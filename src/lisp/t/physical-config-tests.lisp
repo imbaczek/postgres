@@ -424,6 +424,33 @@
         (ok (intake-fails-p (lambda () (pg::startup-configuration-output args))))
         (ok (not (probe-file missing))))))
 
+(cl-spec:defproperty signed-binary-prefix-preserves-int32-values
+    ((number (range integer -2147483648 2147483647)))
+  (:about pg::startup-numeric-prefix)
+  (:trials (:normal 200))
+  (multiple-value-bind (parsed unit)
+      (pg::startup-numeric-prefix (format nil "~:[0b~;-0b~]~b" (minusp number) (abs number)))
+    (and (= parsed number) (string= unit ""))))
+
+(deftest generated-signed-binary-prefix-roundtrip
+    (let ((data (cl-spec:result-data
+                 (cl-spec:run-property 'signed-binary-prefix-preserves-int32-values :seed 42))))
+      (ok (eq :passed (getf data :status)) (format nil "~s" data))))
+
+(deftest signed-integer-gucs-accept-c23-binary-prefixes
+    (dolist (case '(("max_connections" "0b1100100" 100)
+                    ("max_connections" "0b10000000" 128)
+                    ("max_connections" "+0B1010" 10)
+                    ("max_slot_wal_keep_size" "-0b1" -1)
+                    ("checkpoint_timeout" "0b11110s" 30)
+                    ("max_wal_size" "0b10GB" 2048)))
+      (destructuring-bind (name text expected) case
+        (ok (= expected (pg::startup-normalize-setting name text)))))
+  (dolist (text (list "0b" "0b2" "0b10e1" "0b10.5"
+                      (concatenate 'string "0b" (make-string 80 :initial-element #\1))))
+    (ok (intake-fails-p
+         (lambda () (pg::startup-normalize-setting "max_connections" text))))))
+
 (deftest startup-integer-conversion-matches-pinned-c-rounding
     (dolist (case '(("port" "0x1538" 5432) ("port" "012470" 5432)
                     ("port" "5432.5" 5432) ("port" "5433.5" 5434)

@@ -80,6 +80,17 @@ rounding do not apply."
                      (error "invalid recovery_target_timeline ~s" text))
                    timeline))))))))
 
+(defun startup-integer-number (begin end)
+  (let ((address (sb-sys:find-foreign-symbol-address "__isoc23_strtol")))
+    (setf (sb-alien:deref (startup-errno-location)) 0)
+    (if address
+        (sb-alien:alien-funcall
+         (sb-alien:sap-alien
+          (sb-sys:int-sap address)
+          (function sb-alien:long (* sb-alien:char) (* (* sb-alien:char)) sb-alien:int))
+         begin end 0)
+        (startup-strtol begin end 0))))
+
 (defun startup-numeric-prefix (text)
   "Use the same C numeric conversions as guc.c:parse_int, without Lisp READ."
   (when (find (code-char 0) text) (error "NUL in configuration value"))
@@ -91,7 +102,7 @@ rounding do not apply."
                (number nil)
                (offset nil))
           (setf (sb-alien:deref errno) 0
-                number (startup-strtol begin (sb-alien:addr end) 0)
+                number (startup-integer-number begin (sb-alien:addr end))
                 offset (- (sb-sys:sap-int (sb-alien:alien-sap end))
                           (sb-sys:sap-int (sb-sys:vector-sap bytes))))
           (when (or (= (sb-alien:deref errno) sb-posix:erange)
