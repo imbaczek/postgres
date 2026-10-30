@@ -46,6 +46,7 @@ are unsupported by the helper."
   (fallback "" :type string :read-only t))
 
 (defun physical-libpq-default-fallback ()
+  "Use cluster_name as the application name fallback, or walreceiver if empty."
   (let ((name (startup-setting-show-value "cluster_name")))
     (if (and name (plusp (length name))) name "walreceiver")))
 
@@ -433,6 +434,8 @@ unsolicited EOF, which is a protocol violation."
   "One receiver, one transition and one asynchronous retirement may overlap.")
 
 (defun physical-libpq-reserve-channel ()
+  "Reserve capacity for a receiver, transition, or cleanup child.
+Stopping a child does not free its slot; close releases it only after reaping."
   (sb-thread:with-mutex (*physical-libpq-channels-lock*)
     (when (>= (hash-table-count *physical-libpq-channels*) +physical-libpq-channel-limit+)
       (error "libpq helper capacity exhausted"))

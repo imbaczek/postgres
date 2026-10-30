@@ -95,6 +95,10 @@ frozen profile has a 32 KiB budget within a control envelope of about 70 MiB. Th
 status interface is
 `pg_catalog.pg_stat_get_wal_receiver()`.
 
+The default libpq fallback application name is the startup `cluster_name` when
+nonempty, otherwise `walreceiver`; an explicit `:fallback` overrides that default.
+An explicit libpq `application_name` takes precedence over the fallback.
+
 `t/libpq-follow.sh` is the integration acceptance wrapper for this path.
 
 ## Write-ahead logging
@@ -1587,7 +1591,8 @@ PATRONI_PYTHON=/path/to/pinned-venv/bin/python3
 It exercises the unmodified writer's attach, replace and clear configuration
 against C `postgres -C`; the output directory must not already exist. Optional
 `--native /path/to/pg-lisp.sh` also compares native metadata. That full native
-comparison currently fails on unsupported `cluster_name`. This checks generated
+comparison currently fails on unsupported `max_locks_per_transaction`; 16 writer
+fields remain unregistered. This checks generated
 metadata, not `Postgresql.follow`, a receiver, an HA controller or DCS.
 
 Physical follow also requires that pinned environment and checks Patroni's unchanged

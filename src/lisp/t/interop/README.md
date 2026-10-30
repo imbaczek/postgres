@@ -59,8 +59,30 @@ PATRONI_PYTHON=/path/to/pinned-venv/bin/python3
 ```
 
 Pass `--native /path/to/pg-lisp.sh` to compare native metadata as well; the full
-comparison currently fails on unsupported `cluster_name`. This oracle does not
+comparison currently fails on unsupported `max_locks_per_transaction`, with 16
+writer fields unregistered. This oracle does not
 run `Postgresql.follow`, a receiver, a coordinator or DCS.
+
+From `src/lisp`, compare `cluster_name` configuration and byte normalization
+against a C executable using Python 3, SBCL and an existing C installation:
+
+```sh
+python3 t/interop/cluster-name.py "$PWD" /path/to/c/bin/postgres
+```
+
+For the live libpq follow checks, use the pinned Patroni Python environment,
+the C binaries and libpq 17 or newer. `PG_CONFIG` selects the matching libpq
+headers and library for the helper build:
+
+```sh
+PATRONI_PYTHON=/path/to/pinned-venv/bin/python3 \
+REFERENCE_POSTGRES=/path/to/c/bin/postgres PG_CONFIG=/path/to/c/bin/pg_config \
+FOLLOW_CLUSTER_NAME=1 t/libpq-follow.sh
+```
+
+The flag adds cluster-name fallback, empty-cluster fallback, SQL context and
+reload checks to the follow acceptance run. It observes actual source backend
+names through the task-owned control REPL. The wrapper builds a temporary helper.
 
 From `src/lisp`, run the native session quota, reload, restart and raw-wire checks:
 

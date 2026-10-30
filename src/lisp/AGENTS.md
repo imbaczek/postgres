@@ -452,6 +452,12 @@ this mode.
 
 ### Startup and timeout debugging
 
+- Check postmaster encoding behavior against a running C server with a UTF-8
+  data directory as well as `-C`: `cluster_name` clips raw SQL_ASCII bytes at
+  63 before cleaning, unlike session `application_name`'s whole-character clip.
+  When helper capacity is exhausted, inspect actual receiver, transition and
+  cleanup owners in the task-owned control REPL before calling it a leak. Two
+  slots proved insufficient when receiver and cleanup overlapped a transition.
 - Inspect receiver and replay state through the owned control REPL when a stop
   unexpectedly poisons recovery. An intentional helper SIGKILL once surfaced as
   `08P01` and stopped replay too; explicit stop must be distinguished from an

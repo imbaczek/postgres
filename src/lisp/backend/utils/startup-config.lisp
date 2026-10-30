@@ -104,19 +104,27 @@
       (princ-to-string value)))
 
 (defun guc-clean-ascii-octets (octets)
+  "Render printable ASCII directly and escape each other byte as hexadecimal."
   (with-output-to-string (output)
     (loop for byte across octets
           do (if (<= 32 byte 126)
                  (write-char (code-char byte) output)
                  (format output "\\x~(~2,'0x~)" byte)))))
 
-(defun startup-input-octets (input) (etypecase input
-                                      (string (string->bytes input))
-                                      ((vector (unsigned-byte 8)) (copy-seq input))))
+(defun startup-input-octets (input)
+  "Encode text as UTF-8 or copy already parsed octets without reencoding."
+  (etypecase input
+    (string (string->bytes input))
+    ((vector (unsigned-byte 8)) (copy-seq input))))
 
-(defun startup-input-text (input) (bytes->string (startup-input-octets input)))
+(defun startup-input-text (input)
+  "Decode input octets as UTF-8 for ordinary settings and include paths."
+  (bytes->string (startup-input-octets input)))
 
 (defun startup-normalize-setting (name input)
+  "Normalize a startup setting from text or literal octets.
+For cluster_name, postmaster SQL_ASCII clips 63 raw bytes before ASCII cleaning,
+even with a UTF-8 database. Other settings decode their input as UTF-8."
   (let ((spec (assoc name *startup-setting-specs* :test #'string=))
         (octets (startup-input-octets input)))
     (unless spec (error "unrecognized configuration parameter ~s" name))
@@ -201,7 +209,9 @@
     (make-pathname :directory (cons :absolute (nreverse parts)) :defaults absolute)))
 
 (defun startup-config-value (line position)
-  "Parse a one-byte character view into literal octets, without the Lisp reader."
+  "Parse a Latin-1 byte view into literal octets, without the Lisp reader.
+Octal escapes produce raw bytes; retain only the prefix before the first NUL,
+as in a C string. Do not reencode the byte view as UTF-8."
   (let ((length (length line)) (index position))
     (labels ((space-p (char) (find char '(#\Space #\Tab #\Return)))
              (skip () (loop while (and (< index length) (space-p (char line index))) do (incf index))))
@@ -259,7 +269,8 @@
   (merge-pathnames (startup-input-text value) (uiop:pathname-directory-pathname parent)))
 
 (defun startup-open-config (path)
-  "Follow config symlinks, but reject special files without blocking the reload gate."
+  "Open a bounded regular config file as a Latin-1 byte view.
+Follow symlinks, but reject special files without blocking the reload gate."
   (let* ((fd (sb-posix:open (namestring path)
                             (logior sb-posix:o-rdonly sb-posix:o-nonblock +postmaster-o-cloexec+)))
          (success nil))

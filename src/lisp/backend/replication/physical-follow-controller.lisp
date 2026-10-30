@@ -787,7 +787,8 @@ recovery cannot yet be enabled. A failed first connection leaves replay running.
     (physical-follow-operation-result operation)))
 
 (defun physical-follow-retarget-conninfo (conninfo &key (prefix "follow") (fallback (physical-libpq-default-fallback)))
-  "Attach or retarget native follow using a libpq profile."
+  "Attach or retarget native follow using a libpq profile.
+Unless supplied, FALLBACK uses cluster_name or walreceiver when it is empty."
   (when (plusp *live-operation-depth*)
     (error "native follow retarget requires its own operation admission"))
   (let ((profile (make-physical-libpq-profile conninfo :fallback fallback)))

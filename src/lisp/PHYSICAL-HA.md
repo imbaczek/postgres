@@ -726,6 +726,36 @@ conninfo, and `xlogrecovery.c:3851-3852` gates receiver launch on conninfo.
 Standard Patroni configuration integration and desired-generation handling remain
 follow-up work.
 
+### Cluster name and receiver fallback — completed milestone
+
+`cluster_name` is a postmaster setting and supplies the default libpq receiver
+application-name fallback when nonempty; otherwise the fallback is `walreceiver`.
+Postmaster normalization clips 63 raw SQL_ASCII bytes before ASCII cleaning, even
+for a UTF-8 data directory. Session `application_name` instead clips at a UTF-8
+character boundary. Configuration literals preserve deescaped bytes, including
+octal escapes, and use the prefix before the first NUL. The libpq helper limit is
+three concurrent children for receiver, transition and cleanup; a stopped child
+retains its slot until reaped.
+
+The full physical suite passed 1068 tests, zero failures and zero pending
+(405359 ms); strict cold compile passed (`/tmp/pg-cluster-name-final-compile.log`).
+The C differential (`/tmp/pg-cluster-name-final-differential.log`) and live run
+(`/tmp/pg-cluster-name-live-e2e-final.log`) passed. The live run checked source
+backend names through the owned control REPL, SQLSTATE `55P02`, pending restart
+reversion, owner preservation and the `walreceiver` fallback for an empty cluster
+name, together with the follow,
+crash and promotion suite. A live UTF-8 C probe in
+`/tmp/pg-cluster-name-c-probe.ou21x44o` showed that 62 ASCII bytes followed by
+`é` retain only its first byte before cleaning. Sol high code and Sol medium
+refactor reviews were clear. The property passed 200 trials at seeds 42 and 43,
+digest `1c758a1cb784bcb9`; rejection counts and input coverage were unmeasured.
+
+The Patroni C writer metadata oracle passed
+(`/tmp/pg-cluster-name-writer-c-checked.log`), but the full native writer oracle
+still stops at `max_locks_per_transaction` and has 16 unregistered fields. Standard
+follow configuration, desired-generation reconciliation and receiver use of a public
+primary slot remain unwired.
+
 ### Standard follow configuration integration — in progress
 
 The next integrated milestone is startup and upstream replacement through
@@ -747,8 +777,9 @@ A separate pinned Patroni 4.1.5 oracle constructs the real `Postgresql` and
 emitted and recovery settings with C `postgres -C`. It verifies passfile mode
 and escaping, connection options, slot name, local configuration and signal
 files. The C run passes; the full native comparison currently fails on unsupported
-`cluster_name`. This is a writer and metadata oracle, not a `Postgresql.follow`
-or receiver test. Full GUC behavior, desired-generation reconciliation, automatic
+`max_locks_per_transaction`, with 16 writer fields unregistered. This is a writer
+and metadata oracle, not a `Postgresql.follow` or receiver test. Full GUC behavior,
+desired-generation reconciliation, automatic
 Patroni conninfo wiring through libpq, GUC-driven first attachment and
 same-timeline follow and the follow acceptance matrix remain open.
 
@@ -769,8 +800,8 @@ zero senders, saturated cancellation and a pending raw handshake. Native control
 checks observed reload preserving the active caps. Fresh full physical tests passed
 975, interop 185, legacy 1,155 checks and strict cold compilation passed. The
 seeded admission property passed with input-coverage and rejection-count gaps
-unmeasured. Full writer GUC behavior, libraries and
-effective follow remain open; the writer oracle still first rejects `cluster_name`.
+unmeasured. Full writer GUC behavior, libraries and effective follow remain open;
+the first unsupported native writer setting is now `max_locks_per_transaction`.
 
 `hot_standby` is a postmaster Boolean, default on, reported as canonical on/off
 with Boolean type and NULL unit. GUC Boolean prefixes are accepted, but edge

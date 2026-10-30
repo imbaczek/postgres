@@ -87,7 +87,8 @@
       (session-custom-setting-p name)))
 
 (defun session-normalize-application-name (value)
-  "Clip VALUE at 63 UTF-8 bytes, then escape bytes outside printable ASCII.
+  "Clip VALUE at 63 UTF-8 bytes without splitting a character, then escape bytes
+outside printable ASCII. This differs from postmaster cluster_name byte clipping.
 Return the escaped value, whether clipping occurred, and the clipped input text."
   (let* ((text (princ-to-string value))
          (clipped (sql-name-input text)))
