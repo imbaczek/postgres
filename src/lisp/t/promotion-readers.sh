@@ -2,6 +2,11 @@
 set -eu
 BASE=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 . "$BASE/t/test-support.sh"
+if [ -n "${PROMOTION_SUSPENDED_PORTAL:-}" ] && \
+   { [ -n "${PROMOTION_CRASH:-}" ] || [ -n "${PROMOTION_ONLY_SNAPSHOT:-}" ]; }; then
+    echo 'promotion-readers: PROMOTION_SUSPENDED_PORTAL cannot be combined with PROMOTION_CRASH or PROMOTION_ONLY_SNAPSHOT' >&2
+    exit 2
+fi
 PSQL=${PSQL:-psql}
 SBCL=${SBCL:-sbcl}
 PATRONI_PYTHON=${PATRONI_PYTHON:-/tmp/pg-patroni-4.1.5-venv/bin/python3}
@@ -45,7 +50,10 @@ if [ -z "${PROMOTION_CRASH:-}" ]; then kill -KILL "$TARGET"; fi
 wait "$TARGET" 2>/dev/null || :; TARGET=
 start_target
 test "$(sql "$TARGET_PORT" 'SELECT pg_is_in_recovery()')" = f
-if [ -n "${PROMOTION_ONLY_SNAPSHOT:-}" ]; then
+if [ -n "${PROMOTION_SUSPENDED_PORTAL:-}" ]; then
+    test "$(sql "$TARGET_PORT" 'SELECT count(*) FROM promotion_sql_items')" = 403
+    test "$(sql "$TARGET_PORT" 'SELECT label FROM promotion_sql_items WHERE id=402')" = changed
+elif [ -n "${PROMOTION_ONLY_SNAPSHOT:-}" ]; then
     test "$(sql "$TARGET_PORT" 'SELECT count(*) FROM promotion_sql_items')" = 5
 elif [ -n "${PROMOTION_CRASH:-}" ]; then
     test "$(sql "$TARGET_PORT" 'SELECT count(*) FROM promotion_sql_items')" = 3
