@@ -53,7 +53,6 @@
                   ("SELECT .5" "0.5") ("SELECT 1." "1")))
     (ok (string= (second case)
                  (pg::sql-numeric-output (aref (first (derived-query-rows (first case))) 0)))))
-  (ok (equal "0A000" (sqlstate-of (derived-query-rows "SELECT 1 LIMIT 1.5"))))
   (ok (equalp '(#(32 10 63 3))
               (derived-query-rows "SELECT 0x20,1_0,0o7_7,0b1_1")))
   (dolist (sql '("SELECT 1__0" "SELECT 123abc" "SELECT 0xG" "SELECT 1e+"))

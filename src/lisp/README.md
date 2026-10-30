@@ -718,6 +718,11 @@ UPDATE t [AS alias] SET col = expr [, ...] [FROM source [, ...]]
 DELETE FROM t [AS alias] [USING source [, ...]] [WHERE e] [RETURNING expr, ... | *];
 ```
 
+`LIMIT` currently accepts a signed numeric literal. Decimal literals are coerced
+to bigint with ties rounded away from zero, as in PostgreSQL; a negative result
+is rejected. General expression-valued limits, parameters, `NULL`, `ALL`, and
+`OFFSET` remain outside this grammar subset.
+
 Expression subqueries support correlated and uncorrelated `EXISTS`, scalar
 subqueries, `IN`/`NOT IN`, and comparisons with `ANY`/`SOME`/`ALL`.
 `ARRAY(SELECT ...)` supports text elements. These forms use the existing

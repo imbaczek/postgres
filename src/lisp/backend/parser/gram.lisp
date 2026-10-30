@@ -95,6 +95,22 @@
       (token-value (pnext p))
       (syntax-error p "expected integer literal")))
 
+(defun parse-limit-literal (p)
+  "Coerce a numeric row-count literal to int8, rounding numeric ties away from zero."
+  (let* ((negative-p (match-op p "-"))
+         (positive-p (and (not negative-p) (match-op p "+")))
+         (value (cond ((eq (pkind p) :integer) (token-value (pnext p)))
+                      ((eq (pkind p) :numeric)
+                       (sql-numeric-rounded-coefficient
+                        (sql-numeric-input (token-value (pnext p))) 0))
+                      (t (syntax-error p "expected numeric LIMIT literal"))))
+         (count (* (if negative-p -1 1) value)))
+    (declare (ignore positive-p))
+    (unless (<= +int8-min+ count +int8-max+)
+      (ereport "22003" "bigint out of range"))
+    (when (minusp count) (ereport "2201W" "LIMIT must not be negative"))
+    count))
+
 (defun parse-string-literal (p)
   (if (eq (pkind p) :string)
       (token-value (pnext p))
@@ -270,7 +286,7 @@
     (setf (getf left :order-by) (parse-order-list p)))
   (when (match-kw p "limit")
     (when (getf left :limit) (syntax-error p "multiple LIMIT clauses"))
-    (setf (getf left :limit) (parse-integer-literal p)))
+    (setf (getf left :limit) (parse-limit-literal p)))
   ;; Sort the projected VALUES row so its expressions are evaluated only once.
   (if (and (getf left :values-query-p) (getf left :order-by))
       (let ((inner (copy-list left)))
