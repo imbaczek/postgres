@@ -46,6 +46,24 @@
           (when toast (pg-toast-relfilenode toast))
           (when toast (pg-toast-index-relfilenode toast)))))
 
+(defun check-truncate-table-not-in-use (table)
+  "Reject storage replacement while this backend retains an executor for TABLE.
+
+A named portal can retain its executor after Bind or after execution completes,
+until Close releases it.  Transaction reader registrations alone do not imply
+that an executor is still using the table.  Relation gates exclude other backends,
+but cannot protect a retained executor in this backend from its own TRUNCATE."
+  (when (some (lambda (owner)
+                (and (eq *backend* (query-execution-owner-backend owner))
+                     (not (query-execution-owner-closed-p owner))
+                     (some (lambda (relation)
+                             (and (not (getf relation :virtual-p))
+                                  (eq table (getf relation :table))))
+                           (query-execution-owner-binding owner '*subquery-registered-relations*))))
+              (query-execution-owner-reload-state))
+    (ereport "55006" "cannot TRUNCATE \"~a\" because it is being used by active queries in this session"
+             (pg-class-name table))))
+
 (defun exec-truncate (stream ast)
   "Replace table, index and TOAST storage while retaining gates through transaction end.
 Recheck identities after waiting and under catalog locks before changing storage."
@@ -57,6 +75,7 @@ Recheck identities after waiting and under catalog locks before changing storage
                  (mapcar
                   (lambda (name)
                     (let ((table (resolve-table-or-error name)))
+                      (check-truncate-table-not-in-use table)
                       (cons table (truncate-table-storage-state table))))
                   (remove-duplicates (getf ast :tables) :test #'equal :from-end t))))
              (targets (mapcar #'car captured))
