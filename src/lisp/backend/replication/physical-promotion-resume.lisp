@@ -67,6 +67,7 @@
                   (getf state :source-reservation) (copy-list (getf metadata :source-reservation))
                   (getf state :source-xids) (copy-tree (getf metadata :source-xids)))
             (physical-promotion-check-pending-retained control metadata)
+            (physical-promotion-timeline-floor state)
             (values state metadata prefix generation)))))))
 
 (defun physical-promotion-open-pending-store (state)

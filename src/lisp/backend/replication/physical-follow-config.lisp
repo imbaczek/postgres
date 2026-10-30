@@ -84,12 +84,14 @@ Names contain 1 to 63 lowercase ASCII letters, digits or underscores."
 (defun physical-follow-controller-copy (state)
   "Check and copy durable controller state. A preparation reserves one queue slot."
   (let ((keys '(:version :enabled :preparing :cleanup)))
-    (dolist (key '(:source :mode :unowned-bootstrap :public-slot))
+    (dolist (key '(:source :mode :unowned-bootstrap :public-slot :known-timeline))
       (when (getf state key) (setf keys (append keys (list key)))))
     (physical-follow-check-plist state keys))
   (unless (and (eql 1 (getf state :version)) (member (getf state :enabled) '(nil t))
                (listp (getf state :cleanup))
-               (member (getf state :mode) '(nil :standby-unattached)))
+               (member (getf state :mode) '(nil :standby-unattached))
+               (or (null (getf state :known-timeline))
+                   (typep (getf state :known-timeline) '(integer 1 4294967295))))
     (error "invalid native follow controller state"))
   (let* ((preparing (when (getf state :preparing)
                       (physical-follow-cleanup-copy (getf state :preparing))))
@@ -99,6 +101,8 @@ Names contain 1 to 63 lowercase ASCII letters, digits or underscores."
                  (= (length queue) (length (remove-duplicates queue :test #'equal))))
       (error "native follow cleanup capacity, preparation or duplicate entry is invalid"))
     (append (list :version 1 :enabled (getf state :enabled) :preparing preparing :cleanup queue)
+            (when (getf state :known-timeline)
+              (list :known-timeline (getf state :known-timeline)))
             (when (getf state :public-slot)
               (list :public-slot (physical-follow-public-slot-copy (getf state :public-slot))))
             (when (getf state :source)
@@ -107,6 +111,13 @@ Names contain 1 to 63 lowercase ASCII letters, digits or underscores."
             (when (getf state :unowned-bootstrap)
               (list :unowned-bootstrap
                     (physical-follow-unowned-bootstrap-copy (getf state :unowned-bootstrap)))))))
+
+(defun physical-follow-remember-timeline (state timeline)
+  (unless (typep timeline '(integer 1 4294967295))
+    (error "invalid known follow timeline"))
+  (let ((copy (physical-follow-controller-copy state)))
+    (setf (getf copy :known-timeline) (max timeline (or (getf copy :known-timeline) 1)))
+    copy))
 
 (defun physical-follow-no-source-p (config)
   (and (listp config) (= 6 (length config)) (eql 1 (first config))
@@ -140,6 +151,18 @@ Names contain 1 to 63 lowercase ASCII letters, digits or underscores."
   (if (= 6 (length config))
       (physical-follow-controller-copy (sixth config))
       (list :version 1 :enabled t :preparing nil :cleanup nil)))
+
+(defun physical-follow-remember-config-timeline (config)
+  (let* ((state (physical-follow-controller-state config))
+         (anchor (getf (fifth config) :anchor))
+         (known (getf state :known-timeline)))
+    (when anchor
+      (physical-follow-anchor-check anchor)
+      (setf known (max (or known 1) (getf anchor :source-timeline))))
+    (dolist (entry (append (when (getf state :preparing) (list (getf state :preparing)))
+                           (getf state :cleanup)))
+      (setf known (max (or known 1) (getf (getf entry :request) :source-timeline))))
+    (if known (physical-follow-remember-timeline state known) state)))
 
 (defun physical-follow-check-unowned-bootstrap-base (config base)
   "Require any unowned reference and preparation to agree with the verified base."

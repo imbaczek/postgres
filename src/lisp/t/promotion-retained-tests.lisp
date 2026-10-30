@@ -1178,7 +1178,7 @@
              (pending (call-with-promotion-exclusion #'pg::physical-promotion-publish-intent))
              (reference (getf pending :retained-reference)))
         (declare (ignore selection))
-        (ok (= 2 (getf pending :promotion-child)))
+        (ok (= 6 (getf pending :promotion-child)))
         (ok (= 1 (getf pending :applied-timeline (getf pending :timeline))))
         (ok (equal source (pg::physical-store-control-tuple store)))
         (multiple-value-bind (metadata) (pg::physical-restartpoint-read pending)
@@ -1190,7 +1190,7 @@
                        (getf index :entries)))))
         (call-with-promotion-exclusion #'pg::physical-promotion-install-prefix)
         (call-with-promotion-exclusion #'pg::physical-promotion-publish-child-control)
-        (ok (pg::physical-promotion-check-child-control 2 2)))))
+        (ok (pg::physical-promotion-check-child-control 6 6)))))
 
 (deftest promotion-intent-uses-applied-child-selection-digest-before-future-target
     (with-promotion-fixture (root store)
@@ -1236,7 +1236,7 @@
             (ok (= 2 (getf recovery-facts :checkpoint-timeline) (getf recovery-facts :recovery-timeline)))
             (ok (= 304 (getf recovery-facts :checkpoint)))
             (ok (= 424 (getf recovery-facts :recovery-lsn)))
-            (ok (= 3 (getf pending :promotion-child)))
+            (ok (= 6 (getf pending :promotion-child)))
             (ok (= 2 (getf pending :applied-timeline)))
             (ok (/= parent-digest future-digest))
             (ok (= 2 (getf index :history-target)))

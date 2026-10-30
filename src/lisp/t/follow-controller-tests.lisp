@@ -110,6 +110,194 @@
          (funcall function root store active))))
    :applied 152 :system-id 42))
 
+(deftest retained-source-history-prevents-reusing-its-timeline-on-parent-promotion
+    (call-with-retained-follow-config
+     (lambda (root store config)
+       (declare (ignore store))
+       (ok (= 2 (getf (getf (fifth config) :anchor) :source-timeline)))
+       (ok (not (probe-file (pg::timeline-history-path 2 root))))
+       (let ((pending (call-with-promotion-exclusion
+                       (lambda () (pg::physical-promotion-publish-intent)))))
+         (ok (= 3 (getf pending :promotion-child)))
+         (ok (= 1 (pg::physical-recovery-replay-timeline pending)))
+         (ok (not (probe-file (pg::timeline-history-path 2 root))))
+         (ok (= 3 (getf (pg::physical-recovery-read-control root) :promotion-child)))))))
+
+(deftest follow-known-timeline-survives-replacement-disable-and-promotion-cleanup
+    (call-with-retained-follow-config
+     (lambda (root store config)
+       (declare (ignore root store))
+       (let* ((state (pg::physical-follow-remember-timeline
+                      (pg::physical-follow-controller-state config) 19))
+              (replacement (pg::physical-follow-with-controller
+                            '(1 "127.0.0.1" 5434 "replacement") state)))
+         (setf (getf state :enabled) nil)
+         (let ((disabled (pg::physical-follow-with-controller replacement state)))
+           (pg::physical-follow-save-config disabled)
+           (ok (= 19 (getf (pg::physical-follow-controller-state
+                            (pg::physical-follow-read-config)) :known-timeline)))
+           (let ((cleanup (pg::physical-follow-promotion-cleanup-config)))
+             (ok (= 19 (getf (pg::physical-follow-controller-state cleanup) :known-timeline)))
+             (ok (pg::physical-follow-no-source-p cleanup))))))))
+
+(deftest legacy-source-timeline-is-remembered-before-replacing-or-retiring-its-anchor
+    (call-with-retained-follow-config
+     (lambda (root store config)
+       (declare (ignore root store))
+       (setf (getf (getf (fifth config) :anchor) :source-timeline) 19)
+       (pg::physical-follow-check-config config)
+       (let* ((before (copy-tree config))
+              (state (pg::physical-follow-remember-config-timeline config))
+              (lower (pg::physical-follow-remember-timeline state 2)))
+         (ok (= 19 (getf lower :known-timeline)))
+         (ok (equal before config))
+         (pg::physical-follow-save-config config)
+         (ok (= 19 (getf (pg::physical-follow-controller-state
+                          (pg::physical-follow-promotion-cleanup-config)) :known-timeline)))))))
+
+(deftest promotion-freezes-known-namespace-before-intent-and-ignores-later-policy
+    (call-with-promotion-fixture
+     (lambda (root store)
+       (pg::wal-atomic-write-bytes (pg::clog-path) (empty-octets))
+       (pg::timeline-write-history 12 1 216 "known target" root)
+       (setf (getf pg::*physical-recovery-state* :timeline-policy)
+             (pg::physical-recovery-resolve-timeline-policy
+              pg::*physical-recovery-state* store nil 12))
+       (let ((pending (call-with-promotion-exclusion
+                       (lambda () (pg::physical-promotion-publish-intent)))))
+         (ok (= 13 (getf pending :promotion-child)))
+         (ok (= 12 (getf (pg::physical-follow-controller-state
+                          (pg::physical-follow-read-config)) :known-timeline)))
+         (ok (not (probe-file (pg::timeline-history-path 2 root))))
+         (setf (getf pending :timeline-policy) (list :target 99))
+         (ok (= 12 (pg::physical-promotion-timeline-floor pending)))
+         (ok (progn (pg::physical-promotion-check-history pending nil) t))
+         (let ((config (pg::physical-follow-read-config)))
+           (dolist (bad '(1 13))
+             (let ((state (pg::physical-follow-controller-state config)))
+               (setf (getf state :known-timeline) bad)
+               (pg::physical-follow-save-config (pg::physical-follow-with-controller config state))
+               (if (= bad 13)
+                   (ok (signals (pg::physical-promotion-timeline-floor pending) 'error))
+                   (ok (signals (pg::physical-promotion-check-history pending nil) 'error)))))
+           (pg::physical-follow-save-config config))))))
+
+(deftest known-timeline-exhaustion-rejects-before-promotion-intent
+    (call-with-promotion-fixture
+     (lambda (root store)
+       (declare (ignore root store))
+       (pg::wal-atomic-write-bytes (pg::clog-path) (empty-octets))
+       (let ((config (pg::physical-follow-with-controller
+                      '(1 "127.0.0.1" 5432 "old_source")
+                      (pg::physical-follow-remember-timeline
+                       (follow-controller-test-state) 4294967295))))
+         (pg::physical-follow-save-config config)
+         (ok (signals (call-with-promotion-exclusion
+                       (lambda () (pg::physical-promotion-publish-intent))) 'error))
+         (ok (= 2 (getf pg::*physical-recovery-state* :phase)))
+         (ok (= 2 (getf (pg::physical-recovery-read-control pg::*pgdata*) :phase)))
+         (ok (equal config (pg::physical-follow-read-config)))
+         (ok (not pg::*physical-recovery-failed-p*))))))
+
+(deftest cleanup-only-recovery-preserves-retired-source-namespace-through-promotion
+    (call-with-promotion-fixture
+     (lambda (root store)
+       (declare (ignore root store))
+       (pg::wal-atomic-write-bytes (pg::clog-path) (empty-octets))
+       (let ((entry (follow-controller-test-entry "retired_high_source")))
+         (setf (getf (getf entry :request) :source-timeline) 19)
+         (pg::physical-follow-save-config
+          (list 1 nil nil nil nil
+                (follow-controller-test-state :enabled nil :queue (list entry))))
+         (let ((connect (symbol-function 'pg::physical-follow-cleanup-connect))
+               (abort (symbol-function 'pg::pg-client-native-abort))
+               (pg::*physical-follow-controller-errors* (make-hash-table :test #'equal))
+               (pg::*physical-follow-cleanup-retry-after* (make-hash-table :test #'equal))
+               (acks 0))
+           (unwind-protect
+                (progn
+                  (setf (symbol-function 'pg::physical-follow-cleanup-connect)
+                        (lambda (record) (declare (ignore record)) nil)
+                        (symbol-function 'pg::pg-client-native-abort)
+                        (lambda (&rest args) (declare (ignore args)) (incf acks)))
+                  (pg::physical-follow-controller-cleanup entry)
+                  (ok (= 1 acks))
+                  (let ((state (pg::physical-follow-controller-state (pg::physical-follow-read-config))))
+                    (ok (null (getf state :cleanup)))
+                    (ok (= 19 (getf state :known-timeline)))))
+             (setf (symbol-function 'pg::physical-follow-cleanup-connect) connect
+                   (symbol-function 'pg::pg-client-native-abort) abort)))
+         (let ((pending (call-with-promotion-exclusion
+                         (lambda () (pg::physical-promotion-publish-intent)))))
+           (ok (= 20 (getf pending :promotion-child)))
+           (ok (= 19 (pg::physical-promotion-timeline-floor pending)))
+           (ok (progn (pg::physical-promotion-check-history pending nil) t)))))))
+
+(deftest promotion-known-timeline-save-cuts-leave-phase-two-retryable
+    (dolist (point '(:before-follow-config-fsync :after-follow-config-fsync
+                     :before-follow-config-rename :after-follow-config-rename
+                     :after-follow-config-directory-fsync))
+      (call-with-retained-follow-config
+       (lambda (root store config)
+         (declare (ignore config))
+         (let ((before (pg::physical-store-control-tuple store))
+               (hits 0))
+           (let ((pg::*physical-follow-test-hook*
+                   (lambda (at) (when (eq at point) (incf hits) (error "floor save cut")))))
+             (ok (signals (call-with-promotion-exclusion
+                           (lambda () (pg::physical-promotion-publish-intent))) 'error)))
+           (ok (= 1 hits))
+           (ok (= 2 (getf pg::*physical-recovery-state* :phase)))
+           (ok (= 2 (getf (pg::physical-recovery-read-control root) :phase)))
+           (ok (equal before (pg::physical-store-control-tuple store)))
+           (ok (not pg::*physical-recovery-failed-p*))
+           (let ((known (getf (pg::physical-follow-controller-state
+                               (pg::physical-follow-read-config)) :known-timeline)))
+             (if (member point '(:after-follow-config-rename :after-follow-config-directory-fsync))
+                 (ok (eql 2 known))
+                 (ok (null known))))
+           (let ((pending (call-with-promotion-exclusion
+                           (lambda () (pg::physical-promotion-publish-intent)))))
+             (ok (= 3 (getf pending :promotion-child)))
+             (ok (progn (pg::physical-promotion-check-history pending nil) t))))))))
+
+(deftest cold-pending-reconstruction-uses-frozen-known-timeline
+    (call-with-promotion-fixture
+     (lambda (root store)
+       (declare (ignore root))
+       (pg::wal-atomic-write-bytes (pg::clog-path) (empty-octets))
+       (pg::physical-follow-save-config
+        (pg::physical-follow-with-controller
+         '(1 "127.0.0.1" 5432 "old_source")
+         (pg::physical-follow-remember-timeline (follow-controller-test-state) 19)))
+       (call-with-promotion-exclusion (lambda () (pg::physical-promotion-publish-intent)))
+       (let ((pg::*physical-receive-store* nil))
+         (multiple-value-bind (pending metadata prefix generation)
+             (pg::physical-promotion-read-pending-state)
+           (declare (ignore metadata prefix generation))
+           (ok (= 20 (getf pending :promotion-child)))
+           (ok (= 19 (pg::physical-promotion-timeline-floor pending)))
+           (ok (progn (pg::physical-promotion-check-history pending nil) t))))
+       (ok (= 1 (pg::physical-store-selected-timeline store))))
+     :system-id (pg::physical-store-update-digest
+                 #xCBF29CE484222325 (pg::string->bytes "history-source"))))
+
+(deftest legacy-pending-intent-cannot-reuse-an-observed-source-timeline
+    (call-with-retained-follow-config
+     (lambda (root store config)
+       (declare (ignore root store))
+       (let ((pending (call-with-promotion-exclusion
+                       (lambda () (pg::physical-promotion-publish-intent)))))
+         (let ((state (pg::physical-follow-controller-state (pg::physical-follow-read-config))))
+           (remf state :known-timeline)
+           (pg::physical-follow-save-config (pg::physical-follow-with-controller config state)))
+         (let ((colliding (copy-list pending)))
+           (setf (getf colliding :promotion-child) 2)
+           (ok (signals (pg::physical-promotion-timeline-floor colliding) 'error)))
+         (pg::timeline-write-history 2 1 152 "legacy observed source")
+         (ok (= 1 (pg::physical-promotion-timeline-floor pending)))
+         (ok (progn (pg::physical-promotion-check-history pending nil) t))))))
+
 (deftest retained-receiver-completion-is-a-timeline-end-event
     (dolist (copy '(nil t))
       (call-with-retained-follow-config
@@ -1272,6 +1460,33 @@
                  (cl-spec:run-property 'follow-controller-envelope-preserves-cleanup-identities-and-enable-state
                                        :seed 42))))
       (ok (eq :passed (getf data :status)) (format nil "~s" data))))
+
+(cl-spec:defproperty follow-known-timeline-survives-controller-roundtrip
+    ((known (range integer 1 4294967295))
+     (observed (range integer 1 4294967295))
+     (enabled (range integer 0 1)))
+  (:about pg::physical-follow-decode-config)
+  (:trials (:normal 200))
+  (let* ((plain '(1 "127.0.0.1" 5432 "known_source"))
+         (config (pg::physical-follow-with-controller
+                  plain (pg::physical-follow-remember-timeline
+                         (append (follow-controller-test-state :enabled (plusp enabled))
+                                 (list :known-timeline known)) observed)))
+         (decoded (pg::physical-follow-decode-config (pg::physical-follow-config-image config))))
+    (and (= (max known observed) (getf (pg::physical-follow-controller-state decoded) :known-timeline))
+         (equal (pg::physical-follow-effective-config plain)
+                (pg::physical-follow-effective-config decoded)))))
+
+(deftest generated-follow-known-timeline-controller-roundtrip
+    (let ((data (cl-spec:result-data
+                 (cl-spec:run-property 'follow-known-timeline-survives-controller-roundtrip :seed 42))))
+      (ok (eq :passed (getf data :status)) (format nil "~s" data))))
+
+(deftest follow-known-timeline-rejects-invalid-namespace-values
+    (dolist (known '(nil 0 -1 4294967296 "2"))
+      (ok (signals (pg::physical-follow-controller-copy
+                    (append (follow-controller-test-state) (list :known-timeline known)))
+                   'error))))
 
 (defun follow-controller-test-state (&key preparing queue (enabled t))
   (list :version 1 :enabled enabled :preparing preparing :cleanup queue))

@@ -191,6 +191,38 @@ phase-2 recovery can yield to shutdown."
           do (return-from physical-promotion-select-child child))
   (error "no representable child timeline remains"))
 
+(defun physical-promotion-timeline-floor (state)
+  (let* ((parent (physical-recovery-replay-timeline state))
+         (config (when (probe-file (physical-follow-config-path)) (physical-follow-read-config)))
+         (controller (when config (physical-follow-controller-state config)))
+         (known (getf controller :known-timeline))
+         (observed (when config
+                     (getf (physical-follow-remember-config-timeline config) :known-timeline)))
+         (binding (fifth config))
+         (selected (if *physical-receive-store*
+                       (physical-store-selected-timeline *physical-receive-store*) parent)))
+    (when (= 3 (getf state :phase))
+      (unless (> (getf state :promotion-child) (max parent selected (or observed 1)))
+        (error "pending child reuses an observed timeline namespace"))
+      (when known
+        (unless (and (not (getf controller :preparing))
+                     (or (null binding) (eq :active (getf binding :phase)))
+                     (>= known (max parent selected (or observed 1)))
+                     (< known (getf state :promotion-child)))
+          (error "pending promotion has inconsistent known timeline metadata")))
+      (return-from physical-promotion-timeline-floor (or known parent)))
+    (max parent (or observed 1) selected
+         (or (getf (getf state :timeline-policy) :target) 1))))
+
+(defun physical-promotion-freeze-timeline-floor (floor)
+  (let* ((config (if (probe-file (physical-follow-config-path))
+                     (physical-follow-read-config)
+                     (physical-follow-unattached-config-for-base (physical-follow-promotion-base))))
+         (state (physical-follow-remember-timeline (physical-follow-remember-config-timeline config) floor))
+         (frozen (physical-follow-with-controller config state)))
+    (unless (equal frozen config) (physical-follow-controller-save-config frozen))
+    frozen))
+
 (defun physical-promotion-check-base-control (state)
   "Recheck immutable base control and parent history files before promotion intent."
   (let ((entry (find "global/pg_wal_control" (getf state :files) :key #'first :test #'equal)))
@@ -309,7 +341,8 @@ handoff.  Failure during publication fences recovery."
     (physical-recovery-publish-selected-history *physical-receive-store*)
     (let* ((state *physical-recovery-state*)
            (namespace (physical-promotion-check-base-control state))
-           (child (physical-promotion-select-child (physical-recovery-replay-timeline state))))
+           (floor (physical-promotion-timeline-floor state))
+           (child (physical-promotion-select-child floor)))
       (when (and requested-child (not (eql requested-child child)))
         (error "requested promotion child is not the next local timeline"))
       (multiple-value-bind (metadata catalog prefix generation) (physical-restartpoint-read state)
@@ -318,6 +351,7 @@ handoff.  Failure during publication fences recovery."
         (multiple-value-bind (fork next) (physical-promotion-check-progress state metadata prefix generation)
           (physical-promotion-preflight-runtime
            next (getf (getf metadata :source-reservation) :bound) fork)
+          (physical-promotion-freeze-timeline-floor floor)
           (let ((time (- (get-universal-time) 2208988800)) (finished nil))
             (unwind-protect
                  (let ((pending
@@ -347,15 +381,16 @@ handoff.  Failure during publication fences recovery."
                              (unless (= 1 parent) (timeline-history-bytes parent)))))
 
 (defun physical-promotion-check-history (state allow-history)
-  (let* ((parent (physical-recovery-replay-timeline state)) (child (getf state :promotion-child))
-                                                            (path (timeline-history-path child *pgdata*)))
+  (let* ((floor (physical-promotion-timeline-floor state)) (child (getf state :promotion-child))
+                                                           (path (timeline-history-path child *pgdata*)))
+    (unless (> child floor) (error "pending child does not exceed known timeline floor"))
     (if (wal-namespace-file-stat path t)
         (unless (and allow-history
-                     (loop for timeline from (1+ parent) below child
+                     (loop for timeline from (1+ floor) below child
                            always (wal-namespace-file-stat (timeline-history-path timeline *pgdata*) t))
                      (equalp (physical-promotion-history-image state) (physical-promotion-read-file path)))
           (error "pending child history is already published or differs"))
-        (unless (= child (physical-promotion-select-child parent))
+        (unless (= child (physical-promotion-select-child floor))
           (error "pending child selection changed")))))
 
 (declaim (ftype function physical-promotion-check-pending-slots))

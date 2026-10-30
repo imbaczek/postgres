@@ -291,7 +291,7 @@ base provenance is removed; it does not identify a cleanup endpoint."
                  (physical-follow-promotion-base)))
          (config (if base (physical-follow-unattached-config-for-base base)
                      (physical-follow-read-config)))
-         (state (physical-follow-controller-state config)))
+         (state (physical-follow-remember-config-timeline config)))
     (when (physical-follow-cleanup-only-p config)
       (return-from physical-follow-promotion-cleanup-config config))
     (when (or (getf state :preparing) (eq :pending (getf (fifth config) :phase)))
@@ -612,14 +612,16 @@ state. Receipt resumes only after activation."
                (request (getf snapshot :coordinates))
                (old (physical-follow-operation-config operation))
                (binding (physical-follow-controller-plan snapshot anchor view))
-               (state (physical-follow-controller-state old))
+               (state (physical-follow-remember-config-timeline old))
                (retired (physical-follow-current-retirement old (getf snapshot :base)))
                (pending nil))
           (unless (and (equal request (getf entry :request))
                        (equal (getf anchor :history-text) (getf view :history-text)))
             (error "native follow prefix or source history changed during preparation"))
           (remf state :mode)
-          (setf state (physical-follow-operation-source-state operation state))
+          (setf state (physical-follow-remember-timeline
+                       (physical-follow-operation-source-state operation state)
+                       (getf anchor :source-timeline)))
           (setf (getf state :preparing) nil
                 (getf state :enabled) t
                 state (if retired (physical-follow-enqueue-cleanup state retired) state)
@@ -1052,7 +1054,7 @@ old credential leaves the entry queued for a later retry."
                  (with-live-operation
                    (when (probe-file (physical-follow-config-path))
                      (let* ((config (physical-follow-read-config))
-                            (state (physical-follow-controller-state config)))
+                            (state (physical-follow-remember-config-timeline config)))
                        (when (and (not (getf state :preparing))
                                   (or (not (fifth config)) (eq :active (getf (fifth config) :phase)))
                                   (not (equal (getf entry :pin) (fourth config)))
