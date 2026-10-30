@@ -125,6 +125,93 @@
               (symbol-function 'execute-statement) old-execute)
         (when (probe-file path) (delete-file path)))))
 
+(rove:deftest returning-borrowed-spool-is-deferred-and-retained
+    (let* ((*query-temp-directory* (uiop:temporary-directory))
+           (old-close (symbol-function 'close-query-row-spool))
+           (close-count 0)
+           (seen nil)
+           (path nil)
+           (targets (list :target)))
+      (unwind-protect
+           (progn
+             (setf (symbol-function 'close-query-row-spool)
+                   (lambda (spool) (incf close-count) (funcall old-close spool)))
+             (with-query-temp-files
+               (let* ((*dml-returning-spool* (make-query-row-spool 1))
+                      (borrowed *dml-returning-spool*)
+                      (*dml-returning-receiver*
+                        (lambda (spool receiver-targets tag)
+                          (setf seen (list spool receiver-targets tag)))))
+                 (call-with-dml-returning-spool
+                  targets
+                  (lambda ()
+                    (rove:ok (eq borrowed *dml-returning-spool*))
+                    (query-row-spool-append *dml-returning-spool* (vector "large value"))
+                    (setf path (query-row-spool-pathname *dml-returning-spool*))
+                    (finish-dml-command nil targets "UPDATE 1")))
+                 (rove:ok (eq borrowed (first seen)))
+                 (rove:ok (eq targets (second seen)))
+                 (rove:ok (equal "UPDATE 1" (third seen)))
+                 (rove:ok (query-row-spool-sealed-p borrowed))
+                 (rove:ok (zerop close-count))
+                 (let ((rows nil))
+                   (map-query-row-spool borrowed
+                                        (lambda (row index)
+                                          (declare (ignore index))
+                                          (push row rows)))
+                   (rove:ok (equalp rows (list (vector "large value")))))
+                 (rove:ok (handler-case
+                              (progn (call-with-dml-returning-spool targets
+                                                                    (lambda () (error "injected")))
+                                     nil)
+                            (error () t)))
+                 (rove:ok (zerop close-count))
+                 (let ((*dml-returning-spool* nil))
+                   (rove:ok (handler-case (progn (call-with-dml-returning-spool targets (lambda () t)) nil)
+                              (error () t))))
+                 (let ((*dml-returning-receiver* nil))
+                   (call-with-dml-returning-spool targets (lambda () t)))
+                 (rove:ok (= close-count 1))
+                 (close-query-row-spool borrowed)))
+             (rove:ok path)
+             (rove:ok (not (probe-file path))))
+        (setf (symbol-function 'close-query-row-spool) old-close))))
+
+(rove:deftest returning-deferred-handoff-failure-keeps-caller-ownership
+    (let ((*query-temp-directory* (uiop:temporary-directory)))
+      (with-query-temp-files
+        (dolist (mode '(:error :throw))
+          (let* ((spool (make-query-row-spool 1))
+                 (*dml-returning-spool* spool)
+                 (called nil)
+                 (*dml-returning-receiver*
+                   (lambda (received targets tag)
+                     (declare (ignore targets tag))
+                     (setf called (eq received spool))
+                     (ecase mode
+                       (:error (error "injected receiver failure"))
+                       (:throw (throw 'receiver-exit :throw))))))
+            (unwind-protect
+                 (progn
+                   (query-row-spool-append spool (vector "retained"))
+                   (rove:ok (eq mode
+                                (handler-case
+                                    (catch 'receiver-exit
+                                      (call-with-dml-returning-spool
+                                       (list :target)
+                                       (lambda () (finish-dml-command nil (list :target) "DELETE 1")))
+                                      nil)
+                                  (error () :error))))
+                   (rove:ok called)
+                   (rove:ok (query-row-spool-sealed-p spool))
+                   (let ((rows nil))
+                     (map-query-row-spool spool
+                                          (lambda (row index)
+                                            (declare (ignore index))
+                                            (push row rows)))
+                     (rove:ok (equalp rows (list (vector "retained"))))))
+              (close-query-row-spool spool)))))))
+
 (rove:deftest returning-extended-drift-precedes-mutation
     (let* ((targets (returning-test-targets "DELETE FROM things RETURNING id,label"))
            (*select-suppress-description* t)
