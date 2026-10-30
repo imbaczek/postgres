@@ -4,6 +4,11 @@
 
 (defstruct (resource-parameters
             (:constructor %make-resource-parameters (connections workers senders prepared locks)))
+  "Immutable five-field resource tuple, constructed explicitly with checked values.
+NIL means unknown and is not a valid tuple. This codec does not supply defaults
+for legacy data or publish resource requirements. A consumer must associate a
+tuple with its applied LSN and timeline, not use later received values for an
+older replay seed."
   (connections 1 :read-only t)
   (workers 0 :read-only t)
   (senders 0 :read-only t)
@@ -18,6 +23,9 @@
         (resource-parameters-locks parameters)))
 
 (defun resource-parameters-valid-p (parameters)
+  "Check field ranges and minimum feasible process count.
+The minimum includes one autovacuum slot and two special processes; local
+capacity calculation checks the actual autovacuum slot count separately."
   (and (resource-parameters-p parameters)
        (typep (resource-parameters-connections parameters) '(integer 1 262143))
        (every (lambda (value) (typep value '(integer 0 262143)))
@@ -31,12 +39,16 @@
            262143)))
 
 (defun make-resource-parameters (connections workers senders prepared locks)
+  "Construct a checked tuple from all five explicit values."
   (let ((parameters (%make-resource-parameters connections workers senders prepared locks)))
     (unless (resource-parameters-valid-p parameters)
       (error "invalid resource parameters"))
     parameters))
 
 (defun wal-encode-resource-parameters (parameters)
+  "Encode the native 32-byte PGRES001 tuple with five little-endian words.
+The reserved final word is zero. This is not C physical WAL and has no CRC;
+the containing format must provide integrity protection."
   (unless (resource-parameters-valid-p parameters)
     (error "invalid resource parameters"))
   (let ((bytes (make-array +resource-parameters-size+
@@ -48,6 +60,8 @@
     bytes))
 
 (defun wal-decode-resource-parameters (bytes)
+  "Decode and validate the complete native tuple; reject malformed input.
+Unknown requirements are represented by NIL outside this codec."
   (unless (and (typep bytes '(vector (unsigned-byte 8)))
                (= (length bytes) +resource-parameters-size+)
                (equalp (subseq bytes 0 8) #(80 71 82 69 83 48 48 49))
@@ -57,6 +71,9 @@
          (loop for offset from 8 below 28 by 4 collect (wal-u32 bytes offset))))
 
 (defun resource-parameters-shortfalls (local required)
+  "Return local values below the required fields, in C parameter check order.
+Compare the supplied tuple as-is, so a later requirement may decrease. Unknown
+or invalid tuples are errors rather than an empty shortfall list."
   (unless (and (resource-parameters-valid-p local) (resource-parameters-valid-p required))
     (error "resource parameter requirements are unknown or invalid"))
   (loop for name in '("max_connections" "max_worker_processes" "max_wal_senders"
@@ -66,6 +83,9 @@
         when (< current minimum) collect (list (copy-seq name) current minimum)))
 
 (defun resource-lock-capacities (parameters &key (autovacuum-worker-slots 16))
+  "Calculate local object and owner capacities using actual autovacuum slots.
+MaxBackends excludes prepared transactions; N includes them and the owner
+capacity is twice N. The default autovacuum slot count is 16."
   (unless (and (resource-parameters-valid-p parameters)
                (typep autovacuum-worker-slots '(integer 1 262143)))
     (error "invalid resource capacity inputs"))

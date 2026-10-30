@@ -21,6 +21,15 @@
   acquisition, abort/cancellation/disconnect and virtual-reader cleanup.
   Include persisted source resource requirements and standby validation, following
   C's `XLogReportParameters` and `CheckRequiredParameterValues`.
+  The shared five-field value, strict native codec, floor comparison and capacity
+  arithmetic are implemented. Next emit a parameter-change terminal in an empty
+  WAL batch and flush it before updating existing primary control metadata.
+  Carry exact resource facts with applied/required positions, checkpoint and
+  restartpoint seeds, backup validation and private follow scans. Missing legacy
+  facts stay unknown; do not substitute current defaults or newer received facts
+  for an older replay seed. Cold hot-standby admission needs positive proof;
+  online insufficiency needs its own pause, promotion refusal and shutdown on
+  resume. Register the GUC only after those paths and startup sizing are complete.
 
 - [ ] Fix signed integer GUC parsing for C23 binary prefixes independently of
   the unsigned recovery timeline parser. C reports `100` for

@@ -124,6 +124,29 @@ returns or callback throws. The latter inspect the exact grant point: one grante
 object/owner pair and no pending request. The compile log is
 `/tmp/pg-queued-resource-final-compile.log`.
 
+### Resource requirements value and codec
+
+A shared immutable value now represents the five resource requirements checked
+by C hot standby: connections, workers, WAL senders, prepared transactions and
+locks. Its native codec has a fixed 32-byte shape, explicit fields and a zero
+reserved word. Missing legacy requirements remain unknown; neither construction
+nor decoding substitutes defaults. The containing WAL or control format must
+provide integrity and bind these values to an applied position.
+
+Validation rejects out-of-range fields and process totals that no C source could
+have started. The latter uses C's minimum one autovacuum slot and two special
+processes, rather than assuming the source used the default sixteen slots.
+Local capacity sizing checks its actual autovacuum slot count. Prepared
+transactions contribute to lock capacity, not to MaxBackends. Floor comparison
+checks each field separately and allows requirements to decrease.
+
+This codec does not yet report parameters in WAL or carry them through control,
+backup, checkpoint or restartpoint state. Those integrations, safe hot-standby
+admission and online resource-pause behavior remain prerequisites for the GUC.
+Validation passed 668 unit Rove tests, including seven new codec/policy tests and
+200 generated cases at seed 42, plus fresh strict compilation recorded in
+`/tmp/pg-resource-parameters-final-compile.log`.
+
 ### Child follow and rejoin intake
 
 A fresh backup from a promoted child now records its actual timeline and copies
