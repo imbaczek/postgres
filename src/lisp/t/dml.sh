@@ -41,6 +41,8 @@ NATIVE=$!
 test_wait_owned_sql_server "$NATIVE" "$PORT" "${PSQL:-psql}"
 timeout --foreground --kill-after=5 120 "$PYTHON" \
     "$BASE/t/interop/dml.py" "$REFERENCE_PORT" "$PORT" "$BASE" "$ROOT/native.sock"
+timeout --foreground --kill-after=5 120 "$PYTHON" \
+    "$BASE/t/interop/returning_portals.py" "$REFERENCE_PORT" "$PORT"
 "$PYTHON" "$BASE/t/interop/signal-owned-server.py" "$NATIVE" "$ROOT/native" INT 20
 wait "$NATIVE"
 NATIVE=

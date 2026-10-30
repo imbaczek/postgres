@@ -2024,6 +2024,14 @@ projection or filter forms fall back to ordinary full materialization."
         (result-column-attnum column) (result-column-type-oid column)
         (result-column-typlen column) (result-column-typmod column)))
 
+(defun check-result-column-shape (columns expected)
+  "Reject a changed portal descriptor before executing its query.
+Compare the advertised column shape, independently of result format codes."
+  (unless (equal (mapcar #'select-result-column-signature columns)
+                 (mapcar #'select-result-column-signature expected))
+    (ereport "0A000" "cached plan must not change result type"))
+  columns)
+
 (defun exec-select (stream ast)
   (let* ((plan (plan-select-query ast))
          (prepared (query-plan-prepared plan))
@@ -2031,10 +2039,8 @@ projection or filter forms fall back to ordinary full materialization."
          (targets (getf prepared :targets))
          (columns (mapcar #'target->result-column targets))
          (row-count 0))
-    (when (and *select-suppress-description*
-               (not (equal (mapcar #'select-result-column-signature columns)
-                           (mapcar #'select-result-column-signature *select-expected-result-columns*))))
-      (error "SELECT result metadata changed after Bind"))
+    (when *select-suppress-description*
+      (check-result-column-shape columns *select-expected-result-columns*))
     (labels ((send-row (row)
                (send-select-row stream row targets)
                (incf row-count)))
