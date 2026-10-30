@@ -1,5 +1,447 @@
 (in-package #:pg-physical-tests)
 
+(deftest fixed-follow-source-discovery-fetches-only-the-permitted-child
+    (call-with-promotion-fixture
+     (lambda (root store)
+       (declare (ignore root))
+       (let* ((two (store-history-text 1 216))
+              (three (concatenate 'string two (store-history-text 2 288)))
+              (names '(pg::physical-follow-client-identity pg::pg-client-native-history))
+              (saved (mapcar (lambda (name) (cons name (symbol-function name))) names))
+              (fetched nil))
+         (unwind-protect
+              (progn
+                (setf (symbol-function 'pg::physical-follow-client-identity)
+                      (lambda (client) (declare (ignore client)) (values 42 3))
+                      (symbol-function 'pg::pg-client-native-history)
+                      (lambda (client timeline)
+                        (declare (ignore client))
+                        (push timeline fetched)
+                        (pg::string->bytes (ecase timeline (2 two) (3 three)))))
+                (dolist (goal '(:latest :current 2))
+                  (setf fetched nil)
+                  (let* ((policy (if (eq goal :latest) nil
+                                     (if (eq goal :current)
+                                         (pg::physical-recovery-resolve-timeline-policy
+                                          pg::*physical-recovery-state* store nil goal)
+                                         (list :target 2 :history (pg::timeline-parse-history 2 two)))))
+                         (view (pg::physical-follow-controller-source-view nil policy)))
+                    (ok (eq :attach (getf view :action)))
+                    (ok (= 3 (getf view :source)))
+                    (ok (= 1 (getf view :parent)))
+                    (ok (= 216 (getf view :fork)))
+                    (if (eq goal :current)
+                        (progn
+                          (ok (eq :retained-timeline (getf view :proof-kind)))
+                          (ok (null (getf view :child-history)))
+                          (ok (equal '(3) (reverse fetched))))
+                        (progn
+                          (ok (eq :descendant (getf view :proof-kind)))
+                          (ok (= 2 (getf view :child)))
+                          (ok (equal '(3 2) (reverse fetched))))))))
+           (dolist (entry saved) (setf (symbol-function (car entry)) (cdr entry))))))
+     :applied 152 :system-id 42))
+
+(deftest follow-operation-captures-and-rechecks-the-startup-policy
+    (call-with-promotion-fixture
+     (lambda (root store)
+       (declare (ignore root))
+       (pg::wal-atomic-write-bytes (pg::clog-path) (empty-octets))
+       (let* ((policy (pg::physical-recovery-resolve-timeline-policy
+                       pg::*physical-recovery-state* store nil :current))
+              (operation (pg::make-physical-follow-operation))
+              (pg::*physical-follow-operation* operation)
+              (pg::*physical-follow-controller-blocked-p* nil)
+              (pg::*physical-follow-controller-stopping-p* nil))
+         (setf (getf pg::*physical-recovery-state* :timeline-policy) policy)
+         (pg::physical-follow-save-config '(1 "127.0.0.1" 5432 "old_bootstrap"))
+         (pg::physical-follow-operation-initial-config operation)
+         (ok (eq policy (getf (pg::physical-follow-operation-context operation) :timeline-policy)))
+         (ok (eq :discover (getf (getf (pg::physical-follow-operation-context operation) :local-decision) :action)))
+         (setf (getf pg::*physical-recovery-state* :timeline-policy) (copy-tree policy))
+         (ok (signals (pg::physical-follow-operation-check operation) 'pg::physical-follow-controller-cancelled))))
+     :applied 152 :system-id 42))
+
+(deftest retained-follow-route-declines-a-local-parent-tail-without-clamping
+    (call-with-promotion-fixture
+     (lambda (root store)
+       (declare (ignore root))
+       (pg::wal-atomic-write-bytes (pg::clog-path) (empty-octets))
+       (let* ((policy (pg::physical-recovery-resolve-timeline-policy
+                       pg::*physical-recovery-state* store nil :current))
+              (view (append (follow-controller-test-view 216)
+                            (list :proof-kind :retained-timeline :fixed-policy policy))))
+         (follow-controller-test-advance store)
+         (let ((before (pg::physical-store-control-tuple store)))
+           (call-with-promotion-exclusion
+            (lambda ()
+              (ok (handler-case
+                      (progn (pg::physical-follow-controller-snapshot view) nil)
+                    (pg::physical-follow-route-unavailable (condition)
+                      (eq :source-history-exhausted (pg::physical-follow-route-reason condition)))))))
+           (ok (equal before (pg::physical-store-control-tuple store)))
+           (ok (= 224 pg::*last-replay-lsn*))
+           (ok (not pg::*physical-recovery-failed-p*)))))
+     :applied 152 :system-id 42))
+
+(defun call-with-retained-follow-config (function &key fork)
+  (call-with-promotion-fixture
+   (lambda (root store)
+     (pg::wal-atomic-write-bytes (pg::clog-path) (empty-octets))
+     (pg::wal-atomic-write-bytes (merge-pathnames "PG_VERSION" root)
+                                 (pg::string->bytes (format nil "20~%")))
+     (let* ((base (pg::physical-recovery-verify-base-state))
+            (pending (pg::physical-follow-with-controller
+                      (follow-pending-proof-config-for-store store base)
+                      (follow-controller-test-state)))
+            (binding (fifth pending))
+            (anchor (getf binding :anchor)))
+       (when fork (setf (getf anchor :history-text) (store-history-text 1 fork)))
+       (remf anchor :eor-octets)
+       (setf (getf anchor :kind) :retained-timeline
+             (getf binding :anchor) anchor
+             (getf binding :child-history) nil
+             (getf binding :after) (copy-list (getf binding :before)))
+       (pg::physical-follow-save-config pending)
+       (let ((active (call-with-promotion-exclusion
+                      (lambda () (pg::physical-follow-reconcile-pending-store store base pending)))))
+         (setf (getf pg::*physical-recovery-state* :timeline-policy)
+               (pg::physical-recovery-resolve-timeline-policy base store nil :current))
+         (funcall function root store active))))
+   :applied 152 :system-id 42))
+
+(deftest retained-receiver-completion-is-a-timeline-end-event
+    (dolist (copy '(nil t))
+      (call-with-retained-follow-config
+       (lambda (root store config)
+         (declare (ignore root))
+         (let* ((fork (pg::physical-store-flushed-lsn store))
+                (runtime (pg::make-physical-follow-runtime :host "127.0.0.1" :port 1
+                                                           :pin (fourth config) :config config))
+                (pg::*physical-follow-statistics* nil)
+                (names '(pg::physical-follow-client-identity pg::physical-client-start
+                         pg::physical-client-receive pg::physical-client-finish
+                         pg::physical-follow-feedback))
+                (saved (mapcar (lambda (name) (cons name (symbol-function name))) names))
+                (feedback 0) (finished 0))
+           (unwind-protect
+                (progn
+                  (setf (symbol-function 'pg::physical-follow-client-identity)
+                        (lambda (client) (declare (ignore client)) (values 42 2))
+                        (symbol-function 'pg::physical-client-start)
+                        (lambda (client query)
+                          (declare (ignore client))
+                          (ok (search "timeline '1'" query))
+                          (if copy :copy-both (list :switch 2 fork)))
+                        (symbol-function 'pg::physical-client-receive)
+                        (lambda (client) (declare (ignore client)) (values :done nil))
+                        (symbol-function 'pg::physical-client-finish)
+                        (lambda (client next limit)
+                          (declare (ignore client))
+                          (incf finished)
+                          (ok (= 2 next)) (ok (= fork limit))
+                          (list :switch next limit))
+                        (symbol-function 'pg::physical-follow-feedback)
+                        (lambda (client) (declare (ignore client)) (incf feedback)))
+                  (ok (equal (list :timeline-end :timeline 1 :fork fork :next 2)
+                             (pg::physical-follow-bound-stream nil runtime fork)))
+                  (ok (= (if copy 1 0) feedback finished))
+                  (ok (= fork (pg::physical-store-flushed-lsn store)))
+                  (ok (not pg::*physical-recovery-failed-p*)))
+             (dolist (entry saved) (setf (symbol-function (car entry)) (cdr entry)))))))))
+
+(deftest fixed-timeline-completion-stops-only-receipt-and-parent-replay-continues
+    (dolist (paused '(nil t))
+      (call-with-retained-follow-config
+       (lambda (root store config)
+         (declare (ignore root))
+         (let* ((pg::*physical-replay-paused-p* paused)
+                (pg::*physical-follow-operation* nil)
+                (pg::*physical-follow-controller-blocked-p* nil)
+                (pg::*physical-follow-controller-stopping-p* nil)
+                (pg::*physical-follow-auto-error* nil)
+                (pg::*physical-follow-auto-retry-after* 0)
+                (receive (symbol-function 'pg::physical-follow-receiver-loop))
+                (handoff (symbol-function 'pg::physical-follow-start-operation))
+                (handoffs 0))
+           (pg::clog-init)
+           (unwind-protect
+                (progn
+                  (setf (symbol-function 'pg::physical-follow-receiver-loop)
+                        (lambda (runtime)
+                          (loop until (pg::physical-follow-receiver-stopped-p runtime)
+                                do (sleep 0.005)))
+                        (symbol-function 'pg::physical-follow-start-operation)
+                        (lambda (&rest args) (declare (ignore args))
+                          (incf handoffs) (error "unexpected child handoff")))
+                  (sb-thread:with-mutex (pg::*physical-follow-command-lock*)
+                    (pg::physical-follow-launch config))
+                  (let* ((runtime pg::*physical-follow-runtime*)
+                         (receiver (pg::physical-follow-runtime-receiver-thread runtime))
+                         (replay (pg::physical-follow-runtime-replay-thread runtime)))
+                    (ok receiver)
+                    (pg::with-live-operation
+                      (pg::physical-recovery-receive
+                       152 (pg::wal-encode-record pg::+wal-record-batch-start+ 0 152 (empty-octets)))
+                      (pg::physical-recovery-receive
+                       184 (pg::wal-encode-record pg::+wal-record-commit+ 70 184
+                                                  (pg::wal-encode-commit-timestamp 42)))
+                      (pg::physical-recovery-flush))
+                    (setf (pg::physical-follow-runtime-transition runtime)
+                          '(:timeline-end :timeline 1 :fork 224 :next 2))
+                    (ok (eq :replay-only (pg::physical-follow-controller-step)))
+                    (ok (zerop handoffs))
+                    (ok (not (sb-thread:thread-alive-p receiver)))
+                    (ok (eq replay (pg::physical-follow-runtime-replay-thread runtime)))
+                    (ok (sb-thread:thread-alive-p replay))
+                    (ok (not (pg::physical-follow-runtime-stopped-p runtime)))
+                    (ok (eql paused pg::*physical-replay-paused-p*))
+                    (ok (equal config (pg::physical-follow-read-config)))
+                    (setf pg::*physical-replay-paused-p* nil)
+                    (pg::physical-recovery-replay)
+                    (ok (= 224 pg::*last-replay-lsn*))
+                    (ok (= 71 pg::*next-xid*))
+                    (ok (= 224 (pg::physical-store-flushed-lsn store)))
+                    (ok (not pg::*physical-recovery-failed-p*))))
+             (sb-thread:with-mutex (pg::*physical-follow-command-lock*)
+               (pg::physical-follow-quiesce-runtime))
+             (setf (symbol-function 'pg::physical-follow-receiver-loop) receive
+                   (symbol-function 'pg::physical-follow-start-operation) handoff)
+             (when pg::*clog-stream* (close pg::*clog-stream*) (setf pg::*clog-stream* nil)))))
+       :fork 224)))
+
+(deftest cold-completed-retained-binding-starts-replay-without-contacting-source
+    (call-with-retained-follow-config
+     (lambda (root store config)
+       (pg::physical-store-close store)
+       (sb-posix:rename (namestring (pg::physical-store-directory store))
+                        (namestring (pg::physical-recovery-spool-directory)))
+       (call-with-current-promotion-owner
+        (lambda ()
+          (let ((pg::*wal-ready* nil) (pg::*physical-receive-store* nil)
+                                      (pg::*physical-recovery-state* nil) (pg::*physical-follow-runtime* nil)
+                                      (pg::*physical-restartpoint-worker* nil)
+                                      (pg::*wal-checkpoint-snapshot* pg::*wal-checkpoint-snapshot*)
+                                      (pg::*wal-poisoned* pg::*wal-poisoned*)
+                                      (pg::*active-xids* pg::*active-xids*)
+                                      (pg::*physical-follow-operation* nil)
+                                      (pg::*physical-follow-controller-blocked-p* nil)
+                                      (pg::*physical-follow-controller-stopping-p* nil)
+                                      (receive (symbol-function 'pg::physical-follow-receiver-loop))
+                                      (handoff (symbol-function 'pg::physical-follow-start-operation))
+                                      (contacts 0))
+            (unwind-protect
+                 (progn
+                   (setf (symbol-function 'pg::physical-follow-receiver-loop)
+                         (lambda (runtime) (declare (ignore runtime)) (incf contacts))
+                         (symbol-function 'pg::physical-follow-start-operation)
+                         (lambda (&rest args) (declare (ignore args))
+                           (incf contacts) (error "unexpected source discovery")))
+                   (pg::physical-recovery-prepare :timeline-goal :current)
+                   (pg::physical-recovery-open-storage)
+                   (pg::physical-follow-autostart)
+                   (let ((runtime pg::*physical-follow-runtime*))
+                     (ok runtime)
+                     (ok (null (pg::physical-follow-runtime-receiver-thread runtime)))
+                     (ok (pg::physical-follow-runtime-receiver-stopped-p runtime))
+                     (ok (sb-thread:thread-alive-p (pg::physical-follow-runtime-replay-thread runtime)))
+                     (ok (equal '(:waiting :timeline-target-reached)
+                                (pg::physical-follow-runtime-transition runtime))))
+                   (pg::physical-follow-controller-step)
+                   (pg::physical-follow-controller-step)
+                   (ok (zerop contacts))
+                   (ok (equal config (pg::physical-follow-read-config)))
+                   (ok (not pg::*physical-recovery-failed-p*)))
+              (sb-thread:with-mutex (pg::*physical-follow-command-lock*)
+                (pg::physical-follow-quiesce-runtime))
+              (setf (symbol-function 'pg::physical-follow-receiver-loop) receive
+                    (symbol-function 'pg::physical-follow-start-operation) handoff)
+              (when pg::*clog-stream* (close pg::*clog-stream*) (setf pg::*clog-stream* nil))
+              (when pg::*physical-receive-store*
+                (pg::physical-store-close pg::*physical-receive-store*)))))))))
+
+(deftest manual-follow-operation-publishes-retained-proof-or-reports-unavailable
+    (dolist (goal '(:current 2))
+      (call-with-promotion-fixture
+       (lambda (root store)
+         (declare (ignore root))
+         (pg::wal-atomic-write-bytes (pg::clog-path) (empty-octets))
+         (let* ((two (store-history-text 1 216))
+                (source (if (eq goal :current)
+                            (concatenate 'string two (store-history-text 2 288))
+                            (store-history-text 1 240)))
+                (policy (if (eq goal :current)
+                            (pg::physical-recovery-resolve-timeline-policy
+                             pg::*physical-recovery-state* store nil goal)
+                            (list :target 2 :history (pg::timeline-parse-history 2 two))))
+                (operation (pg::make-physical-follow-operation :host "127.0.0.1" :port 5433 :prefix "route"))
+                (pg::*physical-follow-operation* operation)
+                (pg::*physical-follow-controller-blocked-p* nil)
+                (pg::*physical-follow-controller-stopping-p* nil)
+                (pg::*physical-follow-auto-error* nil)
+                (old '(1 "127.0.0.1" 5432 "old_bootstrap"))
+                (before (pg::physical-store-control-tuple store))
+                (names '(pg::physical-follow-operation-connect pg::physical-follow-client-identity
+                         pg::pg-client-native-history pg::pg-client-native-prepare pg::physical-follow-launch))
+                (saved (mapcar (lambda (name) (cons name (symbol-function name))) names))
+                (prepared nil) (launched nil))
+           (setf (getf pg::*physical-recovery-state* :timeline-policy) policy)
+           (pg::physical-follow-save-config old)
+           (unwind-protect
+                (progn
+                  (setf (symbol-function 'pg::physical-follow-operation-connect)
+                        (lambda (op) (declare (ignore op)) nil)
+                        (symbol-function 'pg::physical-follow-client-identity)
+                        (lambda (client) (declare (ignore client)) (values 42 3))
+                        (symbol-function 'pg::pg-client-native-history)
+                        (lambda (client timeline)
+                          (declare (ignore client))
+                          (unless (= timeline 3) (error "unexpected child history request"))
+                          (pg::string->bytes source))
+                        (symbol-function 'pg::pg-client-native-prepare)
+                        (lambda (client pin request)
+                          (declare (ignore client pin))
+                          (setf prepared request)
+                          (append (copy-list request) (list :history-text source)))
+                        (symbol-function 'pg::physical-follow-launch)
+                        (lambda (config) (setf launched config) :started))
+                  (pg::physical-follow-operation-run operation)
+                  (ok (null (pg::physical-follow-operation-error operation)))
+                  (ok (equal before (pg::physical-store-control-tuple store)))
+                  (if (eq goal :current)
+                      (progn
+                        (ok (eq :started (pg::physical-follow-operation-result operation)))
+                        (ok (eq :retained-timeline (getf prepared :kind)))
+                        (ok (eq :retained-timeline (getf (getf (fifth launched) :anchor) :kind)))
+                        (ok (and (equal before (getf (fifth launched) :before))
+                                 (equal before (getf (fifth launched) :after)))))
+                      (progn
+                        (ok (equal '(:not-attached :reason :timeline-history-unavailable)
+                                   (pg::physical-follow-operation-result operation)))
+                        (ok (null prepared)) (ok (null launched))
+                        (ok (equal old (pg::physical-follow-read-config)))))
+                  (ok (not pg::*physical-recovery-failed-p*)))
+             (dolist (entry saved) (setf (symbol-function (car entry)) (cdr entry))))))
+       :applied 152 :system-id 42)))
+
+(deftest follow-retarget-apis-return-the-not-attached-result
+    (let* ((result '(:not-attached :reason :timeline-history-unavailable))
+           (operation (pg::make-physical-follow-operation
+                       :result result
+                       :thread (sb-thread:make-thread (lambda () nil) :name "follow-result-fixture")))
+           (names '(pg::physical-follow-ensure-attachment-state
+                    pg::physical-follow-controller-start-worker pg::physical-follow-start-operation))
+           (saved (mapcar (lambda (name) (cons name (symbol-function name))) names)))
+      (unwind-protect
+           (progn
+             (setf (symbol-function 'pg::physical-follow-ensure-attachment-state) (lambda () :ready)
+                   (symbol-function 'pg::physical-follow-controller-start-worker)
+                   (lambda (&rest args) (declare (ignore args)) nil)
+                   (symbol-function 'pg::physical-follow-start-operation)
+                   (lambda (&rest args) (declare (ignore args)) operation))
+             (ok (equal result (pg::physical-follow-retarget "127.0.0.1" 1 "result")))
+             (setf (pg::physical-follow-operation-thread operation)
+                   (sb-thread:make-thread (lambda () nil) :name "follow-libpq-result-fixture"))
+             (ok (equal result (pg::physical-follow-retarget-conninfo
+                                "host=127.0.0.1 port=1" :prefix "result" :fallback "test"))))
+        (dolist (entry saved) (setf (symbol-function (car entry)) (cdr entry))))))
+
+(deftest cancelling-an-unavailable-fixed-route-does-not-poison-recovery
+    (dolist (automatic '(nil t))
+      (call-with-promotion-fixture
+       (lambda (root store)
+         (declare (ignore root))
+         (pg::wal-atomic-write-bytes (pg::clog-path) (empty-octets))
+         (let* ((policy (pg::physical-recovery-resolve-timeline-policy
+                         pg::*physical-recovery-state* store nil :current))
+                (operation (pg::make-physical-follow-operation
+                            :host "127.0.0.1" :port 5433 :prefix "cancel_route"
+                            :context (list :automatic-p automatic)))
+                (pg::*physical-follow-operation* operation)
+                (pg::*physical-follow-controller-blocked-p* nil)
+                (pg::*physical-follow-controller-stopping-p* nil)
+                (pg::*physical-follow-auto-error* nil)
+                (config '(1 "127.0.0.1" 5432 "old_bootstrap"))
+                (names '(pg::physical-follow-operation-connect pg::physical-follow-client-identity
+                         pg::pg-client-native-history pg::physical-follow-operation-not-attached))
+                (saved (mapcar (lambda (name) (cons name (symbol-function name))) names))
+                (handled 0))
+           (setf (getf pg::*physical-recovery-state* :timeline-policy) policy)
+           (follow-controller-test-advance store)
+           (pg::physical-follow-save-config config)
+           (unwind-protect
+                (progn
+                  (setf (symbol-function 'pg::physical-follow-operation-connect)
+                        (lambda (op) (declare (ignore op)) nil)
+                        (symbol-function 'pg::physical-follow-client-identity)
+                        (lambda (client) (declare (ignore client)) (values 42 2))
+                        (symbol-function 'pg::pg-client-native-history)
+                        (lambda (client timeline)
+                          (declare (ignore client timeline))
+                          (pg::string->bytes (store-history-text 1 216)))
+                        (symbol-function 'pg::physical-follow-operation-not-attached)
+                        (lambda (op decision)
+                          (incf handled)
+                          (setf (pg::physical-follow-operation-cancelled-p op) t)
+                          (funcall (cdr (assoc 'pg::physical-follow-operation-not-attached saved)) op decision)))
+                  (pg::physical-follow-operation-run operation)
+                  (ok (= 1 handled))
+                  (ok (typep (pg::physical-follow-operation-error operation)
+                             'pg::physical-follow-controller-cancelled))
+                  (ok (not pg::*physical-recovery-failed-p*))
+                  (ok (equal config (pg::physical-follow-read-config)))
+                  (ok (= 224 (pg::physical-store-flushed-lsn store))))
+             (dolist (entry saved) (setf (symbol-function (car entry)) (cdr entry))))))
+       :applied 152 :system-id 42)))
+
+(deftest cached-child-fences-receipt-before-network-even-with-full-cleanup
+    (dolist (paused '(nil t))
+      (call-with-cached-child-follow-config
+       (lambda (root store active fork)
+         (declare (ignore root fork))
+         (let* ((policy (pg::physical-recovery-resolve-timeline-policy
+                         (pg::physical-recovery-verify-base-state) store nil :current))
+                (state (pg::physical-follow-controller-state active))
+                (queue (loop for index below pg::+physical-follow-cleanup-capacity+
+                             collect (follow-controller-test-entry (format nil "waiting_~d" index))))
+                (config nil)
+                (pg::*physical-replay-paused-p* paused)
+                (operation (pg::make-physical-follow-operation :host "unused" :port 1 :prefix "no_attach"
+                                                               :context '(:requested-slot "new_public")))
+                (pg::*physical-follow-operation* operation)
+                (pg::*physical-follow-controller-blocked-p* nil)
+                (pg::*physical-follow-controller-stopping-p* nil)
+                (pg::*physical-follow-auto-error* nil)
+                (contacts 0)
+                (connect (symbol-function 'pg::physical-follow-operation-connect)))
+           (setf (getf state :cleanup) queue (getf state :public-slot) "keep_public"
+                 config (pg::physical-follow-with-controller active state)
+                 (getf pg::*physical-recovery-state* :timeline-policy) policy)
+           (pg::physical-follow-save-config config)
+           (unwind-protect
+                (progn
+                  (setf (symbol-function 'pg::physical-follow-operation-connect)
+                        (lambda (op) (declare (ignore op)) (incf contacts) (error "unexpected network")))
+                  (sb-thread:with-mutex (pg::*physical-follow-command-lock*)
+                    (pg::physical-follow-launch config))
+                  (let* ((runtime pg::*physical-follow-runtime*)
+                         (replay (pg::physical-follow-runtime-replay-thread runtime)))
+                    (pg::physical-follow-operation-run operation)
+                    (ok (null (pg::physical-follow-operation-error operation)))
+                    (ok (equal '(:not-attached :reason :timeline-target-reached)
+                               (pg::physical-follow-operation-result operation)))
+                    (ok (zerop contacts))
+                    (ok (eq runtime pg::*physical-follow-runtime*))
+                    (ok (eq replay (pg::physical-follow-runtime-replay-thread runtime))))
+                  (ok (sb-thread:thread-alive-p (pg::physical-follow-runtime-replay-thread pg::*physical-follow-runtime*)))
+                  (ok (null (pg::physical-follow-runtime-receiver-thread pg::*physical-follow-runtime*)))
+                  (ok (eql paused pg::*physical-replay-paused-p*))
+                  (ok (equal config (pg::physical-follow-read-config)))
+                  (ok (not pg::*physical-recovery-failed-p*)))
+             (setf (symbol-function 'pg::physical-follow-operation-connect) connect)
+             (sb-thread:with-mutex (pg::*physical-follow-command-lock*)
+               (pg::physical-follow-quiesce-runtime))))))))
+
 (defun follow-policy-test-history (timeline &rest forks)
   (pg::timeline-parse-history
    timeline
@@ -7,6 +449,113 @@
      (dolist (fork forks)
        (format out "~d~c~a~cpromotion~%" (first fork) #\Tab
                (pg::wal-format-lsn (second fork)) #\Tab)))))
+
+(deftest fixed-follow-ancestor-source-wait-preserves-authority-until-source-advances
+    (dolist (automatic '(nil t))
+      (call-with-promotion-fixture
+       (lambda (root store)
+         (declare (ignore root store))
+         (pg::wal-atomic-write-bytes (pg::clog-path) (empty-octets))
+         (let* ((history (store-history-text 1 216))
+                (policy (list :target 2 :history (pg::timeline-parse-history 2 history)))
+                (old '(1 "127.0.0.1" 5432 "old_bootstrap"))
+                (runtime (pg::make-physical-follow-runtime :config old :receiver-stopped-p t))
+                (operation (pg::make-physical-follow-operation
+                            :host "127.0.0.1" :port 5432 :prefix "waiting"
+                            :runtime (when automatic runtime)
+                            :context (list :automatic-p automatic)))
+                (pg::*physical-follow-runtime* runtime)
+                (pg::*physical-follow-operation* operation)
+                (pg::*physical-follow-controller-blocked-p* nil)
+                (pg::*physical-follow-controller-stopping-p* nil)
+                (pg::*physical-follow-auto-error* nil)
+                (pg::*physical-follow-auto-retry-after* 0)
+                (source 1) (prepared 0)
+                (names '(pg::physical-follow-operation-connect pg::physical-follow-client-identity
+                         pg::pg-client-native-history pg::pg-client-native-prepare))
+                (saved (mapcar (lambda (name) (cons name (symbol-function name))) names)))
+           (setf (getf pg::*physical-recovery-state* :timeline-policy) policy)
+           (pg::physical-follow-save-config old)
+           (unwind-protect
+                (progn
+                  (setf (symbol-function 'pg::physical-follow-operation-connect)
+                        (lambda (op) (declare (ignore op)) nil)
+                        (symbol-function 'pg::physical-follow-client-identity)
+                        (lambda (client) (declare (ignore client)) (values 42 source))
+                        (symbol-function 'pg::pg-client-native-history)
+                        (lambda (client timeline)
+                          (declare (ignore client))
+                          (assert (= timeline 2))
+                          (pg::string->bytes history))
+                        (symbol-function 'pg::pg-client-native-prepare)
+                        (lambda (&rest args) (declare (ignore args))
+                          (incf prepared) (error "unavailable source must not prepare")))
+                  (pg::physical-follow-operation-run operation)
+                  (ok (null (pg::physical-follow-operation-error operation)))
+                  (ok (equal '(:not-attached :reason :timeline-history-unavailable)
+                             (pg::physical-follow-operation-result operation)))
+                  (ok (zerop prepared))
+                  (ok (equal old (pg::physical-follow-read-config)))
+                  (ok (eq automatic
+                          (not (null (getf (cddr (pg::physical-follow-runtime-transition runtime))
+                                           :retry-source)))))
+                  (when automatic
+                    (ok (> pg::*physical-follow-auto-retry-after* (get-internal-real-time))))
+                  (setf source 2)
+                  (let ((view (pg::physical-follow-controller-source-view nil policy)))
+                    (ok (eq :attach (getf view :action)))
+                    (ok (eq :descendant (getf view :proof-kind)))
+                    (ok (= 2 (getf view :child))))
+                  (ok (not pg::*physical-recovery-failed-p*)))
+             (dolist (entry saved) (setf (symbol-function (car entry)) (cdr entry))))))
+       :applied 152 :system-id 42)))
+
+(deftest fixed-follow-unavailable-source-retries-only-a-target-ancestor
+    (let* ((one (follow-policy-test-history 1))
+           (two (follow-policy-test-history 2 '(1 64)))
+           (other (follow-policy-test-history 3 '(1 96)))
+           (policy (list :target 2 :history two)))
+      (let ((decision (pg::physical-follow-policy-selection policy one one)))
+        (ok (eq :unavailable (getf decision :action)))
+        (ok (getf decision :retry-source)))
+      (let ((decision (pg::physical-follow-policy-selection policy one other)))
+        (ok (eq :unavailable (getf decision :action)))
+        (ok (null (getf decision :retry-source))))
+      (ok (eq :attach (getf (pg::physical-follow-policy-selection policy one two) :action)))))
+
+(deftest fixed-follow-waiting-source-retry-obeys-deadline-and-accepted-config
+    (call-with-retained-follow-config
+     (lambda (root store config)
+       (declare (ignore root store))
+       (let* ((runtime (pg::make-physical-follow-runtime :config config :receiver-stopped-p t))
+              (pg::*physical-follow-runtime* runtime)
+              (pg::*physical-follow-operation* nil)
+              (pg::*physical-follow-controller-blocked-p* nil)
+              (pg::*physical-follow-controller-stopping-p* nil)
+              (pg::*physical-follow-auto-error* nil)
+              (pg::*physical-follow-auto-retry-after* 0)
+              (start (symbol-function 'pg::physical-follow-start-operation))
+              (attempts nil))
+         (unwind-protect
+              (progn
+                (setf (symbol-function 'pg::physical-follow-start-operation)
+                      (lambda (&rest args) (push args attempts)))
+                (sb-thread:with-mutex (pg::*physical-follow-command-lock*)
+                  (pg::physical-follow-wait-for-policy runtime :timeline-history-unavailable t))
+                (ok (> pg::*physical-follow-auto-retry-after* (get-internal-real-time)))
+                (pg::physical-follow-controller-step)
+                (ok (null attempts))
+                (setf pg::*physical-follow-auto-retry-after* 0)
+                (pg::physical-follow-controller-step)
+                (ok (equal (list (second config) (third config) "follow" runtime) (first attempts)))
+                (ok (= 1 (length attempts)))
+                (setf attempts nil)
+                (sb-thread:with-mutex (pg::*physical-follow-command-lock*)
+                  (pg::physical-follow-wait-for-policy runtime :timeline-history-unavailable))
+                (pg::physical-follow-controller-step)
+                (ok (null attempts))
+                (ok (equal config (pg::physical-follow-read-config))))
+           (setf (symbol-function 'pg::physical-follow-start-operation) start))))))
 
 (deftest fixed-follow-policy-selects-only-the-path-to-its-target
     (let* ((one (follow-policy-test-history 1))
@@ -633,12 +1182,15 @@
     (call-with-promotion-fixture
      (lambda (root store)
        (declare (ignore root store))
+       (pg::wal-atomic-write-bytes (pg::clog-path) (empty-octets))
        (let* ((runtime (pg::make-physical-follow-runtime))
               (pg::*physical-follow-runtime* runtime)
               (operation (pg::make-physical-follow-operation))
               (pg::*physical-follow-operation* operation)
               (pg::*physical-follow-controller-blocked-p* nil)
               (pg::*physical-follow-controller-stopping-p* nil)
+              (pg::*physical-follow-auto-error* nil)
+              (pg::*physical-follow-auto-retry-after* 0)
               (queue (loop for index below pg::+physical-follow-cleanup-capacity+
                            collect (follow-controller-test-entry (format nil "queued_~d" index))))
               (config (pg::physical-follow-with-controller
@@ -650,7 +1202,29 @@
          (ok (eq runtime pg::*physical-follow-runtime*))
          (ok (not (pg::physical-follow-runtime-stopped-p runtime)))
          (ok (equal config (pg::physical-follow-read-config)))
-         (ok (not pg::*physical-recovery-failed-p*))))
+         (ok (not pg::*physical-recovery-failed-p*))
+         (ok (search "cleanup queue is full"
+                     (princ-to-string (pg::physical-follow-operation-error operation))))
+         (ok (null (pg::physical-follow-operation-config operation)))
+         (ok (null (first pg::*physical-follow-auto-error*)))
+         (let* ((state (pg::physical-follow-controller-state config))
+                (start (symbol-function 'pg::physical-follow-start-operation))
+                (attempts nil))
+           (setf (getf state :cleanup) (cdr (getf state :cleanup)))
+           (pg::physical-follow-save-config (pg::physical-follow-with-controller config state))
+           (setf (pg::physical-follow-runtime-receiver-stopped-p runtime) t
+                 (pg::physical-follow-runtime-transition runtime)
+                 '(:waiting :timeline-history-unavailable :retry-source t)
+                 pg::*physical-follow-auto-retry-after* 0)
+           (unwind-protect
+                (progn
+                  (setf (symbol-function 'pg::physical-follow-start-operation)
+                        (lambda (&rest args) (push args attempts)))
+                  (pg::physical-follow-controller-step)
+                  (ok (= 1 (length attempts)))
+                  (ok (equal (list (second config) (third config) "follow" runtime)
+                             (first attempts))))
+             (setf (symbol-function 'pg::physical-follow-start-operation) start)))))
      :system-id 42))
 
 (deftest follow-controller-rejects-rewritten-older-forks-before-parent-catchup

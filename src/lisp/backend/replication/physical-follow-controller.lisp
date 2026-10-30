@@ -129,6 +129,12 @@ reload exclusion and live-operation quiescence."
       (physical-follow-controller-check-current config)))
   (physical-follow-launch-workers config nil))
 
+(define-condition physical-follow-route-unavailable (error)
+  ((reason :initarg :reason :reader physical-follow-route-reason))
+  (:report (lambda (condition stream)
+             (format stream "native follow route is unavailable: ~a"
+                     (physical-follow-route-reason condition)))))
+
 (defun physical-follow-controller-snapshot-under-lease (view)
   "Capture the receive, replay and durable recovery witnesses under root protection.
 The receive timeline can differ from the applied replay timeline.  A retained
@@ -142,7 +148,8 @@ proof kind is included in the saved receiver coordinates."
                          (getf control :applied-timeline (getf control :timeline))))
          (limit (if (= (getf view :source) (getf view :parent))
                     (fourth before) (getf view :fork)))
-         (cursor (min (fourth before) limit))
+         (cursor (if (eq :retained-timeline (getf view :proof-kind))
+                     (fourth before) (min (fourth before) limit)))
          (index (physical-follow-controller-index store))
          (coordinates nil))
     (unless (and (eql 2 (getf control :phase)) (eql 3 (getf control :control-version)))
@@ -150,6 +157,14 @@ proof kind is included in the saved receiver coordinates."
     (unless (= (physical-store-selected-timeline store) (getf view :parent))
       (error "receive selection changed during source discovery"))
     (sb-thread:with-mutex ((physical-store-mutex store))
+      (when (getf view :fixed-policy)
+        (let ((local-history (physical-store-retained-history store))
+              (flush (physical-store-flushed-lsn store)))
+          (physical-store-check-follow-frontier store applied local-history flush :applied t)
+          (physical-store-check-follow-frontier store required local-history flush)
+          (when (or (> (max (physical-store-floor-lsn store) (first applied) (first required)) limit)
+                    (and (eq :retained-timeline (getf view :proof-kind)) (> flush limit)))
+            (error 'physical-follow-route-unavailable :reason :source-history-exhausted))))
       (physical-follow-check-source-history store (getf view :history))
       (physical-store-check-follow-frontier store applied (getf view :history) limit :applied t)
       (physical-store-check-follow-frontier store required (getf view :history) limit)
@@ -196,36 +211,34 @@ A retained binding carries no child history and cannot pass its fork."
     (physical-follow-binding-check binding)
     binding))
 
-(defun physical-follow-controller-source-view (client)
-  "Read source identity and validated remote history, allowing equal timelines.
-Timeline 1 has no history file and uses empty history.
-The later snapshot checks exact local ancestry. System identifier and timeline
-cannot distinguish endpoint remaps or clones; the direct endpoint must continue
-to identify the same PGDATA."
+(defun physical-follow-controller-source-view (client &optional (policy (getf *physical-recovery-state* :timeline-policy)))
   (multiple-value-bind (system-id source) (physical-follow-client-identity client)
-    (let ((parent (with-live-operation
-                    (unless (= system-id (getf *physical-recovery-state* :system-id))
-                      (physical-follow-reject "follow target has a different system identifier"))
-                    (physical-store-selected-timeline *physical-receive-store*))))
-      (unless (>= source parent) (error "follow target timeline precedes the receive selection"))
+    (let* ((local-history
+             (with-live-operation
+               (unless (= system-id (getf *physical-recovery-state* :system-id))
+                 (physical-follow-reject "follow target has a different system identifier"))
+               (sb-thread:with-mutex ((physical-store-mutex *physical-receive-store*))
+                 (physical-store-retained-history *physical-receive-store*))))
+           (parent (timeline-history-entry-timeline (first local-history))))
+      (when (and (null (getf policy :target)) (< source parent))
+        (error "follow target timeline precedes the receive selection"))
       (let* ((text (if (= source 1) (string->bytes "")
                        (sb-ext:with-timeout 10 (pg-client-native-history client source))))
              (history (timeline-check-lineage (timeline-parse-history source (bytes->string text))))
-             (position (position parent history :key #'timeline-history-entry-timeline)))
-        (unless position (error "follow target does not contain receive ancestry"))
-        (when (= source parent)
-          (return-from physical-follow-controller-source-view
-            (list :source source :parent parent :history history :history-text (bytes->string text))))
-        (unless (plusp position) (error "follow target has no descendant timeline to select"))
-        (let* ((child (timeline-history-entry-timeline (nth (1- position) history)))
-               (child-text (if (= child source) text
-                               (sb-ext:with-timeout 10 (pg-client-native-history client child)))))
-          (unless (physical-store-history-extends-p
-                   (timeline-check-lineage (timeline-parse-history child (bytes->string child-text))) history)
-            (error "follow child history differs from source ancestry"))
-          (list :source source :parent parent :history history :history-text (bytes->string text)
-                :child child :child-history (bytes->string child-text)
-                :fork (timeline-history-entry-end (nth position history))))))))
+             (view (physical-follow-policy-selection policy local-history history)))
+        (unless (eq :attach (getf view :action))
+          (return-from physical-follow-controller-source-view view))
+        (setf (getf view :history-text) (bytes->string text))
+        (when (getf policy :target) (setf (getf view :fixed-policy) policy))
+        (when (eq :descendant (getf view :proof-kind))
+          (let* ((child (getf view :child))
+                 (child-text (if (= child source) text
+                                 (sb-ext:with-timeout 10 (pg-client-native-history client child)))))
+            (unless (physical-store-history-extends-p
+                     (timeline-check-lineage (timeline-parse-history child (bytes->string child-text))) history)
+              (error "follow child history differs from source ancestry"))
+            (setf (getf view :child-history) (bytes->string child-text))))
+        view))))
 
 (defun physical-follow-current-retirement (config base)
   "Copy the current source identity for later asynchronous retirement."
@@ -400,6 +413,11 @@ uses strict candidate proof; protect the store and retained root."
                  (not *physical-follow-controller-blocked-p*)
                  (not *physical-follow-controller-stopping-p*))
       (error 'physical-follow-controller-cancelled :format-control "native follow transition was canceled")))
+  (let ((context (physical-follow-operation-context operation)))
+    (when (and (getf context :policy-captured-p)
+               (not (eq (getf context :timeline-policy)
+                        (getf *physical-recovery-state* :timeline-policy))))
+      (error 'physical-follow-controller-cancelled :format-control "native follow timeline policy changed")))
   (check-physical-recovery-worker-start)
   (unless (and (recovery-in-progress-p) *physical-receive-store*
                (eql 2 (getf *physical-recovery-state* :phase)))
@@ -425,8 +443,16 @@ uses strict candidate proof; protect the store and retained root."
           (error "native follow transition is already pending or has no current source"))
         (physical-follow-check-unowned-bootstrap-base
          config (physical-recovery-verify-base-state))
-        (unless (< (length (getf state :cleanup)) +physical-follow-cleanup-capacity+)
-          (error "native follow cleanup queue is full"))
+        (let* ((policy (getf *physical-recovery-state* :timeline-policy))
+               (decision (sb-thread:with-mutex ((physical-store-mutex *physical-receive-store*))
+                           (physical-follow-policy-selection
+                            policy (physical-store-retained-history *physical-receive-store*)))))
+          (setf (getf (physical-follow-operation-context operation) :timeline-policy) policy
+                (getf (physical-follow-operation-context operation) :policy-captured-p) t
+                (getf (physical-follow-operation-context operation) :local-decision) decision)
+          (when (and (eq :discover (getf decision :action))
+                     (>= (length (getf state :cleanup)) +physical-follow-cleanup-capacity+))
+            (error "native follow cleanup queue is full")))
         (when (and (physical-follow-operation-runtime operation)
                    (not (eq runtime (physical-follow-operation-runtime operation))))
           (error "native follow transition refers to a replaced receiver"))
@@ -658,14 +684,58 @@ restoration. Ambiguous publication failures fence recovery for restart reconcili
            (sb-thread:with-mutex (*physical-follow-lock*)
              (physical-follow-operation-cancelled-p operation)))))
 
+(defun physical-follow-wait-for-policy (runtime reason &optional retry-source)
+  (unless (sb-thread:holding-mutex-p *physical-follow-command-lock*)
+    (error "policy wait requires follow command exclusion"))
+  (when (and runtime (eq runtime *physical-follow-runtime*))
+    (physical-follow-quiesce-receiver)
+    (sb-thread:with-mutex (*physical-follow-lock*)
+      (when (eq runtime *physical-follow-runtime*)
+        (setf (physical-follow-runtime-transition runtime)
+              (if retry-source (list :waiting reason :retry-source t) (list :waiting reason)))
+        (when retry-source
+          (setf *physical-follow-auto-error* nil
+                *physical-follow-auto-retry-after*
+                (+ (get-internal-real-time) internal-time-units-per-second)))))
+    :replay-only))
+
+(defun physical-follow-operation-not-attached (operation decision)
+  (when (getf (physical-follow-operation-context operation) :stopped)
+    (physical-follow-operation-recover operation))
+  (physical-follow-operation-check operation)
+  (let ((reason (getf decision :reason)))
+    (when (or (eq :replay-only (getf decision :action))
+              (getf (physical-follow-operation-context operation) :automatic-p))
+      (sb-thread:with-mutex (*physical-follow-command-lock*)
+        (physical-follow-operation-check operation)
+        (unless *physical-follow-runtime*
+          (let ((config (physical-follow-read-config)))
+            (if (physical-follow-controller-enabled-p config)
+                (physical-follow-launch config)
+                (physical-follow-launch-replay-only config))))
+        (physical-follow-wait-for-policy
+         *physical-follow-runtime* reason
+         (and (getf (physical-follow-operation-context operation) :automatic-p)
+              (getf decision :retry-source)))))
+    (physical-follow-operation-check operation)
+    (setf (physical-follow-operation-result operation) (list :not-attached :reason reason))))
+
 (defun physical-follow-operation-run (operation)
   (let ((client nil))
     (unwind-protect
          (handler-case
              (progn
                (physical-follow-operation-initial-config operation)
+               (let ((local (getf (physical-follow-operation-context operation) :local-decision)))
+                 (when (eq :replay-only (getf local :action))
+                   (return-from physical-follow-operation-run
+                     (physical-follow-operation-not-attached operation local))))
                (setf client (physical-follow-operation-connect operation))
-               (let ((view (physical-follow-controller-source-view client)))
+               (let ((view (physical-follow-controller-source-view
+                            client (getf (physical-follow-operation-context operation) :timeline-policy))))
+                 (unless (eq :attach (getf view :action))
+                   (return-from physical-follow-operation-run
+                     (physical-follow-operation-not-attached operation view)))
                  (multiple-value-bind (entry snapshot) (physical-follow-operation-intent operation view)
                    (declare (ignore snapshot))
                    (let ((anchor (sb-ext:with-timeout *physical-follow-prepare-timeout*
@@ -681,6 +751,15 @@ restoration. Ambiguous publication failures fence recovery for restart reconcili
                    (physical-follow-launch current)))
                (setf *physical-follow-auto-error* nil
                      (physical-follow-operation-result operation) :started))
+           (physical-follow-route-unavailable (condition)
+             (handler-case
+                 (physical-follow-operation-not-attached
+                  operation (list :action :unavailable :reason (physical-follow-route-reason condition)))
+               (error (recovery-error)
+                 (setf (physical-follow-operation-error operation) recovery-error)
+                 (unless (or (physical-follow-operation-cancelled-condition-p operation recovery-error)
+                             (typep recovery-error 'physical-recovery-worker-shutdown))
+                   (setf *physical-recovery-failed-p* t)))))
            ((or error sb-ext:timeout) (condition)
              (setf (physical-follow-operation-error operation) condition)
              (when (and (getf (physical-follow-operation-context operation) :committed)
@@ -725,7 +804,7 @@ requests no slot. Capture the choice before the worker starts."
          (ready nil)
          (operation (make-physical-follow-operation
                      :host (copy-seq host) :port port :prefix (copy-seq prefix) :runtime runtime
-                     :context (append (list :requested-slot public-slot)
+                     :context (append (list :requested-slot public-slot :automatic-p (not (null runtime)))
                                       (when requested (list :requested-profile requested))))))
     (sb-thread:with-mutex (*physical-follow-lock*)
       (when (or *physical-follow-operation* *physical-follow-controller-blocked-p*
@@ -894,7 +973,7 @@ binding and restart reconciliation; the old slot may not be restored."
       (sb-thread:join-thread (physical-follow-operation-thread operation))
       (when (physical-follow-operation-error operation)
         (error "native follow transition failed: ~a" (physical-follow-operation-error operation)))
-      :started)))
+      (physical-follow-operation-result operation))))
 
 (defvar *physical-follow-cleanup-retry-after* (make-hash-table :test #'equal))
 
@@ -1059,13 +1138,21 @@ Call outside command, reload and live-operation admission locks."
                                          :port (getf entry :port) :pin (getf entry :pin)
                                          :last-error (gethash entry *physical-follow-controller-errors*)))))))
 
+(defun physical-follow-controller-fence-receipt (runtime config decision)
+  (sb-thread:with-mutex (*physical-follow-command-lock*)
+    (unless (and (eq runtime *physical-follow-runtime*)
+                 (equal (physical-follow-effective-config config)
+                        (physical-follow-effective-config (physical-follow-read-config))))
+      (return-from physical-follow-controller-fence-receipt nil))
+    (physical-follow-wait-for-policy runtime (getf decision :reason))))
+
 (defun physical-follow-controller-step ()
   "Start an eligible automatic transition or retry one queued retirement.
 An empty cleanup-only configuration stops the worker but remains on disk."
   (let ((config (with-live-operation
                   (check-recovery-available)
                   (when (probe-file (physical-follow-config-path)) (physical-follow-read-config))))
-        (runtime nil) (busy nil) (blocked nil) (auto-error nil))
+        (runtime nil) (busy nil) (blocked nil) (auto-error nil) (decision nil))
     (sb-thread:with-mutex (*physical-follow-lock*)
       (setf runtime *physical-follow-runtime* busy *physical-follow-operation*
             blocked (or *physical-follow-controller-blocked-p* *physical-follow-controller-stopping-p*)
@@ -1076,6 +1163,15 @@ An empty cleanup-only configuration stops the worker but remains on disk."
             (null (getf (physical-follow-controller-state config) :cleanup))) :idle)
       ((and runtime (physical-follow-runtime-transition runtime)
             (not (physical-follow-receiver-stopped-p runtime))
+            (eq :replay-only (getf (setf decision (physical-follow-launch-decision config)) :action)))
+       (physical-follow-controller-fence-receipt
+        runtime config decision))
+      ((and runtime (physical-follow-runtime-transition runtime)
+            (or (not (physical-follow-receiver-stopped-p runtime))
+                (eq :policy-refresh (first (physical-follow-runtime-transition runtime)))
+                (let ((transition (physical-follow-runtime-transition runtime)))
+                  (and (eq :waiting (first transition))
+                       (getf (cddr transition) :retry-source))))
             (physical-follow-controller-enabled-p config)
             (not (equal (first auto-error) (physical-follow-effective-config config)))
             (<= *physical-follow-auto-retry-after* (get-internal-real-time)))

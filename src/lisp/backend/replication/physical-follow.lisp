@@ -135,8 +135,7 @@ timelines use same-timeline proof. A source toward the target uses descendant
 proof; at the target, a later source
 uses retained-timeline proof.  A locally cached child past the target permits
 replay only. A different local branch returns :REPLAY-ONLY with an unavailable
-reason; an incompatible source returns :UNAVAILABLE. This pure planner is not
-yet wired to source selection or the controller lifecycle."
+reason; an incompatible source returns :UNAVAILABLE."
   (timeline-check-lineage local-history)
   (let* ((target (getf policy :target))
          (target-history (getf policy :history))
@@ -155,7 +154,8 @@ yet wired to source selection or the controller lifecycle."
     (timeline-check-lineage source-history)
     (when (and target (not (physical-store-history-extends-p target-history source-history)))
       (return-from physical-follow-policy-selection
-        (list :action :unavailable :reason :timeline-history-unavailable)))
+        (list :action :unavailable :reason :timeline-history-unavailable
+              :retry-source (physical-store-history-extends-p source-history target-history))))
     (unless (physical-store-history-extends-p local-history source-history)
       (error "source follow history rewrites local ancestry"))
     (let* ((source (timeline-history-entry-timeline (first source-history)))
@@ -1203,6 +1203,19 @@ is not authentication or proof of source identity."
                (otherwise (physical-follow-reject "unexpected native replication frame"))))
            (physical-follow-feedback client)))
 
+(defun physical-follow-bound-completion (runtime result)
+  (when (and (eq :retained-timeline
+                 (physical-follow-anchor-kind (getf (physical-follow-runtime-binding runtime) :anchor)))
+             result)
+    (let ((fork (physical-follow-runtime-limit runtime))
+          (next (physical-follow-runtime-next-timeline runtime)))
+      (unless (equal result (list :switch next fork))
+        (physical-follow-reject "retained completion differs from its bound fork"))
+      (return-from physical-follow-bound-completion
+        (list :timeline-end :timeline (physical-follow-runtime-receive-timeline runtime)
+                            :fork fork :next next))))
+  result)
+
 (defun physical-follow-bound-stream (client runtime cursor)
   (multiple-value-bind (system-id timeline) (physical-follow-client-identity client)
     (unless (= system-id (getf *physical-recovery-state* :system-id))
@@ -1218,12 +1231,13 @@ is not authentication or proof of source identity."
           (physical-follow-runtime-next-timeline runtime) next)
     (let* ((query (physical-follow-start-query runtime cursor))
            (result (sb-ext:with-timeout 10 (physical-client-start client query))))
-      (if (eq :copy-both result)
-          (physical-follow-copy-stream client runtime)
-          (progn
-            (unless (and limit (= cursor limit) (equal result (list :switch next limit)))
-              (physical-follow-reject "immediate source completion differs from its bound fork"))
-            result)))))
+      (physical-follow-bound-completion runtime
+                                        (if (eq :copy-both result)
+                                            (physical-follow-copy-stream client runtime)
+                                            (progn
+                                              (unless (and limit (= cursor limit) (equal result (list :switch next limit)))
+                                                (physical-follow-reject "immediate source completion differs from its bound fork"))
+                                              result))))))
 
 (defun physical-follow-session (runtime cursor)
   (physical-follow-call-with-client
@@ -1316,7 +1330,7 @@ reload exclusion and quiescence before workers can read it."
          *physical-receive-store* (physical-recovery-verify-base-state) config))))
   config)
 
-(defun physical-follow-launch-workers (config receive-p)
+(defun physical-follow-launch-workers (config receive-p &optional transition)
   "Publish replay and, when RECEIVE-P, receipt workers together.
 The caller holds the command mutex outside admission and has validated CONFIG."
   (unless (and (zerop *live-operation-depth*)
@@ -1326,7 +1340,7 @@ The caller holds the command mutex outside admission and has validated CONFIG."
     (when *physical-follow-runtime* (error "native physical follow already has a runtime; stop it first"))
     (let ((runtime (make-physical-follow-runtime :host (second config) :port (third config)
                                                  :pin (fourth config) :config (copy-tree config)
-                                                 :receiver-stopped-p (not receive-p)))
+                                                 :receiver-stopped-p (not receive-p) :transition transition))
           (ready nil) (success nil))
       (unwind-protect
            (flet ((run (function)
@@ -1346,11 +1360,43 @@ The caller holds the command mutex outside admission and has validated CONFIG."
           ;; No worker can touch storage before every requested worker is published.
           (setf (physical-follow-runtime-stopped-p runtime) t ready t))))))
 
+(defun physical-follow-launch-decision (config)
+  (with-live-operation
+    (let* ((policy (getf *physical-recovery-state* :timeline-policy))
+           (store *physical-receive-store*)
+           (binding (fifth config)))
+      (sb-thread:with-mutex ((physical-store-mutex store))
+        (let* ((history (physical-store-retained-history store))
+               (local (physical-follow-policy-selection policy history)))
+          (unless (eq :discover (getf local :action))
+            (return-from physical-follow-launch-decision local))
+          (when (and (getf policy :target) (null binding))
+            (return-from physical-follow-launch-decision (list :action :refresh)))
+          (when binding
+            (let* ((source-history (physical-follow-anchor-check (getf binding :anchor)))
+                   (route (physical-follow-policy-selection policy history source-history))
+                   (timeline (physical-store-selected-timeline store))
+                   (entry (find timeline source-history :key #'timeline-history-entry-timeline))
+                   (fork (and entry (timeline-history-entry-end entry))))
+              (unless (eq :attach (getf route :action))
+                (return-from physical-follow-launch-decision (list :action :refresh)))
+              (when (and (eql timeline (getf policy :target)) fork
+                         (= fork (physical-store-flushed-lsn store)))
+                (return-from physical-follow-launch-decision
+                  (list :action :replay-only :reason :timeline-target-reached)))))
+          (list :action :receive))))))
+
 (defun physical-follow-launch (config)
   "Launch an admitted bootstrap or active bound config with the command mutex held."
   (check-physical-recovery-worker-start)
   (physical-follow-check-launch config)
-  (physical-follow-launch-workers config t))
+  (let ((decision (physical-follow-launch-decision config)))
+    (if (eq :receive (getf decision :action))
+        (physical-follow-launch-workers config t)
+        (physical-follow-launch-workers
+         config nil (if (eq :refresh (getf decision :action))
+                        '(:policy-refresh)
+                        (list :waiting (getf decision :reason)))))))
 
 (defun physical-follow-start (host port pin)
   "Enable an accepted endpoint without replacing its binding or cleanup queue."
