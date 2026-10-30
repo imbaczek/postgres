@@ -27,6 +27,7 @@ start_server() {
     data_dir=${2:-$PGDATA}
     pause_relation=${3:-}
     max_start=${4:-150}
+    control_socket=${5:-}
     if [ -n "$pause_at" ]; then
         rm -f "$data_dir/pg_wal/test-paused-$pause_at" \
             "$data_dir/pg_wal/test-resume-$pause_at"
@@ -45,6 +46,9 @@ start_server() {
             PG_WAL_TEST_PAUSE_AT="$pause_at" "$BASE/pg-lisp.sh" \
                 -p "$PORT" -D "$data_dir" >> "$LOG" 2>&1 &
         fi
+    elif [ -n "$control_socket" ]; then
+        rm -f "$control_socket"
+        "$BASE/pg-lisp.sh" -p "$PORT" -D "$data_dir" --control-socket "$control_socket" >> "$LOG" 2>&1 &
     else
         "$BASE/pg-lisp.sh" -p "$PORT" -D "$data_dir" >> "$LOG" 2>&1 &
     fi
@@ -1131,6 +1135,61 @@ wait "$CLIENT"
 psql_db -c 'VACUUM wal_snapshot_vacuum'
 psql_db -c 'INSERT INTO wal_snapshot_vacuum VALUES (7)'
 [ "$(psql_db -A -t -c 'SELECT id FROM wal_snapshot_vacuum')" = 7 ]
+stop_server
+
+# Checkpoint the staged parent, TOAST heap and TOAST index pages while an
+# INSERT and replacement UPDATE remain uncommitted, then kill the primary.
+# PostgreSQL's toast_save_datum writes chunks as part of the parent transaction;
+# recovery must not expose those chunks or lose the old committed value.
+start_server '' "$PGDATA" '' 150 "$TMP/toast-control.sock"
+psql_db -c 'CREATE TABLE wal_toast_crash (id int PRIMARY KEY, v text)'
+psql_db -c 'ALTER TABLE wal_toast_crash ALTER COLUMN v SET STORAGE EXTERNAL'
+old_value=$(awk 'BEGIN { for(i=0;i<20000;i++) printf "a" }')
+new_value=$(awk 'BEGIN { for(i=0;i<24000;i++) printf "b" }')
+insert_value=$(awk 'BEGIN { for(i=0;i<22000;i++) printf "c" }')
+psql_db -c "INSERT INTO wal_toast_crash VALUES (1, '$old_value')"
+psql_db -c 'CHECKPOINT'
+toast_chunk_count() {
+    printf '%s\n(quit)\n' '(let* ((db (gethash "postgres" (catalog-databases *catalog*))) (table (gethash "wal_toast_crash" (database-tables db))) (node (pg-toast-index-relfilenode (pg-class-toast table)))) (call-with-btree-relation-read-lock node (lambda () (format t "CHUNKS=~d~%" (length (btree-prefix-entries-unlocked node (empty-key)))))))' |
+        "$SBCL" --script "$BASE/t/control-client.lisp" unix "$TMP/toast-control.sock" >"$TMP/toast-chunk-count.out"
+    if grep -q ';; error:' "$TMP/toast-chunk-count.out"; then cat "$TMP/toast-chunk-count.out" >&2; exit 1; fi
+    awk -F= '/CHUNKS=/{print $2}' "$TMP/toast-chunk-count.out"
+}
+old_chunks=$(toast_chunk_count)
+[ "$old_chunks" -gt 0 ]
+mkfifo "$TMP/open-toast-transaction.sql"
+psql_db < "$TMP/open-toast-transaction.sql" > "$TMP/open-toast-transaction.out" 2>&1 &
+CLIENT=$!
+exec 3> "$TMP/open-toast-transaction.sql"
+printf "BEGIN;\nINSERT INTO wal_toast_crash VALUES (2, '%s');\nUPDATE wal_toast_crash SET v='%s' WHERE id=1;\nSELECT count(*) FROM wal_toast_crash WHERE (id=1 AND v='%s') OR (id=2 AND v='%s');\n\\! touch %s\n" \
+    "$insert_value" "$new_value" "$new_value" "$insert_value" "$TMP/open-toast-staged" >&3
+i=0
+while [ ! -f "$TMP/open-toast-staged" ]; do
+    if ! kill -0 "$CLIENT" 2>/dev/null; then
+        echo 'wal-crash-recovery: TOAST transaction exited before staging' >&2
+        cat "$TMP/open-toast-transaction.out" >&2; exit 1
+    fi
+    i=$((i + 1))
+    [ "$i" -lt 300 ] || { echo 'wal-crash-recovery: TOAST staging timed out' >&2; exit 1; }
+    sleep 0.1
+done
+grep -Eq '^[[:space:]]*2[[:space:]]*$' "$TMP/open-toast-transaction.out"
+[ "$(psql_db -A -t -c "SELECT count(*) FROM wal_toast_crash WHERE id=1 AND v='$old_value'")" = 1 ]
+psql_db -c 'CHECKPOINT'
+kill -0 "$CLIENT" 2>/dev/null || { echo 'wal-crash-recovery: TOAST writer exited before crash' >&2; exit 1; }
+staged_chunks=$(toast_chunk_count)
+[ "$staged_chunks" -gt "$old_chunks" ]
+crash_server
+exec 3>&-
+wait "$CLIENT" 2>/dev/null || true
+start_server '' "$PGDATA" '' 150 "$TMP/toast-control.sock"
+[ "$(psql_db -A -t -c "SELECT count(*) FROM wal_toast_crash WHERE id=1 AND v='$old_value'")" = 1 ]
+[ "$(psql_db -A -t -c 'SELECT count(*) FROM wal_toast_crash WHERE id=2')" = 0 ]
+[ "$(toast_chunk_count)" = "$staged_chunks" ]
+psql_db -c 'VACUUM wal_toast_crash'
+[ "$(toast_chunk_count)" = "$old_chunks" ]
+psql_db -c "INSERT INTO wal_toast_crash VALUES (2, '$insert_value')"
+[ "$(psql_db -A -t -c "SELECT count(*) FROM wal_toast_crash WHERE (id=1 AND v='$old_value') OR (id=2 AND v='$insert_value')")" = 2 ]
 stop_server
 
 echo "wal-crash-recovery: PASS"
