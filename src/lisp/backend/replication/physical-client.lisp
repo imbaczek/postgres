@@ -248,6 +248,7 @@ or transport failure. Do not perform network I/O under recovery quiescence."
   (values))
 
 (defun physical-client-identity-row (client)
+  "Check IDENTIFY_SYSTEM; only its database field may be null."
   (physical-client-query client "IDENTIFY_SYSTEM"
                          '(("systemid" 25) ("timeline" 20) ("xlogpos" 25) ("dbname" 25 :nullable))
                          "IDENTIFY_SYSTEM"))

@@ -40,9 +40,10 @@
             (:print-function physical-libpq-print-private-object))
   "Copied connection settings; printing the profile does not expose secrets.
 CONNINFO is copied as a string or as raw octets. FALLBACK supplies libpq's
-fallback application name. Libpq resolves service and
-environment settings for each connection attempt. Effective multihost connections
-are unsupported by the helper."
+fallback application name. Libpq resolves service and environment settings on
+each connection attempt. MODE is immutable: :DATABASE is the default, and
+:PHYSICAL requests physical replication. The helper does not support effective
+multihost connections."
   (conninfo "" :type (or string (vector (unsigned-byte 8))) :read-only t)
   (fallback "" :type string :read-only t)
   (mode :database :type (member :database :physical) :read-only t))
@@ -246,6 +247,8 @@ Its canonical hexadecimal bytes are reversible, not encrypted; treat as secret."
          collect (list (copy-seq key) (physical-libpq-octets-datum value)))))
 
 (defun physical-libpq-parameters-mode (parameters)
+  "Derive mode from saved options and require the physical passfile database.
+Missing replication is the legacy database mode."
   (let ((replication (second (assoc "replication" parameters :test #'equal))))
     (cond
       ((or (null replication) (equalp replication (string->bytes "database"))) :database)
@@ -260,6 +263,7 @@ Its canonical hexadecimal bytes are reversible, not encrypted; treat as secret."
   (physical-libpq-parameters-mode (%physical-libpq-frozen-profile-parameters profile)))
 
 (defun physical-libpq-check-connection-mode (info mode)
+  "Check mode independently of the selected route, including physical dbname."
   (unless (and (eq mode (physical-libpq-parameters-mode
                          (physical-libpq-connection-info-parameters info)))
                (or (eq mode :database)
@@ -695,6 +699,7 @@ supported. A failed open attempts to close the reserved channel."
   payload)
 
 (defun physical-libpq-connect (helper profile &key on-spawn)
+  "Open with W for physical mode or O for database mode, then check metadata."
   (let ((channel (physical-libpq-open-channel helper :on-spawn on-spawn)))
     (with-physical-libpq-operation (channel)
       (let ((body (make-payload)))

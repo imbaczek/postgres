@@ -14,6 +14,8 @@
     (error "invalid native physical follow endpoint")))
 
 (defun physical-follow-source-profile (source)
+  "Return the checked connection profile and frozen owner as two values.
+The saved owner supplies the accepted mode for reconnect and handoff."
   (physical-follow-check-plist source '(:conninfo :fallback :owner))
   (let ((owner (physical-libpq-frozen-profile-from-datum (getf source :owner))))
     (values

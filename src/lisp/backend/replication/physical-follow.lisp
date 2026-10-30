@@ -1135,6 +1135,7 @@ The public slot is a separate persistent source slot, not the proof pin."
 
 (defun physical-follow-open-runtime-client (runtime publish)
   "Reconnect using the original settings, then compare the selected route.
+The saved owner supplies the mode, which the connection checks separately.
 A changed route forces fresh preparation before queries or WAL. Route equality
 is not authentication or proof of source identity."
   (let ((source (physical-follow-config-source (physical-follow-runtime-config runtime))))

@@ -789,8 +789,20 @@ strings. Raw bytes survive durable metadata and reconnect; lowercase hex is a
 lossless representation, not encryption. The full physical suite passed 1160
 tests, strict fresh compilation passed, and owned libpq experiments passed for
 raw and legacy first attachment, retained timeline follow and cold restart.
-This does not implement the standard `primary_conninfo` GUC; the helper still
-uses `replication=database`, so physical replication mode parity remains open.
+Manual private follow also supports `:mode :physical`; the default remains
+`:database`. Physical mode uses `replication=true` and `dbname=replication`
+for passfile lookup. Standard `primary_conninfo` and `primary_slot_name`
+desired-generation reconciliation remains open.
+
+The physical-mode suite passed 1168 tests and strict fresh compilation passed
+(`/tmp/pg-physical-mode-final-full-suite.log` and
+`/tmp/pg-physical-mode-final-compile.log`). The C SSL helper oracle passed,
+including physical authentication and frozen reconnect
+(`/tmp/pg-physical-mode-ssl-verified-helper.log`). Owned native runs passed
+for raw and literal conninfo, including saved mode across cold restart, retained
+timeline, public slot, replay pause and promotion crash cases
+(`/tmp/pg-physical-mode-owned-asserted-e2e.log` and
+`/tmp/pg-physical-mode-literal-e2e.log`).
 
 The native `-C` metadata path now prints supported static settings using
 configuration precedence and base units before storage ownership or listener

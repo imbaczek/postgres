@@ -277,7 +277,9 @@ static void
 open_connection(const unsigned char *body, uint32_t size, int physical)
 {
 	/* Resolve conninfo afresh on each normal connection. The fallback
-	 * application name is a separate libpq option, not an override. */
+	 * application name is a separate libpq option, not an override.
+	 * Physical mode overrides expanded conninfo with replication=true and a
+	 * final dbname=replication for passfile lookup, without forcing UTF8. */
 	if (connection)
 		fail("08P01", "helper connection is already open");
 	const unsigned char *next = body;
@@ -350,6 +352,8 @@ open_frozen_connection(const unsigned char *body, uint32_t size)
 	int local = host[0] == '/' || host[0] == '@';
 	if ((!local && (!address || !*address)) || (local && address && *address))
 		fail("08P01", "helper frozen route lacks its selected address");
+	/* Preserve the saved mode and, in physical mode, its client encoding.
+	 * Legacy database mode continues to force UTF8. */
 	int physical = replication && !strcmp(replication, "true");
 	if ((replication && strcmp(replication, "database") && !physical) ||
 		(physical && (!database || strcmp(database, "replication"))))

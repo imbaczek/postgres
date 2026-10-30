@@ -1014,6 +1014,7 @@ recovery cannot yet be enabled. A failed first connection leaves replay running.
 
 (defun physical-follow-retarget-conninfo (conninfo &key (prefix "follow") (fallback (physical-libpq-default-fallback)) slot (mode :database))
   "Attach or retarget native follow using a libpq profile.
+MODE defaults to :DATABASE; :PHYSICAL selects physical replication.
 Unless supplied, FALLBACK uses cluster_name or walreceiver when it is empty.
 SLOT is NIL or a normalized public slot name of 1 to 63 lowercase ASCII letters,
 digits or underscores. Omission and explicit NIL both request no public slot.
