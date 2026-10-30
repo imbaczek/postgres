@@ -1601,6 +1601,20 @@ Transaction options and session characteristics are excluded."
           (backend-command-id *backend*) 0)
     (set-backend-state *backend* :in-progress)))
 
+(defun execute-simple-query-statement (stream ast)
+  "Withhold a standalone autocommit tag until execution and commit succeed."
+  (if (or *defer-command-complete-p*
+          (backend-explicit *backend*)
+          (backend-implicit-query-block *backend*))
+      (execute-statement stream ast)
+      (let ((*deferred-command-completes* nil))
+        (let ((*defer-command-complete-p* t))
+          (execute-statement stream ast))
+        ;; EXECUTE-STATEMENT commits autocommit work before returning. An
+        ;; execution or commit error unwinds the private queue without output.
+        (dolist (response (nreverse *deferred-command-completes*))
+          (apply #'send-command-complete response)))))
+
 (defun execute-query-statements (stream statements implicit-block-p)
   "Execute statements in order, deferring the last command tag in an implicit block."
   (loop for tail on statements
@@ -1612,7 +1626,8 @@ Transaction options and session characteristics are excluded."
            (arm-statement-timeout)
            (let ((*defer-command-complete-p* (and implicit-block-p (null (rest tail)))))
              (unwind-protect
-                  (progn (check-for-interrupts) (execute-statement stream ast))
+                  (progn (check-for-interrupts)
+                         (execute-simple-query-statement stream ast))
                (clear-statement-timeout)))))
 
 (defun execute-simple-query-statements (stream statements)

@@ -1207,6 +1207,7 @@ cd src/lisp
 ./t/run-unit-tests.sh     # page/tuple/index/visibility and VACUUM horizon tests
 ./t/psql-smoke.sh         # boots a server and diffs psql output against a golden file
 ./t/wal-crash-recovery.sh  # SIGKILL recovery at commit, page, update, split, and checkpoint boundaries
+python3 ./t/command-complete.py # autocommit reply ordering, commit errors, recovery and protocol boundaries
 ./t/unique-index-concurrency.sh # unique-index build/drop writer races
 ./t/update-concurrency.sh # concurrent UPDATE chain and WHERE rechecks
 ./t/vacuum-update-concurrency.sh # ordinary VACUUM with same-page concurrent writers
