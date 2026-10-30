@@ -11,6 +11,7 @@ CTL = runpy.run_path(str(HERE.parents[1] / "bin/pg_ctl"))
 CHECK = runpy.run_path(str(HERE / "resource_control_fields.py"))["check_optional_fields"]
 PROMOTION = runpy.run_path(str(HERE / "promotion-primary-inspect.py"))["control"]
 CHECKPOINT = runpy.run_path(str(HERE / "checkpoint-snapshot.py"))["read_copy"]
+DECODE_CHECKPOINT = runpy.run_path(str(HERE / "checkpoint-snapshot.py"))["checkpoint"]
 NAMESPACE = runpy.run_path(str(HERE / "wal-namespace-inspect.py"))["inspect"]
 
 
@@ -44,6 +45,21 @@ class ResourceControlTests(unittest.TestCase):
         prefix = " ".join(fields).encode("ascii")
         crc = zlib.crc32(prefix) ^ bool(corrupt_crc)
         (self.root / "global/pg_wal_control").write_bytes(prefix + f" {crc:08X}\n".encode("ascii"))
+
+    def known_checkpoint(self, timeline=1):
+        fields = self.fields(resources=True, timeline=timeline)
+        snapshot = bytearray.fromhex(fields[6])
+        struct.pack_into("<3Q", snapshot, 8, 128, 296, 128)
+        snapshot += bytes.fromhex(fields[11]) + struct.pack("<QII", 96, 1, 0)
+        fields[1:3] = ["296", "296"]
+        fields[6] = snapshot.hex()
+        fields[12:14] = ["96", "1"]
+        record = bytearray(struct.pack("<4sHHIQQI", b"PGWL", 8, 4, 168, 128, 0, 0) + snapshot)
+        struct.pack_into("<I", record, 28, zlib.crc32(record))
+        filename = "0000000000000000.wal" if timeline == 1 else f"{timeline:08X}0000000000000000.wal"
+        (self.root / "pg_wal" / filename).write_bytes(bytes(128) + record)
+        self.write(fields)
+        return fields, snapshot
 
     def test_utility_accepts_legacy_and_extended_shapes(self):
         for metadata, retained, resources in ((False, False, False), (True, False, False),
@@ -101,6 +117,36 @@ class ResourceControlTests(unittest.TestCase):
         for inspect in (PROMOTION, CHECKPOINT, NAMESPACE):
             with self.assertRaises(AssertionError):
                 inspect(self.root)
+
+    def test_checkpoint_readers_accept_positioned_facts_and_parent_origins(self):
+        for timeline in (1, 2):
+            with self.subTest(timeline=timeline):
+                fields, snapshot = self.known_checkpoint(timeline)
+                self.assertEqual(timeline > 1, CTL["primary_committed"](self.root))
+                facts, _ = CHECKPOINT(self.root)
+                self.assertEqual(296, facts["end"])
+                self.assertEqual(dict(parameters=[100, 8, 10, 0, 128], lsn=96, timeline=1),
+                                 facts["resource_fact"])
+                self.assertEqual(snapshot, PROMOTION(self.root)[5])
+                if timeline == 1:
+                    self.assertEqual(296, NAMESPACE(self.root)[0]["durable"])
+                else:
+                    with self.assertRaises(AssertionError):
+                        NAMESPACE(self.root)  # This migration oracle selects timeline 1.
+                self.assertEqual(96, CHECK(fields)["lsn"])
+
+    def test_checkpoint_extension_rejects_malformed_and_future_facts(self):
+        _, snapshot = self.known_checkpoint()
+        for offset, value in ((88, 0), (116, 1), (120, 0), (120, 129), (128, 0), (128, 2), (132, 1)):
+            bad = snapshot.copy()
+            struct.pack_into("<I", bad, offset, value)
+            with self.subTest(offset=offset, value=value), self.assertRaises(AssertionError):
+                DECODE_CHECKPOINT(bad)
+        bad = snapshot.copy()
+        bad[:8] = b"PGCKPT01"
+        for data in (bad, snapshot[:-1], snapshot + b"\0"):
+            with self.assertRaises(AssertionError):
+                DECODE_CHECKPOINT(data)
 
 
 if __name__ == "__main__":

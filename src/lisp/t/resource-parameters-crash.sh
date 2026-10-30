@@ -116,10 +116,19 @@ done
 # A lower tuple must survive checkpoint recycling and another fresh image.
 control '(wal-report-resource-parameters (make-resource-parameters 50 4 5 0 64))'
 sql CHECKPOINT
+mkdir "$TMP/backup"
+control "(physical-base-backup \"$TMP/backup\" \"resource_seed\")"
+python3 "$BASE/t/interop/checkpoint-snapshot.py" "$TMP/data" --save "$TMP/checkpoint.json"
+python3 "$BASE/t/interop/checkpoint-snapshot.py" "$TMP/backup" --expect "$TMP/checkpoint.json"
+control "(let ((*pgdata* #p\"$TMP/backup/\"))
+  (multiple-value-bind (state control) (physical-recovery-verify-base-state)
+    (declare (ignore control))
+    (assert (equal '(50 4 5 0 64)
+      (getf (getf state :source-checkpoint) :resource-parameters)))))"
 kill "$SRV"
 wait "$SRV"
 SRV=
 start
 check_control 50,4,5,0,64
 [ "$(sql 'SELECT id FROM resource_crash_witness')" = 2 ]
-echo 'resource-parameters-crash: PASS (flush/control SIGKILL, replay repair, decrease and checkpoint restart)'
+echo 'resource-parameters-crash: PASS (flush/control SIGKILL, replay repair, decrease, checkpoint backup and restart)'

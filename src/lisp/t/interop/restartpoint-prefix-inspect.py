@@ -5,10 +5,12 @@ import pathlib
 import hashlib
 import json
 import re
+import runpy
 import struct
 import sys
 import zlib
 
+CHECK_RESOURCES = runpy.run_path(str(pathlib.Path(__file__).with_name("resource_control_fields.py")))["checkpoint_resource_fact"]
 
 def fnv(data, value=0xCBF29CE484222325):
     for byte in data:
@@ -179,7 +181,9 @@ def check_archive_records(data, segment, first, history, logical_start):
             fork = timeline[1]
             expected = fork if fork % (16 * 1024 * 1024) + 56 <= 16 * 1024 * 1024 else (fork // (16 * 1024 * 1024) + 1) * 16 * 1024 * 1024
             assert start == expected and level in (0, 1, 2) and padding == 0
-        elif kind == 4 and size == 120:
+        elif kind == 4:
+            assert size in (120, 168) and (version >= 8 or size == 120)
+            CHECK_RESOURCES(record[32:])
             assert record[32:40] == b"PGCKPT02"
             assert struct.unpack_from("<QQQ", record, 40) == (start, start + size, start)
             assert struct.unpack_from("<I", record, 96)[0] == timeline[0]

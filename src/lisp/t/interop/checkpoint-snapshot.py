@@ -9,10 +9,11 @@ import struct
 import zlib
 
 CHECK_OPTIONAL_CONTROL = runpy.run_path(str(Path(__file__).with_name("resource_control_fields.py")))["check_optional_fields"]
+CHECK_RESOURCES = runpy.run_path(str(Path(__file__).with_name("resource_control_fields.py")))["checkpoint_resource_fact"]
 
 
 def checkpoint(data):
-    assert len(data) == 88 and data[:8] in (b"PGCKPT01", b"PGCKPT02")
+    resources = CHECK_RESOURCES(data)
     start, end, redo, xid, reserved, oid = struct.unpack_from("<6Q", data, 8)
     timestamp = struct.unpack_from("<q", data, 56)[0]
     timeline, previous, active, known_oid, tail = struct.unpack_from("<IIQII", data, 64)
@@ -23,14 +24,17 @@ def checkpoint(data):
     if tail & 2:
         assert active == 0
         active = 1 << 64
-    assert end == start + 120 and start // 16777216 == (end - 1) // 16777216
+    assert end == start + 32 + len(data) and start // 16777216 == (end - 1) // 16777216
     assert redo == start and 3 <= xid <= reserved + 1 and reserved >= 2
     assert active == 0 or 3 <= active <= xid
-    assert timeline == previous == 1 and known_oid in (0, 1)
+    assert 1 <= previous <= timeline and known_oid in (0, 1)
     assert known_oid or oid == 0
-    return dict(start=start, end=end, redo=redo, next_xid=xid,
-                reserved_through=reserved, next_oid=oid if known_oid else None,
-                time=timestamp, timeline=timeline, previous=previous, active=active)
+    facts = dict(start=start, end=end, redo=redo, next_xid=xid,
+                 reserved_through=reserved, next_oid=oid if known_oid else None,
+                 time=timestamp, timeline=timeline, previous=previous, active=active)
+    if resources is not None:
+        facts["resource_fact"] = resources
+    return facts
 
 
 def read_copy(pgdata):
@@ -43,7 +47,7 @@ def read_copy(pgdata):
     if fields[0] == "PGWAL6":
         CHECK_OPTIONAL_CONTROL(fields)
         version, end, durable, insertion, checkpoint_tli, namespace, payload = fields[:7]
-        assert int(insertion) == int(checkpoint_tli) == 1
+        assert 1 <= int(checkpoint_tli) <= int(insertion)
         assert namespace in ("legacy", "timeline")
     elif fields[0] == "PGWAL5":
         version, end, durable, insertion, checkpoint_tli, payload = fields
@@ -53,17 +57,22 @@ def read_copy(pgdata):
         assert version == "PGWAL4"
     data = bytes.fromhex(payload)
     facts = checkpoint(data)
+    if version in ("PGWAL5", "PGWAL6"):
+        assert facts["timeline"] == int(checkpoint_tli)
+    else:
+        assert facts["timeline"] == 1
     assert facts["end"] == int(end) <= int(durable)
     number = facts['start'] // 16777216
-    name = (f"{number:016X}" if namespace == "legacy" else f"00000001{number // 256:08X}{number % 256:08X}")
+    name = (f"{number:016X}" if namespace == "legacy" else f"{facts['timeline']:08X}{number // 256:08X}{number % 256:08X}")
     segment = pgdata / f"pg_wal/{name}.wal"
     with segment.open("rb") as stream:
         stream.seek(facts["start"] % 16777216)
-        record = bytearray(stream.read(120))
+        record = bytearray(stream.read(32 + len(data)))
     magic, wal_version, kind, size, start, xid, crc = struct.unpack_from("<4sHHIQQI", record)
     assert wal_version in (6, 7, 8)
     assert wal_version >= 7 or data[:8] == b"PGCKPT01"
-    assert (magic, kind, size, start, xid) == (b"PGWL", 4, 120, facts["start"], 0)
+    assert wal_version >= 8 or len(data) == 88
+    assert (magic, kind, size, start, xid) == (b"PGWL", 4, 32 + len(data), facts["start"], 0)
     struct.pack_into("<I", record, 28, 0)
     assert zlib.crc32(record) == crc and record[32:] == data
     return facts, payload
@@ -81,6 +90,7 @@ def check_stopped(pgdata):
 def convert_fixture(pgdata, facts, payload, legacy, unsupported_insertion=False):
     """Only the shell regression calls this, after killing and waiting its PID."""
     check_stopped(pgdata)
+    assert facts["timeline"] == facts["previous"] == 1
     control = pgdata / "global/pg_wal_control"
     fields = control.read_text().split()
     assert int(fields[1]) == int(fields[2]) == facts["end"]

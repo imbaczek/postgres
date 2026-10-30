@@ -13,6 +13,7 @@ import zlib
 SIZE = 16 * 1024 * 1024
 ARCHIVE = runpy.run_path(str(pathlib.Path(__file__).with_name("restartpoint-prefix-inspect.py")))
 CHECK_OPTIONAL_CONTROL = runpy.run_path(str(pathlib.Path(__file__).with_name("resource_control_fields.py")))["check_optional_fields"]
+CHECK_RESOURCES = runpy.run_path(str(pathlib.Path(__file__).with_name("resource_control_fields.py")))["checkpoint_resource_fact"]
 
 
 def crc(data, offset):
@@ -90,15 +91,17 @@ def check_primary(target, expected_path, initial):
     expected = json.loads(pathlib.Path(expected_path).read_text())
     checkpoint, durable, child, checkpoint_child, namespace, snapshot = control(root)
     fields = (root / "global/pg_wal_control").read_bytes().split()
-    assert len(fields) == 17, "committed child lost its retained reference"
+    assert len(fields) in (17, 21), "committed child lost its retained reference"
     assert int(fields[7]) == expected["system_id"] and int(fields[8]) == 6
     assert [int(value) for value in fields[10:16]] == expected["retained_reference"]
     assert child == checkpoint_child == expected["child"] and namespace == b"timeline"
-    assert len(snapshot) == 88 and snapshot[:8] == b"PGCKPT02"
+    CHECK_RESOURCES(snapshot)
+    assert snapshot[:8] == b"PGCKPT02"
+    record_size = 32 + len(snapshot)
     start, end, redo = struct.unpack_from("<QQQ", snapshot, 8)
-    assert checkpoint == end == start + 120 and redo == start and checkpoint <= durable
+    assert checkpoint == end == start + record_size and redo == start and checkpoint <= durable
     assert struct.unpack_from("<II", snapshot, 64) == (child, expected["parent"])
-    assert read_record(root, child, start, 120, 4)[32:] == snapshot
+    assert read_record(root, child, start, record_size, 4)[32:] == snapshot
     assert parents(root) == expected["parents"], "parent WAL changed"
     history = (root / "pg_wal" / f"{child:08X}.history").read_bytes()
     parsed = ARCHIVE["parsed_history"](child, history.decode("ascii"))
@@ -118,7 +121,7 @@ def check_primary(target, expected_path, initial):
     if initial == "initial":
         eor_start = after(expected["fork"], 56)
         batch_start = after(eor_start + 56, 32)
-        checkpoint_start = after(batch_start + 32, 120)
+        checkpoint_start = after(batch_start + 32, record_size)
         assert start == checkpoint_start
         flags = struct.unpack_from("<I", snapshot, 84)[0]
         next_xid = (1 << 64) if flags & 1 else struct.unpack_from("<Q", snapshot, 32)[0]
