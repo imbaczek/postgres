@@ -45,6 +45,11 @@ capacity calculation checks the actual autovacuum slot count separately."
       (error "invalid resource parameters"))
     parameters))
 
+(defun resource-parameters-from-values (values)
+  (unless (and (listp values) (= 5 (length values)))
+    (error "resource parameters require five explicit values"))
+  (apply #'make-resource-parameters values))
+
 (defun wal-encode-resource-parameters (parameters)
   "Encode the native 32-byte PGRES001 tuple with five little-endian words.
 The reserved final word is zero. This is not C physical WAL and has no CRC;
@@ -97,3 +102,18 @@ capacity is twice N. The default autovacuum slot count is 16."
                      (+ backends (resource-parameters-prepared parameters)))))
     (when (> backends 262143) (error "too many server processes configured"))
     (values objects (* 2 objects))))
+
+(defun wal-resource-parameters-hex (parameters)
+  (with-output-to-string (stream)
+    (loop for byte across (wal-encode-resource-parameters parameters)
+          do (format stream "~2,'0X" byte))))
+
+(defun wal-resource-parameters-from-hex (text)
+  (unless (and (stringp text) (= (length text) (* 2 +resource-parameters-size+))
+               (every (lambda (character) (digit-char-p character 16)) text))
+    (error "invalid resource parameter hex encoding"))
+  (let ((bytes (make-array +resource-parameters-size+ :element-type '(unsigned-byte 8))))
+    (loop for index below (length bytes)
+          do (setf (aref bytes index)
+                   (parse-integer text :start (* index 2) :end (+ (* index 2) 2) :radix 16)))
+    (wal-decode-resource-parameters bytes)))

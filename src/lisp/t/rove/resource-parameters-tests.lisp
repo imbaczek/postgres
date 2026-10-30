@@ -114,3 +114,99 @@
                  (cl-spec:run-property 'resource-parameters-roundtrip-and-capacity :seed 42))))
       (rove:ok (eq :passed (getf data :status)) (format nil "~s" data))
       (rove:ok (= 200 (getf data :trials)))))
+
+(rove:deftest resource-control-roundtrip-preserves-known-and-unknown-facts
+    (dolist (retained '(nil t))
+      (let* ((base (append (make-wal-control-metadata 42 4 0)
+                           (when retained
+                             (list :retained-reference
+                                   '(:root-id 1 :base-timeline 1 :base 32
+                                     :manifest-digest 99 :end 64 :end-digest 7)))))
+             (parameters (resource-parameters-values (make-resource-parameters 100 8 10 0 128)))
+             (known (append base (list :resource-parameters parameters
+                                       :resource-lsn 96 :resource-timeline 1))))
+        (dolist (metadata (list base known))
+          (rove:ok (wal-control-metadata-valid-p metadata))
+          (let* ((bytes (wal-encode-control-image 0 96 nil :metadata metadata))
+                 (actual (nth-value 6 (wal-decode-control-line (bytes->string bytes)))))
+            (rove:ok (equal metadata actual))
+            (rove:ok (eq (not (null (getf metadata :resource-parameters)))
+                         (not (null (getf actual :resource-parameters))))))))))
+
+(rove:deftest resource-control-rejects-partial-invalid-and-future-facts
+    (let* ((base (make-wal-control-metadata 42 4 0))
+           (parameters (resource-parameters-values (make-resource-parameters 100 8 10 0 128))))
+      (dolist (fields (list (list :resource-parameters parameters)
+                            (list :resource-lsn 96 :resource-timeline 1)
+                            (list :resource-parameters nil :resource-lsn 96 :resource-timeline 1)
+                            (list :resource-parameters parameters :resource-lsn 0 :resource-timeline 1)
+                            (list :resource-parameters parameters :resource-lsn 96 :resource-timeline 0)))
+        (rove:ok (not (wal-control-metadata-valid-p (append base fields)))))
+      (dolist (fields (list (list :resource-parameters parameters :resource-lsn 97 :resource-timeline 1)
+                            (list :resource-parameters parameters :resource-lsn 96 :resource-timeline 2)))
+        (rove:ok (resource-parameters-test-error-p
+                  (lambda () (wal-encode-control-image 0 96 nil :metadata (append base fields))))))))
+
+(rove:deftest resource-control-decodes-only-the-complete-tagged-extension
+    (let ((hex (wal-resource-parameters-hex (make-resource-parameters 100 8 10 0 128))))
+      (flet ((decode (tail)
+               (let ((prefix (format nil "PGWAL6 0 96 1 1 legacy - 42 4 0 ~a" tail)))
+                 (wal-decode-control-line
+                  (format nil "~a ~8,'0X" prefix (wal-crc32 (string->bytes prefix)))))))
+        (rove:ok (equal '(100 8 10 0 128)
+                        (getf (nth-value 6 (decode (format nil "R ~a 96 1" hex)))
+                              :resource-parameters)))
+        (dolist (tail (list (format nil "X ~a 96 1" hex)
+                            (format nil "R ~a 97 1" hex)
+                            (format nil "R ~a 96 2" hex)
+                            (format nil "R ~a 96" hex)
+                            (format nil "R ~a 96 1 0" hex)
+                            (format nil "R ~a 1_20 1" hex)
+                            (format nil "R ~a 96 0_1" hex)
+                            (format nil "R ~a 96 1" (subseq hex 2))))
+          (rove:ok (resource-parameters-test-error-p (lambda () (decode tail))))))))
+
+(rove:deftest resource-control-refresh-preserves-resource-position
+    (let* ((parameters (resource-parameters-values (make-resource-parameters 100 8 10 0 128)))
+           (metadata (append (make-wal-control-metadata 42 4 0)
+                             (list :resource-parameters parameters :resource-lsn 96 :resource-timeline 1)))
+           (refreshed (wal-refresh-control-metadata metadata 6 1)))
+      (rove:ok (equal parameters (getf refreshed :resource-parameters)))
+      (rove:ok (not (eq parameters (getf refreshed :resource-parameters))))
+      (setf (first (getf refreshed :resource-parameters)) 101)
+      (rove:ok (= 100 (first parameters)))
+      (rove:ok (= 96 (getf refreshed :resource-lsn)))
+      (rove:ok (= 1 (getf refreshed :resource-timeline)))
+      (rove:ok (= 6 (getf refreshed :db-state)))))
+
+(rove:deftest resource-control-bounded-reader-accepts-the-complete-extended-image
+    (let* ((maximum 18446744073709551615)
+           (start (* (- (floor maximum +wal-segment-size+) 1) +wal-segment-size+))
+           (end (+ start (wal-checkpoint-record-size)))
+           (snapshot (list :version 2 :start start :end end :redo start :next-xid 3
+                           :xid-reserved-through 2 :next-oid maximum :time -9223372036854775808
+                           :timeline 4294967295 :prev-timeline 4294967295 :oldest-active-xid 0))
+           (metadata (append (make-wal-control-metadata maximum 4 9223372036854775807)
+                             (list :retained-reference
+                                   (list :root-id maximum :base-timeline 4294967295 :base (- maximum 64)
+                                         :manifest-digest maximum :end maximum :end-digest maximum)
+                                   :resource-parameters '(100 8 10 0 128)
+                                   :resource-lsn maximum :resource-timeline 4294967295)))
+           (bytes (wal-encode-control-image end maximum snapshot
+                                            :timeline 4294967295 :namespace :timeline :metadata metadata))
+           (control-path (symbol-function 'wal-control-path)))
+      (rove:ok (> (length bytes) 513))
+      (uiop:with-temporary-file (:stream stream :pathname path :direction :output
+                                 :element-type '(unsigned-byte 8))
+        (write-sequence bytes stream)
+        :close-stream
+        (unwind-protect
+             (progn
+               (setf (symbol-function 'wal-control-path) (lambda () path))
+               (let ((actual (multiple-value-list (wal-read-control-fields))))
+                 (rove:ok (equal (list end maximum snapshot 4294967295 4294967295 :timeline metadata)
+                                 actual))
+                 (setf (first (getf (seventh actual) :resource-parameters)) 101)
+                 (rove:ok (= 100 (first (getf metadata :resource-parameters))))
+                 (rove:ok (= 100 (first (getf (nth-value 6 (wal-read-control-fields)) :resource-parameters))))))
+          (setf (symbol-function 'wal-control-path) control-path)))))

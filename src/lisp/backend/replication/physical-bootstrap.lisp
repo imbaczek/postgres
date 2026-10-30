@@ -159,7 +159,7 @@ The new base receives its own archive; the old primary archive is not copied."
                         :checkpoint-timeline checkpoint-timeline :namespace namespace :metadata copied)))
             (wal-ensure-directory-durable (uiop:pathname-directory-pathname path))
             (wal-atomic-write-bytes path bytes)
-            (let ((actual (recovery-read-bytes path :maximum 513)))
+            (let ((actual (recovery-read-bytes path :maximum (1+ +wal-control-maximum-bytes+))))
               (unless (and (equalp bytes actual)
                            (equal (multiple-value-list (wal-decode-control-line (bytes->string actual)))
                                   (list checkpoint durable snapshot insertion checkpoint-timeline namespace copied)))

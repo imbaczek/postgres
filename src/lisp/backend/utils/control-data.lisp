@@ -152,7 +152,7 @@ Reject a missing entry or a length or digest mismatch; bound the read by MAXIMUM
 For a child base, also authenticate its history file and check child control
 against that history. An ordinary base cannot carry an old primary's retained
 archive reference; pending promotion may retain one."
-  (let ((bytes (native-control-manifest-file manifest "global/pg_wal_control" 513)))
+  (let ((bytes (native-control-manifest-file manifest "global/pg_wal_control" (1+ +wal-control-maximum-bytes+))))
     (multiple-value-bind (checkpoint durable actual insertion checkpoint-timeline namespace metadata)
         (wal-decode-control-line (bytes->string bytes))
       (unless (and (= checkpoint (getf manifest :checkpoint))

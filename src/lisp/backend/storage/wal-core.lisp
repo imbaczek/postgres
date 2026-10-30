@@ -4,6 +4,9 @@
 
 (defconstant +wal-segment-size+ (* 16 1024 1024))
 (defconstant +wal-header-size+ 32)
+
+(defconstant +wal-control-maximum-bytes+ 1024)
+
 (defconstant +wal-max-page-images-per-record+ 512)
 (defconstant +wal-record-pages+ 1)
 (defconstant +wal-record-commit+ 2)
@@ -2741,9 +2744,9 @@ Reject extra lines before decoding its CRC and checkpoint metadata."
   (let ((path (wal-control-path)))
     (handler-case
         (with-input-from-string
-            (stream (bytes->string (read-bounded-regular-file path 513 :minimum 1)))
+            (stream (bytes->string (read-bounded-regular-file path (1+ +wal-control-maximum-bytes+) :minimum 1)))
           (let ((line (read-line stream nil nil)))
-            (unless (and line (<= (length line) 512) (null (read-line stream nil nil)))
+            (unless (and line (<= (length line) +wal-control-maximum-bytes+) (null (read-line stream nil nil)))
               (error "WAL control file ~a is corrupt" path))
             (handler-case (wal-decode-control-line line)
               (error (condition)

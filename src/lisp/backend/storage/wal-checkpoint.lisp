@@ -142,18 +142,71 @@
        (typep (getf reference :base-timeline) '(integer 1 4294967295))
        (<= (getf reference :base) (getf reference :end))))
 
+(defun wal-control-resource-parameters (metadata)
+  (let ((keys (loop for (key value) on metadata by #'cddr collect key)))
+    (when (member :resource-parameters keys)
+      (resource-parameters-from-values (getf metadata :resource-parameters)))))
+
+(defun wal-control-resource-fields-valid-p (metadata)
+  (let* ((keys (loop for (key value) on metadata by #'cddr collect key))
+         (present (intersection keys '(:resource-parameters :resource-lsn :resource-timeline))))
+    (or (null present)
+        (and (= 3 (length present))
+             (ignore-errors (wal-control-resource-parameters metadata))
+             (typep (getf metadata :resource-lsn) '(integer 1 18446744073709551615))
+             (typep (getf metadata :resource-timeline) '(integer 1 4294967295))))))
+
+(defun wal-control-resource-position-valid-p (metadata durable timeline)
+  (or (null (getf metadata :resource-parameters))
+      (and (<= (getf metadata :resource-lsn) durable)
+           (<= (getf metadata :resource-timeline) timeline))))
+
+(defun wal-copy-control-resource-fields (metadata)
+  (when (getf metadata :resource-parameters)
+    (list :resource-parameters (copy-list (getf metadata :resource-parameters))
+          :resource-lsn (getf metadata :resource-lsn)
+          :resource-timeline (getf metadata :resource-timeline))))
+
+(defun wal-decode-control-metadata (fields)
+  (when (member (length fields) '(11 15 17 21))
+    (let ((metadata
+            (make-wal-control-metadata
+             (ignore-errors (parse-integer (eighth fields)))
+             (ignore-errors (parse-integer (ninth fields)))
+             (ignore-errors (parse-integer (tenth fields))))))
+      (when (member (length fields) '(17 21))
+        (setf metadata
+              (append metadata
+                      (list :retained-reference
+                            (loop for key in *wal-retained-reference-keys*
+                                  for field in (subseq fields 10 16)
+                                  append (list key (ignore-errors (parse-integer field))))))))
+      (when (member (length fields) '(15 21))
+        (let ((offset (if (= 21 (length fields)) 16 10)))
+          (unless (equal "R" (nth offset fields))
+            (error "invalid resource control extension tag"))
+          (setf metadata
+                (append metadata
+                        (list :resource-parameters (resource-parameters-values (wal-resource-parameters-from-hex (nth (1+ offset) fields)))
+                              :resource-lsn (ignore-errors (parse-integer (nth (+ offset 2) fields)))
+                              :resource-timeline (ignore-errors (parse-integer (nth (+ offset 3) fields))))))))
+      (unless (wal-control-metadata-valid-p metadata)
+        (error "invalid primary control metadata"))
+      metadata)))
+
 (defun wal-control-metadata-valid-p (metadata)
-  "Recognize lifecycle fields and an optional exact retained archive reference."
-  (and (listp metadata) (member (length metadata) '(6 8))
+  (and (listp metadata) (member (length metadata) '(6 8 12 14))
        (let ((keys (loop for (key value) on metadata by #'cddr collect key)))
          (and (= (/ (length metadata) 2) (length (remove-duplicates keys)))
               (null (set-difference '(:system-id :db-state :state-time) keys))
-              (null (set-difference keys '(:system-id :db-state :state-time :retained-reference)))))
+              (null (set-difference keys '(:system-id :db-state :state-time :retained-reference
+                                           :resource-parameters :resource-lsn :resource-timeline)))
+              (or (not (member :retained-reference keys))
+                  (wal-retained-reference-valid-p (getf metadata :retained-reference)))))
        (typep (getf metadata :system-id) '(unsigned-byte 64))
        (typep (getf metadata :db-state) '(integer 0 6))
        (typep (getf metadata :state-time) '(signed-byte 64))
-       (or (= 6 (length metadata))
-           (wal-retained-reference-valid-p (getf metadata :retained-reference)))))
+       (wal-control-resource-fields-valid-p metadata)))
 
 (defun make-wal-control-metadata (system-id state &optional (time (- (get-universal-time) 2208988800)))
   "Build checked primary lifecycle metadata, using Unix seconds for TIME."
@@ -162,12 +215,13 @@
     metadata))
 
 (defun wal-refresh-control-metadata (metadata state &optional (time (- (get-universal-time) 2208988800)))
-  "Change lifecycle state without losing the selected archive reference."
+  "Change lifecycle state without losing existing durable metadata."
   (unless (wal-control-metadata-valid-p metadata)
     (error "invalid primary control metadata"))
   (append (make-wal-control-metadata (getf metadata :system-id) state time)
           (when (getf metadata :retained-reference)
-            (list :retained-reference (copy-list (getf metadata :retained-reference))))))
+            (list :retained-reference (copy-list (getf metadata :retained-reference))))
+          (wal-copy-control-resource-fields metadata)))
 
 (defun wal-encode-control-image (checkpoint durable snapshot
                                  &key (timeline 1) (namespace :legacy) metadata
@@ -183,7 +237,9 @@ fixed key order. The CRC covers every supplied field."
                (typep checkpoint-timeline '(integer 1 4294967295))
                (<= checkpoint-timeline timeline)
                (member namespace '(:legacy :timeline))
-               (or (null metadata) (wal-control-metadata-valid-p metadata))
+               (or (null metadata)
+                   (and (wal-control-metadata-valid-p metadata)
+                        (wal-control-resource-position-valid-p metadata durable timeline)))
                (or (null snapshot)
                    (and (wal-checkpoint-snapshot-valid-p snapshot)
                         (= checkpoint (getf snapshot :end))
@@ -202,14 +258,16 @@ fixed key order. The CRC covers every supplied field."
                              (mapcar (lambda (key) (getf reference key))
                                      *wal-retained-reference-keys*))
                      prefix))
+         (parameters (wal-control-resource-parameters metadata))
+         (prefix (if parameters
+                     (format nil "~a R ~a ~d ~d" prefix (wal-resource-parameters-hex parameters)
+                             (getf metadata :resource-lsn) (getf metadata :resource-timeline))
+                     prefix))
          (crc (wal-crc32 (string->bytes prefix))))
     (string->bytes (format nil "~a ~8,'0X~%" prefix crc))))
 
 (defun wal-decode-control-line (line)
-  "Return checkpoint end, durable end, snapshot, insertion TLI, checkpoint TLI,
-namespace and optional lifecycle metadata. PGWAL6 retained-reference values use
-the fixed key order. Legacy control implies timeline 1 and legacy names. An
-older image's absent lifecycle metadata is unknown state."
+  "Decode a CRC-bound control image, retaining unknown legacy resource facts."
   (let* ((fields (and line (wal-split-fields line)))
          (version (first fields))
          (v6 (equal version "PGWAL6"))
@@ -223,7 +281,8 @@ older image's absent lifecycle metadata is unknown state."
                                  ((equal (sixth fields) "timeline") :timeline))
                         :legacy))
          (crc (ignore-errors (parse-integer (car (last fields)) :radix 16))))
-    (unless (and (cond (v6 (member (length fields) '(8 11 17))) (identities (= (length fields) 7))
+    (unless (and (cond (v6 (member (length fields) '(8 11 15 17 21)))
+                       (identities (= (length fields) 7))
                        (v4 (= (length fields) 5))
                        (t (and (= (length fields) 4)
                                (member version '("PGWAL2" "PGWAL3") :test #'equal))))
@@ -242,23 +301,9 @@ older image's absent lifecycle metadata is unknown state."
       (when (and snapshot (or (/= checkpoint (getf snapshot :end))
                               (/= checkpoint-timeline (getf snapshot :timeline))))
         (error "checkpoint control copy names another record or timeline"))
-      (let ((metadata
-              (when (and v6 (member (length fields) '(11 17)))
-                (let ((metadata
-                        (make-wal-control-metadata
-                         (ignore-errors (parse-integer (eighth fields)))
-                         (ignore-errors (parse-integer (ninth fields)))
-                         (ignore-errors (parse-integer (tenth fields))))))
-                  (when (= 17 (length fields))
-                    (setf metadata
-                          (append metadata
-                                  (list :retained-reference
-                                        (loop for key in *wal-retained-reference-keys*
-                                              for field in (subseq fields 10 16)
-                                              append (list key (ignore-errors (parse-integer field))))))))
-                  (unless (wal-control-metadata-valid-p metadata)
-                    (error "invalid primary control metadata"))
-                  metadata))))
+      (let ((metadata (when v6 (wal-decode-control-metadata fields))))
+        (unless (wal-control-resource-position-valid-p metadata durable timeline)
+          (error "resource facts exceed durable control coordinates"))
         (values checkpoint durable snapshot timeline checkpoint-timeline namespace metadata)))))
 
 (declaim (ftype function physical-promotion-check-child-control))
