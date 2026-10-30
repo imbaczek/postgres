@@ -32,9 +32,11 @@ one segment; rotation leaves an EOF gap rather than inventing padding records."
                (typep local-floor '(integer 3 18446744073709551616)))
     (error "child checkpoint lacks allocation proof"))
   (multiple-value-bind (eor eor-start) (physical-promotion-eor-image state)
-    (let* ((batch-start (wal-record-start-after (+ eor-start (length eor)) +wal-header-size+))
-           (start (wal-record-start-after (+ batch-start +wal-header-size+) (wal-checkpoint-record-size)))
-           (end (+ start (wal-checkpoint-record-size)))
+    (let* ((resource-fact (copy-tree (getf state :source-resource-fact)))
+           (record-size (wal-checkpoint-record-size resource-fact))
+           (batch-start (wal-record-start-after (+ eor-start (length eor)) +wal-header-size+))
+           (start (wal-record-start-after (+ batch-start +wal-header-size+) record-size))
+           (end (+ start record-size))
            (next (canonical-next-full-xid
                   (max (getf state :next-xid) local-floor
                        (1+ (getf (getf state :source-reservation) :bound)))))
@@ -42,6 +44,7 @@ one segment; rotation leaves an EOF gap rather than inventing padding records."
                            :next-xid next :xid-reserved-through (1- next) :next-oid next-oid
                            :time (getf state :state-time) :timeline (getf state :promotion-child)
                            :prev-timeline (physical-recovery-replay-timeline state) :oldest-active-xid next)))
+      (setf snapshot (append snapshot resource-fact))
       (unless (and (<= end #xffffffffffffffff) (wal-checkpoint-snapshot-valid-p snapshot))
         (error "invalid child checkpoint plan"))
       (list :fork (getf state :applied) :child (getf state :promotion-child)
@@ -197,6 +200,7 @@ finish; a durable child is not yet a production-ready postmaster."
                                           (metadata (make-wal-control-metadata (getf *physical-recovery-state* :system-id)
                                                                                +db-in-crash-recovery+))
                                           (reference (getf *physical-recovery-state* :retained-reference)))
+    (setf metadata (append metadata (wal-copy-control-resource-fields snapshot)))
     (when reference (setf (getf metadata :retained-reference) (copy-list reference)))
     (with-atomic-output
         (stream (wal-control-path) (merge-pathnames "global/pg_wal_control.tmp" *pgdata*)

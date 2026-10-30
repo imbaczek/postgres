@@ -36,7 +36,7 @@ the referenced archive."
   (destructuring-bind (&key phase system-id timeline manifest-digest checkpoint
                          applied next-xid db-state state-time (control-version 3)
                          (applied-timeline timeline) history-target history-digest
-                         promotion-child promotion-generation promotion-source-namespace retained-reference
+                         promotion-child promotion-generation promotion-source-namespace retained-reference resource-fact
                        &allow-other-keys)
       control
     (and (member phase '(0 1 2 3))
@@ -45,6 +45,12 @@ the referenced archive."
          (every (lambda (value) (typep value '(unsigned-byte 64)))
                 (list system-id manifest-digest checkpoint applied))
          (member control-version '(1 2 3 4))
+         (or (null resource-fact)
+             (and (member control-version '(3 4))
+                  (typep applied-timeline '(integer 1 4294967295))
+                  (wal-resource-fact-valid-p resource-fact)
+                  (<= (getf resource-fact :resource-lsn) applied)
+                  (<= (getf resource-fact :resource-timeline) applied-timeline)))
          (or (null retained-reference)
              (and (= phase 3) (= control-version 4)
                   (wal-retained-reference-valid-p retained-reference)
@@ -96,19 +102,21 @@ the referenced archive."
                                         &key (db-state (if (zerop phase) +db-startup+ +db-in-archive-recovery+))
                                           (state-time (- (get-universal-time) 2208988800))
                                           (applied-timeline timeline) history-target history-digest
-                                          promotion-child promotion-generation promotion-source-namespace retained-reference)
+                                          promotion-child promotion-generation promotion-source-namespace retained-reference resource-fact)
   (let* ((pending (= phase 3)) (version (if pending 4 3))
                                (extension-start (if pending 84 68))
                                (selected (not (null history-target)))
                                (reference-offset (+ extension-start (if selected 16 0)))
-                               (crc-offset (+ reference-offset (if retained-reference 44 0))))
+                               (resource-offset (+ reference-offset (if retained-reference 44 0)))
+                               (crc-offset (+ resource-offset (if resource-fact +wal-resource-fact-size+ 0))))
     (unless (physical-recovery-control-valid-p
              (list :control-version version :phase phase :system-id system-id :timeline timeline
                    :manifest-digest manifest-digest :checkpoint checkpoint :applied applied
                    :next-xid next-xid :db-state db-state :state-time state-time
                    :applied-timeline applied-timeline :history-target history-target :history-digest history-digest
                    :promotion-child promotion-child :promotion-generation promotion-generation
-                   :promotion-source-namespace promotion-source-namespace :retained-reference retained-reference))
+                   :promotion-source-namespace promotion-source-namespace :retained-reference retained-reference
+                   :resource-fact resource-fact))
       (error "unrepresentable physical recovery control state"))
     (let ((bytes (make-array (+ crc-offset 4) :element-type '(unsigned-byte 8) :initial-element 0)))
       (replace bytes (if pending #(80 71 82 83 84 65 84 52) #(80 71 82 83 84 65 84 51)))
@@ -131,6 +139,8 @@ the referenced archive."
         (wal-set-u64 bytes (+ extension-start 8) history-digest))
       (when retained-reference
         (physical-recovery-write-retained-reference bytes reference-offset retained-reference))
+      (when resource-fact
+        (replace bytes (wal-encode-resource-fact resource-fact) :start1 resource-offset))
       (wal-set-u32 bytes crc-offset (wal-crc32 bytes))
       bytes)))
 
@@ -141,19 +151,24 @@ The old pending and selected ordinary images are both 88 bytes; their magic
 separates them. Selected pending control uses 104 bytes. A pending retained
 reference adds 44 bytes, giving 132 or 148 bytes."
 
-  (unless (member (length bytes) '(60 72 88 104 132 148))
+  (unless (member (length bytes) '(60 72 88 104 120 132 136 148 152 180 196))
     (error "invalid physical recovery control length"))
   (let* ((size (length bytes)) (magic (subseq bytes 0 8))
+                               (resources (or (and (equalp magic #(80 71 82 83 84 65 84 51))
+                                                   (member size '(120 136)))
+                                              (and (equalp magic #(80 71 82 83 84 65 84 52))
+                                                   (member size '(136 152 180 196)))))
+                               (layout-size (- size (if resources +wal-resource-fact-size+ 0)))
                                (version (cond
                                           ((and (= size 60) (equalp magic #(80 71 82 83 84 65 84 69))) 1)
                                           ((and (= size 72) (equalp magic #(80 71 82 83 84 65 84 50))) 2)
-                                          ((and (member size '(72 88)) (equalp magic #(80 71 82 83 84 65 84 51))) 3)
-                                          ((and (member size '(88 104 132 148)) (equalp magic #(80 71 82 83 84 65 84 52))) 4)))
+                                          ((and (member layout-size '(72 88)) (equalp magic #(80 71 82 83 84 65 84 51))) 3)
+                                          ((and (member layout-size '(88 104 132 148)) (equalp magic #(80 71 82 83 84 65 84 52))) 4)))
                                (legacy (eql version 1)) (pending (eql version 4))
                                (extension-start (if pending 84 68))
-                               (retained (and pending (member size '(132 148))))
+                               (retained (and pending (member layout-size '(132 148))))
                                (selected (and (member version '(3 4))
-                                              (= size (+ extension-start 20 (if retained 44 0)))))
+                                              (= layout-size (+ extension-start 20 (if retained 44 0)))))
                                (crc-offset (- size 4))
                                (copy (copy-seq bytes)) (crc (wal-u32 copy crc-offset))
                                (raw-phase (wal-u32 bytes 8))
@@ -182,14 +197,17 @@ reference adds 44 bytes, giving 132 or 148 bytes."
               (getf control :history-digest) (wal-u64 bytes (+ extension-start 8))))
       (when retained
         (setf (getf control :retained-reference)
-              (physical-recovery-read-retained-reference bytes (- crc-offset 44))))
+              (physical-recovery-read-retained-reference bytes (- layout-size 48))))
+      (when resources
+        (setf (getf control :resource-fact)
+              (wal-decode-resource-fact (subseq bytes (- size 52) crc-offset))))
       (unless (physical-recovery-control-valid-p control :legacy legacy)
         (error "corrupt or unsupported physical recovery control"))
       control)))
 
 (defun physical-recovery-read-control (directory)
   (physical-recovery-decode-control
-   (recovery-read-bytes (physical-recovery-control-path directory) :maximum 148)))
+   (recovery-read-bytes (physical-recovery-control-path directory) :maximum 196)))
 
 (defvar *physical-recovery-control-test-hook* nil
   "Optional deterministic hook for recovery control publication failures.")
@@ -223,18 +241,34 @@ reference adds 44 bytes, giving 132 or 148 bytes."
       (write-sequence bytes stream))))
 
 (defun physical-recovery-control-frontier (state applied)
-  "Choose the durable minimum recovery position and its timeline as a pair.
-Keep the required pair while replay is behind. Reject a replay timeline that
-disagrees at the required boundary."
   (let* ((base (getf state :timeline))
          (runtime (getf state :replay-timeline base))
          (required (getf state :required-applied))
-         (required-timeline (getf state :required-timeline base)))
+         (required-timeline (getf state :required-timeline base))
+         (source (getf state :source-resource-fact))
+         (minimum (getf state :required-resource-fact)))
+    (unless (or (null source)
+                (and (wal-resource-fact-valid-p source)
+                     (<= (getf source :resource-lsn) applied)
+                     (<= (getf source :resource-timeline) runtime)))
+      (error "resource fact is outside the current replay frontier"))
+    (unless (or (null minimum)
+                (and required (wal-resource-fact-valid-p minimum)
+                     (<= (getf minimum :resource-lsn) required)
+                     (<= (getf minimum :resource-timeline) required-timeline)))
+      (error "resource fact is outside the required recovery frontier"))
     (when (and required (= applied required) (/= runtime required-timeline))
       (error "replay timeline differs at the required applied boundary"))
+    (when (and required (>= applied required) minimum)
+      (unless (and source
+                   (>= (getf source :resource-lsn) (getf minimum :resource-lsn))
+                   (or (> (getf source :resource-lsn) (getf minimum :resource-lsn))
+                       (equal source minimum))
+                   (or (> applied required) (equal source minimum)))
+        (error "reconstructed resources differ at the required recovery frontier")))
     (if (and required (< applied required))
-        (values required required-timeline)
-        (values applied runtime))))
+        (values required required-timeline (wal-copy-control-resource-fields minimum))
+        (values applied runtime (wal-copy-control-resource-fields source)))))
 
 (defun physical-recovery-write-control (state phase applied next-xid
                                         &key (db-state +db-in-archive-recovery+))
@@ -247,16 +281,22 @@ disagrees at the required boundary."
   (when (and (= db-state +db-shutdowned-in-recovery+)
              (< applied (or (getf state :required-applied) applied)))
     (error "clean recovery has not reached its previously applied boundary"))
-  (multiple-value-bind (required required-timeline) (physical-recovery-control-frontier state applied)
+  (multiple-value-bind (required required-timeline resource-fact) (physical-recovery-control-frontier state applied)
     (let* ((state (copy-list state))
            (next-xid (max next-xid (or (getf state :observed-next-xid) next-xid)))
            (time (- (get-universal-time) 2208988800))
            (bytes (physical-recovery-control-image
                    phase (getf state :system-id) (getf state :timeline)
                    (getf state :manifest-digest) (getf state :checkpoint) required next-xid
-                   :applied-timeline required-timeline
+                   :applied-timeline required-timeline :resource-fact resource-fact
                    :history-target (getf state :history-target) :history-digest (getf state :history-digest)
                    :db-state db-state :state-time time)))
+      (when (getf state :source-resource-fact)
+        (setf (getf state :source-resource-fact)
+              (wal-copy-control-resource-fields (getf state :source-resource-fact))))
+      (if resource-fact
+          (setf (getf state :required-resource-fact) (wal-copy-control-resource-fields resource-fact))
+          (remf state :required-resource-fact))
       (physical-recovery-persist-control-bytes bytes db-state)
       (setf (getf state :phase) phase
             (getf state :db-state) db-state
@@ -275,7 +315,8 @@ disagrees at the required boundary."
   (wal-atomic-write-bytes
    (physical-recovery-control-path directory)
    (physical-recovery-control-image 0 (catalog-system-identifier) *wal-insert-timeline* 0
-                                    *wal-checkpoint-lsn* *wal-durable-lsn* *next-xid*)))
+                                    *wal-checkpoint-lsn* *wal-durable-lsn* *next-xid*
+                                    :resource-fact (wal-copy-control-resource-fields *wal-checkpoint-snapshot*))))
 
 (defun recovery-check-literal-text (text)
   "Accept only the literal list/string/number/keyword grammar emitted by our manifest."
@@ -531,6 +572,14 @@ the manifest does not add another authority for those facts."
           (error "base checkpoint control differs from manifest"))
         (physical-recovery-check-checkpoint-resources snapshot metadata)
         (setf (getf manifest :source-checkpoint) snapshot))
+      (when (getf (getf manifest :source-checkpoint) :resource-parameters)
+        (setf (getf manifest :source-resource-fact)
+              (wal-copy-control-resource-fields (getf manifest :source-checkpoint))
+              (getf manifest :base-source-resource-fact)
+              (wal-copy-control-resource-fields (getf manifest :source-checkpoint))))
+      (when (getf control :resource-fact)
+        (setf (getf manifest :required-resource-fact)
+              (wal-copy-control-resource-fields (getf control :resource-fact))))
       (setf (getf manifest :source-reservation) (physical-recovery-initial-reservation manifest))
       (setf (getf manifest :manifest-digest) digest
             (getf manifest :phase) (if (= 2 (getf control :phase)) 2 1)
@@ -620,7 +669,7 @@ A saved binding must have been reconciled and admitted before this point."
           *wal-segment-namespace* (getf *physical-recovery-state* :wal-namespace :legacy)
           *wal-insert-timeline* (getf *physical-recovery-state* :timeline)
           *wal-checkpoint-timeline* (getf *physical-recovery-state* :timeline)
-          *wal-checkpoint-snapshot* (copy-list (getf *physical-recovery-state* :source-checkpoint))
+          *wal-checkpoint-snapshot* (copy-tree (getf *physical-recovery-state* :source-checkpoint))
           *wal-checkpoint-lsn* (getf *physical-recovery-state* :checkpoint)
           *wal-durable-lsn* (getf *physical-recovery-state* :end)
           *wal-end-lsn* *wal-durable-lsn*

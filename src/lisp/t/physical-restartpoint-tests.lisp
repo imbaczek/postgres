@@ -43,6 +43,269 @@
 (defmacro with-restartpoint-fixture ((root store) &body body)
   `(call-with-restartpoint-fixture (lambda (,root ,store) ,@body)))
 
+(defun append-resource-test-parameter (store connections)
+  (let* ((start (pg::physical-store-flushed-lsn store))
+         (record-start (+ start 32))
+         (payload (pg::wal-encode-resource-parameters
+                   (pg::make-resource-parameters connections 8 10 0 128))))
+    (pg::physical-store-input store start (sample-physical-record start))
+    (pg::physical-store-input store record-start
+                              (pg::wal-encode-record pg::+wal-record-parameter-change+ 0 record-start payload))
+    (pg::physical-store-flush store)
+    (pg::physical-store-flushed-lsn store)))
+
+(defun call-with-resource-restartpoint-fixture (function)
+  (with-restartpoint-fixture (root store)
+    (let ((pg::*wal-page-cache* (make-hash-table :test #'equal))
+          (pg::*wal-page-cache-xids* (make-hash-table :test #'equal))
+          (pg::*wal-dirty-store* nil)
+          (pg::*physical-replay-restarting-p* t))
+      (append-resource-test-parameter store 100)
+      (pg::physical-replay-from 96)
+      (funcall function root store))))
+
+(defun publish-resource-test-generation (store &key legacy compact)
+  (let ((before pg::*physical-recovery-state*))
+    (unwind-protect
+         (progn
+           (when legacy
+             (setf pg::*physical-recovery-state* (copy-list before))
+             (remf pg::*physical-recovery-state* :source-resource-fact))
+           (if compact
+               (pg::physical-store-compact store pg::*last-replay-lsn* #'pg::physical-restartpoint-publish)
+               (pg::physical-restartpoint-publish
+                (pg::physical-store-prefix-digest store pg::*last-replay-lsn*))))
+      (when legacy (setf pg::*physical-recovery-state* before)))))
+
+(deftest follow-historical-resource-witness-distinguishes-unknown-from-legacy
+    (call-with-resource-restartpoint-fixture
+     (lambda (root store)
+       (declare (ignore root))
+       (let* ((state (copy-tree pg::*physical-recovery-state*))
+              (fact (copy-tree (getf state :source-resource-fact)))
+              (seed (list 192 1 pg::*next-xid* (getf state :source-checkpoint)
+                          (getf state :source-reservation) (getf state :source-xids) fact)))
+         (flet ((scan (witness)
+                  (pg::physical-follow-scan-replay-from-seed
+                   store state '(192 1) '(192 1) pg::*next-xid* seed
+                   (lambda (function start)
+                     (pg::physical-store-map-durable-records store function :start-lsn start))
+                   nil witness)))
+           (ok (scan (list 192 1 pg::*next-xid* fact)))
+           (ok (scan (list 192 1 pg::*next-xid*)))
+           (ok (intake-fails-p (lambda () (scan (list 192 1 pg::*next-xid* nil))))))))))
+
+(deftest follow-resource-scan-proves-a-required-decrease-and-rejects-a-forged-fact
+    (call-with-resource-restartpoint-fixture
+     (lambda (root store)
+       (let* ((state (copy-tree pg::*physical-recovery-state*))
+              (fact (copy-tree (getf state :source-resource-fact)))
+              (required (list :resource-parameters (list 50 8 10 0 128)
+                              :resource-lsn 288 :resource-timeline 1))
+              (seed (list 192 1 pg::*next-xid* (getf state :source-checkpoint)
+                          (getf state :source-reservation) (getf state :source-xids) fact))
+              (before (lineage-test-bytes (pg::physical-recovery-control-path root))))
+         (append-resource-test-parameter store 50)
+         (setf (getf state :required-resource-fact) required)
+         (flet ((scan ()
+                  (pg::physical-follow-scan-replay-from-seed
+                   store state '(192 1) '(288 1) pg::*next-xid* seed
+                   (lambda (function start)
+                     (pg::physical-store-map-durable-records store function :start-lsn start))
+                   nil)))
+           (let ((result (scan)))
+             (ok (equal fact (getf result :applied-resource-fact)))
+             (ok (equal required (getf result :required-resource-fact))))
+           (setf (first (getf required :resource-parameters)) 75)
+           (ok (intake-fails-p #'scan))
+           (setf (getf state :required-resource-fact) nil)
+           (ok (intake-fails-p #'scan))
+           (ok (= 192 pg::*last-replay-lsn*))
+           (ok (equalp before (lineage-test-bytes (pg::physical-recovery-control-path root))))
+           (ok (equal fact (getf pg::*physical-recovery-state* :source-resource-fact))))))))
+
+(deftest follow-resource-scan-keeps-unapplied-tail-out-of-applied-facts
+    (call-with-resource-restartpoint-fixture
+     (lambda (root store)
+       (declare (ignore root))
+       (let* ((state (copy-tree pg::*physical-recovery-state*))
+              (fact (copy-tree (getf state :source-resource-fact)))
+              (seed (list 192 1 pg::*next-xid* (getf state :source-checkpoint)
+                          (getf state :source-reservation) (getf state :source-xids) fact)))
+         (append-resource-test-parameter store 50)
+         (let ((result (pg::physical-follow-scan-replay-from-seed
+                        store state '(192 1) '(192 1) pg::*next-xid* seed
+                        (lambda (function start)
+                          (pg::physical-store-map-durable-records store function :start-lsn start))
+                        nil)))
+           (ok (= 288 (getf result :terminal)))
+           (ok (equal fact (getf result :applied-resource-fact)))
+           (ok (equal fact (getf result :required-resource-fact)))
+           (ok (= 192 pg::*last-replay-lsn*))
+           (ok (equal fact (getf pg::*physical-recovery-state* :source-resource-fact))))))))
+
+(deftest restartpoint-resources-restore-older-seed-without-borrowing-required-decrease
+    (call-with-resource-restartpoint-fixture
+     (lambda (root store)
+       (let ((older (copy-tree (getf pg::*physical-recovery-state* :source-resource-fact))))
+         (ok (= 192 pg::*last-replay-lsn*))
+         (publish-resource-test-generation store :compact t)
+         (append-resource-test-parameter store 50)
+         (pg::physical-replay-from 192)
+         (let ((required (copy-tree (getf pg::*physical-recovery-state* :required-resource-fact))))
+           (ok (= 288 pg::*last-replay-lsn*))
+           (ok (equal '(50 8 10 0 128) (getf required :resource-parameters)))
+           (dotimes (attempt 2)
+             (declare (ignorable attempt))
+             (setf (getf pg::*physical-recovery-state* :source-resource-fact) (copy-tree required))
+             (ok (= 192 (pg::physical-restartpoint-prepare-storage store)))
+             (ok (equal older (getf pg::*physical-recovery-state* :source-resource-fact)))
+             (ok (equal required (getf pg::*physical-recovery-state* :required-resource-fact)))
+             (setf pg::*physical-recovery-state*
+                   (pg::physical-recovery-write-control pg::*physical-recovery-state* 2 192 pg::*next-xid*))
+             (let ((control (pg::physical-recovery-read-control root)))
+               (ok (= 288 (getf control :applied)))
+               (ok (equal required (getf control :resource-fact)))))
+           (pg::physical-replay-from 192)
+           (ok (= 288 pg::*last-replay-lsn*))
+           (ok (equal required (getf pg::*physical-recovery-state* :source-resource-fact))))))))
+
+(deftest legacy-resource-seed-rehydrates-facts-without-rewinding-its-data-counters
+    (call-with-resource-restartpoint-fixture
+     (lambda (root store)
+       (declare (ignore root))
+       (let* ((start (pg::physical-store-flushed-lsn store))
+              (record-start (+ start 32))
+              (payload (pg::wal-encode-running-xacts 80 nil t)))
+         (pg::physical-store-input store start (sample-physical-record start))
+         (pg::physical-store-input store record-start
+                                   (pg::wal-encode-record pg::+wal-record-running-xacts+ 0 record-start payload))
+         (pg::physical-store-flush store)
+         (pg::physical-replay-from start))
+       (let ((seed pg::*last-replay-lsn*)
+             (fact (copy-tree (getf pg::*physical-recovery-state* :source-resource-fact))))
+         (publish-resource-test-generation store :legacy t)
+         (setf (getf pg::*physical-recovery-state* :source-resource-fact) nil pg::*next-xid* 50)
+         (ok (= seed (pg::physical-restartpoint-prepare-storage store)))
+         (ok (= 80 pg::*next-xid*))
+         (ok (equal fact (getf pg::*physical-recovery-state* :source-resource-fact)))
+         (ok (= seed (getf pg::*physical-recovery-state* :restartpoint-lsn)))))))
+
+(deftest legacy-resource-seed-below-required-waits-for-real-forward-parameter-proof
+    (call-with-resource-restartpoint-fixture
+     (lambda (root store)
+       (declare (ignore root))
+       (publish-resource-test-generation store :legacy t :compact t)
+       (append-resource-test-parameter store 50)
+       (pg::physical-replay-from 192)
+       (let ((minimum (copy-tree (getf pg::*physical-recovery-state* :required-resource-fact))))
+         (setf (getf pg::*physical-recovery-state* :source-resource-fact) nil)
+         (ok (= 192 (pg::physical-restartpoint-prepare-storage store)))
+         (ok (null (getf pg::*physical-recovery-state* :source-resource-fact)))
+         (ok (equal minimum (getf pg::*physical-recovery-state* :required-resource-fact)))
+         (pg::physical-replay-from 192)
+         (ok (equal minimum (getf pg::*physical-recovery-state* :source-resource-fact)))))))
+
+(deftest legacy-resource-seed-cannot-borrow-an-anchor-after-the-required-boundary
+    (call-with-resource-restartpoint-fixture
+     (lambda (root store)
+       (publish-resource-test-generation store :legacy t :compact t)
+       (pg::physical-store-input store 192 (sample-physical-record 192))
+       (pg::physical-store-input store 224 (pg::wal-encode-record pg::+wal-record-maintenance+ 0 224 (empty-octets)))
+       (pg::physical-store-flush store)
+       (pg::physical-replay-from 192)
+       (let* ((fact (copy-tree (getf pg::*physical-recovery-state* :source-resource-fact)))
+              (snapshot (append '(:version 2 :start 288 :end 456 :redo 288 :next-xid 50
+                                  :xid-reserved-through 1002 :next-oid nil :time 0
+                                  :timeline 1 :prev-timeline 1 :oldest-active-xid 0) fact)))
+         (pg::physical-store-input store 256 (sample-physical-record 256))
+         (pg::physical-store-input store 288
+                                   (pg::wal-encode-record pg::+wal-record-checkpoint+ 0 288
+                                                          (pg::wal-encode-checkpoint-snapshot snapshot)))
+         (pg::physical-store-flush store)
+         (setf (getf pg::*physical-recovery-state* :source-resource-fact) nil)
+         (let ((before-state (copy-tree pg::*physical-recovery-state*))
+               (control (pg::recovery-read-bytes (pg::physical-recovery-control-path root)))
+               (pointer (pg::recovery-read-bytes (pg::physical-restartpoint-pointer-path)))
+               (catalog (pg::recovery-read-bytes (pg::catalog-path))))
+           (ok (intake-fails-p (lambda () (pg::physical-restartpoint-prepare-storage store))))
+           (ok (equal before-state pg::*physical-recovery-state*))
+           (ok (equalp control (pg::recovery-read-bytes (pg::physical-recovery-control-path root))))
+           (ok (equalp pointer (pg::recovery-read-bytes (pg::physical-restartpoint-pointer-path))))
+           (ok (equalp catalog (pg::recovery-read-bytes (pg::catalog-path)))))))))
+
+(defun append-resource-test-checkpoint (store)
+  (let* ((begin (pg::physical-store-flushed-lsn store))
+         (start (+ begin 32))
+         (fact (pg::wal-copy-control-resource-fields (getf pg::*physical-recovery-state* :source-resource-fact)))
+         (snapshot (append (list :version 2 :start start :end (+ start 168) :redo start
+                                 :next-xid pg::*next-xid* :xid-reserved-through 1002 :next-oid nil :time 0
+                                 :timeline 1 :prev-timeline 1 :oldest-active-xid 0) fact)))
+    (pg::physical-store-input store begin (sample-physical-record begin))
+    (pg::physical-store-input store start
+                              (pg::wal-encode-record pg::+wal-record-checkpoint+ 0 start
+                                                     (pg::wal-encode-checkpoint-snapshot snapshot)))
+    (pg::physical-store-flush store)
+    (pg::physical-store-flushed-lsn store)))
+
+(deftest legacy-resource-seed-uses-a-checkpoint-anchor-at-the-required-boundary
+    (call-with-resource-restartpoint-fixture
+     (lambda (root store)
+       (declare (ignore root))
+       (publish-resource-test-generation store :legacy t :compact t)
+       (append-resource-test-checkpoint store)
+       (pg::physical-replay-from 192)
+       (let ((minimum (copy-tree (getf pg::*physical-recovery-state* :required-resource-fact))))
+         (ok (= 392 pg::*last-replay-lsn*))
+         (setf (getf pg::*physical-recovery-state* :source-resource-fact) nil
+               (getf pg::*physical-recovery-state* :source-checkpoint) nil)
+         (ok (= 192 (pg::physical-restartpoint-prepare-storage store)))
+         (ok (null (getf pg::*physical-recovery-state* :source-resource-fact)))
+         (ok (null (getf pg::*physical-recovery-state* :source-checkpoint)))
+         (pg::physical-replay-from 192)
+         (ok (= 392 pg::*last-replay-lsn*))
+         (ok (equal minimum (getf pg::*physical-recovery-state* :source-resource-fact)))))))
+
+(deftest legacy-resource-seed-at-required-needs-a-retained-or-exact-seed-proof
+    (call-with-resource-restartpoint-fixture
+     (lambda (root store)
+       (publish-resource-test-generation store :legacy t :compact t)
+       (setf (getf pg::*physical-recovery-state* :source-resource-fact) nil)
+       (let ((before (copy-tree pg::*physical-recovery-state*))
+             (catalog (pg::recovery-read-bytes (pg::catalog-path)))
+             (control (pg::recovery-read-bytes (pg::physical-recovery-control-path root))))
+         (ok (intake-fails-p (lambda () (pg::physical-restartpoint-prepare-storage store))))
+         (ok (equal before pg::*physical-recovery-state*))
+         (ok (equalp catalog (pg::recovery-read-bytes (pg::catalog-path))))
+         (ok (equalp control (pg::recovery-read-bytes (pg::physical-recovery-control-path root))))))))
+
+(deftest newer-legacy-seed-can-prove-a-decrease-from-its-exact-checkpoint
+    (call-with-resource-restartpoint-fixture
+     (lambda (root store)
+       (let ((older (copy-tree (getf pg::*physical-recovery-state* :source-resource-fact))))
+         (append-resource-test-parameter store 50)
+         (pg::physical-replay-from 192)
+         (append-resource-test-checkpoint store)
+         (pg::physical-replay-from 288)
+         (ok (= 488 pg::*last-replay-lsn*))
+         (let ((decreased (copy-tree (getf pg::*physical-recovery-state* :source-resource-fact))))
+           (publish-resource-test-generation store :legacy t :compact t)
+           (pg::wal-atomic-write-bytes
+            (pg::physical-recovery-control-path root)
+            (pg::physical-recovery-control-image 2 123 1 77 32 192 50 :resource-fact older))
+           (setf (getf pg::*physical-recovery-state* :required-applied) 192
+                 (getf pg::*physical-recovery-state* :required-resource-fact) older
+                 (getf pg::*physical-recovery-state* :source-resource-fact) nil
+                 (getf pg::*physical-recovery-state* :source-checkpoint) nil)
+           (ok (= 488 (pg::physical-restartpoint-prepare-storage store)))
+           (ok (= 488 (getf pg::*physical-recovery-state* :required-applied)))
+           (ok (equal decreased (getf pg::*physical-recovery-state* :source-resource-fact)))
+           (ok (equal decreased (getf pg::*physical-recovery-state* :required-resource-fact)))
+           (pg::physical-recovery-save-progress 488 pg::*next-xid*)
+           (let ((control (pg::physical-recovery-read-control root)))
+             (ok (= 488 (getf control :applied)))
+             (ok (equal decreased (getf control :resource-fact)))))))))
+
 (deftest restartpoint-generation-roundtrip-and-suffix-start
     (with-restartpoint-fixture (root store)
       (declare (ignore root))

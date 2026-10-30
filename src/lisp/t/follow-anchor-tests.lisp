@@ -216,6 +216,21 @@
           (getf binding :after) (copy-list before))
     config))
 
+(deftest follow-binding-resource-witness-roundtrips-and-owns-its-tuple
+    (let* ((config (follow-binding-test-config))
+           (binding (fifth config))
+           (fact (list :resource-parameters (list 100 8 10 0 64)
+                       :resource-lsn 96 :resource-timeline 1))
+           (witness (pg::physical-follow-recovery-witness
+                     (getf binding :recovery) (list :resource-fact fact))))
+      (setf (getf binding :recovery) witness)
+      (ok (equalp config (pg::physical-follow-decode-config
+                          (pg::physical-follow-config-image config))))
+      (setf (first (getf fact :resource-parameters)) 50)
+      (ok (= 100 (first (getf (getf witness :resource-fact) :resource-parameters))))
+      (setf (getf witness :resource-fact) nil)
+      (ok (intake-fails-p (lambda () (pg::physical-follow-check-config config))))))
+
 (deftest same-timeline-binding-preserves-every-receive-control-field
     (let* ((config (same-timeline-follow-binding-config))
            (binding (fifth config))

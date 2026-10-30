@@ -214,13 +214,24 @@ Use PHYSICAL-STORE-CONTROL-TUPLE's field order; no durable file is read here."
     (error "invalid follow receive-control witness"))
   tuple)
 
+(defun physical-follow-recovery-witness (witness control)
+  (let ((copy (copy-tree witness)) (fact (getf control :resource-fact)))
+    (when fact
+      (unless (wal-resource-fact-valid-p fact) (error "invalid follow resource witness"))
+      (setf (getf copy :resource-fact) (copy-tree fact)))
+    copy))
+
 (defun physical-follow-binding-recovery-check (witness before applied)
   "Check the named phase-2 recovery witness against the saved tuple and applied pair.
 Identity, checkpoint, observed XID, old history reference and restartpoint token
 still require comparison with durable recovery state."
   (physical-follow-check-plist
-   witness '(:phase :cluster-identity :checkpoint :observed-next-xid
-             :history-target :history-digest :restartpoint))
+   witness (append '(:phase :cluster-identity :checkpoint :observed-next-xid
+                     :history-target :history-digest :restartpoint)
+                   (when (member :resource-fact witness) '(:resource-fact))))
+  (when (member :resource-fact witness)
+    (unless (wal-resource-fact-valid-p (getf witness :resource-fact))
+      (error "invalid follow resource witness")))
   (let ((identity (getf witness :cluster-identity))
         (checkpoint (getf witness :checkpoint))
         (observed (getf witness :observed-next-xid))
@@ -369,7 +380,8 @@ caller supplies a verified BASE and protects PGDATA and the retained root."
                          (<= next (1+ (getf reservation :bound)))))
           (error "follow replay seed has an invalid allocation frontier")))
       (values start timeline next snapshot reservation
-              (when metadata (copy-tree (getf metadata :source-xids)))))))
+              (when metadata (copy-tree (getf metadata :source-xids)))
+              (physical-restartpoint-resource-seed metadata base store start)))))
 
 (defun physical-follow-scan-replay-from-seed
     (candidate verified-base applied required observed seed map-records allow-open-tail &optional witness)
@@ -381,11 +393,12 @@ historical (LSN timeline next-XID) triple checked at a clean boundary. The
 caller owns the candidate and keeps its input stable during the scan.  Return
 its disposition with the semantic result; this scan does not update replay's
 exhaustion cache.  A policy fence must leave a clean batch boundary."
-  (destructuring-bind (start timeline next snapshot reservation source-xids) seed
+  (destructuring-bind (start timeline next snapshot reservation source-xids &optional resource-fact) seed
     (let* ((*physical-recovery-state* (copy-tree verified-base))
            (*physical-receive-store* candidate)
            (terminal start) (disposition nil) (applied-seen nil) (required-seen nil) (required-next nil)
            (witness-seen (null witness))
+           (applied-resource-fact nil) (required-resource-fact nil)
            (removed (make-hash-table :test #'eql)))
       (setf (getf *physical-recovery-state* :replay-timeline) timeline
             (getf *physical-recovery-state* :source-checkpoint) snapshot
@@ -398,15 +411,23 @@ exhaustion cache.  A policy fence must leave a clean batch boundary."
         (setf required-seen t required-next observed))
       (labels ((note-boundary ()
                  (when (and witness (= terminal (first witness)))
-                   (unless (equal witness (list terminal timeline next))
+                   (unless (and (equal (subseq witness 0 3) (list terminal timeline next))
+                                (or (< (length witness) 4)
+                                    (equal (fourth witness) resource-fact)))
                      (error "follow replay differs from its restartpoint visibility"))
                    (setf witness-seen t))
                  (when (equal applied (list terminal timeline))
-                   (setf applied-seen t))
+                   (setf applied-seen t applied-resource-fact (copy-tree resource-fact)))
                  (when (equal required (list terminal timeline))
                    (unless (= next observed)
                      (error "follow replay differs from required XID visibility"))
-                   (setf required-seen t required-next next))))
+                   (when (and (loop for key in verified-base by #'cddr
+                                      thereis (eq key :required-resource-fact))
+                              (not (equal resource-fact
+                                          (getf verified-base :required-resource-fact))))
+                     (error "follow replay differs from required resource facts"))
+                   (setf required-seen t required-next next
+                         required-resource-fact (copy-tree resource-fact)))))
         (note-boundary)
         (with-physical-replay-staging ()
           (setf disposition
@@ -430,7 +451,12 @@ exhaustion cache.  A policy fence must leave a clean batch boundary."
                            (setf (getf *physical-recovery-state* :source-checkpoint)
                                  (wal-checkpoint-record-snapshot record)))))
                    (unless *wal-recovery-group-active*
-                     (setf terminal (wal-record-end record))
+                     (setf resource-fact
+                           (physical-resource-fact-next
+                            resource-fact record timeline
+                            (lambda () (physical-recovery-resource-history
+                                        candidate *physical-recovery-state*)))
+                           terminal (wal-record-end record))
                      (note-boundary)))
                  start))
           (unless (and applied-seen required-seen witness-seen
@@ -441,7 +467,9 @@ exhaustion cache.  A policy fence must leave a clean batch boundary."
                                     (= terminal (physical-store-flushed-lsn candidate))))))
             (error "follow replay does not reach clean recovery boundaries"))))
       (list :disposition disposition :start start :terminal terminal :timeline timeline :next-xid next
-            :required-next-xid required-next :reservation reservation :source-xids source-xids))))
+            :required-next-xid required-next
+            :applied-resource-fact applied-resource-fact :required-resource-fact required-resource-fact
+            :reservation reservation :source-xids source-xids))))
 
 (defun physical-follow-scan-replay (candidate verified-base applied required observed restartpoint
                                     &key allow-open-tail)
@@ -463,6 +491,11 @@ exhaustion cache.  A policy fence must leave a clean batch boundary."
 Candidate proof remains strict for pending or new bindings. Same-timeline
 receipt may have an open tail; complete records are still checked."
   (physical-follow-binding-check binding)
+  (setf verified-base (copy-tree verified-base)
+        (getf verified-base :required-applied) (first (getf binding :required))
+        (getf verified-base :required-timeline) (second (getf binding :required))
+        (getf verified-base :required-resource-fact)
+        (copy-tree (getf (getf binding :recovery) :resource-fact)))
   (physical-follow-check-source-history candidate (nth-value 0 (physical-follow-anchor-check (getf binding :anchor))))
   (unless (and (equal (physical-store-control-tuple candidate) (getf binding :after))
                (eql (getf verified-base :system-id) (physical-store-system-id candidate))
@@ -501,7 +534,8 @@ reject any other state."
                  (equal (getf base :cluster-identity) (getf witness :cluster-identity))
                  (equal required (list (getf control :applied)
                                        (getf control :applied-timeline (getf control :timeline))))
-                 (eql (getf control :next-xid) (getf witness :observed-next-xid)))
+                 (eql (getf control :next-xid) (getf witness :observed-next-xid))
+                 (equal (getf control :resource-fact) (getf witness :resource-fact)))
       (error "pending follow differs from durable recovery provenance or progress"))
     (cond ((equal current old) :before)
           ((equal current new) :after)
@@ -532,6 +566,13 @@ caller must keep STORE quiescent and protect its retained root while it is read.
                  (<= (first (getf binding :required)) (first required))
                  (<= (getf witness :observed-next-xid) (getf control :next-xid)))
       (error "active follow differs from durable recovery provenance or progress"))
+    (physical-recovery-control-frontier
+     (list :required-applied (first (getf binding :required))
+           :required-timeline (second (getf binding :required))
+           :required-resource-fact (getf witness :resource-fact)
+           :source-resource-fact (getf control :resource-fact)
+           :replay-timeline (second required))
+     (first required))
     (dolist (pair (list required (getf binding :required) (getf binding :applied)))
       (physical-recovery-check-store-point store (first pair) (second pair)))
     required))
@@ -638,6 +679,10 @@ The store validates its whole spool before callbacks stop at a policy fence."
   "Check applied, required and seed positions, then scan their semantic history.
 A fixed policy bounds spool callbacks, while full durable validation still runs.
 Return the scan disposition; it is not a numeric reconciliation success value."
+  (setf base (copy-tree base)
+        (getf base :required-applied) (first required)
+        (getf base :required-timeline) (second required)
+        (getf base :required-resource-fact) (copy-tree (getf control :resource-fact)))
   (physical-recovery-check-store-point candidate (first applied) (second applied))
   (multiple-value-bind (metadata token)
       (physical-follow-check-current-restartpoint candidate base minimum)
@@ -654,9 +699,10 @@ Return the scan disposition; it is not a numeric reconciliation success value."
            candidate base pair required (getf control :next-xid)
            (list (getf base :end) (getf base :timeline) (getf base :next-xid)
                  (copy-tree (getf base :source-checkpoint))
-                 (copy-tree (getf base :source-reservation)) nil)
+                 (copy-tree (getf base :source-reservation)) nil
+                 (copy-tree (getf base :base-source-resource-fact)))
            (lambda (function start) (physical-follow-map-active-prefix candidate index function start policy))
-           t (subseq seed 0 3))
+           t (append (subseq seed 0 3) (list (seventh seed))))
           (physical-follow-scan-replay-from-seed
            candidate base pair required (getf control :next-xid) seed
            (lambda (function start)
@@ -802,6 +848,8 @@ Read control back and verify the resulting history and recovery provenance."
           (getf state :replay-timeline) (second required)
           (getf state :observed-next-xid) (getf witness :observed-next-xid)
           (getf state :history-target) target (getf state :history-digest) digest)
+    (setf (getf state :source-resource-fact) (copy-tree (getf witness :resource-fact))
+          (getf state :required-resource-fact) (copy-tree (getf witness :resource-fact)))
     (physical-recovery-write-control state 2 (first required) (getf witness :observed-next-xid))
     (let ((control (physical-recovery-read-control *pgdata*)))
       (physical-follow-pending-recovery-position base binding control)

@@ -188,11 +188,11 @@ proof kind is included in the saved receiver coordinates."
     (multiple-value-bind (metadata catalog prefix digest) (physical-restartpoint-read base)
       (declare (ignore catalog prefix))
       (list :base base :before before :applied applied :required required :coordinates coordinates
-            :recovery (list :phase 2 :cluster-identity (getf base :cluster-identity)
-                            :checkpoint (getf base :checkpoint) :observed-next-xid (getf control :next-xid)
-                            :history-target (getf control :history-target)
-                            :history-digest (getf control :history-digest)
-                            :restartpoint (when metadata (list (getf metadata :lsn) digest)))))))
+            :recovery (physical-follow-recovery-witness (list :phase 2 :cluster-identity (getf base :cluster-identity)
+                                                              :checkpoint (getf base :checkpoint) :observed-next-xid (getf control :next-xid)
+                                                              :history-target (getf control :history-target)
+                                                              :history-digest (getf control :history-digest)
+                                                              :restartpoint (when metadata (list (getf metadata :lsn) digest))) control)))))
 
 (defun physical-follow-controller-plan (snapshot anchor view)
   "Build a binding; same-timeline and retained follow keep the receive tuple.

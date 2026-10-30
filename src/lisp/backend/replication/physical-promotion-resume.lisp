@@ -65,9 +65,13 @@ for legacy pending state that has no saved floor."
               (error "pending promotion lost its exact selected generation"))
             (setf (getf state :wal-prefix-lsn) (getf metadata :lsn)
                   (getf state :wal-prefix-bytes) prefix
-                  (getf state :source-checkpoint) (copy-list (getf metadata :source-checkpoint))
+                  (getf state :source-checkpoint) (copy-tree (getf metadata :source-checkpoint))
                   (getf state :source-reservation) (copy-list (getf metadata :source-reservation))
                   (getf state :source-xids) (copy-tree (getf metadata :source-xids)))
+            (let ((fact (physical-promotion-frozen-resource-fact control metadata)))
+              (when fact
+                (setf (getf state :source-resource-fact) (copy-tree fact)
+                      (getf state :required-resource-fact) fact)))
             (physical-promotion-check-pending-retained control metadata)
             (physical-promotion-timeline-floor state)
             (values state metadata prefix generation)))))))

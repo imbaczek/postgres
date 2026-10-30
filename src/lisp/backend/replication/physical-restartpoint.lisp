@@ -90,14 +90,61 @@
         (error "restartpoint source membership differs from its replay boundary"))))
   (values))
 
+(defun physical-restartpoint-check-source-resources (metadata)
+  (when (loop for key in metadata by #'cddr thereis (eq key :source-resource-fact))
+    (let ((fact (getf metadata :source-resource-fact))
+          (timeline (getf metadata :replay-timeline (getf metadata :timeline))))
+      (unless (and (eql 4 (getf metadata :version)) (wal-resource-fact-valid-p fact)
+                   (<= (getf fact :resource-lsn) (getf metadata :lsn))
+                   (<= (getf fact :resource-timeline) timeline))
+        (error "invalid restartpoint source resource fact"))))
+  (values))
+
+(defun physical-restartpoint-resource-seed (metadata state store start)
+  (let* ((checkpoint (if metadata (getf metadata :source-checkpoint) (getf state :source-checkpoint)))
+         (timeline (if metadata (getf metadata :replay-timeline (getf metadata :timeline))
+                       (getf state :timeline)))
+         (base (getf state :end))
+         (base-fact (getf state :base-source-resource-fact))
+         (fact (if metadata (getf metadata :source-resource-fact) base-fact))
+         (required (getf state :required-applied))
+         (minimum (getf state :required-resource-fact)))
+    (when (and (null fact) checkpoint
+               (= (getf checkpoint :end) start) (= (getf checkpoint :timeline) timeline))
+      (setf fact (wal-copy-control-resource-fields checkpoint)))
+    (when (and metadata (null fact))
+      (cond
+        ((and checkpoint (getf checkpoint :resource-parameters)
+              (<= (physical-store-floor-lsn store) (getf checkpoint :end) start))
+         (setf fact (physical-recovery-scan-resource-fact
+                     store (getf checkpoint :end) start (wal-copy-control-resource-fields checkpoint) state)))
+        ((<= (physical-store-floor-lsn store) base)
+         (setf fact (physical-recovery-scan-resource-fact store base start base-fact state)))))
+    (when fact
+      (unless (<= (getf fact :resource-lsn) start)
+        (error "restartpoint resources are newer than its replay seed"))
+      (timeline-check-resource-origin fact (physical-recovery-resource-history store state)))
+    (when minimum
+      (if (< start required)
+          (unless (equal minimum (physical-recovery-scan-resource-fact store start required fact state))
+            (error "required resource fact cannot be reconstructed; take a fresh base backup"))
+          (let ((candidate (copy-list state)))
+            (unless fact
+              (error "restartpoint lacks required resource proof; take a fresh base backup"))
+            (setf (getf candidate :source-resource-fact) fact
+                  (getf candidate :replay-timeline) timeline)
+            (physical-recovery-control-frontier candidate start))))
+    (wal-copy-control-resource-fields fact)))
+
 (defun physical-restartpoint-history-fields-valid-p (metadata)
   "Check the optional selected-history reference and replay timeline in metadata.
 Older metadata without these fields uses the base timeline."
   (let* ((base (getf metadata :timeline)) (target (getf metadata :history-target))
                                           (digest (getf metadata :history-digest))
                                           (replay (getf metadata :replay-timeline base))
-                                          (source-xids (loop for key in metadata by #'cddr thereis (eq key :source-xids))))
-    (and (= (length metadata) (+ 28 (if source-xids 2 0) (if target 6 0)))
+                                          (source-xids (loop for key in metadata by #'cddr thereis (eq key :source-xids)))
+                                          (resources (loop for key in metadata by #'cddr thereis (eq key :source-resource-fact))))
+    (and (= (length metadata) (+ 28 (if source-xids 2 0) (if resources 2 0) (if target 6 0)))
          (physical-recovery-selection-fields-valid-p 2 3 base replay target digest)
          (or (not target)
              (every (lambda (key) (loop for name in metadata by #'cddr thereis (eq key name)))
@@ -129,6 +176,7 @@ Older metadata without these fields uses the base timeline."
                           '(integer 3 18446744073709551615))))
     (error "foreign or malformed physical restartpoint metadata"))
   (physical-restartpoint-check-source-xids metadata)
+  (physical-restartpoint-check-source-resources metadata)
   (let ((reservation (getf metadata :source-reservation)))
     (when reservation
       (unless (and (physical-source-reservation-valid-p reservation)
@@ -195,10 +243,14 @@ Older metadata without these fields uses the base timeline."
                   :manifest-digest (getf state :manifest-digest) :base (getf state :end)
                   :lsn *last-replay-lsn* :prefix-digest digest :next-xid *next-xid*
                   :forks forks :seen (sort seen #'<)
-                  :source-checkpoint (copy-list (getf state :source-checkpoint))
+                  :source-checkpoint (copy-tree (getf state :source-checkpoint))
                   :source-reservation (copy-list (getf state :source-reservation))
                   :wal-prefix-digest (when prefix-bytes
                                        (physical-store-update-digest #xCBF29CE484222325 prefix-bytes)))))
+      (when (getf state :source-resource-fact)
+        (setf metadata (append metadata
+                               (list :source-resource-fact
+                                     (wal-copy-control-resource-fields (getf state :source-resource-fact))))))
       (when (getf state :source-xids)
         (setf metadata (append metadata (list :source-xids (copy-tree (getf state :source-xids))))))
       (when (getf state :history-target)
@@ -281,7 +333,8 @@ Older metadata without these fields uses the base timeline."
           (error "legacy restartpoint lost actual XID history; reseed required"))
         (setf metadata nil catalog-bytes nil))
       (physical-recovery-policy-check-seed state store metadata)
-      (let ((start (if metadata (getf metadata :lsn) (getf state :end))))
+      (let ((start (if metadata (getf metadata :lsn) (getf state :end)))
+            (resource-seed nil))
         (unless (and (<= (physical-store-floor-lsn store) start (physical-store-flushed-lsn store))
                      (or metadata (= start (physical-store-base-lsn store))))
           (error "receive floor lacks its required published restartpoint"))
@@ -292,6 +345,7 @@ Older metadata without these fields uses the base timeline."
            store start (getf metadata :replay-timeline (getf metadata :timeline)))
           (unless (= (getf metadata :prefix-digest) (physical-store-prefix-digest store start))
             (error "restartpoint differs from its durable receive prefix")))
+        (setf resource-seed (physical-restartpoint-resource-seed metadata state store start))
         (multiple-value-bind (removed terminal reset-forks)
             (physical-recovery-proven-drops
              store identity :start-lsn start :required-lsn (max required start)
@@ -314,7 +368,7 @@ Older metadata without these fields uses the base timeline."
                     *xid-batch-end* *next-xid*
                     (getf *physical-recovery-state* :restartpoint-lsn) start
                     (getf *physical-recovery-state* :source-checkpoint)
-                    (copy-list (getf metadata :source-checkpoint))
+                    (copy-tree (getf metadata :source-checkpoint))
                     (getf *physical-recovery-state* :source-reservation)
                     (copy-list (getf metadata :source-reservation))
                     (getf *physical-recovery-state* :source-xids)
@@ -325,10 +379,16 @@ Older metadata without these fields uses the base timeline."
               (setf (getf *physical-recovery-state* :source-xids) nil
                     *next-xid* (canonical-next-full-xid (getf state :next-xid))
                     *xid-batch-end* *next-xid*)))
+        (when (or resource-seed (getf *physical-recovery-state* :source-resource-fact))
+          (setf (getf *physical-recovery-state* :source-resource-fact)
+                (wal-copy-control-resource-fields resource-seed)))
         (setf (getf *physical-recovery-state* :replay-timeline)
               (if metadata (getf metadata :replay-timeline (getf metadata :timeline))
                   (getf state :timeline)))
         (when (> start required)
+          (when resource-seed
+            (setf (getf *physical-recovery-state* :required-resource-fact)
+                  (wal-copy-control-resource-fields resource-seed)))
           (setf (getf *physical-recovery-state* :required-applied) start
                 (getf *physical-recovery-state* :required-timeline) (physical-recovery-replay-timeline)
                 (getf *physical-recovery-state* :observed-next-xid)

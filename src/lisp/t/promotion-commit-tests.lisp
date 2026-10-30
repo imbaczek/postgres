@@ -26,6 +26,74 @@
         (ok (equal snapshot (pg::wal-checkpoint-record-snapshot
                              (pg::wal-decode-record (second (third frames)) (first (third frames)))))))))
 
+(deftest pending-intent-encodes-and-owns-its-known-resource-fact
+    (with-promotion-fixture (root store)
+      (declare (ignore root store))
+      (multiple-value-bind (metadata catalog prefix generation)
+          (pg::physical-restartpoint-read pg::*physical-recovery-state*)
+        (declare (ignore catalog))
+        (let* ((metadata (copy-tree metadata))
+               (fact (list :resource-parameters (list 100 8 10 0 64)
+                           :resource-lsn 96 :resource-timeline 1)))
+          (setf (getf metadata :source-resource-fact) fact
+                (getf metadata :source-checkpoint)
+                (append (getf metadata :source-checkpoint) (copy-tree fact)))
+          (multiple-value-bind (bytes pending)
+              (pg::physical-promotion-make-pending
+               pg::*physical-recovery-state* metadata prefix generation :legacy 2 1793030000 nil)
+            (let* ((control (pg::physical-recovery-decode-control bytes))
+                   (restored (pg::physical-promotion-frozen-resource-fact control metadata))
+                   (before (pg::physical-promotion-checkpoint-plan pending 20000 1003))
+                   (cold (copy-tree pending)))
+              (ok (equal fact (getf control :resource-fact)))
+              (setf (getf cold :source-resource-fact) restored)
+              (ok (equalp (getf before :frames)
+                          (getf (pg::physical-promotion-checkpoint-plan cold 20000 1003) :frames)))
+              (setf (first (getf fact :resource-parameters)) 50
+                    (first (getf (getf metadata :source-checkpoint) :resource-parameters)) 60)
+              (ok (= 100 (first (getf (getf pending :source-resource-fact) :resource-parameters))))
+              (ok (= 100 (first (getf (getf pending :required-resource-fact) :resource-parameters))))
+              (ok (= 100 (first (getf (getf pending :source-checkpoint) :resource-parameters))))
+              (setf (first (getf (getf pending :source-resource-fact) :resource-parameters)) 70)
+              (ok (= 100 (first (getf (getf pending :required-resource-fact) :resource-parameters))))))))))
+
+(deftest pending-resource-fact-is-bound-to-the-selected-generation
+    (let* ((fact (list :resource-parameters (list 100 8 10 0 64)
+                       :resource-lsn 192 :resource-timeline 1))
+           (control (list :resource-fact fact))
+           (metadata (list :source-resource-fact (copy-tree fact)))
+           (restored (pg::physical-promotion-frozen-resource-fact control metadata)))
+      (ok (equal fact restored))
+      (setf (first (getf restored :resource-parameters)) 50)
+      (ok (= 100 (first (getf fact :resource-parameters))))
+      (ok (equal fact (pg::physical-promotion-frozen-resource-fact nil metadata)))
+      (ok (null (pg::physical-promotion-frozen-resource-fact nil nil)))
+      (ok (intake-fails-p
+           (lambda () (pg::physical-promotion-frozen-resource-fact control nil))))
+      (setf (first (getf (getf metadata :source-resource-fact) :resource-parameters)) 50)
+      (ok (intake-fails-p
+           (lambda () (pg::physical-promotion-frozen-resource-fact control metadata))))))
+
+(deftest child-checkpoint-plan-preserves-frozen-parent-resources
+    (dolist (fork (list 216 (- pg::+wal-segment-size+ 256)
+                        (- pg::+wal-segment-size+ 255)))
+      (let* ((fact (list :resource-parameters (list 100 8 10 0 64)
+                         :resource-lsn 192 :resource-timeline 1))
+             (state (sample-promotion-checkpoint-state fork)))
+        (setf (getf state :source-resource-fact) fact)
+        (let* ((plan (pg::physical-promotion-checkpoint-plan state 20000 1003))
+               (snapshot (getf plan :snapshot))
+               (frame (third (getf plan :frames))))
+          (ok (equal fact (pg::wal-copy-control-resource-fields snapshot)))
+          (ok (= 168 (length (second frame))))
+          (ok (equal snapshot
+                     (pg::wal-checkpoint-record-snapshot
+                      (pg::wal-decode-record (second frame) (first frame)))))
+          (ok (<= (+ (mod (first frame) pg::+wal-segment-size+)
+                     (length (second frame))) pg::+wal-segment-size+))
+          (setf (first (getf fact :resource-parameters)) 999)
+          (ok (= 100 (first (getf snapshot :resource-parameters))))))))
+
 (deftest child-checkpoint-plan-preserves-exhaustion-and-rejects-overflow
     (let* ((state (sample-promotion-checkpoint-state 216 :bound #xffffffffffffffff
                                                          :next #x10000000000000000))

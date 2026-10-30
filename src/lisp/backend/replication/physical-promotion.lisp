@@ -294,6 +294,8 @@ parent.  The phase check here alone does not establish that ownership."
                     (getf metadata :replay-timeline (getf metadata :timeline)))
                  (equal (getf control :history-target) (getf state :history-target))
                  (equal (getf control :history-digest) (getf state :history-digest))
+                 (equal (getf state :source-resource-fact) (getf metadata :source-resource-fact))
+                 (equal (getf state :source-resource-fact) (getf control :resource-fact))
                  snapshot (wal-checkpoint-snapshot-valid-p snapshot)
                  (= (getf snapshot :timeline) (physical-recovery-replay-timeline state))
                  reservation (physical-source-reservation-valid-p reservation)
@@ -326,6 +328,15 @@ parent.  The phase check here alone does not establish that ownership."
 
 (declaim (ftype function physical-promotion-publish-retained-intent))
 
+(defun physical-promotion-frozen-resource-fact (control metadata)
+  (let ((frozen (getf control :resource-fact))
+        (source (getf metadata :source-resource-fact)))
+    (unless (and (or (null frozen) (wal-resource-fact-valid-p frozen))
+                 (or (null source) (wal-resource-fact-valid-p source))
+                 (or (null frozen) (equal frozen source)))
+      (error "pending promotion resource fact differs from its selected generation"))
+    (copy-tree (or frozen source))))
+
 (defun physical-promotion-make-pending (state metadata prefix generation namespace child time reference)
   "Build pending control bytes and runtime state for the selected archive.
 The caller publishes the bytes and installs the state after owner handoff."
@@ -337,14 +348,20 @@ The caller publishes the bytes and installs the state after owner handoff."
                  :state-time time :promotion-child child :promotion-generation generation
                  :applied-timeline (physical-recovery-replay-timeline state)
                  :history-target (getf state :history-target) :history-digest (getf state :history-digest)
-                 :promotion-source-namespace namespace :retained-reference reference))
+                 :promotion-source-namespace namespace :retained-reference reference
+                 :resource-fact (getf metadata :source-resource-fact)))
          (pending (copy-list state)))
     (loop for (key value) on (physical-recovery-decode-control bytes) by #'cddr
           do (setf (getf pending key) value))
     (setf (getf pending :required-applied) fork (getf pending :observed-next-xid) next
           (getf pending :wal-prefix-lsn) fork (getf pending :wal-prefix-bytes) prefix
-          (getf pending :source-checkpoint) (copy-list (getf metadata :source-checkpoint))
+          (getf pending :source-checkpoint) (copy-tree (getf metadata :source-checkpoint))
           (getf pending :source-reservation) (copy-list (getf metadata :source-reservation)))
+    (let ((fact (physical-promotion-frozen-resource-fact
+                 (physical-recovery-decode-control bytes) metadata)))
+      (when fact
+        (setf (getf pending :source-resource-fact) (copy-tree fact)
+              (getf pending :required-resource-fact) fact)))
     (values bytes pending)))
 
 (defun physical-promotion-publish-intent (&optional requested-child)

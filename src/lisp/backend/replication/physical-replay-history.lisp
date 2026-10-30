@@ -45,6 +45,9 @@ Adopt the latest selection without moving the applied replay timeline."
   (physical-recovery-check-store-point
    store (getf state :required-applied)
    (getf state :required-timeline (getf state :timeline)))
+  (when (getf state :required-resource-fact)
+    (timeline-check-resource-origin (getf state :required-resource-fact)
+                                    (physical-recovery-resource-history store state)))
   (let ((candidate (copy-list state)) (selection (physical-store-selection store)))
     (when selection
       (setf (getf candidate :history-target) (getf selection :target)
