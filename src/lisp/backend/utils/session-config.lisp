@@ -185,7 +185,7 @@ This changes in-memory state only; client reporting occurs later."
           (if *backend*
               (gethash '(:source "application_name") (backend-settings *backend*) "default")
               "default")
-          +null+ +null+ nil))
+          +null+ +null+ +null+ nil))
 
 (defun session-set-extra-setting (name value)
   "Set or reset a session setting, saving the transaction's settings before changes.
@@ -295,4 +295,4 @@ The saved settings allow an abort to restore the values in effect at transaction
          (value (if settings (gethash "statement_timeout" settings 0) 0))
          (source (if settings (gethash '(:source "statement_timeout") settings "default") "default")))
     (vector "statement_timeout" (princ-to-string value) "ms" "user" "integer"
-            source +null+ +null+ nil)))
+            source +null+ +null+ +null+ nil)))

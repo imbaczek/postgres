@@ -31,6 +31,8 @@
     ("primary_slot_name" :sighup :slot "")
     ("recovery_target_timeline" :postmaster :timeline "latest")
     ("hot_standby" :postmaster :boolean "on")
+    ("wal_level" :postmaster :wal-level "replica")
+    ("wal_log_hints" :postmaster :boolean "off")
     ("max_connections" :postmaster :integer "100" 1 262143 nil)
     ("max_wal_senders" :postmaster :integer "10" 0 262143 nil)
     ("max_worker_processes" :postmaster :integer "8" 0 262143 nil)
@@ -205,6 +207,12 @@ uses strtod. Return the remaining unit for the caller's conversion and rounding.
   "Decode input octets as UTF-8 for ordinary settings and include paths."
   (bytes->string (startup-input-octets input)))
 
+(defun startup-parse-wal-level (text)
+  (let ((value (string-downcase text)))
+    (cond ((member value '("minimal" "replica" "logical") :test #'string=) value)
+          ((member value '("archive" "hot_standby") :test #'string=) "replica")
+          (t (error "invalid value for configuration parameter wal_level: ~s" text)))))
+
 (defun startup-normalize-setting (name input)
   "Normalize a startup setting from text or literal octets.
 For cluster_name, postmaster SQL_ASCII clips 63 raw bytes before ASCII cleaning,
@@ -227,6 +235,7 @@ Timeline input is validated but its original spelling is retained."
         (return-from startup-normalize-setting text))
       (ecase (third spec)
         (:integer (startup-parse-integer-setting spec text))
+        (:wal-level (startup-parse-wal-level text))
         (:boolean (startup-parse-boolean-setting text))
         (:timeline (startup-parse-recovery-timeline text) text)
         (:string
@@ -499,6 +508,8 @@ A reload may record a different desired value, but does not change this goal."
   "Reject effective settings that enable unsupported features.
 Prepared transactions must be zero, commit timestamp tracking off, and each
 listed recovery target empty. Return SETTINGS after validation."
+  (unless (member (startup-setting-value settings "wal_level") '("replica" "logical") :test #'equal)
+    (error "wal_level=minimal requires unimplemented minimal WAL generation"))
   (when (plusp (startup-setting-value settings "max_prepared_transactions"))
     (error "positive max_prepared_transactions requires unimplemented prepared transactions"))
   (when (startup-setting-value settings "track_commit_timestamp")
@@ -646,6 +657,7 @@ follow generation are published together under live-operation quiescence."
                                                  (setf *startup-server-settings* settings
                                                        *startup-native-inputs* native *startup-command-overrides* overrides
                                                        *enable-hot-standby* (startup-setting-value settings "hot_standby")
+                                                       *wal-level* (if (equal "logical" (startup-setting-value settings "wal_level")) :logical :replica)
                                                        *wal-keep-size-mb* (startup-setting-value settings "wal_keep_size")
                                                        *physical-restartpoint-timeout* timeout
                                                        *physical-restartpoint-wal-bytes* wal-bytes
@@ -718,10 +730,13 @@ Reject an unsupported effective candidate before publishing any reload changes."
                 unit "B" source (if command :command-line :environment)))))
     (vector name (startup-setting-text name value) unit
             (if spec (string-downcase (symbol-name (second spec))) "postmaster")
-            (case (third spec) (:integer "integer") (:boolean "bool") (t "string"))
+            (case (third spec) (:integer "integer") (:boolean "bool") (:wal-level "enum") (t "string"))
             (ecase source
               (:default "default") (:file "configuration file") (:override "override")
               (:command-line "command line") (:environment "environment variable"))
+            (if (eq (third spec) :wal-level) (make-sql-array :element-type-id :text
+                                                             :elements (vector "minimal" "replica" "logical")
+                                                             :dimensions '(3) :lower-bounds '(1)) +null+)
             (if (eq source :file) (or (getf entry :sourcefile) +null+) +null+)
             (if (eq source :file) (or (getf entry :sourceline) +null+) +null+)
             (not (null (getf entry :pending-restart))))))

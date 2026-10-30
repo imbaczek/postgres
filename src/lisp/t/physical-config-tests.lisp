@@ -403,7 +403,7 @@
                    (ok (equal "1" (aref row 1)))
                    (ok (equal "postmaster" (aref row 3)))
                    (ok (equal "integer" (aref row 4)))
-                   (ok (aref row 8)))
+                   (ok (aref row 9)))
                  (ok (eq installed pg::*installed-resource-parameters*))
                  (ok (eq slots pg::*managed-worker-slots*))
                  (ok (= 1 (length slots)))
@@ -539,6 +539,31 @@
                     :source :command-line))
         (ok (intake-fails-p (lambda () (pg::startup-resource-capacity-plan settings)))))))
 
+(deftest wal-settings-match-c-enum-aliases-defaults-and-context
+    (let* ((pg::*startup-server-settings* (pg::startup-default-settings "/tmp/wal-settings/"))
+           (pg::*startup-native-inputs* (make-hash-table :test #'equal)))
+      (ok (equal "replica" (pg::startup-setting-value pg::*startup-server-settings* "wal_level")))
+      (ok (not (pg::startup-setting-value pg::*startup-server-settings* "wal_log_hints")))
+      (dolist (input '("replica" "REPLICA" "archive" "hot_standby"))
+        (ok (equal "replica" (pg::startup-normalize-setting "wal_level" input))))
+      (ok (equal "logical" (pg::startup-normalize-setting "wal_level" "LoGiCaL")))
+      (ok (pg::startup-normalize-setting "wal_log_hints" "on"))
+      (dolist (input '("" "archivejunk" "invalid"))
+        (ok (intake-fails-p (lambda () (pg::startup-normalize-setting "wal_level" input)))))
+      (let ((row (find "wal_level" (pg::startup-settings-rows)
+                       :key (lambda (row) (aref row 0)) :test #'equal)))
+        (progn (ok (equal "enum" (aref row 4)))
+               (ok (equalp #("minimal" "replica" "logical")
+                           (pg::sql-array-elements (aref row 6))))))
+      (dolist (name '("wal_level" "wal_log_hints"))
+        (ok (equal "55P02"
+                   (recovery-state-of
+                    (lambda () (pg::startup-check-session-setting name))))))
+      (setf (gethash "wal_level" pg::*startup-server-settings*)
+            (list :value "minimal" :source :command-line))
+      (ok (intake-fails-p
+           (lambda () (pg::startup-resource-capacity-plan pg::*startup-server-settings*))))))
+
 (deftest startup-settings-catalog-keeps-base-units-and-active-provenance
     (let* ((pg::*startup-server-settings* (pg::startup-default-settings "/tmp/data/"))
            (pg::*startup-native-inputs* (make-hash-table :test #'equal)))
@@ -549,13 +574,13 @@
       (let* ((rows (pg::startup-settings-rows))
              (timeout (find "checkpoint_timeout" rows :key (lambda (row) (aref row 0)) :test #'equal))
              (port (find "port" rows :key (lambda (row) (aref row 0)) :test #'equal)))
-        (ok (equalp timeout #("checkpoint_timeout" "90" "s" "sighup" "integer"
-                              "configuration file" "/tmp/include.conf" 7 nil)))
+        (ok (equalp timeout (vector "checkpoint_timeout" "90" "s" "sighup" "integer"
+                                    "configuration file" pg::+null+ "/tmp/include.conf" 7 nil)))
         (ok (equal "5433" (aref port 1)))
-        (ok (eq pg::+null+ (aref port 6)))
-        (ok (aref port 8))
+        (ok (eq pg::+null+ (aref port 7)))
+        (ok (aref port 9))
         (ok (equal "90s" (pg::startup-setting-show-value "checkpoint_timeout")))
-        (ok (equal '(1 2 3 7 8 9 15 16 17)
+        (ok (equal '(1 2 3 7 8 9 12 15 16 17)
                    (mapcar #'fourth pg::+sql-settings-fields+))))))
 
 (deftest startup-removing-file-postmaster-default-still-needs-restart
@@ -849,7 +874,7 @@
                     "cluster_name" (gethash "cluster_name" pg::*startup-server-settings*))))
           (ok (equal "original cluster" (aref row 1)))
           (ok (equal "postmaster" (aref row 3)))
-          (ok (aref row 8)))
+          (ok (aref row 9)))
         (let ((installed pg::*startup-server-settings*))
           (write-startup-config configuration
                                 (format nil "checkpoint_timeout='120s'~%data_directory='\\377'~%"))

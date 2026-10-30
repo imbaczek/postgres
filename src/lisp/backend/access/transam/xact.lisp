@@ -263,6 +263,8 @@ or :QUERY-STATE for the wire dispatch's existing reload/shutdown cleanup lane."
 (defvar *logical-capture-live-slots* nil
   "Live slot count, or NIL until authoritatively refreshed under WAL lock.")
 
+(defvar *wal-level* :replica)
+
 (defvar *xid-wrap-lock* (sb-thread:make-mutex :name "pg xid wrap gate"))
 (defvar *xid-wrap-work-lock* (sb-thread:make-mutex :name "pg xid wrap worker"))
 (defvar *xid-wrap-cv* (sb-thread:make-waitqueue :name "pg xid wrap waitqueue"))
@@ -809,7 +811,8 @@ holding a portal snapshot must be allowed to run so it can release its pin."
   (let* ((xid *next-xid*)
          (next (advance-full-xid xid))
          (link (list xid))
-         (capture (or (not (eql *logical-capture-live-slots* 0))
+         (capture (or (eq *wal-level* :logical)
+                      (not (eql *logical-capture-live-slots* 0))
                       (plusp (hash-table-count *logical-capture-arming*)))))
     (sb-sys:without-interrupts
       (setf (gethash xid *logical-capture-xid-modes*) (if capture :capture :skip)

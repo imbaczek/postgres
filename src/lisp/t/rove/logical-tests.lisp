@@ -1243,6 +1243,19 @@
              (rove:ok (logical-capture-xid-needed-p new)))
         (setf (symbol-function 'wait-for-xid) original-wait))))
 
+(rove:deftest test-wal-level-logical-forces-xid-capture-without-slots
+    (let ((*logical-capture-xid-modes* (make-hash-table :test #'eql))
+          (*logical-capture-arming* (make-hash-table :test #'eq))
+          (*logical-capture-live-slots* 0)
+          (*active-xids* nil) (*next-xid* 100))
+      (let ((captured (progv '(*wal-level*) '(:logical)
+                        (sb-thread:with-mutex (*xid-lock*) (xid-allocate-under-lock)))))
+        (rove:ok (logical-capture-xid-needed-p captured))
+        (progv '(*wal-level*) '(:replica)
+          (let ((skipped (sb-thread:with-mutex (*xid-lock*) (xid-allocate-under-lock))))
+            (rove:ok (not (logical-capture-xid-needed-p skipped)))
+            (rove:ok (logical-capture-xid-needed-p captured)))))))
+
 (rove:deftest test-logical-capture-gate-skips-row-and-truncate
     (let* ((*logical-capture-xid-modes* (make-hash-table :test #'eql))
            (*backend* (make-backend :xid 42)))

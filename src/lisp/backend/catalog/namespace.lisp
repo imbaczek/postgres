@@ -413,6 +413,7 @@ Reject unsupported parameters and unsupported local settings."
 (defparameter +sql-settings-fields+
   '(("name" :text nil 1) ("setting" :text nil 2) ("unit" :text nil 3)
     ("context" :text nil 7) ("vartype" :text nil 8) ("source" :text nil 9)
+    ("enumvals" :text-array nil 12)
     ("sourcefile" :text nil 15) ("sourceline" :int4 nil 16)
     ("pending_restart" :bool nil 17)))
 
