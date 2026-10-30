@@ -89,6 +89,30 @@ also need durable source reporting and standby checks, following C's
 Archive recovery, rejoin/reseed, synchronous durability and coordination remain
 outside this checkpoint; no coordinator or election mechanism was added.
 
+### Relation resource accounting foundation
+
+Relation admission now checks the complete proposed set against private object
+and owner limits before publishing registrations. Counts come from the existing
+reader, writer, builder and maintenance maps under their mutex. Repeated access
+and upgrades share an owner entry; normal cleanup restores capacity without a
+second accounting ledger. Gate tokens retain their accounting owner independently
+of build-group metadata. A backend-owned gate can reuse its later real or virtual
+transaction identity without allocating an XID for accounting.
+
+This is an internal foundation. Limits remain unbounded in normal startup, and
+`max_locks_per_transaction` is not registered. C accounts for waiting requests
+before grant; native requests blocked before publication still need an ownership
+registry. That registry, startup sizing and durable source resource requirements
+must precede production enforcement. Native counts also do not reproduce C's
+fast-path storage or every C lock tag.
+
+Validation passed all 654 unit Rove tests, 13 new resource tests including 200
+generated cases at seed 42, 10 physical reader/cleanup tests and a fresh strict
+compile. Tests cover whole-group rejection, shared and reusable capacity, upgrades,
+late XID assignment, virtual readers, transaction gate/writer publication,
+partial gate release, callback errors and cancellation of a published builder.
+The compile log is `/tmp/pg-relation-resource-compile.log`.
+
 ### Child follow and rejoin intake
 
 A fresh backup from a promoted child now records its actual timeline and copies

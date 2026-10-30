@@ -12,10 +12,12 @@
   `max_worker_processes`, `track_commit_timestamp`, `wal_level`, `wal_log_hints`,
   `hba_file`, `ident_file`, `recovery_target`, `recovery_target_lsn`,
   `recovery_target_name`, `recovery_target_time` and `recovery_target_xid`.
-  Keep the complete writer oracle unchanged. Next establish shared lock-object
-  and owner accounting before exposing `max_locks_per_transaction`; C sizes a
-  shared pool, not a per-transaction limit. Cover atomic multi-relation admission,
-  repeated acquisition, abort/cancellation/disconnect and virtual-reader cleanup.
+  Keep the complete writer oracle unchanged. Internal checks now derive shared
+  relation-object and owner counts from published registrations, with private
+  limits left unbounded. Next include waiting requests before enabling production
+  capacity or exposing `max_locks_per_transaction`; C sizes a shared pool, not a
+  per-transaction limit. Preserve atomic multi-relation admission, repeated
+  acquisition, abort/cancellation/disconnect and virtual-reader cleanup.
   Include persisted source resource requirements and standby validation, following
   C's `XLogReportParameters` and `CheckRequiredParameterValues`.
 

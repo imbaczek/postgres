@@ -291,9 +291,13 @@ These identities never enter the real active-XID set, CLOG or WAL.")
 
 (defvar *relation-maintainers* (make-hash-table :test #'eql))
 
-(defvar *relation-lock-object-limit* nil)
+(defvar *relation-lock-object-limit* nil
+  "Private object cap, or NIL for no limit. Keep unbounded until queued owners
+and startup, resource and source-floor policy are wired. No
+max_locks_per_transaction setting is registered yet.")
 
-(defvar *relation-lock-owner-limit* nil)
+(defvar *relation-lock-owner-limit* nil
+  "Private relation-owner pair cap, or NIL for no limit; see object cap.")
 
 (defun print-relation-gate-token (object stream depth)
   (declare (ignore depth))
@@ -302,9 +306,18 @@ These identities never enter the real active-XID set, CLOG or WAL.")
 (defstruct (relation-gate-token
             (:constructor make-relation-gate-token (owner))
             (:print-function print-relation-gate-token))
+  "A gate scope with an owner independent of the build group metadata.
+OWNER may be an XID or backend; a token without an owner identifies itself."
   (owner nil :read-only t))
 
 (defun relation-resource-footprint-under-lock (&optional requested owner)
+  "Count distinct relations and relation-owner pairs under relation exclusion.
+Published reader, writer, builder and maintainer registrations are authoritative.
+Modes and upgrades for the same pair count once. REQUESTED adds the whole
+prospective set. Resolve each backend once per count, using its virtual or real
+XID if present, otherwise the backend itself; do not force XID allocation.
+Recounting after release needs no separate ledger. Queued requests are not yet
+counted here, although PostgreSQL C accounts for ownership before grant."
   (unless (sb-thread:holding-mutex-p *relation-lock-mutex*)
     (error "relation resource accounting requires relation exclusion"))
   (let ((objects (make-hash-table :test #'eql))
@@ -337,10 +350,12 @@ These identities never enter the real active-XID set, CLOG or WAL.")
                     sum (hash-table-count owners))))))
 
 (defun relation-resource-footprint ()
+  "Return the current object and owner-pair counts under relation exclusion."
   (sb-thread:with-mutex (*relation-lock-mutex*)
     (relation-resource-footprint-under-lock)))
 
 (defun relation-resource-check-under-lock (requested owner)
+  "Check the complete prospective set before publishing any registration."
   (when (or *relation-lock-object-limit* *relation-lock-owner-limit*)
     (multiple-value-bind (objects owners)
         (relation-resource-footprint-under-lock requested owner)
