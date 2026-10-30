@@ -615,11 +615,9 @@ recovery for restart reconciliation."
                        (physical-follow-operation-cancelled-p operation)
                        *physical-shutdown-state* *physical-promotion-stopping-p*
                        (shutdown-in-progress-p))
-             (cond
-               ((physical-follow-unattached-p config)
-                (physical-follow-launch-replay-only config))
-               ((physical-follow-controller-enabled-p config)
-                (physical-follow-launch config))))))))))
+             (if (physical-follow-controller-enabled-p config)
+                 (physical-follow-launch config)
+                 (physical-follow-launch-replay-only config)))))))))
 
 (declaim (special *physical-follow-prepare-timeout*))
 

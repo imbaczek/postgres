@@ -735,6 +735,66 @@
            (setf (symbol-function 'pg::physical-follow-replay-loop) original))))
      :system-id 42))
 
+(deftest follow-disabled-failed-preparation-restores-replay-without-reenabling-receipt
+    (dolist (bound '(nil t))
+      (dolist (paused '(nil t))
+        (call-with-promotion-fixture
+         (lambda (root store)
+           (declare (ignore root))
+           (pg::wal-atomic-write-bytes (pg::clog-path) (empty-octets))
+           (let* ((base (pg::physical-recovery-verify-base-state))
+                  (state (append (follow-controller-test-state
+                                  :enabled nil :queue (list (follow-controller-test-entry "previous_cleanup")))
+                                 '(:public-slot "held_public")))
+                  (config (pg::physical-follow-with-controller
+                           (if bound (follow-pending-proof-config-for-store store base)
+                               '(1 "127.0.0.1" 5432 "accepted_bootstrap")) state))
+                  (operation (pg::make-physical-follow-operation
+                              :host "127.0.0.1" :port 5433 :prefix "retry"))
+                  (pg::*physical-follow-operation* operation)
+                  (pg::*physical-follow-controller-blocked-p* nil)
+                  (pg::*physical-follow-controller-stopping-p* nil)
+                  (pg::*physical-replay-paused-p* paused)
+                  (original (symbol-function 'pg::physical-follow-replay-loop)))
+             (unwind-protect
+                  (progn
+                    (pg::physical-follow-save-config config)
+                    (when bound
+                      (setf config (call-with-promotion-exclusion
+                                    (lambda () (pg::physical-follow-reconcile-pending-store store base config)))))
+                    (setf (symbol-function 'pg::physical-follow-replay-loop)
+                          (lambda (runtime)
+                            (loop until (pg::physical-follow-runtime-stopped-p runtime)
+                                  do (sleep 0.005))))
+                    (pg::physical-follow-operation-initial-config operation)
+                    (let* ((text (if bound (getf (fifth config) :child-history) ""))
+                           (source (if bound 2 1))
+                           (view (list :source source :parent source :child source
+                                       :history-text text :child-history text
+                                       :history (pg::timeline-parse-history source text))))
+                      (multiple-value-bind (entry snapshot) (pg::physical-follow-operation-intent operation view)
+                        (declare (ignore snapshot))
+                        (pg::physical-follow-operation-recover operation)
+                        (let ((saved (pg::physical-follow-read-config))
+                              (runtime pg::*physical-follow-runtime*))
+                          (ok (equal (pg::physical-follow-effective-config config)
+                                     (pg::physical-follow-effective-config saved)))
+                          (ok (not (pg::physical-follow-controller-enabled-p saved)))
+                          (ok (null (getf (sixth saved) :preparing)))
+                          (ok (equal (append (getf state :cleanup) (list entry))
+                                     (getf (sixth saved) :cleanup)))
+                          (ok runtime)
+                          (when runtime
+                            (ok (null (pg::physical-follow-runtime-client runtime)))
+                            (ok (null (pg::physical-follow-runtime-receiver-thread runtime)))
+                            (ok (sb-thread:thread-alive-p (pg::physical-follow-runtime-replay-thread runtime))))
+                          (ok (eql paused pg::*physical-replay-paused-p*))
+                          (ok (not pg::*physical-recovery-failed-p*))))))
+               (sb-thread:with-mutex (pg::*physical-follow-command-lock*)
+                 (pg::physical-follow-quiesce-runtime))
+               (setf (symbol-function 'pg::physical-follow-replay-loop) original))))
+         :system-id 42))))
+
 (deftest follow-unattached-state-rejects-receipt-authority-and-pin-aliases
     (dolist (change '((:mode :invalid) (:enabled t) (:unowned-bootstrap nil) (:source :invalid)))
       (let ((config (follow-unattached-test-config)))
