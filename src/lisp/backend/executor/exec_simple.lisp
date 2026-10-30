@@ -49,17 +49,16 @@
 (defun check-truncate-table-not-in-use (table)
   "Reject storage replacement while this backend retains an executor for TABLE.
 
-A named portal can retain its executor after Bind or after execution completes,
+An initialized portal can retain its executor after execution completes,
 until Close releases it.  Transaction reader registrations alone do not imply
 that an executor is still using the table.  Relation gates exclude other backends,
 but cannot protect a retained executor in this backend from its own TRUNCATE."
   (when (some (lambda (owner)
                 (and (eq *backend* (query-execution-owner-backend owner))
                      (not (query-execution-owner-closed-p owner))
-                     (some (lambda (relation)
-                             (and (not (getf relation :virtual-p))
-                                  (eq table (getf relation :table))))
-                           (query-execution-owner-binding owner '*subquery-registered-relations*))))
+                     (member table
+                             (query-execution-owner-binding owner '*query-executor-tables*)
+                             :test #'eq)))
               (query-execution-owner-reload-state))
     (ereport "55006" "cannot TRUNCATE \"~a\" because it is being used by active queries in this session"
              (pg-class-name table))))

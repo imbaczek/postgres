@@ -336,6 +336,42 @@
 
 (defvar *query-execution-owner* nil)
 
+(defvar *query-executor-tables* nil
+  "Physical scan tables retained by this query owner until it closes.")
+
+(defun retain-query-plan-executor-tables (plan relations)
+  "Record physical scan tables used by PLAN and its child plans.
+Lazy child plans count even before they run.  Virtual relations do not retain a
+table.  With no query owner there is no persistent executor to record."
+  (when *query-execution-owner*
+    (let ((seen (make-hash-table :test #'eq)))
+      (labels ((visit (plan relations)
+                 (unless (gethash plan seen)
+                   (setf (gethash plan seen) t)
+                   (dolist (node (collect-query-plan-nodes (query-plan-physical plan)))
+                     (case (first node)
+                       (:with-ctes
+                           ;; C initializes shared producers even if their readers
+                           ;; were removed. Unused definitions have no plan.
+                           (dolist (definition (second node))
+                             (let ((child (sql-cte-plan definition)))
+                               (when (and child (sql-cte-shared-p definition))
+                                 (visit child (subquery-registered-relations child))))))
+                       ((:seq-scan :index-scan)
+                        (let ((relation (physical-scan-relation node relations)))
+                          (unless (getf relation :virtual-p)
+                            (pushnew (getf relation :table) *query-executor-tables* :test #'eq))))
+                       (:cte-scan
+                        (let* ((relation (physical-scan-relation node relations))
+                               (definition (getf relation :cte))
+                               (child (or (getf relation :cte-reference-plan)
+                                          (and definition (sql-cte-plan definition)))))
+                          (when child (visit child (subquery-registered-relations child)))))))
+                   (dolist (descriptor (query-plan-expression-subplans plan))
+                     (let ((child (sql-subplan-plan descriptor)))
+                       (visit child (subquery-registered-relations child)))))))
+        (visit plan relations)))))
+
 (defvar *query-execution-owners* (make-hash-table :test #'eq))
 
 (defvar *query-execution-owner-lock*
@@ -353,7 +389,7 @@
     *subquery-execution-active-p* *subquery-result-cache* *subquery-registered-relations*
     *subquery-outer-frames* *subquery-output-value* *subquery-backend-entry*
     *subquery-instrumentation-depth* *cte-execution-context* *cte-open-states*
-    *cte-active-plan* *sql-open-iterators* *recursive-cte-worktables*
+    *cte-active-plan* *sql-open-iterators* *query-executor-tables* *recursive-cte-worktables*
     *recursive-cte-generation-caches* *lateral-outer-environment*
     *datum-origin-capture* *query-row-origins* *select-toast-demand*
     *select-toast-slice-plan* *toast-slice-current* *query-plan-instrumentation-p*
@@ -413,10 +449,13 @@
                  :backend backend :thread sb-thread:*current-thread* :bindings context
                  :snapshot-registration (make-snapshot-registration) :temp-owner temporary)))
     (setf (query-temp-cleanup-owner-temporary-directory temporary) *query-temp-directory*)
+    ;; A new owner must not inherit executor tables or other mutable state from
+    ;; an enclosing query. Its saved bindings survive until the owner closes.
     (dolist (symbol '(*cte-execution-context* *recursive-cte-worktables*
                       *recursive-cte-generation-caches* *subquery-outer-frames*
                       *subquery-output-value* *subquery-registered-relations*
-                      *cte-active-plan* *lateral-outer-environment* *query-row-origins*
+                      *cte-active-plan* *query-executor-tables*
+                      *lateral-outer-environment* *query-row-origins*
                       *toast-slice-current* *select-index-scans*
                       *select-index-lease-domain* *select-index-lease-groups*))
       (setf (cdr (assoc symbol context)) nil))

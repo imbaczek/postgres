@@ -296,7 +296,13 @@ reordered tree, and each parameterized path can reference only joined Vars."
                                    (zerop (getf prepared :aggregate-count 0)))))
     (when (getf prepared :join-order)
       (let ((join-qual (select-reordered-join-qual prepared)))
-        (when join-qual (setf input (list :filter join-qual input)))))
+        (when join-qual
+          ;; A false or NULL constant rejects every joined row. Keep the filter
+          ;; on a Result input so scans removed by this test are not initialized.
+          (when (and (window-constant-expression-p join-qual)
+                     (not (true-p (eval-expr join-qual #()))))
+            (setf input '(:result)))
+          (setf input (list :filter join-qual input)))))
     (when degenerate-having-p
       ;; With no transitions or grouping keys, HAVING alone generates one row;
       ;; neither the FROM input nor its WHERE clause can change that group.

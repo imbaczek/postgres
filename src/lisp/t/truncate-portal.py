@@ -5,6 +5,7 @@ Use a multi-page heap so a suspended scan cannot hide the loss in its page copy.
 import importlib.util
 from pathlib import Path
 import struct
+import sys
 
 spec = importlib.util.spec_from_file_location(
     "portal_fixture", Path(__file__).with_name("portal-snapshot.py"))
@@ -13,11 +14,12 @@ spec.loader.exec_module(fixture)
 
 
 class Connection(fixture.Connection):
-    def prepare_sql(self, sql, statement):
+    def prepare_sql(self, sql, statement, bind=True):
         self.send(b"P", statement.encode() + b"\0" + sql.encode() + b"\0" + struct.pack("!H", 0))
-        self.bind(statement=statement)
+        if bind:
+            self.bind(statement=statement)
         self.send(b"H")
-        self.through(b"2")
+        self.through(b"2" if bind else b"1")
 
     def execute_limit(self, limit, portal="portal"):
         self.send(b"E", portal.encode() + b"\0" + struct.pack("!I", limit))
@@ -48,21 +50,82 @@ class Connection(fixture.Connection):
         assert "active queries in this session" in error["M"], error
         assert frames[-1] == (b"Z", b"E"), frames
 
+    def truncate_success(self):
+        self.send(b"Q", b"TRUNCATE portal_truncate\0")
+        frames = []
+        while True:
+            item = self.receive()
+            frames.append(item)
+            if item[0] == b"Z":
+                break
+        assert frames == [(b"C", b"TRUNCATE TABLE\0"), (b"Z", b"T")], frames
+
+
+def check_scan_matrix(connection):
+    cases = (
+        ("SELECT id FROM portal_truncate WHERE false", [], False),
+        ("SELECT count(*) FROM portal_truncate WHERE false", [["0"]], False),
+        ("SELECT a.id FROM portal_truncate a JOIN portal_truncate b ON false", [], False),
+        ("SELECT (SELECT id FROM portal_truncate WHERE false)", [[None]], False),
+        ("SELECT EXISTS(SELECT id FROM portal_truncate WHERE false)", [["f"]], False),
+        ("SELECT id FROM portal_truncate WHERE false UNION ALL SELECT 7", [["7"]], False),
+        ("WITH q AS (SELECT id FROM portal_truncate WHERE false) SELECT id FROM q", [], False),
+        ("SELECT id FROM portal_truncate", [[str(i)] for i in range(1, 1001)], True),
+        ("SELECT count(*) FROM portal_truncate", [["1000"]], True),
+        ("SELECT (SELECT max(id) FROM portal_truncate)", [["1000"]], True),
+        ("SELECT EXISTS(SELECT id FROM portal_truncate)", [["t"]], True),
+        ("WITH q AS (SELECT id FROM portal_truncate) SELECT id FROM q",
+         [[str(i)] for i in range(1, 1001)], True),
+        # C initializes a shared producer even if all its readers were removed.
+        ("WITH q AS MATERIALIZED (SELECT id FROM portal_truncate) "
+         "SELECT id FROM q WHERE false", [], True),
+        ("WITH q AS NOT MATERIALIZED (SELECT id FROM portal_truncate) "
+         "SELECT id FROM q WHERE false", [], False),
+        ("WITH q AS MATERIALIZED (SELECT id FROM portal_truncate) SELECT 7", [["7"]], False),
+    )
+    for number, (sql, expected, scans) in enumerate(cases):
+        for phase in ("parsed", "bound", "one_row", "completed", "closed"):
+            connection.query("BEGIN")
+            connection.prepare_sql(sql, f"matrix_{number}_{phase}", bind=phase != "parsed")
+            if phase in ("one_row", "completed", "closed"):
+                limit = 1 if phase == "one_row" else 0
+                rows, frames = connection.execute_limit(limit)
+                assert rows == (expected[:1] if limit else expected), (sql, rows, expected)
+                assert frames[-1] == (b"Z", b"T"), (sql, frames)
+            if phase == "closed":
+                connection.close_portal()
+            try:
+                if scans and phase not in ("parsed", "closed"):
+                    connection.truncate_error()
+                else:
+                    connection.truncate_success()
+            except AssertionError as error:
+                raise AssertionError((sql, phase, error.args)) from error
+            # A bound plan without scans remains executable after TRUNCATE.
+            if phase == "bound" and not scans:
+                assert connection.execute_limit(0)[0] == expected, sql
+            connection.query("ROLLBACK")
+    print(f"truncate-portal: {len(cases)} query shapes x 5 portal phases PASS")
+
 
 def run():
-    server = fixture.wire.OwnedLisp()
+    server = None if len(sys.argv) > 1 else fixture.wire.OwnedLisp()
     connection = None
     try:
-        server.start()
-        connection = Connection(server.port)
+        if server:
+            server.start()
+        connection = Connection(int(sys.argv[1]) if server is None else server.port)
         connection.query("CREATE TABLE portal_truncate(id int)")
         connection.query("INSERT INTO portal_truncate VALUES " +
                          ",".join(f"({i})" for i in range(1, 1001)))
         # More than one heap page is an explicit precondition of the regression.
-        server.control(
-            '(let ((pg::*backend* (pg::make-backend))) '
-            '(assert (> (pg::smgr-nblocks (pg::pg-class-relfilenode '
-            '(pg::resolve-table-or-error "portal_truncate"))) 1)))')
+        if server:
+            server.control(
+                '(let ((pg::*backend* (pg::make-backend))) '
+                '(assert (> (pg::smgr-nblocks (pg::pg-class-relfilenode '
+                '(pg::resolve-table-or-error "portal_truncate"))) 1)))')
+
+        check_scan_matrix(connection)
 
         connection.query("BEGIN")
         connection.prepare("portal_truncate", statement="suspended")
@@ -130,8 +193,9 @@ def run():
     finally:
         if connection is not None:
             connection.close()
-        server.stop()
-        print(f"artifacts: {server.root}")
+        if server:
+            server.stop()
+            print(f"artifacts: {server.root}")
 
 
 if __name__ == "__main__":

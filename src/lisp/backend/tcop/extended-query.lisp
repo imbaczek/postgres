@@ -259,6 +259,9 @@
                          (reconcile-query-plan-access-paths plan relations)
                          (setf (query-execution-owner-binding owner '*subquery-registered-relations*)
                                relations)
+                         ;; Record scans now, including lazy children, while the portal
+                         ;; owns the initialized executor.
+                         (retain-query-plan-executor-tables plan relations)
                          (call-with-select-index-lease-domain
                           (query-plan-index-relfilenodes plan relations)
                           (lambda ()
