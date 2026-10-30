@@ -63,67 +63,389 @@
           (pg-error (condition) (setf caught (pg-error-sqlstate condition))))
         (rove:ok (equal caught (second case)) (first case)))))
 
+(defun call-with-returning-portal-test (function &key
+                                                   (rows (list #(7 "label") #(8 "second")))
+                                                   after-finish)
+  (call-with-select-portal-test
+   (lambda (stream)
+     (let* ((targets (returning-test-targets "UPDATE things SET id=id RETURNING id,label"))
+            (prepared (list :returning targets))
+            (calls (list 0))
+            (names '(prepare-dml-subqueries register-dml-subquery-relations
+                     get-current-reader-xid exec-insert exec-update exec-delete))
+            (originals (mapcar #'symbol-function names)))
+       (unwind-protect
+            (flet ((execute (output ast)
+                     (rove:ok (eq prepared (cdr *dml-bound-preparation*)))
+                     (incf (car calls))
+                     (call-with-dml-returning-spool
+                      targets
+                      (lambda ()
+                        (dolist (row rows)
+                          (query-row-spool-append *dml-returning-spool* (copy-query-sort-value row)))
+                        (finish-dml-command
+                         output targets
+                         (format nil "~a ~d"
+                                 (if (eq (getf ast :type) :insert) "INSERT 0"
+                                     (string-upcase (symbol-name (getf ast :type))))
+                                 (length rows)))
+                        (when after-finish (funcall after-finish))))))
+              (setf (symbol-function 'prepare-dml-subqueries)
+                    (lambda (ast) (declare (ignore ast)) prepared)
+                    (symbol-function 'register-dml-subquery-relations)
+                    (lambda (value &optional xid)
+                      (declare (ignore xid))
+                      (rove:ok (eq value prepared))
+                      (values))
+                    (symbol-function 'get-current-reader-xid) (lambda () 100)
+                    (symbol-function 'exec-insert) #'execute
+                    (symbol-function 'exec-update) #'execute
+                    (symbol-function 'exec-delete) #'execute)
+              (funcall function stream calls))
+         (loop for name in names for original in originals
+               do (setf (symbol-function name) original)))))))
+
 (rove:deftest returning-extended-metadata-and-formats
-    (let* ((*backend* (make-backend))
-           (*extended-query-state* (make-extended-query-state))
-           (path (merge-pathnames
-                  (format nil "pg-returning-wire-~d-~d" (sb-posix:getpid) (random 1000000))
-                  (uiop:temporary-directory)))
-           (old-prepare (symbol-function 'prepare-dml-subqueries))
-           (old-execute (symbol-function 'execute-statement))
-           (targets (returning-test-targets
-                     "UPDATE things SET id=id RETURNING id,label"))
-           (frames nil))
-      (unwind-protect
-           (progn
-             (setf (symbol-function 'prepare-dml-subqueries)
-                   (lambda (ast) (declare (ignore ast)) (list :returning targets))
-                   (symbol-function 'execute-statement)
-                   (lambda (stream ast)
-                     (declare (ignore ast))
-                     (rove:ok *select-suppress-description*)
-                     (rove:ok (equalp *select-result-formats* #(0 1)))
-                     (with-query-temp-files ()
-                                            (let ((*dml-returning-spool* (make-query-row-spool)))
-                                              (unwind-protect
-                                                   (progn
-                                                     (query-row-spool-append *dml-returning-spool* #(7 "label"))
-                                                     (finish-dml-command stream targets "UPDATE 1"))
-                                                (close-query-row-spool *dml-returning-spool*))))))
-             (with-open-file (out path :direction :io :element-type '(unsigned-byte 8)
-                                       :if-exists :supersede :if-does-not-exist :create)
-               (extended-apply-operation
-                out '(:parse "s" "UPDATE things SET id=id RETURNING id,label" ()) #())
-               (extended-apply-operation out '(:describe #\S "s") #())
-               (extended-apply-operation out '(:bind "p" "s" () () (0 1)) #())
-               (extended-apply-operation out '(:describe #\P "p") #())
-               (extended-apply-operation out '(:execute "p" 0) #())
-               (finish-output out)
-               (file-position out 0)
-               (loop for (type length payload) = (multiple-value-list (read-message-frame out))
-                     while type do (push (cons (code-char type) payload) frames)))
-             (setf frames (nreverse frames))
-             (rove:ok (equal (mapcar #'car frames) '(#\1 #\t #\T #\2 #\T #\D #\C)))
-             (dolist (entry (list (cons (third frames) '(0 0))
-                                  (cons (fifth frames) '(0 1))))
-               (let ((columns (let ((payload (cdar entry)) (position 2))
-                                (loop repeat (bytes-to-u16 payload 0)
-                                      collect
-                                      (multiple-value-bind (name next)
-                                          (extended-read-cstring payload position)
-                                        (setf position (+ next 18))
-                                        (make-pg-client-column-with-format
-                                         :name name
-                                         :type-oid (bytes-to-u32 payload (+ next 6))
-                                         :format (bytes-to-u16 payload (+ next 16))))))))
-                 (rove:ok (equal (mapcar #'pg-client-column-name columns) '("id" "label")))
-                 (rove:ok (equal (mapcar #'pg-client-column-type-oid columns) '(23 1043)))
-                 (rove:ok (equal (mapcar #'pg-client-column-format columns) (cdr entry)))))
-             (rove:ok (equalp (cdr (sixth frames))
-                              #(0 2 0 0 0 1 55 0 0 0 5 108 97 98 101 108))))
-        (setf (symbol-function 'prepare-dml-subqueries) old-prepare
-              (symbol-function 'execute-statement) old-execute)
-        (when (probe-file path) (delete-file path)))))
+    (call-with-returning-portal-test
+     (lambda (out calls)
+       (extended-apply-operation out '(:parse "s" "UPDATE things SET id=id RETURNING id,label" ()) #())
+       (extended-apply-operation out '(:describe #\S "s") #())
+       (extended-apply-operation out '(:bind "p" "s" () () (0 1)) #())
+       (extended-apply-operation out '(:describe #\P "p") #())
+       (extended-apply-operation out '(:execute "p" 0) #())
+       (rove:ok (= 1 (car calls)))
+       (let ((frames (select-portal-test-frames out)))
+         (rove:ok (equal (mapcar #'car frames) '(#\1 #\t #\T #\2 #\T #\D #\C)))
+         (dolist (entry (list (cons (third frames) '(0 0))
+                              (cons (fifth frames) '(0 1))))
+           (let ((columns
+                   (let ((payload (cdar entry)) (position 2))
+                     (loop repeat (bytes-to-u16 payload 0)
+                           collect
+                           (multiple-value-bind (name next)
+                               (extended-read-cstring payload position)
+                             (setf position (+ next 18))
+                             (make-pg-client-column-with-format
+                              :name name
+                              :type-oid (bytes-to-u32 payload (+ next 6))
+                              :format (bytes-to-u16 payload (+ next 16))))))))
+             (rove:ok (equal (mapcar #'pg-client-column-name columns) '("id" "label")))
+             (rove:ok (equal (mapcar #'pg-client-column-type-oid columns) '(23 1043)))
+             (rove:ok (equal (mapcar #'pg-client-column-format columns) (cdr entry)))))
+         (rove:ok (equalp (cdr (sixth frames))
+                          #(0 2 0 0 0 1 55 0 0 0 5 108 97 98 101 108)))))
+     :rows (list #(7 "label"))))
+
+(rove:deftest returning-portal-exact-limit-and-per-fetch-tags
+    (dolist (case '(("INSERT INTO things(id) VALUES(1),(2) RETURNING id,label" "INSERT 0")
+                    ("UPDATE things SET id=id RETURNING id,label" "UPDATE")
+                    ("DELETE FROM things RETURNING id,label" "DELETE")))
+      (call-with-returning-portal-test
+       (lambda (stream calls)
+         (extended-apply-operation stream (list :parse "s" (first case) nil) #())
+         (extended-apply-operation stream '(:bind "p" "s" () () ()) #())
+         (let* ((portal (gethash "p" (extended-query-state-portals *extended-query-state*)))
+                (execution (extended-dml-execution-for portal))
+                (owner (extended-dml-execution-owner execution))
+                (cid (backend-command-id *backend*)))
+           (rove:ok (null (query-execution-owner-snapshot owner)))
+           (rove:ok (zerop *active-snapshots*))
+           (rove:ok (not (gethash *backend* *backend-used-command-ids*)))
+           (extended-apply-operation stream '(:execute "p" 2) #())
+           (rove:ok (= 1 (car calls)))
+           (rove:ok (= cid (backend-command-id *backend*)))
+           (rove:ok (= 1 *active-snapshots*))
+           (rove:ok (= cid (snapshot-curcid (query-execution-owner-snapshot owner))))
+           (rove:ok (extended-dml-execution-ready-p execution))
+           (rove:ok (not (extended-dml-execution-at-end-p execution)))
+           (extended-apply-operation stream '(:execute "p" 0) #())
+           (extended-apply-operation stream '(:execute "p" -1) #())
+           (rove:ok (= 1 (car calls)))
+           (rove:ok (= (+ cid 2) (backend-command-id *backend*)))
+           (let ((frames (select-portal-test-frames stream)))
+             (rove:ok (equal (mapcar #'car frames) '(#\1 #\2 #\D #\D #\s #\C #\C)))
+             (dolist (frame (last frames 2))
+               (rove:ok (equalp (cdr frame)
+                                (string->bytes (format nil "~a 0~c" (second case) (code-char 0)))))))
+           (extended-close-portal portal)
+           (rove:ok (zerop *active-snapshots*)))))))
+
+(rove:deftest returning-portal-close-before-sync-preserves-command-use
+    (call-with-returning-portal-test
+     (lambda (stream calls)
+       (extended-apply-operation stream '(:parse "s" "UPDATE things SET id=id RETURNING id,label" ()) #())
+       (extended-apply-operation stream '(:bind "never" "s" () () ()) #())
+       (let ((cid (backend-command-id *backend*)))
+         (extended-apply-operation stream '(:sync) #())
+         (rove:ok (= cid (backend-command-id *backend*)))
+         (extended-apply-operation stream '(:close #\P "never") #())
+         (rove:ok (zerop (car calls)))
+         (extended-apply-operation stream '(:bind "p" "s" () () ()) #())
+         (extended-apply-operation stream '(:execute "p" 1) #())
+         (extended-apply-operation stream '(:flush) #())
+         (rove:ok (= cid (backend-command-id *backend*)))
+         (extended-apply-operation stream '(:close #\P "p") #())
+         (rove:ok (zerop *active-snapshots*))
+         (rove:ok (= 1 (car calls)))
+         (rove:ok (= cid (gethash *backend* *backend-used-command-ids*)))
+         (extended-apply-operation stream '(:sync) #())
+         (rove:ok (= (1+ cid) (backend-command-id *backend*)))
+         (extended-apply-operation stream '(:sync) #())
+         (rove:ok (= (1+ cid) (backend-command-id *backend*)))))))
+
+(rove:deftest returning-portal-partial-fetch-and-spill-lifetime
+    (let ((*query-work-memory-bytes* 1)
+          (*query-temp-directory* (uiop:temporary-directory)))
+      (call-with-returning-portal-test
+       (lambda (stream calls)
+         (extended-apply-operation stream '(:parse "s" "UPDATE things SET id=id RETURNING id,label" ()) #())
+         (extended-apply-operation stream '(:bind "p" "s" () () ()) #())
+         (extended-apply-operation stream '(:execute "p" 1) #())
+         (let* ((portal (gethash "p" (extended-query-state-portals *extended-query-state*)))
+                (execution (extended-dml-execution-for portal))
+                (owner (extended-dml-execution-owner execution))
+                (store (extended-dml-execution-store execution))
+                (path (query-row-spool-pathname (query-replay-store-spool store)))
+                (quota (query-temp-cleanup-owner-quota (query-execution-owner-temp-owner owner))))
+           (rove:ok (and path (probe-file path)))
+           (rove:ok (plusp (query-temp-quota-used-bytes quota)))
+           (extended-apply-operation stream '(:execute "p" -2147483648) #())
+           (rove:ok (= 1 (car calls)))
+           (rove:ok (probe-file path))
+           (let ((frames (select-portal-test-frames stream)))
+             (rove:ok (equal (mapcar #'car frames) '(#\1 #\2 #\D #\s #\D #\C)))
+             (rove:ok (equalp (cdr (car (last frames)))
+                              (string->bytes (format nil "UPDATE 1~c" (code-char 0))))))
+           (extended-apply-operation stream '(:close #\P "p") #())
+           (rove:ok (not (probe-file path)))
+           (rove:ok (zerop (query-temp-quota-used-bytes quota))))))))
+
+(rove:deftest returning-portal-handoff-errors-publish-no-rows
+    (dolist (failure '(:after-receiver :adoption :reader))
+      (let ((*query-work-memory-bytes* 1)
+            (*query-temp-directory* (uiop:temporary-directory)))
+        (call-with-returning-portal-test
+         (lambda (stream calls)
+           (declare (ignore calls))
+           (extended-apply-operation stream '(:parse "s" "UPDATE things SET id=id RETURNING id,label" ()) #())
+           (extended-apply-operation stream '(:bind "p" "s" () () ()) #())
+           (let* ((portal (gethash "p" (extended-query-state-portals *extended-query-state*)))
+                  (owner (extended-dml-execution-owner (extended-dml-execution-for portal)))
+                  (quota (query-temp-cleanup-owner-quota (query-execution-owner-temp-owner owner)))
+                  (name (case failure (:adoption 'adopt-sealed-query-row-spool) (:reader 'make-query-replay-reader)))
+                  (original (when name (symbol-function name)))
+                  (close-original (symbol-function 'close-query-row-spool))
+                  (closed (make-hash-table :test #'eq)))
+             (unwind-protect
+                  (progn
+                    (setf (symbol-function 'close-query-row-spool)
+                          (lambda (spool)
+                            (incf (gethash spool closed 0))
+                            (funcall close-original spool)))
+                    (when name
+                      (setf (symbol-function name)
+                            (lambda (&rest arguments) (declare (ignore arguments)) (error "injected handoff failure"))))
+                    (rove:ok
+                     (handler-case (progn (extended-apply-operation stream '(:execute "p" 1) #()) nil)
+                       (error () (note-query-error) t))))
+               (when name (setf (symbol-function name) original))
+               (setf (symbol-function 'close-query-row-spool) close-original))
+             (rove:ok (= 1 (hash-table-count closed)))
+             (rove:ok (every (lambda (count) (= count 1))
+                             (loop for count being the hash-values of closed collect count)))
+             (rove:ok (query-execution-owner-closed-p owner))
+             (rove:ok (zerop *active-snapshots*))
+             (rove:ok (zerop (query-temp-quota-used-bytes quota)))
+             (rove:ok (eq :aborted (backend-state *backend*)))
+             (rove:ok (equal (mapcar #'car (select-portal-test-frames stream)) '(#\1 #\2)))))
+         :after-finish (when (eq failure :after-receiver)
+                         (lambda () (error "injected outer unwind failure")))))))
+
+(rove:deftest returning-portal-nonlocal-handoff-exits-cannot-reexecute
+    (dolist (phase '(:receiver :reader))
+      (dolist (exit '(:timeout :throw))
+        (flet ((leave ()
+                 (if (eq exit :timeout)
+                     (error 'sb-ext:timeout)
+                     (throw 'returning-test-escape :thrown))))
+          (call-with-returning-portal-test
+           (lambda (stream calls)
+             (extended-apply-operation stream '(:parse "s" "UPDATE things SET id=id RETURNING id,label" ()) #())
+             (extended-apply-operation stream '(:bind "p" "s" () () ()) #())
+             (let* ((portal (gethash "p" (extended-query-state-portals *extended-query-state*)))
+                    (execution (extended-dml-execution-for portal))
+                    (owner (extended-dml-execution-owner execution))
+                    (reader (symbol-function 'make-query-replay-reader))
+                    (result nil))
+               (unwind-protect
+                    (progn
+                      (when (eq phase :reader)
+                        (setf (symbol-function 'make-query-replay-reader)
+                              (lambda (store)
+                                (funcall reader store)
+                                (leave))))
+                      (setf result
+                            (handler-case
+                                (catch 'returning-test-escape
+                                  (extended-apply-operation stream '(:execute "p" 1) #())
+                                  :completed)
+                              (sb-ext:timeout () :timed-out))))
+                 (setf (symbol-function 'make-query-replay-reader) reader))
+               (rove:ok (eq result (if (eq exit :timeout) :timed-out :thrown)))
+               (rove:ok (= 1 (car calls)))
+               (rove:ok (extended-dml-execution-failed-p execution))
+               (rove:ok (not (extended-dml-execution-ready-p execution)))
+               (rove:ok (query-execution-owner-closed-p owner))
+               (rove:ok (zerop *active-snapshots*))
+               (rove:ok
+                (handler-case (progn (extended-apply-operation stream '(:execute "p" 1) #()) nil)
+                  (pg-error (condition) (string= "55000" (pg-error-sqlstate condition)))))
+               (rove:ok (= 1 (car calls)))
+               (rove:ok (equal (mapcar #'car (select-portal-test-frames stream)) '(#\1 #\2)))))
+           :after-finish (when (eq phase :receiver) #'leave))))))
+
+(rove:deftest returning-portal-close-keeps-cleanup-failure-details
+    (call-with-returning-portal-test
+     (lambda (stream calls)
+       (declare (ignore calls))
+       (extended-apply-operation stream '(:parse "s" "UPDATE things SET id=id RETURNING id,label" ()) #())
+       (extended-apply-operation stream '(:bind "p" "s" () () ()) #())
+       (let* ((portal (gethash "p" (extended-query-state-portals *extended-query-state*)))
+              (owner (extended-dml-execution-owner (extended-dml-execution-for portal)))
+              (fail t))
+         (query-execution-owner-add-cleanup
+          owner (lambda () (when fail (ereport "58030" "injected portal close failure"))))
+         (multiple-value-bind (closed failures) (extended-close-portal portal)
+           (rove:ok (not closed))
+           (rove:ok
+            (find-if (lambda (condition)
+                       (and (typep condition 'pg-error)
+                            (string= "injected portal close failure" (pg-error-message condition))))
+                     failures)))
+         (rove:ok (eq :cleanup-pending (query-execution-owner-state owner)))
+         (setf fail nil)
+         (rove:ok (extended-close-portal portal))
+         (rove:ok (query-execution-owner-closed-p owner))))))
+
+(rove:deftest returning-portal-cleanup-fatal-takes-precedence
+    (dolist (exit '(:error :timeout :throw :fatal :handled-fatal))
+      (call-with-returning-portal-test
+       (lambda (stream calls)
+         (declare (ignore calls))
+         (extended-apply-operation stream '(:parse "s" "UPDATE things SET id=id RETURNING id,label" ()) #())
+         (extended-apply-operation stream '(:bind "p" "s" () () ()) #())
+         (let* ((portal (gethash "p" (extended-query-state-portals *extended-query-state*)))
+                (execution (extended-dml-execution-for portal))
+                (owner (extended-dml-execution-owner execution))
+                (reader (symbol-function 'make-query-replay-reader))
+                (original (case exit
+                            ((:error :handled-fatal) (make-condition 'simple-error :format-control "original error"))
+                            (:timeout (make-condition 'sb-ext:timeout))
+                            (:fatal (make-condition 'pg-error :severity "FATAL" :sqlstate "57P01"
+                                                              :message "original fatal"))))
+                (cleanup-fatal (make-condition 'pg-error :severity "FATAL" :sqlstate "57P01"
+                                                         :message "cleanup fatal"))
+                (fail t)
+                (caught nil))
+           (query-execution-owner-add-cleanup
+            owner (lambda ()
+                    (rove:ok (extended-dml-execution-failed-p execution))
+                    (when fail (setf fail nil) (error cleanup-fatal))))
+           (unwind-protect
+                (progn
+                  (setf (symbol-function 'make-query-replay-reader)
+                        (lambda (store)
+                          (funcall reader store)
+                          (when (eq exit :handled-fatal)
+                            (handler-case
+                                (ereport-fatal "57P01" "handled fatal")
+                              (pg-error () nil)))
+                          (if (eq exit :throw)
+                              (throw 'returning-fatal-test :unexpected-throw)
+                              (error original))))
+                  (setf caught
+                        (handler-case
+                            (catch 'returning-fatal-test
+                              (extended-apply-operation stream '(:execute "p" 1) #())
+                              nil)
+                          (pg-error (condition) condition)
+                          (error (condition) condition)
+                          (sb-ext:timeout (condition) condition))))
+             (setf (symbol-function 'make-query-replay-reader) reader))
+           (rove:ok (eq caught (if (eq exit :fatal) original cleanup-fatal)))
+           (rove:ok (extended-dml-execution-failed-p execution))
+           (rove:ok (eq :cleanup-pending (query-execution-owner-state owner)))
+           (rove:ok (member owner (query-execution-owner-reload-state) :test #'eq))
+           (rove:ok (equal (mapcar #'car (select-portal-test-frames stream)) '(#\1 #\2)))
+           (rove:ok (extended-close-portal portal))
+           (rove:ok (zerop *active-snapshots*)))))))
+
+(rove:deftest returning-portal-second-interrupt-sees-failed-publication
+    (call-with-returning-portal-test
+     (lambda (stream calls)
+       (declare (ignore calls))
+       (extended-apply-operation stream '(:parse "s" "UPDATE things SET id=id RETURNING id,label" ()) #())
+       (extended-apply-operation stream '(:bind "p" "s" () () ()) #())
+       (let* ((portal (gethash "p" (extended-query-state-portals *extended-query-state*)))
+              (execution (extended-dml-execution-for portal))
+              (owner (extended-dml-execution-owner execution))
+              (reader (symbol-function 'make-query-replay-reader))
+              (close (symbol-function 'extended-close-portal))
+              (original (make-condition 'sb-ext:timeout))
+              (second (make-condition 'sb-ext:timeout))
+              (observed nil)
+              (caught nil))
+         (unwind-protect
+              (progn
+                (setf (symbol-function 'make-query-replay-reader)
+                      (lambda (store) (funcall reader store) (error original))
+                      (symbol-function 'extended-close-portal)
+                      (lambda (value &optional failed-p)
+                        (declare (ignore value failed-p))
+                        (sb-thread:interrupt-thread
+                         sb-thread:*current-thread*
+                         (lambda ()
+                           (setf observed (extended-dml-execution-failed-p execution))
+                           (error second)))))
+                (let ((*error-output* (make-string-output-stream)))
+                  (setf caught
+                        (handler-case (extended-apply-operation stream '(:execute "p" 1) #())
+                          (sb-ext:timeout (condition) condition)))))
+           (setf (symbol-function 'make-query-replay-reader) reader
+                 (symbol-function 'extended-close-portal) close))
+         (rove:ok (eq caught original))
+         (rove:ok observed)
+         (rove:ok (extended-dml-execution-failed-p execution))
+         (rove:ok (member owner (query-execution-owner-reload-state) :test #'eq))
+         (rove:ok (extended-close-portal portal))
+         (rove:ok (zerop *active-snapshots*))))))
+
+(rove:deftest returning-portal-spill-quota-is-shared-across-portals
+    (let ((*query-work-memory-bytes* 1)
+          (*query-temp-directory* (uiop:temporary-directory)))
+      (call-with-returning-portal-test
+       (lambda (stream calls)
+         (declare (ignore calls))
+         (extended-apply-operation stream '(:parse "s" "UPDATE things SET id=id RETURNING id,label" ()) #())
+         (extended-apply-operation stream '(:bind "one" "s" () () ()) #())
+         (extended-apply-operation stream '(:bind "two" "s" () () ()) #())
+         (flet ((owner (name)
+                  (extended-dml-execution-owner
+                   (extended-dml-execution-for
+                    (gethash name (extended-query-state-portals *extended-query-state*))))))
+           (let* ((one (owner "one")) (two (owner "two"))
+                                      (quota (query-temp-cleanup-owner-quota (query-execution-owner-temp-owner one))))
+             (rove:ok (eq quota (query-temp-cleanup-owner-quota (query-execution-owner-temp-owner two))))
+             (extended-apply-operation stream '(:execute "one" 1) #())
+             (rove:ok (plusp (query-temp-quota-used-bytes quota)))
+             (let ((*query-temp-file-limit-bytes* (1+ (query-temp-quota-used-bytes quota))))
+               (rove:ok
+                (handler-case (progn (extended-apply-operation stream '(:execute "two" 1) #()) nil)
+                  (pg-error (condition) (string= (pg-error-sqlstate condition) "53400")))))
+             (rove:ok (query-execution-owner-closed-p one))
+             (rove:ok (query-execution-owner-closed-p two))
+             (rove:ok (zerop *active-snapshots*))
+             (rove:ok (zerop (query-temp-quota-used-bytes quota)))))))))
 
 (rove:deftest returning-borrowed-spool-is-deferred-and-retained
     (let* ((*query-temp-directory* (uiop:temporary-directory))
@@ -211,6 +533,49 @@
                                             (push row rows)))
                      (rove:ok (equalp rows (list (vector "retained"))))))
               (close-query-row-spool spool)))))))
+
+(rove:deftest returning-bind-admits-target-and-readers-together
+    (let* ((target (returning-test-table))
+           (source (returning-test-table))
+           (index (make-pg-index :relfilenode 24))
+           (spec (list :table source :path (make-select-scan-path :kind :index-scan :index index)))
+           (prepared (list :table target :columns (pg-class-columns target)
+                           :insert-source-plan (%make-query-plan :prepared (list :relations (list spec)))))
+           (names '(register-relation-accesses ensure-current-table refresh-on-conflict-arbiters
+                    revalidate-subquery-relations buf-nblocks))
+           (originals (mapcar #'symbol-function names))
+           (admissions nil)
+           (validated nil))
+      (setf (pg-class-relfilenode target) 11
+            (pg-class-toast target) (make-pg-toast :relfilenode 12 :index-relfilenode 13)
+            (pg-class-relfilenode source) 21
+            (pg-class-toast source) (make-pg-toast :relfilenode 22 :index-relfilenode 23))
+      (unwind-protect
+           (progn
+             (setf (symbol-function 'register-relation-accesses)
+                   (lambda (writes reads xid)
+                     (push (list writes reads xid) admissions))
+                   (symbol-function 'ensure-current-table)
+                   (lambda (table) (rove:ok (eq table target)))
+                   (symbol-function 'refresh-on-conflict-arbiters)
+                   (lambda (&rest arguments) (declare (ignore arguments)))
+                   (symbol-function 'revalidate-subquery-relations)
+                   (lambda (relations)
+                     (rove:ok (= 1 (length admissions)))
+                     (rove:ok (equal '(22 23) (getf (first relations) :registered-toast-nodes)))
+                     (setf validated t))
+                   (symbol-function 'buf-nblocks) (lambda (node) (declare (ignore node)) 2))
+             (let ((*select-suppress-description* nil))
+               (multiple-value-bind (table rel xid relations domain)
+                   (register-dml-subquery-relations prepared 77)
+                 (declare (ignore relations domain))
+                 (rove:ok (eq table target))
+                 (rove:ok (= rel 11))
+                 (rove:ok (= xid 77))))
+             (rove:ok validated)
+             (rove:ok (equal admissions '(((11) (12 13 21 22 23 24) 77)))))
+        (loop for name in names for original in originals
+              do (setf (symbol-function name) original)))))
 
 (rove:deftest returning-extended-drift-precedes-mutation
     (let* ((targets (returning-test-targets "DELETE FROM things RETURNING id,label"))

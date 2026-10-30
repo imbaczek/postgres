@@ -756,13 +756,23 @@ hexadecimal (the default) or traditional escape output. Supported isolation leve
 are `READ COMMITTED` and `REPEATABLE READ`; client encoding is UTF8 and
 `standard_conforming_strings = on`.
 The extended query protocol supports Parse, Bind, Execute, Sync, Describe,
-Close and Flush for a single INSERT, UPDATE or DELETE without RETURNING, and
-supported SELECT statements.
+Close and Flush for supported SELECT statements and single INSERT, UPDATE or
+DELETE statements, including RETURNING.
 Parse requires explicit supported built-in expression type OIDs for parameters;
 string literals in these statements are rejected in favor of parameters.
 Parameters use text format; text, varchar, bytea, json, jsonb, and numeric also
-support binary Bind and SELECT result formats. Limited portal execution is unsupported; each portal
-can execute only once. During reload drain, a Simple Query sent while an
+support binary Bind and result formats. Positive Execute row limits suspend
+row-producing portals after the requested number of rows; a later Execute
+continues them. An exact-sized fetch can suspend at the end, with completion
+reported on the next Execute. SELECT retains its Bind-time snapshot and produces
+rows as they are pulled; sorting and aggregation may first consume their inputs.
+A RETURNING command performs its mutations once on first Execute,
+then retains its buffered results for subsequent fetches. Sync ends an implicit
+transaction; in an explicit transaction, portals remain available until closed
+or the transaction ends. Temporary spill space is shared across a backend's
+queries and portals. Live reload waits for retained portals to close or their
+transactions to end, while allowing clients to resume or close them. During
+reload drain, a Simple Query sent while an
 extended implicit transaction is open is rejected if it has statements after a
 transaction-ending statement. An old protocol handler also fails closed for
 extended message suffixes during a mixed live reload.
@@ -1022,6 +1032,13 @@ and `PSQL`; its `timetz` comparisons cover the local C build's layout.
 
 From `src/lisp`, `./t/toast-dml.sh` exercises TOAST storage policies, DML,
 partial reads and `VACUUM` with variable-width values.
+
+`PG_C_BINDIR=/path/to/installed/postgres/bin ./t/dml.sh` compares DML and
+extended-protocol RETURNING against a C server, including suspended portals and
+large TOAST values. `./t/portal-lifecycle.sh` checks reload, snapshot, spill,
+quota, rollback and disconnect cleanup for retained portals. Set
+`PROMOTION_SUSPENDED_PORTAL=1` when running `./t/promotion-readers.sh` to check
+a suspended standby portal across promotion and restart.
 
 From `src/lisp`, `PG_C_BINDIR=/path/to/installed/postgres/bin ./t/subqueries.sh`
 compares the native server with the repository's installed C PostgreSQL and owns
