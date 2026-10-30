@@ -131,6 +131,55 @@ def unix_default_and_frozen(root, port, env, observer, password):
     print('libpq-helper: Unix SCRAM frozen replay without alias/passfile, revoked password rejection PASS', flush=True)
 
 
+def physical_auth_and_frozen(root, port, env):
+    password = root / 'physical-passfile'
+    password.write_text(f'localhost:{port}:replication:transport_receiver:public-fixture-password\n'
+                        f'{root}:{port}:replication:transport_receiver:public-fixture-password\n')
+    password.chmod(0o600)
+    saved = root / 'physical-passfile.saved'
+    for host in (f'host=localhost hostaddr=127.0.0.1 sslmode=verify-full '
+                 f'sslrootcert={root / "server.crt"}', f'host={root} sslmode=disable'):
+        helper = ipc.Helper(env=dict(env, PGCLIENTENCODING='LATIN1'))
+        try:
+            conninfo = (f'{host} port={port} dbname=does_not_exist replication=database '
+                        f'user=transport_receiver passfile={password}')
+            kind, body = helper.call(b'W', ipc.string(conninfo) + ipc.string('physical-source'))
+            assert kind == b'O', (kind, body)
+            selected, options = connection_metadata(body)
+            assert selected[3] == b'replication', selected
+            assert options['replication'] == b'true'
+            assert options['client_encoding'] == b'LATIN1'
+            assert options['password'] == b'public-fixture-password'
+            identity = query(helper, 'IDENTIFY_SYSTEM')
+            assert len(identity[0]) == 4 and identity[0][3] is None, identity
+            assert helper.call(b'X') == (b'A', b'')
+            helper.process.wait(timeout=2)
+        finally:
+            helper.close()
+        options.pop('service', None)
+        options.update(zip(('host', 'hostaddr', 'port', 'dbname', 'user'), selected))
+        body = struct.pack('!I', len(options)) + b''.join(
+            ipc.string(key) + (struct.pack('!I', 0xffffffff) if value is None else ipc.string(value))
+            for key, value in options.items())
+        password.rename(saved)
+        helper = ipc.Helper(env=dict(env, PGREPLICATION='database', PGDATABASE='wrong',
+                                     PGCLIENTENCODING='UTF8', PGSERVICE='missing-service'))
+        try:
+            kind, response = helper.call(b'P', body)
+            assert kind == b'O', (kind, response)
+            restored, restored_options = connection_metadata(response)
+            assert restored == selected
+            assert restored_options['replication'] == b'true'
+            assert restored_options['client_encoding'] == b'LATIN1'
+            assert query(helper, 'IDENTIFY_SYSTEM')[0][3] is None
+            assert helper.call(b'X') == (b'A', b'')
+            helper.process.wait(timeout=2)
+        finally:
+            helper.close()
+            saved.rename(password)
+    print('libpq-helper: physical SCRAM replication passfile, TCP/TLS/Unix and frozen mode PASS', flush=True)
+
+
 def exercise(observer, conninfo, expected_name, env, *, success=True):
     helper = ipc.Helper(env=env)
     try:
@@ -170,8 +219,10 @@ def run(base, root, executable, port, processes):
     (directory / 'pg_hba.conf').write_text(
         'local all postgres trust\n'
         'local all transport_receiver scram-sha-256\n'
+        'local replication transport_receiver scram-sha-256\n'
         'host all postgres 127.0.0.1/32 trust\n'
-        'host all transport_receiver 127.0.0.1/32 scram-sha-256\n')
+        'host all transport_receiver 127.0.0.1/32 scram-sha-256\n'
+        'host replication transport_receiver 127.0.0.1/32 scram-sha-256\n')
     process = peer.start(base, root, executable, port, 'server', False, processes)
     observer = peer.connect(port)
     try:
@@ -182,6 +233,7 @@ def run(base, root, executable, port, processes):
         password.chmod(0o600)
         env = {key: value for key, value in os.environ.items() if not key.startswith('PG')}
         unix_default_and_frozen(root, port, env, observer, password)
+        physical_auth_and_frozen(root, port, env)
         common = (f'host=localhost hostaddr=127.0.0.1 port={port} dbname=postgres '
                   f'user=transport_receiver passfile={password} sslmode=verify-full '
                   f"sslrootcert={root / 'server.crt'} options='-c statement_timeout=1234'")

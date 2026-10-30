@@ -280,8 +280,9 @@ def retarget_form(port, prefix):
             argument = ("(concatenate '(vector (unsigned-byte 8)) "
                         f'(string->bytes "{conninfo}") '
                         "(make-array 2 :element-type '(unsigned-byte 8) :initial-contents '(255 128)))")
+        mode = ' :mode :physical' if os.environ.get('FOLLOW_LIBPQ_PHYSICAL') == '1' else ''
         return (f'(physical-follow-retarget-conninfo {argument} '
-                f':prefix "{prefix}" :fallback "controller-libpq")')
+                f':prefix "{prefix}" :fallback "controller-libpq"{mode})')
     return f'(physical-follow-retarget "127.0.0.1" {port} "{prefix}")'
 
 
@@ -414,6 +415,8 @@ def exercise_retained_policy(peer, socket_identity, sibling, source, promoted):
     control("sibling.sock", '(assert (and (null *physical-follow-test-hook*) (eq (first *observation-before*) *physical-follow-runtime*) (equal (second *observation-before*) (physical-follow-read-config)) (equal (third *observation-before*) (physical-store-control-tuple *physical-receive-store*)) (eq (fourth *observation-before*) (physical-follow-runtime-replay-thread *physical-follow-runtime*)) (sb-thread:thread-alive-p (fourth *observation-before*)) (= 2 (physical-follow-observed-timeline (getf *physical-recovery-state* :system-id))) (not *physical-recovery-failed-p*) (null *physical-follow-auto-error*)))')
     assert query(sibling, "SELECT pg_is_wal_replay_paused(),count(*) FROM promotion_sql_items") == [(True, 1)]
     control("sibling.sock", form)
+    if os.environ.get('FOLLOW_LIBPQ_PHYSICAL') == '1':
+        control("sibling.sock", '(let* ((source (physical-follow-config-source (physical-follow-read-config))) (profile (physical-follow-source-profile source))) (assert (eq :physical (physical-libpq-profile-mode profile))))')
     if os.environ.get('FOLLOW_LIBPQ_RAW_CONNINFO') == '1':
         control("sibling.sock", '(let* ((source (physical-follow-config-source (physical-follow-read-config))) (datum (getf source :conninfo)) (profile (physical-libpq-profile-from-conninfo-datum datum (getf source :fallback))) (bytes (physical-libpq-profile-conninfo profile))) (assert (eq :bytes (first datum))) (assert (= 255 (aref bytes (- (length bytes) 2)))) (assert (= 128 (aref bytes (1- (length bytes))))))')
     wait(lambda: query(sibling, f"SELECT pg_last_wal_receive_lsn()='{fork}'::pg_lsn") == [(True,)])
@@ -441,6 +444,8 @@ def exercise_retained_policy(peer, socket_identity, sibling, source, promoted):
         sibling = connect(replica_port)
         assert query(sibling, "SELECT pg_is_in_recovery(),count(*) FROM promotion_sql_items") == [(True, 2)]
         assert saved == (data / "physical-follow.control").read_bytes()
+        if os.environ.get('FOLLOW_LIBPQ_PHYSICAL') == '1':
+            control("sibling.sock", '(assert (eq :physical (physical-libpq-profile-mode (physical-follow-source-profile (physical-follow-config-source (physical-follow-read-config))))))')
         control("sibling.sock", '(assert (and (physical-follow-controller-enabled-p (physical-follow-read-config)) (null (physical-follow-runtime-receiver-thread *physical-follow-runtime*)) (physical-follow-runtime-receiver-stopped-p *physical-follow-runtime*) (not *physical-recovery-failed-p*)))')
         control("sibling.sock", '(defparameter *retained-policy-live-state* (list (getf *physical-recovery-state* :timeline-policy) (physical-follow-runtime-replay-thread *physical-follow-runtime*)))')
         (data / "postgresql.auto.conf").write_text("recovery_target_timeline='latest'\n")
@@ -475,6 +480,8 @@ def exercise_retained_policy(peer, socket_identity, sibling, source, promoted):
     print("retained-policy: standard recovery_target_timeline cold policy and pending-restart reload PASS", flush=True)
     if os.environ.get('FOLLOW_LIBPQ_RAW_CONNINFO') == '1':
         print("retained-policy: non-UTF-8 original conninfo survives helper transport and saved source reload PASS", flush=True)
+    if os.environ.get('FOLLOW_LIBPQ_PHYSICAL') == '1':
+        print("retained-policy: physical libpq mode survives accepted source and cold reload PASS", flush=True)
     print("retained-policy: observed namespace save failure preserves replay and accepted route, manual retry PASS", flush=True)
     print("retained-policy: parent promotion skips known source timeline, intent SIGKILL and cold primary restart PASS", flush=True)
     return peer, socket_identity, sibling
