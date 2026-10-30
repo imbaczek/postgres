@@ -42,7 +42,7 @@
 FALLBACK supplies libpq's fallback application name. Libpq resolves service and
 environment settings for each connection attempt. Effective multihost connections
 are unsupported by the helper."
-  (conninfo "" :type string :read-only t)
+  (conninfo "" :type (or string (vector (unsigned-byte 8))) :read-only t)
   (fallback "" :type string :read-only t))
 
 (defun physical-libpq-default-fallback ()
@@ -51,21 +51,32 @@ are unsupported by the helper."
     (if (and name (plusp (length name))) name "walreceiver")))
 
 (defun make-physical-libpq-profile (conninfo &key (fallback (physical-libpq-default-fallback)))
-  (unless (and (stringp conninfo) (stringp fallback))
+  (unless (and (typep conninfo '(or string (vector (unsigned-byte 8)))) (stringp fallback))
     (error "invalid libpq connection profile"))
-  (let ((saved-conninfo (copy-seq conninfo))
-        (saved-fallback (copy-seq fallback)))
-    (unless (handler-case
-                (and (not (find (code-char 0) saved-conninfo))
-                     (not (find (code-char 0) saved-fallback))
-                     (<= (+ 8 (length (string->bytes saved-conninfo))
-                            (length (string->bytes saved-fallback))) 1048576))
-              (error () nil))
+  (let ((conninfo-size (length conninfo)) (fallback-size (length fallback)))
+    (unless (<= (+ 8 conninfo-size fallback-size) 1048576)
       (error "invalid libpq connection profile"))
-    (%make-physical-libpq-profile saved-conninfo saved-fallback)))
+    (handler-case
+        (let* ((saved-conninfo (subseq conninfo 0 conninfo-size))
+               (saved-fallback (subseq fallback 0 fallback-size))
+               (bytes (etypecase saved-conninfo
+                        (string (string->bytes saved-conninfo))
+                        ((vector (unsigned-byte 8)) saved-conninfo))))
+          (unless (and (not (find 0 bytes))
+                       (not (find (code-char 0) saved-fallback))
+                       (<= (+ 8 (length bytes) (length (string->bytes saved-fallback))) 1048576))
+            (error "invalid libpq connection profile"))
+          (%make-physical-libpq-profile saved-conninfo saved-fallback))
+      (error () (error "invalid libpq connection profile")))))
 
 (defun physical-libpq-profile-conninfo (profile)
   (copy-seq (%physical-libpq-profile-conninfo profile)))
+
+(defun physical-libpq-profile-conninfo-octets (profile)
+  (let ((conninfo (%physical-libpq-profile-conninfo profile)))
+    (etypecase conninfo
+      (string (string->bytes conninfo))
+      ((vector (unsigned-byte 8)) (copy-seq conninfo)))))
 
 (defun physical-libpq-profile-fallback (profile)
   (copy-seq (%physical-libpq-profile-fallback profile)))
@@ -159,11 +170,11 @@ are unsupported by the helper."
                            (char text (1+ index)) (char digits (logand byte 15))))
             text))))
 
-(defun physical-libpq-check-byte-datum (datum)
+(defun physical-libpq-check-byte-datum (datum &optional (maximum 16384))
   (when datum
     (unless (and (consp datum) (eq (first datum) :bytes)
                  (consp (cdr datum)) (null (cddr datum)) (stringp (second datum))
-                 (<= (length (second datum)) 32768)
+                 (<= (length (second datum)) (* 2 maximum))
                  (evenp (length (second datum)))
                  (every (lambda (char) (find char "0123456789abcdef")) (second datum)))
       (error "invalid frozen libpq byte datum")))
@@ -191,8 +202,8 @@ are unsupported by the helper."
     (unless (null tail) (error "frozen libpq profile has an invalid option list")))
   datum)
 
-(defun physical-libpq-datum-octets (datum)
-  (physical-libpq-check-byte-datum datum)
+(defun physical-libpq-datum-octets (datum &optional (maximum 16384))
+  (physical-libpq-check-byte-datum datum maximum)
   (when datum
     (let* ((text (second datum))
            (bytes (make-array (/ (length text) 2) :element-type '(unsigned-byte 8))))
@@ -201,6 +212,15 @@ are unsupported by the helper."
                      (+ (ash (digit-char-p (char text (* 2 index)) 16) 4)
                         (digit-char-p (char text (1+ (* 2 index))) 16))))
       bytes)))
+
+(defun physical-libpq-profile-conninfo-datum (profile)
+  (let ((conninfo (%physical-libpq-profile-conninfo profile)))
+    (if (stringp conninfo) (copy-seq conninfo) (physical-libpq-octets-datum conninfo))))
+
+(defun physical-libpq-profile-from-conninfo-datum (datum fallback)
+  (make-physical-libpq-profile
+   (if (stringp datum) datum (physical-libpq-datum-octets datum 1048576))
+   :fallback fallback))
 
 (defun physical-libpq-frozen-profile-datum (profile)
   "Return a bounded, EQUAL-stable private datum for durable cleanup.
@@ -638,7 +658,7 @@ supported. A failed open attempts to close the reserved channel."
   (let ((channel (physical-libpq-open-channel helper :on-spawn on-spawn)))
     (with-physical-libpq-operation (channel)
       (let ((body (make-payload)))
-        (physical-libpq-push-text body (%physical-libpq-profile-conninfo profile))
+        (physical-libpq-push-octets body (physical-libpq-profile-conninfo-octets profile))
         (physical-libpq-push-text body (%physical-libpq-profile-fallback profile))
         (multiple-value-bind (kind bytes)
             (physical-libpq-exchange channel #\O body '(#\O) 1048576)

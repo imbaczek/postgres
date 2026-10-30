@@ -49,6 +49,104 @@
       (ok (intake-fails-p
            (lambda () (pg::make-physical-libpq-profile (format nil "host=x~c" (code-char 0))))))))
 
+(deftest physical-libpq-profile-preserves-opaque-conninfo-octets
+    (let* ((input (make-array 4 :element-type '(unsigned-byte 8) :initial-contents '(65 255 128 66)))
+           (profile (pg::make-physical-libpq-profile input :fallback "rx")))
+      (setf (aref input 0) 90)
+      (ok (equalp '(65 255 128 66) (coerce (pg::physical-libpq-profile-conninfo profile) 'list)))
+      (setf (aref (pg::physical-libpq-profile-conninfo profile) 0) 89)
+      (ok (= 65 (aref (pg::physical-libpq-profile-conninfo profile) 0)))
+      (ok (not (search "255" (princ-to-string profile))))
+      (ok (signals (pg::make-physical-libpq-profile
+                    (make-array 1 :element-type '(unsigned-byte 8) :initial-element 0)) 'error))))
+
+(deftest oversized-libpq-profile-input-is-rejected-before-copying
+    (dolist (input (list (make-array 1048576 :element-type '(unsigned-byte 8) :initial-element 65)
+                         (make-string 1048576 :initial-element #\a)))
+      (let ((before (sb-ext:get-bytes-consed)))
+        (ok (signals (pg::make-physical-libpq-profile input :fallback "") 'error))
+        (ok (< (- (sb-ext:get-bytes-consed) before) 262144)))))
+
+(deftest physical-libpq-connect-sends-raw-conninfo-without-reencoding
+    (let* ((input (make-array 4 :element-type '(unsigned-byte 8) :initial-contents '(65 255 128 66)))
+           (profile (pg::make-physical-libpq-profile input :fallback "rx"))
+           (channel (pg::physical-libpq-reserve-channel))
+           (open (symbol-function 'pg::physical-libpq-open-channel))
+           (exchange (symbol-function 'pg::physical-libpq-exchange))
+           (seen nil))
+      (unwind-protect
+           (progn
+             (setf (symbol-function 'pg::physical-libpq-open-channel)
+                   (lambda (helper &key on-spawn)
+                     (declare (ignore helper))
+                     (when on-spawn (funcall on-spawn channel))
+                     channel)
+                   (symbol-function 'pg::physical-libpq-exchange)
+                   (lambda (actual kind body kinds maximum &key timeout)
+                     (declare (ignore kinds maximum timeout))
+                     (assert (eq actual channel))
+                     (assert (char= kind #\O))
+                     (setf seen (copy-seq body))
+                     (values #\O (libpq-test-connection-body nil))))
+             (ok (eq channel (pg::physical-libpq-connect "/fixture/helper" profile)))
+             (ok (equalp seen (make-array 14 :element-type '(unsigned-byte 8)
+                                             :initial-contents '(0 0 0 4 65 255 128 66 0 0 0 2 114 120)))))
+        (setf (symbol-function 'pg::physical-libpq-open-channel) open
+              (symbol-function 'pg::physical-libpq-exchange) exchange)
+        (pg::physical-libpq-close channel))))
+
+(deftest physical-follow-raw-conninfo-survives-control-reload-and-profile-reconstruction
+    (with-physical-store-directory (root)
+      (let* ((pg::*pgdata* root)
+             (source (libpq-test-source "fixture" 5432)))
+        (setf (getf source :conninfo) '(:bytes "41ff8042"))
+        (let* ((state (pg::physical-follow-controller-copy
+                       (list :version 1 :enabled t :preparing nil :cleanup nil :source source)))
+               (config (list 1 "localhost" 5432 "current" nil state)))
+          (pg::physical-follow-save-config config)
+          (let* ((loaded (pg::physical-follow-read-config))
+                 (saved-source (getf (pg::physical-follow-controller-state loaded) :source))
+                 (profile (pg::physical-libpq-profile-from-conninfo-datum
+                           (getf saved-source :conninfo) (getf saved-source :fallback))))
+            (ok (equal config loaded))
+            (ok (equal '(:bytes "41ff8042") (getf saved-source :conninfo)))
+            (ok (equalp '(65 255 128 66) (coerce (pg::physical-libpq-profile-conninfo profile) 'list))))))))
+
+(deftest physical-follow-raw-conninfo-uses-the-profile-bound-not-the-frozen-option-bound
+    (let* ((bytes (make-array 20000 :element-type '(unsigned-byte 8) :initial-element 65))
+           (source (libpq-test-source "fixture" 5432)))
+      (setf (getf source :conninfo) (pg::physical-libpq-octets-datum bytes))
+      (let* ((checked (pg::physical-follow-source-copy source))
+             (profile (pg::physical-libpq-profile-from-conninfo-datum
+                       (getf checked :conninfo) (getf checked :fallback))))
+        (ok (equalp bytes (pg::physical-libpq-profile-conninfo profile))))))
+
+(cl-spec:defproperty physical-libpq-raw-profile-roundtrip-preserves-nonzero-octets
+    ((size (range integer 0 256))
+     (first-byte (range integer 1 255))
+     (step (range integer 0 255)))
+  (:about pg::make-physical-libpq-profile)
+  (:trials (:normal 200))
+  (let ((input (make-array size :element-type '(unsigned-byte 8))))
+    (dotimes (index size)
+      (setf (aref input index) (1+ (mod (+ (1- first-byte) (* index step)) 255))))
+    (let* ((expected (copy-seq input))
+           (profile (pg::make-physical-libpq-profile input :fallback "rx"))
+           (datum (pg::physical-libpq-profile-conninfo-datum profile))
+           (restored (pg::physical-libpq-profile-from-conninfo-datum datum "rx")))
+      (when (plusp size)
+        (setf (aref input 0) 0
+              (aref (pg::physical-libpq-profile-conninfo profile) 0) 0))
+      (and (equalp expected (pg::physical-libpq-profile-conninfo profile))
+           (equalp expected (pg::physical-libpq-profile-conninfo restored))))))
+
+(deftest generated-physical-libpq-raw-profile-roundtrip
+    (let ((data (cl-spec:result-data
+                 (cl-spec:run-property 'physical-libpq-raw-profile-roundtrip-preserves-nonzero-octets
+                                       :seed 42))))
+      (ok (eq :passed (getf data :status)) (format nil "~s" data))
+      (ok (= 200 (getf data :trials)))))
+
 (deftest physical-libpq-new-profiles-use-installed-cluster-name-with-explicit-fallback-precedence
     (let* ((pg::*startup-server-settings* (make-hash-table :test #'equal))
            (entry (list :value "research")))

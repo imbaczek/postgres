@@ -15,10 +15,10 @@
 
 (defun physical-follow-source-copy (source)
   (physical-follow-check-plist source '(:conninfo :fallback :owner))
-  (let* ((profile (make-physical-libpq-profile (getf source :conninfo)
-                                               :fallback (getf source :fallback)))
+  (let* ((profile (physical-libpq-profile-from-conninfo-datum
+                   (getf source :conninfo) (getf source :fallback)))
          (owner (physical-libpq-frozen-profile-from-datum (getf source :owner))))
-    (list :conninfo (physical-libpq-profile-conninfo profile)
+    (list :conninfo (physical-libpq-profile-conninfo-datum profile)
           :fallback (physical-libpq-profile-fallback profile)
           :owner (physical-libpq-frozen-profile-datum owner))))
 

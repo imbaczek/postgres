@@ -1138,8 +1138,8 @@ A changed route forces fresh preparation before queries or WAL. Route equality
 is not authentication or proof of source identity."
   (let ((source (physical-follow-config-source (physical-follow-runtime-config runtime))))
     (if source
-        (let* ((profile (make-physical-libpq-profile (getf source :conninfo)
-                                                     :fallback (getf source :fallback)))
+        (let* ((profile (physical-libpq-profile-from-conninfo-datum
+                         (getf source :conninfo) (getf source :fallback)))
                (client (physical-libpq-connect (physical-libpq-helper-path) profile :on-spawn publish))
                (owner (physical-libpq-frozen-profile-from-datum (getf source :owner))))
           (unless (equal (physical-libpq-connection-route (physical-libpq-channel-info client))

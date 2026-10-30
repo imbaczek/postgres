@@ -504,7 +504,7 @@ object remains the operation's authority until completion or cancellation."
                          (physical-libpq-connection-info-port info)
                          (getf (physical-follow-operation-context operation) :accepted-source)
                          (physical-follow-source-copy
-                          (list :conninfo (physical-libpq-profile-conninfo profile)
+                          (list :conninfo (physical-libpq-profile-conninfo-datum profile)
                                 :fallback (physical-libpq-profile-fallback profile)
                                 :owner owner)))))
                (progn
@@ -854,8 +854,8 @@ requests no slot. Capture the choice before the worker starts."
   (let* ((source (when runtime (physical-follow-config-source (physical-follow-runtime-config runtime))))
          (requested (or profile
                         (when source
-                          (make-physical-libpq-profile (getf source :conninfo)
-                                                       :fallback (getf source :fallback)))))
+                          (physical-libpq-profile-from-conninfo-datum
+                           (getf source :conninfo) (getf source :fallback)))))
          (public-slot (physical-follow-public-slot-copy
                        (if (eq slot :inherit)
                            (when runtime
