@@ -128,6 +128,41 @@ STOPPED-P stops both workers; RECEIVER-STOPPED-P stops receipt alone."
   '(:version :phase :anchor :child-history :before :after :applied :required :recovery)
   "Exact keys of the optional version 1 binding.")
 
+(defun physical-follow-policy-selection (policy local-history &optional source-history)
+  (timeline-check-lineage local-history)
+  (let* ((target (getf policy :target))
+         (target-history (getf policy :history))
+         (parent (timeline-history-entry-timeline (first local-history))))
+    (when target
+      (timeline-check-lineage target-history)
+      (unless (= target (timeline-history-entry-timeline (first target-history)))
+        (error "follow policy target differs from its resolved history"))
+      (unless (physical-store-history-extends-p local-history target-history)
+        (return-from physical-follow-policy-selection
+          (list :action :replay-only
+                :reason (if (physical-store-history-extends-p target-history local-history)
+                            :timeline-target-reached :timeline-history-unavailable)))))
+    (unless source-history
+      (return-from physical-follow-policy-selection (list :action :discover)))
+    (timeline-check-lineage source-history)
+    (when (and target (not (physical-store-history-extends-p target-history source-history)))
+      (return-from physical-follow-policy-selection
+        (list :action :unavailable :reason :timeline-history-unavailable)))
+    (unless (physical-store-history-extends-p local-history source-history)
+      (error "source follow history rewrites local ancestry"))
+    (let* ((source (timeline-history-entry-timeline (first source-history)))
+           (position (position parent source-history :key #'timeline-history-entry-timeline))
+           (entry (and position (nth position source-history)))
+           (next (when (and position (plusp position))
+                   (timeline-history-entry-timeline (nth (1- position) source-history))))
+           (kind (cond ((= source parent) :same-timeline)
+                       ((and target (= target parent)) :retained-timeline)
+                       (t :descendant))))
+      (unless entry (error "follow target does not contain receive ancestry"))
+      (list :action :attach :proof-kind kind :source source :parent parent
+            :history source-history :fork (timeline-history-entry-end entry)
+            :child (when (eq kind :descendant) next)))))
+
 (defun physical-follow-binding-pair-p (pair)
   "Recognize a bounded (LSN timeline) pair."
   (and (listp pair) (= 2 (length pair))
@@ -217,7 +252,7 @@ manifest and root fields, and validate the proposed selection digest."
 Same-timeline bindings retain all eleven control fields and have no child history."
   (ecase (physical-follow-anchor-kind anchor)
     (:descendant (physical-follow-descendant-binding-transition-check anchor text before after))
-    (:same-timeline
+    ((:same-timeline :retained-timeline)
      (let ((history (physical-follow-anchor-check anchor)))
        (unless (and (null text) (equal before after)
                     (= (or (eighth before) (second before)) (getf anchor :receive-timeline))
@@ -238,7 +273,7 @@ reconciliation; active bindings require durable-state checks before admission."
                                          (applied (getf binding :applied)) (required (getf binding :required))
                                          (witness (getf binding :recovery)))
     (unless (and (eql 1 (getf binding :version)) (member (getf binding :phase) '(:pending :active))
-                 (if (eq :same-timeline (physical-follow-anchor-kind anchor))
+                 (if (member (physical-follow-anchor-kind anchor) '(:same-timeline :retained-timeline))
                      (null text)
                      (and (stringp text)
                           (<= (length (string->bytes text)) +physical-store-history-maximum-bytes+)))
@@ -321,7 +356,7 @@ caller owns the candidate and keeps its input stable during the scan."
   (destructuring-bind (start timeline next snapshot reservation source-xids) seed
     (let* ((*physical-recovery-state* (copy-tree verified-base))
            (*physical-receive-store* candidate)
-           (terminal start) (applied-seen nil) (required-seen nil) (required-next nil)
+           (terminal start) (disposition nil) (applied-seen nil) (required-seen nil) (required-next nil)
            (witness-seen (null witness))
            (removed (make-hash-table :test #'eql)))
       (setf (getf *physical-recovery-state* :replay-timeline) timeline
@@ -346,35 +381,38 @@ caller owns the candidate and keeps its input stable during the scan."
                    (setf required-seen t required-next next))))
         (note-boundary)
         (with-physical-replay-staging ()
-          (funcall
-           map-records
-           (lambda (record raw)
-             (if (= (wal-record-type record) +wal-record-end-of-recovery+)
-                 (setf timeline (physical-replay-check-selected-eor
-                                 candidate record raw terminal timeline)
-                       (getf *physical-recovery-state* :replay-timeline) timeline
-                       reservation (physical-source-reservation-next reservation record next)
-                       source-xids (physical-source-xids-next source-xids record next))
-                 (progn
-                   (physical-replay-check-child-initialization record next)
-                   (setf next (physical-replay-observed-next-xid record next)
-                         reservation (physical-source-reservation-next reservation record next)
-                         source-xids (physical-source-xids-next source-xids record next))
-                   (physical-history-accept-record
-                    record (getf verified-base :cluster-identity) removed)
-                   (when (= (wal-record-type record) +wal-record-checkpoint+)
-                     (setf (getf *physical-recovery-state* :source-checkpoint)
-                           (wal-checkpoint-record-snapshot record)))))
-             (unless *wal-recovery-group-active*
-               (setf terminal (wal-record-end record))
-               (note-boundary)))
-           start)
+          (setf disposition
+                (funcall
+                 map-records
+                 (lambda (record raw)
+                   (if (= (wal-record-type record) +wal-record-end-of-recovery+)
+                       (setf timeline (physical-replay-check-selected-eor
+                                       candidate record raw terminal timeline)
+                             (getf *physical-recovery-state* :replay-timeline) timeline
+                             reservation (physical-source-reservation-next reservation record next)
+                             source-xids (physical-source-xids-next source-xids record next))
+                       (progn
+                         (physical-replay-check-child-initialization record next)
+                         (setf next (physical-replay-observed-next-xid record next)
+                               reservation (physical-source-reservation-next reservation record next)
+                               source-xids (physical-source-xids-next source-xids record next))
+                         (physical-history-accept-record
+                          record (getf verified-base :cluster-identity) removed)
+                         (when (= (wal-record-type record) +wal-record-checkpoint+)
+                           (setf (getf *physical-recovery-state* :source-checkpoint)
+                                 (wal-checkpoint-record-snapshot record)))))
+                   (unless *wal-recovery-group-active*
+                     (setf terminal (wal-record-end record))
+                     (note-boundary)))
+                 start))
           (unless (and applied-seen required-seen witness-seen
-                       (or (and allow-open-tail *wal-recovery-group-active*)
-                           (and (not *wal-recovery-group-active*)
-                                (= terminal (physical-store-flushed-lsn candidate)))))
+                       (if (member disposition '(:timeline-target-reached :timeline-history-unavailable))
+                           (not *wal-recovery-group-active*)
+                           (or (and allow-open-tail *wal-recovery-group-active*)
+                               (and (not *wal-recovery-group-active*)
+                                    (= terminal (physical-store-flushed-lsn candidate))))))
             (error "follow replay does not reach clean recovery boundaries"))))
-      (list :start start :terminal terminal :timeline timeline :next-xid next
+      (list :disposition disposition :start start :terminal terminal :timeline timeline :next-xid next
             :required-next-xid required-next :reservation reservation :source-xids source-xids))))
 
 (defun physical-follow-scan-replay (candidate verified-base applied required observed restartpoint
@@ -505,7 +543,7 @@ compaction has moved them into retained extents."
                      (= (seventh saved) (seventh current))))
       (error "active follow receive identity, selection or floor regressed"))
     (physical-follow-check-source-history store (nth-value 0 (physical-follow-anchor-check anchor)))
-    (when (and (eq :descendant (physical-follow-anchor-kind anchor))
+    (when (and (member (physical-follow-anchor-kind anchor) '(:descendant :retained-timeline))
                (equal (getf binding :before) saved))
       (unless (<= (fourth current)
                   (nth-value 1 (physical-follow-anchor-check anchor)))
@@ -547,7 +585,7 @@ compaction has moved them into retained extents."
           (error "active follow compaction lacks a usable durable restartpoint")))
       (values metadata token))))
 
-(defun physical-follow-map-active-prefix (store index function start)
+(defun physical-follow-map-active-prefix (store index function start &optional policy)
   "Map retained WAL from the base to the current floor, then the spool.
 The caller supplies the checked current inventory and keeps its root protected."
   (unless (= start (physical-store-base-lsn store))
@@ -561,9 +599,9 @@ The caller supplies the checked current inventory and keeps its root protected."
                                           :extent (first entry) +physical-retained-image-limit+))
         (physical-retained-extent-scan metadata bytes (physical-store-retained-history store)
                                        nil function))))
-  (physical-store-map-durable-records store function :start-lsn (physical-store-floor-lsn store)))
+  (physical-recovery-map-permitted-records store function :start-lsn (physical-store-floor-lsn store) :policy policy))
 
-(defun physical-follow-scan-current-state (candidate base applied required control index minimum)
+(defun physical-follow-scan-current-state (candidate base applied required control index minimum &optional policy)
   (physical-recovery-check-store-point candidate (first applied) (second applied))
   (multiple-value-bind (metadata token)
       (physical-follow-check-current-restartpoint candidate base minimum)
@@ -572,18 +610,21 @@ The caller supplies the checked current inventory and keeps its root protected."
                              (getf metadata :lsn) (getf base :end))))
            (pair (list applied (physical-store-prefix-timeline candidate applied)))
            (seed (multiple-value-list (physical-follow-replay-seed candidate base pair token))))
+      (when (getf policy :target)
+        (dolist (point (list pair required (subseq seed 0 2)))
+          (physical-recovery-policy-check-pair point (getf policy :history))))
       (if (< (first required) (first seed))
           (physical-follow-scan-replay-from-seed
            candidate base pair required (getf control :next-xid)
            (list (getf base :end) (getf base :timeline) (getf base :next-xid)
                  (copy-tree (getf base :source-checkpoint))
                  (copy-tree (getf base :source-reservation)) nil)
-           (lambda (function start) (physical-follow-map-active-prefix candidate index function start))
+           (lambda (function start) (physical-follow-map-active-prefix candidate index function start policy))
            t (subseq seed 0 3))
           (physical-follow-scan-replay-from-seed
            candidate base pair required (getf control :next-xid) seed
            (lambda (function start)
-             (physical-store-map-durable-records candidate function :start-lsn start))
+             (physical-recovery-map-permitted-records candidate function :start-lsn start :policy policy))
            t)))))
 
 (defun physical-follow-call-with-receive-root (store function)
@@ -604,7 +645,7 @@ Return a private read-only candidate; the caller keeps input and root stable."
     (physical-store-read-retained-control store (physical-store-control-tuple store))
     (physical-follow-copy-replay-candidate store)))
 
-(defun physical-follow-check-active-state (store verified-base config)
+(defun physical-follow-check-active-state (store verified-base config &key (policy (getf *physical-recovery-state* :timeline-policy)))
   "Validate an active binding without publication, redo or source contact.
 The caller must exclude concurrent recovery, reload and receive changes. This
 function copies a read-only candidate, holds a root reader lease when needed,
@@ -625,7 +666,7 @@ and receiver launch call this before admitting a bound configuration."
                    (physical-follow-check-history-files candidate binding)
                    (let ((result (physical-follow-scan-current-state
                                   candidate verified-base (getf binding :applied) required control index
-                                  (getf (getf binding :recovery) :restartpoint))))
+                                  (getf (getf binding :recovery) :restartpoint) policy)))
                      (unless (and (equal control (physical-recovery-read-control *pgdata*))
                                   (equal config (physical-follow-read-config)))
                        (error "active follow durable witnesses changed during validation"))
@@ -701,11 +742,14 @@ The caller must exclude recovery and reload and protect the selected root."
     (let ((anchor (getf binding :anchor)))
       (multiple-value-bind (history fork eor) (physical-follow-anchor-check anchor)
         (declare (ignore fork))
-        (if (eq :same-timeline (physical-follow-anchor-kind anchor))
-            (when (> (getf anchor :source-timeline) 1)
-              (check-file (getf anchor :source-timeline) (getf anchor :history-text)))
-            (check-file (timeline-check-end-of-recovery eor (getf anchor :receive-timeline) history)
-                        (getf binding :child-history)))))))
+        (case (physical-follow-anchor-kind anchor)
+          (:same-timeline
+           (when (> (getf anchor :source-timeline) 1)
+             (check-file (getf anchor :source-timeline) (getf anchor :history-text))))
+          (:descendant
+           (check-file (timeline-check-end-of-recovery eor (getf anchor :receive-timeline) history)
+                       (getf binding :child-history)))
+          (:retained-timeline nil))))))
 
 (defun physical-follow-publish-pending-recovery (base binding)
   "Publish the required recovery pair and witnessed XID with the selected history.

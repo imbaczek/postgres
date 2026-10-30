@@ -550,19 +550,24 @@ Return the reconstructed state and durable control; do not install runtime state
 Publish dirty recovery control before installing state and allowing redo."
   (physical-recovery-check-required-marker)
   (physical-follow-startup-owner-check)
-  (let* ((manifest (physical-recovery-verify-base-with-namespace))
-         (config (progn
-                   (when (eq signal-mode :archive)
-                     (error "archive recovery requested by recovery.signal is not implemented"))
-                   (physical-follow-prepare-startup manifest))))
-    (setf manifest (physical-recovery-verify-base-with-namespace)
-          (getf manifest :follow-startup-config) config
-          (getf manifest :standard-follow-managed-p) (eq signal-mode :standby)
-          (getf manifest :timeline-policy) (physical-recovery-prepare-timeline-policy manifest timeline-goal))
-    (setf *physical-recovery-state*
-          (physical-recovery-write-control
-           manifest (getf manifest :phase) (getf manifest :end)
-           (getf manifest :observed-next-xid)))))
+  (let ((manifest (physical-recovery-verify-base-with-namespace)))
+    (when (eq signal-mode :archive)
+      (error "archive recovery requested by recovery.signal is not implemented"))
+    (let* ((policy (physical-recovery-prepare-timeline-policy manifest timeline-goal))
+           (config (physical-follow-prepare-startup manifest :policy policy)))
+      (setf manifest (physical-recovery-verify-base-with-namespace))
+      (let ((checked (physical-recovery-prepare-timeline-policy manifest timeline-goal)))
+        (unless (every (lambda (key) (equalp (getf policy key) (getf checked key)))
+                       '(:target :startup-anchor :original-required :original-observed-next-xid
+                         :startup-seed :history))
+          (error "follow startup reconciliation changed the recovery timeline policy")))
+      (setf (getf manifest :follow-startup-config) config
+            (getf manifest :standard-follow-managed-p) (eq signal-mode :standby)
+            (getf manifest :timeline-policy) policy)
+      (setf *physical-recovery-state*
+            (physical-recovery-write-control
+             manifest (getf manifest :phase) (getf manifest :end)
+             (getf manifest :observed-next-xid))))))
 
 (defun note-primary-startup-replay ()
   "Report the last applied terminal, excluding complete records in an unfinished batch."

@@ -2,7 +2,7 @@
 
 (declaim (ftype function physical-recovery-check-store-point))
 
-(declaim (ftype function physical-follow-call-with-offline-store physical-restartpoint-read))
+(declaim (ftype function physical-follow-call-with-startup-candidate physical-restartpoint-read))
 
 (defun physical-recovery-policy-history (state store)
   (timeline-check-lineage
@@ -75,7 +75,7 @@ not a public GUC."
 
 (defun physical-recovery-prepare-timeline-policy (state goal)
   (if (= 2 (getf state :phase))
-      (physical-follow-call-with-offline-store
+      (physical-follow-call-with-startup-candidate
        state (lambda (store)
                (multiple-value-bind (metadata catalog prefix digest) (physical-restartpoint-read state)
                  (declare (ignore catalog prefix digest))

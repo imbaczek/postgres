@@ -1,5 +1,330 @@
 (in-package #:pg-physical-tests)
 
+(defun follow-policy-test-history (timeline &rest forks)
+  (pg::timeline-parse-history
+   timeline
+   (with-output-to-string (out)
+     (dolist (fork forks)
+       (format out "~d~c~a~cpromotion~%" (first fork) #\Tab
+               (pg::wal-format-lsn (second fork)) #\Tab)))))
+
+(deftest fixed-follow-policy-selects-only-the-path-to-its-target
+    (let* ((one (follow-policy-test-history 1))
+           (two (follow-policy-test-history 2 '(1 64)))
+           (three (follow-policy-test-history 3 '(1 64) '(2 128)))
+           (policy (list :target 2 :history two)))
+      (dolist (goal (list nil policy))
+        (let ((decision (pg::physical-follow-policy-selection goal one three)))
+          (ok (eq :attach (getf decision :action)))
+          (ok (eq :descendant (getf decision :proof-kind)))
+          (ok (= 2 (getf decision :child)))
+          (ok (= 64 (getf decision :fork)))))
+      (let ((decision (pg::physical-follow-policy-selection policy two three)))
+        (ok (eq :attach (getf decision :action)))
+        (ok (eq :retained-timeline (getf decision :proof-kind)))
+        (ok (= 128 (getf decision :fork)))
+        (ok (null (getf decision :child))))
+      (let ((decision (pg::physical-follow-policy-selection policy two two)))
+        (ok (eq :attach (getf decision :action)))
+        (ok (eq :same-timeline (getf decision :proof-kind)))
+        (ok (null (getf decision :fork))))
+      (let ((decision (pg::physical-follow-policy-selection policy three)))
+        (ok (eq :replay-only (getf decision :action)))
+        (ok (eq :timeline-target-reached (getf decision :reason))))
+      (ok (eq :discover (getf (pg::physical-follow-policy-selection policy one) :action)))
+      (dolist (source (list one (follow-policy-test-history 3 '(1 96) '(2 128))))
+        (let ((decision (pg::physical-follow-policy-selection policy one source)))
+          (ok (eq :unavailable (getf decision :action)))
+          (ok (eq :timeline-history-unavailable (getf decision :reason)))))))
+
+(deftest fixed-follow-policy-rejects-equal-timeline-ids-with-different-ancestry
+    (let* ((target (follow-policy-test-history 2 '(1 64)))
+           (policy (list :target 2 :history target)))
+      (dolist (local (list (follow-policy-test-history 2 '(1 32))
+                           (follow-policy-test-history 3 '(1 96))))
+        (let ((decision (pg::physical-follow-policy-selection policy local)))
+          (ok (eq :replay-only (getf decision :action)))
+          (ok (eq :timeline-history-unavailable (getf decision :reason)))))))
+
+(cl-spec:defproperty fixed-follow-policy-preserves-gapped-timeline-and-fork-boundaries
+    ((target (range integer 2 4294967294))
+     (fork (range integer 1 18446744073709551583)))
+  (:about pg::physical-follow-policy-selection)
+  (:trials (:normal 200))
+  (let* ((one (follow-policy-test-history 1))
+         (selected (follow-policy-test-history target (list 1 fork)))
+         (source (follow-policy-test-history (1+ target) (list 1 fork) (list target (+ fork 32))))
+         (policy (list :target target :history selected))
+         (toward (pg::physical-follow-policy-selection policy one source))
+         (bounded (pg::physical-follow-policy-selection policy selected source))
+         (cached (pg::physical-follow-policy-selection policy source)))
+    (and (eq :descendant (getf toward :proof-kind))
+         (= target (getf toward :child)) (= fork (getf toward :fork))
+         (eq :retained-timeline (getf bounded :proof-kind))
+         (= (+ fork 32) (getf bounded :fork))
+         (eq :replay-only (getf cached :action))
+         (eq :timeline-target-reached (getf cached :reason)))))
+
+(deftest generated-fixed-follow-policy-boundaries
+    (let ((data (cl-spec:result-data
+                 (cl-spec:run-property 'fixed-follow-policy-preserves-gapped-timeline-and-fork-boundaries :seed 42))))
+      (ok (eq :passed (getf data :status)) (format nil "~s" data))
+      (ok (= 200 (getf data :trials)))))
+
+(deftest retained-follow-binding-preserves-the-entire-receive-selection
+    (let* ((config (same-timeline-follow-binding-config))
+           (binding (fifth config))
+           (before (getf binding :before))
+           (anchor (retained-timeline-follow-anchor (fourth before) 256 (fifth before))))
+      (setf (getf anchor :base) (third before)
+            (getf binding :anchor) anchor)
+      (ok (pg::physical-follow-binding-check binding))
+      (ok (equal config (pg::physical-follow-decode-config (pg::physical-follow-config-image config))))
+      (dolist (change '((:after (42 1 64 127 555 64 14695981039346656037 nil nil 77 nil))
+                        (:child-history "")))
+        (let ((invalid (copy-tree binding)))
+          (setf (getf invalid (first change)) (second change))
+          (ok (signals (pg::physical-follow-binding-check invalid) 'error))))))
+
+(deftest retained-controller-publication-keeps-parent-history-and-bounds-active-receipt
+    (call-with-promotion-fixture
+     (lambda (root store)
+       (declare (ignore root))
+       (pg::wal-atomic-write-bytes (pg::clog-path) (empty-octets))
+       (let* ((text (store-history-text 1 216))
+              (view (list :source 2 :parent 1 :history-text text :fork 216
+                          :proof-kind :retained-timeline
+                          :history (pg::timeline-parse-history 2 text)))
+              (operation (pg::make-physical-follow-operation
+                          :host "127.0.0.1" :port 5433 :prefix "bounded"))
+              (pg::*physical-follow-operation* operation)
+              (pg::*physical-follow-controller-blocked-p* nil)
+              (pg::*physical-follow-controller-stopping-p* nil)
+              (before (pg::physical-store-control-tuple store)))
+         (pg::physical-follow-save-config '(1 "127.0.0.1" 5432 "old_bootstrap"))
+         (pg::physical-follow-operation-initial-config operation)
+         (multiple-value-bind (entry snapshot) (pg::physical-follow-operation-intent operation view)
+           (declare (ignore snapshot))
+           (ok (eq :retained-timeline (getf (getf entry :request) :kind)))
+           (let* ((anchor (append (copy-list (getf entry :request)) (list :history-text text)))
+                  (active (pg::physical-follow-operation-publish operation view entry anchor))
+                  (binding (fifth active)))
+             (ok (equal before (getf binding :before)))
+             (ok (equal before (getf binding :after)))
+             (ok (equal before (pg::physical-store-control-tuple store)))
+             (ok (null (getf binding :child-history)))
+             (ok (null (pg::physical-store-selection store)))
+             (ok (pg::physical-follow-check-active-state
+                  store (pg::physical-recovery-verify-base-state) active))
+             (pg::physical-store-input store 152
+                                       (pg::wal-encode-record pg::+wal-record-batch-start+ 0 152 (empty-octets)))
+             (pg::physical-store-input store 184 (legacy-checkpoint-record 184))
+             (pg::physical-store-flush store)
+             (ok (pg::physical-follow-check-active-state
+                  store (pg::physical-recovery-verify-base-state) active))
+             (let ((candidate (pg::physical-follow-copy-checked-store store)))
+               (setf (pg::physical-store-flushed-lsn candidate) 217
+                     (pg::physical-store-written-lsn candidate) 217)
+               (ok (handler-case
+                       (progn (pg::physical-follow-check-active-receive
+                               candidate (pg::physical-recovery-verify-base-state) binding)
+                              nil)
+                     (error (condition)
+                       (search "crossed its unselected child fork" (princ-to-string condition))))))))))
+     :applied 152 :system-id 42))
+
+(defun call-with-cached-child-follow-config (function &key compact)
+  (call-with-promotion-fixture
+   (lambda (root store)
+     (pg::wal-atomic-write-bytes (pg::clog-path) (empty-octets))
+     (pg::wal-atomic-write-bytes (merge-pathnames "PG_VERSION" root)
+                                 (pg::string->bytes (format nil "20~%")))
+     (when compact
+       (let ((initial (pg::physical-recovery-verify-base-state))
+             (control (pg::recovery-read-bytes (pg::physical-recovery-control-path root))))
+         (let ((frontier (follow-controller-test-advance store)))
+           (call-with-promotion-exclusion
+            (lambda () (pg::physical-store-compact store frontier #'pg::physical-restartpoint-publish))))
+         (pg::wal-atomic-write-bytes (pg::physical-recovery-control-path root) control)
+         (setf (getf pg::*physical-recovery-state* :required-applied) (getf initial :required-applied)
+               (getf pg::*physical-recovery-state* :required-timeline) (getf initial :required-timeline)
+               (getf pg::*physical-recovery-state* :observed-next-xid) (getf initial :observed-next-xid))))
+     (let* ((base (pg::physical-recovery-verify-base-state))
+            (pending (pg::physical-follow-with-controller
+                      (follow-pending-proof-config-for-store store base)
+                      (follow-controller-test-state)))
+            (fork (pg::physical-store-flushed-lsn store))
+            (eor (coerce (getf (getf (fifth pending) :anchor) :eor-octets)
+                         '(vector (unsigned-byte 8))))
+            (active nil))
+       (pg::physical-follow-save-config pending)
+       (setf active
+             (call-with-promotion-exclusion
+              (lambda () (pg::physical-follow-reconcile-pending-store store base pending))))
+       (pg::physical-store-input store fork eor)
+       (let ((next (+ fork (length eor))))
+         (pg::physical-store-input
+          store next (pg::wal-encode-record pg::+wal-record-commit+ 3 next
+                                            (pg::wal-encode-commit-timestamp 42))))
+       (pg::physical-store-flush store)
+       (funcall function root store active fork)))
+   :applied 152 :system-id 42))
+
+(deftest fixed-follow-active-admission-does-not-interpret-excluded-child-records
+    (call-with-cached-child-follow-config
+     (lambda (root store active fork)
+       (declare (ignore root))
+       (let* ((base (pg::physical-recovery-verify-base-state))
+              (policy (pg::physical-recovery-resolve-timeline-policy base store nil :current))
+              (before (list pg::*next-xid* pg::*last-replay-lsn*
+                            (pg::physical-store-control-tuple store))))
+         (call-with-promotion-exclusion
+          (lambda ()
+            (let ((result (pg::physical-follow-check-active-state store base active :policy policy)))
+              (ok (= fork (getf result :terminal)))
+              (ok (eq :timeline-target-reached (getf result :disposition))))
+            (let ((unbound (pg::physical-follow-check-unbound-state
+                            store base (list fork 1) :policy policy)))
+              (ok (= fork (getf unbound :terminal)))
+              (ok (eq :timeline-target-reached (getf unbound :disposition))))
+            (ok (signals (pg::physical-follow-check-unbound-state store base (list fork 1) :policy nil) 'error))
+            (ok (signals (pg::physical-follow-check-active-state store base active :policy nil) 'error))))
+         (ok (equal before (list pg::*next-xid* pg::*last-replay-lsn*
+                                 (pg::physical-store-control-tuple store)))))
+       (ok (not pg::*physical-recovery-failed-p*)))))
+
+(deftest fixed-follow-fence-preserves-required-xid-and-full-prefix-validation
+    (dolist (fault '(:required-xid :child-crc))
+      (call-with-cached-child-follow-config
+       (lambda (root store active fork)
+         (let* ((base (pg::physical-recovery-verify-base-state))
+                (policy (pg::physical-recovery-resolve-timeline-policy base store nil :current))
+                (path (if (eq fault :required-xid)
+                          (pg::physical-recovery-control-path root)
+                          (pg::physical-store-segment-path store 0 2)))
+                (original (pg::recovery-read-bytes path))
+                (visits 0)
+                (accept (symbol-function 'pg::physical-history-accept-record)))
+           (unwind-protect
+                (progn
+                  (if (eq fault :required-xid)
+                      (pg::physical-recovery-write-control base 2 fork (1+ (getf base :observed-next-xid)))
+                      (let ((corrupt (copy-seq original)))
+                        (setf (aref corrupt (1- (length corrupt)))
+                              (logxor 1 (aref corrupt (1- (length corrupt)))))
+                        (pg::wal-atomic-write-bytes path corrupt)
+                        (setf (symbol-function 'pg::physical-history-accept-record)
+                              (lambda (&rest arguments)
+                                (incf visits)
+                                (apply accept arguments)))))
+                  (call-with-promotion-exclusion
+                   (lambda ()
+                     (ok (handler-case
+                             (progn (pg::physical-follow-check-active-state store base active :policy policy) nil)
+                           (error (condition)
+                             (or (eq fault :child-crc)
+                                 (search "required XID visibility" (princ-to-string condition))))))))
+                  (when (eq fault :child-crc) (ok (zerop visits)))
+                  (ok (= fork pg::*last-replay-lsn*)))
+             (setf (symbol-function 'pg::physical-history-accept-record) accept)
+             (pg::wal-atomic-write-bytes path original)))))))
+
+(deftest fixed-follow-fence-validates-archived-required-and-restartpoint-visibility
+    (call-with-cached-child-follow-config
+     (lambda (root store active fork)
+       (declare (ignore root))
+       (let ((base (pg::physical-recovery-verify-base-state)))
+         (ok (< (getf base :required-applied) (pg::physical-store-floor-lsn store)))
+         (ok (= fork (pg::physical-store-floor-lsn store)))
+         (multiple-value-bind (metadata catalog prefix digest) (pg::physical-restartpoint-read base)
+           (declare (ignore catalog prefix digest))
+           (let ((policy (pg::physical-recovery-resolve-timeline-policy base store metadata :current)))
+             (call-with-promotion-exclusion
+              (lambda ()
+                (let ((result (pg::physical-follow-check-active-state store base active :policy policy)))
+                  (ok (= fork (getf result :terminal)))
+                  (ok (eq :timeline-target-reached (getf result :disposition)))
+                  (ok (= 71 (getf result :next-xid)))
+                  (ok (= (getf base :observed-next-xid) (getf result :required-next-xid))))))))))
+     :compact t))
+
+(deftest cold-fixed-follow-admission-latches-policy-before-semantic-scan
+    (dolist (unbound '(nil t))
+      (dolist (goal '(:current :latest))
+        (call-with-cached-child-follow-config
+         (lambda (root store active fork)
+           (declare (ignore active))
+           (when unbound
+             (pg::physical-follow-save-config
+              (pg::physical-follow-unattached-config-for-base (pg::physical-recovery-verify-base-state))))
+           (let ((control (pg::recovery-read-bytes (pg::physical-recovery-control-path root))))
+             (pg::physical-store-close store)
+             (sb-posix:rename (namestring (pg::physical-store-directory store))
+                              (namestring (pg::physical-recovery-spool-directory)))
+             (call-with-current-promotion-owner
+              (lambda ()
+                (let ((pg::*wal-ready* nil) (pg::*physical-receive-store* nil)
+                                            (pg::*physical-recovery-state* nil) (pg::*physical-follow-runtime* nil)
+                                            (pg::*physical-restartpoint-worker* nil)
+                                            (pg::*wal-checkpoint-snapshot* pg::*wal-checkpoint-snapshot*)
+                                            (pg::*wal-poisoned* pg::*wal-poisoned*)
+                                            (pg::*active-xids* pg::*active-xids*))
+                  (unwind-protect
+                       (if (eq goal :latest)
+                           (progn
+                             (ok (signals (pg::physical-recovery-prepare :timeline-goal goal) 'error))
+                             (ok (equalp control (pg::recovery-read-bytes
+                                                  (pg::physical-recovery-control-path root)))))
+                           (progn
+                             (pg::physical-recovery-prepare :timeline-goal goal)
+                             (ok (= 1 (getf (getf pg::*physical-recovery-state* :timeline-policy) :target)))
+                             (pg::physical-recovery-open-storage)
+                             (ok (= fork pg::*last-replay-lsn*))
+                             (ok (= 1 (pg::physical-recovery-replay-timeline)))
+                             (ok (not pg::*physical-recovery-failed-p*))))
+                    (when pg::*clog-stream* (close pg::*clog-stream*) (setf pg::*clog-stream* nil))
+                    (when pg::*physical-receive-store*
+                      (pg::physical-store-close pg::*physical-receive-store*))))))))))))
+
+(deftest cold-numeric-follow-policy-uses-checked-pending-history-before-publication
+    (call-with-promotion-fixture
+     (lambda (root store)
+       (pg::wal-atomic-write-bytes (pg::clog-path) (empty-octets))
+       (pg::wal-atomic-write-bytes (merge-pathnames "PG_VERSION" root)
+                                   (pg::string->bytes (format nil "20~%")))
+       (let* ((base (pg::physical-recovery-verify-base-state))
+              (pending (follow-pending-proof-config-for-store store base))
+              (fork (pg::physical-store-flushed-lsn store)))
+         (pg::physical-follow-save-config pending)
+         (ok (null (probe-file (pg::timeline-history-path 2 root))))
+         (pg::physical-store-close store)
+         (sb-posix:rename (namestring (pg::physical-store-directory store))
+                          (namestring (pg::physical-recovery-spool-directory)))
+         (call-with-current-promotion-owner
+          (lambda ()
+            (let ((pg::*wal-ready* nil) (pg::*physical-receive-store* nil)
+                                        (pg::*physical-recovery-state* nil) (pg::*physical-follow-runtime* nil)
+                                        (pg::*physical-restartpoint-worker* nil)
+                                        (pg::*wal-checkpoint-snapshot* pg::*wal-checkpoint-snapshot*)
+                                        (pg::*wal-poisoned* pg::*wal-poisoned*)
+                                        (pg::*active-xids* pg::*active-xids*))
+              (unwind-protect
+                   (progn
+                     (pg::physical-recovery-prepare :timeline-goal 2)
+                     (ok (= 2 (getf (getf pg::*physical-recovery-state* :timeline-policy) :target)))
+                     (ok (= 1 (getf (getf pg::*physical-recovery-state* :timeline-policy) :startup-anchor)))
+                     (ok (equal (list fork 1)
+                                (getf (getf pg::*physical-recovery-state* :timeline-policy) :original-required)))
+                     (ok (eq :active (getf (fifth (pg::physical-follow-read-config)) :phase)))
+                     (ok (probe-file (pg::timeline-history-path 2 root)))
+                     (pg::physical-recovery-open-storage)
+                     (ok (= 1 (pg::physical-recovery-replay-timeline)))
+                     (ok (= fork pg::*last-replay-lsn*)))
+                (when pg::*clog-stream* (close pg::*clog-stream*) (setf pg::*clog-stream* nil))
+                (when pg::*physical-receive-store*
+                  (pg::physical-store-close pg::*physical-receive-store*))))))))
+     :applied 152 :system-id 42))
+
 (defun follow-controller-test-view (fork)
   (let ((text (store-history-text 1 fork)))
     (list :parent 1 :source 2 :child 2 :fork fork :history-text text

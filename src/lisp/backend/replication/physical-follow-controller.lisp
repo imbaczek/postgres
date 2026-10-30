@@ -71,7 +71,7 @@ reload exclusion and live-operation quiescence."
   (physical-follow-call-with-receive-root
    *physical-receive-store* (lambda () (physical-follow-controller-snapshot-under-lease view))))
 
-(defun physical-follow-check-unbound-state (store base applied)
+(defun physical-follow-check-unbound-state (store base applied &key (policy (getf *physical-recovery-state* :timeline-policy)))
   "Validate an unbound receive store and replay prefix against the verified base.
 The caller excludes mutation; the scan protects retained data with a root lease."
   (physical-follow-call-with-receive-root
@@ -89,7 +89,7 @@ The caller excludes mutation; the scan protects retained data with a root lease.
          (error "current receiver differs from its immutable base"))
        (physical-store-validate-prefix candidate)
        (physical-follow-scan-current-state
-        candidate base applied required control (physical-follow-controller-index candidate) nil)))))
+        candidate base applied required control (physical-follow-controller-index candidate) nil policy)))))
 
 (defun physical-follow-controller-check-current (config)
   "Validate the current recovery and receive state before restoring its receiver.
@@ -162,6 +162,8 @@ The receive timeline can differ from the applied replay timeline."
                   :overlap-digest
                   (physical-store-update-digest
                    #xCBF29CE484222325 (physical-follow-overlap-bytes-under-lock store base index cursor)))))
+    (when (eq :retained-timeline (getf view :proof-kind))
+      (setf coordinates (physical-follow-request-copy (append '(:kind :retained-timeline) coordinates))))
     (multiple-value-bind (metadata catalog prefix digest) (physical-restartpoint-read base)
       (declare (ignore catalog prefix))
       (list :base base :before before :applied applied :required required :coordinates coordinates
@@ -175,7 +177,7 @@ The receive timeline can differ from the applied replay timeline."
   "Build a binding; same-timeline follow keeps the entire receive tuple."
   (let* ((before (getf snapshot :before)) (fork (getf view :fork))
                                           (after
-                                            (if (or (eq :same-timeline (physical-follow-anchor-kind anchor))
+                                            (if (or (member (physical-follow-anchor-kind anchor) '(:same-timeline :retained-timeline))
                                                     (< (fourth before) fork))
                                                 (copy-list before)
                                                 (sb-thread:with-mutex ((physical-store-mutex *physical-receive-store*))
@@ -309,7 +311,24 @@ base provenance is removed; it does not identify a cleanup endpoint."
                 :retained-directory (physical-recovery-retained-directory))))
     (unwind-protect (funcall function store) (physical-store-close store))))
 
-(defun physical-follow-prepare-startup (base)
+(defun physical-follow-call-with-startup-candidate (base function)
+  (physical-follow-call-with-offline-store
+   base
+   (lambda (store)
+     (let ((config (when (probe-file (physical-follow-config-path))
+                     (physical-follow-read-config))))
+       (if (and (fifth config) (eq :pending (getf (fifth config) :phase)))
+           (sb-thread:with-mutex (*physical-follow-command-lock*)
+             (sb-thread:with-mutex (*reload-run-lock*)
+               (with-live-operation-quiescence
+                 (physical-follow-call-with-receive-root
+                  store
+                  (lambda ()
+                    (let ((candidate (physical-follow-check-pending-state store base config)))
+                      (funcall function candidate)))))))
+           (funcall function store))))))
+
+(defun physical-follow-prepare-startup (base &key (policy (getf base :timeline-policy)))
   "Under cold PGDATA ownership, queue unfinished preparation and reconcile pending
 state before validating an active binding. For an unattached standby, validate
 the unowned base reference and unbound store before recovery control publication
@@ -328,10 +347,10 @@ Protect the store and retained root."
                (when (physical-follow-unattached-p config)
                  (physical-follow-check-unbound-state
                   store base (list (getf base :required-applied)
-                                   (getf base :required-timeline))))
+                                   (getf base :required-timeline)) :policy policy))
                (when (getf (physical-follow-controller-state config) :preparing)
                  (when (fifth config)
-                   (physical-follow-check-active-state store base config))
+                   (physical-follow-check-active-state store base config :policy policy))
                  (let ((next (physical-follow-abandon-preparation-config config)))
                    (physical-follow-save-config next)
                    (unless (equal next (physical-follow-read-config))
@@ -340,7 +359,7 @@ Protect the store and retained root."
                (when (and (fifth config) (eq :pending (getf (fifth config) :phase)))
                  (setf config (physical-follow-reconcile-pending-store store base config)))
                (when (fifth config)
-                 (physical-follow-check-active-state store base config))
+                 (physical-follow-check-active-state store base config :policy policy))
                config))))))))
 
 (defun physical-follow-check-startup-admission (state)
