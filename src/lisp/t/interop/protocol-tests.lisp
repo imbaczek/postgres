@@ -6,6 +6,44 @@
 (defun octets (values)
   (make-array (length values) :element-type '(unsigned-byte 8) :initial-contents values))
 
+(defun test-row-equal-p (left right)
+  "Compare nested row values with case-sensitive strings.
+Preserve EQUALP's numeric comparison while descending into SQL value wrappers."
+  (cond ((or (pg::sql-array-p left) (pg::sql-array-p right))
+         (and (pg::sql-array-p left) (pg::sql-array-p right)
+              (equalp (pg::sql-array-element-type-id left) (pg::sql-array-element-type-id right))
+              (equalp (pg::sql-array-dimensions left) (pg::sql-array-dimensions right))
+              (equalp (pg::sql-array-lower-bounds left) (pg::sql-array-lower-bounds right))
+              (test-row-equal-p (pg::sql-array-elements left) (pg::sql-array-elements right))))
+        ((or (pg::sql-record-p left) (pg::sql-record-p right))
+         (and (pg::sql-record-p left) (pg::sql-record-p right)
+              (test-row-equal-p (pg::sql-record-fields left) (pg::sql-record-fields right))
+              (test-row-equal-p (pg::sql-record-values left) (pg::sql-record-values right))))
+        ((or (pg::sql-jsonb-p left) (pg::sql-jsonb-p right))
+         (and (pg::sql-jsonb-p left) (pg::sql-jsonb-p right)
+              (test-row-equal-p (pg::sql-jsonb-value left) (pg::sql-jsonb-value right))))
+        ((or (stringp left) (stringp right))
+         (and (stringp left) (stringp right) (string= left right)))
+        ((or (consp left) (consp right))
+         (and (consp left) (consp right)
+              (test-row-equal-p (car left) (car right))
+              (test-row-equal-p (cdr left) (cdr right))))
+        ((or (vectorp left) (vectorp right))
+         (and (vectorp left) (vectorp right) (= (length left) (length right))
+              (loop for a across left for b across right always (test-row-equal-p a b))))
+        (t (equalp left right))))
+
+(deftest row-comparison-preserves-string-case
+    (ok (test-row-equal-p (list (vector "A" #(1 "b"))) (list (vector "A" #(1.0 "b")))))
+  (ok (not (test-row-equal-p (list (vector "A")) (list (vector "a")))))
+  (ok (not (test-row-equal-p (list (vector #(1 "A"))) (list (vector #(1 "a"))))))
+  (ok (not (test-row-equal-p (list (vector (text-array '("A"))))
+                             (list (vector (text-array '("a")))))))
+  (ok (not (test-row-equal-p (pg::make-sql-record :fields '(("x" :text)) :values #("A"))
+                             (pg::make-sql-record :fields '(("x" :text)) :values #("a")))))
+  (ok (not (test-row-equal-p (pg::make-sql-jsonb '(:object ("k" . "A")))
+                             (pg::make-sql-jsonb '(:object ("k" . "a")))))))
+
 (defun text-array (elements)
   "Build an expected one-dimensional SQL text array with PostgreSQL bounds."
   (pg::make-sql-array :element-type-id :text :elements (coerce elements 'vector)
@@ -404,15 +442,15 @@
              (pg::make-pg-index :oid 203 :name "alpha_pkey" :table-oid 201)
              (gethash "catalog_counter" (pg::database-sequences database))
              (pg::make-pg-sequence :oid 210 :name "catalog_counter"))
-       (ok (equalp '(#(11 "pg_catalog") #(99 "pg_toast") #(2200 "public"))
-                   (derived-query-rows "SELECT oid,nspname FROM pg_catalog.pg_namespace ORDER BY oid")))
-       (ok (equalp (list (vector "alpha" (char-code #\r))
-                         (vector "alpha_pkey" (char-code #\i))
-                         (vector "beta" (char-code #\r))
-                         (vector "catalog_counter" (char-code #\S)))
-                   (derived-query-rows
-                    "SELECT c.relname,c.relkind FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='public' ORDER BY c.relname")))
-       (ok (equalp '(#(201)) (derived-query-rows "SELECT oid FROM pg_class WHERE relname='alpha'")))
+       (ok (test-row-equal-p '(#(11 "pg_catalog") #(99 "pg_toast") #(2200 "public"))
+                             (derived-query-rows "SELECT oid,nspname FROM pg_catalog.pg_namespace ORDER BY oid")))
+       (ok (test-row-equal-p (list (vector "alpha" (char-code #\r))
+                                   (vector "alpha_pkey" (char-code #\i))
+                                   (vector "beta" (char-code #\r))
+                                   (vector "catalog_counter" (char-code #\S)))
+                             (derived-query-rows
+                              "SELECT c.relname,c.relkind FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='public' ORDER BY c.relname")))
+       (ok (test-row-equal-p '(#(201)) (derived-query-rows "SELECT oid FROM pg_class WHERE relname='alpha'")))
        (remhash "alpha_pkey" (pg::database-indexes database))
        (ok (null (derived-query-rows "SELECT relname FROM pg_class WHERE relname='alpha_pkey'"))))))
 
@@ -423,14 +461,14 @@
          (setf (gethash "catalog_counter" (pg::database-sequences database))
                (pg::make-pg-sequence :oid 210 :name "catalog_counter")
                (pg::pg-publication-sequences publication) :all)
-         (ok (equalp '(#("q" "public" "catalog_counter"))
-                     (derived-query-rows "SELECT pubname,schemaname,sequencename FROM pg_publication_sequences")))
+         (ok (test-row-equal-p '(#("q" "public" "catalog_counter"))
+                               (derived-query-rows "SELECT pubname,schemaname,sequencename FROM pg_publication_sequences")))
          (setf (gethash "later_counter" (pg::database-sequences database))
                (pg::make-pg-sequence :oid 211 :name "later_counter"))
          (ok (= 2 (length (derived-query-rows "SELECT sequencename FROM pg_publication_sequences"))))
          (remhash "catalog_counter" (pg::database-sequences database))
-         (ok (equalp '(#("later_counter"))
-                     (derived-query-rows "SELECT sequencename FROM pg_publication_sequences")))))))
+         (ok (test-row-equal-p '(#("later_counter"))
+                               (derived-query-rows "SELECT sequencename FROM pg_publication_sequences")))))))
 
 (deftest discovery-catalog-result-origins
     (call-with-publication-srf-fixture
@@ -456,14 +494,14 @@
                       "SELECT oid FROM pg_namespace WHERE oid IN (11,12)"
                       "SELECT oid FROM pg_namespace WHERE oid IN (11)"
                       "SELECT oid FROM pg_namespace WHERE oid=11::bigint"))
-         (ok (equalp '(#(11)) (derived-query-rows sql)) sql))
-       (ok (equalp '(#(11) #(2200))
-                   (derived-query-rows "SELECT oid FROM pg_namespace WHERE oid IN (11,2200) ORDER BY oid")))
+         (ok (test-row-equal-p '(#(11)) (derived-query-rows sql)) sql))
+       (ok (test-row-equal-p '(#(11) #(2200))
+                             (derived-query-rows "SELECT oid FROM pg_namespace WHERE oid IN (11,2200) ORDER BY oid")))
        (ok (null (derived-query-rows "SELECT oid FROM pg_namespace WHERE oid=-1"))))))
 
 (deftest catalog-oid-explicit-casts
-    (ok (equalp '(#(11 4294967295 -1 4294967295 4294967295))
-                (derived-query-rows "SELECT 11::oid,'-1'::oid,'4294967295'::oid::int4,'4294967295'::oid::bigint,(-1::int4)::oid")))
+    (ok (test-row-equal-p '(#(11 4294967295 -1 4294967295 4294967295))
+                          (derived-query-rows "SELECT 11::oid,'-1'::oid,'4294967295'::oid::int4,'4294967295'::oid::bigint,(-1::int4)::oid")))
   (dolist (case '(("SELECT (-1::bigint)::oid" "22003")
                   ("SELECT true::oid" "42846")
                   ("SELECT 1::oid+1" "42883")
@@ -482,8 +520,8 @@
       (ok (equal (loop for n from 1 to 23 collect n)
                  (mapcar #'fourth (getf (pg::sql-system-relation-definition "pg_replication_slots") :fields))))
       (ok (= -1 (pg::compare-3way restart (pg::sql-pg-lsn-input "10/0")))))
-  (ok (equalp '(#(t)) (derived-query-rows "SELECT 'F/FFFFFFFF'::pg_lsn<'10/0'::pg_lsn")))
-  (ok (equalp '(#("0/00000001")) (derived-query-rows "SELECT '0/1'::pg_lsn::text")))
+  (ok (test-row-equal-p '(#(t)) (derived-query-rows "SELECT 'F/FFFFFFFF'::pg_lsn<'10/0'::pg_lsn")))
+  (ok (test-row-equal-p '(#("0/00000001")) (derived-query-rows "SELECT '0/1'::pg_lsn::text")))
   (dolist (text '(" 0/1" "+0/1" "0x1/1" "000000000/1" "0/1 " "١/1"))
     (ok (equal "22P02" (sqlstate-of (pg::sql-pg-lsn-input text))))))
 
@@ -494,9 +532,9 @@
       (ok (equal '(("oid" :oid t 1) ("datname" :name t 2)) database-fields))))
 
 (deftest star-expansion-keeps-merged-join-expressions
-    (ok (equalp '(#(1) #(2))
-                (derived-query-rows
-                 "SELECT * FROM (SELECT 1 AS id) a FULL JOIN (SELECT 2 AS id) b USING (id) ORDER BY id")))
+    (ok (test-row-equal-p '(#(1) #(2))
+                          (derived-query-rows
+                           "SELECT * FROM (SELECT 1 AS id) a FULL JOIN (SELECT 2 AS id) b USING (id) ORDER BY id")))
   (ok (equal "42702" (sqlstate-of (derived-query-rows
                                    "SELECT id,a.id,b.id FROM (SELECT 1 AS id) a FULL JOIN (SELECT 2 AS id) b USING (id) ORDER BY id")))))
 
@@ -504,18 +542,18 @@
     (call-with-publication-srf-fixture
      (lambda (database)
        (declare (ignore database))
-       (ok (equalp (list (vector 101 201 #(1 2) pg::+null+)
-                         (vector 101 202 #(1) pg::+null+))
-                   (derived-query-rows "SELECT (pg_get_publication_tables('p')).*")))
-       (ok (equalp (list (vector 9 #(1 2)) (vector 9 #(1)))
-                   (derived-query-rows "SELECT 9, (pg_get_publication_tables('p')).attrs")))
-       (ok (equalp (list #(201 201) (vector 202 pg::+null+))
-                   (derived-query-rows "SELECT (pg_get_publication_tables('p')).relid, (pg_get_publication_tables('q')).relid")))
+       (ok (test-row-equal-p (list (vector 101 201 #(1 2) pg::+null+)
+                                   (vector 101 202 #(1) pg::+null+))
+                             (derived-query-rows "SELECT (pg_get_publication_tables('p')).*")))
+       (ok (test-row-equal-p (list (vector 9 #(1 2)) (vector 9 #(1)))
+                             (derived-query-rows "SELECT 9, (pg_get_publication_tables('p')).attrs")))
+       (ok (test-row-equal-p (list #(201 201) (vector 202 pg::+null+))
+                             (derived-query-rows "SELECT (pg_get_publication_tables('p')).relid, (pg_get_publication_tables('q')).relid")))
        (ok (= 4 (length (derived-query-rows "SELECT (pg_get_publication_tables('p','p')).*"))))
        (ok (= 1 (length (derived-query-rows "SELECT (pg_get_publication_tables('p')).* LIMIT 1"))))
        (ok (null (derived-query-rows "SELECT (pg_get_publication_tables(VARIADIC NULL)).*")))
-       (ok (equalp '(#(201) #(202))
-                   (derived-query-rows "SELECT (pg_get_publication_tables('all')).relid"))))))
+       (ok (test-row-equal-p '(#(201) #(202))
+                             (derived-query-rows "SELECT (pg_get_publication_tables('all')).relid"))))))
 
 (deftest publication-srf-record-distinct-and-sort
     (call-with-publication-srf-fixture
@@ -681,28 +719,28 @@
         (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))
 
 (deftest array-aggregate-scalar-and-empty
-    (ok (equalp (list (vector (text-array '("x")))) (derived-query-rows "SELECT array_agg('x'::text)")))
-  (ok (equalp (list (vector (text-array (list pg::+null+))))
-              (derived-query-rows "SELECT array_agg(NULL::text)")))
-  (ok (equalp (list (vector pg::+null+ 0))
-              (derived-query-rows "SELECT array_agg('x'::text), COUNT(*) WHERE false")))
-  (ok (equalp '(#("1" 2))
-              (derived-query-rows "SELECT CAST(COUNT(*) AS text), COUNT(*) + COUNT(*)")))
-  (ok (equalp '(#(3))
-              (derived-query-rows "SELECT length(CAST(array_agg('x'::text) AS text))"))))
+    (ok (test-row-equal-p (list (vector (text-array '("x")))) (derived-query-rows "SELECT array_agg('x'::text)")))
+  (ok (test-row-equal-p (list (vector (text-array (list pg::+null+))))
+                        (derived-query-rows "SELECT array_agg(NULL::text)")))
+  (ok (test-row-equal-p (list (vector pg::+null+ 0))
+                        (derived-query-rows "SELECT array_agg('x'::text), COUNT(*) WHERE false")))
+  (ok (test-row-equal-p '(#("1" 2))
+                        (derived-query-rows "SELECT CAST(COUNT(*) AS text), COUNT(*) + COUNT(*)")))
+  (ok (test-row-equal-p '(#(3))
+                        (derived-query-rows "SELECT length(CAST(array_agg('x'::text) AS text))"))))
 
 (deftest aggregates-in-order-by
-    (ok (equalp '(#(1)) (derived-query-rows "SELECT 1 ORDER BY array_agg('x'::text)")))
-  (ok (equalp '(#(1)) (derived-query-rows "SELECT COUNT(*) ORDER BY array_agg('x'::text)")))
+    (ok (test-row-equal-p '(#(1)) (derived-query-rows "SELECT 1 ORDER BY array_agg('x'::text)")))
+  (ok (test-row-equal-p '(#(1)) (derived-query-rows "SELECT COUNT(*) ORDER BY array_agg('x'::text)")))
   (ok (equal "42P10" (sqlstate-of (derived-query-rows "SELECT DISTINCT 1 ORDER BY COUNT(*)")))))
 
 (deftest distinct-aggregate-order-reuses-selected-values
-    (ok (equalp '(#(1)) (derived-query-rows "SELECT DISTINCT COUNT(*) ORDER BY COUNT(*)")))
+    (ok (test-row-equal-p '(#(1)) (derived-query-rows "SELECT DISTINCT COUNT(*) ORDER BY COUNT(*)")))
   (dolist (sql '("SELECT DISTINCT array_agg('x'::text) ORDER BY array_agg('x'::text)"
                  "SELECT DISTINCT array_agg('x'::text) ORDER BY pg_catalog.array_agg('x'::text)"))
-    (ok (equalp (list (vector (text-array '("x")))) (derived-query-rows sql))))
-  (ok (equalp (list (vector (text-array '("x")) (text-array (list pg::+null+))))
-              (derived-query-rows "SELECT array_agg('x'::text),array_agg(NULL::text)"))))
+    (ok (test-row-equal-p (list (vector (text-array '("x")))) (derived-query-rows sql))))
+  (ok (test-row-equal-p (list (vector (text-array '("x")) (text-array (list pg::+null+))))
+                        (derived-query-rows "SELECT array_agg('x'::text),array_agg(NULL::text)"))))
 
 (deftest array-invalid-operators
     (dolist (sql '("SELECT length(array_agg('x'::text))"
@@ -738,7 +776,7 @@
                    "SELECT 'x'::\"char\" = 'x'"
                    "SELECT 'x'::\"char\" = 'x'::text"
                    "SELECT 'x'::\"char\" = 'x'::name"))
-      (ok (equalp '(#(t)) (derived-query-rows sql))))
+      (ok (test-row-equal-p '(#(t)) (derived-query-rows sql))))
   (dolist (sql '("SELECT 'x'::\"char\" > 0"
                  "SELECT '1 2'::int2vector = '1 2'::text"
                  "SELECT 'x'::\"char\" + 1"))
@@ -767,7 +805,7 @@
       (ok (eq :cast (first (first (third (first (third expression))))))))
   (ok (equal "42601" (sqlstate-of (pg::parse-statements "SELECT f(VARIADIC x, 1)"))))
   ;; C clears the marker when an exact nonvariadic signature matches.
-  (ok (equalp '(#(1)) (derived-query-rows "SELECT length(VARIADIC 'x')"))))
+  (ok (test-row-equal-p '(#(1)) (derived-query-rows "SELECT length(VARIADIC 'x')"))))
 
 (deftest cast-unknown-literal-is-analyzed
     (ok (equal "22P02" (sqlstate-of (pg::prepare-select
@@ -785,7 +823,7 @@
                     ("SELECT 'abcdefgh'::varchar(3)" "abc")
                     ("SELECT 'S'::\"char\"" 83)
                     ("SELECT '-128'::int4::\"char\"::int4" -128)))
-      (ok (equalp (list (vector (second case))) (derived-query-rows (first case))))))
+      (ok (test-row-equal-p (list (vector (second case))) (derived-query-rows (first case))))))
 
 (deftest expression-cast-errors
     (dolist (case '(("SELECT 9223372036854775808::int8" "22003")
@@ -815,11 +853,11 @@
         (ok (= (third case) (pg::result-column-typlen column)))
         (ok (= (fourth case) (pg::result-column-typmod column)))
         (ok (string= (fifth case) (pg::result-column-name column)))))
-  (ok (equalp (list (vector pg::+null+)) (derived-query-rows "SELECT NULL::int2vector"))))
+  (ok (test-row-equal-p (list (vector pg::+null+)) (derived-query-rows "SELECT NULL::int2vector"))))
 
 (deftest expression-cast-vector-and-char-io
-    (ok (equalp '(#(#(1 2 -3))) (derived-query-rows "SELECT '1 2 -3'::int2vector")))
-  (ok (equalp '(#("1 2 -3")) (derived-query-rows "SELECT '1 2 -3'::int2vector::text")))
+    (ok (test-row-equal-p '(#(#(1 2 -3))) (derived-query-rows "SELECT '1 2 -3'::int2vector")))
+  (ok (test-row-equal-p '(#("1 2 -3")) (derived-query-rows "SELECT '1 2 -3'::int2vector::text")))
   (ok (= 255 (pg::sql-char-input (concatenate 'string (string (code-char 92)) "377"))))
   (ok (string= (concatenate 'string (string (code-char 92)) "303")
                (pg::sql-char-output (pg::sql-char-input "é"))))
@@ -842,15 +880,15 @@
                     ("SELECT * FROM (SELECT 2 AS id UNION ALL SELECT 1) AS u ORDER BY id" (#(1) #(2)))
                     ("(SELECT 2 ORDER BY 1 LIMIT 0) UNION ALL SELECT 1" (#(1)))
                     ("SELECT 2 UNION ALL (SELECT 1 UNION ALL SELECT 3 ORDER BY 1 LIMIT 1) ORDER BY 1" (#(1) #(2)))))
-      (ok (equalp (second case) (derived-query-rows (first case))) (first case))))
+      (ok (test-row-equal-p (second case) (derived-query-rows (first case))) (first case))))
 
 (deftest union-all-types-and-errors
-    (ok (equalp '(#(1) #(2)) (derived-query-rows "SELECT '1' UNION ALL SELECT 2")))
-  (ok (equalp '(#(1) #(2)) (derived-query-rows "SELECT 1 UNION SELECT 1 UNION SELECT 2 ORDER BY 1")))
-  (ok (equalp (list (vector pg::+null+)) (derived-query-rows "SELECT NULL UNION SELECT NULL")))
-  (ok (equalp '(#("A") #("a")) (derived-query-rows "SELECT 'a' UNION SELECT 'A' ORDER BY 1")))
-  (ok (equalp (list (vector pg::+null+) #(2))
-              (derived-query-rows "SELECT NULL UNION ALL SELECT 2")))
+    (ok (test-row-equal-p '(#(1) #(2)) (derived-query-rows "SELECT '1' UNION ALL SELECT 2")))
+  (ok (test-row-equal-p '(#(1) #(2)) (derived-query-rows "SELECT 1 UNION SELECT 1 UNION SELECT 2 ORDER BY 1")))
+  (ok (test-row-equal-p (list (vector pg::+null+)) (derived-query-rows "SELECT NULL UNION SELECT NULL")))
+  (ok (test-row-equal-p '(#("A") #("a")) (derived-query-rows "SELECT 'a' UNION SELECT 'A' ORDER BY 1")))
+  (ok (test-row-equal-p (list (vector pg::+null+) #(2))
+                        (derived-query-rows "SELECT NULL UNION ALL SELECT 2")))
   (dolist (case '(("SELECT 1 UNION ALL SELECT 1,2" "42601")
                   ("SELECT 1 UNION ALL SELECT true" "42804")
                   ("SELECT NULL UNION ALL SELECT NULL UNION ALL SELECT 1" "42804")
@@ -879,8 +917,8 @@
               (dolist (memory '(1048576 1))
                 (let ((pg::*query-temp-directory* directory)
                       (pg::*query-work-memory-bytes* memory))
-                  (ok (equalp '(#("q") #("q") #("p") #("p") #("all") #("all"))
-                              (derived-query-rows sql)))
+                  (ok (test-row-equal-p '(#("q") #("q") #("p") #("p") #("all") #("all"))
+                                        (derived-query-rows sql)))
                   (ok (null (uiop:directory-files directory)))))
            (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))))
 
@@ -897,13 +935,13 @@
                    "SELECT a FROM (SELECT 7 AS a)"
                    "SELECT d.a FROM (SELECT q.a FROM (SELECT 7 AS a) q) d"
                    "SELECT DISTINCT q.a FROM (SELECT 7 AS a) q ORDER BY q.a LIMIT 1"))
-      (ok (equalp '(#(7)) (derived-query-rows sql))))
-  (ok (equalp '(#(7 8))
-              (derived-query-rows "SELECT q.a, r.b FROM (SELECT 7 AS a) q JOIN (SELECT 8 AS b) r ON q.a < r.b")))
-  (ok (equalp (list (vector 7 pg::+null+))
-              (derived-query-rows "SELECT q.a, r.b FROM (SELECT 7 AS a) q LEFT JOIN (SELECT 8 AS b) r ON q.a = r.b")))
-  (ok (equalp '(#(7 8))
-              (derived-query-rows "SELECT a,b FROM (SELECT 7 AS a) CROSS JOIN (SELECT 8 AS b)")))
+      (ok (test-row-equal-p '(#(7)) (derived-query-rows sql))))
+  (ok (test-row-equal-p '(#(7 8))
+                        (derived-query-rows "SELECT q.a, r.b FROM (SELECT 7 AS a) q JOIN (SELECT 8 AS b) r ON q.a < r.b")))
+  (ok (test-row-equal-p (list (vector 7 pg::+null+))
+                        (derived-query-rows "SELECT q.a, r.b FROM (SELECT 7 AS a) q LEFT JOIN (SELECT 8 AS b) r ON q.a = r.b")))
+  (ok (test-row-equal-p '(#(7 8))
+                        (derived-query-rows "SELECT a,b FROM (SELECT 7 AS a) CROSS JOIN (SELECT 8 AS b)")))
   (ok (null (derived-query-rows "SELECT q.a FROM (SELECT 7 AS a WHERE false) q"))))
 
 (deftest derived-select-namespace-errors

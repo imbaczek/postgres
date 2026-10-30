@@ -9,9 +9,9 @@
                        ("SELECT 'x'||'0/1'::pg_lsn" "x0/00000001")
                        ("SELECT 'λ'||'🙂'" "λ🙂")
                        ("SELECT 'x'||'λ'::name" "xλ")))
-      (ok (equalp (list (vector (second example))) (derived-query-rows (first example)))))
-  (ok (equalp (list (vector pg::+null+)) (derived-query-rows "SELECT NULL||'x'")))
-  (ok (equalp '(#(t)) (derived-query-rows "SELECT 'x'||1+2 = 'x3'")))
+      (ok (test-row-equal-p (list (vector (second example))) (derived-query-rows (first example)))))
+  (ok (test-row-equal-p (list (vector pg::+null+)) (derived-query-rows "SELECT NULL||'x'")))
+  (ok (test-row-equal-p '(#(t)) (derived-query-rows "SELECT 'x'||1+2 = 'x3'")))
   (ok (equal "42883" (sqlstate-of (derived-query-rows "SELECT 1||2")))))
 
 (deftest substr-adjusts-negative-start-and-counts-characters
@@ -27,7 +27,7 @@
                        ("SELECT substr('abc',-2147483648,2147483647)" "")
                        ("SELECT substr('abc','2','1')" "b")
                        ("SELECT substr('abc',2::smallint,1::smallint)" "b")))
-      (ok (equalp (list (vector (second example))) (derived-query-rows (first example))))))
+      (ok (test-row-equal-p (list (vector (second example))) (derived-query-rows (first example))))))
 
 (deftest string-expressions-preserve-integer-arithmetic-errors
     (dolist (sql '("SELECT substr('abc',2147483647+1)"
@@ -36,14 +36,14 @@
                    "SELECT -('-2147483648'::int)"
                    "SELECT -2147483648 / -1"))
       (ok (equal "22003" (sqlstate-of (derived-query-rows sql)))))
-  (ok (equalp '(#("x-1")) (derived-query-rows "SELECT 'x'||(-5 % 2)")))
-  (ok (equalp '(#(1 -1)) (derived-query-rows "SELECT 5 % -2, -5 % -2")))
+  (ok (test-row-equal-p '(#("x-1")) (derived-query-rows "SELECT 'x'||(-5 % 2)")))
+  (ok (test-row-equal-p '(#(1 -1)) (derived-query-rows "SELECT 5 % -2, -5 % -2")))
   (ok (equal "0A000" (sqlstate-of (derived-query-rows "SELECT '{}'::text[]||'x'")))))
 
 (deftest substr-strict-null-overload-and-error-contract
     (dolist (sql '("SELECT substr(NULL,1,-1)" "SELECT substr('a',NULL)"
                    "SELECT substr('a',1,NULL)"))
-      (ok (equalp (list (vector pg::+null+)) (derived-query-rows sql))))
+      (ok (test-row-equal-p (list (vector pg::+null+)) (derived-query-rows sql))))
   (dolist (example '(("SELECT substr('a',1,-1)" "22011")
                      ("SELECT substr(1,1)" "42883")
                      ("SELECT substr('a',1::bigint)" "42883")
@@ -58,8 +58,8 @@
       (ok (= 25 (pg::result-column-type-oid column)))
       (ok (= -1 (pg::result-column-typlen column)))
       (ok (string= "substr" (pg::result-column-name column))))
-  (ok (equalp '(#("x00000001"))
-              (derived-query-rows "SELECT 'x'||pg_catalog.substr('000000010000000000000001',1,8)"))))
+  (ok (test-row-equal-p '(#("x00000001"))
+                        (derived-query-rows "SELECT 'x'||pg_catalog.substr('000000010000000000000001',1,8)"))))
 
 (cl-spec:defproperty substr-partitions-characters-without-loss
     ((size (range integer 0 128)) (position (range integer 0 256)))
