@@ -319,11 +319,161 @@
                           (rove:ok (equalp (car row) (vector #(2 3) 2)))
                           (rove:ok (= full-fetches (+ before 2)))
                           (rove:ok (equal slice-ids '(102 102))))
-                     (close-sql-iterator iterator))))))
+                     (close-sql-iterator iterator)))))
+             ;; Demand for a deferred expression includes its TOAST argument
+             ;; even though the volatile call itself happens after the sort.
+             (let* ((*query-work-memory-bytes* 1)
+                    (*query-temp-directory* (uiop:temporary-directory))
+                    (volatile '(:func "nextval" ((:col 2 :type :bytea)) :type :int8))
+                    (old-eval (symbol-function 'eval-expr))
+                    (calls 0)
+                    (before full-fetches)
+                    (project (list :project (list (list :expr volatile)) scan))
+                    (physical (list :sort (list (cons '(:col 1 :type :int4) nil)) project)))
+               (unwind-protect
+                    (progn
+                      (setf (symbol-function 'eval-expr)
+                            (lambda (expression environment)
+                              (if (eq expression volatile)
+                                  (progn (incf calls) (length (aref environment 1)))
+                                  (funcall old-eval expression environment))))
+                      (with-query-temp-files
+                        (let ((iterator (make-resumable-query-plan-iterator
+                                         (%make-query-plan :physical physical) relations)))
+                          (unwind-protect
+                               (multiple-value-bind (row present) (sql-iterator-next iterator)
+                                 (rove:ok present)
+                                 (rove:ok (equalp (car row) #(4)))
+                                 (rove:ok (= calls 1))
+                                 (rove:ok (= full-fetches (+ before 2))))
+                            (close-sql-iterator iterator)))))
+                 (setf (symbol-function 'eval-expr) old-eval))))
         (setf (symbol-function 'buf-read) old-read
               (symbol-function 'buf-nblocks) old-count
               (symbol-function 'toast-fetch-value-slice) old-slice
               (symbol-function 'toast-fetch-value) old-fetch))))
+
+(cl-spec:defgenerator sort-projection-expression-arguments ()
+  (list (nth (random 7)
+             '((:func "nextval" ((:const "s")))
+               (:func "random" nil)
+               (:binop "+" (:col 1) (:func "nextval" ((:const "s"))))
+               (:func "current_setting" ((:const "application_name")))
+               (:binop "/" (:const 1) (:col 1))
+               (:subplan (:func "nextval" ((:const "s"))))
+               (:func "unknown_function" nil)))))
+
+(cl-spec:defspec-function sort-projection-volatile-p
+  "Known volatile calls and SubPlan tests may move; nested plans remain opaque."
+  (:args (expression (type list)))
+  (:args-generator sort-projection-expression-arguments)
+  (:returns (type boolean))
+  (:post (eql result
+              (not (null (member expression
+                                 '((:func "nextval" ((:const "s")))
+                                   (:func "random" nil)
+                                   (:binop "+" (:col 1) (:func "nextval" ((:const "s")))))
+                                 :test #'equal))))))
+
+(cl-spec:defproperty sort-projection-nested-volatile-call
+    ((depth (range integer 0 20)))
+  (:about sort-projection-volatile-p)
+  (:trials (:normal 100))
+  (let ((expression '(:func "nextval" ((:const "s")))))
+    (dotimes (i depth) (setf expression (list :cast expression :type :text)))
+    (and (sort-projection-volatile-p expression)
+         (not (sort-projection-volatile-p (list :subplan expression))))))
+
+(rove:deftest test-sort-projection-subplan-volatility
+    (let* ((volatile '(:func "nextval" ((:const "s"))))
+           (quantified (make-sql-subplan :kind :any :test
+                                         (list :binop "=" volatile '(:subquery-output))))
+           (nested (make-sql-subplan :kind :scalar :prepared
+                                     (list :targets (list (list :expr volatile))))))
+      (rove:ok (sort-projection-volatile-p (list :subplan quantified)))
+      (rove:ok (not (sort-projection-volatile-p (list :subplan nested))))))
+
+(rove:deftest test-resumable-sort-defers-volatile-projection
+    (let* ((*query-temp-directory* (uiop:temporary-directory))
+           (*query-work-memory-bytes* 1)
+           (*datum-origin-capture* nil)
+           (table (make-pg-class :oid 42 :name "sorted" :columns
+                                 (vector (make-pg-column :name "id" :type :int4 :attnum 1))))
+           (relations (list (list :table table :row-source
+                                  (lambda () (list #(3) #(1) #(2))))))
+           (scan '(:seq-scan 0 42))
+           (volatile '(:func "nextval" ((:const "s")) :type :int8))
+           (stable '(:func "current_setting" ((:const "application_name")) :type :text))
+           (stable-value "before")
+           (stable-calls 0)
+           (targets (list (list :expr volatile) (list :expr '(:col 1 :type :int4))
+                          (list :expr stable)))
+           (projection (list :project targets scan))
+           (old-eval (symbol-function 'eval-expr))
+           (calls 0))
+      (unwind-protect
+           (progn
+             (setf (symbol-function 'eval-expr)
+                   (lambda (expression environment)
+                     (cond ((eq expression volatile) (incf calls))
+                           ((eq expression stable) (incf stable-calls) stable-value)
+                           (t (funcall old-eval expression environment)))))
+             (with-query-temp-files
+               (dolist (kind '(:sort :top-n))
+                 (setf calls 0 stable-calls 0 stable-value "before")
+                 (let* ((order (list (cons '(:col 1 :type :int4) nil)))
+                        (physical (if (eq kind :sort) (list :sort order projection)
+                                      (list :top-n order 2 projection)))
+                        (plan (%make-query-plan :physical physical))
+                        (iterator (make-resumable-query-plan-iterator plan relations)))
+                   (unwind-protect
+                        (progn
+                          (multiple-value-bind (row present) (sql-iterator-next iterator)
+                            (rove:ok present)
+                            (rove:ok (equalp (car row) #(1 1 "before")))
+                            (rove:ok (= calls 1))
+                            (rove:ok (= stable-calls 3))
+                            (setf stable-value "after"))
+                          (multiple-value-bind (row present) (sql-iterator-next iterator)
+                            (rove:ok present)
+                            (rove:ok (equalp (car row) #(2 2 "before")))
+                            (rove:ok (= calls 2)))
+                          (if (eq kind :sort)
+                              (multiple-value-bind (row present) (sql-iterator-next iterator)
+                                (rove:ok present)
+                                (rove:ok (equalp (car row) #(3 3 "before")))
+                                (rove:ok (= calls 3)))
+                              (rove:ok (not (nth-value 1 (sql-iterator-next iterator))))))
+                     (close-sql-iterator iterator))))
+               ;; A nonvolatile division error still occurs while sorting,
+               ;; before any postponed nextval is evaluated.
+               (setf calls 0)
+               (let* ((danger '(:binop "/" (:const 1 :type :int4)
+                                (:binop "-" (:col 1 :type :int4) (:const 2 :type :int4)
+                                 :type :int4) :type :int4))
+                      (project (list :project (list (list :expr danger) (list :expr volatile)) scan))
+                      (physical (list :sort (list (cons '(:col 1 :type :int4) nil)) project))
+                      (iterator (make-resumable-query-plan-iterator (%make-query-plan :physical physical) relations)))
+                 (unwind-protect
+                      (progn
+                        (rove:ok (handler-case (progn (sql-iterator-next iterator) nil)
+                                   (pg-error (condition) (string= (pg-error-sqlstate condition) "22012"))))
+                        (rove:ok (zerop calls)))
+                   (close-sql-iterator iterator)))
+               ;; A volatile target used as a sort key is computed once per input.
+               (setf calls 0)
+               (let* ((physical (list :sort (list (cons '(:sort-output 1) nil)) projection))
+                      (iterator (make-resumable-query-plan-iterator (%make-query-plan :physical physical) relations)))
+                 (unwind-protect
+                      (progn
+                        (multiple-value-bind (row present) (sql-iterator-next iterator)
+                          (rove:ok present)
+                          (rove:ok (= 1 (aref (car row) 0)))
+                          (rove:ok (= calls 3)))
+                        (sql-iterator-next iterator)
+                        (rove:ok (= calls 3)))
+                   (close-sql-iterator iterator)))))
+        (setf (symbol-function 'eval-expr) old-eval))))
 
 (rove:deftest test-toast-chunk-assembly
     (let ((chunks (list (cons 0 (make-array 4 :element-type '(unsigned-byte 8) :initial-contents '(0 1 2 3)))

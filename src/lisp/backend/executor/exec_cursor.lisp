@@ -40,6 +40,72 @@
 
 (defvar *lateral-outer-environment* nil)
 
+(defvar *query-sort-project* nil)
+
+(defun sort-projection-volatile-p (expression)
+  ;; Like the C volatility walk, inspect a SubPlan's test expression, not its
+  ;; separately planned query. Only functions in this executor's set defer.
+  (labels ((walk (form)
+             (and (consp form)
+                  (cond
+                    ((eq (first form) :subplan)
+                     (let ((subplan (second form)))
+                       (when (sql-subplan-p subplan)
+                         (walk (sql-subplan-test subplan)))))
+                    ((eq (first form) :func)
+                     (or (member (second form)
+                                 '("nextval" "currval" "setval" "random" "setseed"
+                                   "set_config" "pg_cancel_backend" "pg_terminate_backend"
+                                   "pg_promote" "pg_current_wal_lsn" "pg_current_wal_flush_lsn"
+                                   "pg_export_snapshot" "pg_is_in_recovery"
+                                   "pg_last_wal_receive_lsn" "pg_last_wal_replay_lsn"
+                                   "pg_wal_replay_pause" "pg_wal_replay_resume"
+                                   "pg_is_wal_replay_paused" "pg_get_wal_replay_pause_state"
+                                   "pg_reload_conf" "pg_reload_code"
+                                   "pg_create_physical_replication_slot" "pg_replication_slot_advance"
+                                   "pg_drop_replication_slot" "pg_lisp_acquire_subscription")
+                                 :test #'string=)
+                         (walk (third form))))
+                    (t (or (walk (car form)) (walk (cdr form))))))))
+    (not (null (walk expression)))))
+
+(defun sort-projection-deferred-slots (node child)
+  ;; Sort keys must be computed before sorting, even when volatile. Leave
+  ;; those target slots in the input projection and defer other volatile slots.
+  (when (and (not *datum-origin-capture*)
+             (member (first node) '(:sort :top-n))
+             (eq (first child) :project)
+             (not (eq (first (third child)) :project-set)))
+    (let* ((targets (second child))
+           (slots (map 'vector (lambda (target)
+                                 (sort-projection-volatile-p (getf target :expr)))
+                       targets)))
+      (dolist (entry (second node))
+        (let ((expression (car entry)))
+          (when (eq (first expression) :sort-output)
+            (let ((slot (second expression)))
+              (unless (and (integerp slot) (<= 1 slot (length slots)))
+                (return-from sort-projection-deferred-slots nil))
+              (setf (aref slots (1- slot)) nil)))))
+      (when (find t slots) slots))))
+
+(defun make-sort-project-input-row (environment targets deferred)
+  ;; Keep the source environment with precomputed targets for the later pull.
+  (let ((values (make-array (length targets) :initial-element +null+)))
+    (loop for target in targets for i from 0
+          unless (aref deferred i)
+            do (setf (aref values i) (eval-expr (getf target :expr) environment)))
+    (cons values environment)))
+
+(defun finish-sort-project-row (row targets deferred)
+  ;; Evaluate deferred targets once, in target order, as each sorted row leaves.
+  (let ((values (copy-seq (car row)))
+        (environment (cdr row)))
+    (loop for target in targets for i from 0
+          when (aref deferred i)
+            do (setf (aref values i) (eval-expr (getf target :expr) environment)))
+    (cons values environment)))
+
 (defun make-visible-heap-page-iterator (page block columns snapshot)
   "Visit visible heap tuples from an owned PAGE one at a time.
 
@@ -431,18 +497,23 @@ until their next pull.  SNAPSHOT must remain registered for this iterator."
       (lambda (row) (values row (true-p (eval-expr (second node) row)) *query-row-origins*))
       :preserve-toast-context t))
     (:project
-     (make-mapping-sql-iterator
-      (make-physical-plan-iterator (third node) relations)
-      (lambda (row)
-        (if *datum-origin-capture*
-            (let ((values (make-array (length (second node))))
-                  (origins (make-array (length (second node)) :initial-element nil)))
-              (loop for target in (second node) for i from 0
-                    do (multiple-value-bind (value origin)
-                           (eval-expr-with-origin (getf target :expr) row *query-row-origins*)
-                         (setf (aref values i) value (aref origins i) origin)))
-              (values (cons values row) t origins))
-            (values (make-select-result-row row nil (second node)) t nil)))))
+     (let ((deferred (and *query-sort-project*
+                          (eq node (car *query-sort-project*))
+                          (cdr *query-sort-project*))))
+       (make-mapping-sql-iterator
+        (make-physical-plan-iterator (third node) relations)
+        (lambda (row)
+          (cond
+            (deferred (values (make-sort-project-input-row row (second node) deferred) t nil))
+            (*datum-origin-capture*
+             (let ((values (make-array (length (second node))))
+                   (origins (make-array (length (second node)) :initial-element nil)))
+               (loop for target in (second node) for i from 0
+                     do (multiple-value-bind (value origin)
+                            (eval-expr-with-origin (getf target :expr) row *query-row-origins*)
+                          (setf (aref values i) value (aref origins i) origin)))
+               (values (cons values row) t origins)))
+            (t (values (make-select-result-row row nil (second node)) t nil)))))))
     (:window-input
      (make-mapping-sql-iterator
       (make-physical-plan-iterator (third node) relations)
@@ -482,20 +553,27 @@ until their next pull.  SNAPSHOT must remain registered for this iterator."
     ((:sort :top-n :hash-aggregate :sorted-aggregate :hash-distinct)
      (let* ((child (if (member (first node) '(:top-n :hash-aggregate :sorted-aggregate))
                        (fourth node) (third node)))
-            (input (make-physical-plan-iterator child relations)))
-       (make-buffered-sql-iterator
-        (lambda (emit)
-          (flet ((source (callback) (map-sql-iterator input callback)))
-            (case (first node)
-              (:sort (stream-select-sort #'source (second node) emit))
-              (:top-n (dolist (row (collect-select-top-n #'source (second node) (third node) *datum-origin-capture*))
-                        (let ((*query-row-origins* (and *datum-origin-capture* (cdr row))))
-                          (funcall emit (if *datum-origin-capture* (car row) row)))))
-              ((:hash-aggregate :sorted-aggregate)
-               (stream-select-aggregates #'source (second node) (third node) emit))
-              (:hash-distinct
-               (stream-hash-aggregate
-                (lambda (callback) (source (lambda (row) (funcall callback (car row)))))
-                (second node) 0 (lambda (values) (funcall emit (cons values values))))))))
-        input)))
+            (deferred (sort-projection-deferred-slots node child))
+            (*query-sort-project* (and deferred (cons child deferred)))
+            (input (make-physical-plan-iterator child relations))
+            (buffer
+              (make-buffered-sql-iterator
+               (lambda (emit)
+                 (flet ((source (callback) (map-sql-iterator input callback)))
+                   (case (first node)
+                     (:sort (stream-select-sort #'source (second node) emit))
+                     (:top-n (dolist (row (collect-select-top-n #'source (second node) (third node) *datum-origin-capture*))
+                               (let ((*query-row-origins* (and *datum-origin-capture* (cdr row))))
+                                 (funcall emit (if *datum-origin-capture* (car row) row)))))
+                     ((:hash-aggregate :sorted-aggregate)
+                      (stream-select-aggregates #'source (second node) (third node) emit))
+                     (:hash-distinct
+                      (stream-hash-aggregate
+                       (lambda (callback) (source (lambda (row) (funcall callback (car row)))))
+                       (second node) 0 (lambda (values) (funcall emit (cons values values))))))))
+               input)))
+       (if deferred
+           (make-mapping-sql-iterator
+            buffer (lambda (row) (values (finish-sort-project-row row (second child) deferred) t nil)))
+           buffer)))
     (otherwise (ereport "0A000" "unsupported resumable producer node ~a" (first node)))))
