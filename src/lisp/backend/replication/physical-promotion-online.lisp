@@ -42,7 +42,8 @@ An unsafe complete batch defers promotion; an unfinished tail does not."
   (multiple-value-bind (removed terminal)
       (physical-recovery-proven-drops
        *physical-receive-store* (getf *physical-recovery-state* :cluster-identity)
-       :required-lsn *last-replay-lsn*)
+       :required-lsn *last-replay-lsn*
+       :policy (getf *physical-recovery-state* :timeline-policy))
     (declare (ignore removed))
     (= terminal *last-replay-lsn*)))
 
@@ -82,7 +83,7 @@ checkpoint before stopping workers and rechecks after their final flush."
          (reservation (copy-list (getf *physical-recovery-state* :source-reservation)))
          (removed (make-hash-table :test #'eql)))
     (with-physical-replay-staging ()
-      (physical-store-map-durable-records
+      (physical-recovery-map-permitted-records
        store
        (lambda (record raw)
          (if (= (wal-record-type record) +wal-record-end-of-recovery+)

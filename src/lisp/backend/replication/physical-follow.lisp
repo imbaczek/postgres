@@ -1227,7 +1227,7 @@ is not authentication or proof of source identity."
         do (handler-case
                (when (and (not (sb-thread:with-mutex (*physical-replay-pause-lock*)
                                  *physical-replay-paused-p*))
-                          (< *last-replay-lsn* (physical-store-flushed-lsn *physical-receive-store*)))
+                          (physical-recovery-replay-pending-p))
                  (physical-recovery-replay))
              (error (condition)
                (physical-follow-note-error runtime condition t)))

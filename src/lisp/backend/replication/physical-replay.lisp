@@ -353,23 +353,24 @@ Updating source membership does not change existing snapshots."
     (let ((next-xid *next-xid*)
           (source-xids (copy-tree (getf *physical-recovery-state* :source-xids)))
           (reservation (copy-list (getf *physical-recovery-state* :source-reservation))))
-      (physical-store-map-durable-records
-       *physical-receive-store*
-       (lambda (record raw)
-         (when *physical-replay-test-hook*
-           (funcall *physical-replay-test-hook* :before-record record))
-         (if (= (wal-record-type record) +wal-record-end-of-recovery+)
-             (multiple-value-setq (reservation source-xids)
-               (physical-replay-selected-eor record raw next-xid reservation source-xids))
-             (progn
-               (physical-replay-check-child-initialization record next-xid)
-               (setf next-xid (physical-replay-observed-next-xid record next-xid)
-                     reservation (physical-source-reservation-next reservation record next-xid)
-                     source-xids (physical-source-xids-next source-xids record next-xid))
-               (wal-replay-record record)
-               (unless *wal-recovery-group-active*
-                 (physical-replay-publish-terminal record next-xid reservation source-xids)))))
-       :start-lsn start-lsn)))
+      (physical-recovery-note-policy-exhaustion
+       (physical-recovery-map-permitted-records
+        *physical-receive-store*
+        (lambda (record raw)
+          (when *physical-replay-test-hook*
+            (funcall *physical-replay-test-hook* :before-record record))
+          (if (= (wal-record-type record) +wal-record-end-of-recovery+)
+              (multiple-value-setq (reservation source-xids)
+                (physical-replay-selected-eor record raw next-xid reservation source-xids))
+              (progn
+                (physical-replay-check-child-initialization record next-xid)
+                (setf next-xid (physical-replay-observed-next-xid record next-xid)
+                      reservation (physical-source-reservation-next reservation record next-xid)
+                      source-xids (physical-source-xids-next source-xids record next-xid))
+                (wal-replay-record record)
+                (unless *wal-recovery-group-active*
+                  (physical-replay-publish-terminal record next-xid reservation source-xids)))))
+        :start-lsn start-lsn) *physical-receive-store*)))
   *last-replay-lsn*)
 
 (defun physical-replay-pause-command (name)

@@ -171,7 +171,7 @@ Invalid or ambiguous catalog metadata fails closed instead of proving a drop."
 (declaim (ftype function physical-replay-check-selected-eor))
 
 (defun physical-recovery-proven-drops (store identity &key
-                                                        (start-lsn (physical-store-floor-lsn store)) required-lsn)
+                                                        (start-lsn (physical-store-floor-lsn store)) required-lsn (policy (getf *physical-recovery-state* :timeline-policy)))
   "Certify drops only from complete catalog terminals in validated durable WAL.
 An unfinished batch grants no exemption. REQUIRED-LSN must be a complete terminal.
 Return the deletion set and last terminal. No database files are written."
@@ -180,7 +180,7 @@ Return the deletion set and last terminal. No database files are written."
           (terminal start-lsn)
           (timeline (physical-store-prefix-timeline store start-lsn))
           (required-found (eql required-lsn start-lsn)))
-      (physical-store-map-durable-records
+      (physical-recovery-map-permitted-records
        store (lambda (record raw)
                (if (= (wal-record-type record) +wal-record-end-of-recovery+)
                    (setf timeline (physical-replay-check-selected-eor store record raw terminal timeline))
@@ -188,7 +188,7 @@ Return the deletion set and last terminal. No database files are written."
                (unless *wal-recovery-group-active*
                  (setf terminal (wal-record-end record))
                  (when (eql required-lsn terminal) (setf required-found t))))
-       :start-lsn start-lsn)
+       :start-lsn start-lsn :policy policy)
       (when (and required-lsn (not required-found))
         (error "durable WAL lost a previously applied terminal"))
       (values removed terminal))))

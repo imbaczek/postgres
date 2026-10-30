@@ -280,6 +280,7 @@ Older metadata without these fields uses the base timeline."
         (unless (<= (physical-store-floor-lsn store) (getf state :end))
           (error "legacy restartpoint lost actual XID history; reseed required"))
         (setf metadata nil catalog-bytes nil))
+      (physical-recovery-policy-check-seed state store metadata)
       (let ((start (if metadata (getf metadata :lsn) (getf state :end))))
         (unless (and (<= (physical-store-floor-lsn store) start (physical-store-flushed-lsn store))
                      (or metadata (= start (physical-store-base-lsn store))))
@@ -292,7 +293,8 @@ Older metadata without these fields uses the base timeline."
           (unless (= (getf metadata :prefix-digest) (physical-store-prefix-digest store start))
             (error "restartpoint differs from its durable receive prefix")))
         (let ((removed (physical-recovery-proven-drops
-                        store identity :start-lsn start :required-lsn (max required start))))
+                        store identity :start-lsn start :required-lsn (max required start)
+                        :policy (getf state :timeline-policy))))
           (physical-recovery-check-base-forks
            (if metadata (list :files (getf metadata :forks)) state) removed))
         (setf (getf *physical-recovery-state* :wal-prefix-lsn) (and metadata start)

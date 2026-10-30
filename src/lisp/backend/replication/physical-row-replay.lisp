@@ -143,29 +143,30 @@ A violation is an error; the outer replay path fences recovery."
     (let ((next-xid *next-xid*)
           (source-xids (copy-tree (getf *physical-recovery-state* :source-xids)))
           (reservation (copy-list (getf *physical-recovery-state* :source-reservation))))
-      (physical-store-map-durable-records
-       *physical-receive-store*
-       (lambda (record raw)
-         (declare (ignore raw))
-         (unless (physical-row-replay-allowed-p record horizon)
-           (return-from physical-row-replay-prefix :deferred))
-         (when *physical-replay-test-hook*
-           (funcall *physical-replay-test-hook* :before-record record))
-         (setf next-xid (physical-replay-observed-next-xid record next-xid)
-               reservation (physical-source-reservation-next reservation record next-xid)
-               source-xids (physical-source-xids-next source-xids record next-xid))
-         (if (wal-terminal-record-type-p (wal-record-type record))
-             (sb-thread:with-mutex (*wal-lock*)
-               (physical-row-replay-check-covered-commit record covered)
-               (when *wal-recovery-page-spool*
-                 (logical-spool-seal *wal-recovery-page-spool*))
-               (unless (physical-row-replay-spool-allowed-p horizon)
-                 (return-from physical-row-replay-prefix :deferred))
-               (physical-row-replay-preflight-with-map #'wal-recovery-map-page-spool)
-               (wal-replay-record record)
-               (physical-row-replay-publish-terminal record next-xid reservation source-xids))
-             (wal-replay-record record)))
-       :start-lsn *last-replay-lsn*)))
+      (physical-recovery-note-policy-exhaustion
+       (physical-recovery-map-permitted-records
+        *physical-receive-store*
+        (lambda (record raw)
+          (declare (ignore raw))
+          (unless (physical-row-replay-allowed-p record horizon)
+            (return-from physical-row-replay-prefix :deferred))
+          (when *physical-replay-test-hook*
+            (funcall *physical-replay-test-hook* :before-record record))
+          (setf next-xid (physical-replay-observed-next-xid record next-xid)
+                reservation (physical-source-reservation-next reservation record next-xid)
+                source-xids (physical-source-xids-next source-xids record next-xid))
+          (if (wal-terminal-record-type-p (wal-record-type record))
+              (sb-thread:with-mutex (*wal-lock*)
+                (physical-row-replay-check-covered-commit record covered)
+                (when *wal-recovery-page-spool*
+                  (logical-spool-seal *wal-recovery-page-spool*))
+                (unless (physical-row-replay-spool-allowed-p horizon)
+                  (return-from physical-row-replay-prefix :deferred))
+                (physical-row-replay-preflight-with-map #'wal-recovery-map-page-spool)
+                (wal-replay-record record)
+                (physical-row-replay-publish-terminal record next-xid reservation source-xids))
+              (wal-replay-record record)))
+        :start-lsn *last-replay-lsn*) *physical-receive-store*)))
   *last-replay-lsn*)
 
 (defun physical-replay-with-readers ()

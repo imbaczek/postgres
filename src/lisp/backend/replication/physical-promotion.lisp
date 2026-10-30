@@ -213,6 +213,12 @@ phase-2 recovery can yield to shutdown."
       (error "promotion base WAL identity or namespace changed"))
     namespace))
 
+(defun physical-promotion-pending-timeline-policy (state metadata store)
+  (unless (eql 3 (getf state :phase))
+    (error "pending timeline policy requires durable promotion intent"))
+  (physical-recovery-resolve-timeline-policy
+   state store metadata (physical-recovery-replay-timeline state)))
+
 (defun physical-promotion-check-progress (state metadata prefix generation &optional (phase 2))
   (let* ((fork *last-replay-lsn*) (next *next-xid*)
                                   (control (physical-recovery-read-control *pgdata*))
@@ -251,7 +257,10 @@ phase-2 recovery can yield to shutdown."
     ;; be applied first; an unfinished native batch does not move the data fork.
     (multiple-value-bind (removed terminal)
         (physical-recovery-proven-drops
-         *physical-receive-store* (getf state :cluster-identity) :required-lsn fork)
+         *physical-receive-store* (getf state :cluster-identity) :required-lsn fork
+         :policy (if (= phase 3)
+                     (physical-promotion-pending-timeline-policy state metadata *physical-receive-store*)
+                     (getf state :timeline-policy)))
       (declare (ignore removed))
       (unless (= fork terminal)
         (error "promotion must replay complete durable receive backlog")))

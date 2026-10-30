@@ -1167,6 +1167,151 @@
                     (ok (null pg::*physical-follow-runtime*))))))))
        :system-id 42)))
 
+(deftest cold-current-timeline-policy-is-latched-before-cached-child-redo
+    (call-with-promotion-fixture
+     (lambda (root store)
+       (pg::wal-atomic-write-bytes (pg::clog-path) (empty-octets))
+       (pg::wal-atomic-write-bytes (merge-pathnames "PG_VERSION" root)
+                                   (pg::string->bytes (format nil "20~%")))
+       (let* ((base (pg::physical-recovery-verify-base-state))
+              (pending (pg::physical-follow-with-controller
+                        (follow-pending-proof-config-for-store store base)
+                        (follow-controller-test-state :enabled nil)))
+              (fork (pg::physical-store-flushed-lsn store))
+              (eor (coerce (getf (getf (fifth pending) :anchor) :eor-octets)
+                           '(vector (unsigned-byte 8)))))
+         (pg::physical-follow-save-config pending)
+         (call-with-promotion-exclusion
+          (lambda () (pg::physical-follow-reconcile-pending-store store base pending)))
+         (pg::physical-store-input store fork eor)
+         (pg::physical-store-flush store)
+         (let ((flush (pg::physical-store-flushed-lsn store)))
+           (pg::physical-store-close store)
+           (sb-posix:rename (namestring (pg::physical-store-directory store))
+                            (namestring (pg::physical-recovery-spool-directory)))
+           (call-with-current-promotion-owner
+            (lambda ()
+              (let ((pg::*wal-ready* nil) (pg::*physical-receive-store* nil)
+                                          (pg::*physical-recovery-state* nil) (pg::*physical-follow-runtime* nil)
+                                          (pg::*physical-restartpoint-worker* nil)
+                                          (pg::*wal-checkpoint-snapshot* pg::*wal-checkpoint-snapshot*)
+                                          (pg::*wal-poisoned* pg::*wal-poisoned*)
+                                          (pg::*active-xids* pg::*active-xids*))
+                (unwind-protect
+                     (progn
+                       (pg::physical-recovery-prepare :timeline-goal :current)
+                       (let ((policy (getf pg::*physical-recovery-state* :timeline-policy)))
+                         (ok (= 1 (getf policy :target) (getf policy :startup-anchor)))
+                         (ok (equal (list fork 1) (getf policy :original-required))))
+                       (pg::physical-recovery-open-storage)
+                       (ok (= fork pg::*last-replay-lsn*))
+                       (ok (= 1 (pg::physical-recovery-replay-timeline)))
+                       (ok (= 2 (pg::physical-store-selected-timeline pg::*physical-receive-store*)))
+                       (ok (= flush (pg::physical-store-flushed-lsn pg::*physical-receive-store*)))
+                       (ok (= fork (getf (pg::physical-recovery-read-control root) :applied)))
+                       (ok (not pg::*physical-recovery-failed-p*)))
+                  (when pg::*clog-stream* (close pg::*clog-stream*) (setf pg::*clog-stream* nil))
+                  (when pg::*physical-receive-store* (pg::physical-store-close pg::*physical-receive-store*)))))))))
+     :applied 152 :system-id 42))
+
+(deftest fixed-timeline-policy-allows-parent-promotion-with-uninitialized-cached-child
+    (call-with-promotion-fixture
+     (lambda (root store)
+       (pg::wal-atomic-write-bytes (pg::clog-path) (empty-octets))
+       (pg::wal-atomic-write-bytes (merge-pathnames "PG_VERSION" root)
+                                   (pg::string->bytes (format nil "20~%")))
+       (let* ((fork (pg::physical-store-flushed-lsn store))
+              (eor (store-history-eor fork 2 1))
+              (captured nil)
+              (pg::*physical-promotion-stopping-p* nil)
+              (pg::*wal-checkpoint-snapshot* pg::*wal-checkpoint-snapshot*)
+              (pg::*wal-poisoned* pg::*wal-poisoned*)
+              (pg::*active-xids* pg::*active-xids*))
+         (pg::physical-store-select-history store 2 (store-history-text 1 fork) eor)
+         (setf pg::*physical-recovery-state*
+               (pg::physical-recovery-attach-selected-store pg::*physical-recovery-state* store))
+         (pg::physical-store-input store fork eor)
+         (let ((next (+ fork (length eor))))
+           (pg::physical-store-input store next
+                                     (pg::wal-encode-record pg::+wal-record-commit+ 3 next (pg::wal-encode-commit-timestamp 42))))
+         (pg::physical-store-flush store)
+         (pg::physical-recovery-publish-selected-history store)
+         (pg::physical-recovery-save-progress fork pg::*next-xid*)
+         (multiple-value-bind (metadata catalog prefix digest)
+             (pg::physical-restartpoint-read pg::*physical-recovery-state*)
+           (declare (ignore catalog prefix digest))
+           (setf (getf pg::*physical-recovery-state* :timeline-policy)
+                 (pg::physical-recovery-resolve-timeline-policy pg::*physical-recovery-state* store metadata :current)))
+         (call-with-current-promotion-owner
+          (lambda ()
+            (pg::clog-init)
+            (unwind-protect
+                 (ok (eq :at-intent
+                         (block reached
+                           (let ((pg::*physical-promotion-test-hook*
+                                   (lambda (point)
+                                     (when (eq point :after-online-intent)
+                                       (setf captured (copy-list pg::*physical-recovery-state*))
+                                       (return-from reached :at-intent)))))
+                             (pg::physical-recovery-promote)))))
+              (when pg::*clog-stream* (close pg::*clog-stream*) (setf pg::*clog-stream* nil)))))
+         (ok captured)
+         (when captured
+           (ok (= 1 (pg::physical-recovery-replay-timeline captured)))
+           (ok (= 3 (getf captured :promotion-child)))
+           (ok (= fork pg::*last-replay-lsn*)))
+         (ok (= 3 (getf (pg::physical-recovery-read-control root) :phase)))
+         (pg::physical-store-close store)
+         (sb-posix:rename (namestring (pg::physical-store-directory store))
+                          (namestring (pg::physical-recovery-spool-directory)))
+         (call-with-current-promotion-owner
+          (lambda ()
+            (let ((pg::*wal-ready* nil) (pg::*physical-recovery-state* nil)
+                                        (pg::*physical-receive-store* nil))
+              (multiple-value-bind (state metadata prefix generation) (pg::physical-promotion-read-pending-state)
+                (ok (null (getf state :timeline-policy)))
+                (let ((reopened (pg::physical-promotion-open-pending-store state)))
+                  (unwind-protect
+                       (ok (eq :validated
+                               (call-with-promotion-exclusion
+                                (lambda ()
+                                  (pg::physical-promotion-validate-cold-state state metadata prefix generation reopened)
+                                  (pg::physical-promotion-restore-cold-state state reopened)
+                                  (ok (= fork pg::*last-replay-lsn*))
+                                  (ok (= 1 (pg::physical-recovery-replay-timeline)))
+                                  (ok (= 0 (pg::clog-get 3)))
+                                  :validated))))
+                    (when pg::*clog-stream* (close pg::*clog-stream*) (setf pg::*clog-stream* nil))
+                    (pg::physical-store-close reopened)))))))))
+     :applied 152
+     :system-id (pg::physical-store-update-digest #xCBF29CE484222325 (pg::string->bytes "history-source"))))
+
+(deftest pending-timeline-policy-still-rejects-later-same-parent-terminal
+    (call-with-promotion-fixture
+     (lambda (root store)
+       (declare (ignore root))
+       (pg::clog-init)
+       (unwind-protect
+            (call-with-current-promotion-owner
+             (lambda ()
+               (call-with-promotion-exclusion
+                (lambda ()
+                  (let ((pending (pg::physical-promotion-publish-intent)))
+                    (pg::physical-store-input store 152 (sample-physical-record 152))
+                    (pg::physical-store-input store 184
+                                              (pg::wal-encode-record pg::+wal-record-maintenance+ 0 184 (empty-octets)))
+                    (pg::physical-store-flush store)
+                    (multiple-value-bind (metadata catalog prefix generation) (pg::physical-restartpoint-read pending)
+                      (declare (ignore catalog))
+                      (let ((message
+                              (handler-case
+                                  (progn (pg::physical-promotion-check-progress pending metadata prefix generation 3) nil)
+                                (error (condition) (princ-to-string condition)))))
+                        (ok (and message (search "promotion must replay complete durable receive backlog" message))))))))))
+         (when pg::*clog-stream* (close pg::*clog-stream*) (setf pg::*clog-stream* nil))))
+     :applied 152
+     :system-id (pg::physical-store-update-digest #xCBF29CE484222325 (pg::string->bytes "history-source"))))
+
 (deftest managed-follow-startup-disables-saved-receipt-before-autostart
     (dolist (kind '(:unattached :bootstrap :bound))
       (call-with-promotion-fixture

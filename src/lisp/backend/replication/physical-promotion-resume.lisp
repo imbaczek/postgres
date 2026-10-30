@@ -122,6 +122,10 @@ Use the verified pending base identity and the recovery retained archive."
         *last-replay-lsn* (getf state :applied) *next-xid* (getf state :next-xid)
         *xid-batch-end* *next-xid* *active-xids* nil *wal-ready* t *wal-poisoned* nil
         (getf *physical-recovery-state* :receive-lsn) (physical-store-flushed-lsn store))
+  (multiple-value-bind (metadata catalog prefix generation) (physical-restartpoint-read state)
+    (declare (ignore catalog prefix generation))
+    (setf (getf *physical-recovery-state* :timeline-policy)
+          (physical-promotion-pending-timeline-policy state metadata store)))
   (physical-restartpoint-prepare-storage store)
   (setf *clog-stream* (open (clog-path) :direction :input :element-type '(unsigned-byte 8)
                                         :if-does-not-exist :error))
