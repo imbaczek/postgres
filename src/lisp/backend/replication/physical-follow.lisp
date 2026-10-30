@@ -132,10 +132,11 @@ STOPPED-P stops both workers; RECEIVER-STOPPED-P stops receipt alone."
   "Choose a follow action from resolved policy and checked history intervals.
 Return :DISCOVER when source history is needed. Equal source and receive
 timelines use same-timeline proof. A source toward the target uses descendant
-proof; at the target, a later source
-uses retained-timeline proof.  A locally cached child past the target permits
+proof. At the target, a later source uses retained-timeline proof.
+A locally cached child past the target permits
 replay only. A different local branch returns :REPLAY-ONLY with an unavailable
-reason; an incompatible source returns :UNAVAILABLE."
+reason; an incompatible source returns :UNAVAILABLE.  Only a source whose
+history is an ancestor of the target requests automatic source retry."
   (timeline-check-lineage local-history)
   (let* ((target (getf policy :target))
          (target-history (getf policy :history))
@@ -1204,6 +1205,8 @@ is not authentication or proof of source identity."
            (physical-follow-feedback client)))
 
 (defun physical-follow-bound-completion (runtime result)
+  "Accept retained completion only at the bound next timeline and fork.
+Receipt ends there; replay remains free to reach its own policy fence."
   (when (and (eq :retained-timeline
                  (physical-follow-anchor-kind (getf (physical-follow-runtime-binding runtime) :anchor)))
              result)
@@ -1361,6 +1364,8 @@ The caller holds the command mutex outside admission and has validated CONFIG."
           (setf (physical-follow-runtime-stopped-p runtime) t ready t))))))
 
 (defun physical-follow-launch-decision (config)
+  "Choose receipt, refresh or replay only from the admitted local state.
+A completed retained fork launches replay without contacting the source."
   (with-live-operation
     (let* ((policy (getf *physical-recovery-state* :timeline-policy))
            (store *physical-receive-store*)

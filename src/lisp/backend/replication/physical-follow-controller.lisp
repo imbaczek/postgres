@@ -212,6 +212,9 @@ A retained binding carries no child history and cannot pass its fork."
     binding))
 
 (defun physical-follow-controller-source-view (client &optional (policy (getf *physical-recovery-state* :timeline-policy)))
+  "Check source identity and history against the captured policy and local lineage.
+Return a non-attach decision when the source cannot serve the selected route;
+fetch child history only for a descendant attachment."
   (multiple-value-bind (system-id source) (physical-follow-client-identity client)
     (let* ((local-history
              (with-live-operation
@@ -407,6 +410,8 @@ uses strict candidate proof; protect the store and retained root."
 (defvar *physical-follow-auto-retry-after* 0)
 
 (defun physical-follow-operation-check (operation)
+  "Require the current uncancelled operation and its captured policy.
+A policy replacement cancels the operation before it can publish or launch."
   (sb-thread:with-mutex (*physical-follow-lock*)
     (unless (and (eq operation *physical-follow-operation*)
                  (not (physical-follow-operation-cancelled-p operation))
@@ -431,7 +436,9 @@ uses strict candidate proof; protect the store and retained root."
   config)
 
 (defun physical-follow-operation-initial-config (operation)
-  "Check the current receiver and cleanup capacity before disturbing it or PREPARE."
+  "Capture the policy and check the local route before contacting the source.
+Only a route needing discovery requires cleanup capacity.  The captured policy
+object remains the operation's authority until completion or cancellation."
   (sb-thread:with-mutex (*physical-follow-command-lock*)
     (with-live-operation
       (physical-follow-operation-check operation)
@@ -685,6 +692,8 @@ restoration. Ambiguous publication failures fence recovery for restart reconcili
              (physical-follow-operation-cancelled-p operation)))))
 
 (defun physical-follow-wait-for-policy (runtime reason &optional retry-source)
+  "Stop receipt under command exclusion; preserve replay and its pause state.
+Only an eligible source retry schedules another automatic discovery."
   (unless (sb-thread:holding-mutex-p *physical-follow-command-lock*)
     (error "policy wait requires follow command exclusion"))
   (when (and runtime (eq runtime *physical-follow-runtime*))
@@ -700,6 +709,9 @@ restoration. Ambiguous publication failures fence recovery for restart reconcili
     :replay-only))
 
 (defun physical-follow-operation-not-attached (operation decision)
+  "Return a non-attach result without granting source or binding authority.
+Recheck cancellation before changing runtime state and before publishing the
+result; restore stopped workers when needed."
   (when (getf (physical-follow-operation-context operation) :stopped)
     (physical-follow-operation-recover operation))
   (physical-follow-operation-check operation)
