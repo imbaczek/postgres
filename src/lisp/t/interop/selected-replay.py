@@ -290,6 +290,16 @@ def exercise_managed_restart(peer, socket_identity, sibling):
     (data / "standby.signal").unlink()
     control("sibling.sock", '(reload)')
     control("sibling.sock", '(assert (and (getf *physical-recovery-state* :standard-follow-managed-p) (not (physical-follow-controller-enabled-p (physical-follow-read-config))) (null (physical-follow-runtime-receiver-thread *physical-follow-runtime*))))')
+    control("sibling.sock", '(defparameter *managed-recovery-saved-hook* *physical-follow-test-hook*)')
+    control("sibling.sock", '(setf *physical-follow-test-hook* (lambda (point) (when (eq point :after-controller-intent) (error "managed replacement preparation test failure"))))')
+    try:
+        failure = control("sibling.sock", retarget_form(source_port, "managed_failed"), expect_error=True)
+        assert "managed replacement preparation test failure" in failure, failure
+    finally:
+        control("sibling.sock", '(setf *physical-follow-test-hook* *managed-recovery-saved-hook*)')
+    control("sibling.sock", '(assert (and (not *physical-recovery-failed-p*) (not (physical-follow-controller-enabled-p (physical-follow-read-config))) (null (getf (sixth (physical-follow-read-config)) :preparing)) *physical-follow-runtime* (null (physical-follow-runtime-client *physical-follow-runtime*)) (null (physical-follow-runtime-receiver-thread *physical-follow-runtime*)) (sb-thread:thread-alive-p (physical-follow-runtime-replay-thread *physical-follow-runtime*))))')
+    assert accepted == control("sibling.sock", '(list (subseq (physical-follow-read-config) 0 5) (getf (sixth (physical-follow-read-config)) :source) (getf (sixth (physical-follow-read-config)) :unowned-bootstrap))')
+    print("follow-controller: failed preparation restores disabled accepted replay-only service PASS", flush=True)
     control("sibling.sock", retarget_form(source_port, "managed_resume"))
     print("follow-controller: marker phase-1 startup, disabled accepted cold restart and reload latch PASS", flush=True)
     return peer, socket_identity, sibling
