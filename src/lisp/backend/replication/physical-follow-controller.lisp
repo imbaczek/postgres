@@ -102,7 +102,11 @@ The caller excludes concurrent mutation and protects the selected store."
          (list *last-replay-lsn* (physical-recovery-replay-timeline))))))
 
 (defun physical-follow-launch-replay-only (config)
-  "Validate disabled standby state and start replay without a receiver.
+  "Start replay without a receiver for reconciled, disabled standby state.
+An unattached, accepted bootstrap or active binding may be used; the saved
+configuration, base and receive proof are checked before workers start. The
+accepted binding and source owner remain intact. Enabled, preparing, pending
+and primary cleanup-only states are rejected.
 The caller holds the command mutex outside admission; validation also takes
 reload exclusion and live-operation quiescence."
   (check-physical-recovery-worker-start)

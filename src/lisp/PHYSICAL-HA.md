@@ -671,6 +671,19 @@ after mutex refinement. Strict compilation passed
 Sol medium found no further refactor needed, and functions remained under 120
 lines.
 
+The internal replay-only launcher now also accepts a reconciled, disabled
+accepted bootstrap or active binding, preserving its binding and source owner
+without creating a receiver or client. It checks the saved configuration,
+base and unbound prefix or bound proof before starting workers. Enabled,
+pending, preparing and primary cleanup-only states are rejected. Six focused
+tests passed, covering disabled bootstrap and active bindings with pause on and
+off, unsafe states, frozen owner preservation, unattached recovery and legacy
+durable stop/autostart. Fresh strict compilation passed
+(`/tmp/pg-disabled-follow-replay-compile.log`); Luna, Sol high and Sol medium
+reviews were clear. This is a foundation for standard configuration work, not
+a public command: legacy stopped configurations still do not autostart, and no
+standard GUC or desired-generation latch is wired yet.
+
 ### Same-timeline follow — completed milestone
 
 An existing native follow configuration can be retargeted to a source on its
