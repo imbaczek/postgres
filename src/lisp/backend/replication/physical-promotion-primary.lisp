@@ -399,7 +399,8 @@ recovery; restart must classify durable control."
       (unless finished (setf *physical-recovery-failed-p* t)))))
 
 (defun physical-promotion-finish-child-primary ()
-  "Retire recovery triggers before clearing the recovery role and declaring readiness."
+  "Retire recovery triggers before clearing the recovery role and declaring readiness.
+Report installed capacity on the new primary before declaring it ready."
   (physical-promotion-test-point :after-child-primary-initialization)
   (physical-promotion-retire-recovery)
   (sb-thread:with-mutex (*wal-lock*)

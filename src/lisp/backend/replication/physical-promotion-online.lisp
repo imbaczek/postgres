@@ -18,7 +18,8 @@
 (defun physical-promotion-check-online (&key allow-resource-pause)
   "Require owned, healthy phase-2 streaming recovery before changing lifecycle state.
 Call under admission or owned quiescence. Report shutdown separately so the
-orchestrator can yield before intent without marking recovery failed."
+orchestrator can yield before intent without marking recovery failed.
+ALLOW-RESOURCE-PAUSE is used only to restore recovery workers after a failed attempt."
   (check-recovery-available)
   (unless allow-resource-pause (check-physical-resource-promotion))
   (when (shutdown-in-progress-p) (error 'physical-promotion-shutdown))
@@ -53,7 +54,8 @@ An unsafe complete batch defers promotion; an unfinished tail does not."
 (defun physical-promotion-try-online ()
   "Attempt promotion under reload exclusion and closed admission.
 Recheck child initialization after worker joins and before enrolling readers.
-An unsafe complete batch defers the attempt; otherwise publish the child."
+An unsafe complete batch defers the attempt; otherwise publish the child.
+A resource pause found while draining the backlog stops before intent."
   (sb-thread:with-mutex (*reload-run-lock*)
     (with-live-operation-quiescence
       (physical-promotion-check-online)
@@ -108,7 +110,7 @@ checkpoint before stopping workers and rechecks after their final flush."
                        :timeline (getf *physical-recovery-state* :timeline)))))
 
 (defun physical-promotion-resume-recovery-workers (config paused restartpoint)
-  "Restore prior workers after a healthy pre-intent wait for child initialization.
+  "Restore workers after a healthy pre-intent wait or a resource pause.
 Restore pause state before clearing stopping under restartpoint-start, then
 pause lock. Acknowledged pause commands cannot be overwritten by this restore.
 An unattached or disabled standby resumes replay without starting a receiver."
@@ -139,7 +141,9 @@ stop worker starts, unpause replay and join workers before closing admission.
 Use the fresh saved config, including a disabled route, if workers must resume.
 Retry unsafe complete replay barriers outside the gates, allowing readers to
 finish.  Return the child checkpoint end, or :SHUTDOWN if shutdown takes over
-before intent.  Other failures after work starts fence the process for restart."
+before intent.  Other failures after work starts fence the process for restart.
+If backlog replay reaches insufficient capacity, restore recovery workers and
+return :RESOURCE-PAUSED without publishing promotion intent."
   (when (plusp *live-operation-depth*)
     (error "online promotion must run outside operation admission"))
   (physical-follow-call-with-controller-blocked

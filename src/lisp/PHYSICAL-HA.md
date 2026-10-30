@@ -256,9 +256,32 @@ Private follow scans capture facts at the applied and required boundaries,
 independently of later received records. Durable follow witnesses preserve the
 required fact. Promotion freezes the selected generation's parent fact in pending
 control and carries it into the deterministic child checkpoint and primary
-control. This records the last source report; it does not prove the child's
-installed capacity. Resource admission, startup sizing and automatic reporting
-remain unfinished.
+control. This records the last source report. After adopting the child, the server
+reports its installed local tuple before production readiness; that report may
+change the tuple without changing the deterministic checkpoint's retry bytes.
+
+Cold startup now installs finite relation-object and owner limits together with
+the local tuple. Connections and senders use their active startup settings;
+workers, prepared transactions and locks use internal values 8, 0 and 64. These
+three public GUCs remain unregistered. Hot-standby admission requires a known,
+adequate fact after reconstruction reaches the required replay boundary.
+`hot_standby=off` permits recovery with unknown facts and continues to reject SQL
+startup.
+
+A live insufficient report becomes durable before a separate resource pause
+stops replay. Receipt can continue, and existing readers remain usable. Promotion
+is refused, including when its backlog replay discovers the shortfall; a healthy
+refusal restores standby workers. Resume requests fast shutdown without clearing
+the resource latch. Restart with adequate capacity can replay the remaining WAL.
+
+The admission milestone passed all 1,240 physical tests, the external unit
+runner's 1,159 checks, eight independent Python tests and fresh strict compilation.
+`t/resource-admission.sh` covers retained readers, receipt beyond replay, direct
+and promotion-backlog pauses, refusal, resume shutdown, capacity-checked restart,
+and UNKNOWN/OFF recovery. `t/promotion-online.sh` with `RESOURCE_FACTS=1` checks the
+frozen parent checkpoint and the new local child report through crash/restart.
+The reporter SIGKILL test independently decodes WAL to check that the crashed
+report remains durable and precedes the new installed-capacity report.
 
 The recovery propagation milestone passed 1,232 physical tests, followed by 102
 focused tests after the final historical-witness check. The external unit runner

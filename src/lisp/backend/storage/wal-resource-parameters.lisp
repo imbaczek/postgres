@@ -179,12 +179,10 @@ Read back the complete control image before installing the new memory copy."
   (values))
 
 (defun wal-report-resource-parameters (parameters)
-  "Explicitly report a primary tuple, returning its durable record end.
+  "Report a primary tuple, returning its durable record end.
 Under the WAL lock, skip unchanged values; otherwise append and flush the batch
 before publishing and reading back control. Failure or cancellation after append
-starts poisons WAL before unlocking and requests shutdown. Startup does not call
-this yet; installed capacities and standby seeds and floors must be complete
-before enabling it."
+starts poisons WAL before unlocking and requests shutdown."
   (prevent-recovery-primary-operation "primary resource reporting")
   (unless (resource-parameters-valid-p parameters) (error "invalid resource parameters"))
   (let ((started nil) (completed nil) (failure nil) (result nil))
@@ -267,6 +265,9 @@ values replace earlier ones even when they decrease."
     fact))
 
 (defun resource-recovery-admission (local fact hot-standby)
+  "Compare installed capacity with a positioned source fact without changing state.
+Return :DISABLED when hot standby is off, :UNKNOWN when the fact is absent, or
+:READY or :INSUFFICIENT with the ordered list of shortfalls."
   (unless (resource-parameters-valid-p local) (error "invalid installed resource parameters"))
   (when (and fact (not (wal-resource-fact-valid-p fact)))
     (error "invalid recovery resource fact"))

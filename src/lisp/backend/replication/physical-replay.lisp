@@ -398,7 +398,8 @@ Updating source membership does not change existing snapshots."
 
 (defun physical-replay-publish-terminal (record next-xid reservation source-xids
                                          &key (resource-fact (getf *physical-recovery-state* :source-resource-fact)))
-  "Durably finish pages/CLOG/catalog before publishing an applied terminal."
+  "Durably finish pages/CLOG/catalog before publishing an applied terminal.
+Check resource limits after the durable terminal and its fact are published."
   (when *physical-replay-test-hook*
     (funcall *physical-replay-test-hook* :after-redo record))
   (let* ((*catalog-identity-needs-persist-p* nil)
@@ -428,6 +429,9 @@ Updating source membership does not change existing snapshots."
 (declaim (ftype function physical-replay-selected-eor physical-replay-check-child-initialization))
 
 (defun physical-recovery-check-resource-readiness ()
+  "Before admitting a recovered standby, check the required frontier and capacity.
+Hot standby rejects unknown or insufficient source facts; disabling it skips the
+capacity comparison after the frontier has been reconstructed."
   (unless (resource-parameters-valid-p *installed-resource-parameters*)
     (error "resource capacity was not installed before recovery admission"))
   (physical-recovery-control-frontier *physical-recovery-state* *last-replay-lsn*)
@@ -448,12 +452,16 @@ Updating source membership does not change existing snapshots."
     decision))
 
 (defun wal-report-installed-resource-capacity ()
+  "Report installed capacity before declaring the primary ready.
+Initialize primary control metadata first if it is absent."
   (unless (resource-parameters-valid-p *installed-resource-parameters*)
     (error "resource capacity was not installed before primary readiness"))
   (unless *wal-control-metadata* (wal-set-primary-state +db-in-crash-recovery+))
   (wal-report-resource-parameters *installed-resource-parameters*))
 
 (defun physical-recovery-note-resource-limits ()
+  "After publishing a replay terminal, save the first insufficient fact and pause.
+Cold restart replay defers this check to startup admission."
   (when (and *installed-resource-parameters* *enable-hot-standby*
              (not *physical-replay-restarting-p*))
     (multiple-value-bind (decision shortfalls)
@@ -468,7 +476,8 @@ Updating source membership does not change existing snapshots."
         (when *physical-resource-pause* :resource-paused)))))
 
 (defun physical-replay-from (start-lsn)
-  "Called only before listeners or under operation quiescence, with no old readers."
+  "Called only before listeners or under operation quiescence, with no old readers.
+Stop before the next record when a published terminal causes a resource pause."
   (physical-recovery-control-frontier *physical-recovery-state* start-lsn)
   (with-physical-replay-staging ()
     (let ((next-xid *next-xid*)
@@ -508,6 +517,8 @@ Updating source membership does not change existing snapshots."
   (if *physical-resource-pause* :resource-paused *last-replay-lsn*))
 
 (defun physical-replay-pause-command (name)
+  "Apply replay pause commands under the pause lock.
+A resume request during a resource pause requests shutdown after releasing the lock."
   (with-live-operation
     (check-recovery-available)
     (when (member name '("pg_wal_replay_pause" "pg_wal_replay_resume") :test #'string=)
@@ -557,7 +568,8 @@ already writable; fence any error or nonlocal exit once replay starts."
 (declaim (ftype function physical-replay-with-readers))
 
 (defun physical-recovery-replay ()
-  "Apply durable batches under closed admission, deferring an unsafe reader prefix."
+  "Apply durable batches under closed admission, deferring an unsafe reader prefix.
+A resource pause remains in effect independently of a user-requested pause."
   (check-physical-recovery-work)
   (unless *physical-receive-store* (error "no native physical receiver spool"))
   (when (plusp *live-operation-depth*) (error "replay requires its own admission gate"))

@@ -292,9 +292,8 @@ These identities never enter the real active-XID set, CLOG or WAL.")
 (defvar *relation-maintainers* (make-hash-table :test #'eql))
 
 (defvar *relation-lock-object-limit* nil
-  "Private object cap, or NIL for no limit. Keep unbounded until startup sizing
-and durable checks of the primary's resource requirements are implemented. No
-max_locks_per_transaction setting is registered yet.")
+  "Private object cap, or NIL before startup installs the relation limits.
+The current startup plan uses an internal fixed locks-per-transaction value.")
 
 (defvar *relation-lock-owner-limit* nil
   "Private relation-owner pair cap, or NIL for no limit; see object cap.")

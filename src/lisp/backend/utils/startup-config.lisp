@@ -536,8 +536,7 @@ A reload may record a different desired value, but does not change this goal."
               settings native overrides))))
 
 (defun startup-check-connection-limits (settings)
-  "Check reserved-slot and C process-budget bounds before installing settings.
-The other worker pools use their C defaults in the process-budget calculation."
+  "Check reserved connection slots and plan the process and lock capacities."
   (let ((connections (startup-setting-value settings "max_connections"))
         (reserved (startup-setting-value settings "reserved_connections"))
         (superuser (startup-setting-value settings "superuser_reserved_connections")))
@@ -546,6 +545,9 @@ The other worker pools use their C defaults in the process-budget calculation."
     (startup-resource-capacity-plan settings)))
 
 (defun startup-resource-capacity-plan (settings)
+  "Plan the installed tuple and relation lock capacities from startup settings.
+Worker processes, prepared transactions and locks per transaction currently use
+internal fixed values of 8, 0 and 64, respectively."
   (let ((parameters (make-resource-parameters
                      (startup-setting-value settings "max_connections") 8
                      (startup-setting-value settings "max_wal_senders") 0 64)))
@@ -553,6 +555,8 @@ The other worker pools use their C defaults in the process-budget calculation."
       (values parameters objects owners))))
 
 (defun startup-install-resource-capacity (settings)
+  "Install the tuple and relation limits once under the relation lock.
+Check existing registrations fit before publishing either limit."
   (multiple-value-bind (parameters objects owners) (startup-resource-capacity-plan settings)
     (sb-thread:with-mutex (*relation-lock-mutex*)
       (when *installed-resource-parameters*

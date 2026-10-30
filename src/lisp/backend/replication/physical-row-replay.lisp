@@ -27,6 +27,7 @@ Zero is valid when every registered snapshot is covered."
       (values horizon (nreverse covered)))))
 
 (defun physical-row-replay-allowed-p (record horizon)
+  ;; Parameter changes carry no row images and are checked at their terminal.
   ;; Stop at the first record outside the certified row replay prefix.
   ;; Empty allocation-reservation batches are allowed; the decoder validates
   ;; that they have the required empty shape.
@@ -126,6 +127,7 @@ A violation is an error; the outer replay path fences recovery."
 
 (defun physical-row-replay-publish-terminal (record next-xid reservation source-xids
                                              &key (resource-fact (getf *physical-recovery-state* :source-resource-fact)))
+  ;; Check the published resource fact before replaying the next record.
   ;; Publish progress only after redo; restart can repeat an unpublished batch.
   (when *physical-replay-test-hook*
     (funcall *physical-replay-test-hook* :after-redo record))
@@ -138,6 +140,7 @@ A violation is an error; the outer replay path fences recovery."
   (physical-recovery-note-resource-limits))
 
 (defun physical-row-replay-prefix (horizon &optional covered)
+  ;; Publish resource facts at safe terminals, then stop on an insufficient fact.
   ;; Publish each safe terminal in order, and defer at the first unsafe batch.
   ;; Coverage checks do not replace provenance, storage or quiescence barriers.
   ;; Ordinary DML preserves heap and index versions, including during splits.

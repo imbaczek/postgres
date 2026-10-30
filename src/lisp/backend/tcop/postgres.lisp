@@ -880,6 +880,7 @@ CL's RENAME-FILE merges a relative target with the source's directory."
   (complete-xid-wraparound))
 
 (defun main ()
+  ;; Install resource limits before recovery, and check or report them before listen.
   (startup-handle-meta-request (cdr sb-ext:*posix-argv*))
   (multiple-value-bind (host port pgdata control-port control-socket
                         swank-port swank-bind-address temp-file-limit-bytes

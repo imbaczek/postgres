@@ -18,7 +18,8 @@
 (defvar *enable-hot-standby* t
   "Installed hot_standby setting; controls client startup during recovery.")
 
-(defvar *installed-resource-parameters* nil)
+(defvar *installed-resource-parameters* nil
+  "Capacity installed once at cold startup, used for recovery checks and WAL reporting.")
 
 (defvar *physical-recovery-state* nil
   "Verified native recovery image metadata, preserved across code reloads.")
@@ -28,7 +29,8 @@
 (defvar *physical-replay-paused-p* nil
   "Process-local replay pause; preserved across reload, cleared by process restart.")
 
-(defvar *physical-resource-pause* nil)
+(defvar *physical-resource-pause* nil
+  "Insufficient source fact and shortfalls saved under the replay pause lock.")
 
 (defvar *physical-replay-pause-lock*
   (sb-thread:make-mutex :name "native replay pause"))
@@ -79,6 +81,7 @@
 (defvar *physical-shutdown-lock* (sb-thread:make-mutex :name "native standby shutdown"))
 
 (defun check-physical-resource-promotion ()
+  "Reject promotion while replay is paused for insufficient resource capacity."
   (when *physical-resource-pause*
     (ereport "22023" "promotion is not possible because of insufficient parameter settings"
              :hint "Restart the server after making the necessary configuration changes.")))

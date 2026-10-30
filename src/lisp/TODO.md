@@ -14,12 +14,14 @@
   `recovery_target_name`, `recovery_target_time` and `recovery_target_xid`.
   Keep the complete writer oracle unchanged. Internal checks now derive shared
   relation-object and owner counts from published registrations and waiting
-  requests, with private limits left unbounded. Next wire startup sizing and
-  durable source requirements before enabling production capacity or exposing
-  `max_locks_per_transaction`; C sizes a shared pool, not a per-transaction limit.
+  requests. Cold startup installs a finite shared object/owner pool together with
+  the local resource tuple. Workers, prepared transactions and locks still use
+  internal values 8, 0 and 64; their public GUCs remain unregistered. Next expose
+  those settings with supported semantics and preserve pending-restart behavior.
+  C sizes a shared pool, not a per-transaction limit.
   Preserve atomic multi-relation admission, repeated
   acquisition, abort/cancellation/disconnect and virtual-reader cleanup.
-  Include persisted source resource requirements and standby validation, following
+  Persisted source resource requirements and standby validation now follow
   C's `XLogReportParameters` and `CheckRequiredParameterValues`.
   The shared five-field value, strict native codec, floor comparison, capacity
   arithmetic and optional positioned control metadata are implemented. Native
@@ -28,20 +30,22 @@
   publishing and reading back control metadata. Primary redo repairs an interrupted
   publication from durable WAL. Logical/history readers and slot resume checks
   validate the terminal without publishing applied resource facts. Owned-server
-  SIGKILL tests cover both publication boundaries. Automatic startup reporting
-  is not wired yet: its tuple must describe actual installed capacity.
+  SIGKILL tests cover both publication boundaries. Ordinary primary startup and
+  child-primary completion report installed capacity before production readiness.
   Ordinary checkpoints now carry an optional positioned tuple, and verified base
   images require exact agreement with copied control and a valid ancestor origin.
   Their manifest hashes bind the checkpoint facts without extra manifest fields.
   Exact facts now follow applied/required positions, restartpoint seeds, private
   follow scans and durable follow witnesses. Pending promotion freezes the parent
   fact, and its child checkpoint and primary control preserve it across restart.
-  Legacy seeds reconstruct facts from available durable WAL before restoring storage when
-  a known durable requirement needs proof. Missing legacy
+  Legacy seeds reconstruct facts from available durable WAL before restoring
+  storage when a known durable requirement needs proof. Missing legacy
   facts stay unknown; do not substitute current defaults or newer received facts
-  for an older replay seed. Cold hot-standby admission needs positive proof;
-  online insufficiency needs its own pause, promotion refusal and shutdown on
-  resume. Register the GUC only after those paths and startup sizing are complete.
+  for an older replay seed. Cold hot-standby admission now requires positive
+  proof after reconstruction; OFF recovery permits unknown facts. Online
+  insufficiency persists the report, pauses before later WAL, preserves readers,
+  refuses promotion and shuts down on resume. Owned tests cover direct pauses,
+  insufficiency discovered during promotion backlog replay, and adequate restart.
 
 - [ ] Fix signed integer GUC parsing for C23 binary prefixes independently of
   the unsigned recovery timeline parser. C reports `100` for
