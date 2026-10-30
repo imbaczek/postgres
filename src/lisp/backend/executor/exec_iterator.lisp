@@ -78,6 +78,46 @@
                     (query-replay-store-producer store) nil)))))))
   (values))
 
+(defvar *adopted-query-row-spools* (make-hash-table :test #'eq :weakness :key)
+  "Spools whose ownership has been transferred to a replay store.")
+
+(defvar *adopted-query-row-spools-lock*
+  (sb-thread:make-mutex :name "adopted query row spools"))
+
+(defun adopt-sealed-query-row-spool (spool)
+  "Transfer a sealed SPOOL once to a replay store with independent readers.
+
+The caller must retain the spool's temporary-file scope until the store closes
+and publish the returned store within its own protected cleanup scope.  The
+store owns the spool after adoption; readers do not own it.  The store has no
+producer, and the spool cannot be adopted again.  If indexing in-memory rows fails after
+ownership is claimed, close the newly created store."
+  (unless (query-row-spool-sealed-p spool)
+    (error "Cannot adopt an unsealed query row spool"))
+  (let ((store (%make-query-replay-store :spool spool :eof-p t
+                                         :capture-origins-p nil))
+        (claimed nil)
+        (complete nil))
+    (sb-sys:without-interrupts
+      (unwind-protect
+           (progn
+             (sb-thread:with-mutex (*adopted-query-row-spools-lock*)
+               (when (gethash spool *adopted-query-row-spools*)
+                 (error "Query row spool was already adopted"))
+               (setf (gethash spool *adopted-query-row-spools*) t
+                     claimed t))
+             (prog1
+                 (sb-sys:with-local-interrupts
+                   (unless (query-row-spool-pathname spool)
+                     (let ((rows (coerce (reverse (query-row-spool-rows spool)) 'vector)))
+                       (sb-sys:without-interrupts
+                         (setf (query-replay-store-memory-rows store) rows
+                               (query-row-spool-rows spool) nil))))
+                   store)
+               (setf complete t)))
+        (when (and claimed (not complete))
+          (close-query-replay-store store))))))
+
 (defun append-query-replay-row (store row &optional (origins *query-row-origins*))
   (let* ((spool (query-replay-store-spool store))
          (copy (copy-query-sort-value
@@ -92,6 +132,8 @@
         (vector-push-extend copy (query-replay-store-memory-rows store)))))
 
 (defun make-query-replay-reader (store)
+  ;; Each reader keeps its own position and input stream. Closing a reader
+  ;; releases that stream; closing the store also closes every live reader.
   (let ((index 0) (input nil) (offset nil) (reader nil))
     (setf reader
           (make-sql-iterator
