@@ -28,6 +28,7 @@
     ("hot_standby" :postmaster :boolean "on")
     ("max_connections" :postmaster :integer "100" 1 262143 nil)
     ("max_wal_senders" :postmaster :integer "10" 0 262143 nil)
+    ("max_worker_processes" :postmaster :integer "8" 0 262143 nil)
     ("max_locks_per_transaction" :postmaster :integer "128" 10 2147483647 nil)
     ("reserved_connections" :postmaster :integer "0" 0 262143 nil)
     ("superuser_reserved_connections" :postmaster :integer "3" 0 262143 nil)
@@ -566,11 +567,11 @@ A reload may record a different desired value, but does not change this goal."
 
 (defun startup-resource-capacity-plan (settings)
   "Plan the installed tuple and relation lock capacities from startup settings.
-Connections, WAL senders and locks per transaction use active settings; worker
-processes and prepared transactions use internal values 8 and 0. The lock setting
-has default 128 and range 10 through INT_MAX, and requires a restart to change."
+Connections, workers, WAL senders and locks per transaction use active settings.
+Prepared transactions remain disabled with an internal capacity of zero."
   (let ((parameters (make-resource-parameters
-                     (startup-setting-value settings "max_connections") 8
+                     (startup-setting-value settings "max_connections")
+                     (startup-setting-value settings "max_worker_processes")
                      (startup-setting-value settings "max_wal_senders") 0
                      (startup-setting-value settings "max_locks_per_transaction"))))
     (multiple-value-bind (objects owners) (resource-lock-capacities parameters)
@@ -579,8 +580,8 @@ has default 128 and range 10 through INT_MAX, and requires a restart to change."
 (defun startup-install-resource-capacity (settings)
   "Install the tuple, relation limits and managed-worker slots once at startup.
 Check existing relation registrations before publishing under the relation and
-worker locks. The current internal worker capacity is eight; auxiliary services
-have separate lifecycles and do not consume these slots."
+worker locks. Auxiliary services have separate lifecycles and do not consume
+these slots."
   (multiple-value-bind (parameters objects owners) (startup-resource-capacity-plan settings)
     (let ((slots (make-array (resource-parameters-workers parameters) :initial-element nil)))
       (sb-thread:with-mutex (*relation-lock-mutex*)

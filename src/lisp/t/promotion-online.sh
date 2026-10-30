@@ -6,6 +6,7 @@ SBCL=${SBCL:-sbcl}
 PSQL=${PSQL:-psql}
 PATRONI_PYTHON=${PATRONI_PYTHON:-/tmp/pg-patroni-4.1.5-venv/bin/python3}
 PORT=${PORT:-6530}
+WORKER_PROCESSES=${WORKER_PROCESSES:-8}
 TARGET_PORT=$((PORT + 1))
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/pg-promotion-online.XXXXXX")
 SOURCE= TARGET= READER= UTILITY=
@@ -30,9 +31,11 @@ checked() {
 }
 start_target() {
     rm -f "$TMP/target.sock"
-    "$BASE/pg-lisp.sh" -p "$TARGET_PORT" -D "$TMP/copy" --control-socket "$TMP/target.sock" >>"$TMP/target.log" 2>&1 &
+    "$BASE/pg-lisp.sh" -p "$TARGET_PORT" -D "$TMP/copy" -c "max_worker_processes=$WORKER_PROCESSES" --control-socket "$TMP/target.sock" >>"$TMP/target.log" 2>&1 &
     TARGET=$!
     test_wait_owned_sql_server "$TARGET" "$TARGET_PORT" "$PSQL"
+    test "$(sql "$TARGET_PORT" 'SHOW max_worker_processes')" = "$WORKER_PROCESSES"
+    test "$(sql "$TARGET_PORT" "SELECT setting, context, vartype, pending_restart FROM pg_settings WHERE name = 'max_worker_processes'")" = "$WORKER_PROCESSES|postmaster|integer|f"
 }
 wait_value() {
     attempt=0
@@ -43,9 +46,10 @@ wait_value() {
     done
 }
 mkdir -m 700 "$TMP/copy"
-"$BASE/pg-lisp.sh" -p "$PORT" -D "$TMP/source" --control-socket "$TMP/source.sock" >"$TMP/source.log" 2>&1 &
+"$BASE/pg-lisp.sh" -p "$PORT" -D "$TMP/source" -c "max_worker_processes=$WORKER_PROCESSES" --control-socket "$TMP/source.sock" >"$TMP/source.log" 2>&1 &
 SOURCE=$!
 test_wait_owned_sql_server "$SOURCE" "$PORT" "$PSQL"
+test "$(sql "$PORT" 'SHOW max_worker_processes')" = "$WORKER_PROCESSES"
 sql "$PORT" 'CREATE TABLE data (id integer PRIMARY KEY); INSERT INTO data VALUES (1)'
 if [ "${RESOURCE_FACTS:-0}" = 1 ]; then
     checked source '(wal-report-resource-parameters (make-resource-parameters 100 8 10 0 64))' resource-initial
@@ -72,6 +76,10 @@ fi
 checked target "(physical-follow-start \"127.0.0.1\" $PORT \"online_promotion\")" follow
 sql "$PORT" 'INSERT INTO data VALUES (2),(3),(4),(5)'
 wait_value 'SELECT count(*) FROM data' 5
+if [ "$WORKER_PROCESSES" = 0 ]; then
+    checked target '(physical-recovery-restartpoint)' zero-worker-restartpoint
+    checked target '(progn (assert (zerop (length *managed-worker-slots*))) (assert (null (managed-worker-register (lambda () :refused)))))' zero-worker-admission
+fi
 if [ "${RESOURCE_FACTS:-0}" = 1 ]; then
     checked source '(wal-report-resource-parameters (make-resource-parameters 50 4 5 0 64))' resource-decrease
     resource_end=$(sql "$PORT" 'SELECT pg_current_wal_flush_lsn()')
@@ -151,6 +159,9 @@ exec 3>&-
 wait_value 'SELECT pg_is_in_recovery()' f
 test "$(sql "$TARGET_PORT" 'SELECT count(*) FROM data')" = 12
 checked target '(assert (and (not *physical-follow-runtime*) (not *physical-restartpoint-worker*) (not *physical-promotion-stopping-p*) (not *physical-recovery-state*) (not *physical-recovery-failed-p*)))' primary
+if [ "$WORKER_PROCESSES" = 0 ]; then
+    checked target '(assert (equal (quote (100 0 10 0 128)) (getf *wal-control-metadata* :resource-parameters)))' zero-worker-promoted
+fi
 if [ "${RESOURCE_FACTS:-0}" = 1 ]; then
     checked target "(progn (assert (equal '(50 4 5 0 64) (getf *wal-checkpoint-snapshot* :resource-parameters))) (assert (equal '(100 8 10 0 128) (getf *wal-control-metadata* :resource-parameters))) (assert (= 2 (getf *wal-control-metadata* :resource-timeline))))" resource-promoted
 fi

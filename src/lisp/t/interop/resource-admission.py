@@ -65,16 +65,18 @@ def startup_error_sqlstate(name):
                 return fields[b"C"].decode("ascii")
 
 
-def start(name, connections=100, ready=True, hot_standby=True):
+def start(name, connections=100, ready=True, hot_standby=True, workers=None):
     socket = ROOT / f"{name}.sock"
     socket.unlink(missing_ok=True)
     log = open(ROOT / f"{name}-{connections}.log", "ab")
     LOGS.append(log)
-    process = subprocess.Popen(
-        [str(BASE / "pg-lisp.sh"), "-p", str(PORT + (name == "target")),
+    arguments = [str(BASE / "pg-lisp.sh"), "-p", str(PORT + (name == "target")),
          "-D", str(ROOT / name), "--control-socket", str(socket),
          "-c", f"max_connections={connections}",
-         "-c", f"hot_standby={'on' if hot_standby else 'off'}"], stdout=log, stderr=log)
+         "-c", f"hot_standby={'on' if hot_standby else 'off'}"]
+    if workers is not None:
+        arguments += ["-c", f"max_worker_processes={workers}"]
+    process = subprocess.Popen(arguments, stdout=log, stderr=log)
     SERVERS[name] = process
     if not ready:
         assert process.wait(timeout=45) == 1
@@ -111,6 +113,8 @@ def control(name, form):
 
 
 def exercise():
+    resource_field = os.environ.get("RESOURCE_FIELD", "connections")
+    assert resource_field in ("connections", "workers"), resource_field
     start("source")
     sql("source", "CREATE TABLE data (id integer); INSERT INTO data VALUES (1)")
     (ROOT / "target").mkdir(mode=0o700)
@@ -126,9 +130,10 @@ def exercise():
         promotion_backlog = os.environ.get("RESOURCE_PROMOTION_BACKLOG") == "1"
         if promotion_backlog:
             sql("target", "SELECT pg_wal_replay_pause()")
-        # Inject a source requirement through the real reporter to test standby
-        # admission independently of source connection-count configuration.
-        control("source", "(wal-report-resource-parameters (make-resource-parameters 200 8 10 0 64))")
+        # Inject through the real reporter so the pause does not depend on
+        # restarting the source with a larger local capacity first.
+        required = "100 16 10 0 128" if resource_field == "workers" else "200 8 10 0 64"
+        control("source", f"(wal-report-resource-parameters (make-resource-parameters {required}))")
         sql("source", "INSERT INTO data VALUES (2)")
         end = sql("source", "SELECT pg_current_wal_flush_lsn()")
         wait_for(lambda: sql("target", f"SELECT pg_last_wal_receive_lsn() >= '{end}'::pg_lsn"),
@@ -159,13 +164,19 @@ def exercise():
         reader.close()
     start("target", ready=False)
     assert "insufficient parameter settings" in (ROOT / "target-100.log").read_text()
-    start("target", connections=200)
+    if resource_field == "workers":
+        start("target", workers=16)
+        assert sql("target", "SHOW max_worker_processes") == "16"
+    else:
+        start("target", connections=200)
     assert sql("target", "SELECT pg_is_in_recovery()")
     assert sql("target", "SELECT count(*) FROM data") == 2
     print("resource-admission: retained reader, durable pause, receipt, promotion refusal, "
           "resume shutdown and adequate restart PASS")
     if promotion_backlog:
         print("resource-admission: promotion discovers resource shortfall in backlog and restores standby PASS")
+    if resource_field == "workers":
+        print("resource-admission: worker requirement pauses replay; adequate worker capacity restart clears it PASS")
 
 
 def legacy_unknown():

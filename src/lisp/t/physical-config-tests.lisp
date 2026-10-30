@@ -359,6 +359,84 @@
       (ok (equal "55P02" (recovery-state-of
                           (lambda () (pg::startup-check-session-setting "max_locks_per_transaction")))))))
 
+(deftest max-workers-setting-matches-c-bounds-and-startup-context
+    (let ((settings (pg::startup-default-settings "/tmp/worker-setting-test/")))
+      (ok (equal 8 (pg::startup-setting-value settings "max_worker_processes")))
+      (ok (= 0 (pg::startup-normalize-setting "max_worker_processes" "0")))
+      (ok (= 262143 (pg::startup-normalize-setting "max_worker_processes" "262143")))
+      (dolist (value '("-1" "262144"))
+        (ok (intake-fails-p
+             (lambda () (pg::startup-normalize-setting "max_worker_processes" value)))))
+      (ok (equal "55P02"
+                 (recovery-state-of
+                  (lambda () (pg::startup-check-session-setting "max_worker_processes")))))
+      (setf (gethash "max_worker_processes" settings) (list :value 262143 :source :command-line))
+      (ok (intake-fails-p (lambda () (pg::startup-resource-capacity-plan settings))))))
+
+(deftest max-workers-reload-preserves-registrations-and-capacity-until-restart
+    (with-physical-store-directory (root)
+      (let* ((pg::*pgdata* root)
+             (configuration (merge-pathnames "postgresql.conf" root))
+             (pg::*startup-server-settings* nil)
+             (pg::*startup-native-inputs* nil) (pg::*startup-command-overrides* nil)
+             (pg::*installed-resource-parameters* nil)
+             (pg::*managed-worker-slots* nil)
+             (pg::*managed-worker-registration-closed-p* nil)
+             (pg::*relation-lock-object-limit* nil) (pg::*relation-lock-owner-limit* nil))
+        (write-startup-config configuration (format nil "max_worker_processes=1~%"))
+        (multiple-value-bind (native overrides) (pg::startup-cli-inputs (list "-D" (namestring root)))
+          (pg::startup-install-settings (pg::startup-load-settings native overrides) native overrides))
+        (let* ((installed (pg::startup-install-resource-capacity pg::*startup-server-settings*))
+               (slots pg::*managed-worker-slots*)
+               (handle (pg::managed-worker-register (lambda () :reserved))))
+          (unwind-protect
+               (progn
+                 (write-startup-config configuration (format nil "max_worker_processes=2~%"))
+                 (pg::startup-reload-settings)
+                 (let ((entry (gethash "max_worker_processes" pg::*startup-server-settings*)))
+                   (ok (= 1 (getf entry :value)))
+                   (ok (= 2 (getf entry :desired-value)))
+                   (ok (getf entry :pending-restart)))
+                 (let ((row (find "max_worker_processes" (pg::startup-settings-rows)
+                                  :key (lambda (row) (aref row 0)) :test #'equal)))
+                   (ok (equal "1" (pg::startup-setting-show-value "max_worker_processes")))
+                   (ok (equal "1" (aref row 1)))
+                   (ok (equal "postmaster" (aref row 3)))
+                   (ok (equal "integer" (aref row 4)))
+                   (ok (aref row 8)))
+                 (ok (eq installed pg::*installed-resource-parameters*))
+                 (ok (eq slots pg::*managed-worker-slots*))
+                 (ok (= 1 (length slots)))
+                 (ok (eq :registered (pg::managed-worker-status handle)))
+                 (ok (null (pg::managed-worker-register (lambda () :overflow))))
+                 (ok (= (* 128 129) pg::*relation-lock-object-limit*))
+                 (let ((pg::*installed-resource-parameters* nil)
+                       (pg::*managed-worker-slots* nil))
+                   (let* ((settings (pg::startup-load-settings
+                                     pg::*startup-native-inputs* pg::*startup-command-overrides*))
+                          (restarted (pg::startup-install-resource-capacity settings)))
+                     (ok (= 2 (pg::resource-parameters-workers restarted)))
+                     (ok (= 2 (length pg::*managed-worker-slots*))))))
+            (pg::managed-worker-request-stop handle))))))
+
+(cl-spec:defproperty worker-setting-sizes-installed-resource-plan
+    ((workers (range integer 0 512)))
+  (:about pg::startup-resource-capacity-plan)
+  (:trials (:normal 200))
+  (let ((settings (pg::startup-default-settings "/tmp/worker-plan-test/")))
+    (setf (gethash "max_worker_processes" settings)
+          (list :value workers :source :command-line))
+    (multiple-value-bind (parameters objects owners)
+        (pg::startup-resource-capacity-plan settings)
+      (and (= workers (pg::resource-parameters-workers parameters))
+           (= objects (* 128 (+ 100 workers 10 16 2)))
+           (= owners (* 2 objects))))))
+
+(deftest generated-worker-setting-resource-plan
+    (let ((data (cl-spec:result-data
+                 (cl-spec:run-property 'worker-setting-sizes-installed-resource-plan :seed 42))))
+      (ok (eq :passed (getf data :status)) (format nil "~s" data))))
+
 (deftest startup-settings-catalog-keeps-base-units-and-active-provenance
     (let* ((pg::*startup-server-settings* (pg::startup-default-settings "/tmp/data/"))
            (pg::*startup-native-inputs* (make-hash-table :test #'equal)))
