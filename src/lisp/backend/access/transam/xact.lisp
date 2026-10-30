@@ -263,7 +263,8 @@ or :QUERY-STATE for the wire dispatch's existing reload/shutdown cleanup lane."
 (defvar *logical-capture-live-slots* nil
   "Live slot count, or NIL until authoritatively refreshed under WAL lock.")
 
-(defvar *wal-level* :replica)
+(defvar *wal-level* :replica
+  "Installed WAL level used to select each new XID's logical capture mode.")
 
 (defvar *xid-wrap-lock* (sb-thread:make-mutex :name "pg xid wrap gate"))
 (defvar *xid-wrap-work-lock* (sb-thread:make-mutex :name "pg xid wrap worker"))
@@ -808,6 +809,10 @@ holding a portal snapshot must be allowed to run so it can release its pin."
     (ereport "55000" "transaction ID wraparound is waiting for a safe tuple freeze; retry the statement")))
 
 (defun xid-allocate-under-lock ()
+  "Assign an XID and fix its logical capture decision under the XID lock.
+Logical level always captures. At replica level, live slots, an arming slot or
+an unknown live-slot count require capture. The decision stays with the XID as
+its mutations arrive."
   (let* ((xid *next-xid*)
          (next (advance-full-xid xid))
          (link (list xid))

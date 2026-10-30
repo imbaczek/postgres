@@ -7,13 +7,20 @@
   remains unsupported; coordination is outside this scope.
 
 - [ ] Complete the pinned Patroni writer and real `Postgresql.follow` acceptance.
-  Its current complete writer snapshots contain four unsupported settings:
-  `wal_level`, `wal_log_hints`, `hba_file` and `ident_file`. The seven other
+  Its current complete writer snapshots contain two unsupported settings:
+  `hba_file` and `ident_file`. The seven other
   names accept disabled or unset values: `max_prepared_transactions`,
   `track_commit_timestamp`, `recovery_target`, `recovery_target_lsn`,
   `recovery_target_name`, `recovery_target_time` and `recovery_target_xid`.
   Positive prepared-transaction capacity, commit timestamp tracking and targeted
   recovery remain unimplemented. Keep the complete writer oracle unchanged.
+  `wal_level` accepts replica and logical; minimal WAL generation remains
+  unsupported. Replica uses dynamic logical capture for live or arming slots,
+  while logical captures even without slots. Each XID keeps its capture choice.
+  `wal_log_hints` accepts on and off; supported native paths have no persistent
+  hint-bit writers. Full C hint full-page-image behavior and rewind remain open.
+  Source effective WAL level and activation status, including WAL/checkpoint
+  propagation, remain unimplemented; logical decoding on a standby is unsupported.
   Internal checks now derive shared
   relation-object and owner counts from published registrations and waiting
   requests. Cold startup installs a finite shared object/owner pool together with

@@ -208,6 +208,8 @@ uses strtod. Return the remaining unit for the caller's conversion and rounding.
   (bytes->string (startup-input-octets input)))
 
 (defun startup-parse-wal-level (text)
+  "Parse WAL level names, mapping the deprecated archive and hot_standby aliases
+to replica. Feature admission separately rejects minimal."
   (let ((value (string-downcase text)))
     (cond ((member value '("minimal" "replica" "logical") :test #'string=) value)
           ((member value '("archive" "hot_standby") :test #'string=) "replica")
@@ -506,8 +508,9 @@ A reload may record a different desired value, but does not change this goal."
 
 (defun startup-check-feature-support (settings)
   "Reject effective settings that enable unsupported features.
-Prepared transactions must be zero, commit timestamp tracking off, and each
-listed recovery target empty. Return SETTINGS after validation."
+Minimal WAL generation is unavailable. Prepared transactions must be zero,
+commit timestamp tracking off, and each listed recovery target empty.
+Return SETTINGS after validation."
   (unless (member (startup-setting-value settings "wal_level") '("replica" "logical") :test #'equal)
     (error "wal_level=minimal requires unimplemented minimal WAL generation"))
   (when (plusp (startup-setting-value settings "max_prepared_transactions"))
@@ -646,7 +649,9 @@ these slots."
   "Validate and install settings, including session quotas before listen.
 Install wal_keep_size in MB on successful reload; postmaster settings such as
 hot_standby retain their active values until restart. Settings and the desired
-follow generation are published together under live-operation quiescence."
+follow generation are published together under live-operation quiescence.
+The installed WAL level selects logical capture at XID allocation. wal_log_hints accepts
+on and off; supported native paths have no persistent hint-bit writers."
   (startup-check-connection-limits settings)
   (let ((timeout (startup-setting-value settings "checkpoint_timeout"))
         (wal-bytes (* 1024 1024 (startup-setting-value settings "max_wal_size")))
@@ -714,7 +719,9 @@ Reject an unsupported effective candidate before publishing any reload changes."
                         " without restarting the server" " now")))))
 
 (defun startup-settings-row (name entry)
-  "Expose actual installed settings in guc_funcs.c column units and provenance."
+  "Expose actual installed settings in guc_funcs.c column units and provenance.
+WAL level enum values are a text array of canonical names; aliases are hidden.
+Other supported setting rows have NULL enum values."
   (let* ((spec (assoc name *startup-setting-specs* :test #'string=))
          (source (getf entry :source))
          (unit (case (seventh spec) (:seconds "s") (:megabytes "MB") (t +null+)))
