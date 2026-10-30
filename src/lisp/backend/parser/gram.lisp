@@ -96,7 +96,8 @@
       (syntax-error p "expected integer literal")))
 
 (defun parse-limit-literal (p)
-  "Coerce a numeric row-count literal to int8, rounding numeric ties away from zero."
+  "Round a numeric row-count literal to an integer, with ties away from zero.
+Range and negative checks occur when the LIMIT executes."
   (let* ((negative-p (match-op p "-"))
          (positive-p (and (not negative-p) (match-op p "+")))
          (value (cond ((eq (pkind p) :integer) (token-value (pnext p)))
@@ -106,9 +107,6 @@
                       (t (syntax-error p "expected numeric LIMIT literal"))))
          (count (* (if negative-p -1 1) value)))
     (declare (ignore positive-p))
-    (unless (<= +int8-min+ count +int8-max+)
-      (ereport "22003" "bigint out of range"))
-    (when (minusp count) (ereport "2201W" "LIMIT must not be negative"))
     count))
 
 (defun parse-string-literal (p)
@@ -1245,6 +1243,7 @@
             (when read-mode-seen (list :read-only read-only)))))
 
 (defun parse-set-value (p)
+  "Keep numeric SET values as text for the setting's own input conversion."
   (cond
     ((or (op-p p "-") (op-p p "+"))
      (let ((sign (pval p)))

@@ -195,9 +195,17 @@ MODE is the literal :READ or :WRITE. Registration remains until the XID ends."
                          (select-top-n-item-less-p
                           a b (select-top-n-collector-order collector))))))
 
+(defun check-select-limit (count)
+  "Validate the bigint row count when its LIMIT begins execution.
+An unexecuted LIMIT does not raise these errors."
+  (unless (<= +int8-min+ count +int8-max+)
+    (ereport "22003" "bigint out of range"))
+  (when (minusp count) (ereport "2201W" "LIMIT must not be negative"))
+  count)
+
 (defun collect-select-top-n (streamer order limit &optional with-origins)
   "Consume STREAMER while retaining at most LIMIT rows in ORDER BY order."
-  (let ((collector (make-select-top-n-collector limit order)))
+  (let ((collector (make-select-top-n-collector (check-select-limit limit) order)))
     (unless (zerop limit)
       (funcall streamer (lambda (row) (offer-select-top-n-row collector row))))
     (select-top-n-collector-rows collector with-origins)))

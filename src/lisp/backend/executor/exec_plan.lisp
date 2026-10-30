@@ -1842,7 +1842,7 @@ ROW's source environment.  Only final target origins leave this projection."
                             :stop)
                     (return :stop))))))
     (:limit
-     (let ((limit (second node))
+     (let ((limit (check-select-limit (second node)))
            (count 0))
        (unless (zerop limit)
          (funcall run-child

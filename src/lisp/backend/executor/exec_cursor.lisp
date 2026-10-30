@@ -427,6 +427,7 @@ source itself.  Closing the result closes the sort and its source."
         (let ((remaining (third node)))
           (make-sql-iterator
            (lambda ()
+             (check-select-limit remaining)
              (when (plusp remaining)
                (decf remaining)
                (sql-iterator-next output)))
@@ -671,6 +672,7 @@ source itself.  Closing the result closes the sort and its source."
      (let ((remaining (second node)) (input nil))
        (make-sql-iterator
         (lambda ()
+          (check-select-limit remaining)
           (when (plusp remaining)
             (unless input (setf input (make-physical-plan-iterator (third node) relations)))
             (decf remaining)
