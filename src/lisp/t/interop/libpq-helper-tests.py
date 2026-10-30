@@ -344,6 +344,46 @@ class HelperProtocol(unittest.TestCase):
             self.assertEqual(helper.call(b'X'), (b'A', b''))
             helper.process.wait(timeout=2)
 
+    def test_physical_open_overrides_database_and_replication_options(self):
+        def answer(connection):
+            self.assertEqual(wire_read(connection, 1), b'X')
+            self.assertEqual(wire_read(connection, 4), struct.pack('!I', 4))
+
+        with source(answer) as (port, parameters):
+            helper = Helper()
+            try:
+                conninfo = (f'host=127.0.0.1 port={port} user=postgres dbname=unused '
+                            'replication=database sslmode=disable gssencmode=disable')
+                self.assertEqual(helper.call(b'W', string(conninfo) + string('physical-fallback'))[0], b'O')
+                self.assertEqual(parameters[b'replication'], b'true')
+                self.assertEqual(parameters[b'database'], b'replication')
+                self.assertEqual(parameters[b'application_name'], b'physical-fallback')
+                self.assertEqual(helper.call(b'X'), (b'A', b''))
+                helper.process.wait(timeout=2)
+            finally:
+                helper.close()
+
+    def test_frozen_physical_open_preserves_replication_mode(self):
+        def answer(connection):
+            self.assertEqual(wire_read(connection, 1), b'X')
+            self.assertEqual(wire_read(connection, 4), struct.pack('!I', 4))
+
+        with source(answer) as (port, parameters):
+            helper = Helper(env=dict(os.environ, PGREPLICATION='database', PGDATABASE='wrong'))
+            try:
+                options = [('host', '127.0.0.1'), ('hostaddr', '127.0.0.1'),
+                           ('port', str(port)), ('dbname', 'replication'), ('user', 'postgres'),
+                           ('replication', 'true'), ('sslmode', 'disable'), ('gssencmode', 'disable')]
+                body = struct.pack('!I', len(options)) + b''.join(string(key) + string(value)
+                                                                for key, value in options)
+                self.assertEqual(helper.call(b'P', body)[0], b'O')
+                self.assertEqual(parameters[b'replication'], b'true')
+                self.assertEqual(parameters[b'database'], b'replication')
+                self.assertEqual(helper.call(b'X'), (b'A', b''))
+                helper.process.wait(timeout=2)
+            finally:
+                helper.close()
+
     def test_frozen_open_rejects_service_and_missing_selected_address(self):
         for options in ([('service', 'must-not-resolve')], [('host', 'localhost'), ('port', '5432')]):
             with self.subTest(options=options):

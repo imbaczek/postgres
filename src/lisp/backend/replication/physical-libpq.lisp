@@ -35,7 +35,7 @@
   (values (code-char (aref header 20)) (bytes-to-u32 header 21)))
 
 (defstruct (physical-libpq-profile
-            (:constructor %make-physical-libpq-profile (conninfo fallback))
+            (:constructor %make-physical-libpq-profile (conninfo fallback mode))
             (:conc-name %physical-libpq-profile-)
             (:print-function physical-libpq-print-private-object))
   "Copied connection settings; printing the profile does not expose secrets.
@@ -44,18 +44,20 @@ fallback application name. Libpq resolves service and
 environment settings for each connection attempt. Effective multihost connections
 are unsupported by the helper."
   (conninfo "" :type (or string (vector (unsigned-byte 8))) :read-only t)
-  (fallback "" :type string :read-only t))
+  (fallback "" :type string :read-only t)
+  (mode :database :type (member :database :physical) :read-only t))
 
 (defun physical-libpq-default-fallback ()
   "Use cluster_name as the application name fallback, or walreceiver if empty."
   (let ((name (startup-setting-show-value "cluster_name")))
     (if (and name (plusp (length name))) name "walreceiver")))
 
-(defun make-physical-libpq-profile (conninfo &key (fallback (physical-libpq-default-fallback)))
+(defun make-physical-libpq-profile (conninfo &key (fallback (physical-libpq-default-fallback)) (mode :database))
   "Copy settings and reject NULs or a helper open body over 1 MiB.
 The bound includes both encoded values and their length fields. Errors are
 opaque because the supplied settings may contain credentials."
-  (unless (and (typep conninfo '(or string (vector (unsigned-byte 8)))) (stringp fallback))
+  (unless (and (typep conninfo '(or string (vector (unsigned-byte 8)))) (stringp fallback)
+               (member mode '(:database :physical)))
     (error "invalid libpq connection profile"))
   (let ((conninfo-size (length conninfo)) (fallback-size (length fallback)))
     (unless (<= (+ 8 conninfo-size fallback-size) 1048576)
@@ -70,7 +72,7 @@ opaque because the supplied settings may contain credentials."
                        (not (find (code-char 0) saved-fallback))
                        (<= (+ 8 (length bytes) (length (string->bytes saved-fallback))) 1048576))
             (error "invalid libpq connection profile"))
-          (%make-physical-libpq-profile saved-conninfo saved-fallback))
+          (%make-physical-libpq-profile saved-conninfo saved-fallback mode))
       (error () (error "invalid libpq connection profile")))))
 
 (defun physical-libpq-profile-conninfo (profile)
@@ -86,6 +88,9 @@ opaque because the supplied settings may contain credentials."
 
 (defun physical-libpq-profile-fallback (profile)
   (copy-seq (%physical-libpq-profile-fallback profile)))
+
+(defun physical-libpq-profile-mode (profile)
+  (%physical-libpq-profile-mode profile))
 
 (defstruct (physical-libpq-connection-info
             (:constructor %make-physical-libpq-connection-info)
@@ -227,11 +232,11 @@ opaque because the supplied settings may contain credentials."
   (let ((conninfo (%physical-libpq-profile-conninfo profile)))
     (if (stringp conninfo) (copy-seq conninfo) (physical-libpq-octets-datum conninfo))))
 
-(defun physical-libpq-profile-from-conninfo-datum (datum fallback)
+(defun physical-libpq-profile-from-conninfo-datum (datum fallback &key (mode :database))
   "Restore either legacy string or raw byte conninfo and validate the profile."
   (make-physical-libpq-profile
    (if (stringp datum) datum (physical-libpq-datum-octets datum 1048576))
-   :fallback fallback))
+   :fallback fallback :mode mode))
 
 (defun physical-libpq-frozen-profile-datum (profile)
   "Return a bounded, EQUAL-stable private datum for durable cleanup.
@@ -239,6 +244,29 @@ Its canonical hexadecimal bytes are reversible, not encrypted; treat as secret."
   (physical-libpq-check-profile-datum
    (loop for (key value) in (%physical-libpq-frozen-profile-parameters profile)
          collect (list (copy-seq key) (physical-libpq-octets-datum value)))))
+
+(defun physical-libpq-parameters-mode (parameters)
+  (let ((replication (second (assoc "replication" parameters :test #'equal))))
+    (cond
+      ((or (null replication) (equalp replication (string->bytes "database"))) :database)
+      ((equalp replication (string->bytes "true"))
+       (unless (equalp (second (assoc "dbname" parameters :test #'equal))
+                       (string->bytes "replication"))
+         (error "invalid physical libpq database"))
+       :physical)
+      (t (error "invalid libpq replication mode")))))
+
+(defun physical-libpq-frozen-profile-mode (profile)
+  (physical-libpq-parameters-mode (%physical-libpq-frozen-profile-parameters profile)))
+
+(defun physical-libpq-check-connection-mode (info mode)
+  (unless (and (eq mode (physical-libpq-parameters-mode
+                         (physical-libpq-connection-info-parameters info)))
+               (or (eq mode :database)
+                   (equalp (physical-libpq-connection-info-database info)
+                           (string->bytes "replication"))))
+    (error "libpq connection mode changed"))
+  info)
 
 (defun physical-libpq-check-frozen-route (parameters)
   (let ((host (second (assoc "host" parameters :test #'equal)))
@@ -265,6 +293,7 @@ Its canonical hexadecimal bytes are reversible, not encrypted; treat as secret."
   (let* ((parameters (%physical-libpq-frozen-profile-parameters profile))
          (body (make-payload)))
     (physical-libpq-check-frozen-route parameters)
+    (physical-libpq-frozen-profile-mode profile)
     (unless (<= (length parameters) 128)
       (error "frozen libpq profile has too many options"))
     (payload-push-u32 body (length parameters))
@@ -672,10 +701,11 @@ supported. A failed open attempts to close the reserved channel."
         (physical-libpq-push-octets body (physical-libpq-profile-conninfo-octets profile))
         (physical-libpq-push-text body (%physical-libpq-profile-fallback profile))
         (multiple-value-bind (kind bytes)
-            (physical-libpq-exchange channel #\O body '(#\O) 1048576)
+            (physical-libpq-exchange channel (if (eq :physical (physical-libpq-profile-mode profile)) #\W #\O) body '(#\O) 1048576)
           (declare (ignore kind))
           (setf (physical-libpq-channel-info channel)
-                (physical-libpq-decode-connection-info bytes)))
+                (physical-libpq-check-connection-mode
+                 (physical-libpq-decode-connection-info bytes) (physical-libpq-profile-mode profile))))
         channel))))
 
 (defun physical-libpq-connect-frozen (helper profile &key on-spawn)
@@ -687,7 +717,8 @@ supported. A failed open attempts to close the reserved channel."
                                    '(#\O) 1048576)
         (declare (ignore kind))
         (setf (physical-libpq-channel-info channel)
-              (physical-libpq-decode-connection-info bytes)))
+              (physical-libpq-check-connection-mode
+               (physical-libpq-decode-connection-info bytes) (physical-libpq-frozen-profile-mode profile))))
       channel)))
 
 (defun physical-libpq-query (channel query schema tag &key (maximum 4096) command-only)

@@ -249,7 +249,7 @@ or transport failure. Do not perform network I/O under recovery quiescence."
 
 (defun physical-client-identity-row (client)
   (physical-client-query client "IDENTIFY_SYSTEM"
-                         '(("systemid" 25) ("timeline" 20) ("xlogpos" 25) ("dbname" 25))
+                         '(("systemid" 25) ("timeline" 20) ("xlogpos" 25) ("dbname" 25 :nullable))
                          "IDENTIFY_SYSTEM"))
 
 (defun pg-client-native-history (client timeline)

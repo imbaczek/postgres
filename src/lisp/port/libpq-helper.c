@@ -274,7 +274,7 @@ finish_connection(int64_t deadline)
 }
 
 static void
-open_connection(const unsigned char *body, uint32_t size)
+open_connection(const unsigned char *body, uint32_t size, int physical)
 {
 	/* Resolve conninfo afresh on each normal connection. The fallback
 	 * application name is a separate libpq option, not an override. */
@@ -285,8 +285,10 @@ open_connection(const unsigned char *body, uint32_t size)
 	char *fallback = read_string(&next, body + size);
 	if (next != body + size)
 		fail("08P01", "helper open request has trailing bytes");
-	const char *keys[] = {"dbname", "replication", "client_encoding", "fallback_application_name", NULL};
-	const char *values[] = {conninfo, "database", "UTF8", fallback, NULL};
+	const char *keys[] = {"dbname", "replication", physical ? "dbname" : "client_encoding",
+		"fallback_application_name", NULL};
+	const char *values[] = {conninfo, physical ? "true" : "database",
+		physical ? "replication" : "UTF8", fallback, NULL};
 	int64_t deadline = milliseconds() + OPERATION_MS;
 	connection = PQconnectStartParams(keys, values, 1);
 	free(conninfo);
@@ -321,6 +323,7 @@ open_frozen_connection(const unsigned char *body, uint32_t size)
 	char *values[133] = {0};
 	const unsigned char *next = body + 4;
 	const char *host = NULL, *address = NULL, *port = NULL;
+	const char *replication = NULL, *database = NULL;
 	for (uint32_t i = 0; i < count; i++)
 	{
 		keys[i] = read_string(&next, body + size);
@@ -338,6 +341,8 @@ open_frozen_connection(const unsigned char *body, uint32_t size)
 		if (!strcmp(keys[i], "host")) host = values[i];
 		if (!strcmp(keys[i], "hostaddr")) address = values[i];
 		if (!strcmp(keys[i], "port")) port = values[i];
+		if (!strcmp(keys[i], "replication")) replication = values[i];
+		if (!strcmp(keys[i], "dbname")) database = values[i];
 	}
 	if (next != body + size || !host || !*host || !port || !*port ||
 		strchr(host, ',') || strchr(port, ',') || (address && strchr(address, ',')))
@@ -345,9 +350,13 @@ open_frozen_connection(const unsigned char *body, uint32_t size)
 	int local = host[0] == '/' || host[0] == '@';
 	if ((!local && (!address || !*address)) || (local && address && *address))
 		fail("08P01", "helper frozen route lacks its selected address");
-	const char *forced_keys[] = {"replication", "client_encoding", "target_session_attrs", "load_balance_hosts"};
-	const char *forced_values[] = {"database", "UTF8", "any", "disable"};
-	for (int i = 0; i < 4; i++)
+	int physical = replication && !strcmp(replication, "true");
+	if ((replication && strcmp(replication, "database") && !physical) ||
+		(physical && (!database || strcmp(database, "replication"))))
+		fail("08P01", "helper frozen replication mode is invalid");
+	const char *forced_keys[] = {"replication", "target_session_attrs", "load_balance_hosts", "client_encoding"};
+	const char *forced_values[] = {physical ? "true" : "database", "any", "disable", "UTF8"};
+	for (int i = 0; i < (physical ? 3 : 4); i++)
 	{
 		keys[count + i] = (char *) forced_keys[i];
 		values[count + i] = (char *) forced_values[i];
@@ -758,7 +767,8 @@ main(int argc, char **argv)
 			fail("08P01", "helper request body is incomplete");
 		switch (header[20])
 		{
-			case 'O': open_connection(request_body, size); break;
+			case 'O': open_connection(request_body, size, 0); break;
+			case 'W': open_connection(request_body, size, 1); break;
 			case 'P': open_frozen_connection(request_body, size); break;
 			case 'Q': query(request_body, size); break;
 			case 'R': receive_copy(request_body, size); break;

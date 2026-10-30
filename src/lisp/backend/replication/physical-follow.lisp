@@ -1139,15 +1139,13 @@ A changed route forces fresh preparation before queries or WAL. Route equality
 is not authentication or proof of source identity."
   (let ((source (physical-follow-config-source (physical-follow-runtime-config runtime))))
     (if source
-        (let* ((profile (physical-libpq-profile-from-conninfo-datum
-                         (getf source :conninfo) (getf source :fallback)))
-               (client (physical-libpq-connect (physical-libpq-helper-path) profile :on-spawn publish))
-               (owner (physical-libpq-frozen-profile-from-datum (getf source :owner))))
-          (unless (equal (physical-libpq-connection-route (physical-libpq-channel-info client))
-                         (physical-libpq-frozen-route owner))
-            (error 'physical-follow-route-changed
-                   :format-control "native physical source route changed"))
-          client)
+        (multiple-value-bind (profile owner) (physical-follow-source-profile source)
+          (let ((client (physical-libpq-connect (physical-libpq-helper-path) profile :on-spawn publish)))
+            (unless (equal (physical-libpq-connection-route (physical-libpq-channel-info client))
+                           (physical-libpq-frozen-route owner))
+              (error 'physical-follow-route-changed
+                     :format-control "native physical source route changed"))
+            client))
         (let ((client (sb-ext:with-timeout 10
                         (pg-client-connect (physical-follow-runtime-host runtime)
                                            (physical-follow-runtime-port runtime) "postgres"

@@ -855,8 +855,7 @@ requests no slot. Capture the choice before the worker starts."
   (let* ((source (when runtime (physical-follow-config-source (physical-follow-runtime-config runtime))))
          (requested (or profile
                         (when source
-                          (physical-libpq-profile-from-conninfo-datum
-                           (getf source :conninfo) (getf source :fallback)))))
+                          (physical-follow-source-profile source))))
          (public-slot (physical-follow-public-slot-copy
                        (if (eq slot :inherit)
                            (when runtime
@@ -1013,7 +1012,7 @@ recovery cannot yet be enabled. A failed first connection leaves replay running.
       (error "native follow transition failed: ~a" (physical-follow-operation-error operation)))
     (physical-follow-operation-result operation)))
 
-(defun physical-follow-retarget-conninfo (conninfo &key (prefix "follow") (fallback (physical-libpq-default-fallback)) slot)
+(defun physical-follow-retarget-conninfo (conninfo &key (prefix "follow") (fallback (physical-libpq-default-fallback)) slot (mode :database))
   "Attach or retarget native follow using a libpq profile.
 Unless supplied, FALLBACK uses cluster_name or walreceiver when it is empty.
 SLOT is NIL or a normalized public slot name of 1 to 63 lowercase ASCII letters,
@@ -1023,7 +1022,7 @@ preserve the old accepted slot. After publication, acceptance follows the durabl
 binding and restart reconciliation; the old slot may not be restored."
   (when (plusp *live-operation-depth*)
     (error "native follow retarget requires its own operation admission"))
-  (let ((profile (make-physical-libpq-profile conninfo :fallback fallback))
+  (let ((profile (make-physical-libpq-profile conninfo :fallback fallback :mode mode))
         (slot (physical-follow-public-slot-copy slot)))
     (physical-follow-endpoint-check "libpq" 5432 prefix)
     (unless (<= (length prefix) 30) (error "follow pin prefix exceeds 30 characters"))

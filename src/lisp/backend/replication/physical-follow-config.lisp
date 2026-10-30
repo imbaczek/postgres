@@ -13,12 +13,18 @@
                (stringp pin) (wal-valid-replication-slot-name-p pin))
     (error "invalid native physical follow endpoint")))
 
+(defun physical-follow-source-profile (source)
+  (physical-follow-check-plist source '(:conninfo :fallback :owner))
+  (let ((owner (physical-libpq-frozen-profile-from-datum (getf source :owner))))
+    (values
+     (physical-libpq-profile-from-conninfo-datum
+      (getf source :conninfo) (getf source :fallback)
+      :mode (physical-libpq-frozen-profile-mode owner))
+     owner)))
+
 (defun physical-follow-source-copy (source)
   "Validate and copy private source settings and the frozen cleanup owner."
-  (physical-follow-check-plist source '(:conninfo :fallback :owner))
-  (let* ((profile (physical-libpq-profile-from-conninfo-datum
-                   (getf source :conninfo) (getf source :fallback)))
-         (owner (physical-libpq-frozen-profile-from-datum (getf source :owner))))
+  (multiple-value-bind (profile owner) (physical-follow-source-profile source)
     (list :conninfo (physical-libpq-profile-conninfo-datum profile)
           :fallback (physical-libpq-profile-fallback profile)
           :owner (physical-libpq-frozen-profile-datum owner))))

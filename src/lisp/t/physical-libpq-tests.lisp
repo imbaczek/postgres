@@ -147,6 +147,174 @@
       (ok (eq :passed (getf data :status)) (format nil "~s" data))
       (ok (= 200 (getf data :trials)))))
 
+(deftest physical-libpq-profile-mode-is-explicit-and-validated
+    (ok (eq :database (pg::physical-libpq-profile-mode (pg::make-physical-libpq-profile ""))))
+  (ok (eq :physical (pg::physical-libpq-profile-mode
+                     (pg::make-physical-libpq-profile "" :mode :physical))))
+  (ok (intake-fails-p (lambda () (pg::make-physical-libpq-profile "" :mode :unknown)))))
+
+(deftest physical-libpq-physical-profile-selects-physical-helper-open
+    (let* ((profile (pg::make-physical-libpq-profile "dbname=unused" :fallback "rx" :mode :physical))
+           (channel (pg::physical-libpq-reserve-channel))
+           (open (symbol-function 'pg::physical-libpq-open-channel))
+           (exchange (symbol-function 'pg::physical-libpq-exchange))
+           (seen nil))
+      (unwind-protect
+           (progn
+             (setf (symbol-function 'pg::physical-libpq-open-channel)
+                   (lambda (helper &key on-spawn)
+                     (declare (ignore helper on-spawn))
+                     channel)
+                   (symbol-function 'pg::physical-libpq-exchange)
+                   (lambda (actual kind body kinds maximum &key timeout)
+                     (declare (ignore actual body kinds maximum timeout))
+                     (setf seen kind)
+                     (values #\O (libpq-test-connection-body '(("replication" "true") ("dbname" "replication")) "replication"))))
+             (ok (eq channel (pg::physical-libpq-connect "/fixture/helper" profile)))
+             (ok (eql #\W seen)))
+        (setf (symbol-function 'pg::physical-libpq-open-channel) open
+              (symbol-function 'pg::physical-libpq-exchange) exchange)
+        (pg::physical-libpq-close channel))))
+
+(defun libpq-test-source-with-mode (mode conninfo)
+  (let ((info (pg::physical-libpq-decode-connection-info
+               (libpq-test-connection-body
+                (list (list "replication" (if (eq mode :physical) "true" "database")))))))
+    (when (eq mode :physical)
+      (setf (pg::physical-libpq-connection-info-database info) (pg::string->bytes "replication")))
+    (list :conninfo conninfo :fallback "rx"
+          :owner (pg::physical-libpq-frozen-profile-datum
+                  (pg::make-physical-libpq-frozen-profile info)))))
+
+(cl-spec:defproperty physical-follow-saved-source-preserves-connection-mode
+    ((physical (range integer 0 1)) (value (range integer 1 255)))
+  (:about pg::make-physical-libpq-profile)
+  (:trials (:normal 200))
+  (let* ((mode (if (zerop physical) :database :physical))
+         (bytes (make-array 3 :element-type '(unsigned-byte 8) :initial-element value))
+         (source (libpq-test-source-with-mode mode (pg::physical-libpq-octets-datum bytes)))
+         (restored (pg::physical-follow-source-profile (pg::physical-follow-source-copy source))))
+    (and (eq mode (pg::physical-libpq-profile-mode restored))
+         (equalp bytes (pg::physical-libpq-profile-conninfo restored)))))
+
+(deftest generated-physical-follow-saved-source-connection-modes
+    (let ((data (cl-spec:result-data
+                 (cl-spec:run-property 'physical-follow-saved-source-preserves-connection-mode :seed 42))))
+      (ok (eq :passed (getf data :status)) (format nil "~s" data))
+      (ok (= 200 (getf data :trials)))))
+
+(deftest physical-follow-physical-mode-survives-durable-control-reload
+    (with-physical-store-directory (root)
+      (let* ((pg::*pgdata* root)
+             (source (libpq-test-source-with-mode :physical "dbname=unused"))
+             (state (pg::physical-follow-controller-copy
+                     (list :version 1 :enabled t :preparing nil :cleanup nil :source source)))
+             (config (list 1 "localhost" 5432 "current" nil state)))
+        (pg::physical-follow-save-config config)
+        (let ((profile (pg::physical-follow-source-profile
+                        (pg::physical-follow-config-source (pg::physical-follow-read-config)))))
+          (ok (eq :physical (pg::physical-libpq-profile-mode profile)))
+          (ok (string= "dbname=unused" (pg::physical-libpq-profile-conninfo profile)))))))
+
+(deftest physical-libpq-frozen-mode-rejects-unknown-mode-and-wrong-physical-database
+    (dolist (parameters '((("replication" "true")) (("replication" "")) (("replication" "false"))))
+      (ok (intake-fails-p
+           (lambda ()
+             (pg::make-physical-libpq-frozen-profile
+              (pg::physical-libpq-decode-connection-info (libpq-test-connection-body parameters))))))))
+
+(deftest physical-libpq-rejects-mode-mismatch-even-when-the-database-matches
+    (dolist (frozen '(nil t))
+      (let* ((profile (pg::make-physical-libpq-profile "" :mode :physical))
+             (owner (pg::physical-libpq-frozen-profile-from-datum
+                     (getf (libpq-test-source-with-mode :physical "") :owner)))
+             (channel (pg::physical-libpq-reserve-channel))
+             (open (symbol-function 'pg::physical-libpq-open-channel))
+             (exchange (symbol-function 'pg::physical-libpq-exchange)))
+        (unwind-protect
+             (progn
+               (setf (symbol-function 'pg::physical-libpq-open-channel)
+                     (lambda (helper &key on-spawn)
+                       (declare (ignore helper on-spawn))
+                       channel)
+                     (symbol-function 'pg::physical-libpq-exchange)
+                     (lambda (actual kind body kinds maximum &key timeout)
+                       (declare (ignore actual kind body kinds maximum timeout))
+                       (values #\O (libpq-test-connection-body
+                                    '(("replication" "database") ("dbname" "replication")) "replication"))))
+               (ok (intake-fails-p
+                    (lambda ()
+                      (if frozen (pg::physical-libpq-connect-frozen "/fixture/helper" owner)
+                          (pg::physical-libpq-connect "/fixture/helper" profile)))))
+               (ok (pg::physical-libpq-channel-closed channel)))
+          (setf (symbol-function 'pg::physical-libpq-open-channel) open
+                (symbol-function 'pg::physical-libpq-exchange) exchange)
+          (pg::physical-libpq-close channel)))))
+
+(deftest physical-follow-reconnect-and-automatic-handoff-inherit-physical-mode
+    (let* ((source (libpq-test-source-with-mode :physical "dbname=unused"))
+           (state (pg::physical-follow-controller-copy
+                   (list :version 1 :enabled t :preparing nil :cleanup nil :source source)))
+           (runtime (pg::make-physical-follow-runtime :host "localhost" :port 5432
+                                                      :config (list 1 "localhost" 5432 "current" nil state)))
+           (channel (pg::physical-libpq-reserve-channel))
+           (path (symbol-function 'pg::physical-libpq-helper-path))
+           (connect (symbol-function 'pg::physical-libpq-connect))
+           (run (symbol-function 'pg::physical-follow-operation-run))
+           (pg::*physical-follow-operation* nil)
+           (pg::*physical-follow-controller-blocked-p* nil)
+           (pg::*physical-follow-controller-stopping-p* nil)
+           (seen nil))
+      (unwind-protect
+           (progn
+             (setf (symbol-function 'pg::physical-libpq-helper-path) (lambda () "/fixture/helper")
+                   (pg::physical-libpq-channel-info channel)
+                   (pg::physical-libpq-decode-connection-info
+                    (libpq-test-connection-body '(("replication" "true") ("dbname" "replication")) "replication"))
+                   (symbol-function 'pg::physical-libpq-connect)
+                   (lambda (helper profile &key on-spawn)
+                     (declare (ignore helper))
+                     (setf seen (pg::physical-libpq-profile-mode profile))
+                     (when on-spawn (funcall on-spawn channel))
+                     channel)
+                   (symbol-function 'pg::physical-follow-operation-run)
+                   (lambda (operation) (declare (ignore operation)) nil))
+             (ok (eq channel (pg::physical-follow-open-runtime-client runtime (constantly nil))))
+             (ok (eq :physical seen))
+             (let ((operation (pg::physical-follow-start-operation "localhost" 5432 "mode" runtime)))
+               (sb-thread:join-thread (pg::physical-follow-operation-thread operation))
+               (ok (eq :physical
+                       (pg::physical-libpq-profile-mode
+                        (getf (pg::physical-follow-operation-context operation) :requested-profile))))))
+        (setf (symbol-function 'pg::physical-libpq-helper-path) path
+              (symbol-function 'pg::physical-libpq-connect) connect
+              (symbol-function 'pg::physical-follow-operation-run) run)
+        (pg::physical-libpq-close channel))))
+
+(deftest physical-client-identity-allows-only-the-physical-database-null
+    (let ((query (symbol-function 'pg::physical-client-query))
+          (row (vector "42" "1" "0/10" nil)))
+      (unwind-protect
+           (progn
+             (setf (symbol-function 'pg::physical-client-query)
+                   (lambda (client statement schema tag &key maximum command-only)
+                     (declare (ignore client statement tag maximum command-only))
+                     (list (pg::physical-client-check-row row schema))))
+             (ok (equalp (first (pg::physical-client-identity-row nil)) row))
+             (setf (aref row 3) "postgres")
+             (ok (equalp (first (pg::physical-client-identity-row nil)) row))
+             (dotimes (index 3)
+               (let ((bad (copy-seq row)))
+                 (setf (aref bad index) nil)
+                 (let ((row bad))
+                   (declare (ignorable row))
+                   (setf (symbol-function 'pg::physical-client-query)
+                         (lambda (client statement schema tag &key maximum command-only)
+                           (declare (ignore client statement tag maximum command-only))
+                           (list (pg::physical-client-check-row row schema))))
+                   (ok (intake-fails-p (lambda () (pg::physical-client-identity-row nil))))))))
+        (setf (symbol-function 'pg::physical-client-query) query))))
+
 (deftest physical-libpq-new-profiles-use-installed-cluster-name-with-explicit-fallback-precedence
     (let* ((pg::*startup-server-settings* (make-hash-table :test #'equal))
            (entry (list :value "research")))
@@ -174,9 +342,9 @@
     (pg::payload-push-u32 payload (length bytes))
     (loop for byte across bytes do (vector-push-extend byte payload))))
 
-(defun libpq-test-connection-body (parameters)
+(defun libpq-test-connection-body (parameters &optional (database "db=literal"))
   (let ((body (pg::make-payload)))
-    (dolist (text '("localhost" "127.0.0.1" "5432" "db=literal" "postgres"))
+    (dolist (text (list "localhost" "127.0.0.1" "5432" database "postgres"))
       (libpq-test-string body text))
     (pg::payload-push-u32 body (length parameters))
     (dolist (parameter parameters)
