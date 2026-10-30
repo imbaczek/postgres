@@ -30,6 +30,7 @@
       :components ((:file "bufpage")
                    (:file "smgr")
                    (:file "wal" :pathname "wal-core")
+                   (:file "wal-resource-parameters")
                    (:file "wal-eor")
                    (:file "wal-checkpoint")
                    (:file "bufmgr")))
