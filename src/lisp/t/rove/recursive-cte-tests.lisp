@@ -88,12 +88,34 @@
                     ("WITH RECURSIVE r(n) AS(SELECT 1 UNION ALL SELECT n+1 FROM r LIMIT 3) SELECT * FROM r" "0A000")
                     ("WITH RECURSIVE a AS(SELECT * FROM b),b AS(SELECT * FROM a) SELECT * FROM a" "0A000")
                     ("WITH RECURSIVE r(n) AS(SELECT 1 UNION ALL SELECT n::int8 FROM r) SELECT * FROM r" "42804")
-                    ("WITH RECURSIVE r(n) AS(SELECT 'a' UNION ALL SELECT 1 FROM r) SELECT * FROM r" "42804")
+                    ("WITH RECURSIVE r(n) AS(SELECT 'a' UNION ALL SELECT 1 FROM r) SELECT * FROM r" "22P02")
                     ("WITH RECURSIVE r(s) AS(SELECT 'a'::varchar(2) UNION ALL SELECT (s||'b')::varchar(3) FROM r) SELECT * FROM r" "42804")))
       (let ((caught nil))
         (handler-case (plan-select-query (first (parse-statements (first case))))
           (pg-error (error) (setf caught error)))
         (rove:ok (and caught (string= (second case) (pg-error-sqlstate caught))) (first case)))))
+
+(rove:deftest recursive-cte-seed-type-resolution
+    (dolist (operation '("UNION" "UNION ALL"))
+      (dolist (case '(("SELECT 'a'" "SELECT 1 FROM r" "22P02")
+                      ("SELECT 'bad'" "SELECT true FROM r" "22P02")
+                      ("SELECT '1'" "SELECT 1 FROM r" "42804")
+                      ("SELECT NULL" "SELECT 1 FROM r" "42804")
+                      ("SELECT 'a'" "SELECT n::varchar FROM r" "42804")
+                      ("SELECT 'a'" "SELECT n::varchar(2) FROM r" "42804")
+                      ("SELECT 'a'::text" "SELECT 1 FROM r" "42804")
+                      ("SELECT 1" "SELECT n::int8 FROM r" "42804")
+                      ("SELECT 'a'::varchar(2)" "SELECT n::varchar(3) FROM r" "42804")))
+        (let ((sql (format nil "WITH RECURSIVE r(n) AS(~a ~a ~a) SELECT * FROM r"
+                           (first case) operation (second case)))
+              (caught nil))
+          (handler-case (plan-select-query (first (parse-statements sql)))
+            (pg-error (error) (setf caught error)))
+          (rove:ok (and caught (string= (pg-error-sqlstate caught) (third case))) sql))))
+  (rove:ok (equal '(("a"))
+                  (subquery-test-rows
+                   "WITH RECURSIVE r(n) AS(SELECT 'a' UNION SELECT n::text FROM r) SELECT n FROM r"))
+           "Unknown seeds expose text to the recursive arm without pre-coercing UNION input"))
 
 (rove:deftest recursive-cte-generation-and-parameter-epochs
     (dolist (case

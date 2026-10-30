@@ -809,7 +809,9 @@ COLUMN-OFFSET maps the query-wide Var numbers back to this relation's attnums."
                     (prepare-select-internal (getf ast :right))))))
     (when definition (validate-recursive-term-aggregates right))
     (multiple-value-bind (targets coercions)
-        (analyze-union-targets (or frozen (getf left :targets)) (getf right :targets))
+        ;; Frozen targets describe only the recursive worktable.  UNION must
+        ;; still resolve and coerce the original seed, including unknown literals.
+        (analyze-union-targets (getf left :targets) (getf right :targets))
       (when (not (eq (getf ast :set-operation) :union-all))
         (let ((target (find-if (lambda (item) (member (getf item :type) '(:json :json-array))) targets)))
           (when target (json-equality-or-order-error (getf target :type) nil))))
