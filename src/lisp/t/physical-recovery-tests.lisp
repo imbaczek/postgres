@@ -16,6 +16,40 @@
    (pg::string->bytes
     (format nil "PGPHYSICALBACKUP1 ~8,'0X~%~a~%" (pg::wal-crc32 (pg::string->bytes text)) text))))
 
+(defun pglz-corruption-rejected-p (function)
+  (handler-case (progn (funcall function) nil)
+    (pg::pg-error (condition) (string= (pg::pg-error-sqlstate condition) "XX001"))))
+
+(cl-spec:defproperty pglz-compressed-roundtrip-and-streamed-slices
+    ((size (range integer 32 8192))
+     (period (range integer 1 4))
+     (seed-byte (range integer 0 255))
+     (start-seed (range integer 0 8192))
+     (length-seed (range integer 0 8192)))
+  (:about pg::pglz-compress pg::pglz-decompress pg::pglz-decompress-slice)
+  (:trials (:normal 200))
+  (let* ((data (make-array size :element-type '(unsigned-byte 8)))
+         (start (mod start-seed (1+ size)))
+         (length (mod length-seed (1+ (- size start)))))
+    (dotimes (i size)
+      (setf (aref data i) (mod (+ seed-byte (mod i period)) 256)))
+    (let* ((compressed (pg::pglz-compress data))
+           (decode (lambda (stream)
+                     (pg::pglz-decompress-slice size start length (length stream)
+                                                (lambda (consume)
+                                                  (loop for byte across stream do (funcall consume byte)))))))
+      (and compressed
+           (equalp data (pg::pglz-decompress compressed size))
+           (equalp (subseq data start (+ start length)) (funcall decode compressed))
+           (pglz-corruption-rejected-p (lambda () (funcall decode (subseq compressed 0 (1- (length compressed))))))
+           (pglz-corruption-rejected-p (lambda () (funcall decode
+                                                           (concatenate '(vector (unsigned-byte 8)) compressed #(0)))))))))
+
+(deftest generated-pglz-roundtrip-and-slices
+    (let ((result (cl-spec:result-data
+                   (cl-spec:run-property 'pglz-compressed-roundtrip-and-streamed-slices :seed 42))))
+      (ok (eq :passed (getf result :status)) (format nil "~s" result))))
+
 (deftest recovery-manifest-is-literal-and-checksummed
     (with-physical-store-directory (root)
       (let* ((manifest (sample-recovery-manifest))

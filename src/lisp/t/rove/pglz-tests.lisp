@@ -99,6 +99,17 @@
                         (handler-case (progn (pglz-decompress stream 4098 :start 1 :end (1- end)) nil)
                           (pg-error (condition) (pg-error-sqlstate condition))))))))
 
+(rove:deftest test-pglz-c-codec-golden-streams
+    ;; PostgreSQL src/common/pg_lzcompress.c, PGLZ_strategy_default.
+    (let* ((run (make-array 32 :element-type '(unsigned-byte 8) :initial-element 97))
+           (binary (make-array 2048 :element-type '(unsigned-byte 8)
+                                    :initial-contents (loop for i below 2048 collect (mod i 16))))
+           (run-c (sql-bytea-input "\\x02610f010d"))
+           (binary-c (sql-bytea-input "\\x0000010203040506070008090a0b0c0d0e0fff0f10ff0f10ff0f10ff0f10ff0f10ff0f10ff0f10ff0f1067")))
+      (dolist (pair (list (cons run run-c) (cons binary binary-c)))
+        (rove:ok (equalp (car pair) (pglz-decompress (cdr pair) (length (car pair)))))
+        (rove:ok (equalp (cdr pair) (pglz-compress (car pair)))))))
+
 (rove:deftest test-pglz-roundtrip
     (dolist (size '(32 126 127 273 1024 4096 10000))
       (let ((data (make-array size :element-type '(unsigned-byte 8))))
