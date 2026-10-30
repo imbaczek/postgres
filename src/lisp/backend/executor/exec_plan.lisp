@@ -322,8 +322,13 @@ reordered tree, and each parameterized path can reference only joined Vars."
       (setf input (list :window-input (getf prepared :window-keys) input)))
     (dolist (stage (window-plan-stages prepared))
       (setf input (list :window stage input)))
+    ;; Record the pre-ProjectSet width, including window slots. The resumable
+    ;; sort path uses it to distinguish source columns from generated values.
     (when (getf prepared :set-functions)
-      (setf input (list :project-set (getf prepared :set-functions) input)))
+      (setf input (list :project-set (getf prepared :set-functions) input
+                        (when (getf prepared :window-input-width)
+                          (+ (getf prepared :window-input-width)
+                             (length (getf prepared :windows)))))))
     (setf input (list :project (getf prepared :targets) input))
     (when (getf prepared :distinct)
       (setf input (list (if physical-p :hash-distinct :distinct)
