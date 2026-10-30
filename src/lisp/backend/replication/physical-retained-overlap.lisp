@@ -26,7 +26,7 @@
            (origin (* segment +wal-segment-size+))
            (name (concatenate 'string "pg_wal/" (wal-segment-filename segment timeline namespace))))
       (unless (and (<= origin start) (< start base)
-                   (member (- base start) (list +wal-header-size+ (wal-checkpoint-record-size)))
+                   (wal-checkpoint-record-length-p (- base start))
                    (equal name (first entry)) (= (- base origin) (second entry)))
         (error "retained base overlap differs from its file evidence"))))
   metadata)

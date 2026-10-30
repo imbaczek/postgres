@@ -3,8 +3,23 @@
 
 (defconstant +wal-checkpoint-snapshot-size+ 88)
 
-(defun wal-checkpoint-record-size ()
-  (+ +wal-header-size+ +wal-checkpoint-snapshot-size+))
+(defconstant +wal-checkpoint-resource-snapshot-size+ 136)
+
+(declaim (ftype function wal-control-resource-fields-valid-p wal-control-resource-parameters
+                wal-copy-control-resource-fields))
+
+(defun wal-checkpoint-record-size (&optional resource-facts)
+  (unless (wal-control-resource-fields-valid-p resource-facts)
+    (error "invalid checkpoint resource facts"))
+  (+ +wal-header-size+
+     (if (wal-control-resource-parameters resource-facts)
+         +wal-checkpoint-resource-snapshot-size+
+         +wal-checkpoint-snapshot-size+)))
+
+(defun wal-checkpoint-record-length-p (length)
+  (member length (list +wal-header-size+
+                       (+ +wal-header-size+ +wal-checkpoint-snapshot-size+)
+                       (+ +wal-header-size+ +wal-checkpoint-resource-snapshot-size+)) :test #'=))
 
 (defun wal-checkpoint-snapshot-valid-p (snapshot)
   (let ((version (getf snapshot :version))
@@ -13,13 +28,14 @@
         (reserved (getf snapshot :xid-reserved-through))
         (oid (getf snapshot :next-oid)) (active (getf snapshot :oldest-active-xid)))
     (and (member version '(1 2))
+         (wal-control-resource-fields-valid-p snapshot)
          (every (lambda (value) (typep value '(unsigned-byte 64)))
                 (list start end redo reserved))
          (typep next (if (= version 1) '(integer 3 18446744073709551615)
                          '(integer 3 18446744073709551616)))
          (typep active (if (= version 1) '(unsigned-byte 64)
                            '(integer 0 18446744073709551616)))
-         (= end (+ start (wal-checkpoint-record-size)))
+         (= end (+ start (wal-checkpoint-record-size snapshot)))
          (= (floor start +wal-segment-size+) (floor (1- end) +wal-segment-size+))
          (= redo start) (<= next (1+ reserved)) (<= 2 reserved)
          (or (zerop active) (<= 3 active next))
@@ -27,12 +43,16 @@
          (typep (getf snapshot :time) '(signed-byte 64))
          (typep (getf snapshot :timeline) '(integer 1 4294967295))
          (typep (getf snapshot :prev-timeline) '(integer 1 4294967295))
+         (or (null (wal-control-resource-parameters snapshot))
+             (and (= version 2)
+                  (<= (getf snapshot :resource-lsn) start)
+                  (<= (getf snapshot :resource-timeline) (getf snapshot :timeline))))
          (<= (getf snapshot :prev-timeline) (getf snapshot :timeline)))))
 
 (defun wal-encode-checkpoint-snapshot (snapshot)
   "V2 uses explicit flags for one-past FullXIDs, without truncating the sentinel."
   (unless (wal-checkpoint-snapshot-valid-p snapshot) (error "invalid native checkpoint snapshot"))
-  (let* ((bytes (make-array +wal-checkpoint-snapshot-size+
+  (let* ((bytes (make-array (- (wal-checkpoint-record-size snapshot) +wal-header-size+)
                             :element-type '(unsigned-byte 8) :initial-element 0))
          (next-exhausted (= (getf snapshot :next-xid) 18446744073709551616))
          (active-exhausted (= (getf snapshot :oldest-active-xid) 18446744073709551616)))
@@ -47,16 +67,22 @@
     (wal-set-u64 bytes 72 (if active-exhausted 0 (getf snapshot :oldest-active-xid)))
     (when (getf snapshot :next-oid) (wal-set-u32 bytes 80 1))
     (wal-set-u32 bytes 84 (logior (if next-exhausted 1 0) (if active-exhausted 2 0)))
+    (when (getf snapshot :resource-parameters)
+      (replace bytes (wal-encode-resource-parameters (wal-control-resource-parameters snapshot)) :start1 88)
+      (wal-set-u64 bytes 120 (getf snapshot :resource-lsn))
+      (wal-set-u32 bytes 128 (getf snapshot :resource-timeline)))
     bytes))
 
 (defun wal-decode-checkpoint-snapshot (bytes)
   "Containing WAL/control supplies CRC; reject ambiguous flags and hidden values."
-  (unless (= (length bytes) +wal-checkpoint-snapshot-size+)
+  (unless (member (length bytes) (list +wal-checkpoint-snapshot-size+ +wal-checkpoint-resource-snapshot-size+))
     (error "invalid checkpoint snapshot length"))
   (let* ((version (cond ((equalp (subseq bytes 0 8) #(80 71 67 75 80 84 48 49)) 1)
                         ((equalp (subseq bytes 0 8) #(80 71 67 75 80 84 48 50)) 2)))
          (flags (wal-u32 bytes 84)))
     (unless (and version (if (= version 1) (zerop flags) (<= 0 flags 3))
+                 (or (= (length bytes) +wal-checkpoint-snapshot-size+)
+                     (and (= version 2) (zerop (wal-u32 bytes 132))))
                  (member (wal-u32 bytes 80) '(0 1))
                  (or (= 1 (wal-u32 bytes 80)) (zerop (wal-u64 bytes 48)))
                  (or (not (logbitp 0 flags)) (zerop (wal-u64 bytes 32)))
@@ -71,6 +97,12 @@
                   :time (wal-i64 bytes 56) :timeline (wal-u32 bytes 64)
                   :prev-timeline (wal-u32 bytes 68)
                   :oldest-active-xid (if (logbitp 1 flags) 18446744073709551616 (wal-u64 bytes 72)))))
+      (when (= (length bytes) +wal-checkpoint-resource-snapshot-size+)
+        (setf snapshot
+              (append snapshot
+                      (list :resource-parameters
+                            (resource-parameters-values (wal-decode-resource-parameters (subseq bytes 88 120)))
+                            :resource-lsn (wal-u64 bytes 120) :resource-timeline (wal-u32 bytes 128)))))
       (unless (wal-checkpoint-snapshot-valid-p snapshot) (error "invalid native checkpoint snapshot"))
       snapshot)))
 
@@ -86,7 +118,9 @@
           (error "invalid legacy checkpoint record boundary"))
         nil)
       (let ((snapshot (wal-decode-checkpoint-snapshot (wal-record-payload record))))
-        (unless (and (>= (wal-record-version record) (if (= 2 (getf snapshot :version)) 7 6))
+        (unless (and (>= (wal-record-version record)
+                         (cond ((getf snapshot :resource-parameters) 8)
+                               ((= 2 (getf snapshot :version)) 7) (t 6)))
                      (= (wal-record-start record) (getf snapshot :start))
                      (= (wal-record-end record) (getf snapshot :end)))
           (error "checkpoint snapshot differs from its WAL record"))
@@ -94,7 +128,7 @@
 
 (defun wal-read-checkpoint-record (start end)
   (unless (and (typep start '(unsigned-byte 64)) (typep end '(unsigned-byte 64))
-               (member (- end start) (list +wal-header-size+ (wal-checkpoint-record-size)))
+               (wal-checkpoint-record-length-p (- end start))
                (= (floor start +wal-segment-size+) (floor (1- end) +wal-segment-size+)))
     (error "invalid checkpoint record coordinates"))
   (let ((bytes (make-array (- end start) :element-type '(unsigned-byte 8))))
@@ -119,10 +153,11 @@
           do (format stream "~2,'0X" byte))))
 
 (defun wal-checkpoint-snapshot-from-hex (text)
-  (unless (and (= (length text) (* 2 +wal-checkpoint-snapshot-size+))
+  (unless (and (member (length text) (list (* 2 +wal-checkpoint-snapshot-size+)
+                                           (* 2 +wal-checkpoint-resource-snapshot-size+)))
                (every (lambda (char) (digit-char-p char 16)) text))
     (error "invalid checkpoint control snapshot encoding"))
-  (let ((bytes (make-array +wal-checkpoint-snapshot-size+ :element-type '(unsigned-byte 8))))
+  (let ((bytes (make-array (/ (length text) 2) :element-type '(unsigned-byte 8))))
     (loop for index below (length bytes)
           do (setf (aref bytes index)
                    (parse-integer text :start (* index 2) :end (+ (* index 2) 2) :radix 16)))
@@ -335,17 +370,18 @@ its archive before mutation."
 
 (declaim (notinline catalog-next-oid))
 
-(defun wal-capture-checkpoint-snapshot (start)
+(defun wal-capture-checkpoint-snapshot (start &optional resource-facts)
   "Called with writer and WAL locks; sample counters under XID lock, as C does."
   (sb-thread:with-mutex (*xid-lock*)
     (let* ((next *next-xid*)
            (active (reduce #'min *active-xids* :initial-value next))
-           (snapshot (list :version 2 :start start :end (+ start (wal-checkpoint-record-size))
-                           ;; Native checkpoints synchronously install every preceding page.
-                           :redo start :next-xid next :xid-reserved-through (1- *xid-batch-end*)
-                           :next-oid (when *catalog* (catalog-next-oid *catalog*))
-                           :time (- (get-universal-time) 2208988800)
-                           :timeline *wal-insert-timeline* :prev-timeline *wal-prev-timeline* :oldest-active-xid active)))
+           (snapshot (append (list :version 2 :start start :end (+ start (wal-checkpoint-record-size resource-facts))
+                                   ;; Native checkpoints synchronously install every preceding page.
+                                   :redo start :next-xid next :xid-reserved-through (1- *xid-batch-end*)
+                                   :next-oid (when *catalog* (catalog-next-oid *catalog*))
+                                   :time (- (get-universal-time) 2208988800)
+                                   :timeline *wal-insert-timeline* :prev-timeline *wal-prev-timeline* :oldest-active-xid active)
+                             (wal-copy-control-resource-fields resource-facts))))
       (unless (wal-checkpoint-snapshot-valid-p snapshot)
         (error "source allocation state cannot be represented in checkpoint"))
       snapshot)))

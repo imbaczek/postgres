@@ -262,3 +262,78 @@
         (physical-history-accept-record record nil nil)
         (rove:ok (not *wal-recovery-group-active*))
         (rove:ok (null (getf *wal-control-metadata* :resource-parameters))))))
+
+(defun resource-checkpoint-test-snapshot (&key (known t) (start 64) (connections 100))
+  (append (list :version 2 :start start :end (+ start (if known 168 120)) :redo start
+                :next-xid 3 :xid-reserved-through 2 :next-oid nil :time 0
+                :timeline 3 :prev-timeline 2 :oldest-active-xid 0)
+          (when known
+            (list :resource-parameters (list connections 8 10 0 128)
+                  :resource-lsn 32 :resource-timeline 2))))
+
+(rove:deftest resource-checkpoint-roundtrip-preserves-exact-position-and-legacy-unknowns
+    (dolist (known '(nil t))
+      (let* ((snapshot (resource-checkpoint-test-snapshot :known known))
+             (bytes (wal-encode-checkpoint-snapshot snapshot)))
+        (rove:ok (wal-checkpoint-snapshot-valid-p snapshot))
+        (rove:ok (= (if known 136 88) (length bytes)))
+        (rove:ok (= (if known 168 120) (wal-checkpoint-record-size snapshot)))
+        (rove:ok (equal snapshot (wal-decode-checkpoint-snapshot bytes)))
+        (rove:ok (equal snapshot (wal-checkpoint-record-snapshot
+                                  (make-wal-record :version 8 :type 4 :xid 0 :start 64
+                                                   :end (getf snapshot :end) :payload bytes))))
+        (when known
+          (rove:ok (resource-parameters-test-error-p
+                    (lambda ()
+                      (wal-checkpoint-record-snapshot
+                       (make-wal-record :version 7 :type 4 :xid 0 :start 64
+                                        :end (getf snapshot :end) :payload bytes)))))))))
+
+(rove:deftest resource-checkpoint-rejects-partial-future-or-malformed-facts
+    (let ((snapshot (resource-checkpoint-test-snapshot)))
+      (dolist (change '((:resource-parameters nil) (:resource-parameters (100 8 10 0 9))
+                        (:resource-lsn 0) (:resource-lsn 65) (:resource-timeline 0)
+                        (:resource-timeline 4) (:end 184)))
+        (let ((candidate (copy-tree snapshot)))
+          (setf (getf candidate (first change)) (second change))
+          (rove:ok (not (wal-checkpoint-snapshot-valid-p candidate)))
+          (rove:ok (resource-parameters-test-error-p
+                    (lambda () (wal-encode-checkpoint-snapshot candidate))))))
+      (dolist (key '(:resource-parameters :resource-lsn :resource-timeline))
+        (let ((candidate (copy-tree snapshot)))
+          (remf candidate key)
+          (rove:ok (not (wal-checkpoint-snapshot-valid-p candidate))))))
+  (let ((bytes (wal-encode-checkpoint-snapshot (resource-checkpoint-test-snapshot))))
+    (dolist (offset '(88 116 132 133 134 135))
+      (let ((bad (copy-seq bytes)))
+        (setf (aref bad offset) (logxor 1 (aref bad offset)))
+        (rove:ok (resource-parameters-test-error-p
+                  (lambda () (wal-decode-checkpoint-snapshot bad))))))))
+
+(rove:deftest resource-checkpoint-control-roundtrip-keeps-both-positioned-copies
+    (let* ((snapshot (resource-checkpoint-test-snapshot))
+           (metadata (append (make-wal-control-metadata 42 4 0)
+                             (wal-copy-control-resource-fields snapshot)))
+           (bytes (wal-encode-control-image (getf snapshot :end) (getf snapshot :end) snapshot
+                                            :timeline 3 :checkpoint-timeline 3
+                                            :namespace :timeline :metadata metadata))
+           (values (multiple-value-list (wal-decode-control-line (bytes->string bytes)))))
+      (rove:ok (equal snapshot (third values)))
+      (rove:ok (equal metadata (seventh values)))
+      (setf (first (getf (third values) :resource-parameters)) 101)
+      (rove:ok (= 100 (first (getf (seventh values) :resource-parameters))))
+      (rove:ok (= 100 (first (getf snapshot :resource-parameters))))))
+
+(cl-spec:defproperty resource-checkpoint-facts-roundtrip
+    ((connections (range integer 1 2000)) (start (range integer 64 1000000)))
+  (:about wal-encode-checkpoint-snapshot wal-decode-checkpoint-snapshot)
+  (:trials (:normal 200))
+  (let* ((snapshot (resource-checkpoint-test-snapshot :connections connections :start start))
+         (bytes (wal-encode-checkpoint-snapshot snapshot)))
+    (and (= 136 (length bytes)) (equal snapshot (wal-decode-checkpoint-snapshot bytes)))))
+
+(rove:deftest generated-resource-checkpoint-facts-roundtrip
+    (let ((data (cl-spec:result-data
+                 (cl-spec:run-property 'resource-checkpoint-facts-roundtrip :seed 42))))
+      (rove:ok (eq :passed (getf data :status)) (format nil "~s" data))
+      (rove:ok (= 200 (getf data :trials)))))

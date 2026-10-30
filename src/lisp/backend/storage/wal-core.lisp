@@ -2982,11 +2982,16 @@ Refresh its modification time. Update memory only after atomic publication."
           (wal-primary-record-page-xids keys (wal-append-batch-start))
           (wal-primary-append-pages keys spool)
           (wal-primary-seal-page-spool spool)
-          (let* ((start (wal-next-record-start (wal-checkpoint-record-size)))
-                 (snapshot (wal-capture-checkpoint-snapshot start))
+          (let* ((resource-facts (wal-copy-control-resource-fields *wal-control-metadata*))
+                 (size (wal-checkpoint-record-size resource-facts))
+                 (start (wal-next-record-start size))
+                 (snapshot (wal-capture-checkpoint-snapshot start resource-facts))
+                 (payload (wal-encode-checkpoint-snapshot snapshot))
                  (checkpoint-end
-                   (wal-append-record +wal-record-checkpoint+ 0
-                                      (wal-encode-checkpoint-snapshot snapshot))))
+                   (progn
+                     (unless (= size (+ +wal-header-size+ (length payload)))
+                       (error "checkpoint encoding differs from planned size"))
+                     (wal-append-record +wal-record-checkpoint+ 0 payload))))
             (wal-flush)
             (wal-test-pause :after-checkpoint-wal-flush)
             (wal-primary-apply-page-spool spool)

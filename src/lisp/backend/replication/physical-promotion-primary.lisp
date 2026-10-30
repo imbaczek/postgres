@@ -34,9 +34,10 @@ retained archive is checked against the child history, including its fixed fork.
       (unless (and parent (= (getf snapshot :prev-timeline) (timeline-history-entry-timeline parent))
                    (= insertion (timeline-at-point start history)))
         (error "child checkpoint differs from its history"))
+      (timeline-check-resource-origin snapshot history)
       (multiple-value-bind (stream size) (physical-promotion-open-file path)
         (unwind-protect
-             (let ((bytes (make-array (wal-checkpoint-record-size) :element-type '(unsigned-byte 8)))
+             (let ((bytes (make-array (wal-checkpoint-record-size snapshot) :element-type '(unsigned-byte 8)))
                    (offset (mod start +wal-segment-size+)))
                (unless (<= (+ offset (length bytes)) size) (error "child checkpoint is truncated"))
                (file-position stream offset)

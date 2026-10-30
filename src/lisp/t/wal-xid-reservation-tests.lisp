@@ -250,6 +250,91 @@
                     (lambda () (pg::wal-slot-terminal-ack-p slot pg::*wal-durable-lsn*)))))
            (ok (null (getf pg::*wal-control-metadata* :resource-parameters))))))))
 
+(deftest resource-checkpoint-captures-the-frozen-primary-fact-and-real-record-size
+    (call-with-resource-wal-fixture
+     (lambda ()
+       (let ((pg::*relation-streams* (make-hash-table :test #'equal))
+             (pg::*physical-source-pins* (make-hash-table :test #'equal))
+             (pg::*wal-prev-timeline* 1))
+         (ensure-directories-exist (merge-pathnames "base/placeholder" pg::*pgdata*))
+         (pg::wal-report-resource-parameters (pg::make-resource-parameters 100 8 10 0 128))
+         (pg::wal-checkpoint-core)
+         (let* ((snapshot (copy-tree pg::*wal-checkpoint-snapshot*))
+                (fields (multiple-value-list (pg::wal-read-control-fields)))
+                (record (pg::wal-read-checkpoint-record 128 296)))
+           (ok (= 128 (getf snapshot :start)))
+           (ok (= 296 (getf snapshot :end) pg::*wal-durable-lsn*))
+           (ok (= 136 (length (pg::wal-record-payload record))))
+           (ok (equal snapshot (pg::wal-checkpoint-record-snapshot record)))
+           (ok (equal snapshot (third fields)))
+           (ok (= 96 (getf snapshot :resource-lsn)))
+           (ok (equal '(100 8 10 0 128) (getf snapshot :resource-parameters)))
+           (ok (equal (pg::wal-copy-control-resource-fields snapshot)
+                      (pg::physical-recovery-check-checkpoint-resources snapshot (seventh fields))))
+           (pg::wal-report-resource-parameters (pg::make-resource-parameters 50 4 5 0 64))
+           (ok (equal '(100 8 10 0 128) (getf pg::*wal-checkpoint-snapshot* :resource-parameters)))
+           (ok (intake-fails-p
+                (lambda ()
+                  (pg::physical-recovery-check-checkpoint-resources snapshot pg::*wal-control-metadata*))))
+           (pg::wal-checkpoint-core)
+           (ok (equal '(50 4 5 0 64) (getf pg::*wal-checkpoint-snapshot* :resource-parameters)))
+           (ok (= 392 (getf pg::*wal-checkpoint-snapshot* :resource-lsn))))))))
+
+(deftest resource-checkpoint-placement-plans-the-extension-before-rotation
+    (let* ((cursor (- pg::+wal-segment-size+ 160))
+           (facts '(:resource-parameters (100 8 10 0 128) :resource-lsn 96 :resource-timeline 1)))
+      (ok (= cursor (pg::wal-record-start-after cursor (pg::wal-checkpoint-record-size))))
+      (ok (= pg::+wal-segment-size+
+             (pg::wal-record-start-after cursor (pg::wal-checkpoint-record-size facts))))))
+
+(deftest resource-checkpoint-base-proof-requires-exact-copy-and-ancestor-origin
+    (with-physical-store-directory (root)
+      (let ((pg::*pgdata* root))
+        (pg::wal-ensure-directory-durable (pg::wal-directory))
+        (pg::timeline-write-history 2 1 64 "first fork")
+        (pg::timeline-write-history 3 2 256 "second fork")
+        (pg::timeline-write-history 4 1 256 "sibling fork")
+        (let* ((snapshot '(:version 2 :start 320 :end 488 :redo 320 :next-xid 3 :xid-reserved-through 2
+                           :next-oid nil :time 0 :timeline 3 :prev-timeline 2 :oldest-active-xid 0
+                           :resource-parameters (100 8 10 0 128) :resource-lsn 128 :resource-timeline 2))
+               (metadata (append (pg::make-wal-control-metadata 42 4 0)
+                                 (pg::wal-copy-control-resource-fields snapshot))))
+          (ok (pg::wal-checkpoint-snapshot-valid-p snapshot))
+          (let ((facts (pg::physical-recovery-check-checkpoint-resources snapshot metadata)))
+            (ok (equal (getf snapshot :resource-parameters) (getf facts :resource-parameters)))
+            (setf (first (getf facts :resource-parameters)) 101)
+            (ok (= 100 (first (getf snapshot :resource-parameters)))))
+          (dolist (change '((:resource-parameters (50 4 5 0 64)) (:resource-lsn 127) (:resource-timeline 1)))
+            (let ((different (copy-tree metadata)))
+              (setf (getf different (first change)) (second change))
+              (ok (intake-fails-p
+                   (lambda () (pg::physical-recovery-check-checkpoint-resources snapshot different))))))
+          (let ((sibling (copy-tree snapshot)))
+            (setf (getf sibling :resource-timeline) 1)
+            (ok (pg::wal-checkpoint-snapshot-valid-p sibling))
+            (ok (intake-fails-p
+                 (lambda ()
+                   (pg::physical-recovery-check-checkpoint-resources
+                    sibling (pg::wal-copy-control-resource-fields sibling))))))
+          (let ((sibling (copy-tree snapshot)))
+            (setf (getf sibling :timeline) 4 (getf sibling :prev-timeline) 1)
+            (ok (pg::wal-checkpoint-snapshot-valid-p sibling))
+            (ok (intake-fails-p
+                 (lambda ()
+                   (pg::physical-recovery-check-checkpoint-resources
+                    sibling (pg::wal-copy-control-resource-fields sibling))))))
+          (dolist (end '(64 65))
+            (let ((boundary (copy-tree snapshot)))
+              (setf (getf boundary :resource-lsn) end (getf boundary :resource-timeline) 1)
+              (if (= end 64)
+                  (ok (pg::timeline-check-resource-origin boundary (pg::timeline-read-history 3)))
+                  (ok (intake-fails-p
+                       (lambda ()
+                         (pg::timeline-check-resource-origin boundary (pg::timeline-read-history 3))))))))
+          (ok (intake-fails-p
+               (lambda () (pg::physical-recovery-check-checkpoint-resources nil metadata))))
+          (ok (null (pg::physical-recovery-check-checkpoint-resources nil nil)))))))
+
 (deftest xid-allocation-flushes-reservation-once-before-using-capacity
     (call-with-wal-allocation-fixture
      (lambda ()

@@ -69,6 +69,16 @@
     (unless entry (error "WAL point is outside timeline history"))
     (timeline-history-entry-timeline entry)))
 
+(defun timeline-check-resource-origin (facts history)
+  (unless (wal-control-resource-fields-valid-p facts)
+    (error "invalid resource origin facts"))
+  (timeline-check-lineage history)
+  (when (getf facts :resource-parameters)
+    (unless (eql (getf facts :resource-timeline)
+                 (timeline-at-point (1- (getf facts :resource-lsn)) history))
+      (error "resource origin is outside its timeline history")))
+  (wal-copy-control-resource-fields facts))
+
 (defun timeline-segment-candidates (segment history &optional (previous-file-timeline 0))
   "Return C XLogFileReadAnyTLI's newest-first file candidates, not record owners.
 A descendant file can contain an ancestor's copied prefix. The caller must

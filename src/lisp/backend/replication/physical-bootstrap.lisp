@@ -206,6 +206,8 @@ The new base receives its own archive; the old primary archive is not copied."
                (t value))))
     (with-standard-io-syntax (prin1-to-string (literal manifest)))))
 
+(declaim (ftype function physical-recovery-check-checkpoint-resources))
+
 (defun physical-bootstrap-copy-under-quiescence (target pin-name)
   "Checkpoint and capture one complete native image while mutation admission is closed."
   (unless (eq *live-operation-quiescence-owner-thread* sb-thread:*current-thread*)
@@ -217,6 +219,7 @@ The new base receives its own archive; the old primary archive is not copied."
             (probe-file (xid-wrap-marker-path)))
     (error "physical base backup requires no active transaction IDs or pending XID wrap"))
   (wal-checkpoint-core)
+  (physical-recovery-check-checkpoint-resources *wal-checkpoint-snapshot* *wal-control-metadata*)
   (let ((pin (physical-source-pin-create pin-name)))
     ;; Failure after here intentionally retains the durable source pin. The
     ;; operator must inspect the failed target and explicitly release the pin.
