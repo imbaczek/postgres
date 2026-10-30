@@ -16,6 +16,10 @@
                 parse-query-sort-arena-limit-bytes parse-slot-wal-keep-bytes
                 parse-bind-address-arg))
 
+(defparameter *startup-recovery-target-settings*
+  '("recovery_target" "recovery_target_lsn" "recovery_target_name"
+    "recovery_target_time" "recovery_target_xid"))
+
 (defparameter *startup-setting-specs*
   '(("port" :postmaster :integer "5433" 1 65535 nil)
     ("listen_addresses" :postmaster :string "127.0.0.1")
@@ -29,6 +33,13 @@
     ("max_connections" :postmaster :integer "100" 1 262143 nil)
     ("max_wal_senders" :postmaster :integer "10" 0 262143 nil)
     ("max_worker_processes" :postmaster :integer "8" 0 262143 nil)
+    ("max_prepared_transactions" :postmaster :integer "0" 0 262143 nil)
+    ("track_commit_timestamp" :postmaster :boolean "off")
+    ("recovery_target" :postmaster :string "")
+    ("recovery_target_lsn" :postmaster :string "")
+    ("recovery_target_name" :postmaster :string "")
+    ("recovery_target_time" :postmaster :string "")
+    ("recovery_target_xid" :postmaster :string "")
     ("max_locks_per_transaction" :postmaster :integer "128" 10 2147483647 nil)
     ("reserved_connections" :postmaster :integer "0" 0 262143 nil)
     ("superuser_reserved_connections" :postmaster :integer "3" 0 262143 nil)
@@ -220,7 +231,9 @@ Timeline input is validated but its original spelling is retained."
         (:string
          (when (and (string= name "restore_command") (not (equal text "")))
            (error "nonempty restore_command requires unimplemented archive recovery"))
-         (unless (or (string= name "restore_command") (plusp (length text)))
+         (unless (or (string= name "restore_command")
+                     (member name *startup-recovery-target-settings* :test #'string=)
+                     (plusp (length text)))
            (error "invalid empty configuration parameter ~a" name))
          (when (and (string= name "listen_addresses") (find #\, text))
            (error "multiple listen_addresses are not implemented"))
@@ -481,6 +494,16 @@ A reload may record a different desired value, but does not change this goal."
                   :source :default)))
     settings))
 
+(defun startup-check-feature-support (settings)
+  (when (plusp (startup-setting-value settings "max_prepared_transactions"))
+    (error "positive max_prepared_transactions requires unimplemented prepared transactions"))
+  (when (startup-setting-value settings "track_commit_timestamp")
+    (error "track_commit_timestamp=on requires unimplemented commit timestamp tracking"))
+  (dolist (name *startup-recovery-target-settings*)
+    (unless (equal "" (startup-setting-value settings name))
+      (error "nonempty ~a requires unimplemented targeted recovery" name)))
+  settings)
+
 (defun startup-load-settings (native overrides &optional reload-directory)
   "Read primary/includes, then auto.conf, then command-line overrides."
   (let* ((directory (namestring (directory-pathname
@@ -513,7 +536,7 @@ A reload may record a different desired value, but does not change this goal."
           (getf (gethash "data_directory" settings) :source) :override)
     (setf (gethash "config_file" settings)
           (list :value (namestring (startup-absolute-config-path path)) :source :override))
-    settings))
+    (startup-check-feature-support settings)))
 
 (defun startup-native-limit (native key environment parser fallback)
   (let ((value (or (gethash key native) (uiop:getenv environment))))
@@ -569,10 +592,12 @@ A reload may record a different desired value, but does not change this goal."
   "Plan the installed tuple and relation lock capacities from startup settings.
 Connections, workers, WAL senders and locks per transaction use active settings.
 Prepared transactions remain disabled with an internal capacity of zero."
+  (startup-check-feature-support settings)
   (let ((parameters (make-resource-parameters
                      (startup-setting-value settings "max_connections")
                      (startup-setting-value settings "max_worker_processes")
-                     (startup-setting-value settings "max_wal_senders") 0
+                     (startup-setting-value settings "max_wal_senders")
+                     (startup-setting-value settings "max_prepared_transactions")
                      (startup-setting-value settings "max_locks_per_transaction"))))
     (multiple-value-bind (objects owners) (resource-lock-capacities parameters)
       (values parameters objects owners))))

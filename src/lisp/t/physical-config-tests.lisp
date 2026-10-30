@@ -437,6 +437,108 @@
                  (cl-spec:run-property 'worker-setting-sizes-installed-resource-plan :seed 42))))
       (ok (eq :passed (getf data :status)) (format nil "~s" data))))
 
+(deftest disabled-feature-defaults-match-c-metadata-and-context
+    (let ((settings (pg::startup-default-settings "/tmp/disabled-features/")))
+      (ok (equal 0 (pg::startup-setting-value settings "max_prepared_transactions")))
+      (ok (assoc "track_commit_timestamp" pg::*startup-setting-specs* :test #'equal))
+      (ok (not (pg::startup-setting-value settings "track_commit_timestamp")))
+      (ok (= 262143 (pg::startup-normalize-setting "max_prepared_transactions" "262143")))
+      (dolist (value '("-1" "262144"))
+        (ok (intake-fails-p
+             (lambda () (pg::startup-normalize-setting "max_prepared_transactions" value)))))
+      (dolist (name '("recovery_target" "recovery_target_lsn" "recovery_target_name"
+                      "recovery_target_time" "recovery_target_xid"))
+        (ok (equal "" (pg::startup-setting-value settings name)))
+        (ok (equal "" (pg::startup-normalize-setting name ""))))
+      (dolist (name '("max_prepared_transactions" "track_commit_timestamp" "recovery_target"
+                      "recovery_target_lsn" "recovery_target_name" "recovery_target_time"
+                      "recovery_target_xid"))
+        (ok (equal "55P02"
+                   (recovery-state-of
+                    (lambda () (pg::startup-check-session-setting name))))))))
+
+(deftest disabled-features-check-final-values-after-configuration-precedence
+    (with-physical-store-directory (root)
+      (let ((configuration (merge-pathnames "postgresql.conf" root))
+            (included (merge-pathnames "included.conf" root)))
+        (dolist (setting '(("max_prepared_transactions" "1" "0")
+                           ("track_commit_timestamp" "on" "off")
+                           ("recovery_target" "immediate" "")
+                           ("recovery_target_lsn" "0/10" "")
+                           ("recovery_target_name" "stop_here" "")
+                           ("recovery_target_time" "2026-10-30 00:00:00+00" "")
+                           ("recovery_target_xid" "42" "")))
+          (destructuring-bind (name enabled disabled) setting
+            (write-startup-config included (format nil "~a='~a'~%" name enabled))
+            (write-startup-config configuration
+                                  (format nil "include='included.conf'~%~a='~a'~%" name disabled))
+            (multiple-value-bind (native overrides)
+                (pg::startup-cli-inputs (list "-D" (namestring root)))
+              (let ((settings (pg::startup-load-settings native overrides)))
+                (ok (equal (pg::startup-normalize-setting name disabled)
+                           (pg::startup-setting-value settings name))))
+              (write-startup-config configuration (format nil "include='included.conf'~%"))
+              (ok (intake-fails-p
+                   (lambda () (pg::startup-load-settings native overrides))))
+              (let ((auto (merge-pathnames "postgresql.auto.conf" root)))
+                (write-startup-config auto (format nil "~a='~a'~%" name disabled))
+                (ok (equal (pg::startup-normalize-setting name disabled)
+                           (pg::startup-setting-value (pg::startup-load-settings native overrides) name)))
+                (write-startup-config auto (format nil "~a='~a'~%" name enabled))
+                (multiple-value-bind (command-native command-overrides)
+                    (pg::startup-cli-inputs (list "-D" (namestring root)
+                                                  "-c" (format nil "~a=~a" name disabled)))
+                  (ok (equal (pg::startup-normalize-setting name disabled)
+                             (pg::startup-setting-value
+                              (pg::startup-load-settings command-native command-overrides) name))))
+                (delete-file auto))))))))
+
+(deftest unsupported-feature-reload-preserves-the-entire-installed-configuration
+    (with-physical-store-directory (root)
+      (let* ((pg::*pgdata* root)
+             (configuration (merge-pathnames "postgresql.conf" root))
+             (pg::*startup-server-settings* nil)
+             (pg::*startup-native-inputs* nil) (pg::*startup-command-overrides* nil)
+             (pg::*installed-resource-parameters* nil)
+             (pg::*managed-worker-slots* nil)
+             (pg::*managed-worker-registration-closed-p* nil)
+             (pg::*relation-lock-object-limit* nil) (pg::*relation-lock-owner-limit* nil))
+        (write-startup-config configuration (format nil "checkpoint_timeout=90~%"))
+        (multiple-value-bind (native overrides) (pg::startup-cli-inputs (list "-D" (namestring root)))
+          (pg::startup-install-settings (pg::startup-load-settings native overrides) native overrides))
+        (pg::startup-install-resource-capacity pg::*startup-server-settings*)
+        (let ((active pg::*startup-server-settings*)
+              (installed pg::*installed-resource-parameters*)
+              (slots pg::*managed-worker-slots*))
+          (dolist (assignment '("max_prepared_transactions=1"
+                                "track_commit_timestamp=on"
+                                "recovery_target='immediate'"
+                                "recovery_target_lsn='0/10'"
+                                "recovery_target_name='stop_here'"
+                                "recovery_target_time='2026-10-30 00:00:00+00'"
+                                "recovery_target_xid='42'"))
+            (write-startup-config configuration (format nil "checkpoint_timeout=120~%~a~%" assignment))
+            (ok (intake-fails-p #'pg::startup-reload-settings))
+            (ok (eq active pg::*startup-server-settings*))
+            (ok (eq installed pg::*installed-resource-parameters*))
+            (ok (eq slots pg::*managed-worker-slots*))
+            (ok (= 90 (pg::startup-setting-value active "checkpoint_timeout")))
+            (ok (zerop (pg::resource-parameters-prepared installed))))))))
+
+(deftest direct-resource-planning-cannot-enable-unsupported-features
+    (dolist (setting '(("max_prepared_transactions" . "1")
+                       ("track_commit_timestamp" . "on")
+                       ("recovery_target" . "immediate")
+                       ("recovery_target_lsn" . "0/10")
+                       ("recovery_target_name" . "stop_here")
+                       ("recovery_target_time" . "2026-10-30 00:00:00+00")
+                       ("recovery_target_xid" . "42")))
+      (let ((settings (pg::startup-default-settings "/tmp/direct-feature-plan/")))
+        (setf (gethash (car setting) settings)
+              (list :value (pg::startup-normalize-setting (car setting) (cdr setting))
+                    :source :command-line))
+        (ok (intake-fails-p (lambda () (pg::startup-resource-capacity-plan settings)))))))
+
 (deftest startup-settings-catalog-keeps-base-units-and-active-provenance
     (let* ((pg::*startup-server-settings* (pg::startup-default-settings "/tmp/data/"))
            (pg::*startup-native-inputs* (make-hash-table :test #'equal)))
