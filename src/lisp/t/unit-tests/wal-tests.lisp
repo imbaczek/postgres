@@ -1344,7 +1344,14 @@
                        +wal-record-commit+))
              (record (if (= type +wal-record-checkpoint+)
                          (wal-test-legacy-checkpoint-record start)
-                         (wal-encode-record type 0 start #()))))
+                         (wal-encode-record
+                          type 0 start
+                          ;; Fill segment 1 so the record in segment 2 is
+                          ;; a legal successor before segment 1 is removed.
+                          (if (= segment 1)
+                              (make-array (- +wal-segment-size+ +wal-header-size+)
+                                          :element-type '(unsigned-byte 8) :initial-element 0)
+                              #())))))
         (with-open-file (stream (wal-segment-path segment)
                                 :direction :output
                                 :element-type '(unsigned-byte 8)
