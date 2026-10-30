@@ -398,7 +398,29 @@ def exercise_retained_policy(peer, socket_identity, sibling, source, promoted):
         control("sibling.sock", '(assert (and (eq (first *retained-policy-live-state*) (getf *physical-recovery-state* :timeline-policy)) (eq (second *retained-policy-live-state*) (physical-follow-runtime-replay-thread *physical-follow-runtime*)) (sb-thread:thread-alive-p (second *retained-policy-live-state*)) (null (physical-follow-runtime-receiver-thread *physical-follow-runtime*))))')
     finally:
         subprocess.run([*signaler, "CONT"], check=True)
+    control("sibling.sock", '(assert (not (probe-file (timeline-history-path 2 *pgdata*))))')
+    control("sibling.sock", f'(load {lisp_string(base / "t/child-bootstrap-native.lisp")})')
+    control("sibling.sock", f'(child-bootstrap-install-promotion-crash #p{lisp_string(str(root) + "/")} :after-online-intent)')
+    assert query(sibling, "SELECT pg_promote(false,30)") == [(True,)]
+    marker = root / "promotion-crash-held"
+    wait(lambda: marker.exists() and int(marker.read_text()) == peer.pid)
+    sibling.close()
+    assert stop_peer(peer, socket_identity, crash=True) == -signal.SIGKILL
+    peer, socket_identity = start_peer()
+    sibling = connect(replica_port)
+    assert query(sibling, "SELECT pg_is_in_recovery(),count(*) FROM promotion_sql_items") == [(False, 2)]
+    control("sibling.sock", '(assert (= 3 *wal-insert-timeline*)) (let ((history (timeline-read-history 3))) (assert (= 1 (timeline-history-entry-timeline (second history)))))')
+    query(sibling, "INSERT INTO promotion_sql_items VALUES (4,'new-parent-writer')")
+    assert query(sibling, "SELECT count(*) FROM promotion_sql_items") == [(3,)]
+    assert query(sibling, "SELECT count(*) FROM promotion_sql_items WHERE id=3") == [(0,)]
+    assert query(promoted, "SELECT count(*) FROM promotion_sql_items WHERE id=4") == [(0,)]
+    sibling.close()
+    assert stop_peer(peer, socket_identity, crash=True) == -signal.SIGKILL
+    peer, socket_identity = start_peer()
+    sibling = connect(replica_port)
+    assert query(sibling, "SELECT pg_is_in_recovery(),count(*) FROM promotion_sql_items") == [(False, 3)]
     print("retained-policy: parent-only receipt completion, paused replay/resume, source-offline cold startup and live reload PASS", flush=True)
+    print("retained-policy: parent promotion skips known source timeline, intent SIGKILL and cold primary restart PASS", flush=True)
     return peer, socket_identity, sibling
 
 
