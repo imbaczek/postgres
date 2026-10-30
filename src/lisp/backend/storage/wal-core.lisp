@@ -25,7 +25,8 @@
 
 (defconstant +wal-record-running-xacts+ 14)
 
-(defconstant +wal-record-parameter-change+ 16)
+(defconstant +wal-record-parameter-change+ 16
+  "Native version 8 empty-batch terminal carrying a resource tuple.")
 
 (declaim (ftype function wal-parameter-change-record-info wal-recover-resource-parameters))
 
@@ -2065,11 +2066,12 @@ src/backend/access/transam/xlogreader.c."
   (values))
 
 (defun wal-empty-metadata-terminal-type-p (type)
+  "Recognize terminals that must be the only record after a batch marker."
   (member type (list +wal-record-running-xacts+ +wal-record-xid-reservation+
                      +wal-record-parameter-change+) :test #'=))
 
 (defun wal-note-recovery-batch-record (record)
-  "Allocation and running-transaction terminals require an empty batch marker."
+  "Track whether a metadata terminal can follow the batch marker alone."
   (wal-require-ordinary-record-type (wal-record-type record))
   (let ((type (wal-record-type record)))
     (cond
@@ -2081,6 +2083,8 @@ src/backend/access/transam/xlogreader.c."
        (setf *wal-recovery-reservation-batch-clean-p* nil)))))
 
 (defun wal-validate-empty-metadata-terminal (record clean-p)
+  "Decode a metadata terminal without publishing it.
+CLEAN-P must certify that only a valid batch marker precedes the terminal."
   (unless clean-p
     (error "metadata terminal must be the sole record after its batch marker"))
   (let ((type (wal-record-type record)))
@@ -2091,6 +2095,9 @@ src/backend/access/transam/xlogreader.c."
       (t (error "unsupported empty metadata terminal")))))
 
 (defun wal-replay-empty-metadata-terminal (record)
+  "Validate and finish an empty metadata batch.
+Primary XID reservations restore their allocation floor; parameter facts are
+published separately after primary redo completes."
   (wal-recovery-validate-logical-terminal :other)
   (let* ((decoded (wal-validate-empty-metadata-terminal
                    record *wal-recovery-reservation-batch-clean-p*))
@@ -2234,7 +2241,9 @@ src/backend/access/transam/xlogreader.c."
          (wal-recovery-reset-logical-change-batch)))))
 
 (defun wal-recover ()
-  "Redo durable complete batches before loading the catalog."
+  "Redo durable complete batches before loading the catalog.
+After the scan, publish the latest parameter terminal beyond the checkpoint;
+the scan itself validates records without publishing their resource state."
   (let ((*wal-recovery-page-spool-enabled* t)
         (resource-record nil))
     (with-wal-replay-staging ()
@@ -2528,6 +2537,7 @@ as in C's metadata calculation. Lost slots remain lost."
           :test #'=))
 
 (defun wal-slot-terminal-ack-p (slot target-lsn)
+  "Check a terminal acknowledgment, validating metadata batches without applying them."
   (let ((*wal-recovery-reservation-batch-clean-p* nil)
         (batch-open nil)
         (found nil)

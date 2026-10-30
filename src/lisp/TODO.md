@@ -23,9 +23,13 @@
   C's `XLogReportParameters` and `CheckRequiredParameterValues`.
   The shared five-field value, strict native codec, floor comparison, capacity
   arithmetic and optional positioned control metadata are implemented. Native
-  utilities and independent control readers accept the extension. Next emit a
-  parameter-change terminal in an empty WAL batch and flush it before updating
-  primary control metadata; automatic source reporting is not wired yet.
+  utilities and independent control readers accept the extension. The explicit
+  primary reporter now flushes an empty-batch parameter-change terminal before
+  publishing and reading back control metadata. Primary redo repairs an interrupted
+  publication from durable WAL. Logical/history readers and slot resume checks
+  validate the terminal without publishing applied resource facts. Owned-server
+  SIGKILL tests cover both publication boundaries. Automatic startup reporting
+  is not wired yet: its tuple must describe actual installed capacity.
   Carry exact resource facts with applied/required positions, checkpoint and
   restartpoint seeds, backup validation and private follow scans. Missing legacy
   facts stay unknown; do not substitute current defaults or newer received facts

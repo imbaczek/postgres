@@ -6,8 +6,8 @@
             (:constructor %make-resource-parameters (connections workers senders prepared locks)))
   "Immutable five-field resource tuple, constructed explicitly with checked values.
 NIL means unknown and is not a valid tuple. This codec does not supply defaults
-for legacy data or publish resource requirements. A consumer must associate a
-tuple with its applied LSN and timeline, not use later received values for an
+for legacy data. A consumer must associate a tuple with its applied LSN and
+timeline, not use later received values for an
 older replay seed."
   (connections 1 :read-only t)
   (workers 0 :read-only t)
@@ -122,6 +122,8 @@ capacity is twice N. The default autovacuum slot count is 16."
     (wal-decode-resource-parameters bytes)))
 
 (defun wal-parameter-change-record-info (record)
+  "Validate a native version 8 parameter terminal and decode its tuple.
+This record is not PostgreSQL C physical WAL."
   (unless (and (= (wal-record-type record) +wal-record-parameter-change+)
                (>= (wal-record-version record) 8)
                (zerop (wal-record-xid record))
@@ -139,13 +141,17 @@ capacity is twice N. The default autovacuum slot count is 16."
 (declaim (ftype function wal-save-control-fields wal-read-control-fields
                 wal-control-metadata-valid-p wal-control-resource-parameters))
 
-(defvar *wal-resource-parameters-test-hook* nil)
+(defvar *wal-resource-parameters-test-hook* nil
+  "Optional test hook at resource WAL and control publication boundaries.")
 
 (defun wal-resource-parameters-test-point (point end)
+  "Call the test hook with the publication point and record end."
   (when *wal-resource-parameters-test-hook*
     (funcall *wal-resource-parameters-test-hook* point end)))
 
 (defun wal-publish-resource-parameters-under-lock (parameters end timeline)
+  "Save a durable record's tuple and coordinates under the WAL lock.
+Read back the complete control image before installing the new memory copy."
   (unless (and (wal-control-metadata-valid-p *wal-control-metadata*)
                (resource-parameters-valid-p parameters)
                (typep end '(integer 1 18446744073709551615))
@@ -173,6 +179,12 @@ capacity is twice N. The default autovacuum slot count is 16."
   (values))
 
 (defun wal-report-resource-parameters (parameters)
+  "Explicitly report a primary tuple, returning its durable record end.
+Under the WAL lock, skip unchanged values; otherwise append and flush the batch
+before publishing and reading back control. Failure or cancellation after append
+starts poisons WAL before unlocking and requests shutdown. Startup does not call
+this yet; installed capacities and standby seeds and floors must be complete
+before enabling it."
   (prevent-recovery-primary-operation "primary resource reporting")
   (unless (resource-parameters-valid-p parameters) (error "invalid resource parameters"))
   (let ((started nil) (completed nil) (failure nil) (result nil))
@@ -207,6 +219,9 @@ capacity is twice N. The default autovacuum slot count is 16."
     result))
 
 (defun wal-recover-resource-parameters (record)
+  "Publish the latest replayed primary tuple under WAL exclusion.
+An equal position must match control; older records do not replace it. Later
+values replace earlier ones even when they decrease."
   (let* ((parameters (wal-parameter-change-record-info record))
          (end (wal-record-end record))
          (prior (getf *wal-control-metadata* :resource-lsn)))

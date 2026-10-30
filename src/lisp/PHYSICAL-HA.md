@@ -154,8 +154,9 @@ Native control now supports an optional resource tuple with its LSN and timeline
 The `PGWAL6` extension is tagged `R` and CRC-covered; old controls remain readable
 with unknown resource facts. A present tuple must be complete and valid, and its
 position cannot exceed the control's durable LSN or insertion timeline. These are
-numeric bounds, not proof of the tuple's WAL origin or lineage. The forthcoming
-reporting and recovery paths must establish that association.
+numeric bounds, not proof of the tuple's WAL origin or lineage. Primary reporting
+and redo now bind the tuple to a validated WAL record. Standby replay seeds and
+source lineage checks still need that association.
 
 Control metadata uses a fresh five-integer list. Runtime consumers reconstruct
 the checked immutable value. This preserves existing `equal` provenance checks
@@ -167,12 +168,53 @@ characters plus its newline; a valid 524-byte fixture covers the enlarged reader
 They validate the resource extension, including decimal position syntax; Python's
 underscore-separated integers are rejected to match the Lisp parser. Synthetic
 tests exercise utility role checks, three oracle readers, malformed fields with
-valid CRCs and checksum failure. They do not establish source emission or recovery
-admission. No parameter-change WAL record or automatic reporting is wired yet.
+valid CRCs and checksum failure. Those tests cover metadata transport; WAL reporting
+is described below. Standby resource admission remains incomplete.
 
 Validation passed 673 unit Rove tests, 12 resource value/control tests, 101 related
 physical tests and four Python tests, plus fresh strict compilation at
 `/tmp/pg-resource-control-compile.log`.
+
+### Resource parameter WAL reporting
+
+The explicit internal `wal-report-resource-parameters` operation follows C's
+`XLogReportParameters`: append a parameter-change record, flush its WAL, then
+publish control metadata. The native record is type 16 in the existing version 8
+format. It has XID zero and exactly one checked 32-byte tuple, and must be the sole
+record after an empty batch marker. This is native WAL, not PostgreSQL C WAL.
+
+The reporter requires initialized primary storage and a control identity. It holds
+the WAL lock through append, flush, control publication and readback. Only a
+matching durable readback installs the new in-memory metadata. An unchanged tuple
+does not emit another record. After append starts, failure or cancellation fences
+further writes before releasing the WAL lock and requests shutdown. Ordinary
+validation refusals do not start a batch or poison WAL.
+
+Primary startup redo validates complete batches before selecting the latest
+parameter-change record after its checkpoint. It repairs a flushed record whose
+control publication was interrupted, preserves a later control fact, and rejects
+conflicting facts at the same position. Requirements may decrease: redo uses the
+latest exact tuple rather than a maximum over history. Existing control metadata
+preserves that tuple after checkpoint/restart.
+
+Logical decoding, catalog-history validation and logical-slot resume checks share
+the empty-metadata validator. They reject malformed or mixed parameter batches
+without publishing resource facts. The concurrent row-replay path keeps a parameter
+change as a barrier. Standby applied progress and its resource tuple still need to
+be persisted together in replay and restartpoint seeds before reader admission can
+use them.
+
+This reporter is not called automatically at startup yet. Startup sizing, truthful
+installed capacity, resource floors and the online insufficient-resource pause
+remain prerequisites. The crash script invokes the internal API on an isolated
+server; its supplied tuples do not install resource limits.
+
+Validation passed 676 unit tests and 1,207 physical tests. After the final resume
+and cancellation fixes, 157 related physical tests and all 676 unit tests passed.
+Fresh strict compilation passed at `/tmp/pg-parameter-wal-final-compile.log`.
+`t/resource-parameters-crash.sh` SIGKILLs its owned server after WAL flush and after
+control publication, verifies repair in fresh images, and checks a decrease across
+checkpoint/restart. The final run passed at `/tmp/pg-parameter-wal-owned-v3.log`.
 
 ### Child follow and rejoin intake
 
