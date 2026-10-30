@@ -96,8 +96,8 @@
                "VACUUM uses the normal minimum-age target below aggressive age")
       (rove:ok (= (vacuum-compute-freeze-cutoff
                    aggressive-old-xid oldest-xmin next-xid)
-                  oldest-xmin)
-               "VACUUM switches at aggressive age and clamps to oldest xmin")
+                  (- next-xid +vacuum-freeze-min-age+))
+               "aggressive age does not change the minimum-age freeze target")
       (rove:ok (= (vacuum-full-freeze-cutoff table oldest-xmin next-xid)
                   (vacuum-compute-freeze-cutoff
                    aggressive-old-xid oldest-xmin next-xid))

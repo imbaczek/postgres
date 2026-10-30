@@ -8,14 +8,10 @@
 (defun vacuum-compute-freeze-cutoff
     (old-relfrozenxid oldest-xmin next-xid &key forced-freeze-cutoff)
   "Choose the freeze cutoff from the caller's horizon and age policy."
-  (let* ((old-relfrozenxid (or old-relfrozenxid +first-normal-xid+))
-         (age (max 0 (- next-xid old-relfrozenxid)))
-         (freeze-target
-           (or forced-freeze-cutoff
-               (if (>= age +vacuum-aggressive-freeze-age+)
-                   next-xid
-                   (max +first-normal-xid+
-                        (- next-xid +vacuum-freeze-min-age+))))))
+  (declare (ignore old-relfrozenxid))
+  (let ((freeze-target
+          (or forced-freeze-cutoff
+              (max +first-normal-xid+ (- next-xid +vacuum-freeze-min-age+)))))
     (min oldest-xmin freeze-target)))
 
 (defun call-with-revalidated-relation-locks
