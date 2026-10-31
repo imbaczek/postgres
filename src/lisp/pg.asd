@@ -69,6 +69,7 @@
       :serial t
       :components ((:file "postmaster") (:file "bgworker")))
      (:file "replication/walsender-status")
+     (:file "replication/syncrep")
      (:module "catalog"
       :serial t
       :components ((:file "catalog")

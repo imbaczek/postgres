@@ -6,10 +6,29 @@
 
 (defstruct wal-sender-status
   "Mutable status owned by one replication backend and protected by the sender lock."
-  backend (state "startup") sent-lsn write-lsn flush-lsn replay-lsn reply-time)
+  backend index (state "startup") sent-lsn write-lsn flush-lsn replay-lsn reply-time)
 
 (defvar *wal-sender-lock* (sb-thread:make-mutex :name "pg walsender status"))
 (defvar *wal-sender-registry* (make-hash-table :test #'eq))
+
+(defun wal-sender-next-index-under-lock ()
+  (let ((used (make-hash-table :test #'eql)))
+    (maphash (lambda (backend sender)
+               (declare (ignore backend))
+               (setf (gethash (wal-sender-status-index sender) used) t))
+             *wal-sender-registry*)
+    (loop for index from 0 unless (gethash index used) return index)))
+
+(defun wal-sender-snapshot-under-lock (sender)
+  (let ((backend (wal-sender-status-backend sender)))
+    (list :pid (backend-pid backend)
+          :application-name (copy-seq (or (backend-application-name backend) ""))
+          :state (copy-seq (wal-sender-status-state sender))
+          :sent-lsn (wal-sender-status-sent-lsn sender)
+          :write-lsn (wal-sender-status-write-lsn sender)
+          :flush-lsn (wal-sender-status-flush-lsn sender)
+          :replay-lsn (wal-sender-status-replay-lsn sender)
+          :reply-time (wal-sender-status-reply-time sender))))
 
 (defun wal-sender-register (backend)
   "Register one status token for a replication backend under the sender lock."
@@ -21,7 +40,8 @@
       (when (gethash backend *wal-sender-registry*)
         (error "backend already owns walsender status"))
       (sb-sys:without-interrupts
-        (setf (gethash backend *wal-sender-registry*) sender)))
+        (setf (wal-sender-status-index sender) (wal-sender-next-index-under-lock)
+              (gethash backend *wal-sender-registry*) sender)))
     sender))
 
 (defun wal-sender-unregister (backend &optional (expected nil expected-p))
@@ -106,13 +126,5 @@ Feedback and cleanup use that token, so they cannot affect a replacement registr
   "Copy registered sender fields under the lock for a stable monitoring result."
   (sb-thread:with-mutex (*wal-sender-lock*)
     (sort (loop for sender being the hash-values of *wal-sender-registry*
-                for backend = (wal-sender-status-backend sender)
-                collect (list :pid (backend-pid backend)
-                              :application-name (copy-seq (or (backend-application-name backend) ""))
-                              :state (copy-seq (wal-sender-status-state sender))
-                              :sent-lsn (wal-sender-status-sent-lsn sender)
-                              :write-lsn (wal-sender-status-write-lsn sender)
-                              :flush-lsn (wal-sender-status-flush-lsn sender)
-                              :replay-lsn (wal-sender-status-replay-lsn sender)
-                              :reply-time (wal-sender-status-reply-time sender)))
+                collect (wal-sender-snapshot-under-lock sender))
           #'< :key (lambda (row) (getf row :pid)))))
