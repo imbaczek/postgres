@@ -1362,6 +1362,26 @@ both before writing can be interrupted."
                ,@(when memory-limit-p (list memory-limit)))
      ,@body))
 
+(defun map-query-row-spool-prefix (spool callback)
+  (let ((count (query-row-spool-count spool)))
+    (if (query-row-spool-pathname spool)
+        (progn
+          (when (query-row-spool-output-stream spool)
+            (finish-output (query-row-spool-output-stream spool)))
+          (with-query-temp-input (stream (query-row-spool-pathname spool))
+            (dotimes (index count)
+              (check-for-interrupts)
+              (let ((row (query-spill-read-record stream)))
+                (when (eq row +query-spill-eof+) (error "Query spool prefix ended early"))
+                (when (eq (funcall callback row index) :stop)
+                  (return-from map-query-row-spool-prefix :stop))))))
+        (loop for row in (reverse (query-row-spool-rows spool))
+              for index below count
+              do (check-for-interrupts)
+                 (when (eq (funcall callback row index) :stop)
+                   (return-from map-query-row-spool-prefix :stop))))
+    (values)))
+
 (defun map-query-row-spool (spool callback)
   (unless (query-row-spool-sealed-p spool)
     (error "Cannot read an unsealed query row spool"))

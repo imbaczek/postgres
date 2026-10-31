@@ -913,6 +913,60 @@ Preserve EQUALP's numeric comparison while descending into SQL value wrappers."
                      "SELECT to_json(r.*) FROM (SELECT 1 AS id) l LEFT JOIN LATERAL (SELECT l.id WHERE false) r ON true"))
         (ok (test-row-equal-p (list (vector pg::+null+)) (whole-row-query-rows sql iterator-p))))))
 
+(deftest json-aggregate-preserves-null-and-whole-row-values
+    (dolist (iterator-p '(nil t))
+      (dolist (memory '(1 100000))
+        (let ((pg::*query-work-memory-bytes* memory)
+              (pg::*query-temp-directory* (uiop:temporary-directory)))
+          (dolist (case
+                      (list
+                       (list "SELECT json_agg(r.id) FROM (SELECT 1 AS id WHERE false) r"
+                             (list (vector pg::+null+)))
+                       (list "SELECT json_agg(r.id) FROM (SELECT NULL::integer AS id) r"
+                             '(#("[null]")))
+                       (list "SELECT pg_catalog.json_agg(r.id) FROM (SELECT 1 AS id UNION ALL SELECT 2) r"
+                             '(#("[1, 2]")))
+                       (list "SELECT json_agg(r.*) FROM (SELECT NULL::integer AS id) r"
+                             '(#("[{\"id\":null}]")))
+                       (list "SELECT json_agg(r.*) FROM (SELECT 1 AS id) l LEFT JOIN (SELECT NULL::integer AS id) r ON false"
+                             '(#("[null]")))
+                       (list "SELECT json_agg(r.*) FROM (SELECT 1 AS id UNION ALL SELECT 2) r"
+                             (list (vector (format nil "[{\"id\":1}, ~% {\"id\":2}]"))))
+                       (list "SELECT json_agg(r.x) FROM (SELECT false AS x UNION ALL SELECT true UNION ALL SELECT NULL::boolean) r"
+                             '(#("[false, true, null]")))
+                       (list "SELECT json_agg(r.x) FROM (SELECT ARRAY[1,2] AS x UNION ALL SELECT ARRAY[3,4]) r"
+                             (list (vector (format nil "[[1,2], ~% [3,4]]"))))
+                       (list "SELECT json_agg(r.j) FROM (SELECT '{ \"raw\" : 1 }'::json AS j) r"
+                             '(#("[{ \"raw\" : 1 }]")))))
+            (ok (test-row-equal-p (second case)
+                                  (whole-row-query-rows (first case) iterator-p))))))))
+
+(deftest json-aggregate-group-and-window-snapshots
+    (dolist (iterator-p '(nil t))
+      (dolist (memory '(1 100000))
+        (let ((pg::*query-work-memory-bytes* memory)
+              (pg::*query-temp-directory* (uiop:temporary-directory)))
+          (dolist (case
+                      '(("SELECT k,json_agg(v) FROM (SELECT 1 AS k,'a'::text AS v UNION ALL SELECT 2,'b'::text UNION ALL SELECT 1,'c'::text) r GROUP BY k ORDER BY k"
+                         (#(1 "[\"a\", \"c\"]") #(2 "[\"b\"]")))
+                        ("SELECT v,json_agg(v) OVER (ORDER BY v ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM (SELECT 1 AS v UNION ALL SELECT 2 UNION ALL SELECT 3) r ORDER BY v"
+                         (#(1 "[1]") #(2 "[1, 2]") #(3 "[1, 2, 3]")))
+                        ("SELECT v,json_agg(v) OVER (ORDER BY v) FROM (SELECT 1 AS v UNION ALL SELECT 1 UNION ALL SELECT 2) r ORDER BY v"
+                         (#(1 "[1, 1]") #(1 "[1, 1]") #(2 "[1, 1, 2]")))
+                        ("SELECT v,json_agg(v) OVER (ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) FROM (SELECT 1 AS v UNION ALL SELECT 2) r ORDER BY v"
+                         (#(1 "[1, 2]") #(2 "[1, 2]")))))
+            (ok (test-row-equal-p (second case)
+                                  (whole-row-query-rows (first case) iterator-p))))))))
+
+(deftest json-aggregate-rejects-unknown-and-unsupported-call-decorations
+    (dolist (case '(("SELECT json_agg('x')" . "42804")
+                    ("SELECT json_agg(NULL)" . "42804")
+                    ("SELECT json_agg(DISTINCT 1)" . "0A000")
+                    ("SELECT json_agg(1 ORDER BY 1)" . "0A000")))
+      (ok (equal (cdr case)
+                 (handler-case (progn (whole-row-query-rows (car case)) nil)
+                   (pg::pg-error (condition) (pg::pg-error-sqlstate condition)))))))
+
 (deftest whole-row-analysis-retains-column-precedence-and-slot-identity
     (dolist (iterator-p '(nil t))
       (dolist (case
@@ -1018,6 +1072,18 @@ Preserve EQUALP's numeric comparison while descending into SQL value wrappers."
                       FROM pg_catalog.pg_stat_get_wal_senders() w,
                            pg_catalog.pg_stat_get_activity(w.pid)
                       WHERE w.state = 'streaming'")))
+               (dolist (iterator-p '(nil t))
+                 (ok (test-row-equal-p
+                      '(#("[{\"pid\":2354,\"application_name\":\"status_join\",\"sync_state\":\"async\",\"write_lsn\":80,\"flush_lsn\":64,\"replay_lsn\":32}]"))
+                      (whole-row-query-rows
+                       "SELECT json_agg(r.*) FROM (
+                          SELECT w.pid AS pid, application_name, sync_state,
+                                 pg_wal_lsn_diff(write_lsn,'0/0')::bigint AS write_lsn,
+                                 pg_wal_lsn_diff(flush_lsn,'0/0')::bigint AS flush_lsn,
+                                 pg_wal_lsn_diff(replay_lsn,'0/0')::bigint AS replay_lsn
+                          FROM pg_stat_get_wal_senders() w, pg_stat_get_activity(w.pid)
+                          WHERE w.state='streaming') r"
+                       iterator-p))))
                (ok (test-row-equal-p
                     '(#(2354 "status_join") #(2355 "sql_only"))
                     (derived-query-rows

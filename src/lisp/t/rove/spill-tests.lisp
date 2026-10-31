@@ -198,6 +198,224 @@
       (rove:ok (equal (sql-to-json +null+ :record) "null"))
       (rove:ok (eq (sql-to-jsonb +null+ :record) +null+))))
 
+(cl-spec:defgenerator json-text-writer-arguments ()
+  (let ((alphabet #(#\a #\" #\\ #\Newline #\Tab #\ą #\€ #\😀)))
+    (list (coerce (loop repeat (random 5000)
+                        collect (aref alphabet (random (length alphabet)))) 'string)
+          :text)))
+
+(cl-spec:defspec-function sql-to-json
+  "Typed text becomes a JSON string with the same Unicode characters."
+  (:args (value (type string)) (type (member :text)))
+  (:args-generator json-text-writer-arguments)
+  (:returns (type string))
+  (:post (equal value (sql-jsonb-value (sql-jsonb-input result)))))
+
+(cl-spec:defproperty json-text-rendering-retains-unicode
+    ((size (range integer 0 5000)) (choice (range integer 0 7)))
+  (:about sql-to-json)
+  (:trials (:normal 100))
+  (let* ((alphabet #(#\a #\" #\\ #\Newline #\Tab #\ą #\€ #\😀))
+         (text (make-string size :initial-element (aref alphabet choice))))
+    (equal text (sql-jsonb-value (sql-jsonb-input (sql-to-json text :text))))))
+
+(rove:deftest json-text-rendering-contracts
+    (let ((data (cl-spec:result-data
+                 (cl-spec:check-function 'sql-to-json :trials 100 :seed 42))))
+      (rove:ok (eq :passed (getf data :status)) (format nil "~s" data)))
+  (unit-check-property 'json-text-rendering-retains-unicode))
+
+(rove:deftest spool-prefix-reading-keeps-transition-appendable
+    (let ((*query-temp-directory* (uiop:temporary-directory)))
+      (dolist (memory '(1 100000))
+        (with-query-temp-files ()
+                               (with-query-row-spool (spool memory)
+                                 (query-row-spool-append spool #(1))
+                                 (let ((first nil))
+                                   (map-query-row-spool-prefix spool (lambda (row index)
+                                                                       (declare (ignore index))
+                                                                       (push row first)))
+                                   (rove:ok (equalp first '(#(1))))
+                                   (rove:ok (not (query-row-spool-sealed-p spool))))
+                                 (query-row-spool-append spool #(2))
+                                 (let ((second nil))
+                                   (map-query-row-spool-prefix spool (lambda (row index)
+                                                                       (declare (ignore index))
+                                                                       (push row second)))
+                                   (rove:ok (equalp (nreverse second) '(#(1) #(2))))
+                                   (rove:ok (not (query-row-spool-sealed-p spool)))))))))
+
+(cl-spec:defproperty json-aggregate-byte-limit-counts-utf8-and-escaping
+    ((size (range integer 0 128)) (choice (range integer 0 5))
+                                  (delta (range integer -1 1)))
+  (:about json-aggregate-result)
+  (:trials (:normal 75))
+  (let* ((alphabet #(#\a #\€ #\😀 #\" #\Newline #\\))
+         (text (make-string size :initial-element (aref alphabet choice)))
+         (expected (concatenate 'string "[" (sql-to-json text :text) "]"))
+         (limit (+ (length (string->bytes expected)) delta))
+         (*query-work-memory-bytes* 1)
+         (*query-temp-directory* (uiop:temporary-directory)))
+    (with-query-temp-files ()
+                           (progv '(*json-aggregate-output-max-bytes*) (list limit)
+                             (handler-case
+                                 (let ((rows (subquery-test-rows (format nil "SELECT json_agg('~a'::text)" text))))
+                                   (and (not (minusp delta)) (equal rows (list (list expected)))))
+                               (pg-error (condition)
+                                 (and (minusp delta) (equal (pg-error-sqlstate condition) "54000"))))))))
+
+(rove:deftest json-aggregate-byte-limit-property
+    (unit-check-property 'json-aggregate-byte-limit-counts-utf8-and-escaping))
+
+(rove:deftest json-aggregate-coalesces-small-utf8-transitions
+    (let ((*query-temp-directory* (uiop:temporary-directory))
+          (*query-work-memory-bytes* 256))
+      (with-query-temp-files ()
+                             (let* ((descriptors '((:kind :json-agg :input (:col 1 :type :text) :type :json)))
+                                    (states (make-aggregate-transition-states descriptors))
+                                    (token (sql-to-json "€" :text)))
+                               (unwind-protect
+                                    (progn
+                                      (dotimes (index 300)
+                                        (step-aggregate-transition-states states descriptors (vector "€") 0))
+                                      (rove:ok (< (query-row-spool-count
+                                                   (json-aggregate-transition-spool (aref states 0))) 50))
+                                      (rove:ok (equal (aref (window-transition-results states) 0)
+                                                      (format nil "[~{~a~^, ~}]" (make-list 300 :initial-element token)))))
+                                 (close-aggregate-transition-states states))))))
+
+(rove:deftest json-aggregate-batches-around-large-utf8-fragments
+    (let ((*query-temp-directory* (uiop:temporary-directory))
+          (*query-work-memory-bytes* 256))
+      (with-query-temp-files ()
+                             (let* ((descriptors '((:kind :json-agg :input (:col 1 :type :text) :type :json)))
+                                    (states (make-aggregate-transition-states descriptors))
+                                    (large (make-string 5000 :initial-element #\😀))
+                                    (values (list "start" large "end")))
+                               (unwind-protect
+                                    (progn
+                                      (dolist (value values)
+                                        (step-aggregate-transition-states states descriptors (vector value) 0))
+                                      (rove:ok
+                                       (equal (aref (window-transition-results states) 0)
+                                              (format nil "[~{~a~^, ~}]"
+                                                      (mapcar (lambda (value) (sql-to-json value :text)) values))))
+                                      (let* ((state (aref states 0))
+                                             (spool (json-aggregate-transition-spool state))
+                                             (pending (json-aggregate-transition-pending state)))
+                                        (rove:ok (query-row-spool-pathname spool))
+                                        (rove:ok (<= (+ (query-row-spool-memory-limit spool)
+                                                        (array-total-size pending))
+                                                     *query-work-memory-bytes*))))
+                                 (close-aggregate-transition-states states))))))
+
+(rove:deftest json-aggregate-limit-stops-before-later-input
+    (let ((*query-temp-directory* (uiop:temporary-directory))
+          (*query-work-memory-bytes* 1)
+          (*json-aggregate-output-max-bytes* 4)
+          (visited 0))
+      (rove:ok
+       (handler-case
+           (progn
+             (stream-sorted-aggregates
+              (lambda (callback)
+                (incf visited)
+                (funcall callback #("oversized"))
+                (incf visited)
+                (error "later input must not be evaluated"))
+              nil '((:kind :json-agg :input (:col 1 :type :text) :type :json))
+              (lambda (row) (declare (ignore row)) nil))
+             nil)
+         (pg-error (condition) (equal (pg-error-sqlstate condition) "54000"))))
+      (rove:ok (= visited 1))))
+
+(rove:deftest json-aggregate-freezes-session-formatting-at-transition
+    (let ((*query-temp-directory* (uiop:temporary-directory))
+          (*backend* (make-backend)))
+      (dolist (memory '(1 100000))
+        (setf (gethash "timezone" (backend-settings *backend*)) "UTC")
+        (with-query-temp-files ()
+                               (let* ((*query-work-memory-bytes* memory)
+                                      (descriptors '((:kind :json-agg :input (:col 1 :type :timestamptz) :type :json)))
+                                      (states (make-aggregate-transition-states descriptors))
+                                      (value (sql-cast-value "2020-01-01 00:00:00+00" :text :timestamptz -1))
+                                      (first (sql-to-json value :timestamptz)))
+                                 (unwind-protect
+                                      (progn
+                                        (step-aggregate-transition-states states descriptors (vector value) 0)
+                                        (setf (gethash "timezone" (backend-settings *backend*)) "Europe/Warsaw")
+                                        (let ((second (sql-to-json value :timestamptz)))
+                                          (rove:ok (not (equal first second)))
+                                          (rove:ok (equal (aref (window-transition-results states) 0)
+                                                          (concatenate 'string "[" first "]")))
+                                          (step-aggregate-transition-states states descriptors (vector value) 0)
+                                          (rove:ok (equal (aref (window-transition-results states) 0)
+                                                          (concatenate 'string "[" first ", " second "]")))))
+                                   (close-aggregate-transition-states states)))))))
+
+(rove:deftest json-aggregate-owns-inputs-and-window-results
+    (let ((*query-temp-directory* (uiop:temporary-directory)))
+      (dolist (memory '(1 100000))
+        (with-query-temp-files ()
+                               (let* ((*query-work-memory-bytes* memory)
+                                      (descriptors '((:kind :json-agg :input (:col 1 :type :record) :type :json)))
+                                      (states (make-aggregate-transition-states descriptors))
+                                      (input (make-sql-record :fields '(("label" :text))
+                                                              :values (vector (copy-seq "before")))))
+                                 (unwind-protect
+                                      (progn
+                                        (step-aggregate-transition-states states descriptors (vector input) 0)
+                                        (setf (char (aref (sql-record-values input) 0) 0) #\X)
+                                        (let ((first (aref (window-transition-results states) 0)))
+                                          (rove:ok (equal first "[{\"label\":\"before\"}]"))
+                                          (setf (char first 1) #\X))
+                                        (rove:ok (not (query-row-spool-sealed-p
+                                                       (json-aggregate-transition-spool (aref states 0)))))
+                                        (step-aggregate-transition-states
+                                         states descriptors
+                                         (vector (make-sql-record :fields '(("label" :text)) :values (vector "after"))) 0)
+                                        (let ((expected (format nil "[{\"label\":\"before\"}, ~% {\"label\":\"after\"}]")))
+                                          (rove:ok (equal (aref (window-transition-results states) 0) expected))
+                                          (rove:ok (equal (aref (finalize-aggregate-transition-states states) 0) expected))))
+                                   (close-aggregate-transition-states states)))))))
+
+(rove:deftest json-aggregate-cleans-spills-on-stop-consumer-error-and-limit
+    (let* ((directory (merge-pathnames (format nil "pg-json-aggregate-~a/" (gensym))
+                                       (uiop:temporary-directory)))
+           (*query-temp-directory* directory)
+           (*query-work-memory-bytes* 1)
+           (descriptors '((:kind :json-agg :input (:col 2 :type :text) :type :json)))
+           (input '(#(1 "a") #(2 "b") #(1 "c") #(2 "d"))))
+      (ensure-directories-exist directory)
+      (unwind-protect
+           (flet ((source (callback) (dolist (row input) (funcall callback row))))
+             (let ((count 0))
+               (stream-sorted-aggregates
+                #'source '((:col 1 :type :int4)) descriptors
+                (lambda (row) (declare (ignore row)) (incf count) :stop))
+               (rove:ok (= count 1)))
+             (rove:ok (null (uiop:directory-files directory)))
+             (rove:ok
+              (handler-case
+                  (progn
+                    (stream-sorted-aggregates
+                     #'source '((:col 1 :type :int4)) descriptors
+                     (lambda (row) (declare (ignore row)) (ereport "57014" "cancelled")))
+                    nil)
+                (pg-error (condition) (equal (pg-error-sqlstate condition) "57014"))))
+             (rove:ok (null (uiop:directory-files directory)))
+             (let ((*json-aggregate-output-max-bytes* 8))
+               (rove:ok
+                (handler-case
+                    (progn
+                      (stream-sorted-aggregates
+                       #'source '((:col 1 :type :int4)) descriptors
+                       (lambda (row) (declare (ignore row)) nil))
+                      nil)
+                  (pg-error (condition) (equal (pg-error-sqlstate condition) "54000")))))
+             (rove:ok (null (uiop:directory-files directory))))
+        (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))
+
 (rove:deftest whole-row-semantic-keys-ignore-runtime-source-identities
     (labels ((expressions ()
                (let* ((table (make-pg-class :oid 0 :name "empty" :columns #()))

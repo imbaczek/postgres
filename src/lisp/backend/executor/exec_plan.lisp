@@ -1222,6 +1222,77 @@ on an abnormal exit."
                value)))
         (t state)))
 
+(defstruct json-aggregate-transition type spool (bytes 0) (rows 0) pending)
+
+(defvar *json-aggregate-output-max-bytes* (- #x3fffffff 4))
+
+(defun check-json-aggregate-output-size (bytes)
+  (when (> bytes *json-aggregate-output-max-bytes*)
+    (ereport "54000" "JSON aggregate exceeds the maximum size"))
+  bytes)
+
+(defun spool-json-aggregate-chunk (state octets)
+  (let ((pending (json-aggregate-transition-pending state))
+        (spool (json-aggregate-transition-spool state)))
+    (if (null pending)
+        (query-row-spool-append spool octets)
+        (progn
+          (when (> (+ (length pending) (length octets)) (array-total-size pending))
+            (when (plusp (length pending))
+              (query-row-spool-append spool (copy-seq pending))
+              (setf (fill-pointer pending) 0)))
+          (if (> (length octets) (array-total-size pending))
+              (query-row-spool-append spool octets)
+              (let ((offset (length pending)))
+                (incf (fill-pointer pending) (length octets))
+                (replace pending octets :start1 offset)))))))
+
+(defun append-json-aggregate-value (state value)
+  (let* ((spool (json-aggregate-transition-spool state))
+         (type (json-aggregate-transition-type state))
+         (out
+           (make-instance
+            'logical-utf8-output-stream
+            :buffer
+            (lambda (octets)
+              (check-for-interrupts)
+              (let ((bytes (check-json-aggregate-output-size
+                            (+ (json-aggregate-transition-bytes state) (length octets)))))
+                (spool-json-aggregate-chunk state octets)
+                (setf (json-aggregate-transition-bytes state) bytes))))))
+    (when (query-row-spool-sealed-p spool)
+      (error "Cannot append to a sealed JSON aggregate"))
+    (if (zerop (json-aggregate-transition-rows state))
+        (write-char #\[ out)
+        (progn
+          (write-string ", " out)
+          (when (and (not (eq value +null+))
+                     (or (eq type :record) (eq type :int2vector) (sql-array-element-type type)))
+            (terpri out)
+            (write-char #\Space out))))
+    (sql-write-json value type out)
+    (logical-flush-utf8-output out)
+    (incf (json-aggregate-transition-rows state))))
+
+(defun json-aggregate-result (state &optional (seal-p t))
+  (when (zerop (json-aggregate-transition-rows state))
+    (return-from json-aggregate-result +null+))
+  (check-json-aggregate-output-size (1+ (json-aggregate-transition-bytes state)))
+  (let ((spool (json-aggregate-transition-spool state)))
+    (when seal-p (query-row-spool-seal spool))
+    (with-output-to-string (out)
+      (map-query-row-spool-prefix
+       spool
+       (lambda (octets index)
+         (declare (ignore index))
+         (write-string (sb-ext:octets-to-string octets :external-format :utf-8) out)
+         nil))
+      (let ((pending (json-aggregate-transition-pending state)))
+        (when (plusp (length pending))
+          (write-string (sb-ext:octets-to-string pending :end (length pending)
+                                                         :external-format :utf-8) out)))
+      (write-char #\] out))))
+
 (defun make-aggregate-transition-states (descriptors)
   (let ((budget (max 1 (floor *query-work-memory-bytes* (max 1 (length descriptors))))))
     (map 'vector (lambda (descriptor)
@@ -1235,16 +1306,26 @@ on an abnormal exit."
                              (:interval (make-interval-aggregate-transition :kind :avg))
                              (:float8 (make-float-average-transition))
                              (otherwise (make-average-transition))))
-                     (:array-agg (make-query-row-spool budget))))
+                     (:array-agg (make-query-row-spool budget))
+                     (:json-agg
+                      (let ((capacity (min 4096 (floor budget 2))))
+                        (make-json-aggregate-transition
+                         :type (expr-type (getf descriptor :input))
+                         :spool (make-query-row-spool (- budget capacity))
+                         :pending (make-array capacity :element-type '(unsigned-byte 8)
+                                                       :fill-pointer 0))))))
          descriptors)))
 
 (defun close-aggregate-transition-states (states)
   (when states
     (loop for state across states
-          when (query-row-spool-p state)
-            do (close-query-row-spool state)
-               (when (query-row-spool-pathname state)
-                 (delete-query-temp-file (query-row-spool-pathname state))))))
+          for spool = (cond ((query-row-spool-p state) state)
+                            ((json-aggregate-transition-p state)
+                             (json-aggregate-transition-spool state)))
+          when spool
+            do (close-query-row-spool spool)
+               (when (query-row-spool-pathname spool)
+                 (delete-query-temp-file (query-row-spool-pathname spool))))))
 
 (defun sum-aggregate-transition (state value result-type)
   "Match C's NULL start, int64 int2/int4 accumulator, and exact numeric totals."
@@ -1296,21 +1377,23 @@ on an abnormal exit."
                       (t (setf (average-transition-sum state)
                                (sql-numeric-accumulate (average-transition-sum state) value))
                          (incf (average-transition-count state))))))
-             (:array-agg (query-row-spool-append state value)))))
+             (:array-agg (query-row-spool-append state value))
+             (:json-agg (append-json-aggregate-value state value)))))
 
 (defun finalize-aggregate-transition-states (states)
   (map 'vector
        (lambda (state)
-         (if (query-row-spool-p state)
-             (if (zerop (query-row-spool-count state)) +null+
-                 (let ((result (make-array (query-row-spool-count state))))
-                   (query-row-spool-seal state)
-                   (map-query-row-spool state (lambda (value index)
-                                                (check-for-interrupts)
-                                                (setf (aref result index) value)))
-                   (make-sql-array :element-type-id :text :elements result
-                                   :dimensions (list (length result)) :lower-bounds (list 1))))
-             (scalar-aggregate-transition-result state)))
+         (cond ((json-aggregate-transition-p state) (json-aggregate-result state))
+               ((query-row-spool-p state)
+                (if (zerop (query-row-spool-count state)) +null+
+                    (let ((result (make-array (query-row-spool-count state))))
+                      (query-row-spool-seal state)
+                      (map-query-row-spool state (lambda (value index)
+                                                   (check-for-interrupts)
+                                                   (setf (aref result index) value)))
+                      (make-sql-array :element-type-id :text :elements result
+                                      :dimensions (list (length result)) :lower-bounds (list 1)))))
+               (t (scalar-aggregate-transition-result state))))
        states))
 
 (defun aggregate-input-row (environment group-keys descriptors)

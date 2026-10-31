@@ -57,25 +57,20 @@
        (loop for a across left for b across right always (zerop (order-compare a b)))))
 
 (defun window-array-snapshot (spool)
-  ;; Snapshot without consuming transition state: later rows need its full prefix.
   (let ((result (make-array (query-row-spool-count spool))))
-    (if (query-row-spool-pathname spool)
-        (progn
-          (finish-output (query-row-spool-output-stream spool))
-          (with-query-temp-input (stream (query-row-spool-pathname spool))
-            (dotimes (index (length result))
-              (check-for-interrupts)
-              (setf (aref result index) (query-spill-read-record stream)))))
-        (loop for value in (reverse (query-row-spool-rows spool)) for index from 0
-              do (setf (aref result index) (copy-query-sort-value value))))
+    (map-query-row-spool-prefix
+     spool (lambda (value index)
+             (setf (aref result index) (copy-query-sort-value value))))
     (if (zerop (length result)) +null+
         (make-sql-array :element-type-id :text :elements result
                         :dimensions (list (length result)) :lower-bounds (list 1)))))
 
 (defun window-transition-results (states)
-  (map 'vector (lambda (state)
-                 (if (query-row-spool-p state) (window-array-snapshot state)
-                     (scalar-aggregate-transition-result state)))
+  (map 'vector
+       (lambda (state)
+         (cond ((query-row-spool-p state) (window-array-snapshot state))
+               ((json-aggregate-transition-p state) (json-aggregate-result state nil))
+               (t (scalar-aggregate-transition-result state))))
        states))
 
 (defun window-aggregate-inputs (aggregates environment)
