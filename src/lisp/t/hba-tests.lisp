@@ -443,21 +443,29 @@
 (deftest authentication-temporary-descriptors-are-exclusive-and-close-on-exec
     (with-physical-store-directory (root)
       (let ((paths nil))
-        (dotimes (index 2)
-          (declare (ignore index))
-          (multiple-value-bind (fd path)
-              (pg::open-exclusive-temporary-file (merge-pathnames ".auth-XXXXXX" root))
-            (unwind-protect
-                 (progn
-                   (ok (not (member path paths :test #'equal)))
-                   (push path paths)
-                   (ok (logbitp 0 (sb-posix:fcntl fd sb-posix:f-getfd)))
-                   (ok (sb-posix:s-isreg (sb-posix:stat-mode (sb-posix:fstat fd))))
-                   (ok (= #o600 (logand #o777 (sb-posix:stat-mode (sb-posix:fstat fd))))))
-              (sb-posix:close fd)
-              (sb-posix:unlink (namestring path)))))
-        (ok (signals (pg::open-exclusive-temporary-file
-                      (merge-pathnames "missing/.auth-XXXXXX" root)))))))
+        (loop repeat 2
+              do (let ((fd nil) (path nil))
+                   (unwind-protect
+                        (progn
+                          (sb-sys:without-interrupts
+                            (multiple-value-setq (fd path)
+                              (pg::open-exclusive-temporary-file (merge-pathnames ".auth-XXXXXX" root))))
+                          (ok (not (member path paths :test #'equal)))
+                          (push path paths)
+                          (ok (logbitp 0 (sb-posix:fcntl fd sb-posix:f-getfd)))
+                          (ok (sb-posix:s-isreg (sb-posix:stat-mode (sb-posix:fstat fd))))
+                          (ok (= #o600 (logand #o777 (sb-posix:stat-mode (sb-posix:fstat fd))))))
+                     (when fd (sb-posix:close fd))
+                     (when path (sb-posix:unlink (namestring path))))))
+        (let ((fd nil) (path nil))
+          (unwind-protect
+               (ok (signals
+                    (sb-sys:without-interrupts
+                      (multiple-value-setq (fd path)
+                        (pg::open-exclusive-temporary-file (merge-pathnames "missing/.auth-XXXXXX" root))))
+                    'sb-posix:syscall-error))
+            (when fd (sb-posix:close fd))
+            (when path (sb-posix:unlink (namestring path))))))))
 
 (deftest authentication-authorization-requires-an-installed-matching-trust-rule
     (let ((trust (pg::make-authentication-policy
