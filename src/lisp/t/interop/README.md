@@ -59,9 +59,14 @@ PATRONI_PYTHON=/path/to/pinned-venv/bin/python3
 ```
 
 Pass `--native /path/to/pg-lisp.sh` to compare native metadata as well; the full
-comparison currently fails on unsupported `max_locks_per_transaction`, with 16
-writer fields unregistered. This oracle does not
-run `Postgresql.follow`, a receiver, a coordinator or DCS.
+unchanged writer comparison now passes. This oracle does not run
+`Postgresql.follow`, a receiver, a coordinator or DCS. The separate
+`t/patroni-follow.sh` test exercises the real follow method with owned native
+peers, without a coordinator or DCS. Its optional `DEBUG_WAL_FAILURE` instrumentation
+is scoped to the owned source. `t/libpq-helper.sh` runs the helper wire probe,
+which flushes contiguous WAL payload before acknowledging its flush position,
+with apply set to zero. The suite Python must provide Linux `os.pidfd_open` and
+`psutil.Process.net_connections`; psutil 7.1.3 is suitable.
 
 From `src/lisp`, compare `cluster_name` configuration and byte normalization
 against a C executable using Python 3, SBCL and an existing C installation:

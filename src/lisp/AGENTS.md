@@ -157,6 +157,12 @@ appropriate instead of replacing the native C peer or adding a message relay.
 
 ### Network deadlines and live socket inspection
 
+- Defer asynchronous interrupts during critical WAL publication and protect entry
+  to failure cleanup. Keep nonlocal-exit fencing explicit; do not classify every
+  exit as an ordinary error. Preserve source SQLSTATE 57P01 rather than treating
+  it as a protocol violation.
+- After a confirmed SIGKILL of a task-owned source, unlink its stale private
+  control socket before restarting that source in the owned harness.
 - In the current SBCL, `sb-ext:timeout` is not an ordinary `error` condition.
   A retry loop handling only `error` allowed a receiver timeout to escape its
   thread and terminate the server. Catch that timeout explicitly when the
@@ -176,6 +182,10 @@ appropriate instead of replacing the native C peer or adding a message relay.
 
 ### Reader and test-discovery checks
 
+- A changed macro needs its callers recompiled. Clear the `pg` FASLs and reload
+  before testing expanded call sites; redefining the macro alone leaves old code.
+- Renamed Rove tests can remain in a warm registry. Check `get-test` for obsolete
+  names and remove confirmed orphans with `remove-test` before counting a suite.
 - Run the full physical package with `rove:run-suite :pg-physical-tests` in a
   tracked background thread and verify the actual test count. `rove:run` on
   the system found zero tests in this worker despite reporting success.

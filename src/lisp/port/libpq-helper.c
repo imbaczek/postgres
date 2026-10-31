@@ -556,6 +556,8 @@ emit_result(uint32_t maximum, unsigned char kind)
 	free(body);
 }
 
+/* Preserve a well-formed source SQLSTATE, including shutdown (57P01).
+ * A missing or malformed state is a protocol violation. */
 static const char *
 result_sqlstate(PGresult *value)
 {
@@ -659,11 +661,16 @@ receive_copy(const unsigned char *body, uint32_t size)
 		}
 		if (count == -2)
 			fail("08P01", "native COPY receive failed");
+		/* End of COPY can mean a source error, a completed stream, or COPY IN.
+		 * Only COPY IN sends 'F', leaving input open for final feedback; the
+		 * caller checks any timeline switch and fork proof. */
 		if (count == -1)
 		{
 			result = next_result(milliseconds() + OPERATION_MS);
 			if (result && PQresultStatus(result) == PGRES_FATAL_ERROR)
 				fail(result_sqlstate(result), "native source stopped streaming");
+			/* COPY 0 followed by no extra results ends streaming and can be
+			 * retried. Wrong tags, extra results and invalid state are 08P01. */
 			if (result && PQresultStatus(result) == PGRES_COMMAND_OK)
 			{
 				if (strcmp(PQcmdStatus(result), "COPY 0"))

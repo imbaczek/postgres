@@ -1682,8 +1682,9 @@ It builds the libpq helper using `PG_CONFIG`, starts owned native peers, and cal
 the real `Postgresql.follow` method for start, reload, restart, clear and reattach.
 It fences the source, promotes through Patroni and checks child writes. A private
 control socket is used for setup and debugging. No DCS, election or HA loop runs.
-Source shutdown currently logs an 08P01 COPY completion error; its EOF and
-reconnect handling remains under investigation.
+The test also covers source shutdown and crash, restart, reconnect on the same
+binding and catch-up before promotion. These checks cover the exercised COPY
+termination paths; they do not establish general rejoin or coordination behavior.
 
 `./pg-lisp.sh -D EXISTING_PGDATA -C setting` prints a supported configuration
 value in base units using normal file and command-line precedence, without

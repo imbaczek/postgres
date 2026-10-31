@@ -94,9 +94,13 @@ start, changed-host reload, restart, clear, reattach, source fencing, promotion 
 child writes. It builds the native libpq helper and uses a private control socket
 for setup and debugging; it does not run a DCS or HA loop. The run passed at
 `/tmp/pg-real-follow-promotion-final.log`. Switching to a different upstream,
-following a descendant and rejoining remain open. Source fast shutdown logged an
-08P01 COPY completion error; the EOF and reconnect path remains an open audit
-despite successful promotion.
+following a descendant and rejoining remain open. The exercised source shutdown
+and crash paths now reconnect on the same binding and catch up before promotion;
+the previous COPY completion error is covered by bounded protocol regressions.
+The restart and reconnect run is `/tmp/pg-copy-wal-reconnect-clean-final.log`;
+the independent C helper probe is `/tmp/pg-copy-helper-final.log`. Controlled WAL
+guard regressions, 1,304 physical, 683 unit and 186 logical wire tests, and a
+strict cold compile also passed for this milestone.
 Native control data now exposes persisted resource capacities, allowing Patroni
 to raise a standby's lock setting to the backup requirement. `pg_ctl reload`
 signals the verified owner without waiting for completion.
@@ -1122,12 +1126,10 @@ A separate pinned Patroni 4.1.5 oracle constructs the real `Postgresql` and
 `ConfigHandler`, writes attach, replace and clear configurations, and checks all
 emitted and recovery settings with C `postgres -C`. It verifies passfile mode
 and escaping, connection options, slot name, local configuration and signal
-files. The C run passes; the full native comparison currently fails on unsupported
-`max_locks_per_transaction`, with 16 writer fields unregistered. This is a writer
-and metadata oracle, not a `Postgresql.follow` or receiver test. Full GUC behavior,
-desired-generation reconciliation, automatic
-Patroni conninfo wiring through libpq, GUC-driven first attachment and
-same-timeline follow and the follow acceptance matrix remain open.
+files. The C and full native writer comparisons pass. This is a writer and
+metadata oracle; the separate real `Postgresql.follow` test covers configured
+first attachment, same-timeline changes and promotion. Full GUC behavior and
+switching upstream, descendant follow and rejoin acceptance remain open.
 
 Native startup now installs independent `max_connections` (default 100) and
 `max_wal_senders` (default 10) session quotas before listening. Startup packets

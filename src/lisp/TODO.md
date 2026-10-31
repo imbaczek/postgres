@@ -67,10 +67,12 @@
   refuses promotion and shuts down on resume. Owned tests cover direct pauses,
   insufficiency discovered during promotion backlog replay, and adequate restart.
 
-- [ ] Audit source EOF, COPY shutdown and reconnect against C. During the real
-  Patroni follow test, fast shutdown of the source logged receiver error 08P01,
-  "native COPY lacks its input completion phase". Promotion and child writes
-  passed, but the shutdown path needs an independent explanation and regression.
+- [ ] Audit direct WAL publication guards outside `with-wal-critical`, including
+  `xid-assign-with-wal-reservation` and `wal-report-resource-parameters`. Both
+  bypass the macro and can be interrupted during publication. The new critical
+  section guard does not establish WAL-wide coverage. One earlier source SIGINT
+  poison log lacked a captured cause; controlled tests independently reproduced
+  the asynchronous guard bug, and owned restart passed after the fix.
 
 - [x] Fix signed integer GUC parsing for C23 binary prefixes independently of
   the unsigned recovery timeline parser. The signed converter uses C23 strtol

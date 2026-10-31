@@ -961,7 +961,11 @@ Legacy 16-hex segment names always belong to timeline 1."
   (values))
 
 (defmacro with-wal-critical (&body body)
-  "Run BODY under WAL, deferring asynchronous interrupts during publication."
+  "Run BODY under WAL, deferring asynchronous interrupts during publication.
+The lock wait remains interruptible unless the caller already masked interrupts.
+Mask the body and error recording; the outer mask protects cleanup entry. An
+error recorded here triggers fail-stop after the mutex unwinds. Validation errors
+are propagated without poisoning. Nonlocal exits need their own fencing."
   (let ((failure (gensym "FAILURE"))
         (condition (gensym "CONDITION")))
     `(let ((,failure nil))
