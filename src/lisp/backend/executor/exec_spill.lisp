@@ -1363,6 +1363,9 @@ both before writing can be interrupted."
      ,@body))
 
 (defun map-query-row-spool-prefix (spool callback)
+  ;; Snapshot the record count and flush an active writer before reading.  Values
+  ;; passed to CALLBACK are borrowed; callers retaining them must copy them.
+  ;; Unlike map-query-row-spool, this does not require a sealed spool.
   (let ((count (query-row-spool-count spool)))
     (if (query-row-spool-pathname spool)
         (progn

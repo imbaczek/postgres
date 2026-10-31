@@ -1222,7 +1222,10 @@ on an abnormal exit."
                value)))
         (t state)))
 
-(defstruct json-aggregate-transition type spool (bytes 0) (rows 0) pending)
+(defstruct json-aggregate-transition
+  ;; The spool and pending buffer hold encoded UTF-8, not input datums.  ROWS
+  ;; counts inputs, not spool records; BYTES includes the opening delimiter.
+  type spool (bytes 0) (rows 0) pending)
 
 (defvar *json-aggregate-output-max-bytes* (- #x3fffffff 4))
 
@@ -1232,6 +1235,8 @@ on an abnormal exit."
   bytes)
 
 (defun spool-json-aggregate-chunk (state octets)
+  ;; Coalesce whole UTF-8 fragments without splitting codepoints.  Copy pending
+  ;; before resetting it; an oversized chunk follows any pending data directly.
   (let ((pending (json-aggregate-transition-pending state))
         (spool (json-aggregate-transition-spool state)))
     (if (null pending)
@@ -1248,6 +1253,9 @@ on an abnormal exit."
                 (replace pending octets :start1 offset)))))))
 
 (defun append-json-aggregate-value (state value)
+  ;; Render now to freeze session-dependent formatting and enforce the byte cap
+  ;; before later inputs.  A failed transition must be closed, not resumed.
+  ;; NULL inputs render as JSON null; structured types use C's newline separator.
   (let* ((spool (json-aggregate-transition-spool state))
          (type (json-aggregate-transition-type state))
          (out
@@ -1275,6 +1283,9 @@ on an abnormal exit."
     (incf (json-aggregate-transition-rows state))))
 
 (defun json-aggregate-result (state &optional (seal-p t))
+  ;; No inputs yield SQL NULL.  Include the closing bracket in the size check.
+  ;; Group finalization seals the spool; window snapshots leave it writable and
+  ;; read its prefix followed by the live pending buffer without changing either.
   (when (zerop (json-aggregate-transition-rows state))
     (return-from json-aggregate-result +null+))
   (check-json-aggregate-output-size (1+ (json-aggregate-transition-bytes state)))
@@ -1308,6 +1319,7 @@ on an abnormal exit."
                              (otherwise (make-average-transition))))
                      (:array-agg (make-query-row-spool budget))
                      (:json-agg
+                      ;; Share the budget between pending fragments and spool.
                       (let ((capacity (min 4096 (floor budget 2))))
                         (make-json-aggregate-transition
                          :type (expr-type (getf descriptor :input))

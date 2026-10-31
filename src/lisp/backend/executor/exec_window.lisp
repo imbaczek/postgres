@@ -57,6 +57,7 @@
        (loop for a across left for b across right always (zerop (order-compare a b)))))
 
 (defun window-array-snapshot (spool)
+  ;; The prefix mapper lends its values, so detach each value in the result.
   (let ((result (make-array (query-row-spool-count spool))))
     (map-query-row-spool-prefix
      spool (lambda (value index)

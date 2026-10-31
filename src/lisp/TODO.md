@@ -15,10 +15,15 @@
   all-NULL record. Named composite types and whole-row RETURNING remain unsupported.
   C parity evidence is `/tmp/pg-sender-status-c-oracle-fhw2qqsb/whole-row-parity.log`.
 
+- [x] Support `json_agg` in the supported aggregate and window subset. The
+  sender-status JSON subquery is tested with real registry rows through both
+  callback and iterator execution. Aggregate DISTINCT and ORDER BY remain
+  unsupported. C parity evidence is
+  `/tmp/pg-sender-status-c-oracle-fhw2qqsb/json-aggregate-parity.log`.
+
 - [ ] Complete the unchanged Patroni monitoring query and synchronous-replication
-  backend contract. `json_agg` is absent, and synchronous setting lookup fails
-  with 42704. Preserve the complete real query as the acceptance oracle.
-  C reports 42804 for `json_agg('x')`; the native aggregate is absent.
+  backend contract. Synchronous setting lookup fails with 42704. Preserve the
+  complete real query as the acceptance oracle.
   Patroni's sync handler also emits a DO block containing SET LOCAL
   synchronous_commit=off and PERFORM txid_current(); these remain dependencies
   of unchanged-method acceptance. Implement commit waiting and FIRST/ANY

@@ -144,6 +144,18 @@ Suite logs are `/tmp/pg-whole-row-unit.log`, `/tmp/pg-whole-row-wire.log` and
 monitoring query and synchronous-replication work remain open. No coordination
 was implemented.
 
+`json_agg` now supports the aggregate and window subset, including the
+sender-status JSON subquery with real registry rows in callback and iterator
+execution. Aggregate DISTINCT and ORDER BY remain unsupported; the complete
+unchanged Patroni monitoring query remains open, and no coordination was added.
+The checkpoint passed 705 unit, 201 wire and 1,323 physical tests (logs
+`/tmp/pg-json-aggregate-unit.log`, `/tmp/pg-json-aggregate-wire.log`, and
+`/tmp/pg-json-aggregate-physical.log`), with strict cold compilation in
+`/tmp/pg-json-aggregate-final-cold.log` and C oracle
+`/tmp/pg-sender-status-c-oracle-fhw2qqsb/json-aggregate-parity.log`. Scoped
+cl-spec checks at seed 42 ran 100 text Function Spec trials, 100 Unicode
+property trials and 75 output-byte-bound property trials.
+
 ### Relation resource accounting
 
 Relation admission now checks the complete proposed set against private object

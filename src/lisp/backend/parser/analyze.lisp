@@ -5288,7 +5288,7 @@ truncate and interpret the result at TYPE's signed width."
         (make-sql-jsonb root)))))
 
 (defun sql-write-json (value type out &optional (depth 0))
-  "Write a typed datum as JSON, preserving JSON input verbatim."
+  "Write a typed datum as JSON to caller-owned OUT, preserving JSON input verbatim."
   ;; Record fields retain their order and duplicate names.  This internal
   ;; renderer writes NULL as JSON null; the SQL to_json call is strict.
   (when (> depth 512) (ereport "54001" "JSON nesting exceeds supported depth"))
@@ -5341,7 +5341,7 @@ truncate and interpret the result at TYPE's signed width."
             (t (scalar value type))))))
 
 (defun sql-to-json (value type &optional (depth 0))
-  "Convert a typed datum to JSON text, preserving JSON input verbatim."
+  "Return JSON text using the same renderer as sql-write-json."
   (with-output-to-string (out)
     (sql-write-json value type out depth)))
 
