@@ -955,7 +955,10 @@ cannot replace the current operation's result or automatic error state."
   "Start a transition with a snapshot of the requested public slot.
 :INHERIT copies the runtime's accepted slot for automatic handoff; explicit NIL
 requests no slot. Capture the choice and generation before the worker starts.
-Configured operations must still own the active desired generation."
+Configured operations must still own the active desired generation. If worker
+creation or publication fails before the handoff completes, cancel and withdraw
+only this operation and release its start gate so the worker exits without storage
+work. No join occurs under the publication lock."
   (physical-follow-endpoint-check host port prefix)
   (unless (<= (length prefix) 30) (error "follow pin prefix exceeds 30 characters"))
   (let* ((source (when runtime (physical-follow-config-source (physical-follow-runtime-config runtime))))

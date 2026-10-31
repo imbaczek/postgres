@@ -52,7 +52,13 @@ lock, and release the follow lock before taking the store mutex."
           (funcall function)))))
 
 (defun call-with-physical-follow-worker-publication (generation-p function)
-  "Mask worker publication through release of its lifecycle mutexes."
+  "Publish workers while holding the requested lifecycle locks.
+Neither generation nor follow lock may already be held; the command lock is
+allowed. GENERATION-P selects generation then follow; NIL takes follow alone.
+The outermost wait is interruptible according to the caller's mask. Once the
+generation lock is held, the follow wait is masked; follow critical sections
+must stay bounded. FUNCTION, failure cleanup and both unlocks are masked.
+Pending interrupts can be delivered after unlock."
   (let ((generation *physical-follow-generation-lock*)
         (follow *physical-follow-lock*)
         (generation-held nil)
@@ -1494,7 +1500,10 @@ reload exclusion and quiescence before workers can read it."
   "Publish replay and, when RECEIVE-P, receipt workers together under the fence.
 The caller holds the command mutex outside admission and has validated CONFIG.
 Configured receipt also requires an active desired generation at publication;
-the accepted binding alone does not authorize a stale configured launch."
+the accepted binding alone does not authorize a stale configured launch.
+If worker creation or publication fails before the handoff completes, stop and
+withdraw only this runtime and always release its workers' start gate; they exit
+without storage work. No join occurs under these locks."
   (unless (and (zerop *live-operation-depth*)
                (sb-thread:holding-mutex-p *physical-follow-command-lock*))
     (error "follow worker launch requires command exclusion outside admission"))

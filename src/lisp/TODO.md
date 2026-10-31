@@ -107,12 +107,15 @@
   (`/tmp/controller-fence-cold.log`) and SQL smoke
   (`/tmp/controller-fence-smoke.log`).
 
-- [ ] Close worker-start interruption gaps in `physical-follow-start-operation`
-  and `physical-follow-launch-workers`. Mask thread creation, owner publication
-  and start-gate release together. On a failed start, release every created
-  child's gate and prevent it from touching storage. In particular, publishing
-  `success` before `ready` must not leave a child waiting forever after an
-  interrupt. Keep joins outside lifecycle locks and the generation fence.
+- [x] Close worker-start interruption gaps in `physical-follow-start-operation`
+  and `physical-follow-launch-workers` (`8687a20236b`). Mask thread creation,
+  owner publication and start-gate release together; failures before handoff
+  completion release each child without storage work. The checkpoint passed 1,367 physical
+  (`/tmp/worker-start-final-physical.log`), 752 unit
+  (`/tmp/worker-start-final-unit.log`), 201 wire
+  (`/tmp/worker-start-final-wire.log`) and 1,159 legacy checks
+  (`/tmp/worker-start-legacy.log`), strict cold compilation
+  (`/tmp/worker-start-cold.log`) and SQL smoke (`/tmp/worker-start-smoke.log`).
 
 - [ ] Build the independent configuration service needed before commit waiting.
   This is proposed, not implemented; it adds no coordinator. Parking synchronous
