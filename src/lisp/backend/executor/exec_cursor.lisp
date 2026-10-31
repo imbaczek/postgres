@@ -8,18 +8,19 @@
   (make-sql-iterator
    (lambda ()
      (loop
-       (multiple-value-bind (row present origins toast-context) (sql-iterator-next input)
+       (multiple-value-bind (row present origins toast-context presence) (sql-iterator-next input)
          (unless present (return (values nil nil nil nil)))
          ;; A scan's saved pointer belongs only to this input row. Nested
          ;; subqueries must compute their own demand and slice plans.
          (let ((*query-row-origins* (and *datum-origin-capture* origins))
                (*toast-slice-current* toast-context)
+               (*query-row-presence* presence)
                (*select-toast-demand* nil)
                (*select-toast-slice-plan* nil))
            (multiple-value-bind (result keep result-origins) (funcall function row)
              (when keep
                (return (values result t result-origins
-                               (and preserve-toast-context toast-context)))))))))
+                               (and preserve-toast-context toast-context) presence))))))))
    (lambda () (close-sql-iterator input))))
 
 (defun make-buffered-sql-iterator (producer &optional input)
@@ -108,7 +109,8 @@ until their next pull.  SNAPSHOT must remain registered for this iterator."
 (defun make-select-index-scan-iterator (table path snapshot relation relations environment capture-p demand)
   ;; Fetch and check one buffered TID at a time against the scan snapshot.
   ;; Closing this iterator also closes the TID buffer.
-  (let ((tids (make-select-index-tid-iterator table path environment)))
+  (let ((tids (make-select-index-tid-iterator table path environment))
+        (presence (vector (ensure-select-source-identity relation))))
     (make-sql-iterator
      (lambda ()
        (loop
@@ -128,7 +130,8 @@ until their next pull.  SNAPSHOT must remain registered for this iterator."
                            t
                            (if (getf relation :join-order-base)
                                (make-select-relation-origins relations relation origins)
-                               origins)))))))))
+                               origins)
+                           nil presence))))))))
      (lambda () (close-sql-iterator tids)))))
 
 (defun make-select-scan-iterator (node relations)
@@ -136,6 +139,7 @@ until their next pull.  SNAPSHOT must remain registered for this iterator."
   ;; lifetime; later outer rows must not change its index key or visibility.
   (let* ((relation (physical-scan-relation node relations))
          (table (getf relation :table))
+         (presence (vector (ensure-select-source-identity relation)))
          (path (physical-scan-path node relation))
          (environment (copy-query-sort-value *lateral-outer-environment*))
          (source (getf relation :row-source))
@@ -164,7 +168,7 @@ until their next pull.  SNAPSHOT must remain registered for this iterator."
                (values (if (getf relation :join-order-base)
                            (make-select-relation-environment relations relation row)
                            row)
-                       t nil))))
+                       t nil nil presence))))
          (when page-reader
            (multiple-value-bind (tuple present) (sql-iterator-next page-reader)
              (when present
@@ -187,7 +191,7 @@ until their next pull.  SNAPSHOT must remain registered for this iterator."
                            (if (getf relation :join-order-base)
                                (make-select-relation-origins relations relation origins)
                                origins)
-                           toast-context))))
+                           toast-context presence))))
              (close-sql-iterator page-reader)
              (setf page-reader nil)))
          (when (or source (>= block nblocks)) (return (values nil nil)))
@@ -211,40 +215,44 @@ until their next pull.  SNAPSHOT must remain registered for this iterator."
            (let ((arm (pop remaining)))
              (setf coercions (first arm)
                    input (make-physical-plan-iterator (second arm) relations))))
-         (multiple-value-bind (row present origins) (sql-iterator-next input)
-           (if present
-               (let ((values (make-array (length coercions)))
-                     (result-origins (and *datum-origin-capture*
-                                          (make-array (length coercions) :initial-element nil))))
-                 (loop for expression in coercions for i from 0
-                       do (multiple-value-bind (value origin)
-                              (if *datum-origin-capture*
-                                  (eval-expr-with-origin expression (car row) origins)
-                                  (values (eval-expr expression (car row)) nil))
-                            (setf (aref values i) value)
-                            (when result-origins (setf (aref result-origins i) origin))))
-                 (return (values (cons values values) t result-origins)))
-               (progn (close-sql-iterator input) (setf input nil))))))
+         (multiple-value-bind (row present origins toast presence) (sql-iterator-next input)
+           (declare (ignore toast))
+           (let ((*query-row-presence* presence))
+             (if present
+                 (let ((values (make-array (length coercions)))
+                       (result-origins (and *datum-origin-capture*
+                                            (make-array (length coercions) :initial-element nil))))
+                   (loop for expression in coercions for i from 0
+                         do (multiple-value-bind (value origin)
+                                (if *datum-origin-capture*
+                                    (eval-expr-with-origin expression (car row) origins)
+                                    (values (eval-expr expression (car row)) nil))
+                              (setf (aref values i) value)
+                              (when result-origins (setf (aref result-origins i) origin))))
+                   (return (values (cons values values) t result-origins nil presence)))
+                 (progn (close-sql-iterator input) (setf input nil)))))))
      (lambda () (close-sql-iterator input)))))
 
 (defun make-project-set-iterator (input calls &key attempt-function)
   ;; Keep each input row until all its sets are exhausted. Each pull zips the
   ;; sets, padding exhausted ones with NULL and suppressing an all-empty row.
   ;; ATTEMPT-FUNCTION may step sets in target order before the remaining steps.
-  (let ((environment nil) (input-origins nil) (sets nil) (ended nil))
+  (let ((environment nil) (input-origins nil) (input-presence nil) (sets nil) (ended nil))
     (make-sql-iterator
      (lambda ()
        (loop
          (unless sets
-           (multiple-value-bind (row present origins) (sql-iterator-next input)
+           (multiple-value-bind (row present origins toast presence) (sql-iterator-next input)
+             (declare (ignore toast))
              (unless present (return (values nil nil)))
-             (setf environment row input-origins origins
+             (setf environment row input-origins origins input-presence presence
                    sets (make-array (length calls) :initial-element nil)
                    ended (make-array (length calls) :element-type 'bit :initial-element 0))))
          (let ((values (make-array (length calls) :initial-element +null+))
                (visited (make-array (length calls) :element-type 'bit :initial-element 0))
                (any nil)
-               (*query-row-origins* input-origins))
+               (*query-row-origins* input-origins)
+               (*query-row-presence* input-presence))
            (flet ((step-set (index)
                     (check-for-interrupts)
                     (when (and (zerop (aref visited index)) (zerop (aref ended index)))
@@ -262,7 +270,8 @@ until their next pull.  SNAPSHOT must remain registered for this iterator."
              (dotimes (index (length calls)) (step-set index)))
            (if any
                (return (values (concatenate 'vector environment values) t
-                               (project-set-row-origins input-origins (length environment) (length values))))
+                               (project-set-row-origins input-origins (length environment) (length values))
+                               nil input-presence))
                (setf sets nil ended nil)))))
      (lambda ()
        (setf sets nil ended nil environment nil input-origins nil)
@@ -436,24 +445,29 @@ source itself.  Closing the result closes the sort and its source."
 
 (defun make-lateral-join-iterator (join left right-factory)
   ;; Each left row owns a fresh right iterator and parameter epoch.
-  (let ((right nil) (current-left nil) (left-origins nil) (left-present nil) (matched nil)
+  (let ((right nil) (current-left nil) (left-origins nil) (left-presence nil) (left-present nil) (matched nil)
                     (null-right (make-array (getf join :right-width) :initial-element +null+)))
     (make-sql-iterator
      (lambda ()
        (loop
          (unless left-present
-           (multiple-value-setq (current-left left-present left-origins) (sql-iterator-next left))
+           (multiple-value-bind (row present origins toast presence) (sql-iterator-next left)
+             (declare (ignore toast))
+             (setf current-left row left-present present
+                   left-origins origins left-presence presence))
            (unless left-present (return (values nil nil)))
-           (setf matched nil right (funcall right-factory current-left left-origins)))
-         (multiple-value-bind (row present right-origins) (sql-iterator-next right)
+           (setf matched nil right (funcall right-factory current-left left-origins left-presence)))
+         (multiple-value-bind (row present right-origins toast right-presence) (sql-iterator-next right)
+           (declare (ignore toast))
            (if present
                (let* ((joined (combine-select-join-environment current-left row join))
                       (origins (and *datum-origin-capture*
                                     (combine-select-join-origins current-left left-origins row right-origins join)))
-                      (*query-row-origins* origins))
+                      (*query-row-origins* origins)
+                      (*query-row-presence* (combine-query-row-presence left-presence right-presence)))
                  (when (true-p (eval-expr (getf join :qual) joined))
                    (setf matched t)
-                   (return (values joined t origins))))
+                   (return (values joined t origins nil *query-row-presence*))))
                (progn
                  (close-sql-iterator right)
                  (setf right nil left-present nil)
@@ -462,7 +476,8 @@ source itself.  Closing the result closes the sort and its source."
                                    (and *datum-origin-capture*
                                         (concatenate 'vector
                                                      (or left-origins (make-array (length current-left) :initial-element nil))
-                                                     (make-array (length null-right) :initial-element nil)))))))))))
+                                                     (make-array (length null-right) :initial-element nil)))
+                                   nil left-presence))))))))
      (lambda ()
        (close-sql-iterator right)
        (close-sql-iterator left)
@@ -473,7 +488,7 @@ source itself.  Closing the result closes the sort and its source."
 ;; rows.  Closing the join closes the active reader, both inputs and match map.
 (defun make-nested-loop-iterator (join left right)
   (let* ((store (make-query-replay-store right))
-         (reader nil) (current-left nil) (left-origins nil) (left-present nil)
+         (reader nil) (current-left nil) (left-origins nil) (left-presence nil) (left-present nil)
          (left-done nil) (left-seen nil) (matched nil) (right-phase nil)
          (right-index 0)
          (outer-p (member (getf join :type) '(:right :full)))
@@ -484,7 +499,10 @@ source itself.  Closing the result closes the sort and its source."
      (lambda ()
        (loop
          (unless (or left-present left-done)
-           (multiple-value-setq (current-left left-present left-origins) (sql-iterator-next left))
+           (multiple-value-bind (row present origins toast presence) (sql-iterator-next left)
+             (declare (ignore toast))
+             (setf current-left row left-present present
+                   left-origins origins left-presence presence))
            (unless left-present (setf left-done t))
            (when left-present
              (setf left-seen t matched nil right-index 0 reader (make-query-replay-reader store))))
@@ -492,7 +510,8 @@ source itself.  Closing the result closes the sort and its source."
          (when (and left-done (not right-phase))
            (setf right-phase t right-index 0 reader (make-query-replay-reader store))
            (when left-seen (query-match-map-finish matches)))
-         (multiple-value-bind (row present right-origins) (sql-iterator-next reader)
+         (multiple-value-bind (row present right-origins toast right-presence) (sql-iterator-next reader)
+           (declare (ignore toast))
            (when (and matches present)
              (loop while (<= (query-match-map-count matches) right-index)
                    do (query-match-map-append matches)))
@@ -506,18 +525,20 @@ source itself.  Closing the result closes the sort and its source."
                                   (and *datum-origin-capture*
                                        (concatenate 'vector
                                                     (make-array (length null-left) :initial-element nil)
-                                                    (or right-origins (make-array (length row) :initial-element nil)))))))))
+                                                    (or right-origins (make-array (length row) :initial-element nil))))
+                                  nil right-presence)))))
              (present
               (let* ((index right-index)
                      (joined (combine-select-join-environment current-left row join))
                      (origins (and *datum-origin-capture*
                                    (combine-select-join-origins current-left left-origins row right-origins join)))
-                     (*query-row-origins* origins))
+                     (*query-row-origins* origins)
+                     (*query-row-presence* (combine-query-row-presence left-presence right-presence)))
                 (incf right-index)
                 (when (true-p (eval-expr (getf join :qual) joined))
                   (setf matched t)
                   (when matches (query-match-map-mark matches index))
-                  (return (values joined t origins)))))
+                  (return (values joined t origins nil *query-row-presence*)))))
              (t
               (close-sql-iterator reader)
               (setf reader nil left-present nil)
@@ -526,7 +547,8 @@ source itself.  Closing the result closes the sort and its source."
                                 (and *datum-origin-capture*
                                      (concatenate 'vector
                                                   (or left-origins (make-array (length current-left) :initial-element nil))
-                                                  (make-array (length null-right) :initial-element nil)))))))))))
+                                                  (make-array (length null-right) :initial-element nil)))
+                                nil left-presence))))))))
      (lambda ()
        (close-sql-iterator reader)
        (close-sql-iterator left)
@@ -551,13 +573,13 @@ source itself.  Closing the result closes the sort and its source."
                  (incf (plan-node-metadata-actual-loops metadata))
                  (setf started-p t)))
              (unwind-protect
-                  (multiple-value-bind (row present origins toast-context) (sql-iterator-next input)
+                  (multiple-value-bind (row present origins toast-context presence) (sql-iterator-next input)
                     (when (and started present)
                       (incf (plan-node-metadata-actual-row-count metadata))
                       (setf (plan-node-metadata-actual-rows metadata)
                             (/ (plan-node-metadata-actual-row-count metadata)
                                (plan-node-metadata-actual-loops metadata))))
-                    (values row present origins toast-context))
+                    (values row present origins toast-context presence))
                (when started
                  (let ((elapsed (- (get-internal-real-time) started)))
                    (incf (plan-node-metadata-actual-total-time-ticks metadata) elapsed)
@@ -590,40 +612,60 @@ source itself.  Closing the result closes the sort and its source."
                (*select-toast-slice-plan* slice-plan)
                (*toast-slice-current* nil)
                (*cte-active-plan* plan))
-           (multiple-value-bind (row present origins) (sql-iterator-next input)
-             (values row present origins))))
+           (multiple-value-bind (row present origins toast-context presence) (sql-iterator-next input)
+             (declare (ignore toast-context))
+             (values row present origins nil presence))))
        (lambda () (close-sql-iterator input))))))
+
+(defun make-subquery-scan-iterator (node relations)
+  (let* ((relation (physical-scan-relation node relations))
+         (lateral-p (getf relation :lateral-dependent))
+         (presence (vector (ensure-select-source-identity relation)))
+         (frame (make-subquery-parameter-frame
+                 (if lateral-p *lateral-outer-environment* #())
+                 :capture-p lateral-p))
+         (frames (cons frame *subquery-outer-frames*))
+         (input (let ((*subquery-outer-frames* frames))
+                  (make-physical-plan-iterator (fourth node) relations))))
+    (make-sql-iterator
+     (lambda ()
+       (let ((*subquery-outer-frames* frames))
+         (multiple-value-bind (row present origins) (sql-iterator-next input)
+           (values (car row) present origins nil (and present presence)))))
+     (lambda ()
+       (close-sql-iterator input)
+       (close-cte-frame-cache (cdr frame))))))
+
+(defun make-physical-join-iterator (node relations)
+  ;; A parameterized index scan needs a new key and iterator for each left
+  ;; row, just as a LATERAL input does (cf. ExecReScanIndexScan).
+  (if (or (getf (second node) :lateral-dependent)
+          (and (eq (first (fourth node)) :index-scan)
+               (select-scan-path-parameter-expr
+                (physical-scan-path (fourth node) (physical-scan-relation (fourth node) relations)))))
+      (make-lateral-join-iterator
+       (second node) (make-physical-plan-iterator (third node) relations)
+       (lambda (environment origins presence)
+         (let ((*lateral-outer-environment* environment)
+               (*query-row-origins* origins)
+               (*query-row-presence* presence))
+           (make-physical-plan-iterator (fourth node) relations))))
+      (make-nested-loop-iterator
+       (second node) (make-physical-plan-iterator (third node) relations)
+       (make-physical-plan-iterator (fourth node) relations))))
 
 (defun %make-physical-plan-iterator (node relations)
   (case (first node)
     (:result
      (let ((done nil))
-       (make-sql-iterator (lambda () (unless done (setf done t) (values #() t))))))
+       (make-sql-iterator (lambda () (unless done (setf done t) (values #() t nil nil #()))))))
     ((:seq-scan :index-scan) (make-select-scan-iterator node relations))
     (:cte-scan (make-cte-scan-iterator (physical-scan-relation node relations)))
     (:worktable-scan (make-cte-worktable-iterator (physical-scan-relation node relations)))
     (:recursive-union (make-recursive-union-iterator node relations))
     (:with-ctes (make-with-ctes-iterator (second node) (third node) relations))
     (:append (make-append-sql-iterator (second node) relations))
-    (:subquery-scan
-     (physical-scan-relation node relations)
-     (let* ((frames (cons (cons (if (getf (physical-scan-relation node relations) :lateral-dependent)
-                                    *lateral-outer-environment* #())
-                                (make-hash-table :test #'eq)) *subquery-outer-frames*))
-            (input (let ((*subquery-outer-frames* frames))
-                     (when (and *datum-origin-capture*
-                                (getf (physical-scan-relation node relations) :lateral-dependent))
-                       (setf (gethash +subquery-frame-origins-key+ (cdar frames))
-                             (datum-origins-from-spill (datum-origins-for-spill *query-row-origins*))))
-                     (make-physical-plan-iterator (fourth node) relations))))
-       (make-sql-iterator
-        (lambda ()
-          (let ((*subquery-outer-frames* frames))
-            (multiple-value-bind (row present origins) (sql-iterator-next input)
-              (values (car row) present origins))))
-        (lambda ()
-          (close-sql-iterator input)
-          (close-cte-frame-cache (cdar frames))))))
+    (:subquery-scan (make-subquery-scan-iterator node relations))
     (:filter
      (make-mapping-sql-iterator
       (make-physical-plan-iterator (third node) relations)
@@ -678,22 +720,7 @@ source itself.  Closing the result closes the sort and its source."
             (decf remaining)
             (sql-iterator-next input)))
         (lambda () (close-sql-iterator input)))))
-    (:nested-loop-join
-     ;; A parameterized index scan needs a new key and iterator for each left
-     ;; row, just as a LATERAL input does (cf. ExecReScanIndexScan).
-     (if (or (getf (second node) :lateral-dependent)
-             (and (eq (first (fourth node)) :index-scan)
-                  (select-scan-path-parameter-expr
-                   (physical-scan-path (fourth node) (physical-scan-relation (fourth node) relations)))))
-         (make-lateral-join-iterator
-          (second node) (make-physical-plan-iterator (third node) relations)
-          (lambda (environment origins)
-            (let ((*lateral-outer-environment* environment)
-                  (*query-row-origins* origins))
-              (make-physical-plan-iterator (fourth node) relations))))
-         (make-nested-loop-iterator
-          (second node) (make-physical-plan-iterator (third node) relations)
-          (make-physical-plan-iterator (fourth node) relations))))
+    (:nested-loop-join (make-physical-join-iterator node relations))
     ((:sort :top-n :hash-aggregate :sorted-aggregate :hash-distinct)
      (let ((child (if (eq (first node) :top-n) (fourth node) (third node))))
        ;; If a key needs an SRF value, keep expansion below sort instead of
@@ -717,9 +744,10 @@ source itself.  Closing the result closes the sort and its source."
                  (flet ((source (callback) (map-sql-iterator input callback)))
                    (case (first node)
                      (:sort (stream-select-sort #'source (second node) emit))
-                     (:top-n (dolist (row (collect-select-top-n #'source (second node) (third node) *datum-origin-capture*))
-                               (let ((*query-row-origins* (and *datum-origin-capture* (cdr row))))
-                                 (funcall emit (if *datum-origin-capture* (car row) row)))))
+                     (:top-n (dolist (row (collect-select-top-n #'source (second node) (third node) *datum-origin-capture* t))
+                               (let ((*query-row-origins* (second row))
+                                     (*query-row-presence* (third row)))
+                                 (funcall emit (first row)))))
                      ((:hash-aggregate :sorted-aggregate)
                       (stream-select-aggregates #'source (second node) (third node) emit))
                      (:hash-distinct

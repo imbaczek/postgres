@@ -1781,10 +1781,12 @@ Arithmetic binds more tightly; comparison and boolean operators bind less tightl
             (name (pident p)))
        (cond
          ((match-punct p #\.)
-          (let ((col (pident p)))
-            (if (match-punct p #\()
-                (parse-function-call p col name)
-                (list :column name col))))
+          (if (match-op p "*")
+              (list :whole-row name)
+              (let ((col (pident p)))
+                (if (match-punct p #\()
+                    (parse-function-call p col name)
+                    (list :column name col)))))
          ((match-punct p #\()
           (parse-function-call p name nil (and (not quoted) (member name '("greatest" "least") :test #'string=))))
          ((and (not quoted) (member name '("current_user" "session_user" "user"

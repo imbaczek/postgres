@@ -50,8 +50,9 @@
         (lambda ()
           (let ((*cte-active-plan* plan) (*subquery-outer-frames* frames)
                                          (*cte-execution-context* context) (*datum-origin-capture* capture-p))
-            (multiple-value-bind (row present origins) (sql-iterator-next input)
-              (values (when present (if capture-p row (cdr row))) present origins))))
+            (multiple-value-bind (row present origins toast presence) (sql-iterator-next input)
+              (declare (ignore toast))
+              (values (when present (if capture-p row (cdr row))) present origins nil presence))))
         (lambda () (close-sql-iterator input)))))))
 
 (defun dml-one-time-qualification-p (expression)
@@ -59,7 +60,7 @@
   ;; volatile calls. Uncorrelated scalar/EXISTS/array subplans can be InitPlans.
   (cond
     ((atom expression) t)
-    ((member (first expression) '(:col :outer-ref :subquery-output)) nil)
+    ((member (first expression) '(:col :outer-ref :subquery-output :whole-row)) nil)
     ((eq (first expression) :subplan)
      (let ((descriptor (second expression)))
        (and (member (sql-subplan-kind descriptor) '(:scalar :exists :array))
@@ -114,6 +115,8 @@
       (return-from stream-joined-dml-candidates nil)))
   (let* ((plan (getf prepared :dml-source-plan))
          (store (when plan (make-dml-source-replay plan)))
+         (target (first (select-scope-relations (getf prepared :scope))))
+         (target-presence (vector (select-relation-identity target)))
          (where (or (getf prepared :dml-row-where) (getf prepared :where))))
     (unwind-protect
          (do-table-tuples (tuple table)
@@ -122,6 +125,9 @@
            (let ((modified-p nil))
              (flet ((offer (source)
                       (let* ((environment (concatenate 'vector (htup-values tuple) source))
+                             (*query-row-presence*
+                               (combine-query-row-presence target-presence
+                                                           (if store *query-row-presence* #())))
                              (*query-row-origins*
                                (and *datum-origin-capture*
                                     (dml-row-origins tuple *query-row-origins* environment))))

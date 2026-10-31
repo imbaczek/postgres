@@ -348,7 +348,7 @@
 
 (defun cte-reference-filter-p (form relation)
   (cond ((atom form) t)
-        ((member (first form) '(:subplan :outer-ref :window-ref)) nil)
+        ((member (first form) '(:subplan :outer-ref :window-ref :whole-row)) nil)
         ((eq (first form) :col)
          (< (getf relation :offset) (second form)
             (1+ (+ (getf relation :offset) (getf relation :width)))))

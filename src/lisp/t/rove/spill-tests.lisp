@@ -12,6 +12,257 @@
       (rove:ok (equal actual '((7 100)))
                "a single heavily skewed group stays in one bounded hash state")))
 
+(rove:deftest replay-readers-preserve-independent-row-presence
+    (let ((*query-temp-directory* (uiop:temporary-directory)))
+      (with-query-temp-files
+        (dolist (limit '(1 100000))
+          (let* ((count 0)
+                 (source-presence (vector 11 12))
+                 (producer (make-sql-iterator
+                            (lambda ()
+                              (when (< count 2)
+                                (incf count)
+                                (values (vector +null+) t nil nil
+                                        (if (= count 1) source-presence #()))))))
+                 (store (make-query-replay-store producer limit))
+                 (first-reader (make-query-replay-reader store))
+                 (second-reader (make-query-replay-reader store)))
+            (unwind-protect
+                 (progn
+                   (multiple-value-bind (row present origins toast-context presence)
+                       (sql-iterator-next first-reader)
+                     (declare (ignore toast-context))
+                     (rove:ok present)
+                     (rove:ok (eq +null+ (aref row 0)))
+                     (rove:ok (null origins))
+                     (rove:ok (equalp #(11 12) presence))
+                     (when (plusp (length presence)) (setf (aref presence 0) 99)))
+                   (multiple-value-bind (row present origins toast-context presence)
+                       (sql-iterator-next second-reader)
+                     (declare (ignore row origins toast-context))
+                     (rove:ok present)
+                     (rove:ok (equalp #(11 12) presence))
+                     (rove:ok (equalp #(11 12) source-presence)))
+                   (multiple-value-bind (row present origins toast-context presence)
+                       (sql-iterator-next first-reader)
+                     (declare (ignore origins toast-context))
+                     (rove:ok present)
+                     (rove:ok (eq +null+ (aref row 0)))
+                     (rove:ok (equalp #() presence))))
+              (close-query-replay-store store)))))))
+
+(rove:deftest iterator-mapping-preserves-toast-and-row-presence-separately
+    (let* ((done nil)
+           (context (list :toast-context))
+           (presence (vector 21))
+           (producer (make-sql-iterator
+                      (lambda ()
+                        (unless done
+                          (setf done t)
+                          (values #(1) t nil context presence)))))
+           (mapped (make-mapping-sql-iterator
+                    producer
+                    (lambda (row)
+                      (rove:ok (eq context *toast-slice-current*))
+                      (rove:ok (equalp presence *query-row-presence*))
+                      (values row t nil))
+                    :preserve-toast-context t)))
+      (unwind-protect
+           (multiple-value-bind (row present origins toast output-presence)
+               (sql-iterator-next mapped)
+             (declare (ignore row origins))
+             (rove:ok present)
+             (rove:ok (eq context toast))
+             (rove:ok (equalp presence output-presence)))
+        (close-sql-iterator mapped))))
+
+(rove:deftest query-source-identities-survive-namespace-copies
+    (let* ((table (make-pg-class :oid 0 :name "empty" :columns #()))
+           (source (list :name "r" :alias "r" :table table :offset 0 :width 0))
+           (other (list :name "r" :alias "r" :table table :offset 0 :width 0))
+           (first (select-source-scope-relation source))
+           (second (select-source-scope-relation source))
+           (third (select-source-scope-relation other)))
+      (rove:ok (integerp (select-relation-identity first)))
+      (rove:ok (eql (getf source :identity) (select-relation-identity first)))
+      (rove:ok (eql (select-relation-identity first) (select-relation-identity second)))
+      (rove:ok (eql (select-relation-identity first)
+                    (select-relation-identity (copy-select-relation first))))
+      (rove:ok (not (eql (select-relation-identity first) (select-relation-identity third))))))
+
+(rove:deftest whole-row-resolution-retains-source-and-lexical-depth
+    (let* ((table (make-pg-class :oid 0 :name "empty" :columns #()))
+           (source (list :name "r" :alias "r" :table table :offset 0 :width 0))
+           (relation (select-source-scope-relation source))
+           (scope (make-select-scope :parent nil :relations (list relation)))
+           (expression (analyze-expr '(:whole-row "r") scope))
+           (outer (analyze-expr '(:whole-row "r")
+                                (make-select-scope :parent scope))))
+      (rove:ok (eq (first expression) :whole-row))
+      (rove:ok (eql (second expression) (getf source :identity)))
+      (rove:ok (null (third expression)))
+      (rove:ok (eq (expr-type expression) :record))
+      (rove:ok (equal outer (list :outer-ref 1 expression :type :record :typmod -1)))
+      (flet ((state (relations)
+               (handler-case
+                   (progn (analyze-expr '(:whole-row "r")
+                                        (make-select-scope :parent nil :relations relations))
+                          nil)
+                 (pg-error (condition) (pg-error-sqlstate condition)))))
+        (rove:ok (equal (state nil) "42P01"))
+        (rove:ok (equal (state (list relation (copy-select-relation relation))) "42P09"))
+        (let ((forbidden (copy-select-relation relation)))
+          (setf (select-relation-lateral-forbidden-p forbidden) t)
+          (rove:ok (equal (state (list forbidden relation)) "42P10"))))))
+
+(rove:deftest whole-row-evaluation-distinguishes-absence-from-null-fields
+    (let ((expression '(:whole-row 37 ((:col 1 :type :int4 :typmod -1))
+                        :type :record :typmod -1 :fields (("id" :int4)))))
+      (let* ((*query-row-presence* #(37))
+             (record (eval-expr expression (vector +null+))))
+        (rove:ok (sql-record-p record))
+        (rove:ok (equal (sql-record-fields record) '(("id" :int4))))
+        (rove:ok (equalp (sql-record-values record) (vector +null+))))
+      (let ((*query-row-presence* #()))
+        (rove:ok (eq (eval-expr expression (vector +null+)) +null+)))
+      (let ((*query-row-presence* nil))
+        (rove:ok
+         (handler-case (progn (eval-expr expression (vector +null+)) nil)
+           (pg-error (condition) (equal (pg-error-sqlstate condition) "XX000"))))))
+  (let ((*query-row-presence* #(38)))
+    (rove:ok (sql-record-p
+              (eval-expr '(:whole-row 38 nil :type :record :typmod -1 :fields nil)
+                         #())))))
+
+(rove:deftest scan-presence-retains-zero-column-source-identity
+    (let* ((table (make-pg-class :oid 42 :name "empty" :columns #()))
+           (source (list :name "r" :table table
+                         :row-source (lambda () (list #()))))
+           (identity (ensure-select-source-identity source))
+           (iterator (make-select-scan-iterator '(:seq-scan 0 42) (list source))))
+      (unwind-protect
+           (multiple-value-bind (row present origins toast presence)
+               (sql-iterator-next iterator)
+             (rove:ok present)
+             (rove:ok (equalp row #()))
+             (rove:ok (null origins))
+             (rove:ok (null toast))
+             (rove:ok (equalp presence (vector identity)))
+             (let ((*query-row-presence* presence))
+               (rove:ok (sql-record-p
+                         (eval-expr (list :whole-row identity nil :type :record
+                                                                  :typmod -1 :fields nil) row))))
+             (rove:ok (not (nth-value 1 (sql-iterator-next iterator)))))
+        (close-sql-iterator iterator))))
+
+(rove:deftest outer-whole-row-evaluation-restores-frame-presence
+    (let* ((*query-row-presence* #(41))
+           (environment (vector +null+))
+           (frame (make-subquery-parameter-frame environment :copy-p t))
+           (reference '(:outer-ref 1
+                        (:whole-row 41 ((:col 1 :type :int4))
+                         :type :record :fields (("id" :int4)))))
+           (*subquery-outer-frames* (list frame))
+           (*query-row-presence* #(99)))
+      (setf (aref environment 0) 7)
+      (let ((record (eval-expr reference #())))
+        (rove:ok (sql-record-p record))
+        (rove:ok (eq (aref (sql-record-values record) 0) +null+)))
+      (rove:ok (equalp *query-row-presence* #(99)))
+      (rove:ok (equalp (gethash +subquery-frame-presence-key+ (cdr frame)) #(41)))
+      (let* ((*query-row-presence* #())
+             (absent (make-subquery-parameter-frame environment))
+             (*subquery-outer-frames* (list absent))
+             (*query-row-presence* #(41)))
+        (rove:ok (eq (eval-expr reference #()) +null+)))
+      (let* ((*query-row-presence* #(42))
+             (inner (make-subquery-parameter-frame #()))
+             (*subquery-outer-frames* (list inner frame)))
+        (rove:ok
+         (sql-record-p
+          (eval-expr (list :outer-ref 2 (third reference)) #()))))))
+
+(rove:deftest composite-json-preserves-fields-and-normalizes-jsonb
+    (let* ((child (make-sql-record :fields '(("x" :int4))
+                                   :values (vector +null+)))
+           (record (make-sql-record
+                    :fields '(("z" :int4) ("a" :json) ("z" :text) ("child" :record))
+                    :values (vector 1 "{\"raw\" : 2}" "last" child))))
+      (rove:ok
+       (equal (sql-to-json record :record)
+              "{\"z\":1,\"a\":{\"raw\" : 2},\"z\":\"last\",\"child\":{\"x\":null}}"))
+      (rove:ok
+       (equal (sql-jsonb-output (sql-to-jsonb record :record))
+              "{\"a\": {\"raw\": 2}, \"z\": \"last\", \"child\": {\"x\": null}}"))
+      (rove:ok (equal (sql-to-json (make-sql-record :fields nil :values #()) :record) "{}"))
+      (rove:ok (equal (sql-to-json +null+ :record) "null"))
+      (rove:ok (eq (sql-to-jsonb +null+ :record) +null+))))
+
+(rove:deftest whole-row-semantic-keys-ignore-runtime-source-identities
+    (labels ((expressions ()
+               (let* ((table (make-pg-class :oid 0 :name "empty" :columns #()))
+                      (left (select-source-scope-relation
+                             (list :name "a" :table table :offset 0 :width 0)))
+                      (right (select-source-scope-relation
+                              (list :name "b" :table table :offset 0 :width 0)))
+                      (scope (make-select-scope :parent nil :relations (list left right))))
+                 (list (resolve-select-whole-row scope "a")
+                       (resolve-select-whole-row scope "b")))))
+      (let* ((first (expressions))
+             (second (expressions))
+             (a (first first))
+             (b (second first)))
+        (rove:ok (not (eql (second a) (second (first second)))))
+        (rove:ok (equal (subquery-semantic-key a) (subquery-semantic-key (first second))))
+        (rove:ok (not (equal (subquery-semantic-key a) (subquery-semantic-key b))))
+        (rove:ok (expression-contains-column-p a))
+        (rove:ok (not (dml-one-time-qualification-p a)))
+        (rove:ok (not (cte-reference-filter-p a '(:offset 0 :width 0)))))))
+
+(rove:deftest top-n-retains-source-presence
+    (let* ((collector (make-select-top-n-collector 1 '(((:col 1 :type :int4)))))
+           (*query-row-presence* (vector 71)))
+      (offer-select-top-n-row collector (cons #(2) #(2)))
+      (setf (aref *query-row-presence* 0) 99)
+      (let* ((stored (first (select-top-n-collector-rows collector nil t)))
+             (*query-row-presence* (third stored)))
+        (rove:ok (equalp *query-row-presence* #(71)))
+        (rove:ok (equalp (car (first stored)) #(2))))))
+
+(rove:deftest project-set-preserves-whole-row-source-presence
+    (let* ((table (make-pg-class :oid 42 :name "r"
+                                 :columns (vector (make-pg-column :name "id" :type :int4 :attnum 1))))
+           (source (list :name "r" :table table :offset 0 :width 1
+                         :row-source (lambda () (list (vector +null+)))))
+           (identity (ensure-select-source-identity source))
+           (expression (list :whole-row identity '((:col 1 :type :int4))
+                             :type :record :typmod -1 :fields '(("id" :int4))))
+           (targets (list (list :expr (list :func "to_json" (list expression) :type :json :typmod -1))
+                          (list :expr '(:col 2 :type :int4 :typmod -1))))
+           (node (list :project targets
+                       (list :project-set '((:set-func "presence-test" nil)) '(:seq-scan 0 42) 1)))
+           (original (symbol-function 'make-sql-set-function-iterator)))
+      (unwind-protect
+           (progn
+             (setf (symbol-function 'make-sql-set-function-iterator)
+                   (lambda (call environment)
+                     (declare (ignore call environment))
+                     (rove:ok (equalp *query-row-presence* (vector identity)))
+                     (let ((index 0))
+                       (lambda () (when (< index 2) (values (incf index) t))))))
+             (dolist (iterator-p '(nil t))
+               (let ((rows nil))
+                 (flet ((emit (row) (push (copy-seq (car row)) rows) nil))
+                   (if iterator-p
+                       (let ((input (make-physical-plan-iterator node (list source))))
+                         (unwind-protect (map-sql-iterator input #'emit)
+                           (close-sql-iterator input)))
+                       (interpret-query-plan (%make-query-plan :physical node)
+                                             (list source) #'emit)))
+                 (rove:ok (equalp (nreverse rows)
+                                  '(#("{\"id\":null}" 1) #("{\"id\":null}" 2)))))))
+        (setf (symbol-function 'make-sql-set-function-iterator) original))))
+
 (rove:deftest test-query-temp-fd-scope-macro-expansion-protects-cleanup
     (let* ((expansion (macroexpand-1 '(with-query-temp-fd (fd nil) :body)))
            (scope-form (and (consp expansion) (third expansion)))

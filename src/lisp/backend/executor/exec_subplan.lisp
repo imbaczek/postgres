@@ -115,19 +115,18 @@
            (plan (sql-subplan-plan descriptor))
            (registered (subquery-registered-relations plan))
            (caller-frames *subquery-outer-frames*)
-           (frame (cons (map 'vector #'copy-subquery-value environment) (make-hash-table :test #'eq)))
+           (caller-presence *query-row-presence*)
+           (frame (make-subquery-parameter-frame environment :copy-p t))
            (found nil)
            (origin nil)
            (result (case kind (:all t) (:scalar +null+) (t nil)))
            (array (when (eq kind :array) (make-array 0 :adjustable t :fill-pointer 0))))
-      (when *datum-origin-capture*
-        (setf (gethash +subquery-frame-origins-key+ (cdr frame))
-              (datum-origins-from-spill (datum-origins-for-spill *query-row-origins*))))
       (reconcile-query-plan-access-paths plan registered)
       (let ((*subquery-outer-frames* (cons frame caller-frames))
             (*datum-origin-capture* (and *datum-origin-capture* (eq kind :scalar)
                                          (simple-datum-origin-plan-p (query-plan-physical plan) registered)))
-            (*query-row-origins* nil))
+            (*query-row-origins* nil)
+            (*query-row-presence* nil))
         (unwind-protect
              (execute-query-plan
               plan registered
@@ -144,6 +143,7 @@
                   (:array (vector-push-extend (copy-subquery-value (aref (car row) 0)) array) nil)
                   ((:any :all)
                    (let* ((*subquery-outer-frames* caller-frames)
+                          (*query-row-presence* caller-presence)
                           (*subquery-output-value* (aref (car row) 0))
                           (value (eval-expr (sql-subplan-test descriptor) environment)))
                      (setf result (subquery-quantified-step kind result value))

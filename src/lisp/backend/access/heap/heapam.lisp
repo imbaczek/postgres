@@ -14,6 +14,8 @@
 (defvar *query-row-origins* nil
   "Per-slot compression provenance for the row currently emitted.")
 
+(defvar *query-row-presence* nil)
+
 (defstruct datum-origin compressed external-p descriptor)
 
 (defstruct htup

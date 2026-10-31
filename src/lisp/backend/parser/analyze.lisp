@@ -2,11 +2,34 @@
 
 (in-package #:pg)
 
+(defvar *select-source-identity-counter* 0)
+
+(defvar *select-source-identity-lock*
+  (sb-thread:make-mutex :name "query source identities"))
+
+(defun next-select-source-identity-locked ()
+  (when (= *select-source-identity-counter* most-positive-fixnum)
+    (error "query source identities exhausted"))
+  (incf *select-source-identity-counter*))
+
+(defun make-select-source-identity ()
+  (sb-thread:with-mutex (*select-source-identity-lock*)
+    (next-select-source-identity-locked)))
+
+(defun ensure-select-source-identity (source)
+  (unless (consp source) (error "missing query source descriptor"))
+  (sb-thread:with-mutex (*select-source-identity-lock*)
+    (or (getf source :identity)
+        (let ((identity (next-select-source-identity-locked)))
+          (nconc source (list :identity identity))
+          identity))))
+
 ;; A relation supplies a qualifier and a slice of the input row at OFFSET
 ;; with WIDTH entries.  ORIGINS carries source metadata; LATERAL-FORBIDDEN-P
 ;; retains an entry for lookup so an invalid reference can be diagnosed.
 (defstruct select-relation
   name
+  (identity nil :read-only t)
   alias
   table
   origins
@@ -42,24 +65,37 @@
 
 (defvar *dml-source-target-scope* nil)
 
+(defun find-select-qualified-relation (scope qualifier)
+  (let ((matches (remove-if-not
+                  (lambda (relation) (equal qualifier (select-relation-qualifier relation)))
+                  (select-scope-relations scope))))
+    (when (and matches (select-relation-lateral-forbidden-p (first matches)))
+      (ereport "42P10" "invalid reference to the target table in a FROM subquery"))
+    (when (rest matches)
+      (ereport "42P09" "table reference \"~a\" is ambiguous" qualifier))
+    (first matches)))
+
+(defun resolve-select-qualified-relation (scope qualifier)
+  (loop for current = (and (typep scope 'select-scope) scope)
+          then (select-scope-parent current)
+        for depth from 0 while current
+        for relation = (find-select-qualified-relation current qualifier)
+        when relation do (return-from resolve-select-qualified-relation
+                           (values relation depth current)))
+  (ereport "42P01" "missing FROM-clause entry for table \"~a\"" qualifier))
+
+(defun select-outer-reference (expression depth)
+  (if (zerop depth) expression
+      (list :outer-ref depth expression :type (expr-type expression)
+                                        :typmod (expr-typmod expression))))
+
 (defun resolve-select-column (scope qualifier name)
   ;; Search one scope at a time; outer references retain their lexical depth.
   ;; A forbidden matching entry raises 42P10 before ambiguity, matching C's
   ;; per-entry LATERAL check instead of treating the target as invisible.
   (loop for current = scope then (select-scope-parent current)
         for depth from 0 while current
-        for relation = (and qualifier
-                            (let ((qualified
-                                    (remove-if-not
-                                     (lambda (relation)
-                                       (let ((name (select-relation-qualifier relation)))
-                                         (and name (string= qualifier name))))
-                                     (select-scope-relations current))))
-                              (when (and (first qualified) (select-relation-lateral-forbidden-p (first qualified)))
-                                (ereport "42P10" "invalid reference to the target table in a FROM subquery"))
-                              (when (rest qualified)
-                                (ereport "42P09" "table reference \"~a\" is ambiguous" qualifier))
-                              (first qualified)))
+        for relation = (and qualifier (find-select-qualified-relation current qualifier))
         for columns = (if qualifier
                           (and relation (select-relation-columns relation))
                           (select-scope-columns current))
@@ -90,7 +126,28 @@
              (ereport "42703" "column \"~a\" does not exist" name)))
   (if qualifier
       (ereport "42P01" "missing FROM-clause entry for table \"~a\"" qualifier)
-      (ereport "42703" "column \"~a\" does not exist" name)))
+      (if (loop for current = scope then (select-scope-parent current)
+                while current
+                  thereis (find-select-qualified-relation current name))
+          (resolve-select-whole-row scope name)
+          (ereport "42703" "column \"~a\" does not exist" name))))
+
+(defun resolve-select-whole-row (scope qualifier)
+  (multiple-value-bind (relation depth owner)
+      (resolve-select-qualified-relation scope qualifier)
+    (when (eq (getf (select-scope-analysis-frame owner) :kind) :returning)
+      (ereport "0A000" "whole-row RETURNING requires named composite types"))
+    (let* ((columns (select-relation-columns relation))
+           (identity (select-relation-identity relation))
+           (expression
+             (list :whole-row identity (mapcar #'select-column-expr columns)
+                   :type :record :typmod -1
+                   :source-index (position relation (select-scope-relations owner) :test #'eq)
+                   :fields (mapcar (lambda (column)
+                                     (list (select-column-name column) (select-column-type column)))
+                                   columns))))
+      (unless identity (ereport "XX000" "whole-row source has no query identity"))
+      (select-outer-reference expression depth))))
 
 (defun clear-query-analysis-contexts (prepared)
   "Drop transient ownership frames after the entire statement has been analyzed."
@@ -407,7 +464,7 @@ result is text for typeof and int4 for array_length."
     (when (and (in-unknown-constant-p argument) (not *defer-function-constant-coercion-p*))
       (ereport "42804" "could not determine polymorphic type because input has type unknown"))
     (unless (or *defer-function-constant-coercion-p*
-                (member element-type '(:text :varchar :name :bool :int2 :int4 :int8
+                (member element-type '(:record :text :varchar :name :bool :int2 :int4 :int8
                                        :numeric :float4 :float8 :json :jsonb :bytea :oid :char :bit :date
                                        :time :timetz :timestamp :timestamptz :interval :pg-lsn :int2vector)))
       (ereport "0A000" "to_jsonb for type ~a is not supported" type))
@@ -1662,7 +1719,7 @@ only when a non-NULL call executes; explicit text arguments arrive here then."
 (defun expression-contains-column-p (form)
   "Detect row references through every analyzed expression, including IN lists."
   (and (consp form)
-       (or (eq (first form) :col)
+       (or (member (first form) '(:col :whole-row))
            (some #'expression-contains-column-p form))))
 
 (defun in-unknown-constant-p (expr)
@@ -3184,6 +3241,40 @@ candidate selection."
     (ereport "42P02" "there is no parameter $~a" index))
   (aref vector (1- index)))
 
+(defun analyze-constant-expression (expr)
+  (let ((v (second expr)))
+    (cond
+      ((eq v +null+) (list :const v :type :text :typmod -1))
+      ((integerp v)
+       (list :const v
+             :type (cond ((<= +int4-min+ v +int4-max+) :int4)
+                         ((<= +int8-min+ v +int8-max+) :int8)
+                         (t :numeric))
+             :typmod -1))
+      ((stringp v) (list :const v :type :text :typmod -1))
+      (t (list :const v :type :text :typmod -1)))))
+
+(defun analyze-column-expression (expr table)
+  (let ((name (if (third expr) (third expr) (second expr)))
+        (qualifier (and (third expr) (second expr))))
+    (cond
+      ((typep table 'select-scope)
+       (resolve-select-column table qualifier name))
+      (t
+       (when (and (null table) qualifier)
+         (ereport "42P01" "missing FROM-clause entry for table \"~a\"" qualifier))
+       (unless table
+         (ereport "42703" "column \"~a\" does not exist" name))
+       (let ((col (find-column table name)))
+         (unless col
+           (ereport "42703" "column \"~a\" does not exist" name))
+         (list :col (pg-column-attnum col)
+               :type (pg-column-type col)
+               :typmod (pg-column-typmod col)
+               :notnull (pg-column-notnull col)
+               :table-oid (pg-class-oid table)
+               :attnum (pg-column-attnum col)))))))
+
 (defun analyze-expr (expr table)
   "Resolve column references and annotate expression types."
   (case (first expr)
@@ -3193,18 +3284,7 @@ candidate selection."
        (list :parameter (second expr) :type type :typmod -1)))
     (:sublink (analyze-sublink expr table))
     (:window (analyze-window-call expr table))
-    (:const
-     (let ((v (second expr)))
-       (cond
-         ((eq v +null+) (list :const v :type :text :typmod -1))
-         ((integerp v)
-          (list :const v
-                :type (cond ((<= +int4-min+ v +int4-max+) :int4)
-                            ((<= +int8-min+ v +int8-max+) :int8)
-                            (t :numeric))
-                :typmod -1))
-         ((stringp v) (list :const v :type :text :typmod -1))
-         (t (list :const v :type :text :typmod -1)))))
+    (:const (analyze-constant-expression expr))
     (:numeric-literal
      (list :const (sql-numeric-input (second expr)) :type :numeric :typmod -1))
     (:bit-literal
@@ -3223,26 +3303,8 @@ candidate selection."
            (cons :single-record (cdr call)))))
     (:bool
      (list :bool (second expr) :type :bool :typmod -1))
-    (:column
-     (let ((name (if (third expr) (third expr) (second expr)))
-           (qualifier (and (third expr) (second expr))))
-       (cond
-         ((typep table 'select-scope)
-          (resolve-select-column table qualifier name))
-         (t
-          (when (and (null table) qualifier)
-            (ereport "42P01" "missing FROM-clause entry for table \"~a\"" qualifier))
-          (unless table
-            (ereport "42703" "column \"~a\" does not exist" name))
-          (let ((col (find-column table name)))
-            (unless col
-              (ereport "42703" "column \"~a\" does not exist" name))
-            (list :col (pg-column-attnum col)
-                  :type (pg-column-type col)
-                  :typmod (pg-column-typmod col)
-                  :notnull (pg-column-notnull col)
-                  :table-oid (pg-class-oid table)
-                  :attnum (pg-column-attnum col)))))))
+    (:column (analyze-column-expression expr table))
+    (:whole-row (resolve-select-whole-row table (second expr)))
     (:binop (analyze-binop-expression expr table))
     (:unary
      (let ((e (analyze-expr (third expr) table)))
@@ -3381,21 +3443,19 @@ candidate selection."
           (t (ereport "42809" "expression is not a supported composite type")))))
 
 (defun qualified-star-targets (qualifier scope)
-  (loop for current = scope then (select-scope-parent current)
-        while (typep current 'select-scope)
-        for relation = (find qualifier (select-scope-relations current)
-                             :key #'select-relation-qualifier :test #'equal)
-        when relation
-          do (return-from qualified-star-targets
-               (loop for column in (select-relation-columns relation)
-                     collect (list :expr (list :column qualifier (select-column-name column))))))
-  (ereport "42P01" "missing FROM-clause entry for table ~s" qualifier))
+  (multiple-value-bind (relation depth) (resolve-select-qualified-relation scope qualifier)
+    (loop for column in (select-relation-columns relation)
+          for target = (select-column-target column)
+          do (setf (getf target :expr) (select-outer-reference (getf target :expr) depth))
+          collect target)))
 
 (defun expand-select-targets (targets scope)
   "Expand records before analysis, as C ExpandRowReference does with FieldSelect."
   (loop for target in targets for raw = (getf target :expr)
         append
         (cond
+          ((eq (first raw) :whole-row)
+           (qualified-star-targets (second raw) scope))
           ((getf target :qualified-star)
            (qualified-star-targets (getf target :qualified-star) scope))
           ((getf target :star)
@@ -3780,6 +3840,9 @@ candidate selection."
     ((member (first form) '(:outer-ref :window-ref)) form)
     ((eq (first form) :subplan)
      (rewrite-subplan-group-columns form group-keys scope))
+    ((eq (first form) :whole-row)
+     (ereport "42803"
+              "whole-row reference must appear in the GROUP BY clause or be used in an aggregate function"))
     ((eq (first form) :col)
      (if (getf (cddr form) :aggregate-output)
          form
@@ -4484,6 +4547,31 @@ aliases share the corresponding numeric operator implementation."
 
 (defvar +subquery-frame-origins-key+ (gensym "SUBQUERY-FRAME-ORIGINS-"))
 
+(defvar +subquery-frame-presence-key+ (gensym "SUBQUERY-FRAME-PRESENCE-"))
+
+(defun make-subquery-parameter-frame (environment &key copy-p (capture-p t))
+  (let ((frame (cons (if copy-p
+                         (map 'vector #'copy-subquery-value environment)
+                         environment)
+                     (make-hash-table :test #'eq))))
+    (setf (gethash +subquery-frame-presence-key+ (cdr frame))
+          (if capture-p (copy-seq *query-row-presence*) #()))
+    (when (and capture-p *datum-origin-capture*)
+      (setf (gethash +subquery-frame-origins-key+ (cdr frame))
+            (datum-origins-from-spill (datum-origins-for-spill *query-row-origins*))))
+    frame))
+
+(defun eval-outer-reference (expression &optional with-origin)
+  (let* ((depth (second expression))
+         (frame (nth (1- depth) *subquery-outer-frames*))
+         (*subquery-outer-frames* (nthcdr depth *subquery-outer-frames*)))
+    (unless frame (error "Missing outer query parameter frame"))
+    (let ((*query-row-presence* (gethash +subquery-frame-presence-key+ (cdr frame)))
+          (*query-row-origins* (gethash +subquery-frame-origins-key+ (cdr frame))))
+      (if with-origin
+          (eval-expr-with-origin (third expression) (car frame) *query-row-origins*)
+          (eval-expr (third expression) (car frame))))))
+
 (defun datum-origin-coercion-compatible-p (source-type source-typmod target-type target-typmod)
   "Match PostgreSQL's binary relabel and varchar/numeric typmod support rules."
   (cond ((and (member source-type '(:text :varchar)) (member target-type '(:text :varchar)))
@@ -4522,13 +4610,7 @@ and the selected CASE or COALESCE branch retain origin. Other computations clear
     (:subplan
      (let ((*query-row-origins* origins))
        (eval-subquery-expression (second expression) environment)))
-    (:outer-ref
-     (let* ((depth (second expression))
-            (frame (nth (1- depth) *subquery-outer-frames*))
-            (*subquery-outer-frames* (nthcdr depth *subquery-outer-frames*)))
-       (unless frame (error "Missing outer query parameter frame"))
-       (eval-expr-with-origin (third expression) (car frame)
-                              (gethash +subquery-frame-origins-key+ (cdr frame)))))
+    (:outer-ref (eval-outer-reference expression t))
     (:join-coalesce
      (multiple-value-bind (value origin) (eval-expr-with-origin (second expression) environment origins)
        (if (eq value +null+)
@@ -4787,18 +4869,81 @@ truncate and interpret the result at TYPE's signed width."
 
 (declaim (ftype function sql-to-jsonb))
 
+(defun eval-binop-expression (expr env)
+  (let ((op (second expr))
+        (l (eval-expr (third expr) env))
+        (r (eval-expr (fourth expr) env)))
+    (if (member op '("=" "<>" "<" "<=" ">" ">=") :test #'string=)
+        (sql-compare op l r)
+        (let ((value (cond ((or (eq l +null+) (eq r +null+)) +null+)
+                           ((member op '("@>" "<@") :test #'string=)
+                            (if (string= op "@>") (sql-jsonb-contains-p l r)
+                                (sql-jsonb-contains-p r l)))
+                           ((string= op "?") (sql-jsonb-exists-p l r))
+                           ((member op '("?|" "?&") :test #'string=)
+                            (sql-jsonb-exists-keys-p
+                             l (if (sql-array-p r) (sql-array-elements r) r)
+                             (string= op "?&")))
+                           ((string= op "#-") (sql-jsonb-delete-path l r))
+                           ((and (string= op "-") (eq (expr-type (third expr)) :jsonb))
+                            (sql-jsonb-delete l r (case (expr-type (fourth expr))
+                                                    (:int4 :index) (:text-array :keys) (otherwise :key))))
+                           ((member op '("#>" "#>>") :test #'string=)
+                            (sql-json-path-extract
+                             l (if (sql-array-p r) (sql-array-elements r) r)
+                             (eq (expr-type (third expr)) :jsonb)
+                             (string= op "#>>")))
+                           ((member op '("->" "->>") :test #'string=)
+                            (if (eq (expr-type (third expr)) :json)
+                                (sql-json-extract l r (string= op "->>"))
+                                (sql-jsonb-extract l r (string= op "->>"))))
+                           ((or (member (expr-type (third expr)) '(:time :timestamp :timestamptz :interval))
+                                (member (expr-type (fourth expr)) '(:time :timestamp :timestamptz :interval)))
+                            (sql-temporal-arithmetic op l r (expr-type (third expr)) (expr-type (fourth expr))
+                                                     (when (or (eq (expr-type (third expr)) :timestamptz)
+                                                               (eq (expr-type (fourth expr)) :timestamptz))
+                                                       (sql-session-timezone))))
+                           ((or (eq (expr-type (third expr)) :date) (eq (expr-type (fourth expr)) :date))
+                            (sql-date-arithmetic op l r (expr-type (third expr)) (expr-type (fourth expr))))
+                           ((member op '("&" "|" "#" "<<" ">>") :test #'string=)
+                            (sql-integer-bitwise op l r (expr-type expr)))
+                           ((string= op "^")
+                            (if (eq (expr-type expr) :numeric)
+                                (sql-numeric-power l r) (sql-float-power l r)))
+                           ((eq (expr-type expr) :numeric) (sql-numeric-arithmetic op l r))
+                           ((member (expr-type expr) '(:float4 :float8)) (sql-float-arithmetic op l r))
+                           (t (sql-arith op l r)))))
+          (if (member (expr-type expr) '(:int2 :int4 :int8))
+              (sql-cast-value value (expr-type expr) (expr-type expr) -1) value)))))
+
+(defun eval-whole-row-expression (expression environment)
+  (unless (simple-vector-p *query-row-presence*)
+    (ereport "XX000" "whole-row evaluation requires source presence metadata"))
+  (if (find (second expression) *query-row-presence* :test #'eql)
+      (make-sql-record
+       :fields (getf (cdddr expression) :fields)
+       :values (map 'vector (lambda (field) (eval-expr field environment))
+                    (third expression)))
+      +null+))
+
+(defun eval-null-test (expression environment)
+  (let ((value (eval-expr (second expression) environment))
+        (negated-p (third expression)))
+    (cond
+      ((eq value +null+) (not negated-p))
+      ((sql-record-p value)
+       (every (lambda (field)
+                (if negated-p (not (eq field +null+)) (eq field +null+)))
+              (sql-record-values value)))
+      (t (not (null negated-p))))))
+
 (defun eval-expr (expr env)
   (case (first expr)
     (:parameter (query-parameter-slot (second expr) *query-parameter-values*))
     (:subplan (eval-subquery-expression (second expr) env))
     (:assignment (eval-subquery-assignment expr env))
     (:subquery-output *subquery-output-value*)
-    (:outer-ref
-     (let* ((depth (second expr))
-            (frame (nth (1- depth) *subquery-outer-frames*))
-            (*subquery-outer-frames* (nthcdr depth *subquery-outer-frames*)))
-       (unless frame (error "Missing outer query parameter frame"))
-       (eval-expr (third expr) (car frame))))
+    (:outer-ref (eval-outer-reference expr))
     ((:const :scalar-array-const) (second expr))
     (:coalesce (eval-coalesce-expression expr env))
     (:case (eval-case-expression expr env))
@@ -4807,6 +4952,7 @@ truncate and interpret the result at TYPE's signed width."
     (:cast (sql-cast-value (eval-expr (second expr) env)
                            (expr-type (second expr)) (expr-type expr) (expr-typmod expr)))
     (:bool (second expr))
+    (:whole-row (eval-whole-row-expression expr env))
     (:array (eval-array-constructor expr env))
     (:array-subscript (eval-array-subscript expr env))
     (:array-slice (eval-array-slice expr env))
@@ -4833,52 +4979,7 @@ truncate and interpret the result at TYPE's signed width."
          (:bytea (sql-bytea-concat left right))
          (:jsonb (sql-jsonb-concat left right))
          (otherwise (concatenate 'string left right)))))
-    (:binop
-     (let ((op (second expr))
-           (l (eval-expr (third expr) env))
-           (r (eval-expr (fourth expr) env)))
-       (if (member op '("=" "<>" "<" "<=" ">" ">=") :test #'string=)
-           (sql-compare op l r)
-           (let ((value (cond ((or (eq l +null+) (eq r +null+)) +null+)
-                              ((member op '("@>" "<@") :test #'string=)
-                               (if (string= op "@>") (sql-jsonb-contains-p l r)
-                                   (sql-jsonb-contains-p r l)))
-                              ((string= op "?") (sql-jsonb-exists-p l r))
-                              ((member op '("?|" "?&") :test #'string=)
-                               (sql-jsonb-exists-keys-p
-                                l (if (sql-array-p r) (sql-array-elements r) r)
-                                (string= op "?&")))
-                              ((string= op "#-") (sql-jsonb-delete-path l r))
-                              ((and (string= op "-") (eq (expr-type (third expr)) :jsonb))
-                               (sql-jsonb-delete l r (case (expr-type (fourth expr))
-                                                       (:int4 :index) (:text-array :keys) (otherwise :key))))
-                              ((member op '("#>" "#>>") :test #'string=)
-                               (sql-json-path-extract
-                                l (if (sql-array-p r) (sql-array-elements r) r)
-                                (eq (expr-type (third expr)) :jsonb)
-                                (string= op "#>>")))
-                              ((member op '("->" "->>") :test #'string=)
-                               (if (eq (expr-type (third expr)) :json)
-                                   (sql-json-extract l r (string= op "->>"))
-                                   (sql-jsonb-extract l r (string= op "->>"))))
-                              ((or (member (expr-type (third expr)) '(:time :timestamp :timestamptz :interval))
-                                   (member (expr-type (fourth expr)) '(:time :timestamp :timestamptz :interval)))
-                               (sql-temporal-arithmetic op l r (expr-type (third expr)) (expr-type (fourth expr))
-                                                        (when (or (eq (expr-type (third expr)) :timestamptz)
-                                                                  (eq (expr-type (fourth expr)) :timestamptz))
-                                                          (sql-session-timezone))))
-                              ((or (eq (expr-type (third expr)) :date) (eq (expr-type (fourth expr)) :date))
-                               (sql-date-arithmetic op l r (expr-type (third expr)) (expr-type (fourth expr))))
-                              ((member op '("&" "|" "#" "<<" ">>") :test #'string=)
-                               (sql-integer-bitwise op l r (expr-type expr)))
-                              ((string= op "^")
-                               (if (eq (expr-type expr) :numeric)
-                                   (sql-numeric-power l r) (sql-float-power l r)))
-                              ((eq (expr-type expr) :numeric) (sql-numeric-arithmetic op l r))
-                              ((member (expr-type expr) '(:float4 :float8)) (sql-float-arithmetic op l r))
-                              (t (sql-arith op l r)))))
-             (if (member (expr-type expr) '(:int2 :int4 :int8))
-                 (sql-cast-value value (expr-type expr) (expr-type expr) -1) value)))))
+    (:binop (eval-binop-expression expr env))
     (:unary
      (sql-strict-let ((value (eval-expr (third expr) env)))
        (cond
@@ -4906,11 +5007,7 @@ truncate and interpret the result at TYPE's signed width."
            (sql-3val-or left (eval-expr (third expr) env)))))
     (:not (sql-3val-not (eval-expr (second expr) env)))
     (:in (eval-in-expression expr env))
-    (:is-null
-     (let ((v (eval-expr (second expr) env)))
-       (if (third expr)
-           (not (eq v +null+))
-           (eq v +null+))))
+    (:is-null (eval-null-test expr env))
     (:is-bool
      (let ((v (eval-expr (second expr) env))
            (want (fourth expr))
@@ -5099,13 +5196,28 @@ truncate and interpret the result at TYPE's signed width."
           (setf text (concatenate 'string (subseq text 0 end) ":00" (subseq text end))))))
     text))
 
-(defun sql-to-jsonb (value type)
+(defun sql-record-to-jsonb-value (record depth)
+  (let ((items (make-hash-table :test #'equal)))
+    (loop for (name type) in (sql-record-fields record)
+          for value across (sql-record-values record)
+          for index from 0
+          do (when (zerop (mod index 4096)) (check-for-interrupts))
+             (setf (gethash (copy-seq name) items)
+                   (if (eq value +null+) :json-null
+                       (sql-jsonb-value (sql-to-jsonb value type (1+ depth))))))
+    (let ((pairs nil))
+      (maphash (lambda (key value) (push (cons key value) pairs)) items)
+      (cons :object (sort pairs #'sql-jsonb-key-less-p :key #'car)))))
+
+(defun sql-to-jsonb (value type &optional (depth 0))
   "Convert a supported typed SQL value to JSONB without mutating its input."
+  (when (> depth 512) (ereport "54001" "JSON nesting exceeds supported depth"))
   (when (eq value +null+) (return-from sql-to-jsonb +null+))
   (let ((element-type (sql-array-element-type type)))
     (labels ((scalar (item scalar-type)
                (cond
                  ((eq item +null+) :json-null)
+                 ((eq scalar-type :record) (sql-record-to-jsonb-value item depth))
                  ((eq scalar-type :bool) (if item :json-true :json-false))
                  ((member scalar-type '(:int2 :int4 :int8)) item)
                  ((eq scalar-type :numeric)
@@ -5141,7 +5253,7 @@ truncate and interpret the result at TYPE's signed width."
                                           (prog1 (scalar (aref elements position) item-type)
                                             (incf position))))))))
                    (if (null (sql-array-dimensions array)) #()
-                       (dimension (sql-array-dimensions array) 0))))))
+                       (dimension (sql-array-dimensions array) depth))))))
       (let* ((root (if element-type (array-value value element-type) (scalar value type)))
              (pending (list (cons root 0)))
              (visited 0))
@@ -5154,13 +5266,25 @@ truncate and interpret the result at TYPE's signed width."
                         (loop for child across item do (push (cons child (1+ depth)) pending)))))
         (make-sql-jsonb root)))))
 
-(defun sql-to-json (value type)
+(defun sql-to-json (value type &optional (depth 0))
   "Convert a typed datum to JSON text, preserving JSON input verbatim."
+  (when (> depth 512) (ereport "54001" "JSON nesting exceeds supported depth"))
   (when (eq value +null+) (return-from sql-to-json "null"))
   (with-output-to-string (out)
     (labels ((scalar (item item-type)
                (cond ((eq item +null+) (write-string "null" out))
                      ((eq item-type :json) (write-string item out))
+                     ((eq item-type :record)
+                      (write-char #\{ out)
+                      (loop for (name field-type) in (sql-record-fields item)
+                            for field-value across (sql-record-values item)
+                            for first = t then nil for index from 0
+                            do (when (zerop (mod index 4096)) (check-for-interrupts))
+                               (unless first (write-char #\, out))
+                               (sql-jsonb-write-string name out)
+                               (write-char #\: out)
+                               (write-string (sql-to-json field-value field-type (1+ depth)) out))
+                      (write-char #\} out))
                      ((member item-type '(:float4 :float8))
                       (let ((text (value->text item item-type)))
                         (if (or (sb-ext:float-nan-p item) (sb-ext:float-infinity-p item))
@@ -5179,7 +5303,7 @@ truncate and interpret the result at TYPE's signed width."
                                   (progn (scalar (aref elements position) item-type) (incf position))))
                             (write-char #\] out)))
                    (if (null (sql-array-dimensions array)) (write-string "[]" out)
-                       (dimension (sql-array-dimensions array) 0))))))
+                       (dimension (sql-array-dimensions array) depth))))))
       (let ((element-type (sql-array-element-type type)))
         (cond (element-type (array-value value element-type))
               ((eq type :int2vector)
@@ -5219,7 +5343,7 @@ truncate and interpret the result at TYPE's signed width."
                            (when (eq key +null+)
                              (if jsonb-p (ereport "22023" "argument ~d: key must not be null" position)
                                  (ereport "22004" "null value not allowed for object key")))
-                           (when (or (sql-array-element-type key-type) (member key-type '(:json :jsonb :int2vector)))
+                           (when (or (sql-array-element-type key-type) (member key-type '(:record :json :jsonb :int2vector)))
                              (ereport "22023" "key value must be scalar, not array, composite, or json"))
                            (unless first (write-string ", " out))
                            (let* ((converted (sql-jsonb-value (sql-to-jsonb key key-type)))

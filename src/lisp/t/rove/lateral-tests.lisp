@@ -48,17 +48,18 @@
     (let ((opens nil) (closes nil) (next 0))
       (let* ((left (make-sql-iterator
                     (lambda ()
-                      (when (< next 3) (values (vector (incf next)) t)))))
+                      (when (< next 3) (values (vector (incf next)) t nil nil #(51))))))
              (iterator
                (make-lateral-join-iterator
                 '(:type :left :qual (:bool t) :left-width 1 :right-width 1)
                 left
-                (lambda (row origins)
+                (lambda (row origins presence)
                   (declare (ignore origins))
+                  (rove:ok (equalp presence #(51)))
                   (let ((value (aref row 0)) (done nil))
                     (push value opens)
                     (make-sql-iterator
-                     (lambda () (unless done (setf done t) (values (vector value) t)))
+                     (lambda () (unless done (setf done t) (values (vector value) t nil nil #(52))))
                      (lambda () (push value closes))))))))
         (unwind-protect
              (progn

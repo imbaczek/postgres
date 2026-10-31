@@ -36,9 +36,11 @@
 
 (defun map-sql-iterator (iterator callback)
   (loop
-    (multiple-value-bind (row present origins) (sql-iterator-next iterator)
+    (multiple-value-bind (row present origins toast-context presence) (sql-iterator-next iterator)
+      (declare (ignore toast-context))
       (unless present (return))
-      (let ((*query-row-origins* (and *datum-origin-capture* origins)))
+      (let ((*query-row-origins* (and *datum-origin-capture* origins))
+            (*query-row-presence* presence))
         (when (eq (funcall callback row) :stop) (return :stop))))))
 
 ;; A store owns its producer, spool, and all readers.  Each reader has an
@@ -50,11 +52,23 @@
 ;; The spool can spill while readers are active, so readers open and seek their
 ;; own input streams when disk storage first becomes necessary.
 (defstruct (query-replay-store (:constructor %make-query-replay-store))
-  producer spool eof-p readers closed-p capture-origins-p
+  producer spool eof-p readers closed-p capture-origins-p capture-presence-p
   (memory-rows (make-array 0 :adjustable t :fill-pointer 0)))
 
+(defun combine-query-row-presence (left right)
+  (when (and (simple-vector-p left) (simple-vector-p right))
+    (concatenate 'simple-vector left right)))
+
+(defun make-source-presence-iterator (input relation)
+  (let ((presence (vector (ensure-select-source-identity relation))))
+    (make-sql-iterator
+     (lambda ()
+       (multiple-value-bind (row present origins) (sql-iterator-next input)
+         (values row present origins nil (and present presence))))
+     (lambda () (close-sql-iterator input)))))
+
 (defun make-query-replay-store (producer &optional (memory-limit *query-work-memory-bytes*))
-  (%make-query-replay-store :producer producer :spool (make-query-row-spool memory-limit) :capture-origins-p *datum-origin-capture*))
+  (%make-query-replay-store :producer producer :spool (make-query-row-spool memory-limit) :capture-origins-p *datum-origin-capture* :capture-presence-p t))
 
 (defun close-query-replay-store (store)
   (sb-sys:without-interrupts
@@ -118,11 +132,17 @@ ownership is claimed, close the newly created store."
         (when (and claimed (not complete))
           (close-query-replay-store store))))))
 
-(defun append-query-replay-row (store row &optional (origins *query-row-origins*))
+(defun append-query-replay-row (store row &optional (origins *query-row-origins*)
+                                            (presence *query-row-presence*))
   (let* ((spool (query-replay-store-spool store))
+         (metadata (or (query-replay-store-capture-origins-p store)
+                       (query-replay-store-capture-presence-p store)))
          (copy (copy-query-sort-value
-                (if (query-replay-store-capture-origins-p store)
-                    (list row (datum-origins-for-spill origins))
+                (if metadata
+                    (list row
+                          (when (query-replay-store-capture-origins-p store)
+                            (datum-origins-for-spill origins))
+                          (when (query-replay-store-capture-presence-p store) presence))
                     row))))
     (unless (query-row-spool-pathname spool)
       (incf (query-row-spool-memory-bytes spool) 16))
@@ -143,10 +163,11 @@ ownership is claimed, close the newly created store."
              (let ((spool (query-replay-store-spool store)))
                (when (and (= index (query-row-spool-count spool))
                           (not (query-replay-store-eof-p store)))
-                 (multiple-value-bind (row present origins)
+                 (multiple-value-bind (row present origins toast-context presence)
                      (sql-iterator-next (query-replay-store-producer store))
+                   (declare (ignore toast-context))
                    (if present
-                       (append-query-replay-row store row origins)
+                       (append-query-replay-row store row origins presence)
                        (progn
                          (setf (query-replay-store-eof-p store) t)
                          (close-sql-iterator (query-replay-store-producer store))
@@ -166,10 +187,15 @@ ownership is claimed, close the newly created store."
                                  (setf offset (file-position input))))
                              (aref (query-replay-store-memory-rows store) index))))
                    (incf index)
-                   (if (query-replay-store-capture-origins-p store)
+                   (if (or (query-replay-store-capture-origins-p store)
+                           (query-replay-store-capture-presence-p store))
                        (values (copy-query-sort-value (first value)) t
-                               (datum-origins-from-spill (second value)))
-                       (values (copy-query-sort-value value) t nil))))))
+                               (when (query-replay-store-capture-origins-p store)
+                                 (datum-origins-from-spill (second value)))
+                               nil
+                               (when (query-replay-store-capture-presence-p store)
+                                 (copy-query-sort-value (third value))))
+                       (values (copy-query-sort-value value) t nil nil nil))))))
            (lambda ()
              (when input (finish-query-temp-stream input nil))
              (setf (query-replay-store-readers store)

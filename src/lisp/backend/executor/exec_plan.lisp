@@ -851,14 +851,18 @@ if a registered TOAST index is missing."
                                                    order)
                                               row
                                               (and *datum-origin-capture*
-                                                   (datum-origins-for-spill *query-row-origins*)))))
+                                                   (datum-origins-for-spill *query-row-origins*))
+                                              *query-row-presence*)))
                                     (emit-run (pathname)
                                       (with-query-temp-input (stream pathname)
                                         (loop for item = (query-spill-read-record stream)
                                               until (eq item +query-spill-eof+)
                                               do (check-for-interrupts)
                                                  (let ((*query-row-origins* (and *datum-origin-capture*
-                                                                                 (datum-origins-from-spill (fifth item)))))
+                                                                                 (datum-origins-from-spill (fifth item))))
+                                                       (*query-row-presence* (if arena
+                                                                                 (copy-query-sort-value (sixth item))
+                                                                                 (sixth item))))
                                                    (when (eq (funcall callback (fourth item)) :stop)
                                                      (return-from stream-select-sort-with-arena :stop)))))))
                              (unwind-protect
@@ -887,7 +891,10 @@ if a registered TOAST index is missing."
                                             (check-for-interrupts)
                                             ;; Consumers, including instrumentation, can retain rows.
                                             (let ((*query-row-origins* (and *datum-origin-capture*
-                                                                            (datum-origins-from-spill (fifth item)))))
+                                                                            (datum-origins-from-spill (fifth item))))
+                                                  (*query-row-presence* (if arena
+                                                                            (copy-query-sort-value (sixth item))
+                                                                            (sixth item))))
                                               (when (eq (funcall callback
                                                                  (if arena
                                                                      (copy-query-sort-value (fourth item))
@@ -1641,174 +1648,78 @@ ROW's source environment.  Only final target origins leave this projection."
                  (when origins (setf (aref origins i) origin))))
     (values (cons values environment) origins)))
 
-(defun execute-physical-plan-node (node registered-relations outer-environment
-                                   emit run-child run-node)
-  "Execute one physical node using the instrumented callbacks from RUN-NODE."
-  (when (member (first node) '(:sort :top-n))
-    (let ((child (if (eq (first node) :top-n) (fourth node) (third node))))
-      (multiple-value-bind (set-node width calls targets) (sort-project-set-info node child)
-        (when (and set-node
-                   (notany (lambda (entry)
-                             (project-set-expression-dependent-p
-                              (car entry) width (length calls) targets))
-                           (second node)))
-          (let ((input (make-sorted-project-set-iterator
-                        node child set-node width calls registered-relations
-                        :source-streamer
-                        (lambda (callback) (funcall run-child (third set-node) callback)))))
-            (return-from execute-physical-plan-node
-              (unwind-protect (map-sql-iterator input emit)
-                (close-sql-iterator input))))))))
-  (case (first node)
-    (:result
-     (let ((*query-row-origins* nil)) (funcall emit #())))
-    (:with-ctes
-        (call-with-cte-definitions (second node) (lambda () (funcall run-child (third node) emit))))
-    (:cte-scan
-     (let ((reader (make-cte-scan-iterator (physical-scan-relation node registered-relations))))
-       (unwind-protect (map-sql-iterator reader emit) (close-sql-iterator reader))))
-    (:worktable-scan
-     (let ((reader (make-cte-worktable-iterator (physical-scan-relation node registered-relations))))
-       (unwind-protect (map-sql-iterator reader emit) (close-sql-iterator reader))))
-    (:recursive-union
-     (let ((input (make-recursive-union-iterator node registered-relations)))
-       (unwind-protect (map-sql-iterator input emit) (close-sql-iterator input))))
-    (:append (stream-union-all (second node) emit run-child))
-    ((:seq-scan :index-scan)
-     (let* ((relation (physical-scan-relation node registered-relations))
-            (path (physical-scan-path node relation)))
-       (scan-select-relation
-        relation path *current-snapshot*
-        (lambda (row)
-          (check-for-interrupts)
-          (let* ((environment (if (getf relation :row-source)
-                                  row
-                                  (htup-values row)))
-                 (*query-row-origins*
-                   (and *datum-origin-capture* (not (getf relation :row-source))
-                        (if (getf relation :join-order-base)
-                            (make-select-relation-origins registered-relations relation (htup-origins row))
-                            (htup-origins row)))))
-            (funcall emit
+(defun execute-physical-scan-node (node registered-relations outer-environment emit)
+  (let* ((relation (physical-scan-relation node registered-relations))
+         (path (physical-scan-path node relation))
+         (presence (vector (ensure-select-source-identity relation))))
+    (scan-select-relation
+     relation path *current-snapshot*
+     (lambda (row)
+       (check-for-interrupts)
+       (let* ((*query-row-presence* presence)
+              (environment (if (getf relation :row-source)
+                               row
+                               (htup-values row)))
+              (*query-row-origins*
+                (and *datum-origin-capture* (not (getf relation :row-source))
                      (if (getf relation :join-order-base)
-                         (make-select-relation-environment
-                          registered-relations relation environment)
-                         environment))))
-        outer-environment)))
-    (:subquery-scan
-     (physical-scan-relation node registered-relations)
-     (let* ((parent-frames *subquery-outer-frames*)
-            (frame (cons (if (getf (physical-scan-relation node registered-relations) :lateral-dependent)
-                             outer-environment #())
-                         (make-hash-table :test #'eq)))
-            (*subquery-outer-frames* (cons frame parent-frames)))
-       (when (and *datum-origin-capture*
-                  (getf (physical-scan-relation node registered-relations) :lateral-dependent))
-         (setf (gethash +subquery-frame-origins-key+ (cdr frame))
-               (datum-origins-from-spill (datum-origins-for-spill *query-row-origins*))))
-       (unwind-protect
-            (funcall run-child (fourth node)
-                     (lambda (row)
-                       (let ((*subquery-outer-frames* parent-frames))
-                         (funcall emit (car row)))))
-         (close-cte-frame-cache (cdr frame)))))
-    (:filter
-     (let ((qual (second node)))
-       (funcall run-child
-                (third node)
-                (lambda (environment)
-                  (when (true-p (eval-expr qual environment))
-                    (funcall emit environment))))))
-    (:nested-loop-join
-     (let* ((join (second node))
-            (left (third node))
-            (right (fourth node))
-            (right-relation
-              (and (member (first right) '(:seq-scan :index-scan) :test #'eq)
-                   (physical-scan-relation right registered-relations)))
-            (right-path
-              (and right-relation
-                   (physical-scan-path right right-relation))))
-       (if (or (getf join :lateral-dependent)
-               (and right-path (select-scan-path-parameter-expr right-path)))
-           (stream-select-indexed-join-environments
-            (lambda (left-callback)
-              (funcall run-child left left-callback))
-            (lambda (outer-environment right-callback)
-              (funcall run-node right right-callback outer-environment))
-            join emit)
-           (stream-select-join-environments
-            (lambda (left-callback)
-              (funcall run-child left left-callback))
-            (lambda (right-callback)
-              (funcall run-child right right-callback))
-            join emit))))
-    (:window-input
-     (funcall run-child (third node)
-              (lambda (environment)
-                (multiple-value-bind (values origins)
-                    (window-input-with-origins environment (second node) *query-row-origins*)
-                  (let ((*query-row-origins* origins))
-                    (funcall emit values))))))
-    (:window
-     (stream-window-stage (lambda (callback) (funcall run-child (third node) callback))
-                          (second node) emit))
-    (:project-set
-     (let ((targets (and *query-project-set*
-                         (eq node (car *query-project-set*))
-                         (cdr *query-project-set*))))
-       (funcall run-child (third node)
-                (lambda (environment)
-                  (if targets
-                      (let* ((pending t)
-                             (origins *query-row-origins*)
-                             (input (make-sql-iterator
-                                     (lambda ()
-                                       (when pending
-                                         (setf pending nil)
-                                         (values environment t origins)))))
-                             (projected
-                               (make-project-set-projection-iterator
-                                input (second node) targets (fourth node))))
-                        (unwind-protect (map-sql-iterator projected emit)
-                          (close-sql-iterator projected)))
-                      (stream-project-set environment (second node) emit))))))
-    (:project
-     (let* ((targets (second node))
-            (deferred (and *query-sort-project*
-                           (eq node (car *query-sort-project*))
-                           (cdr *query-sort-project*)))
-            (set-node (and (null deferred) (project-set-projection-node node)))
-            (*query-project-set* (and set-node (cons set-node targets))))
-       (funcall run-child
-                (third node)
-                (lambda (environment)
-                  (cond
-                    (set-node (funcall emit environment))
-                    (deferred
-                        (multiple-value-bind (row origins)
-                            (make-sort-project-input-row environment targets deferred)
-                          (let ((*query-row-origins* origins))
-                            (funcall emit row))))
-                    (*datum-origin-capture*
-                     (let ((values (make-array (length targets)))
-                           (origins (make-array (length targets) :initial-element nil)))
-                       (loop for target in targets for i from 0
-                             do (multiple-value-bind (value origin)
-                                    (eval-expr-with-origin (getf target :expr) environment *query-row-origins*)
-                                  (setf (aref values i) value (aref origins i) origin)))
+                         (make-select-relation-origins registered-relations relation (htup-origins row))
+                         (htup-origins row)))))
+         (funcall emit
+                  (if (getf relation :join-order-base)
+                      (make-select-relation-environment
+                       registered-relations relation environment)
+                      environment))))
+     outer-environment)))
+
+(defun execute-physical-subquery-scan (node registered-relations outer-environment emit run-child)
+  (let* ((relation (physical-scan-relation node registered-relations))
+         (lateral-p (getf relation :lateral-dependent))
+         (presence (vector (ensure-select-source-identity relation)))
+         (parent-frames *subquery-outer-frames*)
+         (frame (make-subquery-parameter-frame
+                 (if lateral-p outer-environment #()) :capture-p lateral-p))
+         (*subquery-outer-frames* (cons frame parent-frames)))
+    (unwind-protect
+         (funcall run-child (fourth node)
+                  (lambda (row)
+                    (let ((*subquery-outer-frames* parent-frames)
+                          (*query-row-presence* presence))
+                      (funcall emit (car row)))))
+      (close-cte-frame-cache (cdr frame)))))
+
+(defun execute-physical-projection (node emit run-child)
+  (let* ((targets (second node))
+         (deferred (and *query-sort-project*
+                        (eq node (car *query-sort-project*))
+                        (cdr *query-sort-project*)))
+         (set-node (and (null deferred) (project-set-projection-node node)))
+         (*query-project-set* (and set-node (cons set-node targets))))
+    (funcall run-child
+             (third node)
+             (lambda (environment)
+               (cond
+                 (set-node (funcall emit environment))
+                 (deferred
+                     (multiple-value-bind (row origins)
+                         (make-sort-project-input-row environment targets deferred)
                        (let ((*query-row-origins* origins))
-                         (funcall emit (cons values environment)))))
-                    (t
-                     (let ((row (make-select-result-row environment nil targets)))
-                       (when row (funcall emit row)))))))))
-    (:hash-distinct
-     (stream-hash-aggregate
-      (lambda (callback)
-        (funcall run-child (third node)
-                 (lambda (row) (funcall callback (car row)))))
-      (second node) 0
-      (lambda (values) (funcall emit (cons values values)))))
+                         (funcall emit row))))
+                 (*datum-origin-capture*
+                  (let ((values (make-array (length targets)))
+                        (origins (make-array (length targets) :initial-element nil)))
+                    (loop for target in targets for i from 0
+                          do (multiple-value-bind (value origin)
+                                 (eval-expr-with-origin (getf target :expr) environment *query-row-origins*)
+                               (setf (aref values i) value (aref origins i) origin)))
+                    (let ((*query-row-origins* origins))
+                      (funcall emit (cons values environment)))))
+                 (t
+                  (let ((row (make-select-result-row environment nil targets)))
+                    (when row (funcall emit row)))))))))
+
+(defun execute-physical-order (node emit run-child)
+  (case (first node)
     (:sort
      (let* ((child (third node))
             (deferred (sort-projection-deferred-slots node child))
@@ -1833,10 +1744,11 @@ ROW's source environment.  Only final target origins leave this projection."
             (rows (collect-select-top-n
                    (lambda (callback)
                      (funcall run-child input callback))
-                   order limit *datum-origin-capture*)))
+                   order limit *datum-origin-capture* t)))
        (loop for stored in rows
-             for row = (if *datum-origin-capture* (car stored) stored)
-             do (let ((*query-row-origins* (and *datum-origin-capture* (cdr stored))))
+             for row = (first stored)
+             do (let ((*query-row-origins* (second stored))
+                      (*query-row-presence* (third stored)))
                   (when (eq (if deferred
                                 (multiple-value-bind (projected origins)
                                     (finish-sort-project-row row (second input) deferred)
@@ -1845,6 +1757,118 @@ ROW's source environment.  Only final target origins leave this projection."
                                 (funcall emit row))
                             :stop)
                     (return :stop))))))
+    (otherwise (error "Unexpected ordering node ~s" node))))
+
+(defun execute-physical-join (node registered-relations emit run-child run-node)
+  (let* ((join (second node))
+         (left (third node))
+         (right (fourth node))
+         (right-relation
+           (and (member (first right) '(:seq-scan :index-scan) :test #'eq)
+                (physical-scan-relation right registered-relations)))
+         (right-path
+           (and right-relation
+                (physical-scan-path right right-relation))))
+    (if (or (getf join :lateral-dependent)
+            (and right-path (select-scan-path-parameter-expr right-path)))
+        (stream-select-indexed-join-environments
+         (lambda (left-callback)
+           (funcall run-child left left-callback))
+         (lambda (outer-environment right-callback)
+           (funcall run-node right right-callback outer-environment))
+         join emit)
+        (stream-select-join-environments
+         (lambda (left-callback)
+           (funcall run-child left left-callback))
+         (lambda (right-callback)
+           (funcall run-child right right-callback))
+         join emit))))
+
+(defun execute-physical-plan-node (node registered-relations outer-environment
+                                   emit run-child run-node)
+  "Execute one physical node using the instrumented callbacks from RUN-NODE."
+  (when (member (first node) '(:sort :top-n))
+    (let ((child (if (eq (first node) :top-n) (fourth node) (third node))))
+      (multiple-value-bind (set-node width calls targets) (sort-project-set-info node child)
+        (when (and set-node
+                   (notany (lambda (entry)
+                             (project-set-expression-dependent-p
+                              (car entry) width (length calls) targets))
+                           (second node)))
+          (let ((input (make-sorted-project-set-iterator
+                        node child set-node width calls registered-relations
+                        :source-streamer
+                        (lambda (callback) (funcall run-child (third set-node) callback)))))
+            (return-from execute-physical-plan-node
+              (unwind-protect (map-sql-iterator input emit)
+                (close-sql-iterator input))))))))
+  (case (first node)
+    (:result
+     (let ((*query-row-origins* nil) (*query-row-presence* #())) (funcall emit #())))
+    (:with-ctes
+        (call-with-cte-definitions (second node) (lambda () (funcall run-child (third node) emit))))
+    (:cte-scan
+     (let ((reader (make-cte-scan-iterator (physical-scan-relation node registered-relations))))
+       (unwind-protect (map-sql-iterator reader emit) (close-sql-iterator reader))))
+    (:worktable-scan
+     (let ((reader (make-cte-worktable-iterator (physical-scan-relation node registered-relations))))
+       (unwind-protect (map-sql-iterator reader emit) (close-sql-iterator reader))))
+    (:recursive-union
+     (let ((input (make-recursive-union-iterator node registered-relations)))
+       (unwind-protect (map-sql-iterator input emit) (close-sql-iterator input))))
+    (:append (stream-union-all (second node) emit run-child))
+    ((:seq-scan :index-scan)
+     (execute-physical-scan-node node registered-relations outer-environment emit))
+    (:subquery-scan
+     (execute-physical-subquery-scan node registered-relations outer-environment emit run-child))
+    (:filter
+     (let ((qual (second node)))
+       (funcall run-child
+                (third node)
+                (lambda (environment)
+                  (when (true-p (eval-expr qual environment))
+                    (funcall emit environment))))))
+    (:nested-loop-join (execute-physical-join node registered-relations emit run-child run-node))
+    (:window-input
+     (funcall run-child (third node)
+              (lambda (environment)
+                (multiple-value-bind (values origins)
+                    (window-input-with-origins environment (second node) *query-row-origins*)
+                  (let ((*query-row-origins* origins))
+                    (funcall emit values))))))
+    (:window
+     (stream-window-stage (lambda (callback) (funcall run-child (third node) callback))
+                          (second node) emit))
+    (:project-set
+     (let ((targets (and *query-project-set*
+                         (eq node (car *query-project-set*))
+                         (cdr *query-project-set*))))
+       (funcall run-child (third node)
+                (lambda (environment)
+                  (if targets
+                      (let* ((pending t)
+                             (origins *query-row-origins*)
+                             (presence *query-row-presence*)
+                             (input (make-sql-iterator
+                                     (lambda ()
+                                       (when pending
+                                         (setf pending nil)
+                                         (values environment t origins nil presence)))))
+                             (projected
+                               (make-project-set-projection-iterator
+                                input (second node) targets (fourth node))))
+                        (unwind-protect (map-sql-iterator projected emit)
+                          (close-sql-iterator projected)))
+                      (stream-project-set environment (second node) emit))))))
+    (:project (execute-physical-projection node emit run-child))
+    (:hash-distinct
+     (stream-hash-aggregate
+      (lambda (callback)
+        (funcall run-child (third node)
+                 (lambda (row) (funcall callback (car row)))))
+      (second node) 0
+      (lambda (values) (funcall emit (cons values values)))))
+    ((:sort :top-n) (execute-physical-order node emit run-child))
     (:limit
      (let ((limit (check-select-limit (second node)))
            (count 0))

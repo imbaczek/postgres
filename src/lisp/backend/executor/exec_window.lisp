@@ -178,7 +178,8 @@
                                                       buffer
                                                       (lambda (row index)
                                                         (declare (ignore index))
-                                                        (let ((*query-row-origins* (datum-origins-from-spill (fifth row))))
+                                                        (let ((*query-row-origins* (datum-origins-from-spill (fifth row)))
+                                                              (*query-row-presence* (sixth row)))
                                                           (output (first row) results (second row) (third row) (fourth row)))))
                                                      :stop)
                                              (return-from stream-window-stage :stop))
@@ -211,7 +212,8 @@
                                         (progn
                                           (unless buffer (setf buffer (make-query-row-spool)))
                                           (query-row-spool-append buffer (list (copy-query-sort-value environment) position rank dense
-                                                                               (and *datum-origin-capture* (datum-origins-for-spill *query-row-origins*)))))
+                                                                               (and *datum-origin-capture* (datum-origins-for-spill *query-row-origins*))
+                                                                               *query-row-presence*)))
                                         (output environment (window-transition-results states) position rank dense))))
                                 (input (callback)
                                   (funcall source

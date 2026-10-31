@@ -49,6 +49,7 @@
   (let* ((target (make-base-select-scope (pg-class-name table) alias table))
          (width (length (pg-class-columns table)))
          (excluded (make-select-relation :name "excluded" :alias "excluded" :table table
+                                         :identity (make-select-source-identity)
                                          :offset width :width width)))
     (make-select-scope :relations (append (select-scope-relations target) (list excluded))
                        :columns (append (select-scope-columns target) (select-relation-columns excluded))
@@ -64,7 +65,8 @@
            (arbiters nil)
            (targets nil)
            (sets nil)
-           (where-target nil))
+           (where-target nil)
+           (expression-scope nil))
       (when constraint
         (let ((index (find constraint indexes :key #'pg-index-name :test #'string=)))
           (unless (and index (pg-index-constraint-owned-p index))
@@ -96,6 +98,7 @@
             (declare (ignore expression)))))
       (when (eq (getf raw :action) :update)
         (let ((scope (on-conflict-expression-scope table alias)) (groups nil))
+          (setf expression-scope scope)
           (dolist (item (getf raw :sets))
             (let ((group (assoc (getf item :column) groups :test #'equal)))
               (if group (push item (cdr group))
@@ -118,6 +121,10 @@
                                             (analyze-expr (getf raw :where) scope) "ON CONFLICT DO UPDATE WHERE")))
             (push where-target targets))))
       (list :action (getf raw :action) :arbiters arbiters
+            :source-presence (if expression-scope
+                                 (map 'vector #'select-relation-identity
+                                      (select-scope-relations expression-scope))
+                                 #())
             :constraint constraint :inference-p (not (null inference)) :inference-columns columns
             :sets (sort sets #'< :key (lambda (item) (pg-column-attnum (car item)))) :where-target where-target :targets (nreverse targets)))))
 
@@ -216,6 +223,7 @@
         (materialize-select-tuple table tuple *current-snapshot*)
         (let* ((old (htup-values tuple))
                (environment (concatenate 'vector old values))
+               (*query-row-presence* (getf conflict :source-presence))
                (*query-row-origins*
                  (concatenate 'vector
                               (or (htup-origins tuple) (make-array (length old) :initial-element nil))

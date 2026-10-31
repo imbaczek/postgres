@@ -871,6 +871,129 @@ Preserve EQUALP's numeric comparison while descending into SQL value wrappers."
      (lambda (row) (push (car row) rows)))
     (nreverse rows)))
 
+(defun whole-row-query-rows (sql &optional iterator-p)
+  (let* ((plan (pg::plan-select-query (first (pg::parse-statements sql))))
+         (relations (getf (pg::query-plan-prepared plan) :relations))
+         (rows nil))
+    (flet ((emit (row) (push (car row) rows) nil))
+      (if iterator-p
+          (let ((pg::*query-plan-backends* (make-hash-table :test #'eq)))
+            (pg::register-query-plan-backend
+             :whole-row-test
+             :executor
+             (lambda (query registered callback)
+               (let ((input (pg::make-resumable-query-plan-iterator query registered)))
+                 (unwind-protect (pg::map-sql-iterator input callback)
+                   (pg::close-sql-iterator input)))))
+            (pg::execute-query-plan plan relations #'emit :backend :whole-row-test))
+          (pg::execute-query-plan plan relations #'emit)))
+    (nreverse rows)))
+
+(deftest whole-row-json-distinguishes-present-null-fields
+    (ok (test-row-equal-p
+         '(#("{\"id\":1,\"label\":\"x\"}"))
+         (derived-query-rows
+          "SELECT to_json(r.*) FROM (SELECT 1 AS id, 'x'::text AS label) r")))
+  (ok (test-row-equal-p
+       '(#("{\"id\":null,\"label\":null}"))
+       (derived-query-rows
+        "SELECT to_json(r.*) FROM (SELECT NULL::integer AS id, NULL::text AS label) r")))
+  (ok (test-row-equal-p
+       '(#(1 "x"))
+       (derived-query-rows "SELECT r.* FROM (SELECT 1 AS id, 'x'::text AS label) r"))))
+
+(deftest whole-row-json-survives-correlated-and-lateral-execution
+    (dolist (iterator-p '(nil t))
+      (dolist (sql '("SELECT to_json(r.*) FROM (SELECT NULL::integer AS id) r"
+                     "SELECT (SELECT to_json(r.*)) FROM (SELECT NULL::integer AS id) r"
+                     "SELECT (SELECT (SELECT to_json(r.*))) FROM (SELECT NULL::integer AS id) r"
+                     "SELECT to_json(r.*) FROM (SELECT NULL::integer AS id) l LEFT JOIN LATERAL (SELECT l.id) r ON true"))
+        (ok (test-row-equal-p '(#("{\"id\":null}")) (whole-row-query-rows sql iterator-p))))
+      (dolist (sql '("SELECT (SELECT to_json(r.*)) FROM (SELECT 1 AS id) l LEFT JOIN (SELECT NULL::integer AS id) r ON false"
+                     "SELECT to_json(r.*) FROM (SELECT 1 AS id) l LEFT JOIN LATERAL (SELECT l.id WHERE false) r ON true"))
+        (ok (test-row-equal-p (list (vector pg::+null+)) (whole-row-query-rows sql iterator-p))))))
+
+(deftest whole-row-analysis-retains-column-precedence-and-slot-identity
+    (dolist (iterator-p '(nil t))
+      (dolist (case
+                  '(("SELECT to_json(r) FROM (SELECT 1 AS id, 'x'::text AS label) r"
+                     (#("{\"id\":1,\"label\":\"x\"}")))
+                    ("SELECT r FROM (SELECT 7 AS r) r" (#(7)))
+                    ("SELECT (SELECT r FROM (SELECT 1 AS id) r) FROM (SELECT 7 AS r) o"
+                     (#(7)))
+                    ("SELECT r.* FROM (SELECT 1 AS x, 2 AS x) r" (#(1 2)))
+                    ("SELECT (r.*) FROM (SELECT 1 AS x, 2 AS x) r" (#(1 2)))
+                    ("SELECT to_json((r.*)) FROM (SELECT 1 AS x, 2 AS x) r"
+                     (#("{\"x\":1,\"x\":2}")))
+                    ("SELECT count(r.*) FROM (SELECT NULL::integer AS id) r" (#(1)))
+                    ("SELECT count(r.*) FROM (SELECT 1 AS id) l LEFT JOIN (SELECT NULL::integer AS id) r ON false"
+                     (#(0)))))
+        (ok (test-row-equal-p (second case) (whole-row-query-rows (first case) iterator-p)))))
+  (dolist (sql '("SELECT to_json(r.*) FROM (SELECT 1 AS id) r GROUP BY r.id"
+                 "SELECT (SELECT to_json(r.*)) FROM (SELECT 1 AS id) r GROUP BY r.id"))
+    (ok (equal "42803"
+               (handler-case (progn (whole-row-query-rows sql) nil)
+                 (pg::pg-error (condition) (pg::pg-error-sqlstate condition)))))))
+
+(deftest whole-row-origin-capture-restores-correlated-presence
+    (dolist (iterator-p '(nil t))
+      (let ((pg::*datum-origin-capture* t))
+        (ok (test-row-equal-p
+             '(#("{\"id\":null}"))
+             (whole-row-query-rows
+              "SELECT to_json((SELECT COALESCE(r.*))) FROM (SELECT NULL::integer AS id) r"
+              iterator-p))))))
+
+(deftest whole-row-null-tests-use-composite-semantics
+    (dolist (iterator-p '(nil t))
+      (dolist (case
+                  '(("SELECT (r.*) IS NULL, (r.*) IS NOT NULL FROM (SELECT NULL::integer AS id, NULL::text AS label) r"
+                     (#(t nil)))
+                    ("SELECT (r.*) IS NULL, (r.*) IS NOT NULL FROM (SELECT 1 AS id, NULL::text AS label) r"
+                     (#(nil nil)))
+                    ("SELECT (r.*) IS NULL, (r.*) IS NOT NULL FROM (SELECT 1 AS id, 'x'::text AS label) r"
+                     (#(nil t)))
+                    ("SELECT (r.*) IS NULL, (r.*) IS NOT NULL FROM (SELECT 1 AS id) l LEFT JOIN (SELECT 2 AS id) r ON false"
+                     (#(t nil)))
+                    ("SELECT (r.*) FROM (SELECT 1 AS id, 'x'::text AS label) r"
+                     (#(1 "x")))))
+        (ok (test-row-equal-p (second case)
+                              (whole-row-query-rows (first case) iterator-p))))))
+
+(deftest whole-row-json-survives-materialization-and-set-expansion
+    (dolist (iterator-p '(nil t))
+      (dolist (memory '(1 100000))
+        (let ((pg::*query-work-memory-bytes* memory)
+              (pg::*query-temp-directory* (uiop:temporary-directory)))
+          (dolist (case
+                      '(("SELECT CASE WHEN random() < 0.5 THEN to_json(r.*) ELSE to_json(r.*) END FROM (SELECT 2 AS id UNION ALL SELECT 1) r ORDER BY id LIMIT 1"
+                         (#("{\"id\":1}")))
+                        ("WITH r AS MATERIALIZED (SELECT NULL::integer AS id) SELECT to_json(r.*) FROM r"
+                         (#("{\"id\":null}")))
+                        ("WITH RECURSIVE r(id) AS (SELECT 1 UNION ALL SELECT id + 1 FROM r WHERE id < 2) SELECT to_json(r.*) FROM r ORDER BY id"
+                         (#("{\"id\":1}") #("{\"id\":2}")))
+                        ("SELECT to_json(r.*) FROM (SELECT 1 AS id) r UNION ALL SELECT to_json(r.*) FROM (SELECT 2 AS id) r"
+                         (#("{\"id\":1}") #("{\"id\":2}")))
+                        ("SELECT to_json(r.*), row_number() OVER () FROM (SELECT NULL::integer AS id) r"
+                         (#("{\"id\":null}" 1)))
+                        ("SELECT to_json(r.*), sum(id) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) FROM (SELECT 1 AS id UNION ALL SELECT 2) r ORDER BY id"
+                         (#("{\"id\":1}" 3) #("{\"id\":2}" 3)))))
+            (ok (test-row-equal-p (second case)
+                                  (whole-row-query-rows (first case) iterator-p))))))))
+
+(deftest whole-row-json-preserves-null-extension-through-outer-joins
+    (dolist (sql '("SELECT to_json(r.*) FROM (SELECT 1 AS id) l
+                   LEFT JOIN (SELECT 2 AS id) r ON false"
+                   "SELECT to_json(l.*) FROM (SELECT 1 AS id) l
+                   RIGHT JOIN (SELECT 2 AS id) r ON false"))
+      (ok (test-row-equal-p (list (vector pg::+null+)) (derived-query-rows sql))))
+  (ok (test-row-equal-p
+       (list (vector "{\"id\":1}" pg::+null+)
+             (vector pg::+null+ "{\"id\":2}"))
+       (derived-query-rows
+        "SELECT to_json(l.*), to_json(r.*) FROM (SELECT 1 AS id) l
+           FULL JOIN (SELECT 2 AS id) r ON false ORDER BY coalesce(l.id,r.id)"))))
+
 (deftest source-status-functions-join-real-activity-and-independent-feedback
     (let* ((pg::*backend-registry* (make-hash-table :test #'eql))
            (pg::*wal-sender-registry* (make-hash-table :test #'eq))

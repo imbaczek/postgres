@@ -102,7 +102,7 @@
 (defun make-cte-worktable-iterator (relation)
   (let ((binding (assoc (getf relation :cte) *recursive-cte-worktables* :test #'eq)))
     (unless binding (error "Recursive worktable has no active generation"))
-    (make-query-replay-reader (cdr binding))))
+    (make-source-presence-iterator (make-query-replay-reader (cdr binding)) relation)))
 
 (defun make-recursive-union-iterator (node relations)
   ;; Self scans read the sealed working generation while new rows fill the
@@ -155,15 +155,16 @@
          (loop
            (when done (return (values nil nil)))
            (unless input (open-input))
-           (multiple-value-bind (row present origins)
+           (multiple-value-bind (row present origins toast presence)
                (let ((*recursive-cte-worktables* (worktables))
                      (*recursive-cte-generation-caches* (generation-caches)))
                  (sql-iterator-next input))
+             (declare (ignore toast))
              (if present
                  (let ((values (car row)))
                    (when (or all-p (recursive-cte-seen-new-p seen (recursive-cte-seen-key values targets)))
-                     (append-query-replay-row (if recursing intermediate working) values origins)
-                     (return (values row t origins))))
+                     (append-query-replay-row (if recursing intermediate working) values origins presence)
+                     (return (values row t origins nil presence))))
                  (next-generation)))))
        (lambda ()
          (unwind-protect (unwind-protect (close-input) (close-recursive-cte-generation generation-cache))
@@ -318,9 +319,11 @@
            (cache (cte-state-cache definition frames))
            (state (or (and cache (gethash definition cache))
                       (make-cte-producer-state definition frames *cte-execution-context* cache (getf relation :cte-reference-plan))))
-           (reader (if (sql-cte-shared-p definition)
-                       (make-query-replay-reader (cte-execution-state-store state))
-                       (query-replay-store-producer (cte-execution-state-store state)))))
+           (reader (make-source-presence-iterator
+                    (if (sql-cte-shared-p definition)
+                        (make-query-replay-reader (cte-execution-state-store state))
+                        (query-replay-store-producer (cte-execution-state-store state)))
+                    relation)))
       (make-sql-iterator
        (lambda () (sql-iterator-next reader))
        (lambda ()
@@ -391,7 +394,7 @@ table.  With no query owner there is no persistent executor to record."
     *subquery-instrumentation-depth* *cte-execution-context* *cte-open-states*
     *cte-active-plan* *sql-open-iterators* *query-executor-tables* *recursive-cte-worktables*
     *recursive-cte-generation-caches* *lateral-outer-environment*
-    *datum-origin-capture* *query-row-origins* *select-toast-demand*
+    *datum-origin-capture* *query-row-origins* *query-row-presence* *select-toast-demand*
     *select-toast-slice-plan* *toast-slice-current* *query-plan-instrumentation-p*
     *select-index-scans* *select-index-lease-domain* *select-index-lease-groups*
     *select-result-formats* *select-suppress-description* *select-expected-result-columns*
