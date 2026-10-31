@@ -178,7 +178,10 @@ Join outside the follow lock; failure to stop marks recovery failed."
   (nth-value 0 (sync-replication-configuration-state)))
 
 (defun startup-capture-installation-basis ()
-  "Capture the actual root, desired generation and source under their publication fence."
+  "Capture the actual root, desired generation, source, timeline policy and
+managed claim together under the publication fence. Reload captures this before
+reading configuration files; preparation copies inputs and may read
+authentication afterward."
   (call-with-physical-follow-generation-fence
    (lambda ()
      (sb-thread:with-mutex (*physical-follow-lock*)

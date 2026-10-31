@@ -15,14 +15,17 @@
 (define-condition startup-configuration-changed (simple-error) ())
 
 (defstruct startup-installation-basis
-  "One root, desired generation and source captured before preparation."
+  "Transient snapshot of the actual root, desired generation, source, timeline
+policy and managed claim used to prepare one candidate."
   (root nil :read-only t) (desired nil :read-only t) (source nil :read-only t)
   (timeline-policy nil :read-only t) (managed-p nil :read-only t))
 
 (defstruct startup-configuration
-  ;; Each root has a fresh identity and stores only its predecessor's identity.
-  ;; Inputs and authentication are owned copies; desired may reuse an unchanged
-  ;; generation. Resources are validated, not the installed live capacity.
+  ;; Each root has a fresh identity and stores predecessor identities, not an
+  ;; earlier root. SOURCE-PREDECESSOR is historical: capture the actual source
+  ;; again for the next candidate. Inputs and authentication are owned copies;
+  ;; desired may reuse an unchanged generation. Resources are validated, not
+  ;; the installed live capacity.
   (identity (gensym "CONFIGURATION-") :read-only t)
   (predecessor nil :read-only t)
   (source-predecessor nil :read-only t)
@@ -77,7 +80,9 @@ Reject unsupported objects without printing their contents."
 
 (defun startup-prepare-installation-from-basis
     (settings native overrides basis policy supplied-p)
-  "Prepare owned configuration values against the captured installation basis."
+  "Prepare owned configuration values against BASIS.
+Use its root and follow state throughout preparation; its source is the
+candidate's predecessor, not a claim on the current source."
   (let* ((installed (startup-installation-basis-root basis))
          (predecessor (when installed (startup-configuration-identity installed)))
          (owned-settings (startup-copy-input settings))
@@ -811,7 +816,9 @@ root; retention and restartpoint readers still use globals."
   (values))
 
 (defun startup-commit-installation (candidate)
-  "Check and publish CANDIDATE with its desired follow generation."
+  "Check and publish CANDIDATE with its desired follow generation.
+Reject stale root or source predecessors before the managed claim. Reprepare
+from a fresh basis after a stale-candidate error."
   (check-type candidate startup-configuration)
   (physical-follow-call-with-desired-install
    (startup-configuration-desired candidate)
