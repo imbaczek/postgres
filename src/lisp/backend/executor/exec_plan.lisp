@@ -282,10 +282,14 @@ reordered tree, and each parameterized path can reference only joined Vars."
                 (list :and left right :type :bool :typmod -1))
               (rest quals) :initial-value (first quals)))))
 
-(defun prepared-transition-aggregate-p (prepared)
-  "Only COUNT(*) can use the count-only hash aggregate fast path."
-  (some (lambda (descriptor) (not (eq (getf descriptor :kind) :count)))
-        (getf prepared :aggregates)))
+(defun prepared-sorted-aggregate-p (prepared)
+  "Choose sorted aggregation for non-count transitions or record group keys.
+Anonymous records lack hash support in C. Adjacent SQL equality also permits a
+record comparison to stop before an unsupported later field."
+  (or (some (lambda (descriptor) (not (eq (getf descriptor :kind) :count)))
+            (getf prepared :aggregates))
+      (some (lambda (key) (eq (expr-type key) :record))
+            (getf prepared :group-keys))))
 
 (defun select-distinct-plan-kind (targets physical-p)
   "Choose the DISTINCT implementation for the projected target types.
@@ -297,27 +301,74 @@ physical plan containing one must sort and compare adjacent rows."
         (t :hash-distinct)))
 
 (defun constant-distinct-record-p (expression prepared)
-  "Prove a whole-row key constant for a non-nullable one-row subquery.
-C can prune such keys after subquery pull-up. The window constant predicate
-does not cover parameters or source lineage. This narrower proof accepts literal
-and parameter targets and casts of those, but not arbitrary expressions or a
-source made nullable by an outer join."
+  "Prove that a DISTINCT record key is constant through supported projections.
+This is a bounded proof, not a general constant-expression test. Follow column
+aliases only through pullable subqueries and unshared CTEs, and accept a whole
+row only when its source has no relations and every target is a literal,
+parameter, or cast thereof. Stop at query fences, volatile targets, lateral or
+worktable sources, and potentially null-extending joins. For aggregate output,
+first translate the output slot to its group key. Failure to prove constancy
+returns NIL and leaves the key in DISTINCT.
+
+The window constant predicate is insufficient here: it does not follow source
+lineage or recognize parameters. The pull-up fences follow the relevant cases
+of C's is_simple_subquery, rather than claiming a complete equivalent."
   (labels ((constant-p (form)
              (case (first form)
                ((:const :bool :parameter) t)
                (:cast (constant-p (second form)))
-               (otherwise nil))))
-    (when (and (eq (first expression) :whole-row)
-               (every (lambda (join) (member (getf join :type) '(:inner :cross)))
-                      (getf prepared :joins)))
-      (let* ((source (nth (getf (cdddr expression) :source-index)
-                          (getf prepared :relations)))
-             (query (getf source :subquery-prepared)))
-        (and query (not (getf source :lateral-dependent))
-             (not (getf query :set-operation)) (not (getf query :relations))
-             (not (getf query :aggregate-p)) (not (getf query :set-functions))
-             (every (lambda (target) (constant-p (getf target :expr)))
-                    (getf query :targets)))))))
+               (otherwise nil)))
+           (nonnullable-p (query)
+             (every (lambda (join) (member (getf join :type) '(:inner :cross)))
+                    (getf query :joins)))
+           (pullable-p (query)
+             ;; Match the relevant fences in C is_simple_subquery.
+             (and query
+                  (notany (lambda (target) (cte-expression-volatile-p (getf target :expr)))
+                          (getf query :targets))
+                  (notany (lambda (key) (getf query key))
+                          '(:set-operation :aggregate-p :group-keys :has-having
+                            :set-functions :windows :order :limit :distinct :ctes))))
+           (source-query (source)
+             (unless (or (getf source :lateral-dependent)
+                         (getf source :cte-worktable))
+               (or (getf source :subquery-prepared)
+                   (let ((cte (getf source :cte)))
+                     (when (and cte (not (sql-cte-shared-p cte)))
+                       (sql-cte-prepared cte))))))
+           (record-constant-p (form query)
+             (when (nonnullable-p query)
+               (let ((sources (or (getf query :source-relations)
+                                  (getf query :relations))))
+                 (case (first form)
+                   (:whole-row
+                    (let* ((source (nth (getf (cdddr form) :source-index) sources))
+                           (child (source-query source)))
+                      (and (pullable-p child) (not (getf child :relations))
+                           (every (lambda (target) (constant-p (getf target :expr)))
+                                  (getf child :targets)))))
+                   (:col
+                    (let* ((slot (1- (second form)))
+                           (source (find-if
+                                    (lambda (source)
+                                      (<= (getf source :offset) slot
+                                          (1- (+ (getf source :offset)
+                                                 (getf source :width)))))
+                                    sources))
+                           (child (and source (source-query source))))
+                      (and (pullable-p child)
+                           (record-constant-p
+                            (getf (nth (- slot (getf source :offset))
+                                       (getf child :targets)) :expr)
+                            child)))))))))
+    (and (eq (expr-type expression) :record)
+         (let ((source-expression
+                 (if (getf prepared :aggregate-p)
+                     ;; Translate the grouped output slot once to its source key.
+                     (when (eq (first expression) :col)
+                       (nth (1- (second expression)) (getf prepared :group-keys)))
+                     expression)))
+           (and source-expression (record-constant-p source-expression prepared))))))
 
 (defun select-distinct-keys (prepared)
   "Build the keys for DISTINCT, placing ORDER BY keys first for sorted plans.
@@ -364,10 +415,10 @@ sorting and adjacent equality. The remaining key order controls sort priority."
     (when aggregate-p
       (setf input
             (list (if physical-p
-                      (if (prepared-transition-aggregate-p prepared) :sorted-aggregate :hash-aggregate)
+                      (if (prepared-sorted-aggregate-p prepared) :sorted-aggregate :hash-aggregate)
                       :aggregate)
                   (getf prepared :group-keys)
-                  (if (prepared-transition-aggregate-p prepared)
+                  (if (prepared-sorted-aggregate-p prepared)
                       (getf prepared :aggregates) (getf prepared :aggregate-count))
                   input)))
     (when (getf prepared :having)
@@ -859,6 +910,18 @@ if a registered TOAST index is missing."
    (lambda (arena)
      (stream-select-sort-with-arena streamer order callback arena on-complete))))
 
+(defun grouping-rows-equal-p (keys left right)
+  "Compare grouping keys in LEFT and RIGHT using SQL not-distinct semantics.
+Two NULLs match, and one NULL does not. As in C ExecBuildGroupingEqual, visit
+the least significant key first and stop at the first unequal key. Record
+equality likewise stops at the first unequal field; an error in a later field
+is raised only if comparison reaches it."
+  (loop for key in (reverse keys)
+        for a = (eval-expr key left)
+        for b = (eval-expr key right)
+        always (if (eq a +null+) (eq b +null+)
+                   (and (not (eq b +null+)) (sql-compare "=" a b)))))
+
 (defun stream-sorted-distinct (source keys callback)
   "Sort DISTINCT inputs and compare adjacent rows when records cannot be hashed.
 Sorting visits keys in priority order; adjacent equality visits them in reverse
@@ -870,11 +933,7 @@ sorter for spill and origins, and emit each row as (projected . projected)."
      source (mapcar (lambda (key) (list (list :sort-output (second key)))) keys)
      (lambda (row)
        (unless (and previous
-                    (loop for key in (reverse keys)
-                          for a = (eval-expr key previous)
-                          for b = (eval-expr key (car row))
-                          always (if (eq a +null+) (eq b +null+)
-                                     (and (not (eq b +null+)) (sql-compare "=" a b)))))
+                    (grouping-rows-equal-p keys previous (car row)))
          (setf previous (copy-query-sort-value (car row)))
          (funcall callback (cons (car row) (car row))))))))
 
@@ -1506,12 +1565,20 @@ on an abnormal exit."
     (values values origins)))
 
 (defun stream-sorted-aggregates (source group-keys descriptors callback)
-  "Keep one group's spillable transitions; final output allocation is unavoidable."
+  "Sort grouped input and stream one group's aggregate transitions at a time.
+Evaluate keys and aggregate inputs before sorting, so spill replay does not
+repeat scalar evaluation. Compare adjacent keys with SQL equality: a singleton
+needs no equality comparison, and record equality can stop before an unsupported
+later field. With no group keys, emit one aggregate even for empty input.
+
+The current group owns its transition states until emission; close them on
+normal completion, consumer stop, or error. The surrounding temporary-file
+scope owns sort spills. A consumer's :STOP ends further group consumption."
   (with-query-temp-files ()
                          (let* ((width (length group-keys))
                                 (keys (loop for key in group-keys for position from 1
                                             collect (list :col position :type (expr-type key) :typmod (expr-typmod key))))
-                                (states nil) (current-key nil) (current-values nil)
+                                (states nil) (current-values nil)
                                 (group-origins nil) (transition-origins nil))
                            (labels ((emit-current ()
                                       (when states
@@ -1526,20 +1593,19 @@ on an abnormal exit."
                                           (setf states nil))))
                                     (consume (row)
                                       (let ((environment (cdr row)))
-                                        (multiple-value-bind (values key) (hash-aggregate-group keys environment)
-                                          (when (and states (not (equal key current-key)))
-                                            (when (eq (emit-current) :stop) (return-from consume :stop)))
-                                          (unless states
-                                            (setf states (make-aggregate-transition-states descriptors)
-                                                  current-key key current-values (coerce values 'vector)
-                                                  group-origins (make-array width :initial-element nil)
-                                                  transition-origins (make-array (length descriptors) :initial-element nil))
-                                            (when (and *datum-origin-capture* *query-row-origins*)
-                                              (dotimes (i width)
-                                                (setf (aref group-origins i) (aref *query-row-origins* i)))))
-                                          (step-aggregate-transition-origins states descriptors environment
-                                                                             *query-row-origins* transition-origins width)
-                                          (step-aggregate-transition-states states descriptors environment width))))
+                                        (when (and states (not (grouping-rows-equal-p keys current-values environment)))
+                                          (when (eq (emit-current) :stop) (return-from consume :stop)))
+                                        (unless states
+                                          (setf states (make-aggregate-transition-states descriptors)
+                                                current-values (subseq environment 0 width)
+                                                group-origins (make-array width :initial-element nil)
+                                                transition-origins (make-array (length descriptors) :initial-element nil))
+                                          (when (and *datum-origin-capture* *query-row-origins*)
+                                            (dotimes (i width)
+                                              (setf (aref group-origins i) (aref *query-row-origins* i)))))
+                                        (step-aggregate-transition-origins states descriptors environment
+                                                                           *query-row-origins* transition-origins width)
+                                        (step-aggregate-transition-states states descriptors environment width)))
                                     (finish ()
                                       (when (and (null states) (null group-keys))
                                         (setf states (make-aggregate-transition-states descriptors)

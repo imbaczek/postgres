@@ -5,6 +5,9 @@ whole-row equality, ordering, DISTINCT and JSON rendering against an isolated C
 peer, using both Simple Query and parameterized Extended Query. Both supplied
 ports must belong to trust-authenticated test servers. The test includes NULL
 JSON fields, nested records, JSONB controls and absent outer-join records.
+Record grouping covers singleton inputs and decisive field prefixes; DISTINCT
+covers projected constants, inline and materialized CTEs, grouped output slots,
+and volatile projection barriers.
 
 Inventory and refactor review: 2026-10-25, based on commit `19df2752d7e`.
 

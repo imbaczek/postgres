@@ -32,6 +32,64 @@
       (rove:ok (sql-compare "<>" left right))
       (rove:ok (minusp (compare-3way left right)))))
 
+(rove:deftest record-grouping-compares-only-reached-fields
+    (dolist (memory '(1 100000))
+      (let ((*query-work-memory-bytes* memory)
+            (*query-temp-directory* (uiop:temporary-directory)))
+        (dolist (fixture '(("(SELECT q AS r,id FROM (SELECT 1 AS id,'{}'::json AS j UNION ALL SELECT 2,NULL::json) q) s"
+                            (("(1,{})" 1) ("(2,)" 1)) (("(1,{})" 1) ("(2,)" 2)))
+                           ("(SELECT q AS r,id FROM (SELECT 1 AS id,NULL::json AS j) q) s"
+                            (("(1,)" 1)) (("(1,)" 1)))
+                           ("(SELECT q AS r,id FROM (SELECT 1 AS id,'{}'::json AS j) q) s"
+                            (("(1,{})" 1)) (("(1,{})" 1)))))
+          (loop for aggregate in '("count(*)" "sum(id)")
+                for expected in (rest fixture)
+                for sql = (format nil "SELECT r::text,~a FROM ~a GROUP BY r ORDER BY r"
+                                  aggregate (first fixture))
+                do (rove:ok (equal expected (subquery-test-rows sql)) sql)))
+        (rove:ok (equal '(("(1,{})" 1) ("(2,)" 2))
+                        (subquery-test-rows
+                         "WITH s AS (SELECT q AS r,id FROM (SELECT 1 AS id,'{}'::json AS j UNION ALL SELECT 2,NULL::json) q) SELECT r::text,sum(id) FROM s GROUP BY r ORDER BY r")))
+        (rove:ok (equal '(("(1,{})" 2))
+                        (subquery-test-rows
+                         "SELECT r::text,count(*) FROM (SELECT q AS r FROM (SELECT 1 AS id,'{}'::jsonb AS j UNION ALL SELECT 1,'{}'::jsonb) q) s GROUP BY r")))))
+  (dolist (json '("'{}'::json" "NULL::json"))
+    (let ((sql (format nil "SELECT r,count(*) FROM (SELECT q AS r FROM (SELECT 1 AS id,~a AS j UNION ALL SELECT 1,~a) q) s GROUP BY r" json json)))
+      (rove:ok (equal "42883"
+                      (handler-case (progn (subquery-test-rows sql) nil)
+                        (pg-error (condition) (pg-error-sqlstate condition))))
+               sql))))
+
+(cl-spec:defproperty record-grouping-prefix-determines-groups
+    ((prefix (range integer -10000 10000)) (delta (range integer 1 100)))
+  (:about stream-sorted-aggregates grouping-rows-equal-p)
+  (:trials (:normal 100))
+  (let* ((fields '(("id" :int4) ("j" :json)))
+         (rows (list (vector (make-sql-record :fields fields :values (vector prefix "{}")))
+                     (vector (make-sql-record :fields fields :values (vector (+ prefix delta) +null+)))))
+         (result nil))
+    (stream-sorted-aggregates
+     (lambda (visit) (dolist (row (reverse rows)) (funcall visit row)))
+     '((:col 1 :type :record)) '((:kind :count :input nil))
+     (lambda (row) (push (list (aref (sql-record-values (aref row 0)) 0) (aref row 1)) result)))
+    (equal (reverse result) (list (list prefix 1) (list (+ prefix delta) 1)))))
+
+(rove:deftest generated-record-grouping-prefix
+    (let ((data (cl-spec:result-data
+                 (cl-spec:run-property 'record-grouping-prefix-determines-groups :seed 42))))
+      (rove:ok (eq :passed (getf data :status)) (format nil "~s" data))
+      (rove:ok (= 100 (getf data :trials)))))
+
+(rove:deftest record-distinct-lineage-stops-at-slot-and-volatility-boundaries
+    (let ((sql "SELECT DISTINCT r FROM (SELECT c AS c,q AS r FROM (SELECT '{}'::json AS j) c CROSS JOIN (SELECT 1 AS id UNION ALL SELECT 2) q) s GROUP BY r"))
+      (rove:ok (= 2 (length (subquery-test-rows sql))))))
+
+(rove:deftest record-distinct-volatile-projection-is-a-barrier
+    (let ((sql "SELECT DISTINCT r FROM (SELECT q AS r,random() AS x FROM (SELECT '{}'::json AS j) q) s CROSS JOIN (SELECT 1 AS n UNION ALL SELECT 2) n"))
+      (rove:ok (equal "42883"
+                      (handler-case (progn (subquery-test-rows sql) nil)
+                        (pg-error (condition) (pg-error-sqlstate condition)))) sql)))
+
 (cl-spec:defproperty record-prefix-determines-comparison
     ((prefix (range integer -10000 10000)) (delta (range integer 1 100)))
   (:about compare-sql-records sql-compare compare-3way)
@@ -81,6 +139,43 @@
                            (funcall visit (cons values values)))
                          '((:col 1 :type :record)) (lambda (row) (declare (ignore row))))
                       (pg-error (condition) (pg-error-sqlstate condition))))))))))
+
+(rove:deftest record-distinct-preserves-constant-projection-lineage
+    (dolist (sql '("SELECT DISTINCT r FROM (SELECT q AS r FROM (SELECT '{\"a\":1}'::json AS j) q) s CROSS JOIN (SELECT 1 AS n UNION ALL SELECT 2) n"
+                   "WITH s AS (SELECT q AS r FROM (SELECT '{\"a\":1}'::json AS j) q) SELECT DISTINCT r FROM s CROSS JOIN (SELECT 1 AS n UNION ALL SELECT 2) n"
+                   "SELECT DISTINCT renamed FROM (SELECT r AS renamed FROM (SELECT q AS r FROM (SELECT '{\"a\":1}'::json AS j) q) s) t CROSS JOIN (SELECT 1 AS n UNION ALL SELECT 2) n"
+                   "SELECT DISTINCT r FROM (SELECT 7 AS preceding, q AS r FROM (SELECT '{\"a\":1}'::json AS j) q) s CROSS JOIN (SELECT 1 AS n UNION ALL SELECT 2) n"))
+      (let ((rows (subquery-test-rows sql)))
+        (rove:ok (= 1 (length rows)) sql)
+        (rove:ok (equal "{\"a\":1}" (aref (sql-record-values (first (first rows))) 0)))))
+  (let ((rows (subquery-test-rows "SELECT DISTINCT r, n FROM (SELECT q AS r FROM (SELECT '{\"a\":1}'::json AS j) q) s CROSS JOIN (SELECT 1 AS n UNION ALL SELECT 2) n ORDER BY n")))
+    (rove:ok (equal '(1 2) (mapcar #'second rows))
+             "pruning the constant record retains the varying DISTINCT key"))
+  (dolist (sql '("WITH s AS MATERIALIZED (SELECT q AS r FROM (SELECT '{\"a\":1}'::json AS j) q) SELECT DISTINCT r FROM s CROSS JOIN (SELECT 1 AS n UNION ALL SELECT 2) n"
+                 "SELECT DISTINCT r FROM (SELECT q AS r FROM (SELECT '{\"a\":1}'::json AS j) q LIMIT 1) s CROSS JOIN (SELECT 1 AS n UNION ALL SELECT 2) n"
+                 "SELECT DISTINCT r FROM (SELECT q AS r FROM (SELECT 1 AS n UNION ALL SELECT 2) n LEFT JOIN (SELECT '{\"a\":1}'::json AS j) q ON n.n = 1) s CROSS JOIN (SELECT 1 AS m UNION ALL SELECT 2) m"))
+    (rove:ok (equal "42883"
+                    (handler-case (progn (subquery-test-rows sql) nil)
+                      (pg-error (condition) (pg-error-sqlstate condition))))
+             sql)))
+
+(cl-spec:defproperty record-distinct-projection-depth
+    ((depth (range integer 0 6)) (payload (range integer -1000 1000)))
+  (:about constant-distinct-record-p)
+  (:trials (:normal 40))
+  (let ((source (format nil "SELECT q AS r FROM (SELECT '~d'::json AS j) q" payload)))
+    (dotimes (index depth)
+      (setf source (format nil "SELECT r FROM (~a) alias~d" source index)))
+    (let* ((sql (format nil "SELECT DISTINCT r FROM (~a) s CROSS JOIN (SELECT 1 AS n UNION ALL SELECT 2) n" source))
+           (plan (plan-select-query (first (parse-statements sql))))
+           (prepared (query-plan-prepared plan)))
+      (null (select-distinct-keys prepared)))))
+
+(rove:deftest generated-record-distinct-projection-lineage
+    (let ((result (cl-spec:result-data
+                   (cl-spec:run-property 'record-distinct-projection-depth :seed 42))))
+      (rove:ok (eq :passed (getf result :status)) (format nil "~s" result))
+      (rove:ok (= 40 (getf result :trials)))))
 
 (rove:deftest test-sql-strict-let-evaluation
     (let ((evaluations '()))
