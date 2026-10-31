@@ -74,7 +74,8 @@
   ;; The first durable end anchors SOURCE-ID. Catalog ends accumulate the
   ;; maximum for that source; USER-END is this transaction's commit terminal.
   ;; A source mismatch is sticky.
-  source-id catalog-end user-end (source-changed-p nil))
+  source-id catalog-end user-end (source-changed-p nil)
+  (ddl-prepared-p nil) ddl-wait-mode (final-ddl-p nil) final-ddl-end)
 
 (defun prepare-backend-wal-obligation (backend)
   "Snapshot the source and prepare an obligation before WAL publication.
@@ -100,6 +101,21 @@ permanently. A mismatched context cannot prove replication. A NIL end changes no
             (setf (transaction-wal-obligation-catalog-end context)
                   (max end (or (transaction-wal-obligation-catalog-end context) 0)))
             (setf (transaction-wal-obligation-user-end context) end))))
+  (values))
+
+(defun record-final-ddl-wal-boundary (context source end)
+  (setf (transaction-wal-obligation-final-ddl-p context) t)
+  (record-transaction-wal-boundary context source end t)
+  (when (and end (not (transaction-wal-obligation-source-changed-p context)))
+    (setf (transaction-wal-obligation-final-ddl-end context) end))
+  (values))
+
+(defun prepare-backend-final-ddl (backend)
+  (let ((mode (synchronous-commit-wait-mode)))
+    (multiple-value-bind (context source) (prepare-backend-wal-obligation backend)
+      (declare (ignore source))
+      (setf (transaction-wal-obligation-ddl-prepared-p context) t
+            (transaction-wal-obligation-ddl-wait-mode context) mode)))
   (values))
 
 (defun backend-own-wal-effects-p (backend)
@@ -2351,7 +2367,7 @@ On commit, retire the saved settings snapshot; abort leaves it for whole-table u
       (unwind-protect
            (handler-bind ((error (lambda (condition) (unless failure (setf failure condition)))))
              (unwind-protect
-                  (release-xid xid)
+                  (when xid (release-xid xid))
                ;; Use the raw mutex to retire private references even if WAL is
                ;; poisoned.  This does not clear poison; any future remote wait
                ;; must run outside this mutex.
@@ -2375,21 +2391,22 @@ On commit, retire the saved settings snapshot; abort leaves it for whole-table u
     (error "Invalid synchronous commit wait mode: ~s" *synchronous-commit-wait-mode*))
   *synchronous-commit-wait-mode*)
 
-(defun wait-for-committed-wal-obligation (backend obligation mode)
+(defun wait-for-committed-wal-obligation
+    (backend obligation mode &optional (end (and obligation (transaction-wal-obligation-user-end obligation))))
   "Wait for this locally committed transaction's own terminal boundary.
 A changed source or abnormal exit suppresses frontend output, as does
 termination; cancellation and timeout are handled after committed cleanup.
 The caller keeps interrupts masked and retains the XID until cleanup."
   (when (and mode obligation
              (or (transaction-wal-obligation-source-changed-p obligation)
-                 (transaction-wal-obligation-user-end obligation)))
+                 end))
     (let ((complete nil))
       (unwind-protect
            (let ((outcome
                    (if (transaction-wal-obligation-source-changed-p obligation)
                        :source-changed
                        (sync-replication-wait
-                        backend (transaction-wal-obligation-user-end obligation)
+                        backend end
                         mode (transaction-wal-obligation-source-id obligation)))))
              (ecase outcome
                ((:acknowledged :disabled :cancelled :timeout))
@@ -2430,6 +2447,31 @@ and source change close the connection. An incomplete response suppresses output
     (ereport-fatal "08006" "connection closed after unconfirmed synchronous commit"))
   (values))
 
+(defun backend-final-ddl-committed-p (backend)
+  (let ((context (backend-wal-obligation backend)))
+    (and context (transaction-wal-obligation-final-ddl-p context))))
+
+(defun finish-failed-final-ddl (backend)
+  (suppress-backend-frontend-output backend :abnormal-ddl-completion)
+  (when (or (backend-xid backend) (not (eq (backend-state backend) :idle)))
+    (if (and (backend-xid backend) (not *wal-poisoned*))
+        (abort-transaction)
+        (finish-committed-transaction backend (backend-xid backend))))
+  (values))
+
+(defun commit-final-ddl-without-xid (backend)
+  (let* ((context (backend-wal-obligation backend))
+         (outcome nil))
+    (sb-sys:without-interrupts
+      (unwind-protect
+           (setf outcome
+                 (wait-for-committed-wal-obligation
+                  backend context (transaction-wal-obligation-ddl-wait-mode context)
+                  (transaction-wal-obligation-final-ddl-end context)))
+        (finish-committed-transaction backend nil))
+      (finish-synchronous-commit-response backend outcome)))
+  (values))
+
 (defun commit-transaction ()
   (ensure-exported-snapshot-scope-can-end *backend*)
   (prepare-backend-portal-transaction-end *backend* t)
@@ -2459,7 +2501,9 @@ and source change close the connection. An incomplete response suppresses output
                 (prepare-backend-wal-obligation b))
             (sb-sys:without-interrupts
               (let ((irreversible nil)
-                    (mode (synchronous-commit-wait-mode))
+                    (mode (if (backend-final-ddl-committed-p b)
+                              (transaction-wal-obligation-ddl-wait-mode (backend-wal-obligation b))
+                              (synchronous-commit-wait-mode)))
                     (outcome nil)
                     (wal-ready-at-entry-p *wal-ready*)
                     (xid (backend-xid b)))
@@ -2480,7 +2524,9 @@ and source change close the connection. An incomplete response suppresses output
                   (when (or irreversible (and wal-ready-at-entry-p *wal-poisoned*))
                     (finish-committed-transaction b xid)))
                 (finish-synchronous-commit-response b outcome)))))
-        (finish-backend-transaction b t)))
+        (if (backend-final-ddl-committed-p b)
+            (commit-final-ddl-without-xid b)
+            (finish-backend-transaction b t))))
   (values))
 
 (defun abort-transaction ()

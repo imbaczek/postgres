@@ -505,6 +505,30 @@
           (rove:ok (plusp (file-length other))
                    "other streams retain normal framing")))))
 
+(cl-spec:defproperty final-ddl-boundary-preserves-irreversibility
+    ((end (range integer 1 1000000))
+     (source-choice (range integer 0 1)))
+  (:about record-final-ddl-wal-boundary)
+  (:trials (:normal 100))
+  (let ((context (make-transaction-wal-obligation :source-id :source-a :catalog-end 1))
+        (same-source (zerop source-choice)))
+    (record-final-ddl-wal-boundary context (if same-source :source-a :source-b) end)
+    (and (transaction-wal-obligation-final-ddl-p context)
+         (if same-source
+             (and (eql end (transaction-wal-obligation-final-ddl-end context))
+                  (not (transaction-wal-obligation-source-changed-p context)))
+             (and (transaction-wal-obligation-source-changed-p context)
+                  (null (transaction-wal-obligation-final-ddl-end context)))))))
+
+(rove:deftest final-ddl-boundary-recording-contract
+    (unit-check-property 'final-ddl-boundary-preserves-irreversibility)
+  (let ((context (make-transaction-wal-obligation)))
+    (record-final-ddl-wal-boundary context :source-a nil)
+    (rove:ok (transaction-wal-obligation-final-ddl-p context))
+    (rove:ok (null (transaction-wal-obligation-final-ddl-end context)))
+    (rove:ok (null (transaction-wal-obligation-catalog-end context)))
+    (rove:ok (null (transaction-wal-obligation-source-id context)))))
+
 (rove:deftest synchronous-queue-orders-lsns-and-preserves-completed-outcomes
     (call-with-sync-wait-state
      (lambda ()

@@ -167,7 +167,7 @@ Recheck identities after waiting and under catalog locks before changing storage
          (setf previous (copy-pg-sequence sequence)
                (pg-sequence-last-value sequence) last
                (pg-sequence-called-p sequence) called)
-         (save-catalog :logical-event (logical-sequence-state-event name)))))
+         (save-catalog :final-ddl-p t :logical-event (logical-sequence-state-event name)))))
     (send-command-complete stream "APPLY LOGICAL EVENT")))
 
 (defun logical-event-ddl-ast (payload)
@@ -260,7 +260,7 @@ Recheck identities after waiting and under catalog locks before changing storage
                                  :min-value minimum :max-value maximum
                                  :last-value start :called-p nil)
                created t))
-       (save-catalog :logical-event
+       (save-catalog :final-ddl-p t :logical-event
                      (logical-catalog-event-for-ast ast))))
     (send-command-complete stream "CREATE SEQUENCE")))
 
@@ -296,7 +296,7 @@ Recheck identities after waiting and under catalog locks before changing storage
                (ereport "22003" "sequence restart value is out of bounds"))
              (setf (pg-sequence-last-value sequence) restart
                    (pg-sequence-called-p sequence) nil)))
-         (save-catalog :logical-event
+         (save-catalog :final-ddl-p t :logical-event
                        (logical-catalog-event-for-ast ast)))))
     (send-command-complete stream "ALTER SEQUENCE")))
 
@@ -349,7 +349,7 @@ Recheck identities after waiting and under catalog locks before changing storage
                (when if-exists
                  (send-notice stream
                               (format nil "sequence \"~a\" does not exist, skipping" name))))))
-       (save-catalog :logical-event
+       (save-catalog :final-ddl-p t :logical-event
                      (logical-catalog-event-for-ast ast))))
     (send-command-complete stream "DROP SEQUENCE")))
 
@@ -412,7 +412,7 @@ Recheck identities after waiting and under catalog locks before changing storage
        (setf (pg-publication-oid publication) (allocate-oid))
        (setf (gethash name (database-publications db)) publication
              created t)
-       (save-catalog :logical-event
+       (save-catalog :final-ddl-p t :logical-event
                      (logical-catalog-event-for-ast ast))))
     (send-command-complete stream "CREATE PUBLICATION")))
 
@@ -496,7 +496,7 @@ Recheck identities after waiting and under catalog locks before changing storage
            (incf (pg-publication-generation candidate))
            (validate-publication-definition candidate db)
            (setf (gethash name (database-publications db)) candidate)
-           (save-catalog :logical-event (logical-catalog-event-for-ast ast))))))
+           (save-catalog :final-ddl-p t :logical-event (logical-catalog-event-for-ast ast))))))
     (send-command-complete stream "ALTER PUBLICATION")))
 
 (defun exec-drop-publication (stream ast)
@@ -520,7 +520,7 @@ Recheck identities after waiting and under catalog locks before changing storage
                  (send-notice stream
                               (format nil "publication \"~a\" does not exist, skipping"
                                       name))))))
-       (save-catalog :logical-event
+       (save-catalog :final-ddl-p t :logical-event
                      (logical-catalog-event-for-ast ast))))
     (send-command-complete stream "DROP PUBLICATION")))
 
@@ -994,7 +994,7 @@ before this removal horizon is captured."
               ;; have been built above and inline indexes are empty here.
               (setf (pg-index-valid-p idx) t)
               (fsync-index idx))
-            (save-catalog :logical-event
+            (save-catalog :final-ddl-p t :logical-event
                           (logical-catalog-event-for-ast ast)
                           :on-record-appended (lambda () (setf terminal-appended t))))))
       (send-command-complete stream "CREATE TABLE"))))
@@ -1043,7 +1043,7 @@ before this removal horizon is captured."
                   (send-notice stream
                                (format nil "table \"~a\" does not exist, skipping"
                                        name)))))
-          (save-catalog :logical-event
+          (save-catalog :final-ddl-p t :logical-event
                         (logical-catalog-event-for-ast ast)))))
     (send-command-complete stream "DROP TABLE")))
 
@@ -1122,7 +1122,7 @@ before this removal horizon is captured."
                           (when skipped
                             (wal-defer-relation-delete
                              (pg-index-relfilenode idx)))
-                          (save-catalog :logical-event
+                          (save-catalog :final-ddl-p t :logical-event
                                         (logical-catalog-event-for-ast ast)))
                       (error (publish-condition)
                         ;; Do not roll back memory if WAL has published this
@@ -1209,7 +1209,7 @@ before this removal horizon is captured."
                   (send-notice stream
                                (format nil "index \"~a\" does not exist, skipping"
                                        name)))))
-          (save-catalog :logical-event
+          (save-catalog :final-ddl-p t :logical-event
                         (logical-catalog-event-for-ast ast)))))
     (send-command-complete stream "DROP INDEX")))
 
@@ -1236,7 +1236,7 @@ before this removal horizon is captured."
               (ereport "42704" "index \"~a\" does not exist" name)))
         (with-catalog-mutation-rollback (db)
           (rename-index* db name new-name)
-          (save-catalog :logical-event
+          (save-catalog :final-ddl-p t :logical-event
                         (logical-catalog-event-for-ast ast)))))
     (send-command-complete stream "ALTER INDEX")))
 
@@ -1290,7 +1290,7 @@ before this removal horizon is captured."
           (setf (pg-index-constraint-p idx) t)
           (unless (string= new-name (pg-index-name idx))
             (rename-index* db (pg-index-name idx) new-name))
-          (save-catalog :logical-event
+          (save-catalog :final-ddl-p t :logical-event
                         (logical-catalog-event-for-ast ast)))))))
 
 (defun exec-alter-table-constraint (stream db table ast)
@@ -1325,7 +1325,7 @@ before this removal horizon is captured."
              (rename-index* db name (getf ast :new-name)))
             (:drop-constraint
              (drop-index* db name)))
-          (save-catalog :logical-event
+          (save-catalog :final-ddl-p t :logical-event
                         (logical-catalog-event-for-ast ast)))))
     t))
 
@@ -1411,7 +1411,7 @@ before this removal horizon is captured."
                   t))
           (unless (string= new-name (pg-index-name new-idx))
             (rename-index* db (pg-index-name new-idx) new-name))
-          (save-catalog :logical-event
+          (save-catalog :final-ddl-p t :logical-event
                         (logical-catalog-event-for-ast ast)))))))
 
 (defun exec-alter-column-storage (db table ast)
@@ -1440,7 +1440,7 @@ before this removal horizon is captured."
             (setf (pg-column-storage replacement) storage
                   (aref columns (1- (pg-column-attnum column))) replacement
                   (pg-class-columns table) columns))
-          (save-catalog :logical-event (logical-catalog-event-for-ast ast)))))))
+          (save-catalog :final-ddl-p t :logical-event (logical-catalog-event-for-ast ast)))))))
 
 (defun exec-alter-table (stream ast)
   (let* ((name (getf ast :table))
@@ -1523,7 +1523,7 @@ before this removal horizon is captured."
                                 (1- attnum)))
                          t)))
                (fsync-index idx)
-               (save-catalog :logical-event
+               (save-catalog :final-ddl-p t :logical-event
                              (logical-catalog-event-for-ast ast))))))))
     (send-command-complete stream "ALTER TABLE")))
 
@@ -1534,7 +1534,7 @@ before this removal horizon is captured."
   (commit-transaction)
   (flush-logical-ddl-deferred-responses responses))
 
-(defun execute-in-transaction (stream ast)
+(defun execute-in-transaction-body (stream ast)
   (let ((implicit (not (or (backend-explicit *backend*)
                            (backend-implicit-query-block *backend*))))
         (logical-ddl-responses nil)
@@ -1613,7 +1613,7 @@ before this removal horizon is captured."
                     result))
                 (execute-body)))
         (error (e)
-          (if (fatal-error-p e)
+          (if (or (fatal-error-p e) (backend-final-ddl-committed-p *backend*))
               (error e)
               (progn
                 (if implicit
@@ -1629,6 +1629,23 @@ before this removal horizon is captured."
           (commit-transaction)))
     (when copy-row-count
       (send-copy-command-complete stream copy-row-count))))
+
+(defun execute-in-transaction (stream ast)
+  (if (ddl-p ast)
+      (progn
+        (prepare-backend-final-ddl *backend*)
+        (let ((context (backend-wal-obligation *backend*))
+              (complete nil))
+          (sb-sys:without-interrupts
+            (unwind-protect
+                 (multiple-value-prog1
+                     (sb-sys:allow-with-interrupts
+                       (sb-sys:with-local-interrupts
+                         (execute-in-transaction-body stream ast)))
+                   (setf complete t))
+              (when (and (not complete) (transaction-wal-obligation-final-ddl-p context))
+                (finish-failed-final-ddl *backend*))))))
+      (execute-in-transaction-body stream ast)))
 
 (defun execute-statement (stream ast)
   (let ((type (getf ast :type)))

@@ -332,5 +332,5 @@ snapshot is scanned. Expression evaluation holds no global write/catalog mutex."
                      (setf (getf replacement :name) (getf ast :new-name)))
                  (setf (pg-class-checks table)
                        (substitute replacement check (pg-class-checks table))))))
-            (save-catalog :logical-event (logical-catalog-event-for-ast ast)))))))
+            (save-catalog :final-ddl-p t :logical-event (logical-catalog-event-for-ast ast)))))))
   t)

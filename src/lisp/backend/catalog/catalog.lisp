@@ -468,16 +468,21 @@ cluster-wide minimum directly and skips missing horizons."
   (or *catalog-oldest-relfrozenxid*
       (catalog-compute-oldest-relfrozenxid)))
 
-(defun save-catalog (&key deferred-relations logical-event on-record-appended
+(defun save-catalog (&key deferred-relations logical-event on-record-appended final-ddl-p
                        (applied-logical-event-id *logical-event-apply-id*))
   (prevent-recovery-write "catalog persistence")
+  (when final-ddl-p
+    (unless (and *backend* (eq (backend-state *backend*) :in-progress)
+                 (backend-wal-obligation *backend*)
+                 (transaction-wal-obligation-ddl-prepared-p (backend-wal-obligation *backend*)))
+      (error "Final DDL publication requires a prepared backend context")))
   ;; Do fallible derived-state work before publication. Once WAL commits, the
   ;; generation update and cache assignment below must not signal: callers use
   ;; the generation to distinguish rollback-safe failures from durable ones.
   ;; Only an active backend transaction captures this catalog terminal.
   ;; Startup saves and maintenance outside a transaction are excluded.
   (multiple-value-bind (obligation source)
-      (when (and *wal-ready* *backend* (eq (backend-state *backend*) :in-progress))
+      (when (and (or *wal-ready* final-ddl-p) *backend* (eq (backend-state *backend*) :in-progress))
         (prepare-backend-wal-obligation *backend*))
     (let* ((event-key (car applied-logical-event-id))
            (event-lsn (cdr applied-logical-event-id))
@@ -509,10 +514,11 @@ cluster-wide minimum directly and skips missing horizons."
                :relation-deletes deferred-relations
                :logical-event logical-event
                :on-record-appended on-record-appended
-               ;; This records a catalog boundary, not an XID commit or final DDL.
                :on-durable (when obligation
                              (lambda (end)
-                               (record-transaction-wal-boundary obligation source end t)))))
+                               (if final-ddl-p
+                                   (record-final-ddl-wal-boundary obligation source end)
+                                   (record-transaction-wal-boundary obligation source end t))))))
             (incf *catalog-durable-generation*)
             (setf *catalog-oldest-relfrozenxid* oldest))
         (error (condition)

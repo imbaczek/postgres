@@ -104,6 +104,37 @@
        (pg::wal-save-control-fields 0 0)
        (funcall function)))))
 
+(deftest final-ddl-without-wal-keeps-only-the-commit-marker
+    (call-with-resource-wal-fixture
+     (lambda ()
+       (let ((pg::*wal-ready* nil))
+         (pg::catalog-init)
+         (uiop:with-temporary-file (:stream stream :direction :io
+                                    :element-type '(unsigned-byte 8))
+           (let* ((pg::*relation-streams* (make-hash-table :test #'equal))
+                  (pg::*backend* (pg::make-backend :stream stream))
+                  (original (symbol-function 'pg::save-catalog))
+                  (context nil))
+             (unwind-protect
+                  (progn
+                    (setf (symbol-function 'pg::save-catalog)
+                          (lambda (&rest arguments)
+                            (multiple-value-prog1 (apply original arguments)
+                              (when (getf arguments :final-ddl-p)
+                                (setf context (pg::backend-wal-obligation pg::*backend*))))))
+                    (pg::exec-simple-query stream "CREATE TABLE ddl_no_wal (id int)")
+                    (ok context)
+                    (ok (pg::transaction-wal-obligation-final-ddl-p context))
+                    (ok (null (pg::transaction-wal-obligation-final-ddl-end context)))
+                    (ok (null (pg::transaction-wal-obligation-catalog-end context)))
+                    (ok (null (pg::transaction-wal-obligation-source-id context)))
+                    (ok (null (pg::backend-wal-obligation pg::*backend*)))
+                    (ok (eq :idle (pg::backend-state pg::*backend*)))
+                    (ok (pg::lookup-table "ddl_no_wal"))
+                    (ok (plusp (file-length stream))))
+               (setf (symbol-function 'pg::save-catalog) original)
+               (pg::smgr-close-all))))))))
+
 (defun call-with-synchronous-commit-test-state (function)
   (let ((pg::*wal-sender-registry* (make-hash-table :test #'eq))
         (pg::*physical-recovery-state* nil)
