@@ -348,6 +348,154 @@
                 (ok (= 1 cleaned)))
            (dolist (entry saved) (setf (symbol-function (car entry)) (cdr entry))))))))
 
+(deftest superseded-receipt-disable-cannot-claim-or-save-after-preparation
+    (call-with-retained-follow-config
+     (lambda (root store config)
+       (declare (ignore root store))
+       (let* ((desired (pg::physical-follow-next-desired
+                        nil "" "" "rx" (getf pg::*physical-recovery-state* :timeline-policy) t))
+              (replacement (pg::physical-follow-next-desired
+                            desired "host=replacement" "" "rx"
+                            (getf pg::*physical-recovery-state* :timeline-policy) t))
+              (pg::*physical-follow-desired* desired)
+              (runtime (pg::make-physical-follow-runtime :generation desired :config config))
+              (pg::*physical-follow-runtime* runtime)
+              (pg::*physical-follow-operation* nil)
+              (pg::*physical-follow-controller-blocked-p* nil)
+              (pg::*physical-follow-controller-stopping-p* nil)
+              (pg::*physical-follow-manual-generation* nil)
+              (pg::*physical-follow-desired-stopping-p* nil)
+              (check (symbol-function 'pg::physical-follow-controller-check-current))
+              (claim (symbol-function 'pg::physical-follow-persist-management))
+              (save (symbol-function 'pg::physical-follow-controller-save-config))
+              (claims 0) (saves 0))
+         (unwind-protect
+              (progn
+                (setf (symbol-function 'pg::physical-follow-controller-check-current)
+                      (lambda (image)
+                        (funcall check image)
+                        (pg::physical-follow-install-desired replacement)
+                        (setf claims 0))
+                      (symbol-function 'pg::physical-follow-persist-management)
+                      (lambda (base) (incf claims) (funcall claim base))
+                      (symbol-function 'pg::physical-follow-controller-save-config)
+                      (lambda (image) (incf saves) (funcall save image)))
+                (ok (signals (pg::physical-follow-disable-desired-receipt desired)
+                             'pg::physical-follow-generation-changed))
+                (ok (eq replacement pg::*physical-follow-desired*))
+                (ok (zerop claims))
+                (ok (zerop saves))
+                (ok (equal config (pg::physical-follow-read-config)))
+                (ok (equal config (pg::physical-follow-runtime-config runtime)))
+                (ok (pg::physical-follow-runtime-receiver-stopped-p runtime))
+                (ok (not pg::*physical-recovery-failed-p*)))
+           (setf (symbol-function 'pg::physical-follow-controller-check-current) check
+                 (symbol-function 'pg::physical-follow-persist-management) claim
+                 (symbol-function 'pg::physical-follow-controller-save-config) save))))))
+
+(deftest superseded-policy-wait-stops-old-receipt-without-publishing-retry
+    (call-with-retained-follow-config
+     (lambda (root store config)
+       (declare (ignore root store))
+       (let* ((a (pg::physical-follow-next-desired
+                  nil "host=old" "" "rx" (getf pg::*physical-recovery-state* :timeline-policy) t))
+              (b (pg::physical-follow-next-desired
+                  a "host=new" "" "rx" (getf pg::*physical-recovery-state* :timeline-policy) t))
+              (pg::*physical-follow-desired* a)
+              (runtime (pg::make-physical-follow-runtime :generation a :config config
+                                                         :transition '(:accepted)))
+              (pg::*physical-follow-runtime* runtime)
+              (pg::*physical-follow-auto-error* '(:new-generation-error))
+              (pg::*physical-follow-auto-retry-after* 123)
+              (quiesce (symbol-function 'pg::physical-follow-quiesce-receiver))
+              (joined-with-fence nil) (transition-after-stop nil))
+         (unwind-protect
+              (progn
+                (setf (symbol-function 'pg::physical-follow-quiesce-receiver)
+                      (lambda ()
+                        (setf joined-with-fence
+                              (sb-thread:holding-mutex-p pg::*physical-follow-generation-lock*))
+                        (funcall quiesce)
+                        (setf transition-after-stop (copy-tree (pg::physical-follow-runtime-transition runtime)))
+                        (pg::physical-follow-install-desired b)))
+                (sb-thread:with-mutex (pg::*physical-follow-command-lock*)
+                  (pg::physical-follow-wait-for-policy runtime :old-decision t))
+                (ok (not joined-with-fence))
+                (ok (eq b pg::*physical-follow-desired*))
+                (ok (pg::physical-follow-runtime-receiver-stopped-p runtime))
+                (ok (equal transition-after-stop (pg::physical-follow-runtime-transition runtime)))
+                (ok (equal '(:new-generation-error) pg::*physical-follow-auto-error*))
+                (ok (= 123 pg::*physical-follow-auto-retry-after*)))
+           (setf (symbol-function 'pg::physical-follow-quiesce-receiver) quiesce))))))
+
+(deftest superseded-desired-reconciliation-cannot-replace-current-error
+    (call-with-retained-follow-config
+     (lambda (root store config)
+       (declare (ignore root store config))
+       (let* ((a (pg::physical-follow-next-desired
+                  nil "host=old" "" "rx" (getf pg::*physical-recovery-state* :timeline-policy) t))
+              (b (pg::physical-follow-next-desired
+                  a "host=new" "" "rx" (getf pg::*physical-recovery-state* :timeline-policy) t))
+              (pg::*physical-follow-desired* a)
+              (pg::*physical-follow-desired-applied* nil)
+              (pg::*physical-follow-manual-generation* nil)
+              (pg::*physical-follow-manual-reservation* nil)
+              (pg::*physical-follow-desired-stopping-p* nil)
+              (pg::*physical-follow-desired-last-error* "current error")
+              (ensure (symbol-function 'pg::physical-follow-ensure-attachment-state))
+              (disable (symbol-function 'pg::physical-follow-disable-desired-receipt)))
+         (unwind-protect
+              (progn
+                (setf (symbol-function 'pg::physical-follow-ensure-attachment-state) (lambda () nil)
+                      (symbol-function 'pg::physical-follow-disable-desired-receipt)
+                      (lambda (desired)
+                        (declare (ignore desired))
+                        (pg::physical-follow-install-desired b)
+                        (error "old desired failed")))
+                (pg::physical-follow-reconcile-desired-step)
+                (ok (eq b pg::*physical-follow-desired*))
+                (ok (equal "current error" pg::*physical-follow-desired-last-error*))
+                (ok (not pg::*physical-recovery-failed-p*)))
+           (setf (symbol-function 'pg::physical-follow-ensure-attachment-state) ensure
+                 (symbol-function 'pg::physical-follow-disable-desired-receipt) disable))))))
+
+(deftest configured-receipt-disable-fences-management-and-config-publication
+    (call-with-retained-follow-config
+     (lambda (root store config)
+       (declare (ignore root store))
+       (let* ((desired (pg::physical-follow-next-desired
+                        nil "" "" "rx" (getf pg::*physical-recovery-state* :timeline-policy) t))
+              (pg::*physical-follow-desired* desired)
+              (runtime (pg::make-physical-follow-runtime :generation desired :config config))
+              (pg::*physical-follow-runtime* runtime)
+              (pg::*physical-follow-operation* nil)
+              (pg::*physical-follow-controller-blocked-p* nil)
+              (pg::*physical-follow-controller-stopping-p* nil)
+              (pg::*physical-follow-manual-generation* nil)
+              (pg::*physical-follow-desired-stopping-p* nil)
+              (claim (symbol-function 'pg::physical-follow-persist-management))
+              (save (symbol-function 'pg::physical-follow-controller-save-config))
+              (events nil))
+         (flet ((record (phase)
+                  (push (list phase (not sb-sys:*interrupts-enabled*)
+                              (sb-thread:holding-mutex-p pg::*physical-follow-generation-lock*))
+                        events)))
+           (unwind-protect
+                (progn
+                  (setf (symbol-function 'pg::physical-follow-persist-management)
+                        (lambda (base) (record :claim) (funcall claim base))
+                        (symbol-function 'pg::physical-follow-controller-save-config)
+                        (lambda (image) (record :save) (funcall save image)))
+                  (let ((disabled (pg::physical-follow-disable-desired-receipt desired)))
+                    (ok (equal '((:claim t t) (:save t t)) (reverse events)))
+                    (ok (equal disabled (pg::physical-follow-read-config)))
+                    (ok (equal disabled (pg::physical-follow-runtime-config runtime)))
+                    (ok (not (pg::physical-follow-controller-enabled-p disabled))))
+                  (ok (pg::physical-follow-runtime-receiver-stopped-p runtime))
+                  (ok (not (pg::physical-follow-runtime-stopped-p runtime))))
+             (setf (symbol-function 'pg::physical-follow-persist-management) claim
+                   (symbol-function 'pg::physical-follow-controller-save-config) save)))))))
+
 (deftest configured-follow-clear-stops-receipt-and-preserves-replay-and-proof
     (call-with-retained-follow-config
      (lambda (root store config)

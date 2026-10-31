@@ -417,18 +417,30 @@ uses strict candidate proof; protect the store and retained root."
 
 (defvar *physical-follow-auto-retry-after* 0)
 
+(defun physical-follow-operation-check-owner (operation)
+  "Require OPERATION's current authority while holding the follow mutex."
+  (unless (sb-thread:holding-mutex-p *physical-follow-lock*)
+    (error "follow operation ownership check requires the follow mutex"))
+  (physical-follow-require-generation (getf (physical-follow-operation-context operation) :generation))
+  (when (getf (physical-follow-operation-context operation) :configured-p)
+    (physical-follow-check-desired-active (getf (physical-follow-operation-context operation) :generation)))
+  (unless (and (eq operation *physical-follow-operation*)
+               (not (physical-follow-operation-cancelled-p operation))
+               (not *physical-follow-controller-blocked-p*)
+               (not *physical-follow-controller-stopping-p*))
+    (error 'physical-follow-controller-cancelled :format-control "native follow transition was canceled"))
+  t)
+
+(defun physical-follow-operation-owner-current-p (operation)
+  "Check current ownership without replacing an operation's original error."
+  (handler-case (physical-follow-operation-check-owner operation)
+    ((or physical-follow-generation-changed physical-follow-controller-cancelled) () nil)))
+
 (defun physical-follow-operation-check (operation)
   "Require the current uncancelled operation and its captured policy.
 A policy replacement cancels the operation before it can publish or launch."
   (sb-thread:with-mutex (*physical-follow-lock*)
-    (physical-follow-require-generation (getf (physical-follow-operation-context operation) :generation))
-    (when (getf (physical-follow-operation-context operation) :configured-p)
-      (physical-follow-check-desired-active (getf (physical-follow-operation-context operation) :generation)))
-    (unless (and (eq operation *physical-follow-operation*)
-                 (not (physical-follow-operation-cancelled-p operation))
-                 (not *physical-follow-controller-blocked-p*)
-                 (not *physical-follow-controller-stopping-p*))
-      (error 'physical-follow-controller-cancelled :format-control "native follow transition was canceled")))
+    (physical-follow-operation-check-owner operation))
   (let ((context (physical-follow-operation-context operation)))
     (when (and (getf context :policy-captured-p)
                (not (eq (getf context :timeline-policy)
@@ -595,21 +607,50 @@ The saved bound grants no source or WAL authority and creates no PREPARE debt."
       (error "observed follow source belongs to a different cluster"))
     (when (eql 2 (getf *physical-recovery-state* :phase))
       (physical-follow-observe-timeline system-id timeline))
-    (with-live-operation
+    (with-physical-follow-generation-operation
       (let ((current (physical-follow-operation-current-config operation)))
         (let* ((state (physical-follow-remember-timeline
                        (physical-follow-remember-config-timeline current)
                        (or (physical-follow-observed-timeline system-id) timeline)))
-               (known (getf state :known-timeline)))
-          (when (> known (or (getf (physical-follow-controller-state current) :known-timeline) 1))
+               (known (getf state :known-timeline))
+               (changed (> known (or (getf (physical-follow-controller-state current) :known-timeline) 1))))
+          (when changed
             (setf current (physical-follow-with-controller current state))
-            (physical-follow-config-image current)
-            (handler-case (physical-follow-controller-save-config current)
-              (error (condition)
-                (error 'physical-follow-observation-save-failed :cause condition))))
-          (setf (physical-follow-operation-config operation) current)
+            (physical-follow-config-image current))
+          (sb-sys:without-interrupts
+            (when changed
+              (handler-case (physical-follow-controller-save-config current)
+                (error (condition)
+                  (error 'physical-follow-observation-save-failed :cause condition))))
+            (setf (physical-follow-operation-config operation) current))
           (physical-follow-operation-check operation)
           known)))))
+
+(defmacro with-physical-follow-controller-publication ((obsolete) &body body)
+  "Publish under the generation fence, then notify captured owners after release."
+  (let ((mutex (gensym "MUTEX-")) (held (gensym "HELD-")))
+    `(let ((,mutex *physical-follow-generation-lock*) (,held nil) (,obsolete nil))
+       (unless (and (zerop *live-operation-depth*)
+                    (eq *live-operation-quiescence-owner-thread* sb-thread:*current-thread*)
+                    (sb-thread:holding-mutex-p *physical-follow-command-lock*)
+                    (sb-thread:holding-mutex-p *reload-run-lock*))
+         (error "controller publication requires command, reload and quiescence ownership"))
+       (when (or (sb-thread:holding-mutex-p ,mutex)
+                 (sb-thread:holding-mutex-p *physical-follow-lock*)
+                 (sb-thread:holding-mutex-p *wal-sender-lock*)
+                 (sb-thread:holding-mutex-p *wal-lock*)
+                 (and *physical-receive-store*
+                      (sb-thread:holding-mutex-p (physical-store-mutex *physical-receive-store*))))
+         (error "controller publication must acquire its generation fence first"))
+       (sb-sys:without-interrupts
+         (unwind-protect
+              (unwind-protect
+                   (progn
+                     (sb-sys:allow-with-interrupts
+                       (setf ,held (sb-thread:grab-mutex ,mutex)))
+                     ,@body)
+                (when ,held (sb-thread:release-mutex ,mutex)))
+           (sync-replication-notify-obsolete-senders ,obsolete))))))
 
 (defun physical-follow-operation-intent (operation view)
   "Stop the old runtime and save preparation intent before contacting PREPARE.
@@ -644,12 +685,14 @@ that owner stays with the pin until a new publication, not a later reconnect."
                       preview)))
                   (physical-follow-config-image
                    (physical-follow-with-controller intent preview))))
-            (setf (getf (physical-follow-operation-context operation) :intent-write) t)
-            (physical-follow-controller-save-config intent)
-            (setf (physical-follow-operation-config operation) intent
-                  (getf (physical-follow-operation-context operation) :intent) t)
-            (physical-follow-test-point :after-controller-intent)
-            (values entry snapshot)))))))
+            (with-physical-follow-controller-publication (obsolete)
+              (physical-follow-operation-check operation)
+              (setf (getf (physical-follow-operation-context operation) :intent-write) t)
+              (physical-follow-controller-save-config intent)
+              (setf (physical-follow-operation-config operation) intent
+                    (getf (physical-follow-operation-context operation) :intent) t)
+              (physical-follow-test-point :after-controller-intent)
+              (values entry snapshot))))))))
 
 (defun physical-follow-operation-publish (operation view entry anchor)
   "Recheck a fresh snapshot and publish pending then active binding under quiescence.
@@ -695,21 +738,25 @@ transition complete."
                          (getf view :child-history)
                          (coerce (getf anchor :eor-octets) '(vector (unsigned-byte 8))))))))
             (physical-follow-validate-candidate-replay candidate (getf snapshot :base) binding))
-          (physical-follow-operation-check operation)
-          (setf (getf (physical-follow-operation-context operation) :pending-write) t)
-          (physical-follow-controller-save-config pending)
-          (physical-follow-test-point :after-controller-pending)
-          (let ((active (physical-follow-reconcile-pending-store
-                         *physical-receive-store* (getf snapshot :base) pending)))
-            (physical-follow-check-active-state *physical-receive-store* (getf snapshot :base) active)
-            (setf *physical-recovery-state*
-                  (physical-recovery-attach-selected-store *physical-recovery-state* *physical-receive-store*)
-                  (getf *physical-recovery-state* :receive-lsn)
-                  (physical-store-flushed-lsn *physical-receive-store*))
-            (sync-replication-new-source-incarnation)
-            (setf (getf (physical-follow-operation-context operation) :committed) t
-                  (physical-follow-operation-result operation) active)
-            active))))))
+          (with-physical-follow-controller-publication (obsolete)
+            (physical-follow-operation-check operation)
+            (setf (getf (physical-follow-operation-context operation) :pending-write) t)
+            (physical-follow-controller-save-config pending)
+            (physical-follow-test-point :after-controller-pending)
+            (let ((active (physical-follow-reconcile-pending-store
+                           *physical-receive-store* (getf snapshot :base) pending)))
+              (physical-follow-check-active-state *physical-receive-store* (getf snapshot :base) active)
+              (setf *physical-recovery-state*
+                    (physical-recovery-attach-selected-store *physical-recovery-state* *physical-receive-store*)
+                    (getf *physical-recovery-state* :receive-lsn)
+                    (physical-store-flushed-lsn *physical-receive-store*))
+              (multiple-value-bind (source retired-owners)
+                  (sync-replication-new-source-incarnation :defer-notifications t)
+                (declare (ignore source))
+                (setf obsolete retired-owners))
+              (setf (getf (physical-follow-operation-context operation) :committed) t
+                    (physical-follow-operation-result operation) active)
+              active)))))))
 
 (defun physical-follow-operation-recover (operation)
   "Queue a saved preparation and restore the old workers when safe.
@@ -727,12 +774,13 @@ restoration. Ambiguous publication failures fence recovery for restart reconcili
          (let ((config (physical-follow-operation-config operation)))
            (sb-thread:with-mutex (*reload-run-lock*)
              (with-live-operation-quiescence
-               (unless (equal config (physical-follow-read-config))
-                 (error "follow configuration changed before transition recovery"))
-               (when (getf context :intent)
-                 (setf config (physical-follow-abandon-preparation-config config))
-                 (physical-follow-controller-save-config config)
-                 (setf (physical-follow-operation-config operation) config))
+               (with-physical-follow-controller-publication (obsolete)
+                 (unless (equal config (physical-follow-read-config))
+                   (error "follow configuration changed before transition recovery"))
+                 (when (getf context :intent)
+                   (setf config (physical-follow-abandon-preparation-config config))
+                   (physical-follow-controller-save-config config)
+                   (setf (physical-follow-operation-config operation) config)))
                (physical-follow-controller-check-current config)))
            (unless (or (not (physical-follow-generation-current-p (getf context :generation)))
                        *physical-follow-controller-blocked-p*
@@ -756,21 +804,27 @@ restoration. Ambiguous publication failures fence recovery for restart reconcili
                  (not (physical-follow-generation-current-p
                        (getf (physical-follow-operation-context operation) :generation))))))))
 
-(defun physical-follow-wait-for-policy (runtime reason &optional retry-source)
+(defun physical-follow-wait-for-policy
+    (runtime reason &optional retry-source (generation (and runtime (physical-follow-runtime-generation runtime))) operation)
   "Stop receipt under command exclusion; preserve replay and its pause state.
 Only an eligible source retry schedules another automatic discovery."
   (unless (sb-thread:holding-mutex-p *physical-follow-command-lock*)
     (error "policy wait requires follow command exclusion"))
   (when (and runtime (eq runtime *physical-follow-runtime*))
     (physical-follow-quiesce-receiver)
-    (sb-thread:with-mutex (*physical-follow-lock*)
-      (when (eq runtime *physical-follow-runtime*)
-        (setf (physical-follow-runtime-transition runtime)
-              (if retry-source (list :waiting reason :retry-source t) (list :waiting reason)))
-        (when retry-source
-          (setf *physical-follow-auto-error* nil
-                *physical-follow-auto-retry-after*
-                (+ (get-internal-real-time) internal-time-units-per-second)))))
+    (call-with-physical-follow-generation-fence
+     (lambda ()
+       (sb-thread:with-mutex (*physical-follow-lock*)
+         (when (and (eq runtime *physical-follow-runtime*)
+                    (physical-follow-generation-current-p generation)
+                    (or (null operation) (physical-follow-operation-owner-current-p operation)))
+           (sb-sys:without-interrupts
+             (setf (physical-follow-runtime-transition runtime)
+                   (if retry-source (list :waiting reason :retry-source t) (list :waiting reason)))
+             (when retry-source
+               (setf *physical-follow-auto-error* nil
+                     *physical-follow-auto-retry-after*
+                     (+ (get-internal-real-time) internal-time-units-per-second))))))))
     :replay-only))
 
 (defun physical-follow-operation-not-attached (operation decision)
@@ -793,9 +847,13 @@ result; restore stopped workers when needed."
         (physical-follow-wait-for-policy
          *physical-follow-runtime* reason
          (and (getf (physical-follow-operation-context operation) :automatic-p)
-              (getf decision :retry-source)))))
-    (physical-follow-operation-check operation)
-    (setf (physical-follow-operation-result operation) (list :not-attached :reason reason))))
+              (getf decision :retry-source))
+         (getf (physical-follow-operation-context operation) :generation) operation)))
+    (call-with-physical-follow-generation-fence
+     (lambda ()
+       (sb-sys:without-interrupts
+         (physical-follow-operation-check operation)
+         (setf (physical-follow-operation-result operation) (list :not-attached :reason reason)))))))
 
 (defun physical-follow-operation-run (operation)
   (let ((client nil))
@@ -830,8 +888,12 @@ result; restore stopped workers when needed."
                    (physical-follow-launch current
                                            (getf (physical-follow-operation-context operation) :generation)
                                            (getf (physical-follow-operation-context operation) :configured-p))))
-               (setf *physical-follow-auto-error* nil
-                     (physical-follow-operation-result operation) :started))
+               (call-with-physical-follow-generation-fence
+                (lambda ()
+                  (sb-sys:without-interrupts
+                    (physical-follow-operation-check operation)
+                    (setf *physical-follow-auto-error* nil
+                          (physical-follow-operation-result operation) :started)))))
            (physical-follow-route-unavailable (condition)
              (handler-case
                  (physical-follow-operation-not-attached
@@ -853,17 +915,22 @@ result; restore stopped workers when needed."
                              (typep recovery-error 'physical-recovery-worker-shutdown))
                    (setf *physical-recovery-failed-p* t)
                    (admin-log "native follow transition recovery failed: ~a" recovery-error))))
-             (physical-follow-controller-record-error :transition condition)
-             (unless (or (getf (physical-follow-operation-context operation) :configured-p)
-                         (physical-client-retryable-condition-p condition)
-                         (typep condition 'physical-follow-observation-save-failed)
-                         (physical-follow-operation-cancelled-condition-p operation condition))
-               (setf *physical-follow-auto-error*
-                     (list (and (physical-follow-operation-config operation)
-                                (physical-follow-effective-config (physical-follow-operation-config operation)))
-                           (princ-to-string condition))))
-             (setf *physical-follow-auto-retry-after*
-                   (+ (get-internal-real-time) internal-time-units-per-second))))
+             (physical-follow-controller-record-error :transition condition operation)
+             (call-with-physical-follow-generation-fence
+              (lambda ()
+                (sb-thread:with-mutex (*physical-follow-lock*)
+                  (when (physical-follow-operation-owner-current-p operation)
+                    (sb-sys:without-interrupts
+                      (unless (or (getf (physical-follow-operation-context operation) :configured-p)
+                                  (physical-client-retryable-condition-p condition)
+                                  (typep condition 'physical-follow-observation-save-failed)
+                                  (physical-follow-operation-cancelled-p operation))
+                        (setf *physical-follow-auto-error*
+                              (list (and (physical-follow-operation-config operation)
+                                         (physical-follow-effective-config (physical-follow-operation-config operation)))
+                                    (princ-to-string condition))))
+                      (setf *physical-follow-auto-retry-after*
+                            (+ (get-internal-real-time) internal-time-units-per-second)))))))))
       (physical-client-close client)
       (sb-thread:with-mutex (*physical-follow-lock*)
         (setf (physical-follow-operation-client operation) nil)
@@ -1083,10 +1150,11 @@ binding and restart reconciliation; the old slot may not be restored."
 
 (defvar *physical-follow-prepare-timeout* 60)
 
-(defun physical-follow-controller-record-error (key condition)
+(defun physical-follow-controller-record-error (key condition &optional operation)
   (let ((message (princ-to-string condition)))
     (sb-thread:with-mutex (*physical-follow-lock*)
-      (setf (gethash key *physical-follow-controller-errors*) message)))
+      (when (or (null operation) (physical-follow-operation-owner-current-p operation))
+        (setf (gethash key *physical-follow-controller-errors*) message))))
   nil)
 
 (defun physical-follow-cleanup-register-client (client)

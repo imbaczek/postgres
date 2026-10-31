@@ -1,5 +1,189 @@
 (in-package #:pg-physical-tests)
 
+(defun call-with-controller-publication-test-locks (function)
+  "Supply component-test ownership and hold the command and reload mutexes."
+  (let ((pg::*live-operation-quiescence-owner-thread* sb-thread:*current-thread*)
+        (pg::*backend* nil))
+    (sb-thread:with-mutex (pg::*physical-follow-command-lock*)
+      (sb-thread:with-mutex (pg::*reload-run-lock*)
+        (funcall function)))))
+
+(deftest controller-intent-and-active-publication-use-one-fenced-commit-boundary
+    (let* ((pg::*sync-replication-state* (pg::make-sync-replication-state :source-id :source-a))
+           (pg::*wal-sender-registry* (make-hash-table :test #'eq))
+           (save (symbol-function 'pg::physical-follow-save-config))
+           (terminate (symbol-function 'pg::terminate-backend))
+           (owner (pg::make-backend :pid 912 :replication-mode :physical))
+           (operation nil) (events nil))
+      (unwind-protect
+           (progn
+             (setf (symbol-function 'pg::physical-follow-save-config)
+                   (lambda (config)
+                     (let* ((state (pg::physical-follow-controller-state config))
+                            (phase (getf (fifth config) :phase))
+                            (stage (if (getf state :preparing) :intent phase)))
+                       (when stage
+                         (push (list stage (not sb-sys:*interrupts-enabled*)
+                                     (sb-thread:holding-mutex-p pg::*physical-follow-generation-lock*))
+                               events)))
+                     (funcall save config))
+                   (symbol-function 'pg::terminate-backend)
+                   (lambda (backend)
+                     (push (list :notify (not sb-sys:*interrupts-enabled*)
+                                 (sb-thread:holding-mutex-p pg::*physical-follow-generation-lock*)
+                                 (and operation
+                                      (getf (pg::physical-follow-operation-context operation) :committed))
+                                 (eq backend owner))
+                           events)))
+             (call-with-controller-intent
+              (lambda (root store current view entry snapshot)
+                (declare (ignore root store snapshot))
+                (pg::wal-sender-register owner :source-a)
+                (let ((anchor (copy-list (getf entry :request))))
+                  (setf (getf anchor :history-text) (getf view :history-text)
+                        (getf anchor :eor-octets)
+                        (coerce (store-history-eor (getf view :fork) 2 1) 'list))
+                  (let ((active (pg::physical-follow-operation-publish current view entry anchor)))
+                    (ok (eq :active (getf (fifth active) :phase)))
+                    (ok (getf (pg::physical-follow-operation-context current) :committed))
+                    (ok (equal active (pg::physical-follow-read-config))))))
+              :before-intent (lambda (current) (setf operation current)))
+             (ok (equal '((:intent t t) (:pending t t) (:active t t) (:notify t nil t t))
+                        (reverse events)))
+             (ok (zerop (hash-table-count pg::*wal-sender-registry*))))
+        (setf (symbol-function 'pg::physical-follow-save-config) save
+              (symbol-function 'pg::terminate-backend) terminate))))
+
+(deftest controller-publication-fence-wait-remains-interruptible
+    (let ((lock pg::*physical-follow-generation-lock*)
+          (thread nil) (entered nil) (result nil) (waiting nil))
+      (sb-thread:grab-mutex lock)
+      (unwind-protect
+           (progn
+             (setf thread
+                   (sb-thread:make-thread
+                    (lambda ()
+                      (setf result
+                            (catch 'cancel-publication-wait
+                              (call-with-controller-publication-test-locks
+                               (lambda ()
+                                 (pg::with-physical-follow-controller-publication (obsolete)
+                                   (setf entered t))))
+                              :unexpected-success)))))
+             (loop with deadline = (+ (get-internal-real-time)
+                                      (* 3 internal-time-units-per-second))
+                   until (or (setf waiting (eq lock (sb-thread::thread-waiting-for thread)))
+                             (not (sb-thread:thread-alive-p thread))
+                             (> (get-internal-real-time) deadline))
+                   do (sleep 0.001))
+             (ok waiting)
+             (sb-thread:interrupt-thread
+              thread (lambda () (throw 'cancel-publication-wait :cancelled)))
+             (ok (not (eq :blocked (sb-thread:join-thread thread :timeout 3 :default :blocked))))
+             (ok (eq :cancelled result))
+             (ok (not entered)))
+        (when (sb-thread:holding-mutex-p lock) (sb-thread:release-mutex lock))
+        (when thread (sb-thread:join-thread thread)))))
+
+(deftest controller-publication-finishes-markers-and-notifications-before-interruption
+    (let* ((owner (pg::make-backend :pid 911))
+           (owners (list owner))
+           (ready (sb-thread:make-semaphore))
+           (resume (sb-thread:make-semaphore))
+           (terminate (symbol-function 'pg::terminate-backend))
+           (thread nil) (committed nil) (notified nil) (observed nil) (result nil))
+      (unwind-protect
+           (progn
+             (setf (symbol-function 'pg::terminate-backend)
+                   (lambda (backend)
+                     (setf notified
+                           (and (eq backend owner) committed
+                                (not sb-sys:*interrupts-enabled*)
+                                (not (sb-thread:holding-mutex-p pg::*physical-follow-generation-lock*))
+                                (not (sb-thread:holding-mutex-p pg::*wal-sender-lock*))))))
+             (setf thread
+                   (sb-thread:make-thread
+                    (lambda ()
+                      (setf result
+                            (catch 'cancel-controller-publication
+                              (call-with-controller-publication-test-locks
+                               (lambda ()
+                                 (pg::with-physical-follow-controller-publication (obsolete)
+                                   (setf obsolete owners)
+                                   (sb-thread:signal-semaphore ready)
+                                   (unless (sb-thread:wait-on-semaphore resume :timeout 3)
+                                     (error "publication barrier expired"))
+                                   (setf committed t))))
+                              :unexpected-success)))))
+             (ok (sb-thread:wait-on-semaphore ready :timeout 3))
+             (sb-thread:interrupt-thread
+              thread (lambda ()
+                       (setf observed (list committed notified))
+                       (throw 'cancel-controller-publication :cancelled)))
+             (ok (eq :pending (sb-thread:join-thread thread :timeout 0.05 :default :pending)))
+             (sb-thread:signal-semaphore resume)
+             (ok (not (eq :blocked (sb-thread:join-thread thread :timeout 3 :default :blocked))))
+             (ok (eq :cancelled result))
+             (ok (equal '(t t) observed))
+             (ok committed)
+             (ok notified))
+        (sb-thread:signal-semaphore resume)
+        (when thread (sb-thread:join-thread thread))
+        (setf (symbol-function 'pg::terminate-backend) terminate))))
+
+(deftest controller-publication-masks-effects-and-notifies-after-fence-release
+    (let* ((owner (pg::make-backend :pid 909))
+           (owners (list owner))
+           (terminate (symbol-function 'pg::terminate-backend))
+           (events nil) (committed nil) (result nil)
+           (pg::*live-operation-quiescence-owner-thread* sb-thread:*current-thread*))
+      (unwind-protect
+           (progn
+             (setf (symbol-function 'pg::terminate-backend)
+                   (lambda (backend)
+                     (push (list :notify (not sb-sys:*interrupts-enabled*)
+                                 (sb-thread:holding-mutex-p pg::*physical-follow-generation-lock*)
+                                 committed (eq owner backend)) events)))
+             (sb-thread:with-mutex (pg::*physical-follow-command-lock*)
+               (sb-thread:with-mutex (pg::*reload-run-lock*)
+                 (setf result
+                       (multiple-value-list
+                        (pg::with-physical-follow-controller-publication (obsolete)
+                          (push (list :body (not sb-sys:*interrupts-enabled*)
+                                      (sb-thread:holding-mutex-p pg::*physical-follow-generation-lock*))
+                                events)
+                          (setf obsolete owners committed t)
+                          (values :active :extra))))))
+             (ok (equal '(:active :extra) result))
+             (ok (equal '((:body t t) (:notify t nil t t)) (reverse events)))
+             (ok (not (sb-thread:holding-mutex-p pg::*physical-follow-generation-lock*))))
+        (setf (symbol-function 'pg::terminate-backend) terminate))))
+
+(deftest controller-publication-discharges-notifications-on-nonlocal-exit
+    (let* ((owner (pg::make-backend :pid 910))
+           (owners (list owner))
+           (terminate (symbol-function 'pg::terminate-backend))
+           (notified nil)
+           (pg::*live-operation-quiescence-owner-thread* sb-thread:*current-thread*))
+      (unwind-protect
+           (progn
+             (setf (symbol-function 'pg::terminate-backend)
+                   (lambda (backend)
+                     (setf notified
+                           (and (eq backend owner)
+                                (not sb-sys:*interrupts-enabled*)
+                                (not (sb-thread:holding-mutex-p pg::*physical-follow-generation-lock*))))))
+             (sb-thread:with-mutex (pg::*physical-follow-command-lock*)
+               (sb-thread:with-mutex (pg::*reload-run-lock*)
+                 (ok (eq :escaped
+                         (catch 'publication-exit
+                           (pg::with-physical-follow-controller-publication (obsolete)
+                             (setf obsolete owners)
+                             (throw 'publication-exit :escaped)))))))
+             (ok notified)
+             (ok (not (sb-thread:holding-mutex-p pg::*physical-follow-generation-lock*))))
+        (setf (symbol-function 'pg::terminate-backend) terminate))))
+
 (deftest fixed-follow-source-discovery-fetches-only-the-permitted-child
     (call-with-promotion-fixture
      (lambda (root store)
@@ -617,6 +801,49 @@
                      (symbol-function 'pg::pg-client-native-history) history)))))
        :applied 152 :system-id 42)))
 
+(deftest observed-source-config-save-holds-the-generation-fence
+    (call-with-promotion-fixture
+     (lambda (root store)
+       (declare (ignore root store))
+       (pg::wal-atomic-write-bytes (pg::clog-path) (empty-octets))
+       (let* ((old '(1 "127.0.0.1" 5432 "accepted_source"))
+              (runtime (pg::make-physical-follow-runtime :config old))
+              (operation (pg::make-physical-follow-operation :runtime runtime))
+              (pg::*physical-follow-runtime* runtime)
+              (pg::*physical-follow-operation* operation)
+              (pg::*physical-follow-controller-blocked-p* nil)
+              (pg::*physical-follow-controller-stopping-p* nil)
+              (save (symbol-function 'pg::physical-follow-controller-save-config))
+              (events nil))
+         (pg::physical-follow-save-config old)
+         (pg::physical-follow-operation-initial-config operation)
+         (unwind-protect
+              (progn
+                (setf (symbol-function 'pg::physical-follow-controller-save-config)
+                      (lambda (config)
+                        (push (list (plusp pg::*live-operation-depth*)
+                                    (sb-thread:holding-mutex-p pg::*physical-follow-generation-lock*)
+                                    (not sb-sys:*interrupts-enabled*))
+                              events)
+                        (funcall save config)))
+                (ok (= 19 (pg::physical-follow-operation-remember-source operation 19)))
+                (ok (equal '((t t t)) events))
+                (ok (= 19 (getf (pg::physical-follow-controller-state
+                                 (pg::physical-follow-read-config))
+                                :known-timeline)))
+                (let ((pg::*physical-follow-desired*
+                        (pg::physical-follow-next-desired
+                         nil "" "" "walreceiver"
+                         (getf pg::*physical-recovery-state* :timeline-policy) t)))
+                  (ok (signals (pg::physical-follow-operation-remember-source operation 20)
+                               'pg::physical-follow-generation-changed))
+                  (ok (equal '((t t t)) events))
+                  (ok (= 19 (getf (pg::physical-follow-controller-state
+                                   (pg::physical-follow-read-config))
+                                  :known-timeline)))
+                  (ok (= 20 (pg::physical-promotion-timeline-floor pg::*physical-recovery-state*)))))
+           (setf (symbol-function 'pg::physical-follow-controller-save-config) save))))))
+
 (deftest source-observation-save-failures-and-cancellation-preserve-the-old-runtime
     (dolist (mode '(:before-follow-config-fsync :after-follow-config-fsync
                     :before-follow-config-rename :after-follow-config-rename
@@ -678,7 +905,9 @@
                       (ok (typep (pg::physical-follow-operation-error operation)
                                  'pg::physical-follow-observation-save-failed)))
                   (ok (null pg::*physical-follow-auto-error*))
-                  (ok (> pg::*physical-follow-auto-retry-after* (get-internal-real-time)))
+                  (if (member mode '(:cancel-before :cancel-after-rename :cancel-after-sync))
+                      (ok (zerop pg::*physical-follow-auto-retry-after*))
+                      (ok (> pg::*physical-follow-auto-retry-after* (get-internal-real-time))))
                   (ok (eq runtime pg::*physical-follow-runtime*))
                   (ok (not (pg::physical-follow-runtime-stopped-p runtime)))
                   (ok (not (pg::physical-follow-runtime-receiver-stopped-p runtime)))
@@ -1498,6 +1727,34 @@
          (funcall function root store operation view entry snapshot))))
    :system-id 42))
 
+(deftest superseded-controller-recovery-fences-owned-preparation-cleanup
+    (call-with-controller-intent
+     (lambda (root store operation view entry snapshot)
+       (declare (ignore root store view snapshot))
+       (let ((pg::*physical-follow-desired*
+               (pg::physical-follow-next-desired
+                nil "" "" "walreceiver"
+                (getf pg::*physical-recovery-state* :timeline-policy) t))
+             (save (symbol-function 'pg::physical-follow-controller-save-config))
+             (events nil))
+         (unwind-protect
+              (progn
+                (setf (symbol-function 'pg::physical-follow-controller-save-config)
+                      (lambda (config)
+                        (push (list (not sb-sys:*interrupts-enabled*)
+                                    (sb-thread:holding-mutex-p pg::*physical-follow-generation-lock*))
+                              events)
+                        (funcall save config)))
+                (pg::physical-follow-operation-recover operation)
+                (ok (equal '((t t)) events))
+                (let ((saved (pg::physical-follow-read-config)))
+                  (ok (equal saved (pg::physical-follow-operation-config operation)))
+                  (ok (null (getf (sixth saved) :preparing)))
+                  (ok (equal (list entry) (getf (sixth saved) :cleanup))))
+                (ok (null pg::*physical-follow-runtime*))
+                (ok (not pg::*physical-recovery-failed-p*)))
+           (setf (symbol-function 'pg::physical-follow-controller-save-config) save))))))
+
 (deftest follow-controller-cancelled-preparation-preserves-old-source-and-queues-exact-abort
     (call-with-controller-intent
      (lambda (root store operation view entry snapshot)
@@ -1558,6 +1815,90 @@
          (ok pg::*physical-recovery-failed-p*)
          (ok (eq :pending (getf (fifth (pg::physical-follow-read-config)) :phase)))
          (ok (null pg::*physical-follow-runtime*))))))
+
+(deftest superseded-controller-launch-cannot-report-started-or-clear-current-error
+    (call-with-promotion-fixture
+     (lambda (root store)
+       (declare (ignore root store))
+       (pg::wal-atomic-write-bytes (pg::clog-path) (empty-octets))
+       (let* ((config '(1 "127.0.0.1" 5432 "accepted_source"))
+              (operation (pg::make-physical-follow-operation))
+              (pg::*physical-follow-operation* operation)
+              (pg::*physical-follow-controller-blocked-p* nil)
+              (pg::*physical-follow-controller-stopping-p* nil)
+              (pg::*physical-follow-auto-error* nil)
+              (pg::*physical-follow-auto-retry-after* 123)
+              (pg::*physical-follow-controller-errors* (make-hash-table :test #'equal))
+              (replacement (pg::physical-follow-next-desired
+                            nil "host=replacement" "" "rx"
+                            (getf pg::*physical-recovery-state* :timeline-policy) t))
+              (names '(pg::physical-follow-operation-initial-config pg::physical-follow-operation-connect
+                       pg::physical-follow-controller-source-view pg::physical-follow-operation-intent
+                       pg::pg-client-native-prepare pg::physical-follow-operation-publish pg::physical-follow-launch))
+              (saved (mapcar (lambda (name) (cons name (symbol-function name))) names)))
+         (pg::physical-follow-save-config config)
+         (unwind-protect
+              (progn
+                (setf (symbol-function 'pg::physical-follow-operation-initial-config)
+                      (lambda (op) (setf (pg::physical-follow-operation-config op) config))
+                      (symbol-function 'pg::physical-follow-operation-connect)
+                      (lambda (op) (declare (ignore op)) nil)
+                      (symbol-function 'pg::physical-follow-controller-source-view)
+                      (lambda (&rest args) (declare (ignore args)) '(:action :attach))
+                      (symbol-function 'pg::physical-follow-operation-intent)
+                      (lambda (&rest args) (declare (ignore args)) (values nil nil))
+                      (symbol-function 'pg::pg-client-native-prepare)
+                      (lambda (&rest args) (declare (ignore args)) nil)
+                      (symbol-function 'pg::physical-follow-operation-publish)
+                      (lambda (op &rest args)
+                        (declare (ignore args))
+                        (setf (getf (pg::physical-follow-operation-context op) :committed) t
+                              (pg::physical-follow-operation-result op) config))
+                      (symbol-function 'pg::physical-follow-launch)
+                      (lambda (&rest args)
+                        (declare (ignore args))
+                        (pg::physical-follow-install-desired replacement)
+                        (setf pg::*physical-follow-auto-error* '(:current-error))
+                        :started))
+                (pg::physical-follow-operation-run operation)
+                (ok (eq replacement pg::*physical-follow-desired*))
+                (ok (typep (pg::physical-follow-operation-error operation)
+                           'pg::physical-follow-generation-changed))
+                (ok (equal config (pg::physical-follow-operation-result operation)))
+                (ok (equal '(:current-error) pg::*physical-follow-auto-error*))
+                (ok (= 123 pg::*physical-follow-auto-retry-after*))
+                (ok (not pg::*physical-recovery-failed-p*)))
+           (dolist (entry saved) (setf (symbol-function (car entry)) (cdr entry))))))))
+
+(deftest retired-controller-error-cannot-overwrite-current-retry-state
+    (let* ((old (pg::make-physical-follow-operation))
+           (current (pg::make-physical-follow-operation))
+           (pg::*physical-follow-operation* old)
+           (pg::*physical-follow-desired* nil)
+           (pg::*physical-follow-controller-blocked-p* nil)
+           (pg::*physical-follow-controller-stopping-p* nil)
+           (pg::*physical-recovery-failed-p* nil)
+           (pg::*physical-follow-auto-error* '(:current-error))
+           (pg::*physical-follow-auto-retry-after* 123)
+           (pg::*physical-follow-controller-errors* (make-hash-table :test #'equal))
+           (failure (make-condition 'simple-error :format-control "retired operation failed"))
+           (initial (symbol-function 'pg::physical-follow-operation-initial-config)))
+      (unwind-protect
+           (progn
+             (setf (symbol-function 'pg::physical-follow-operation-initial-config)
+                   (lambda (operation)
+                     (declare (ignore operation))
+                     (setf pg::*physical-follow-operation* current)
+                     (error failure)))
+             (setf (gethash :transition pg::*physical-follow-controller-errors*) "current status error")
+             (pg::physical-follow-operation-run old)
+             (ok (equal "current status error" (gethash :transition pg::*physical-follow-controller-errors*)))
+             (ok (eq failure (pg::physical-follow-operation-error old)))
+             (ok (eq current pg::*physical-follow-operation*))
+             (ok (equal '(:current-error) pg::*physical-follow-auto-error*))
+             (ok (= 123 pg::*physical-follow-auto-retry-after*))
+             (ok (not pg::*physical-recovery-failed-p*)))
+        (setf (symbol-function 'pg::physical-follow-operation-initial-config) initial))))
 
 (deftest follow-controller-early-rejection-is-contained-before-config-capture
     (let* ((operation (pg::make-physical-follow-operation))

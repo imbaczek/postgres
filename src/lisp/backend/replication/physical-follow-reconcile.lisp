@@ -41,15 +41,18 @@ Persist the disabled state under reload exclusion and live-operation quiescence.
                     (settled (physical-follow-abandon-preparation-config remembered))
                     (state (physical-follow-controller-state settled)))
                (physical-follow-controller-check-current current)
-               (physical-follow-persist-management base)
                (setf (getf state :enabled) nil
                      disabled (physical-follow-with-controller settled state))
-               (unless (equal disabled current)
-                 (physical-follow-controller-save-config disabled))
-               (sb-thread:with-mutex (*physical-follow-lock*)
+               (physical-follow-config-image disabled)
+               (with-physical-follow-controller-publication (obsolete)
                  (physical-follow-check-desired-active desired)
-                 (when *physical-follow-runtime*
-                   (setf (physical-follow-runtime-config *physical-follow-runtime*) (copy-tree disabled)))))))
+                 (check-physical-recovery-worker-start)
+                 (physical-follow-persist-management base)
+                 (unless (equal disabled current)
+                   (physical-follow-controller-save-config disabled))
+                 (sb-thread:with-mutex (*physical-follow-lock*)
+                   (when *physical-follow-runtime*
+                     (setf (physical-follow-runtime-config *physical-follow-runtime*) (copy-tree disabled))))))))
          (unless *physical-follow-runtime*
            (physical-follow-launch-replay-only disabled))
          disabled)))))
@@ -102,7 +105,11 @@ does not provide an external failover coordinator."
          (physical-follow-generation-changed () :superseded)
          (physical-recovery-worker-shutdown () :shutdown)
          ((or error sb-ext:timeout) (condition)
-           (setf *physical-follow-desired-last-error* (princ-to-string condition))
+           (let ((message (princ-to-string condition)))
+             (sb-thread:with-mutex (*physical-follow-lock*)
+               (when (handler-case (physical-follow-check-desired-active desired)
+                       (physical-follow-generation-changed () nil))
+                 (setf *physical-follow-desired-last-error* message))))
            (if *physical-recovery-failed-p* :failed :retry)))))))
 
 (defun physical-follow-desired-loop ()
