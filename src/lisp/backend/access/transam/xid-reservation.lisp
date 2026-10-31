@@ -53,7 +53,11 @@
     (xid-reservation-test-point :after-capacity-publication end)))
 
 (defun xid-assign-with-wal-reservation (oldest)
-  "Slow path rechecks capacity and ordinary refusals before entering critical I/O."
+  "Recheck capacity and allocation refusals before entering critical I/O.
+Lock waits and preflight remain interruptible unless the caller has masked them.
+Defer asynchronous interrupts while publishing the reservation; release that mask
+before allocating the XID. An incomplete publication poisons WAL under the locks,
+and protected cleanup requests fail-stop after they unwind."
   (let ((result nil) (failure nil) (started nil) (completed nil))
     (sb-sys:without-interrupts
       (unwind-protect

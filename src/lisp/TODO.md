@@ -1,5 +1,13 @@
 # Development TODO
 
+- [ ] Make active XID allocation and backend ownership handoff atomic. An owned
+  SQL termination after `xid-allocate-under-lock` returns but before
+  `get-current-xid` stores the backend XID leaves `(3)` in `*active-xids*` after
+  the backend exits; WAL remains healthy and fast shutdown fails on the leaked
+  registration. See `/tmp/pg-xid-handoff-confirmed.log`. C publishes the process
+  XID under `XidGenLock` before releasing it; the native handoff needs equivalent
+  ownership and cleanup guarantees.
+
 - [x] Implement desired-generation reconciliation for `primary_conninfo` and
   `primary_slot_name` for native standard follow, including reload, durable
   management ownership, cold restart and promotion. `recovery_target_timeline`
@@ -67,12 +75,13 @@
   refuses promotion and shuts down on resume. Owned tests cover direct pauses,
   insufficiency discovered during promotion backlog replay, and adequate restart.
 
-- [ ] Audit direct WAL publication guards outside `with-wal-critical`, including
-  `xid-assign-with-wal-reservation` and `wal-report-resource-parameters`. Both
-  bypass the macro and can be interrupted during publication. The new critical
-  section guard does not establish WAL-wide coverage. One earlier source SIGINT
-  poison log lacked a captured cause; controlled tests independently reproduced
-  the asynchronous guard bug, and owned restart passed after the fix.
+- [x] Guard direct WAL publication in `xid-assign-with-wal-reservation` and
+  `wal-report-resource-parameters`. Their publication regions defer interrupts;
+  preflight and lock waits remain cancellable. Controlled tests cover termination
+  and storage failure. This targeted change does not establish WAL-wide coverage.
+  One earlier source SIGINT poison log lacked a captured cause; controlled tests
+  independently reproduced the asynchronous guard bug, and owned restart passed
+  after the fix.
 
 - [x] Fix signed integer GUC parsing for C23 binary prefixes independently of
   the unsigned recovery timeline parser. The signed converter uses C23 strtol

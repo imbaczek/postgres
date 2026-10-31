@@ -180,9 +180,10 @@ Read back the complete control image before installing the new memory copy."
 
 (defun wal-report-resource-parameters (parameters)
   "Report a primary tuple, returning its durable record end.
-Under the WAL lock, skip unchanged values; otherwise append and flush the batch
-before publishing and reading back control. Publication defers asynchronous
-termination; failures and abandoned publications poison WAL before unlocking."
+Preflight and lock waits remain interruptible unless the caller masked interrupts;
+unchanged values need no publication. Mask interrupts from append through flush,
+control publication and readback. An incomplete publication poisons WAL under the
+lock, and protected cleanup requests fail-stop after the lock unwinds."
   (prevent-recovery-primary-operation "primary resource reporting")
   (unless (resource-parameters-valid-p parameters) (error "invalid resource parameters"))
   (let ((started nil) (completed nil) (failure nil) (result nil))
