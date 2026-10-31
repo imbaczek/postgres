@@ -18,6 +18,18 @@
       (ok (eq :passed (getf data :status)) (format nil "~s" data))
       (ok (= 200 (getf data :trials)))))
 
+(deftest desired-install-fences-preflight-and-publication
+    (let* ((pg::*physical-follow-desired* nil)
+           (desired (pg::physical-follow-next-desired nil "" "" "rx" nil nil))
+           (events nil))
+      (flet ((record (stage)
+               (push (list stage (sb-thread:holding-mutex-p pg::*physical-follow-generation-lock*))
+                     events)))
+        (pg::physical-follow-call-with-desired-install
+         desired (lambda () (record :publish)) (lambda () (record :preflight)))
+        (ok (equal '((:preflight t) (:preflight t) (:publish t)) (reverse events)))
+        (ok (eq desired pg::*physical-follow-desired*)))))
+
 (deftest follow-desired-generation-copies-private-input-and-getters
     (let* ((bytes (make-array 3 :element-type '(unsigned-byte 8) :initial-contents '(65 255 128)))
            (slot (copy-seq "public_slot"))
