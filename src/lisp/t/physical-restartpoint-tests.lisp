@@ -572,12 +572,77 @@
       (ok (pg::physical-restartpoint-due-p 64 32 (* 300 second) 0 300 64))
       (ok (not (pg::physical-restartpoint-due-p 64 32 (* 299 second) 0 300 64)))))
 
-(deftest restartpoint-scheduler-ignores-unapplied-receive-backlog
+(deftest restartpoint-scheduler-captures-one-root-before-store-inspection
+    (with-restartpoint-fixture (root store)
+      (declare (ignore root))
+      (let ((settings (pg::startup-default-settings "/tmp/restartpoint-settings/")))
+        (setf (gethash "checkpoint_timeout" settings) (list :value 30 :source :command-line)
+              (gethash "max_wal_size" settings) (list :value 2 :source :command-line))
+        (let ((first (prepare-reader-test-configuration settings)))
+          (setf (gethash "checkpoint_timeout" settings) (list :value 90 :source :command-line)
+                (gethash "max_wal_size" settings) (list :value 4 :source :command-line))
+          (let* ((next (prepare-reader-test-configuration settings))
+                 (pg::*startup-installed-configuration* first)
+                 (pg::*physical-receive-store* store)
+                 (pg::*last-replay-lsn* 96)
+                 (pg::*physical-restartpoint-last-time* 0)
+                 (pg::*physical-restartpoint-timeout* 1)
+                 (pg::*physical-restartpoint-wal-bytes* 1)
+                 (capture (symbol-function 'pg::startup-capture-configuration))
+                 (check (symbol-function 'pg::physical-store-check-live))
+                 (due (symbol-function 'pg::physical-restartpoint-due-p))
+                 (captures 0) (thresholds nil))
+            (unwind-protect
+                 (progn
+                   (setf (symbol-function 'pg::startup-capture-configuration)
+                         (lambda ()
+                           (ok (not (sb-thread:holding-mutex-p (pg::physical-store-mutex store))))
+                           (incf captures)
+                           (funcall capture))
+                         (symbol-function 'pg::physical-store-check-live)
+                         (lambda (value)
+                           (funcall check value)
+                           (ok (not (sb-thread:holding-mutex-p pg::*startup-configuration-lock*)))
+                           (setf pg::*startup-installed-configuration* next))
+                         (symbol-function 'pg::physical-restartpoint-due-p)
+                         (lambda (applied floor now last-time timeout wal-bytes)
+                           (push (list timeout wal-bytes) thresholds)
+                           (funcall due applied floor now last-time timeout wal-bytes)))
+                   (pg::with-live-operation
+                     (ok (pg::physical-restartpoint-needed-p (* 45 internal-time-units-per-second)))
+                     (ok (not (pg::physical-restartpoint-needed-p (* 45 internal-time-units-per-second)))))
+                   (ok (= 2 captures))
+                   (ok (equal (list (list 30 (* 2 1024 1024)) (list 90 (* 4 1024 1024)))
+                              (reverse thresholds)))
+                   (setf pg::*startup-installed-configuration* first captures 0 thresholds nil
+                         pg::*physical-restartpoint-last-time*
+                         (- (get-internal-real-time) (* 45 internal-time-units-per-second)))
+                   (ok (eq :not-due (pg::physical-restartpoint-worker-step)))
+                   (ok (= 2 captures))
+                   (ok (= 32 (pg::physical-store-floor-lsn store))))
+              (setf (symbol-function 'pg::startup-capture-configuration) capture
+                    (symbol-function 'pg::physical-store-check-live) check
+                    (symbol-function 'pg::physical-restartpoint-due-p) due)))))))
+
+(deftest restartpoint-scheduler-requires-installed-settings-for-a-live-store
     (with-restartpoint-fixture (root store)
       (declare (ignore root))
       (let ((pg::*physical-receive-store* store)
+            (pg::*startup-installed-configuration* nil))
+        (pg::with-live-operation
+          (ok (intake-fails-p #'pg::physical-restartpoint-needed-p)))
+        (ok (not pg::*physical-recovery-failed-p*))
+        (ok (= 32 (pg::physical-store-floor-lsn store))))))
+
+(deftest restartpoint-scheduler-ignores-unapplied-receive-backlog
+    (with-restartpoint-fixture (root store)
+      (declare (ignore root))
+      (let ((pg::*startup-installed-configuration*
+              (prepare-reader-test-configuration (pg::startup-default-settings "/tmp/restartpoint-backlog/")))
+            (pg::*physical-receive-store* store)
             (pg::*last-replay-lsn* 32)
-            (pg::*physical-restartpoint-last-time* 0)
+            (pg::*physical-restartpoint-last-time*
+              (- (get-internal-real-time) (* 300 internal-time-units-per-second)))
             (pg::*physical-restartpoint-timeout* 0)
             (pg::*physical-restartpoint-wal-bytes* 1))
         (ok (not (pg::physical-restartpoint-needed-p)))

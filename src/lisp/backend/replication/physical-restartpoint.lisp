@@ -416,12 +416,14 @@ Older metadata without these fields uses the base timeline."
 (defun physical-restartpoint-needed-p (&optional (now (get-internal-real-time)))
   "Call with admission or quiescence; inspect floor and apply under the store lock."
   (when (and *physical-receive-store* (not *physical-recovery-failed-p*))
-    (sb-thread:with-mutex ((physical-store-mutex *physical-receive-store*))
-      (physical-store-check-live *physical-receive-store*)
-      (physical-restartpoint-due-p
-       *last-replay-lsn* (physical-store-floor-lsn *physical-receive-store*)
-       now *physical-restartpoint-last-time*
-       *physical-restartpoint-timeout* *physical-restartpoint-wal-bytes*))))
+    (let ((configuration (startup-require-configuration)))
+      (sb-thread:with-mutex ((physical-store-mutex *physical-receive-store*))
+        (physical-store-check-live *physical-receive-store*)
+        (physical-restartpoint-due-p
+         *last-replay-lsn* (physical-store-floor-lsn *physical-receive-store*)
+         now *physical-restartpoint-last-time*
+         (startup-configuration-timeout configuration)
+         (startup-configuration-wal-bytes configuration))))))
 
 (defun physical-recovery-restartpoint-core ()
   "Publish while admission pins replay, or while this thread owns quiescence.
