@@ -4960,9 +4960,10 @@
                    (*physical-follow-desired* nil)
                    (*physical-recovery-state* nil))
                (setf (gethash "max-slot-wal-keep-bytes" native) "-1")
-               (startup-prepare-installation-from-base
-                (startup-default-settings directory) native (make-hash-table :test #'equal)
-                nil nil t)))
+               (let ((*startup-installed-configuration* nil))
+                 (startup-prepare-installation
+                  (startup-default-settings directory) native (make-hash-table :test #'equal)
+                  nil))))
            (owner (list :owner)) (*wal-logical-slot-owner* owner)
            (slot (make-wal-replication-slot :name "scan" :database-oid 7 :restart-lsn 0
                                             :consistent-lsn 0 :confirmed-flush-lsn 0 :active-owner owner))

@@ -3,7 +3,8 @@
 
 (declaim (special *authentication-policy*))
 
-(declaim (ftype function authentication-read-policy))
+(declaim (ftype function authentication-read-policy startup-capture-installation-basis
+                startup-current-source-incarnation physical-follow-plan-settings-from-basis))
 
 (defvar *startup-server-settings* nil)
 
@@ -11,12 +12,20 @@
 
 (defvar *startup-command-overrides* nil)
 
+(define-condition startup-configuration-changed (simple-error) ())
+
+(defstruct startup-installation-basis
+  "One root, desired generation and source captured before preparation."
+  (root nil :read-only t) (desired nil :read-only t) (source nil :read-only t)
+  (timeline-policy nil :read-only t) (managed-p nil :read-only t))
+
 (defstruct startup-configuration
   ;; Each root has a fresh identity and stores only its predecessor's identity.
   ;; Inputs and authentication are owned copies; desired may reuse an unchanged
   ;; generation. Resources are validated, not the installed live capacity.
   (identity (gensym "CONFIGURATION-") :read-only t)
   (predecessor nil :read-only t)
+  (source-predecessor nil :read-only t)
   (settings nil :read-only t) (native nil :read-only t) (overrides nil :read-only t)
   (authentication nil :read-only t) (desired nil :read-only t)
   (slot-policy nil :read-only t) (resources nil :read-only t)
@@ -66,13 +75,11 @@ Reject unsupported objects without printing their contents."
 
 (declaim (ftype function authentication-copy-policy))
 
-(defun startup-prepare-installation-from-base (settings native overrides installed policy supplied-p)
-  "Prepare owned inputs, authentication, desired follow state and validated values.
-Reload derives inputs and predecessor from the same captured base; default
-authentication also uses that base. An explicitly supplied NIL policy differs
-from an omitted policy. Resolve slot retention once here.
-Resource capacity installation remains a startup step."
-  (let* ((predecessor (when installed (startup-configuration-identity installed)))
+(defun startup-prepare-installation-from-basis
+    (settings native overrides basis policy supplied-p)
+  "Prepare owned configuration values against the captured installation basis."
+  (let* ((installed (startup-installation-basis-root basis))
+         (predecessor (when installed (startup-configuration-identity installed)))
          (owned-settings (startup-copy-input settings))
          (owned-native (startup-copy-input native))
          (owned-overrides (startup-copy-input overrides))
@@ -82,9 +89,13 @@ Resource capacity installation remains a startup step."
                                 (authentication-read-policy owned-settings)))))
          (resources (startup-check-connection-limits owned-settings))
          (slot-policy (startup-effective-slot-policy owned-settings owned-native))
-         (desired (physical-follow-plan-settings owned-settings)))
+         (desired (physical-follow-plan-settings-from-basis
+                   owned-settings (startup-installation-basis-desired basis)
+                   (startup-installation-basis-timeline-policy basis)
+                   (startup-installation-basis-managed-p basis))))
     (make-startup-configuration
-     :predecessor predecessor :settings owned-settings :native owned-native
+     :predecessor predecessor :source-predecessor (startup-installation-basis-source basis)
+     :settings owned-settings :native owned-native
      :overrides owned-overrides :authentication authentication :desired desired
      :resources resources :slot-policy slot-policy
      :timeout (startup-setting-value owned-settings "checkpoint_timeout")
@@ -98,8 +109,9 @@ Resource capacity installation remains a startup step."
 
 (defun startup-prepare-installation (settings native overrides &optional (policy nil supplied-p))
   "Prepare an installation against one captured configuration generation."
-  (startup-prepare-installation-from-base
-   settings native overrides (startup-capture-configuration) policy supplied-p))
+  (let ((basis (startup-capture-installation-basis)))
+    (startup-prepare-installation-from-basis
+     settings native overrides basis policy supplied-p)))
 
 (declaim (special *managed-worker-slots* *managed-worker-lock*
                   *managed-worker-registration-closed-p*))
@@ -764,11 +776,16 @@ these slots."
     parameters))
 
 (defun startup-check-installation-predecessor (candidate)
-  "Reject a candidate whose predecessor is no longer the installed identity."
-  (let ((installed (startup-capture-configuration)))
+  "Reject a candidate whose root or source predecessor changed."
+  (let ((source (startup-current-source-incarnation))
+        (installed (startup-capture-configuration)))
     (unless (eq (startup-configuration-predecessor candidate)
                 (when installed (startup-configuration-identity installed)))
-      (error "configuration generation changed before installation")))
+      (error 'startup-configuration-changed
+             :format-control "configuration generation changed before installation"))
+    (unless (eql (startup-configuration-source-predecessor candidate) source)
+      (error 'startup-configuration-changed
+             :format-control "replication source changed before configuration installation")))
   (values))
 
 (defun startup-publish-configuration (candidate)
@@ -816,7 +833,8 @@ Postmaster settings retain their active values and record pending restart.  A
 setting added to a warm registry uses its boot default as the old value.
 Reject an unsupported effective candidate before publishing any reload changes.
 Capture the base once before file I/O and use it for both inputs and predecessor."
-  (let ((base (startup-capture-configuration)))
+  (let* ((basis (startup-capture-installation-basis))
+         (base (startup-installation-basis-root basis)))
     (when base
       (let* ((native (startup-configuration-native base))
              (overrides (startup-configuration-overrides base))
@@ -839,7 +857,7 @@ Capture the base once before file I/O and use it for both inputs and predecessor
                     (list* :pending-restart t :desired-value (getf new :value) (copy-list old)))
               (admin-log "configuration parameter ~a requires restart" name))))
         (startup-commit-installation
-         (startup-prepare-installation-from-base candidate native overrides base nil nil))
+         (startup-prepare-installation-from-basis candidate native overrides basis nil nil))
         candidate))))
 
 (defun startup-format-unit (value kind)

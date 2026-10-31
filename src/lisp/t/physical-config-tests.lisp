@@ -75,6 +75,124 @@
         (pg::*max-connections* pg::*max-connections*) (pg::*max-wal-senders* pg::*max-wal-senders*))
     (funcall function)))
 
+(defun rotate-startup-candidate-test-source ()
+  (sb-thread:with-mutex (pg::*physical-follow-command-lock*)
+    (sb-thread:with-mutex (pg::*reload-run-lock*)
+      (pg::with-live-operation-quiescence
+        (pg::with-physical-follow-controller-publication (obsolete)
+          (multiple-value-bind (source retired)
+              (pg::sync-replication-new-source-incarnation :defer-notifications t)
+            (setf obsolete retired)
+            source))))))
+
+(deftest startup-candidates-reject-a-changed-source-before-management-claims
+    (call-with-startup-candidate-test
+     (lambda ()
+       (let* ((pg::*sync-replication-state* (pg::make-sync-replication-state :source-id :source-a))
+              (pg::*wal-sender-registry* (make-hash-table :test #'eq))
+              (pg::*physical-recovery-failed-p* nil)
+              (settings (pg::startup-default-settings "/tmp/source-predecessor/"))
+              (native (make-hash-table :test #'equal))
+              (overrides (make-hash-table :test #'equal))
+              (claim (symbol-function 'pg::physical-follow-prepare-managed-claim))
+              (claims 0))
+         (pg::startup-install-settings settings native overrides nil)
+         (let ((installed (pg::startup-capture-configuration)))
+           (setf (getf (gethash "checkpoint_timeout" settings) :value) 42)
+           (let ((stale (pg::startup-prepare-installation settings native overrides nil)))
+             (rotate-startup-candidate-test-source)
+             (unwind-protect
+                  (progn
+                    (setf (symbol-function 'pg::physical-follow-prepare-managed-claim)
+                          (lambda (desired) (declare (ignore desired)) (incf claims)))
+                    (ok (signals (pg::startup-commit-installation stale) 'pg::startup-configuration-changed))
+                    (ok (zerop claims))
+                    (ok (eq installed (pg::startup-capture-configuration)))
+                    (ok (not pg::*physical-recovery-failed-p*))
+                    (let ((fresh (pg::startup-prepare-installation settings native overrides nil)))
+                      (pg::startup-commit-installation fresh)
+                      (ok (eq fresh (pg::startup-capture-configuration)))
+                      (ok (= 42 pg::*physical-restartpoint-timeout*))
+                      (ok (= 1 claims))))
+               (setf (symbol-function 'pg::physical-follow-prepare-managed-claim) claim))))))))
+
+(deftest startup-preparation-retains-its-desired-basis-through-authentication-copy
+    (call-with-startup-candidate-test
+     (lambda ()
+       (let* ((pg::*sync-replication-state* (pg::make-sync-replication-state :source-id :source-a))
+              (pg::*wal-sender-registry* (make-hash-table :test #'eq))
+              (settings (pg::startup-default-settings "/tmp/desired-predecessor/"))
+              (native (make-hash-table :test #'equal))
+              (overrides (make-hash-table :test #'equal))
+              (copy-policy (symbol-function 'pg::authentication-copy-policy))
+              (claim (symbol-function 'pg::physical-follow-prepare-managed-claim))
+              (claims 0) (stale nil))
+         (pg::startup-install-settings settings native overrides nil)
+         (let* ((installed (pg::startup-capture-configuration))
+                (replacement (pg::physical-follow-next-desired
+                              pg::*physical-follow-desired* "host=replacement" "" "walreceiver" nil t)))
+           (unwind-protect
+                (progn
+                  (setf (symbol-function 'pg::authentication-copy-policy)
+                        (lambda (policy)
+                          (prog1 (funcall copy-policy policy)
+                            (pg::physical-follow-install-desired replacement))))
+                  (setf stale (pg::startup-prepare-installation settings native overrides nil)))
+             (setf (symbol-function 'pg::authentication-copy-policy) copy-policy))
+           (unwind-protect
+                (progn
+                  (setf (symbol-function 'pg::physical-follow-prepare-managed-claim)
+                        (lambda (desired) (declare (ignore desired)) (incf claims)))
+                  (ok (signals (pg::startup-commit-installation stale) 'pg::physical-follow-generation-changed))
+                  (ok (zerop claims))
+                  (ok (eq installed (pg::startup-capture-configuration)))
+                  (ok (eq replacement pg::*physical-follow-desired*))
+                  (let ((fresh (pg::startup-prepare-installation settings native overrides nil)))
+                    (pg::startup-commit-installation fresh)
+                    (ok (eq fresh (pg::startup-capture-configuration)))
+                    (ok (eq (pg::startup-configuration-desired fresh) pg::*physical-follow-desired*))
+                    (ok (= 1 claims))))
+             (setf (symbol-function 'pg::physical-follow-prepare-managed-claim) claim)))))))
+
+(deftest startup-reload-captures-its-source-before-reading-files
+    (call-with-startup-candidate-test
+     (lambda ()
+       (let* ((pg::*pgdata* #p"/tmp/reload-source-predecessor/")
+              (pg::*sync-replication-state* (pg::make-sync-replication-state :source-id :source-a))
+              (pg::*wal-sender-registry* (make-hash-table :test #'eq))
+              (pg::*physical-recovery-failed-p* nil)
+              (settings (pg::startup-default-settings (namestring pg::*pgdata*)))
+              (native (make-hash-table :test #'equal))
+              (overrides (make-hash-table :test #'equal))
+              (load-settings (symbol-function 'pg::startup-load-settings))
+              (claim (symbol-function 'pg::physical-follow-prepare-managed-claim))
+              (moved nil) (claims 0))
+         (pg::startup-install-settings settings native overrides nil)
+         (let ((installed (pg::startup-capture-configuration)))
+           (setf (getf (gethash "checkpoint_timeout" settings) :value) 90)
+           (unwind-protect
+                (progn
+                  (setf (symbol-function 'pg::startup-load-settings)
+                        (lambda (&rest args)
+                          (declare (ignore args))
+                          (unless moved
+                            (rotate-startup-candidate-test-source)
+                            (setf moved t))
+                          (pg::startup-copy-input settings))
+                        (symbol-function 'pg::physical-follow-prepare-managed-claim)
+                        (lambda (desired) (declare (ignore desired)) (incf claims)))
+                  (ok (signals (pg::startup-reload-settings) 'pg::startup-configuration-changed))
+                  (ok moved)
+                  (ok (zerop claims))
+                  (ok (eq installed (pg::startup-capture-configuration)))
+                  (ok (= 300 pg::*physical-restartpoint-timeout*))
+                  (ok (not pg::*physical-recovery-failed-p*))
+                  (pg::startup-reload-settings)
+                  (ok (= 90 pg::*physical-restartpoint-timeout*))
+                  (ok (= 1 claims)))
+             (setf (symbol-function 'pg::startup-load-settings) load-settings
+                   (symbol-function 'pg::physical-follow-prepare-managed-claim) claim)))))))
+
 (deftest startup-candidates-reject-stale-predecessors-before-management-claims
     (call-with-startup-candidate-test
      (lambda ()

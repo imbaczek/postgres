@@ -33,10 +33,11 @@
          (*wal-durable-lsn* 4096)
          (*startup-installed-configuration*
            (let ((*physical-follow-desired* nil) (*physical-recovery-state* nil))
-             (startup-prepare-installation-from-base
-              (startup-default-settings "/tmp/catalog-slot-settings/")
-              (make-hash-table :test #'equal) (make-hash-table :test #'equal)
-              nil nil t)))
+             (let ((*startup-installed-configuration* nil))
+               (startup-prepare-installation
+                (startup-default-settings "/tmp/catalog-slot-settings/")
+                (make-hash-table :test #'equal) (make-hash-table :test #'equal)
+                nil))))
          (slot (make-wal-replication-slot
                 :name "view_slot" :restart-lsn 1024 :consistent-lsn 2048
                 :confirmed-flush-lsn 3072 :active-owner (gensym "OWNER-")

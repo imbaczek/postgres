@@ -174,19 +174,43 @@ Join outside the follow lock; failure to stop marks recovery failed."
           (setf *physical-follow-desired-worker* nil))))
     (not (null worker))))
 
-(defun physical-follow-plan-settings (settings &optional force-claim)
-  "Snapshot configured settings and retain an existing management claim."
+(defun startup-current-source-incarnation ()
+  (nth-value 0 (sync-replication-configuration-state)))
+
+(defun startup-capture-installation-basis ()
+  "Capture the actual root, desired generation and source under their publication fence."
+  (call-with-physical-follow-generation-fence
+   (lambda ()
+     (sb-thread:with-mutex (*physical-follow-lock*)
+       (let ((source (startup-current-source-incarnation)))
+         (make-startup-installation-basis
+          :root (startup-capture-configuration)
+          :desired *physical-follow-desired* :source source
+          :timeline-policy (getf *physical-recovery-state* :timeline-policy)
+          :managed-p (getf *physical-recovery-state* :standard-follow-managed-p)))))))
+
+(defun physical-follow-plan-settings-from-basis
+    (settings previous timeline-policy managed-p &optional force-claim)
+  "Plan desired settings using only the captured follow inputs."
   (let* ((entry (and settings (gethash "primary_conninfo" settings)))
          (slot (and settings (gethash "primary_slot_name" settings)))
          (cluster (and settings (gethash "cluster_name" settings)))
          (name (and cluster (getf cluster :value))))
     (physical-follow-next-desired
-     *physical-follow-desired* (if entry (getf entry :value) "")
+     previous (if entry (getf entry :value) "")
      (if slot (getf slot :value) "")
      (if (and (stringp name) (plusp (length name))) name "walreceiver")
-     (getf *physical-recovery-state* :timeline-policy)
-     (or force-claim (getf *physical-recovery-state* :standard-follow-managed-p)
+     timeline-policy
+     (or force-claim managed-p
          (and entry (not (eq :default (getf entry :source))))))))
+
+(defun physical-follow-plan-settings (settings &optional force-claim)
+  "Snapshot configured settings and retain an existing management claim."
+  (physical-follow-plan-settings-from-basis
+   settings *physical-follow-desired*
+   (getf *physical-recovery-state* :timeline-policy)
+   (getf *physical-recovery-state* :standard-follow-managed-p)
+   force-claim))
 
 (defun physical-follow-activate-standard-desired ()
   (let ((desired (physical-follow-plan-settings
