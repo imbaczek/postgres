@@ -42,6 +42,7 @@
   ;; until the target delivers termination.  Future masked sync waits may inspect
   ;; this flag without consuming it before commit cleanup.
   (termination-pending nil)
+  ;; First WAL failure, retained for the lifetime of this backend.
   (wal-failure nil)
   ;; Visible to the local control REPL so concurrency tests can synchronize on
   ;; a real lock wait instead of relying on scheduler timing.
@@ -106,16 +107,19 @@
         0.1)))
 
 (defun note-backend-wal-failure (condition)
+  "Retain the first WAL failure for this backend until it terminates."
   (when (and *backend* (not (backend-wal-failure *backend*)))
     (setf (backend-wal-failure *backend*) condition))
   (values))
 
 (defun current-backend-wal-failed-p ()
+  "Return true if this backend has latched a WAL failure."
   (and *backend* (not (null (backend-wal-failure *backend*)))))
 
 (defun deliver-backend-termination (backend)
   ;; Consume only at delivery, and let termination supersede query cancel.
   ;; A queued helper becomes a no-op if a cooperative check delivered it first.
+  ;; A failed backend keeps its original WAL error; other backends still terminate.
   (when (and backend (backend-termination-pending backend)
              (not (backend-wal-failure backend)))
     (setf (backend-termination-pending backend) nil
@@ -124,7 +128,8 @@
   (values))
 
 (defun check-for-interrupts ()
-  "Deliver pending termination before checking statement timeout or cancel."
+  "Deliver pending termination before checking statement timeout or cancel.
+After a WAL failure, leave pending interrupts alone so they cannot replace it."
   (when (current-backend-wal-failed-p)
     (return-from check-for-interrupts (values)))
   (deliver-backend-termination *backend*)

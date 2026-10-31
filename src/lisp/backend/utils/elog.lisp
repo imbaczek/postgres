@@ -26,14 +26,15 @@
              (format s "~a: ~a" (pg-error-sqlstate c) (pg-error-message c)))))
 
 (defun fatal-error-p (condition)
-  "True if CONDITION is a PG-ERROR that must end the connection."
+  "True if CONDITION is fatal or this backend has latched a WAL failure."
   (or (and (fboundp 'current-backend-wal-failed-p)
            (funcall 'current-backend-wal-failed-p))
       (and (typep condition 'pg-error)
            (string= (pg-error-severity condition) "FATAL"))))
 
 (defmacro handler-case-nonfatal (form (condition &body handler-body))
-  "Handle ERROR from FORM, re-signaling fatal PG errors before HANDLER-BODY."
+  "Handle ERROR from FORM, re-signaling fatal errors before HANDLER-BODY.
+Every error is fatal once this backend has latched a WAL failure."
   `(handler-case ,form
      (error (,condition)
        (if (fatal-error-p ,condition)

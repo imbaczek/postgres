@@ -950,6 +950,8 @@ Legacy 16-hex segment names always belong to timeline 1."
     (wal-invalid-input "end-of-recovery requires a verified timeline transition")))
 
 (defun wal-fail-stop (condition)
+  "Poison WAL, retain CONDITION on this backend, and request fast shutdown.
+Re-signal CONDITION after requesting shutdown."
   (setf *wal-poisoned* t)
   (when (fboundp 'note-backend-wal-failure)
     (funcall 'note-backend-wal-failure condition))
@@ -963,11 +965,11 @@ Legacy 16-hex segment names always belong to timeline 1."
   (values))
 
 (defmacro with-wal-critical (&body body)
-  "Run BODY under WAL, deferring asynchronous interrupts during publication.
-The lock wait remains interruptible unless the caller already masked interrupts.
-Mask the body and error recording; the outer mask protects cleanup entry. An
-error recorded here triggers fail-stop after the mutex unwinds. Validation errors
-are propagated without poisoning. Nonlocal exits need their own fencing."
+  "Hold the WAL mutex while BODY publishes shared state.
+Waiting for the mutex is interruptible unless the caller already masks interrupts.
+Once acquired, mask interrupts through body execution, error recording and mutex
+release. Validation errors propagate without poisoning; other errors fail-stop
+after release. Nonlocal exits need a publication fence."
   (let ((failure (gensym "FAILURE-"))
         (condition (gensym "CONDITION-"))
         (mutex (gensym "MUTEX-"))
@@ -990,6 +992,10 @@ are propagated without poisoning. Nonlocal exits need their own fencing."
            (when ,failure (wal-fail-stop ,failure)))))))
 
 (defmacro with-wal-publication-fence ((begin-publication) &body body)
+  "Fence publication begun by BEGIN-PUBLICATION through completion of BODY.
+After it begins, an error or nonlocal exit fail-stops after releasing WAL. Retain
+the first error even if cleanup fails. Mask interrupts during cleanup, and keep
+pending backend termination from replacing a latched WAL failure."
   (let ((started (gensym "STARTED-"))
         (complete (gensym "COMPLETE-"))
         (failure (gensym "FAILURE-"))
@@ -1415,8 +1421,8 @@ the terminal, then flush WAL before truncating any relation fork. Return this
 transaction's commit record end LSN after local storage apply completes. When
 WAL is unavailable, return no values. With WAL ready, TERMINAL-DURABLE-FUNCTION,
 when supplied, receives the exact end LSN immediately after the flush, before
-AFTER-DURABLE-FUNCTION. In that path, incomplete publication fail-stops after
-releasing WAL; the first error is retained, including when cleanup also fails."
+AFTER-DURABLE-FUNCTION. In that WAL-ready path, incomplete publication fail-stops
+after releasing WAL; the first error is retained even if cleanup also fails."
   (unless *wal-ready*
     (when (fboundp 'publish-transaction-replacements-under-wal-lock)
       (with-wal-critical
@@ -1641,6 +1647,8 @@ snapshot capture under *WRITE-LOCK* and durable slot publication."
   (values))
 
 (defun wal-prepare-logical-catalog-event-under-lock (event)
+  "Validate EVENT and return it only if a slot or in-flight snapshot needs it.
+Call with the WAL lock held, before beginning publication."
   (when event
     (when (< (length event) 4)
       (wal-invalid-input "invalid WAL logical catalog event envelope"))
@@ -1654,7 +1662,12 @@ snapshot capture under *WRITE-LOCK* and durable slot publication."
 (defun wal-commit-catalog (catalog-bytes write-function
                            &key relation-deletes logical-event
                              on-record-appended on-durable)
-  "Durably publish a full catalog image and any deferred relation drops."
+  "Durably publish a full catalog image and any deferred relation drops.
+With WAL ready, return the exact end LSN of the terminal catalog record after
+local apply. ON-RECORD-APPENDED runs after that record is appended; ON-DURABLE
+receives its end LSN after the flush and before local page, catalog and drop
+application. An incomplete publication fail-stops, retaining the first error.
+Without WAL, write the catalog, call ON-DURABLE with NIL, and return no values."
   (unless *wal-ready*
     (funcall write-function catalog-bytes)
     (sb-thread:with-mutex (*wal-lock*)
