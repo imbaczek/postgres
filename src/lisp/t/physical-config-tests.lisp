@@ -1034,7 +1034,7 @@
                (ok (eq :idle (pg::backend-state pg::*backend*)))
                (ok (equal (if commit-p "session" "base")
                           (pg::backend-application-name pg::*backend*)))
-               (ok (null (gethash :application-name-local (pg::backend-settings pg::*backend*))))
+               (ok (null (gethash '(:local "application_name") (pg::backend-settings pg::*backend*))))
                (when commit-p
                  (ok (null (pg::backend-settings-transaction-start pg::*backend*)))))
           (setf (symbol-function 'pg::reset-backend-transaction) original)))))

@@ -415,6 +415,9 @@ Reject unsupported parameters and unsupported local settings."
   (when (string-equal name "application_name")
     (return-from set-config-value
       (session-set-application-name value (and local-p (not (eq local-p +null+))))))
+  (when (string-equal name "synchronous_commit")
+    (session-set-synchronous-commit value (and local-p (not (eq local-p +null+))))
+    (return-from set-config-value (session-synchronous-commit-value)))
   (when (session-extra-setting-p (string-downcase name))
     (when (and local-p (not (eq local-p +null+)))
       (ereport "0A000" "transaction-local settings are not supported"))

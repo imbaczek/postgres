@@ -83,6 +83,7 @@
 
 (defun session-extra-setting-p (name)
   (or (string= name "application_name") (string= name "statement_timeout")
+      (string= name "synchronous_commit")
       (assoc name *session-format-defaults* :test #'string=)
       (session-custom-setting-p name)))
 
@@ -121,12 +122,89 @@ Search-path reporting is an existing native extension."
     (session-report-parameter stream "application_name"
                               (gethash "application_name" (backend-settings *backend*) ""))))
 
+(defun session-normalize-synchronous-commit (value)
+  (let ((text (string-downcase (princ-to-string value))))
+    (cond
+      ((member text '("on" "true" "yes" "1") :test #'string=) "on")
+      ((member text '("local" "remote_write" "remote_apply") :test #'string=) text)
+      ((member text '("off" "false" "no" "0") :test #'string=)
+       (ereport "0A000" "asynchronous commit is not supported"))
+      (t (ereport "22023" "invalid value for parameter synchronous_commit")))))
+
+(defun session-capture-raw-binding (settings name)
+  (multiple-value-bind (value present-p) (gethash name settings)
+    (multiple-value-bind (source source-present-p) (gethash (list :source name) settings)
+      (list present-p value source-present-p source))))
+
+(defun session-install-raw-binding (settings name binding)
+  (destructuring-bind (present-p value source-present-p source) binding
+    (if present-p (setf (gethash name settings) value) (remhash name settings))
+    (if source-present-p
+        (setf (gethash (list :source name) settings) source)
+        (remhash (list :source name) settings)))
+  binding)
+
 (defun session-remember-settings ()
   "Save the transaction's settings once so abort can restore the whole settings table."
   (when (and (eq (backend-state *backend*) :in-progress)
              (null (backend-settings-transaction-start *backend*)))
     (setf (backend-settings-transaction-start *backend*)
           (copy-session-settings (backend-settings *backend*)))))
+
+(defun session-assign-setting-binding (name value reset-p local-p)
+  (let ((settings (backend-settings *backend*))
+        (local-key (list :local name)))
+    (sb-sys:without-interrupts
+      (session-remember-settings)
+      (if local-p
+          (unless (nth-value 1 (gethash local-key settings))
+            (setf (gethash local-key settings) (session-capture-raw-binding settings name)))
+          (remhash local-key settings))
+      (session-install-raw-binding
+       settings name
+       (if reset-p
+           (session-capture-raw-binding (backend-settings-reset *backend*) name)
+           (list t value t "session"))))
+    value))
+
+(defun session-set-synchronous-commit (value &optional local-p)
+  (let* ((reset-p (or (eq value :default) (eq value +null+)))
+         (text (unless reset-p (session-normalize-synchronous-commit value))))
+    (session-assign-setting-binding "synchronous_commit" text reset-p local-p)))
+
+(defun session-synchronous-commit-value (&optional (configuration nil supplied-p))
+  (when *backend*
+    (multiple-value-bind (value present-p)
+        (gethash "synchronous_commit" (backend-settings *backend*))
+      (when present-p (return-from session-synchronous-commit-value value))))
+  (let* ((root (if supplied-p configuration (startup-require-configuration)))
+         (entry (and root (gethash "synchronous_commit" (startup-configuration-settings root)))))
+    (unless entry (error "synchronous_commit has no installed default"))
+    (getf entry :value)))
+
+(defun session-synchronous-commit-wait-mode ()
+  (let ((value (session-normalize-synchronous-commit (session-synchronous-commit-value))))
+    (cond ((string= value "on") :flush)
+          ((string= value "remote_write") :write)
+          ((string= value "remote_apply") :apply)
+          ((string= value "local") nil))))
+
+(defun session-synchronous-commit-settings-row (configuration)
+  (multiple-value-bind (value present-p)
+      (if *backend*
+          (gethash "synchronous_commit" (backend-settings *backend*))
+          (values nil nil))
+    (let ((entry (if present-p
+                     (list :value value :source :default)
+                     (and configuration
+                          (gethash "synchronous_commit"
+                                   (startup-configuration-settings configuration))))))
+      (when entry
+        (let ((row (startup-settings-row "synchronous_commit" entry configuration)))
+          (when present-p
+            (setf (aref row 5)
+                  (gethash '(:source "synchronous_commit") (backend-settings *backend*) "session")))
+          row)))))
 
 (defun session-application-name-value (value)
   "Normalize VALUE and send its truncation notice without assigning a setting."
@@ -141,42 +219,28 @@ Search-path reporting is an existing native extension."
 
 (defun session-set-application-name (value &optional local-p)
   "Set the application name and its source, retaining transaction undo state.
-Repeated LOCAL assignments preserve the value to restore at commit; a normal SET
-clears that local restoration. Reset uses the already validated baseline.
+Repeated LOCAL assignments preserve the binding to restore at commit.
 LOCAL-P is used only within a transaction."
-  (let* ((settings (backend-settings *backend*))
-         (reset (backend-settings-reset *backend*))
-         (reset-p (or (eq value :default) (eq value +null+)))
-         (text (if reset-p
-                   (gethash "application_name" reset "")
-                   (session-application-name-value value))))
-    (session-remember-settings)
-    (if local-p
-        (unless (gethash :application-name-local settings)
-          (setf (gethash :application-name-local settings)
-                (list (gethash "application_name" settings "")
-                      (gethash '(:source "application_name") settings "default"))))
-        (remhash :application-name-local settings))
-    (setf (gethash "application_name" settings) text
-          (gethash '(:source "application_name") settings)
-          (if reset-p (gethash '(:source "application_name") reset "default") "session"))
-    (session-publish-application-name)))
+  (let* ((reset-p (or (eq value :default) (eq value +null+)))
+         (text (unless reset-p (session-application-name-value value))))
+    (sb-sys:without-interrupts
+      (session-assign-setting-binding "application_name" text reset-p local-p)
+      (session-publish-application-name))))
 
-(defun session-finish-application-name (commit-p)
-  "Restore the masked session value at commit or the transaction-start value on abort.
+(defun session-finish-transaction-settings (commit-p)
+  "Restore supported LOCAL bindings at commit or transaction-start bindings on abort.
 This changes in-memory state only; client reporting occurs later."
-  (let* ((settings (backend-settings *backend*))
-         (start (backend-settings-transaction-start *backend*))
-         (restore (if commit-p
-                      (gethash :application-name-local settings)
-                      (when start
-                        (list (gethash "application_name" start "")
-                              (gethash '(:source "application_name") start "default"))))))
-    (when restore
-      (setf (gethash "application_name" settings) (first restore)
-            (gethash '(:source "application_name") settings) (second restore)))
-    (remhash :application-name-local settings)
-    (session-publish-application-name)))
+  (let ((settings (backend-settings *backend*))
+        (start (backend-settings-transaction-start *backend*)))
+    (sb-sys:without-interrupts
+      (dolist (name *session-local-setting-names*)
+        (let* ((key (list :local name))
+               (restore (if commit-p
+                            (gethash key settings)
+                            (when start (session-capture-raw-binding start name)))))
+          (when restore (session-install-raw-binding settings name restore))
+          (remhash key settings)))
+      (session-publish-application-name))))
 
 (defun session-application-name-settings-row ()
   "Build the supported pg_settings fields for application_name."
@@ -192,6 +256,9 @@ This changes in-memory state only; client reporting occurs later."
 The saved settings allow an abort to restore the values in effect at transaction start."
   (when (string= name "application_name")
     (return-from session-set-extra-setting (session-set-application-name value)))
+  (when (string= name "synchronous_commit")
+    (session-set-synchronous-commit value)
+    (return-from session-set-extra-setting (session-synchronous-commit-value)))
   (let* ((settings (backend-settings *backend*))
          (reset-p (or (eq value :default) (eq value +null+)))
          (reset (backend-settings-reset *backend*)))
@@ -215,6 +282,7 @@ The saved settings allow an abort to restore the values in effect at transaction
   (when (and *backend* (session-extra-setting-p name))
     (multiple-value-bind (value present-p) (gethash name (backend-settings *backend*))
       (cond
+        ((string= name "synchronous_commit") (values (session-synchronous-commit-value) t))
         ((string= name "application_name") (values (or value "") t))
         ((string= name "statement_timeout")
          (let ((milliseconds (or value 0)))

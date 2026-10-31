@@ -2352,13 +2352,13 @@ can discard the owner of a virtual ID or its remaining relation locks."
   (values))
 
 (defun finish-backend-transaction (backend commit-p)
-  "Reset BACKEND and finish application_name state atomically.
+  "Reset BACKEND and restore transaction-local settings atomically.
 On commit, retire the saved settings snapshot; abort leaves it for whole-table undo."
   (sb-sys:without-interrupts
     (let ((*backend* backend))
       (reset-backend-transaction backend)
       ;; Portal resources retire before COMMIT enters WAL or ABORT releases XID locks.
-      (session-finish-application-name commit-p)
+      (session-finish-transaction-settings commit-p)
       (when commit-p
         (setf (backend-settings-transaction-start backend) nil))))
   (values))
@@ -2388,14 +2388,8 @@ On commit, retire the saved settings snapshot; abort leaves it for whole-table u
                                :format-arguments nil)))))))
   (values))
 
-(defvar *synchronous-commit-wait-mode* :flush
-  "Private wait mode for user commits: NIL, :WRITE, :FLUSH or :APPLY.")
-
 (defun synchronous-commit-wait-mode ()
-  "Validate the private commit wait mode; NIL skips the remote wait."
-  (unless (member *synchronous-commit-wait-mode* '(nil :write :flush :apply))
-    (error "Invalid synchronous commit wait mode: ~s" *synchronous-commit-wait-mode*))
-  *synchronous-commit-wait-mode*)
+  (session-synchronous-commit-wait-mode))
 
 (defun wait-for-committed-wal-obligation
     (backend obligation mode &optional (end (and obligation (transaction-wal-obligation-user-end obligation))))

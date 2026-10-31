@@ -364,6 +364,7 @@
          (path (merge-pathnames
                 (format nil "pg-select-fetch-~d-~d" (sb-posix:getpid) (random 1000000))
                 (uiop:temporary-directory))))
+    (session-set-synchronous-commit "on")
     (set-backend-state *backend* :in-progress)
     (unwind-protect
          (progn
@@ -824,6 +825,7 @@
                (let* ((*backend* (make-backend :xid 777 :state :in-progress :read-only nil
                                                :dirty-relations (when writes '(123))))
                       (context (prepare-backend-wal-obligation *backend*)))
+                 (setf (gethash "synchronous_commit" (backend-settings *backend*)) "on")
                  (rove:ok (eql writes (not (null (backend-own-wal-effects-p *backend*)))))
                  (commit-transaction)
                  (rove:ok (null (backend-wal-obligation *backend*)))

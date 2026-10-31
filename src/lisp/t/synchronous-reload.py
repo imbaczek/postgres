@@ -24,6 +24,61 @@ def wait(server, predicate, label, timeout=30):
     raise TimeoutError(label)
 
 
+def commit_default_reload(server, witness, writer, contender):
+    config = server.data / 'postgresql.conf'
+    log = server.root / 'server.log'
+    baseline = log.read_text(errors='replace').count('pg-lisp: reload complete')
+    config.write_text("synchronous_standby_names='FIRST 1 (peer)'\nsynchronous_commit=on\n")
+    assert witness.query('SELECT pg_reload_conf()') == [['t']]
+    wait(server, lambda: witness.query('SHOW synchronous_standby_names')
+         == [['FIRST 1 (peer)']], 'standby names for commit-default reload')
+    wait(server, lambda: log.read_text(errors='replace').count('pg-lisp: reload complete') > baseline,
+         'code reload before commit-default test', timeout=60)
+    baseline = log.read_text(errors='replace').count('pg-lisp: reload complete')
+    writer.send(b'Q', b'UPDATE reload_rows SET n=3 WHERE id=1\0')
+    api['api']['wait_for_commit'](server)
+    server.control('(defvar *default-reload-waiter* nil)')
+    server.control('(sb-thread:with-mutex (*wal-sender-lock*) '
+                   '(setf *default-reload-waiter* (first (getf '
+                   '(sync-replication-state-queues *sync-replication-state*) :flush))))')
+    config.write_text("synchronous_standby_names='FIRST 1 (peer)'\nsynchronous_commit=local\n")
+    assert not select.select([writer.socket], [], [], 0)[0]
+    # Control evaluation also needs admission. Keep one callback admitted across
+    # SIGHUP so code drain cannot block the inspection or the old acknowledgement.
+    server.control(
+        '(let ((deadline (+ (get-internal-real-time) (* 10 internal-time-units-per-second)))) '
+        '(sb-posix:kill (sb-posix:getpid) 1) '
+        '(loop until (string= "local" (let ((*backend* nil)) (session-synchronous-commit-value))) '
+        'do (when (> (get-internal-real-time) deadline) (error "commit default reload timed out")) '
+        '(sleep 0.02)) '
+        '(sb-thread:with-mutex (*wal-sender-lock*) '
+        '(assert (eq :waiting (sync-replication-waiter-state *default-reload-waiter*))) '
+        '(assert (member *default-reload-waiter* (getf '
+        '(sync-replication-state-queues *sync-replication-state*) :flush)))) '
+        '(let* ((end (sync-replication-waiter-lsn *default-reload-waiter*)) '
+        '(sender (wal-sender-register (make-backend :pid 999999 '
+        ':replication-mode :database :application-name "peer")))) '
+        '(unwind-protect (progn (wal-sender-set-state sender "streaming") '
+        '(wal-sender-note-sent sender end) (wal-sender-note-reply sender end end end 1)) '
+        '(wal-sender-unregister (wal-sender-status-backend sender)))))')
+    assert [kind for kind, _ in receive_ready(writer)] == [b'C', b'Z']
+    # The new terminal exceeds the old acknowledged LSN. Incorrectly using ON
+    # would wait indefinitely because there is no second acknowledgement.
+    contender.query('INSERT INTO reload_rows VALUES (2, 4)')
+    wait(server, lambda: log.read_text(errors='replace').count('pg-lisp: reload complete') > baseline,
+         'code reload after old flush waiter retires', timeout=60)
+    assert witness.query('SELECT n FROM reload_rows WHERE id=1') == [['3']]
+    assert witness.query("SELECT setting,source FROM pg_settings WHERE name='synchronous_commit'") == [
+        ['local', 'configuration file']]
+    config.write_text("synchronous_standby_names=''\n")
+    server.process.send_signal(signal.SIGHUP)
+    wait(server, lambda: witness.query('SHOW synchronous_standby_names') == [['']],
+         'clear standby names after commit-default test')
+    assert witness.query('SHOW synchronous_commit') == [['on']]
+    print('synchronous-reload: changing commit default preserves queued waits '
+          'and applies to future transactions PASS', flush=True)
+
+
 def run():
     server = OwnedLisp()
     clients = []
@@ -98,6 +153,7 @@ def run():
         assert witness.query('SHOW synchronous_standby_names') == [['']]
         print('synchronous-reload: invalid reloads preserve waits; clearing names '
               'releases commits; retained portal preserves SQL service; code reload PASS', flush=True)
+        commit_default_reload(server, witness, writer, contender)
     finally:
         for connection in clients:
             connection.close()

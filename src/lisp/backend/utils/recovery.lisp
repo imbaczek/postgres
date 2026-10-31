@@ -1,6 +1,12 @@
 ;;;; Cluster-owned recovery role; session settings never grant write authority.
 (in-package #:pg)
 
+(declaim (ftype function session-finish-transaction-settings session-normalize-synchronous-commit
+                session-set-synchronous-commit session-synchronous-commit-value
+                session-synchronous-commit-wait-mode session-synchronous-commit-settings-row))
+
+(defparameter *session-local-setting-names* '("application_name" "synchronous_commit"))
+
 (defconstant +db-startup+ 0)
 
 (defconstant +db-shutdowned+ 1)

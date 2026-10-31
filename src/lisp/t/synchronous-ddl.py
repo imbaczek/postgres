@@ -111,33 +111,32 @@ def failed_and_skipped(server, connection):
 
 def preparation_cases(server, connection):
     server.control('(defvar *ddl-test-before-wal* nil)')
-    server.control('(setf *ddl-test-before-wal* *wal-end-lsn* '
-                   '*synchronous-commit-wait-mode* :invalid)')
-    try:
-        connection.send(b'Q', b'CREATE TABLE ddl_invalid (id int)\0')
-        frames = receive_ready(connection)
-        assert [kind for kind, _ in frames] == [b'E', b'Z'], frames
-        server.control('(assert (= *ddl-test-before-wal* *wal-end-lsn*))')
-        server.control('(with-write-lock '
-                       '(assert (not (gethash "ddl_invalid" '
-                       '(database-tables (get-database "postgres"))))))')
-    finally:
-        server.control('(setf *synchronous-commit-wait-mode* :flush)')
+    connection.query('SET synchronous_commit = on')
+    server.control('(setf *ddl-test-before-wal* *wal-end-lsn*)')
+    connection.send(b'Q', b"SET synchronous_commit = 'invalid'\0")
+    frames = receive_ready(connection)
+    assert [kind for kind, _ in frames] == [b'E', b'Z'], frames
+    server.control('(assert (= *ddl-test-before-wal* *wal-end-lsn*))')
+    assert connection.query('SHOW synchronous_commit') == [['on']]
     server.control('(defvar *ddl-test-save* (symbol-function \'save-catalog))')
     server.control(
         '(setf (symbol-function \'save-catalog) '
         '(lambda (&rest arguments) '
         '(multiple-value-prog1 (apply *ddl-test-save* arguments) '
         '(when (getf arguments :final-ddl-p) '
-        '(setf *synchronous-commit-wait-mode* :invalid)))))')
+        '(session-set-synchronous-commit "local")))))')
     try:
         ddl_case(server, connection, 'CREATE TABLE ddl_captured_mode (id int)')
-        server.control('(setf *synchronous-commit-wait-mode* :flush)')
+        assert connection.query('SHOW synchronous_commit') == [['local']]
+        configure(server, 'FIRST 1 (peer)')
+        connection.query('CREATE TABLE ddl_subsequent_local (id int)')
+        configure(server, '')
+        connection.query('SET synchronous_commit = on')
         ddl_case(server, connection, 'ALTER TABLE ddl_rows ADD CONSTRAINT captured_check '
                  "CHECK (nextval('ddl_seq') > 0)", with_xid=True)
     finally:
-        server.control('(setf (symbol-function \'save-catalog) *ddl-test-save* '
-                       '*synchronous-commit-wait-mode* :flush)')
+        server.control('(setf (symbol-function \'save-catalog) *ddl-test-save*)')
+        connection.query('SET synchronous_commit = on')
     print('synchronous-ddl: prepublication validation and captured mode PASS', flush=True)
 
 

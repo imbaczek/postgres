@@ -175,9 +175,7 @@
                         (sb-thread:make-thread
                          (lambda ()
                            (let ((pg::*sync-replication-state* runtime)
-                                 (pg::*wal-sender-registry* registry)
-                                 (pg::*synchronous-commit-wait-mode*
-                                   (case action (:write :write) (:apply :apply) (t :flush))))
+                                 (pg::*wal-sender-registry* registry))
                              (call-with-resource-wal-fixture
                               (lambda ()
                                 (uiop:with-temporary-file
@@ -185,6 +183,8 @@
                                      :element-type '(unsigned-byte 8))
                                   (let* ((pg::*backend* (pg::make-backend :stream stream))
                                          (condition nil))
+                                    (pg::session-set-synchronous-commit
+                                     (case action (:write "remote_write") (:apply "remote_apply") (t "on")))
                                     (setf backend pg::*backend*
                                           xid (pg::assign-xid backend)
                                           (pg::backend-dirty-relations backend) '(999))
@@ -260,23 +260,24 @@
               (ok (zerop (file-length stream))))))))))
 
 (deftest synchronous-user-commit-validates-mode-before-wal
-    (dolist (mode '(nil :invalid))
+    (dolist (mode '("local" "invalid"))
       (call-with-synchronous-commit-test-state
        (lambda ()
          (pg::sync-replication-install-configuration "FIRST 1 (peer)" :source-a :source-a 0)
          (call-with-resource-wal-fixture
           (lambda ()
             (let* ((pg::*backend* (pg::make-backend))
-                   (pg::*synchronous-commit-wait-mode* mode)
                    (xid (pg::assign-xid pg::*backend*))
                    (before pg::*wal-end-lsn*)
                    (failure nil))
-              (setf (pg::backend-dirty-relations pg::*backend*) '(999))
+              ;; Corrupt the raw binding deliberately to test the pre-WAL defensive check.
+              (setf (gethash "synchronous_commit" (pg::backend-settings pg::*backend*)) mode
+                    (pg::backend-dirty-relations pg::*backend*) '(999))
               (unwind-protect
                    (progn
                      (handler-case (pg::commit-transaction)
                        (error (condition) (setf failure condition)))
-                     (if mode
+                     (if (string= mode "invalid")
                          (progn
                            (ok failure)
                            (ok (= before pg::*wal-end-lsn*))

@@ -154,6 +154,7 @@ synchronous configuration plan against the same source and generation."
     ("primary_conninfo" :sighup :conninfo "")
     ("primary_slot_name" :sighup :slot "")
     ("synchronous_standby_names" :sighup :standby-names "")
+    ("synchronous_commit" :user :synchronous-commit "on")
     ("recovery_target_timeline" :postmaster :timeline "latest")
     ("hot_standby" :postmaster :boolean "on")
     ("wal_level" :postmaster :wal-level "replica")
@@ -367,6 +368,7 @@ original spelling."
         (:boolean (startup-parse-boolean-setting text))
         (:timeline (startup-parse-recovery-timeline text) text)
         (:standby-names (parse-sync-standby-names text) text)
+        (:synchronous-commit (session-normalize-synchronous-commit text))
         (:string
          (when (and (string= name "restore_command") (not (equal text "")))
            (error "nonempty restore_command requires unimplemented archive recovery"))
@@ -1045,7 +1047,7 @@ This configuration path does not take live admission or the code reload lock."
 (defun startup-check-session-setting (name)
   "Enforce guc.c's POSTMASTER/SIGHUP contexts for SQL SET and RESET."
   (let ((spec (assoc name *startup-setting-specs* :test #'string=)))
-    (when (or spec (string= name "config_file"))
+    (when (or (and spec (not (eq (second spec) :user))) (string= name "config_file"))
       (ereport "55P02" "parameter ~s cannot be changed~a"
                name (if (or (string= name "config_file")
                             (eq (second spec) :postmaster))
@@ -1073,13 +1075,17 @@ environment."
                            :command-line :environment)))))
     (vector name (startup-setting-text name value) unit
             (if spec (string-downcase (symbol-name (second spec))) "postmaster")
-            (case (third spec) (:integer "integer") (:boolean "bool") (:wal-level "enum") (t "string"))
+            (case (third spec) (:integer "integer") (:boolean "bool") ((:wal-level :synchronous-commit) "enum") (t "string"))
             (ecase source
               (:default "default") (:file "configuration file") (:override "override")
               (:command-line "command line") (:environment "environment variable"))
-            (if (eq (third spec) :wal-level) (make-sql-array :element-type-id :text
-                                                             :elements (vector "minimal" "replica" "logical")
-                                                             :dimensions '(3) :lower-bounds '(1)) +null+)
+            (let ((choices (case (third spec)
+                             (:wal-level (vector "minimal" "replica" "logical"))
+                             (:synchronous-commit (vector "local" "remote_write" "remote_apply" "on")))))
+              (if choices
+                  (make-sql-array :element-type-id :text :elements choices
+                                  :dimensions (list (length choices)) :lower-bounds '(1))
+                  +null+))
             (if (eq source :file) (or (getf entry :sourcefile) +null+) +null+)
             (if (eq source :file) (or (getf entry :sourceline) +null+) +null+)
             (not (null (getf entry :pending-restart))))))
@@ -1092,7 +1098,10 @@ Use one root for all server rows. Without an installed root, return session rows
     (append
      (when settings
        (loop for name in (sort (loop for name being the hash-keys of settings collect name) #'string<)
-             collect (startup-settings-row name (gethash name settings) configuration)))
+             unless (string= name "synchronous_commit")
+               collect (startup-settings-row name (gethash name settings) configuration)))
+     (let ((row (session-synchronous-commit-settings-row configuration)))
+       (when row (list row)))
      (list (session-timeout-settings-row) (session-application-name-settings-row)))))
 
 (defun startup-setting-show-value (name)
@@ -1147,7 +1156,7 @@ As in C's zero-initialized reset fields, booleans report FALSE and integers 0;
 strings and enums use boot values. These are not runtime or -C defaults."
   (loop for (name context kind boot minimum maximum) in *startup-setting-specs*
         for type = (case kind
-                     (:integer "INTEGER") (:boolean "BOOLEAN") (:wal-level "ENUM")
+                     (:integer "INTEGER") (:boolean "BOOLEAN") ((:wal-level :synchronous-commit) "ENUM")
                      (t "STRING"))
         for default = (case kind
                         ;; C GucInfoMain builds the registry without initializing reset fields.

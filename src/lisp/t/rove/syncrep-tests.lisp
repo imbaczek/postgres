@@ -253,6 +253,123 @@
                (progn (startup-normalize-setting "synchronous_standby_names" "ANY 0 (peer)") nil)
              (error () t))))
 
+(cl-spec:defproperty synchronous-commit-on-aliases-are-canonical
+    ((choice (range integer 0 3)))
+  (:about session-normalize-synchronous-commit)
+  (:trials (:normal 100))
+  (string= "on" (session-normalize-synchronous-commit
+                 (nth choice '("ON" "true" "YES" "1")))))
+
+(rove:deftest synchronous-commit-value-contract
+    (unit-check-property 'synchronous-commit-on-aliases-are-canonical)
+  (dolist (value '("local" "remote_write" "remote_apply"))
+    (rove:ok (string= value (session-normalize-synchronous-commit (string-upcase value)))))
+  (dolist (entry '(("off" . "0A000") ("false" . "0A000") ("no" . "0A000")
+                   ("0" . "0A000") ("t" . "22023") (" on " . "22023")
+                   ("remote" . "22023")))
+    (rove:ok (equal (cdr entry)
+                    (handler-case
+                        (progn (session-normalize-synchronous-commit (car entry)) nil)
+                      (pg-error (condition) (pg-error-sqlstate condition)))))))
+
+(rove:deftest session-raw-binding-preserves-absence-and-source
+    (dolist (value-p '(nil t))
+      (dolist (source-p '(nil t))
+        (let ((settings (make-hash-table :test #'equal)))
+          (when value-p (setf (gethash "synchronous_commit" settings) "local"))
+          (when source-p (setf (gethash '(:source "synchronous_commit") settings) "client"))
+          (let ((binding (session-capture-raw-binding settings "synchronous_commit")))
+            (setf (gethash "synchronous_commit" settings) "on"
+                  (gethash '(:source "synchronous_commit") settings) "session")
+            (session-install-raw-binding settings "synchronous_commit" binding)
+            (rove:ok (equal binding
+                            (session-capture-raw-binding settings "synchronous_commit"))))))))
+
+(rove:deftest session-local-bindings-restore-absence-and-baseline
+    (let* ((*backend* (make-backend :state :in-progress))
+           (settings (backend-settings *backend*)))
+      (session-set-synchronous-commit "remote_write" t)
+      (session-set-synchronous-commit "remote_apply" t)
+      (rove:ok (equal "remote_apply" (gethash "synchronous_commit" settings)))
+      (session-finish-transaction-settings t)
+      (rove:ok (not (nth-value 1 (gethash "synchronous_commit" settings))))
+      (rove:ok (not (nth-value 1 (gethash '(:source "synchronous_commit") settings))))
+      (setf (gethash "synchronous_commit" (backend-settings-reset *backend*)) "local"
+            (gethash '(:source "synchronous_commit") (backend-settings-reset *backend*)) "client")
+      (session-set-synchronous-commit "on")
+      (session-set-synchronous-commit :default t)
+      (rove:ok (equal "local" (gethash "synchronous_commit" settings)))
+      (rove:ok (equal "client" (gethash '(:source "synchronous_commit") settings)))
+      (session-finish-transaction-settings t)
+      (rove:ok (equal "on" (gethash "synchronous_commit" settings)))
+      (rove:ok (equal "session" (gethash '(:source "synchronous_commit") settings)))
+      (session-set-synchronous-commit "local" t)
+      (session-set-synchronous-commit "remote_write")
+      (session-finish-transaction-settings t)
+      (rove:ok (equal "remote_write" (gethash "synchronous_commit" settings)))))
+
+(rove:deftest session-invalid-commit-setting-does-not-save-or-mutate
+    (let* ((*backend* (make-backend :state :in-progress))
+           (settings (backend-settings *backend*)))
+      (dolist (value '("off" "invalid"))
+        (rove:ok (handler-case (progn (session-set-synchronous-commit value t) nil)
+                   (pg-error () t)))
+        (rove:ok (zerop (hash-table-count settings)))
+        (rove:ok (null (backend-settings-transaction-start *backend*))))))
+
+(rove:deftest synchronous-commit-session-uses-current-root-after-local-and-reset
+    (let* ((settings (make-hash-table :test #'equal))
+           (*startup-installed-configuration* (make-startup-configuration :settings settings))
+           (*backend* (make-backend :state :in-progress :explicit t)))
+      (setf (gethash "synchronous_commit" settings) (list :value "on" :source :file
+                                                          :sourcefile "/owned/test.conf" :sourceline 7))
+      (rove:ok (equal "on" (sql-setting-value "synchronous_commit")))
+      (rove:ok (eq :flush (session-synchronous-commit-wait-mode)))
+      (exec-set (make-broadcast-stream)
+                (first (parse-statements "SET LOCAL synchronous_commit = remote_apply")))
+      (rove:ok (eq :apply (session-synchronous-commit-wait-mode)))
+      (let ((replacement (copy-session-settings settings)))
+        (setf (gethash "synchronous_commit" replacement)
+              (list :value "local" :source :file :sourcefile "/owned/new.conf" :sourceline 8)
+              *startup-installed-configuration* (make-startup-configuration :settings replacement)))
+      (session-finish-transaction-settings t)
+      (rove:ok (equal "local" (sql-setting-value "synchronous_commit")))
+      (rove:ok (null (session-synchronous-commit-wait-mode)))
+      (rove:ok (equal "remote_write" (set-config-value "synchronous_commit" "REMOTE_WRITE" nil)))
+      (let ((rows (remove-if-not (lambda (row) (equal "synchronous_commit" (aref row 0)))
+                                 (startup-settings-rows))))
+        (rove:ok (= 1 (length rows)))
+        (rove:ok (equal '("remote_write" "user" "enum" "session")
+                        (loop for index in '(1 3 4 5) collect (aref (first rows) index))))
+        (rove:ok (eq +null+ (aref (first rows) 7))))
+      (exec-reset (make-broadcast-stream) (first (parse-statements "RESET synchronous_commit")))
+      (rove:ok (equal "local" (sql-setting-value "synchronous_commit")))
+      (let ((row (session-synchronous-commit-settings-row *startup-installed-configuration*)))
+        (rove:ok (equal "configuration file" (aref row 5)))
+        (rove:ok (equal "/owned/new.conf" (aref row 7)))
+        (rove:ok (= 8 (aref row 8))))
+      (rove:ok (not (nth-value 1 (gethash "synchronous_commit" (backend-settings *backend*)))))
+      (rove:ok (not (nth-value 1 (gethash "synchronous_commit" (backend-settings-reset *backend*)))))))
+
+(rove:deftest synchronous-commit-client-baseline-survives-reset-and-abort
+    (let ((*backend* (make-backend)))
+      (session-apply-startup-options '(("options" . "-c synchronous_commit=remote_write")))
+      (rove:ok (equal "remote_write" (sql-setting-value "synchronous_commit")))
+      (rove:ok (equal "client" (aref (session-synchronous-commit-settings-row nil) 5)))
+      (setf (backend-state *backend*) :in-progress)
+      (session-set-synchronous-commit "local")
+      (session-finish-transaction-settings nil)
+      (rove:ok (equal "remote_write" (sql-setting-value "synchronous_commit")))
+      (rove:ok (equal "client" (aref (session-synchronous-commit-settings-row nil) 5)))
+      (session-set-synchronous-commit "on")
+      (session-set-extra-setting "synchronous_commit" :default)
+      (rove:ok (equal "remote_write" (sql-setting-value "synchronous_commit")))
+      (session-set-synchronous-commit "local" t)
+      (session-reset-all-settings)
+      (session-finish-transaction-settings t)
+      (rove:ok (equal "remote_write" (sql-setting-value "synchronous_commit")))
+      (rove:ok (equal "client" (aref (session-synchronous-commit-settings-row nil) 5)))))
+
 (rove:deftest synchronous-configuration-disable-is-atomic-with-enqueue
     (call-with-sync-wait-state
      (lambda ()

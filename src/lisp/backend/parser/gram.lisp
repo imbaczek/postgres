@@ -1282,8 +1282,8 @@ Range and negative checks occur when the LIMIT executes."
     (when (match-kw p "local")
       (when session-p (syntax-error p "SESSION and LOCAL are alternatives"))
       (let ((name (pident p)))
-        (unless (string-equal name "application_name")
-          (ereport "0A000" "SET LOCAL is only supported for application_name"))
+        (unless (member name *session-local-setting-names* :test #'string-equal)
+          (ereport "0A000" "SET LOCAL is only supported for application_name and synchronous_commit"))
         (when (eq (pkind p) :op) (pnext p))
         (match-kw p "to")
         (return-from parse-set
