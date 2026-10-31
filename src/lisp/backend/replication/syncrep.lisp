@@ -304,38 +304,54 @@ Signal the current backend last so its termination cannot prevent other signals.
       (terminate-backend *backend*)))
   (values))
 
-(defun sync-replication-install-configuration (text source-id expected-source-id expected-generation
-                                               &key defer-notifications)
-  "Install the configuration after checking both predecessor values.
-Return the installed configuration generation. By default, notify obsolete
-senders before returning. With DEFER-NOTIFICATIONS, return the exact backend
-list as a second value. With DEFER-NOTIFICATIONS, the caller must already mask
-interrupts and retain the mask through fence release and notification, including
-on unwind."
-  ;; Compare both predecessor source and configuration generation under lock.
-  ;; Source IDs are immutable symbols or integers; the owning lifecycle must
-  ;; supply a fresh real generation for every source incarnation.
-  (when (and defer-notifications sb-sys:*interrupts-enabled*)
-    (error "deferred sender notification requires masked interrupts"))
+(define-condition sync-replication-configuration-changed (pg-error) ()
+  (:default-initargs :sqlstate "55000"
+                     :message "synchronous replication configuration generation changed"))
+
+(defstruct (sync-replication-configuration-plan
+            (:constructor %make-sync-replication-configuration-plan))
+  (names nil :read-only t) (config nil :read-only t)
+  (source-id nil :read-only t) (expected-source-id nil :read-only t)
+  (expected-generation nil :read-only t))
+
+(defun prepare-sync-replication-configuration (text source-id expected-source-id expected-generation)
   (sync-replication-check-source-id source-id)
   (sync-replication-check-source-id expected-source-id)
-  (let ((config (parse-sync-standby-names text))
-        (names (copy-seq text))
+  (let* ((names (copy-seq text))
+         (config (parse-sync-standby-names names)))
+    (%make-sync-replication-configuration-plan
+     :names names :config config :source-id source-id
+     :expected-source-id expected-source-id :expected-generation expected-generation)))
+
+(defun sync-replication-publish-prepared-configuration
+    (plan &key publication defer-notifications)
+  (check-type plan sync-replication-configuration-plan)
+  (when (and defer-notifications sb-sys:*interrupts-enabled*)
+    (error "deferred sender notification requires masked interrupts"))
+  (let ((config (sync-replication-configuration-plan-config plan))
+        (names (sync-replication-configuration-plan-names plan))
+        (source-id (sync-replication-configuration-plan-source-id plan))
         (obsolete nil)
         (installed-generation nil))
     (sb-sys:without-interrupts
       (sb-thread:with-mutex (*wal-sender-lock*)
-        (unless (and (eql expected-generation (sync-replication-state-generation *sync-replication-state*))
-                     (eql expected-source-id (sync-replication-state-source-id *sync-replication-state*)))
-          (ereport "55000" "synchronous replication configuration generation changed"))
-        (let* ((source-changed (not (eql source-id (sync-replication-state-source-id *sync-replication-state*))))
+        (unless (and (eql (sync-replication-configuration-plan-expected-generation plan)
+                          (sync-replication-state-generation *sync-replication-state*))
+                     (eql (sync-replication-configuration-plan-expected-source-id plan)
+                          (sync-replication-state-source-id *sync-replication-state*)))
+          (error 'sync-replication-configuration-changed))
+        (let* ((source-changed
+                 (not (eql source-id (sync-replication-state-source-id *sync-replication-state*))))
                (frontiers (if source-changed
                               (list :write 0 :flush 0 :apply 0)
                               (sync-replication-next-frontiers-under-lock config)))
                (generation (1+ (sync-replication-state-generation *sync-replication-state*))))
           (when source-changed
             (setf obsolete (loop for backend being the hash-keys of *wal-sender-registry*
-                                 collect backend))
+                                 collect backend)))
+          ;; A publisher may reject before writing; its stores must not fail.
+          (when publication (funcall publication))
+          (when source-changed
             (sync-replication-complete-all-under-lock :source-changed)
             (clrhash *wal-sender-registry*))
           (setf (sync-replication-state-config *sync-replication-state*) config
@@ -347,12 +363,17 @@ on unwind."
           (if config
               (sync-replication-release-under-lock)
               (sync-replication-complete-all-under-lock :disabled))))
-      ;; A deferred caller retains the interrupt mask through notification.
       (if defer-notifications
           (values installed-generation obsolete)
           (progn
             (sync-replication-notify-obsolete-senders obsolete)
             installed-generation)))))
+
+(defun sync-replication-install-configuration (text source-id expected-source-id expected-generation
+                                               &key defer-notifications)
+  (sync-replication-publish-prepared-configuration
+   (prepare-sync-replication-configuration text source-id expected-source-id expected-generation)
+   :defer-notifications defer-notifications))
 
 (declaim (special *live-operation-quiescence-owner-thread*))
 

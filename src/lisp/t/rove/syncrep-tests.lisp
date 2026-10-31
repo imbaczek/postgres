@@ -220,6 +220,24 @@
     (wal-sender-note-reply sender write flush apply 1)
     sender))
 
+(cl-spec:defproperty prepared-synchronous-configuration-owns-input
+    ((count (range integer 1 100))
+     (suffix (range integer 0 1000000)))
+  (:about prepare-sync-replication-configuration)
+  (:trials (:normal 100))
+  (let* ((text (format nil "ANY ~d (peer~d)" count suffix))
+         (expected (copy-seq text))
+         (plan (prepare-sync-replication-configuration text :source-a :source-a 0)))
+    (setf (char text 0) #\X)
+    (and (string= expected (sync-replication-configuration-plan-names plan))
+         (eq :any (getf (sync-replication-configuration-plan-config plan) :method))
+         (= count (getf (sync-replication-configuration-plan-config plan) :count))
+         (equal (list (format nil "peer~d" suffix))
+                (getf (sync-replication-configuration-plan-config plan) :members)))))
+
+(rove:deftest prepared-synchronous-configuration-input-contract
+    (unit-check-property 'prepared-synchronous-configuration-owns-input))
+
 (rove:deftest synchronous-configuration-disable-is-atomic-with-enqueue
     (call-with-sync-wait-state
      (lambda ()
@@ -371,6 +389,81 @@
            (sync-replication-install-configuration "" source source generation))
          (when thread
            (sb-thread:join-thread thread :timeout 5 :default :timeout)))))))
+
+(rove:deftest prepared-synchronous-publication-precedes-waiter-release
+    (let ((plan (prepare-sync-replication-configuration "" :source-a :source-a 1))
+          (published nil))
+      (let ((result
+              (call-with-blocking-sync-wait
+               (lambda (backend finished)
+                 (declare (ignore backend finished))
+                 (let ((parser (symbol-function 'parse-sync-standby-names)))
+                   (unwind-protect
+                        (progn
+                          (setf (symbol-function 'parse-sync-standby-names)
+                                (lambda (&rest arguments)
+                                  (declare (ignore arguments))
+                                  (error "publication parsed configuration")))
+                          (sync-replication-publish-prepared-configuration
+                           plan
+                           :publication
+                           (lambda ()
+                             (rove:ok (not sb-sys:*interrupts-enabled*))
+                             (rove:ok (sb-thread:holding-mutex-p *wal-sender-lock*))
+                             (rove:ok (= 1 (sync-replication-state-generation *sync-replication-state*)))
+                             (rove:ok (eq :waiting (sync-replication-waiter-state
+                                                    (first (getf (sync-replication-state-queues
+                                                                  *sync-replication-state*) :flush)))))
+                             (setf published t))))
+                     (setf (symbol-function 'parse-sync-standby-names) parser)))))))
+        (rove:ok published)
+        (rove:ok (eq :disabled (getf result :outcome)))
+        (rove:ok (null (getf result :fatal))))))
+
+(rove:deftest prepared-synchronous-publication-rejects-stale-predecessors
+    (call-with-sync-wait-state
+     (lambda ()
+       (sync-replication-install-configuration "FIRST 1 (peer)" :source-a :source-a 0)
+       (let ((waiter (sync-test-enqueue 100 :flush))
+             (called nil))
+         (dolist (basis '((:source-a 0) (:source-b 1)))
+           (let* ((plan (prepare-sync-replication-configuration
+                         "" :source-a (first basis) (second basis)))
+                  (failure
+                    (handler-case
+                        (progn (sync-replication-publish-prepared-configuration
+                                plan :publication (lambda () (setf called t))) nil)
+                      (sync-replication-configuration-changed (condition) condition))))
+             (rove:ok (typep failure 'sync-replication-configuration-changed))
+             (rove:ok (equal "55000" (pg-error-sqlstate failure)))
+             (rove:ok (not called))
+             (rove:ok (= 1 (sync-replication-state-generation *sync-replication-state*)))
+             (rove:ok (eq :waiting (sync-replication-waiter-state waiter)))))))))
+
+(rove:deftest prepared-synchronous-publication-failure-preserves-old-state
+    (dolist (kind '(:error :throw))
+      (call-with-sync-wait-state
+       (lambda ()
+         (sync-replication-install-configuration "FIRST 1 (peer)" :source-a :source-a 0)
+         (let* ((sender (sync-test-sender "peer" 1 50 50 0))
+                (waiter (sync-test-enqueue 100 :flush))
+                (plan (prepare-sync-replication-configuration "" :source-b :source-a 1))
+                (outcome
+                  (handler-case
+                      (catch 'publication-rejected
+                        (sync-replication-publish-prepared-configuration
+                         plan :publication
+                         (lambda ()
+                           (ecase kind
+                             (:error (error "publication rejected before stores"))
+                             (:throw (throw 'publication-rejected :rejected))))))
+                    (error () :rejected))))
+           (rove:ok (eq :rejected outcome))
+           (rove:ok (eq :source-a (sync-replication-state-source-id *sync-replication-state*)))
+           (rove:ok (= 1 (sync-replication-state-generation *sync-replication-state*)))
+           (rove:ok (equal "FIRST 1 (peer)" (sync-replication-state-names *sync-replication-state*)))
+           (rove:ok (eq :waiting (sync-replication-waiter-state waiter)))
+           (rove:ok (eq sender (wal-sender-for-backend (wal-sender-status-backend sender)))))))))
 
 (rove:deftest synchronous-blocking-wait-requires-proven-flush
     (let ((result
