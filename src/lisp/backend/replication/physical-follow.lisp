@@ -52,6 +52,28 @@ lock, and release the follow lock before taking the store mutex."
         (sb-thread:with-mutex (*physical-follow-generation-lock*)
           (funcall function)))))
 
+(declaim (special *startup-configuration-lock*))
+
+(defun call-with-physical-follow-generation-publication (function after-release)
+  (let ((mutex *physical-follow-generation-lock*) (held nil))
+    (when (or (sb-thread:holding-mutex-p mutex)
+              (sb-thread:holding-mutex-p *physical-follow-lock*)
+              (sb-thread:holding-mutex-p *startup-configuration-lock*)
+              (sb-thread:holding-mutex-p *wal-sender-lock*)
+              (sb-thread:holding-mutex-p *wal-lock*)
+              (and *physical-receive-store*
+                   (sb-thread:holding-mutex-p (physical-store-mutex *physical-receive-store*))))
+      (error "configuration publication must acquire its generation fence first"))
+    (sb-sys:without-interrupts
+      (unwind-protect
+           (unwind-protect
+                (progn
+                  (setf held
+                        (sb-sys:allow-with-interrupts (sb-thread:grab-mutex mutex)))
+                  (funcall function))
+             (when held (sb-thread:release-mutex mutex)))
+        (funcall after-release)))))
+
 (defun call-with-physical-follow-worker-publication (generation-p function)
   "Publish workers while holding the requested lifecycle locks.
 Neither generation nor follow lock may already be held; the command lock is

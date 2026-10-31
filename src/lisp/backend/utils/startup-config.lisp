@@ -891,7 +891,7 @@ authentication and an initialized source."
   "Run the shared installation kernel with boundary checks supplied by callers.
 The desired installer holds quiescence and the generation fence for publication."
   (check-type candidate startup-configuration)
-  (physical-follow-call-with-desired-install
+  (physical-follow-call-with-prepared-install
    (startup-configuration-desired candidate)
    (lambda () (startup-publish-configuration candidate))
    (lambda ()

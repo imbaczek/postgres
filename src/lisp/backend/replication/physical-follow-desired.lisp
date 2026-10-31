@@ -170,40 +170,41 @@ Unclaimed and non-standby cases need no check; live replay files are not read."
                        (physical-follow-desired-claimed-p desired))))
     (error 'physical-follow-generation-changed)))
 
-(defun physical-follow-call-with-desired-install (desired function &optional preflight claim-preflight publication-preflight)
-  "Install settings and their generation together under quiescence.
-Under the generation fence, check the desired predecessor and run PREFLIGHT
-under the follow lock before and after the durable claim. Run CLAIM-PREFLIGHT
-before the claim and PUBLICATION-PREFLIGHT after it, both outside the follow lock.
-Publish under the follow lock with interrupts masked, then notify outside the fence. A notification error is logged
-without undoing the installed configuration."
+(defun physical-follow-call-with-prepared-install
+    (desired function preflight claim-preflight publication-preflight)
   (check-type desired physical-follow-desired)
   (let ((changed nil))
-    (flet ((install ()
-             (call-with-physical-follow-generation-fence
-              (lambda ()
-                (sb-thread:with-mutex (*physical-follow-lock*)
-                  (when preflight (funcall preflight))
-                  (physical-follow-check-desired-predecessor desired))
-                (when claim-preflight (funcall claim-preflight))
-                (physical-follow-prepare-managed-claim desired)
-                (when publication-preflight (funcall publication-preflight))
-                (sb-thread:with-mutex (*physical-follow-lock*)
-                  (when preflight (funcall preflight))
-                  (physical-follow-check-desired-predecessor desired)
-                  (sb-sys:without-interrupts
-                    (funcall function)
-                    (unless (eq desired *physical-follow-desired*)
-                      (setf *physical-follow-desired* desired changed t))))))
-             (when changed
-               (handler-case (sb-thread:signal-semaphore *physical-follow-desired-wake*)
-                 (error (condition)
-                   (ignore-errors
-                    (admin-log "configuration installed; follow wake failed: ~a" condition)))))))
-      (if (eq *live-operation-quiescence-owner-thread* sb-thread:*current-thread*)
-          (install)
-          (with-live-operation-quiescence (install)))))
+    (call-with-physical-follow-generation-publication
+     (lambda ()
+       (sb-thread:with-mutex (*physical-follow-lock*)
+         (when preflight (funcall preflight))
+         (physical-follow-check-desired-predecessor desired))
+       (when claim-preflight (funcall claim-preflight))
+       (physical-follow-prepare-managed-claim desired)
+       (when publication-preflight (funcall publication-preflight))
+       (sb-thread:with-mutex (*physical-follow-lock*)
+         (when preflight (funcall preflight))
+         (physical-follow-check-desired-predecessor desired)
+         (funcall function)
+         (unless (eq desired *physical-follow-desired*)
+           (setf *physical-follow-desired* desired changed t))))
+     (lambda ()
+       (when changed
+         (handler-case (sb-thread:signal-semaphore *physical-follow-desired-wake*)
+           (error (condition)
+             (ignore-errors
+              (admin-log "configuration installed; follow wake failed: ~a" condition))))))))
   desired)
+
+(defun physical-follow-call-with-desired-install
+    (desired function &optional preflight claim-preflight publication-preflight)
+  "Install a direct desired generation under live-operation quiescence."
+  (flet ((install ()
+           (physical-follow-call-with-prepared-install
+            desired function preflight claim-preflight publication-preflight)))
+    (if (eq *live-operation-quiescence-owner-thread* sb-thread:*current-thread*)
+        (install)
+        (with-live-operation-quiescence (install)))))
 
 (defun physical-follow-install-desired (desired)
   (physical-follow-call-with-desired-install desired (constantly nil)))

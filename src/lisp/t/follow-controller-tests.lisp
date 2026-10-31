@@ -1,5 +1,135 @@
 (in-package #:pg-physical-tests)
 
+(deftest configuration-publication-acquisition-handoff-keeps-interrupts-masked
+    (let ((tag (gensym "CONFIG-HANDOFF-"))
+          (target sb-thread:*current-thread*)
+          (mutex pg::*physical-follow-generation-lock*)
+          (acquired nil) (masked nil) (body-ran nil) (after-ran nil) (delivery nil))
+      (unwind-protect
+           (progn
+             (sb-int:encapsulate
+              'sb-thread:grab-mutex tag
+              (lambda (original &rest arguments)
+                (multiple-value-prog1 (apply original arguments)
+                  (when (and (eq target sb-thread:*current-thread*)
+                             (eq mutex (first arguments)) (not acquired)
+                             (sb-thread:holding-mutex-p mutex))
+                    (setf acquired t masked (not sb-sys:*interrupts-enabled*))
+                    (sb-thread:interrupt-thread
+                     target
+                     (lambda ()
+                       (setf delivery (list body-ran after-ran (sb-thread:holding-mutex-p mutex)))
+                       (throw 'configuration-grab-handoff :interrupted)))))))
+             (ok (equal '(:interrupted t t (t t nil))
+                        (list (catch 'configuration-grab-handoff
+                                (pg::call-with-physical-follow-generation-publication
+                                 (lambda () (setf body-ran t))
+                                 (lambda () (setf after-ran t))))
+                              acquired masked delivery))))
+        (sb-int:unencapsulate 'sb-thread:grab-mutex tag)
+        (sb-sys:without-interrupts
+          (when (sb-thread:holding-mutex-p mutex) (sb-thread:release-mutex mutex)))))
+  )
+
+(deftest configuration-publication-generation-wait-remains-cancellable
+    (let ((mutex pg::*physical-follow-generation-lock*)
+          (thread nil) (waiting nil) (body-ran nil) (cleanup nil) (joined nil))
+      (unwind-protect
+           (progn
+             (sb-thread:with-mutex (mutex)
+               (setf thread
+                     (sb-thread:make-thread
+                      (lambda ()
+                        (catch 'cancel-configuration-wait
+                          (pg::call-with-physical-follow-generation-publication
+                           (lambda () (setf body-ran t))
+                           (lambda ()
+                             (setf cleanup
+                                   (list (not sb-sys:*interrupts-enabled*)
+                                         (sb-thread:holding-mutex-p mutex)))))))
+                      :name "configuration generation waiter"))
+               (loop repeat 1000
+                     when (eq mutex (sb-thread::thread-waiting-for thread))
+                       do (setf waiting t) (return)
+                     do (sleep 0.001))
+               (sb-thread:interrupt-thread
+                thread (lambda () (throw 'cancel-configuration-wait :cancelled)))
+               (setf joined (sb-thread:join-thread thread :timeout 2 :default :pending)))
+             (ok waiting)
+             (ok (eq :cancelled joined))
+             (ok (not body-ran))
+             (ok (equal '(t nil) cleanup)))
+        (when thread (sb-thread:join-thread thread :timeout 2 :default :cleanup-timeout)))))
+
+(deftest configuration-publication-follow-wait-defers-interruption-through-wake
+    (let ((thread nil) (waiting nil) (body-ran nil) (after-ran nil)
+                       (delivery nil) (pending nil) (joined nil))
+      (unwind-protect
+           (progn
+             (sb-thread:with-mutex (pg::*physical-follow-lock*)
+               (setf thread
+                     (sb-thread:make-thread
+                      (lambda ()
+                        (catch 'cancel-configuration-publication
+                          (pg::call-with-physical-follow-generation-publication
+                           (lambda ()
+                             (sb-thread:with-mutex (pg::*physical-follow-lock*)
+                               (setf body-ran t)))
+                           (lambda ()
+                             (setf after-ran
+                                   (and (not sb-sys:*interrupts-enabled*)
+                                        (not (sb-thread:holding-mutex-p pg::*physical-follow-generation-lock*))
+                                        (not (sb-thread:holding-mutex-p pg::*physical-follow-lock*))))))))
+                      :name "configuration follow waiter"))
+               (loop repeat 1000
+                     when (eq pg::*physical-follow-lock* (sb-thread::thread-waiting-for thread))
+                       do (setf waiting t) (return)
+                     do (sleep 0.001))
+               (sb-thread:interrupt-thread
+                thread
+                (lambda ()
+                  (setf delivery
+                        (list body-ran after-ran
+                              (sb-thread:holding-mutex-p pg::*physical-follow-generation-lock*)
+                              (sb-thread:holding-mutex-p pg::*physical-follow-lock*)))
+                  (throw 'cancel-configuration-publication :cancelled)))
+               (setf pending (eq :pending (sb-thread:join-thread thread :timeout 0.05 :default :pending))))
+             (setf joined (sb-thread:join-thread thread :timeout 2 :default :pending))
+             (ok waiting)
+             (ok pending)
+             (ok (eq :cancelled joined))
+             (ok (equal '(t t nil nil) delivery)))
+        (when thread (sb-thread:join-thread thread :timeout 2 :default :cleanup-timeout)))))
+
+(deftest configuration-publication-preserves-values-and-rejects-inverted-locks
+    (let ((after-count 0))
+      (ok (equal '(17 nil 23)
+                 (multiple-value-list
+                  (pg::call-with-physical-follow-generation-publication
+                   (lambda () (values 17 nil 23)) (lambda () (incf after-count))))))
+      (ok (null (multiple-value-list
+                 (pg::call-with-physical-follow-generation-publication
+                  (lambda () (values)) (lambda () (incf after-count))))))
+      (ok (eq :body-error
+              (catch 'body-error
+                (pg::call-with-physical-follow-generation-publication
+                 (lambda () (throw 'body-error :body-error))
+                 (lambda () (incf after-count))))))
+      (ok (= 3 after-count))
+      (dolist (mutex (list pg::*physical-follow-generation-lock* pg::*physical-follow-lock*
+                           pg::*startup-configuration-lock* pg::*wal-sender-lock* pg::*wal-lock*))
+        (dolist (masked '(nil t))
+          (let ((called nil))
+            (flet ((attempt ()
+                     (sb-thread:with-mutex (mutex)
+                       (ok (intake-fails-p
+                            (lambda ()
+                              (pg::call-with-physical-follow-generation-publication
+                               (lambda () (setf called t)) (lambda () (setf called t))))))
+                       (ok (sb-thread:holding-mutex-p mutex)))))
+              (if masked (sb-sys:without-interrupts (attempt)) (attempt)))
+            (ok (not called)))))))
+
 (deftest worker-publication-first-mutex-wait-remains-interruptible
     (dolist (generation-p '(nil t))
       (let ((mutex (if generation-p pg::*physical-follow-generation-lock* pg::*physical-follow-lock*))

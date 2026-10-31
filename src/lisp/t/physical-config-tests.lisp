@@ -102,6 +102,132 @@
    settings native overrides
    (pg::startup-configuration-authentication (pg::startup-capture-configuration))))
 
+(deftest runtime-configuration-publication-keeps-an-admitted-operation-active
+    (call-with-parking-test-state
+     (lambda ()
+       (call-with-runtime-installation-test
+        (lambda (settings native overrides)
+          (let ((old (pg::startup-capture-configuration)))
+            (setf (getf (gethash "checkpoint_timeout" settings) :value) 42
+                  (getf (gethash "wal_keep_size" settings) :value) 16)
+            (let ((candidate (prepare-runtime-test-installation settings native overrides)))
+              (pg::with-live-operation
+                (ok (= 1 pg::*live-operation-count*))
+                (ok pg::*live-operation-admission-open*)
+                ;; Direct desired installation retains its quiescent contract.
+                (ok (intake-fails-p
+                     (lambda () (pg::physical-follow-install-desired pg::*physical-follow-desired*))))
+                (ok (null (startup-installation-error-message candidate)))
+                (ok (= 1 pg::*live-operation-count*))
+                (ok (= 1 pg::*live-operation-depth*))
+                (ok pg::*live-operation-admission-open*)
+                (ok (null pg::*live-operation-quiescence-owner-thread*))
+                (ok (eq candidate (pg::startup-capture-configuration)))
+                (ok (= 300 (pg::startup-configuration-timeout old)))
+                (ok (= 0 (pg::startup-configuration-keep-mb old)))
+                (ok (= 42 (pg::startup-configuration-timeout (pg::startup-capture-configuration))))
+                (ok (= 16 (pg::startup-configuration-keep-mb (pg::startup-capture-configuration))))))))))))
+
+(deftest runtime-publication-wakes-after-unlock-before-a-pending-interrupt
+    (dolist (outer-mask '(nil t))
+      (call-with-runtime-installation-test
+       (lambda (settings native overrides)
+         (let* ((pg::*physical-follow-desired-wake* (sb-thread:make-semaphore :count 0))
+                (publish (symbol-function 'pg::startup-publish-configuration))
+                (observed nil) (masked nil) (returned-inside-mask nil))
+           (setf (gethash "primary_conninfo" settings)
+                 (list :value (pg::string->bytes "host=next") :source :file))
+           (let ((candidate (prepare-runtime-test-installation settings native overrides)))
+             (unwind-protect
+                  (progn
+                    (setf (symbol-function 'pg::startup-publish-configuration)
+                          (lambda (prepared)
+                            (setf masked (not sb-sys:*interrupts-enabled*))
+                            (sb-thread:interrupt-thread
+                             sb-thread:*current-thread*
+                             (lambda ()
+                               (setf observed
+                                     (list (eq candidate (pg::startup-capture-configuration))
+                                           (eq (pg::startup-configuration-desired candidate)
+                                               pg::*physical-follow-desired*)
+                                           (sb-thread:semaphore-count pg::*physical-follow-desired-wake*)
+                                           (sb-thread:holding-mutex-p pg::*physical-follow-generation-lock*)
+                                           (sb-thread:holding-mutex-p pg::*physical-follow-lock*)
+                                           (sb-thread:holding-mutex-p pg::*startup-configuration-lock*)))
+                               (throw 'configuration-publication-cut :interrupted)))
+                            (funcall publish prepared)))
+                    (ok (eq :interrupted
+                            (catch 'configuration-publication-cut
+                              (if outer-mask
+                                  (sb-sys:without-interrupts
+                                    (pg::startup-commit-installation candidate)
+                                    (setf returned-inside-mask t))
+                                  (pg::startup-commit-installation candidate))
+                              :returned)))
+                    (ok masked)
+                    (ok (equal '(t t 1 nil nil nil) observed))
+                    (ok (eq outer-mask returned-inside-mask)))
+               (setf (symbol-function 'pg::startup-publish-configuration) publish))))))))
+
+(deftest runtime-preflight-failure-defers-a-pending-interrupt-through-unlock
+    (call-with-runtime-installation-test
+     (lambda (settings native overrides)
+       (let* ((installed (pg::startup-capture-configuration))
+              (desired pg::*physical-follow-desired*)
+              (pg::*physical-follow-desired-wake* (sb-thread:make-semaphore :count 0))
+              (claim (symbol-function 'pg::physical-follow-prepare-managed-claim))
+              (delivery nil))
+         (setf (gethash "primary_conninfo" settings)
+               (list :value (pg::string->bytes "host=next") :source :file))
+         (let ((candidate (prepare-runtime-test-installation settings native overrides)))
+           (unwind-protect
+                (progn
+                  (setf (symbol-function 'pg::physical-follow-prepare-managed-claim)
+                        (lambda (next)
+                          (declare (ignore next))
+                          (sb-thread:interrupt-thread
+                           sb-thread:*current-thread*
+                           (lambda ()
+                             (setf delivery
+                                   (list (eq installed (pg::startup-capture-configuration))
+                                         (eq desired pg::*physical-follow-desired*)
+                                         (sb-thread:semaphore-count pg::*physical-follow-desired-wake*)
+                                         (sb-thread:holding-mutex-p pg::*physical-follow-generation-lock*)
+                                         (sb-thread:holding-mutex-p pg::*physical-follow-lock*)))
+                             (throw 'failed-configuration-cut :interrupted)))
+                          (error "claim failed before publication")))
+                  (ok (eq :interrupted
+                          (catch 'failed-configuration-cut
+                            (handler-case (pg::startup-commit-installation candidate)
+                              (error () :claim-error)))))
+                  (ok (equal '(t t 0 nil nil) delivery)))
+             (setf (symbol-function 'pg::physical-follow-prepare-managed-claim) claim)))))))
+
+(deftest runtime-publication-notification-errors-are-contained-after-unlock
+    (call-with-runtime-installation-test
+     (lambda (settings native overrides)
+       (let ((pg::*physical-follow-desired-wake* :invalid-test-semaphore)
+             (logger (symbol-function 'pg::admin-log))
+             (observed nil))
+         (setf (gethash "primary_conninfo" settings)
+               (list :value (pg::string->bytes "host=next") :source :file))
+         (let ((candidate (prepare-runtime-test-installation settings native overrides)))
+           (unwind-protect
+                (progn
+                  (setf (symbol-function 'pg::admin-log)
+                        (lambda (&rest arguments)
+                          (declare (ignore arguments))
+                          (setf observed
+                                (list (eq candidate (pg::startup-capture-configuration))
+                                      (eq (pg::startup-configuration-desired candidate)
+                                          pg::*physical-follow-desired*)
+                                      (sb-thread:holding-mutex-p pg::*physical-follow-generation-lock*)
+                                      (sb-thread:holding-mutex-p pg::*physical-follow-lock*)
+                                      (sb-thread:holding-mutex-p pg::*startup-configuration-lock*)))))
+                  (ok (null (startup-installation-error-message candidate)))
+                  (ok (equal '(t t nil nil nil) observed)))
+             (setf (symbol-function 'pg::admin-log) logger)))))))
+
 (defun startup-installation-error-message (candidate)
   (handler-case (progn (pg::startup-commit-installation candidate) nil)
     (error (condition) (princ-to-string condition))))
