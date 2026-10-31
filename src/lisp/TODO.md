@@ -147,6 +147,13 @@
   seed 42 (digest `942121ab116a97c6`); coverage and rejection counts were not
   measured.
 
+- [x] Prepare synchronous replication configuration before publishing it under
+  the sender lock (`a6eae66b69d`). The checkpoint passed 1,409 physical, 759
+  unit, 201 wire and 1,159 legacy checks, strict cold compilation and native
+  user and DDL scripts. The scoped cl-spec property ran 100 trials at seed 42
+  (digest `3f289db7c7c4a86e`); input coverage and rejection counts were not
+  measured. Actual root and generation wiring remains open.
+
 - [ ] Complete public synchronous settings and status and true asynchronous
   `synchronous_commit=off`. Regress a synchronous waiter
   retaining its XID, a second transaction blocked on it, and a pending code reload:

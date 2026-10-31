@@ -305,16 +305,20 @@ Signal the current backend last so its termination cannot prevent other signals.
   (values))
 
 (define-condition sync-replication-configuration-changed (pg-error) ()
+  (:documentation "The prepared configuration's source or generation is stale.")
   (:default-initargs :sqlstate "55000"
                      :message "synchronous replication configuration generation changed"))
 
 (defstruct (sync-replication-configuration-plan
             (:constructor %make-sync-replication-configuration-plan))
+  "Private prepared configuration. Do not mutate NAMES or CONFIG after preparation:
+publication shares these objects with runtime state."
   (names nil :read-only t) (config nil :read-only t)
   (source-id nil :read-only t) (expected-source-id nil :read-only t)
   (expected-generation nil :read-only t))
 
 (defun prepare-sync-replication-configuration (text source-id expected-source-id expected-generation)
+  "Copy TEXT before parsing and prepare a private plan with its predecessors."
   (sync-replication-check-source-id source-id)
   (sync-replication-check-source-id expected-source-id)
   (let* ((names (copy-seq text))
@@ -325,6 +329,14 @@ Signal the current backend last so its termination cannot prevent other signals.
 
 (defun sync-replication-publish-prepared-configuration
     (plan &key publication defer-notifications)
+  "Publish PLAN under the sender lock and interrupt mask.
+Precompute frontiers and obsolete owners before calling PUBLICATION. The trusted
+callback must not reacquire the sender lock. It may reject before publishing
+caller state, but must not fail or exit after publication starts. Queue changes
+and state installation remain under the lock. Notify obsolete owners after
+unlock and return the installed generation. With DEFER-NOTIFICATIONS, return the
+exact backend list as a second value; the caller must already mask interrupts
+and retain the mask through notification, including on unwind."
   (check-type plan sync-replication-configuration-plan)
   (when (and defer-notifications sb-sys:*interrupts-enabled*)
     (error "deferred sender notification requires masked interrupts"))
@@ -371,6 +383,10 @@ Signal the current backend last so its termination cannot prevent other signals.
 
 (defun sync-replication-install-configuration (text source-id expected-source-id expected-generation
                                                &key defer-notifications)
+  "Prepare and install TEXT. Return the installed generation.
+Normally notify obsolete senders before returning. With deferred notification,
+the caller must already mask interrupts and keep them masked through notification,
+including on unwind; the second value is the exact backend list to notify."
   (sync-replication-publish-prepared-configuration
    (prepare-sync-replication-configuration text source-id expected-source-id expected-generation)
    :defer-notifications defer-notifications))
