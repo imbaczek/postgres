@@ -1,8 +1,7 @@
 ;;; Host authentication rule parsing and matching.
 ;;;
-;;; This is a pure lexer, parser and matcher for a limited HBA subset.  It is
-;;; not yet connected to authentication or hba_file and ident_file handling.
-;;; Parsed rules are treated as immutable after a generation is built.
+;;; The lexer, parser and matcher implement the trust/reject policy used by
+;;; auth-policy.lisp. Parsed rules are treated as immutable after publication.
 (in-package #:pg)
 
 (defstruct (hba-token (:constructor %make-hba-token (text quoted-p)))

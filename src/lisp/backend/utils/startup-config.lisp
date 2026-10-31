@@ -530,6 +530,9 @@ Return SETTINGS after validation."
   settings)
 
 (defun startup-resolve-auth-files (settings directory)
+  "Resolve implicit HBA and ident defaults under DIRECTORY, the original config
+directory. Explicit relative paths resolve against the invocation directory.
+Record whether each path was implicit."
   (dolist (pair '(("hba_file" . "pg_hba.conf") ("ident_file" . "pg_ident.conf")))
     (let* ((name (car pair))
            (value (startup-setting-value settings name)))
@@ -544,7 +547,8 @@ Return SETTINGS after validation."
 
 (defun startup-load-settings (native overrides &optional reload-directory)
   "Read primary/includes, then auto.conf, then command-line overrides.
-Check feature support after applying all sources, so later overrides take precedence."
+Check feature support after applying all sources, so later overrides take precedence.
+Resolve authentication paths after all settings sources have been applied."
   (let* ((directory (namestring (directory-pathname
                                  (or (gethash "pgdata" native) (uiop:getenv "PGDATA") "./pgdata"))))
          (configuration-directory
@@ -678,7 +682,9 @@ Install wal_keep_size in MB on successful reload; postmaster settings such as
 hot_standby retain their active values until restart. Settings and the desired
 follow generation are published together under live-operation quiescence.
 The installed WAL level selects logical capture at XID allocation. wal_log_hints accepts
-on and off; supported native paths have no persistent hint-bit writers."
+on and off; supported native paths have no persistent hint-bit writers.
+On reload, validate a candidate authentication generation before publishing it
+with settings."
   (startup-check-connection-limits settings)
   (let ((timeout (startup-setting-value settings "checkpoint_timeout"))
         (wal-bytes (* 1024 1024 (startup-setting-value settings "max_wal_size")))

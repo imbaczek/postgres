@@ -52,10 +52,25 @@ this option is supplied. `--swank-bind-address ADDR` selects another interface
 when `--swank-port` is also set; its default is `127.0.0.1`, and the address
 option by itself never starts a listener.
 
-Authentication and authorization are accepted and ignored: any user/database is
-trusted, and `postgres` is always the effective role. Only the simple query
-protocol (`Q`) is implemented, which is all `psql` uses for the supported
-statements.
+TCP startup uses the first matching `pg_hba.conf` rule for the actual peer and
+startup user/database. The implicit default trusts loopback connections for
+ordinary and physical replication startup. The supported methods are `trust` and
+`reject`; unsupported methods and selectors reject the candidate configuration.
+`hba_file` and
+`ident_file` select the files, and reload validates a new policy before publishing
+it. Implicit paths are under the original `-D`/`PGDATA` configuration directory;
+explicit relative paths resolve against the invocation directory. Empty or
+comment-only ident files are supported; a missing ident file is
+nonfatal. SQL role authorization is not implemented: admitted SQL sessions use
+the `postgres` role. Native TCP listens on IPv4; scoped IPv6 HBA addresses are
+unsupported. The separate control REPL does not use this policy.
+
+On first initialization, missing implicit policy files located in owned PGDATA are
+created without replacing existing files. Once the initialization marker exists,
+a missing HBA file is an error. Physical backups copy the active policy generation,
+not un-reloaded disk edits, into mutable canonical adjuncts. Backups marked as
+requiring the policy reject missing or invalid adjuncts. Startup names are clipped
+to 63 UTF-8 bytes; a split character currently fails with SQLSTATE `22021`.
 
 ## Physical follow with libpq
 
@@ -1075,6 +1090,10 @@ Lisp→Lisp, Lisp→C and C→Lisp with an owned writer, source shutdown as the 
 durable target validation, sequence alignment and post-cutover writes.
 
 ## Testing
+
+From `src/lisp`, run `python3 t/interop/hba-policy.py` and
+`python3 t/interop/hba-backup.py` with psycopg2 installed to exercise policy
+admission, reload, backup and promotion using owned server processes.
 
 From `src/lisp`, `PG_C_BINDIR=/path/to/installed/postgres/bin ./t/random-sql.sh`
 compares seeded sequences and mixed overloads with the repository's C PostgreSQL,

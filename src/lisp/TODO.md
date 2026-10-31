@@ -6,18 +6,18 @@
   is active at cold startup and changes require restart. Archive-only recovery
   remains unsupported; coordination is outside this scope.
 
-- [ ] Complete the pinned Patroni writer and real `Postgresql.follow` acceptance.
-  Its current complete writer snapshots contain two unsupported settings:
-  `hba_file` and `ident_file`. The seven other
-  names accept disabled or unset values: `max_prepared_transactions`,
+- [ ] Complete real `Postgresql.follow` acceptance with the pinned Patroni path.
+  The complete unchanged Patroni writer oracle now passes, including `hba_file`
+  and `ident_file`. These settings accept only disabled or unset values:
+  `max_prepared_transactions`,
   `track_commit_timestamp`, `recovery_target`, `recovery_target_lsn`,
   `recovery_target_name`, `recovery_target_time` and `recovery_target_xid`.
   Positive prepared-transaction capacity, commit timestamp tracking and targeted
   recovery remain unimplemented. Keep the complete writer oracle unchanged.
-    Ordered trust/reject HBA parsing and matching are implemented, but are not yet
-    connected to startup authentication. File loading, active-path reload,
-    connection enforcement and backup policy preservation remain open. Numeric
-    IPv4 includes C's legacy forms; scoped IPv6 addresses remain unsupported.
+  Ordered trust/reject HBA rules are enforced at startup, with validated reloads
+  and active-policy preservation in physical backups. SQL role authorization,
+  other methods and selectors, raw-byte names split at 63 UTF-8 bytes, and scoped
+  IPv6 addresses remain unsupported. Numeric IPv4 includes C's legacy forms.
   `wal_level` accepts replica and logical; minimal WAL generation remains
   unsupported. Replica uses dynamic logical capture for live or arming slots,
   while logical captures even without slots. Each XID keeps its capture choice.

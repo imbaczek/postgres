@@ -406,6 +406,8 @@ Child images may include history files no newer than their selected timeline."
       (- (getf manifest :checkpoint) +wal-header-size+)))
 
 (defun recovery-manifest-keys-valid-p (manifest)
+  "Accept canonical legacy keys or the exact version 3 authentication requirement.
+The optional flag is exactly 1 and follows the legacy keys."
   (let* ((version (getf manifest :version))
          (keys (loop for (key value) on manifest by #'cddr collect key))
          (legacy (if (member version '(2 3))
@@ -675,7 +677,9 @@ Publish dirty recovery control before installing state and allowing redo."
 (defun physical-recovery-open-storage ()
   "Open verified recovery after follow startup admission. In phase 2, attach the
 receive store and redo its retained prefix before loading slots and serving SQL.
-A saved binding must have been reconciled and admitted before this point."
+A saved binding must have been reconciled and admitted before this point.
+Restore a missing empty base directory only after the backup is verified; missing
+listed relation forks still fail validation."
   (unless (recovery-in-progress-p) (error "physical recovery image was not verified"))
   (physical-follow-check-startup-admission *physical-recovery-state*)
   (wal-ensure-directory-durable (merge-pathnames "base/" *pgdata*))

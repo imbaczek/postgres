@@ -125,6 +125,8 @@ CancelRequest, before the rest of that packet is read."
                         :hint "Valid values are: \"false\", 0, \"true\", 1, \"database\"."))))))
 
 (defun startup-replication-parameters-mode (params)
+  "Resolve repeated replication parameters using their startup packet order.
+An enabled database mode stays selected if a later enabled value is physical."
   (let ((enabled nil) (database-p nil))
     (dolist (pair params)
       (when (string= "replication" (car pair))
@@ -155,7 +157,9 @@ Like C ReportChangedGUCOptions, recovery can only change from on to off."
 
 (defun process-startup (stream body)
   "Parse startup mode, check availability and authenticate before reserving quota.
-When hot_standby is off, reject every startup mode during recovery before authentication."
+When hot_standby is off, reject every startup mode during recovery before authentication.
+Use the socket peer and final startup identities for HBA before reserving quota.
+SQL role authorization remains separate and currently uses the postgres role."
   (with-live-operation
     (let* ((code (bytes-to-u32 body 0))
            (major (ash code -16)))
@@ -892,6 +896,7 @@ CL's RENAME-FILE merges a relative target with the source's directory."
   (complete-xid-wraparound))
 
 (defun main ()
+  ;; Preflight policy before ownership, then initialize it after owning PGDATA.
   ;; Install resource limits before recovery, and check or report them before listen.
   (startup-handle-meta-request (cdr sb-ext:*posix-argv*))
   (multiple-value-bind (host port pgdata control-port control-socket

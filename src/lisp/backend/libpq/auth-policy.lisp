@@ -1,13 +1,19 @@
+;;; Authentication policy publication and connection admission.
+;;;
+;;; HBA rules and their source text are installed as one generation.  Startup
+;;; and reload validate a candidate before making it visible to connections.
 (in-package #:pg)
 
 (defvar *authentication-policy* nil)
 
 (defstruct authentication-policy
+  "One installed rule generation and the source texts retained for backup."
   (rules nil :read-only t)
   (hba-text "" :read-only t) (ident-text "" :read-only t)
   (hba-path nil :read-only t) (ident-path nil :read-only t))
 
 (defun authentication-read-text (path)
+  "Read at most 1 MiB from a bounded regular file and decode it as UTF-8."
   (with-open-stream (stream (startup-open-config path 1048576))
     (let* ((buffer (make-string 1048577))
            (count (read-sequence buffer stream)))
@@ -17,10 +23,12 @@
        :external-format :utf-8))))
 
 (defun hba-read-file (path)
+  "Return parsed HBA rules and their source text as two values."
   (let ((text (authentication-read-text path)))
     (values (hba-parse-text text :source (namestring path)) text)))
 
 (defun ident-read-file (path)
+  "Accept an empty or comment-only ident file; identity mappings are unsupported."
   (let ((text (authentication-read-text path)))
     (when (find (code-char 0) text) (error "NUL in identity mapping file: ~a" path))
     (dolist (entry (hba-logical-lines text :source (namestring path)))
@@ -29,6 +37,9 @@
     text))
 
 (defun authentication-read-policy (settings)
+  "Build a candidate from the resolved HBA and ident paths.
+An HBA error rejects the candidate. An unreadable or unsupported ident file is
+logged and treated as empty, as ident mappings are not used by this subset."
   (let ((hba (pathname (startup-setting-value settings "hba_file")))
         (ident (pathname (startup-setting-value settings "ident_file"))))
     (multiple-value-bind (rules text) (hba-read-file hba)
@@ -70,6 +81,8 @@
                 (namestring (startup-absolute-config-path (merge-pathnames filename *pgdata*)))))))
 
 (defun authentication-check-backup-policy (directory)
+  "Require the marker and both canonical policy files when the backup manifest
+requires them. Validate the files before allowing startup to create defaults."
   (when (authentication-entry-exists-p (merge-pathnames "physical-backup.manifest" directory))
     (let ((manifest (recovery-check-manifest-schema (recovery-read-manifest directory))))
       (when (eql 1 (getf manifest :auth-policy-required))
@@ -79,6 +92,9 @@
         t))))
 
 (defun authentication-preflight-startup (settings)
+  "Check existing policy and backup requirements before creating defaults.
+An unmarked target with recovery.required but no manifest cannot acquire fresh
+defaults; a marked target must retain a valid marker and readable HBA file."
   (authentication-check-backup-policy *pgdata*)
   (let ((marked (authentication-entry-exists-p (authentication-marker-path *pgdata*)))
         (hba (pathname (startup-setting-value settings "hba_file"))))
@@ -101,6 +117,10 @@
     (funcall *authentication-publication-test-hook* point path)))
 
 (defun authentication-create-file (path text)
+  "Publish TEXT without replacing an existing path. Sync the temporary inode before
+linking it, then remove the temporary name and sync the directory. On unwinding,
+clean up owned descriptors and temporary names. A published final name remains
+if a later operation fails."
   (let ((bytes (string->bytes text))
         (directory (uiop:pathname-directory-pathname path))
         (fd nil) (temporary nil) (stream nil) (installed nil))
@@ -135,6 +155,9 @@
       (when temporary (ignore-errors (sb-posix:unlink (namestring temporary)))))))
 
 (defun authentication-prepare-startup (settings)
+  "Initialize implicit PGDATA defaults only while owning the data directory.
+Never replace existing files; validate the candidate and publish the marker last.
+A marked cluster must not silently recreate a missing HBA file."
   (unless (and *postmaster-data-lock* (postmaster-pid-owned-p)
                (equal (truename *pgdata*) *postmaster-pid-directory*))
     (error "authentication initialization requires owned PGDATA"))
@@ -154,12 +177,16 @@
       policy)))
 
 (defun authentication-capture-policy ()
+  "Return the installed generation for a backup, not uninstalled disk edits.
+The backup caller holds reload exclusion and operation quiescence."
   (let ((policy *authentication-policy*))
     (unless (and (authentication-policy-p policy) (authentication-policy-rules policy))
       (error "physical backup requires an installed authentication policy"))
     policy))
 
 (defun authentication-write-backup-policy (policy target)
+  "Copy the captured generation's text and marker into the backup target.
+Each canonical adjunct must be created successfully; existing paths fail."
   (unless (and (authentication-policy-p policy) (authentication-policy-rules policy))
     (error "invalid physical backup authentication policy"))
   (dolist (entry (list (cons "pg_hba.conf" (authentication-policy-hba-text policy))
@@ -171,9 +198,12 @@
   t)
 
 (defun startup-last-parameter (params name)
+  "Return the last occurrence of NAME in a startup packet."
   (cdr (find name params :key #'car :test #'string= :from-end t)))
 
 (defun authentication-clip-name (name)
+  "Limit a startup name to 63 UTF-8 bytes. A slice splitting a code point fails
+with 22021; arbitrary invalid UTF-8 names are not supported."
   (handler-case
       (let ((bytes (string->bytes name)))
         (sb-ext:octets-to-string bytes :end (min 63 (length bytes)) :external-format :utf-8))
@@ -181,6 +211,8 @@
       (ereport-fatal "22021" "startup name is not valid UTF-8 after byte truncation"))))
 
 (defun authentication-startup-identities (params replication)
+  "Resolve startup user and database for HBA matching from the final parameters.
+A missing database defaults to the user; physical replication has no database."
   (let ((user (startup-last-parameter params "user"))
         (database (startup-last-parameter params "database")))
     (unless (and user (plusp (length user)))
@@ -204,6 +236,8 @@
           (error "could not format numeric client address")))))
 
 (defun authentication-authorize (policy user database peer replication)
+  "Apply the installed first-match HBA policy to the numeric peer and startup names.
+Trust admits the connection; reject and no match signal distinct fatal errors."
   (unless policy (ereport-fatal "28000" "authentication policy is not initialized"))
   (let ((method (hba-match-rules (authentication-policy-rules policy) user database peer
                                  :replication replication)))

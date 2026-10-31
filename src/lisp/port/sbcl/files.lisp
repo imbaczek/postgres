@@ -13,6 +13,10 @@ SB-POSIX does not export this flag in the supported SBCL.")
   (template (* (sb-alien:unsigned 8))) (flags sb-alien:int))
 
 (defun open-exclusive-temporary-file (template)
+  "Create a private temporary inode from TEMPLATE with close-on-exec set atomically.
+The caller must establish cleanup before calling and mask interrupts until the
+returned descriptor and path are recorded. Ownership then passes to the caller;
+an incomplete return closes the descriptor and removes any known temporary path."
   (let* ((bytes (concatenate '(vector (unsigned-byte 8))
                              (sb-ext:string-to-octets (namestring template) :external-format :utf-8)
                              #(0)))
