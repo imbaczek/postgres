@@ -173,6 +173,111 @@
         (ok (equal '(:storage-error t t t)
                    (direct-publication-termination-test kind fault))))))
 
+(defun xid-owner-termination-test (fast)
+  (let* ((ready (sb-thread:make-semaphore))
+         (release (sb-thread:make-semaphore))
+         (backend (pg::make-backend :pid 98767 :state :in-progress :read-only nil))
+         (original (symbol-function 'pg::xid-allocate-under-lock))
+         (allocated nil) (owner-at-barrier nil) (thread nil))
+    (unwind-protect
+         (progn
+           (setf (symbol-function 'pg::xid-allocate-under-lock)
+                 (lambda (&rest arguments)
+                   (let ((xid (apply original arguments)))
+                     (when (eq pg::*backend* backend)
+                       (setf allocated xid owner-at-barrier (pg::backend-xid backend))
+                       (sb-thread:signal-semaphore ready)
+                       (unless (sb-thread:wait-on-semaphore release :timeout 10)
+                         (error "XID ownership barrier expired")))
+                     xid)))
+           (setf thread
+                 (sb-thread:make-thread
+                  (lambda ()
+                    (let ((pg::*wal-lock* (sb-thread:make-mutex :name "XID owner WAL"))
+                          (pg::*xid-lock* (sb-thread:make-mutex :name "XID owner allocation"))
+                          (pg::*logical-capture-xid-modes* (make-hash-table :test #'eql))
+                          (pg::*logical-capture-arming* (make-hash-table :test #'eq)))
+                      (call-with-wal-allocation-fixture
+                       (lambda ()
+                         (when fast
+                           (let ((first (pg::assign-xid)))
+                             (pg::clog-set first pg::+clog-aborted+ :fsync t)
+                             (pg::release-xid first)))
+                         (let ((pg::*backend* backend)
+                               (before pg::*wal-end-lsn*))
+                           (handler-case
+                               (progn (pg::get-current-xid) :unexpected-success)
+                             (pg::pg-error (condition)
+                               (pg::end-backend-session)
+                               (list (pg::pg-error-sqlstate condition)
+                                     (eql owner-at-barrier allocated)
+                                     (null pg::*active-xids*)
+                                     (zerop (hash-table-count pg::*logical-capture-xid-modes*))
+                                     (null (pg::backend-xid backend))
+                                     (not pg::*wal-poisoned*)
+                                     (= pg::*next-xid* (1+ allocated))
+                                     (= (pg::clog-get allocated) pg::+clog-aborted+)
+                                     (if fast (= before pg::*wal-end-lsn*)
+                                         (< before pg::*wal-end-lsn*))))))))))
+                  :name "XID owner termination"))
+           (setf (pg::backend-thread backend) thread)
+           (assert (sb-thread:wait-on-semaphore ready :timeout 10))
+           (let ((pg::*backend* nil)) (pg::terminate-backend backend))
+           (sb-thread:signal-semaphore release)
+           (sb-thread:join-thread thread :timeout 10 :default :timed-out))
+      (sb-thread:signal-semaphore release)
+      (when thread (ignore-errors (sb-thread:join-thread thread :timeout 12 :default nil)))
+      (setf (symbol-function 'pg::xid-allocate-under-lock) original))))
+
+(deftest fast-xid-allocation-publishes-backend-owner-before-interruptible-return
+    (ok (equal '("57P01" t t t t t t t t) (xid-owner-termination-test t))))
+
+(deftest reserved-xid-allocation-publishes-backend-owner-before-interruptible-return
+    (ok (equal '("57P01" t t t t t t t t) (xid-owner-termination-test nil))))
+
+(deftest xid-owner-refusal-does-not-reserve-or-consume-capacity
+    (dolist (owner (list :invalid (pg::make-backend :read-only nil :xid 99)))
+      (call-with-wal-allocation-fixture
+       (lambda ()
+         (let ((before (list pg::*next-xid* pg::*xid-batch-end* pg::*wal-end-lsn*
+                             pg::*wal-durable-lsn* (copy-list pg::*active-xids*))))
+           (ok (intake-fails-p (lambda () (pg::assign-xid owner))))
+           (ok (equal before (list pg::*next-xid* pg::*xid-batch-end* pg::*wal-end-lsn*
+                                   pg::*wal-durable-lsn* pg::*active-xids*)))
+           (ok (not pg::*wal-poisoned*)))))))
+
+(deftest owned-xid-allocation-is-idempotent-through-get-current-xid
+    (call-with-wal-allocation-fixture
+     (lambda ()
+       (let* ((pg::*logical-capture-xid-modes* (make-hash-table :test #'eql))
+              (owner (pg::make-backend :read-only nil :state :in-progress))
+              (xid (pg::assign-xid owner))
+              (before pg::*wal-end-lsn*))
+         (ok (= 3 xid (pg::backend-xid owner)))
+         (ok (intake-fails-p (lambda () (pg::assign-xid owner))))
+         (let ((pg::*backend* owner))
+           (ok (= xid (pg::get-current-xid) (pg::get-current-xid)))
+           (pg::end-backend-session))
+         (ok (= 4 pg::*next-xid*))
+         (ok (= before pg::*wal-end-lsn*))
+         (ok (null pg::*active-xids*))
+         (ok (zerop (hash-table-count pg::*logical-capture-xid-modes*)))))))
+
+(deftest raw-xid-allocation-keeps-backend-ownership-explicit
+    (call-with-wal-allocation-fixture
+     (lambda ()
+       (let* ((pg::*logical-capture-xid-modes* (make-hash-table :test #'eql))
+              (pg::*backend* (pg::make-backend :read-only nil :state :in-progress))
+              (raw (pg::assign-xid)))
+         (ok (= 3 raw))
+         (ok (null (pg::backend-xid pg::*backend*)))
+         (pg::clog-set raw pg::+clog-aborted+ :fsync t)
+         (pg::release-xid raw)
+         (ok (= 4 (pg::get-current-xid) (pg::backend-xid pg::*backend*)))
+         (pg::end-backend-session)
+         (ok (null pg::*active-xids*))
+         (ok (zerop (hash-table-count pg::*logical-capture-xid-modes*)))))))
+
 (deftest primary-resource-report-flushes-before-publication-and-skips-unchanged-values
     (call-with-resource-wal-fixture
      (lambda ()

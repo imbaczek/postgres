@@ -808,11 +808,18 @@ holding a portal snapshot must be allowed to run so it can release its pin."
              (not (eql *next-xid* *xid-wrap-completed-through*)))
     (ereport "55000" "transaction ID wraparound is waiting for a safe tuple freeze; retry the statement")))
 
-(defun xid-allocate-under-lock ()
+(defun xid-check-allocation-owner (owner)
+  (when owner
+    (unless (backend-p owner) (error "invalid XID allocation backend"))
+    (when (backend-xid owner) (error "backend already owns a transaction ID")))
+  (values))
+
+(defun xid-allocate-under-lock (&optional owner)
   "Assign an XID and fix its logical capture decision under the XID lock.
 Logical level always captures. At replica level, live slots, an arming slot or
 an unknown live-slot count require capture. The decision stays with the XID as
 its mutations arrive."
+  (xid-check-allocation-owner owner)
   (let* ((xid *next-xid*)
          (next (advance-full-xid xid))
          (link (list xid))
@@ -823,24 +830,26 @@ its mutations arrive."
       (setf (gethash xid *logical-capture-xid-modes*) (if capture :capture :skip)
             (cdr link) *active-xids*
             *active-xids* link
-            *next-xid* next))
+            *next-xid* next)
+      (when owner (setf (backend-xid owner) xid)))
     xid))
 
-(defun assign-xid ()
+(defun assign-xid (&optional owner)
   (prevent-recovery-write "transaction ID assignment")
   (when *wal-ready* (wal-check-healthy))
   (let ((oldest (catalog-oldest-relfrozenxid)))
     (sb-thread:with-mutex (*xid-lock*)
+      (xid-check-allocation-owner owner)
       (xid-check-allocation-under-lock oldest)
       (when (< *next-xid* *xid-batch-end*)
-        (return-from assign-xid (xid-allocate-under-lock)))
+        (return-from assign-xid (xid-allocate-under-lock owner)))
       (unless *wal-ready*
         ;; Standalone storage use retains the pre-WAL file durability contract.
         (let ((*xid-batch-end* (xid-reservation-end *next-xid*))) (save-next-xid))
         (setf *xid-batch-end* (xid-reservation-end *next-xid*))
-        (return-from assign-xid (xid-allocate-under-lock))))
+        (return-from assign-xid (xid-allocate-under-lock owner))))
     ;; Never acquire WAL while holding XID; checkpoints take WAL then XID.
-    (xid-assign-with-wal-reservation oldest)))
+    (xid-assign-with-wal-reservation oldest owner)))
 
 (defun relation-build-group-has-user-p (token xid writers-p readers-p)
   (let ((group (gethash token *relation-build-groups*)))
@@ -2008,8 +2017,7 @@ remains after BODY and should be dropped when its WAL is no longer needed."
 ;;; ---- per-backend transaction state ----
 
 (defun get-current-xid ()
-  (or (backend-xid *backend*)
-      (setf (backend-xid *backend*) (assign-xid))))
+  (or (backend-xid *backend*) (assign-xid *backend*)))
 
 (defvar *recovery-reader-xid-counter* 0)
 

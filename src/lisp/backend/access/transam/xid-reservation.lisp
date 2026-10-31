@@ -52,7 +52,7 @@
           *wal-xid-reserved-through* (max (or *wal-xid-reserved-through* 2) (1- end)))
     (xid-reservation-test-point :after-capacity-publication end)))
 
-(defun xid-assign-with-wal-reservation (oldest)
+(defun xid-assign-with-wal-reservation (oldest &optional owner)
   "Recheck capacity and allocation refusals before entering critical I/O.
 Lock waits and preflight remain interruptible unless the caller has masked them.
 Defer asynchronous interrupts while publishing the reservation; release that mask
@@ -65,6 +65,7 @@ and protected cleanup requests fail-stop after they unwind."
              (sb-thread:with-mutex (*wal-lock*)
                (wal-check-healthy)
                (sb-thread:with-mutex (*xid-lock*)
+                 (xid-check-allocation-owner owner)
                  (xid-check-allocation-under-lock oldest)
                  (when (>= *next-xid* *xid-batch-end*)
                    (sb-sys:without-interrupts
@@ -74,7 +75,7 @@ and protected cleanup requests fail-stop after they unwind."
                               (progn (xid-reserve-wal-batch-under-lock) (setf completed t))
                             (error (condition) (setf failure condition)))
                        (unless completed (setf *wal-poisoned* t)))))
-                 (unless failure (setf result (xid-allocate-under-lock))))))
+                 (unless failure (setf result (xid-allocate-under-lock owner))))))
         (cond
           (failure (wal-fail-stop failure))
           ((and started (not completed))
