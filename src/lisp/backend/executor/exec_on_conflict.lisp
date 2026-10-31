@@ -46,6 +46,8 @@
             (t (syntax-error p "expected NOTHING or UPDATE"))))))
 
 (defun on-conflict-expression-scope (table alias)
+  ;; DO UPDATE retains these exact target and excluded identities for execution;
+  ;; an inference scope must not supply identities for this expression scope.
   (let* ((target (make-base-select-scope (pg-class-name table) alias table))
          (width (length (pg-class-columns table)))
          (excluded (make-select-relation :name "excluded" :alias "excluded" :table table

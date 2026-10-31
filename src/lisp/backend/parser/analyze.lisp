@@ -8,6 +8,7 @@
   (sb-thread:make-mutex :name "query source identities"))
 
 (defun next-select-source-identity-locked ()
+  ;; Caller holds *SELECT-SOURCE-IDENTITY-LOCK*.
   (when (= *select-source-identity-counter* most-positive-fixnum)
     (error "query source identities exhausted"))
   (incf *select-source-identity-counter*))
@@ -21,6 +22,7 @@
   (sb-thread:with-mutex (*select-source-identity-lock*)
     (or (getf source :identity)
         (let ((identity (next-select-source-identity-locked)))
+          ;; Preserve the plist head so existing aliases see the identity.
           (nconc source (list :identity identity))
           identity))))
 
@@ -29,6 +31,9 @@
 ;; retains an entry for lookup so an invalid reference can be diagnosed.
 (defstruct select-relation
   name
+  ;; Runtime source ID. Prepared SELECT descriptors share it with this namespace;
+  ;; DML target and excluded namespaces allocate IDs directly. The query-local
+  ;; :source-index in an expression is used only for semantic keys.
   (identity nil :read-only t)
   alias
   table
@@ -133,6 +138,8 @@
           (ereport "42703" "column \"~a\" does not exist" name))))
 
 (defun resolve-select-whole-row (scope qualifier)
+  ;; Unlike target-list star expansion, this builds one record expression.
+  ;; Named composite types and whole-row RETURNING are not supported here.
   (multiple-value-bind (relation depth owner)
       (resolve-select-qualified-relation scope qualifier)
     (when (eq (getf (select-scope-analysis-frame owner) :kind) :returning)
@@ -4550,6 +4557,8 @@ aliases share the corresponding numeric operator implementation."
 (defvar +subquery-frame-presence-key+ (gensym "SUBQUERY-FRAME-PRESENCE-"))
 
 (defun make-subquery-parameter-frame (environment &key copy-p (capture-p t))
+  ;; COPY-P detaches the environment; otherwise the frame borrows it.
+  ;; Presence is always detached, or known empty when CAPTURE-P is false.
   (let ((frame (cons (if copy-p
                          (map 'vector #'copy-subquery-value environment)
                          environment)
@@ -4562,6 +4571,8 @@ aliases share the corresponding numeric operator implementation."
     frame))
 
 (defun eval-outer-reference (expression &optional with-origin)
+  ;; Both evaluation paths use the outer frame's origins and presence, rather
+  ;; than the metadata of the row currently executing the subquery.
   (let* ((depth (second expression))
          (frame (nth (1- depth) *subquery-outer-frames*))
          (*subquery-outer-frames* (nthcdr depth *subquery-outer-frames*)))
@@ -4917,6 +4928,8 @@ truncate and interpret the result at TYPE's signed width."
               (sql-cast-value value (expr-type expr) (expr-type expr) -1) value)))))
 
 (defun eval-whole-row-expression (expression environment)
+  ;; A missing outer-join source is SQL NULL, even when a present source could
+  ;; produce an all-NULL or zero-field record.  Unknown presence is an error.
   (unless (simple-vector-p *query-row-presence*)
     (ereport "XX000" "whole-row evaluation requires source presence metadata"))
   (if (find (second expression) *query-row-presence* :test #'eql)
@@ -4927,6 +4940,7 @@ truncate and interpret the result at TYPE's signed width."
       +null+))
 
 (defun eval-null-test (expression environment)
+  ;; Row NULL tests inspect immediate fields only, not fields of nested rows.
   (let ((value (eval-expr (second expression) environment))
         (negated-p (third expression)))
     (cond
@@ -5197,6 +5211,7 @@ truncate and interpret the result at TYPE's signed width."
     text))
 
 (defun sql-record-to-jsonb-value (record depth)
+  ;; JSONB normalizes object keys and keeps the last duplicate field name.
   (let ((items (make-hash-table :test #'equal)))
     (loop for (name type) in (sql-record-fields record)
           for value across (sql-record-values record)
@@ -5268,6 +5283,8 @@ truncate and interpret the result at TYPE's signed width."
 
 (defun sql-to-json (value type &optional (depth 0))
   "Convert a typed datum to JSON text, preserving JSON input verbatim."
+  ;; Record fields retain their order and duplicate names.  This internal
+  ;; renderer writes NULL as JSON null; the SQL to_json call is strict.
   (when (> depth 512) (ereport "54001" "JSON nesting exceeds supported depth"))
   (when (eq value +null+) (return-from sql-to-json "null"))
   (with-output-to-string (out)

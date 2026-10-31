@@ -212,6 +212,8 @@ An unexecuted LIMIT does not raise these errors."
 
 (defun collect-select-top-n (streamer order limit &optional with-origins with-presence)
   "Consume STREAMER while retaining at most LIMIT rows in ORDER BY order."
+  ;; Retained rows and their origins and presence must be detached from the
+  ;; producer; subsequent projection needs the metadata paired with each row.
   (let ((collector (make-select-top-n-collector (check-select-limit limit) order)))
     (unless (zerop limit)
       (funcall streamer (lambda (row) (offer-select-top-n-row collector row))))

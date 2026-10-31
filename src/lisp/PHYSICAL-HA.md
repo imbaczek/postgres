@@ -134,6 +134,16 @@ cold compilation and an owned SQL status and Patroni follow/promotion run
 real sync handler and remote commit waiting remain open; no DCS or coordination
 was added.
 
+Whole-row arguments and composite JSON conversion now distinguish a missing
+outer row from a present all-NULL record. The checkpoint passed 696 unit, 198
+wire and 1,323 physical tests, with strict cold compilation in
+`/tmp/pg-whole-row-dml-cold.log`.
+Suite logs are `/tmp/pg-whole-row-unit.log`, `/tmp/pg-whole-row-wire.log` and
+`/tmp/pg-whole-row-physical-final.log`; the owned C oracle is
+`/tmp/pg-sender-status-c-oracle-fhw2qqsb/whole-row-parity.log`. The unchanged
+monitoring query and synchronous-replication work remain open. No coordination
+was implemented.
+
 ### Relation resource accounting
 
 Relation admission now checks the complete proposed set against private object

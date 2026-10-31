@@ -9,6 +9,9 @@
 ;; idempotent, releases the captured callbacks, and unregisters the iterator.
 ;; When dynamically bound, *SQL-OPEN-ITERATORS* tracks live iterators for cleanup.
 (defstruct (sql-iterator (:constructor %make-sql-iterator))
+  ;; Additional values are optional datum origins, TOAST slice context, and
+  ;; source presence.  Presence NIL is unknown; #() is known empty.  Borrowed
+  ;; carriers are immutable and must be copied when retained.
   next-function close-function closed-p)
 
 (defun make-sql-iterator (next &optional close)
@@ -52,6 +55,8 @@
 ;; The spool can spill while readers are active, so readers open and seek their
 ;; own input streams when disk storage first becomes necessary.
 (defstruct (query-replay-store (:constructor %make-query-replay-store))
+  ;; Capture flags describe the spool layout.  An adopted RETURNING spool has
+  ;; raw rows and must not be decoded as a metadata-bearing spool.
   producer spool eof-p readers closed-p capture-origins-p capture-presence-p
   (memory-rows (make-array 0 :adjustable t :fill-pointer 0)))
 
@@ -60,6 +65,8 @@
     (concatenate 'simple-vector left right)))
 
 (defun make-source-presence-iterator (input relation)
+  ;; A CTE, derived table, or worktable is a new source: discard inner source
+  ;; identities and report the identity of this scan for every produced row.
   (let ((presence (vector (ensure-select-source-identity relation))))
     (make-sql-iterator
      (lambda ()

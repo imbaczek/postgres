@@ -10,12 +10,14 @@
   filtering is not implemented. The source C oracle is
   `/tmp/pg-sender-status-c-oracle-fhw2qqsb/result.log`.
 
+- [x] Support whole-row arguments and composite JSON conversion in the supported
+  query subset. An unmatched outer row is SQL NULL, distinct from a present
+  all-NULL record. Named composite types and whole-row RETURNING remain unsupported.
+  C parity evidence is `/tmp/pg-sender-status-c-oracle-fhw2qqsb/whole-row-parity.log`.
+
 - [ ] Complete the unchanged Patroni monitoring query and synchronous-replication
-  backend contract. Whole-row arguments such as `to_json(r.*)` fail with 42601,
-  `json_agg` is absent, and synchronous setting lookup fails with 42704. Preserve
-  the complete real query as the acceptance oracle. A future whole-row result
-  must distinguish an unmatched outer join's SQL NULL from a present all-NULL
-  record; C evidence is `/tmp/pg-sender-status-c-oracle-fhw2qqsb/json-row-nullability.log`.
+  backend contract. `json_agg` is absent, and synchronous setting lookup fails
+  with 42704. Preserve the complete real query as the acceptance oracle.
   C reports 42804 for `json_agg('x')`; the native aggregate is absent.
   Patroni's sync handler also emits a DO block containing SET LOCAL
   synchronous_commit=off and PERFORM txid_current(); these remain dependencies
