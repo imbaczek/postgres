@@ -115,6 +115,40 @@ def instrument_source(process, root):
                   (setf (symbol-function 'wal-fail-stop) original)))))''')
 
 
+def check_source_sender(process, root):
+    def ready():
+        result = control(process, root / 'source.sock', '''
+          (let ((rows (remove-if-not
+                       (lambda (row) (and (equal (getf row :application-name) "follow_one")
+                                          (equal (getf row :state) "streaming")))
+                       (wal-sender-snapshots))))
+            (when (= (length rows) 1)
+              (let* ((row (first rows))
+                     (positions (mapcar (lambda (key) (getf row key))
+                                        '(:replay-lsn :flush-lsn :write-lsn :sent-lsn))))
+                (when (every #'integerp positions)
+                  (assert (apply #'<= positions))
+                  (assert (plusp (getf row :reply-time)))
+                  (defparameter *patroni-source-sender-pid* (getf row :pid))
+                  :source-sender-ready))))''')
+        return ':SOURCE-SENDER-READY' in result.upper()
+    wait_for(ready)
+    rows = query(int((root / 'source/postmaster.pid').read_text().splitlines()[3]), '''
+        SELECT w.pid, application_name, sync_state,
+               pg_catalog.pg_wal_lsn_diff(write_lsn, '0/0')::bigint,
+               pg_catalog.pg_wal_lsn_diff(flush_lsn, '0/0')::bigint,
+               pg_catalog.pg_wal_lsn_diff(replay_lsn, '0/0')::bigint
+        FROM pg_catalog.pg_stat_get_wal_senders() w,
+             pg_catalog.pg_stat_get_activity(w.pid)
+        WHERE w.state = 'streaming' ''')
+    assert len(rows) == 1, rows
+    pid, application, sync_state, write, flush, replay = rows[0]
+    assert application == 'follow_one' and sync_state == 'async', rows
+    assert 0 < replay <= flush <= write, rows
+    control(process, root / 'source.sock',
+            f'(assert (= *patroni-source-sender-pid* {pid}))')
+
+
 def exercise(root, ports, source_log):
     source_data, target_data = root / 'source', root / "replica 'one'"
     source_socket = root / 'source.sock'
@@ -161,6 +195,7 @@ def exercise(root, ports, source_log):
         wait_for(lambda: query(ports[1], 'SELECT id FROM follow_items ORDER BY id') == [(1,), (2,)])
         assert query(ports[1], 'SELECT status,slot_name FROM pg_stat_get_wal_receiver()') == [
             ('streaming', 'follow_one')]
+        check_source_sender(source, root)
         replacement = Member(0, 'source', None,
                              {'conn_url': f'postgres://localhost:{ports[0]}/postgres'})
         assert node.follow(replacement, do_reload=True) is True
@@ -170,6 +205,7 @@ def exercise(root, ports, source_log):
         query(ports[0], 'INSERT INTO follow_items VALUES (3)')
         wait_for(lambda: query(ports[1], 'SELECT id FROM follow_items ORDER BY id') == [(1,), (2,), (3,)])
         assert int((target_data / 'postmaster.pid').read_text().splitlines()[0]) == target_pid
+        check_source_sender(source, root)
         assert node.follow(replacement, timeout=90) is True
         assert node.is_running().pid != target_pid
         query(ports[0], 'INSERT INTO follow_items VALUES (4)')
@@ -178,11 +214,16 @@ def exercise(root, ports, source_log):
         assert query(ports[1], 'SELECT status,slot_name FROM pg_stat_get_wal_receiver()') == [
             ('streaming', 'follow_one')]
         restarted_pid = node.is_running().pid
+        check_source_sender(source, root)
         assert node.follow(None, do_reload=True) is True
         wait_for(lambda: query(ports[1], 'SHOW primary_conninfo') == [('',)]
                  and query(ports[1], 'SELECT pid FROM pg_stat_get_wal_receiver()') == [(None,)])
         wait_for(lambda: query(ports[0], "SELECT active FROM pg_replication_slots WHERE slot_name='follow_one'")
                  == [(False,)])
+        wait_for(lambda: ':SOURCE-SENDER-RETIRED' in control(
+            source, source_socket,
+            '(unless (find *patroni-source-sender-pid* (wal-sender-snapshots) '
+            ':key (lambda (row) (getf row :pid))) :source-sender-retired)').upper())
         query(ports[0], 'INSERT INTO follow_items VALUES (5)')
         assert query(ports[1], 'SELECT id FROM follow_items ORDER BY id') == [(1,), (2,), (3,), (4,)]
         assert node.follow(member, do_reload=True) is True
