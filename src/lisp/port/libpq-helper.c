@@ -556,6 +556,14 @@ emit_result(uint32_t maximum, unsigned char kind)
 	free(body);
 }
 
+static const char *
+result_sqlstate(PGresult *value)
+{
+	const char *state = PQresultErrorField(value, PG_DIAG_SQLSTATE);
+	return state && strlen(state) == 5 &&
+		strspn(state, "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ") == 5 ? state : "08P01";
+}
+
 static void
 finish_result(uint32_t maximum, int64_t deadline)
 {
@@ -563,10 +571,7 @@ finish_result(uint32_t maximum, int64_t deadline)
 		fail("08P01", "native query lacks a result");
 	ExecStatusType status = PQresultStatus(result);
 	if (status != PGRES_TUPLES_OK && status != PGRES_COMMAND_OK)
-	{
-		const char *state = PQresultErrorField(result, PG_DIAG_SQLSTATE);
-		fail(state && strlen(state) == 5 ? state : "08P01", "native source command failed");
-	}
+		fail(result_sqlstate(result), "native source command failed");
 	PGresult *extra = next_result(deadline);
 	if (extra)
 	{
@@ -657,6 +662,25 @@ receive_copy(const unsigned char *body, uint32_t size)
 		if (count == -1)
 		{
 			result = next_result(milliseconds() + OPERATION_MS);
+			if (result && PQresultStatus(result) == PGRES_FATAL_ERROR)
+				fail(result_sqlstate(result), "native source stopped streaming");
+			if (result && PQresultStatus(result) == PGRES_COMMAND_OK)
+			{
+				if (strcmp(PQcmdStatus(result), "COPY 0"))
+					fail("08P01", "native COPY returned an unexpected command tag");
+				PGresult *extra = next_result(milliseconds() + OPERATION_MS);
+				if (extra)
+				{
+					PQclear(extra);
+					fail("08P01", "native COPY returned extra results");
+				}
+				if (PQtransactionStatus(connection) != PQTRANS_IDLE &&
+					PQstatus(connection) != CONNECTION_BAD)
+					fail("08P01", "native COPY did not finish idle");
+				fail("08006", "native source ended WAL streaming");
+			}
+			if (!result && PQstatus(connection) == CONNECTION_BAD)
+				fail("08006", "native source closed WAL streaming");
 			if (!result || PQresultStatus(result) != PGRES_COPY_IN)
 				fail("08P01", "native COPY lacks its input completion phase");
 			PQclear(result);

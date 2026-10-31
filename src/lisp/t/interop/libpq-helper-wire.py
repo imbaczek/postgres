@@ -6,6 +6,7 @@ from pathlib import Path
 import struct
 import subprocess
 import sys
+import time
 
 peer = importlib.import_module('backend-admission')
 ipc = importlib.import_module('libpq-helper-tests')
@@ -201,6 +202,62 @@ def exercise(observer, conninfo, expected_name, env, *, success=True):
         helper.close()
 
 
+def physical_source_shutdown(base, root, port, env, process):
+    helper = ipc.Helper(env=env)
+    stopping = None
+    try:
+        conninfo = (f'host=localhost hostaddr=127.0.0.1 port={port} '
+                    f'user=transport_receiver passfile={root / "physical-passfile"} '
+                    f'sslmode=verify-full sslrootcert={root / "server.crt"}')
+        kind, body = helper.call(b'W', ipc.string(conninfo) + ipc.string('shutdown-probe'))
+        assert kind == b'O', (kind, body)
+        identity = query(helper, 'IDENTIFY_SYSTEM')[0]
+        statement = f'START_REPLICATION PHYSICAL {identity[2]} TIMELINE {identity[1]}'
+        high, low = identity[2].split('/')
+        next_position = (int(high, 16) << 32) | int(low, 16)
+        assert helper.call(b'Q', struct.pack('!I', 4096) + ipc.string(statement))[0] == b'B'
+        with (root / 'shutdown.log').open('w') as log, (root / 'received-wal').open('wb') as wal:
+            stopping = subprocess.Popen(
+                [sys.executable, str(base / 't/interop/signal-owned-server.py'),
+                 str(process.pid), str(root / 'data'), 'INT', '20'], stdout=log, stderr=log)
+            deadline, flushed = time.monotonic() + 25, 0
+            while True:
+                assert time.monotonic() < deadline, 'C stream shutdown timed out'
+                kind, body = helper.call(b'R', struct.pack('!II', 128 * 1024 + 25, 1000))
+                if kind == b'!':
+                    (root / 'shutdown-helper-error').write_bytes(body)
+                    assert body[:5] == b'08006', (kind, body)
+                    assert helper.process.wait(timeout=2) != 0
+                    break
+                assert kind in (b'D', b'I'), (kind, body)
+                if kind == b'D':
+                    if body[:1] == b'w':
+                        assert len(body) > 25
+                        start, wal_end = struct.unpack_from('!QQ', body, 1)
+                        assert start == next_position, (start, next_position)
+                        assert start + len(body) - 25 <= wal_end
+                        wal.write(body[25:])
+                        wal.flush()
+                        os.fsync(wal.fileno())
+                        flushed = start + len(body) - 25
+                        next_position = flushed
+                    else:
+                        assert body[:1] == b'k' and len(body) == 18, body
+                    # Acknowledge only bytes synced above; this probe does not replay.
+                    feedback = b'r' + struct.pack('!QQQqB', flushed, flushed, 0, 0, 0)
+                    assert helper.call(b'S', feedback) == (b'A', b'')
+            assert flushed and wal.tell(), 'shutdown did not exercise WAL drain and feedback'
+            assert stopping.wait(timeout=5) == 0
+            assert process.wait(timeout=5) == 0
+    finally:
+        helper.close()
+        if stopping is not None and stopping.poll() is None:
+            stopping.kill()
+            stopping.wait(timeout=5)
+    print('libpq-helper: real C walsender shutdown is retryable source end, not timeline completion PASS',
+          flush=True)
+
+
 def run(base, root, executable, port, processes):
     directory = root / 'data'
     with (root / 'initdb.log').open('w') as output:
@@ -260,7 +317,7 @@ def run(base, root, executable, port, processes):
               flush=True)
     finally:
         observer.close()
-    peer.stop(base, root, process)
+    physical_source_shutdown(base, root, port, env, process)
 
 
 def main():

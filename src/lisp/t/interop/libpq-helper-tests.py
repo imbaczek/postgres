@@ -282,6 +282,76 @@ class HelperProtocol(unittest.TestCase):
             self.assertIn(b'next_tli_startpos', body)
             self.assertEqual(self.helper.call(b'X'), (b'A', b''))
 
+    def test_query_source_errors_validate_state_without_echoing_details(self):
+        for state in (b'57P01', b'57P0!', b'bad'):
+            with self.subTest(state=state):
+                helper = Helper()
+                try:
+                    def answer(connection):
+                        self.assertEqual(wire_read(connection, 1), b'Q')
+                        size = struct.unpack('!I', wire_read(connection, 4))[0]
+                        self.assertEqual(wire_read(connection, size - 4), b'IDENTIFY_SYSTEM\0')
+                        wire_frame(connection, b'E', b'SERROR\0VERROR\0C' + state
+                                   + b'\0Mprivate source detail\0\0')
+                        wire_frame(connection, b'Z', b'I')
+                        while connection.recv(1024):
+                            pass
+
+                    with source(answer) as (port, _):
+                        conninfo = (f'host=127.0.0.1 port={port} user=postgres dbname=postgres '
+                                    'sslmode=disable gssencmode=disable')
+                        self.assertEqual(helper.call(b'O', string(conninfo) + string('fallback'))[0], b'O')
+                        kind, body = helper.call(b'Q', struct.pack('!I', 4096) + string('IDENTIFY_SYSTEM'))
+                        self.assertEqual(kind, b'!')
+                        self.assertEqual(body[:5], b'57P01' if state == b'57P01' else b'08P01')
+                        self.assertNotIn(b'private', body)
+                        self.assertNotEqual(helper.process.wait(timeout=2), 0)
+                finally:
+                    helper.close()
+
+    def test_copy_source_exit_preserves_shutdown_and_transport_failures(self):
+        cases = (
+            ('shutdown', [(b'E', b'SFATAL\0VFATAL\0C57P01\0Mprivate shutdown detail\0\0')], b'57P01'),
+            ('eof', [], b'08006'),
+            ('copy-command', [(b'C', b'COPY 0\0'), (b'Z', b'I')], b'08006'),
+            ('wrong-command', [(b'C', b'SELECT 1\0'), (b'Z', b'I')], b'08P01'),
+            ('extra-result', [(b'C', b'COPY 0\0'), (b'C', b'SELECT 1\0'), (b'Z', b'I')], b'08P01'),
+            ('protocol-error', [(b'E', b'SFATAL\0VFATAL\0C08P01\0Mprivate protocol detail\0\0')], b'08P01'),
+            ('invalid-state', [(b'E', b'SFATAL\0VFATAL\0C57P0!\0Mprivate detail\0\0')], b'08P01'),
+            ('invalid-length', [(None, b'd' + struct.pack('!I', 3))], b'08P01'),
+        )
+        for name, frames, expected in cases:
+            with self.subTest(name=name):
+                helper = Helper()
+                try:
+                    def answer(connection):
+                        self.assertEqual(wire_read(connection, 1), b'Q')
+                        size = struct.unpack('!I', wire_read(connection, 4))[0]
+                        self.assertEqual(wire_read(connection, size - 4), b'START_STREAMING\0')
+                        wire_frame(connection, b'W', b'\0\0\0')
+                        for kind, body in frames:
+                            if kind is None:
+                                connection.sendall(body)
+                            else:
+                                wire_frame(connection, kind, body)
+                        if frames:
+                            while connection.recv(1024):
+                                pass
+
+                    with source(answer) as (port, _):
+                        conninfo = (f'host=127.0.0.1 port={port} user=postgres dbname=postgres '
+                                    'sslmode=disable gssencmode=disable')
+                        self.assertEqual(helper.call(b'O', string(conninfo) + string('fallback'))[0], b'O')
+                        self.assertEqual(helper.call(b'Q', struct.pack('!I', 4096)
+                                                     + string('START_STREAMING'))[0], b'B')
+                        kind, body = helper.call(b'R', struct.pack('!II', 65532, 1000))
+                        self.assertEqual(kind, b'!')
+                        self.assertEqual(body[:5], expected)
+                        self.assertNotIn(b'private', body)
+                        self.assertNotEqual(helper.process.wait(timeout=2), 0)
+                finally:
+                    helper.close()
+
     def test_copy_receive_accepts_full_native_and_stock_batches_with_a_bound(self):
         maximum = 128 * 1024 + 25
         for length in (65532, 65533, 65536 + 25, maximum, maximum + 1):
