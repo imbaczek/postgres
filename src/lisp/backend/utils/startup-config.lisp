@@ -39,6 +39,12 @@ Hold the root mutex only for the pointer read; callers use the root after releas
   (or (startup-capture-configuration)
       (error "server configuration is not installed")))
 
+(defun startup-retention-inputs ()
+  "Return the retention policy and keep size from one installed configuration."
+  (let ((configuration (startup-require-configuration)))
+    (values (startup-configuration-slot-policy configuration)
+            (startup-configuration-keep-mb configuration))))
+
 (defun startup-copy-input (value)
   "Copy mutable storage in configuration input trees.
 Reject unsupported objects without printing their contents."

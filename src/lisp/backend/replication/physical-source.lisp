@@ -367,15 +367,15 @@ leave that registry intact."
   (with-wal-critical
     (physical-source-confirm-receipt-under-lock name owner lsn digest)))
 
-(defun physical-source-invalidate-lagging-pins-under-wal-lock ()
+(defun physical-source-invalidate-lagging-pins-under-wal-lock (limit)
   "Persist lost retention before checkpoint may remove its required WAL."
-  (when (integerp *max-slot-wal-keep-bytes*)
+  (when (integerp limit)
     (maphash
      (lambda (name pin)
        (declare (ignore name))
        (when (and (not (physical-source-pin-lost-p pin))
                   (> (- *wal-durable-lsn* (physical-source-pin-restart-lsn pin))
-                     *max-slot-wal-keep-bytes*))
+                     limit))
          (let ((candidate (copy-physical-source-pin pin)))
            (setf (physical-source-pin-lost-p candidate) t)
            (physical-source-pin-save candidate)

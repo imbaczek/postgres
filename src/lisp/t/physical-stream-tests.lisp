@@ -539,7 +539,9 @@
          (ok (eq creator (pg::wal-replication-slot-active-owner public)))
          (ok (eq creator (pg::wal-replication-slot-active-owner-backend public)))
          (ok (plusp (pg::wal-replication-slot-inactive-since public)))
-         (ok (not (eq pg::+null+ (aref (pg::sql-public-replication-slot-row public) 16))))
+         (multiple-value-bind (policy keep-mb) (pg::startup-retention-inputs)
+           (ok (not (eq pg::+null+
+                        (aref (pg::sql-public-replication-slot-row public policy keep-mb) 16)))))
          (ok (eq public (gethash "public_slot" pg::*wal-replication-slots*)))
          (ok (probe-file (pg::wal-replication-slot-path "public_slot")))))
      :temporary t))

@@ -396,7 +396,7 @@ Preserve EQUALP's numeric comparison while descending into SQL value wrappers."
                    (lambda (candidate)
                      (push (pg::bytes->string (pg::wal-encode-replication-slot candidate)) saved)))
              (pg::wal-persist-replication-slot-ack-under-lock slot 200)
-             (pg::wal-invalidate-lagging-replication-slots-under-wal-lock)
+             (pg::wal-invalidate-lagging-replication-slots-under-wal-lock pg::*max-slot-wal-keep-bytes*)
              (ok (= 2 (length saved)))
              (ok (every (lambda (line) (and (search "PGSLOT5 " line)
                                             (search " binary-bytea " line))) saved))

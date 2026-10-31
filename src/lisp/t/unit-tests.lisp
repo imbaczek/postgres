@@ -211,7 +211,14 @@
               #p"/tmp/opencode/")))
     (ensure-directories-exist dir)
     (let ((*pgdata* dir)
-          (*backend* (make-backend)))
+          (*backend* (make-backend))
+          (*startup-installed-configuration*
+            (let ((native (make-hash-table :test #'equal))
+                  (*physical-follow-desired* nil) (*physical-recovery-state* nil))
+              (setf (gethash "max-slot-wal-keep-bytes" native) "1073741824")
+              (startup-prepare-installation-from-base
+               (startup-default-settings dir) native (make-hash-table :test #'equal)
+               nil nil t))))
       (clog-init)
       (run-query-and-concurrency-unit-tests)
       (run-backend-protocol-and-wal-unit-tests)

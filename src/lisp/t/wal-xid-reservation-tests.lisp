@@ -73,6 +73,9 @@
     (let* ((pg::*pgdata* root) (pg::*backend* nil) (pg::*catalog* nil)
                                (pg::*catalog-oldest-relfrozenxid* nil) (pg::*physical-recovery-state* nil)
                                (pg::*wal-ready* nil) (pg::*wal-poisoned* nil)
+                               (pg::*startup-installed-configuration*
+                                 (physical-slot-test-configuration
+                                  (pg::make-wal-slot-retention-policy :mode :bytes :limit 1073741824) 0))
                                (pg::*wal-end-lsn* 0) (pg::*wal-durable-lsn* 0) (pg::*wal-checkpoint-lsn* 0)
                                (pg::*wal-checkpoint-snapshot* nil) (pg::*wal-xid-reserved-through* nil)
                                (pg::*wal-output-stream* nil) (pg::*wal-output-segment* nil)

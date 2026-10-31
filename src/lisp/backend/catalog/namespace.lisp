@@ -545,7 +545,7 @@ Reject unsupported parameters and unsupported local settings."
             (aref row 6) "logical" (aref row 7) nil
             (if (string= (aref row 5) "lost") "wal_removed" +null+) nil nil)))
 
-(defun sql-public-replication-slot-row (slot)
+(defun sql-public-replication-slot-row (slot policy keep-mb)
   "Build a public view row while the caller holds write and WAL locks.
 Lost slots expose NULL restart while retaining their saved floor internally.
 The retained-byte extension measures from the durable or flushed endpoint."
@@ -568,18 +568,21 @@ The retained-byte extension measures from the durable or flushed endpoint."
               (if backend (backend-pid backend) +null+)
               +null+ +null+ (if lost +null+ (nullable restart))
               (nullable (wal-replication-slot-confirmed-flush-lsn slot))
-              (wal-slot-catalog-status slot)
-              (wal-slot-safe-wal-bytes slot)
+              (wal-slot-catalog-status slot policy keep-mb)
+              (wal-slot-safe-wal-bytes slot policy keep-mb)
               nil +null+ (if (zerop inactive) +null+ inactive)
               (if physical +null+ nil) (if lost "wal_removed" +null+)
               nil nil +null+ (if (or lost (null restart)) 0 (max 0 (- durable restart)))))))
+
+(declaim (ftype function startup-retention-inputs))
 
 (defun sql-replication-slot-rows ()
   "Snapshot both slot kinds under write-before-WAL locking."
   (with-write-lock
     (sb-thread:with-mutex (*wal-lock*)
-      (loop for slot being the hash-values of *wal-replication-slots*
-            collect (sql-public-replication-slot-row slot)))))
+      (multiple-value-bind (policy keep-mb) (startup-retention-inputs)
+        (loop for slot being the hash-values of *wal-replication-slots*
+              collect (sql-public-replication-slot-row slot policy keep-mb))))))
 
 (defun make-replication-slot-result-iterator ()
   "Project the public snapshot to the 21 columns of pg_get_replication_slots."

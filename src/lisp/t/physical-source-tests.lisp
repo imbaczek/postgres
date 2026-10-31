@@ -11,6 +11,9 @@
            (pg::*wal-xid-first-lsn* (make-hash-table :test #'eql))
            (pg::*wal-output-stream* nil) (pg::*wal-output-segment* nil)
            (pg::*wal-poisoned* nil)
+           (pg::*startup-installed-configuration*
+             (physical-slot-test-configuration
+              (pg::make-wal-slot-retention-policy :mode :bytes :limit 1073741824) 0))
            (pg::*pm-requested-mode* pg::+no-shutdown+)
            (pg::*wal-checkpoint-lsn* (* 2 pg::+wal-segment-size+))
            (pg::*wal-durable-lsn* (+ (* 3 pg::+wal-segment-size+) 64)))
@@ -50,6 +53,9 @@
      (lambda ()
        (let* ((pg::*physical-source-senders* (make-hash-table :test #'equal))
               (pg::*max-slot-wal-keep-bytes* nil)
+              (pg::*startup-installed-configuration*
+                (physical-slot-test-configuration
+                 (pg::make-wal-slot-retention-policy :mode :bytes :limit nil) 0))
               (pin (pg::physical-source-pin-create "advance"))
               (owner (gensym "SENDER"))
               (received (+ (* 3 pg::+wal-segment-size+) 32)))
@@ -97,6 +103,9 @@
     (call-with-physical-source-fixture
      (lambda ()
        (let* ((pg::*max-slot-wal-keep-bytes* 64)
+              (pg::*startup-installed-configuration*
+                (physical-slot-test-configuration
+                 (pg::make-wal-slot-retention-policy :mode :bytes :limit 64) 0))
               (pin (pg::physical-source-pin-create "lagged"))
               (snapshot (list :unrelated-snapshot)))
          (setf (gethash snapshot pg::*wal-snapshot-retention-pins*) 0)
@@ -119,7 +128,9 @@
        (let* ((pg::*max-slot-wal-keep-bytes* 64)
               (pg::*wal-keep-size-mb* 64)
               (pg::*wal-slot-retention-policy*
-                (pg::make-wal-slot-retention-policy :mode :segments :limit 64))
+                (pg::make-wal-slot-retention-policy :mode :segments :limit (* 1024 1024)))
+              (pg::*startup-installed-configuration*
+                (physical-slot-test-configuration pg::*wal-slot-retention-policy* 64))
               (pin (pg::physical-source-pin-create "wal_keep")))
          (pg::wal-remove-checkpointed-segments pg::*wal-durable-lsn*)
          (ok (pg::physical-source-pin-lost-p pin))
@@ -127,7 +138,9 @@
          (ok (equal '(0 1 2 3) (pg::wal-discover-segments)))
          (pg::physical-source-pin-load)
          (ok (pg::physical-source-pin-lost-p (gethash "wal_keep" pg::*physical-source-pins*)))
-         (setf pg::*wal-keep-size-mb* 0)
+         (setf pg::*wal-keep-size-mb* 0
+               pg::*startup-installed-configuration*
+               (physical-slot-test-configuration pg::*wal-slot-retention-policy* 0))
          (pg::wal-remove-checkpointed-segments pg::*wal-durable-lsn*)
          (ok (equal '(3) (pg::wal-discover-segments)))))))
 

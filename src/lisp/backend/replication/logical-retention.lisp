@@ -22,11 +22,11 @@ or role changes. DURABLE-LSN freezes the checkpoint's current endpoint for the r
    :retained-reference (copy-tree (getf *wal-control-metadata* :retained-reference))
    :requests requests))
 
-(defun wal-slot-recycling-work-current-p (work)
+(defun wal-slot-recycling-work-current-p (work &optional (policy (nth-value 0 (startup-retention-inputs))))
   "Check the ticket's registry and storage context. Authoritative callers hold WAL;
 checks outside WAL are advisory."
   (and *wal-ready* (not *wal-poisoned*)
-       (eq :segments (wal-slot-retention-mode))
+       (eq :segments (wal-slot-retention-mode policy))
        (not (recovery-in-progress-p)) (not *physical-recovery-failed-p*)
        (not *live-operation-terminal-shutdown*)
        (not (shutdown-in-progress-p))
@@ -59,19 +59,20 @@ checks outside WAL are advisory."
        (not (shutdown-in-progress-p))))
 
 (defun wal-slot-recycling-owner-current-p (work slot owner backend)
-  "Recheck the owner and current removal predicate under WAL before signaling.
-Use the ticket's frozen endpoint for wal_keep_size and slot-cap calculations."
-  (and (wal-slot-recycling-work-current-p work)
-       (eq :segments (wal-slot-retention-mode))
-       (eq slot (gethash (wal-replication-slot-name slot) *wal-replication-slots*))
-       (wal-slot-reserved-p slot)
-       (eq owner (wal-replication-slot-active-owner slot))
-       (eq backend (wal-replication-slot-active-owner-backend slot))
-       (let* ((redo (wal-checkpoint-recycling-segment (wal-slot-recycling-work-checkpoint-lsn work)))
-              (independent (wal-independent-retention-segment redo (wal-slot-recycling-work-durable-lsn work)))
-              (keep (wal-slot-removal-segment
-                     redo independent (wal-slot-recycling-work-durable-lsn work))))
-         (< (wal-replication-slot-restart-lsn slot) (* keep +wal-segment-size+)))))
+  "Recheck the owner and current policy under WAL before signaling.
+Use the ticket's frozen endpoint with a freshly captured retention configuration."
+  (multiple-value-bind (policy keep-mb) (startup-retention-inputs)
+    (and (wal-slot-recycling-work-current-p work policy)
+         (eq slot (gethash (wal-replication-slot-name slot) *wal-replication-slots*))
+         (wal-slot-reserved-p slot)
+         (eq owner (wal-replication-slot-active-owner slot))
+         (eq backend (wal-replication-slot-active-owner-backend slot))
+         (let* ((current (wal-slot-recycling-work-durable-lsn work))
+                (redo (wal-checkpoint-recycling-segment (wal-slot-recycling-work-checkpoint-lsn work)))
+                (independent (wal-independent-retention-segment redo current keep-mb))
+                (keep (wal-slot-removal-segment
+                       redo independent current policy)))
+           (< (wal-replication-slot-restart-lsn slot) (* keep +wal-segment-size+))))))
 
 (defvar *wal-slot-recycling-termination-requests*
   (make-hash-table :test #'eq :weakness :key)
@@ -178,12 +179,12 @@ The saved restart floor remains internal; consumer cleanup runs after locks drai
   (wal-refresh-logical-capture-slot-mirror-under-wal-lock)
   (values))
 
-(defun wal-prepare-standard-slot-recycling-under-lock (redo-segment current)
+(defun wal-prepare-standard-slot-recycling-under-lock (redo-segment current policy keep-mb)
   "Save loss for inactive slots and collect active owner triples under WAL.
 Combine independent retention, including wal_keep_size, before judging loss.
 Active slots retain WAL until release and a recheck at the same endpoint."
-  (let* ((independent (wal-independent-retention-segment redo-segment current))
-         (keep (wal-slot-removal-segment redo-segment independent current))
+  (let* ((independent (wal-independent-retention-segment redo-segment current keep-mb))
+         (keep (wal-slot-removal-segment redo-segment independent current policy))
          (requests nil))
     (wal-invalidate-replication-slots-matching-under-lock
      (lambda (slot)
@@ -195,27 +196,29 @@ Active slots retain WAL until release and a recheck at the same endpoint."
                      requests)
                nil)
              t))))
-    (values (wal-slot-removal-segment redo-segment independent current) (nreverse requests))))
+    (values (wal-slot-removal-segment redo-segment independent current policy)
+            (nreverse requests))))
 
 (defun wal-prepare-slot-recycling-under-lock (redo-segment &optional (current *wal-durable-lsn*))
-  "Apply the selected policy under WAL and return the floor and owner requests.
-Standard segments stop active owners first; native bytes keep their existing path."
-  (ecase (wal-slot-retention-mode)
-    (:bytes
-     (wal-invalidate-lagging-replication-slots-under-wal-lock)
-     (wal-slot-removal-segment
-      redo-segment (wal-independent-retention-segment redo-segment current) current))
-    (:segments
-     (physical-source-invalidate-lagging-pins-under-wal-lock)
-     (wal-prepare-standard-slot-recycling-under-lock redo-segment current))))
+  "Apply one captured policy under WAL and return the floor and owner requests."
+  (multiple-value-bind (policy keep-mb) (startup-retention-inputs)
+    (let ((limit (wal-slot-retention-policy-limit policy)))
+      (ecase (wal-slot-retention-mode policy)
+        (:bytes
+         (wal-invalidate-lagging-replication-slots-under-wal-lock limit)
+         (wal-slot-removal-segment
+          redo-segment (wal-independent-retention-segment redo-segment current keep-mb)
+          current policy))
+        (:segments
+         (physical-source-invalidate-lagging-pins-under-wal-lock limit)
+         (wal-prepare-standard-slot-recycling-under-lock redo-segment current policy keep-mb))))))
 
-(defun wal-invalidate-lagging-replication-slots-under-wal-lock ()
-  "Apply the native byte cap at durable WAL, including private source pins.
-The recycling dispatcher selects the standard segment policy separately."
+(defun wal-invalidate-lagging-replication-slots-under-wal-lock (limit)
+  "Apply the explicit native byte cap at durable WAL, including private source pins."
   (wal-invalidate-replication-slots-matching-under-lock
    (lambda (slot)
-     (wal-slot-byte-limit-exceeded-p slot *wal-durable-lsn*)))
-  (physical-source-invalidate-lagging-pins-under-wal-lock)
+     (wal-slot-byte-limit-exceeded-p slot *wal-durable-lsn* limit)))
+  (physical-source-invalidate-lagging-pins-under-wal-lock limit)
   (values))
 
 (defun wal-lost-replication-slots ()

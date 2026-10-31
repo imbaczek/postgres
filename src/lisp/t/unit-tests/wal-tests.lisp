@@ -159,6 +159,13 @@
          (*wal-durable-lsn* (+ (* 2 +wal-segment-size+) 100))
          (*wal-poisoned* nil)
          (*max-slot-wal-keep-bytes* 32)
+         (*startup-installed-configuration*
+           (let ((native (make-hash-table :test #'equal))
+                 (*physical-follow-desired* nil) (*physical-recovery-state* nil))
+             (setf (gethash "max-slot-wal-keep-bytes" native) "32")
+             (startup-prepare-installation-from-base
+              (startup-default-settings test-pgdata) native (make-hash-table :test #'equal)
+              nil nil t)))
          (*wal-replication-slots* (make-hash-table :test #'equal))
          (slot (make-wal-replication-slot :name "lag_slot" :restart-lsn 0
                                           :consistent-lsn *wal-durable-lsn*)))
