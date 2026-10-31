@@ -433,7 +433,9 @@ table.  With no query owner there is no persistent executor to record."
 
 (defun wait-for-reload-condition (queue mutex check-cancel)
   "Return with MUTEX owned, including after an SBCL timed wait releases it.
-The caller's cleanup must also permit cancellation while the mutex is unowned."
+A timed-out wait leaves MUTEX unowned; check cancellation in that state and
+reacquire before returning. Caller cleanup must permit cancellation while unowned.
+Without CHECK-CANCEL, use the ordinary untimed condition wait."
   (when check-cancel (funcall check-cancel))
   (if check-cancel
       (unless (sb-thread:condition-wait queue mutex :timeout 0.05)

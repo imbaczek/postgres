@@ -992,6 +992,8 @@ strict runtime boundary."
          candidate)))))
 
 (defun startup-reload-settings-under-definition-lock ()
+  "Capture, prepare and commit a full reload while definition exclusion is held.
+This configuration path does not take live admission or the code reload lock."
   (check-reload-service-running)
   (multiple-value-bind (candidate settings) (startup-prepare-reload-installation)
     (when candidate

@@ -31,9 +31,11 @@
 
 ;; Serialize SIGHUP reloads and explicit (reload) calls so they cannot run
 ;; concurrently and interleave a half-compiled image.
-(defvar *reload-run-lock* (sb-thread:make-mutex :name "pg reload run lock"))
+(defvar *reload-run-lock* (sb-thread:make-mutex :name "pg reload run lock")
+  "Serialize code reload drain and compilation.")
 
-(defvar *reload-definition-lock* (sb-thread:make-mutex :name "pg reload definitions"))
+(defvar *reload-definition-lock* (sb-thread:make-mutex :name "pg reload definitions")
+  "Serialize configuration preparation and commit with definition replacement.")
 
 (defvar *reload-configuration-worker* nil)
 
@@ -41,15 +43,22 @@
 
 (defvar *reload-worker-wake* (sb-thread:make-semaphore :count 0))
 
-(defvar *reload-worker-join-timeout* 5)
+(defvar *reload-worker-join-timeout* 5
+  "Bound each worker join in seconds, not time spent waiting for mutexes.")
 
-(defvar *reload-service-failure* nil)
+(defvar *reload-service-failure* nil
+  "First unexpected worker condition, or :ABNORMAL-EXIT for a nonlocal exit.
+NIL until a worker exits abnormally.")
 
 (defun call-with-reload-definitions (function)
+  "Serialize configuration work with definition replacement.
+A symbol FUNCTION is resolved while the lock is held, after any code reload."
   (if (sb-thread:holding-mutex-p *reload-definition-lock*)
       (funcall function)
       (sb-thread:with-mutex (*reload-definition-lock*)
         (funcall function))))
+
+;; Among reload paths, only code reload uses this admission protocol.
 
 ;; A reload closes admission to SQL operations and waits for current queries to
 ;; leave before redefining functions used by backend threads.
@@ -108,7 +117,9 @@ statement registrations captured while parked."
 
 (defconstant +reload-service-stopped+ 4)
 
-(defvar *reload-requests* 0)
+(defvar *reload-requests* 0
+  "Pending configuration and code bits, or terminal STOPPED.
+Repeated requests share bits; pending bits survive ASDF reload.")
 
 (define-condition reload-service-stopped (error) ())
 
@@ -125,6 +136,8 @@ statement registrations captured while parked."
   (logtest mask *reload-requests*))
 
 (defun request-reload-bits (mask)
+  "Add request bits atomically unless the service is stopped.
+Concurrent requests remain pending for their consumers."
   (loop for old = *reload-requests*
         for new = (logior old mask)
         when (logtest +reload-service-stopped+ old) return nil
@@ -132,6 +145,7 @@ statement registrations captured while parked."
             return t))
 
 (defun claim-reload-request (mask)
+  "Claim only MASK, preserving other bits and requests arriving during work."
   (loop for old = *reload-requests*
         for new = (logandc2 old mask)
         unless (and (not (logtest +reload-service-stopped+ old)) (logtest mask old))
@@ -787,7 +801,8 @@ lane must not run query or storage work."
   "Run FUNCTION after active, parked, and suspended query owners have drained.
 
 Reopen admission and release the reload lock before waiting, so a client can
-resume or close a portal that retains executable state."
+resume or close a portal that retains executable state. Definition exclusion is
+taken by the code caller only after the active, parked and query-owner drains."
   (when (or (plusp *live-operation-depth*) *live-operation-parked-p*
             (query-execution-owner-thread-retains-state-p))
     (error "reload exclusion requires an outside caller"))
@@ -812,6 +827,9 @@ resume or close a portal that retains executable state."
   t)
 
 (defun configuration-reload-step ()
+  "Prepare and commit configuration under definition exclusion, without admission.
+On a stale predecessor, release exclusion and retry from fresh inputs; log other
+invalid candidates once. This path does not take the code reload lock."
   (loop
     (handler-case
         (return (call-with-reload-definitions 'configuration-reload-attempt-under-definition-lock))
@@ -824,6 +842,7 @@ resume or close a portal that retains executable state."
         (return nil)))))
 
 (defun reload-code-under-definition-lock ()
+  "Check the service again before ASDF replaces definitions under exclusion."
   (check-reload-service-running)
   (let ((*standard-output* (or *server-output* *standard-output*))
         (*error-output* (or *server-error* *error-output*))
@@ -833,6 +852,7 @@ resume or close a portal that retains executable state."
     t))
 
 (defun execute-code-reload ()
+  "Drain executable owners before taking definition exclusion for code reload."
   (when (reload-service-stopped-p) (return-from execute-code-reload nil))
   (format t "~&pg-lisp: reloading code...~%")
   (finish-output)
@@ -854,6 +874,8 @@ resume or close a portal that retains executable state."
     ok))
 
 (defun reload ()
+  "Request configuration first, then reload code or queue both requests.
+A caller retaining admission or executable state must queue both requests."
   (when (or (plusp *live-operation-depth*) *live-operation-parked-p*
             (query-execution-owner-thread-retains-state-p))
     (request-reload)
@@ -862,6 +884,7 @@ resume or close a portal that retains executable state."
   (if (reload-service-stopped-p) nil (execute-code-reload)))
 
 (defun publish-reload-service-stop ()
+  "Publish STOPPED under definition then generation exclusion."
   (unless (sb-thread:holding-mutex-p *reload-definition-lock*)
     (error "reload stop publication requires definition exclusion"))
   (call-with-physical-follow-generation-publication
@@ -869,6 +892,8 @@ resume or close a portal that retains executable state."
    (constantly nil)))
 
 (defun fail-reload-service (condition)
+  "Keep the first worker failure, stop the service, and wake both workers.
+Publish stop under the locks; wake the peer after releasing them."
   (sb-sys:without-interrupts
     (sb-ext:compare-and-swap *reload-service-failure* nil condition)
     (call-with-reload-definitions 'publish-reload-service-stop)
@@ -876,6 +901,9 @@ resume or close a portal that retains executable state."
   (values))
 
 (defun reload-worker-loop (kind ready)
+  "Consume KIND's requests until stopped, fencing abnormal exits.
+The outer interrupt mask protects failure cleanup; a failed service is not
+restarted automatically."
   (let ((normal nil) (failure nil))
     (sb-sys:without-interrupts
       (unwind-protect
@@ -903,6 +931,10 @@ resume or close a portal that retains executable state."
   (reload-worker-loop :code nil))
 
 (defun start-reload-workers ()
+  "Start the two tracked workers behind a shared ready gate.
+A complete live pair makes this idempotent. On partial start, publish STOPPED
+while definition exclusion is held and release both children. Otherwise pending
+requests remain intact."
   (call-with-reload-definitions
    (lambda ()
      (check-reload-service-running)
@@ -931,6 +963,8 @@ resume or close a portal that retains executable state."
   (values))
 
 (defun stop-reload-workers ()
+  "Stop and join reload workers before storage finalization.
+Join outside the locks with a bounded wait; a timeout prevents finalization."
   (when (or (plusp *live-operation-depth*)
             (sb-thread:holding-mutex-p *reload-definition-lock*)
             (sb-thread:holding-mutex-p *reload-run-lock*)
