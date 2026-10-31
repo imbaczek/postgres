@@ -55,6 +55,11 @@ lock, and release the follow lock before taking the store mutex."
 (declaim (special *startup-configuration-lock*))
 
 (defun call-with-physical-follow-generation-publication (function after-release)
+  "Call FUNCTION under the non-reentrant generation fence.
+Do not enter while holding the generation, follow, configuration, sender, WAL
+or receive-store mutex. The initial wait is interruptible according to the
+caller's mask. Run FUNCTION, unlock and AFTER-RELEASE with interrupts masked;
+call AFTER-RELEASE on unwind too. Return FUNCTION's values."
   (let ((mutex *physical-follow-generation-lock*) (held nil))
     (when (or (sb-thread:holding-mutex-p mutex)
               (sb-thread:holding-mutex-p *physical-follow-lock*)

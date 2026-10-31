@@ -172,6 +172,11 @@ Unclaimed and non-standby cases need no check; live replay files are not read."
 
 (defun physical-follow-call-with-prepared-install
     (desired function preflight claim-preflight publication-preflight)
+  "Install a prepared desired generation without taking admission or quiescence.
+Under the generation fence, check predecessor and PREFLIGHT under the follow
+lock before and after the claim. Run claim and publication preflights outside
+the follow lock. Wake the desired worker after fence release, including on
+unwind after publication; a wake failure does not undo publication."
   (check-type desired physical-follow-desired)
   (let ((changed nil))
     (call-with-physical-follow-generation-publication
@@ -198,7 +203,8 @@ Unclaimed and non-standby cases need no check; live replay files are not read."
 
 (defun physical-follow-call-with-desired-install
     (desired function &optional preflight claim-preflight publication-preflight)
-  "Install a direct desired generation under live-operation quiescence."
+  "Install a direct desired generation under live-operation quiescence.
+Reuse the caller's quiescence when already owned."
   (flet ((install ()
            (physical-follow-call-with-prepared-install
             desired function preflight claim-preflight publication-preflight)))

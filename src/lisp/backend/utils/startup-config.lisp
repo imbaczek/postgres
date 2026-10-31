@@ -800,8 +800,8 @@ these slots."
 
 (defun startup-publish-configuration (candidate)
   "Publish prepared values and the root under the root mutex.
-Publication still uses live-operation quiescence; readers capture the installed
-root for coherent settings."
+The caller supplies publication exclusion; readers capture the installed root
+for coherent settings."
   (sb-thread:with-mutex (*startup-configuration-lock*)
     (setf *authentication-policy* (startup-configuration-authentication candidate)
           *startup-server-settings* (startup-configuration-settings candidate)
@@ -888,8 +888,9 @@ authentication and an initialized source."
   (values))
 
 (defun startup-call-with-prepared-installation (candidate preflight claim-preflight publication-preflight)
-  "Run the shared installation kernel with boundary checks supplied by callers.
-The desired installer holds quiescence and the generation fence for publication."
+  "Run the prepared installation with boundary checks supplied by callers.
+The generation fence protects publication; this kernel does not take admission
+or quiescence."
   (check-type candidate startup-configuration)
   (physical-follow-call-with-prepared-install
    (startup-configuration-desired candidate)
@@ -949,7 +950,8 @@ Check the cold stage and ownership before creating default policy files."
   (startup-commit-installation-at-boundary candidate :runtime))
 
 (defun startup-install-settings (settings native overrides &optional (policy nil supplied-p))
-  "Prepare and install owned settings under quiescence; return the original SETTINGS."
+  "Prepare and install owned settings; return the original SETTINGS.
+Publication uses the generation fence. Code reload still drains live operations."
   (startup-commit-installation
    (if supplied-p
        (startup-prepare-installation settings native overrides policy)
