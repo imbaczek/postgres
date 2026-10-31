@@ -208,6 +208,11 @@
 (defvar *sync-replication-state* (make-sync-replication-state))
 
 (defun sync-replication-monitoring-snapshots-under-lock ()
+  "Snapshot current sender tokens and synchronous selection under the sender lock.
+A positive valid flush is required for priority. Selection requires a current
+token and a streaming or stopping sender on a primary.
+FIRST marks selected senders sync, ANY marks them quorum, other positive-priority
+senders are potential, and zero-priority senders are async. Return detached rows."
   (unless (sb-thread:holding-mutex-p *wal-sender-lock*)
     (error "synchronous monitoring requires the sender lock"))
   (let* ((config (sync-replication-state-config *sync-replication-state*))

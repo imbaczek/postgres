@@ -142,6 +142,12 @@ appropriate instead of replacing the native C peer or adding a message relay.
 - Dissect can fault while collecting SBCL mutex-frame locals for an ordinary
   missing-root error. A direct `handler-bind` can expose the original condition;
   the TODO tracks this diagnostic issue.
+- A warm test worker can retain orphan fixture XIDs and cached relation streams
+  pointing into deleted legacy PGDATA. A direct REPL `macrolet` reproduction
+  without Rove exposed an ordinary promotion error hidden by Dissect's mutex-frame
+  fault; the intended fresh legacy runner passed 1,159 checks. The leak producer
+  and suite-isolation fix remain unknown. Check for backend and test actors before
+  cleaning up owned fixture state.
 - Catch background test errors inside `with-open-file` to preserve their log,
   and bind error and trace output as well as standard output to that stream.
 - A replaceable worker-step function can make an older loop exit safely at an

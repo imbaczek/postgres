@@ -138,7 +138,8 @@ Feedback and cleanup use that token, so they cannot affect a replacement registr
         (wal-sender-set-state sender "startup")))))
 
 (defun wal-sender-snapshots ()
-  "Copy registered sender fields under the lock for a stable monitoring result."
+  "Copy sender fields and current synchronous status under one sender lock.
+Selection uses exact registered tokens; returned rows are detached snapshots."
   (sb-thread:with-mutex (*wal-sender-lock*)
     (sort (sync-replication-monitoring-snapshots-under-lock)
           #'< :key (lambda (row) (getf row :pid)))))

@@ -215,8 +215,8 @@
 (defparameter +activity-result-fields+ '(("pid" :int4) ("application_name" :text)))
 
 (defun sql-wal-sender-row (snapshot)
-  "Convert a sender snapshot to C's twelve-column sender status record.
-Unknown positions and lag are NULL; priority zero and async do not imply sync support."
+  "Convert a detached sender snapshot to C's twelve-column status record.
+Report its captured priority and synchronous state; unknown positions and lag are NULL."
   (flet ((nullable-position (key)
            (let ((value (getf snapshot key)))
              (if (or (null value) (zerop value)) +null+ value))))

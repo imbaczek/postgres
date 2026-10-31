@@ -176,7 +176,24 @@
   draining an active commit. The reload test uses a pre-admitted callback across
   SIGHUP; ordinary control evaluation also requires admission.
 
-- [ ] Complete truthful FIRST/ANY status and true asynchronous OFF.
+- [x] Report current FIRST/ANY sender priority and state from one sender-lock
+  snapshot (`336ab343ffb`). The native status test uses an owned server, public
+  reload and SQL with controlled sender registrations. Insufficient ANY peers
+  still show quorum candidates; unmeasured lag is NULL. The checkpoint passed
+  1,413 physical, 777 unit,
+  201 wire and 1,159 legacy checks, strict cold compilation and the native status,
+  user, DDL and reload tests. The physical run used a tracked private active-XID
+  binding; the unit run followed clearing 247 FASLs. The property ran 100 trials
+  each at seeds 42 and 98749024680794852 (digest `cdce92d88fc2e9ad`); input
+  coverage and rejection counts were not measured.
+
+- [ ] Implement true asynchronous OFF. Separate policy and accepted versus durable
+  receipts; keep CLOG dependencies volatile until WAL is durable. Add an owned
+  pending batch spool and page overlay, and a common FIFO flush and materialization
+  path for all publishers, checkpoints and deletes, with a tracked primary WAL
+  writer. Preserve WAL-to-CLOG lock order and the truthful durable frontier; never
+  put pending committed bits on disk before WAL. Enable OFF only when ordinary DML
+  can acknowledge before the durable frontier advances. This adds no coordination.
 
 - [ ] Complete the unchanged Patroni monitoring query and synchronous-replication
   backend contract. Preserve the complete real query as the acceptance oracle.
@@ -184,8 +201,7 @@
   synchronous_commit=off and PERFORM txid_current(); these remain dependencies
   of unchanged-method acceptance. Complete public FIRST/ANY integration against
   C `syncrep.c`, with independent acknowledgment/crash tests;
-  this item adds no coordination. Keep sender status asynchronous until truthful
-  public status is implemented: Patroni treats sync status as a safety signal. Preserve the
+  this item adds no coordination. Preserve the
   different-upstream, descendant and rejoin acceptance work alongside this path.
 
 - [x] Publish an allocated backend XID with its active registration under the XID
@@ -297,8 +313,12 @@
 
 - [ ] Restore legacy unit-test runner fixture state after the suite. A warm worker
   retained `*active-xids* = (3)` after 1,598 passing checks, causing later physical
-  promotion and shutdown checks to fail. Until fixed, run physical and interop
-  suites in a fresh worker before the legacy suite. This is a test isolation issue.
+  promotion and shutdown checks to fail. Use the intended fresh legacy entrypoint
+  for acceptance and inspect or isolate fixture state before later warm suites;
+  do not restart an owned live SQL server to hide leaks. A later warm worker also
+  had orphan fixture XIDs and cached streams pointing at deleted legacy PGDATA;
+  the fresh intended legacy runner passed 1,159 checks. The leaking test and
+  suite-isolation fix are not yet known.
 
 - [ ] Audit cold-image compilation and ASDF load-order dependencies across `pg`
   and its test systems. A warm REPL must not conceal missing declarations or
@@ -316,7 +336,8 @@
   infer storage corruption from this secondary reporting failure. Observed on
   2026-10-31 in SBCL process 1984912 during the retention-reader milestone.
   Background test logs must catch errors inside `with-open-file` so abort cleanup
-  keeps the log.
+  keeps the log. A direct REPL reproduction without Rove later exposed an ordinary
+  promotion error hidden by the same frame-local fault.
 
 - [ ] Extend implicit simple-query transactions to the remaining statement and
   transaction-control cases, including transactional DDL and TRUNCATE, using C as
