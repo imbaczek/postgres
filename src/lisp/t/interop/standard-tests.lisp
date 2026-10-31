@@ -54,6 +54,57 @@
        (ok (equal "22023" (sqlstate-of (pg::standard-accept-feedback
                                         state (standard-test-feedback 300 300 300))))))))
 
+(deftest standard-feedback-status-keeps-logical-positions-independent
+    (call-with-owned-standard-stream
+     (lambda (state slot)
+       (let* ((pg::*wal-sender-registry* (make-hash-table :test #'eq))
+              (backend (pg::make-backend :pid 2350 :replication-mode :database))
+              (pg::*wal-sender* (pg::wal-sender-register backend)))
+         (unwind-protect
+              (progn
+                (pg::standard-accept-feedback state (standard-test-feedback 230 200 240))
+                (let ((snapshot (first (pg::wal-sender-snapshots))))
+                  (ok (= 230 (getf snapshot :write-lsn)))
+                  (ok (= 200 (getf snapshot :flush-lsn)))
+                  (ok (= 240 (getf snapshot :replay-lsn)))
+                  (ok (= 128 (pg::wal-replication-slot-confirmed-flush-lsn slot))))
+                (pg::standard-accept-feedback state (standard-test-feedback 0 0 0))
+                (ok (zerop (getf (first (pg::wal-sender-snapshots)) :flush-lsn))))
+           (pg::wal-sender-unregister backend pg::*wal-sender*))))))
+
+(deftest logical-startup-status-reports-slot-restart-before-copy
+    (call-with-standard-slot-fixture
+     (lambda ()
+       (pg::create-standard-logical-slot "status_start" :nothing)
+       (let* ((slot (gethash "status_start" pg::*wal-replication-slots*))
+              (restart (pg::wal-replication-slot-restart-lsn slot))
+              (requested (pg::wal-replication-slot-confirmed-flush-lsn slot))
+              (pg::*wal-sender-registry* (make-hash-table :test #'eq))
+              (original (symbol-function 'pg::send-copy-both-response))
+              (sender nil) (seen nil))
+         (setf (pg::backend-pid pg::*backend*) 2356
+               (pg::backend-replication-mode pg::*backend*) :database
+               sender (pg::wal-sender-register pg::*backend*))
+         (unwind-protect
+              (progn
+                (ok (< restart requested))
+                (setf (symbol-function 'pg::send-copy-both-response)
+                      (lambda (stream)
+                        (declare (ignore stream))
+                        (setf seen (pg::wal-sender-status-sent-lsn pg::*wal-sender*))
+                        (throw 'stop-before-copy :stopped)))
+                (ok (eq :stopped
+                        (catch 'stop-before-copy
+                          (pg::start-standard-logical-replication
+                           nil (pg::parse-replication-command
+                                (format nil "START_REPLICATION SLOT status_start LOGICAL ~a (proto_version '1', publication_names 'unused')"
+                                        (pg::wal-format-lsn requested)))))))
+                (ok (= restart seen))
+                (ok (null (pg::wal-replication-slot-active-owner slot)))
+                (ok (equal "startup" (getf (first (pg::wal-sender-snapshots)) :state))))
+           (setf (symbol-function 'pg::send-copy-both-response) original)
+           (pg::wal-sender-unregister pg::*backend* sender))))))
+
 (deftest standard-feedback-preserves-private-ack-rules
     (call-with-owned-standard-stream
      (lambda (state slot)
@@ -144,6 +195,65 @@
       (pg::close-connection server output)
       (pg::close-connection client input)
       (ignore-errors (sb-bsd-sockets:socket-close listener)))))
+
+(deftest standard-catchup-waits-for-a-read-that-exhausts-wal
+    (call-with-standard-socket-pair
+     (lambda (state input)
+       (declare (ignore input))
+       (let* ((pg::*wal-sender-registry* (make-hash-table :test #'eq))
+              (pg::*backend* (pg::make-backend :pid 2357 :replication-mode :database))
+              (sender (pg::wal-sender-register pg::*backend*))
+              (poll (symbol-function 'pg::standard-poll-feedback))
+              (reader (symbol-function 'pg::wal-logical-slot-read-transactions))
+              (polls 0) (reads 0) (seen nil))
+         (setf (pg::standard-stream-pending-count state) pg::+standard-stream-boundary-limit+
+               (pg::standard-stream-scan-cursor state) 128)
+         (unwind-protect
+              (progn
+                (setf (symbol-function 'pg::standard-poll-feedback)
+                      (lambda (stream)
+                        (when (> (incf polls) 1)
+                          (push (getf (first (pg::wal-sender-snapshots)) :state) seen))
+                        (when (= polls 2) (setf (pg::standard-stream-pending-count stream) 0))
+                        (when (= polls 4) (setf (pg::standard-stream-stop-reason stream) :disconnect)))
+                      (symbol-function 'pg::wal-logical-slot-read-transactions)
+                      (lambda (&rest arguments)
+                        (declare (ignore arguments))
+                        (values nil 128 (= (incf reads) 2))))
+                (pg::call-with-wal-sender-stream (lambda () (pg::standard-stream-loop state)))
+                (ok (= reads 2))
+                (ok (equal '("catchup" "catchup" "streaming") (nreverse seen))))
+           (setf (symbol-function 'pg::standard-poll-feedback) poll
+                 (symbol-function 'pg::wal-logical-slot-read-transactions) reader)
+           (pg::wal-sender-unregister pg::*backend* sender))))))
+
+(deftest native-logical-catchup-requires-reader-exhaustion
+    (dolist (exhausted '(nil t))
+      (let* ((pg::*wal-sender-registry* (make-hash-table :test #'eq))
+             (pg::*backend* (pg::make-backend :pid 2358 :replication-mode :database))
+             (sender (pg::wal-sender-register pg::*backend*))
+             (reader (symbol-function 'pg::wal-logical-slot-read-transactions))
+             (keepalive (symbol-function 'pg::send-logical-keepalive))
+             (seen nil))
+        (unwind-protect
+             (progn
+               (setf (symbol-function 'pg::wal-logical-slot-read-transactions)
+                     (lambda (&rest arguments)
+                       (declare (ignore arguments))
+                       (values nil 128 exhausted))
+                     (symbol-function 'pg::send-logical-keepalive)
+                     (lambda (&rest arguments)
+                       (declare (ignore arguments))
+                       (setf seen (getf (first (pg::wal-sender-snapshots)) :state))
+                       (throw 'stop-keepalive :stopped)))
+               (ok (eq :stopped
+                       (catch 'stop-keepalive
+                         (pg::call-with-wal-sender-stream
+                          (lambda () (pg::stream-logical-replication-loop nil "unused" 128))))))
+               (ok (equal (if exhausted "streaming" "catchup") seen)))
+          (setf (symbol-function 'pg::wal-logical-slot-read-transactions) reader
+                (symbol-function 'pg::send-logical-keepalive) keepalive)
+          (pg::wal-sender-unregister pg::*backend* sender)))))
 
 (deftest standard-copydone-finishes-current-partial-frame
     (call-with-standard-socket-pair

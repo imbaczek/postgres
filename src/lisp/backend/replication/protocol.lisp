@@ -289,6 +289,10 @@ On a standby, receipt ahead of replay is reported only on the replay timeline."
         do (setf value (logior (ash value 8) (aref bytes position)))
         finally (return value)))
 
+(defun replication-read-i64 (bytes offset)
+  (let ((value (replication-read-u64 bytes offset)))
+    (if (logbitp 63 value) (- value (ash 1 64)) value)))
+
 (defun replication-standby-status (stream &optional allow-copy-done)
   "Read a standby status, or NIL at EOF.
 When ALLOW-COPY-DONE is true, accept an empty CopyDone as a second true value
@@ -309,7 +313,8 @@ and an empty Terminate as EOF. Other malformed messages remain protocol errors."
       (ereport-fatal "08P01" "expected a standby status update in CopyBoth mode"))
     (list :write (replication-read-u64 payload 1)
           :flush (replication-read-u64 payload 9)
-          :apply (replication-read-u64 payload 17))))
+          :apply (replication-read-u64 payload 17)
+          :reply-time (replication-read-i64 payload 25))))
 
 (defun send-copy-both-response (stream)
   ;; CopyBothResponse: text format and zero result columns.
@@ -812,6 +817,8 @@ keepalive's WAL-end field, which may include changes not yet applied."
     ;; LogicalConfirmReceivedLocation() makes the persisted consumer horizon
     ;; visible only after the slot file is durable.
     (logical-test-failpoint :after-slot-acknowledgment slot-name position)
+    (wal-sender-note-reply *wal-sender* (getf status :write) (getf status :flush)
+                           (getf status :apply) (getf status :reply-time 0))
     position))
 
 (defun end-logical-copy-mode (stream)
@@ -830,53 +837,59 @@ keepalive's WAL-end field, which may include changes not yet applied."
              (assoc "publication_names" (logical-replication-command-options command)
                     :test #'equal))
     (ereport "0A000" "publication options require a pgoutput slot"))
-  (let ((copy-mode-p nil))
-    (handler-case-nonfatal
-     (progn
-       (wal-logical-slot-validate-start-position slot-name requested-lsn)
-       (call-with-logical-replication-slot
-        slot-name
-        (lambda (slot)
-          (unless (equal (wal-replication-slot-plugin slot) "pg_lisp")
-            (ereport "0A000" "standard pgoutput streaming is not implemented"))
-          (when (eq (wal-slot-profile slot) :binary-bytea)
-            (let ((option (and command
-                               (assoc "binary_bytea"
-                                      (logical-replication-command-options command)
-                                      :test #'equal))))
-              (unless (and option (replication-option-boolean "binary_bytea" (cdr option)))
-                (ereport "0A000" "replication slot requires binary bytea transport"))))
-          (let ((initial-copy-p
-                  (null (wal-replication-slot-confirmed-flush-lsn slot))))
-            (wal-logical-slot-validate-start-position
-             slot-name requested-lsn)
-            (send-copy-both-response stream)
-            (setf copy-mode-p t)
-            (let ((first-status (replication-standby-status stream)))
-              (unless first-status
-                (return-from start-logical-replication nil))
-              (if initial-copy-p
-                  (finalize-initial-replication-copy
-                   slot-name slot requested-lsn first-status)
-                  (let ((position (replication-status-position first-status)))
-                    (unless (= position requested-lsn)
-                      (ereport "22023"
-                               "first resumed standby status must equal the requested LSN"))
-                    (wal-logical-slot-accept-resume-position
-                     slot-name requested-lsn))))
-            (let* ((option (and command (assoc "binary_bytea" (logical-replication-command-options command) :test #'equal)))
-                   (*pgoutput-binary-bytea* (and option (replication-option-boolean "binary_bytea" (cdr option)))))
-              (stream-logical-replication-loop stream slot-name requested-lsn))))
-        :allow-initial-copy t)
-       (when copy-mode-p (end-logical-copy-mode stream)))
-     (condition
-      (if copy-mode-p
-          (progn
-            (send-error-response stream condition)
-            (end-logical-copy-mode stream))
-          (progn
-            (send-error-response stream condition)
-            (send-ready-for-query stream #\I)))))))
+  (call-with-wal-sender-stream
+   (lambda ()
+     (let ((copy-mode-p nil))
+       (handler-case-nonfatal
+        (progn
+          (wal-logical-slot-validate-start-position slot-name requested-lsn)
+          (call-with-logical-replication-slot
+           slot-name
+           (lambda (slot)
+             (unless (equal (wal-replication-slot-plugin slot) "pg_lisp")
+               (ereport "0A000" "standard pgoutput streaming is not implemented"))
+             (when (eq (wal-slot-profile slot) :binary-bytea)
+               (let ((option (and command
+                                  (assoc "binary_bytea"
+                                         (logical-replication-command-options command)
+                                         :test #'equal))))
+                 (unless (and option (replication-option-boolean "binary_bytea" (cdr option)))
+                   (ereport "0A000" "replication slot requires binary bytea transport"))))
+             (let ((initial-copy-p
+                     (null (wal-replication-slot-confirmed-flush-lsn slot))))
+               (wal-logical-slot-validate-start-position
+                slot-name requested-lsn)
+               (wal-sender-note-sent *wal-sender* (wal-replication-slot-restart-lsn slot))
+               (send-copy-both-response stream)
+               (setf copy-mode-p t)
+               (let ((first-status (replication-standby-status stream)))
+                 (unless first-status
+                   (return-from start-logical-replication nil))
+                 (if initial-copy-p
+                     (finalize-initial-replication-copy
+                      slot-name slot requested-lsn first-status)
+                     (let ((position (replication-status-position first-status)))
+                       (unless (= position requested-lsn)
+                         (ereport "22023"
+                                  "first resumed standby status must equal the requested LSN"))
+                       (wal-logical-slot-accept-resume-position
+                        slot-name requested-lsn)))
+                 (wal-sender-note-reply *wal-sender* (getf first-status :write)
+                                        (getf first-status :flush) (getf first-status :apply)
+                                        (getf first-status :reply-time 0)))
+               (let* ((option (and command (assoc "binary_bytea" (logical-replication-command-options command) :test #'equal)))
+                      (*pgoutput-binary-bytea* (and option (replication-option-boolean "binary_bytea" (cdr option)))))
+                 (stream-logical-replication-loop stream slot-name requested-lsn))))
+           :allow-initial-copy t)
+          (when copy-mode-p (end-logical-copy-mode stream)))
+        (condition
+         (if copy-mode-p
+             (progn
+               (send-error-response stream condition)
+               (end-logical-copy-mode stream))
+             (progn
+               (send-error-response stream condition)
+               (send-ready-for-query stream #\I)))))))))
 
 (defun logical-scan-budget-limit (override failpoint action)
   "Return the scan budget, permitting a narrow value only for crash tests."
@@ -906,7 +919,7 @@ keepalive's WAL-end field, which may include changes not yet applied."
       (unless
           (call-with-logical-reader-spools
            (lambda ()
-             (multiple-value-bind (transactions progress-lsn)
+             (multiple-value-bind (transactions progress-lsn exhausted)
                  (wal-logical-slot-read-transactions
                   slot-name :max-transactions 1
                   :max-scan-bytes (logical-stream-scan-budget-bytes))
@@ -915,6 +928,7 @@ keepalive's WAL-end field, which may include changes not yet applied."
                           (commit-lsn (logical-transaction-commit-lsn transaction)))
                      (send-logical-transaction stream transaction progress-lsn)
                      (setf sent-lsn commit-lsn)
+                     (wal-sender-note-sent *wal-sender* commit-lsn)
                      (let ((status (replication-standby-status stream)))
                        (when status
                          (setf sent-lsn (validate-stream-status slot-name sent-lsn status))
@@ -923,11 +937,13 @@ keepalive's WAL-end field, which may include changes not yet applied."
                        (progn
                          (send-logical-progress stream progress-lsn)
                          (setf sent-lsn progress-lsn)
+                         (wal-sender-note-sent *wal-sender* progress-lsn)
                          (let ((status (replication-standby-status stream)))
                            (when status
                              (setf sent-lsn (validate-stream-status slot-name sent-lsn status))
                              t)))
                        (progn
+                         (when exhausted (wal-sender-set-state *wal-sender* "streaming"))
                          (send-logical-keepalive stream sent-lsn)
                          (let ((status (replication-standby-status stream)))
                            (when status

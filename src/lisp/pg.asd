@@ -68,6 +68,7 @@
      (:module "postmaster"
       :serial t
       :components ((:file "postmaster") (:file "bgworker")))
+     (:file "replication/walsender-status")
      (:module "catalog"
       :serial t
       :components ((:file "catalog")

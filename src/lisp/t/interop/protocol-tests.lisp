@@ -871,6 +871,36 @@ Preserve EQUALP's numeric comparison while descending into SQL value wrappers."
      (lambda (row) (push (car row) rows)))
     (nreverse rows)))
 
+(deftest source-status-functions-join-real-activity-and-independent-feedback
+    (let* ((pg::*backend-registry* (make-hash-table :test #'eql))
+           (pg::*wal-sender-registry* (make-hash-table :test #'eq))
+           (backend (pg::make-backend :pid 2354 :replication-mode :physical
+                                      :application-name "status_join"))
+           (ordinary (pg::make-backend :pid 2355 :application-name "sql_only")))
+      (setf (gethash 2354 pg::*backend-registry*) backend
+            (gethash 2355 pg::*backend-registry*) ordinary)
+      (let ((sender (pg::wal-sender-register backend)))
+        (unwind-protect
+             (progn
+               (pg::wal-sender-set-state sender "streaming")
+               (pg::wal-sender-note-sent sender 96)
+               (pg::wal-sender-note-reply sender 80 64 32 123)
+               (ok (test-row-equal-p
+                    '(#(2354 "status_join" "async" 80 64 32))
+                    (derived-query-rows
+                     "SELECT w.pid, application_name, sync_state,
+                             pg_catalog.pg_wal_lsn_diff(write_lsn, '0/0')::bigint,
+                             pg_catalog.pg_wal_lsn_diff(flush_lsn, '0/0')::bigint,
+                             pg_catalog.pg_wal_lsn_diff(replay_lsn, '0/0')::bigint
+                      FROM pg_catalog.pg_stat_get_wal_senders() w,
+                           pg_catalog.pg_stat_get_activity(w.pid)
+                      WHERE w.state = 'streaming'")))
+               (ok (test-row-equal-p
+                    '(#(2354 "status_join") #(2355 "sql_only"))
+                    (derived-query-rows
+                     "SELECT pid, application_name FROM pg_stat_get_activity(NULL) ORDER BY pid"))))
+          (pg::wal-sender-unregister backend sender)))))
+
 (deftest union-all-rows-and-boundaries
     (dolist (case '(("SELECT 1 UNION ALL SELECT 1" (#(1) #(1)))
                     ("(SELECT 1 LIMIT 1) UNION ALL SELECT 2" (#(1) #(2)))

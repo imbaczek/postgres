@@ -1653,13 +1653,13 @@ executor, so capture the same operation before transaction commit."
     (ereport "22023" "logical WAL scan byte limit must be positive"))
   (values))
 
-(defun wal-logical-reader-return (transactions progress-lsn)
+(defun wal-logical-reader-return (transactions progress-lsn exhausted-p)
   (when (and *wal-logical-slot-owner*
              (integerp progress-lsn))
     (setf *wal-logical-slot-read-progress*
           (max (or *wal-logical-slot-read-progress* progress-lsn)
                progress-lsn)))
-  (values transactions progress-lsn))
+  (values transactions progress-lsn exhausted-p))
 
 (defun wal-acknowledge-standard-replication-slot
     (name acknowledged-lsn restart-floor sent-lsn)
@@ -1867,7 +1867,7 @@ tracked by the bounded sender. SENT-LSN never includes an unfinished frame."
         (end-lsn (wal-retained-slot-scan-end scan)))
     (when (= start-lsn end-lsn)
       (return-from wal-logical-slot-read-transactions-from-scan
-        (values '() start-lsn)))
+        (values '() start-lsn t)))
     (let ((*wal-recovery-reservation-batch-clean-p* nil)
           (state (make-logical-reader-state
                   :database-oid (wal-retained-slot-scan-database scan)))
@@ -1907,7 +1907,7 @@ tracked by the bounded sender. SENT-LSN never includes an unfinished frame."
                                   (values
                                    (nreverse
                                     (logical-reader-state-transactions state))
-                                   progress-lsn)))
+                                   progress-lsn nil)))
                               (wal-logical-reader-finish-batch state record)
                               (setf progress-lsn (wal-record-end record))
                               (when has-changes
@@ -1920,11 +1920,11 @@ tracked by the bounded sender. SENT-LSN never includes an unfinished frame."
                                   (values
                                    (nreverse
                                     (logical-reader-state-transactions state))
-                                   progress-lsn)))))))))
+                                   progress-lsn nil)))))))))
              ;; An open batch at the durable scan horizon is an incomplete commit
              ;; tail. Its changes stay invisible, as in DecodeCommit/reorderbuffer.
              (values
-              (nreverse (logical-reader-state-transactions state)) progress-lsn))
+              (nreverse (logical-reader-state-transactions state)) progress-lsn t))
         (wal-logical-reader-reset-batch state nil)))))
 
 (defun wal-logical-slot-read-transactions
@@ -1937,11 +1937,11 @@ tracked by the bounded sender. SENT-LSN never includes an unfinished frame."
   (call-with-wal-retained-slot-scan
    name from-lsn upto-lsn
    (lambda (scan)
-     (multiple-value-bind (transactions progress)
+     (multiple-value-bind (transactions progress exhausted)
          (wal-logical-slot-read-transactions-from-scan scan max-transactions max-bytes max-scan-bytes)
        (sb-thread:with-mutex (*wal-lock*)
          (wal-retained-slot-scan-validate-under-lock scan)
-         (wal-logical-reader-return transactions progress))))))
+         (wal-logical-reader-return transactions progress exhausted))))))
 
 (defun wal-logical-slot-acknowledge (name acknowledged-lsn)
   "Acknowledge scanned WAL after all preceding row changes are durable."

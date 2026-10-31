@@ -714,6 +714,7 @@ finish outer connection accounting after unregistering."
              (when backend
                (unwind-protect
                     (progn
+                      (wal-sender-unregister backend)
                       (forget-extended-query-state backend)
                       (wal-cleanup-backend-physical-slots backend)
                       (logical-release-subscription-owner backend))
@@ -746,6 +747,8 @@ finish outer connection accounting after unregistering."
                       (let ((body (read-startup-until-ready stream)))
                         (when body
                           (process-startup stream body)
+                          (when (backend-replication-mode *backend*)
+                            (wal-sender-register *backend*))
                           (backend-loop stream)))
                    ;; Fast teardown cannot wait behind a closed reload gate.
                    ;; MAIN retires its captured transaction after all clients exit.

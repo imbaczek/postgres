@@ -66,7 +66,11 @@
           (max flush (standard-stream-reported-flush state))
           (standard-stream-last-reply-time state) (get-internal-real-time))
     (when (= (aref payload 33) 1) (setf (standard-stream-reply-p state) t))
-    (standard-acknowledge-flush state)))
+    (prog1 (standard-acknowledge-flush state)
+      (wal-sender-note-reply *wal-sender*
+                             (replication-read-u64 payload 1) flush
+                             (replication-read-u64 payload 17)
+                             (replication-read-i64 payload 25)))))
 
 (defun replication-protocol-version (word)
   (let* ((value (or (replication-command-value word) ""))
@@ -385,7 +389,9 @@ that position cannot certify the whole transaction; retention alone is not enoug
     (replication-push-u64 data end)
     (replication-push-i64 data (postgres-current-timestamp))
     (payload-push data payload)
-    (standard-write-frame state #\d data)))
+    (when (standard-write-frame state #\d data)
+      (when (plusp end) (wal-sender-note-sent *wal-sender* end))
+      t)))
 
 (defun standard-send-socket-chunk (socket chunk)
   (sb-bsd-sockets:socket-send socket chunk (length chunk) :dontwait t :nosignal t))
@@ -446,7 +452,9 @@ that position cannot certify the whole transaction; retention alone is not enoug
     (replication-push-u64 payload (standard-stream-safe-frontier state))
     (replication-push-i64 payload (postgres-current-timestamp))
     (payload-push-byte payload (if request-reply 1 0))
-    (standard-write-frame state #\d payload)))
+    (when (standard-write-frame state #\d payload)
+      (wal-sender-note-sent *wal-sender* (standard-stream-safe-frontier state))
+      t)))
 
 (defun standard-maybe-keepalive (state)
   (when (and (not (standard-stream-stop-reason state))
@@ -497,15 +505,16 @@ records need not decode their publication history. Keep eligibility there."
     (loop
       (standard-poll-feedback state)
       (when (standard-stream-stop-reason state) (return))
-      (let ((advanced nil))
+      (let ((advanced nil) (exhausted nil))
         (when (< (standard-stream-pending-count state) +standard-stream-boundary-limit+)
           (call-with-logical-reader-spools
            (lambda ()
-             (multiple-value-bind (transactions progress)
+             (multiple-value-bind (transactions progress exhausted-p)
                  (with-live-operation
                    (wal-logical-slot-read-transactions
                     (standard-stream-slot-name state)
                     :from-lsn (standard-stream-scan-cursor state) :max-transactions 1))
+               (setf exhausted exhausted-p)
                (dolist (transaction transactions)
                  (when (standard-transaction-visible-p transaction (standard-stream-emit-floor state))
                    (unless (standard-send-scoped-transaction
@@ -517,6 +526,7 @@ records need not decode their publication history. Keep eligibility there."
                  (with-live-operation (standard-acknowledge-flush state)))))))
         (standard-maybe-keepalive state)
         (unless advanced
+          (when exhausted (wal-sender-set-state *wal-sender* "streaming"))
           (sb-sys:wait-until-fd-usable
            (sb-bsd-sockets:socket-file-descriptor (standard-stream-socket state)) :input 0.05 nil)))))
   (when (eq (standard-stream-stop-reason state) :done)
@@ -524,41 +534,44 @@ records need not decode their publication history. Keep eligibility there."
   (standard-stream-stop-reason state))
 
 (defun start-standard-logical-replication (stream command)
-  (let ((reason
-          (handler-case
-              (call-with-logical-replication-slot
-               (logical-replication-command-slot-name command)
-               (lambda (slot)
-                 (unless (equal (wal-replication-slot-plugin slot) "pgoutput")
-                   (ereport "0A000" "standard replication requires a pgoutput slot"))
-                 (let* ((names (standard-publication-names command))
-                        (confirmed (wal-replication-slot-confirmed-flush-lsn slot))
-                        (state (make-standard-stream
-                                :stream stream :socket (backend-socket *backend*)
-                                :slot-name (wal-replication-slot-name slot) :slot-object slot
-                                :publication-names names
-                                :emit-floor
-                                (max confirmed (logical-replication-command-requested-lsn command))
-                                :scan-cursor (wal-replication-slot-restart-lsn slot)
-                                :safe-frontier confirmed :reported-flush confirmed
-                                :restart-floor (wal-replication-slot-restart-lsn slot))))
-                   (logical-test-failpoint
-                    :standard-stream-start (wal-replication-slot-name slot)
-                    (logical-replication-command-protocol-version command) names)
-                   (send-copy-both-response stream)
-                   ;; Preserve input read-ahead while switching the fully drained
-                   ;; output side of SBCL's dual-channel stream to raw sends.
-                   (finish-output stream)
-                   (let* ((option (assoc "binary" (logical-replication-command-options command) :test #'equal))
-                          (*pgoutput-binary-bytea* (and option (replication-option-boolean "binary" (cdr option)))))
-                     (standard-stream-loop state)))))
-            (standard-replication-timeout ()
-              (ignore-errors (close stream :abort t))
-              :disconnect))))
-    ;; C releases its slot before both completion results and the following query.
-    (case reason
-      (:done
-       (send-command-complete stream "COPY 0")
-       (send-command-complete stream "START_REPLICATION")
-       (send-ready-for-query stream #\I))
-      (:disconnect (ignore-errors (close stream :abort t))))))
+  (call-with-wal-sender-stream
+   (lambda ()
+     (let ((reason
+             (handler-case
+                 (call-with-logical-replication-slot
+                  (logical-replication-command-slot-name command)
+                  (lambda (slot)
+                    (unless (equal (wal-replication-slot-plugin slot) "pgoutput")
+                      (ereport "0A000" "standard replication requires a pgoutput slot"))
+                    (let* ((names (standard-publication-names command))
+                           (confirmed (wal-replication-slot-confirmed-flush-lsn slot))
+                           (state (make-standard-stream
+                                   :stream stream :socket (backend-socket *backend*)
+                                   :slot-name (wal-replication-slot-name slot) :slot-object slot
+                                   :publication-names names
+                                   :emit-floor
+                                   (max confirmed (logical-replication-command-requested-lsn command))
+                                   :scan-cursor (wal-replication-slot-restart-lsn slot)
+                                   :safe-frontier confirmed :reported-flush confirmed
+                                   :restart-floor (wal-replication-slot-restart-lsn slot))))
+                      (logical-test-failpoint
+                       :standard-stream-start (wal-replication-slot-name slot)
+                       (logical-replication-command-protocol-version command) names)
+                      (wal-sender-note-sent *wal-sender* (wal-replication-slot-restart-lsn slot))
+                      (send-copy-both-response stream)
+                      ;; Preserve input read-ahead while switching the fully drained
+                      ;; output side of SBCL's dual-channel stream to raw sends.
+                      (finish-output stream)
+                      (let* ((option (assoc "binary" (logical-replication-command-options command) :test #'equal))
+                             (*pgoutput-binary-bytea* (and option (replication-option-boolean "binary" (cdr option)))))
+                        (standard-stream-loop state)))))
+               (standard-replication-timeout ()
+                 (ignore-errors (close stream :abort t))
+                 :disconnect))))
+       ;; C releases its slot before both completion results and the following query.
+       (case reason
+         (:done
+          (send-command-complete stream "COPY 0")
+          (send-command-complete stream "START_REPLICATION")
+          (send-ready-for-query stream #\I))
+         (:disconnect (ignore-errors (close stream :abort t))))))))

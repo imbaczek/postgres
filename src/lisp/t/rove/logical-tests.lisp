@@ -5003,6 +5003,48 @@
              (rove:ok (zerop (hash-table-count *wal-snapshot-retention-pins*))))
         (setf (symbol-function 'wal-logical-slot-read-transactions-from-scan) original))))
 
+(rove:deftest test-logical-reader-reports-exhaustion-separately-from-progress
+    (let* ((directory (merge-pathnames (format nil "pg-scan-exhaustion-~d-~d/"
+                                               (sb-posix:getpid) (random 1000000))
+                                       (uiop:temporary-directory)))
+           (*pgdata* directory)
+           (*wal-snapshot-retention-pins* (make-hash-table :test #'eq))
+           (*wal-replication-slots* (make-hash-table :test #'equal))
+           (*wal-poisoned* nil)
+           (owner (list :owner))
+           (*wal-logical-slot-owner* owner)
+           (*wal-logical-slot-read-progress* nil)
+           (*wal-durable-lsn* 128)
+           (slot (make-wal-replication-slot :name "scan" :database-oid 7
+                                            :restart-lsn 0 :consistent-lsn 0
+                                            :confirmed-flush-lsn 0 :active-owner owner)))
+      (setf (gethash "scan" *wal-replication-slots*) slot)
+      (ensure-directories-exist (wal-segment-path 0))
+      (unwind-protect
+           (progn
+             (with-open-file (out (wal-segment-path 0) :direction :output
+                                                       :element-type '(unsigned-byte 8) :if-exists :supersede)
+               (loop for start from 0 below 128 by 32
+                     for type = (if (zerop (mod start 64))
+                                    +wal-record-batch-start+ +wal-record-maintenance+)
+                     do (write-sequence (wal-encode-record type 0 start #()) out)))
+             (multiple-value-bind (transactions progress exhausted)
+                 (wal-logical-slot-read-transactions "scan" :max-scan-bytes 1)
+               (rove:ok (null transactions))
+               (rove:ok (= 64 progress))
+               (rove:ok (not exhausted)))
+             (multiple-value-bind (transactions progress exhausted)
+                 (wal-logical-slot-read-transactions "scan")
+               (rove:ok (null transactions))
+               (rove:ok (= 128 progress))
+               (rove:ok exhausted))
+             (multiple-value-bind (transactions progress exhausted)
+                 (wal-logical-slot-read-transactions "scan" :from-lsn 128)
+               (rove:ok (null transactions))
+               (rove:ok (= 128 progress))
+               (rove:ok exhausted)))
+        (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))
+
 (rove:deftest test-unscoped-logical-reader-remains-bounded
     (let* ((state (make-logical-reader-state :database-oid 7
                                              :change-bytes (1+ +max-unscoped-logical-materialization-bytes+)))

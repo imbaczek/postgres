@@ -638,6 +638,25 @@ Omit NULL elements unless a non-NULL replacement is supplied."
     (ereport "42883" "function ~a(~a) does not exist" name (call-signature arguments)))
   (list :func name nil :type :record :typmod -1 :fields +wal-receiver-result-fields+))
 
+(defun analyze-record-set-call (name arguments fields)
+  (unless *select-set-functions-allowed-p*
+    (ereport "0A000" "set-returning functions are not allowed in this context"))
+  (when *inside-aggregate-input-p*
+    (ereport "0A000" "aggregate function calls cannot contain set-returning functions"))
+  (list :set-func name arguments :type :record :typmod -1 :fields fields))
+
+(defun analyze-source-status-function (name arguments)
+  (let ((activity (string= name "pg_stat_get_activity")))
+    (unless (if activity
+                (and (= (length arguments) 1)
+                     (or (member (expr-type (first arguments)) '(:int2 :int4))
+                         (in-unknown-constant-p (first arguments))))
+                (null arguments))
+      (ereport "42883" "function ~a(~a) does not exist" name (call-signature arguments)))
+    (analyze-record-set-call
+     name (when activity (list (coerce-common-expression (first arguments) :int4)))
+     (if activity +activity-result-fields+ +wal-sender-result-fields+))))
+
 (defun analyze-promotion-arguments (arguments table &optional variadic)
   "Bind pg_promote arguments in parameter order and supply defaults.
 Check the signature before coercion, including named and VARIADIC arguments.
@@ -1485,6 +1504,53 @@ only when a non-NULL call executes; explicit text arguments arrive here then."
         (with-write-lock (check-relation))))
   name)
 
+(defun analyze-utility-function-call (name args)
+  (cond
+    ((string= name "set_config")
+     (unless (and (= (length args) 3)
+                  (eq (expr-type (first args)) :text)
+                  (eq (expr-type (second args)) :text)
+                  (or (eq (expr-type (third args)) :bool)
+                      (equal (third args) (list :const +null+ :type :text :typmod -1))))
+       (ereport "42883" "function ~a(~a) does not exist" name (call-signature args)))
+     (list :func name args :type :text :typmod -1))
+    ((member name '("length" "char_length" "character_length" "octet_length") :test #'string=)
+     (unless (and (= (length args) 1)
+                  (or (member (expr-type (first args)) '(:text :varchar :name :char))
+                      (and (member name '("length" "octet_length") :test #'string=)
+                           (eq (expr-type (first args)) :bytea))))
+       (ereport "42883" "function ~a(~a) does not exist" name (call-signature args)))
+     (when (eq (expr-type (first args)) :char)
+       (setf args (list (list :cast (first args) :type :text :typmod -1))))
+     (list :func name args :type :int4 :typmod -1))
+    ((string= name "pg_backend_pid")
+     (when args
+       (ereport "42883" "function ~a(~a) does not exist"
+                name (call-signature args)))
+     (list :func name args :type :int4 :typmod -1))
+    ((string= name "pg_cancel_backend")
+     (unless (and (= (length args) 1)
+                  (admin-arg-coercible-p (first args) :int4))
+       (ereport "42883" "function ~a(~a) does not exist"
+                name (call-signature args)))
+     (list :func name args :type :bool :typmod -1))
+    ((string= name "pg_terminate_backend")
+     (unless (and (<= 1 (length args) 2)
+                  (admin-arg-coercible-p (first args) :int4)
+                  (or (= (length args) 1)
+                      (admin-arg-coercible-p (second args) :int8)))
+       (ereport "42883" "function ~a(~a) does not exist"
+                name (call-signature args)))
+     (list :func name args :type :bool :typmod -1))
+    ((member name '("pg_reload_conf" "pg_reload_code") :test #'string=)
+     (when args
+       (ereport "42883" "function ~a(~a) does not exist"
+                name (call-signature args)))
+     (list :func name args :type :bool :typmod -1))
+    (t
+     (ereport "42883" "function ~a(~a) does not exist"
+              name (call-signature args)))))
+
 (defun analyze-function-expression (expr table)
   "Resolve a supported scalar or administrative function call."
   (check-qualified-numeric-function-call expr table)
@@ -1545,6 +1611,8 @@ only when a non-NULL call executes; explicit text arguments arrive here then."
          (analyze-jsonb-set-function name args)))
       ((string= name "pg_promote") (list :func name args :type :bool :typmod -1))
       ((string= name "pg_stat_get_wal_receiver") (analyze-wal-receiver-function name args))
+      ((member name '("pg_stat_get_wal_senders" "pg_stat_get_activity") :test #'string=)
+       (analyze-source-status-function name args))
       ((member name '("json_typeof" "jsonb_typeof" "json_array_length" "jsonb_array_length")
                :test #'string=)
        (let ((*defer-function-constant-coercion-p*
@@ -1586,50 +1654,7 @@ only when a non-NULL call executes; explicit text arguments arrive here then."
                (or (getf (cdddr expr) :call-distinct)
                    (getf (cdddr expr) :call-order))))
          (analyze-sequence-function name args)))
-      ((string= name "set_config")
-       (unless (and (= (length args) 3)
-                    (eq (expr-type (first args)) :text)
-                    (eq (expr-type (second args)) :text)
-                    (or (eq (expr-type (third args)) :bool)
-                        (equal (third args) (list :const +null+ :type :text :typmod -1))))
-         (ereport "42883" "function ~a(~a) does not exist" name (call-signature args)))
-       (list :func name args :type :text :typmod -1))
-      ((member name '("length" "char_length" "character_length" "octet_length") :test #'string=)
-       (unless (and (= (length args) 1)
-                    (or (member (expr-type (first args)) '(:text :varchar :name :char))
-                        (and (member name '("length" "octet_length") :test #'string=)
-                             (eq (expr-type (first args)) :bytea))))
-         (ereport "42883" "function ~a(~a) does not exist" name (call-signature args)))
-       (when (eq (expr-type (first args)) :char)
-         (setf args (list (list :cast (first args) :type :text :typmod -1))))
-       (list :func name args :type :int4 :typmod -1))
-      ((string= name "pg_backend_pid")
-       (when args
-         (ereport "42883" "function ~a(~a) does not exist"
-                  name (call-signature args)))
-       (list :func name args :type :int4 :typmod -1))
-      ((string= name "pg_cancel_backend")
-       (unless (and (= (length args) 1)
-                    (admin-arg-coercible-p (first args) :int4))
-         (ereport "42883" "function ~a(~a) does not exist"
-                  name (call-signature args)))
-       (list :func name args :type :bool :typmod -1))
-      ((string= name "pg_terminate_backend")
-       (unless (and (<= 1 (length args) 2)
-                    (admin-arg-coercible-p (first args) :int4)
-                    (or (= (length args) 1)
-                        (admin-arg-coercible-p (second args) :int8)))
-         (ereport "42883" "function ~a(~a) does not exist"
-                  name (call-signature args)))
-       (list :func name args :type :bool :typmod -1))
-      ((member name '("pg_reload_conf" "pg_reload_code") :test #'string=)
-       (when args
-         (ereport "42883" "function ~a(~a) does not exist"
-                  name (call-signature args)))
-       (list :func name args :type :bool :typmod -1))
-      (t
-       (ereport "42883" "function ~a(~a) does not exist"
-                name (call-signature args))))))
+      (t (analyze-utility-function-call name args)))))
 
 (defun expression-contains-column-p (form)
   "Detect row references through every analyzed expression, including IN lists."
@@ -3345,6 +3370,8 @@ candidate selection."
   (let ((name (builtin-function-name (second raw) (getf (cdddr raw) :schema))))
     (cond ((string= name "pg_get_publication_tables") +publication-table-result-fields+)
           ((string= name "pg_stat_get_wal_receiver") +wal-receiver-result-fields+)
+          ((string= name "pg_stat_get_wal_senders") +wal-sender-result-fields+)
+          ((string= name "pg_stat_get_activity") +activity-result-fields+)
           ((string= name "pg_get_replication_slots") +replication-slot-result-fields+)
           ((string= name "pg_create_physical_replication_slot") +physical-slot-create-result-fields+)
           ((string= name "pg_replication_slot_advance") +physical-slot-advance-result-fields+)
@@ -3395,11 +3422,7 @@ candidate selection."
   "Resolve the nullary slot SRF and reject contexts that cannot accept a set."
   (when arguments
     (ereport "42883" "function ~a(~a) does not exist" name (call-signature arguments)))
-  (unless *select-set-functions-allowed-p*
-    (ereport "0A000" "set-returning functions are not allowed in this context"))
-  (when *inside-aggregate-input-p*
-    (ereport "0A000" "aggregate function calls cannot contain set-returning functions"))
-  (list :set-func name nil :type :record :typmod -1 :fields +replication-slot-result-fields+))
+  (analyze-record-set-call name nil +replication-slot-result-fields+))
 
 (defun analyze-publication-table-call (name arguments variadic)
   (unless *select-set-functions-allowed-p*

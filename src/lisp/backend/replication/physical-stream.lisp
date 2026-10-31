@@ -513,6 +513,13 @@ shutdown after unlocking; the private pin remains retained."
                  (setf *wal-poisoned* t interrupted t)))))
       (when interrupted (request-fast-shutdown)))))
 
+(defun physical-source-confirm-initial-status (command owner status)
+  (physical-source-confirm-feedback
+   command owner (getf status :flush)
+   (physical-stream-u64 (physical-stream-option command "prefix_digest")))
+  (wal-sender-note-status *wal-sender* status)
+  status)
+
 (defun physical-source-confirm-status (command owner status)
   "Advance retention from validated flush, independently of write and apply."
   (let ((name (physical-stream-proof-pin command))
@@ -523,6 +530,8 @@ shutdown after unlocking; the private pin remains retained."
         (setf digest (physical-source-prove-range name owner floor received digest)))
       (with-live-operation
         (physical-source-confirm-feedback command owner received digest))))
+  (when (physical-sender-p owner)
+    (wal-sender-note-status *wal-sender* status))
   status)
 
 (defun physical-source-validate-resume (command owner &optional progress)
@@ -559,7 +568,8 @@ shutdown after unlocking; the private pin remains retained."
         (physical-stream-validate-status reply previous sent base)))))
 
 (defun physical-stream-send-data (stream start durable bytes)
-  (sb-ext:with-timeout 10 (send-logical-xlog-data stream start durable bytes)))
+  (prog1 (sb-ext:with-timeout 10 (send-logical-xlog-data stream start durable bytes))
+    (wal-sender-note-sent *wal-sender* (+ start (length bytes)))))
 
 (defun physical-stream-send-keepalive (stream durable)
   (sb-ext:with-timeout 10 (send-logical-keepalive stream durable)))
@@ -608,6 +618,7 @@ A historic stream stops at its fork before sending child end-of-recovery WAL."
          (cursor (logical-replication-command-requested-lsn command))
          (base (parse-replication-lsn (physical-stream-option command "base_lsn")))
          (status (list :write cursor :flush cursor :apply base)))
+    (wal-sender-note-sent *wal-sender* cursor)
     (loop
       (when (and limit (= cursor limit))
         (return (values :switch status)))
@@ -629,6 +640,7 @@ A historic stream stops at its fork before sending child end-of-recovery WAL."
                      (when *physical-stream-test-hook*
                        (funcall *physical-stream-test-hook* :after-fragment stream (< end (length raw)))))
             (progn
+              (wal-sender-set-state *wal-sender* "streaming")
               (physical-stream-send-keepalive stream durable)
               (setf status (physical-stream-read-status stream status cursor base))
               (unless status (return))
@@ -642,56 +654,56 @@ Prove the resume prefix before WalData. Resume proof alone confirms the private
 pin; only actual validated positive flush feedback updates the public slot.
 At the fork, complete without entering Copy mode.  Always release both sender
 claims."
-  (call-with-native-physical-sender
-   command
-   (lambda (owner limit next)
-     (let ((name (physical-stream-proof-pin command))
-           (cursor (logical-replication-command-requested-lsn command))
-           (base (parse-replication-lsn (physical-stream-option command "base_lsn")))
-           (copy-mode nil))
-       (handler-case
-           (if (and limit (= cursor limit))
-               (progn
-                 (physical-source-validate-resume command owner)
-                 (with-live-operation
-                   (physical-source-confirm-receipt
-                    name owner cursor (physical-stream-u64 (physical-stream-option command "prefix_digest"))))
-                 (physical-stream-complete stream command owner next limit))
-               (progn
-                 (sb-ext:with-timeout 10 (send-copy-both-response stream))
-                 (setf copy-mode t)
-                 (let ((status (list :write cursor :flush cursor :apply base))
-                       (feedback nil))
-                   (physical-source-validate-resume
-                    command owner
-                    (lambda (durable)
-                      (physical-stream-send-keepalive stream (if limit (min durable limit) durable))
-                      (setf status (physical-stream-read-status stream status cursor base))
-                      (unless status (error 'end-of-file :stream stream))
-                      (setf feedback status)))
-                   (with-live-operation
-                     (if feedback
-                         (physical-source-confirm-feedback
-                          command owner (getf feedback :flush)
-                          (physical-stream-u64 (physical-stream-option command "prefix_digest")))
-                         (physical-source-confirm-receipt
-                          name owner cursor (physical-stream-u64 (physical-stream-option command "prefix_digest"))))))
-                 (multiple-value-bind (result status)
-                     (physical-stream-send-loop stream command owner limit)
-                   (when (and (eq result :switch)
-                              (physical-stream-finish-historic stream command owner limit status))
-                     (physical-stream-complete stream command owner next limit)))))
-         (physical-stream-copy-done ()
-           (write-message stream #\c (make-payload))
-           (physical-stream-complete stream command owner next limit))
-         (sb-ext:timeout () (ignore-errors (close stream :abort t)))
-         (stream-error () (ignore-errors (close stream :abort t)))
-         (sb-bsd-sockets:socket-error () (ignore-errors (close stream :abort t)))
-         (error (condition)
-           (unless copy-mode (error condition))
-           (ignore-errors
-            (send-error-response stream
-                                 (if (typep condition 'pg-error) condition
-                                     (make-condition 'pg-error :sqlstate "XX000"
-                                                               :message (princ-to-string condition)))))
-           (ignore-errors (close stream :abort t))))))))
+  (call-with-wal-sender-stream
+   (lambda ()
+     (call-with-native-physical-sender
+      command
+      (lambda (owner limit next)
+        (let ((name (physical-stream-proof-pin command))
+              (cursor (logical-replication-command-requested-lsn command))
+              (base (parse-replication-lsn (physical-stream-option command "base_lsn")))
+              (copy-mode nil))
+          (handler-case
+              (if (and limit (= cursor limit))
+                  (progn
+                    (physical-source-validate-resume command owner)
+                    (with-live-operation
+                      (physical-source-confirm-receipt
+                       name owner cursor (physical-stream-u64 (physical-stream-option command "prefix_digest"))))
+                    (physical-stream-complete stream command owner next limit))
+                  (progn
+                    (sb-ext:with-timeout 10 (send-copy-both-response stream))
+                    (setf copy-mode t)
+                    (let ((status (list :write cursor :flush cursor :apply base))
+                          (feedback nil))
+                      (physical-source-validate-resume
+                       command owner
+                       (lambda (durable)
+                         (physical-stream-send-keepalive stream (if limit (min durable limit) durable))
+                         (setf status (physical-stream-read-status stream status cursor base))
+                         (unless status (error 'end-of-file :stream stream))
+                         (setf feedback status)))
+                      (with-live-operation
+                        (if feedback
+                            (physical-source-confirm-initial-status command owner feedback)
+                            (physical-source-confirm-receipt
+                             name owner cursor (physical-stream-u64 (physical-stream-option command "prefix_digest"))))))
+                    (multiple-value-bind (result status)
+                        (physical-stream-send-loop stream command owner limit)
+                      (when (and (eq result :switch)
+                                 (physical-stream-finish-historic stream command owner limit status))
+                        (physical-stream-complete stream command owner next limit)))))
+            (physical-stream-copy-done ()
+              (write-message stream #\c (make-payload))
+              (physical-stream-complete stream command owner next limit))
+            (sb-ext:timeout () (ignore-errors (close stream :abort t)))
+            (stream-error () (ignore-errors (close stream :abort t)))
+            (sb-bsd-sockets:socket-error () (ignore-errors (close stream :abort t)))
+            (error (condition)
+              (unless copy-mode (error condition))
+              (ignore-errors
+               (send-error-response stream
+                                    (if (typep condition 'pg-error) condition
+                                        (make-condition 'pg-error :sqlstate "XX000"
+                                                                  :message (princ-to-string condition)))))
+              (ignore-errors (close stream :abort t))))))))))

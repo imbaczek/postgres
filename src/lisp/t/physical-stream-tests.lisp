@@ -142,6 +142,155 @@
                          (pg::physical-source-pin-prefix-digest pin)))))
          (funcall function #'command public pin base))))))
 
+(deftest sender-status-keeps-positions-independent-and-snapshots-detached
+    (let* ((pg::*wal-sender-registry* (make-hash-table :test #'eq))
+           (backend (pg::make-backend :pid 2345 :replication-mode :physical
+                                      :application-name "standby_one"))
+           (sender (pg::wal-sender-register backend)))
+      (unwind-protect
+           (progn
+             (ok (equal '((:pid 2345 :application-name "standby_one" :state "startup"
+                           :sent-lsn nil :write-lsn nil :flush-lsn nil :replay-lsn nil
+                           :reply-time nil))
+                        (pg::wal-sender-snapshots)))
+             (ok (pg::wal-sender-note-sent sender 96))
+             (ok (pg::wal-sender-note-reply sender 80 64 32 123))
+             (pg::wal-sender-set-state sender "streaming")
+             (let ((snapshot (first (pg::wal-sender-snapshots))))
+               (ok (= 96 (getf snapshot :sent-lsn)))
+               (ok (= 80 (getf snapshot :write-lsn)))
+               (ok (= 64 (getf snapshot :flush-lsn)))
+               (ok (= 32 (getf snapshot :replay-lsn)))
+               (ok (= 123 (getf snapshot :reply-time)))
+               (setf (char (getf snapshot :application-name) 0) #\X)
+               (ok (equal "standby_one" (pg::backend-application-name backend))))
+             (ok (intake-fails-p (lambda () (pg::wal-sender-register backend)))))
+        (pg::wal-sender-unregister backend))
+      (ok (null (pg::wal-sender-snapshots)))))
+
+(deftest sender-status-rejects-stale-generation-without-changing-replacement
+    (let* ((pg::*wal-sender-registry* (make-hash-table :test #'eq))
+           (backend (pg::make-backend :pid 2346 :replication-mode :database))
+           (old (pg::wal-sender-register backend)))
+      (pg::wal-sender-unregister backend)
+      (let ((replacement (pg::wal-sender-register backend)))
+        (unwind-protect
+             (progn
+               (ok (null (pg::wal-sender-note-sent old 999)))
+               (ok (null (pg::wal-sender-note-reply old 999 999 999 456)))
+               (ok (null (pg::wal-sender-set-state old "streaming")))
+               (pg::wal-sender-unregister backend old)
+               (ok (eq replacement (pg::wal-sender-for-backend backend)))
+               (ok (null (getf (first (pg::wal-sender-snapshots)) :sent-lsn)))
+               (ok (equal "startup" (getf (first (pg::wal-sender-snapshots)) :state))))
+          (pg::wal-sender-unregister backend)))))
+
+(deftest sender-status-includes-logical-and-physical-connections-only
+    (let ((pg::*wal-sender-registry* (make-hash-table :test #'eq))
+          (physical (pg::make-backend :pid 2347 :replication-mode :physical))
+          (logical (pg::make-backend :pid 2348 :replication-mode :database)))
+      (unwind-protect
+           (progn
+             (pg::wal-sender-register physical)
+             (pg::wal-sender-register logical)
+             (ok (equal '(2347 2348) (mapcar (lambda (row) (getf row :pid))
+                                             (pg::wal-sender-snapshots))))
+             (ok (intake-fails-p (lambda () (pg::wal-sender-register (pg::make-backend)))))
+             (ok (= 2 (hash-table-count pg::*wal-sender-registry*))))
+        (pg::wal-sender-unregister physical)
+        (pg::wal-sender-unregister logical))))
+
+(deftest sender-status-srf-uses-c-fields-and-null-unreported-positions
+    (let* ((pg::*wal-sender-registry* (make-hash-table :test #'eq))
+           (backend (pg::make-backend :pid 2351 :replication-mode :physical))
+           (sender (pg::wal-sender-register backend))
+           (pg::*select-set-functions-allowed-p* t))
+      (unwind-protect
+           (let* ((call (physical-slot-test-analyze-call
+                         "SELECT pg_catalog.pg_stat_get_wal_senders()"))
+                  (fields (getf (cdddr call) :fields))
+                  (iterator (pg::make-sql-set-function-iterator call nil)))
+             (ok (eq :set-func (first call)))
+             (ok (equal '("pid" "state" "sent_lsn" "write_lsn" "flush_lsn" "replay_lsn"
+                          "write_lag" "flush_lag" "replay_lag" "sync_priority" "sync_state" "reply_time")
+                        (mapcar #'first fields)))
+             (pg::wal-sender-note-sent sender 96)
+             (pg::wal-sender-note-reply sender 80 64 32 123)
+             (multiple-value-bind (record present) (funcall iterator)
+               (ok present)
+               (let ((row (pg::sql-record-values record)))
+                 (ok (= 2351 (aref row 0)))
+                 (dolist (index '(2 3 4 5 6 7 8 11))
+                   (ok (eq pg::+null+ (aref row index))))
+                 (ok (= 0 (aref row 9)))
+                 (ok (equal "async" (aref row 10)))))
+             (multiple-value-bind (record present) (funcall iterator)
+               (ok (null record))
+               (ok (not present))))
+        (pg::wal-sender-unregister backend sender))))
+
+(deftest activity-status-subset-uses-live-backends-and-snapshots-results
+    (let* ((pg::*backend-registry* (make-hash-table :test #'eql))
+           (backend (pg::make-backend :pid 2352 :application-name "ordinary_sql"))
+           (other (pg::make-backend :pid 2353 :application-name "replication"
+                                    :replication-mode :physical))
+           (pg::*select-set-functions-allowed-p* t))
+      (setf (gethash 2352 pg::*backend-registry*) backend
+            (gethash 2353 pg::*backend-registry*) other)
+      (let* ((call (physical-slot-test-analyze-call
+                    "SELECT pg_catalog.pg_stat_get_activity(2352)"))
+             (iterator (pg::make-sql-set-function-iterator call nil)))
+        (ok (equal '(("pid" :int4) ("application_name" :text))
+                   (getf (cdddr call) :fields)))
+        (remhash 2352 pg::*backend-registry*)
+        (multiple-value-bind (record present) (funcall iterator)
+          (ok present)
+          (ok (equalp #(2352 "ordinary_sql") (pg::sql-record-values record))))
+        (multiple-value-bind (record present) (funcall iterator)
+          (ok (null record))
+          (ok (not present))))
+      (dolist (sql '("SELECT pg_stat_get_activity(2352)"
+                     "SELECT pg_stat_get_activity(9999)"))
+        (let* ((call (physical-slot-test-analyze-call sql))
+               (iterator (pg::make-sql-set-function-iterator call nil)))
+          (multiple-value-bind (record present) (funcall iterator)
+            (ok (null record))
+            (ok (not present)))))
+      (let* ((call (physical-slot-test-analyze-call "SELECT pg_stat_get_activity(NULL)"))
+             (iterator (pg::make-sql-set-function-iterator call nil)))
+        (multiple-value-bind (record present) (funcall iterator)
+          (ok present)
+          (ok (equalp #(2353 "replication") (pg::sql-record-values record)))))
+      (ok (equal "42883" (recovery-state-of
+                          (lambda () (physical-slot-test-analyze-call
+                                      "SELECT pg_stat_get_activity(1::bigint)")))))))
+
+(deftest sender-status-stream-scope-clears-old-feedback-and-restores-state
+    (let* ((pg::*wal-sender-registry* (make-hash-table :test #'eq))
+           (pg::*backend* (pg::make-backend :pid 2349 :replication-mode :physical))
+           (sender (pg::wal-sender-register pg::*backend*)))
+      (unwind-protect
+           (progn
+             (pg::wal-sender-note-reply sender 80 64 32 123)
+             (ok (eq :stopped
+                     (catch 'stop-stream
+                       (pg::call-with-wal-sender-stream
+                        (lambda ()
+                          (ok (eq sender pg::*wal-sender*))
+                          (let ((snapshot (first (pg::wal-sender-snapshots))))
+                            (ok (equal "catchup" (getf snapshot :state)))
+                            (ok (null (getf snapshot :flush-lsn))))
+                          (pg::wal-sender-set-state sender "streaming")
+                          (throw 'stop-stream :stopped))))))
+             (ok (equal "startup" (getf (first (pg::wal-sender-snapshots)) :state))))
+        (pg::wal-sender-unregister pg::*backend* sender))))
+
+(deftest standby-status-timestamp-decoding-preserves-signed-int64
+    (dolist (value (list (- (ash 1 63)) -1 0 1 (1- (ash 1 63))))
+      (let ((payload (pg::make-payload)))
+        (pg::replication-push-i64 payload value)
+        (ok (= value (pg::replication-read-i64 payload 0))))))
+
 (deftest named-native-stream-claims-both-identities-and-keeps-durable-state
     (dolist (shared '(nil t))
       (call-with-public-stream-fixture
@@ -201,6 +350,76 @@
          (ok (null (pg::wal-replication-slot-active-owner public)))
          (ok (null (gethash (pg::physical-source-pin-name pin) pg::*physical-source-senders*)))
          (ok (not pg::*wal-poisoned*))))))
+
+(deftest sender-status-publishes-initial-resume-proof-reply
+    (call-with-public-stream-fixture
+     (lambda (command public pin base)
+       (declare (ignore public pin))
+       (setf (pg::backend-replication-mode pg::*backend*) :physical)
+       (let* ((pg::*wal-sender-registry* (make-hash-table :test #'eq))
+              (query (funcall command))
+              (pg::*wal-sender* (pg::wal-sender-register pg::*backend*)))
+         (unwind-protect
+              (pg::call-with-native-physical-sender
+               query
+               (lambda (owner limit next)
+                 (declare (ignore limit next))
+                 (pg::physical-source-confirm-initial-status
+                  query owner (list :write base :flush base :apply base :reply-time 123))
+                 (let ((snapshot (first (pg::wal-sender-snapshots))))
+                   (ok (= base (getf snapshot :write-lsn)))
+                   (ok (= base (getf snapshot :flush-lsn)))
+                   (ok (= base (getf snapshot :replay-lsn)))
+                   (ok (= 123 (getf snapshot :reply-time))))))
+           (pg::wal-sender-unregister pg::*backend* pg::*wal-sender*))))))
+
+(deftest sender-status-native-feedback-preserves-write-flush-and-apply
+    (call-with-public-stream-fixture
+     (lambda (command public pin base)
+       (declare (ignore public pin))
+       (setf (pg::backend-replication-mode pg::*backend*) :physical)
+       (let* ((pg::*wal-sender-registry* (make-hash-table :test #'eq))
+              (query (funcall command))
+              (pg::*wal-sender* (pg::wal-sender-register pg::*backend*)))
+         (unwind-protect
+              (pg::call-with-native-physical-sender
+               query
+               (lambda (owner limit next)
+                 (declare (ignore limit next))
+                 (pg::physical-source-confirm-status
+                  query owner (list :write (+ base 64) :flush (+ base 32)
+                                    :apply base :reply-time 123))
+                 (let ((snapshot (first (pg::wal-sender-snapshots))))
+                   (ok (= (+ base 64) (getf snapshot :write-lsn)))
+                   (ok (= (+ base 32) (getf snapshot :flush-lsn)))
+                   (ok (= base (getf snapshot :replay-lsn)))
+                   (ok (= 123 (getf snapshot :reply-time))))))
+           (pg::wal-sender-unregister pg::*backend* pg::*wal-sender*))))))
+
+(deftest sender-status-native-feedback-cannot-cross-registration-generation
+    (call-with-public-stream-fixture
+     (lambda (command public pin base)
+       (declare (ignore public pin))
+       (setf (pg::backend-replication-mode pg::*backend*) :physical)
+       (let* ((pg::*wal-sender-registry* (make-hash-table :test #'eq))
+              (query (funcall command))
+              (pg::*wal-sender* (pg::wal-sender-register pg::*backend*)))
+         (unwind-protect
+              (pg::call-with-native-physical-sender
+               query
+               (lambda (owner limit next)
+                 (declare (ignore limit next))
+                 (pg::wal-sender-unregister pg::*backend* pg::*wal-sender*)
+                 (let ((replacement (pg::wal-sender-register pg::*backend*)))
+                   (unwind-protect
+                        (progn
+                          (pg::physical-source-confirm-status
+                           query owner (list :write (+ base 64) :flush (+ base 32)
+                                             :apply base :reply-time 123))
+                          (ok (eq replacement (pg::wal-sender-for-backend)))
+                          (ok (null (getf (first (pg::wal-sender-snapshots)) :flush-lsn))))
+                     (pg::wal-sender-unregister pg::*backend* replacement)))))
+           (pg::wal-sender-unregister pg::*backend* pg::*wal-sender*))))))
 
 (deftest named-native-stream-first-real-feedback-reserves-only-flush
     (call-with-public-stream-fixture

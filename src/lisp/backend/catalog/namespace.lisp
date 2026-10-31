@@ -206,6 +206,41 @@
 (defparameter +publication-table-result-fields+
   '(("pubid" :oid) ("relid" :oid) ("attrs" :int2vector) ("qual" :pg-node-tree)))
 
+(defparameter +wal-sender-result-fields+
+  '(("pid" :int4) ("state" :text) ("sent_lsn" :pg-lsn) ("write_lsn" :pg-lsn)
+    ("flush_lsn" :pg-lsn) ("replay_lsn" :pg-lsn) ("write_lag" :interval)
+    ("flush_lag" :interval) ("replay_lag" :interval) ("sync_priority" :int4)
+    ("sync_state" :text) ("reply_time" :timestamptz)))
+
+(defparameter +activity-result-fields+ '(("pid" :int4) ("application_name" :text)))
+
+(defun sql-wal-sender-row (snapshot)
+  (flet ((nullable-position (key)
+           (let ((value (getf snapshot key)))
+             (if (or (null value) (zerop value)) +null+ value))))
+    (vector (getf snapshot :pid) (getf snapshot :state)
+            (nullable-position :sent-lsn) (nullable-position :write-lsn)
+            (nullable-position :flush-lsn) (nullable-position :replay-lsn)
+            +null+ +null+ +null+ 0 "async" (nullable-position :reply-time))))
+
+(defun make-status-record-iterator (fields rows)
+  (lambda ()
+    (if rows
+        (values (make-sql-record :fields fields :values (pop rows)) t)
+        (values nil nil))))
+
+(defun make-wal-sender-result-iterator ()
+  (make-status-record-iterator +wal-sender-result-fields+
+                               (mapcar #'sql-wal-sender-row (wal-sender-snapshots))))
+
+(defun make-activity-result-iterator (pid)
+  (make-status-record-iterator
+   +activity-result-fields+
+   (loop for backend in (list-backends)
+         when (or (eq pid +null+) (= pid (backend-pid backend)))
+           collect (vector (backend-pid backend)
+                           (copy-seq (or (backend-application-name backend) ""))))))
+
 (defparameter +wal-receiver-result-fields+
   '(("pid" :int4) ("status" :text) ("receive_start_lsn" :pg-lsn)
     ("receive_start_tli" :int4) ("written_lsn" :pg-lsn) ("flushed_lsn" :pg-lsn)
