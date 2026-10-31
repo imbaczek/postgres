@@ -207,6 +207,32 @@
 
 (defvar *sync-replication-state* (make-sync-replication-state))
 
+(defun sync-replication-monitoring-snapshots-under-lock ()
+  (unless (sb-thread:holding-mutex-p *wal-sender-lock*)
+    (error "synchronous monitoring requires the sender lock"))
+  (let* ((config (sync-replication-state-config *sync-replication-state*))
+         (cascading-p (recovery-in-progress-p))
+         (snapshots (loop for sender being the hash-values of *wal-sender-registry*
+                          collect (cons sender (wal-sender-snapshot-under-lock sender))))
+         (selected
+           (sync-replication-select-standbys
+            config
+            (loop for (sender . snapshot) in snapshots
+                  collect (list* :sender sender :index (wal-sender-status-index sender)
+                                 :cascading-p cascading-p snapshot)))))
+    (loop for (sender . snapshot) in snapshots
+          for priority = (if (typep (getf snapshot :flush-lsn) '(integer 1 18446744073709551615))
+                             (sync-standby-priority config (getf snapshot :application-name) cascading-p)
+                             0)
+          for selected-p = (find sender selected :key (lambda (row) (getf row :sender)) :test #'eq)
+          collect (append snapshot
+                          (list :sync-priority priority
+                                :sync-state (copy-seq
+                                             (cond ((zerop priority) "async")
+                                                   (selected-p (if (eq :any (getf config :method))
+                                                                   "quorum" "sync"))
+                                                   (t "potential"))))))))
+
 (defun sync-replication-check-source-id (source-id)
   (unless (typep source-id '(or symbol integer))
     (ereport "22023" "replication source identity must be an immutable symbol or integer"))

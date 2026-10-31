@@ -208,7 +208,7 @@
            (progn
              (ok (equal '((:pid 2345 :application-name "standby_one" :state "startup"
                            :sent-lsn nil :write-lsn nil :flush-lsn nil :replay-lsn nil
-                           :reply-time nil))
+                           :reply-time nil :sync-priority 0 :sync-state "async"))
                         (pg::wal-sender-snapshots)))
              (ok (pg::wal-sender-note-sent sender 96))
              (ok (pg::wal-sender-note-reply sender 80 64 32 123))

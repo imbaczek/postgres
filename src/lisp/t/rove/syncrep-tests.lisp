@@ -220,6 +220,118 @@
     (wal-sender-note-reply sender write flush apply 1)
     sender))
 
+(cl-spec:defproperty synchronous-monitoring-follows-current-candidates
+    ((count (range integer 1 3)) (quorum-p (member nil t)))
+  (:about wal-sender-snapshots)
+  (:trials (:normal 100))
+  (call-with-sync-wait-state
+   (lambda ()
+     (sync-replication-install-configuration
+      (format nil "~a ~d (peer,other,late,unknown)" (if quorum-p "ANY" "FIRST") count)
+      :source-a :source-a 0)
+     (sync-test-sender "peer" 10 80 60 40)
+     (sync-test-sender "other" 20 90 70 50)
+     (let ((late (sync-test-sender "late" 30 100 80 60)))
+       (wal-sender-set-state late "catchup"))
+     (sync-test-sender "unknown" 40 100 0 0)
+     (let ((rows (wal-sender-snapshots)))
+       (and (equal '(10 20 30 40) (mapcar (lambda (row) (getf row :pid)) rows))
+            (equal (if quorum-p '(1 1 1 0) '(1 2 3 0))
+                   (mapcar (lambda (row) (getf row :sync-priority)) rows))
+            (equal (list (if quorum-p "quorum" "sync")
+                         (cond (quorum-p "quorum") ((= count 1) "potential") (t "sync"))
+                         "potential" "async")
+                   (mapcar (lambda (row) (getf row :sync-state)) rows)))))))
+
+(rove:deftest synchronous-monitoring-current-selection-contract
+    (unit-check-property 'synchronous-monitoring-follows-current-candidates))
+
+(rove:deftest synchronous-monitoring-detaches-status-and-tracks-replacement
+    (call-with-sync-wait-state
+     (lambda ()
+       (sync-replication-install-configuration "FIRST 1 (peer)" :source-a :source-a 0)
+       (let* ((old (sync-test-sender "peer" 10 120 100 80))
+              (backend (wal-sender-status-backend old))
+              (snapshot (first (wal-sender-snapshots)))
+              (sql (sql-wal-sender-row snapshot)))
+         (rove:ok (= 1 (aref sql 9)))
+         (rove:ok (string= "sync" (aref sql 10)))
+         (setf (char (getf snapshot :sync-state) 0) #\X)
+         (rove:ok (string= (coerce '(#\s #\y #\n #\c) 'string)
+                           (getf (first (wal-sender-snapshots)) :sync-state)))
+         (wal-sender-unregister backend old)
+         (let ((replacement (wal-sender-register backend)))
+           (rove:ok (= (wal-sender-status-index old) (wal-sender-status-index replacement)))
+           (rove:ok (null (wal-sender-note-reply old 999 999 999 1)))
+           (let ((row (first (wal-sender-snapshots))))
+             (rove:ok (= 0 (getf row :sync-priority)))
+             (rove:ok (string= "async" (getf row :sync-state))))
+           (wal-sender-set-state replacement "streaming")
+           (wal-sender-note-reply replacement 50 40 30 1)
+           (let ((row (first (wal-sender-snapshots))))
+             (rove:ok (= 1 (getf row :sync-priority)))
+             (rove:ok (string= (coerce '(#\s #\y #\n #\c) 'string) (getf row :sync-state))))
+           (rove:ok (= 100 (getf (sync-replication-state-frontiers *sync-replication-state*) :flush))))))))
+
+(rove:deftest synchronous-monitoring-state-and-recovery-matrix
+    (dolist (method '("FIRST" "ANY"))
+      (dolist (state '("startup" "backup" "catchup" "streaming" "stopping"))
+        (dolist (flush '(nil 0 40))
+          (call-with-sync-wait-state
+           (lambda ()
+             (sync-replication-install-configuration
+              (format nil "~a 1 (*)" method) :source-a :source-a 0)
+             (let ((sender (wal-sender-register
+                            (make-backend :pid 10 :replication-mode :physical :application-name "peer"))))
+               (wal-sender-set-state sender state)
+               (when flush (wal-sender-note-reply sender 60 flush 20 1))
+               (dolist (recovering-p '(nil t))
+                 (let* ((*physical-recovery-state* (when recovering-p '(:recovering)))
+                        (row (sql-wal-sender-row (first (wal-sender-snapshots))))
+                        (priority (if (and (not recovering-p) flush (plusp flush)) 1 0))
+                        (expected (cond ((zerop priority) "async")
+                                        ((not (member state '("streaming" "stopping") :test #'string=))
+                                         "potential")
+                                        ((string= method "ANY") "quorum")
+                                        (t "sync"))))
+                   (rove:ok (= priority (aref row 9)))
+                   (rove:ok (string= expected (aref row 10))))))))))))
+
+(rove:deftest synchronous-monitoring-wildcard-ties-and-configuration-disable
+    (call-with-sync-wait-state
+     (lambda ()
+       (sync-replication-install-configuration "FIRST 1 (*)" :source-a :source-a 0)
+       (let* ((first (sync-test-sender "same" 20 100 80 60))
+              (second (sync-test-sender "same" 10 90 70 50))
+              (rows (wal-sender-snapshots)))
+         (rove:ok (equal '("potential" "sync") (mapcar (lambda (row) (getf row :sync-state)) rows)))
+         (wal-sender-unregister (wal-sender-status-backend first) first)
+         (rove:ok (string= "sync" (getf (first (wal-sender-snapshots)) :sync-state)))
+         (wal-sender-set-state second "backup")
+         (rove:ok (string= "potential" (getf (first (wal-sender-snapshots)) :sync-state)))
+         (sync-replication-install-configuration "" :source-a :source-a 1)
+         (let ((row (first (wal-sender-snapshots))))
+           (rove:ok (= 0 (getf row :sync-priority)))
+           (rove:ok (string= "async" (getf row :sync-state))))))))
+
+(rove:deftest synchronous-monitoring-sql-iterator-keeps-its-configuration-snapshot
+    (call-with-sync-wait-state
+     (lambda ()
+       (sync-replication-install-configuration "FIRST 1 (a,b)" :source-a :source-a 0)
+       (let* ((a (sync-test-sender "a" 10 100 80 60))
+              (b (sync-test-sender "b" 20 90 70 50))
+              (iterator (make-wal-sender-result-iterator)))
+         (sync-replication-install-configuration "ANY 2 (a,b)" :source-a :source-a 1)
+         (wal-sender-note-reply a 200 180 160 2)
+         (wal-sender-note-reply b 190 170 150 2)
+         (dolist (expected '((10 80 1 "sync") (20 70 2 "potential")))
+           (multiple-value-bind (record present-p) (funcall iterator)
+             (rove:ok present-p)
+             (let ((row (sql-record-values record)))
+               (rove:ok (equal expected (loop for index in '(0 4 9 10) collect (aref row index)))))))
+         (rove:ok (equal '("quorum" "quorum")
+                         (mapcar (lambda (row) (getf row :sync-state)) (wal-sender-snapshots))))))))
+
 (cl-spec:defproperty prepared-synchronous-configuration-owns-input
     ((count (range integer 1 100))
      (suffix (range integer 0 1000000)))
@@ -831,6 +943,8 @@
                                   (loop for mode in '(:write :flush :apply)
                                         collect (getf (sync-replication-state-frontiers
                                                        *sync-replication-state*) mode))))
+                  (rove:ok (null (wal-sender-snapshots))
+                           "source rotation retires old sender monitoring rows")
                   (rove:ok (eq :source-changed (sync-replication-waiter-state pending)))
                   (rove:ok (eq :acknowledged (sync-replication-waiter-state completed)))
                   (rove:ok (equal (list (wal-sender-status-backend sender)) retired))

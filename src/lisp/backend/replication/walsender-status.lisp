@@ -140,6 +140,5 @@ Feedback and cleanup use that token, so they cannot affect a replacement registr
 (defun wal-sender-snapshots ()
   "Copy registered sender fields under the lock for a stable monitoring result."
   (sb-thread:with-mutex (*wal-sender-lock*)
-    (sort (loop for sender being the hash-values of *wal-sender-registry*
-                collect (wal-sender-snapshot-under-lock sender))
+    (sort (sync-replication-monitoring-snapshots-under-lock)
           #'< :key (lambda (row) (getf row :pid)))))

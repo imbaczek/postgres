@@ -7,6 +7,8 @@
 
 (defparameter *session-local-setting-names* '("application_name" "synchronous_commit"))
 
+(declaim (ftype function sync-replication-monitoring-snapshots-under-lock))
+
 (defconstant +db-startup+ 0)
 
 (defconstant +db-shutdowned+ 1)

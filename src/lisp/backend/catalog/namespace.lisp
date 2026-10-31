@@ -223,7 +223,8 @@ Unknown positions and lag are NULL; priority zero and async do not imply sync su
     (vector (getf snapshot :pid) (getf snapshot :state)
             (nullable-position :sent-lsn) (nullable-position :write-lsn)
             (nullable-position :flush-lsn) (nullable-position :replay-lsn)
-            +null+ +null+ +null+ 0 "async" (nullable-position :reply-time))))
+            +null+ +null+ +null+ (getf snapshot :sync-priority)
+            (getf snapshot :sync-state) (nullable-position :reply-time))))
 
 (defun make-status-record-iterator (fields rows)
   "Return records from the captured rows using the supplied field descriptors."
