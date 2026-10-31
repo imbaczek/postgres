@@ -6,7 +6,11 @@
   is active at cold startup and changes require restart. Archive-only recovery
   remains unsupported; coordination is outside this scope.
 
-- [ ] Complete real `Postgresql.follow` acceptance with the pinned Patroni path.
+- [ ] Extend real `Postgresql.follow` acceptance with the pinned Patroni path.
+  The owned test now covers start, changed-host reload, restart, clear, reattach,
+  source fencing, Patroni promotion and child writes. Switching to a different
+  upstream, following a descendant and rejoining remain open; this test has no
+  DCS or coordination.
   The complete unchanged Patroni writer oracle now passes, including `hba_file`
   and `ident_file`. These settings accept only disabled or unset values:
   `max_prepared_transactions`,
@@ -62,6 +66,11 @@
   insufficiency persists the report, pauses before later WAL, preserves readers,
   refuses promotion and shuts down on resume. Owned tests cover direct pauses,
   insufficiency discovered during promotion backlog replay, and adequate restart.
+
+- [ ] Audit source EOF, COPY shutdown and reconnect against C. During the real
+  Patroni follow test, fast shutdown of the source logged receiver error 08P01,
+  "native COPY lacks its input completion phase". Promotion and child writes
+  passed, but the shutdown path needs an independent explanation and regression.
 
 - [x] Fix signed integer GUC parsing for C23 binary prefixes independently of
   the unsigned recovery timeline parser. The signed converter uses C23 strtol

@@ -77,17 +77,29 @@ The final run passed at `/tmp/pg-operation-parking.gSyZhs`, recorded in
 strict compile (`/tmp/pg-configured-follow-final2-compile.log`). Process-kill tests
 do not establish power-loss behavior.
 
-This completes the native configured-source path, not the complete pinned
-Patroni interface. Twelve writer settings remain unsupported, as listed in TODO.md;
-the complete writer oracle is unchanged. Shared lock-object and owner admission
-now enforces capacity sized by `max_locks_per_transaction`.
+The complete unchanged pinned Patroni writer oracle now passes. Shared lock-object
+and owner admission now enforces capacity sized by `max_locks_per_transaction`.
 C sizes shared capacity from that value and backend/prepared-transaction counts;
 it does not cap each transaction at that number. Native resource requirements
 also have durable source reporting and standby checks, following C's
 `XLogReportParameters` and `CheckRequiredParameterValues`. Real
-`Postgresql.follow` acceptance remains separate from the writer metadata oracle.
-Archive recovery, rejoin/reseed, synchronous durability and coordination remain
-outside this checkpoint; no coordinator or election mechanism was added.
+`Postgresql.follow` is also exercised through the real pinned method as described
+below. Archive recovery, rejoin/reseed, synchronous durability and coordination
+remain outside this checkpoint; no coordinator or election mechanism was added.
+
+### Real Patroni follow method
+
+`t/patroni-follow.sh` uses pinned Patroni 4.1.5 and owned native peers to exercise
+start, changed-host reload, restart, clear, reattach, source fencing, promotion and
+child writes. It builds the native libpq helper and uses a private control socket
+for setup and debugging; it does not run a DCS or HA loop. The run passed at
+`/tmp/pg-real-follow-promotion-final.log`. Switching to a different upstream,
+following a descendant and rejoining remain open. Source fast shutdown logged an
+08P01 COPY completion error; the EOF and reconnect path remains an open audit
+despite successful promotion.
+Native control data now exposes persisted resource capacities, allowing Patroni
+to raise a standby's lock setting to the backup requirement. `pg_ctl reload`
+signals the verified owner without waiting for completion.
 
 ### Relation resource accounting
 

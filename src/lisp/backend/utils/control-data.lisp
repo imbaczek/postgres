@@ -206,7 +206,9 @@ floor, even on a child timeline. Phase 0 has not yet bound the manifest digest.
 A phase-3 request remains pending when insertion equals its parent timeline.
 A committed child must agree with its history; while phase-3 control remains,
 retired recovery files are ignored.
-Report checkpoint starts, though WAL control stores ends."
+Report checkpoint starts, though WAL control stores ends.
+Resource fields come from primary WAL control metadata, or from recovery control
+and then the verified selected checkpoint for a standby. Never use local settings."
   (multiple-value-bind (checkpoint durable snapshot insertion checkpoint-id namespace metadata)
       (wal-decode-control-line (bytes->string (first capture)))
     (declare (ignore durable namespace))
@@ -283,7 +285,8 @@ the base files are still checked against the manifest read from disk."
 (defun native-control-data-rows (facts)
   "Return supported native facts under C pg_controldata's field names.
 Omit fields the native format does not establish, including rewind settings
-and checksum versions. A legacy primary's unknown lifecycle stays unknown."
+and checksum versions. A legacy primary's unknown lifecycle stays unknown.
+Print all five persisted resource values together when known; omit them when unknown."
   (let* ((snapshot (getf facts :snapshot))
          (timeline (or (getf snapshot :timeline) (getf facts :checkpoint-timeline)))
          (redo (or (getf snapshot :redo) (getf facts :checkpoint)))

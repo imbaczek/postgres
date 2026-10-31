@@ -834,6 +834,9 @@ installing settings, taking PGDATA ownership or starting listeners."
     (finish-output output)))
 
 (defun startup-description-rows ()
+  "Build the native registry subset in C --describe-config field order.
+As in C's zero-initialized reset fields, booleans report FALSE and integers 0;
+strings and enums use boot values. These are not runtime or -C defaults."
   (loop for (name context kind boot minimum maximum) in *startup-setting-specs*
         for type = (case kind
                      (:integer "INTEGER") (:boolean "BOOLEAN") (:wal-level "ENUM")
@@ -850,6 +853,8 @@ installing settings, taking PGDATA ownership or starting listeners."
                       "" "")))
 
 (defun startup-print-description (&optional (output *standard-output*))
+  "Print nine tab-separated fields per supported native server setting.
+The group is Native server settings and both description fields are empty."
   (dolist (row (startup-description-rows))
     (loop for field in row
           for first = t then nil
@@ -858,7 +863,8 @@ installing settings, taking PGDATA ownership or starting listeners."
     (terpri output)))
 
 (defun startup-handle-meta-request (argv)
-  "Print and exit for version or configuration requests before server startup."
+  "Print and exit for version or configuration requests before server startup.
+A first argument of --describe-config prints the registry and exits before startup."
   (when (or (equal argv '("--version")) (equal argv '("-V")))
     (format t "pg-lisp (PostgreSQL) ~a~%" *server-version*)
     (finish-output)

@@ -1671,10 +1671,19 @@ uv venv /tmp/pg-patroni-4.1.5-venv
 uv pip install --python /tmp/pg-patroni-4.1.5-venv/bin/python3 -r t/interop/patroni-requirements.txt
 PATRONI_PYTHON=/tmp/pg-patroni-4.1.5-venv/bin/python3 ./t/postmaster-pid.sh
 PATRONI_PYTHON=/tmp/pg-patroni-4.1.5-venv/bin/python3 ./t/patroni-start.sh
+PATRONI_PYTHON=/tmp/pg-patroni-4.1.5-venv/bin/python3 ./t/patroni-follow.sh
 PATRONI_PYTHON=/tmp/pg-patroni-4.1.5-venv/bin/python3 ./t/physical-follow.sh
 FOLLOW_FIRST_ATTACH=1 FOLLOW_MANAGED_STARTUP=1 SELECTED_REPLAY_CONTROLLER=1 ./t/selected-replay.sh
 FOLLOW_PUBLIC_SLOT=1 FOLLOW_FIRST_ATTACH=1 ./t/libpq-follow.sh
 ```
+
+The follow test uses pinned Patroni 4.1.5, psycopg2 2.9.11 and psutil 7.1.3.
+It builds the libpq helper using `PG_CONFIG`, starts owned native peers, and calls
+the real `Postgresql.follow` method for start, reload, restart, clear and reattach.
+It fences the source, promotes through Patroni and checks child writes. A private
+control socket is used for setup and debugging. No DCS, election or HA loop runs.
+Source shutdown currently logs an 08P01 COPY completion error; its EOF and
+reconnect handling remains under investigation.
 
 `./pg-lisp.sh -D EXISTING_PGDATA -C setting` prints a supported configuration
 value in base units using normal file and command-line precedence, without
@@ -1682,6 +1691,11 @@ initializing storage or opening listeners. `-Csetting` also works; names are
 case-insensitive. A `-C` value containing only decimal digits retains the native
 control-port meaning, and the last `-C` selects between the two meanings.
 `--control-port` is unchanged.
+When passed as the first argument, `--describe-config` prints the supported
+native registry as nine tab-separated fields per setting. Its Boolean and integer
+reset fields mirror C's zero-initialized description output; use `-C` or runtime
+settings for actual values. `bin/pg_ctl reload -D PGDATA` signals the verified
+owner with SIGHUP and returns without waiting for reload completion.
 Run `./t/config-output.sh` for the CLI checks, optionally setting
 `REFERENCE_POSTGRES` to the pinned C executable for comparison.
 

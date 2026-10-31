@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Request promotion of a native pg-lisp standby.
+"""Request promotion or configuration reload from a native pg-lisp server.
 
 Use C pg_ctl's promote file and SIGUSR1 interface, with native control files.
-Only the promote command is implemented. A Linux pidfd binds the signal to the
-validated postmaster process; a reused PID must not redirect the request.
+A Linux pidfd binds each signal to the validated postmaster process; a reused
+PID must not redirect the request. Reload sends SIGHUP without waiting for it to
+complete.
 """
 import argparse
 import os
@@ -184,6 +185,7 @@ def promote(root, wait, timeout, quiet):
 
 
 def reload(root, quiet):
+    """Signal the verified PGDATA owner after rechecking its PID metadata."""
     handle, metadata = open_postmaster(root)
     try:
         if metadata != read_regular(root / "postmaster.pid", 8192):
@@ -196,8 +198,8 @@ def reload(root, quiet):
 
 
 def main():
-    """Parse the supported C-style options and dispatch native promotion."""
-    parser = argparse.ArgumentParser(description="Native pg-lisp promotion utility")
+    """Parse the supported C-style options and dispatch promotion or reload."""
+    parser = argparse.ArgumentParser(description="Native pg-lisp promotion and reload utility")
     parser.add_argument("command", choices=["promote", "reload"])
     parser.add_argument("-D", "--pgdata", default=os.environ.get("PGDATA"))
     parser.add_argument("-w", "--wait", dest="wait", action="store_true", default=True)
