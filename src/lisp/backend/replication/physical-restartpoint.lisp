@@ -414,7 +414,9 @@ Older metadata without these fields uses the base timeline."
            (>= (- now last-time) (* timeout internal-time-units-per-second)))))
 
 (defun physical-restartpoint-needed-p (&optional (now (get-internal-real-time)))
-  "Call with admission or quiescence; inspect floor and apply under the store lock."
+  "Decide whether a restartpoint is due, with admission or quiescence held.
+Capture one required installed configuration before taking the store mutex.
+The configuration lock is released before inspecting the store."
   (when (and *physical-receive-store* (not *physical-recovery-failed-p*))
     (let ((configuration (startup-require-configuration)))
       (sb-thread:with-mutex ((physical-store-mutex *physical-receive-store*))
@@ -455,7 +457,9 @@ Never acquire the reload mutex here: a replayer may own it while draining SQL."
       :unchanged))
 
 (defun physical-recovery-restartpoint (&key automatic)
-  "Publish a local durable terminal and compact its receive spool; never promote."
+  "Publish a local durable terminal and compact its receive spool; never promote.
+An automatic request rechecks whether it is due after entering quiescence,
+using a fresh configuration for that decision."
   (check-physical-recovery-work)
   (unless (and (recovery-in-progress-p) *physical-receive-store*)
     (error "restartpoint requires streaming recovery"))
