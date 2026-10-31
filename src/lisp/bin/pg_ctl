@@ -183,10 +183,22 @@ def promote(root, wait, timeout, quiet):
         os.close(handle)
 
 
+def reload(root, quiet):
+    handle, metadata = open_postmaster(root)
+    try:
+        if metadata != read_regular(root / "postmaster.pid", 8192):
+            raise ValueError("postmaster changed before reload signal")
+        signal.pidfd_send_signal(handle, signal.SIGHUP)
+        if not quiet:
+            print("server signaled")
+    finally:
+        os.close(handle)
+
+
 def main():
     """Parse the supported C-style options and dispatch native promotion."""
     parser = argparse.ArgumentParser(description="Native pg-lisp promotion utility")
-    parser.add_argument("command", choices=["promote"])
+    parser.add_argument("command", choices=["promote", "reload"])
     parser.add_argument("-D", "--pgdata", default=os.environ.get("PGDATA"))
     parser.add_argument("-w", "--wait", dest="wait", action="store_true", default=True)
     parser.add_argument("-W", "--no-wait", dest="wait", action="store_false")
@@ -195,7 +207,11 @@ def main():
     args = parser.parse_args()
     if not args.pgdata or args.timeout < 0:
         parser.error("an existing -D directory and a nonnegative timeout are required")
-    promote(pathlib.Path(args.pgdata).resolve(strict=True), args.wait, args.timeout, args.silent)
+    root = pathlib.Path(args.pgdata).resolve(strict=True)
+    if args.command == "reload":
+        reload(root, args.silent)
+    else:
+        promote(root, args.wait, args.timeout, args.silent)
 
 
 if __name__ == "__main__":
