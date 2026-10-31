@@ -56,7 +56,10 @@ An unsafe complete batch defers promotion; an unfinished tail does not."
   "Attempt promotion under reload exclusion and closed admission.
 Recheck child initialization after worker joins and before enrolling readers.
 An unsafe complete batch defers the attempt; otherwise publish the child.
-A resource pause found while draining the backlog stops before intent."
+A resource pause found while draining the backlog stops before intent. Drain
+and restartpoint work precede the generation fence. Intent through final
+completion, including the ready hook and stopping and context markers, is masked
+under the fence; notify exact old senders after release."
   (sb-thread:with-mutex (*reload-run-lock*)
     (with-live-operation-quiescence
       (physical-promotion-check-online)
@@ -152,7 +155,10 @@ Retry unsafe complete replay barriers outside the gates, allowing readers to
 finish.  Return the child checkpoint end, or :SHUTDOWN if shutdown takes over
 before intent.  Other failures after work starts fence the process for restart.
 If backlog replay reaches insufficient capacity, restore recovery workers and
-return :RESOURCE-PAUSED without publishing promotion intent."
+return :RESOURCE-PAUSED without publishing promotion intent. One publication
+context carries completion and sender debt through the whole live attempt.
+A completed context prevents an interrupt after publication from fencing an
+already completed promotion; errors before completion still fail closed."
   (when (plusp *live-operation-depth*)
     (error "online promotion must run outside operation admission"))
   (physical-follow-call-with-controller-blocked

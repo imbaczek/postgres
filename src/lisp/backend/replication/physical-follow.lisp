@@ -87,7 +87,8 @@ Pending interrupts can be delivered after unlock."
 The caller already owns command and reload exclusion and quiescence. Fence
 acquisition is interruptible unless the caller already masked interrupts;
 publication and cleanup are masked. OBSOLETE receives exact sender backends to
-notify after fence release, including on unwind."
+notify after fence release, including on unwind. Keep preparation and worker
+joins outside this fence; use it for native publication and source rotation."
   (let ((mutex (gensym "MUTEX-")) (held (gensym "HELD-")))
     `(let ((,mutex *physical-follow-generation-lock*) (,held nil) (,obsolete nil))
        (unless (and (zerop *live-operation-depth*)
@@ -1743,10 +1744,12 @@ A successful manual stop suspends configured reconciliation for this generation.
 
 (defun physical-recovery-select-history (target history-text eor-bytes)
   "Select receive history under follow-command, reload and quiescence exclusion.
-Follow must already be stopped. The caller must independently verify remote
-system identity, exact prefix and retention before invoking this private control.
-After the control write, retire old synchronous replication proof before finishing.
-A failure after selection work begins fences recovery; this does not admit a network source."
+Block the controller and cancel and join its operation before taking those locks.
+The follow runtime must already be stopped. The caller must independently verify
+remote system identity, exact prefix and retention before this private control.
+Selection, control write and source rotation run under the generation fence;
+old senders are notified after release. A failure after selection work begins
+fences recovery."
   (when (plusp *live-operation-depth*) (error "history selection requires its own operation admission"))
   (physical-follow-call-with-controller-blocked
    (lambda ()

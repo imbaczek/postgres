@@ -117,6 +117,18 @@
   (`/tmp/worker-start-legacy.log`), strict cold compilation
   (`/tmp/worker-start-cold.log`) and SQL smoke (`/tmp/worker-start-smoke.log`).
 
+- [x] Fence private history selection and live promotion through source rotation,
+  carrying sender retirement and completion through the live promotion
+  (`88a00f72820`, `39bf35d5396`). The checkpoint passed 1,370 physical
+  (`/tmp/source-lifecycle-final-physical.log`), 752 unit
+  (`/tmp/source-lifecycle-final-unit.log`), 201 wire
+  (`/tmp/source-lifecycle-final-wire.log`) and 1,159 legacy checks
+  (`/tmp/source-lifecycle-final-legacy.log`), strict cold compilation
+  (`/tmp/source-lifecycle-final-cold.log`) and SQL smoke
+  (`/tmp/source-lifecycle-final-smoke.log`). Real HBA backup and promotion with
+  `DEBUG_PROMOTION=1` passed (`/tmp/source-lifecycle-hba-debug.log`, artifacts
+  `/tmp/pg-hba-policy.49dp84dn`).
+
 - [ ] Build the independent configuration service needed before commit waiting.
   This is proposed, not implemented; it adds no coordinator. Parking synchronous
   waiters alone does not keep configuration service available.
@@ -130,9 +142,9 @@
   2. Receiver effects, desired-generation installation, and controller intent
      and active-binding publication are fenced. Capture root, desired generation
      and real source predecessor coherently; check the source before managed claim.
-     Fence live promotion and private history selection through source rotation
-     before dropping quiescence. Then publish candidates atomically without
-     quiescence after HBA, claim, resource, slot and predecessor checks.
+     Live promotion and private history selection are fenced through source
+     rotation. Publish candidates atomically without quiescence after HBA, claim,
+     resource, slot and predecessor checks; the installer remains quiescent today.
   3. Separate the configuration worker from code drain. Serialize candidate
      preparation/publication with actual ASDF replacement, never holding that
      definition lock while draining. Configuration takes neither the reload run

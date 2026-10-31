@@ -401,7 +401,9 @@ recovery; restart must classify durable control."
 (defun physical-promotion-finish-child-primary (&optional publication)
   "Retire recovery triggers before clearing the recovery role and declaring readiness.
 Report installed capacity on the new primary before declaring it ready, then
-retire synchronous replication proof from the previous source."
+retire synchronous replication proof from the previous source. With PUBLICATION,
+record the exact obsolete senders before the ready hook can fail; the outer
+live promotion notifies them after releasing its fence. NIL notifies immediately."
   (physical-promotion-test-point :after-child-primary-initialization)
   (physical-promotion-retire-recovery)
   (sb-thread:with-mutex (*wal-lock*)
@@ -422,7 +424,8 @@ retire synchronous replication proof from the previous source."
   "Privately adopt the child, close the receive spool and finish promotion.
 
 Keep the existing CLOG stream, storage handles and reader state. The completion
-caller must keep admission closed and fence any failure."
+caller must keep admission closed and fence any failure. PUBLICATION carries
+sender retirement to the outer live promotion."
   (physical-promotion-adopt-live-child-runtime)
   (when *physical-receive-store* (physical-store-close *physical-receive-store*))
   (setf *physical-receive-store* nil)
@@ -433,7 +436,8 @@ caller must keep admission closed and fence any failure."
 Register the primary retained root before storage initialization loads slots.
 Close standby storage, then hide recovery only in the initializer's dynamic
 scope; the outer pending role still excludes writers. Retire recovery triggers
-before declaring the primary ready. On failure restart from durable child control."
+before declaring the primary ready. NIL PUBLICATION retains immediate sender
+notification for cold startup. On failure restart from durable child control."
   (physical-promotion-restore-primary-retained)
   (when *physical-receive-store* (physical-store-close *physical-receive-store*))
   (setf *physical-receive-store* nil)
@@ -446,8 +450,10 @@ before declaring the primary ready. On failure restart from durable child contro
   "Commit child control, initialize the primary and return the checkpoint end.
 
 Keep admission closed throughout.  The scoped reader-preservation flag selects
-live adoption; otherwise initialize cold storage.  Any error or nonlocal exit
-fences the process.  A new process must classify durable control before retrying."
+live adoption; otherwise initialize cold storage. An error or nonlocal exit
+before child completion fences the process. A new process must classify durable
+control before retrying.
+PUBLICATION, when supplied, carries sender retirement through live completion."
   (let ((finished nil))
     (unwind-protect
          (let ((end (physical-promotion-publish-child-control)))

@@ -2,7 +2,9 @@
 (in-package #:pg)
 
 (defstruct physical-promotion-publication
-  "Completion and sender retirement owned by one live promotion publication."
+  "One outer live promotion owns this completion flag and exact sender debt.
+Completion is set only after child promotion, including its ready hook,
+succeeds and stopping is cleared."
   obsolete completed-p)
 
 (defvar *physical-promotion-preserve-readers-p* nil
@@ -177,7 +179,8 @@ IDs, and keep retained transactions read-only."
 
 The caller owns closed admission and has joined the recovery workers.  Within
 the scoped transition, an incomplete exit fences recovery, except when healthy
-phase-2 recovery can yield to shutdown."
+phase-2 recovery can yield to shutdown. A completed PUBLICATION also protects
+against an interrupt after publication but before local completion is recorded."
   (physical-promotion-enroll-readers)
   (sb-thread:with-mutex (*physical-restartpoint-start-lock*)
     (when (and *physical-restartpoint-worker*
