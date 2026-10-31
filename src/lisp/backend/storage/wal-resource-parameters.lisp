@@ -181,39 +181,42 @@ Read back the complete control image before installing the new memory copy."
 (defun wal-report-resource-parameters (parameters)
   "Report a primary tuple, returning its durable record end.
 Under the WAL lock, skip unchanged values; otherwise append and flush the batch
-before publishing and reading back control. Failure or cancellation after append
-starts poisons WAL before unlocking and requests shutdown."
+before publishing and reading back control. Publication defers asynchronous
+termination; failures and abandoned publications poison WAL before unlocking."
   (prevent-recovery-primary-operation "primary resource reporting")
   (unless (resource-parameters-valid-p parameters) (error "invalid resource parameters"))
   (let ((started nil) (completed nil) (failure nil) (result nil))
-    (unwind-protect
-         (sb-thread:with-mutex (*wal-lock*)
-           (wal-check-healthy)
-           (unless (and *wal-ready* (wal-control-metadata-valid-p *wal-control-metadata*))
-             (error "primary control identity is not initialized"))
-           (if (equal (resource-parameters-values parameters)
-                      (getf *wal-control-metadata* :resource-parameters))
-               (setf result (getf *wal-control-metadata* :resource-lsn))
-               (progn
-                 (unwind-protect
-                      (handler-case
-                          (progn
-                            (setf started t)
-                            (wal-append-batch-start)
-                            (wal-append-record +wal-record-parameter-change+ 0
-                                               (wal-encode-resource-parameters parameters))
-                            (wal-flush)
-                            (wal-resource-parameters-test-point :after-wal-flush *wal-end-lsn*)
-                            (wal-publish-resource-parameters-under-lock
-                             parameters *wal-end-lsn* *wal-insert-timeline*)
-                            (wal-resource-parameters-test-point :after-control-save *wal-end-lsn*)
-                            (setf result *wal-end-lsn* completed t))
-                        (error (condition) (setf failure condition)))
-                   (unless completed (setf *wal-poisoned* t))))))
-      (when (and started (not completed) (not failure))
-        (when (fboundp 'request-fast-shutdown)
-          (ignore-errors (funcall (symbol-function 'request-fast-shutdown))))))
-    (when failure (wal-fail-stop failure))
+    (sb-sys:without-interrupts
+      (unwind-protect
+           (sb-sys:with-local-interrupts
+             (sb-thread:with-mutex (*wal-lock*)
+               (wal-check-healthy)
+               (unless (and *wal-ready* (wal-control-metadata-valid-p *wal-control-metadata*))
+                 (error "primary control identity is not initialized"))
+               (if (equal (resource-parameters-values parameters)
+                          (getf *wal-control-metadata* :resource-parameters))
+                   (setf result (getf *wal-control-metadata* :resource-lsn))
+                   (sb-sys:without-interrupts
+                     (unwind-protect
+                          (handler-case
+                              (progn
+                                (setf started t)
+                                (wal-append-batch-start)
+                                (wal-append-record +wal-record-parameter-change+ 0
+                                                   (wal-encode-resource-parameters parameters))
+                                (wal-flush)
+                                (wal-resource-parameters-test-point :after-wal-flush *wal-end-lsn*)
+                                (wal-publish-resource-parameters-under-lock
+                                 parameters *wal-end-lsn* *wal-insert-timeline*)
+                                (wal-resource-parameters-test-point :after-control-save *wal-end-lsn*)
+                                (setf result *wal-end-lsn* completed t))
+                            (error (condition) (setf failure condition)))
+                       (unless completed (setf *wal-poisoned* t)))))))
+        (cond
+          (failure (wal-fail-stop failure))
+          ((and started (not completed))
+           (when (fboundp 'request-fast-shutdown)
+             (ignore-errors (funcall (symbol-function 'request-fast-shutdown))))))))
     result))
 
 (defun wal-recover-resource-parameters (record)

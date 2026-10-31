@@ -101,6 +101,78 @@
        (pg::wal-save-control-fields 0 0)
        (funcall function)))))
 
+(defun direct-publication-termination-test (kind &optional fault)
+  (let* ((ready (sb-thread:make-semaphore))
+         (release (sb-thread:make-semaphore))
+         (backend (pg::make-backend :pid 98766 :read-only nil))
+         (thread nil))
+    (unwind-protect
+         (progn
+           (setf thread
+                 (sb-thread:make-thread
+                  (lambda ()
+                    (let ((pg::*wal-lock* (sb-thread:make-mutex :name "direct publication WAL"))
+                          (pg::*xid-lock* (sb-thread:make-mutex :name "direct publication XID")))
+                      (funcall
+                       (if (eq kind :resource)
+                           #'call-with-resource-wal-fixture
+                           #'call-with-wal-allocation-fixture)
+                       (lambda ()
+                         (flet ((pause (point end)
+                                  (declare (ignore end))
+                                  (when (eq point :after-wal-flush)
+                                    (sb-thread:signal-semaphore ready)
+                                    (unless (sb-thread:wait-on-semaphore release :timeout 10)
+                                      (error "direct publication barrier expired"))
+                                    (when fault (error fault)))))
+                           (let ((pg::*xid-reservation-test-hook* #'pause)
+                                 (pg::*wal-resource-parameters-test-hook* #'pause))
+                             (handler-case
+                                 (progn
+                                   (ecase kind
+                                     (:resource
+                                      (pg::wal-report-resource-parameters
+                                       (pg::make-resource-parameters 100 8 10 0 128)))
+                                     (:xid (pg::assign-xid)))
+                                   :unexpected-success)
+                               (pg::pg-error (condition)
+                                 (list
+                                  (pg::pg-error-sqlstate condition) pg::*wal-poisoned*
+                                  (ecase kind
+                                    (:resource
+                                     (list (getf pg::*wal-control-metadata* :resource-parameters)
+                                           (getf (nth-value 6 (pg::wal-read-control-fields))
+                                                 :resource-parameters)))
+                                    (:xid
+                                     (list pg::*next-xid* pg::*xid-batch-end*
+                                           (pg::load-next-xid) pg::*active-xids*)))))
+                               (error (condition)
+                                 (list :storage-error (eq condition fault) pg::*wal-poisoned*
+                                       (= pg::*pm-requested-mode* pg::+fast-shutdown+))))))))))
+                  :name "direct publication termination"))
+           (setf (pg::backend-thread backend) thread)
+           (assert (sb-thread:wait-on-semaphore ready :timeout 10))
+           (let ((pg::*backend* nil)) (pg::terminate-backend backend))
+           (sb-thread:join-thread thread :timeout 0.05 :default :pending)
+           (sb-thread:signal-semaphore release)
+           (sb-thread:join-thread thread :timeout 10 :default :timed-out))
+      (sb-thread:signal-semaphore release)
+      (when thread (ignore-errors (sb-thread:join-thread thread :timeout 12 :default nil))))))
+
+(deftest resource-report-finishes-publication-before-backend-termination
+    (ok (equal '("57P01" nil ((100 8 10 0 128) (100 8 10 0 128)))
+               (direct-publication-termination-test :resource))))
+
+(deftest xid-reservation-finishes-capacity-before-termination-without-allocating-an-id
+    (ok (equal '("57P01" nil (3 1003 1003 nil))
+               (direct-publication-termination-test :xid))))
+
+(deftest direct-publication-storage-failure-wins-over-pending-termination
+    (dolist (kind '(:resource :xid))
+      (let ((fault (make-condition 'simple-error :format-control "injected publication I/O error")))
+        (ok (equal '(:storage-error t t t)
+                   (direct-publication-termination-test kind fault))))))
+
 (deftest primary-resource-report-flushes-before-publication-and-skips-unchanged-values
     (call-with-resource-wal-fixture
      (lambda ()

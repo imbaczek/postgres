@@ -55,24 +55,27 @@
 (defun xid-assign-with-wal-reservation (oldest)
   "Slow path rechecks capacity and ordinary refusals before entering critical I/O."
   (let ((result nil) (failure nil) (started nil) (completed nil))
-    (unwind-protect
-         (sb-thread:with-mutex (*wal-lock*)
-           (wal-check-healthy)
-           (sb-thread:with-mutex (*xid-lock*)
-             (xid-check-allocation-under-lock oldest)
-             (when (>= *next-xid* *xid-batch-end*)
-               (setf started t)
-               (unwind-protect
-                    (handler-case
-                        (progn (xid-reserve-wal-batch-under-lock) (setf completed t))
-                      (error (condition) (setf failure condition)))
-                 ;; Poison before releasing WAL, including a nonlocal exit.
-                 (unless completed (setf *wal-poisoned* t))))
-             (unless failure (setf result (xid-allocate-under-lock)))))
-      (when (and started (not completed) (not failure))
-        (when (fboundp 'request-fast-shutdown)
-          (ignore-errors (funcall (symbol-function 'request-fast-shutdown))))))
-    (when failure (wal-fail-stop failure))
+    (sb-sys:without-interrupts
+      (unwind-protect
+           (sb-sys:with-local-interrupts
+             (sb-thread:with-mutex (*wal-lock*)
+               (wal-check-healthy)
+               (sb-thread:with-mutex (*xid-lock*)
+                 (xid-check-allocation-under-lock oldest)
+                 (when (>= *next-xid* *xid-batch-end*)
+                   (sb-sys:without-interrupts
+                     (setf started t)
+                     (unwind-protect
+                          (handler-case
+                              (progn (xid-reserve-wal-batch-under-lock) (setf completed t))
+                            (error (condition) (setf failure condition)))
+                       (unless completed (setf *wal-poisoned* t)))))
+                 (unless failure (setf result (xid-allocate-under-lock))))))
+        (cond
+          (failure (wal-fail-stop failure))
+          ((and started (not completed))
+           (when (fboundp 'request-fast-shutdown)
+             (ignore-errors (funcall (symbol-function 'request-fast-shutdown))))))))
     result))
 
 (defun xid-restore-reservation-floor (bound)
