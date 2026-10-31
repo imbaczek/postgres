@@ -38,8 +38,8 @@
                                       (source-id (nth-value 0 (sync-replication-configuration-state))))
   "Register one status token for a replication backend under the sender lock."
   ;; SOURCE-ID is checked against current state under that lock.  The default is
-  ;; the private legacy boundary; integration must capture the connection's real
-  ;; source ownership earlier and pass that snapshot here.
+  ;; a fallback for callers without an earlier connection snapshot. Production
+  ;; startup passes the identity it captured under admission.
   (unless (and (backend-p backend)
                (member (backend-replication-mode backend) '(:physical :database)))
     (error "walsender status requires a replication backend"))

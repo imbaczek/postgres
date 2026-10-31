@@ -157,6 +157,8 @@ Like C ReportChangedGUCOptions, recovery can only change from on to off."
 
 (defun process-startup (stream body)
   "Parse startup mode, check availability and authenticate before reserving quota.
+Capture a replication connection's source identity under admission so later
+sender registration can reject a source change during the intervening gap.
 When hot_standby is off, reject every startup mode during recovery before authentication.
 Use the socket peer and final startup identities for HBA before reserving quota.
 SQL role authorization remains separate and currently uses the postgres role."
@@ -750,6 +752,7 @@ finish outer connection accounting after unregistering."
                       (let ((body (read-startup-until-ready stream)))
                         (when body
                           (process-startup stream body)
+                          ;; Use the startup identity even if the source changed before registration.
                           (when (backend-replication-mode *backend*)
                             (wal-sender-register *backend* (backend-replication-source-id *backend*)))
                           (backend-loop stream)))
@@ -937,6 +940,7 @@ CL's RENAME-FILE merges a relative target with the source's directory."
             (wal-report-installed-resource-capacity)
             (wal-note-primary-ready)))
       (if primary-ready
+          ;; Cold promotion already installed the source identity.
           (assert (nth-value 0 (sync-replication-configuration-state)))
           (with-live-operation-quiescence
             (sync-replication-new-source-incarnation)))

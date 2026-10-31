@@ -9,6 +9,7 @@
   (cancel-key nil)
   (database "postgres")
   (replication-mode nil)
+  ;; Capture during admitted startup; registration checks this same source identity.
   (replication-source-id nil)
   (application-name nil)
   (reported-settings (make-hash-table :test #'equal))

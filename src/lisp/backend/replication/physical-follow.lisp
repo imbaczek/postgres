@@ -1620,6 +1620,7 @@ A successful manual stop suspends configured reconciliation for this generation.
   "Select receive history under follow-command, reload and quiescence exclusion.
 Follow must already be stopped. The caller must independently verify remote
 system identity, exact prefix and retention before invoking this private control.
+After the control write, retire old synchronous replication proof before finishing.
 A failure after selection work begins fences recovery; this does not admit a network source."
   (when (plusp *live-operation-depth*) (error "history selection requires its own operation admission"))
   (sb-thread:with-mutex (*physical-follow-command-lock*)

@@ -189,8 +189,8 @@
   (sb-thread:with-mutex (*wal-sender-lock*)
     (sync-replication-select-current-under-lock config)))
 
-;; Private publication and wait core.  Public settings, commit, startup and
-;; native source events are not yet wired to it.
+;; Publication and wait core with native source lifecycle fencing.
+;; Public settings and transaction commit waits are not yet wired to it.
 
 (defstruct sync-replication-waiter
   ;; Only :WAITING entries are queued; terminal outcomes stay fixed.  The
@@ -337,6 +337,10 @@
 (declaim (special *live-operation-quiescence-owner-thread*))
 
 (defun sync-replication-new-source-incarnation ()
+  "Replace the source identity while preserving synchronous standby names.
+The caller must own live-operation quiescence and must not hold the WAL mutex.
+The configuration installer retires old senders, releases pending waiters with
+:SOURCE-CHANGED, and clears frontier proof when it installs the new identity."
   (unless (eq *live-operation-quiescence-owner-thread* sb-thread:*current-thread*)
     (error "replication source replacement requires closed admission"))
   (when (sb-thread:holding-mutex-p *wal-lock*)

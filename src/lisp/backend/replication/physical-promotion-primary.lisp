@@ -400,7 +400,8 @@ recovery; restart must classify durable control."
 
 (defun physical-promotion-finish-child-primary ()
   "Retire recovery triggers before clearing the recovery role and declaring readiness.
-Report installed capacity on the new primary before declaring it ready."
+Report installed capacity on the new primary before declaring it ready, then
+retire synchronous replication proof from the previous source."
   (physical-promotion-test-point :after-child-primary-initialization)
   (physical-promotion-retire-recovery)
   (sb-thread:with-mutex (*wal-lock*)

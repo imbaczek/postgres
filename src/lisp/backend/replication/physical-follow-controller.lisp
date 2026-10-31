@@ -657,7 +657,9 @@ A restartpoint can advance during the RPC; use the final durable witness. Queue
 the old source before publication; its remote acknowledgment is not required.
 With workers quiesced, strictly validate the candidate before writing pending
 state. Receipt resumes only after activation. The generation is checked again
-under command and reload exclusion before durable publication."
+under command and reload exclusion before durable publication. After attaching
+the active source, retire old synchronous replication proof before marking the
+transition complete."
   (sb-thread:with-mutex (*physical-follow-command-lock*)
     (sb-thread:with-mutex (*reload-run-lock*)
       (with-live-operation-quiescence
