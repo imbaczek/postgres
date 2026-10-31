@@ -51,6 +51,30 @@ lock, and release the follow lock before taking the store mutex."
         (sb-thread:with-mutex (*physical-follow-generation-lock*)
           (funcall function)))))
 
+(defun call-with-physical-follow-worker-publication (generation-p function)
+  "Mask worker publication through release of its lifecycle mutexes."
+  (let ((generation *physical-follow-generation-lock*)
+        (follow *physical-follow-lock*)
+        (generation-held nil)
+        (follow-held nil))
+    (when (or (sb-thread:holding-mutex-p generation)
+              (sb-thread:holding-mutex-p follow))
+      (error "worker publication requires unowned generation and follow locks"))
+    (sb-sys:without-interrupts
+      (unwind-protect
+           (progn
+             (if generation-p
+                 (progn
+                   (sb-sys:allow-with-interrupts
+                     (setf generation-held (sb-thread:grab-mutex generation)))
+                   (setf follow-held (sb-thread:grab-mutex follow)))
+                 (sb-sys:allow-with-interrupts
+                   (setf follow-held (sb-thread:grab-mutex follow))))
+             (funcall function))
+        (unwind-protect
+             (when follow-held (sb-thread:release-mutex follow))
+          (when generation-held (sb-thread:release-mutex generation)))))))
+
 (defmacro with-physical-follow-generation-operation (&body body)
   "Enter admission before fencing receiver-local checks and effects."
   `(progn
@@ -1474,9 +1498,8 @@ the accepted binding alone does not authorize a stale configured launch."
   (unless (and (zerop *live-operation-depth*)
                (sb-thread:holding-mutex-p *physical-follow-command-lock*))
     (error "follow worker launch requires command exclusion outside admission"))
-  (call-with-physical-follow-generation-fence
-   (lambda ()
-     (sb-thread:with-mutex (*physical-follow-lock*)
+  (call-with-physical-follow-worker-publication
+   t (lambda ()
        (when receive-p
          (physical-follow-require-generation generation)
          (when configured-p (physical-follow-check-desired-active generation)))
@@ -1493,15 +1516,21 @@ the accepted binding alone does not authorize a stale configured launch."
                 (when receive-p
                   (setf (physical-follow-runtime-receiver-thread runtime)
                         (sb-thread:make-thread (lambda () (run #'physical-follow-receiver-loop))
-                                               :name "native physical WAL receiver")))
+                                               :name "native physical WAL receiver"))
+                  (physical-follow-test-point :after-follow-receiver-create))
                 (setf (physical-follow-runtime-replay-thread runtime)
                       (sb-thread:make-thread (lambda () (run #'physical-follow-replay-loop))
-                                             :name "native physical WAL replay")
-                      *physical-follow-runtime* runtime success t ready t)
+                                             :name "native physical WAL replay"))
+                (physical-follow-test-point :after-follow-worker-create)
+                (setf *physical-follow-runtime* runtime)
+                (physical-follow-test-point :after-follow-runtime-publication)
+                (setf success t ready t)
                 :started)
            (unless success
-             ;; No worker can touch storage before every requested worker is published.
-             (setf (physical-follow-runtime-stopped-p runtime) t ready t))))))))
+             (setf (physical-follow-runtime-stopped-p runtime) t)
+             (when (eq *physical-follow-runtime* runtime)
+               (setf *physical-follow-runtime* nil)))
+           (setf ready t))))))
 
 (defun physical-follow-launch-decision (config)
   "Choose receipt, refresh or replay only from the admitted local state.

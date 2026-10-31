@@ -970,28 +970,39 @@ Configured operations must still own the active desired generation."
          (captured-generation (or generation
                                   (if runtime (physical-follow-runtime-generation runtime)
                                       *physical-follow-desired*)))
-         (ready nil)
+         (ready nil) (success nil)
          (operation (make-physical-follow-operation
                      :host (copy-seq host) :port port :prefix (copy-seq prefix) :runtime runtime
                      :context (append (list :requested-slot public-slot :automatic-p (not (null runtime))
                                             :generation captured-generation :configured-p configured-p)
                                       (when requested (list :requested-profile requested))))))
-    (sb-thread:with-mutex (*physical-follow-lock*)
-      (physical-follow-require-generation captured-generation)
-      (when (and runtime *physical-follow-manual-reservation*)
-        (error 'physical-follow-controller-cancelled))
-      (when configured-p (physical-follow-check-desired-active captured-generation))
-      (when (or *physical-follow-operation* *physical-follow-controller-blocked-p*
-                *physical-follow-controller-stopping-p*)
-        (error "native follow controller is busy or stopping"))
-      (setf (physical-follow-operation-thread operation)
-            (sb-thread:make-thread
-             (lambda ()
-               (loop until ready do (sleep 0.001))
-               (physical-follow-operation-run operation))
-             :name "native follow transition")
-            *physical-follow-operation* operation
-            ready t))
+    (call-with-physical-follow-worker-publication
+     nil (lambda ()
+           (physical-follow-require-generation captured-generation)
+           (when (and runtime *physical-follow-manual-reservation*)
+             (error 'physical-follow-controller-cancelled))
+           (when configured-p (physical-follow-check-desired-active captured-generation))
+           (when (or *physical-follow-operation* *physical-follow-controller-blocked-p*
+                     *physical-follow-controller-stopping-p*)
+             (error "native follow controller is busy or stopping"))
+           (unwind-protect
+                (progn
+                  (setf (physical-follow-operation-thread operation)
+                        (sb-thread:make-thread
+                         (lambda ()
+                           (loop until ready do (sleep 0.001))
+                           (unless (physical-follow-operation-cancelled-p operation)
+                             (physical-follow-operation-run operation)))
+                         :name "native follow transition"))
+                  (physical-follow-test-point :after-controller-worker-create)
+                  (setf *physical-follow-operation* operation)
+                  (physical-follow-test-point :after-controller-worker-publication)
+                  (setf success t ready t))
+             (unless success
+               (setf (physical-follow-operation-cancelled-p operation) t)
+               (when (eq *physical-follow-operation* operation)
+                 (setf *physical-follow-operation* nil)))
+             (setf ready t))))
     operation))
 
 (defun physical-follow-controller-cancel-join ()

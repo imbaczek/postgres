@@ -1,5 +1,197 @@
 (in-package #:pg-physical-tests)
 
+(deftest worker-publication-first-mutex-wait-remains-interruptible
+    (dolist (generation-p '(nil t))
+      (let ((mutex (if generation-p pg::*physical-follow-generation-lock* pg::*physical-follow-lock*))
+            (thread nil) (waiting nil) (body-ran nil) (delivery-locks nil) (joined nil))
+        (unwind-protect
+             (progn
+               (sb-thread:with-mutex (mutex)
+                 (setf thread
+                       (sb-thread:make-thread
+                        (lambda ()
+                          (catch 'worker-lock-cancel
+                            (pg::call-with-physical-follow-worker-publication
+                             generation-p (lambda () (setf body-ran t)))))
+                        :name "worker publication first lock waiter"))
+                 (loop repeat 1000
+                       when (eq mutex (sb-thread::thread-waiting-for thread))
+                         do (setf waiting t) (return)
+                       do (sleep 0.001))
+                 (sb-thread:interrupt-thread
+                  thread
+                  (lambda ()
+                    (setf delivery-locks
+                          (list (sb-thread:holding-mutex-p pg::*physical-follow-lock*)
+                                (sb-thread:holding-mutex-p pg::*physical-follow-generation-lock*)))
+                    (throw 'worker-lock-cancel :cancelled)))
+                 (setf joined (sb-thread:join-thread thread :timeout 2 :default :pending)))
+               (ok waiting)
+               (ok (eq :cancelled joined))
+               (ok (not body-ran))
+               (ok (equal '(nil nil) delivery-locks)))
+          (when thread
+            (sb-thread:join-thread thread :timeout 2 :default :cleanup-timeout))))))
+
+(deftest worker-publication-second-mutex-wait-defers-interruption-through-release
+    (let ((thread nil) (waiting nil) (body-ran nil)
+                       (delivery-locks nil) (pending nil) (joined nil))
+      (unwind-protect
+           (progn
+             (sb-thread:with-mutex (pg::*physical-follow-lock*)
+               (setf thread
+                     (sb-thread:make-thread
+                      (lambda ()
+                        (catch 'worker-lock-cancel
+                          (pg::call-with-physical-follow-worker-publication
+                           t (lambda () (setf body-ran t)))))
+                      :name "worker publication second lock waiter"))
+               (loop repeat 1000
+                     when (eq pg::*physical-follow-lock* (sb-thread::thread-waiting-for thread))
+                       do (setf waiting t) (return)
+                     do (sleep 0.001))
+               (sb-thread:interrupt-thread
+                thread
+                (lambda ()
+                  (setf delivery-locks
+                        (list (sb-thread:holding-mutex-p pg::*physical-follow-lock*)
+                              (sb-thread:holding-mutex-p pg::*physical-follow-generation-lock*)))
+                  (throw 'worker-lock-cancel :cancelled)))
+               (setf pending (eq :pending (sb-thread:join-thread thread :timeout 0.05 :default :pending))))
+             (setf joined (sb-thread:join-thread thread :timeout 2 :default :pending))
+             (ok waiting)
+             (ok pending)
+             (ok (eq :cancelled joined))
+             (ok body-ran)
+             (ok (equal '(nil nil) delivery-locks)))
+        (when thread
+          (sb-thread:join-thread thread :timeout 2 :default :cleanup-timeout)))))
+
+(defun exercise-follow-worker-start (kind fail-p)
+  "Pause a task-owned start and report publication, delivery and child completion."
+  (let* ((entered (sb-thread:make-semaphore))
+         (resume (sb-thread:make-semaphore))
+         (event-lock (sb-thread:make-mutex))
+         (baseline (sb-thread:list-all-threads))
+         (names '(pg::physical-follow-operation-run pg::physical-follow-receiver-loop
+                  pg::physical-follow-replay-loop))
+         (saved (mapcar (lambda (name) (cons name (symbol-function name))) names))
+         (point (if (eq kind :operation)
+                    (if (eq fail-p :published) :after-controller-worker-publication
+                        :after-controller-worker-create)
+                    (case fail-p
+                      (:created :after-follow-worker-create)
+                      ((t) :after-follow-receiver-create)
+                      (otherwise :after-follow-runtime-publication))))
+         (children nil) (events nil) (caller nil) (result nil)
+         (masked nil) (deferred nil) (interrupt-published nil) (final-owner nil)
+         (delivery-locks nil)
+         (joined nil))
+    (labels ((record-child (object)
+               (sb-thread:with-mutex (event-lock)
+                 (push (list sb-thread:*current-thread* object) events))
+               :ran)
+             (stop-owned-thread (thread)
+               (when (and thread (sb-thread:thread-alive-p thread))
+                 (sb-thread:interrupt-thread thread
+                                             (lambda () (sb-thread:return-from-thread :test-cleanup))))
+               (when thread
+                 (ignore-errors (sb-thread:join-thread thread :timeout 2 :default :cleanup-timeout)))))
+      (unwind-protect
+           (progn
+             (dolist (name names) (setf (symbol-function name) #'record-child))
+             (setf caller
+                   (sb-thread:make-thread
+                    (lambda ()
+                      (setf result
+                            (catch 'worker-start-interrupt
+                              (handler-case
+                                  (let ((pg::*physical-follow-operation* nil)
+                                        (pg::*physical-follow-runtime* nil)
+                                        (pg::*physical-follow-desired* nil)
+                                        (pg::*physical-follow-manual-reservation* nil)
+                                        (pg::*physical-follow-controller-blocked-p* nil)
+                                        (pg::*physical-follow-controller-stopping-p* nil)
+                                        (pg::*live-operation-depth* 0)
+                                        (pg::*physical-follow-test-hook*
+                                          (lambda (at)
+                                            (when (eq at point)
+                                              (setf masked (not sb-sys:*interrupts-enabled*)
+                                                    children
+                                                    (remove-if-not
+                                                     (lambda (thread)
+                                                       (and (not (member thread baseline))
+                                                            (member (sb-thread:thread-name thread)
+                                                                    '("native follow transition"
+                                                                      "native physical WAL receiver"
+                                                                      "native physical WAL replay")
+                                                                    :test #'string=)))
+                                                     (sb-thread:list-all-threads)))
+                                              (sb-thread:signal-semaphore entered)
+                                              (sb-thread:wait-on-semaphore resume)
+                                              (when fail-p (error "worker start cut"))))))
+                                    (unwind-protect
+                                         (if (eq kind :operation)
+                                             (pg::physical-follow-start-operation "127.0.0.1" 5432 "start")
+                                             (sb-thread:with-mutex (pg::*physical-follow-command-lock*)
+                                               (pg::physical-follow-launch-workers
+                                                '(1 "127.0.0.1" 5432 "start") t)))
+                                      (setf final-owner
+                                            (if (eq kind :operation) pg::*physical-follow-operation*
+                                                pg::*physical-follow-runtime*)))
+                                    :completed)
+                                (error (condition) (list :error (princ-to-string condition)))))))
+                    :name "follow start test caller"))
+             (unless (sb-thread:wait-on-semaphore entered :timeout 5)
+               (error "worker start did not reach the test point"))
+             (unless fail-p
+               (sb-thread:interrupt-thread
+                caller
+                (lambda ()
+                  (setf delivery-locks (list (sb-thread:holding-mutex-p pg::*physical-follow-lock*)
+                                             (sb-thread:holding-mutex-p pg::*physical-follow-generation-lock*))
+                        interrupt-published
+                        (not (null (if (eq kind :operation) pg::*physical-follow-operation*
+                                       pg::*physical-follow-runtime*))))
+                  (throw 'worker-start-interrupt :interrupted)))
+               (setf deferred (eq :pending (sb-thread:join-thread caller :timeout 0.05 :default :pending))))
+             (sb-thread:signal-semaphore resume)
+             (sb-thread:join-thread caller :timeout 3 :default :caller-timeout)
+             (setf joined
+                   (loop for child in children
+                         collect (not (eq :child-timeout (sb-thread:join-thread child :timeout 1 :default :child-timeout)))))
+             (list :result result :masked masked :deferred deferred :published interrupt-published
+                   :owner final-owner :children (length children) :runs (length events)
+                   :joined joined :delivery-locks delivery-locks))
+        (sb-thread:signal-semaphore resume)
+        (stop-owned-thread caller)
+        (dolist (child children) (stop-owned-thread child))
+        (dolist (entry saved) (setf (symbol-function (car entry)) (cdr entry)))))))
+
+(deftest follow-worker-start-defers-interruption-until-owners-and-gates-are-published
+    (dolist (kind '(:operation :runtime))
+      (let ((report (exercise-follow-worker-start kind nil)))
+        (ok (getf report :masked))
+        (ok (getf report :deferred))
+        (ok (getf report :published))
+        (ok (equal '(nil nil) (getf report :delivery-locks)))
+        (ok (eq :interrupted (getf report :result)))
+        (ok (getf report :owner))
+        (ok (= (if (eq kind :operation) 1 2) (getf report :children)))
+        (ok (= (getf report :children) (getf report :runs)))
+        (ok (every #'identity (getf report :joined))))))
+
+(deftest failed-follow-worker-start-releases-created-children-without-running-them
+    (dolist (kind '(:operation :runtime))
+      (dolist (cut (if (eq kind :runtime) '(t :created :published) '(t :published)))
+        (let ((report (exercise-follow-worker-start kind cut)))
+          (ok (eq :error (first (getf report :result))))
+          (ok (null (getf report :owner)))
+          (ok (= (if (and (eq kind :runtime) (member cut '(:created :published))) 2 1)
+                 (getf report :children)))
+          (ok (zerop (getf report :runs)))
+          (ok (every #'identity (getf report :joined)))))))
+
 (defun call-with-controller-publication-test-locks (function)
   "Supply component-test ownership and hold the command and reload mutexes."
   (let ((pg::*live-operation-quiescence-owner-thread* sb-thread:*current-thread*)
