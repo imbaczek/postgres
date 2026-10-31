@@ -38,6 +38,9 @@
   ;; backend's own thread, used by pg_cancel_backend()/pg_terminate_backend().
   (executing nil)
   (cancel-pending nil)
+  ;; Published under the admission mutex and retained across query boundaries
+  ;; until the target delivers termination.  Future masked sync waits may inspect
+  ;; this flag without consuming it before commit cleanup.
   (termination-pending nil)
   ;; Visible to the local control REPL so concurrency tests can synchronize on
   ;; a real lock wait instead of relying on scheduler timing.
@@ -102,6 +105,8 @@
         0.1)))
 
 (defun deliver-backend-termination (backend)
+  ;; Consume only at delivery, and let termination supersede query cancel.
+  ;; A queued helper becomes a no-op if a cooperative check delivered it first.
   (when (and backend (backend-termination-pending backend))
     (setf (backend-termination-pending backend) nil
           (backend-cancel-pending backend) nil)
@@ -109,7 +114,7 @@
   (values))
 
 (defun check-for-interrupts ()
-  "Port of PostgreSQL's CHECK_FOR_INTERRUPTS()."
+  "Deliver pending termination before checking statement timeout or cancel."
   (deliver-backend-termination *backend*)
   (when (and *backend* (backend-statement-deadline *backend*)
              (>= (get-internal-real-time) (backend-statement-deadline *backend*)))

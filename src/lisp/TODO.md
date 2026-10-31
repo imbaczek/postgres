@@ -30,6 +30,12 @@
   cold compilation passed (`/tmp/pg-commit-lifecycle-final-cold.log`), as did
   actual psql smoke (`/tmp/pg-commit-lifecycle-smoke.log`).
 
+- [x] Establish a termination handoff for later synchronous waiting: publish
+  pending termination before queuing the target interrupt, and consume it at
+  delivery. No remote wait was added. The checkpoint passed 711 unit and 201
+  wire tests, strict cold compilation, and the real shutdown test
+  (`/tmp/pg-sync-termination-shutdown.log`).
+
 - [ ] Complete the unchanged Patroni monitoring query and synchronous-replication
   backend contract. Synchronous setting lookup fails with 42704. Preserve the
   complete real query as the acceptance oracle.

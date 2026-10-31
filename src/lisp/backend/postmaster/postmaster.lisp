@@ -226,11 +226,11 @@ was the last one and a smart/fast shutdown is in progress."
 ;;; ---- pg_cancel_backend / pg_terminate_backend ----
 
 (defun terminate-backend (backend)
-  "Deliver the equivalent of SIGTERM: abort and terminate BACKEND.
-
-Signalling ourselves raises the FATAL in this call stack; another backend is
-interrupted, which unwinds it to the connection loop no matter what it was
-doing (including a blocking read while idle)."
+  "Request termination of BACKEND, including while it is idle.
+Publish the pending flag under the admission mutex and wake admission waiters.
+The requester remains interrupt-masked through unlock and queuing the target
+interrupt. The target consumes the flag at FATAL delivery; a queued helper does
+nothing if a cooperative check has already delivered it."
   (when backend
     (let ((self-p (eq backend *backend*))
           (thread (backend-thread backend)))

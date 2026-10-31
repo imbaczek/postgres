@@ -161,6 +161,7 @@ must not run inside a handler either; the reloader thread polls the flag."
     (error "parked callbacks cannot enter live operations"))
   (call-with-live-operation-lock
    (lambda ()
+     ;; Cleanup admission disables these checks so resource retirement can finish.
      (loop do (when (and *live-operation-check-cancel-p*
                          backend
                          (or (backend-termination-pending backend)
