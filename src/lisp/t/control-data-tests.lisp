@@ -214,6 +214,57 @@
       (ok (string= "unrecognized status code"
                    (cdr (assoc "Database cluster state" (pg::native-control-data-rows facts) :test #'string=))))))
 
+(deftest control-data-reports-only-persisted-resource-capacity
+    (let* ((names '("max_connections setting" "max_worker_processes setting"
+                    "max_wal_senders setting" "max_prepared_xacts setting"
+                    "max_locks_per_xact setting"))
+           (facts (list :system-id 1 :db-state 6 :checkpoint 32
+                        :checkpoint-timeline 1 :recovery-lsn 0 :recovery-timeline 0)))
+      (ok (notany (lambda (name)
+                    (assoc name (pg::native-control-data-rows facts) :test #'string=))
+                  names))
+      (setf (getf facts :resource-parameters) (pg::make-resource-parameters 123 9 11 0 173))
+      (let ((rows (pg::native-control-data-rows facts)))
+        (ok (equal (mapcar (lambda (name) (cdr (assoc name rows :test #'string=))) names)
+                   '("123" "9" "11" "0" "173"))))))
+
+(deftest control-data-resource-facts-follow-the-selected-durable-role
+    (let* ((snapshot (sample-checkpoint-snapshot
+                      :version 2 :end 200 :resource-parameters '(111 9 11 0 131)
+                      :resource-lsn 10 :resource-timeline 1))
+           (metadata (list :system-id 1 :db-state 6 :state-time 0
+                           :resource-parameters '(122 10 12 0 142)
+                           :resource-lsn 220 :resource-timeline 1))
+           (wal (pg::wal-encode-control-image 200 400 snapshot :metadata metadata))
+           (capture (list wal nil nil nil nil nil nil))
+           (reader (symbol-function 'pg::native-control-recovery-checkpoint))
+           (calls 0))
+      (ok (equal '(122 10 12 0 142)
+                 (pg::resource-parameters-values
+                  (getf (pg::native-control-facts capture) :resource-parameters))))
+      (unwind-protect
+           (progn
+             ;; Isolate selection from the separately tested base/restartpoint verifier.
+             (setf (symbol-function 'pg::native-control-recovery-checkpoint)
+                   (lambda (control old)
+                     (declare (ignore old))
+                     (incf calls)
+                     (assert (= 300 (getf control :applied)))
+                     snapshot))
+             (dolist (fact (list '(:resource-parameters (133 11 13 0 153)
+                                   :resource-lsn 250 :resource-timeline 1) nil))
+               (setf (second capture)
+                     (pg::physical-recovery-control-image
+                      2 1 1 1 200 300 42 :resource-fact fact)
+                     (third capture) (pg::physical-recovery-marker-bytes))
+               (ok (equal (if fact '(133 11 13 0 153) '(111 9 11 0 131))
+                          (pg::resource-parameters-values
+                           (getf (pg::native-control-facts capture) :resource-parameters)))))
+             (setf snapshot (sample-checkpoint-snapshot))
+             (ok (null (getf (pg::native-control-facts capture) :resource-parameters))))
+        (setf (symbol-function 'pg::native-control-recovery-checkpoint) reader))
+      (ok (= 3 calls))))
+
 (deftest control-data-directory-options-match-the-supported-c-cli
     (dolist (arguments '(("/tmp/data") ("-D" "/tmp/data") ("--pgdata=/tmp/data") ("-D/tmp/data")))
       (ok (string= "/tmp/data" (pg::native-controldata-directory arguments))))

@@ -216,6 +216,7 @@ Report checkpoint starts, though WAL control stores ends."
                           (native-control-catalog-system-id)))
            (state (getf metadata :db-state))
            (time (getf metadata :state-time))
+           (resources (wal-control-resource-parameters metadata))
            (recovery-lsn 0) (recovery-timeline 0))
       (when (and (null control)
                  (or (third capture) (fourth capture) (fifth capture)
@@ -237,6 +238,8 @@ Report checkpoint starts, though WAL control stores ends."
          (when (and metadata (/= system-id (getf control :system-id)))
            (error "recovery and base control system identifiers differ"))
          (setf snapshot (native-control-recovery-checkpoint control snapshot)
+               resources (or (wal-control-resource-parameters (getf control :resource-fact))
+                             (wal-control-resource-parameters snapshot))
                state (getf control :db-state) time (getf control :state-time)
                system-id (getf control :system-id)
                recovery-lsn (getf control :applied)
@@ -245,6 +248,7 @@ Report checkpoint starts, though WAL control stores ends."
             :checkpoint (if snapshot (getf snapshot :start)
                             (max 0 (- checkpoint +wal-header-size+)))
             :checkpoint-timeline (if snapshot (getf snapshot :timeline) checkpoint-id) :snapshot snapshot
+            :resource-parameters resources
             :recovery-lsn recovery-lsn :recovery-timeline recovery-timeline))))
 
 (defun native-control-read (directory)
@@ -312,6 +316,12 @@ and checksum versions. A legacy primary's unknown lifecycle stays unknown."
         (add "Time of latest checkpoint" (native-control-time-text (getf snapshot :time))))
       (add "Minimum recovery ending location" (wal-format-lsn (getf facts :recovery-lsn)))
       (add "Min recovery ending loc's timeline" (getf facts :recovery-timeline))
+      (when (getf facts :resource-parameters)
+        (loop for name in '("max_connections setting" "max_worker_processes setting"
+                            "max_wal_senders setting" "max_prepared_xacts setting"
+                            "max_locks_per_xact setting")
+              for value in (resource-parameters-values (getf facts :resource-parameters))
+              do (add name value)))
       (add "Database block size" +blcksz+)
       (add "Bytes per WAL segment" +wal-segment-size+))
     (nreverse rows)))
