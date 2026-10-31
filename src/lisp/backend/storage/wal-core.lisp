@@ -1382,7 +1382,9 @@ the transaction (see SnapBuildCommitTxn and CreateInitDecodingContext)."
   "Flush storage resets, page images and XID's commit as one WAL boundary.
 The reset descriptors are owned here across AFTER-DURABLE-FUNCTION, which may
 release the transaction's private replacements. Preflight the page spool before
-the terminal, then flush WAL before truncating any relation fork."
+the terminal, then flush WAL before truncating any relation fork. Return this
+transaction's commit record end LSN after local storage apply completes. When
+WAL is unavailable, return no values."
   (unless *wal-ready*
     (when (fboundp 'publish-transaction-replacements-under-wal-lock)
       (with-wal-critical
