@@ -178,17 +178,16 @@ Join outside the follow lock; failure to stop marks recovery failed."
   (nth-value 0 (sync-replication-configuration-state)))
 
 (defun startup-capture-installation-basis ()
-  "Capture the actual root, desired generation, source, timeline policy and
-managed claim together under the publication fence. Reload captures this before
-reading configuration files; preparation copies inputs and may read
-authentication afterward."
+  "Capture the root and replication predecessors under publication exclusion."
   (call-with-physical-follow-generation-fence
    (lambda ()
      (sb-thread:with-mutex (*physical-follow-lock*)
-       (let ((source (startup-current-source-incarnation)))
+       (sb-thread:with-mutex (*wal-sender-lock*)
          (make-startup-installation-basis
           :root (startup-capture-configuration)
-          :desired *physical-follow-desired* :source source
+          :desired *physical-follow-desired*
+          :source (sync-replication-state-source-id *sync-replication-state*)
+          :sync-generation (sync-replication-state-generation *sync-replication-state*)
           :timeline-policy (getf *physical-recovery-state* :timeline-policy)
           :managed-p (getf *physical-recovery-state* :standard-follow-managed-p)))))))
 

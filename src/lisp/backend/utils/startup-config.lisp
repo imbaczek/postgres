@@ -20,7 +20,8 @@
   "Transient snapshot of the actual root, desired generation, source, timeline
 policy and managed claim used to prepare one candidate."
   (root nil :read-only t) (desired nil :read-only t) (source nil :read-only t)
-  (timeline-policy nil :read-only t) (managed-p nil :read-only t))
+  (timeline-policy nil :read-only t) (managed-p nil :read-only t)
+  (sync-generation nil :read-only t))
 
 (defstruct startup-configuration
   ;; Each root has a fresh identity and stores predecessor identities, not an
@@ -33,6 +34,7 @@ policy and managed claim used to prepare one candidate."
   (source-predecessor nil :read-only t)
   (settings nil :read-only t) (native nil :read-only t) (overrides nil :read-only t)
   (authentication nil :read-only t) (desired nil :read-only t)
+  (sync-plan nil :read-only t)
   (slot-policy nil :read-only t) (resources nil :read-only t)
   (timeout 0 :read-only t) (wal-bytes 0 :read-only t) (keep-mb 0 :read-only t)
   (hot-standby nil :read-only t) (wal-level nil :read-only t)
@@ -102,6 +104,11 @@ candidate's predecessor, not a claim on the current source."
                    (startup-installation-basis-managed-p basis))))
     (make-startup-configuration
      :predecessor predecessor :source-predecessor (startup-installation-basis-source basis)
+     :sync-plan (prepare-sync-replication-configuration
+                 (startup-setting-value owned-settings "synchronous_standby_names")
+                 (startup-installation-basis-source basis)
+                 (startup-installation-basis-source basis)
+                 (startup-installation-basis-sync-generation basis))
      :settings owned-settings :native owned-native
      :overrides owned-overrides :authentication authentication :desired desired
      :resources resources :slot-policy slot-policy
@@ -144,6 +151,7 @@ candidate's predecessor, not a claim on the current source."
     ("restore_command" :sighup :string "")
     ("primary_conninfo" :sighup :conninfo "")
     ("primary_slot_name" :sighup :slot "")
+    ("synchronous_standby_names" :sighup :standby-names "")
     ("recovery_target_timeline" :postmaster :timeline "latest")
     ("hot_standby" :postmaster :boolean "on")
     ("wal_level" :postmaster :wal-level "replica")
@@ -355,6 +363,7 @@ Timeline input is validated but its original spelling is retained."
         (:wal-level (startup-parse-wal-level text))
         (:boolean (startup-parse-boolean-setting text))
         (:timeline (startup-parse-recovery-timeline text) text)
+        (:standby-names (parse-sync-standby-names text) text)
         (:string
          (when (and (string= name "restore_command") (not (equal text "")))
            (error "nonempty restore_command requires unimplemented archive recovery"))
@@ -798,6 +807,14 @@ these slots."
   (startup-check-predecessors (startup-configuration-predecessor candidate)
                               (startup-configuration-source-predecessor candidate)))
 
+(defun startup-check-synchronous-predecessor (candidate)
+  (handler-case
+      (sync-replication-check-prepared-configuration (startup-configuration-sync-plan candidate))
+    (sync-replication-configuration-changed ()
+      (error 'startup-configuration-changed
+             :format-control "synchronous replication changed before configuration installation")))
+  (values))
+
 (defun startup-publish-configuration (candidate)
   "Publish prepared values and the root under the root mutex.
 The caller supplies publication exclusion; readers capture the installed root
@@ -888,17 +905,22 @@ authentication and an initialized source."
   (values))
 
 (defun startup-call-with-prepared-installation (candidate preflight claim-preflight publication-preflight)
-  "Run the prepared installation with boundary checks supplied by callers.
-The generation fence protects publication; this kernel does not take admission
-or quiescence."
   (check-type candidate startup-configuration)
-  (physical-follow-call-with-prepared-install
-   (startup-configuration-desired candidate)
-   (lambda () (startup-publish-configuration candidate))
-   (lambda ()
-     (startup-check-installation-predecessor candidate)
-     (when preflight (funcall preflight)))
-   claim-preflight publication-preflight)
+  (handler-case
+      (physical-follow-call-with-prepared-install
+       (startup-configuration-desired candidate)
+       (lambda () (startup-publish-configuration candidate))
+       (lambda ()
+         (startup-check-installation-predecessor candidate)
+         (startup-check-synchronous-predecessor candidate)
+         (when preflight (funcall preflight)))
+       claim-preflight publication-preflight
+       (lambda (publish)
+         (sync-replication-publish-prepared-configuration
+          (startup-configuration-sync-plan candidate) :publication publish)))
+    (sync-replication-configuration-changed ()
+      (error 'startup-configuration-changed
+             :format-control "synchronous replication changed during configuration publication")))
   candidate)
 
 (defun startup-commit-installation-at-boundary (candidate boundary)

@@ -102,6 +102,102 @@
    settings native overrides
    (pg::startup-configuration-authentication (pg::startup-capture-configuration))))
 
+(deftest malformed-synchronous-reload-preserves-installed-state
+    (call-with-runtime-installation-test
+     (lambda (settings native overrides)
+       (declare (ignore settings native overrides))
+       (let ((root (pg::startup-capture-configuration))
+             (desired pg::*physical-follow-desired*)
+             (authentication pg::*authentication-policy*)
+             (sync (multiple-value-list (pg::sync-replication-configuration-state))))
+         (with-open-file (out (merge-pathnames "postgresql.auto.conf" pg::*pgdata*)
+                              :direction :output :if-exists :supersede)
+           (write-line "synchronous_standby_names='ANY 0 (peer)'" out))
+         (ok (signals (pg::startup-reload-settings) 'error))
+         (ok (eq root (pg::startup-capture-configuration)))
+         (ok (eq desired pg::*physical-follow-desired*))
+         (ok (eq authentication pg::*authentication-policy*))
+         (ok (equal sync (multiple-value-list (pg::sync-replication-configuration-state))))))))
+
+(deftest synchronous-root-staleness-is-rejected-before-management-claim
+    (call-with-runtime-installation-test
+     (lambda (settings native overrides)
+       (let* ((old (pg::startup-capture-configuration))
+              (candidate (prepare-runtime-test-installation settings native overrides))
+              (claim (symbol-function 'pg::physical-follow-prepare-managed-claim))
+              (claims 0))
+         (multiple-value-bind (source generation) (pg::sync-replication-configuration-state)
+           (pg::sync-replication-install-configuration "FIRST 1 (peer)" source source generation))
+         (unwind-protect
+              (progn
+                (setf (symbol-function 'pg::physical-follow-prepare-managed-claim)
+                      (lambda (desired) (declare (ignore desired)) (incf claims)))
+                (ok (signals (pg::startup-commit-installation candidate) 'pg::startup-configuration-changed))
+                (ok (zerop claims))
+                (ok (eq old (pg::startup-capture-configuration))))
+           (setf (symbol-function 'pg::physical-follow-prepare-managed-claim) claim))))))
+
+(deftest synchronous-root-final-cas-rejects-a-late-generation-change
+    (call-with-runtime-installation-test
+     (lambda (settings native overrides)
+       (let* ((old (pg::startup-capture-configuration))
+              (desired pg::*physical-follow-desired*)
+              (candidate (prepare-runtime-test-installation settings native overrides))
+              (target (pg::startup-configuration-sync-plan candidate))
+              (publisher (symbol-function 'pg::sync-replication-publish-prepared-configuration))
+              (injected nil))
+         (unwind-protect
+              (progn
+                (setf (symbol-function 'pg::sync-replication-publish-prepared-configuration)
+                      (lambda (plan &rest arguments)
+                        (when (and (eq plan target) (not injected))
+                          (setf injected t)
+                          (multiple-value-bind (source generation) (pg::sync-replication-configuration-state)
+                            (pg::sync-replication-install-configuration
+                             "FIRST 1 (peer)" source source generation)))
+                        (apply publisher plan arguments)))
+                (ok (signals (pg::startup-commit-installation candidate) 'pg::startup-configuration-changed))
+                (ok injected)
+                (ok (eq old (pg::startup-capture-configuration)))
+                (ok (eq desired pg::*physical-follow-desired*))
+                (ok (equal "FIRST 1 (peer)"
+                           (nth-value 2 (pg::sync-replication-configuration-state)))))
+           (setf (symbol-function 'pg::sync-replication-publish-prepared-configuration) publisher))))))
+
+(deftest synchronous-root-and-desired-publish-before-waiter-release
+    (call-with-runtime-installation-test
+     (lambda (settings native overrides)
+       (setf (getf (gethash "synchronous_standby_names" settings) :value) "FIRST 1 (peer)")
+       (pg::startup-commit-installation (prepare-runtime-test-installation settings native overrides))
+       (let ((waiter
+               (sb-sys:without-interrupts
+                 (sb-thread:with-mutex (pg::*wal-sender-lock*)
+                   (pg::sync-replication-enqueue-under-lock
+                    (pg::make-backend) 100 :flush :runtime-source))))
+             (complete (symbol-function 'pg::sync-replication-complete-all-under-lock))
+             (observed nil))
+         (setf (getf (gethash "synchronous_standby_names" settings) :value) ""
+               (gethash "primary_conninfo" settings)
+               (list :value (pg::string->bytes "host=next") :source :file))
+         (let ((candidate (prepare-runtime-test-installation settings native overrides)))
+           (unwind-protect
+                (progn
+                  (setf (symbol-function 'pg::sync-replication-complete-all-under-lock)
+                        (lambda (state)
+                          (when (eq state :disabled)
+                            (setf observed t)
+                            (ok (not sb-sys:*interrupts-enabled*))
+                            (ok (sb-thread:holding-mutex-p pg::*physical-follow-lock*))
+                            (ok (sb-thread:holding-mutex-p pg::*wal-sender-lock*))
+                            (ok (eq candidate (pg::startup-capture-configuration)))
+                            (ok (eq (pg::startup-configuration-desired candidate) pg::*physical-follow-desired*))
+                            (ok (string= "" (pg::sync-replication-state-names pg::*sync-replication-state*))))
+                          (funcall complete state)))
+                  (pg::startup-commit-installation candidate)
+                  (ok observed)
+                  (ok (eq :disabled (pg::sync-replication-waiter-state waiter))))
+             (setf (symbol-function 'pg::sync-replication-complete-all-under-lock) complete)))))))
+
 (deftest runtime-configuration-publication-keeps-an-admitted-operation-active
     (call-with-parking-test-state
      (lambda ()

@@ -238,6 +238,21 @@
 (rove:deftest prepared-synchronous-configuration-input-contract
     (unit-check-property 'prepared-synchronous-configuration-owns-input))
 
+(cl-spec:defproperty synchronous-standby-setting-preserves-validated-text
+    ((count (range integer 1 100))
+     (suffix (range integer 0 1000000)))
+  (:about startup-normalize-setting)
+  (:trials (:normal 100))
+  (let ((text (format nil "ANY ~d (peer~d)" count suffix)))
+    (string= text (startup-normalize-setting "synchronous_standby_names" text))))
+
+(rove:deftest synchronous-standby-setting-normalization
+    (unit-check-property 'synchronous-standby-setting-preserves-validated-text)
+  (rove:ok (string= "" (startup-normalize-setting "synchronous_standby_names" "")))
+  (rove:ok (handler-case
+               (progn (startup-normalize-setting "synchronous_standby_names" "ANY 0 (peer)") nil)
+             (error () t))))
+
 (rove:deftest synchronous-configuration-disable-is-atomic-with-enqueue
     (call-with-sync-wait-state
      (lambda ()

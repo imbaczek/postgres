@@ -171,34 +171,33 @@ Unclaimed and non-standby cases need no check; live replay files are not read."
     (error 'physical-follow-generation-changed)))
 
 (defun physical-follow-call-with-prepared-install
-    (desired function preflight claim-preflight publication-preflight)
-  "Install a prepared desired generation without taking admission or quiescence.
-Under the generation fence, check predecessor and PREFLIGHT under the follow
-lock before and after the claim. Run claim and publication preflights outside
-the follow lock. Wake the desired worker after fence release, including on
-unwind after publication; a wake failure does not undo publication."
+    (desired function preflight claim-preflight publication-preflight &optional publication-wrapper)
   (check-type desired physical-follow-desired)
   (let ((changed nil))
-    (call-with-physical-follow-generation-publication
-     (lambda ()
-       (sb-thread:with-mutex (*physical-follow-lock*)
-         (when preflight (funcall preflight))
-         (physical-follow-check-desired-predecessor desired))
-       (when claim-preflight (funcall claim-preflight))
-       (physical-follow-prepare-managed-claim desired)
-       (when publication-preflight (funcall publication-preflight))
-       (sb-thread:with-mutex (*physical-follow-lock*)
-         (when preflight (funcall preflight))
-         (physical-follow-check-desired-predecessor desired)
-         (funcall function)
-         (unless (eq desired *physical-follow-desired*)
-           (setf *physical-follow-desired* desired changed t))))
-     (lambda ()
-       (when changed
-         (handler-case (sb-thread:signal-semaphore *physical-follow-desired-wake*)
-           (error (condition)
-             (ignore-errors
-              (admin-log "configuration installed; follow wake failed: ~a" condition))))))))
+    (flet ((publish ()
+             (funcall function)
+             (unless (eq desired *physical-follow-desired*)
+               (setf *physical-follow-desired* desired changed t))))
+      (call-with-physical-follow-generation-publication
+       (lambda ()
+         (sb-thread:with-mutex (*physical-follow-lock*)
+           (when preflight (funcall preflight))
+           (physical-follow-check-desired-predecessor desired))
+         (when claim-preflight (funcall claim-preflight))
+         (physical-follow-prepare-managed-claim desired)
+         (when publication-preflight (funcall publication-preflight))
+         (sb-thread:with-mutex (*physical-follow-lock*)
+           (when preflight (funcall preflight))
+           (physical-follow-check-desired-predecessor desired)
+           (if publication-wrapper
+               (funcall publication-wrapper #'publish)
+               (publish))))
+       (lambda ()
+         (when changed
+           (handler-case (sb-thread:signal-semaphore *physical-follow-desired-wake*)
+             (error (condition)
+               (ignore-errors
+                (admin-log "configuration installed; follow wake failed: ~a" condition)))))))))
   desired)
 
 (defun physical-follow-call-with-desired-install

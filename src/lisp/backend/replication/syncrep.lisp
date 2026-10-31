@@ -327,6 +327,20 @@ publication shares these objects with runtime state."
      :names names :config config :source-id source-id
      :expected-source-id expected-source-id :expected-generation expected-generation)))
 
+(defun sync-replication-check-prepared-under-lock (plan)
+  (assert (sb-thread:holding-mutex-p *wal-sender-lock*))
+  (unless (and (eql (sync-replication-configuration-plan-expected-generation plan)
+                    (sync-replication-state-generation *sync-replication-state*))
+               (eql (sync-replication-configuration-plan-expected-source-id plan)
+                    (sync-replication-state-source-id *sync-replication-state*)))
+    (error 'sync-replication-configuration-changed))
+  (values))
+
+(defun sync-replication-check-prepared-configuration (plan)
+  (sb-thread:with-mutex (*wal-sender-lock*)
+    (sync-replication-check-prepared-under-lock plan))
+  (values))
+
 (defun sync-replication-publish-prepared-configuration
     (plan &key publication defer-notifications)
   "Publish PLAN under the sender lock and interrupt mask.
@@ -347,11 +361,7 @@ and retain the mask through notification, including on unwind."
         (installed-generation nil))
     (sb-sys:without-interrupts
       (sb-thread:with-mutex (*wal-sender-lock*)
-        (unless (and (eql (sync-replication-configuration-plan-expected-generation plan)
-                          (sync-replication-state-generation *sync-replication-state*))
-                     (eql (sync-replication-configuration-plan-expected-source-id plan)
-                          (sync-replication-state-source-id *sync-replication-state*)))
-          (error 'sync-replication-configuration-changed))
+        (sync-replication-check-prepared-under-lock plan)
         (let* ((source-changed
                  (not (eql source-id (sync-replication-state-source-id *sync-replication-state*))))
                (frontiers (if source-changed
