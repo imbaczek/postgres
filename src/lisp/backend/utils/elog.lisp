@@ -27,8 +27,10 @@
 
 (defun fatal-error-p (condition)
   "True if CONDITION is a PG-ERROR that must end the connection."
-  (and (typep condition 'pg-error)
-       (string= (pg-error-severity condition) "FATAL")))
+  (or (and (fboundp 'current-backend-wal-failed-p)
+           (funcall 'current-backend-wal-failed-p))
+      (and (typep condition 'pg-error)
+           (string= (pg-error-severity condition) "FATAL"))))
 
 (defmacro handler-case-nonfatal (form (condition &body handler-body))
   "Handle ERROR from FORM, re-signaling fatal PG errors before HANDLER-BODY."

@@ -1037,6 +1037,232 @@ Each entry in SEGMENTS contains a segment number followed by its byte vectors."
         (dolist (entry saved) (setf (symbol-function (car entry)) (cdr entry)))
         (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))
 
+(defun call-with-catalog-boundary-test (function &key chunked fault (wal-ready t))
+  (let* ((directory (merge-pathnames
+                     (format nil "pg-catalog-boundary-~d-~d/" (sb-posix:getpid) (random 1000000))
+                     (uiop:temporary-directory)))
+         (*query-temp-directory* directory)
+         (*backend* nil)
+         (*wal-ready* wal-ready)
+         (*wal-poisoned* nil)
+         (*wal-output-stream* nil)
+         (*wal-dirty-store* nil)
+         (*wal-page-cache* (make-hash-table :test #'equal))
+         (*wal-page-cache-xids* (make-hash-table :test #'equal))
+         (*wal-pending-deletes* nil)
+         (*wal-vacuum-full-publication* nil)
+         (*wal-catalog-flush-generation* 0)
+         (*wal-end-lsn* 100)
+         (names '(wal-append-batch-start wal-append-record wal-flush
+                  wal-primary-apply-page-spool wal-test-pause wal-fail-stop))
+         (saved (mapcar (lambda (name) (cons name (symbol-function name))) names))
+         (terminal nil) (durable nil) (flushed nil) (events nil)
+         (returned nil) (failure nil) (result nil))
+    (ensure-directories-exist directory)
+    (unwind-protect
+         (progn
+           (setf (symbol-function 'wal-append-batch-start) (lambda () 100)
+                 (symbol-function 'wal-append-record)
+                 (lambda (type xid payload)
+                   (declare (ignore xid))
+                   (incf *wal-end-lsn* (+ +wal-header-size+ (length payload)))
+                   (when (member type (list +wal-record-catalog+ +wal-record-catalog-commit+))
+                     (setf terminal *wal-end-lsn*))
+                   *wal-end-lsn*)
+                 (symbol-function 'wal-flush) (lambda () (setf flushed t))
+                 (symbol-function 'wal-primary-apply-page-spool)
+                 (lambda (&rest arguments)
+                   (declare (ignore arguments))
+                   (push :apply events)
+                   (when (eq fault :apply) (throw 'catalog-exit :escaped)))
+                 (symbol-function 'wal-test-pause)
+                 (lambda (point)
+                   (when (eq point :after-catalog-wal-flush)
+                     (push :after-flush events)
+                     (when (eq fault :hook) (throw 'catalog-exit :escaped))))
+                 (symbol-function 'wal-fail-stop)
+                 (lambda (condition)
+                   (rove:ok (not (sb-thread:holding-mutex-p *wal-lock*)))
+                   (setf *wal-poisoned* t)
+                   (error condition)))
+           (setf result
+                 (handler-case
+                     (catch 'catalog-exit
+                       (setf returned
+                             (wal-commit-catalog
+                              (make-array (if chunked (1+ +wal-segment-size+) 3)
+                                          :element-type '(unsigned-byte 8) :initial-element 0)
+                              (lambda (bytes)
+                                (declare (ignore bytes))
+                                (push :write events)
+                                (when (eq fault :write) (error "catalog write failed"))
+                                (incf *wal-end-lsn* 1000))
+                              :on-record-appended
+                              (lambda ()
+                                (rove:ok (not flushed))
+                                (push :appended events))
+                              :on-durable
+                              (lambda (end)
+                                (rove:ok (or (not wal-ready) flushed))
+                                (rove:ok (= 1 *wal-catalog-flush-generation*))
+                                (setf durable (list end))
+                                (push :durable events)
+                                (when (eq fault :durable) (throw 'catalog-exit :escaped)))))
+                       :returned)
+                   (error (condition) (setf failure condition) :failed)))
+           (funcall function
+                    (list :result result :failure failure :returned returned
+                          :terminal terminal :durable durable :events (nreverse events)
+                          :poisoned *wal-poisoned* :generation *wal-catalog-flush-generation*)))
+      (dolist (entry saved) (setf (symbol-function (car entry)) (cdr entry)))
+      (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))
+
+(rove:deftest catalog-commit-retains-exact-terminal-and-durable-callback-order
+    (dolist (chunked '(nil t))
+      (call-with-catalog-boundary-test
+       (lambda (facts)
+         (rove:ok (eq :returned (getf facts :result)))
+         (rove:ok (typep (getf facts :terminal) '(integer 1 18446744073709551615)))
+         (rove:ok (eql (getf facts :returned) (getf facts :terminal)))
+         (rove:ok (equal (list (getf facts :terminal)) (getf facts :durable)))
+         (rove:ok (equal '(:appended :durable :after-flush :apply :write) (getf facts :events)))
+         (rove:ok (not (getf facts :poisoned))))
+       :chunked chunked)))
+
+(rove:deftest catalog-publication-nonlocal-exits-fail-stop-after-durability
+    (dolist (fault '(:durable :hook :apply))
+      (call-with-catalog-boundary-test
+       (lambda (facts)
+         (rove:ok (eq :failed (getf facts :result)))
+         (rove:ok (getf facts :poisoned))
+         (rove:ok (= 1 (getf facts :generation)))
+         (rove:ok (equal (list (getf facts :terminal)) (getf facts :durable)))
+         (rove:ok (not (member :write (getf facts :events)))))
+       :fault fault)))
+
+(rove:deftest catalog-no-wal-durable-callback-follows-successful-direct-write
+    (call-with-catalog-boundary-test
+     (lambda (facts)
+       (rove:ok (eq :returned (getf facts :result)))
+       (rove:ok (null (getf facts :returned)))
+       (rove:ok (equal '(nil) (getf facts :durable)))
+       (rove:ok (equal '(:write :durable) (getf facts :events))))
+     :wal-ready nil)
+  (call-with-catalog-boundary-test
+   (lambda (facts)
+     (rove:ok (eq :failed (getf facts :result)))
+     (rove:ok (null (getf facts :durable)))
+     (rove:ok (zerop (getf facts :generation)))
+     (rove:ok (not (getf facts :poisoned))))
+   :wal-ready nil :fault :write))
+
+(rove:deftest wal-publication-fence-retains-body-error-through-cleanup-failure
+    (let* ((*wal-poisoned* nil)
+           (original (make-condition 'simple-error :format-control "publication failed"))
+           (secondary (make-condition 'simple-error :format-control "spool cleanup failed"))
+           (fail-stop (symbol-function 'wal-fail-stop))
+           (seen nil))
+      (unwind-protect
+           (progn
+             (setf (symbol-function 'wal-fail-stop)
+                   (lambda (condition)
+                     (rove:ok (not (sb-thread:holding-mutex-p *wal-lock*)))
+                     (push condition seen)
+                     (setf *wal-poisoned* t)
+                     (error condition)))
+             (let ((result
+                     (handler-case
+                         (with-wal-publication-fence (begin-publication)
+                           (begin-publication)
+                           (unwind-protect (error original) (error secondary)))
+                       (error (condition) condition))))
+               (rove:ok (eq original result))
+               (rove:ok (eq original (first seen))))
+             (rove:ok *wal-poisoned*)
+             (let ((*wal-poisoned* nil))
+               (setf seen nil)
+               (rove:ok
+                (handler-case
+                    (with-wal-publication-fence (begin-publication)
+                      (wal-invalid-input "invalid before publication")
+                      (begin-publication)
+                      nil)
+                  (wal-input-validation-error () t)))
+               (rove:ok (not *wal-poisoned*))
+               (rove:ok (null seen))))
+        (setf (symbol-function 'wal-fail-stop) fail-stop))))
+
+(defun wal-lock-cancellation-probe (masked-p)
+  (let ((lock (sb-thread:make-mutex :name "owned WAL lock wait"))
+        (finished (sb-thread:make-semaphore))
+        (thread nil) (entered nil) (result nil) (early nil)
+        (failure nil) (poisoned nil))
+    (sb-thread:grab-mutex lock)
+    (unwind-protect
+         (progn
+           (setf thread
+                 (sb-thread:make-thread
+                  (lambda ()
+                    (let ((*wal-lock* lock) (*wal-poisoned* nil))
+                      (flet ((publish ()
+                               (with-wal-publication-fence (begin-publication)
+                                 (begin-publication)
+                                 (setf entered t))))
+                        (handler-case
+                            (setf result
+                                  (catch 'wal-lock-cancel
+                                    (if masked-p
+                                        (sb-sys:without-interrupts (publish))
+                                        (publish))
+                                    :published))
+                          (error (condition) (setf failure condition)))
+                        (setf poisoned *wal-poisoned*)
+                        (sb-thread:signal-semaphore finished))))
+                  :name "WAL lock cancellation probe"))
+           (loop repeat 200
+                 when (eq lock (sb-thread::thread-waiting-for thread)) do (return)
+                   do (sleep 0.005)
+                 finally (error "owned WAL actor did not wait for its mutex"))
+           (sb-thread:interrupt-thread thread (lambda () (throw 'wal-lock-cancel :cancelled)))
+           (setf early (not (null (sb-thread:wait-on-semaphore finished :timeout 0.2))))
+           (rove:ok (eq sb-thread:*current-thread* (sb-thread:mutex-owner lock))))
+      (when (eq sb-thread:*current-thread* (sb-thread:mutex-owner lock))
+        (sb-thread:release-mutex lock))
+      (when thread (sb-thread:join-thread thread :timeout 3 :default :timeout)))
+    (rove:ok (not (sb-thread:thread-alive-p thread)))
+    (rove:ok (null failure) (format nil "~a" failure))
+    (rove:ok (not poisoned))
+    (rove:ok (eq :cancelled result))
+    (rove:ok (eq early (not masked-p)) "inherit caller permission while waiting for WAL")
+    (rove:ok (eq entered masked-p) "an interruptible wait exits before publication")))
+
+(rove:deftest wal-publication-fence-preserves-lock-wait-interruptibility
+    (wal-lock-cancellation-probe nil)
+  (wal-lock-cancellation-probe t))
+
+(rove:deftest wal-critical-defers-interrupts-through-unlock-and-preserves-values
+    (let* ((*wal-lock* (sb-thread:make-mutex :name "owned WAL mask handoff"))
+           (*wal-poisoned* nil)
+           (lock *wal-lock*)
+           (delivered nil)
+           (outside nil)
+           (masks nil))
+      (rove:ok
+       (equal '(:first :second)
+              (multiple-value-list
+               (with-wal-critical
+                 (setf masks (list sb-sys:*interrupts-enabled* sb-sys:*allow-with-interrupts*))
+                 (sb-thread:interrupt-thread
+                  sb-thread:*current-thread*
+                  (lambda ()
+                    (setf delivered t
+                          outside (not (sb-thread:holding-mutex-p lock)))))
+                 (values :first :second)))))
+      (rove:ok (equal '(nil nil) masks))
+      (rove:ok delivered)
+      (rove:ok outside)
+      (rove:ok (not *wal-poisoned*))))
+
 (rove:deftest test-wal-primary-spool-corruption-fails-stop-before-and-after-commit
     (let* ((directory (merge-pathnames
                        (format nil "pg-primary-corrupt-~d-~d/" (sb-posix:getpid) (random 1000000))

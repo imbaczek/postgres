@@ -506,6 +506,7 @@ HANDLE-SIMPLE-QUERY-FRAME so decoding occurs after admission."
                       (extended-query-state-in-cycle-p state) nil)
                 (send-ready-for-query stream (transaction-status-char)))))
           (error (condition)
+            (when (fatal-error-p condition) (error condition))
             (let ((implicit (extended-query-state-implicit-p state)))
               (note-query-error)
               (setf (extended-query-state-statement-deadline state) nil

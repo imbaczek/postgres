@@ -69,6 +69,63 @@
     (let ((fault (make-condition 'simple-error :format-control "injected storage error")))
       (ok (equal '((:storage-error t :started t) 1 nil) (wal-termination-test t fault)))))
 
+(deftest wal-failure-defers-termination-only-for-the-failing-backend
+    (let* ((pg::*wal-poisoned* t)
+           (failed (pg::make-backend :termination-pending t :cancel-pending t))
+           (sibling (pg::make-backend :termination-pending t))
+           (pg::*backend* failed)
+           (fault (make-condition 'pg::pg-error :sqlstate "58030" :message "storage fault")))
+      (pg::note-backend-wal-failure fault)
+      (ok (pg::fatal-error-p fault))
+      (ok (pg::fatal-error-p (make-condition 'simple-error)))
+      (let ((pg::*backend* sibling))
+        (ok (not (pg::fatal-error-p fault))))
+      (ok (eq fault (handler-case
+                        (pg::handler-case-nonfatal (error fault)
+                                                   (condition (list :recovered condition)))
+                      (error (condition) condition))))
+      (ok (null (pg::deliver-backend-termination failed)))
+      (ok (pg::backend-termination-pending failed))
+      (ok (pg::backend-cancel-pending failed))
+      (setf (pg::backend-statement-deadline failed) 0)
+      (ok (null (pg::check-for-interrupts)))
+      (ok (pg::backend-cancel-pending failed))
+      (ok (eql 0 (pg::backend-statement-deadline failed)))
+      (ok (equal "57P01"
+                 (handler-case (pg::deliver-backend-termination sibling)
+                   (pg::pg-error (condition) (pg::pg-error-sqlstate condition)))))
+      (ok (not (pg::backend-termination-pending sibling)))
+      (ok (not (pg::backend-wal-failure sibling)))))
+
+(deftest wal-fail-stop-escapes-simple-and-extended-generic-error-handlers
+    (let ((original-arm (symbol-function 'pg::arm-statement-timeout))
+          (original-shutdown (symbol-function 'pg::request-fast-shutdown))
+          (fault (make-condition 'simple-error :format-control "storage failure")))
+      (unwind-protect
+           (progn
+             (setf (symbol-function 'pg::request-fast-shutdown)
+                   (lambda () (values))
+                   (symbol-function 'pg::arm-statement-timeout)
+                   (lambda (&rest arguments)
+                     (declare (ignore arguments))
+                     (pg::wal-fail-stop fault)))
+             (dolist (extended '(nil t))
+               (let ((pg::*backend* (pg::make-backend :read-only nil))
+                     (pg::*wal-poisoned* nil)
+                     (pg::*extended-query-state* (pg::make-extended-query-state))
+                     (stream (make-string-output-stream)))
+                 (ok (eq fault
+                         (handler-case
+                             (if extended
+                                 (pg::handle-extended-query-frame
+                                  stream (char-code #\H) #(0 0 0 4) #())
+                                 (pg::exec-simple-query stream "SELECT 1"))
+                           (error (condition) condition))))
+                 (ok (pg::backend-wal-failure pg::*backend*))
+                 (ok (equal "" (get-output-stream-string stream))))))
+        (setf (symbol-function 'pg::arm-statement-timeout) original-arm
+              (symbol-function 'pg::request-fast-shutdown) original-shutdown))))
+
 (deftest wal-critical-preserves-values-validation-and-an-enclosing-interrupt-mask
     (let* ((pg::*wal-lock* (sb-thread:make-mutex :name "test WAL values"))
            (pg::*wal-poisoned* nil))

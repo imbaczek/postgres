@@ -951,6 +951,8 @@ Legacy 16-hex segment names always belong to timeline 1."
 
 (defun wal-fail-stop (condition)
   (setf *wal-poisoned* t)
+  (when (fboundp 'note-backend-wal-failure)
+    (funcall 'note-backend-wal-failure condition))
   (when (fboundp 'request-fast-shutdown)
     (ignore-errors (funcall (symbol-function 'request-fast-shutdown))))
   (error condition))
@@ -966,26 +968,53 @@ The lock wait remains interruptible unless the caller already masked interrupts.
 Mask the body and error recording; the outer mask protects cleanup entry. An
 error recorded here triggers fail-stop after the mutex unwinds. Validation errors
 are propagated without poisoning. Nonlocal exits need their own fencing."
-  (let ((failure (gensym "FAILURE"))
-        (condition (gensym "CONDITION")))
-    `(let ((,failure nil))
+  (let ((failure (gensym "FAILURE-"))
+        (condition (gensym "CONDITION-"))
+        (mutex (gensym "MUTEX-"))
+        (held (gensym "HELD-")))
+    `(let ((,failure nil) (,mutex *wal-lock*) (,held nil))
        (sb-sys:without-interrupts
          (unwind-protect
-              (sb-sys:with-local-interrupts
-                (sb-thread:with-mutex (*wal-lock*)
-                  (sb-sys:without-interrupts
-                    (handler-case
-                        (progn
-                          (wal-check-healthy)
-                          ,@body)
-                      (wal-input-validation-error (,condition)
-                        (error ,condition))
-                      (error (,condition)
-                        (setf ,failure ,condition
-                              *wal-poisoned* t)
-                        (error ,condition))))))
-           (when ,failure
-             (wal-fail-stop ,failure)))))))
+              (unwind-protect
+                   (progn
+                     (sb-sys:allow-with-interrupts
+                       (setf ,held (sb-thread:grab-mutex ,mutex)))
+                     (handler-case
+                         (progn (wal-check-healthy) ,@body)
+                       (wal-input-validation-error (,condition)
+                         (error ,condition))
+                       (error (,condition)
+                         (setf ,failure ,condition *wal-poisoned* t)
+                         (error ,condition))))
+                (when ,held (sb-thread:release-mutex ,mutex)))
+           (when ,failure (wal-fail-stop ,failure)))))))
+
+(defmacro with-wal-publication-fence ((begin-publication) &body body)
+  (let ((started (gensym "STARTED-"))
+        (complete (gensym "COMPLETE-"))
+        (failure (gensym "FAILURE-"))
+        (condition (gensym "CONDITION-"))
+        (record (gensym "RECORD-")))
+    `(let ((,started nil) (,complete nil) (,failure nil))
+       (flet ((,begin-publication () (setf ,started t))
+              (,record (,condition)
+                (when (and ,started (not ,failure))
+                  (setf ,failure ,condition))))
+         (sb-sys:without-interrupts
+           (unwind-protect
+                (handler-bind ((error #',record))
+                  (multiple-value-prog1
+                      (sb-sys:allow-with-interrupts
+                        (with-wal-critical
+                          (handler-bind ((error #',record))
+                            ,@body)))
+                    (setf ,complete t)))
+             (when (and ,started (not ,complete))
+               (wal-fail-stop
+                (or ,failure
+                    (make-condition 'simple-error
+                                    :format-control "WAL publication exited before completion"
+                                    :format-arguments nil))))))))))
 
 (defun wal-record-start-after (cursor length)
   "Plan native rotation without changing insertion state."
@@ -1395,55 +1424,43 @@ releasing WAL; the first error is retained, including when cleanup also fails."
                  (when (boundp '*backend*) (symbol-value '*backend*)) t)))
     (funcall after-durable-function)
     (return-from wal-commit-transaction (values)))
-  (let ((commit-lsn nil)
-        (publication-started nil)
-        (publication-complete nil)
-        (failure nil))
+  (let ((commit-lsn nil))
     (sb-sys:without-interrupts
-      (unwind-protect
-           (handler-bind ((error (lambda (condition) (unless failure (setf failure condition)))))
-             (with-wal-critical
-               (wal-validate-logical-binary-capability-under-lock xid)
-               (setf publication-started t)
-               (let* ((resets
-                        (when (fboundp 'publish-transaction-replacements-under-wal-lock)
-                          (funcall 'publish-transaction-replacements-under-wal-lock
-                                   (when (boundp '*backend*) (symbol-value '*backend*)))))
-                      (keys (wal-primary-page-keys))
-                      (split-p *wal-pending-btree-split*))
-                 (wal-primary-preflight-page-keys keys)
-                 (with-wal-primary-page-spool (spool)
-                   (wal-append-running-xacts-under-lock xid)
-                   (wal-primary-record-page-xids keys (wal-append-batch-start))
-                   (dolist (reset resets)
-                     (wal-append-record +wal-record-relation-reset+ xid
-                                        (wal-encode-relation-reset (first reset) (second reset))))
-                   (wal-primary-append-pages keys spool)
-                   (wal-primary-seal-page-spool spool)
-                   (when logical-changes (wal-append-logical-changes xid logical-changes))
-                   (when *wal-output-stream* (finish-output *wal-output-stream*))
-                   (wal-test-pause :after-page-images)
-                   (setf commit-lsn
-                         (wal-append-record +wal-record-commit+ xid
-                                            (wal-encode-commit-timestamp (postgres-current-timestamp))))
-                   (wal-flush)
-                   (when terminal-durable-function (funcall terminal-durable-function commit-lsn))
-                   (wal-slot-record-xid-commit-under-wal-lock xid commit-lsn)
-                   (wal-test-pause :after-wal-flush)
-                   (funcall after-durable-function)
-                   (wal-apply-relation-resets resets)
-                   (when resets (wal-test-pause :after-relation-resets))
-                   (wal-primary-apply-page-spool spool :split-p split-p :fault-on-first-write t)
-                   (wal-clear-page-cache)
-                   (setf *wal-pending-btree-split* nil))))
-             (setf publication-complete t))
-        (when (and publication-started (not publication-complete))
-          (wal-fail-stop
-           (or failure
-               (make-condition 'simple-error
-                               :format-control "WAL commit publication exited before completion"
-                               :format-arguments nil)))))
-      commit-lsn)))
+      (with-wal-publication-fence (begin-publication)
+        (wal-validate-logical-binary-capability-under-lock xid)
+        (begin-publication)
+        (let* ((resets
+                 (when (fboundp 'publish-transaction-replacements-under-wal-lock)
+                   (funcall 'publish-transaction-replacements-under-wal-lock
+                            (when (boundp '*backend*) (symbol-value '*backend*)))))
+               (keys (wal-primary-page-keys))
+               (split-p *wal-pending-btree-split*))
+          (wal-primary-preflight-page-keys keys)
+          (with-wal-primary-page-spool (spool)
+            (wal-append-running-xacts-under-lock xid)
+            (wal-primary-record-page-xids keys (wal-append-batch-start))
+            (dolist (reset resets)
+              (wal-append-record +wal-record-relation-reset+ xid
+                                 (wal-encode-relation-reset (first reset) (second reset))))
+            (wal-primary-append-pages keys spool)
+            (wal-primary-seal-page-spool spool)
+            (when logical-changes (wal-append-logical-changes xid logical-changes))
+            (when *wal-output-stream* (finish-output *wal-output-stream*))
+            (wal-test-pause :after-page-images)
+            (setf commit-lsn
+                  (wal-append-record +wal-record-commit+ xid
+                                     (wal-encode-commit-timestamp (postgres-current-timestamp))))
+            (wal-flush)
+            (when terminal-durable-function (funcall terminal-durable-function commit-lsn))
+            (wal-slot-record-xid-commit-under-wal-lock xid commit-lsn)
+            (wal-test-pause :after-wal-flush)
+            (funcall after-durable-function)
+            (wal-apply-relation-resets resets)
+            (when resets (wal-test-pause :after-relation-resets))
+            (wal-primary-apply-page-spool spool :split-p split-p :fault-on-first-write t)
+            (wal-clear-page-cache)
+            (setf *wal-pending-btree-split* nil)))))
+    commit-lsn))
 
 (defun wal-commit-maintenance ()
   "Durably publish staged storage maintenance without committing a user XID."
@@ -1623,109 +1640,91 @@ snapshot capture under *WRITE-LOCK* and durable slot publication."
       (remhash registration *wal-logical-catalog-event-interests*)))
   (values))
 
+(defun wal-prepare-logical-catalog-event-under-lock (event)
+  (when event
+    (when (< (length event) 4)
+      (wal-invalid-input "invalid WAL logical catalog event envelope"))
+    (when (wal-logical-catalog-event-needed-under-lock-p (wal-u32 event 0))
+      (when (< (length event) 8)
+        (wal-invalid-input "invalid WAL logical catalog event envelope"))
+      (when (> (+ +wal-header-size+ (length event)) +wal-segment-size+)
+        (wal-invalid-input "WAL logical catalog event exceeds the segment size"))
+      event)))
+
 (defun wal-commit-catalog (catalog-bytes write-function
                            &key relation-deletes logical-event
-                             on-record-appended)
+                             on-record-appended on-durable)
   "Durably publish a full catalog image and any deferred relation drops."
   (unless *wal-ready*
-    (prog1 (funcall write-function catalog-bytes)
-      (sb-thread:with-mutex (*wal-lock*)
-        (incf *wal-catalog-flush-generation*)))
+    (funcall write-function catalog-bytes)
+    (sb-thread:with-mutex (*wal-lock*)
+      (incf *wal-catalog-flush-generation*))
+    (when on-durable (funcall on-durable nil))
     (return-from wal-commit-catalog (values)))
-  (with-wal-critical
-    (let* ((logical-event
-             (when logical-event
-               ;; At least the database identifier is needed to decide whether
-               ;; a slot or snapshot lease retains this event. Malformed input
-               ;; that cannot identify its database is rejected without
-               ;; poisoning WAL.
-               (when (< (length logical-event) 4)
-                 (wal-invalid-input
-                  "invalid WAL logical catalog event envelope"))
-               (when (wal-logical-catalog-event-needed-under-lock-p
-                      (wal-u32 logical-event 0))
-                 (when (< (length logical-event) 8)
-                   (wal-invalid-input
-                    "invalid WAL logical catalog event envelope"))
-                 (when (> (+ +wal-header-size+ (length logical-event))
-                          +wal-segment-size+)
-                   (wal-invalid-input
-                    "WAL logical catalog event exceeds the segment size"))
-                 logical-event)))
-           (deletes (sort (remove-duplicates
-                           (append (copy-list *wal-pending-deletes*)
-                                   (copy-list relation-deletes))
-                           :test #'eql)
-                          #'<))
-           (keys (wal-primary-page-keys deletes))
-           (catalog-payload
-             (wal-encode-catalog-payload catalog-bytes deletes))
-           (chunked-p
-             (> (+ +wal-header-size+ (length catalog-payload))
-                +wal-segment-size+))
-           (chunk-count (when chunked-p
-                          (wal-catalog-chunk-count catalog-payload)))
-           (commit-payload (when chunked-p
-                             (wal-encode-catalog-commit-payload
-                              catalog-payload chunk-count))))
-      (wal-primary-preflight-page-keys keys)
-      (with-wal-primary-page-spool (spool)
-        (wal-primary-record-page-xids keys (wal-append-batch-start))
-        (wal-primary-append-pages keys spool)
-        (wal-primary-seal-page-spool spool)
-        (when chunked-p
-          (wal-append-catalog-chunks catalog-payload chunk-count)
-          (when *wal-output-stream*
-            (finish-output *wal-output-stream*))
-          (wal-test-pause :after-catalog-chunks))
-        (when logical-event
-          ;; A reader exposes this event only when the following catalog terminal
-          ;; is complete. This mirrors pgoutput's commit callback boundary.
-          (wal-append-record +wal-record-logical-catalog-event+ 0 logical-event))
-        (when (and *wal-vacuum-full-publication*
-                   *wal-test-before-vacuum-full-catalog-record-appended-hook*)
-          (funcall *wal-test-before-vacuum-full-catalog-record-appended-hook*))
-        (if chunked-p
-            (wal-append-record +wal-record-catalog-commit+ 0 commit-payload)
-            (wal-append-record +wal-record-catalog+ 0 catalog-payload))
-        ;; Only a complete terminal record makes this catalog image replayable.
-        (when on-record-appended
-          (funcall on-record-appended))
-        (when (and *wal-vacuum-full-publication*
-                   *wal-test-pause-at*
-                   (string= *wal-test-pause-at*
-                            "after-vacuum-full-catalog-wal-append"))
-          ;; Reproduce a complete record that reached stable storage before a
-          ;; failure left the durable-LSN control file unchanged.
-          (finish-output *wal-output-stream*)
-          (fsync-stream *wal-output-stream*)
-          (when *wal-new-segments*
-            (fsync-directory (wal-directory))
-            (setf *wal-new-segments* '()))
-          (wal-test-pause :after-vacuum-full-catalog-wal-append))
-        (when (and *wal-vacuum-full-publication*
-                   *wal-test-before-vacuum-full-catalog-flush-hook*)
-          (funcall *wal-test-before-vacuum-full-catalog-flush-hook*))
-        (wal-flush)
-        ;; This marker advances at the durable boundary, before any fallible
-        ;; page application, catalog-file replacement, or relfile deletion.
-        (incf *wal-catalog-flush-generation*)
-        (wal-test-pause :after-catalog-wal-flush)
-        (when *wal-vacuum-full-publication*
-          (wal-test-pause :after-vacuum-full-catalog-wal-flush))
-        (when (and *wal-vacuum-full-publication*
-                   *wal-test-after-vacuum-full-catalog-flush-hook*)
-          (funcall *wal-test-after-vacuum-full-catalog-flush-hook*))
-        (wal-primary-apply-page-spool spool)
-        (funcall write-function catalog-bytes)
-        (dolist (relfilenode deletes)
-          (smgr-forget relfilenode :delete t))
-        (setf *wal-pending-deletes*
-              (set-difference *wal-pending-deletes* deletes :test #'eql))
-        (when deletes (fsync-directory (merge-pathnames "base/" *pgdata*)))
-        (wal-clear-page-cache)
-        (setf *wal-pending-btree-split* nil))))
-  (values))
+  (let ((commit-lsn nil))
+    (with-wal-publication-fence (begin-publication)
+      (let* ((logical-event (wal-prepare-logical-catalog-event-under-lock logical-event))
+             (deletes (sort (remove-duplicates
+                             (append (copy-list *wal-pending-deletes*)
+                                     (copy-list relation-deletes))
+                             :test #'eql)
+                            #'<))
+             (keys (wal-primary-page-keys deletes))
+             (catalog-payload (wal-encode-catalog-payload catalog-bytes deletes))
+             (chunked-p (> (+ +wal-header-size+ (length catalog-payload)) +wal-segment-size+))
+             (chunk-count (when chunked-p (wal-catalog-chunk-count catalog-payload)))
+             (commit-payload (when chunked-p
+                               (wal-encode-catalog-commit-payload catalog-payload chunk-count))))
+        (wal-primary-preflight-page-keys keys)
+        (with-wal-primary-page-spool (spool)
+          (begin-publication)
+          (wal-primary-record-page-xids keys (wal-append-batch-start))
+          (wal-primary-append-pages keys spool)
+          (wal-primary-seal-page-spool spool)
+          (when chunked-p
+            (wal-append-catalog-chunks catalog-payload chunk-count)
+            (when *wal-output-stream* (finish-output *wal-output-stream*))
+            (wal-test-pause :after-catalog-chunks))
+          (when logical-event
+            (wal-append-record +wal-record-logical-catalog-event+ 0 logical-event))
+          (when (and *wal-vacuum-full-publication*
+                     *wal-test-before-vacuum-full-catalog-record-appended-hook*)
+            (funcall *wal-test-before-vacuum-full-catalog-record-appended-hook*))
+          (setf commit-lsn
+                (if chunked-p
+                    (wal-append-record +wal-record-catalog-commit+ 0 commit-payload)
+                    (wal-append-record +wal-record-catalog+ 0 catalog-payload)))
+          (when on-record-appended (funcall on-record-appended))
+          (when (and *wal-vacuum-full-publication*
+                     *wal-test-pause-at*
+                     (string= *wal-test-pause-at* "after-vacuum-full-catalog-wal-append"))
+            (finish-output *wal-output-stream*)
+            (fsync-stream *wal-output-stream*)
+            (when *wal-new-segments*
+              (fsync-directory (wal-directory))
+              (setf *wal-new-segments* '()))
+            (wal-test-pause :after-vacuum-full-catalog-wal-append))
+          (when (and *wal-vacuum-full-publication*
+                     *wal-test-before-vacuum-full-catalog-flush-hook*)
+            (funcall *wal-test-before-vacuum-full-catalog-flush-hook*))
+          (wal-flush)
+          (incf *wal-catalog-flush-generation*)
+          (when on-durable (funcall on-durable commit-lsn))
+          (wal-test-pause :after-catalog-wal-flush)
+          (when *wal-vacuum-full-publication*
+            (wal-test-pause :after-vacuum-full-catalog-wal-flush))
+          (when (and *wal-vacuum-full-publication*
+                     *wal-test-after-vacuum-full-catalog-flush-hook*)
+            (funcall *wal-test-after-vacuum-full-catalog-flush-hook*))
+          (wal-primary-apply-page-spool spool)
+          (funcall write-function catalog-bytes)
+          (dolist (relfilenode deletes) (smgr-forget relfilenode :delete t))
+          (setf *wal-pending-deletes*
+                (set-difference *wal-pending-deletes* deletes :test #'eql))
+          (when deletes (fsync-directory (merge-pathnames "base/" *pgdata*)))
+          (wal-clear-page-cache)
+          (setf *wal-pending-btree-split* nil))))
+    commit-lsn))
 
 (defun wal-segment-entry-names ()
   "Return raw WAL entry names, including dangling links.

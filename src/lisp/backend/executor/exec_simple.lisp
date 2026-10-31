@@ -1764,6 +1764,7 @@ is sent only after commit."
                      (if (fatal-error-p e) (error e)
                          (progn (note-query-error) (send-error-response stream e))))
                    (error (e)
+                     (when (fatal-error-p e) (error e))
                      (clear-statement-timeout)
                      (note-query-error)
                      (send-error-response

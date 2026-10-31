@@ -42,6 +42,7 @@
   ;; until the target delivers termination.  Future masked sync waits may inspect
   ;; this flag without consuming it before commit cleanup.
   (termination-pending nil)
+  (wal-failure nil)
   ;; Visible to the local control REPL so concurrency tests can synchronize on
   ;; a real lock wait instead of relying on scheduler timing.
   (waiting-xid nil)
@@ -104,10 +105,19 @@
                                (float internal-time-units-per-second 1d0))))
         0.1)))
 
+(defun note-backend-wal-failure (condition)
+  (when (and *backend* (not (backend-wal-failure *backend*)))
+    (setf (backend-wal-failure *backend*) condition))
+  (values))
+
+(defun current-backend-wal-failed-p ()
+  (and *backend* (not (null (backend-wal-failure *backend*)))))
+
 (defun deliver-backend-termination (backend)
   ;; Consume only at delivery, and let termination supersede query cancel.
   ;; A queued helper becomes a no-op if a cooperative check delivered it first.
-  (when (and backend (backend-termination-pending backend))
+  (when (and backend (backend-termination-pending backend)
+             (not (backend-wal-failure backend)))
     (setf (backend-termination-pending backend) nil
           (backend-cancel-pending backend) nil)
     (ereport-fatal "57P01" "terminating connection due to administrator command"))
@@ -115,6 +125,8 @@
 
 (defun check-for-interrupts ()
   "Deliver pending termination before checking statement timeout or cancel."
+  (when (current-backend-wal-failed-p)
+    (return-from check-for-interrupts (values)))
   (deliver-backend-termination *backend*)
   (when (and *backend* (backend-statement-deadline *backend*)
              (>= (get-internal-real-time) (backend-statement-deadline *backend*)))
