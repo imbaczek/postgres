@@ -37,6 +37,9 @@
 (defun wal-sender-register (backend &optional
                                       (source-id (nth-value 0 (sync-replication-configuration-state))))
   "Register one status token for a replication backend under the sender lock."
+  ;; SOURCE-ID is checked against current state under that lock.  The default is
+  ;; the private legacy boundary; integration must capture the connection's real
+  ;; source ownership earlier and pass that snapshot here.
   (unless (and (backend-p backend)
                (member (backend-replication-mode backend) '(:physical :database)))
     (error "walsender status requires a replication backend"))
@@ -91,7 +94,8 @@
 
 (defun wal-sender-note-reply (sender write flush replay reply-time)
   "Publish write, flush, replay and reply time from one received feedback message.
-These fields are independent and do not infer apply from flush."
+These fields are independent and do not infer apply from flush. Refresh the
+private sync proof while the sender mutex still protects the feedback."
   (unless (and (every (lambda (value) (typep value '(unsigned-byte 64)))
                       (list write flush replay))
                (typep reply-time '(signed-byte 64)))

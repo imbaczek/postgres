@@ -189,10 +189,17 @@
   (sb-thread:with-mutex (*wal-sender-lock*)
     (sync-replication-select-current-under-lock config)))
 
+;; Private publication and wait core.  Public settings, commit, startup and
+;; native source events are not yet wired to it.
+
 (defstruct sync-replication-waiter
+  ;; Only :WAITING entries are queued; terminal outcomes stay fixed.  The
+  ;; caller owns transaction cleanup after the wait.
   backend lsn mode source-id (state :waiting))
 
 (defstruct sync-replication-state
+  ;; One shared state is protected by the sender mutex.  Queues are sorted by
+  ;; LSN per mode; frontiers retain monotonic proof until the source changes.
   config (names "") source-id (generation 0)
   (frontiers (list :write 0 :flush 0 :apply 0))
   (queues (list :write nil :flush nil :apply nil))
@@ -237,6 +244,7 @@
   (values))
 
 (defun sync-replication-next-frontiers-under-lock (config)
+  ;; Current candidates may fall behind or disappear; retained proof does not.
   (let ((current (when config
                    (nth-value 1 (sync-replication-select-current-under-lock config)))))
     (loop for mode in '(:write :flush :apply)
@@ -251,6 +259,8 @@
   (values))
 
 (defun sync-replication-enqueue-under-lock (backend lsn mode source-id)
+  ;; Hold the sender mutex and mask interrupts through the caller's waiter
+  ;; assignment and unwind ownership, so a published entry cannot be orphaned.
   (sync-replication-check-source-id source-id)
   (assert (and (sb-thread:holding-mutex-p *wal-sender-lock*)
                (not sb-sys:*interrupts-enabled*)))
@@ -283,6 +293,9 @@
   (values))
 
 (defun sync-replication-install-configuration (text source-id expected-source-id expected-generation)
+  ;; Compare both predecessor source and configuration generation under lock.
+  ;; Source IDs are immutable symbols or integers; the owning lifecycle must
+  ;; supply a fresh real generation for every source incarnation.
   (sync-replication-check-source-id source-id)
   (sync-replication-check-source-id expected-source-id)
   (let ((config (parse-sync-standby-names text))
@@ -313,6 +326,8 @@
           (if config
               (sync-replication-release-under-lock)
               (sync-replication-complete-all-under-lock :disabled))))
+      ;; OBSOLETE holds exact backend objects captured before registry clear.
+      ;; Signal after unlock, with this backend last so it cannot interrupt the rest.
       (dolist (backend obsolete)
         (unless (eq backend *backend*) (terminate-backend backend)))
       (when (member *backend* obsolete :test #'eq)
@@ -320,6 +335,8 @@
       installed-generation)))
 
 (defun sync-replication-interruption (backend)
+  ;; Termination wins and stays pending for delivery after committed cleanup.
+  ;; Timeout and cancel are returned as reasons, not aborting errors.
   (cond
     ((backend-termination-pending backend) :terminated)
     ((and (backend-statement-deadline backend)
@@ -332,6 +349,10 @@
      :cancelled)))
 
 (defun sync-replication-wait (backend lsn mode source-id)
+  ;; The caller must keep interrupts masked through later committed cleanup and
+  ;; must not hold WAL here.  Condition waits release the sender mutex; polling
+  ;; checks interrupt flags every 0.1 seconds.  Source change is not success.
+  ;; On any nonlocal exit, unlink the waiter without poisoning WAL.
   (assert (not sb-sys:*interrupts-enabled*))
   (sb-sys:without-interrupts
     (let ((waiter nil))

@@ -48,6 +48,17 @@
   property (`a3f4bbb1a9500ce5`) and quorum property (`99cb3720a61bacdc`). Input
   coverage and rejection counts were not measured.
 
+- [x] Add the private synchronous publication and wait core. Real worker
+  threads modeled feedback, config, cancel and termination; SQL commit waiting
+  was not tested or wired. The checkpoint passed 732 unit and 201 wire tests,
+  seven existing sender physical tests (not a full physical rerun), and strict
+  cold compilation (`/tmp/pg-sync-wait-reviewed-cold.log`). The scoped cl-spec
+  queue-prefix property ran 100 trials at seed 42 (digest `9248d664822bed72`);
+  input coverage and rejection counts were not measured. Remaining integration
+  includes a separate nonblocking config service (the sole reload worker can
+  deadlock on drain), fully prepared candidate validation and commit, actual
+  commit waiting, native source-incarnation events and early registration fencing.
+
 - [ ] Complete the unchanged Patroni monitoring query and synchronous-replication
   backend contract. Synchronous setting lookup fails with 42704. Preserve the
   complete real query as the acceptance oracle.
