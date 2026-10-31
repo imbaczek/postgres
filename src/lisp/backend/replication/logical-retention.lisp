@@ -107,7 +107,9 @@ revoke the already authorized signal."
 (defun wal-finish-slot-recycling-work (work &key (wait t))
   "Stop owners outside storage locks, then recheck and retry WAL removal.
 WAIT parks admission in bounded slices until owners release or work becomes stale.
-With WAIT NIL, never park; leave unresolved work for another safe retry."
+With WAIT NIL, never park; leave unresolved work for another safe retry.
+Each owner claim and removal retry uses current settings with the ticket's
+frozen WAL endpoint, allowing a reload to change the retention decision."
   (when (wal-slot-recycling-can-wait-p)
     (with-live-operation
       (loop
@@ -200,7 +202,8 @@ Active slots retain WAL until release and a recheck at the same endpoint."
             (nreverse requests))))
 
 (defun wal-prepare-slot-recycling-under-lock (redo-segment &optional (current *wal-durable-lsn*))
-  "Apply one captured policy under WAL and return the floor and owner requests."
+  "Apply one captured policy and keep size under WAL, returning floor and requests.
+A removal retry captures current settings again at the same frozen endpoint."
   (multiple-value-bind (policy keep-mb) (startup-retention-inputs)
     (let ((limit (wal-slot-retention-policy-limit policy)))
       (ecase (wal-slot-retention-mode policy)

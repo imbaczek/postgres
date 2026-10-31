@@ -53,21 +53,21 @@
 (defconstant +wal-version+ 8)
 
 (defvar *wal-keep-size-mb* 0
-  "Installed wal_keep_size in MB; reload may change the retention horizon.")
+  "Published wal_keep_size mirror in MB; retention uses a captured configuration.")
 
 (defparameter *max-slot-wal-keep-bytes* (* 1024 1024 1024)
-  "Native exact-byte slot cap; NIL disables it. Installed settings select the policy.
-The initial 1 GiB value is also the fallback before a policy is installed.")
+  "Published slot limit mirror in bytes; NIL means unlimited.
+Retention uses the policy captured from an installed configuration.")
 
 (defstruct wal-slot-retention-policy
-  "MODE is :bytes or :segments. In :segments mode LIMIT is the standard cap
-in bytes, or NIL for unlimited; recycling rounds it down to whole segments.
-In :bytes mode the getter uses *MAX-SLOT-WAL-KEEP-BYTES* for native compatibility.
+  "MODE is :bytes or :segments; LIMIT is the selected byte cap, or NIL for
+unlimited. Segment mode rounds the cap down to whole segments for recycling.
 MAX-WAL-BYTES sets the normal WAL window used by catalog status."
   mode limit (max-wal-bytes 1073741824))
 
 (defvar *wal-slot-retention-policy* nil
-  "Installed slot retention policy, or NIL for the native byte-cap fallback.")
+  "Published slot policy mirror; NIL before configuration is installed.
+Runtime retention requires a captured installed policy.")
 
 (defvar *wal-replication-slot-loss-collector* nil
   "Dynamically bound list receiving durably invalidated slots during WAL maintenance.")
@@ -2306,12 +2306,11 @@ the scan itself validates records without publishing their resource state."
     (write-sequence bytes stream)))
 
 (defun wal-slot-retention-mode (policy)
-  "Return the installed mode, or native byte mode before policy installation."
+  "Return POLICY's mode."
   (wal-slot-retention-policy-mode policy))
 
 (defun wal-slot-retention-limit (policy)
-  "Return the standard policy's byte limit or the native byte-cap global.
-NIL disables the selected cap."
+  "Return POLICY's byte limit, or NIL if the cap is disabled."
   (wal-slot-retention-policy-limit policy))
 
 (defun wal-slot-reserved-p (slot)
@@ -2360,7 +2359,8 @@ The standard policy rounds its limit down to whole WAL segments."
 (defun wal-slot-safe-wal-bytes (slot policy keep-mb)
   "Report remaining safe bytes from the write endpoint, which can be negative.
 For the standard segment policy use the greater of slot cap and wal_keep_size,
-plus one segment. The native byte policy retains its own exact-byte calculation."
+plus one segment. The native byte policy retains its own exact-byte calculation.
+The caller holds WAL and supplies POLICY and KEEP-MB from one configuration."
   (let* ((restart (wal-replication-slot-restart-lsn slot))
          (limit (wal-slot-retention-limit policy))
          (mode (wal-slot-retention-mode policy))
@@ -2382,8 +2382,7 @@ plus one segment. The native byte policy retains its own exact-byte calculation.
        (> (- current (wal-replication-slot-restart-lsn slot)) limit)))
 
 (defun wal-slot-within-normal-window-p (restart write policy)
-  "Test whether RESTART lies within the normal max_wal_size window.
-Use 1 GiB when no policy is installed."
+  "Test RESTART against the normal max_wal_size window in POLICY."
   (let* ((maximum (wal-slot-retention-policy-max-wal-bytes policy))
          (oldest (max 0 (- (floor write +wal-segment-size+)
                            (1+ (floor maximum +wal-segment-size+))))))
@@ -2392,7 +2391,8 @@ Use 1 GiB when no policy is installed."
 (defun wal-slot-catalog-status (slot policy keep-mb)
   "Compute advisory public WAL status at the write endpoint; do not invalidate.
 The standard horizon includes wal_keep_size but excludes XID and snapshot floors,
-as in C's metadata calculation. Lost slots remain lost."
+as in C's metadata calculation. Lost slots remain lost. The caller holds WAL
+and supplies POLICY and KEEP-MB from the same captured configuration."
   (when (eq :lost (wal-replication-slot-wal-status slot))
     (return-from wal-slot-catalog-status "lost"))
   (let ((restart (wal-replication-slot-restart-lsn slot)))
@@ -3055,7 +3055,8 @@ Check the encoded size against that plan before appending the checkpoint."
   "Plan and remove a contiguous WAL prefix under WAL exclusion.
 Active standard-policy owners defer removal in a process-local ticket; the caller
 retries outside locks after stopping them. Independent XID and snapshot floors
-also constrain removal. CURRENT freezes the endpoint across that retry."
+also constrain removal. CURRENT freezes the endpoint across that retry, while
+each calculation captures the current retention settings."
   (let ((checkpoint-segment (wal-checkpoint-recycling-segment checkpoint-lsn)))
     (multiple-value-bind (keep-segment requests)
         (wal-prepare-slot-recycling-under-lock checkpoint-segment current)

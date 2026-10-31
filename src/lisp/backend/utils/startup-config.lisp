@@ -40,7 +40,8 @@ Hold the root mutex only for the pointer read; callers use the root after releas
       (error "server configuration is not installed")))
 
 (defun startup-retention-inputs ()
-  "Return the retention policy and keep size from one installed configuration."
+  "Return policy and keep size from one required installed configuration.
+A missing root is an error; there is no fallback to globals."
   (let ((configuration (startup-require-configuration)))
     (values (startup-configuration-slot-policy configuration)
             (startup-configuration-keep-mb configuration))))

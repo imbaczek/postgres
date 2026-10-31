@@ -136,6 +136,14 @@ appropriate instead of replacing the native C peer or adding a message relay.
   already know a special variable defined by a later module and hide a missing
   forward declaration. A fresh receiver-shutdown test exposed such a warning
   even though loading the same saved source into cl-mcp succeeded.
+- An FTYPE declaration alone does not avoid SBCL's warning when an earlier ASDF
+  module calls a later DEFSTRUCT accessor. Put a helper in the later module and
+  return the needed values through it.
+- Dissect can fault while collecting SBCL mutex-frame locals for an ordinary
+  missing-root error. A direct `handler-bind` can expose the original condition;
+  the TODO tracks this diagnostic issue.
+- Catch background test errors inside `with-open-file` to preserve their log,
+  and bind error and trace output as well as standard output to that stream.
 - A replaceable worker-step function can make an older loop exit safely at an
   iteration boundary. Check that the current thread is the registered worker,
   then use SBCL's synchronous `return-from-thread` before taking admission or

@@ -368,7 +368,8 @@ leave that registry intact."
     (physical-source-confirm-receipt-under-lock name owner lsn digest)))
 
 (defun physical-source-invalidate-lagging-pins-under-wal-lock (limit)
-  "Persist lost retention before checkpoint may remove its required WAL."
+  "Persist lagging private pin loss before checkpoint removes required WAL.
+The caller holds WAL. LIMIT is an exact-byte cap independent of wal_keep_size."
   (when (integerp limit)
     (maphash
      (lambda (name pin)

@@ -577,7 +577,8 @@ The retained-byte extension measures from the durable or flushed endpoint."
 (declaim (ftype function startup-retention-inputs))
 
 (defun sql-replication-slot-rows ()
-  "Snapshot both slot kinds under write-before-WAL locking."
+  "Snapshot both slot kinds under write-before-WAL locking.
+Capture policy and keep size once for every row in the snapshot."
   (with-write-lock
     (sb-thread:with-mutex (*wal-lock*)
       (multiple-value-bind (policy keep-mb) (startup-retention-inputs)

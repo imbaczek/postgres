@@ -81,12 +81,19 @@
   (`/tmp/pg-config-readers-smoke.log`) and live divergence/reload checks. No root
   means uninstalled; quota admission takes explicit captured limits.
 
+- [x] Capture restartpoint settings before the store mutex (`99ade2667aa`) and
+  pass one retention policy and keep size through each removal calculation and
+  catalog snapshot. Owner claims and removal retries capture fresh
+  settings while preserving the ticket's WAL endpoint. The checkpoint passed
+  744 unit, 1,341 physical and 201 wire tests, plus 1,159 legacy checks, strict
+  cold compilation and SQL smoke. No independent configuration service is added.
+
 - [ ] Build the independent configuration service needed before commit waiting.
   This is proposed, not implemented; it adds no coordinator. Parking synchronous
   waiters alone does not keep configuration service available.
 
-  1. Migrate retention and restartpoint readers to captured roots. Capture policy
-     and keep size once per calculation or catalog snapshot; recapture on each
+  1. Completed: migrate retention and restartpoint readers to captured roots.
+     Capture policy and keep size once per calculation or catalog snapshot; recapture on each
      authoritative retry or owner termination claim while the ticket WAL endpoint
      stays fixed, so reload can rescue retention. The private pin's exact-byte cap
      remains independent of `wal_keep_size`; preserve invalidation order. Capture
@@ -234,6 +241,16 @@
   structure accessor before its `DEFSTRUCT` caused an inlining warning only in a
   cold compile. Moving the slot module after its dependencies fixed that case;
   the wider audit remains open.
+
+- [ ] Reproduce and report Dissect's SBCL frame-local inspection fault. While Rove
+  reported a missing installed configuration in a retention fixture, Dissect's
+  `FRAME-LOCALS` called `SB-DI::SUB-ACCESS-DEBUG-VAR-SLOT` on a mutex frame and
+  raised a memory fault. A direct handler reported the original `SIMPLE-ERROR`
+  correctly. Preserve the original condition before collecting locals; do not
+  infer storage corruption from this secondary reporting failure. Observed on
+  2026-10-31 in SBCL process 1984912 during the retention-reader milestone.
+  Background test logs must catch errors inside `with-open-file` so abort cleanup
+  keeps the log.
 
 - [ ] Extend implicit simple-query transactions to the remaining statement and
   transaction-control cases, including transactional DDL and TRUNCATE, using C as
