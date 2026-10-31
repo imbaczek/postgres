@@ -176,15 +176,27 @@
 (deftest primary-resource-publication-readback-failure-keeps-old-memory-and-fences-writes
     (call-with-resource-wal-fixture
      (lambda ()
-       (let ((read-control (symbol-function 'pg::wal-read-control-fields))
-             (prior (copy-list pg::*wal-control-metadata*)))
+       (let* ((read-control (symbol-function 'pg::wal-read-control-fields))
+              (prior nil)
+              (flush-count 0)
+              (pg::*wal-resource-parameters-test-hook*
+                (lambda (point end)
+                  (when (eq point :after-wal-flush)
+                    (incf flush-count)
+                    (ok (= 96 end pg::*wal-durable-lsn*))
+                    (ok (null (getf pg::*wal-control-metadata* :resource-parameters)))
+                    (setf prior (copy-tree pg::*wal-control-metadata*))))))
          (unwind-protect
               (progn
                 (setf (symbol-function 'pg::wal-read-control-fields)
-                      (lambda () (values 0 0 nil 1 1 :legacy prior)))
+                      (lambda ()
+                        (values pg::*wal-checkpoint-lsn* pg::*wal-durable-lsn*
+                                pg::*wal-checkpoint-snapshot* pg::*wal-insert-timeline*
+                                pg::*wal-checkpoint-timeline* pg::*wal-segment-namespace* prior)))
                 (ok (intake-fails-p
                      (lambda () (pg::wal-report-resource-parameters
                                  (pg::make-resource-parameters 100 8 10 0 128)))))
+                (ok (= 1 flush-count))
                 (ok pg::*wal-poisoned*)
                 (ok (equal prior pg::*wal-control-metadata*)))
            (setf (symbol-function 'pg::wal-read-control-fields) read-control)))
