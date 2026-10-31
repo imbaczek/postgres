@@ -833,10 +833,38 @@ installing settings, taking PGDATA ownership or starting listeners."
     (write-byte 10 output)
     (finish-output output)))
 
+(defun startup-description-rows ()
+  (loop for (name context kind boot minimum maximum) in *startup-setting-specs*
+        for type = (case kind
+                     (:integer "INTEGER") (:boolean "BOOLEAN") (:wal-level "ENUM")
+                     (t "STRING"))
+        for default = (case kind
+                        ;; C GucInfoMain builds the registry without initializing reset fields.
+                        (:boolean "FALSE")
+                        (:integer "0")
+                        (t (or boot "")))
+        collect (list name (string-downcase (symbol-name context))
+                      "Native server settings" type default
+                      (if (eq kind :integer) (princ-to-string minimum) "")
+                      (if (eq kind :integer) (princ-to-string maximum) "")
+                      "" "")))
+
+(defun startup-print-description (&optional (output *standard-output*))
+  (dolist (row (startup-description-rows))
+    (loop for field in row
+          for first = t then nil
+          unless first do (write-char #\Tab output)
+            do (write-string field output))
+    (terpri output)))
+
 (defun startup-handle-meta-request (argv)
   "Print and exit for version or configuration requests before server startup."
   (when (or (equal argv '("--version")) (equal argv '("-V")))
     (format t "pg-lisp (PostgreSQL) ~a~%" *server-version*)
+    (finish-output)
+    (sb-ext:exit :code 0))
+  (when (equal (first argv) "--describe-config")
+    (startup-print-description)
     (finish-output)
     (sb-ext:exit :code 0))
   (let ((value (startup-configuration-output argv)))
