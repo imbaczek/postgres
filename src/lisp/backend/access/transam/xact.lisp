@@ -26,6 +26,7 @@
   (transaction-schema-read-lock-held-p nil)
   (first-snapshot-set nil)
   (dirty-relations '())
+  (wal-obligation nil)
   (logical-changes '())
   (logical-spool nil)
   (logical-change-bytes 0)
@@ -54,6 +55,39 @@
   (virtual-reader-xid nil))
 
 (defvar *backend* nil)
+
+(defstruct transaction-wal-obligation
+  source-id catalog-end user-end (source-changed-p nil))
+
+(defun prepare-backend-wal-obligation (backend)
+  (let ((source (nth-value 0 (sync-replication-configuration-state))))
+    (values (or (backend-wal-obligation backend)
+                (setf (backend-wal-obligation backend)
+                      (make-transaction-wal-obligation)))
+            source)))
+
+(defun record-transaction-wal-boundary (context source end catalog-p)
+  (when (and context end (not (transaction-wal-obligation-source-changed-p context)))
+    (when (and (null (transaction-wal-obligation-catalog-end context))
+               (null (transaction-wal-obligation-user-end context)))
+      (setf (transaction-wal-obligation-source-id context) source))
+    (if (not (eql source (transaction-wal-obligation-source-id context)))
+        (setf (transaction-wal-obligation-source-changed-p context) t)
+        (if catalog-p
+            (setf (transaction-wal-obligation-catalog-end context)
+                  (max end (or (transaction-wal-obligation-catalog-end context) 0)))
+            (setf (transaction-wal-obligation-user-end context) end))))
+  (values))
+
+(defun backend-own-wal-effects-p (backend)
+  (or (backend-dirty-relations backend)
+      (backend-logical-changes backend)
+      (plusp (backend-logical-change-bytes backend))
+      (let ((context (backend-wal-obligation backend)))
+        (and context (or (transaction-wal-obligation-catalog-end context)
+                         (transaction-wal-obligation-user-end context))))
+      (let ((replacements (gethash backend *transaction-relation-replacements*)))
+        (and replacements (plusp (hash-table-count replacements))))))
 
 (declaim (special *live-operation-lock*))
 (declaim (special *live-operation-cv*))
@@ -2251,6 +2285,7 @@ can discard the owner of a virtual ID or its remaining relation locks."
           (backend-snapshot b) nil
           (backend-first-snapshot-set b) nil
           (backend-dirty-relations b) '()
+          (backend-wal-obligation b) nil
           (backend-logical-changes b) '()
           (backend-logical-change-bytes b) 0)
     (set-backend-state b :idle))
@@ -2326,22 +2361,26 @@ On commit, retire the saved settings snapshot; abort leaves it for whole-table u
           ;; publication and lexical ownership of cleanup.  A poisoned WAL can
           ;; leave the outcome indeterminate: retire resources without inventing
           ;; a CLOG commit or abort.
-          (sb-sys:without-interrupts
-            (let ((irreversible nil)
-                  (wal-ready-at-entry-p *wal-ready*)
-                  (xid (backend-xid b)))
-              (unwind-protect
-                   (wal-commit-transaction
-                    xid
-                    (lambda ()
-                      (clog-set xid +clog-committed+ :fsync (not wal-ready-at-entry-p))
-                      (setf irreversible t))
-                    changes
-                    (lambda (end)
-                      (declare (ignore end))
-                      (setf irreversible t)))
-                (when (or irreversible (and wal-ready-at-entry-p *wal-poisoned*))
-                  (finish-committed-transaction b xid))))))
+          (multiple-value-bind (obligation source)
+              (when (and *wal-ready*
+                         (or changes (backend-own-wal-effects-p b)))
+                (prepare-backend-wal-obligation b))
+            (sb-sys:without-interrupts
+              (let ((irreversible nil)
+                    (wal-ready-at-entry-p *wal-ready*)
+                    (xid (backend-xid b)))
+                (unwind-protect
+                     (wal-commit-transaction
+                      xid
+                      (lambda ()
+                        (clog-set xid +clog-committed+ :fsync (not wal-ready-at-entry-p))
+                        (setf irreversible t))
+                      changes
+                      (lambda (end)
+                        (setf irreversible t)
+                        (record-transaction-wal-boundary obligation source end nil)))
+                  (when (or irreversible (and wal-ready-at-entry-p *wal-poisoned*))
+                    (finish-committed-transaction b xid)))))))
         (finish-backend-transaction b t)))
   (values))
 

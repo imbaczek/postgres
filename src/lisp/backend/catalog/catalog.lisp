@@ -474,54 +474,60 @@ cluster-wide minimum directly and skips missing horizons."
   ;; Do fallible derived-state work before publication. Once WAL commits, the
   ;; generation update and cache assignment below must not signal: callers use
   ;; the generation to distinguish rollback-safe failures from durable ones.
-  (let* ((event-key (car applied-logical-event-id))
-         (event-lsn (cdr applied-logical-event-id))
-         (database (and event-key *backend* (current-database)))
-         (previous-event-lsn (and database
-                                  (gethash event-key
-                                           (database-applied-logical-event-ids
-                                            database))))
-         (previous-event-present-p
-           (and database
-                (nth-value 1
-                           (gethash event-key
-                                    (database-applied-logical-event-ids database)))))
-         (wal-generation (wal-catalog-flush-generation)))
-    (when database
-      (setf (gethash event-key (database-applied-logical-event-ids database))
-            event-lsn))
-    (handler-case
-        (let ((oldest (catalog-compute-oldest-relfrozenxid)))
-          (when (and logical-event *logical-event-schema-contract*)
-            (logical-validate-schema-contract-under-write-lock
-             (getf *logical-event-schema-contract* :schema-after) :after))
-          (when logical-event
-            (logical-test-failpoint :before-catalog-event-wal-terminal))
-          (let ((*catalog-logical-event-publication-p*
-                  (not (null logical-event))))
-            (wal-commit-catalog
-             (catalog-image-bytes) #'write-catalog-image
-             :relation-deletes deferred-relations
-             :logical-event logical-event
-             :on-record-appended on-record-appended))
-          (incf *catalog-durable-generation*)
-          (setf *catalog-oldest-relfrozenxid* oldest))
-      (error (condition)
-        (if (> (wal-catalog-flush-generation) wal-generation)
-            (setf *catalog-save-error-after-durable-p* t)
-            (when database
-              (if previous-event-present-p
-                  (setf (gethash event-key
-                                 (database-applied-logical-event-ids database))
-                        previous-event-lsn)
-                  (remhash event-key
-                           (database-applied-logical-event-ids database)))))
-        (error condition)))
-    (when logical-event
-      ;; The catalog terminal is now durable. Crashing here leaves a replayable
-      ;; standalone event, matching the subscriber's target-commit/feedback gap.
-      (logical-test-failpoint :after-catalog-event-wal-terminal))
-    (values)))
+  (multiple-value-bind (obligation source)
+      (when (and *wal-ready* *backend* (eq (backend-state *backend*) :in-progress))
+        (prepare-backend-wal-obligation *backend*))
+    (let* ((event-key (car applied-logical-event-id))
+           (event-lsn (cdr applied-logical-event-id))
+           (database (and event-key *backend* (current-database)))
+           (previous-event-lsn (and database
+                                    (gethash event-key
+                                             (database-applied-logical-event-ids
+                                              database))))
+           (previous-event-present-p
+             (and database
+                  (nth-value 1
+                             (gethash event-key
+                                      (database-applied-logical-event-ids database)))))
+           (wal-generation (wal-catalog-flush-generation)))
+      (when database
+        (setf (gethash event-key (database-applied-logical-event-ids database))
+              event-lsn))
+      (handler-case
+          (let ((oldest (catalog-compute-oldest-relfrozenxid)))
+            (when (and logical-event *logical-event-schema-contract*)
+              (logical-validate-schema-contract-under-write-lock
+               (getf *logical-event-schema-contract* :schema-after) :after))
+            (when logical-event
+              (logical-test-failpoint :before-catalog-event-wal-terminal))
+            (let ((*catalog-logical-event-publication-p*
+                    (not (null logical-event))))
+              (wal-commit-catalog
+               (catalog-image-bytes) #'write-catalog-image
+               :relation-deletes deferred-relations
+               :logical-event logical-event
+               :on-record-appended on-record-appended
+               :on-durable (when obligation
+                             (lambda (end)
+                               (record-transaction-wal-boundary obligation source end t)))))
+            (incf *catalog-durable-generation*)
+            (setf *catalog-oldest-relfrozenxid* oldest))
+        (error (condition)
+          (if (> (wal-catalog-flush-generation) wal-generation)
+              (setf *catalog-save-error-after-durable-p* t)
+              (when database
+                (if previous-event-present-p
+                    (setf (gethash event-key
+                                   (database-applied-logical-event-ids database))
+                          previous-event-lsn)
+                    (remhash event-key
+                             (database-applied-logical-event-ids database)))))
+          (error condition)))
+      (when logical-event
+        ;; The catalog terminal is now durable. Crashing here leaves a replayable
+        ;; standalone event, matching the subscriber's target-commit/feedback gap.
+        (logical-test-failpoint :after-catalog-event-wal-terminal))
+      (values))))
 
 (defun load-catalog ()
   (let ((path (catalog-path)))
