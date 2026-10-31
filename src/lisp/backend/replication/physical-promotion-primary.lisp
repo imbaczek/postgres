@@ -398,7 +398,7 @@ recovery; restart must classify durable control."
                checkpoint)))
       (unless finished (setf *physical-recovery-failed-p* t)))))
 
-(defun physical-promotion-finish-child-primary ()
+(defun physical-promotion-finish-child-primary (&optional publication)
   "Retire recovery triggers before clearing the recovery role and declaring readiness.
 Report installed capacity on the new primary before declaring it ready, then
 retire synchronous replication proof from the previous source."
@@ -410,10 +410,15 @@ retire synchronous replication proof from the previous source."
         *physical-replay-seen-relfilenodes* nil)
   (wal-report-installed-resource-capacity)
   (wal-note-primary-ready)
-  (sync-replication-new-source-incarnation)
+  (if publication
+      (multiple-value-bind (source obsolete)
+          (sync-replication-new-source-incarnation :defer-notifications t)
+        (declare (ignore source))
+        (setf (physical-promotion-publication-obsolete publication) obsolete))
+      (sync-replication-new-source-incarnation))
   (physical-promotion-test-point :after-child-primary-ready))
 
-(defun physical-promotion-start-live-child-primary ()
+(defun physical-promotion-start-live-child-primary (&optional publication)
   "Privately adopt the child, close the receive spool and finish promotion.
 
 Keep the existing CLOG stream, storage handles and reader state. The completion
@@ -421,9 +426,9 @@ caller must keep admission closed and fence any failure."
   (physical-promotion-adopt-live-child-runtime)
   (when *physical-receive-store* (physical-store-close *physical-receive-store*))
   (setf *physical-receive-store* nil)
-  (physical-promotion-finish-child-primary))
+  (physical-promotion-finish-child-primary publication))
 
-(defun physical-promotion-start-child-primary ()
+(defun physical-promotion-start-child-primary (&optional publication)
   "Initialize a committed child as an ordinary primary under closed admission.
 Register the primary retained root before storage initialization loads slots.
 Close standby storage, then hide recovery only in the initializer's dynamic
@@ -435,9 +440,9 @@ before declaring the primary ready. On failure restart from durable child contro
   (when *clog-stream* (close *clog-stream*) (setf *clog-stream* nil))
   (smgr-close-all)
   (let ((*physical-recovery-state* nil)) (initialize-primary-storage))
-  (physical-promotion-finish-child-primary))
+  (physical-promotion-finish-child-primary publication))
 
-(defun physical-promotion-complete-child ()
+(defun physical-promotion-complete-child (&optional publication)
   "Commit child control, initialize the primary and return the checkpoint end.
 
 Keep admission closed throughout.  The scoped reader-preservation flag selects
@@ -447,8 +452,8 @@ fences the process.  A new process must classify durable control before retrying
     (unwind-protect
          (let ((end (physical-promotion-publish-child-control)))
            (if *physical-promotion-preserve-readers-p*
-               (physical-promotion-start-live-child-primary)
-               (physical-promotion-start-child-primary))
+               (physical-promotion-start-live-child-primary publication)
+               (physical-promotion-start-child-primary publication))
            (setf finished t)
            end)
       (unless finished (setf *physical-recovery-failed-p* t)))))

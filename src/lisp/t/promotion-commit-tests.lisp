@@ -37,7 +37,8 @@
          (unwind-protect
               (progn
                 (setf (symbol-function 'pg::physical-promotion-try-online)
-                      (lambda ()
+                      (lambda (&optional publication)
+                        (declare (ignore publication))
                         (setf pg::*physical-resource-pause*
                               (list :fact nil :shortfalls nil :resume-requested nil))
                         :resource-paused)
@@ -356,6 +357,73 @@
            (ok (= 216 pg::*last-replay-lsn*))
            (ok (eql 2 (getf pg::*physical-recovery-state* :phase)))
            (ok (not pg::*physical-recovery-failed-p*)))))))
+
+(deftest live-promotion-source-publication-preserves-completion-and-debt
+    (dolist (mode '(:complete :interrupt :error))
+      (call-with-live-child-fixture
+       (lambda (root store)
+         (declare (ignore root store))
+         (let* ((pg::*backend-registry* (make-hash-table :test #'eql))
+                (pg::*shutdown-abandoned-backends* nil)
+                (pg::*physical-promotion-stopping-p* nil)
+                (pg::*physical-follow-controller-blocked-p* nil)
+                (pg::*physical-follow-controller-stopping-p* nil)
+                (pg::*sync-replication-state* (pg::make-sync-replication-state :source-id :source-a))
+                (pg::*wal-sender-registry* (make-hash-table :test #'eq))
+                (owner (pg::make-backend :pid 914 :replication-mode :physical))
+                (terminate (symbol-function 'pg::terminate-backend))
+                (events nil))
+           (setf (gethash 1 pg::*backend-registry*) pg::*backend*)
+           (pg::ensure-transaction-snapshot pg::*backend* 1)
+           (pg::get-current-reader-xid)
+           (flet ((record (phase)
+                    (push (list phase (not sb-sys:*interrupts-enabled*)
+                                (sb-thread:holding-mutex-p pg::*physical-follow-generation-lock*))
+                          events)))
+             (unwind-protect
+                  (progn
+                    (pg::wal-sender-register owner :source-a)
+                    (setf (symbol-function 'pg::terminate-backend)
+                          (lambda (backend)
+                            (unless (eq backend owner) (error "wrong promotion sender"))
+                            (record :notify)))
+                    (let* ((pg::*physical-promotion-test-hook*
+                             (lambda (point)
+                               (case point
+                                 (:before-online-intent (record :intent))
+                                 (:after-child-primary-ready
+                                  (record :ready)
+                                  (case mode
+                                    (:interrupt
+                                     (sb-thread:interrupt-thread
+                                      sb-thread:*current-thread*
+                                      (lambda ()
+                                        (record :interrupt)
+                                        (throw 'promotion-interrupted :interrupted))))
+                                    (:error (error "promotion readiness cut")))))))
+                           (result
+                             (call-with-current-promotion-owner
+                              (lambda ()
+                                (handler-case
+                                    (catch 'promotion-interrupted (pg::physical-recovery-promote))
+                                  (error (condition)
+                                    (push (list :failure (princ-to-string condition)) events)
+                                    :failed))))))
+                      (ok (eql (case mode (:complete 424) (:interrupt :interrupted) (:error :failed)) result)))
+                    (let ((ordered (reverse events)))
+                      (ok (equal '((:intent t t) (:ready t t) (:notify t nil))
+                                 (subseq ordered 0 (min 3 (length ordered)))))
+                      (when (eq mode :interrupt)
+                        (ok (eq :interrupt (first (fourth ordered))))
+                        (ok (null (third (fourth ordered))))))
+                    (ok (not (pg::recovery-in-progress-p)))
+                    (ok (eql (eq mode :error) pg::*physical-recovery-failed-p*))
+                    (unless (eq mode :error) (ok (not pg::*physical-promotion-stopping-p*)))
+                    (ok (zerop (hash-table-count pg::*wal-sender-registry*)))
+                    (ok (not (eq :source-a (pg::sync-replication-state-source-id
+                                            pg::*sync-replication-state*)))))
+               (setf (symbol-function 'pg::terminate-backend) terminate)))))
+       :committed-child nil)))
 
 (deftest live-promotion-completes-with-readers-enrolled-before-intent
     (call-with-live-child-fixture

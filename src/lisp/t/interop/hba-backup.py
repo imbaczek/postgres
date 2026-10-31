@@ -102,7 +102,7 @@ def standby_and_promotion(log):
     if os.environ.get("DEBUG_PROMOTION"):
         hba.control(f'''(let ((original (symbol-function 'physical-promotion-try-online)))
           (setf (symbol-function 'physical-promotion-try-online)
-            (lambda ()
+              (lambda (&rest arguments)
               (unwind-protect
                    (handler-bind
                        ((error (lambda (condition)
@@ -112,7 +112,7 @@ def standby_and_promotion(log):
                                                  :if-does-not-exist :create)
                               (format out "PID=~d PGDATA=~a~%~a~%" (sb-posix:getpid) *pgdata* condition)
                               (sb-debug:print-backtrace :stream out :count 45))))))
-                     (funcall original))
+                      (apply original arguments))
                 (setf (symbol-function 'physical-promotion-try-online) original)))))''', process, CONTROL)
     connection = psycopg2.connect(host="127.0.0.1", port=PORT, user="postgres",
                                   dbname="postgres", connect_timeout=2)

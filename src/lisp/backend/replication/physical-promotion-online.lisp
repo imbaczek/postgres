@@ -51,7 +51,8 @@ An unsafe complete batch defers promotion; an unfinished tail does not."
 
 (declaim (ftype (function () *) physical-promotion-awaiting-child-initialization-p))
 
-(defun physical-promotion-try-online ()
+(defun physical-promotion-try-online
+    (&optional (publication (make-physical-promotion-publication)))
   "Attempt promotion under reload exclusion and closed admission.
 Recheck child initialization after worker joins and before enrolling readers.
 An unsafe complete batch defers the attempt; otherwise publish the child.
@@ -67,14 +68,22 @@ A resource pause found while draining the backlog stops before intent."
            (cond
              (*physical-resource-pause* :resource-paused)
              ((not drained) :deferred)
-             (t (progn
-                  (physical-recovery-restartpoint-core)
-                  (physical-promotion-test-point :before-online-intent)
-                  (physical-promotion-publish-intent)
-                  (physical-promotion-test-point :after-online-intent)
-                  (physical-promotion-install-prefix)
-                  (prog1 (physical-promotion-complete-child)
-                    (setf *physical-promotion-stopping-p* nil)))))))))))
+             (t
+              (physical-recovery-restartpoint-core)
+              (with-physical-follow-controller-publication (obsolete)
+                (unwind-protect
+                     (progn
+                       (physical-promotion-test-point :before-online-intent)
+                       (physical-promotion-check-online)
+                       (physical-promotion-publish-intent)
+                       (physical-promotion-test-point :after-online-intent)
+                       (physical-promotion-install-prefix)
+                       (multiple-value-prog1
+                           (physical-promotion-complete-child publication)
+                         (setf *physical-promotion-stopping-p* nil
+                               (physical-promotion-publication-completed-p publication) t)))
+                  (setf obsolete (physical-promotion-publication-obsolete publication))))))))
+       publication))))
 
 (defun physical-promotion-awaiting-child-initialization-p ()
   "Scan the durable suffix without applying it to check child initialization.
@@ -154,7 +163,8 @@ return :RESOURCE-PAUSED without publishing promotion intent."
            (physical-promotion-check-online)
            (when (physical-promotion-awaiting-child-initialization-p)
              (return-from physical-recovery-promote :awaiting-child-initialization)))
-         (let* ((finished nil)
+         (let* ((publication (make-physical-promotion-publication))
+                (finished nil)
                 (runtime *physical-follow-runtime*)
                 (config (let ((saved (when (probe-file (physical-follow-config-path))
                                        (physical-follow-read-config))))
@@ -184,7 +194,7 @@ return :RESOURCE-PAUSED without publishing promotion intent."
                       (physical-follow-quiesce-runtime)
                       (physical-restartpoint-join-for-shutdown)
                       (physical-promotion-test-point :after-online-worker-join)
-                      (loop for result = (physical-promotion-try-online)
+                      (loop for result = (physical-promotion-try-online publication)
                             unless (eq result :deferred)
                               do (when (member result '(:awaiting-child-initialization :resource-paused))
                                    (physical-promotion-resume-recovery-workers config paused restartpoint))
@@ -195,7 +205,8 @@ return :RESOURCE-PAUSED without publishing promotion intent."
                       (error condition))
                     (setf finished t)
                     :shutdown))
-             (unless finished (setf *physical-recovery-failed-p* t)))))))))
+             (unless (or finished (physical-promotion-publication-completed-p publication))
+               (setf *physical-recovery-failed-p* t)))))))))
 
 (defun request-physical-promotion (&rest signal-info)
   "Record SIGUSR1 without locks or file I/O. The request worker checks the file."

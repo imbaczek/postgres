@@ -1,6 +1,10 @@
 ;;;; Local pending-promotion publication; EOR and writer admission remain separate.
 (in-package #:pg)
 
+(defstruct physical-promotion-publication
+  "Completion and sender retirement owned by one live promotion publication."
+  obsolete completed-p)
+
 (defvar *physical-promotion-preserve-readers-p* nil
   "Dynamically select live reader preservation after the ownership census.
 The default is NIL, so cold completion retains its strict checks.  This is not
@@ -168,7 +172,7 @@ IDs, and keep retained transactions read-only."
        (eql 2 (getf *physical-recovery-state* :phase))
        (not *physical-recovery-failed-p*)))
 
-(defun call-with-physical-promotion-readers (function)
+(defun call-with-physical-promotion-readers (function &optional publication)
   "Enroll retained readers and call FUNCTION with live preservation enabled.
 
 The caller owns closed admission and has joined the recovery workers.  Within
@@ -192,7 +196,8 @@ phase-2 recovery can yield to shutdown."
              (when (physical-promotion-can-yield-to-shutdown-p)
                (setf finished t))
              (error condition)))
-      (unless finished (setf *physical-recovery-failed-p* t)))))
+      (unless (or finished (and publication (physical-promotion-publication-completed-p publication)))
+        (setf *physical-recovery-failed-p* t)))))
 
 (defun physical-promotion-select-child (parent)
   "Probe consecutive local history files above the namespace floor, as C does.
