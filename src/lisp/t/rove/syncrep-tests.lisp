@@ -479,6 +479,32 @@
       (rove:ok (eq :cancelled (sync-replication-interruption backend)))
       (rove:ok (null (backend-cancel-pending backend)))))
 
+(rove:deftest synchronous-terminal-output-survives-transaction-reset
+    (uiop:with-temporary-file (:stream stream :direction :io
+                               :element-type '(unsigned-byte 8))
+      (uiop:with-temporary-file (:stream other :direction :io
+                                 :element-type '(unsigned-byte 8))
+        (let ((*backend* (make-backend :stream stream)))
+          (suppress-backend-frontend-output *backend* :source-changed)
+          (suppress-backend-frontend-output *backend* :terminated)
+          (rove:ok (eq :source-changed
+                       (backend-frontend-output-suppressed-reason *backend*)))
+          (reset-backend-transaction *backend*)
+          (rove:ok (backend-frontend-output-suppressed-p stream))
+          (send-command-complete stream "COMMIT")
+          (send-ready-for-query stream #\I)
+          (send-error-response stream
+                               (make-condition 'pg-error :sqlstate "57P01"
+                                                         :message "terminating" :severity "FATAL"))
+          (flush-logical-ddl-deferred-responses
+           (list (list :command-complete stream "CREATE TABLE")
+                 (list :notice stream "deferred" "NOTICE" "00000")))
+          (rove:ok (zerop (file-length stream))
+                   "no completion, ready, fatal or deferred output after reset")
+          (send-command-complete other "SELECT 1")
+          (rove:ok (plusp (file-length other))
+                   "other streams retain normal framing")))))
+
 (rove:deftest synchronous-queue-orders-lsns-and-preserves-completed-outcomes
     (call-with-sync-wait-state
      (lambda ()

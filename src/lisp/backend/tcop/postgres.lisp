@@ -687,6 +687,7 @@ Preserve all dispatch values, including secondary values, for the caller."
 
 (defun backend-loop (stream)
   (loop
+    (check-backend-frontend-output)
     (let ((type-byte (read-byte stream nil nil)))
       (unless type-byte (return))
       (multiple-value-bind (length-bytes got) (read-exact-bytes stream 4)

@@ -160,7 +160,11 @@ Production callers run this inside the live-operation gate."
 
 ;;; ---- writing ----
 
+(declaim (ftype (function (t) t) backend-frontend-output-suppressed-p))
+
 (defun write-message (stream type payload)
+  (when (backend-frontend-output-suppressed-p stream)
+    (return-from write-message nil))
   (write-byte (char-code type) stream)
   (write-sequence (u32-to-bytes (+ 4 (length payload))) stream)
   (write-sequence payload stream)

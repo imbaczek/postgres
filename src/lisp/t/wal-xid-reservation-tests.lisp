@@ -104,6 +104,161 @@
        (pg::wal-save-control-fields 0 0)
        (funcall function)))))
 
+(defun call-with-synchronous-commit-test-state (function)
+  (let ((pg::*wal-sender-registry* (make-hash-table :test #'eq))
+        (pg::*physical-recovery-state* nil)
+        (pg::*sync-replication-state* (pg::make-sync-replication-state :source-id :source-a)))
+    (funcall function)))
+
+(deftest synchronous-user-commit-waits-after-local-durability
+    (dolist (action '(:acknowledged :write :apply :cancelled :timeout :terminated :source-changed :abnormal :warning-error))
+      (call-with-synchronous-commit-test-state
+       (lambda ()
+         (pg::sync-replication-install-configuration "FIRST 1 (peer)" :source-a :source-a 0)
+         (let* ((runtime pg::*sync-replication-state*)
+                (registry pg::*wal-sender-registry*)
+                (ready (sb-thread:make-semaphore :count 0))
+                (backend nil) (xid nil) (observed nil) (result nil)
+                (thread nil)
+                (original (symbol-function 'pg::sync-replication-interruption))
+                (notice (symbol-function 'pg::send-notice)))
+           (unwind-protect
+                (progn
+                  (setf (symbol-function 'pg::send-notice)
+                        (lambda (&rest arguments)
+                          (if (and (eq action :warning-error) (eq pg::*backend* backend))
+                              (error "injected committed warning failure")
+                              (apply notice arguments))))
+                  (setf (symbol-function 'pg::sync-replication-interruption)
+                        (lambda (owner)
+                          (when (and (eq owner backend) (null observed))
+                            (setf observed
+                                  (list (= pg::+clog-committed+ (pg::clog-get xid))
+                                        (eql xid (pg::backend-xid owner))
+                                        (not (sb-thread:holding-mutex-p pg::*wal-lock*))
+                                        (plusp pg::*live-operation-depth*)))
+                            (sb-thread:signal-semaphore ready))
+                          (when (eq action :abnormal) (error "injected committed wait failure"))
+                          (funcall original owner)))
+                  (setf thread
+                        (sb-thread:make-thread
+                         (lambda ()
+                           (let ((pg::*sync-replication-state* runtime)
+                                 (pg::*wal-sender-registry* registry)
+                                 (pg::*synchronous-commit-wait-mode*
+                                   (case action (:write :write) (:apply :apply) (t :flush))))
+                             (call-with-resource-wal-fixture
+                              (lambda ()
+                                (uiop:with-temporary-file
+                                    (:stream stream :direction :io
+                                     :element-type '(unsigned-byte 8))
+                                  (let* ((pg::*backend* (pg::make-backend :stream stream))
+                                         (condition nil))
+                                    (setf backend pg::*backend*
+                                          xid (pg::assign-xid backend)
+                                          (pg::backend-dirty-relations backend) '(999))
+                                    (handler-case
+                                        (pg::with-live-operation (pg::commit-transaction))
+                                      (error (failure) (setf condition failure)))
+                                    (pg::send-command-complete stream "COMMIT")
+                                    (when condition (pg::send-error-response stream condition))
+                                    (setf result
+                                          (list :committed (= pg::+clog-committed+ (pg::clog-get xid))
+                                                :clean (null (pg::backend-xid backend))
+                                                :healthy (not pg::*wal-poisoned*)
+                                                :output (file-length stream)
+                                                :suppressed (pg::backend-frontend-output-suppressed-reason backend)
+                                                :fatal (and condition (pg::fatal-error-p condition))))))))))
+                         :name "durable synchronous user commit"))
+                  (unless (sb-thread:wait-on-semaphore ready :timeout 5)
+                    (error "user commit did not reach synchronous wait"))
+                  (ok (equal '(t t t t) observed)
+                      "CLOG is committed while XID and admission remain owned outside WAL")
+                  (ecase action
+                    ((:acknowledged :write :apply)
+                     (let* ((obligation (pg::backend-wal-obligation backend))
+                            (end (pg::transaction-wal-obligation-user-end obligation))
+                            (sender (pg::wal-sender-register
+                                     (pg::make-backend :pid 1 :replication-mode :database
+                                                       :application-name "peer"))))
+                       (pg::wal-sender-set-state sender "streaming")
+                       (pg::wal-sender-note-reply sender end end end 2)))
+                    ((:cancelled :warning-error) (setf (pg::backend-cancel-pending backend) t))
+                    (:timeout (setf (pg::backend-statement-deadline backend) 0))
+                    (:terminated (setf (pg::backend-termination-pending backend) t))
+                    (:abnormal nil)
+                    (:source-changed
+                     (pg::sync-replication-install-configuration "" :source-b :source-a 1)))
+                  (sb-thread:join-thread thread :timeout 5 :default :pending)
+                  (ok (not (sb-thread:thread-alive-p thread)))
+                  (ok (getf result :committed))
+                  (ok (getf result :clean))
+                  (ok (getf result :healthy))
+                  (if (member action '(:source-changed :terminated :abnormal :warning-error))
+                      (progn (ok (zerop (getf result :output)))
+                             (ok (getf result :suppressed))
+                             (unless (member action '(:abnormal :warning-error)) (ok (getf result :fatal))))
+                      (ok (plusp (getf result :output)))))
+             (multiple-value-bind (source generation) (pg::sync-replication-configuration-state)
+               (pg::sync-replication-install-configuration "" source source generation))
+             (when thread (sb-thread:join-thread thread :timeout 5 :default :pending))
+             (setf (symbol-function 'pg::sync-replication-interruption) original
+                   (symbol-function 'pg::send-notice) notice)))))))
+
+(deftest synchronous-user-commit-rejects-sticky-source-mismatch
+    (call-with-synchronous-commit-test-state
+     (lambda ()
+       (call-with-resource-wal-fixture
+        (lambda ()
+          (uiop:with-temporary-file (:stream stream :direction :io
+                                     :element-type '(unsigned-byte 8))
+            (let* ((pg::*backend* (pg::make-backend :stream stream))
+                   (obligation (pg::make-transaction-wal-obligation
+                                :source-id :prior-source :catalog-end 32))
+                   (xid (pg::assign-xid pg::*backend*)))
+              (setf (pg::backend-wal-obligation pg::*backend*) obligation)
+              (ok (handler-case
+                      (progn (pg::commit-transaction) nil)
+                    (pg::pg-error (condition) (pg::fatal-error-p condition))))
+              (ok (pg::transaction-wal-obligation-source-changed-p obligation))
+              (ok (null (pg::transaction-wal-obligation-user-end obligation)))
+              (ok (= pg::+clog-committed+ (pg::clog-get xid)))
+              (ok (null (pg::backend-xid pg::*backend*)))
+              (ok (not pg::*wal-poisoned*))
+              (pg::send-command-complete stream "COMMIT")
+              (ok (zerop (file-length stream))))))))))
+
+(deftest synchronous-user-commit-validates-mode-before-wal
+    (dolist (mode '(nil :invalid))
+      (call-with-synchronous-commit-test-state
+       (lambda ()
+         (pg::sync-replication-install-configuration "FIRST 1 (peer)" :source-a :source-a 0)
+         (call-with-resource-wal-fixture
+          (lambda ()
+            (let* ((pg::*backend* (pg::make-backend))
+                   (pg::*synchronous-commit-wait-mode* mode)
+                   (xid (pg::assign-xid pg::*backend*))
+                   (before pg::*wal-end-lsn*)
+                   (failure nil))
+              (setf (pg::backend-dirty-relations pg::*backend*) '(999))
+              (unwind-protect
+                   (progn
+                     (handler-case (pg::commit-transaction)
+                       (error (condition) (setf failure condition)))
+                     (if mode
+                         (progn
+                           (ok failure)
+                           (ok (= before pg::*wal-end-lsn*))
+                           (ok (= pg::+clog-in-progress+ (pg::clog-get xid)))
+                           (ok (eql xid (pg::backend-xid pg::*backend*))))
+                         (progn
+                           (ok (null failure))
+                           (ok (< before pg::*wal-end-lsn*))
+                           (ok (= pg::+clog-committed+ (pg::clog-get xid)))
+                           (ok (null (pg::backend-xid pg::*backend*)))))
+                     (ok (not pg::*wal-poisoned*)))
+                (when (pg::backend-xid pg::*backend*) (pg::abort-transaction))))))))))
+
 (defun direct-publication-termination-test (kind &optional fault)
   (let* ((ready (sb-thread:make-semaphore))
          (release (sb-thread:make-semaphore))

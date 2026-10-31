@@ -48,6 +48,7 @@
   (termination-pending nil)
   ;; First WAL failure, retained for the lifetime of this backend.
   (wal-failure nil)
+  (frontend-output-suppressed-reason nil)
   ;; Visible to the local control REPL so concurrency tests can synchronize on
   ;; a real lock wait instead of relying on scheduler timing.
   (waiting-xid nil)
@@ -56,6 +57,15 @@
   (virtual-reader-xid nil))
 
 (defvar *backend* nil)
+
+(defun suppress-backend-frontend-output (backend reason)
+  (unless (backend-frontend-output-suppressed-reason backend)
+    (setf (backend-frontend-output-suppressed-reason backend) reason))
+  (values))
+
+(defun backend-frontend-output-suppressed-p (stream)
+  (and *backend* (eq stream (backend-stream *backend*))
+       (not (null (backend-frontend-output-suppressed-reason *backend*)))))
 
 (defstruct transaction-wal-obligation
   ;; The first durable end anchors SOURCE-ID. Catalog ends accumulate the
@@ -181,6 +191,7 @@ count; an XID alone, shared cache pages and an empty context do not."
 After a WAL failure, leave pending interrupts alone so they cannot replace it."
   (when (current-backend-wal-failed-p)
     (return-from check-for-interrupts (values)))
+  (check-backend-frontend-output)
   (deliver-backend-termination *backend*)
   (when (and *backend* (backend-statement-deadline *backend*)
              (>= (get-internal-real-time) (backend-statement-deadline *backend*)))
@@ -2352,6 +2363,60 @@ On commit, retire the saved settings snapshot; abort leaves it for whole-table u
                                :format-arguments nil)))))))
   (values))
 
+(defvar *synchronous-commit-wait-mode* :flush)
+
+(defun synchronous-commit-wait-mode ()
+  (unless (member *synchronous-commit-wait-mode* '(nil :write :flush :apply))
+    (error "Invalid synchronous commit wait mode: ~s" *synchronous-commit-wait-mode*))
+  *synchronous-commit-wait-mode*)
+
+(defun wait-for-committed-wal-obligation (backend obligation mode)
+  (when (and mode obligation
+             (or (transaction-wal-obligation-source-changed-p obligation)
+                 (transaction-wal-obligation-user-end obligation)))
+    (let ((complete nil))
+      (unwind-protect
+           (let ((outcome
+                   (if (transaction-wal-obligation-source-changed-p obligation)
+                       :source-changed
+                       (sync-replication-wait
+                        backend (transaction-wal-obligation-user-end obligation)
+                        mode (transaction-wal-obligation-source-id obligation)))))
+             (ecase outcome
+               ((:acknowledged :disabled :cancelled :timeout))
+               ((:terminated :source-changed)
+                (suppress-backend-frontend-output backend outcome)))
+             (setf complete t)
+             outcome)
+        (unless complete
+          (suppress-backend-frontend-output backend :abnormal-commit-wait))))))
+
+(defun finish-synchronous-commit-response (backend outcome)
+  (let ((complete nil))
+    (unwind-protect
+         (progn
+           (case outcome
+             ((:cancelled :timeout)
+              (let ((*logical-ddl-event-order-active-p* nil))
+                (when (backend-stream backend)
+                  (send-notice
+                   (backend-stream backend)
+                   (format nil "canceling wait for synchronous replication due to ~a; the transaction has already committed locally, but might not have been replicated to the standby"
+                           (if (eq outcome :timeout) "statement timeout" "user request"))
+                   "WARNING"))))
+             (:terminated (deliver-backend-termination backend))
+             (:source-changed
+              (ereport-fatal "08006" "replication source changed after local commit")))
+           (setf complete t))
+      (unless complete
+        (suppress-backend-frontend-output backend :abnormal-commit-response))))
+  (values))
+
+(defun check-backend-frontend-output ()
+  (when (and *backend* (backend-frontend-output-suppressed-reason *backend*))
+    (ereport-fatal "08006" "connection closed after unconfirmed synchronous commit"))
+  (values))
+
 (defun commit-transaction ()
   (ensure-exported-snapshot-scope-can-end *backend*)
   (prepare-backend-portal-transaction-end *backend* t)
@@ -2381,21 +2446,26 @@ On commit, retire the saved settings snapshot; abort leaves it for whole-table u
                 (prepare-backend-wal-obligation b))
             (sb-sys:without-interrupts
               (let ((irreversible nil)
+                    (mode (synchronous-commit-wait-mode))
+                    (outcome nil)
                     (wal-ready-at-entry-p *wal-ready*)
                     (xid (backend-xid b)))
                 (unwind-protect
-                     (wal-commit-transaction
-                      xid
-                      (lambda ()
-                        (clog-set xid +clog-committed+ :fsync (not wal-ready-at-entry-p))
-                        (setf irreversible t))
-                      changes
-                      (lambda (end)
-                        (setf irreversible t)
-                        ;; Capture this terminal after marking the commit irreversible.
-                        (record-transaction-wal-boundary obligation source end nil)))
+                     (progn
+                       (wal-commit-transaction
+                        xid
+                        (lambda ()
+                          (clog-set xid +clog-committed+ :fsync (not wal-ready-at-entry-p))
+                          (setf irreversible t))
+                        changes
+                        (lambda (end)
+                          (setf irreversible t)
+                          ;; Capture this terminal after marking the commit irreversible.
+                          (record-transaction-wal-boundary obligation source end nil)))
+                       (setf outcome (wait-for-committed-wal-obligation b obligation mode)))
                   (when (or irreversible (and wal-ready-at-entry-p *wal-poisoned*))
-                    (finish-committed-transaction b xid)))))))
+                    (finish-committed-transaction b xid)))
+                (finish-synchronous-commit-response b outcome)))))
         (finish-backend-transaction b t)))
   (values))
 
