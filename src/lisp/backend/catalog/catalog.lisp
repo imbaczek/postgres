@@ -474,6 +474,8 @@ cluster-wide minimum directly and skips missing horizons."
   ;; Do fallible derived-state work before publication. Once WAL commits, the
   ;; generation update and cache assignment below must not signal: callers use
   ;; the generation to distinguish rollback-safe failures from durable ones.
+  ;; Only an active backend transaction captures this catalog terminal.
+  ;; Startup saves and maintenance outside a transaction are excluded.
   (multiple-value-bind (obligation source)
       (when (and *wal-ready* *backend* (eq (backend-state *backend*) :in-progress))
         (prepare-backend-wal-obligation *backend*))
@@ -507,6 +509,7 @@ cluster-wide minimum directly and skips missing horizons."
                :relation-deletes deferred-relations
                :logical-event logical-event
                :on-record-appended on-record-appended
+               ;; This records a catalog boundary, not an XID commit or final DDL.
                :on-durable (when obligation
                              (lambda (end)
                                (record-transaction-wal-boundary obligation source end t)))))

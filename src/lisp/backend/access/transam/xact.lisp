@@ -26,6 +26,7 @@
   (transaction-schema-read-lock-held-p nil)
   (first-snapshot-set nil)
   (dirty-relations '())
+  ;; Per-transaction durable boundaries; reset detaches this context.
   (wal-obligation nil)
   (logical-changes '())
   (logical-spool nil)
@@ -57,9 +58,14 @@
 (defvar *backend* nil)
 
 (defstruct transaction-wal-obligation
+  ;; The first durable end anchors SOURCE-ID. Catalog ends accumulate the
+  ;; maximum for that source; USER-END is this transaction's commit terminal.
+  ;; A source mismatch is sticky.
   source-id catalog-end user-end (source-changed-p nil))
 
 (defun prepare-backend-wal-obligation (backend)
+  "Snapshot the source and prepare an obligation before WAL publication.
+A newly allocated context has no source anchor until its first non-NIL durable end."
   (let ((source (nth-value 0 (sync-replication-configuration-state))))
     (values (or (backend-wal-obligation backend)
                 (setf (backend-wal-obligation backend)
@@ -67,6 +73,10 @@
             source)))
 
 (defun record-transaction-wal-boundary (context source end catalog-p)
+  "Record a durable end in the preallocated context without I/O, locks or allocation.
+CATALOG-P selects catalog accumulation; otherwise record this user commit end.
+Retain the greatest catalog end for one source and mark a source mismatch
+permanently. A mismatched context cannot prove replication. A NIL end changes nothing."
   (when (and context end (not (transaction-wal-obligation-source-changed-p context)))
     (when (and (null (transaction-wal-obligation-catalog-end context))
                (null (transaction-wal-obligation-user-end context)))
@@ -80,6 +90,9 @@
   (values))
 
 (defun backend-own-wal-effects-p (backend)
+  "Return whether BACKEND has its own effects requiring a WAL obligation.
+Dirty relations, logical changes, replacements and recorded durable boundaries
+count; an XID alone, shared cache pages and an empty context do not."
   (or (backend-dirty-relations backend)
       (backend-logical-changes backend)
       (plusp (backend-logical-change-bytes backend))
@@ -2262,6 +2275,7 @@ Portal initialization can retain the current command ID by disabling advance."
 
 (defun reset-backend-transaction (b)
   "Release transaction resources and return B to idle.
+Detach the WAL obligation without modifying it, so a lexical owner can retain it.
 
 Mask interrupts until cleanup and the idle transition finish, so no interrupt
 can discard the owner of a virtual ID or its remaining relation locks."
@@ -2378,6 +2392,7 @@ On commit, retire the saved settings snapshot; abort leaves it for whole-table u
                       changes
                       (lambda (end)
                         (setf irreversible t)
+                        ;; Capture this terminal after marking the commit irreversible.
                         (record-transaction-wal-boundary obligation source end nil)))
                   (when (or irreversible (and wal-ready-at-entry-p *wal-poisoned*))
                     (finish-committed-transaction b xid)))))))

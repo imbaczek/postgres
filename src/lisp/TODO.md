@@ -37,8 +37,8 @@
   (`/tmp/pg-sync-termination-shutdown.log`).
 
 - [x] Add the synchronous standby configuration parser and sender selection
-  foundation. No GUC, public synchronous state or commit waiting is wired yet;
-  config, wait, feedback and source-incarnation fencing integration remain open.
+  foundation. At this checkpoint no GUC, public synchronous state or commit wait
+  was wired, and config, feedback and source fencing integration remained open.
   Restart the Lisp image for the sender structure layout change. The checkpoint
   passed 719 unit and 201 wire tests, plus seven existing sender physical
   regressions (not a full physical rerun); strict cold compilation passed
@@ -50,14 +50,40 @@
 
 - [x] Add the private synchronous publication and wait core. Real worker
   threads modeled feedback, config, cancel and termination; SQL commit waiting
-  was not tested or wired. The checkpoint passed 732 unit and 201 wire tests,
+  was not tested or wired at that checkpoint. It passed 732 unit and 201 wire tests,
   seven existing sender physical tests (not a full physical rerun), and strict
   cold compilation (`/tmp/pg-sync-wait-reviewed-cold.log`). The scoped cl-spec
   queue-prefix property ran 100 trials at seed 42 (digest `9248d664822bed72`);
   input coverage and rejection counts were not measured. Remaining integration
-  includes a separate nonblocking config service (the sole reload worker can
-  deadlock on drain), fully prepared candidate validation and commit, actual
-  commit waiting, native source-incarnation events and early registration fencing.
+  includes public settings, actual commit waiting, final DDL and maintenance
+  policy, and asynchronous `synchronous_commit=off` behavior.
+
+- [x] Capture exact durable catalog terminal boundaries before local apply, with
+  fail-stop publication and backend failure fencing (`a59b2256057`). Install a
+  fresh source incarnation at startup, promotion and accepted follow or history
+  changes; capture sender ownership during startup (`cdfa0829c6c`). Capture each
+  transaction's own catalog and commit boundaries for future waiting
+  (`809b80b6110`). The latest checkpoint passed 744 unit, 1,325 physical and 201
+  wire tests, strict cold compilation (`/tmp/pg-transaction-obligation-cold.log`)
+  and SQL smoke. This captures obligations only; it adds no remote wait.
+
+- [ ] Build the independent configuration service needed before commit waiting.
+  This is proposed, not implemented; it adds no coordinator. Parking synchronous
+  waiters alone does not keep configuration service available.
+
+  1. Prepare an immutable installed snapshot in full and migrate coherent readers
+     under the existing quiescent installer.
+  2. Fence follow generation checks through their effects, then publish candidates
+     atomically without quiescence after HBA, claim, resource, slot and predecessor
+     checks.
+  3. Separate the configuration worker from code drain. Serialize candidate
+     preparation/publication with actual ASDF replacement, never holding that
+     definition lock while draining. Configuration takes neither the reload run
+     lock nor admission.
+  4. Regress a synchronous waiter retaining its XID, a second admitted transaction
+     blocked on that XID, and a pending code reload. Repeated SIGHUP must preserve
+     everything on invalid input and release waiters when valid names are cleared. A third request
+     with a retained portal must demonstrate continuous service.
 
 - [ ] Complete the unchanged Patroni monitoring query and synchronous-replication
   backend contract. Synchronous setting lookup fails with 42704. Preserve the
