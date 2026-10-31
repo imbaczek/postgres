@@ -14,6 +14,10 @@
   `recovery_target_name`, `recovery_target_time` and `recovery_target_xid`.
   Positive prepared-transaction capacity, commit timestamp tracking and targeted
   recovery remain unimplemented. Keep the complete writer oracle unchanged.
+    Ordered trust/reject HBA parsing and matching are implemented, but are not yet
+    connected to startup authentication. File loading, active-path reload,
+    connection enforcement and backup policy preservation remain open. Numeric
+    IPv4 includes C's legacy forms; scoped IPv6 addresses remain unsupported.
   `wal_level` accepts replica and logical; minimal WAL generation remains
   unsupported. Replica uses dynamic logical capture for live or arming slots,
   while logical captures even without slots. Each XID keeps its capture choice.

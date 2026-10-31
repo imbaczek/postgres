@@ -1,6 +1,12 @@
+;;; Host authentication rule parsing and matching.
+;;;
+;;; This is a pure lexer, parser and matcher for a limited HBA subset.  It is
+;;; not yet connected to authentication or hba_file and ident_file handling.
+;;; Parsed rules are treated as immutable after a generation is built.
 (in-package #:pg)
 
 (defstruct (hba-token (:constructor %make-hba-token (text quoted-p)))
+  "Retain token text and whether its initial quote prevents keyword matching."
   (text "" :read-only t)
   (quoted-p nil :read-only t))
 
@@ -8,6 +14,9 @@
   (or (char= character #\Space) (char= character #\Tab)))
 
 (defun hba-next-token (line position)
+  "Read one token and return its end position and comma separator flag.
+Keep whether the token began quoted for keyword matching. As in C, an unmatched
+quote at end of line is accepted."
   (let ((length (length line))
         (buffer (make-array 32 :element-type 'character :adjustable t :fill-pointer 0))
         (in-quote nil) (was-quote nil) (saw-quote nil) (initial-quote nil) (comma nil))
@@ -36,6 +45,8 @@
             position comma)))
 
 (defun hba-tokenize-line (line)
+  "Split one logical line into fields and comma-separated tokens.
+Quoted keywords remain literal values; unquoted comments end the line."
   (check-type line string)
   (when (or (find (code-char 0) line) (find #\Newline line))
     (error "authentication tokenizer requires one logical line without NUL"))
@@ -52,11 +63,14 @@
         (push (nreverse field) fields)))))
 
 (defstruct hba-rule
+  "A parsed rule with source location, treated as immutable within its generation."
   (transport nil :read-only t) (databases nil :read-only t) (users nil :read-only t)
   (network nil :read-only t) (mask nil :read-only t) (method nil :read-only t)
   (source nil :read-only t) (line 0 :read-only t))
 
 (defun hba-logical-lines (text &key (source "pg_hba.conf"))
+  "Join backslash-continued physical lines and retain each starting line number.
+Reject a logical line longer than 65536 characters."
   (let ((lines nil) (number 0) (start 0) (continuing nil)
                     (buffer (make-string-output-stream)) (size 0))
     (with-input-from-string (input text)
@@ -85,6 +99,8 @@
   (first field))
 
 (defun hba-check-selectors (tokens database-p)
+  "Reject selector forms this matcher cannot resolve, including role membership,
+include files and regular expressions, before accepting a rule."
   (dolist (token tokens)
     (let ((text (hba-token-text token)))
       (when (or (and (plusp (length text)) (char= (char text 0) #\/))
@@ -101,6 +117,8 @@
   (text sb-alien:c-string) (address (* (sb-alien:unsigned 8))))
 
 (defun hba-parse-ip-address (text)
+  "Parse a numeric address without DNS. IPv6 must be unscoped; IPv4 uses libc's
+legacy numeric forms after an ASCII character whitelist check."
   (handler-case
       (if (find #\: text)
           (progn
@@ -109,6 +127,7 @@
               (error "unsupported IPv6 address syntax"))
             (sb-bsd-sockets:make-inet6-address text))
           (let ((address (make-array 4 :element-type '(unsigned-byte 8) :initial-element 0)))
+            ;; Keep legacy numeric forms while excluding inet_aton's trailing whitespace.
             (unless (and (plusp (length text))
                          (every (lambda (character)
                                   (find character "0123456789abcdefABCDEFxX.")) text)
@@ -121,6 +140,9 @@
     (error () (error "unsupported or invalid numeric authentication address ~s" text))))
 
 (defun hba-parse-prefix (text)
+  "Parse decimal prefix text with C strtol whitespace and sign rules.
+Leading ASCII whitespace and a sign are accepted; trailing text is rejected.
+The caller checks the address-family range."
   (let* ((length (length text))
          (start (position-if-not (lambda (character)
                                    (find (char-code character) '(9 10 11 12 13 32))) text))
@@ -142,6 +164,8 @@
        (coerce (loop for index below length collect index) 'vector)))
 
 (defun hba-parse-network (fields)
+  "Read an all-address keyword, CIDR address or numeric address and netmask.
+Require matching address families and return the number of fields consumed."
   (let* ((token (hba-single-token (first fields) "address"))
          (text (hba-token-text token)) (slash (position #\/ text)))
     (when (hba-keyword-p token "all") (return-from hba-parse-network (values nil nil 1)))
@@ -156,6 +180,9 @@
       (values address mask (if slash 1 2)))))
 
 (defun hba-parse-rule (fields source line)
+  "Build a rule with its source and logical line for diagnostics.
+Only supported transports and trust or reject methods are accepted; unsupported
+selectors, methods, options and extra fields fail the parse."
   (unless (>= (length fields) 4) (error "authentication rule has too few fields"))
   (let* ((name (hba-token-text (hba-single-token (first fields) "connection type")))
          (transport (cdr (assoc name '(("local" . :local) ("host" . :host)
@@ -176,6 +203,9 @@
                        :network network :mask mask :method method :source source :line line)))))
 
 (defun hba-parse-text (text &key (source "pg_hba.conf"))
+  "Parse a complete candidate generation in file order, or signal an error.
+Reject NUL, empty rule sets and input over 1048576 characters. Each rule retains
+its source and starting line; callers must treat the result as immutable."
   (check-type text string)
   (when (or (> (length text) 1048576) (find (code-char 0) text))
     (error "authentication file exceeds its bound or contains NUL"))
@@ -195,6 +225,8 @@
         tokens))
 
 (defun hba-database-matches-p (tokens user database replication)
+  "Match the database field. Physical replication requires the unquoted
+replication keyword; all does not match it."
   (some (lambda (token)
           (if (eq replication :physical)
               (hba-keyword-p token "replication")
@@ -219,6 +251,9 @@
                    always (zerop (logand (logxor address client) bits)))))))
 
 (defun hba-match-rules (rules user database peer &key replication (transport :tcp) ssl-p)
+  "Return the first matching method and rule, or :IMPLICIT-REJECT and NIL.
+TCP callers must supply a validated four- or sixteen-octet numeric peer address.
+No hostname lookup is performed."
   (check-type user string)
   (check-type database string)
   (unless (member replication '(nil :database :physical))
