@@ -585,21 +585,188 @@
                   (query-execution-owner-add-cleanup owner (lambda () (push :owner events))))
                 (setf (backend-xid *backend*) 777
                       (symbol-function 'wal-commit-transaction)
-                      (lambda (xid after &optional changes)
+                      (lambda (xid after &optional changes terminal-durable)
                         (declare (ignore xid changes))
                         (push :wal events)
                         (rove:ok (zerop *active-snapshots*))
-                        (funcall after))
+                        (when (and *wal-ready* terminal-durable)
+                          (funcall terminal-durable 140))
+                        (funcall after)
+                        (rove:ok (eql (backend-xid *backend*) 777)
+                                 "durable publication retains the transaction identity")
+                        (rove:ok (not (member :release events))
+                                 "storage apply precedes XID release")
+                        (push :storage-applied events))
                       (symbol-function 'clog-set)
                       (lambda (&rest arguments) (declare (ignore arguments)))
                       (symbol-function 'release-xid)
                       (lambda (&rest arguments) (declare (ignore arguments)) (push :release events)))
                 (commit-transaction)
-                (rove:ok (equal (nreverse events) '(:owner :wal :release))))
+                (rove:ok (equal (nreverse events) '(:owner :wal :storage-applied :release))))
            (setf (symbol-function 'wal-commit-transaction) wal
                  (symbol-function 'clog-set) clog
                  (symbol-function 'release-xid) release
                  (backend-xid *backend*) nil))))))
+
+(rove:deftest commit-publication-failure-keeps-committed-cleanup
+    (call-with-select-portal-test
+     (lambda (stream)
+       (declare (ignore stream))
+       (let ((wal (symbol-function 'wal-commit-transaction))
+             (clog (symbol-function 'clog-set))
+             (release (symbol-function 'release-xid)))
+         (unwind-protect
+              (dolist (wal-ready '(nil t))
+                (dolist (phase '(:before :clog :storage :success))
+                  (let* ((*wal-ready* wal-ready)
+                         (settings (make-hash-table :test #'equal))
+                         (committed-p (and (not (eq phase :before))
+                                           (or wal-ready (not (eq phase :clog)))))
+                         (released nil))
+                    (setf (backend-xid *backend*) 777
+                          (backend-settings-transaction-start *backend*) settings
+                          (symbol-function 'release-xid)
+                          (lambda (xid &optional backend)
+                            (declare (ignore backend))
+                            (rove:ok (= xid 777))
+                            (setf released t))
+                          (symbol-function 'clog-set)
+                          (lambda (&rest arguments)
+                            (declare (ignore arguments))
+                            (when (eq phase :clog) (error "CLOG publication failure")))
+                          (symbol-function 'wal-commit-transaction)
+                          (lambda (xid after &optional changes terminal-durable)
+                            (declare (ignore xid changes))
+                            (when (eq phase :before) (error "before durable terminal"))
+                            (when (and *wal-ready* terminal-durable)
+                              (funcall terminal-durable 140))
+                            (funcall after)
+                            (when (eq phase :storage) (error "storage apply failure"))
+                            140))
+                    (let ((failed (handler-case (progn (commit-transaction) nil)
+                                    (error () t))))
+                      (rove:ok (eql failed (not (eq phase :success)))))
+                    (rove:ok (eql released (not (null committed-p))))
+                    (if committed-p
+                        (progn
+                          (rove:ok (null (backend-xid *backend*)))
+                          (rove:ok (null (backend-settings-transaction-start *backend*))
+                                   "irreversible commit retires rollback settings"))
+                        (progn
+                          (rove:ok (= (backend-xid *backend*) 777))
+                          (rove:ok (eq (backend-settings-transaction-start *backend*) settings))))
+                    (setf (backend-xid *backend*) nil
+                          (backend-settings-transaction-start *backend*) nil))))
+           (setf (symbol-function 'wal-commit-transaction) wal
+                 (symbol-function 'clog-set) clog
+                 (symbol-function 'release-xid) release
+                 (backend-xid *backend*) nil
+                 (backend-settings-transaction-start *backend*) nil))))))
+
+(rove:deftest commit-nonlocal-publication-exits-fail-stop
+    (call-with-select-portal-test
+     (lambda (stream)
+       (declare (ignore stream))
+       (let* ((directory (merge-pathnames
+                          (format nil "pg-commit-exit-~d-~d/" (sb-posix:getpid) (random 1000000))
+                          (uiop:temporary-directory)))
+              (*query-temp-directory* directory)
+              (*wal-ready* t)
+              (*wal-output-stream* nil)
+              (*wal-dirty-store* nil)
+              (*wal-page-cache* (make-hash-table :test #'equal))
+              (*wal-page-cache-xids* (make-hash-table :test #'equal))
+              (names '(wal-append-running-xacts-under-lock wal-append-batch-start
+                       wal-append-record wal-flush wal-slot-record-xid-commit-under-wal-lock
+                       wal-primary-apply-page-spool wal-fail-stop clog-set release-xid))
+              (saved (mapcar (lambda (name) (cons name (symbol-function name))) names)))
+         (ensure-directories-exist directory)
+         (unwind-protect
+              (dolist (phase '(:flush :slot :clog :apply :release))
+                (let ((*wal-poisoned* nil)
+                      (statuses nil)
+                      (released nil)
+                      (fenced nil))
+                  (setf (backend-xid *backend*) 777
+                        (backend-settings-transaction-start *backend*) (make-hash-table)
+                        (symbol-function 'wal-append-running-xacts-under-lock)
+                        (lambda (xid) (declare (ignore xid)))
+                        (symbol-function 'wal-append-batch-start) (lambda () 100)
+                        (symbol-function 'wal-append-record)
+                        (lambda (&rest arguments) (declare (ignore arguments)) 140)
+                        (symbol-function 'wal-flush)
+                        (lambda () (when (eq phase :flush) (throw 'publication-exit :escaped)))
+                        (symbol-function 'wal-slot-record-xid-commit-under-wal-lock)
+                        (lambda (&rest arguments)
+                          (declare (ignore arguments))
+                          (when (eq phase :slot) (throw 'publication-exit :escaped)))
+                        (symbol-function 'clog-set)
+                        (lambda (xid status &key fsync)
+                          (declare (ignore xid fsync))
+                          (push status statuses)
+                          (when (eq phase :clog) (throw 'publication-exit :escaped)))
+                        (symbol-function 'wal-primary-apply-page-spool)
+                        (lambda (&rest arguments)
+                          (declare (ignore arguments))
+                          (when (eq phase :apply) (throw 'publication-exit :escaped)))
+                        (symbol-function 'release-xid)
+                        (lambda (&rest arguments)
+                          (declare (ignore arguments))
+                          (setf released t)
+                          (when (eq phase :release) (throw 'publication-exit :escaped)))
+                        (symbol-function 'wal-fail-stop)
+                        (lambda (condition)
+                          (rove:ok (not (sb-thread:holding-mutex-p *wal-lock*))
+                                   "publication fencing runs after releasing WAL")
+                          (setf *wal-poisoned* t fenced t)
+                          (error condition)))
+                  (rove:ok
+                   (eq :failed
+                       (handler-case
+                           (catch 'publication-exit (commit-transaction) :success)
+                         (error () :failed)))
+                   "a nonlocal publication exit becomes fail-stop, never success")
+                  (rove:ok fenced)
+                  (rove:ok *wal-poisoned*)
+                  (rove:ok released)
+                  (rove:ok (null (backend-xid *backend*)))
+                  (rove:ok (null (backend-settings-transaction-start *backend*)))
+                  (rove:ok (not (member +clog-aborted+ statuses))
+                           "indeterminate durability must not publish an abort")))
+           (dolist (entry saved) (setf (symbol-function (car entry)) (cdr entry)))
+           (setf (backend-xid *backend*) nil
+                 (backend-settings-transaction-start *backend*) nil)
+           (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))))
+
+(rove:deftest committed-cleanup-preserves-first-error
+    (let* ((backend (make-backend :xid 777))
+           (original (make-condition 'simple-error :format-control "release failed"))
+           (names '(release-xid finish-backend-transaction wal-fail-stop))
+           (saved (mapcar (lambda (name) (cons name (symbol-function name))) names))
+           (attempted nil)
+           (fenced nil))
+      (unwind-protect
+           (progn
+             (setf (symbol-function 'release-xid)
+                   (lambda (&rest arguments) (declare (ignore arguments)) (error original))
+                   (symbol-function 'finish-backend-transaction)
+                   (lambda (owner committed-p)
+                     (rove:ok (eq owner backend))
+                     (rove:ok committed-p)
+                     (setf attempted t)
+                     (error "secondary cleanup failure"))
+                   (symbol-function 'wal-fail-stop)
+                   (lambda (condition)
+                     (rove:ok (not (sb-thread:holding-mutex-p *wal-lock*)))
+                     (setf fenced condition)
+                     (error condition)))
+             (rove:ok (eq original
+                          (handler-case (finish-committed-transaction backend 777)
+                            (error (condition) condition))))
+             (rove:ok attempted)
+             (rove:ok (eq fenced original)
+                      "cleanup failure must not replace the original release error"))
+        (dolist (entry saved) (setf (symbol-function (car entry)) (cdr entry))))))
 
 (rove:deftest select-portal-connection-finish-invalidates-before-retirement
     (call-with-select-portal-test

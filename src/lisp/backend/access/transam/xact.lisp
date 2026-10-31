@@ -2250,6 +2250,25 @@ On commit, retire the saved settings snapshot; abort leaves it for whole-table u
         (setf (backend-settings-transaction-start backend) nil))))
   (values))
 
+(defun finish-committed-transaction (backend xid)
+  (let ((complete nil)
+        (failure nil))
+    (sb-sys:without-interrupts
+      (unwind-protect
+           (handler-bind ((error (lambda (condition) (unless failure (setf failure condition)))))
+             (unwind-protect
+                  (release-xid xid)
+               (sb-thread:with-mutex (*wal-lock*)
+                 (finish-backend-transaction backend t)))
+             (setf complete t))
+        (unless complete
+          (wal-fail-stop
+           (or failure
+               (make-condition 'simple-error
+                               :format-control "Committed transaction cleanup exited before completion"
+                               :format-arguments nil)))))))
+  (values))
+
 (defun commit-transaction ()
   (ensure-exported-snapshot-scope-can-end *backend*)
   (prepare-backend-portal-transaction-end *backend* t)
@@ -2270,14 +2289,21 @@ On commit, retire the saved settings snapshot; abort leaves it for whole-table u
           ;; Validate the spool before publishing any WAL batch. Subsequent I/O
           ;; failure during WAL insertion follows the normal critical-failure path.
           (sb-sys:without-interrupts
-            (wal-commit-transaction
-             (backend-xid b)
-             (lambda ()
-               (clog-set (backend-xid b) +clog-committed+
-                         :fsync (not *wal-ready*))
-               (release-xid (backend-xid b))
-               (finish-backend-transaction b t))
-             changes)))
+            (let ((irreversible nil)
+                  (wal-ready-at-entry-p *wal-ready*)
+                  (xid (backend-xid b)))
+              (unwind-protect
+                   (wal-commit-transaction
+                    xid
+                    (lambda ()
+                      (clog-set xid +clog-committed+ :fsync (not wal-ready-at-entry-p))
+                      (setf irreversible t))
+                    changes
+                    (lambda (end)
+                      (declare (ignore end))
+                      (setf irreversible t)))
+                (when (or irreversible (and wal-ready-at-entry-p *wal-poisoned*))
+                  (finish-committed-transaction b xid))))))
         (finish-backend-transaction b t)))
   (values))
 
