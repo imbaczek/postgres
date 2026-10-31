@@ -1,5 +1,8 @@
 (in-package #:pg)
 
+;; Parse synchronous standby names and select sender frontiers only.  The C
+;; references are syncrep_scanner.l, syncrep_gram.y and syncrep.c.
+
 (defun sync-standby-syntax-error ()
   (ereport "42601" "invalid value for parameter \"synchronous_standby_names\""))
 
@@ -34,6 +37,8 @@
     (sync-standby-syntax-error)))
 
 (defun sync-standby-tokenize (text)
+  ;; This is the configuration grammar, not the SQL identifier scanner; names
+  ;; are retained without SQL identifier truncation.
   (let ((position 0)
         (size (length text))
         (tokens nil))
@@ -75,6 +80,8 @@
     (nreverse tokens)))
 
 (defun parse-sync-standby-names (text)
+  ;; Only an actually empty string disables selection.  The owner must treat
+  ;; the returned :METHOD, :COUNT and :MEMBERS plist as immutable.
   (when (zerop (length text)) (return-from parse-sync-standby-names nil))
   (when (find (code-char 0) text) (sync-standby-syntax-error))
   (let ((tokens (sync-standby-tokenize text))
@@ -107,6 +114,8 @@
       (list :method method :count count :members (nreverse members)))))
 
 (defun sync-standby-priority (config application-name &optional cascading-p)
+  ;; The first matching name or wildcard supplies priority; ANY uses priority 1.
+  ;; Recovery senders are excluded, including cascading senders.
   (if (or (null config) cascading-p)
       0
       (loop for name in (getf config :members)
@@ -124,12 +133,22 @@
         (< a b))))
 
 (defun sync-standby-mode-frontier (selected field method count)
+  ;; FIRST takes a strict minimum, including NIL normalized to zero.  Unlike
+  ;; C's SyncRepGetOldestSyncRecPtr accumulator, a zero cannot be discarded
+  ;; by a later nonzero value.
+  ;; Thus an unknown selected peer blocks this mode; do not substitute another.
+  ;; ANY takes the Nth highest position independently for each mode.
   (let ((positions (mapcar (lambda (row) (or (getf row field) 0)) selected)))
     (ecase method
       (:first (reduce #'min positions))
       (:any (nth (1- count) (sort positions #'>))))))
 
 (defun sync-replication-select-standbys (config rows)
+  ;; The caller supplies current sender rows; this selector does not validate
+  ;; registry tokens.  Eligible senders are streaming or stopping with positive flush;
+  ;; logical senders are eligible on a primary.  FIRST sorts by priority only
+  ;; when a cutoff is needed; otherwise preserve slot order.  Too few candidates
+  ;; still return the selected rows, but no frontiers.
   (unless config (return-from sync-replication-select-standbys (values nil nil)))
   (let* ((method (getf config :method))
          (count (getf config :count))
@@ -165,5 +184,7 @@
                           (wal-sender-snapshot-under-lock sender))))))
 
 (defun sync-replication-current-selection (config)
+  ;; Read current registry membership and sender fields under the sender mutex.
+  ;; This selection alone does not expose sync state or wait for acknowledgments.
   (sb-thread:with-mutex (*wal-sender-lock*)
     (sync-replication-select-current-under-lock config)))

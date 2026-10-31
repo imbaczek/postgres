@@ -36,13 +36,25 @@
   wire tests, strict cold compilation, and the real shutdown test
   (`/tmp/pg-sync-termination-shutdown.log`).
 
+- [x] Add the synchronous standby configuration parser and sender selection
+  foundation. No GUC, public synchronous state or commit waiting is wired yet;
+  config, wait, feedback and source-incarnation fencing integration remain open.
+  Restart the Lisp image for the sender structure layout change. The checkpoint
+  passed 719 unit and 201 wire tests, plus seven existing sender physical
+  regressions (not a full physical rerun); strict cold compilation passed
+  (`/tmp/pg-syncrep-selection-final-cold.log`). The 31-case C parser oracle is
+  `/tmp/pg-syncrep-parser-c-oracle.json`. Scoped cl-spec checks at seed 42 ran
+  100 trials each: parser Function Spec (digest `2ff4d2ff15c97d0d`), quoted
+  property (`a3f4bbb1a9500ce5`) and quorum property (`99cb3720a61bacdc`). Input
+  coverage and rejection counts were not measured.
+
 - [ ] Complete the unchanged Patroni monitoring query and synchronous-replication
   backend contract. Synchronous setting lookup fails with 42704. Preserve the
   complete real query as the acceptance oracle.
   Patroni's sync handler also emits a DO block containing SET LOCAL
   synchronous_commit=off and PERFORM txid_current(); these remain dependencies
   of unchanged-method acceptance. Implement commit waiting and FIRST/ANY
-  selection against C `syncrep.c`, with independent acknowledgment/crash tests;
+  integration against C `syncrep.c`, with independent acknowledgment/crash tests;
   this item adds no coordination. Keep nonempty synchronous standby names
   unsupported and sender status asynchronous until remote commit waiting is
   implemented: Patroni treats sync status as a safety signal. Preserve the

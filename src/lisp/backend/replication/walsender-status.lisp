@@ -6,12 +6,15 @@
 
 (defstruct wal-sender-status
   "Mutable status owned by one replication backend and protected by the sender lock."
+  ;; INDEX is a reusable slot, not a persistent sender identity.  Restart the
+  ;; Lisp image after changing this structure layout.
   backend index (state "startup") sent-lsn write-lsn flush-lsn replay-lsn reply-time)
 
 (defvar *wal-sender-lock* (sb-thread:make-mutex :name "pg walsender status"))
 (defvar *wal-sender-registry* (make-hash-table :test #'eq))
 
 (defun wal-sender-next-index-under-lock ()
+  ;; Reuse the lowest free slot index.  Call with the sender mutex held.
   (let ((used (make-hash-table :test #'eql)))
     (maphash (lambda (backend sender)
                (declare (ignore backend))
@@ -20,6 +23,7 @@
     (loop for index from 0 unless (gethash index used) return index)))
 
 (defun wal-sender-snapshot-under-lock (sender)
+  ;; Detach public fields while the caller holds the sender mutex.
   (let ((backend (wal-sender-status-backend sender)))
     (list :pid (backend-pid backend)
           :application-name (copy-seq (or (backend-application-name backend) ""))
