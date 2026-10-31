@@ -1631,6 +1631,10 @@ before this removal horizon is captured."
       (send-copy-command-complete stream copy-row-count))))
 
 (defun execute-in-transaction (stream ast)
+  "Run a statement and protect cleanup after final DDL publication.
+Mask entry to unwind cleanup and mark completion only after the interrupt mask
+is restored. An incomplete exit after final publication suppresses output and
+retires the transaction without undoing the catalog."
   (if (ddl-p ast)
       (progn
         (prepare-backend-final-ddl *backend*)

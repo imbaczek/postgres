@@ -75,6 +75,8 @@
   ;; maximum for that source; USER-END is this transaction's commit terminal.
   ;; A source mismatch is sticky.
   source-id catalog-end user-end (source-changed-p nil)
+  ;; DDL captures its mode before publication. FINAL-DDL-P records publication
+  ;; even without WAL; FINAL-DDL-END is its exact durable catalog end when present.
   (ddl-prepared-p nil) ddl-wait-mode (final-ddl-p nil) final-ddl-end)
 
 (defun prepare-backend-wal-obligation (backend)
@@ -104,6 +106,8 @@ permanently. A mismatched context cannot prove replication. A NIL end changes no
   (values))
 
 (defun record-final-ddl-wal-boundary (context source end)
+  "Record final DDL publication before recording its optional WAL end.
+The flag remains set even when END is NIL or the source has changed."
   (setf (transaction-wal-obligation-final-ddl-p context) t)
   (record-transaction-wal-boundary context source end t)
   (when (and end (not (transaction-wal-obligation-source-changed-p context)))
@@ -111,6 +115,7 @@ permanently. A mismatched context cannot prove replication. A NIL end changes no
   (values))
 
 (defun prepare-backend-final-ddl (backend)
+  "Prepare a backend context and capture the wait mode before DDL publication."
   (let ((mode (synchronous-commit-wait-mode)))
     (multiple-value-bind (context source) (prepare-backend-wal-obligation backend)
       (declare (ignore source))
@@ -2359,8 +2364,9 @@ On commit, retire the saved settings snapshot; abort leaves it for whole-table u
   (values))
 
 (defun finish-committed-transaction (backend xid)
-  ;; Retire resources even when WAL is poisoned, without changing CLOG.  An
-  ;; incomplete cleanup fail-stops after releasing the mutex; keep the first error.
+  ;; An absent XID needs no release. Retire resources even when WAL is
+  ;; poisoned, without changing CLOG. An incomplete cleanup fail-stops after
+  ;; releasing the mutex; keep the first error.
   (let ((complete nil)
         (failure nil))
     (sb-sys:without-interrupts
@@ -2393,10 +2399,11 @@ On commit, retire the saved settings snapshot; abort leaves it for whole-table u
 
 (defun wait-for-committed-wal-obligation
     (backend obligation mode &optional (end (and obligation (transaction-wal-obligation-user-end obligation))))
-  "Wait for this locally committed transaction's own terminal boundary.
+  "Wait for the supplied locally committed terminal boundary.
+END defaults to the user commit end; no-XID final DDL supplies its catalog end.
 A changed source or abnormal exit suppresses frontend output, as does
 termination; cancellation and timeout are handled after committed cleanup.
-The caller keeps interrupts masked and retains the XID until cleanup."
+The caller keeps interrupts masked and retains any XID until cleanup."
   (when (and mode obligation
              (or (transaction-wal-obligation-source-changed-p obligation)
                  end))
@@ -2448,10 +2455,15 @@ and source change close the connection. An incomplete response suppresses output
   (values))
 
 (defun backend-final-ddl-committed-p (backend)
+  "Test whether this backend crossed the durable final DDL catalog boundary."
   (let ((context (backend-wal-obligation backend)))
     (and context (transaction-wal-obligation-final-ddl-p context))))
 
 (defun finish-failed-final-ddl (backend)
+  "Suppress output after failed final DDL completion.
+Abort an in-progress XID when WAL is healthy; poisoned WAL uses indeterminate
+committed cleanup instead. The catalog publication remains durable.
+The caller keeps interrupts masked through this cleanup."
   (suppress-backend-frontend-output backend :abnormal-ddl-completion)
   (when (or (backend-xid backend) (not (eq (backend-state backend) :idle)))
     (if (and (backend-xid backend) (not *wal-poisoned*))
@@ -2460,6 +2472,9 @@ and source change close the connection. An incomplete response suppresses output
   (values))
 
 (defun commit-final-ddl-without-xid (backend)
+  "Wait for the final DDL catalog end without an XID.
+BACKEND must retain its prepared, published DDL context.
+Run outside publication locks, clean up the transaction, then handle the outcome."
   (let* ((context (backend-wal-obligation backend))
          (outcome nil))
     (sb-sys:without-interrupts
@@ -2501,6 +2516,7 @@ and source change close the connection. An incomplete response suppresses output
                 (prepare-backend-wal-obligation b))
             (sb-sys:without-interrupts
               (let ((irreversible nil)
+                    ;; XID-bearing DDL waits for its user commit with the captured DDL mode.
                     (mode (if (backend-final-ddl-committed-p b)
                               (transaction-wal-obligation-ddl-wait-mode (backend-wal-obligation b))
                               (synchronous-commit-wait-mode)))

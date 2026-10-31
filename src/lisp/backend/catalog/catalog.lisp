@@ -470,6 +470,10 @@ cluster-wide minimum directly and skips missing horizons."
 
 (defun save-catalog (&key deferred-relations logical-event on-record-appended final-ddl-p
                        (applied-logical-event-id *logical-event-apply-id*))
+  "Persist the catalog and any deferred relation drops.
+FINAL-DDL-P marks an explicit final DDL save using a prepared backend context.
+Its durable callback records publication even when no WAL end exists. Reservation,
+cleanup, ordinary sequence and maintenance saves do not use this marker."
   (prevent-recovery-write "catalog persistence")
   (when final-ddl-p
     (unless (and *backend* (eq (backend-state *backend*) :in-progress)

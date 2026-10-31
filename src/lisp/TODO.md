@@ -139,8 +139,16 @@
   tests plus three final focused cases, 754 unit, 201 wire and 1,159 legacy
   checks, strict cold compilation and an owned seven-case SQL script.
 
-- [ ] Complete public synchronous settings and status, no-XID DDL final markers,
-  and true asynchronous `synchronous_commit=off`. Regress a synchronous waiter
+- [x] Capture explicit final DDL catalog boundaries and wait without an XID;
+  XID-bearing DDL waits for its user commit using the prepared mode
+  (`64877d34169`). The checkpoint passed 1,409 physical, 755 unit, 201 wire
+  and 1,159 legacy checks, strict cold compilation, a focused no-WAL rerun and
+  the native DDL scenario script. The scoped cl-spec property ran 100 trials at
+  seed 42 (digest `942121ab116a97c6`); coverage and rejection counts were not
+  measured.
+
+- [ ] Complete public synchronous settings and status and true asynchronous
+  `synchronous_commit=off`. Regress a synchronous waiter
   retaining its XID, a second transaction blocked on it, and a pending code reload:
   repeated SIGHUP with invalid input must preserve the installed state; clearing
   public standby names must
