@@ -88,6 +88,15 @@
   744 unit, 1,341 physical and 201 wire tests, plus 1,159 legacy checks, strict
   cold compilation and SQL smoke. No independent configuration service is added.
 
+- [x] Fence receiver-local effects and desired generation publication
+  (`074b04f0e48`). Admission precedes the receiver fence; network I/O and joins
+  stay outside it. A superseded generation still flushes previously accepted
+  bytes while its runtime owns the store; a retired runtime leaves it alone.
+  Runtime publication and retirement use the same fence. The checkpoint passed
+  749 unit, 1,350 physical and 201 wire tests, 1,159 legacy checks, strict cold
+  compilation and SQL smoke. The installer still requires quiescence; controller
+  durable publication and the independent configuration service remain open.
+
 - [ ] Build the independent configuration service needed before commit waiting.
   This is proposed, not implemented; it adds no coordinator. Parking synchronous
   waiters alone does not keep configuration service available.
@@ -98,9 +107,10 @@
      stays fixed, so reload can rescue retention. The private pin's exact-byte cap
      remains independent of `wal_keep_size`; preserve invalidation order. Capture
      restartpoint settings before taking the store lock.
-  2. Fence follow generation checks through their effects, then publish candidates
-     atomically without quiescence after HBA, claim, resource, slot and predecessor
-     checks.
+  2. Receiver and desired-generation publication fencing is complete. Fence
+     controller intent and active publication, keeping captured obsolete-sender
+     notifications outside the fence. Then publish candidates atomically without
+     quiescence after HBA, claim, resource, slot and predecessor checks.
   3. Separate the configuration worker from code drain. Serialize candidate
      preparation/publication with actual ASDF replacement, never holding that
      definition lock while draining. Configuration takes neither the reload run

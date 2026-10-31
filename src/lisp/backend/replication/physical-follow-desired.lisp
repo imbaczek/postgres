@@ -146,10 +146,11 @@ file and directory synchronization."
 
 (defun physical-follow-call-with-desired-install (desired function &optional preflight)
   "Install settings and their generation together under quiescence.
-Check the follow predecessor and optional preflight before and after the durable
-claim. Under the follow lock and interrupt mask, FUNCTION publishes settings,
-then the desired generation is swapped. Notify after unlock; a notification
-error is logged without undoing the installed configuration."
+After quiescence, take the generation fence and check the follow predecessor
+and optional preflight before and after the durable claim. Under the follow
+lock and interrupt mask, FUNCTION publishes settings, then the desired
+generation is swapped. Notify outside the fence; a notification error is logged
+without undoing the installed configuration."
   (check-type desired physical-follow-desired)
   (let ((changed nil))
     (flet ((install ()

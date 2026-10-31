@@ -7,8 +7,9 @@
 
 (defstruct (physical-follow-runtime (:print-function physical-libpq-print-private-object))
   "CONFIG is the runtime's private saved configuration; TRANSITION requests a
-controller handoff. Lifecycle and client ownership use the follow lock.
-STOPPED-P stops both workers; RECEIVER-STOPPED-P stops receipt alone."
+controller handoff. Lifecycle and client ownership use the follow lock; runtime
+publication and retirement also use the generation fence. STOPPED-P stops both
+workers; RECEIVER-STOPPED-P stops receipt alone."
   host port pin config generation transition limit next-timeline
   (stopped-p nil) (receiver-stopped-p nil) (connected-p nil) last-error client receiver-thread replay-thread)
 
@@ -24,7 +25,7 @@ STOPPED-P stops both workers; RECEIVER-STOPPED-P stops receipt alone."
   (physical-follow-require-generation (physical-follow-runtime-generation runtime)))
 
 (defun physical-follow-authorize-receiver (runtime)
-  "Fence receiver work against a superseded claimed generation under admission."
+  "Check the claimed generation and recovery availability under admission."
   (with-live-operation
     (physical-follow-require-runtime-generation runtime)
     (check-recovery-available))
@@ -39,7 +40,9 @@ STOPPED-P stops both workers; RECEIVER-STOPPED-P stops receipt alone."
   (sb-thread:make-mutex :name "native physical follow generation"))
 
 (defun call-with-physical-follow-generation-fence (function)
-  "Run a local generation check and its effects without concurrent publication."
+  "Run local generation checks and effects under a reentrant fence.
+Callers establish admission when needed; acquire this fence before the follow
+lock, and release the follow lock before taking the store mutex."
   (if (sb-thread:holding-mutex-p *physical-follow-generation-lock*)
       (funcall function)
       (progn
@@ -49,7 +52,7 @@ STOPPED-P stops both workers; RECEIVER-STOPPED-P stops receipt alone."
           (funcall function)))))
 
 (defmacro with-physical-follow-generation-operation (&body body)
-  "Enter admission before fencing receiver-local effects."
+  "Enter admission before fencing receiver-local checks and effects."
   `(progn
      (when (and (zerop *live-operation-depth*)
                 (sb-thread:holding-mutex-p *physical-follow-generation-lock*))
@@ -1075,7 +1078,8 @@ Validation checks coherence, not durable state or source proof."
     (physical-follow-require-bootstrap-config (physical-follow-read-config))))
 
 (defun physical-follow-feedback (client &optional runtime)
-  "Snapshot independent write/flush/apply, then perform socket I/O outside admission."
+  "Snapshot write, flush and apply under admission and the generation fence.
+Send feedback outside the fence and admission."
   (when *physical-stream-test-hook* (funcall *physical-stream-test-hook* :before-feedback))
   (let ((payload
           (with-physical-follow-generation-operation
@@ -1095,6 +1099,9 @@ Validation checks coherence, not durable state or source proof."
       (physical-client-feedback client payload))))
 
 (defun physical-follow-process-frame (payload &optional runtime)
+  "Validate and process a frame under the generation fence.
+For WAL data, publish sender telemetry before the local write.
+Flush when required. The follow lock is released before store operations."
   (with-physical-follow-generation-operation
     (when runtime (physical-follow-require-runtime-generation runtime))
     (unless (and payload (plusp (length payload))) (physical-follow-reject "empty native physical frame"))
@@ -1190,7 +1197,9 @@ The public slot is a separate persistent source slot, not the proof pin."
     (physical-follow-reject "source identity or timeline differs from the native recovery base")))
 
 (defun physical-follow-flush-on-exit (runtime)
-  "Flush accepted writes only while RUNTIME still owns the receive store."
+  "Flush accepted writes while RUNTIME owns the receive store.
+A superseded generation still flushes its own accepted writes; a non-owner does
+nothing. A storage failure closes recovery instead of reporting a clean exit."
   (with-physical-follow-generation-operation
     (unless (sb-thread:with-mutex (*physical-follow-lock*)
               (eq runtime *physical-follow-runtime*))
@@ -1280,7 +1289,9 @@ is not authentication or proof of source identity."
         (physical-client-close client)))))
 
 (defun physical-follow-finish-bound-stream (client runtime)
-  "Flush and verify the parent fork before accepting the source's timeline switch."
+  "Flush and verify the parent fork before accepting the source's timeline switch.
+Fence the local flush and verification. Feedback takes its own local snapshot;
+the feedback send and network completion run outside the fence."
   (let ((limit (physical-follow-runtime-limit runtime))
         (next (physical-follow-runtime-next-timeline runtime)))
     (unless (and limit next)
@@ -1394,6 +1405,9 @@ Receipt ends there; replay remains free to reach its own policy fence."
         (setf (physical-follow-runtime-transition runtime) transition)))))
 
 (defun physical-follow-receiver-loop (runtime)
+  "Receive until stopped or a transition is ready.
+A live reload cannot replace this active loop frame; restart the receiver to
+adopt changes to its reset logic."
   (loop until (or (physical-follow-receiver-stopped-p runtime) (shutdown-in-progress-p))
         do (handler-case
                (let ((cursor (with-physical-follow-generation-operation
@@ -1453,7 +1467,7 @@ reload exclusion and quiescence before workers can read it."
   config)
 
 (defun physical-follow-launch-workers (config receive-p &optional transition generation configured-p)
-  "Publish replay and, when RECEIVE-P, receipt workers together.
+  "Publish replay and, when RECEIVE-P, receipt workers together under the fence.
 The caller holds the command mutex outside admission and has validated CONFIG.
 Configured receipt also requires an active desired generation at publication;
 the accepted binding alone does not authorize a stale configured launch."
@@ -1567,7 +1581,8 @@ A completed retained fork launches replay without contacting the source."
 The lifecycle owner must first block the controller and cancel its operation
 outside command, reload and admission locks, then hold the command mutex here.
 A controller operation already owns its transition when quiescing its runtime.
-Signal and join outside admission; a failed join or exit flush signals an error."
+Mark receipt stopped under the generation fence. Stop the client and join
+outside the fence and admission; a failed join or exit flush signals an error."
   (when (plusp *live-operation-depth*)
     (error "receiver quiescence must join outside admission"))
   (unless (sb-thread:holding-mutex-p *physical-follow-command-lock*)
@@ -1595,7 +1610,8 @@ Signal and join outside admission; a failed join or exit flush signals an error.
   "Stop and join both workers and preserve durable follow configuration.
 The caller owns the command mutex and joins outside admission. A lifecycle
 owner first blocks and cancels the controller; a controller operation already
-owns its transition."
+owns its transition. Publish stop and retirement under the generation fence;
+join workers outside it."
   (when (plusp *live-operation-depth*) (error "follow quiescence must join outside admission"))
   (let ((runtime *physical-follow-runtime*))
     (when runtime
