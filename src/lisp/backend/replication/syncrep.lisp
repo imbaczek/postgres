@@ -292,10 +292,24 @@
       (sb-thread:condition-broadcast (sync-replication-state-cv *sync-replication-state*))))
   (values))
 
-(defun sync-replication-install-configuration (text source-id expected-source-id expected-generation)
+(defun sync-replication-notify-obsolete-senders (obsolete)
+  "Terminate captured sender owners after proof publication releases its mutex."
+  (when (sb-thread:holding-mutex-p *wal-sender-lock*)
+    (error "obsolete sender notification cannot hold the sender mutex"))
+  (sb-sys:without-interrupts
+    (dolist (backend obsolete)
+      (unless (eq backend *backend*) (terminate-backend backend)))
+    (when (member *backend* obsolete :test #'eq)
+      (terminate-backend *backend*)))
+  (values))
+
+(defun sync-replication-install-configuration (text source-id expected-source-id expected-generation
+                                               &key defer-notifications)
   ;; Compare both predecessor source and configuration generation under lock.
   ;; Source IDs are immutable symbols or integers; the owning lifecycle must
   ;; supply a fresh real generation for every source incarnation.
+  (when (and defer-notifications sb-sys:*interrupts-enabled*)
+    (error "deferred sender notification requires masked interrupts"))
   (sync-replication-check-source-id source-id)
   (sync-replication-check-source-id expected-source-id)
   (let ((config (parse-sync-standby-names text))
@@ -326,29 +340,33 @@
           (if config
               (sync-replication-release-under-lock)
               (sync-replication-complete-all-under-lock :disabled))))
-      ;; OBSOLETE holds exact backend objects captured before registry clear.
-      ;; Signal after unlock, with this backend last so it cannot interrupt the rest.
-      (dolist (backend obsolete)
-        (unless (eq backend *backend*) (terminate-backend backend)))
-      (when (member *backend* obsolete :test #'eq)
-        (terminate-backend *backend*))
-      installed-generation)))
+      ;; A deferred caller retains the interrupt mask through notification.
+      (if defer-notifications
+          (values installed-generation obsolete)
+          (progn
+            (sync-replication-notify-obsolete-senders obsolete)
+            installed-generation)))))
 
 (declaim (special *live-operation-quiescence-owner-thread*))
 
-(defun sync-replication-new-source-incarnation ()
+(defun sync-replication-new-source-incarnation (&key defer-notifications)
   "Replace the source identity while preserving synchronous standby names.
 The caller must own live-operation quiescence and must not hold the WAL mutex.
 The configuration installer retires old senders, releases pending waiters with
 :SOURCE-CHANGED, and clears frontier proof when it installs the new identity."
+  (when (and defer-notifications sb-sys:*interrupts-enabled*)
+    (error "deferred sender notification requires masked interrupts"))
   (unless (eq *live-operation-quiescence-owner-thread* sb-thread:*current-thread*)
     (error "replication source replacement requires closed admission"))
   (when (sb-thread:holding-mutex-p *wal-lock*)
     (error "replication source replacement cannot hold the WAL mutex"))
   (multiple-value-bind (old generation names) (sync-replication-configuration-state)
     (let ((source (gensym "WAL-SOURCE-")))
-      (sync-replication-install-configuration names source old generation)
-      source)))
+      (multiple-value-bind (installed obsolete)
+          (sync-replication-install-configuration
+           names source old generation :defer-notifications defer-notifications)
+        (declare (ignore installed))
+        (if defer-notifications (values source obsolete) source)))))
 
 (defun sync-replication-interruption (backend)
   ;; Termination wins and stays pending for delivery after committed cleanup.

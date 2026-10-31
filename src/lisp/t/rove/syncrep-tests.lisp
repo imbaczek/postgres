@@ -587,6 +587,101 @@
          (rove:ok (eq :waiting (sync-replication-waiter-state pending)))
          (rove:ok (zerop (hash-table-count *wal-sender-registry*)))))))
 
+(rove:deftest synchronous-deferred-source-notification-requires-masked-caller
+    (call-with-sync-wait-state
+     (lambda ()
+       (sync-replication-install-configuration "FIRST 1 (*)" :source-a :source-a 0)
+       (let ((pending (sync-test-enqueue 100 :flush)))
+         (rove:ok
+          (handler-case
+              (progn
+                (funcall (symbol-function 'sync-replication-install-configuration)
+                         "FIRST 1 (*)" :source-b :source-a 1 :defer-notifications t)
+                nil)
+            (error () t)))
+         (rove:ok (eq :source-a (sync-replication-state-source-id *sync-replication-state*)))
+         (rove:ok (= 1 (sync-replication-state-generation *sync-replication-state*)))
+         (rove:ok (eq :waiting (sync-replication-waiter-state pending)))))))
+
+(rove:deftest synchronous-deferred-source-notification-keeps-exact-retired-owners
+    (call-with-sync-wait-state
+     (lambda ()
+       (sync-replication-install-configuration "FIRST 1 (*)" :source-a :source-a 0)
+       (let* ((old-backend (make-backend :pid 1 :replication-mode :database))
+              (new-backend (make-backend :pid 1 :replication-mode :database))
+              (old (let ((sender (wal-sender-register old-backend)))
+                     (wal-sender-set-state sender "streaming")
+                     (wal-sender-note-reply sender 90 80 70 1)
+                     sender))
+              (pending (sync-test-enqueue 100 :flush))
+              (done (sync-test-enqueue 70 :flush))
+              (terminate (symbol-function 'terminate-backend))
+              (targets nil)
+              (result nil))
+         (unwind-protect
+              (progn
+                (setf (symbol-function 'terminate-backend)
+                      (lambda (backend)
+                        (rove:ok (not sb-sys:*interrupts-enabled*))
+                        (rove:ok (not (sb-thread:holding-mutex-p *wal-sender-lock*)))
+                        (push backend targets)))
+                (setf result
+                      (handler-case
+                          (sb-sys:without-interrupts
+                            (multiple-value-bind (generation obsolete)
+                                (funcall (symbol-function 'sync-replication-install-configuration)
+                                         "FIRST 1 (*)" :source-b :source-a 1 :defer-notifications t)
+                              (rove:ok (= 2 generation))
+                              (rove:ok (equal (list old-backend) obsolete))
+                              (rove:ok (null targets))
+                              (rove:ok (zerop (hash-table-count *wal-sender-registry*)))
+                              (rove:ok (eq :source-changed (sync-replication-waiter-state pending)))
+                              (rove:ok (eq :acknowledged (sync-replication-waiter-state done)))
+                              (rove:ok (null (wal-sender-note-reply old 999 999 999 1)))
+                              ;; Delivery must not depend on which source is now current.
+                              (sync-replication-install-configuration "FIRST 1 (*)" :source-c :source-b 2)
+                              (let ((replacement (wal-sender-register new-backend :source-c)))
+                                (funcall (symbol-function 'sync-replication-notify-obsolete-senders) obsolete)
+                                (rove:ok (equal (list old-backend) targets))
+                                (rove:ok (eq replacement (wal-sender-for-backend new-backend)))
+                                (rove:ok (null (wal-sender-note-reply old 999 999 999 1))))
+                              :completed))
+                        (error (condition) (list :error (princ-to-string condition)))))
+                (rove:ok (eq :completed result) (format nil "~s" result)))
+           (setf (symbol-function 'terminate-backend) terminate))))))
+
+(rove:deftest synchronous-source-incarnation-can-defer-captured-owner-notification
+    (call-with-sync-wait-state
+     (lambda ()
+       (sync-replication-install-configuration "FIRST 1 (*)" :source-a :source-a 0)
+       (let* ((sender (sync-test-sender "peer" 1 90 80 70))
+              (pending (sync-test-enqueue 81 :flush))
+              (*live-operation-quiescence-owner-thread* sb-thread:*current-thread*)
+              (terminate (symbol-function 'terminate-backend))
+              (targets nil))
+         (rove:ok
+          (handler-case
+              (progn (sync-replication-new-source-incarnation :defer-notifications t) nil)
+            (error () t)))
+         (rove:ok (eq :source-a (sync-replication-state-source-id *sync-replication-state*)))
+         (unwind-protect
+              (progn
+                (setf (symbol-function 'terminate-backend)
+                      (lambda (backend) (push backend targets)))
+                (sb-sys:without-interrupts
+                  (multiple-value-bind (source obsolete)
+                      (sync-replication-new-source-incarnation :defer-notifications t)
+                    (rove:ok (symbolp source))
+                    (rove:ok (not (eq :source-a source)))
+                    (rove:ok (eq source (sync-replication-state-source-id *sync-replication-state*)))
+                    (rove:ok (equal "FIRST 1 (*)" (sync-replication-state-names *sync-replication-state*)))
+                    (rove:ok (eq :source-changed (sync-replication-waiter-state pending)))
+                    (rove:ok (equal (list (wal-sender-status-backend sender)) obsolete))
+                    (rove:ok (null targets))
+                    (sync-replication-notify-obsolete-senders obsolete)
+                    (rove:ok (equal obsolete targets)))))
+           (setf (symbol-function 'terminate-backend) terminate))))))
+
 (rove:deftest synchronous-source-invalidation-signals-self-last
     (call-with-sync-wait-state
      (lambda ()
