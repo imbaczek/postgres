@@ -192,6 +192,88 @@
           (ok (zerop (getf report :runs)))
           (ok (every #'identity (getf report :joined)))))))
 
+(deftest manual-history-publication-joins-an-inflight-controller-before-store-work
+    (call-with-promotion-fixture
+     (lambda (root store)
+       (declare (ignore root store))
+       (pg::wal-atomic-write-bytes (pg::clog-path) (empty-octets))
+       (let* ((operation (pg::make-physical-follow-operation))
+              (pg::*physical-follow-operation* operation)
+              (pg::*physical-follow-controller-blocked-p* nil)
+              (pg::*physical-follow-controller-stopping-p* nil)
+              (select (symbol-function 'pg::physical-store-select-history))
+              (peer nil) (observed nil))
+         (unwind-protect
+              (progn
+                (setf peer (sb-thread:make-thread
+                            (lambda ()
+                              (loop until (pg::physical-follow-operation-cancelled-p operation)
+                                    do (sleep 0.001)))
+                            :name "history selection old controller")
+                      (pg::physical-follow-operation-thread operation) peer
+                      (symbol-function 'pg::physical-store-select-history)
+                      (lambda (&rest args)
+                        (setf observed
+                              (list (pg::physical-follow-operation-cancelled-p operation)
+                                    (not (sb-thread:thread-alive-p peer))
+                                    pg::*physical-follow-controller-blocked-p*))
+                        (apply select args)))
+                (ok (= 2 (pg::physical-recovery-select-history
+                          2 (store-history-text 1 216) (store-history-eor 216 2 1))))
+                (ok (equal '(t t t) observed))
+                (ok (not pg::*physical-recovery-failed-p*)))
+           (setf (pg::physical-follow-operation-cancelled-p operation) t)
+           (when peer (sb-thread:join-thread peer :timeout 2 :default :cleanup-timeout))
+           (setf (symbol-function 'pg::physical-store-select-history) select))))))
+
+(deftest manual-history-publication-fences-source-change-before-notification
+    (dolist (unwind-p '(nil t))
+      (call-with-promotion-fixture
+       (lambda (root store)
+         (declare (ignore root))
+         (pg::wal-atomic-write-bytes (pg::clog-path) (empty-octets))
+         (let* ((pg::*sync-replication-state* (pg::make-sync-replication-state :source-id :source-a))
+                (pg::*wal-sender-registry* (make-hash-table :test #'eq))
+                (pg::*backend* nil)
+                (owner (pg::make-backend :pid 913 :replication-mode :physical))
+                (names '(pg::physical-store-select-history pg::physical-recovery-write-control
+                         pg::terminate-backend))
+                (saved (mapcar (lambda (name) (cons name (symbol-function name))) names))
+                (events nil))
+           (flet ((record (phase)
+                    (push (list phase (not sb-sys:*interrupts-enabled*)
+                                (sb-thread:holding-mutex-p pg::*physical-follow-generation-lock*))
+                          events)))
+             (unwind-protect
+                  (progn
+                    (pg::wal-sender-register owner :source-a)
+                    (setf (symbol-function 'pg::physical-store-select-history)
+                          (lambda (&rest args)
+                            (record :select)
+                            (apply (cdr (assoc 'pg::physical-store-select-history saved)) args))
+                          (symbol-function 'pg::physical-recovery-write-control)
+                          (lambda (&rest args)
+                            (record :control)
+                            (apply (cdr (assoc 'pg::physical-recovery-write-control saved)) args))
+                          (symbol-function 'pg::terminate-backend)
+                          (lambda (backend)
+                            (record :notify)
+                            (unless (eq backend owner) (error "wrong retired owner"))
+                            (when unwind-p (throw 'history-retired :retired))))
+                    (let ((result
+                            (catch 'history-retired
+                              (pg::physical-recovery-select-history
+                               2 (store-history-text 1 216) (store-history-eor 216 2 1)))))
+                      (ok (eql (if unwind-p :retired 2) result)))
+                    (ok (equal '((:select t t) (:control t t) (:notify t nil))
+                               (reverse events)))
+                    (ok (= 2 (pg::physical-store-selected-timeline store)))
+                    (ok (zerop (hash-table-count pg::*wal-sender-registry*)))
+                    (ok (not (eq :source-a (pg::sync-replication-state-source-id
+                                            pg::*sync-replication-state*))))
+                    (ok (not pg::*physical-recovery-failed-p*)))
+               (dolist (entry saved) (setf (symbol-function (car entry)) (cdr entry))))))))))
+
 (defun call-with-controller-publication-test-locks (function)
   "Supply component-test ownership and hold the command and reload mutexes."
   (let ((pg::*live-operation-quiescence-owner-thread* sb-thread:*current-thread*)

@@ -3,7 +3,8 @@
 
 (define-condition physical-follow-terminal-error (simple-error) ())
 
-(declaim (ftype function physical-follow-call-with-manual-source))
+(declaim (ftype function physical-follow-call-with-manual-source
+                physical-follow-call-with-controller-blocked))
 
 (defstruct (physical-follow-runtime (:print-function physical-libpq-print-private-object))
   "CONFIG is the runtime's private saved configuration; TRANSITION requests a
@@ -80,6 +81,36 @@ Pending interrupts can be delivered after unlock."
         (unwind-protect
              (when follow-held (sb-thread:release-mutex follow))
           (when generation-held (sb-thread:release-mutex generation)))))))
+
+(defmacro with-physical-follow-controller-publication ((obsolete) &body body)
+  "Publish under the generation fence.
+The caller already owns command and reload exclusion and quiescence. Fence
+acquisition is interruptible unless the caller already masked interrupts;
+publication and cleanup are masked. OBSOLETE receives exact sender backends to
+notify after fence release, including on unwind."
+  (let ((mutex (gensym "MUTEX-")) (held (gensym "HELD-")))
+    `(let ((,mutex *physical-follow-generation-lock*) (,held nil) (,obsolete nil))
+       (unless (and (zerop *live-operation-depth*)
+                    (eq *live-operation-quiescence-owner-thread* sb-thread:*current-thread*)
+                    (sb-thread:holding-mutex-p *physical-follow-command-lock*)
+                    (sb-thread:holding-mutex-p *reload-run-lock*))
+         (error "controller publication requires command, reload and quiescence ownership"))
+       (when (or (sb-thread:holding-mutex-p ,mutex)
+                 (sb-thread:holding-mutex-p *physical-follow-lock*)
+                 (sb-thread:holding-mutex-p *wal-sender-lock*)
+                 (sb-thread:holding-mutex-p *wal-lock*)
+                 (and *physical-receive-store*
+                      (sb-thread:holding-mutex-p (physical-store-mutex *physical-receive-store*))))
+         (error "controller publication must acquire its generation fence first"))
+       (sb-sys:without-interrupts
+         (unwind-protect
+              (unwind-protect
+                   (progn
+                     (sb-sys:allow-with-interrupts
+                       (setf ,held (sb-thread:grab-mutex ,mutex)))
+                     ,@body)
+                (when ,held (sb-thread:release-mutex ,mutex)))
+           (sync-replication-notify-obsolete-senders ,obsolete))))))
 
 (defmacro with-physical-follow-generation-operation (&body body)
   "Enter admission before fencing receiver-local checks and effects."
@@ -1717,31 +1748,38 @@ system identity, exact prefix and retention before invoking this private control
 After the control write, retire old synchronous replication proof before finishing.
 A failure after selection work begins fences recovery; this does not admit a network source."
   (when (plusp *live-operation-depth*) (error "history selection requires its own operation admission"))
-  (sb-thread:with-mutex (*physical-follow-command-lock*)
-    (check-physical-recovery-worker-start)
-    (when *physical-follow-runtime* (error "stop native follow before selecting receive history"))
-    (sb-thread:with-mutex (*reload-run-lock*)
-      (with-live-operation-quiescence
-        (check-physical-recovery-worker-start)
-        (unless (and *physical-receive-store* (eql 2 (getf *physical-recovery-state* :phase)))
-          (error "history selection requires streaming recovery"))
-        (let ((history (timeline-check-lineage (timeline-parse-history target history-text)))
-              (finished nil))
-          (unless (physical-store-history-extends-p
-                   (timeline-read-history (getf *physical-recovery-state* :timeline)) history)
-            (error "receive history changes immutable base ancestry"))
-          (unwind-protect
-               (progn
-                 (physical-store-select-history *physical-receive-store* target history-text eor-bytes)
-                 (physical-recovery-publish-selected-history *physical-receive-store*)
-                 (let ((candidate (physical-recovery-attach-selected-store
-                                   *physical-recovery-state* *physical-receive-store*)))
-                   (setf *physical-recovery-state*
-                         (physical-recovery-write-control candidate 2 *last-replay-lsn* *next-xid*)))
-                 (sync-replication-new-source-incarnation)
-                 (setf finished t)
-                 target)
-            (unless finished (setf *physical-recovery-failed-p* t))))))))
+  (physical-follow-call-with-controller-blocked
+   (lambda ()
+     (sb-thread:with-mutex (*physical-follow-command-lock*)
+       (check-physical-recovery-worker-start)
+       (when *physical-follow-runtime* (error "stop native follow before selecting receive history"))
+       (sb-thread:with-mutex (*reload-run-lock*)
+         (with-live-operation-quiescence
+           (check-physical-recovery-worker-start)
+           (unless (and *physical-receive-store* (eql 2 (getf *physical-recovery-state* :phase)))
+             (error "history selection requires streaming recovery"))
+           (let ((history (timeline-check-lineage (timeline-parse-history target history-text)))
+                 (finished nil))
+             (unless (physical-store-history-extends-p
+                      (timeline-read-history (getf *physical-recovery-state* :timeline)) history)
+               (error "receive history changes immutable base ancestry"))
+             (with-physical-follow-controller-publication (obsolete)
+               (check-physical-recovery-worker-start)
+               (unwind-protect
+                    (progn
+                      (physical-store-select-history *physical-receive-store* target history-text eor-bytes)
+                      (physical-recovery-publish-selected-history *physical-receive-store*)
+                      (let ((candidate (physical-recovery-attach-selected-store
+                                        *physical-recovery-state* *physical-receive-store*)))
+                        (setf *physical-recovery-state*
+                              (physical-recovery-write-control candidate 2 *last-replay-lsn* *next-xid*)))
+                      (multiple-value-bind (source retired-owners)
+                          (sync-replication-new-source-incarnation :defer-notifications t)
+                        (declare (ignore source))
+                        (setf obsolete retired-owners))
+                      (setf finished t)
+                      target)
+                 (unless finished (setf *physical-recovery-failed-p* t)))))))))))
 
 (defun physical-follow-autostart ()
   "Launch admitted startup workers, using replay only for managed or unattached state."

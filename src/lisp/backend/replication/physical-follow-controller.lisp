@@ -627,36 +627,6 @@ grants no source or WAL authority and creates no PREPARE debt."
           (physical-follow-operation-check operation)
           known)))))
 
-(defmacro with-physical-follow-controller-publication ((obsolete) &body body)
-  "Publish under the generation fence.
-The caller already owns command and reload exclusion and quiescence. Fence
-acquisition is interruptible unless the caller already masked interrupts;
-publication and cleanup are masked. OBSOLETE receives exact sender backends to
-notify after fence release, including on unwind."
-  (let ((mutex (gensym "MUTEX-")) (held (gensym "HELD-")))
-    `(let ((,mutex *physical-follow-generation-lock*) (,held nil) (,obsolete nil))
-       (unless (and (zerop *live-operation-depth*)
-                    (eq *live-operation-quiescence-owner-thread* sb-thread:*current-thread*)
-                    (sb-thread:holding-mutex-p *physical-follow-command-lock*)
-                    (sb-thread:holding-mutex-p *reload-run-lock*))
-         (error "controller publication requires command, reload and quiescence ownership"))
-       (when (or (sb-thread:holding-mutex-p ,mutex)
-                 (sb-thread:holding-mutex-p *physical-follow-lock*)
-                 (sb-thread:holding-mutex-p *wal-sender-lock*)
-                 (sb-thread:holding-mutex-p *wal-lock*)
-                 (and *physical-receive-store*
-                      (sb-thread:holding-mutex-p (physical-store-mutex *physical-receive-store*))))
-         (error "controller publication must acquire its generation fence first"))
-       (sb-sys:without-interrupts
-         (unwind-protect
-              (unwind-protect
-                   (progn
-                     (sb-sys:allow-with-interrupts
-                       (setf ,held (sb-thread:grab-mutex ,mutex)))
-                     ,@body)
-                (when ,held (sb-thread:release-mutex ,mutex)))
-           (sync-replication-notify-obsolete-senders ,obsolete))))))
-
 (defun physical-follow-operation-intent (operation view)
   "Stop the old runtime and save preparation intent before contacting PREPARE.
 Hold command exclusion; snapshot under reload and live-operation quiescence.
