@@ -988,6 +988,55 @@ Each entry in SEGMENTS contains a segment number followed by its byte vectors."
         (dolist (entry saved) (setf (symbol-value (car entry)) (cdr entry)))
         (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))
 
+(rove:deftest test-wal-commit-returns-own-terminal-end
+    (let* ((directory (merge-pathnames
+                       (format nil "pg-commit-end-~d-~d/" (sb-posix:getpid) (random 1000000))
+                       (uiop:temporary-directory)))
+           (*query-temp-directory* directory)
+           (*backend* nil)
+           (*wal-ready* t)
+           (*wal-poisoned* nil)
+           (*wal-output-stream* nil)
+           (*wal-dirty-store* nil)
+           (*wal-page-cache* (make-hash-table :test #'equal))
+           (*wal-page-cache-xids* (make-hash-table :test #'equal))
+           (*wal-end-lsn* 100)
+           (names '(wal-append-running-xacts-under-lock wal-append-batch-start
+                    wal-append-record wal-flush wal-slot-record-xid-commit-under-wal-lock))
+           (saved (mapcar (lambda (name) (cons name (symbol-function name))) names))
+           (terminal nil)
+           (flushed nil)
+           (callback nil))
+      (ensure-directories-exist directory)
+      (unwind-protect
+           (progn
+             (setf (symbol-function 'wal-append-running-xacts-under-lock)
+                   (lambda (xid) (declare (ignore xid)))
+                   (symbol-function 'wal-append-batch-start) (lambda () 100)
+                   (symbol-function 'wal-append-record)
+                   (lambda (type xid payload)
+                     (rove:ok (= type +wal-record-commit+))
+                     (rove:ok (= xid 44))
+                     (setf terminal (incf *wal-end-lsn* (+ +wal-header-size+ (length payload)))))
+                   (symbol-function 'wal-flush) (lambda () (setf flushed t))
+                   (symbol-function 'wal-slot-record-xid-commit-under-wal-lock)
+                   (lambda (xid lsn)
+                     (rove:ok (= xid 44))
+                     (rove:ok (= lsn terminal))))
+             (let ((end (wal-commit-transaction
+                         44 (lambda ()
+                              (rove:ok flushed)
+                              (setf callback t)
+                              (incf *wal-end-lsn* 1000)))))
+               (rove:ok callback)
+               (rove:ok (eql end terminal)
+                        "return the transaction terminal, not subsequent global WAL progress"))
+             (let ((*wal-ready* nil))
+               (rove:ok (null (wal-commit-transaction 45 (lambda () nil)))
+                        "a no-WAL commit has no replication boundary")))
+        (dolist (entry saved) (setf (symbol-function (car entry)) (cdr entry)))
+        (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))
+
 (rove:deftest test-wal-primary-spool-corruption-fails-stop-before-and-after-commit
     (let* ((directory (merge-pathnames
                        (format nil "pg-primary-corrupt-~d-~d/" (sb-posix:getpid) (random 1000000))

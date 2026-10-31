@@ -1390,39 +1390,40 @@ the terminal, then flush WAL before truncating any relation fork."
                  (when (boundp '*backend*) (symbol-value '*backend*)) t)))
     (funcall after-durable-function)
     (return-from wal-commit-transaction (values)))
-  (with-wal-critical
-    (wal-validate-logical-binary-capability-under-lock xid)
-    (let* ((resets
-             (when (fboundp 'publish-transaction-replacements-under-wal-lock)
-               (funcall 'publish-transaction-replacements-under-wal-lock
-                        (when (boundp '*backend*) (symbol-value '*backend*)))))
-           (keys (wal-primary-page-keys))
-           (split-p *wal-pending-btree-split*))
-      (wal-primary-preflight-page-keys keys)
-      (with-wal-primary-page-spool (spool)
-        (wal-append-running-xacts-under-lock xid)
-        (wal-primary-record-page-xids keys (wal-append-batch-start))
-        (dolist (reset resets)
-          (wal-append-record +wal-record-relation-reset+ xid
-                             (wal-encode-relation-reset (first reset) (second reset))))
-        (wal-primary-append-pages keys spool)
-        (wal-primary-seal-page-spool spool)
-        (when logical-changes (wal-append-logical-changes xid logical-changes))
-        (when *wal-output-stream* (finish-output *wal-output-stream*))
-        (wal-test-pause :after-page-images)
-        (let ((commit-lsn
+  (let ((commit-lsn nil))
+    (with-wal-critical
+      (wal-validate-logical-binary-capability-under-lock xid)
+      (let* ((resets
+               (when (fboundp 'publish-transaction-replacements-under-wal-lock)
+                 (funcall 'publish-transaction-replacements-under-wal-lock
+                          (when (boundp '*backend*) (symbol-value '*backend*)))))
+             (keys (wal-primary-page-keys))
+             (split-p *wal-pending-btree-split*))
+        (wal-primary-preflight-page-keys keys)
+        (with-wal-primary-page-spool (spool)
+          (wal-append-running-xacts-under-lock xid)
+          (wal-primary-record-page-xids keys (wal-append-batch-start))
+          (dolist (reset resets)
+            (wal-append-record +wal-record-relation-reset+ xid
+                               (wal-encode-relation-reset (first reset) (second reset))))
+          (wal-primary-append-pages keys spool)
+          (wal-primary-seal-page-spool spool)
+          (when logical-changes (wal-append-logical-changes xid logical-changes))
+          (when *wal-output-stream* (finish-output *wal-output-stream*))
+          (wal-test-pause :after-page-images)
+          (setf commit-lsn
                 (wal-append-record +wal-record-commit+ xid
-                                   (wal-encode-commit-timestamp (postgres-current-timestamp)))))
+                                   (wal-encode-commit-timestamp (postgres-current-timestamp))))
           (wal-flush)
-          (wal-slot-record-xid-commit-under-wal-lock xid commit-lsn))
-        (wal-test-pause :after-wal-flush)
-        (funcall after-durable-function)
-        (wal-apply-relation-resets resets)
-        (when resets (wal-test-pause :after-relation-resets))
-        (wal-primary-apply-page-spool spool :split-p split-p :fault-on-first-write t)
-        (wal-clear-page-cache)
-        (setf *wal-pending-btree-split* nil))))
-  (values))
+          (wal-slot-record-xid-commit-under-wal-lock xid commit-lsn)
+          (wal-test-pause :after-wal-flush)
+          (funcall after-durable-function)
+          (wal-apply-relation-resets resets)
+          (when resets (wal-test-pause :after-relation-resets))
+          (wal-primary-apply-page-spool spool :split-p split-p :fault-on-first-write t)
+          (wal-clear-page-cache)
+          (setf *wal-pending-btree-split* nil))))
+    commit-lsn))
 
 (defun wal-commit-maintenance ()
   "Durably publish staged storage maintenance without committing a user XID."
