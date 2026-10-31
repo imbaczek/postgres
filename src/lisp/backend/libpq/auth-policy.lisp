@@ -12,6 +12,28 @@
   (hba-text "" :read-only t) (ident-text "" :read-only t)
   (hba-path nil :read-only t) (ident-path nil :read-only t))
 
+(defun authentication-copy-rule (rule)
+  (flet ((tokens (items)
+           (mapcar (lambda (token)
+                     (%make-hba-token (copy-seq (hba-token-text token)) (hba-token-quoted-p token)))
+                   items)))
+    (make-hba-rule :transport (hba-rule-transport rule)
+                   :databases (tokens (hba-rule-databases rule))
+                   :users (tokens (hba-rule-users rule))
+                   :network (when (hba-rule-network rule) (copy-seq (hba-rule-network rule)))
+                   :mask (when (hba-rule-mask rule) (copy-seq (hba-rule-mask rule)))
+                   :method (hba-rule-method rule)
+                   :source (copy-seq (hba-rule-source rule)) :line (hba-rule-line rule))))
+
+(defun authentication-copy-policy (policy)
+  (when policy
+    (make-authentication-policy
+     :rules (mapcar #'authentication-copy-rule (authentication-policy-rules policy))
+     :hba-text (copy-seq (authentication-policy-hba-text policy))
+     :ident-text (copy-seq (authentication-policy-ident-text policy))
+     :hba-path (authentication-policy-hba-path policy)
+     :ident-path (authentication-policy-ident-path policy))))
+
 (defun authentication-read-text (path)
   "Read at most 1 MiB from a bounded regular file and decode it as UTF-8."
   (with-open-stream (stream (startup-open-config path 1048576))

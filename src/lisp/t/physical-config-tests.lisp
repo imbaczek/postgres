@@ -18,6 +18,226 @@
       (ok (intake-fails-p
            (lambda () (pg::session-set-extra-setting "extra_float_digits" "4"))))))
 
+(deftest startup-candidate-preparation-owns-inputs-without-publishing
+    (let* ((settings (pg::startup-default-settings "/tmp/prepared-settings/"))
+           (native (make-hash-table :test #'equal))
+           (overrides (make-hash-table :test #'equal))
+           (text (copy-seq "host all alice 127.0.0.1/32 trust"))
+           (policy (pg::make-authentication-policy
+                    :hba-text text :rules (pg::hba-parse-text text)))
+           (pg::*physical-follow-desired* nil)
+           (pg::*physical-recovery-state* nil)
+           (pg::*startup-installed-configuration* nil)
+           (pg::*startup-server-settings* :unchanged)
+           (pg::*authentication-policy* :unchanged))
+      (setf (gethash "cluster_name" settings) (list :value (copy-seq "cluster") :source :file)
+            (gethash "primary_conninfo" settings)
+            (list :value (pg::string->bytes "host=first") :source :file)
+            (gethash "host" native) (copy-seq "localhost")
+            (gethash "checkpoint_timeout" overrides) (copy-seq "30"))
+      (let* ((candidate (pg::startup-prepare-installation settings native overrides policy))
+             (owned (pg::startup-configuration-settings candidate))
+             (auth (pg::startup-configuration-authentication candidate))
+             (rule (first (pg::authentication-policy-rules policy)))
+             (token (first (pg::hba-rule-users rule))))
+        (setf (char (getf (gethash "cluster_name" settings) :value) 0) #\X
+              (aref (getf (gethash "primary_conninfo" settings) :value) 0) 88
+              (char (gethash "host" native) 0) #\X
+              (char (gethash "checkpoint_timeout" overrides) 0) #\9
+              (char text 0) #\X
+              (char (pg::hba-token-text token) 0) #\X
+              (aref (pg::hba-rule-network rule) 0) 10)
+        (ok (equal "cluster" (pg::startup-setting-value owned "cluster_name")))
+        (ok (equalp (pg::string->bytes "host=first")
+                    (pg::startup-setting-value owned "primary_conninfo")))
+        (ok (equal "localhost" (gethash "host" (pg::startup-configuration-native candidate))))
+        (ok (equal "30" (gethash "checkpoint_timeout" (pg::startup-configuration-overrides candidate))))
+        (ok (equal "host all alice 127.0.0.1/32 trust" (pg::authentication-policy-hba-text auth)))
+        (ok (eq :trust (pg::hba-match-rules (pg::authentication-policy-rules auth)
+                                            "alice" "postgres" #(127 0 0 1))))
+        (ok (eq :unchanged pg::*startup-server-settings*))
+        (ok (eq :unchanged pg::*authentication-policy*))
+        (ok (null pg::*physical-follow-desired*)))))
+
+(defun call-with-startup-candidate-test (function)
+  (let ((pg::*startup-installed-configuration* nil)
+        (pg::*startup-server-settings* nil)
+        (pg::*startup-native-inputs* nil) (pg::*startup-command-overrides* nil)
+        (pg::*authentication-policy* nil) (pg::*physical-follow-desired* nil)
+        (pg::*physical-recovery-state* nil) (pg::*postmaster-data-lock* nil)
+        (pg::*enable-hot-standby* pg::*enable-hot-standby*)
+        (pg::*wal-level* pg::*wal-level*) (pg::*wal-keep-size-mb* pg::*wal-keep-size-mb*)
+        (pg::*physical-restartpoint-timeout* pg::*physical-restartpoint-timeout*)
+        (pg::*physical-restartpoint-wal-bytes* pg::*physical-restartpoint-wal-bytes*)
+        (pg::*max-slot-wal-keep-bytes* pg::*max-slot-wal-keep-bytes*)
+        (pg::*wal-slot-retention-policy* pg::*wal-slot-retention-policy*)
+        (pg::*max-replication-slots* pg::*max-replication-slots*)
+        (pg::*max-connections* pg::*max-connections*) (pg::*max-wal-senders* pg::*max-wal-senders*))
+    (funcall function)))
+
+(deftest startup-candidates-reject-stale-predecessors-before-management-claims
+    (call-with-startup-candidate-test
+     (lambda ()
+       (let* ((settings (pg::startup-default-settings "/tmp/prepared-settings/"))
+              (native (make-hash-table :test #'equal))
+              (overrides (make-hash-table :test #'equal))
+              (first (pg::startup-prepare-installation settings native overrides nil))
+              (second (pg::startup-prepare-installation settings native overrides nil))
+              (claim (symbol-function 'pg::physical-follow-prepare-managed-claim))
+              (claims 0))
+         (unwind-protect
+              (progn
+                (setf (symbol-function 'pg::physical-follow-prepare-managed-claim)
+                      (lambda (desired) (declare (ignore desired)) (incf claims)))
+                (pg::startup-commit-installation second)
+                (ok (eq second pg::*startup-installed-configuration*))
+                (ok (not (eq settings pg::*startup-server-settings*)))
+                (ok (= 1 claims))
+                (ok (intake-fails-p (lambda () (pg::startup-commit-installation first))))
+                (ok (= 1 claims))
+                (ok (eq second pg::*startup-installed-configuration*))
+                (ok (eq (pg::startup-configuration-settings second) pg::*startup-server-settings*)))
+           (setf (symbol-function 'pg::physical-follow-prepare-managed-claim) claim))))))
+
+(deftest startup-candidate-captures-one-slot-limit-environment-value
+    (call-with-startup-candidate-test
+     (lambda ()
+       (let ((original (symbol-function 'uiop:getenv))
+             (reads 0))
+         (unwind-protect
+              (progn
+                (setf (symbol-function 'uiop:getenv)
+                      (lambda (name)
+                        (if (string= name "PG_MAX_SLOT_WAL_KEEP_BYTES")
+                            (if (= (incf reads) 1) "17" "29")
+                            (funcall original name))))
+                (let* ((candidate
+                         (pg::startup-prepare-installation
+                          (pg::startup-default-settings "/tmp/prepared-settings/")
+                          (make-hash-table :test #'equal) (make-hash-table :test #'equal) nil))
+                       (policy (pg::startup-configuration-slot-policy candidate)))
+                  (ok (= 1 reads))
+                  (ok (eq :bytes (pg::wal-slot-retention-policy-mode policy)))
+                  (ok (= 17 (pg::wal-slot-retention-policy-limit policy)))))
+           (setf (symbol-function 'uiop:getenv) original))))))
+
+(deftest startup-candidate-claim-failure-and-queued-interrupt-preserve-generations
+    (call-with-startup-candidate-test
+     (lambda ()
+       (let* ((settings (pg::startup-default-settings "/tmp/prepared-settings/"))
+              (native (make-hash-table :test #'equal))
+              (overrides (make-hash-table :test #'equal))
+              (claim (symbol-function 'pg::physical-follow-prepare-managed-claim))
+              (publish (symbol-function 'pg::startup-publish-configuration))
+              (observed nil) (masked nil))
+         (ok (eq settings (pg::startup-install-settings settings native overrides nil)))
+         (let ((installed pg::*startup-installed-configuration*)
+               (old-settings pg::*startup-server-settings*)
+               (old-auth pg::*authentication-policy*)
+               (old-desired pg::*physical-follow-desired*))
+           (setf (getf (gethash "checkpoint_timeout" settings) :value) 42
+                 (getf (gethash "primary_conninfo" settings) :value) (pg::string->bytes "host=next"))
+           (let* ((policy (pg::make-authentication-policy
+                           :rules (pg::hba-parse-text "host all all all reject")))
+                  (candidate (pg::startup-prepare-installation settings native overrides policy)))
+             (unwind-protect
+                  (progn
+                    (setf (symbol-function 'pg::physical-follow-prepare-managed-claim)
+                          (lambda (desired) (declare (ignore desired)) (error "claim failure")))
+                    (ok (intake-fails-p (lambda () (pg::startup-commit-installation candidate))))
+                    (ok (eq installed pg::*startup-installed-configuration*))
+                    (ok (eq old-settings pg::*startup-server-settings*))
+                    (ok (eq old-auth pg::*authentication-policy*))
+                    (ok (eq old-desired pg::*physical-follow-desired*))
+                    (setf (symbol-function 'pg::physical-follow-prepare-managed-claim) claim
+                          (symbol-function 'pg::startup-publish-configuration)
+                          (lambda (prepared)
+                            (setf masked (not sb-sys:*interrupts-enabled*))
+                            (sb-thread:interrupt-thread
+                             sb-thread:*current-thread*
+                             (lambda ()
+                               (setf observed
+                                     (and (eq candidate pg::*startup-installed-configuration*)
+                                          (eq (pg::startup-configuration-settings candidate)
+                                              pg::*startup-server-settings*)
+                                          (eq (pg::startup-configuration-authentication candidate)
+                                              pg::*authentication-policy*)
+                                          (eq (pg::startup-configuration-desired candidate)
+                                              pg::*physical-follow-desired*)
+                                          (= 42 pg::*physical-restartpoint-timeout*)))))
+                            (funcall publish prepared)))
+                    (pg::startup-commit-installation candidate)
+                    (ok masked)
+                    (ok observed)
+                    (ok (not (eq old-desired pg::*physical-follow-desired*))))
+               (setf (symbol-function 'pg::physical-follow-prepare-managed-claim) claim
+                     (symbol-function 'pg::startup-publish-configuration) publish))))))))
+
+(deftest startup-candidate-explicit-nil-authentication-does-not-read-policy
+    (call-with-startup-candidate-test
+     (lambda ()
+       (let ((read (symbol-function 'pg::authentication-read-policy))
+             (pg::*authentication-policy* t)
+             (calls 0))
+         (unwind-protect
+              (progn
+                (setf (symbol-function 'pg::authentication-read-policy)
+                      (lambda (settings)
+                        (declare (ignore settings))
+                        (incf calls)
+                        (pg::make-authentication-policy
+                         :rules (pg::hba-parse-text "host all all all trust"))))
+                (let* ((settings (pg::startup-default-settings "/tmp/prepared-settings/"))
+                       (native (make-hash-table :test #'equal))
+                       (overrides (make-hash-table :test #'equal))
+                       (default (pg::startup-prepare-installation settings native overrides))
+                       (explicit (pg::startup-prepare-installation settings native overrides nil)))
+                  (ok (= 1 calls))
+                  (ok (pg::startup-configuration-authentication default))
+                  (ok (null (pg::startup-configuration-authentication explicit)))))
+           (setf (symbol-function 'pg::authentication-read-policy) read))))))
+
+(deftest startup-authentication-completion-publishes-one-root-and-keeps-follow-identity
+    (call-with-startup-candidate-test
+     (lambda ()
+       (let ((settings (pg::startup-default-settings "/tmp/prepared-settings/"))
+             (native (make-hash-table :test #'equal))
+             (overrides (make-hash-table :test #'equal)))
+         (pg::startup-install-settings settings native overrides nil)
+         (let* ((first pg::*startup-installed-configuration*)
+                (desired pg::*physical-follow-desired*)
+                (policy (pg::make-authentication-policy
+                         :rules (pg::hba-parse-text "host all all all trust"))))
+           (pg::startup-install-settings
+            (pg::startup-configuration-settings first)
+            (pg::startup-configuration-native first)
+            (pg::startup-configuration-overrides first) policy)
+           (let ((second pg::*startup-installed-configuration*))
+             (ok (eq (pg::startup-configuration-identity first)
+                     (pg::startup-configuration-predecessor second)))
+             (ok (symbolp (pg::startup-configuration-predecessor second)))
+             (ok (not (eq first second)))
+             (ok (eq desired pg::*physical-follow-desired*))
+             (ok (eq pg::*authentication-policy*
+                     (pg::startup-configuration-authentication second)))
+             (ok (not (eq policy pg::*authentication-policy*)))))))))
+
+(deftest startup-follow-notification-failure-does-not-reject-published-settings
+    (call-with-startup-candidate-test
+     (lambda ()
+       (let ((pg::*physical-follow-desired-wake* :invalid-test-semaphore)
+             (settings (pg::startup-default-settings "/tmp/prepared-settings/")))
+         (setf (getf (gethash "primary_conninfo" settings) :value) (pg::string->bytes "host=next"))
+         (ok (eq settings (pg::startup-install-settings
+                           settings (make-hash-table :test #'equal)
+                           (make-hash-table :test #'equal) nil)))
+         (let ((installed pg::*startup-installed-configuration*))
+           (ok installed)
+           (ok (eq pg::*physical-follow-desired*
+                   (pg::startup-configuration-desired installed)))
+           (ok (equalp (pg::string->bytes "host=next")
+                       (pg::startup-setting-value pg::*startup-server-settings* "primary_conninfo"))))))))
+
 (deftest application-name-normalization-clips-before-byte-escaping
     (ok (equal "plain" (pg::session-normalize-application-name "plain")))
   (ok (equal "a\\x0a\\xc3\\xa9" (pg::session-normalize-application-name (format nil "a~%é"))))
@@ -257,7 +477,8 @@
       (pg::call-with-btree-relation-write-lock relation (lambda () (ok t)))))
 
 (deftest sql-setting-and-lower-functions-follow-c-semantics
-    (let ((pg::*startup-server-settings* (pg::startup-default-settings "/tmp/data/")))
+    (let ((pg::*startup-installed-configuration* nil)
+          (pg::*startup-server-settings* (pg::startup-default-settings "/tmp/data/")))
       (ok (equal "5min" (pg::eval-func "current_setting" '("CHECKPOINT_TIMEOUT"))))
       (ok (eq pg::+null+ (pg::eval-func "current_setting" '("missing.setting" t))))
       (ok (eq pg::+null+ (pg::eval-func "current_setting" (list pg::+null+))))
@@ -318,6 +539,7 @@
     (with-physical-store-directory (root)
       (let* ((pg::*pgdata* root)
              (configuration (merge-pathnames "postgresql.conf" root))
+             (pg::*startup-installed-configuration* nil)
              (pg::*startup-server-settings* nil)
              (pg::*startup-native-inputs* nil) (pg::*startup-command-overrides* nil)
              (pg::*installed-resource-parameters* nil)
@@ -377,6 +599,7 @@
     (with-physical-store-directory (root)
       (let* ((pg::*pgdata* root)
              (configuration (merge-pathnames "postgresql.conf" root))
+             (pg::*startup-installed-configuration* nil)
              (pg::*startup-server-settings* nil)
              (pg::*startup-native-inputs* nil) (pg::*startup-command-overrides* nil)
              (pg::*installed-resource-parameters* nil)
@@ -497,6 +720,7 @@
     (with-physical-store-directory (root)
       (let* ((pg::*pgdata* root)
              (configuration (merge-pathnames "postgresql.conf" root))
+             (pg::*startup-installed-configuration* nil)
              (pg::*startup-server-settings* nil)
              (pg::*startup-native-inputs* nil) (pg::*startup-command-overrides* nil)
              (pg::*installed-resource-parameters* nil)
@@ -540,7 +764,8 @@
         (ok (intake-fails-p (lambda () (pg::startup-resource-capacity-plan settings)))))))
 
 (deftest wal-settings-match-c-enum-aliases-defaults-and-context
-    (let* ((pg::*startup-server-settings* (pg::startup-default-settings "/tmp/wal-settings/"))
+    (let* ((pg::*startup-installed-configuration* nil)
+           (pg::*startup-server-settings* (pg::startup-default-settings "/tmp/wal-settings/"))
            (pg::*startup-native-inputs* (make-hash-table :test #'equal)))
       (ok (equal "replica" (pg::startup-setting-value pg::*startup-server-settings* "wal_level")))
       (ok (not (pg::startup-setting-value pg::*startup-server-settings* "wal_log_hints")))
@@ -565,7 +790,8 @@
            (lambda () (pg::startup-resource-capacity-plan pg::*startup-server-settings*))))))
 
 (deftest startup-settings-catalog-keeps-base-units-and-active-provenance
-    (let* ((pg::*startup-server-settings* (pg::startup-default-settings "/tmp/data/"))
+    (let* ((pg::*startup-installed-configuration* nil)
+           (pg::*startup-server-settings* (pg::startup-default-settings "/tmp/data/"))
            (pg::*startup-native-inputs* (make-hash-table :test #'equal)))
       (setf (gethash "checkpoint_timeout" pg::*startup-server-settings*)
             (list :value 90 :source :file :sourcefile "/tmp/include.conf" :sourceline 7)
@@ -587,6 +813,7 @@
     (with-physical-store-directory (root)
       (let* ((pg::*pgdata* root)
              (configuration (merge-pathnames "postgresql.conf" root))
+             (pg::*startup-installed-configuration* nil)
              (pg::*startup-server-settings* nil)
              (pg::*startup-native-inputs* nil) (pg::*startup-command-overrides* nil)
              (pg::*physical-restartpoint-timeout* 300)
@@ -647,6 +874,7 @@
     (with-physical-store-directory (root)
       (let* ((configuration (merge-pathnames "postgresql.conf" root))
              (auto (merge-pathnames "postgresql.auto.conf" root))
+             (pg::*startup-installed-configuration* nil)
              (pg::*startup-server-settings* :unchanged)
              (pg::*pgdata* :unchanged)
              (args (list "-D" (namestring root))))
@@ -675,7 +903,8 @@
         (ok (not (probe-file missing))))))
 
 (deftest startup-describe-config-matches-c-reset-fields-without-installation
-    (let* ((pg::*startup-server-settings* :unchanged)
+    (let* ((pg::*startup-installed-configuration* nil)
+           (pg::*startup-server-settings* :unchanged)
            (pg::*pgdata* :unchanged)
            (rows (pg::startup-description-rows)))
       (ok (= (length rows) (length pg::*startup-setting-specs*)))
@@ -879,6 +1108,7 @@
     (with-physical-store-directory (root)
       (let* ((pg::*pgdata* root)
              (configuration (merge-pathnames "postgresql.conf" root))
+             (pg::*startup-installed-configuration* nil)
              (pg::*startup-server-settings* nil)
              (pg::*startup-native-inputs* nil) (pg::*startup-command-overrides* nil)
              (pg::*physical-restartpoint-timeout* 300)
@@ -918,6 +1148,7 @@
     (with-physical-store-directory (root)
       (let* ((pg::*pgdata* root)
              (configuration (merge-pathnames "postgresql.conf" root))
+             (pg::*startup-installed-configuration* nil)
              (pg::*startup-server-settings* nil)
              (pg::*startup-native-inputs* nil) (pg::*startup-command-overrides* nil)
              (pg::*wal-keep-size-mb* 0)

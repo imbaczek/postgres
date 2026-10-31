@@ -61,6 +61,7 @@
                                           (pg::*wal-checkpoint-snapshot* pg::*wal-checkpoint-snapshot*)
                                           (pg::*wal-poisoned* pg::*wal-poisoned*)
                                           (pg::*active-xids* pg::*active-xids*)
+                                          (pg::*startup-installed-configuration* nil)
                                           (pg::*startup-server-settings* (pg::startup-default-settings (namestring root))))
                 (setf (gethash "recovery_target_timeline" pg::*startup-server-settings*)
                       (list :value word :source :file :pending-restart t
@@ -86,6 +87,7 @@
 
 (defun call-with-recovery-timeline-settings (root function)
   (let ((pg::*pgdata* root)
+        (pg::*startup-installed-configuration* nil)
         (pg::*startup-server-settings* nil)
         (pg::*startup-native-inputs* nil) (pg::*startup-command-overrides* nil)
         (pg::*enable-hot-standby* t)

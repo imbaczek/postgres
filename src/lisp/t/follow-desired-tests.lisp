@@ -469,6 +469,7 @@
     (with-physical-store-directory (root)
       (let* ((pg::*pgdata* root) (pg::*postmaster-data-lock* nil)
                                  (pg::*physical-recovery-state* nil) (pg::*physical-follow-desired* nil)
+                                 (pg::*startup-installed-configuration* nil)
                                  (pg::*startup-server-settings* nil) (pg::*startup-native-inputs* nil)
                                  (pg::*startup-command-overrides* nil) (pg::*enable-hot-standby* t)
                                  (pg::*wal-keep-size-mb* 0) (pg::*physical-restartpoint-timeout* 300)

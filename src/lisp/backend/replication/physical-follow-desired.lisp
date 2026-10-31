@@ -144,24 +144,32 @@ file and directory synchronization."
                        (physical-follow-desired-claimed-p desired))))
     (error 'physical-follow-generation-changed)))
 
-(defun physical-follow-call-with-desired-install (desired function)
+(defun physical-follow-call-with-desired-install (desired function &optional preflight)
   "Install settings and their generation together under quiescence.
 Check the predecessor under the follow lock before and after the durable claim;
 FUNCTION publishes the settings while that lock is held."
   (check-type desired physical-follow-desired)
-  (flet ((install ()
-           (sb-thread:with-mutex (*physical-follow-lock*)
-             (physical-follow-check-desired-predecessor desired))
-           (physical-follow-prepare-managed-claim desired)
-           (sb-thread:with-mutex (*physical-follow-lock*)
-             (physical-follow-check-desired-predecessor desired)
-             (funcall function)
-             (unless (eq desired *physical-follow-desired*)
-               (setf *physical-follow-desired* desired)
-               (sb-thread:signal-semaphore *physical-follow-desired-wake*)))))
-    (if (eq *live-operation-quiescence-owner-thread* sb-thread:*current-thread*)
-        (install)
-        (with-live-operation-quiescence (install))))
+  (let ((changed nil))
+    (flet ((install ()
+             (sb-thread:with-mutex (*physical-follow-lock*)
+               (when preflight (funcall preflight))
+               (physical-follow-check-desired-predecessor desired))
+             (physical-follow-prepare-managed-claim desired)
+             (sb-thread:with-mutex (*physical-follow-lock*)
+               (when preflight (funcall preflight))
+               (physical-follow-check-desired-predecessor desired)
+               (sb-sys:without-interrupts
+                 (funcall function)
+                 (unless (eq desired *physical-follow-desired*)
+                   (setf *physical-follow-desired* desired changed t))))
+             (when changed
+               (handler-case (sb-thread:signal-semaphore *physical-follow-desired-wake*)
+                 (error (condition)
+                   (ignore-errors
+                    (admin-log "configuration installed; follow wake failed: ~a" condition)))))))
+      (if (eq *live-operation-quiescence-owner-thread* sb-thread:*current-thread*)
+          (install)
+          (with-live-operation-quiescence (install)))))
   desired)
 
 (defun physical-follow-install-desired (desired)

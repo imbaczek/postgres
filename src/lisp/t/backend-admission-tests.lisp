@@ -190,6 +190,7 @@
        (let ((settings (pg::startup-default-settings "/tmp/connection-gucs/"))
              (native (make-hash-table :test #'equal))
              (overrides (make-hash-table :test #'equal))
+             (pg::*startup-installed-configuration* nil)
              (pg::*startup-server-settings* :unchanged)
              (pg::*startup-native-inputs* nil)
              (pg::*startup-command-overrides* nil)

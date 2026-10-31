@@ -57,6 +57,7 @@
     (with-physical-store-directory (root)
       (let* ((pg::*pgdata* root)
              (configuration (merge-pathnames "postgresql.conf" root))
+             (pg::*startup-installed-configuration* nil)
              (pg::*startup-server-settings* nil)
              (pg::*startup-native-inputs* nil) (pg::*startup-command-overrides* nil)
              (pg::*enable-hot-standby* t)

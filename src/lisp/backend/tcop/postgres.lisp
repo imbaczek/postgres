@@ -921,7 +921,12 @@ CL's RENAME-FILE merges a relative target with the source's directory."
     (startup-install-resource-capacity startup-settings)
     (sb-sys:enable-interrupt sb-unix:sigusr1 #'request-physical-promotion)
     (postmaster-own-data-directory host port)
-    (setf *authentication-policy* (authentication-prepare-startup startup-settings))
+    (let* ((installed *startup-installed-configuration*)
+           (settings (startup-configuration-settings installed)))
+      (startup-install-settings settings
+                                (startup-configuration-native installed)
+                                (startup-configuration-overrides installed)
+                                (authentication-prepare-startup settings)))
     (physical-promotion-initialize-requests)
     (physical-promotion-test-point :after-promotion-request-initialization)
     ;; Reject an unsupported SBCL before pending reconstruction can open storage.

@@ -316,7 +316,8 @@
         (setf (symbol-function 'pg::physical-client-query) query))))
 
 (deftest physical-libpq-new-profiles-use-installed-cluster-name-with-explicit-fallback-precedence
-    (let* ((pg::*startup-server-settings* (make-hash-table :test #'equal))
+    (let* ((pg::*startup-installed-configuration* nil)
+           (pg::*startup-server-settings* (make-hash-table :test #'equal))
            (entry (list :value "research")))
       (setf (gethash "cluster_name" pg::*startup-server-settings*) entry)
       (let ((saved (pg::make-physical-libpq-profile "host=localhost")))

@@ -196,6 +196,7 @@
     (with-physical-store-directory (root)
       (let* ((pg::*pgdata* root)
              (pg::*authentication-policy* nil)
+             (pg::*startup-installed-configuration* nil)
              (pg::*startup-server-settings* nil)
              (pg::*startup-native-inputs* nil) (pg::*startup-command-overrides* nil)
              (pg::*enable-hot-standby* t) (pg::*wal-level* :replica)

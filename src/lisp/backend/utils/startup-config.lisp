@@ -11,6 +11,62 @@
 
 (defvar *startup-command-overrides* nil)
 
+(defstruct startup-configuration
+  (identity (gensym "CONFIGURATION-") :read-only t)
+  (predecessor nil :read-only t)
+  (settings nil :read-only t) (native nil :read-only t) (overrides nil :read-only t)
+  (authentication nil :read-only t) (desired nil :read-only t)
+  (slot-policy nil :read-only t) (resources nil :read-only t)
+  (timeout 0 :read-only t) (wal-bytes 0 :read-only t) (keep-mb 0 :read-only t)
+  (hot-standby nil :read-only t) (wal-level nil :read-only t)
+  (max-slots 0 :read-only t) (max-connections 0 :read-only t) (max-senders 0 :read-only t))
+
+(defvar *startup-installed-configuration* nil)
+
+(defun startup-copy-input (value)
+  (typecase value
+    (hash-table
+     (let ((copy (make-hash-table :test (hash-table-test value))))
+       (maphash (lambda (key item)
+                  (setf (gethash (startup-copy-input key) copy) (startup-copy-input item)))
+                value)
+       copy))
+    (cons (cons (startup-copy-input (car value)) (startup-copy-input (cdr value))))
+    (vector
+     (let ((copy (copy-seq value)))
+       (dotimes (index (length copy) copy)
+         (setf (aref copy index) (startup-copy-input (aref copy index))))))
+    ((or null symbol number character pathname) value)
+    (t (error "unsupported configuration input object"))))
+
+(declaim (ftype function authentication-copy-policy))
+
+(defun startup-prepare-installation (settings native overrides &optional (policy nil supplied-p))
+  (let* ((installed *startup-installed-configuration*)
+         (predecessor (when installed (startup-configuration-identity installed)))
+         (owned-settings (startup-copy-input settings))
+         (owned-native (startup-copy-input native))
+         (owned-overrides (startup-copy-input overrides))
+         (authentication (authentication-copy-policy
+                          (if supplied-p policy
+                              (when *authentication-policy*
+                                (authentication-read-policy owned-settings)))))
+         (resources (startup-check-connection-limits owned-settings))
+         (slot-policy (startup-effective-slot-policy owned-settings owned-native))
+         (desired (physical-follow-plan-settings owned-settings)))
+    (make-startup-configuration
+     :predecessor predecessor :settings owned-settings :native owned-native
+     :overrides owned-overrides :authentication authentication :desired desired
+     :resources resources :slot-policy slot-policy
+     :timeout (startup-setting-value owned-settings "checkpoint_timeout")
+     :keep-mb (startup-setting-value owned-settings "wal_keep_size")
+     :wal-bytes (* 1024 1024 (startup-setting-value owned-settings "max_wal_size"))
+     :hot-standby (startup-setting-value owned-settings "hot_standby")
+     :wal-level (if (equal "logical" (startup-setting-value owned-settings "wal_level")) :logical :replica)
+     :max-slots (startup-setting-value owned-settings "max_replication_slots")
+     :max-connections (startup-setting-value owned-settings "max_connections")
+     :max-senders (startup-setting-value owned-settings "max_wal_senders"))))
+
 (declaim (special *managed-worker-slots* *managed-worker-lock*
                   *managed-worker-registration-closed-p*))
 
@@ -592,19 +648,18 @@ Resolve authentication paths after all settings sources have been applied."
 
 (defun startup-effective-slot-limit (settings native)
   "Select the explicit native byte cap or the standard limit; NIL means unlimited."
-  (let ((bytes (or (gethash "max-slot-wal-keep-bytes" native)
-                   (uiop:getenv "PG_MAX_SLOT_WAL_KEEP_BYTES")))
-        (megabytes (startup-setting-value settings "max_slot_wal_keep_size")))
-    (if bytes (parse-slot-wal-keep-bytes bytes)
-        (unless (= megabytes -1) (* megabytes 1024 1024)))))
+  (wal-slot-retention-policy-limit (startup-effective-slot-policy settings native)))
 
 (defun startup-effective-slot-policy (settings native)
   "Choose exact-byte mode only for an explicit native option or environment value."
-  (make-wal-slot-retention-policy
-   :mode (if (or (gethash "max-slot-wal-keep-bytes" native)
-                 (uiop:getenv "PG_MAX_SLOT_WAL_KEEP_BYTES")) :bytes :segments)
-   :limit (startup-effective-slot-limit settings native)
-   :max-wal-bytes (* 1024 1024 (startup-setting-value settings "max_wal_size"))))
+  (let ((bytes (or (gethash "max-slot-wal-keep-bytes" native)
+                   (uiop:getenv "PG_MAX_SLOT_WAL_KEEP_BYTES")))
+        (megabytes (startup-setting-value settings "max_slot_wal_keep_size")))
+    (make-wal-slot-retention-policy
+     :mode (if bytes :bytes :segments)
+     :limit (if bytes (parse-slot-wal-keep-bytes bytes)
+                (unless (= megabytes -1) (* megabytes 1024 1024)))
+     :max-wal-bytes (* 1024 1024 (startup-setting-value settings "max_wal_size")))))
 
 (defun startup-argument-values (argv)
   (multiple-value-bind (native overrides) (startup-cli-inputs argv)
@@ -674,38 +729,44 @@ these slots."
                   *installed-resource-parameters* parameters)))))
     parameters))
 
-(defun startup-install-settings (settings native overrides &optional
-                                                             (policy (when *authentication-policy*
-                                                                       (authentication-read-policy settings))))
-  "Validate and install settings, including session quotas before listen.
-Install wal_keep_size in MB on successful reload; postmaster settings such as
-hot_standby retain their active values until restart. Settings and the desired
-follow generation are published together under live-operation quiescence.
-The installed WAL level selects logical capture at XID allocation. wal_log_hints accepts
-on and off; supported native paths have no persistent hint-bit writers.
-On reload, validate a candidate authentication generation before publishing it
-with settings."
-  (startup-check-connection-limits settings)
-  (let ((timeout (startup-setting-value settings "checkpoint_timeout"))
-        (wal-bytes (* 1024 1024 (startup-setting-value settings "max_wal_size")))
-        (slot-policy (startup-effective-slot-policy settings native))
-        (desired (physical-follow-plan-settings settings)))
-    (physical-follow-call-with-desired-install desired
-                                               (lambda ()
-                                                 (setf *authentication-policy* policy
-                                                       *startup-server-settings* settings
-                                                       *startup-native-inputs* native *startup-command-overrides* overrides
-                                                       *enable-hot-standby* (startup-setting-value settings "hot_standby")
-                                                       *wal-level* (if (equal "logical" (startup-setting-value settings "wal_level")) :logical :replica)
-                                                       *wal-keep-size-mb* (startup-setting-value settings "wal_keep_size")
-                                                       *physical-restartpoint-timeout* timeout
-                                                       *physical-restartpoint-wal-bytes* wal-bytes
-                                                       *max-slot-wal-keep-bytes* (wal-slot-retention-policy-limit slot-policy)
-                                                       *wal-slot-retention-policy* slot-policy
-                                                       *max-replication-slots* (startup-setting-value settings "max_replication_slots")
-                                                       *max-connections* (startup-setting-value settings "max_connections")
-                                                       *max-wal-senders* (startup-setting-value settings "max_wal_senders")))
-                                               ))
+(defun startup-check-installation-predecessor (candidate)
+  (let ((installed *startup-installed-configuration*))
+    (unless (eq (startup-configuration-predecessor candidate)
+                (when installed (startup-configuration-identity installed)))
+      (error "configuration generation changed before installation")))
+  (values))
+
+(defun startup-publish-configuration (candidate)
+  (setf *authentication-policy* (startup-configuration-authentication candidate)
+        *startup-server-settings* (startup-configuration-settings candidate)
+        *startup-native-inputs* (startup-configuration-native candidate)
+        *startup-command-overrides* (startup-configuration-overrides candidate)
+        *enable-hot-standby* (startup-configuration-hot-standby candidate)
+        *wal-level* (startup-configuration-wal-level candidate)
+        *wal-keep-size-mb* (startup-configuration-keep-mb candidate)
+        *physical-restartpoint-timeout* (startup-configuration-timeout candidate)
+        *physical-restartpoint-wal-bytes* (startup-configuration-wal-bytes candidate)
+        *max-slot-wal-keep-bytes* (wal-slot-retention-policy-limit (startup-configuration-slot-policy candidate))
+        *wal-slot-retention-policy* (startup-configuration-slot-policy candidate)
+        *max-replication-slots* (startup-configuration-max-slots candidate)
+        *max-connections* (startup-configuration-max-connections candidate)
+        *max-wal-senders* (startup-configuration-max-senders candidate)
+        *startup-installed-configuration* candidate)
+  (values))
+
+(defun startup-commit-installation (candidate)
+  (check-type candidate startup-configuration)
+  (physical-follow-call-with-desired-install
+   (startup-configuration-desired candidate)
+   (lambda () (startup-publish-configuration candidate))
+   (lambda () (startup-check-installation-predecessor candidate)))
+  candidate)
+
+(defun startup-install-settings (settings native overrides &optional (policy nil supplied-p))
+  (startup-commit-installation
+   (if supplied-p
+       (startup-prepare-installation settings native overrides policy)
+       (startup-prepare-installation settings native overrides)))
   settings)
 
 (defun startup-reload-settings ()
