@@ -347,7 +347,7 @@ For cluster_name, postmaster SQL_ASCII clips 63 raw bytes before ASCII cleaning,
 even with a UTF-8 database. Conninfo retains its input octets; other settings
 decode their input as UTF-8.
 Timeline and synchronous standby names are validated while retaining their
-original spelling."
+original spelling. Synchronous commit values use the session normalizer."
   (let ((spec (assoc name *startup-setting-specs* :test #'string=))
         (octets (startup-input-octets input)))
     (unless spec (error "unrecognized configuration parameter ~s" name))
@@ -1055,8 +1055,8 @@ This configuration path does not take live admission or the code reload lock."
 
 (defun startup-settings-row (name entry &optional (configuration (startup-capture-configuration)))
   "Expose actual installed settings in guc_funcs.c column units and provenance.
-WAL level enum values are a text array of canonical names; aliases are hidden.
-Other supported setting rows have NULL enum values. CONFIGURATION supplies the
+WAL level and synchronous commit enum values list supported canonical names;
+aliases are hidden. Other rows have NULL enum values. CONFIGURATION supplies the
 slot policy and provenance from the same root as ENTRY, without rereading the
 environment."
   (let* ((spec (assoc name *startup-setting-specs* :test #'string=))
@@ -1092,7 +1092,8 @@ environment."
 
 (defun startup-settings-rows ()
   "Snapshot supported installed server and session GUCs; omit custom placeholders.
-Use one root for all server rows. Without an installed root, return session rows."
+Use one root for all server rows and emit one effective synchronous commit row.
+Without an installed root, return session rows."
   (let* ((configuration (startup-capture-configuration))
          (settings (when configuration (startup-configuration-settings configuration))))
     (append

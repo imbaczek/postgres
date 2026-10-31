@@ -164,8 +164,19 @@
   scoped cl-spec property ran 100 trials at seed 42 (digest `5501aa7e8c09f1d4`);
   input coverage and rejection counts were not measured.
 
-- [ ] Complete session and client `synchronous_commit` settings, including SET
-  LOCAL and RESET, truthful FIRST/ANY status, and true asynchronous OFF.
+- [x] Support session and client `synchronous_commit` values `on`, `local`,
+  `remote_write` and `remote_apply`, including SET LOCAL and RESET
+  (`b57b9154ce1`). `on` waits for remote flush; `local` keeps local durability.
+  OFF and false aliases return 0A000 pending true asynchronous commit. The
+  checkpoint passed 1,413 physical, 772 unit, 201 wire and 1,159 legacy checks,
+  strict cold compilation and native DDL, user SQL and default-change reload
+  tests. The scoped property ran 100 trials at seed 42 (digest `76743fc438b0bd6f`);
+  coverage and rejection counts were not measured. Configuration publication is
+  independent, but SIGHUP also requests code reload and can pause new SQL while
+  draining an active commit. The reload test uses a pre-admitted callback across
+  SIGHUP; ordinary control evaluation also requires admission.
+
+- [ ] Complete truthful FIRST/ANY status and true asynchronous OFF.
 
 - [ ] Complete the unchanged Patroni monitoring query and synchronous-replication
   backend contract. Preserve the complete real query as the acceptance oracle.

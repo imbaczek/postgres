@@ -407,8 +407,8 @@ A changed value is reported at the next reporting boundary."
     text))
 
 (defun set-config-value (name value local-p)
-  "Set a supported session value, including transaction-local application_name.
-Reject unsupported parameters and unsupported local settings."
+  "Set a supported session value, including LOCAL application_name and
+synchronous_commit. Reject unsupported parameters and other local settings."
   (when (eq name +null+)
     (ereport "22004" "SET requires parameter name"))
   (startup-check-session-setting (string-downcase name))

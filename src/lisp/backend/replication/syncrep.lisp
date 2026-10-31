@@ -190,7 +190,7 @@
     (sync-replication-select-current-under-lock config)))
 
 ;; Publication and wait core with native source lifecycle fencing.
-;; Public settings and transaction commit waits are not yet wired to it.
+;; Public settings and transaction commits use this core.
 
 (defstruct sync-replication-waiter
   ;; Only :WAITING entries are queued; terminal outcomes stay fixed.  The

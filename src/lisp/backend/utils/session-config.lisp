@@ -123,6 +123,9 @@ Search-path reporting is an existing native extension."
                               (gethash "application_name" (backend-settings *backend*) ""))))
 
 (defun session-normalize-synchronous-commit (value)
+  "Normalize supported synchronous_commit values.
+ON and its true aliases select remote flush. LOCAL keeps local durability;
+OFF and false aliases are rejected until asynchronous commit is supported."
   (let ((text (string-downcase (princ-to-string value))))
     (cond
       ((member text '("on" "true" "yes" "1") :test #'string=) "on")
@@ -132,11 +135,14 @@ Search-path reporting is an existing native extension."
       (t (ereport "22023" "invalid value for parameter synchronous_commit")))))
 
 (defun session-capture-raw-binding (settings name)
+  "Capture value and source with independent presence flags.
+Treat the four-field snapshot as immutable; transaction undo copies are shallow."
   (multiple-value-bind (value present-p) (gethash name settings)
     (multiple-value-bind (source source-present-p) (gethash (list :source name) settings)
       (list present-p value source-present-p source))))
 
 (defun session-install-raw-binding (settings name binding)
+  "Restore or remove value and source independently, preserving absence."
   (destructuring-bind (present-p value source-present-p source) binding
     (if present-p (setf (gethash name settings) value) (remhash name settings))
     (if source-present-p
@@ -152,6 +158,9 @@ Search-path reporting is an existing native extension."
           (copy-session-settings (backend-settings *backend*)))))
 
 (defun session-assign-setting-binding (name value reset-p local-p)
+  "Assign a validated setting with interrupts masked.
+The first LOCAL captures the prior binding once; ordinary SET clears that marker.
+Snapshot, marker, value and source updates remain in the same masked section."
   (let ((settings (backend-settings *backend*))
         (local-key (list :local name)))
     (sb-sys:without-interrupts
@@ -168,11 +177,16 @@ Search-path reporting is an existing native extension."
     value))
 
 (defun session-set-synchronous-commit (value &optional local-p)
+  "Set or reset the session binding, optionally for this transaction.
+Preserve absence as well as value so LOCAL, RESET and abort can restore fallback."
   (let* ((reset-p (or (eq value :default) (eq value +null+)))
          (text (unless reset-p (session-normalize-synchronous-commit value))))
     (session-assign-setting-binding "synchronous_commit" text reset-p local-p)))
 
 (defun session-synchronous-commit-value (&optional (configuration nil supplied-p))
+  "Return the session override or the installed default.
+Do not copy the default into the session; without an override require a root
+and a default entry. When CONFIGURATION is supplied, use that root for fallback."
   (when *backend*
     (multiple-value-bind (value present-p)
         (gethash "synchronous_commit" (backend-settings *backend*))
@@ -183,6 +197,8 @@ Search-path reporting is an existing native extension."
     (getf entry :value)))
 
 (defun session-synchronous-commit-wait-mode ()
+  "Return the remote wait mode for the effective setting.
+LOCAL skips the remote wait but does not skip local durability."
   (let ((value (session-normalize-synchronous-commit (session-synchronous-commit-value))))
     (cond ((string= value "on") :flush)
           ((string= value "remote_write") :write)
@@ -190,6 +206,7 @@ Search-path reporting is an existing native extension."
           ((string= value "local") nil))))
 
 (defun session-synchronous-commit-settings-row (configuration)
+  "Build one effective user enum row with its session or installed provenance."
   (multiple-value-bind (value present-p)
       (if *backend*
           (gethash "synchronous_commit" (backend-settings *backend*))
@@ -332,6 +349,7 @@ The saved settings allow an abort to restore the values in effect at transaction
     (nreverse assignments)))
 
 (defun session-apply-startup-options (params)
+  "Apply client startup settings and retain them as the session reset baseline."
   (handler-case
       (let ((options (startup-last-parameter params "options"))
             (*session-setting-reports-suppressed-p* t))

@@ -2389,6 +2389,7 @@ On commit, retire the saved settings snapshot; abort leaves it for whole-table u
   (values))
 
 (defun synchronous-commit-wait-mode ()
+  "Read the effective session setting at the commit boundary."
   (session-synchronous-commit-wait-mode))
 
 (defun wait-for-committed-wal-obligation
