@@ -172,6 +172,15 @@ Unclaimed and non-standby cases need no check; live replay files are not read."
 
 (defun physical-follow-call-with-prepared-install
     (desired function preflight claim-preflight publication-preflight &optional publication-wrapper)
+  "Install a prepared desired generation without taking admission or quiescence.
+Under the generation fence, check predecessor and PREFLIGHT under the follow
+lock before and after the claim. Run claim and publication preflights outside
+the follow lock. PUBLICATION-WRAPPER, when supplied, wraps both FUNCTION and
+the desired assignment. The wrapper receives a zero-argument publication
+function and must call it exactly once under its additional exclusion. After
+that function publishes caller state, the wrapper must not fail or exit.
+Wake the desired worker after fence release, including on unwind after
+publication; a wake failure does not undo publication."
   (check-type desired physical-follow-desired)
   (let ((changed nil))
     (flet ((publish ()

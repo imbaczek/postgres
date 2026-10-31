@@ -328,6 +328,8 @@ publication shares these objects with runtime state."
      :expected-source-id expected-source-id :expected-generation expected-generation)))
 
 (defun sync-replication-check-prepared-under-lock (plan)
+  "Check PLAN's source and generation under the sender lock.
+Signal a typed stale condition if either has changed."
   (assert (sb-thread:holding-mutex-p *wal-sender-lock*))
   (unless (and (eql (sync-replication-configuration-plan-expected-generation plan)
                     (sync-replication-state-generation *sync-replication-state*))
@@ -337,6 +339,7 @@ publication shares these objects with runtime state."
   (values))
 
 (defun sync-replication-check-prepared-configuration (plan)
+  "Check PLAN's synchronous predecessors while holding the sender lock."
   (sb-thread:with-mutex (*wal-sender-lock*)
     (sync-replication-check-prepared-under-lock plan))
   (values))

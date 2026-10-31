@@ -152,26 +152,29 @@
   unit, 201 wire and 1,159 legacy checks, strict cold compilation and native
   user and DDL scripts. The scoped cl-spec property ran 100 trials at seed 42
   (digest `3f289db7c7c4a86e`); input coverage and rejection counts were not
-  measured. Actual root and generation wiring remains open.
+  measured. At that checkpoint root and generation wiring remained open.
 
-- [ ] Complete public synchronous settings and status and true asynchronous
-  `synchronous_commit=off`. Regress a synchronous waiter
-  retaining its XID, a second transaction blocked on it, and a pending code reload:
-  repeated SIGHUP with invalid input must preserve the installed state; clearing
-  public standby names must
-  release waiters, and a third request with a retained portal must show service
-  continues. This acceptance scenario remains open.
+- [x] Publish validated `synchronous_standby_names` with the configuration root
+  (`6aad437aef5`). The SIGHUP string defaults to empty; SQL SET returns 55P02.
+  The native rescue test preserves blocked commit and XID waits across three
+  invalid reloads, releases both after clearing names, and shows SQL progress
+  while a retained portal holds code reload until it closes. The checkpoint
+  passed 1,413 physical, 760 unit, 201 wire and 1,159 legacy checks, strict cold
+  compilation, native user and DDL scripts, and real configured follow. The
+  scoped cl-spec property ran 100 trials at seed 42 (digest `5501aa7e8c09f1d4`);
+  input coverage and rejection counts were not measured.
+
+- [ ] Complete session and client `synchronous_commit` settings, including SET
+  LOCAL and RESET, truthful FIRST/ANY status, and true asynchronous OFF.
 
 - [ ] Complete the unchanged Patroni monitoring query and synchronous-replication
-  backend contract. Synchronous setting lookup fails with 42704. Preserve the
-  complete real query as the acceptance oracle.
+  backend contract. Preserve the complete real query as the acceptance oracle.
   Patroni's sync handler also emits a DO block containing SET LOCAL
   synchronous_commit=off and PERFORM txid_current(); these remain dependencies
   of unchanged-method acceptance. Complete public FIRST/ANY integration against
   C `syncrep.c`, with independent acknowledgment/crash tests;
-  this item adds no coordination. Keep nonempty synchronous standby names
-  unsupported and sender status asynchronous until public commit waiting is
-  implemented: Patroni treats sync status as a safety signal. Preserve the
+  this item adds no coordination. Keep sender status asynchronous until truthful
+  public status is implemented: Patroni treats sync status as a safety signal. Preserve the
   different-upstream, descendant and rejoin acceptance work alongside this path.
 
 - [x] Publish an allocated backend XID with its active registration under the XID

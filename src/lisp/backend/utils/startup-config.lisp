@@ -17,8 +17,8 @@
 (define-condition startup-configuration-changed (simple-error) ())
 
 (defstruct startup-installation-basis
-  "Transient snapshot of the actual root, desired generation, source, timeline
-policy and managed claim used to prepare one candidate."
+  "Transient snapshot of the actual root, desired generation, source, synchronous
+generation, timeline policy and managed claim used to prepare one candidate."
   (root nil :read-only t) (desired nil :read-only t) (source nil :read-only t)
   (timeline-policy nil :read-only t) (managed-p nil :read-only t)
   (sync-generation nil :read-only t))
@@ -34,6 +34,7 @@ policy and managed claim used to prepare one candidate."
   (source-predecessor nil :read-only t)
   (settings nil :read-only t) (native nil :read-only t) (overrides nil :read-only t)
   (authentication nil :read-only t) (desired nil :read-only t)
+  ;; Owned prepared names and predecessor; treat the plan as opaque after prepare.
   (sync-plan nil :read-only t)
   (slot-policy nil :read-only t) (resources nil :read-only t)
   (timeout 0 :read-only t) (wal-bytes 0 :read-only t) (keep-mb 0 :read-only t)
@@ -86,7 +87,8 @@ Reject unsupported objects without printing their contents."
     (settings native overrides basis policy supplied-p)
   "Prepare owned configuration values against BASIS.
 Use its root and follow state throughout preparation; its source is the
-candidate's predecessor, not a claim on the current source."
+candidate's predecessor, not a claim on the current source. Prepare an owned
+synchronous configuration plan against the same source and generation."
   (let* ((installed (startup-installation-basis-root basis))
          (predecessor (when installed (startup-configuration-identity installed)))
          (owned-settings (startup-copy-input settings))
@@ -343,7 +345,8 @@ to replica. Feature admission separately rejects minimal."
 For cluster_name, postmaster SQL_ASCII clips 63 raw bytes before ASCII cleaning,
 even with a UTF-8 database. Conninfo retains its input octets; other settings
 decode their input as UTF-8.
-Timeline input is validated but its original spelling is retained."
+Timeline and synchronous standby names are validated while retaining their
+original spelling."
   (let ((spec (assoc name *startup-setting-specs* :test #'string=))
         (octets (startup-input-octets input)))
     (unless spec (error "unrecognized configuration parameter ~s" name))
@@ -808,6 +811,7 @@ these slots."
                               (startup-configuration-source-predecessor candidate)))
 
 (defun startup-check-synchronous-predecessor (candidate)
+  "Translate a stale synchronous plan into a configuration retry."
   (handler-case
       (sync-replication-check-prepared-configuration (startup-configuration-sync-plan candidate))
     (sync-replication-configuration-changed ()
@@ -905,6 +909,9 @@ authentication and an initialized source."
   (values))
 
 (defun startup-call-with-prepared-installation (candidate preflight claim-preflight publication-preflight)
+  "Publish CANDIDATE's root, desired generation and synchronous plan together.
+Check root, source and synchronous predecessors before and after the managed
+claim. Translate a final sender-lock stale check so reload can prepare again."
   (check-type candidate startup-configuration)
   (handler-case
       (physical-follow-call-with-prepared-install

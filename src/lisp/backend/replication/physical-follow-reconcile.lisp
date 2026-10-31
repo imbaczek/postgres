@@ -178,7 +178,9 @@ Join outside the follow lock; failure to stop marks recovery failed."
   (nth-value 0 (sync-replication-configuration-state)))
 
 (defun startup-capture-installation-basis ()
-  "Capture the root and replication predecessors under publication exclusion."
+  "Capture one installation basis under the generation, follow, sender and root
+locks in that order. Read source and synchronous generation from current sender
+state, not from the previously installed root."
   (call-with-physical-follow-generation-fence
    (lambda ()
      (sb-thread:with-mutex (*physical-follow-lock*)
