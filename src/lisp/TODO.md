@@ -94,8 +94,25 @@
   bytes while its runtime owns the store; a retired runtime leaves it alone.
   Runtime publication and retirement use the same fence. The checkpoint passed
   749 unit, 1,350 physical and 201 wire tests, 1,159 legacy checks, strict cold
-  compilation and SQL smoke. The installer still requires quiescence; controller
-  durable publication and the independent configuration service remain open.
+  compilation and SQL smoke. At that checkpoint controller durable publication
+  and the independent configuration service remained open.
+
+- [x] Fence controller intent and active publication and defer notification of
+  captured obsolete senders until after fence release (`a50140c079c`,
+  `54702573208`). The installer still requires quiescence. The checkpoint passed
+  1,363 physical (`/tmp/controller-fence-final-physical.log`), 752 unit
+  (`/tmp/controller-fence-final-unit.log`), 201 wire
+  (`/tmp/controller-fence-final-wire.log`) and 1,159 legacy checks
+  (`/tmp/controller-fence-legacy.log`), strict cold compilation
+  (`/tmp/controller-fence-cold.log`) and SQL smoke
+  (`/tmp/controller-fence-smoke.log`).
+
+- [ ] Close worker-start interruption gaps in `physical-follow-start-operation`
+  and `physical-follow-launch-workers`. Mask thread creation, owner publication
+  and start-gate release together. On a failed start, release every created
+  child's gate and prevent it from touching storage. In particular, publishing
+  `success` before `ready` must not leave a child waiting forever after an
+  interrupt. Keep joins outside lifecycle locks and the generation fence.
 
 - [ ] Build the independent configuration service needed before commit waiting.
   This is proposed, not implemented; it adds no coordinator. Parking synchronous
@@ -107,9 +124,11 @@
      stays fixed, so reload can rescue retention. The private pin's exact-byte cap
      remains independent of `wal_keep_size`; preserve invalidation order. Capture
      restartpoint settings before taking the store lock.
-  2. Receiver and desired-generation publication fencing is complete. Fence
-     controller intent and active publication, keeping captured obsolete-sender
-     notifications outside the fence. Then publish candidates atomically without
+  2. Receiver effects, desired-generation installation, and controller intent
+     and active-binding publication are fenced. Capture root, desired generation
+     and real source predecessor coherently; check the source before managed claim.
+     Fence live promotion and private history selection through source rotation
+     before dropping quiescence. Then publish candidates atomically without
      quiescence after HBA, claim, resource, slot and predecessor checks.
   3. Separate the configuration worker from code drain. Serialize candidate
      preparation/publication with actual ASDF replacement, never holding that

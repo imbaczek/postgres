@@ -22,7 +22,8 @@
 (defun physical-follow-disable-desired-receipt (desired)
   "Disable old receipt before a configured replacement or an empty conninfo.
 Keep replay and its pause state, and queue unfinished preparation for cleanup.
-Persist the disabled state under reload exclusion and live-operation quiescence."
+Persist the disabled state under reload exclusion, live-operation quiescence
+and the generation fence. Receiver stop and join precede fenced publication."
   (physical-follow-call-with-controller-blocked
    (lambda ()
      (sb-thread:with-mutex (*physical-follow-command-lock*)
@@ -67,10 +68,11 @@ Persist the disabled state under reload exclusion and live-operation quiescence.
 (defun physical-follow-reconcile-desired-step ()
   "Reconcile one claimed generation, retrying failures without restoring old receipt.
 An empty conninfo leaves replay running without a receiver. A superseded
-attempt cannot publish local follow state or mark the newer generation
-applied. The native source
-must support this controller's preparation and cleanup protocol; this worker
-does not provide an external failover coordinator."
+attempt cannot publish new attachment authority, current-generation error status
+or the applied marker; cleanup of its exact saved preparation remains allowed.
+The join is outside the generation fence. The native source must support this
+controller's preparation and cleanup protocol; this worker does not provide
+an external failover coordinator."
   (let ((desired (sb-thread:with-mutex (*physical-follow-lock*) *physical-follow-desired*)))
     (cond
       ((not (physical-follow-desired-claimed-p desired)) :unmanaged)

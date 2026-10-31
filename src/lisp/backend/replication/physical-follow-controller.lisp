@@ -601,7 +601,8 @@ Use the fresh saved config so namespace-only changes are retained."
 (defun physical-follow-operation-remember-source (operation timeline &optional (system-id (getf *physical-recovery-state* :system-id)))
   "Record a checked source ID before attempting its durable config update.
 The process-local maximum survives cancellation or a pre-rename save failure.
-The saved bound grants no source or WAL authority and creates no PREPARE debt."
+Admission and the generation fence protect the config update. The saved bound
+grants no source or WAL authority and creates no PREPARE debt."
   (sb-thread:with-mutex (*physical-follow-command-lock*)
     (unless (= system-id (getf *physical-recovery-state* :system-id))
       (error "observed follow source belongs to a different cluster"))
@@ -627,7 +628,11 @@ The saved bound grants no source or WAL authority and creates no PREPARE debt."
           known)))))
 
 (defmacro with-physical-follow-controller-publication ((obsolete) &body body)
-  "Publish under the generation fence, then notify captured owners after release."
+  "Publish under the generation fence.
+The caller already owns command and reload exclusion and quiescence. Fence
+acquisition is interruptible unless the caller already masked interrupts;
+publication and cleanup are masked. OBSOLETE receives exact sender backends to
+notify after fence release, including on unwind."
   (let ((mutex (gensym "MUTEX-")) (held (gensym "HELD-")))
     `(let ((,mutex *physical-follow-generation-lock*) (,held nil) (,obsolete nil))
        (unless (and (zerop *live-operation-depth*)
@@ -656,7 +661,8 @@ The saved bound grants no source or WAL authority and creates no PREPARE debt."
   "Stop the old runtime and save preparation intent before contacting PREPARE.
 Hold command exclusion; snapshot under reload and live-operation quiescence.
 The preparation entry records the selected owner before the RPC. Once accepted,
-that owner stays with the pin until a new publication, not a later reconnect."
+that owner stays with the pin until a new publication, not a later reconnect.
+Worker stop and join happen before the generation-fenced intent write."
   (sb-thread:with-mutex (*physical-follow-command-lock*)
     (let ((current (physical-follow-operation-current-config operation)))
       (setf (physical-follow-operation-config operation) current)
@@ -702,7 +708,8 @@ With workers quiesced, strictly validate the candidate before writing pending
 state. Receipt resumes only after activation. The generation is checked again
 under command and reload exclusion before durable publication. After attaching
 the active source, retire old synchronous replication proof before marking the
-transition complete."
+transition complete. Command, reload, quiescence and generation exclusion
+protect the publication in that order; sender notification follows fence release."
   (sb-thread:with-mutex (*physical-follow-command-lock*)
     (sb-thread:with-mutex (*reload-run-lock*)
       (with-live-operation-quiescence
@@ -760,9 +767,11 @@ transition complete."
 
 (defun physical-follow-operation-recover (operation)
   "Queue a saved preparation and restore the old workers when safe.
-A healthy disabled configuration resumes replay only; an enabled configuration
-restores receipt and replay. Cancellation, shutdown and promotion can prevent
-restoration. Ambiguous publication failures fence recovery for restart reconciliation."
+A superseded or cancelled operation still cleans up its exact saved preparation
+when the saved config matches. Current authority, shutdown and promotion state
+determine whether receipt may be restored. Validate the store after releasing the recovery fence;
+worker publication takes its own fence. Ambiguous publication failures fence
+recovery for restart reconciliation."
   (let ((context (physical-follow-operation-context operation)))
     (cond
       ((getf context :committed) nil)
@@ -807,7 +816,9 @@ restoration. Ambiguous publication failures fence recovery for restart reconcili
 (defun physical-follow-wait-for-policy
     (runtime reason &optional retry-source (generation (and runtime (physical-follow-runtime-generation runtime))) operation)
   "Stop receipt under command exclusion; preserve replay and its pause state.
-Only an eligible source retry schedules another automatic discovery."
+Only an eligible source retry schedules another automatic discovery. Join receipt
+outside the generation fence, then publish the transition only while the runtime
+and operation still own it."
   (unless (sb-thread:holding-mutex-p *physical-follow-command-lock*)
     (error "policy wait requires follow command exclusion"))
   (when (and runtime (eq runtime *physical-follow-runtime*))
@@ -856,6 +867,9 @@ result; restore stopped workers when needed."
          (setf (physical-follow-operation-result operation) (list :not-attached :reason reason)))))))
 
 (defun physical-follow-operation-run (operation)
+  "Run source preparation and publish results only for the current operation.
+Socket I/O and client close stay outside the generation fence. An old operation
+cannot replace the current operation's result or automatic error state."
   (let ((client nil))
     (unwind-protect
          (handler-case
@@ -1151,6 +1165,7 @@ binding and restart reconciliation; the old slot may not be restored."
 (defvar *physical-follow-prepare-timeout* 60)
 
 (defun physical-follow-controller-record-error (key condition &optional operation)
+  "When OPERATION is supplied, record its error only while it still owns the controller."
   (let ((message (princ-to-string condition)))
     (sb-thread:with-mutex (*physical-follow-lock*)
       (when (or (null operation) (physical-follow-operation-owner-current-p operation))

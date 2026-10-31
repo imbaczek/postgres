@@ -293,7 +293,8 @@
   (values))
 
 (defun sync-replication-notify-obsolete-senders (obsolete)
-  "Terminate captured sender owners after proof publication releases its mutex."
+  "Notify exact obsolete sender backends after releasing the sender mutex.
+Signal the current backend last so its termination cannot prevent other signals."
   (when (sb-thread:holding-mutex-p *wal-sender-lock*)
     (error "obsolete sender notification cannot hold the sender mutex"))
   (sb-sys:without-interrupts
@@ -305,6 +306,12 @@
 
 (defun sync-replication-install-configuration (text source-id expected-source-id expected-generation
                                                &key defer-notifications)
+  "Install the configuration after checking both predecessor values.
+Return the installed configuration generation. By default, notify obsolete
+senders before returning. With DEFER-NOTIFICATIONS, return the exact backend
+list as a second value. With DEFER-NOTIFICATIONS, the caller must already mask
+interrupts and retain the mask through fence release and notification, including
+on unwind."
   ;; Compare both predecessor source and configuration generation under lock.
   ;; Source IDs are immutable symbols or integers; the owning lifecycle must
   ;; supply a fresh real generation for every source incarnation.
@@ -352,8 +359,11 @@
 (defun sync-replication-new-source-incarnation (&key defer-notifications)
   "Replace the source identity while preserving synchronous standby names.
 The caller must own live-operation quiescence and must not hold the WAL mutex.
-The configuration installer retires old senders, releases pending waiters with
-:SOURCE-CHANGED, and clears frontier proof when it installs the new identity."
+Retire old senders, release pending waiters with :SOURCE-CHANGED, and clear
+frontier proof. Return the fresh source identity; by default notify senders
+before returning. With deferred notification, return their exact backend list
+as a second value; the caller keeps interrupts masked through notification,
+including on unwind."
   (when (and defer-notifications sb-sys:*interrupts-enabled*)
     (error "deferred sender notification requires masked interrupts"))
   (unless (eq *live-operation-quiescence-owner-thread* sb-thread:*current-thread*)
