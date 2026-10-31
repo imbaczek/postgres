@@ -29,10 +29,13 @@
 (defvar *startup-configuration-lock* (sb-thread:make-mutex :name "installed configuration"))
 
 (defun startup-capture-configuration ()
+  "Capture the installed root, or NIL if configuration is uninstalled.
+Hold the root mutex only for the pointer read; callers use the root after release."
   (sb-thread:with-mutex (*startup-configuration-lock*)
     *startup-installed-configuration*))
 
 (defun startup-require-configuration ()
+  "Return the installed root or signal that configuration is uninstalled."
   (or (startup-capture-configuration)
       (error "server configuration is not installed")))
 
@@ -58,8 +61,10 @@ Reject unsupported objects without printing their contents."
 
 (defun startup-prepare-installation-from-base (settings native overrides installed policy supplied-p)
   "Prepare owned inputs, authentication, desired follow state and validated values.
-An explicitly supplied NIL policy differs from an omitted policy. Resolve slot
-retention once here. Resource capacity installation remains a startup step."
+Reload derives inputs and predecessor from the same captured base; default
+authentication also uses that base. An explicitly supplied NIL policy differs
+from an omitted policy. Resolve slot retention once here.
+Resource capacity installation remains a startup step."
   (let* ((predecessor (when installed (startup-configuration-identity installed)))
          (owned-settings (startup-copy-input settings))
          (owned-native (startup-copy-input native))
@@ -85,6 +90,7 @@ retention once here. Resource capacity installation remains a startup step."
      :max-senders (startup-setting-value owned-settings "max_wal_senders"))))
 
 (defun startup-prepare-installation (settings native overrides &optional (policy nil supplied-p))
+  "Prepare an installation against one captured configuration generation."
   (startup-prepare-installation-from-base
    settings native overrides (startup-capture-configuration) policy supplied-p))
 
@@ -759,8 +765,9 @@ these slots."
   (values))
 
 (defun startup-publish-configuration (candidate)
-  "Publish prepared values and the root; callers provide publication exclusion.
-Publication still uses live-operation quiescence; production readers use globals."
+  "Publish prepared values and the root under the root mutex.
+Publication still uses live-operation quiescence. Migrated readers capture the
+root; retention and restartpoint readers still use globals."
   (sb-thread:with-mutex (*startup-configuration-lock*)
     (setf *authentication-policy* (startup-configuration-authentication candidate)
           *startup-server-settings* (startup-configuration-settings candidate)
@@ -800,7 +807,8 @@ Publication still uses live-operation quiescence; production readers use globals
   "Validate a fresh input tree before replacing active values under quiescence.
 Postmaster settings retain their active values and record pending restart.  A
 setting added to a warm registry uses its boot default as the old value.
-Reject an unsupported effective candidate before publishing any reload changes."
+Reject an unsupported effective candidate before publishing any reload changes.
+Capture the base once before file I/O and use it for both inputs and predecessor."
   (let ((base (startup-capture-configuration)))
     (when base
       (let* ((native (startup-configuration-native base))
@@ -849,7 +857,9 @@ Reject an unsupported effective candidate before publishing any reload changes."
 (defun startup-settings-row (name entry &optional (configuration (startup-capture-configuration)))
   "Expose actual installed settings in guc_funcs.c column units and provenance.
 WAL level enum values are a text array of canonical names; aliases are hidden.
-Other supported setting rows have NULL enum values."
+Other supported setting rows have NULL enum values. CONFIGURATION supplies the
+slot policy and provenance from the same root as ENTRY, without rereading the
+environment."
   (let* ((spec (assoc name *startup-setting-specs* :test #'string=))
          (source (getf entry :source))
          (unit (case (seventh spec) (:seconds "s") (:megabytes "MB") (t +null+)))
@@ -878,7 +888,8 @@ Other supported setting rows have NULL enum values."
             (not (null (getf entry :pending-restart))))))
 
 (defun startup-settings-rows ()
-  "Snapshot supported installed server and session GUCs; omit custom placeholders."
+  "Snapshot supported installed server and session GUCs; omit custom placeholders.
+Use one root for all server rows. Without an installed root, return session rows."
   (let* ((configuration (startup-capture-configuration))
          (settings (when configuration (startup-configuration-settings configuration))))
     (append
@@ -888,6 +899,7 @@ Other supported setting rows have NULL enum values."
      (list (session-timeout-settings-row) (session-application-name-settings-row)))))
 
 (defun startup-setting-show-value (name)
+  "Read NAME from one installed root; return no match when none is installed."
   (let ((configuration (startup-capture-configuration)))
     (when configuration
       (let ((entry (gethash name (startup-configuration-settings configuration))))

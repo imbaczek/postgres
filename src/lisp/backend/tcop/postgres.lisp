@@ -156,6 +156,7 @@ Like C ReportChangedGUCOptions, recovery can only change from on to off."
     (when report (send-parameter-status stream "in_hot_standby" (if standby "on" "off")))))
 
 (defun authorize-and-admit-startup-backend (backend configuration user database peer)
+  "Authorize and reserve quota using one captured configuration root."
   (authentication-authorize (startup-configuration-authentication configuration)
                             user database peer (backend-replication-mode backend))
   (postmaster-admit-startup-backend
@@ -164,6 +165,7 @@ Like C ReportChangedGUCOptions, recovery can only change from on to off."
 
 (defun process-startup (stream body)
   "Parse startup mode, check availability and authenticate before reserving quota.
+Capture one root under admission for hot standby, authentication and quota limits.
 Capture a replication connection's source identity under admission so later
 sender registration can reject a source change during the intervening gap.
 When hot_standby is off, reject every startup mode during recovery before authentication.

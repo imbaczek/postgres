@@ -72,18 +72,25 @@
   The checkpoint passed 744 unit, 1,332 physical and 201 wire tests, strict cold
   compilation (`/tmp/pg-prepared-config-cold.log`), SQL smoke
   (`/tmp/pg-prepared-config-smoke.log`) and live valid/invalid reload checks.
-  Production readers still use globals; independent configuration service remains open.
+  At that checkpoint production readers still used globals.
+
+- [x] Capture one installed root for SHOW/settings rows, authentication backup
+  and startup admission, and derive reload candidates from their captured base
+  (`c907ba9d05b`). The checkpoint passed 744 unit, 1,337 physical and 201 wire
+  tests, strict cold compilation (`/tmp/pg-config-readers-cold.log`), SQL smoke
+  (`/tmp/pg-config-readers-smoke.log`) and live divergence/reload checks. No root
+  means uninstalled; quota admission takes explicit captured limits.
 
 - [ ] Build the independent configuration service needed before commit waiting.
   This is proposed, not implemented; it adds no coordinator. Parking synchronous
   waiters alone does not keep configuration service available.
 
-  1. Capture the installed root under a short mutex and pass the same root through
-     SHOW/settings rows and authentication/startup admission limits. No root means
-     uninstalled, not reconstruction from globals; component quotas take explicit
-     limits. Installed provenance must not reread the environment. Reload preparation
-     must use the same base root captured with its inputs. Migrate retention and
-     restartpoint readers separately.
+  1. Migrate retention and restartpoint readers to captured roots. Capture policy
+     and keep size once per calculation or catalog snapshot; recapture on each
+     authoritative retry or owner termination claim while the ticket WAL endpoint
+     stays fixed, so reload can rescue retention. The private pin's exact-byte cap
+     remains independent of `wal_keep_size`; preserve invalidation order. Capture
+     restartpoint settings before taking the store lock.
   2. Fence follow generation checks through their effects, then publish candidates
      atomically without quiescence after HBA, claim, resource, slot and predecessor
      checks.

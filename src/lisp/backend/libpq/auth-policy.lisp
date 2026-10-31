@@ -201,8 +201,9 @@ A marked cluster must not silently recreate a missing HBA file."
       policy)))
 
 (defun authentication-capture-policy ()
-  "Return the installed generation for a backup, not uninstalled disk edits.
-The backup caller holds reload exclusion and operation quiescence."
+  "Return authentication from a captured installed root for a backup.
+Require an installed policy. Root capture ends before the backup writes files;
+the backup caller also holds reload exclusion and operation quiescence."
   (let ((policy (startup-configuration-authentication (startup-require-configuration))))
     (unless (and (authentication-policy-p policy) (authentication-policy-rules policy))
       (error "physical backup requires an installed authentication policy"))

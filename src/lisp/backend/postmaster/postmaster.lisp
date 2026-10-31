@@ -106,9 +106,9 @@ DEFVAR preserves reservations across function reloads.")
     (gethash pid *backend-registry*)))
 
 (defun postmaster-admit-startup-backend (backend connections senders)
-  "Reserve the SQL or WAL-sender quota for this registered backend generation.
+  "Reserve the SQL or WAL-sender quota using explicit captured limits.
 Check exact PID ownership before accepting a repeated reservation; the class
-cannot change. Exhaustion raises FATAL before authentication succeeds."
+cannot change. Exhaustion raises FATAL before authentication success is sent."
   (let* ((mode (backend-replication-mode backend))
          (kind (if mode :walsender :sql))
          (limit (if mode senders connections)))
