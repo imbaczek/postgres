@@ -26,15 +26,53 @@
                    :method (hba-rule-method rule)
                    :source (copy-seq (hba-rule-source rule)) :line (hba-rule-line rule))))
 
+(defun authentication-text-within-bound-p (text)
+  (and (stringp text) (<= (length text) 1048576)
+       (loop with bytes = 0
+             for character across text
+             for code = (char-code character)
+             do (when (or (> code #x10ffff) (<= #xd800 code #xdfff))
+                  (return nil))
+                (incf bytes (cond ((< code #x80) 1) ((< code #x800) 2)
+                                  ((< code #x10000) 3) (t 4)))
+             when (> bytes 1048576) do (return nil)
+               finally (return t))))
+
+(defun authentication-complete-policy-p (policy)
+  (and (authentication-policy-p policy)
+       (authentication-policy-rules policy)
+       (authentication-text-within-bound-p (authentication-policy-hba-text policy))
+       (plusp (length (authentication-policy-hba-text policy)))
+       (authentication-text-within-bound-p (authentication-policy-ident-text policy))
+       (pathnamep (authentication-policy-hba-path policy))
+       (pathnamep (authentication-policy-ident-path policy))
+       t))
+
+(defun authentication-policy-settings-p (policy settings)
+  (and (authentication-complete-policy-p policy)
+       (loop for (name path) in
+                             (list (list "hba_file" (authentication-policy-hba-path policy))
+                                   (list "ident_file" (authentication-policy-ident-path policy)))
+             always (let ((configured (startup-setting-value settings name)))
+                      (and configured (equal (pathname configured) path))))))
+
 (defun authentication-copy-policy (policy)
-  "Copy the authentication policy and mutable rule data for a configuration root."
+  "Own the policy data. Complete policies derive rules from retained HBA text,
+which is also the source copied into a physical backup. Incomplete component
+fixtures retain their explicit rule trees."
   (when policy
-    (make-authentication-policy
-     :rules (mapcar #'authentication-copy-rule (authentication-policy-rules policy))
-     :hba-text (copy-seq (authentication-policy-hba-text policy))
-     :ident-text (copy-seq (authentication-policy-ident-text policy))
-     :hba-path (authentication-policy-hba-path policy)
-     :ident-path (authentication-policy-ident-path policy))))
+    (let* ((complete (authentication-complete-policy-p policy))
+           (hba-text (copy-seq (authentication-policy-hba-text policy)))
+           (ident-text (copy-seq (authentication-policy-ident-text policy)))
+           (hba-path (authentication-policy-hba-path policy))
+           (ident-path (authentication-policy-ident-path policy)))
+      (when complete (ident-validate-text ident-text ident-path))
+      (make-authentication-policy
+       :rules (if complete
+                  (hba-parse-text hba-text :source (namestring hba-path))
+                  (mapcar #'authentication-copy-rule (authentication-policy-rules policy)))
+       :hba-text hba-text :ident-text ident-text
+       :hba-path hba-path :ident-path ident-path))))
 
 (defun authentication-read-text (path)
   "Read at most 1 MiB from a bounded regular file and decode it as UTF-8."
@@ -51,14 +89,17 @@
   (let ((text (authentication-read-text path)))
     (values (hba-parse-text text :source (namestring path)) text)))
 
+(defun ident-validate-text (text source)
+  (when (or (not (authentication-text-within-bound-p text)) (find (code-char 0) text))
+    (error "invalid identity mapping text: ~a" source))
+  (dolist (entry (hba-logical-lines text :source (namestring source)))
+    (when (hba-tokenize-line (cdr entry))
+      (error "~a:~d: identity mappings are unsupported" source (car entry))))
+  text)
+
 (defun ident-read-file (path)
   "Accept an empty or comment-only ident file; identity mappings are unsupported."
-  (let ((text (authentication-read-text path)))
-    (when (find (code-char 0) text) (error "NUL in identity mapping file: ~a" path))
-    (dolist (entry (hba-logical-lines text :source (namestring path)))
-      (when (hba-tokenize-line (cdr entry))
-        (error "~a:~d: identity mappings are unsupported" path (car entry))))
-    text))
+  (ident-validate-text (authentication-read-text path) path))
 
 (defun authentication-read-policy (settings)
   "Build a candidate from the resolved HBA and ident paths.

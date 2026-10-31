@@ -129,6 +129,28 @@ file and directory synchronization."
         (setf *physical-recovery-failed-p* t)
         (error condition)))))
 
+(defun physical-follow-read-base-provenance ()
+  (multiple-value-bind (manifest digest) (recovery-read-manifest *pgdata*)
+    (recovery-check-manifest-schema manifest)
+    (let ((control (physical-recovery-read-control *pgdata*)))
+      (unless (and (= (getf manifest :system-id) (getf control :system-id))
+                   (= (getf manifest :timeline) (getf control :timeline))
+                   (= digest (getf control :manifest-digest))
+                   (= (getf manifest :checkpoint) (getf control :checkpoint)))
+        (error "native base identity does not match recovery control")))
+    (let ((base (copy-list manifest)))
+      (setf (getf base :manifest-digest) digest)
+      base)))
+
+(defun physical-follow-check-managed-claim-base (desired)
+  (when (and (physical-follow-desired-claimed-p desired)
+             (member (getf *physical-recovery-state* :phase) '(1 2)))
+    (let ((base (physical-follow-read-base-provenance)))
+      (dolist (field '(:system-id :manifest-digest :timeline :checkpoint :end :cluster-identity))
+        (unless (equal (getf base field) (getf *physical-recovery-state* field))
+          (error "managed follow claim differs from verified base provenance")))))
+  (values))
+
 (defun physical-follow-prepare-managed-claim (desired)
   (when (and (physical-follow-desired-claimed-p desired)
              (member (getf *physical-recovery-state* :phase) '(1 2))
@@ -144,7 +166,7 @@ file and directory synchronization."
                        (physical-follow-desired-claimed-p desired))))
     (error 'physical-follow-generation-changed)))
 
-(defun physical-follow-call-with-desired-install (desired function &optional preflight)
+(defun physical-follow-call-with-desired-install (desired function &optional preflight claim-preflight publication-preflight)
   "Install settings and their generation together under quiescence.
 After quiescence, take the generation fence and check the follow predecessor
 and optional preflight before and after the durable claim. Under the follow
@@ -159,7 +181,9 @@ without undoing the installed configuration."
                 (sb-thread:with-mutex (*physical-follow-lock*)
                   (when preflight (funcall preflight))
                   (physical-follow-check-desired-predecessor desired))
+                (when claim-preflight (funcall claim-preflight))
                 (physical-follow-prepare-managed-claim desired)
+                (when publication-preflight (funcall publication-preflight))
                 (sb-thread:with-mutex (*physical-follow-lock*)
                   (when preflight (funcall preflight))
                   (physical-follow-check-desired-predecessor desired)

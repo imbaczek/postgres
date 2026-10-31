@@ -278,17 +278,7 @@ source history validation, OBSERVER records the timeline before route selection.
 (defun physical-follow-promotion-base ()
   "Check base provenance while the manifest and recovery control still exist.
 This also runs after child commit, before recovery artifacts are removed."
-  (multiple-value-bind (manifest digest) (recovery-read-manifest *pgdata*)
-    (recovery-check-manifest-schema manifest)
-    (let ((control (physical-recovery-read-control *pgdata*)))
-      (unless (and (= (getf manifest :system-id) (getf control :system-id))
-                   (= (getf manifest :timeline) (getf control :timeline))
-                   (= digest (getf control :manifest-digest))
-                   (= (getf manifest :checkpoint) (getf control :checkpoint)))
-        (error "promotion cleanup base identity does not match recovery control")))
-    (let ((base (copy-list manifest)))
-      (setf (getf base :manifest-digest) digest)
-      base)))
+  (physical-follow-read-base-provenance))
 
 (defun physical-follow-promotion-cleanup-config ()
   "Build the post-promotion cleanup image before retiring base provenance.

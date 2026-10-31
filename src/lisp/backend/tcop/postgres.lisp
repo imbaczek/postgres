@@ -913,6 +913,17 @@ CL's RENAME-FILE merges a relative target with the source's directory."
   (catalog-remove-orphan-relations)
   (complete-xid-wraparound))
 
+(defun startup-check-cold-installation-state ()
+  (unless (and (not *wal-ready*) (not *wal-output-stream*) (not *catalog*)
+               (not *clog-stream*) (zerop (hash-table-count *relation-streams*))
+               (not *physical-recovery-state*) (not *physical-receive-store*)
+               (not *physical-follow-runtime*) (not *physical-follow-operation*)
+               (not *physical-follow-desired-worker*) (not *physical-follow-controller-worker*)
+               (not *physical-restartpoint-worker*) (not *swank-listener-enabled-p*)
+               (not (shutdown-in-progress-p)))
+    (error "startup configuration requires storage and workers to remain uninitialized"))
+  (values))
+
 (defun main ()
   ;; Preflight policy before ownership, then initialize it after owning PGDATA.
   ;; Install resource limits before recovery, and check or report them before listen.
@@ -926,18 +937,13 @@ CL's RENAME-FILE merges a relative target with the source's directory."
           *query-sort-arena-limit-bytes* sort-arena-limit-bytes
           *max-slot-wal-keep-bytes* max-slot-wal-keep-bytes)
     (authentication-preflight-startup startup-settings)
-    (startup-install-settings startup-settings startup-native startup-overrides)
+    (startup-install-initial-settings startup-settings startup-native startup-overrides)
     (startup-install-resource-capacity startup-settings)
     (sb-sys:enable-interrupt sb-unix:sigusr1 #'request-physical-promotion)
     (postmaster-own-data-directory host port)
     ;; Complete authentication using the captured inputs after PGDATA ownership.
     ;; Do not reread configuration files or reinstall startup resource capacity.
-    (let* ((installed *startup-installed-configuration*)
-           (settings (startup-configuration-settings installed)))
-      (startup-install-settings settings
-                                (startup-configuration-native installed)
-                                (startup-configuration-overrides installed)
-                                (authentication-prepare-startup settings)))
+    (startup-complete-authentication)
     (physical-promotion-initialize-requests)
     (physical-promotion-test-point :after-promotion-request-initialization)
     ;; Reject an unsupported SBCL before pending reconstruction can open storage.

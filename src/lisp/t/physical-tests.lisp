@@ -16,6 +16,23 @@
 (defun intake-fails-p (function)
   (handler-case (progn (funcall function) nil) (error () t)))
 
+(defun commit-component-startup-installation (candidate)
+  "Exercise publication and predecessor checks without requiring a running postmaster."
+  (pg::startup-call-with-prepared-installation candidate nil nil nil))
+
+(defun install-component-startup-settings (settings native overrides &optional (policy nil supplied-p))
+  (commit-component-startup-installation
+   (if supplied-p
+       (pg::startup-prepare-installation settings native overrides policy)
+       (pg::startup-prepare-installation settings native overrides)))
+  settings)
+
+(defun reload-component-startup-settings ()
+  (multiple-value-bind (candidate settings) (pg::startup-prepare-reload-installation)
+    (when candidate
+      (commit-component-startup-installation candidate)
+      settings)))
+
 (deftest fragmented-wal-records
     (let* ((first (pg::wal-encode-record pg::+wal-record-batch-start+ 0 0 (empty-octets)))
            (last (pg::wal-encode-record pg::+wal-record-commit+ 42 (length first)

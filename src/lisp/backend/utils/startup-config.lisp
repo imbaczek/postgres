@@ -4,7 +4,9 @@
 (declaim (special *authentication-policy*))
 
 (declaim (ftype function authentication-read-policy startup-capture-installation-basis
-                startup-current-source-incarnation physical-follow-plan-settings-from-basis))
+                startup-current-source-incarnation physical-follow-plan-settings-from-basis
+                authentication-complete-policy-p authentication-policy-settings-p authentication-prepare-startup
+                startup-check-cold-installation-state postmaster-pid-owned-p physical-follow-check-managed-claim-base))
 
 (defvar *startup-server-settings* nil)
 
@@ -780,18 +782,21 @@ these slots."
                   *installed-resource-parameters* parameters)))))
     parameters))
 
-(defun startup-check-installation-predecessor (candidate)
-  "Reject a candidate whose root or source predecessor changed."
+(defun startup-check-predecessors (root-identity source-identity)
   (let ((source (startup-current-source-incarnation))
         (installed (startup-capture-configuration)))
-    (unless (eq (startup-configuration-predecessor candidate)
-                (when installed (startup-configuration-identity installed)))
+    (unless (eq root-identity (when installed (startup-configuration-identity installed)))
       (error 'startup-configuration-changed
              :format-control "configuration generation changed before installation"))
-    (unless (eql (startup-configuration-source-predecessor candidate) source)
+    (unless (eql source-identity source)
       (error 'startup-configuration-changed
              :format-control "replication source changed before configuration installation")))
   (values))
+
+(defun startup-check-installation-predecessor (candidate)
+  "Reject a candidate whose root or source predecessor changed."
+  (startup-check-predecessors (startup-configuration-predecessor candidate)
+                              (startup-configuration-source-predecessor candidate)))
 
 (defun startup-publish-configuration (candidate)
   "Publish prepared values and the root under the root mutex.
@@ -815,16 +820,120 @@ root; retention and restartpoint readers still use globals."
           *startup-installed-configuration* candidate))
   (values))
 
-(defun startup-commit-installation (candidate)
-  "Check and publish CANDIDATE with its desired follow generation.
-Reject stale root or source predecessors before the managed claim. Reprepare
-from a fresh basis after a stale-candidate error."
+(defun startup-check-installed-capacity (candidate)
+  (unless (and *installed-resource-parameters*
+               (equal (resource-parameters-values *installed-resource-parameters*)
+                      (resource-parameters-values (startup-configuration-resources candidate))))
+    (error "configuration differs from installed resource capacity"))
+  (values))
+
+(defun startup-check-postmaster-values (candidate installed)
+  (let* ((old (startup-configuration-settings installed))
+         (new (startup-configuration-settings candidate))
+         (defaults (startup-default-settings
+                    (startup-setting-value old "data_directory"))))
+    (dolist (spec *startup-setting-specs*)
+      (when (eq :postmaster (second spec))
+        (let ((name (first spec)))
+          (unless (equal (getf (or (gethash name old) (gethash name defaults)) :value)
+                         (startup-setting-value new name))
+            (error "configuration parameter ~a requires restart" name))))))
+  (values))
+
+(defun startup-check-installation-boundary (candidate boundary)
+  (let ((installed (startup-capture-configuration)))
+    (ecase boundary
+      (:initial
+       (when (or installed *installed-resource-parameters* *postmaster-data-lock*
+                 (startup-current-source-incarnation)
+                 (startup-configuration-authentication candidate))
+         (error "initial configuration requires an uninitialized process"))
+       (startup-check-cold-installation-state))
+      ((:authentication :runtime)
+       (unless installed (error "configuration requires an installed root"))
+       (startup-check-installed-capacity candidate)
+       (startup-check-postmaster-values candidate installed)
+       (unless (authentication-policy-settings-p (startup-configuration-authentication candidate)
+                                                 (startup-configuration-settings candidate))
+         (error "configuration requires complete authentication"))
+       (ecase boundary
+         (:authentication
+          (when (or (startup-configuration-authentication installed)
+                    (startup-current-source-incarnation))
+            (error "authentication completion requires the initial configuration"))
+          (startup-check-cold-installation-state))
+         (:runtime
+          (unless (and (startup-current-source-incarnation)
+                       (authentication-complete-policy-p
+                        (startup-configuration-authentication installed)))
+            (error "runtime configuration requires initialized source and authentication")))))))
+  (values))
+
+(defun startup-check-installation-ownership (candidate)
+  (let ((owned *postmaster-pid-directory*)
+        (directory (startup-setting-value (startup-configuration-settings candidate)
+                                          "data_directory")))
+    (unless (and owned *postmaster-data-lock*
+                 (open-stream-p *postmaster-data-lock*)
+                 (postmaster-pid-owned-p)
+                 (equal owned (ignore-errors (truename *pgdata*)))
+                 (equal owned (ignore-errors (truename directory))))
+      (error "configuration requires current PGDATA ownership")))
+  (values))
+
+(defun startup-call-with-prepared-installation (candidate preflight claim-preflight publication-preflight)
   (check-type candidate startup-configuration)
   (physical-follow-call-with-desired-install
    (startup-configuration-desired candidate)
    (lambda () (startup-publish-configuration candidate))
-   (lambda () (startup-check-installation-predecessor candidate)))
+   (lambda ()
+     (startup-check-installation-predecessor candidate)
+     (when preflight (funcall preflight)))
+   claim-preflight publication-preflight)
   candidate)
+
+(defun startup-commit-installation-at-boundary (candidate boundary)
+  (let ((ownership-check
+          (unless (eq :initial boundary)
+            (lambda () (startup-check-installation-ownership candidate)))))
+    (startup-call-with-prepared-installation
+     candidate
+     (lambda () (startup-check-installation-boundary candidate boundary))
+     (when ownership-check
+       (lambda ()
+         (funcall ownership-check)
+         (physical-follow-check-managed-claim-base (startup-configuration-desired candidate))))
+     ownership-check)))
+
+(defun startup-install-initial-settings (settings native overrides)
+  (startup-commit-installation-at-boundary
+   (startup-prepare-installation settings native overrides nil) :initial)
+  settings)
+
+(defun startup-complete-authentication ()
+  (let* ((basis (startup-capture-installation-basis))
+         (installed (startup-installation-basis-root basis)))
+    (unless installed (error "authentication completion requires an initial configuration"))
+    (let ((settings (startup-configuration-settings installed)))
+      ;; Ownership and cold-stage checks precede default policy file creation.
+      (startup-check-predecessors (startup-configuration-identity installed)
+                                  (startup-installation-basis-source basis))
+      (when (or (startup-configuration-authentication installed)
+                (startup-current-source-incarnation))
+        (error "authentication completion requires the initial configuration"))
+      (startup-check-installed-capacity installed)
+      (startup-check-installation-ownership installed)
+      (startup-check-cold-installation-state)
+      (startup-commit-installation-at-boundary
+       (startup-prepare-installation-from-basis
+        settings (startup-configuration-native installed)
+        (startup-configuration-overrides installed) basis
+        (authentication-prepare-startup settings) t)
+       :authentication))))
+
+(defun startup-commit-installation (candidate)
+  "Check and publish a complete runtime configuration."
+  (startup-commit-installation-at-boundary candidate :runtime))
 
 (defun startup-install-settings (settings native overrides &optional (policy nil supplied-p))
   "Prepare and install owned settings under quiescence; return the original SETTINGS."
@@ -834,7 +943,7 @@ from a fresh basis after a stale-candidate error."
        (startup-prepare-installation settings native overrides)))
   settings)
 
-(defun startup-reload-settings ()
+(defun startup-prepare-reload-installation ()
   "Validate a fresh input tree before replacing active values under quiescence.
 Postmaster settings retain their active values and record pending restart.  A
 setting added to a warm registry uses its boot default as the old value.
@@ -863,9 +972,15 @@ Capture the base once before file I/O and use it for both inputs and predecessor
               (setf (gethash name candidate)
                     (list* :pending-restart t :desired-value (getf new :value) (copy-list old)))
               (admin-log "configuration parameter ~a requires restart" name))))
-        (startup-commit-installation
-         (startup-prepare-installation-from-basis candidate native overrides basis nil nil))
-        candidate))))
+        (values
+         (startup-prepare-installation-from-basis candidate native overrides basis nil nil)
+         candidate)))))
+
+(defun startup-reload-settings ()
+  (multiple-value-bind (candidate settings) (startup-prepare-reload-installation)
+    (when candidate
+      (startup-commit-installation candidate)
+      settings)))
 
 (defun startup-format-unit (value kind)
   (if (<= value 0) (princ-to-string value)

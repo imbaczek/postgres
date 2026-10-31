@@ -212,14 +212,14 @@
         (write-startup-config hba "host all all all trust")
         (write-startup-config (merge-pathnames "pg_ident.conf" root) "# no mappings")
         (multiple-value-bind (native overrides) (pg::startup-cli-inputs (list "-D" (namestring root)))
-          (pg::startup-install-settings (pg::startup-load-settings native overrides) native overrides))
-        (pg::startup-install-settings
+          (install-component-startup-settings (pg::startup-load-settings native overrides) native overrides))
+        (install-component-startup-settings
          pg::*startup-server-settings* pg::*startup-native-inputs* pg::*startup-command-overrides*
          (pg::authentication-read-policy pg::*startup-server-settings*))
         (let ((first pg::*authentication-policy*))
           (write-startup-config hba "host all all all reject")
           (write-startup-config configuration (format nil "checkpoint_timeout=90~%"))
-          (pg::startup-reload-settings)
+          (reload-component-startup-settings)
           (ok (not (eq first pg::*authentication-policy*)))
           (ok (= 90 pg::*physical-restartpoint-timeout*))
           (ok (eq :reject
@@ -229,7 +229,7 @@
         (let ((policy pg::*authentication-policy*) (settings pg::*startup-server-settings*))
           (write-startup-config hba "host all all all md5")
           (write-startup-config configuration (format nil "checkpoint_timeout=120~%"))
-          (ok (signals (pg::startup-reload-settings)))
+          (ok (signals (reload-component-startup-settings)))
           (ok (eq policy pg::*authentication-policy*))
           (ok (eq settings pg::*startup-server-settings*))
           (ok (= 90 pg::*physical-restartpoint-timeout*)))
@@ -237,7 +237,7 @@
         (write-startup-config configuration
                               (format nil "hba_file='~a'~%checkpoint_timeout=120~%"
                                       (namestring (merge-pathnames "missing.hba" root))))
-        (pg::startup-reload-settings)
+        (reload-component-startup-settings)
         (let ((entry (gethash "hba_file" pg::*startup-server-settings*)))
           (ok (getf entry :pending-restart))
           (ok (equal (namestring hba) (getf entry :value))))
