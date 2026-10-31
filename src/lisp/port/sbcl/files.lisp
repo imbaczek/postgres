@@ -9,6 +9,32 @@
   "Linux bits/fcntl-linux.h O_CLOEXEC, shared by storage and postmaster descriptors.
 SB-POSIX does not export this flag in the supported SBCL.")
 
+(sb-alien:define-alien-routine ("mkostemp" port-mkostemp) sb-alien:int
+  (template (* (sb-alien:unsigned 8))) (flags sb-alien:int))
+
+(defun open-exclusive-temporary-file (template)
+  (let* ((bytes (concatenate '(vector (unsigned-byte 8))
+                             (sb-ext:string-to-octets (namestring template) :external-format :utf-8)
+                             #(0)))
+         (fd nil) (path nil) (complete nil))
+    (when (find 0 bytes :end (1- (length bytes))) (error "NUL in temporary file template"))
+    (unwind-protect
+         (sb-sys:with-pinned-objects (bytes)
+           (sb-sys:without-interrupts
+             (setf fd (port-mkostemp
+                       (sb-alien:sap-alien (sb-sys:vector-sap bytes) (* (sb-alien:unsigned 8)))
+                       +postmaster-o-cloexec+))
+             (when (minusp fd)
+               (let ((errno (sb-alien:get-errno)))
+                 (error 'sb-posix:syscall-error :name 'mkostemp :errno errno)))
+             (setf path (pathname (sb-ext:octets-to-string
+                                   bytes :end (1- (length bytes)) :external-format :utf-8))
+                   complete t)
+             (values fd path)))
+      (unless complete
+        (when (and fd (not (minusp fd))) (ignore-errors (sb-posix:close fd)))
+        (when path (ignore-errors (sb-posix:unlink (namestring path))))))))
+
 (defun open-bounded-regular-file (path maximum &optional writable)
   "Open PATH as a bounded regular file and return its stream and byte size.
 Check the opened descriptor before allocating a buffer. Do not follow a final

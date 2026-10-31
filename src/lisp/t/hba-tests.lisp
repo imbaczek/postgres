@@ -142,3 +142,22 @@
   (ok (eq :trust
           (pg::hba-match-rules (pg::hba-parse-text "local all all trust")
                                "u" "d" nil :transport :local))))
+
+(deftest authentication-temporary-descriptors-are-exclusive-and-close-on-exec
+    (with-physical-store-directory (root)
+      (let ((paths nil))
+        (dotimes (index 2)
+          (declare (ignore index))
+          (multiple-value-bind (fd path)
+              (pg::open-exclusive-temporary-file (merge-pathnames ".auth-XXXXXX" root))
+            (unwind-protect
+                 (progn
+                   (ok (not (member path paths :test #'equal)))
+                   (push path paths)
+                   (ok (logbitp 0 (sb-posix:fcntl fd sb-posix:f-getfd)))
+                   (ok (sb-posix:s-isreg (sb-posix:stat-mode (sb-posix:fstat fd))))
+                   (ok (= #o600 (logand #o777 (sb-posix:stat-mode (sb-posix:fstat fd))))))
+              (sb-posix:close fd)
+              (sb-posix:unlink (namestring path)))))
+        (ok (signals (pg::open-exclusive-temporary-file
+                      (merge-pathnames "missing/.auth-XXXXXX" root)))))))
