@@ -163,7 +163,8 @@ must not run inside a handler either; the reloader thread polls the flag."
    (lambda ()
      (loop do (when (and *live-operation-check-cancel-p*
                          backend
-                         (backend-cancel-pending backend))
+                         (or (backend-termination-pending backend)
+                             (backend-cancel-pending backend)))
                 (check-for-interrupts))
            until (live-operation-admitted-p drain-p)
            do (when *live-operation-admission-wait-hook*
@@ -191,7 +192,8 @@ must not run inside a handler either; the reloader thread polls the flag."
      (sb-sys:without-interrupts
        (when (and *live-operation-check-cancel-p*
                   backend
-                  (backend-cancel-pending backend))
+                  (or (backend-termination-pending backend)
+                      (backend-cancel-pending backend)))
          (check-for-interrupts))
        (let ((lane (live-operation-admitted-p drain-p)))
          (when lane

@@ -231,23 +231,20 @@ was the last one and a smart/fast shutdown is in progress."
 Signalling ourselves raises the FATAL in this call stack; another backend is
 interrupted, which unwinds it to the connection loop no matter what it was
 doing (including a blocking read while idle)."
-  (cond
-    ((null backend) nil)
-    ((eq backend *backend*)
-     (ereport-fatal "57P01" "terminating connection due to administrator command"))
-    (t
-     (let ((thread (backend-thread backend)))
-       (when (and thread (sb-thread:thread-alive-p thread))
-         (handler-case
-             (sb-thread:interrupt-thread
-              thread
-              (lambda ()
-                (error (make-condition
-                        'pg-error
-                        :sqlstate "57P01"
-                        :severity "FATAL"
-                        :message "terminating connection due to administrator command"))))
-           (error () nil))))))
+  (when backend
+    (let ((self-p (eq backend *backend*))
+          (thread (backend-thread backend)))
+      (when (or self-p (and thread (sb-thread:thread-alive-p thread)))
+        (sb-sys:without-interrupts
+          (sb-thread:with-mutex (*live-operation-lock*)
+            (setf (backend-termination-pending backend) t)
+            (sb-thread:condition-broadcast *live-operation-cv*))
+          (if self-p
+              (deliver-backend-termination backend)
+              (handler-case
+                  (sb-thread:interrupt-thread
+                   thread (lambda () (deliver-backend-termination backend)))
+                (error () nil)))))))
   (values))
 
 (defun cancel-backend (backend)

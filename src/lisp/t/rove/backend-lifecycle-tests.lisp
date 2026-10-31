@@ -768,6 +768,64 @@
                       "cleanup failure must not replace the original release error"))
         (dolist (entry saved) (setf (symbol-function (car entry)) (cdr entry))))))
 
+(rove:deftest backend-termination-is-visible-before-interrupt-delivery
+    (let* ((backend (make-backend :thread sb-thread:*current-thread*))
+           (*backend* nil)
+           (pending-reader (lambda () (backend-termination-pending backend)))
+           (unexpected nil))
+      (setf unexpected
+            (handler-case
+                (sb-sys:without-interrupts
+                  (terminate-backend backend)
+                  (rove:ok (funcall pending-reader)
+                           "masked code sees termination before queued delivery")
+                  (unwind-protect
+                       (progn
+                         (begin-backend-query-execution backend)
+                         (rove:ok (funcall pending-reader)))
+                    (end-backend-query-execution backend))
+                  (rove:ok (funcall pending-reader)
+                           "query cleanup does not consume pending termination")
+                  (let ((*backend* backend))
+                    (setf (backend-statement-deadline backend) 0
+                          (backend-cancel-pending backend) t)
+                    (let ((condition (handler-case (progn (check-for-interrupts) nil)
+                                       (pg-error (condition) condition))))
+                      (rove:ok (typep condition 'pg-error))
+                      (rove:ok (equal "57P01" (pg-error-sqlstate condition)))
+                      (rove:ok (equal "FATAL" (pg-error-severity condition))))
+                    (rove:ok (not (funcall pending-reader))
+                             "the target consumes termination when delivering FATAL"))
+                  nil)
+              (pg-error (condition) condition)))
+      (rove:ok (null unexpected)
+               "the queued interrupt does not deliver a second FATAL")))
+
+(rove:deftest backend-termination-is-checked-before-reload-admission
+    (dolist (entry '(wait-for-live-operation-admission try-enter-live-operation))
+      (let* ((*backend* (make-backend :termination-pending t))
+             (*live-operation-admission-open* nil)
+             (*live-operation-drain-open* nil)
+             (*live-operation-terminal-shutdown* nil)
+             (*live-operation-check-cancel-p* t)
+             (*live-operation-count* 0)
+             (*live-operation-backend-counts* (make-hash-table :test #'eq)))
+        (let ((condition (handler-case (progn (funcall entry nil *backend*) nil)
+                           (pg-error (condition) condition))))
+          (rove:ok (typep condition 'pg-error))
+          (rove:ok (equal "57P01" (pg-error-sqlstate condition)))
+          (rove:ok (equal "FATAL" (pg-error-severity condition))))
+        (rove:ok (null (backend-termination-pending *backend*)))
+        (rove:ok (zerop *live-operation-count*))
+        (rove:ok (zerop (hash-table-count *live-operation-backend-counts*)))))
+  (let* ((*backend* (make-backend :termination-pending t))
+         (*live-operation-admission-open* t)
+         (*live-operation-terminal-shutdown* nil)
+         (*live-operation-check-cancel-p* nil))
+    (wait-for-live-operation-admission nil *backend*)
+    (rove:ok (backend-termination-pending *backend*)
+             "cleanup admission defers delivery without consuming termination")))
+
 (rove:deftest select-portal-connection-finish-invalidates-before-retirement
     (call-with-select-portal-test
      (lambda (stream)

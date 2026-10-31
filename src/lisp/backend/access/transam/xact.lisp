@@ -38,6 +38,7 @@
   ;; backend's own thread, used by pg_cancel_backend()/pg_terminate_backend().
   (executing nil)
   (cancel-pending nil)
+  (termination-pending nil)
   ;; Visible to the local control REPL so concurrency tests can synchronize on
   ;; a real lock wait instead of relying on scheduler timing.
   (waiting-xid nil)
@@ -100,12 +101,16 @@
                                (float internal-time-units-per-second 1d0))))
         0.1)))
 
-(defun check-for-interrupts ()
-  "Port of PostgreSQL's CHECK_FOR_INTERRUPTS().
+(defun deliver-backend-termination (backend)
+  (when (and backend (backend-termination-pending backend))
+    (setf (backend-termination-pending backend) nil
+          (backend-cancel-pending backend) nil)
+    (ereport-fatal "57P01" "terminating connection due to administrator command"))
+  (values))
 
-A pending PG_CANCEL_BACKEND() request raises 57014 here, at a safe point.
-PG_TERMINATE_BACKEND() is delivered as a FATAL condition from
-INTERRUPT-THREAD, so it needs no flag."
+(defun check-for-interrupts ()
+  "Port of PostgreSQL's CHECK_FOR_INTERRUPTS()."
+  (deliver-backend-termination *backend*)
   (when (and *backend* (backend-statement-deadline *backend*)
              (>= (get-internal-real-time) (backend-statement-deadline *backend*)))
     (clear-statement-timeout)
