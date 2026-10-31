@@ -57,7 +57,7 @@ def wait_for(function, seconds=90):
 
 
 def control(process, path, form):
-    assert process.poll() is None
+    assert process.poll() is None if isinstance(process, subprocess.Popen) else process.is_running()
     result = subprocess.run(
         [os.environ.get('SBCL', 'sbcl'), '--script', str(BASE / 't/control-client.lisp'),
          'unix', str(path)], text=True, capture_output=True, check=True, timeout=45,
@@ -94,6 +94,27 @@ def configuration(data, port, root):
                 'host replication all 127.0.0.1/32 trust'])
 
 
+def instrument_source(process, root):
+    if os.environ.get('DEBUG_WAL_FAILURE'):
+        control(process, root / 'source.sock', f'''
+          (let ((original (symbol-function 'wal-fail-stop)))
+            (setf (symbol-function 'wal-fail-stop)
+              (lambda (condition)
+                (unwind-protect
+                     (progn
+                       (ignore-errors
+                         (with-open-file (out {json.dumps(str(root / 'wal-failure.log'))}
+                                              :direction :output :if-exists :append
+                                              :if-does-not-exist :create)
+                           (format out "PID=~d PGDATA=~a THREAD=~a~%~s: ~a~%"
+                                   (sb-posix:getpid) *pgdata*
+                                   (sb-thread:thread-name sb-thread:*current-thread*)
+                                   (type-of condition) condition)
+                           (sb-debug:print-backtrace :stream out :count 45)))
+                       (funcall original condition))
+                  (setf (symbol-function 'wal-fail-stop) original)))))''')
+
+
 def exercise(root, ports, source_log):
     source_data, target_data = root / 'source', root / "replica 'one'"
     source_socket = root / 'source.sock'
@@ -110,6 +131,7 @@ def exercise(root, ports, source_log):
             return True
 
         wait_for(source_ready)
+        instrument_source(source, root)
         # A ready-looking PID file must not let reload signal an unrelated owner.
         foreign = root / 'foreign data'
         foreign.mkdir(mode=0o700)
@@ -167,14 +189,54 @@ def exercise(root, ports, source_log):
         wait_for(lambda: query(ports[1], 'SELECT id FROM follow_items ORDER BY id')
                  == [(1,), (2,), (3,), (4,), (5,)])
         assert node.is_running().pid == restarted_pid
+        target = node.is_running()
+        control(target, root / 'target.sock',
+                '(defparameter *patroni-restart-runtime* *physical-follow-runtime*) '
+                '(defparameter *patroni-restart-binding* '
+                '(copy-tree (getf (physical-follow-runtime-config *physical-follow-runtime*) :binding)))')
+        healthy = ('(assert (and (eq *patroni-restart-runtime* *physical-follow-runtime*) '
+                   '(not (physical-follow-runtime-stopped-p *physical-follow-runtime*)) '
+                   '(not *physical-recovery-failed-p*) '
+                   '(equal *patroni-restart-binding* '
+                   '(getf (physical-follow-runtime-config *physical-follow-runtime*) :binding))))')
+        for stop_signal, row, label in ((signal.SIGINT, 6, 'fast shutdown'),
+                                        (signal.SIGKILL, 7, 'crash')):
+            control(target, root / 'target.sock',
+                    '(defparameter *patroni-before-stop-error* '
+                    '(physical-follow-runtime-last-error *physical-follow-runtime*))')
+            source.send_signal(stop_signal)
+            assert source.wait(timeout=45) == (0 if stop_signal == signal.SIGINT else -signal.SIGKILL)
+            wait_for(lambda: query(ports[1], 'SELECT status FROM pg_stat_get_wal_receiver()')
+                     != [('streaming',)])
+            wait_for(lambda: any(code in control(target, root / 'target.sock',
+                     '(unless (eq *patroni-before-stop-error* '
+                     '(physical-follow-runtime-last-error *physical-follow-runtime*)) '
+                     '(physical-follow-runtime-last-error *physical-follow-runtime*))')
+                     for code in ('57P01', '08006', '08001')))
+            control(target, root / 'target.sock', healthy)
+            assert query(ports[1], 'SELECT pg_is_in_recovery()') == [(True,)]
+            source_socket.unlink(missing_ok=True)
+            source = subprocess.Popen(
+                [str(BASE / 'pg-lisp.sh'), '-D', str(source_data), '-p', str(ports[0]),
+                 '--control-socket', str(source_socket)], stdout=source_log, stderr=source_log)
+            wait_for(source_ready)
+            instrument_source(source, root)
+            query(ports[0], f'INSERT INTO follow_items VALUES ({row})')
+            wait_for(lambda: query(ports[1], 'SELECT id FROM follow_items ORDER BY id')
+                     == [(value,) for value in range(1, row + 1)])
+            assert query(ports[1], 'SELECT status,slot_name FROM pg_stat_get_wal_receiver()') == [
+                ('streaming', 'follow_one')]
+            control(target, root / 'target.sock', healthy)
+            print(f'patroni-follow: source {label}, retry and restart preserve runtime and binding PASS',
+                  flush=True)
         source.send_signal(signal.SIGINT)
         assert source.wait(timeout=45) == 0
         assert node.promote(30, CriticalTask()) is True
         assert node.role == PostgresqlRole.PRIMARY
         assert query(ports[1], 'SELECT pg_is_in_recovery()') == [(False,)]
-        query(ports[1], 'INSERT INTO follow_items VALUES (6)')
+        query(ports[1], 'INSERT INTO follow_items VALUES (8)')
         assert query(ports[1], 'SELECT id FROM follow_items ORDER BY id') == [
-            (1,), (2,), (3,), (4,), (5,), (6,)]
+            (1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,)]
         print('patroni-follow: real start, configured streaming, reload, restart, clear and reattach PASS',
               flush=True)
         print('patroni-follow: fenced source, real Patroni promotion and child writes PASS', flush=True)

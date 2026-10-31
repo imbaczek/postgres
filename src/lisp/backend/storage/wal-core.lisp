@@ -961,24 +961,27 @@ Legacy 16-hex segment names always belong to timeline 1."
   (values))
 
 (defmacro with-wal-critical (&body body)
-  "Run BODY under the WAL lock and request fail-stop shutdown on errors."
-  `(handler-case
-       (sb-thread:with-mutex (*wal-lock*)
-         (handler-case
-             (progn
-               (wal-check-healthy)
-               ,@body)
-           (wal-input-validation-error (condition)
-             (error condition))
-           (error (condition)
-             ;; Publish poison before another WAL operation can acquire the
-             ;; mutex; request shutdown after WITH-MUTEX releases it.
-             (setf *wal-poisoned* t)
-             (error condition))))
-     (wal-input-validation-error (condition)
-       (error condition))
-     (error (condition)
-       (wal-fail-stop condition))))
+  "Run BODY under WAL, deferring asynchronous interrupts during publication."
+  (let ((failure (gensym "FAILURE"))
+        (condition (gensym "CONDITION")))
+    `(let ((,failure nil))
+       (sb-sys:without-interrupts
+         (unwind-protect
+              (sb-sys:with-local-interrupts
+                (sb-thread:with-mutex (*wal-lock*)
+                  (sb-sys:without-interrupts
+                    (handler-case
+                        (progn
+                          (wal-check-healthy)
+                          ,@body)
+                      (wal-input-validation-error (,condition)
+                        (error ,condition))
+                      (error (,condition)
+                        (setf ,failure ,condition
+                              *wal-poisoned* t)
+                        (error ,condition))))))
+           (when ,failure
+             (wal-fail-stop ,failure)))))))
 
 (defun wal-record-start-after (cursor length)
   "Plan native rotation without changing insertion state."

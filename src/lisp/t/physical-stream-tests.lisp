@@ -4,6 +4,82 @@
   (format nil "START_REPLICATION PHYSICAL ~a (proof_pin 'copy', native_format '~a', system_id '~d', timeline '1', base_lsn '~a', prefix_digest '14695981039346656037')"
           (pg::wal-format-lsn cursor) pg::+physical-native-format+ identity (pg::wal-format-lsn base)))
 
+(defun wal-termination-test (inside &optional fault)
+  (let* ((lock (sb-thread:make-mutex :name "test WAL termination"))
+         (ready (sb-thread:make-semaphore))
+         (release (sb-thread:make-semaphore))
+         (backend (pg::make-backend :pid 98765 :read-only nil))
+         (original (symbol-function 'pg::request-fast-shutdown))
+         (shutdowns 0) (shutdown-held-lock nil)
+         (thread nil))
+    (unwind-protect
+         (progn
+           (setf (symbol-function 'pg::request-fast-shutdown)
+                 (lambda (&rest ignored)
+                   (declare (ignore ignored))
+                   (incf shutdowns)
+                   (setf shutdown-held-lock (sb-thread:holding-mutex-p lock))))
+           (unless inside (sb-thread:grab-mutex lock))
+           (setf thread
+                 (sb-thread:make-thread
+                  (lambda ()
+                    (let ((pg::*wal-lock* lock)
+                          (pg::*wal-poisoned* nil)
+                          (pg::*backend* backend)
+                          (published nil))
+                      (handler-case
+                          (progn
+                            (unless inside (sb-thread:signal-semaphore ready))
+                            (pg::with-wal-critical
+                              (when inside
+                                (setf published :started)
+                                (sb-thread:signal-semaphore ready)
+                                (unless (sb-thread:wait-on-semaphore release :timeout 3)
+                                  (error "WAL termination barrier expired")))
+                              (when fault (error fault))
+                              (setf published t))
+                            (list :unexpected-success published pg::*wal-poisoned*))
+                        (pg::pg-error (condition)
+                          (list (pg::pg-error-sqlstate condition) published pg::*wal-poisoned*))
+                        (error (condition)
+                          (list :storage-error (eq condition fault) published pg::*wal-poisoned*)))))
+                  :name "WAL termination test"))
+           (setf (pg::backend-thread backend) thread)
+           (assert (sb-thread:wait-on-semaphore ready :timeout 3))
+           (let ((pg::*backend* nil)) (pg::terminate-backend backend))
+           (when inside
+             ;; The old implementation aborts at this blocked body. The protected
+             ;; implementation must finish it before delivering the pending FATAL.
+             (sb-thread:join-thread thread :timeout 0.05 :default :pending)
+             (sb-thread:signal-semaphore release))
+           (let ((result (sb-thread:join-thread thread :timeout 3 :default :timed-out)))
+             (list result shutdowns shutdown-held-lock)))
+      (sb-thread:signal-semaphore release)
+      (when (sb-thread:holding-mutex-p lock) (sb-thread:release-mutex lock))
+      (when thread (ignore-errors (sb-thread:join-thread thread :timeout 4 :default nil)))
+      (setf (symbol-function 'pg::request-fast-shutdown) original))))
+
+(deftest wal-critical-defers-backend-termination-through-publication
+    (ok (equal '(("57P01" t nil) 0 nil) (wal-termination-test t))))
+
+(deftest wal-critical-mutex-wait-remains-terminable-without-poison
+    (ok (equal '(("57P01" nil nil) 0 nil) (wal-termination-test nil))))
+
+(deftest wal-critical-storage-failure-remains-fatal-with-pending-termination
+    (let ((fault (make-condition 'simple-error :format-control "injected storage error")))
+      (ok (equal '((:storage-error t :started t) 1 nil) (wal-termination-test t fault)))))
+
+(deftest wal-critical-preserves-values-validation-and-an-enclosing-interrupt-mask
+    (let* ((pg::*wal-lock* (sb-thread:make-mutex :name "test WAL values"))
+           (pg::*wal-poisoned* nil))
+      (ok (equal '(1 2 3) (multiple-value-list (pg::with-wal-critical (values 1 2 3)))))
+      (ok (signals (pg::with-wal-critical (pg::wal-invalid-input "invalid test input"))
+                   'pg::wal-input-validation-error))
+      (ok (not pg::*wal-poisoned*))
+      (ok (not (sb-thread:holding-mutex-p pg::*wal-lock*)))
+      (sb-sys:without-interrupts
+        (ok (pg::with-wal-critical (not sb-sys:*interrupts-enabled*))))))
+
 (cl-spec:defproperty native-start-keeps-public-slot-and-proof-identities-separate
     ((public-id (range integer 0 1024))
      (proof-id (range integer 0 1024))
