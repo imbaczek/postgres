@@ -67,12 +67,23 @@
   wire tests, strict cold compilation (`/tmp/pg-transaction-obligation-cold.log`)
   and SQL smoke. This captures obligations only; it adds no remote wait.
 
+- [x] Prepare and publish owned configuration roots under existing quiescence,
+  with predecessor checks and follow generation publication (`cb3a1f3ee46`).
+  The checkpoint passed 744 unit, 1,332 physical and 201 wire tests, strict cold
+  compilation (`/tmp/pg-prepared-config-cold.log`), SQL smoke
+  (`/tmp/pg-prepared-config-smoke.log`) and live valid/invalid reload checks.
+  Production readers still use globals; independent configuration service remains open.
+
 - [ ] Build the independent configuration service needed before commit waiting.
   This is proposed, not implemented; it adds no coordinator. Parking synchronous
   waiters alone does not keep configuration service available.
 
-  1. Prepare an immutable installed snapshot in full and migrate coherent readers
-     under the existing quiescent installer.
+  1. Capture the installed root under a short mutex and pass the same root through
+     SHOW/settings rows and authentication/startup admission limits. No root means
+     uninstalled, not reconstruction from globals; component quotas take explicit
+     limits. Installed provenance must not reread the environment. Reload preparation
+     must use the same base root captured with its inputs. Migrate retention and
+     restartpoint readers separately.
   2. Fence follow generation checks through their effects, then publish candidates
      atomically without quiescence after HBA, claim, resource, slot and predecessor
      checks.

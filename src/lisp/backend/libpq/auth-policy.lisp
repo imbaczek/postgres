@@ -13,6 +13,7 @@
   (hba-path nil :read-only t) (ident-path nil :read-only t))
 
 (defun authentication-copy-rule (rule)
+  "Copy one rule, including selector text, source text and address bytes."
   (flet ((tokens (items)
            (mapcar (lambda (token)
                      (%make-hba-token (copy-seq (hba-token-text token)) (hba-token-quoted-p token)))
@@ -26,6 +27,7 @@
                    :source (copy-seq (hba-rule-source rule)) :line (hba-rule-line rule))))
 
 (defun authentication-copy-policy (policy)
+  "Copy the authentication policy and mutable rule data for a configuration root."
   (when policy
     (make-authentication-policy
      :rules (mapcar #'authentication-copy-rule (authentication-policy-rules policy))

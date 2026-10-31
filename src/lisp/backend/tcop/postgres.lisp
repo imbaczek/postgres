@@ -921,6 +921,8 @@ CL's RENAME-FILE merges a relative target with the source's directory."
     (startup-install-resource-capacity startup-settings)
     (sb-sys:enable-interrupt sb-unix:sigusr1 #'request-physical-promotion)
     (postmaster-own-data-directory host port)
+    ;; Complete authentication using the captured inputs after PGDATA ownership.
+    ;; Do not reread configuration files or reinstall startup resource capacity.
     (let* ((installed *startup-installed-configuration*)
            (settings (startup-configuration-settings installed)))
       (startup-install-settings settings

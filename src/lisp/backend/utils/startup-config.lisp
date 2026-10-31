@@ -12,6 +12,9 @@
 (defvar *startup-command-overrides* nil)
 
 (defstruct startup-configuration
+  ;; Each root has a fresh identity and stores only its predecessor's identity.
+  ;; Inputs and authentication are owned copies; desired may reuse an unchanged
+  ;; generation. Resources are validated, not the installed live capacity.
   (identity (gensym "CONFIGURATION-") :read-only t)
   (predecessor nil :read-only t)
   (settings nil :read-only t) (native nil :read-only t) (overrides nil :read-only t)
@@ -24,6 +27,8 @@
 (defvar *startup-installed-configuration* nil)
 
 (defun startup-copy-input (value)
+  "Copy mutable storage in configuration input trees.
+Reject unsupported objects without printing their contents."
   (typecase value
     (hash-table
      (let ((copy (make-hash-table :test (hash-table-test value))))
@@ -42,6 +47,9 @@
 (declaim (ftype function authentication-copy-policy))
 
 (defun startup-prepare-installation (settings native overrides &optional (policy nil supplied-p))
+  "Prepare owned inputs, authentication, desired follow state and validated values.
+An explicitly supplied NIL policy differs from an omitted policy. Resolve slot
+retention once here. Resource capacity installation remains a startup step."
   (let* ((installed *startup-installed-configuration*)
          (predecessor (when installed (startup-configuration-identity installed)))
          (owned-settings (startup-copy-input settings))
@@ -730,6 +738,7 @@ these slots."
     parameters))
 
 (defun startup-check-installation-predecessor (candidate)
+  "Reject a candidate whose predecessor is no longer the installed identity."
   (let ((installed *startup-installed-configuration*))
     (unless (eq (startup-configuration-predecessor candidate)
                 (when installed (startup-configuration-identity installed)))
@@ -737,6 +746,8 @@ these slots."
   (values))
 
 (defun startup-publish-configuration (candidate)
+  "Publish prepared values and the root; callers provide publication exclusion.
+Publication still uses live-operation quiescence; production readers use globals."
   (setf *authentication-policy* (startup-configuration-authentication candidate)
         *startup-server-settings* (startup-configuration-settings candidate)
         *startup-native-inputs* (startup-configuration-native candidate)
@@ -755,6 +766,7 @@ these slots."
   (values))
 
 (defun startup-commit-installation (candidate)
+  "Check and publish CANDIDATE with its desired follow generation."
   (check-type candidate startup-configuration)
   (physical-follow-call-with-desired-install
    (startup-configuration-desired candidate)
@@ -763,6 +775,7 @@ these slots."
   candidate)
 
 (defun startup-install-settings (settings native overrides &optional (policy nil supplied-p))
+  "Prepare and install owned settings under quiescence; return the original SETTINGS."
   (startup-commit-installation
    (if supplied-p
        (startup-prepare-installation settings native overrides policy)
