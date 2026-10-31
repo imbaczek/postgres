@@ -809,6 +809,7 @@ holding a portal snapshot must be allowed to run so it can release its pin."
     (ereport "55000" "transaction ID wraparound is waiting for a safe tuple freeze; retry the statement")))
 
 (defun xid-check-allocation-owner (owner)
+  "Require an optional allocation owner to be a backend without an existing XID."
   (when owner
     (unless (backend-p owner) (error "invalid XID allocation backend"))
     (when (backend-xid owner) (error "backend already owns a transaction ID")))
@@ -818,7 +819,9 @@ holding a portal snapshot must be allowed to run so it can release its pin."
   "Assign an XID and fix its logical capture decision under the XID lock.
 Logical level always captures. At replica level, live slots, an arming slot or
 an unknown live-slot count require capture. The decision stays with the XID as
-its mutations arrive."
+its mutations arrive.
+When OWNER is supplied, publish its XID with the active registration and next
+counter under the XID lock and interrupt mask, so cleanup can find it."
   (xid-check-allocation-owner owner)
   (let* ((xid *next-xid*)
          (next (advance-full-xid xid))
@@ -835,6 +838,8 @@ its mutations arrive."
     xid))
 
 (defun assign-xid (&optional owner)
+  "Allocate an XID, optionally publishing it to OWNER before releasing the XID lock.
+Without an owner, the caller remains responsible for releasing the active XID."
   (prevent-recovery-write "transaction ID assignment")
   (when *wal-ready* (wal-check-healthy))
   (let ((oldest (catalog-oldest-relfrozenxid)))
@@ -2017,6 +2022,7 @@ remains after BODY and should be dropped when its WAL is no longer needed."
 ;;; ---- per-backend transaction state ----
 
 (defun get-current-xid ()
+  "Return the backend's XID, allocating and publishing one to it if needed."
   (or (backend-xid *backend*) (assign-xid *backend*)))
 
 (defvar *recovery-reader-xid-counter* 0)

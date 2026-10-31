@@ -1,12 +1,13 @@
 # Development TODO
 
-- [ ] Make active XID allocation and backend ownership handoff atomic. An owned
-  SQL termination after `xid-allocate-under-lock` returns but before
-  `get-current-xid` stores the backend XID leaves `(3)` in `*active-xids*` after
-  the backend exits; WAL remains healthy and fast shutdown fails on the leaked
-  registration. See `/tmp/pg-xid-handoff-confirmed.log`. C publishes the process
-  XID under `XidGenLock` before releasing it; the native handoff needs equivalent
-  ownership and cleanup guarantees.
+- [x] Publish an allocated backend XID with its active registration under the XID
+  lock and interrupt mask, following C's ownership-before-unlock ordering. Raw
+  `assign-xid` without an owner remains caller-owned. Real SQL termination tests
+  cover the reserved XID 3 and cached XID 4 paths, abort cleanup and clean fast
+  shutdown (`/tmp/pg-xid-owner-sql.log`, artifacts `/tmp/pg-xid-owner-q296anu1`).
+  The milestone passed 1,312 physical, 683 unit and 186 logical wire tests, a
+  strict cold compile (`/tmp/pg-xid-owner-cold.log`) and Patroni reconnect and
+  promotion (`/tmp/pg-xid-owner-patroni.log`).
 
 - [x] Implement desired-generation reconciliation for `primary_conninfo` and
   `primary_slot_name` for native standard follow, including reload, durable

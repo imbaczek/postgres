@@ -105,8 +105,14 @@ The two direct reservation and resource-report publication paths now defer
 interrupts only during publication, with protected failure cleanup after lock
 unwind. Follow-up tests passed 1,307 physical, 683 unit and 186 logical wire cases,
 a strict cold compile and the owned reconnect/promotion path. This is targeted
-coverage, not a WAL-wide interrupt audit. A separate termination window between
-active XID allocation and backend ownership remains open (see TODO.md).
+coverage, not a WAL-wide interrupt audit. The separate active-XID ownership window
+is now closed by publishing backend ownership with allocation under the XID lock
+and interrupt mask. Real SQL tests cover reserved XID 3 and cached XID 4, abort
+cleanup and clean fast shutdown (`/tmp/pg-xid-owner-sql.log`). The milestone also
+passed 1,312 physical, 683 unit and 186 logical wire tests, a strict cold compile
+(`/tmp/pg-xid-owner-cold.log`) and Patroni reconnect/promotion
+(`/tmp/pg-xid-owner-patroni.log`). Raw allocation without an owner remains the
+caller's responsibility.
 Native control data now exposes persisted resource capacities, allowing Patroni
 to raise a standby's lock setting to the backup requirement. `pg_ctl reload`
 signals the verified owner without waiting for completion.
