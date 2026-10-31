@@ -176,6 +176,10 @@
 (deftest startup-candidate-explicit-nil-authentication-does-not-read-policy
     (call-with-startup-candidate-test
      (lambda ()
+       (pg::startup-install-settings
+        (pg::startup-default-settings "/tmp/prepared-settings/")
+        (make-hash-table :test #'equal) (make-hash-table :test #'equal)
+        (pg::make-authentication-policy :rules (pg::hba-parse-text "host all all all trust")))
        (let ((read (symbol-function 'pg::authentication-read-policy))
              (pg::*authentication-policy* t)
              (calls 0))
@@ -237,6 +241,125 @@
                    (pg::startup-configuration-desired installed)))
            (ok (equalp (pg::string->bytes "host=next")
                        (pg::startup-setting-value pg::*startup-server-settings* "primary_conninfo"))))))))
+
+(defun prepare-reader-test-configuration (settings &optional (native (make-hash-table :test #'equal)))
+  (let ((pg::*startup-installed-configuration* nil)
+        (pg::*physical-follow-desired* nil)
+        (pg::*physical-recovery-state* nil))
+    (pg::startup-prepare-installation settings native (make-hash-table :test #'equal) nil)))
+
+(deftest installed-settings-use-one-root-and-ignore-mirrors-and-environment
+    (call-with-startup-candidate-test
+     (lambda ()
+       (let* ((settings (pg::startup-default-settings "/tmp/reader-settings/"))
+              (native (make-hash-table :test #'equal))
+              (overrides (make-hash-table :test #'equal))
+              (pg::*backend* (pg::make-backend))
+              (row (symbol-function 'pg::startup-settings-row))
+              (getenv (symbol-function 'uiop:getenv))
+              (swapped nil))
+         (setf (getf (gethash "cluster_name" settings) :value) "root"
+               (gethash "max-slot-wal-keep-bytes" native) "17")
+         (pg::startup-install-settings settings native overrides nil)
+         (let ((first pg::*startup-installed-configuration*))
+           (setf (getf (gethash "cluster_name" settings) :value) "new"
+                 (gethash "max-slot-wal-keep-bytes" native) "29")
+           (let ((next (pg::startup-prepare-installation settings native overrides nil)))
+             (ok (eq first (pg::startup-capture-configuration)))
+             (setf pg::*startup-server-settings* settings
+                   pg::*startup-native-inputs* (make-hash-table :test #'equal)
+                   pg::*max-slot-wal-keep-bytes* 999)
+             (unwind-protect
+                  (progn
+                    (setf (symbol-function 'uiop:getenv)
+                          (lambda (name)
+                            (if (string= name "PG_MAX_SLOT_WAL_KEEP_BYTES")
+                                (error "installed reader reread environment")
+                                (funcall getenv name))))
+                    (ok (equal "root" (pg::startup-setting-show-value "cluster_name")))
+                    (ok (equal "17B" (pg::startup-setting-show-value "max_slot_wal_keep_size")))
+                    (setf (symbol-function 'pg::startup-settings-row)
+                          (lambda (name entry &optional configuration)
+                            (ok (not (sb-thread:holding-mutex-p pg::*startup-configuration-lock*)))
+                            (unless swapped
+                              (setf pg::*startup-installed-configuration* next swapped t))
+                            (funcall row name entry configuration)))
+                    (let* ((rows (pg::startup-settings-rows))
+                           (cluster (find "cluster_name" rows :key (lambda (item) (aref item 0)) :test #'equal))
+                           (limit (find "max_slot_wal_keep_size" rows :key (lambda (item) (aref item 0)) :test #'equal)))
+                      (ok (equal "root" (aref cluster 1)))
+                      (ok (equal "17" (aref limit 1)))
+                      (ok (equal "B" (aref limit 2)))
+                      (ok (equal "command line" (aref limit 5)))))
+               (setf (symbol-function 'pg::startup-settings-row) row
+                     (symbol-function 'uiop:getenv) getenv))))))))
+
+(deftest installed-byte-policy-keeps-environment-provenance-after-preparation
+    (call-with-startup-candidate-test
+     (lambda ()
+       (let ((getenv (symbol-function 'uiop:getenv))
+             (preparing t))
+         (unwind-protect
+              (progn
+                (setf (symbol-function 'uiop:getenv)
+                      (lambda (name)
+                        (if (string= name "PG_MAX_SLOT_WAL_KEEP_BYTES")
+                            (if preparing "17" (error "unexpected installed environment read"))
+                            (funcall getenv name))))
+                (setf pg::*startup-installed-configuration*
+                      (prepare-reader-test-configuration
+                       (pg::startup-default-settings "/tmp/environment-generation/"))
+                      preparing nil)
+                (let* ((configuration (pg::startup-require-configuration))
+                       (entry (gethash "max_slot_wal_keep_size"
+                                       (pg::startup-configuration-settings configuration)))
+                       (row (pg::startup-settings-row "max_slot_wal_keep_size" entry configuration)))
+                  (ok (equal "17" (aref row 1)))
+                  (ok (equal "B" (aref row 2)))
+                  (ok (equal "environment variable" (aref row 5)))
+                  (ok (equal "17B" (pg::startup-setting-show-value "max_slot_wal_keep_size")))))
+           (setf (symbol-function 'uiop:getenv) getenv))))))
+
+(deftest installed-readers-do-not-infer-a-root-from-legacy-globals
+    (call-with-startup-candidate-test
+     (lambda ()
+       (let ((pg::*backend* (pg::make-backend)))
+         (setf pg::*startup-server-settings* (pg::startup-default-settings "/tmp/uninstalled/")
+               pg::*authentication-policy*
+               (pg::make-authentication-policy :rules (pg::hba-parse-text "host all all all trust")))
+         (ok (null (pg::startup-capture-configuration)))
+         (ok (intake-fails-p #'pg::startup-require-configuration))
+         (ok (null (pg::startup-setting-show-value "cluster_name")))
+         (ok (= 2 (length (pg::startup-settings-rows))))
+         (ok (intake-fails-p #'pg::authentication-capture-policy))))))
+
+(deftest reload-inputs-cannot-be-stamped-as-a-newer-roots-successor
+    (call-with-startup-candidate-test
+     (lambda ()
+       (let* ((pg::*pgdata* #p"/tmp/snapshot-reload/")
+              (settings (pg::startup-default-settings (namestring pg::*pgdata*)))
+              (native (make-hash-table :test #'equal))
+              (overrides (make-hash-table :test #'equal))
+              (load-settings (symbol-function 'pg::startup-load-settings)))
+         (pg::startup-install-settings settings native overrides nil)
+         (let* ((first pg::*startup-installed-configuration*)
+                (old-input (pg::startup-copy-input (pg::startup-configuration-settings first))))
+           (setf (getf (gethash "checkpoint_timeout" settings) :value) 42
+                 (getf (gethash "checkpoint_timeout" old-input) :value) 90)
+           (let ((next (pg::startup-prepare-installation settings native overrides nil)))
+             (unwind-protect
+                  (progn
+                    (setf (symbol-function 'pg::startup-load-settings)
+                          (lambda (captured-native captured-overrides &rest arguments)
+                            (declare (ignore arguments))
+                            (ok (eq captured-native (pg::startup-configuration-native first)))
+                            (ok (eq captured-overrides (pg::startup-configuration-overrides first)))
+                            (pg::startup-commit-installation next)
+                            old-input))
+                    (ok (intake-fails-p #'pg::startup-reload-settings))
+                    (ok (eq next (pg::startup-capture-configuration)))
+                    (ok (= 42 pg::*physical-restartpoint-timeout*)))
+               (setf (symbol-function 'pg::startup-load-settings) load-settings))))))))
 
 (deftest application-name-normalization-clips-before-byte-escaping
     (ok (equal "plain" (pg::session-normalize-application-name "plain")))
@@ -479,6 +602,8 @@
 (deftest sql-setting-and-lower-functions-follow-c-semantics
     (let ((pg::*startup-installed-configuration* nil)
           (pg::*startup-server-settings* (pg::startup-default-settings "/tmp/data/")))
+      (setf pg::*startup-installed-configuration*
+            (prepare-reader-test-configuration pg::*startup-server-settings*))
       (ok (equal "5min" (pg::eval-func "current_setting" '("CHECKPOINT_TIMEOUT"))))
       (ok (eq pg::+null+ (pg::eval-func "current_setting" '("missing.setting" t))))
       (ok (eq pg::+null+ (pg::eval-func "current_setting" (list pg::+null+))))
@@ -775,6 +900,8 @@
       (ok (pg::startup-normalize-setting "wal_log_hints" "on"))
       (dolist (input '("" "archivejunk" "invalid"))
         (ok (intake-fails-p (lambda () (pg::startup-normalize-setting "wal_level" input)))))
+      (setf pg::*startup-installed-configuration*
+            (prepare-reader-test-configuration pg::*startup-server-settings* pg::*startup-native-inputs*))
       (let ((row (find "wal_level" (pg::startup-settings-rows)
                        :key (lambda (row) (aref row 0)) :test #'equal)))
         (progn (ok (equal "enum" (aref row 4)))
@@ -797,6 +924,8 @@
             (list :value 90 :source :file :sourcefile "/tmp/include.conf" :sourceline 7)
             (gethash "port" pg::*startup-server-settings*)
             (list :value 5433 :source :command-line :pending-restart t :desired-value 5434))
+      (setf pg::*startup-installed-configuration*
+            (prepare-reader-test-configuration pg::*startup-server-settings* pg::*startup-native-inputs*))
       (let* ((rows (pg::startup-settings-rows))
              (timeout (find "checkpoint_timeout" rows :key (lambda (row) (aref row 0)) :test #'equal))
              (port (find "port" rows :key (lambda (row) (aref row 0)) :test #'equal)))

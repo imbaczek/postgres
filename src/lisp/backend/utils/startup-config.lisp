@@ -26,6 +26,16 @@
 
 (defvar *startup-installed-configuration* nil)
 
+(defvar *startup-configuration-lock* (sb-thread:make-mutex :name "installed configuration"))
+
+(defun startup-capture-configuration ()
+  (sb-thread:with-mutex (*startup-configuration-lock*)
+    *startup-installed-configuration*))
+
+(defun startup-require-configuration ()
+  (or (startup-capture-configuration)
+      (error "server configuration is not installed")))
+
 (defun startup-copy-input (value)
   "Copy mutable storage in configuration input trees.
 Reject unsupported objects without printing their contents."
@@ -46,18 +56,17 @@ Reject unsupported objects without printing their contents."
 
 (declaim (ftype function authentication-copy-policy))
 
-(defun startup-prepare-installation (settings native overrides &optional (policy nil supplied-p))
+(defun startup-prepare-installation-from-base (settings native overrides installed policy supplied-p)
   "Prepare owned inputs, authentication, desired follow state and validated values.
 An explicitly supplied NIL policy differs from an omitted policy. Resolve slot
 retention once here. Resource capacity installation remains a startup step."
-  (let* ((installed *startup-installed-configuration*)
-         (predecessor (when installed (startup-configuration-identity installed)))
+  (let* ((predecessor (when installed (startup-configuration-identity installed)))
          (owned-settings (startup-copy-input settings))
          (owned-native (startup-copy-input native))
          (owned-overrides (startup-copy-input overrides))
          (authentication (authentication-copy-policy
                           (if supplied-p policy
-                              (when *authentication-policy*
+                              (when (and installed (startup-configuration-authentication installed))
                                 (authentication-read-policy owned-settings)))))
          (resources (startup-check-connection-limits owned-settings))
          (slot-policy (startup-effective-slot-policy owned-settings owned-native))
@@ -74,6 +83,10 @@ retention once here. Resource capacity installation remains a startup step."
      :max-slots (startup-setting-value owned-settings "max_replication_slots")
      :max-connections (startup-setting-value owned-settings "max_connections")
      :max-senders (startup-setting-value owned-settings "max_wal_senders"))))
+
+(defun startup-prepare-installation (settings native overrides &optional (policy nil supplied-p))
+  (startup-prepare-installation-from-base
+   settings native overrides (startup-capture-configuration) policy supplied-p))
 
 (declaim (special *managed-worker-slots* *managed-worker-lock*
                   *managed-worker-registration-closed-p*))
@@ -739,7 +752,7 @@ these slots."
 
 (defun startup-check-installation-predecessor (candidate)
   "Reject a candidate whose predecessor is no longer the installed identity."
-  (let ((installed *startup-installed-configuration*))
+  (let ((installed (startup-capture-configuration)))
     (unless (eq (startup-configuration-predecessor candidate)
                 (when installed (startup-configuration-identity installed)))
       (error "configuration generation changed before installation")))
@@ -748,21 +761,22 @@ these slots."
 (defun startup-publish-configuration (candidate)
   "Publish prepared values and the root; callers provide publication exclusion.
 Publication still uses live-operation quiescence; production readers use globals."
-  (setf *authentication-policy* (startup-configuration-authentication candidate)
-        *startup-server-settings* (startup-configuration-settings candidate)
-        *startup-native-inputs* (startup-configuration-native candidate)
-        *startup-command-overrides* (startup-configuration-overrides candidate)
-        *enable-hot-standby* (startup-configuration-hot-standby candidate)
-        *wal-level* (startup-configuration-wal-level candidate)
-        *wal-keep-size-mb* (startup-configuration-keep-mb candidate)
-        *physical-restartpoint-timeout* (startup-configuration-timeout candidate)
-        *physical-restartpoint-wal-bytes* (startup-configuration-wal-bytes candidate)
-        *max-slot-wal-keep-bytes* (wal-slot-retention-policy-limit (startup-configuration-slot-policy candidate))
-        *wal-slot-retention-policy* (startup-configuration-slot-policy candidate)
-        *max-replication-slots* (startup-configuration-max-slots candidate)
-        *max-connections* (startup-configuration-max-connections candidate)
-        *max-wal-senders* (startup-configuration-max-senders candidate)
-        *startup-installed-configuration* candidate)
+  (sb-thread:with-mutex (*startup-configuration-lock*)
+    (setf *authentication-policy* (startup-configuration-authentication candidate)
+          *startup-server-settings* (startup-configuration-settings candidate)
+          *startup-native-inputs* (startup-configuration-native candidate)
+          *startup-command-overrides* (startup-configuration-overrides candidate)
+          *enable-hot-standby* (startup-configuration-hot-standby candidate)
+          *wal-level* (startup-configuration-wal-level candidate)
+          *wal-keep-size-mb* (startup-configuration-keep-mb candidate)
+          *physical-restartpoint-timeout* (startup-configuration-timeout candidate)
+          *physical-restartpoint-wal-bytes* (startup-configuration-wal-bytes candidate)
+          *max-slot-wal-keep-bytes* (wal-slot-retention-policy-limit (startup-configuration-slot-policy candidate))
+          *wal-slot-retention-policy* (startup-configuration-slot-policy candidate)
+          *max-replication-slots* (startup-configuration-max-slots candidate)
+          *max-connections* (startup-configuration-max-connections candidate)
+          *max-wal-senders* (startup-configuration-max-senders candidate)
+          *startup-installed-configuration* candidate))
   (values))
 
 (defun startup-commit-installation (candidate)
@@ -787,25 +801,31 @@ Publication still uses live-operation quiescence; production readers use globals
 Postmaster settings retain their active values and record pending restart.  A
 setting added to a warm registry uses its boot default as the old value.
 Reject an unsupported effective candidate before publishing any reload changes."
-  (when *startup-server-settings*
-    (let ((candidate (startup-load-settings *startup-native-inputs* *startup-command-overrides* *pgdata*))
-          (defaults (startup-default-settings (namestring *pgdata*))))
-      (dolist (spec *startup-setting-specs*)
-        (let* ((name (first spec)) (old (or (gethash name *startup-server-settings*) (gethash name defaults)))
-                                   (new (gethash name candidate)))
-          ;; SelectConfigFiles locks the resolved data path above file priority.
-          (when (string= name "data_directory")
-            (setf new (list :value (getf old :value) :source :override)
-                  (gethash name candidate) new))
-          (when (and (eq (second spec) :postmaster)
-                     (or (not (equal (getf old :value) (getf new :value)))
-                         ;; C marks removal even when the file held the boot value.
-                         (and (eq (getf old :source) :file)
-                              (eq (getf new :source) :default))))
-            (setf (gethash name candidate)
-                  (list* :pending-restart t :desired-value (getf new :value) (copy-list old)))
-            (admin-log "configuration parameter ~a requires restart" name))))
-      (startup-install-settings candidate *startup-native-inputs* *startup-command-overrides*))))
+  (let ((base (startup-capture-configuration)))
+    (when base
+      (let* ((native (startup-configuration-native base))
+             (overrides (startup-configuration-overrides base))
+             (settings (startup-configuration-settings base))
+             (candidate (startup-load-settings native overrides *pgdata*))
+             (defaults (startup-default-settings (namestring *pgdata*))))
+        (dolist (spec *startup-setting-specs*)
+          (let* ((name (first spec)) (old (or (gethash name settings) (gethash name defaults)))
+                                     (new (gethash name candidate)))
+            ;; SelectConfigFiles locks the resolved data path above file priority.
+            (when (string= name "data_directory")
+              (setf new (list :value (getf old :value) :source :override)
+                    (gethash name candidate) new))
+            (when (and (eq (second spec) :postmaster)
+                       (or (not (equal (getf old :value) (getf new :value)))
+                           ;; C marks removal even when the file held the boot value.
+                           (and (eq (getf old :source) :file)
+                                (eq (getf new :source) :default))))
+              (setf (gethash name candidate)
+                    (list* :pending-restart t :desired-value (getf new :value) (copy-list old)))
+              (admin-log "configuration parameter ~a requires restart" name))))
+        (startup-commit-installation
+         (startup-prepare-installation-from-base candidate native overrides base nil nil))
+        candidate))))
 
 (defun startup-format-unit (value kind)
   (if (<= value 0) (princ-to-string value)
@@ -826,7 +846,7 @@ Reject an unsupported effective candidate before publishing any reload changes."
                             (eq (second spec) :postmaster))
                         " without restarting the server" " now")))))
 
-(defun startup-settings-row (name entry)
+(defun startup-settings-row (name entry &optional (configuration (startup-capture-configuration)))
   "Expose actual installed settings in guc_funcs.c column units and provenance.
 WAL level enum values are a text array of canonical names; aliases are hidden.
 Other supported setting rows have NULL enum values."
@@ -836,13 +856,14 @@ Other supported setting rows have NULL enum values."
          (value (getf entry :value)))
     ;; The native byte option predates GUC support and can specify partial MB.
     ;; Preserve its true value, unit and provenance instead of rounding it away.
-    (when (string= name "max_slot_wal_keep_size")
-      (let ((command (and *startup-native-inputs*
-                          (gethash "max-slot-wal-keep-bytes" *startup-native-inputs*)))
-            (environment (uiop:getenv "PG_MAX_SLOT_WAL_KEEP_BYTES")))
-        (when (or command environment)
-          (setf value (or *max-slot-wal-keep-bytes* -1)
-                unit "B" source (if command :command-line :environment)))))
+    (when (and configuration (string= name "max_slot_wal_keep_size"))
+      (let ((policy (startup-configuration-slot-policy configuration)))
+        (when (eq :bytes (wal-slot-retention-policy-mode policy))
+          (setf value (or (wal-slot-retention-policy-limit policy) -1)
+                unit "B"
+                source (if (gethash "max-slot-wal-keep-bytes"
+                                    (startup-configuration-native configuration))
+                           :command-line :environment)))))
     (vector name (startup-setting-text name value) unit
             (if spec (string-downcase (symbol-name (second spec))) "postmaster")
             (case (third spec) (:integer "integer") (:boolean "bool") (:wal-level "enum") (t "string"))
@@ -858,26 +879,30 @@ Other supported setting rows have NULL enum values."
 
 (defun startup-settings-rows ()
   "Snapshot supported installed server and session GUCs; omit custom placeholders."
-  (let ((settings *startup-server-settings*))
+  (let* ((configuration (startup-capture-configuration))
+         (settings (when configuration (startup-configuration-settings configuration))))
     (append
      (when settings
        (loop for name in (sort (loop for name being the hash-keys of settings collect name) #'string<)
-             collect (startup-settings-row name (gethash name settings))))
+             collect (startup-settings-row name (gethash name settings) configuration)))
      (list (session-timeout-settings-row) (session-application-name-settings-row)))))
 
 (defun startup-setting-show-value (name)
-  (when *startup-server-settings*
-    (let ((entry (gethash name *startup-server-settings*)))
-      (when entry
-        (let ((value (getf entry :value)))
-          (values (case (intern (string-upcase name) :keyword)
-                    (:checkpoint_timeout (startup-format-unit value :seconds))
-                    ((:max_wal_size :wal_keep_size)
-                     (startup-format-unit (* value 1024 1024) :bytes))
-                    (:max_slot_wal_keep_size
-                     (if *max-slot-wal-keep-bytes* (startup-format-unit *max-slot-wal-keep-bytes* :bytes) "-1"))
-                    (t (startup-setting-text name value)))
-                  t))))))
+  (let ((configuration (startup-capture-configuration)))
+    (when configuration
+      (let ((entry (gethash name (startup-configuration-settings configuration))))
+        (when entry
+          (let ((value (getf entry :value)))
+            (values (case (intern (string-upcase name) :keyword)
+                      (:checkpoint_timeout (startup-format-unit value :seconds))
+                      ((:max_wal_size :wal_keep_size)
+                       (startup-format-unit (* value 1024 1024) :bytes))
+                      (:max_slot_wal_keep_size
+                       (let ((limit (wal-slot-retention-policy-limit
+                                     (startup-configuration-slot-policy configuration))))
+                         (if limit (startup-format-unit limit :bytes) "-1")))
+                      (t (startup-setting-text name value)))
+                    t)))))))
 
 (defun startup-configuration-output (argv)
   "Return the requested -C value in base units using normal configuration precedence.

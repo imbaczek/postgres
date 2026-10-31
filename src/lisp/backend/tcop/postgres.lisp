@@ -155,6 +155,13 @@ Like C ReportChangedGUCOptions, recovery can only change from on to off."
                          (remhash *backend* *hot-standby-reported-backends*))))))
     (when report (send-parameter-status stream "in_hot_standby" (if standby "on" "off")))))
 
+(defun authorize-and-admit-startup-backend (backend configuration user database peer)
+  (authentication-authorize (startup-configuration-authentication configuration)
+                            user database peer (backend-replication-mode backend))
+  (postmaster-admit-startup-backend
+   backend (startup-configuration-max-connections configuration)
+   (startup-configuration-max-senders configuration)))
+
 (defun process-startup (stream body)
   "Parse startup mode, check availability and authenticate before reserving quota.
 Capture a replication connection's source identity under admission so later
@@ -163,7 +170,8 @@ When hot_standby is off, reject every startup mode during recovery before authen
 Use the socket peer and final startup identities for HBA before reserving quota.
 SQL role authorization remains separate and currently uses the postgres role."
   (with-live-operation
-    (let* ((code (bytes-to-u32 body 0))
+    (let* ((configuration (startup-require-configuration))
+           (code (bytes-to-u32 body 0))
            (major (ash code -16)))
       (unless (= major 3)
         (ereport "0A000"
@@ -182,13 +190,12 @@ SQL role authorization remains separate and currently uses the postgres role."
           (setf (backend-replication-mode *backend*) replication
                 (backend-replication-source-id *backend*)
                 (when replication (nth-value 0 (sync-replication-configuration-state))))
-          (when (and (recovery-in-progress-p) (not *enable-hot-standby*))
+          (when (and (recovery-in-progress-p) (not (startup-configuration-hot-standby configuration)))
             (ereport-fatal "57P03" "the database system is not accepting connections"
                            :detail "Hot standby mode is disabled."))
-          (authentication-authorize *authentication-policy* user dbname
-                                    (sb-bsd-sockets:socket-peername (backend-socket *backend*))
-                                    replication)
-          (postmaster-admit-startup-backend *backend*)
+          (authorize-and-admit-startup-backend
+           *backend* configuration user dbname
+           (sb-bsd-sockets:socket-peername (backend-socket *backend*)))
           (send-auth-ok stream)
           (session-apply-startup-options params)
           (with-catalog-lock

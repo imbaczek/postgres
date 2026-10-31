@@ -105,13 +105,13 @@ DEFVAR preserves reservations across function reloads.")
   (sb-thread:with-mutex (*backend-registry-lock*)
     (gethash pid *backend-registry*)))
 
-(defun postmaster-admit-startup-backend (backend)
+(defun postmaster-admit-startup-backend (backend connections senders)
   "Reserve the SQL or WAL-sender quota for this registered backend generation.
 Check exact PID ownership before accepting a repeated reservation; the class
 cannot change. Exhaustion raises FATAL before authentication succeeds."
   (let* ((mode (backend-replication-mode backend))
          (kind (if mode :walsender :sql))
-         (limit (if mode *max-wal-senders* *max-connections*)))
+         (limit (if mode senders connections)))
     (unless (member mode '(nil :physical :database))
       (error "invalid startup replication class"))
     (sb-thread:with-mutex (*backend-registry-lock*)

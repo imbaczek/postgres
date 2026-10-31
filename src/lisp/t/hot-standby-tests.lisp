@@ -23,7 +23,14 @@
     (dolist (mode '(nil "true" "database"))
       (call-with-backend-admission-fixture
        (lambda ()
-         (let* ((pg::*enable-hot-standby* nil)
+         (let* ((settings (pg::startup-default-settings "/tmp/hot-standby-startup/"))
+                (pg::*startup-installed-configuration*
+                  (let ((pg::*physical-recovery-state* nil))
+                    (setf (getf (gethash "hot_standby" settings) :value) nil)
+                    (pg::startup-prepare-installation
+                     settings (make-hash-table :test #'equal) (make-hash-table :test #'equal)
+                     (pg::make-authentication-policy :rules (pg::hba-parse-text "host all all all trust")))))
+                (pg::*enable-hot-standby* t)
                 (pg::*physical-recovery-state* (list :standby t))
                 (pg::*backend* (admission-test-register 1))
                 (stream (make-broadcast-stream))

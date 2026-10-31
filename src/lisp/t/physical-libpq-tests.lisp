@@ -317,9 +317,11 @@
 
 (deftest physical-libpq-new-profiles-use-installed-cluster-name-with-explicit-fallback-precedence
     (let* ((pg::*startup-installed-configuration* nil)
-           (pg::*startup-server-settings* (make-hash-table :test #'equal))
-           (entry (list :value "research")))
-      (setf (gethash "cluster_name" pg::*startup-server-settings*) entry)
+           (pg::*startup-server-settings* (pg::startup-default-settings "/tmp/profile-cluster/"))
+           (entry (list :value "research" :source :default)))
+      (setf (gethash "cluster_name" pg::*startup-server-settings*) entry
+            pg::*startup-installed-configuration*
+            (prepare-reader-test-configuration pg::*startup-server-settings*))
       (let ((saved (pg::make-physical-libpq-profile "host=localhost")))
         (ok (equal "research" (pg::physical-libpq-profile-fallback saved)))
         (ok (equal "explicit"
@@ -328,12 +330,16 @@
         (ok (equal ""
                    (pg::physical-libpq-profile-fallback
                     (pg::make-physical-libpq-profile "host=localhost" :fallback ""))))
-        (setf (getf entry :value) "replacement")
+        (setf (getf entry :value) "replacement"
+              pg::*startup-installed-configuration*
+              (prepare-reader-test-configuration pg::*startup-server-settings*))
         (ok (equal "research" (pg::physical-libpq-profile-fallback saved)))
         (ok (equal "replacement"
                    (pg::physical-libpq-profile-fallback
                     (pg::make-physical-libpq-profile "host=localhost"))))
-        (setf (getf entry :value) "")
+        (setf (getf entry :value) ""
+              pg::*startup-installed-configuration*
+              (prepare-reader-test-configuration pg::*startup-server-settings*))
         (ok (equal "walreceiver"
                    (pg::physical-libpq-profile-fallback
                     (pg::make-physical-libpq-profile "host=localhost")))))))

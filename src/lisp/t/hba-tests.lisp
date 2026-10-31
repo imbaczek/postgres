@@ -213,8 +213,9 @@
         (write-startup-config (merge-pathnames "pg_ident.conf" root) "# no mappings")
         (multiple-value-bind (native overrides) (pg::startup-cli-inputs (list "-D" (namestring root)))
           (pg::startup-install-settings (pg::startup-load-settings native overrides) native overrides))
-        (setf pg::*authentication-policy*
-              (pg::authentication-read-policy pg::*startup-server-settings*))
+        (pg::startup-install-settings
+         pg::*startup-server-settings* pg::*startup-native-inputs* pg::*startup-command-overrides*
+         (pg::authentication-read-policy pg::*startup-server-settings*))
         (let ((first pg::*authentication-policy*))
           (write-startup-config hba "host all all all reject")
           (write-startup-config configuration (format nil "checkpoint_timeout=90~%"))

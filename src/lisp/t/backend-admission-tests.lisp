@@ -22,7 +22,7 @@
 
 (defun admission-test-result (backend)
   (handler-case
-      (progn (pg::postmaster-admit-startup-backend backend) :accepted)
+      (progn (pg::postmaster-admit-startup-backend backend pg::*max-connections* pg::*max-wal-senders*) :accepted)
     (pg::pg-error (condition)
       (list (pg::pg-error-sqlstate condition) (pg::fatal-error-p condition)))))
 
@@ -49,6 +49,41 @@
          (ok (eq :accepted (admission-test-result other-sql)))
          (ok (= 2 (hash-table-count pg::*backend-admission-classes*)))))))
 
+(deftest startup-authorization-and-admission-use-the-same-captured-generation
+    (call-with-startup-candidate-test
+     (lambda ()
+       (call-with-backend-admission-fixture
+        (lambda ()
+          (let* ((settings (pg::startup-default-settings "/tmp/admission-generation/"))
+                 (native (make-hash-table :test #'equal))
+                 (overrides (make-hash-table :test #'equal))
+                 (trust (pg::make-authentication-policy
+                         :rules (pg::hba-parse-text "host replication all all trust")))
+                 (reject (pg::make-authentication-policy
+                          :rules (pg::hba-parse-text "host replication all all reject")))
+                 (authorize (symbol-function 'pg::authentication-authorize))
+                 (backend (admission-test-register 1 :physical)))
+            (setf (getf (gethash "max_wal_senders" settings) :value) 1)
+            (pg::startup-install-settings settings native overrides trust)
+            (let ((captured (pg::startup-require-configuration)))
+              (setf (getf (gethash "max_wal_senders" settings) :value) 0)
+              (let ((next (pg::startup-prepare-installation settings native overrides reject)))
+                (unwind-protect
+                     (progn
+                       (setf (symbol-function 'pg::authentication-authorize)
+                             (lambda (policy &rest arguments)
+                               (declare (ignore arguments))
+                               (ok (eq policy (pg::startup-configuration-authentication captured)))
+                               (ok (not (sb-thread:holding-mutex-p pg::*startup-configuration-lock*)))
+                               (setf pg::*startup-installed-configuration* next
+                                     pg::*authentication-policy* (pg::startup-configuration-authentication next)
+                                     pg::*max-connections* 0 pg::*max-wal-senders* 0)))
+                       (ok (eq backend (pg::authorize-and-admit-startup-backend
+                                        backend captured "postgres" "postgres" #(127 0 0 1))))
+                       (ok (eq :walsender (gethash backend pg::*backend-admission-classes*)))
+                       (ok (eq next (pg::startup-capture-configuration))))
+                  (setf (symbol-function 'pg::authentication-authorize) authorize))))))))))
+
 (deftest zero-senders-rejects-both-replication-modes-without-consuming-sql
     (call-with-backend-admission-fixture
      (lambda ()
@@ -63,12 +98,12 @@
     (call-with-backend-admission-fixture
      (lambda ()
        (let ((backend (pg::make-backend :pid 1)))
-         (ok (intake-fails-p (lambda () (pg::postmaster-admit-startup-backend backend))))
+         (ok (intake-fails-p (lambda () (pg::postmaster-admit-startup-backend backend pg::*max-connections* pg::*max-wal-senders*))))
          (ok (zerop (hash-table-count pg::*backend-admission-classes*)))
          (pg::register-backend backend)
          (ok (eq :accepted (admission-test-result backend)))
          (setf (pg::backend-replication-mode backend) :physical)
-         (ok (intake-fails-p (lambda () (pg::postmaster-admit-startup-backend backend))))
+         (ok (intake-fails-p (lambda () (pg::postmaster-admit-startup-backend backend pg::*max-connections* pg::*max-wal-senders*))))
          (ok (eq :sql (gethash backend pg::*backend-admission-classes*)))
          (pg::unregister-backend backend)
          (ok (zerop (hash-table-count pg::*backend-admission-classes*)))))))
@@ -110,7 +145,7 @@
               (new (pg::make-backend :pid 1)))
          (ok (eq :accepted (admission-test-result old)))
          (setf (gethash 1 pg::*backend-registry*) new)
-         (ok (intake-fails-p (lambda () (pg::postmaster-admit-startup-backend old))))
+         (ok (intake-fails-p (lambda () (pg::postmaster-admit-startup-backend old pg::*max-connections* pg::*max-wal-senders*))))
          (ok (eq :accepted (admission-test-result new)))
          (pg::unregister-backend old)
          (ok (eq new (gethash 1 pg::*backend-registry*)))

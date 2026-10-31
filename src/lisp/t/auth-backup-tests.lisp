@@ -65,8 +65,10 @@
         (ensure-directories-exist (merge-pathnames "placeholder" target))
         (multiple-value-bind (native overrides)
             (pg::startup-cli-inputs (list "-D" (namestring source)))
-          (let ((pg::*authentication-policy*
-                  (pg::authentication-read-policy (pg::startup-load-settings native overrides))))
+          (let* ((settings (pg::startup-load-settings native overrides))
+                 (pg::*authentication-policy* (pg::authentication-read-policy settings))
+                 (pg::*startup-installed-configuration*
+                   (pg::startup-prepare-installation settings native overrides pg::*authentication-policy*)))
             (write-startup-config hba "host all all all md5")
             (delete-file ident)
             (pg::authentication-write-backup-policy (pg::authentication-capture-policy) target)
@@ -75,7 +77,7 @@
             (ok (equal "# preserve comments" (pg::ident-read-file (merge-pathnames "pg_ident.conf" target))))
             (ok (pg::authentication-check-marker target))
             (ok (signals (pg::authentication-write-backup-policy pg::*authentication-policy* target)))))))
-  (let ((pg::*authentication-policy* nil))
+  (let ((pg::*startup-installed-configuration* nil) (pg::*authentication-policy* nil))
     (ok (signals (pg::authentication-capture-policy)))))
 
 (deftest authentication-interrupted-backup-never-initializes-default-policy
