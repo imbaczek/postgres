@@ -1,12 +1,18 @@
+;;; Process-local sender status for replication monitoring.
+;;;
+;;; The registry follows backend ownership; each stream resets its own progress.
+;;; Status is observational and does not grant synchronous commit guarantees.
 (in-package #:pg)
 
 (defstruct wal-sender-status
+  "Mutable status owned by one replication backend and protected by the sender lock."
   backend (state "startup") sent-lsn write-lsn flush-lsn replay-lsn reply-time)
 
 (defvar *wal-sender-lock* (sb-thread:make-mutex :name "pg walsender status"))
 (defvar *wal-sender-registry* (make-hash-table :test #'eq))
 
 (defun wal-sender-register (backend)
+  "Register one status token for a replication backend under the sender lock."
   (unless (and (backend-p backend)
                (member (backend-replication-mode backend) '(:physical :database)))
     (error "walsender status requires a replication backend"))
@@ -19,6 +25,7 @@
     sender))
 
 (defun wal-sender-unregister (backend &optional (expected nil expected-p))
+  "Remove the backend's status; an expected token cannot remove a replacement."
   (sb-sys:without-interrupts
     (sb-thread:with-mutex (*wal-sender-lock*)
       (when (or (not expected-p) (eq expected (gethash backend *wal-sender-registry*)))
@@ -34,6 +41,7 @@
        (eq sender (gethash (wal-sender-status-backend sender) *wal-sender-registry*))))
 
 (defun wal-sender-set-state (sender state)
+  "Publish a valid state only while SENDER is the backend's current token."
   (unless (member state '("startup" "backup" "catchup" "streaming" "stopping") :test #'equal)
     (error "invalid walsender state"))
   (sb-thread:with-mutex (*wal-sender-lock*)
@@ -43,6 +51,7 @@
       t)))
 
 (defun wal-sender-note-sent (sender sent)
+  "Advance the current sender's sent frontier monotonically."
   (unless (typep sent '(unsigned-byte 64)) (error "invalid sent WAL position"))
   (sb-thread:with-mutex (*wal-sender-lock*)
     (when (wal-sender-current-under-lock-p sender)
@@ -52,6 +61,8 @@
       t)))
 
 (defun wal-sender-note-reply (sender write flush replay reply-time)
+  "Publish write, flush, replay and reply time from one received feedback message.
+These fields are independent and do not infer apply from flush."
   (unless (and (every (lambda (value) (typep value '(unsigned-byte 64)))
                       (list write flush replay))
                (typep reply-time '(signed-byte 64)))
@@ -72,6 +83,8 @@
 (defvar *wal-sender* nil)
 
 (defun call-with-wal-sender-stream (function)
+  "Capture the backend's registration token for the stream body and reset progress.
+Feedback and cleanup use that token, so they cannot affect a replacement registration."
   (let* ((sender (wal-sender-for-backend))
          (*wal-sender* sender))
     (sb-sys:without-interrupts
@@ -90,6 +103,7 @@
         (wal-sender-set-state sender "startup")))))
 
 (defun wal-sender-snapshots ()
+  "Copy registered sender fields under the lock for a stable monitoring result."
   (sb-thread:with-mutex (*wal-sender-lock*)
     (sort (loop for sender being the hash-values of *wal-sender-registry*
                 for backend = (wal-sender-status-backend sender)

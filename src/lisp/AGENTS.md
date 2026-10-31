@@ -154,6 +154,8 @@ appropriate instead of replacing the native C peer or adding a message relay.
   exited during an overlapping rebuild in this session; a serialized retry
   succeeded. Do not start another copy of a test merely because its output was
   truncated or a poll timed out; check the original process/session first.
+- Repeated recompilation exhausted immobile code space in one long-lived SBCL
+  worker. A full `(sb-ext:gc :full t)` recovered it without resetting the worker.
 
 ### Network deadlines and live socket inspection
 
@@ -186,6 +188,10 @@ appropriate instead of replacing the native C peer or adding a message relay.
   before testing expanded call sites; redefining the macro alone leaves old code.
 - Renamed Rove tests can remain in a warm registry. Check `get-test` for obsolete
   names and remove confirmed orphans with `remove-test` before counting a suite.
+- An interop `run-tests` call was followed by a missing unit suite in a warm
+  registry. Check suite counts explicitly; after other tracked threads finish,
+  load `pg-unit-tests` and run the explicit package suite. Never count zero tests
+  as a pass. The cause of the registry change has not been established.
 - Run the full physical package with `rove:run-suite :pg-physical-tests` in a
   tracked background thread and verify the actual test count. `rove:run` on
   the system found zero tests in this worker despite reporting success.

@@ -514,6 +514,8 @@ shutdown after unlocking; the private pin remains retained."
       (when interrupted (request-fast-shutdown)))))
 
 (defun physical-source-confirm-initial-status (command owner status)
+  "Publish monitoring fields through the captured sender token only after durable
+receipt confirmation succeeds."
   (physical-source-confirm-feedback
    command owner (getf status :flush)
    (physical-stream-u64 (physical-stream-option command "prefix_digest")))

@@ -1654,6 +1654,8 @@ executor, so capture the same operation before transaction commit."
   (values))
 
 (defun wal-logical-reader-return (transactions progress-lsn exhausted-p)
+  "Return transactions, the processed frontier and whether the scan reached its
+captured horizon. An early limit returns false for exhaustion."
   (when (and *wal-logical-slot-owner*
              (integerp progress-lsn))
     (setf *wal-logical-slot-read-progress*
@@ -1932,7 +1934,9 @@ tracked by the bounded sender. SENT-LSN never includes an unfinished frame."
             (max-transactions +max-logical-read-transactions+)
             (max-bytes +max-logical-read-bytes+)
             (max-scan-bytes +max-logical-read-scan-bytes+))
-  "Read committed transactions at a pinned, fixed durable horizon."
+  "Read committed transactions at a pinned, fixed durable horizon.
+Return transactions, processed progress and a third value indicating that the
+scan reached its horizon rather than stopping at a configured limit."
   (wal-logical-reader-validate-limits max-transactions max-bytes max-scan-bytes)
   (call-with-wal-retained-slot-scan
    name from-lsn upto-lsn

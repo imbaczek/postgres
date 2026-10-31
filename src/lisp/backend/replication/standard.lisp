@@ -501,6 +501,8 @@ records need not decode their publication history. Keep eligibility there."
   (not (standard-stream-stop-reason state)))
 
 (defun standard-stream-loop (state)
+  "Stream logical transactions and process real standby feedback.
+Catchup changes to streaming when the captured scan horizon is exhausted."
   (block streaming
     (loop
       (standard-poll-feedback state)
@@ -534,6 +536,9 @@ records need not decode their publication history. Keep eligibility there."
   (standard-stream-stop-reason state))
 
 (defun start-standard-logical-replication (stream command)
+  "Start a logical stream with status scoped to this command. Seed sent status at
+the slot restart position, then advance it only from processed or sent frontiers;
+the envelope's WAL end alone is not a sent frontier."
   (call-with-wal-sender-stream
    (lambda ()
      (let ((reason

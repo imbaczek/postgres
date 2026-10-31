@@ -117,6 +117,23 @@ Native control data now exposes persisted resource capacities, allowing Patroni
 to raise a standby's lock setting to the backup requirement. `pg_ctl reload`
 signals the verified owner without waiting for completion.
 
+### Source sender status
+
+The source exposes sender snapshots and a PID/application-name activity subset
+through the two status SRFs. Sent progress tracks a safe processed or sent
+frontier; write, flush, replay and reply time come independently from feedback.
+Unknown positions and lag are NULL. Priority 0 and state `async` reflect the
+absence of synchronous settings and commit waiting, not a synchronous guarantee.
+All SQL sessions currently use the postgres superuser; ordinary-role statistics
+filtering is not implemented.
+
+The C twelve-field oracle is `/tmp/pg-sender-status-c-oracle-fhw2qqsb/result.log`.
+The milestone passed 1,322 physical, 191 logical wire and 684 unit tests, strict
+cold compilation and an owned SQL status and Patroni follow/promotion run
+(`/tmp/pg-sender-status-final-owned.log`). The unchanged Patroni monitoring query,
+real sync handler and remote commit waiting remain open; no DCS or coordination
+was added.
+
 ### Relation resource accounting
 
 Relation admission now checks the complete proposed set against private object

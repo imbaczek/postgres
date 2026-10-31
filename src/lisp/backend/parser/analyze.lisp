@@ -639,6 +639,7 @@ Omit NULL elements unless a non-NULL replacement is supplied."
   (list :func name nil :type :record :typmod -1 :fields +wal-receiver-result-fields+))
 
 (defun analyze-record-set-call (name arguments fields)
+  "Build a record-valued set call after checking its expression context."
   (unless *select-set-functions-allowed-p*
     (ereport "0A000" "set-returning functions are not allowed in this context"))
   (when *inside-aggregate-input-p*
@@ -646,6 +647,7 @@ Omit NULL elements unless a non-NULL replacement is supplied."
   (list :set-func name arguments :type :record :typmod -1 :fields fields))
 
 (defun analyze-source-status-function (name arguments)
+  "Check sender or activity arguments and attach the supported result fields."
   (let ((activity (string= name "pg_stat_get_activity")))
     (unless (if activity
                 (and (= (length arguments) 1)
@@ -1505,6 +1507,7 @@ only when a non-NULL call executes; explicit text arguments arrive here then."
   name)
 
 (defun analyze-utility-function-call (name args)
+  "Analyze the supported utility calls or report an unresolved function."
   (cond
     ((string= name "set_config")
      (unless (and (= (length args) 3)

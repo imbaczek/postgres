@@ -215,6 +215,8 @@
 (defparameter +activity-result-fields+ '(("pid" :int4) ("application_name" :text)))
 
 (defun sql-wal-sender-row (snapshot)
+  "Convert a sender snapshot to C's twelve-column sender status record.
+Unknown positions and lag are NULL; priority zero and async do not imply sync support."
   (flet ((nullable-position (key)
            (let ((value (getf snapshot key)))
              (if (or (null value) (zerop value)) +null+ value))))
@@ -224,6 +226,7 @@
             +null+ +null+ +null+ 0 "async" (nullable-position :reply-time))))
 
 (defun make-status-record-iterator (fields rows)
+  "Return records from the captured rows using the supplied field descriptors."
   (lambda ()
     (if rows
         (values (make-sql-record :fields fields :values (pop rows)) t)
@@ -234,6 +237,8 @@
                                (mapcar #'sql-wal-sender-row (wal-sender-snapshots))))
 
 (defun make-activity-result-iterator (pid)
+  "Return PID and application name for the selected backend, or all for SQL NULL.
+This subset has no ordinary-role statistics visibility filtering."
   (make-status-record-iterator
    +activity-result-fields+
    (loop for backend in (list-backends)

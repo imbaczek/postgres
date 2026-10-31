@@ -1,5 +1,31 @@
 # Development TODO
 
+- [x] Implement the source sender-status foundation. The sender and activity
+  SRFs can be joined by PID. Captured registration tokens enforce ownership;
+  snapshots are detached copies with independent, nullable feedback positions.
+  Connection cleanup retires the registration. Activity exposes only PID
+  and application name for registered backends, including NULL enumeration.
+  Lag is unknown and reported NULL; sync priority/state are 0/async. All SQL
+  sessions currently use the postgres superuser; ordinary-role visibility
+  filtering is not implemented. The source C oracle is
+  `/tmp/pg-sender-status-c-oracle-fhw2qqsb/result.log`.
+
+- [ ] Complete the unchanged Patroni monitoring query and synchronous-replication
+  backend contract. Whole-row arguments such as `to_json(r.*)` fail with 42601,
+  `json_agg` is absent, and synchronous setting lookup fails with 42704. Preserve
+  the complete real query as the acceptance oracle. A future whole-row result
+  must distinguish an unmatched outer join's SQL NULL from a present all-NULL
+  record; C evidence is `/tmp/pg-sender-status-c-oracle-fhw2qqsb/json-row-nullability.log`.
+  C reports 42804 for `json_agg('x')`; the native aggregate is absent.
+  Patroni's sync handler also emits a DO block containing SET LOCAL
+  synchronous_commit=off and PERFORM txid_current(); these remain dependencies
+  of unchanged-method acceptance. Implement commit waiting and FIRST/ANY
+  selection against C `syncrep.c`, with independent acknowledgment/crash tests;
+  this item adds no coordination. Keep nonempty synchronous standby names
+  unsupported and sender status asynchronous until remote commit waiting is
+  implemented: Patroni treats sync status as a safety signal. Preserve the
+  different-upstream, descendant and rejoin acceptance work alongside this path.
+
 - [x] Publish an allocated backend XID with its active registration under the XID
   lock and interrupt mask, following C's ownership-before-unlock ordering. Raw
   `assign-xid` without an owner remains caller-owned. Real SQL termination tests
