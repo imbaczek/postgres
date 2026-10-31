@@ -686,6 +686,7 @@ Preserve all dispatch values, including secondary values, for the caller."
 ;;; ---- backend loop ----
 
 (defun backend-loop (stream)
+  "Process frontend messages until termination or suppressed output closes the session."
   (loop
     (check-backend-frontend-output)
     (let ((type-byte (read-byte stream nil nil)))

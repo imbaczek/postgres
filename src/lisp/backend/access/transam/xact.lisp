@@ -48,6 +48,7 @@
   (termination-pending nil)
   ;; First WAL failure, retained for the lifetime of this backend.
   (wal-failure nil)
+  ;; First reason to withhold frontend output after an unconfirmed commit wait.
   (frontend-output-suppressed-reason nil)
   ;; Visible to the local control REPL so concurrency tests can synchronize on
   ;; a real lock wait instead of relying on scheduler timing.
@@ -59,11 +60,13 @@
 (defvar *backend* nil)
 
 (defun suppress-backend-frontend-output (backend reason)
+  "Remember the first reason to suppress this backend's frontend output."
   (unless (backend-frontend-output-suppressed-reason backend)
     (setf (backend-frontend-output-suppressed-reason backend) reason))
   (values))
 
 (defun backend-frontend-output-suppressed-p (stream)
+  "Test suppression only for the current backend's frontend stream."
   (and *backend* (eq stream (backend-stream *backend*))
        (not (null (backend-frontend-output-suppressed-reason *backend*)))))
 
@@ -2363,14 +2366,20 @@ On commit, retire the saved settings snapshot; abort leaves it for whole-table u
                                :format-arguments nil)))))))
   (values))
 
-(defvar *synchronous-commit-wait-mode* :flush)
+(defvar *synchronous-commit-wait-mode* :flush
+  "Private wait mode for user commits: NIL, :WRITE, :FLUSH or :APPLY.")
 
 (defun synchronous-commit-wait-mode ()
+  "Validate the private commit wait mode; NIL skips the remote wait."
   (unless (member *synchronous-commit-wait-mode* '(nil :write :flush :apply))
     (error "Invalid synchronous commit wait mode: ~s" *synchronous-commit-wait-mode*))
   *synchronous-commit-wait-mode*)
 
 (defun wait-for-committed-wal-obligation (backend obligation mode)
+  "Wait for this locally committed transaction's own terminal boundary.
+A changed source or abnormal exit suppresses frontend output, as does
+termination; cancellation and timeout are handled after committed cleanup.
+The caller keeps interrupts masked and retains the XID until cleanup."
   (when (and mode obligation
              (or (transaction-wal-obligation-source-changed-p obligation)
                  (transaction-wal-obligation-user-end obligation)))
@@ -2392,6 +2401,9 @@ On commit, retire the saved settings snapshot; abort leaves it for whole-table u
           (suppress-backend-frontend-output backend :abnormal-commit-wait))))))
 
 (defun finish-synchronous-commit-response (backend outcome)
+  "Handle the wait outcome after committed transaction cleanup.
+Cancellation or timeout warns that remote replication is uncertain; termination
+and source change close the connection. An incomplete response suppresses output."
   (let ((complete nil))
     (unwind-protect
          (progn
@@ -2413,6 +2425,7 @@ On commit, retire the saved settings snapshot; abort leaves it for whole-table u
   (values))
 
 (defun check-backend-frontend-output ()
+  "End the backend before reading another request when output is suppressed."
   (when (and *backend* (backend-frontend-output-suppressed-reason *backend*))
     (ereport-fatal "08006" "connection closed after unconfirmed synchronous commit"))
   (values))
@@ -2462,6 +2475,7 @@ On commit, retire the saved settings snapshot; abort leaves it for whole-table u
                           (setf irreversible t)
                           ;; Capture this terminal after marking the commit irreversible.
                           (record-transaction-wal-boundary obligation source end nil)))
+                       ;; Wait after local commit and apply, before releasing the XID.
                        (setf outcome (wait-for-committed-wal-obligation b obligation mode)))
                   (when (or irreversible (and wal-ready-at-entry-p *wal-poisoned*))
                     (finish-committed-transaction b xid)))

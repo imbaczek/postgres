@@ -54,9 +54,9 @@
   seven existing sender physical tests (not a full physical rerun), and strict
   cold compilation (`/tmp/pg-sync-wait-reviewed-cold.log`). The scoped cl-spec
   queue-prefix property ran 100 trials at seed 42 (digest `9248d664822bed72`);
-  input coverage and rejection counts were not measured. Remaining integration
-  includes public settings, actual commit waiting, final DDL and maintenance
-  policy, and asynchronous `synchronous_commit=off` behavior.
+  input coverage and rejection counts were not measured. The user-XID wait is
+  now wired; public settings, final DDL and maintenance policy, and asynchronous
+  `synchronous_commit=off` remain open below.
 
 - [x] Capture exact durable catalog terminal boundaries before local apply, with
   fail-stop publication and backend failure fencing (`a59b2256057`). Install a
@@ -129,40 +129,33 @@
   `DEBUG_PROMOTION=1` passed (`/tmp/source-lifecycle-hba-debug.log`, artifacts
   `/tmp/pg-hba-policy.49dp84dn`).
 
-- [ ] Build the independent configuration service needed before commit waiting.
-  This is proposed, not implemented; it adds no coordinator. Parking synchronous
-  waiters alone does not keep configuration service available.
+- [x] Run configuration reload independently of code drain (`c1c7f634e8a`,
+  `6476238b1fd`). Candidate preparation and publication are serialized with
+  definition replacement without taking code reload admission. This supplies no
+  failover coordinator.
 
-  1. Completed: migrate retention and restartpoint readers to captured roots.
-     Capture policy and keep size once per calculation or catalog snapshot; recapture on each
-     authoritative retry or owner termination claim while the ticket WAL endpoint
-     stays fixed, so reload can rescue retention. The private pin's exact-byte cap
-     remains independent of `wal_keep_size`; preserve invalidation order. Capture
-     restartpoint settings before taking the store lock.
-  2. Receiver effects, desired-generation installation, and controller intent
-     and active-binding publication are fenced. Capture root, desired generation
-     and real source predecessor coherently; check the source before managed claim.
-     Live promotion and private history selection are fenced through source
-     rotation. Publish candidates atomically without quiescence after HBA, claim,
-     resource, slot and predecessor checks; the installer remains quiescent today.
-  3. Separate the configuration worker from code drain. Serialize candidate
-     preparation/publication with actual ASDF replacement, never holding that
-     definition lock while draining. Configuration takes neither the reload run
-     lock nor admission.
-  4. Regress a synchronous waiter retaining its XID, a second admitted transaction
-     blocked on that XID, and a pending code reload. Repeated SIGHUP must preserve
-     everything on invalid input and release waiters when valid names are cleared. A third request
-     with a retained portal must demonstrate continuous service.
+- [x] Wait for a user XID's own locally committed WAL boundary using the private
+  synchronous wait mode (`ad8194a65c6`). The checkpoint passed 1,407 physical
+  tests plus three final focused cases, 754 unit, 201 wire and 1,159 legacy
+  checks, strict cold compilation and an owned seven-case SQL script.
+
+- [ ] Complete public synchronous settings and status, no-XID DDL final markers,
+  and true asynchronous `synchronous_commit=off`. Regress a synchronous waiter
+  retaining its XID, a second transaction blocked on it, and a pending code reload:
+  repeated SIGHUP with invalid input must preserve the installed state; clearing
+  public standby names must
+  release waiters, and a third request with a retained portal must show service
+  continues. This acceptance scenario remains open.
 
 - [ ] Complete the unchanged Patroni monitoring query and synchronous-replication
   backend contract. Synchronous setting lookup fails with 42704. Preserve the
   complete real query as the acceptance oracle.
   Patroni's sync handler also emits a DO block containing SET LOCAL
   synchronous_commit=off and PERFORM txid_current(); these remain dependencies
-  of unchanged-method acceptance. Implement commit waiting and FIRST/ANY
-  integration against C `syncrep.c`, with independent acknowledgment/crash tests;
+  of unchanged-method acceptance. Complete public FIRST/ANY integration against
+  C `syncrep.c`, with independent acknowledgment/crash tests;
   this item adds no coordination. Keep nonempty synchronous standby names
-  unsupported and sender status asynchronous until remote commit waiting is
+  unsupported and sender status asynchronous until public commit waiting is
   implemented: Patroni treats sync status as a safety signal. Preserve the
   different-upstream, descendant and rejoin acceptance work alongside this path.
 

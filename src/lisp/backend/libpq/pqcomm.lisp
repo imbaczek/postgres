@@ -163,6 +163,7 @@ Production callers run this inside the live-operation gate."
 (declaim (ftype (function (t) t) backend-frontend-output-suppressed-p))
 
 (defun write-message (stream type payload)
+  "Write a frame to the frontend unless this backend has suppressed output."
   (when (backend-frontend-output-suppressed-p stream)
     (return-from write-message nil))
   (write-byte (char-code type) stream)
