@@ -308,6 +308,7 @@ base provenance is removed; it does not identify a cleanup endpoint."
     (physical-follow-check-config (list 1 nil nil nil nil state))))
 
 (defun physical-follow-startup-owner-check ()
+  "Check owned cold PGDATA before accepting a bound follow configuration."
   (when (probe-file (physical-follow-config-path))
     (let ((config (physical-follow-read-config)))
       (unless (= 4 (length config))

@@ -130,6 +130,8 @@ file and directory synchronization."
         (error condition)))))
 
 (defun physical-follow-read-base-provenance ()
+  "Read and compare immutable manifest and control identity fields.
+This is provenance checking, not validation of live replay files."
   (multiple-value-bind (manifest digest) (recovery-read-manifest *pgdata*)
     (recovery-check-manifest-schema manifest)
     (let ((control (physical-recovery-read-control *pgdata*)))
@@ -143,6 +145,8 @@ file and directory synchronization."
       base)))
 
 (defun physical-follow-check-managed-claim-base (desired)
+  "Check a standby's base before persisting a requested management claim.
+Unclaimed and non-standby cases need no check; live replay files are not read."
   (when (and (physical-follow-desired-claimed-p desired)
              (member (getf *physical-recovery-state* :phase) '(1 2)))
     (let ((base (physical-follow-read-base-provenance)))
@@ -168,10 +172,10 @@ file and directory synchronization."
 
 (defun physical-follow-call-with-desired-install (desired function &optional preflight claim-preflight publication-preflight)
   "Install settings and their generation together under quiescence.
-After quiescence, take the generation fence and check the follow predecessor
-and optional preflight before and after the durable claim. Under the follow
-lock and interrupt mask, FUNCTION publishes settings, then the desired
-generation is swapped. Notify outside the fence; a notification error is logged
+Under the generation fence, check the desired predecessor and run PREFLIGHT
+under the follow lock before and after the durable claim. Run CLAIM-PREFLIGHT
+before the claim and PUBLICATION-PREFLIGHT after it, both outside the follow lock.
+Publish under the follow lock with interrupts masked, then notify outside the fence. A notification error is logged
 without undoing the installed configuration."
   (check-type desired physical-follow-desired)
   (let ((changed nil))

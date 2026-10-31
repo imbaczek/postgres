@@ -800,8 +800,8 @@ these slots."
 
 (defun startup-publish-configuration (candidate)
   "Publish prepared values and the root under the root mutex.
-Publication still uses live-operation quiescence. Migrated readers capture the
-root; retention and restartpoint readers still use globals."
+Publication still uses live-operation quiescence; readers capture the installed
+root for coherent settings."
   (sb-thread:with-mutex (*startup-configuration-lock*)
     (setf *authentication-policy* (startup-configuration-authentication candidate)
           *startup-server-settings* (startup-configuration-settings candidate)
@@ -821,6 +821,7 @@ root; retention and restartpoint readers still use globals."
   (values))
 
 (defun startup-check-installed-capacity (candidate)
+  "Check CANDIDATE's resource tuple against the capacity actually installed."
   (unless (and *installed-resource-parameters*
                (equal (resource-parameters-values *installed-resource-parameters*)
                       (resource-parameters-values (startup-configuration-resources candidate))))
@@ -828,6 +829,7 @@ root; retention and restartpoint readers still use globals."
   (values))
 
 (defun startup-check-postmaster-values (candidate installed)
+  "Check all postmaster settings against their active installed values."
   (let* ((old (startup-configuration-settings installed))
          (new (startup-configuration-settings candidate))
          (defaults (startup-default-settings
@@ -841,6 +843,9 @@ root; retention and restartpoint readers still use globals."
   (values))
 
 (defun startup-check-installation-boundary (candidate boundary)
+  "Check the explicit initial, authentication or runtime installation boundary.
+Runtime requires installed capacity, unchanged postmaster values, complete
+authentication and an initialized source."
   (let ((installed (startup-capture-configuration)))
     (ecase boundary
       (:initial
@@ -870,6 +875,7 @@ root; retention and restartpoint readers still use globals."
   (values))
 
 (defun startup-check-installation-ownership (candidate)
+  "Require CANDIDATE's data directory to match current PGDATA ownership."
   (let ((owned *postmaster-pid-directory*)
         (directory (startup-setting-value (startup-configuration-settings candidate)
                                           "data_directory")))
@@ -882,6 +888,8 @@ root; retention and restartpoint readers still use globals."
   (values))
 
 (defun startup-call-with-prepared-installation (candidate preflight claim-preflight publication-preflight)
+  "Run the shared installation kernel with boundary checks supplied by callers.
+The desired installer holds quiescence and the generation fence for publication."
   (check-type candidate startup-configuration)
   (physical-follow-call-with-desired-install
    (startup-configuration-desired candidate)
@@ -893,6 +901,8 @@ root; retention and restartpoint readers still use globals."
   candidate)
 
 (defun startup-commit-installation-at-boundary (candidate boundary)
+  "Commit CANDIDATE after boundary-specific stage checks and, where required,
+PGDATA ownership checks."
   (let ((ownership-check
           (unless (eq :initial boundary)
             (lambda () (startup-check-installation-ownership candidate)))))
@@ -906,11 +916,14 @@ root; retention and restartpoint readers still use globals."
      ownership-check)))
 
 (defun startup-install-initial-settings (settings native overrides)
+  "Install the initial settings before storage, ownership and authentication."
   (startup-commit-installation-at-boundary
    (startup-prepare-installation settings native overrides nil) :initial)
   settings)
 
 (defun startup-complete-authentication ()
+  "Complete authentication for the initial root after acquiring PGDATA ownership.
+Check the cold stage and ownership before creating default policy files."
   (let* ((basis (startup-capture-installation-basis))
          (installed (startup-installation-basis-root basis)))
     (unless installed (error "authentication completion requires an initial configuration"))
@@ -944,11 +957,11 @@ root; retention and restartpoint readers still use globals."
   settings)
 
 (defun startup-prepare-reload-installation ()
-  "Validate a fresh input tree before replacing active values under quiescence.
-Postmaster settings retain their active values and record pending restart.  A
-setting added to a warm registry uses its boot default as the old value.
-Reject an unsupported effective candidate before publishing any reload changes.
-Capture the base once before file I/O and use it for both inputs and predecessor."
+  "Prepare a validated reload candidate and settings without publishing them.
+Capture one basis before file I/O. Postmaster values remain active with pending
+restart recorded; a newly added setting uses its boot default as the old value.
+Component tests can use this preparer; production reload commits through the
+strict runtime boundary."
   (let* ((basis (startup-capture-installation-basis))
          (base (startup-installation-basis-root basis)))
     (when base

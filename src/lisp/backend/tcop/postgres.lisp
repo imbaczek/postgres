@@ -914,6 +914,7 @@ CL's RENAME-FILE merges a relative target with the source's directory."
   (complete-xid-wraparound))
 
 (defun startup-check-cold-installation-state ()
+  "Require storage and workers to remain uninitialized for a cold stage."
   (unless (and (not *wal-ready*) (not *wal-output-stream*) (not *catalog*)
                (not *clog-stream*) (zerop (hash-table-count *relation-streams*))
                (not *physical-recovery-state*) (not *physical-receive-store*)

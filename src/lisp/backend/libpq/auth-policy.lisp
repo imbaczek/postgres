@@ -27,6 +27,7 @@
                    :source (copy-seq (hba-rule-source rule)) :line (hba-rule-line rule))))
 
 (defun authentication-text-within-bound-p (text)
+  "Accept only valid Unicode text whose UTF-8 encoding is at most 1 MiB."
   (and (stringp text) (<= (length text) 1048576)
        (loop with bytes = 0
              for character across text
@@ -39,6 +40,8 @@
                finally (return t))))
 
 (defun authentication-complete-policy-p (policy)
+  "Check policy completeness and text bounds without canonical validation.
+Copying a complete policy validates and parses its retained text."
   (and (authentication-policy-p policy)
        (authentication-policy-rules policy)
        (authentication-text-within-bound-p (authentication-policy-hba-text policy))
@@ -49,6 +52,8 @@
        t))
 
 (defun authentication-policy-settings-p (policy settings)
+  "Require a complete policy whose retained paths match the candidate settings.
+This checks retained provenance, not current file contents."
   (and (authentication-complete-policy-p policy)
        (loop for (name path) in
                              (list (list "hba_file" (authentication-policy-hba-path policy))
@@ -58,8 +63,9 @@
 
 (defun authentication-copy-policy (policy)
   "Own the policy data. Complete policies derive rules from retained HBA text,
-which is also the source copied into a physical backup. Incomplete component
-fixtures retain their explicit rule trees."
+which is also the source copied into a physical backup. Validate retained ident
+text and reparse HBA text rather than trusting a supplied rule tree. Incomplete
+component fixtures retain their explicit rule trees."
   (when policy
     (let* ((complete (authentication-complete-policy-p policy))
            (hba-text (copy-seq (authentication-policy-hba-text policy)))
@@ -90,6 +96,7 @@ fixtures retain their explicit rule trees."
     (values (hba-parse-text text :source (namestring path)) text)))
 
 (defun ident-validate-text (text source)
+  "Validate retained ident text and reject unsupported mappings."
   (when (or (not (authentication-text-within-bound-p text)) (find (code-char 0) text))
     (error "invalid identity mapping text: ~a" source))
   (dolist (entry (hba-logical-lines text :source (namestring source)))
