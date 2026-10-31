@@ -21,6 +21,15 @@
   unsupported. C parity evidence is
   `/tmp/pg-sender-status-c-oracle-fhw2qqsb/json-aggregate-parity.log`.
 
+- [x] Establish the commit lifecycle prerequisite for later synchronous waiting:
+  retain the XID through local apply and retire resources on an indeterminate
+  poisoned WAL outcome. No remote wait or coordination was added. The existing
+  no-WAL replacement and CLOG failure boundary is not claimed hardened. Final
+  code passed 709 unit and 201 wire tests; 1,323 physical tests passed before a
+  diagnostic-only first-error fix, covered by a new two-error unit test. Strict
+  cold compilation passed (`/tmp/pg-commit-lifecycle-final-cold.log`), as did
+  actual psql smoke (`/tmp/pg-commit-lifecycle-smoke.log`).
+
 - [ ] Complete the unchanged Patroni monitoring query and synchronous-replication
   backend contract. Synchronous setting lookup fails with 42704. Preserve the
   complete real query as the acceptance oracle.

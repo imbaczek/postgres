@@ -2251,6 +2251,8 @@ On commit, retire the saved settings snapshot; abort leaves it for whole-table u
   (values))
 
 (defun finish-committed-transaction (backend xid)
+  ;; Retire resources even when WAL is poisoned, without changing CLOG.  An
+  ;; incomplete cleanup fail-stops after releasing the mutex; keep the first error.
   (let ((complete nil)
         (failure nil))
     (sb-sys:without-interrupts
@@ -2258,6 +2260,9 @@ On commit, retire the saved settings snapshot; abort leaves it for whole-table u
            (handler-bind ((error (lambda (condition) (unless failure (setf failure condition)))))
              (unwind-protect
                   (release-xid xid)
+               ;; Use the raw mutex to retire private references even if WAL is
+               ;; poisoned.  This does not clear poison; any future remote wait
+               ;; must run outside this mutex.
                (sb-thread:with-mutex (*wal-lock*)
                  (finish-backend-transaction backend t)))
              (setf complete t))
@@ -2288,6 +2293,10 @@ On commit, retire the saved settings snapshot; abort leaves it for whole-table u
                         (logical-preflight-spool (backend-logical-spool b)))))))
           ;; Validate the spool before publishing any WAL batch. Subsequent I/O
           ;; failure during WAL insertion follows the normal critical-failure path.
+          ;; Keep the XID through local storage apply.  Mask interrupts across
+          ;; publication and lexical ownership of cleanup.  A poisoned WAL can
+          ;; leave the outcome indeterminate: retire resources without inventing
+          ;; a CLOG commit or abort.
           (sb-sys:without-interrupts
             (let ((irreversible nil)
                   (wal-ready-at-entry-p *wal-ready*)

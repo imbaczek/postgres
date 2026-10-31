@@ -1384,7 +1384,10 @@ The reset descriptors are owned here across AFTER-DURABLE-FUNCTION, which may
 release the transaction's private replacements. Preflight the page spool before
 the terminal, then flush WAL before truncating any relation fork. Return this
 transaction's commit record end LSN after local storage apply completes. When
-WAL is unavailable, return no values."
+WAL is unavailable, return no values. With WAL ready, TERMINAL-DURABLE-FUNCTION,
+when supplied, receives the exact end LSN immediately after the flush, before
+AFTER-DURABLE-FUNCTION. In that path, incomplete publication fail-stops after
+releasing WAL; the first error is retained, including when cleanup also fails."
   (unless *wal-ready*
     (when (fboundp 'publish-transaction-replacements-under-wal-lock)
       (with-wal-critical
