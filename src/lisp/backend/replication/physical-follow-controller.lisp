@@ -703,8 +703,9 @@ under command and reload exclusion before durable publication."
             (setf *physical-recovery-state*
                   (physical-recovery-attach-selected-store *physical-recovery-state* *physical-receive-store*)
                   (getf *physical-recovery-state* :receive-lsn)
-                  (physical-store-flushed-lsn *physical-receive-store*)
-                  (getf (physical-follow-operation-context operation) :committed) t
+                  (physical-store-flushed-lsn *physical-receive-store*))
+            (sync-replication-new-source-incarnation)
+            (setf (getf (physical-follow-operation-context operation) :committed) t
                   (physical-follow-operation-result operation) active)
             active))))))
 

@@ -409,6 +409,7 @@ Report installed capacity on the new primary before declaring it ready."
         *physical-replay-seen-relfilenodes* nil)
   (wal-report-installed-resource-capacity)
   (wal-note-primary-ready)
+  (sync-replication-new-source-incarnation)
   (physical-promotion-test-point :after-child-primary-ready))
 
 (defun physical-promotion-start-live-child-primary ()

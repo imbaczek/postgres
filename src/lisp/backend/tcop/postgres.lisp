@@ -177,7 +177,9 @@ SQL role authorization remains separate and currently uses the postgres role."
         (multiple-value-bind (user dbname) (authentication-startup-identities params replication)
           (setf (backend-database *backend*) dbname)
           (setf (backend-application-name *backend*) app)
-          (setf (backend-replication-mode *backend*) replication)
+          (setf (backend-replication-mode *backend*) replication
+                (backend-replication-source-id *backend*)
+                (when replication (nth-value 0 (sync-replication-configuration-state))))
           (when (and (recovery-in-progress-p) (not *enable-hot-standby*))
             (ereport-fatal "57P03" "the database system is not accepting connections"
                            :detail "Hot standby mode is disabled."))
@@ -749,7 +751,7 @@ finish outer connection accounting after unregistering."
                         (when body
                           (process-startup stream body)
                           (when (backend-replication-mode *backend*)
-                            (wal-sender-register *backend*))
+                            (wal-sender-register *backend* (backend-replication-source-id *backend*)))
                           (backend-loop stream)))
                    ;; Fast teardown cannot wait behind a closed reload gate.
                    ;; MAIN retires its captured transaction after all clients exit.
@@ -934,6 +936,10 @@ CL's RENAME-FILE merges a relative target with the source's directory."
           (progn
             (wal-report-installed-resource-capacity)
             (wal-note-primary-ready)))
+      (if primary-ready
+          (assert (nth-value 0 (sync-replication-configuration-state)))
+          (with-live-operation-quiescence
+            (sync-replication-new-source-incarnation)))
       (enable-reload)
       (enable-shutdown-handlers)
       (start-swank-listener swank-port swank-bind-address)

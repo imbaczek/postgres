@@ -1643,6 +1643,7 @@ A failure after selection work begins fences recovery; this does not admit a net
                                    *physical-recovery-state* *physical-receive-store*)))
                    (setf *physical-recovery-state*
                          (physical-recovery-write-control candidate 2 *last-replay-lsn* *next-xid*)))
+                 (sync-replication-new-source-incarnation)
                  (setf finished t)
                  target)
             (unless finished (setf *physical-recovery-failed-p* t))))))))

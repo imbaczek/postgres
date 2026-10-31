@@ -334,6 +334,18 @@
         (terminate-backend *backend*))
       installed-generation)))
 
+(declaim (special *live-operation-quiescence-owner-thread*))
+
+(defun sync-replication-new-source-incarnation ()
+  (unless (eq *live-operation-quiescence-owner-thread* sb-thread:*current-thread*)
+    (error "replication source replacement requires closed admission"))
+  (when (sb-thread:holding-mutex-p *wal-lock*)
+    (error "replication source replacement cannot hold the WAL mutex"))
+  (multiple-value-bind (old generation names) (sync-replication-configuration-state)
+    (let ((source (gensym "WAL-SOURCE-")))
+      (sync-replication-install-configuration names source old generation)
+      source)))
+
 (defun sync-replication-interruption (backend)
   ;; Termination wins and stays pending for delivery after committed cleanup.
   ;; Timeout and cancel are returned as reasons, not aborting errors.

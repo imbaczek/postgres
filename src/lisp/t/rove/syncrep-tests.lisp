@@ -494,6 +494,52 @@
 (rove:deftest generated-synchronous-queue-prefix
     (unit-check-property 'synchronous-queue-release-matches-attested-prefix))
 
+(rove:deftest synchronous-source-incarnation-requires-quiescence-and-retires-old-proof
+    (call-with-sync-wait-state
+     (lambda ()
+       (let ((*live-operation-quiescence-owner-thread* nil))
+         (rove:ok (handler-case (progn (sync-replication-new-source-incarnation) nil)
+                    (error () t)))
+         (rove:ok (eq :source-a (nth-value 0 (sync-replication-configuration-state)))))
+       (let ((*live-operation-quiescence-owner-thread* sb-thread:*current-thread*))
+         (sb-thread:with-mutex (*wal-lock*)
+           (rove:ok (handler-case (progn (sync-replication-new-source-incarnation) nil)
+                      (error () t)))))
+       (sync-replication-install-configuration "FIRST 1 (peer)" :source-a :source-a 0)
+       (let* ((sender (sync-test-sender "peer" 1 90 80 70))
+              (pending (sync-test-enqueue 81 :flush))
+              (completed (sync-test-enqueue 80 :flush))
+              (original (symbol-function 'terminate-backend))
+              (retired nil))
+         (unwind-protect
+              (progn
+                (setf (symbol-function 'terminate-backend)
+                      (lambda (backend) (push backend retired)))
+                (let* ((*live-operation-quiescence-owner-thread* sb-thread:*current-thread*)
+                       (first (sync-replication-new-source-incarnation))
+                       (second (sync-replication-new-source-incarnation)))
+                  (rove:ok (symbolp first))
+                  (rove:ok (not (eq first second)))
+                  (rove:ok (not (eq first :source-a)))
+                  (rove:ok (eq second (nth-value 0 (sync-replication-configuration-state))))
+                  (rove:ok (equal "FIRST 1 (peer)"
+                                  (nth-value 2 (sync-replication-configuration-state))))
+                  (rove:ok (every #'zerop
+                                  (loop for mode in '(:write :flush :apply)
+                                        collect (getf (sync-replication-state-frontiers
+                                                       *sync-replication-state*) mode))))
+                  (rove:ok (eq :source-changed (sync-replication-waiter-state pending)))
+                  (rove:ok (eq :acknowledged (sync-replication-waiter-state completed)))
+                  (rove:ok (equal (list (wal-sender-status-backend sender)) retired))
+                  (rove:ok (null (wal-sender-note-reply sender 999 999 999 1)))
+                  (rove:ok
+                   (equal "55000"
+                          (handler-case
+                              (wal-sender-register
+                               (make-backend :replication-mode :physical) :source-a)
+                            (pg-error (condition) (pg-error-sqlstate condition)))))))
+           (setf (symbol-function 'terminate-backend) original))))))
+
 (rove:deftest synchronous-source-invalidation-terminates-captured-owners-after-unlock
     (call-with-sync-wait-state
      (lambda ()
