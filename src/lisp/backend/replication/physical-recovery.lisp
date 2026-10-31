@@ -471,12 +471,15 @@ The optional flag is exactly 1 and follows the legacy keys."
           (unless (= digest actual) (error "physical recovery file checksum mismatch: ~a" name)))))))
 
 (defun physical-recovery-check-checkpoint-resources (snapshot metadata)
-  "Require checkpoint and coherent control resource facts to agree.
-For known facts, check the claimed origin timeline against selected history."
+  "Validate checkpoint and copied control resource facts.
+When the snapshot has facts, require an exact match and check their origin
+timeline against selected history. A legacy snapshot without facts remains
+unknown, even if the copied control has known resource metadata."
   (unless (and (wal-control-resource-fields-valid-p snapshot)
                (wal-control-resource-fields-valid-p metadata)
-               (equal (wal-copy-control-resource-fields snapshot)
-                      (wal-copy-control-resource-fields metadata)))
+               (or (null (getf snapshot :resource-parameters))
+                   (equal (wal-copy-control-resource-fields snapshot)
+                          (wal-copy-control-resource-fields metadata))))
     (error "base checkpoint resource facts differ from copied control"))
   (if (getf snapshot :resource-parameters)
       (timeline-check-resource-origin snapshot (timeline-read-history (getf snapshot :timeline)))

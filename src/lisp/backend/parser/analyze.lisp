@@ -4163,6 +4163,42 @@ candidate selection."
   (cond ((< (length left) (length right)) -1)
         ((> (length left) (length right)) 1) (t 0)))
 
+(defun check-record-field-comparison (type ordering-p)
+  "Check the reached field's support before handling NULL values.
+Equality and ordering require separate support. As in typcache, array support
+depends on its element type. Nested record fields are checked only when their
+non-NULL record value is reached."
+  (when (member type '(:json :json-array))
+    (if ordering-p
+        (ereport "42883" "could not identify a comparison function for type ~a"
+                 (if (eq type :json-array) "json[]" "json"))
+        (json-equality-or-order-error type nil))))
+
+(defun compare-sql-records (left right ordering-p)
+  "Compare record fields in order, with NULL equal to NULL and greater than non-NULL.
+Check each reached pair's declared types and support before inspecting its values.
+Equality uses field equality operators, since equality need not imply ordering.
+Stop at the first difference, leaving later field types and counts unchecked."
+  (loop for left-field in (sql-record-fields left)
+        for right-field in (sql-record-fields right)
+        for a across (sql-record-values left)
+        for b across (sql-record-values right)
+        for comparison =
+                       (progn
+                         (unless (eq (second left-field) (second right-field))
+                           (ereport "42804" "cannot compare dissimilar record types"))
+                         (check-record-field-comparison (second left-field) ordering-p)
+                         (cond ((and (eq a +null+) (eq b +null+)) 0)
+                               ((eq a +null+) 1)
+                               ((eq b +null+) -1)
+                               (ordering-p (compare-3way a b))
+                               ((sql-compare "=" a b) 0)
+                               (t 1)))
+        unless (zerop comparison) do (return-from compare-sql-records comparison))
+  (unless (= (length (sql-record-fields left)) (length (sql-record-fields right)))
+    (ereport "42804" "cannot compare record types with different numbers of columns"))
+  0)
+
 (defun compare-3way (a b)
   (cond
     ((and (sql-jsonb-p a) (sql-jsonb-p b)) (sql-jsonb-compare a b))
@@ -4183,10 +4219,7 @@ candidate selection."
           (every #'integerp a) (every #'integerp b))
      (compare-integer-vectors a b))
     ((and (sql-record-p a) (sql-record-p b))
-     (unless (equal (mapcar #'second (sql-record-fields a))
-                    (mapcar #'second (sql-record-fields b)))
-       (ereport "42804" "cannot compare dissimilar record types"))
-     (compare-sql-array-values (sql-record-values a) (sql-record-values b)))
+     (compare-sql-records a b t))
     ((and (sql-array-p a) (vectorp b) (not (stringp b)))
      (compare-3way a (make-sql-array :element-type-id :int2 :elements b
                                      :dimensions (list (length b)) :lower-bounds '(0))))
@@ -4227,7 +4260,10 @@ candidate selection."
                (or (eq (sql-array-element-type-id left) :json)
                    (eq (sql-array-element-type-id right) :json)))
       (ereport "42883" "could not identify an equality operator for type json"))
-    (let ((c (compare-3way left right)))
+    (let ((c (if (and (member op '("=" "<>") :test #'string=)
+                      (sql-record-p left) (sql-record-p right))
+                 (compare-sql-records left right nil)
+                 (compare-3way left right))))
       (cond
         ((string= op "=") (zerop c))
         ((string= op "<>") (not (zerop c)))

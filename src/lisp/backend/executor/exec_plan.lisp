@@ -287,6 +287,56 @@ reordered tree, and each parameterized path can reference only joined Vars."
   (some (lambda (descriptor) (not (eq (getf descriptor :kind) :count)))
         (getf prepared :aggregates)))
 
+(defun select-distinct-plan-kind (targets physical-p)
+  "Choose the DISTINCT implementation for the projected target types.
+Anonymous records have ordering support but no hash support in C typcache, so a
+physical plan containing one must sort and compare adjacent rows."
+  (cond ((not physical-p) :distinct)
+        ((some (lambda (target) (eq (expr-type (getf target :expr)) :record)) targets)
+         :sorted-distinct)
+        (t :hash-distinct)))
+
+(defun constant-distinct-record-p (expression prepared)
+  "Prove a whole-row key constant for a non-nullable one-row subquery.
+C can prune such keys after subquery pull-up. The window constant predicate
+does not cover parameters or source lineage. This narrower proof accepts literal
+and parameter targets and casts of those, but not arbitrary expressions or a
+source made nullable by an outer join."
+  (labels ((constant-p (form)
+             (case (first form)
+               ((:const :bool :parameter) t)
+               (:cast (constant-p (second form)))
+               (otherwise nil))))
+    (when (and (eq (first expression) :whole-row)
+               (every (lambda (join) (member (getf join :type) '(:inner :cross)))
+                      (getf prepared :joins)))
+      (let* ((source (nth (getf (cdddr expression) :source-index)
+                          (getf prepared :relations)))
+             (query (getf source :subquery-prepared)))
+        (and query (not (getf source :lateral-dependent))
+             (not (getf query :set-operation)) (not (getf query :relations))
+             (not (getf query :aggregate-p)) (not (getf query :set-functions))
+             (every (lambda (target) (constant-p (getf target :expr)))
+                    (getf query :targets)))))))
+
+(defun select-distinct-keys (prepared)
+  "Build the keys for DISTINCT, placing ORDER BY keys first for sorted plans.
+Remove duplicate target positions and prune proven constant record keys before
+sorting and adjacent equality. The remaining key order controls sort priority."
+  (let* ((targets (getf prepared :targets))
+         (sorted-p (eq (select-distinct-plan-kind targets t) :sorted-distinct))
+         (keys (remove-duplicates
+                (append (when sorted-p (mapcar #'car (getf prepared :order)))
+                        (loop for target in targets for position from 1
+                              collect (projected-target-ref target position)))
+                :key #'second :test #'eql :from-end t)))
+    (if sorted-p
+        (remove-if (lambda (key)
+                     (constant-distinct-record-p
+                      (getf (nth (1- (second key)) targets) :expr) prepared))
+                   keys)
+        keys)))
+
 (defun build-select-plan-tree (prepared physical-p paths)
   (let* ((input (select-plan-input-form prepared physical-p paths))
          (where (getf prepared :where))
@@ -337,9 +387,8 @@ reordered tree, and each parameterized path can reference only joined Vars."
                              (length (getf prepared :windows)))))))
     (setf input (list :project (getf prepared :targets) input))
     (when (getf prepared :distinct)
-      (setf input (list (if physical-p :hash-distinct :distinct)
-                        (loop for target in (getf prepared :targets) for position from 1
-                              collect (projected-target-ref target position))
+      (setf input (list (select-distinct-plan-kind (getf prepared :targets) physical-p)
+                        (select-distinct-keys prepared)
                         input)))
     (finish-select-plan-tree input prepared physical-p)))
 
@@ -353,7 +402,7 @@ reordered tree, and each parameterized path can reference only joined Vars."
        (or (query-plan-relation-node-p node)
            (member (first node)
                    '(:recursive-union :with-ctes :window-input :window :append :result :filter :join :nested-loop-join :project :aggregate
-                     :sort :top-n :limit :project-set :hash-aggregate :sorted-aggregate :distinct :hash-distinct)
+                     :sort :top-n :limit :project-set :hash-aggregate :sorted-aggregate :distinct :hash-distinct :sorted-distinct)
                    :test #'eq))))
 
 (defun collect-query-plan-nodes (tree)
@@ -424,14 +473,24 @@ reordered tree, and each parameterized path can reference only joined Vars."
     plan))
 
 (defun finish-select-plan-tree (input prepared physical-p)
-  (when (getf prepared :order)
-    (setf input (list :sort (getf prepared :order) input)))
-  (when (getf prepared :limit)
-    (setf input
-          (if (and physical-p (getf prepared :order))
-              (list :top-n (getf prepared :order) (getf prepared :limit) (third input))
-              (list :limit (getf prepared :limit) input))))
-  input)
+  "Add final ordering and limit nodes to INPUT.
+For sorted DISTINCT, omit ORDER BY keys pruned as constant from the final sort
+as well. A physical ordered limit can use the bounded top-N node."
+  (let ((order (getf prepared :order)))
+    (when (and (getf prepared :distinct)
+               (eq (select-distinct-plan-kind (getf prepared :targets) t) :sorted-distinct))
+      (let ((keys (select-distinct-keys prepared)))
+        (setf order (remove-if-not
+                     (lambda (entry) (find (second (car entry)) keys :key #'second))
+                     order))))
+    (when order
+      (setf input (list :sort order input)))
+    (when (getf prepared :limit)
+      (setf input
+            (if (and physical-p order)
+                (list :top-n order (getf prepared :limit) (third input))
+                (list :limit (getf prepared :limit) input))))
+    input))
 
 (defun plan-prepared-union (prepared)
   (let ((relations nil) (logical-arms nil) (physical-arms nil))
@@ -453,9 +512,8 @@ reordered tree, and each parameterized path can reference only joined Vars."
                                       (mapcar #'first arms))
                                 (list :append arms))))
                  (when (and (not definition) (eq (getf prepared :set-operation) :union))
-                   (setf tree (list (if physical-p :hash-distinct :distinct)
-                                    (loop for target in (getf prepared :targets) for slot from 1
-                                          collect (projected-target-ref target slot))
+                   (setf tree (list (select-distinct-plan-kind (getf prepared :targets) physical-p)
+                                    (select-distinct-keys prepared)
                                     tree)))
                  (finish-select-plan-tree tree prepared physical-p))))
       (finish-query-plan prepared relations (union-tree logical-arms nil)
@@ -643,8 +701,9 @@ reordered tree, and each parameterized path can reference only joined Vars."
       (finish-query-plan prepared registered logical physical alternative-plans))))
 
 (defun sql-group-value-payload (value)
-  ;; Equal numeric values group together regardless of their display scale,
-  ;; including when nested in records or arrays.
+  ;; Equal values must have equal grouping keys, including values nested in
+  ;; records or arrays. In particular, numeric display scale is not significant.
+  ;; Check record field support before building the key, even for NULL fields.
   (cond
     ((sql-jsonb-p value) (list :jsonb (sql-jsonb-equality-key value)))
     ((sql-decimal-p value) (sql-numeric-rational value))
@@ -657,7 +716,10 @@ reordered tree, and each parameterized path can reference only joined Vars."
            (map 'list #'sql-group-value-payload (sql-array-elements value))))
     ((sql-record-p value)
      (list :record (mapcar #'second (sql-record-fields value))
-           (map 'list #'sql-group-value-payload (sql-record-values value))))
+           (loop for field in (sql-record-fields value)
+                 for datum across (sql-record-values value)
+                 do (check-record-field-comparison (second field) nil)
+                 collect (sql-group-value-payload datum))))
     ((consp value) (cons (sql-group-value-payload (car value))
                          (sql-group-value-payload (cdr value))))
     ((and (vectorp value) (not (stringp value)))
@@ -796,6 +858,25 @@ if a registered TOAST index is missing."
   (call-with-query-sort-arena
    (lambda (arena)
      (stream-select-sort-with-arena streamer order callback arena on-complete))))
+
+(defun stream-sorted-distinct (source keys callback)
+  "Sort DISTINCT inputs and compare adjacent rows when records cannot be hashed.
+Sorting visits keys in priority order; adjacent equality visits them in reverse
+order, as ExecBuildGroupingEqual does. Hashing would inspect unused fields even
+for singleton input or records decided by earlier fields. Reuse the bounded
+sorter for spill and origins, and emit each row as (projected . projected)."
+  (let ((previous nil))
+    (stream-select-sort
+     source (mapcar (lambda (key) (list (list :sort-output (second key)))) keys)
+     (lambda (row)
+       (unless (and previous
+                    (loop for key in (reverse keys)
+                          for a = (eval-expr key previous)
+                          for b = (eval-expr key (car row))
+                          always (if (eq a +null+) (eq b +null+)
+                                     (and (not (eq b +null+)) (sql-compare "=" a b)))))
+         (setf previous (copy-query-sort-value (car row)))
+         (funcall callback (cons (car row) (car row))))))))
 
 (defun datum-origins-for-spill (origins)
   "Represent detached origins with ordinary vectors and lists for sort/spill."
@@ -1565,7 +1646,7 @@ on an abnormal exit."
       relations iterator-p worktable seen))
     (:window
      (simple-datum-origin-plan-p (third node) relations iterator-p worktable seen))
-    (:hash-distinct (simple-datum-origin-plan-p (third node) relations iterator-p worktable seen))
+    ((:hash-distinct :sorted-distinct) (simple-datum-origin-plan-p (third node) relations iterator-p worktable seen))
     (:append
      (every (lambda (arm)
               (simple-datum-origin-plan-p (second arm) relations iterator-p worktable seen))
@@ -1956,6 +2037,10 @@ ROW's source environment.  Only final target origins leave this projection."
                           (close-sql-iterator projected)))
                       (stream-project-set environment (second node) emit))))))
     (:project (execute-physical-projection node emit run-child))
+    (:sorted-distinct
+     (stream-sorted-distinct
+      (lambda (callback) (funcall run-child (third node) callback))
+      (second node) emit))
     (:hash-distinct
      (stream-hash-aggregate
       (lambda (callback)
@@ -2213,7 +2298,7 @@ projection or filter forms fall back to ordinary full materialization."
 (defun physical-plan-node-children (node)
   (case (first node)
     (:append (mapcar #'second (second node)))
-    ((:with-ctes :window-input :window :filter :project :sort :limit :hash-distinct :project-set) (list (third node)))
+    ((:with-ctes :window-input :window :filter :project :sort :limit :hash-distinct :sorted-distinct :project-set) (list (third node)))
     ((:top-n :subquery-scan) (list (fourth node)))
     ((:nested-loop-join :recursive-union) (list (third node) (fourth node)))
     ((:hash-aggregate :sorted-aggregate) (list (fourth node)))
@@ -2278,6 +2363,7 @@ projection or filter forms fall back to ordinary full materialization."
     (:hash-aggregate "HashAggregate")
     (:sorted-aggregate "GroupAggregate")
     (:hash-distinct "HashDistinct")
+    (:sorted-distinct "Unique")
     (:nested-loop-join
      (format nil "Nested Loop ~a Join"
              (case (getf (second node) :type)

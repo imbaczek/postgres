@@ -1,5 +1,11 @@
 # Interoperability test inventory
 
+`python3 t/interop/record-comparison.py NATIVE_PORT REFERENCE_PORT` compares
+whole-row equality, ordering, DISTINCT and JSON rendering against an isolated C
+peer, using both Simple Query and parameterized Extended Query. Both supplied
+ports must belong to trust-authenticated test servers. The test includes NULL
+JSON fields, nested records, JSONB controls and absent outer-join records.
+
 Inventory and refactor review: 2026-10-25, based on commit `19df2752d7e`.
 
 | Tests | Opportunity | Decision |

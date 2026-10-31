@@ -324,6 +324,35 @@
       (rove:ok (= 100 (first (getf (seventh values) :resource-parameters))))
       (rove:ok (= 100 (first (getf snapshot :resource-parameters))))))
 
+(cl-spec:defproperty legacy-checkpoint-resource-proof-stays-unknown
+    ((connections (range integer 1 2000)))
+  (:about physical-recovery-check-checkpoint-resources)
+  (:trials (:normal 200))
+  (let* ((snapshot (resource-checkpoint-test-snapshot :known nil))
+         (metadata (append (make-wal-control-metadata 42 4 0)
+                           (list :resource-parameters (list connections 8 10 0 128)
+                                 :resource-lsn 32 :resource-timeline 2)))
+         (bytes (wal-encode-control-image (getf snapshot :end) (getf snapshot :end)
+                                          snapshot :timeline 3 :checkpoint-timeline 3
+                                          :namespace :timeline :metadata metadata))
+         (decoded (multiple-value-list (wal-decode-control-line (bytes->string bytes)))))
+    (and (= 88 (length (wal-encode-checkpoint-snapshot (third decoded))))
+         (null (physical-recovery-check-checkpoint-resources (third decoded) (seventh decoded)))
+         (null (getf (third decoded) :resource-parameters))
+         (equal metadata (seventh decoded)))))
+
+(rove:deftest generated-legacy-checkpoint-resource-proof
+    (let ((result (cl-spec:result-data
+                   (cl-spec:run-property 'legacy-checkpoint-resource-proof-stays-unknown :seed 42))))
+      (rove:ok (eq :passed (getf result :status)) (format nil "~s" result))
+      (rove:ok (= 200 (getf result :trials))))
+  (let ((snapshot (resource-checkpoint-test-snapshot :known nil)))
+    (dolist (metadata '((:resource-parameters nil :resource-lsn 32 :resource-timeline 2)
+                        (:resource-parameters (100 8 10 0 128))
+                        (:resource-lsn 32 :resource-timeline 2)))
+      (rove:ok (resource-parameters-test-error-p
+                (lambda () (physical-recovery-check-checkpoint-resources snapshot metadata)))))))
+
 (cl-spec:defproperty resource-checkpoint-facts-roundtrip
     ((connections (range integer 1 2000)) (start (range integer 64 1000000)))
   (:about wal-encode-checkpoint-snapshot wal-decode-checkpoint-snapshot)

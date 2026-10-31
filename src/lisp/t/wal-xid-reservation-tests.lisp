@@ -520,8 +520,9 @@
                   (ok (intake-fails-p
                        (lambda ()
                          (pg::timeline-check-resource-origin boundary (pg::timeline-read-history 3))))))))
+          (ok (null (pg::physical-recovery-check-checkpoint-resources nil metadata)))
           (ok (intake-fails-p
-               (lambda () (pg::physical-recovery-check-checkpoint-resources nil metadata))))
+               (lambda () (pg::physical-recovery-check-checkpoint-resources snapshot nil))))
           (ok (null (pg::physical-recovery-check-checkpoint-resources nil nil)))))))
 
 (deftest xid-allocation-flushes-reservation-once-before-using-capacity

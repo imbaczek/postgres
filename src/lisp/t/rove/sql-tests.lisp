@@ -1,6 +1,87 @@
 ;;;; sql-tests.lisp -- migrated unit regressions; run with pg-unit-tests.
 (in-package #:pg)
 
+(rove:deftest record-comparisons-check-field-operators
+    (flet ((record (type value)
+             (make-sql-record :fields (list (list "v" type)) :values (vector value)))
+           (failure (thunk)
+             (handler-case (progn (funcall thunk) nil)
+               (pg-error (condition) (pg-error-sqlstate condition)))))
+      (dolist (value (list "{}" +null+))
+        (let* ((json (record :json value))
+               (nested (record :record json)))
+          (dolist (row (list json nested))
+            (dolist (operation (list (lambda () (sql-compare "=" row row))
+                                     (lambda () (sql-compare "<>" row row))
+                                     (lambda () (compare-3way row row))
+                                     (lambda () (sql-group-value-key row :record))))
+              (rove:ok (equal "42883" (failure operation)))))))
+      (let ((jsonb (record :jsonb (sql-jsonb-input "{}")))
+            (absent +null+))
+        (rove:ok (sql-compare "=" jsonb jsonb))
+        (rove:ok (zerop (compare-3way jsonb jsonb)))
+        (rove:ok (equal (sql-group-value-key jsonb :record)
+                        (sql-group-value-key (record :jsonb (sql-jsonb-input "{}")) :record)))
+        (rove:ok (eq +null+ (sql-compare "=" absent absent))))))
+
+(rove:deftest record-comparisons-stop-at-decisive-fields
+    (let* ((fields '(("id" :int4) ("j" :json)))
+           (left (make-sql-record :fields fields :values #(1 "{}")))
+           (right (make-sql-record :fields fields :values #(2 "{}"))))
+      (rove:ok (not (sql-compare "=" left right)))
+      (rove:ok (sql-compare "<>" left right))
+      (rove:ok (minusp (compare-3way left right)))))
+
+(cl-spec:defproperty record-prefix-determines-comparison
+    ((prefix (range integer -10000 10000)) (delta (range integer 1 100)))
+  (:about compare-sql-records sql-compare compare-3way)
+  (:trials (:normal 200))
+  (let* ((fields '(("id" :int4) ("j" :json)))
+         (left (make-sql-record :fields fields :values (vector prefix +null+)))
+         (right (make-sql-record :fields fields :values (vector (+ prefix delta) "{}"))))
+    (and (not (sql-compare "=" left right))
+         (sql-compare "<>" left right)
+         (sql-compare "<" left right)
+         (sql-compare ">" right left))))
+
+(rove:deftest generated-record-prefix-comparison
+    (let ((result (cl-spec:result-data
+                   (cl-spec:run-property 'record-prefix-determines-comparison :seed 42))))
+      (rove:ok (eq :passed (getf result :status)) (format nil "~s" result))
+      (rove:ok (= 200 (getf result :trials)))))
+
+(rove:deftest record-distinct-sorts-with-bounded-memory
+    (dolist (memory '(1 100000))
+      (let ((*query-work-memory-bytes* memory)
+            (*query-temp-directory* (uiop:temporary-directory)))
+        (flet ((record (id type value)
+                 (make-sql-record :fields (list '("id" :int4) (list "j" type))
+                                  :values (vector id value))))
+          (dolist (case (list (list (list (record 1 :json "{}")) '(1))
+                              (list (list (record 2 :json "{}") (record 1 :json "{}")) '(1 2))
+                              (list (list (record 1 :jsonb (sql-jsonb-input "{}"))
+                                          (record 1 :jsonb (sql-jsonb-input "{}"))) '(1))))
+            (let ((result nil))
+              (stream-sorted-distinct
+               (lambda (visit)
+                 (dolist (record (first case))
+                   (let ((values (vector record)))
+                     (funcall visit (cons values values)))))
+               '((:col 1 :type :record))
+               (lambda (row) (push (aref (sql-record-values (aref (car row) 0)) 0) result)))
+              (rove:ok (equal (reverse result) (second case)))))
+          (let* ((record (record 1 :json "{}"))
+                 (values (vector record)))
+            (rove:ok
+             (equal "42883"
+                    (handler-case
+                        (stream-sorted-distinct
+                         (lambda (visit)
+                           (funcall visit (cons values values))
+                           (funcall visit (cons values values)))
+                         '((:col 1 :type :record)) (lambda (row) (declare (ignore row))))
+                      (pg-error (condition) (pg-error-sqlstate condition))))))))))
+
 (rove:deftest test-sql-strict-let-evaluation
     (let ((evaluations '()))
       (rove:ok (eq +null+

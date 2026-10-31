@@ -721,7 +721,7 @@ source itself.  Closing the result closes the sort and its source."
             (sql-iterator-next input)))
         (lambda () (close-sql-iterator input)))))
     (:nested-loop-join (make-physical-join-iterator node relations))
-    ((:sort :top-n :hash-aggregate :sorted-aggregate :hash-distinct)
+    ((:sort :top-n :hash-aggregate :sorted-aggregate :hash-distinct :sorted-distinct)
      (let ((child (if (eq (first node) :top-n) (fourth node) (third node))))
        ;; If a key needs an SRF value, keep expansion below sort instead of
        ;; moving it above the sort and changing the key's evaluation point.
@@ -750,6 +750,8 @@ source itself.  Closing the result closes the sort and its source."
                                  (funcall emit (first row)))))
                      ((:hash-aggregate :sorted-aggregate)
                       (stream-select-aggregates #'source (second node) (third node) emit))
+                     (:sorted-distinct
+                      (stream-sorted-distinct #'source (second node) emit))
                      (:hash-distinct
                       (stream-hash-aggregate
                        (lambda (callback) (source (lambda (row) (funcall callback (car row)))))
