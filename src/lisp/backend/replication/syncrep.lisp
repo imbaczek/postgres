@@ -188,3 +188,164 @@
   ;; This selection alone does not expose sync state or wait for acknowledgments.
   (sb-thread:with-mutex (*wal-sender-lock*)
     (sync-replication-select-current-under-lock config)))
+
+(defstruct sync-replication-waiter
+  backend lsn mode source-id (state :waiting))
+
+(defstruct sync-replication-state
+  config (names "") source-id (generation 0)
+  (frontiers (list :write 0 :flush 0 :apply 0))
+  (queues (list :write nil :flush nil :apply nil))
+  (cv (sb-thread:make-waitqueue :name "synchronous replication")))
+
+(defvar *sync-replication-state* (make-sync-replication-state))
+
+(defun sync-replication-check-source-id (source-id)
+  (unless (typep source-id '(or symbol integer))
+    (ereport "22023" "replication source identity must be an immutable symbol or integer"))
+  (values))
+
+(defun sync-replication-configuration-state ()
+  (sb-thread:with-mutex (*wal-sender-lock*)
+    (values (sync-replication-state-source-id *sync-replication-state*) (sync-replication-state-generation *sync-replication-state*)
+            (copy-seq (sync-replication-state-names *sync-replication-state*)))))
+
+(defun sync-replication-check-registration-under-lock (source-id)
+  (sync-replication-check-source-id source-id)
+  (unless (eql source-id (sync-replication-state-source-id *sync-replication-state*))
+    (ereport "55000" "replication source changed before sender registration"))
+  (values))
+
+(defun sync-replication-complete-all-under-lock (state)
+  (dolist (mode '(:write :flush :apply))
+    (dolist (waiter (getf (sync-replication-state-queues *sync-replication-state*) mode))
+      (setf (sync-replication-waiter-state waiter) state))
+    (setf (getf (sync-replication-state-queues *sync-replication-state*) mode) nil))
+  (sb-thread:condition-broadcast (sync-replication-state-cv *sync-replication-state*))
+  (values))
+
+(defun sync-replication-release-under-lock ()
+  (let ((released nil))
+    (dolist (mode '(:write :flush :apply))
+      (let ((queue (getf (sync-replication-state-queues *sync-replication-state*) mode))
+            (frontier (getf (sync-replication-state-frontiers *sync-replication-state*) mode)))
+        (loop while (and queue (<= (sync-replication-waiter-lsn (first queue)) frontier))
+              do (setf (sync-replication-waiter-state (pop queue)) :acknowledged
+                       released t))
+        (setf (getf (sync-replication-state-queues *sync-replication-state*) mode) queue)))
+    (when released (sb-thread:condition-broadcast (sync-replication-state-cv *sync-replication-state*))))
+  (values))
+
+(defun sync-replication-next-frontiers-under-lock (config)
+  (let ((current (when config
+                   (nth-value 1 (sync-replication-select-current-under-lock config)))))
+    (loop for mode in '(:write :flush :apply)
+          append (list mode (max (getf (sync-replication-state-frontiers *sync-replication-state*) mode)
+                                 (getf current mode 0))))))
+
+(defun sync-replication-refresh-under-lock ()
+  (when (sync-replication-state-config *sync-replication-state*)
+    (setf (sync-replication-state-frontiers *sync-replication-state*)
+          (sync-replication-next-frontiers-under-lock (sync-replication-state-config *sync-replication-state*)))
+    (sync-replication-release-under-lock))
+  (values))
+
+(defun sync-replication-enqueue-under-lock (backend lsn mode source-id)
+  (sync-replication-check-source-id source-id)
+  (assert (and (sb-thread:holding-mutex-p *wal-sender-lock*)
+               (not sb-sys:*interrupts-enabled*)))
+  (unless (and (backend-p backend)
+               (typep lsn '(integer 1 18446744073709551615))
+               (member mode '(:write :flush :apply)))
+    (error "invalid synchronous replication wait"))
+  (let* ((state (cond ((not (eql source-id (sync-replication-state-source-id *sync-replication-state*))) :source-changed)
+                      ((null (sync-replication-state-config *sync-replication-state*)) :disabled)
+                      ((<= lsn (getf (sync-replication-state-frontiers *sync-replication-state*) mode)) :acknowledged)
+                      (t :waiting)))
+         (waiter (make-sync-replication-waiter :backend backend :lsn lsn :mode mode
+                                               :source-id source-id :state state)))
+    (when (eq state :waiting)
+      (setf (getf (sync-replication-state-queues *sync-replication-state*) mode)
+            (merge 'list (list waiter) (getf (sync-replication-state-queues *sync-replication-state*) mode)
+                   #'< :key #'sync-replication-waiter-lsn)))
+    waiter))
+
+(defun sync-replication-cancel-under-lock (waiter reason)
+  (unless (member reason '(:cancelled :timeout :terminated))
+    (error "invalid synchronous replication cancellation"))
+  (when (eq :waiting (sync-replication-waiter-state waiter))
+    (let ((mode (sync-replication-waiter-mode waiter)))
+      (assert (member waiter (getf (sync-replication-state-queues *sync-replication-state*) mode) :test #'eq))
+      (setf (getf (sync-replication-state-queues *sync-replication-state*) mode)
+            (delete waiter (getf (sync-replication-state-queues *sync-replication-state*) mode) :test #'eq)
+            (sync-replication-waiter-state waiter) reason)
+      (sb-thread:condition-broadcast (sync-replication-state-cv *sync-replication-state*))))
+  (values))
+
+(defun sync-replication-install-configuration (text source-id expected-source-id expected-generation)
+  (sync-replication-check-source-id source-id)
+  (sync-replication-check-source-id expected-source-id)
+  (let ((config (parse-sync-standby-names text))
+        (names (copy-seq text))
+        (obsolete nil)
+        (installed-generation nil))
+    (sb-sys:without-interrupts
+      (sb-thread:with-mutex (*wal-sender-lock*)
+        (unless (and (eql expected-generation (sync-replication-state-generation *sync-replication-state*))
+                     (eql expected-source-id (sync-replication-state-source-id *sync-replication-state*)))
+          (ereport "55000" "synchronous replication configuration generation changed"))
+        (let* ((source-changed (not (eql source-id (sync-replication-state-source-id *sync-replication-state*))))
+               (frontiers (if source-changed
+                              (list :write 0 :flush 0 :apply 0)
+                              (sync-replication-next-frontiers-under-lock config)))
+               (generation (1+ (sync-replication-state-generation *sync-replication-state*))))
+          (when source-changed
+            (setf obsolete (loop for backend being the hash-keys of *wal-sender-registry*
+                                 collect backend))
+            (sync-replication-complete-all-under-lock :source-changed)
+            (clrhash *wal-sender-registry*))
+          (setf (sync-replication-state-config *sync-replication-state*) config
+                (sync-replication-state-names *sync-replication-state*) names
+                (sync-replication-state-source-id *sync-replication-state*) source-id
+                (sync-replication-state-generation *sync-replication-state*) generation
+                (sync-replication-state-frontiers *sync-replication-state*) frontiers
+                installed-generation generation)
+          (if config
+              (sync-replication-release-under-lock)
+              (sync-replication-complete-all-under-lock :disabled))))
+      (dolist (backend obsolete)
+        (unless (eq backend *backend*) (terminate-backend backend)))
+      (when (member *backend* obsolete :test #'eq)
+        (terminate-backend *backend*))
+      installed-generation)))
+
+(defun sync-replication-interruption (backend)
+  (cond
+    ((backend-termination-pending backend) :terminated)
+    ((and (backend-statement-deadline backend)
+          (>= (get-internal-real-time) (backend-statement-deadline backend)))
+     (clear-statement-timeout backend)
+     (setf (backend-cancel-pending backend) nil)
+     :timeout)
+    ((backend-cancel-pending backend)
+     (setf (backend-cancel-pending backend) nil)
+     :cancelled)))
+
+(defun sync-replication-wait (backend lsn mode source-id)
+  (assert (not sb-sys:*interrupts-enabled*))
+  (sb-sys:without-interrupts
+    (let ((waiter nil))
+      (unwind-protect
+           (sb-thread:with-mutex (*wal-sender-lock*)
+             (setf waiter (sync-replication-enqueue-under-lock backend lsn mode source-id))
+             (loop while (eq :waiting (sync-replication-waiter-state waiter))
+                   do (let ((reason (sync-replication-interruption backend)))
+                        (if reason
+                            (sync-replication-cancel-under-lock waiter reason)
+                            (sb-thread:condition-wait
+                             (sync-replication-state-cv *sync-replication-state*)
+                             *wal-sender-lock* :timeout 0.1))))
+             (sync-replication-waiter-state waiter))
+        (when waiter
+          (sb-thread:with-mutex (*wal-sender-lock*)
+            (sync-replication-cancel-under-lock waiter :cancelled)))))))

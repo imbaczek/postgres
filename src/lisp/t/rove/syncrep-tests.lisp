@@ -201,3 +201,371 @@
                  (sync-replication-current-selection (parse-sync-standby-names "ANY 2 (*)"))
                (rove:ok (= 1 (length selected)))
                (rove:ok (null frontiers) "a restarted stream must earn new feedback"))))))))
+
+(defun call-with-sync-wait-state (function)
+  (let ((*wal-sender-registry* (make-hash-table :test #'eq))
+        (*physical-recovery-state* nil)
+        (*sync-replication-state* (make-sync-replication-state :source-id :source-a)))
+    (funcall function)))
+
+(defun sync-test-enqueue (lsn mode &optional (source :source-a))
+  (sb-sys:without-interrupts
+    (sb-thread:with-mutex (*wal-sender-lock*)
+      (sync-replication-enqueue-under-lock (make-backend) lsn mode source))))
+
+(defun sync-test-sender (name pid write flush apply)
+  (let ((sender (wal-sender-register
+                 (make-backend :pid pid :replication-mode :database :application-name name))))
+    (wal-sender-set-state sender "streaming")
+    (wal-sender-note-reply sender write flush apply 1)
+    sender))
+
+(rove:deftest synchronous-configuration-disable-is-atomic-with-enqueue
+    (call-with-sync-wait-state
+     (lambda ()
+       (rove:ok (= 1 (sync-replication-install-configuration "FIRST 1 (peer)" :source-a :source-a 0)))
+       (let* ((sender (sync-test-sender "peer" 1 30 20 10))
+              (pending (sync-test-enqueue 21 :flush))
+              (done (sync-test-enqueue 20 :flush)))
+         (rove:ok (eq :waiting (sync-replication-waiter-state pending)))
+         (rove:ok (eq :acknowledged (sync-replication-waiter-state done)))
+         (rove:ok
+          (equal "42601"
+                 (handler-case
+                     (sync-replication-install-configuration "FIRST (" :source-a :source-a 1)
+                   (pg-error (condition) (pg-error-sqlstate condition)))))
+         (rove:ok
+          (equal "55000"
+                 (handler-case
+                     (sync-replication-install-configuration "" :source-a :source-a 0)
+                   (pg-error (condition) (pg-error-sqlstate condition)))))
+         (rove:ok (= 1 (sync-replication-state-generation *sync-replication-state*)))
+         (rove:ok (equal "FIRST 1 (peer)" (sync-replication-state-names *sync-replication-state*)))
+         (rove:ok (eq sender (wal-sender-for-backend (wal-sender-status-backend sender))))
+         (rove:ok (eq :waiting (sync-replication-waiter-state pending)))
+         (rove:ok (= 2 (sync-replication-install-configuration "" :source-a :source-a 1)))
+         (rove:ok (eq :disabled (sync-replication-waiter-state pending)))
+         (rove:ok (eq :acknowledged (sync-replication-waiter-state done)))
+         (rove:ok (eq :disabled (sync-replication-waiter-state (sync-test-enqueue 99 :flush))))
+         (rove:ok (every #'null (list (getf (sync-replication-state-queues *sync-replication-state*) :write)
+                                      (getf (sync-replication-state-queues *sync-replication-state*) :flush)
+                                      (getf (sync-replication-state-queues *sync-replication-state*) :apply))))))))
+
+(rove:deftest synchronous-feedback-releases-only-the-attested-mode
+    (call-with-sync-wait-state
+     (lambda ()
+       (sync-replication-install-configuration "FIRST 1 (peer)" :source-a :source-a 0)
+       (let* ((sender (sync-test-sender "peer" 1 100 80 40))
+              (write (sync-test-enqueue 90 :write))
+              (flush (sync-test-enqueue 90 :flush))
+              (apply (sync-test-enqueue 90 :apply)))
+         (rove:ok (eq :acknowledged (sync-replication-waiter-state write)))
+         (rove:ok (eq :waiting (sync-replication-waiter-state flush)))
+         (rove:ok (eq :waiting (sync-replication-waiter-state apply)))
+         (wal-sender-note-sent sender 10000)
+         (rove:ok (eq :waiting (sync-replication-waiter-state flush)))
+         (wal-sender-note-reply sender 100 100 50 2)
+         (rove:ok (eq :acknowledged (sync-replication-waiter-state flush)))
+         (rove:ok (eq :waiting (sync-replication-waiter-state apply)))
+         (wal-sender-note-reply sender 100 100 90 3)
+         (rove:ok (eq :acknowledged (sync-replication-waiter-state apply)))))))
+
+(rove:deftest synchronous-disconnect-uses-replacement-proof-without-downgrade
+    (call-with-sync-wait-state
+     (lambda ()
+       (sync-replication-install-configuration "FIRST 1 (a,b)" :source-a :source-a 0)
+       (let* ((a (sync-test-sender "a" 1 30 20 10))
+              (b (sync-test-sender "b" 2 100 90 80))
+              (pending (sync-test-enqueue 60 :flush)))
+         (rove:ok (eq :waiting (sync-replication-waiter-state pending)))
+         (wal-sender-unregister (wal-sender-status-backend a) a)
+         (rove:ok (eq :acknowledged (sync-replication-waiter-state pending)))
+         (let ((blocked (sync-test-enqueue 100 :flush)))
+           (wal-sender-unregister (wal-sender-status-backend b) b)
+           (rove:ok (eq :waiting (sync-replication-waiter-state blocked))
+                    "disconnect cannot turn an unmet wait into async success"))
+         (rove:ok (eq :acknowledged (sync-replication-waiter-state (sync-test-enqueue 60 :flush)))
+                  "recorded proof remains valid after sender disconnect")))))
+
+(rove:deftest synchronous-source-change-fences-old-proof-and-stale-installers
+    (call-with-sync-wait-state
+     (lambda ()
+       (sync-replication-install-configuration "FIRST 1 (*)" :source-a :source-a 0)
+       (let* ((old (sync-test-sender "peer" 1 60 60 60))
+              (done (sync-test-enqueue 50 :flush))
+              (pending (sync-test-enqueue 80 :flush)))
+         (sync-replication-install-configuration "" :source-b :source-a 1)
+         (rove:ok (eq :source-changed (sync-replication-waiter-state pending)))
+         (rove:ok (eq :acknowledged (sync-replication-waiter-state done)))
+         (rove:ok (eq :source-changed
+                      (sync-replication-waiter-state (sync-test-enqueue 10 :flush :source-a))))
+         (rove:ok (zerop (hash-table-count *wal-sender-registry*)))
+         (rove:ok (null (wal-sender-note-reply old 9999 9999 9999 2)))
+         (sync-replication-install-configuration "FIRST 1 (*)" :source-b :source-b 2)
+         (let ((new (sync-test-sender "peer" 1 20 20 20)))
+           (rove:ok
+            (equal "55000"
+                   (handler-case
+                       (wal-sender-register (make-backend :pid 9 :replication-mode :database) :source-a)
+                     (pg-error (condition) (pg-error-sqlstate condition)))))
+           (rove:ok (eq :waiting
+                        (sync-replication-waiter-state (sync-test-enqueue 50 :flush :source-b))))
+           (rove:ok
+            (equal "55000"
+                   (handler-case
+                       (sync-replication-install-configuration "" :source-a :source-a 1)
+                     (pg-error (condition) (pg-error-sqlstate condition)))))
+           (rove:ok (eq new (wal-sender-for-backend (wal-sender-status-backend new))))
+           (wal-sender-unregister (wal-sender-status-backend old) old)
+           (rove:ok (eq new (wal-sender-for-backend (wal-sender-status-backend new)))))))))
+
+(defun call-with-blocking-sync-wait (action)
+  (call-with-sync-wait-state
+   (lambda ()
+     (sync-replication-install-configuration "FIRST 1 (peer)" :source-a :source-a 0)
+     (let* ((*backend* nil)
+            (runtime *sync-replication-state*)
+            (registry *wal-sender-registry*)
+            (backend (make-backend :pid 501 :executing t))
+            (finished (sb-thread:make-semaphore))
+            (outcome nil) (fatal nil) (failure nil) (pending-at-return nil)
+            (thread nil))
+       (unwind-protect
+            (progn
+              (setf thread
+                    (sb-thread:make-thread
+                     (lambda ()
+                       (let ((*sync-replication-state* runtime)
+                             (*wal-sender-registry* registry)
+                             (*backend* backend))
+                         (setf (backend-thread backend) sb-thread:*current-thread*)
+                         (handler-case
+                             (sb-sys:without-interrupts
+                               (setf outcome (sync-replication-wait backend 100 :flush :source-a)
+                                     pending-at-return (backend-termination-pending backend)))
+                           (pg-error (condition) (setf fatal condition))
+                           (error (condition) (setf failure condition)))
+                         (sb-thread:signal-semaphore finished)))
+                     :name "synchronous commit wait regression"))
+              (loop repeat 500
+                    when (sb-thread:with-mutex (*wal-sender-lock*)
+                           (some (lambda (waiter)
+                                   (eq backend (sync-replication-waiter-backend waiter)))
+                                 (getf (sync-replication-state-queues runtime) :flush)))
+                      do (return)
+                    when (plusp (sb-thread:semaphore-count finished))
+                      do (error "wait worker exited before enqueue: ~a ~a" failure fatal)
+                    do (sleep 0.01)
+                    finally (error "wait worker did not enqueue"))
+              (funcall action backend finished)
+              (unless (sb-thread:wait-on-semaphore finished :timeout 5)
+                (error "wait worker did not finish"))
+              (sb-thread:join-thread thread)
+              (rove:ok (null failure) (format nil "wait worker failure: ~a" failure))
+              (rove:ok (every #'null
+                              (loop for mode in '(:write :flush :apply)
+                                    collect (getf (sync-replication-state-queues runtime) mode))))
+              (list :outcome outcome :fatal fatal :pending-at-return pending-at-return
+                    :backend backend))
+         (multiple-value-bind (source generation) (sync-replication-configuration-state)
+           (sync-replication-install-configuration "" source source generation))
+         (when thread
+           (sb-thread:join-thread thread :timeout 5 :default :timeout)))))))
+
+(rove:deftest synchronous-blocking-wait-requires-proven-flush
+    (let ((result
+            (call-with-blocking-sync-wait
+             (lambda (backend finished)
+               (declare (ignore backend))
+               (sb-thread:with-mutex (*wal-lock*)
+                 (rove:ok (zerop (sb-thread:semaphore-count finished))
+                          "the wait leaves WAL available to other actors"))
+               (let ((sender (sync-test-sender "peer" 1 150 50 0)))
+                 (wal-sender-note-sent sender 10000)
+                 (rove:ok (zerop (sb-thread:semaphore-count finished))
+                          "sent and written WAL do not prove flush")
+                 (wal-sender-note-reply sender 150 100 0 2))))))
+      (rove:ok (eq :acknowledged (getf result :outcome)))
+      (rove:ok (null (getf result :fatal)))))
+
+(rove:deftest synchronous-blocking-wait-cancellation-and-configuration-exits
+    (dolist (reason '(:disabled :cancelled :timeout :terminated :source-changed))
+      (let ((result
+              (call-with-blocking-sync-wait
+               (lambda (backend finished)
+                 (declare (ignore finished))
+                 (ecase reason
+                   (:disabled
+                    (sync-replication-install-configuration "" :source-a :source-a 1))
+                   (:cancelled (cancel-backend backend))
+                   (:timeout (setf (backend-statement-deadline backend) 0))
+                   (:terminated (terminate-backend backend))
+                   (:source-changed
+                    (sync-replication-install-configuration "" :source-b :source-a 1)))))))
+        (rove:ok (eq reason (getf result :outcome)) (format nil "wait exits with ~s" reason))
+        (if (eq reason :terminated)
+            (progn
+              (rove:ok (getf result :pending-at-return)
+                       "termination remains pending until the caller can clean up")
+              (rove:ok (typep (getf result :fatal) 'pg-error))
+              (rove:ok (equal "57P01" (pg-error-sqlstate (getf result :fatal)))))
+            (rove:ok (null (getf result :fatal))))
+        (when (eq reason :timeout)
+          (rove:ok (null (backend-statement-deadline (getf result :backend)))))
+        (rove:ok (null (backend-cancel-pending (getf result :backend)))))))
+
+(rove:deftest synchronous-wait-nonlocal-exit-unlinks-without-poisoning-wal
+    (call-with-sync-wait-state
+     (lambda ()
+       (sync-replication-install-configuration "FIRST 1 (peer)" :source-a :source-a 0)
+       (let ((original (symbol-function 'sync-replication-interruption))
+             (*wal-poisoned* nil)
+             (backend (make-backend :xid 88)))
+         (unwind-protect
+              (progn
+                (setf (symbol-function 'sync-replication-interruption)
+                      (lambda (owner)
+                        (declare (ignore owner))
+                        (throw 'sync-exit :escaped)))
+                (rove:ok
+                 (eq :escaped
+                     (catch 'sync-exit
+                       (sb-sys:without-interrupts
+                         (sync-replication-wait backend 100 :flush :source-a)))))
+                (rove:ok (null (getf (sync-replication-state-queues *sync-replication-state*) :flush)))
+                (rove:ok (not *wal-poisoned*))
+                (rove:ok (= 88 (backend-xid backend)) "the caller still owns transaction cleanup"))
+           (setf (symbol-function 'sync-replication-interruption) original))))))
+
+(rove:deftest synchronous-wait-interruption-priority-preserves-termination
+    (let ((backend (make-backend :termination-pending t :statement-deadline 0 :cancel-pending t)))
+      (rove:ok (eq :terminated (sync-replication-interruption backend)))
+      (rove:ok (backend-termination-pending backend))
+      (rove:ok (backend-cancel-pending backend))
+      (rove:ok (eql 0 (backend-statement-deadline backend)))
+      (setf (backend-termination-pending backend) nil)
+      (rove:ok (eq :timeout (sync-replication-interruption backend)))
+      (rove:ok (null (backend-statement-deadline backend)))
+      (rove:ok (null (backend-cancel-pending backend)))
+      (setf (backend-cancel-pending backend) t)
+      (rove:ok (eq :cancelled (sync-replication-interruption backend)))
+      (rove:ok (null (backend-cancel-pending backend)))))
+
+(rove:deftest synchronous-queue-orders-lsns-and-preserves-completed-outcomes
+    (call-with-sync-wait-state
+     (lambda ()
+       (sync-replication-install-configuration "FIRST 1 (*)" :source-a :source-a 0)
+       (let ((later (sync-test-enqueue 200 :flush))
+             (earlier (sync-test-enqueue 100 :flush))
+             (middle (sync-test-enqueue 150 :flush)))
+         (rove:ok
+          (equal '(100 150 200)
+                 (mapcar #'sync-replication-waiter-lsn
+                         (getf (sync-replication-state-queues *sync-replication-state*) :flush))))
+         (sync-test-sender "peer" 1 160 160 160)
+         (rove:ok (eq :acknowledged (sync-replication-waiter-state earlier)))
+         (rove:ok (eq :acknowledged (sync-replication-waiter-state middle)))
+         (rove:ok (eq :waiting (sync-replication-waiter-state later)))
+         (sb-thread:with-mutex (*wal-sender-lock*)
+           (sync-replication-cancel-under-lock earlier :timeout)
+           (sync-replication-cancel-under-lock later :cancelled))
+         (rove:ok (eq :acknowledged (sync-replication-waiter-state earlier)))
+         (rove:ok (eq :cancelled (sync-replication-waiter-state later)))
+         (rove:ok (null (getf (sync-replication-state-queues *sync-replication-state*) :flush)))))))
+
+(cl-spec:defproperty synchronous-queue-release-matches-attested-prefix
+    ((a (range integer 1 100))
+     (b (range integer 1 100))
+     (c (range integer 1 100))
+     (frontier (range integer 0 100)))
+  (:about sync-replication-release-under-lock)
+  (:trials (:normal 100))
+  (call-with-sync-wait-state
+   (lambda ()
+     (sync-replication-install-configuration "FIRST 1 (*)" :source-a :source-a 0)
+     (let ((waiters (mapcar (lambda (lsn) (sync-test-enqueue lsn :flush)) (list a b c))))
+       (sync-test-sender "peer" 1 frontier frontier frontier)
+       (every (lambda (waiter)
+                (eq (if (<= (sync-replication-waiter-lsn waiter) frontier)
+                        :acknowledged :waiting)
+                    (sync-replication-waiter-state waiter)))
+              waiters)))))
+
+(rove:deftest generated-synchronous-queue-prefix
+    (unit-check-property 'synchronous-queue-release-matches-attested-prefix))
+
+(rove:deftest synchronous-source-invalidation-terminates-captured-owners-after-unlock
+    (call-with-sync-wait-state
+     (lambda ()
+       (sync-replication-install-configuration "FIRST 1 (*)" :source-a :source-a 0)
+       (let* ((old-backend (make-backend :pid 1 :replication-mode :database))
+              (new-backend (make-backend :pid 1 :replication-mode :database))
+              (old (wal-sender-register old-backend))
+              (original (symbol-function 'terminate-backend))
+              (terminated nil)
+              (replacement nil))
+         (unwind-protect
+              (progn
+                (setf (symbol-function 'terminate-backend)
+                      (lambda (backend)
+                        (rove:ok (not (sb-thread:holding-mutex-p *wal-sender-lock*)))
+                        (rove:ok (eq backend old-backend))
+                        (push backend terminated)
+                        (setf replacement (wal-sender-register new-backend :source-b))))
+                (sync-replication-install-configuration "FIRST 1 (*)" :source-b :source-a 1)
+                (rove:ok (equal (list old-backend) terminated))
+                (rove:ok (eq replacement (wal-sender-for-backend new-backend)))
+                (rove:ok (null (wal-sender-note-reply old 9999 9999 9999 1))))
+           (setf (symbol-function 'terminate-backend) original))))))
+
+(rove:deftest synchronous-source-identities-must-be-immutable
+    (call-with-sync-wait-state
+     (lambda ()
+       (sync-replication-install-configuration "FIRST 1 (*)" :source-a :source-a 0)
+       (let ((pending (sync-test-enqueue 100 :flush)))
+         (dolist (source (list (copy-seq "mutable") (list :mutable)))
+           (dolist (function
+                    (list (lambda () (sync-replication-install-configuration "" source :source-a 1))
+                          (lambda () (sync-replication-install-configuration "" :source-a source 1))
+                          (lambda () (sync-test-enqueue 100 :flush source))
+                          (lambda () (wal-sender-register
+                                      (make-backend :pid 1 :replication-mode :database) source))))
+             (rove:ok (equal "22023"
+                             (handler-case (progn (funcall function) nil)
+                               (pg-error (condition) (pg-error-sqlstate condition)))))))
+         (multiple-value-bind (source generation names) (sync-replication-configuration-state)
+           (rove:ok (eq source :source-a))
+           (rove:ok (= generation 1))
+           (setf (char names 0) #\X)
+           (rove:ok (equal "FIRST 1 (*)" (sync-replication-state-names *sync-replication-state*))))
+         (rove:ok (eq :waiting (sync-replication-waiter-state pending)))
+         (rove:ok (zerop (hash-table-count *wal-sender-registry*)))))))
+
+(rove:deftest synchronous-source-invalidation-signals-self-last
+    (call-with-sync-wait-state
+     (lambda ()
+       (sync-replication-install-configuration "FIRST 1 (*)" :source-a :source-a 0)
+       (let* ((self (make-backend :pid 1 :replication-mode :database))
+              (other (make-backend :pid 2 :replication-mode :database))
+              (original (symbol-function 'terminate-backend))
+              (targets nil))
+         (wal-sender-register self)
+         (wal-sender-register other)
+         (unwind-protect
+              (progn
+                (setf (symbol-function 'terminate-backend)
+                      (lambda (backend)
+                        (push backend targets)
+                        (when (eq backend self)
+                          (ereport-fatal "57P01" "self termination"))))
+                (let* ((*backend* self)
+                       (condition
+                         (handler-case
+                             (sync-replication-install-configuration "" :source-b :source-a 1)
+                           (pg-error (condition) condition))))
+                  (rove:ok (typep condition 'pg-error))
+                  (rove:ok (equal "FATAL" (pg-error-severity condition))))
+                (rove:ok (equal (list other self) (nreverse targets)))
+                (rove:ok (eq :source-b (sync-replication-state-source-id *sync-replication-state*)))
+                (rove:ok (zerop (hash-table-count *wal-sender-registry*))))
+           (setf (symbol-function 'terminate-backend) original))))))

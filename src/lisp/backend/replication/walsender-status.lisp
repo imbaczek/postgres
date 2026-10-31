@@ -34,18 +34,21 @@
           :replay-lsn (wal-sender-status-replay-lsn sender)
           :reply-time (wal-sender-status-reply-time sender))))
 
-(defun wal-sender-register (backend)
+(defun wal-sender-register (backend &optional
+                                      (source-id (nth-value 0 (sync-replication-configuration-state))))
   "Register one status token for a replication backend under the sender lock."
   (unless (and (backend-p backend)
                (member (backend-replication-mode backend) '(:physical :database)))
     (error "walsender status requires a replication backend"))
   (let ((sender (make-wal-sender-status :backend backend)))
     (sb-thread:with-mutex (*wal-sender-lock*)
+      (sync-replication-check-registration-under-lock source-id)
       (when (gethash backend *wal-sender-registry*)
         (error "backend already owns walsender status"))
       (sb-sys:without-interrupts
         (setf (wal-sender-status-index sender) (wal-sender-next-index-under-lock)
-              (gethash backend *wal-sender-registry*) sender)))
+              (gethash backend *wal-sender-registry*) sender)
+        (sync-replication-refresh-under-lock)))
     sender))
 
 (defun wal-sender-unregister (backend &optional (expected nil expected-p))
@@ -53,7 +56,8 @@
   (sb-sys:without-interrupts
     (sb-thread:with-mutex (*wal-sender-lock*)
       (when (or (not expected-p) (eq expected (gethash backend *wal-sender-registry*)))
-        (remhash backend *wal-sender-registry*))))
+        (remhash backend *wal-sender-registry*)
+        (sync-replication-refresh-under-lock))))
   (values))
 
 (defun wal-sender-for-backend (&optional (backend *backend*))
@@ -71,7 +75,8 @@
   (sb-thread:with-mutex (*wal-sender-lock*)
     (when (wal-sender-current-under-lock-p sender)
       (sb-sys:without-interrupts
-        (setf (wal-sender-status-state sender) (copy-seq state)))
+        (setf (wal-sender-status-state sender) (copy-seq state))
+        (sync-replication-refresh-under-lock))
       t)))
 
 (defun wal-sender-note-sent (sender sent)
@@ -97,7 +102,8 @@ These fields are independent and do not infer apply from flush."
         (setf (wal-sender-status-write-lsn sender) write
               (wal-sender-status-flush-lsn sender) flush
               (wal-sender-status-replay-lsn sender) replay
-              (wal-sender-status-reply-time sender) reply-time))
+              (wal-sender-status-reply-time sender) reply-time)
+        (sync-replication-refresh-under-lock))
       t)))
 
 (defun wal-sender-note-status (sender status)
@@ -122,7 +128,8 @@ Feedback and cleanup use that token, so they cannot affect a replacement registr
                          (wal-sender-status-write-lsn sender) nil
                          (wal-sender-status-flush-lsn sender) nil
                          (wal-sender-status-replay-lsn sender) nil
-                         (wal-sender-status-reply-time sender) nil))))
+                         (wal-sender-status-reply-time sender) nil)
+                   (sync-replication-refresh-under-lock))))
              (funcall function))
         (wal-sender-set-state sender "startup")))))
 
