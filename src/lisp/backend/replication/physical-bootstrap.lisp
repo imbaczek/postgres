@@ -226,6 +226,7 @@ Check checkpoint resource facts against control before creating the source pin."
     ;; operator must inspect the failed target and explicitly release the pin.
     (physical-bootstrap-mark-target target)
     (physical-recovery-mark-target target)
+    (wal-ensure-directory-durable (merge-pathnames "base/" target))
     (physical-bootstrap-test-point :after-checkpoint target)
     (let* ((checkpoint *wal-checkpoint-lsn*)
            (end *wal-durable-lsn*)

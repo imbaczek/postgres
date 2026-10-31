@@ -875,6 +875,7 @@ CL's RENAME-FILE merges a relative target with the source's directory."
   (sb-thread:with-mutex (*wal-lock*)
     (wal-refresh-logical-capture-slot-mirror-under-wal-lock))
   (catalog-init)
+  (wal-ensure-directory-durable (merge-pathnames "base/" *pgdata*))
   (physical-source-pin-load)
   (catalog-remove-orphan-relations)
   (complete-xid-wraparound))
