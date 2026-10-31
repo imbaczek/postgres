@@ -407,9 +407,12 @@ including on unwind."
                    do (let ((reason (sync-replication-interruption backend)))
                         (if reason
                             (sync-replication-cancel-under-lock waiter reason)
-                            (sb-thread:condition-wait
-                             (sync-replication-state-cv *sync-replication-state*)
-                             *wal-sender-lock* :timeout 0.1))))
+                            (unless (sb-thread:condition-wait
+                                     (sync-replication-state-cv *sync-replication-state*)
+                                     *wal-sender-lock* :timeout 0.1)
+                              ;; SBCL leaves the mutex unowned on timeout.
+                              ;; Keep interrupts masked through committed cleanup.
+                              (sb-thread:grab-mutex *wal-sender-lock*)))))
              (sync-replication-waiter-state waiter))
         (when waiter
           (sb-thread:with-mutex (*wal-sender-lock*)

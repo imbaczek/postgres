@@ -388,6 +388,34 @@
       (rove:ok (eq :acknowledged (getf result :outcome)))
       (rove:ok (null (getf result :fatal)))))
 
+(rove:deftest synchronous-blocking-wait-reacquires-after-poll-timeout
+    (let ((original (symbol-function 'sync-replication-interruption))
+          (polled (sb-thread:make-semaphore :count 0))
+          (ownership nil))
+      (unwind-protect
+           (progn
+             (setf (symbol-function 'sync-replication-interruption)
+                   (lambda (backend)
+                     (push (sb-thread:holding-mutex-p *wal-sender-lock*) ownership)
+                     (sb-thread:signal-semaphore polled)
+                     (funcall original backend)))
+             (let ((result
+                     (call-with-blocking-sync-wait
+                      (lambda (backend finished)
+                        (declare (ignore backend finished))
+                        (loop repeat 4
+                              do (unless (sb-thread:wait-on-semaphore polled :timeout 1)
+                                   (return)))
+                        (rove:ok (>= (length ownership) 4)
+                                 "the wait survives several polling timeouts")
+                        (rove:ok (every #'identity ownership)
+                                 "each queue inspection owns the sender mutex")
+                        (let ((sender (sync-test-sender "peer" 1 100 100 0)))
+                          (wal-sender-note-reply sender 100 100 0 2))))))
+               (rove:ok (eq :acknowledged (getf result :outcome)))
+               (rove:ok (null (getf result :fatal)))))
+        (setf (symbol-function 'sync-replication-interruption) original))))
+
 (rove:deftest synchronous-blocking-wait-cancellation-and-configuration-exits
     (dolist (reason '(:disabled :cancelled :timeout :terminated :source-changed))
       (let ((result
