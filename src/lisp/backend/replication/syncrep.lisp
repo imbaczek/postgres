@@ -393,10 +393,12 @@ including on unwind."
      :cancelled)))
 
 (defun sync-replication-wait (backend lsn mode source-id)
-  ;; The caller must keep interrupts masked through later committed cleanup and
-  ;; must not hold WAL here.  Condition waits release the sender mutex; polling
-  ;; checks interrupt flags every 0.1 seconds.  Source change is not success.
-  ;; On any nonlocal exit, unlink the waiter without poisoning WAL.
+  "Wait for the selected synchronous frontier and return the waiter outcome.
+The caller must keep interrupts masked through later committed cleanup and
+must not hold the WAL mutex. A source change is not success. On nonlocal exit,
+unlink the waiter without poisoning WAL. A timed-out wait leaves the sender
+mutex unowned; reacquire it with interrupts masked before inspecting the waiter
+again."
   (assert (not sb-sys:*interrupts-enabled*))
   (sb-sys:without-interrupts
     (let ((waiter nil))
