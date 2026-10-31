@@ -405,14 +405,22 @@ Child images may include history files no newer than their selected timeline."
   (if (member (getf manifest :version) '(2 3)) (getf manifest :checkpoint-start)
       (- (getf manifest :checkpoint) +wal-header-size+)))
 
+(defun recovery-manifest-keys-valid-p (manifest)
+  (let* ((version (getf manifest :version))
+         (keys (loop for (key value) on manifest by #'cddr collect key))
+         (legacy (if (member version '(2 3))
+                     '(:version :system-id :cluster-identity :timeline :checkpoint
+                       :checkpoint-start :end :next-xid :source-pin :files)
+                     '(:version :system-id :cluster-identity :timeline :checkpoint
+                       :end :next-xid :source-pin :files))))
+    (or (equal keys legacy)
+        (and (eql version 3) (eql 1 (getf manifest :auth-policy-required))
+             (equal keys (append legacy '(:auth-policy-required)))))))
+
 (defun recovery-check-manifest-schema (manifest)
   (unless (and (listp manifest) (member (getf manifest :version) '(1 2 3))
-               (equal (loop for (key value) on manifest by #'cddr collect key)
-                      (if (member (getf manifest :version) '(2 3))
-                          '(:version :system-id :cluster-identity :timeline :checkpoint
-                            :checkpoint-start :end :next-xid :source-pin :files)
-                          '(:version :system-id :cluster-identity :timeline :checkpoint
-                            :end :next-xid :source-pin :files))) (typep (getf manifest :timeline) '(integer 1 4294967295))
+               (recovery-manifest-keys-valid-p manifest)
+               (typep (getf manifest :timeline) '(integer 1 4294967295))
                (or (eql 3 (getf manifest :version)) (eql 1 (getf manifest :timeline)))
                (typep (getf manifest :system-id) '(unsigned-byte 64))
                (stringp (getf manifest :cluster-identity))

@@ -26,6 +26,7 @@
                (:file "t/retained-project-tests")
                (:file "t/physical-bootstrap-tests")
                (:file "t/physical-recovery-tests")
+               (:file "t/auth-backup-tests")
                (:file "t/physical-control-tests")
                (:file "t/selected-recovery-tests")
                (:file "t/child-bootstrap-tests")

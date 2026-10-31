@@ -219,44 +219,46 @@ Check checkpoint resource facts against control before creating the source pin."
   (when (or (not (active-xids-empty-p)) *xid-wrap-pending*
             (probe-file (xid-wrap-marker-path)))
     (error "physical base backup requires no active transaction IDs or pending XID wrap"))
-  (wal-checkpoint-core)
-  (physical-recovery-check-checkpoint-resources *wal-checkpoint-snapshot* *wal-control-metadata*)
-  (let ((pin (physical-source-pin-create pin-name)))
-    ;; Failure after here intentionally retains the durable source pin. The
-    ;; operator must inspect the failed target and explicitly release the pin.
-    (physical-bootstrap-mark-target target)
-    (physical-recovery-mark-target target)
-    (wal-ensure-directory-durable (merge-pathnames "base/" target))
-    (physical-bootstrap-test-point :after-checkpoint target)
-    (let* ((checkpoint *wal-checkpoint-lsn*)
-           (end *wal-durable-lsn*)
-           (system-id (catalog-system-identifier))
-           (last-segment (and (plusp end) (concatenate 'string "pg_wal/"
-                                                       (file-namestring (wal-segment-path
-                                                                         (floor (1- end) +wal-segment-size+))))))
-           (files (mapcar (lambda (relative)
-                            (physical-bootstrap-copy-file
-                             relative target
-                             :limit (when (equal relative last-segment)
-                                      (1+ (mod (1- end) +wal-segment-size+)))))
-                          (physical-bootstrap-inventory)))
-           (manifest (list :version 3 :system-id system-id
-                           :cluster-identity (catalog-cluster-identity *catalog*) :timeline *wal-insert-timeline*
-                           :checkpoint checkpoint :checkpoint-start (wal-checkpoint-record-start checkpoint)
-                           :end end :next-xid *next-xid*
-                           :source-pin (physical-source-pin-name pin) :files files)))
-      (physical-bootstrap-test-point :before-manifest target)
-      (let* ((*print-readably* t)
-             (text (physical-bootstrap-manifest-text manifest))
-             (bytes (string->bytes text))
-             (crc (wal-crc32 bytes))
-             (image (string->bytes (format nil "PGPHYSICALBACKUP1 ~8,'0X~%~a~%" crc text))))
-        (physical-source-pin-bind-manifest pin (physical-store-update-digest #xCBF29CE484222325 image))
-        (physical-bootstrap-test-point :after-pin-binding target)
-        (wal-atomic-write-bytes (merge-pathnames "physical-backup.manifest" target) image))
-      (fsync-directory target)
-      (physical-bootstrap-test-point :after-manifest target)
-      manifest)))
+  (let ((policy (authentication-capture-policy)))
+    (wal-checkpoint-core)
+    (physical-recovery-check-checkpoint-resources *wal-checkpoint-snapshot* *wal-control-metadata*)
+    (let ((pin (physical-source-pin-create pin-name)))
+      ;; Failure after here intentionally retains the durable source pin. The
+      ;; operator must inspect the failed target and explicitly release the pin.
+      (physical-bootstrap-mark-target target)
+      (physical-recovery-mark-target target)
+      (wal-ensure-directory-durable (merge-pathnames "base/" target))
+      (authentication-write-backup-policy policy target)
+      (physical-bootstrap-test-point :after-checkpoint target)
+      (let* ((checkpoint *wal-checkpoint-lsn*)
+             (end *wal-durable-lsn*)
+             (system-id (catalog-system-identifier))
+             (last-segment (and (plusp end) (concatenate 'string "pg_wal/"
+                                                         (file-namestring (wal-segment-path
+                                                                           (floor (1- end) +wal-segment-size+))))))
+             (files (mapcar (lambda (relative)
+                              (physical-bootstrap-copy-file
+                               relative target
+                               :limit (when (equal relative last-segment)
+                                        (1+ (mod (1- end) +wal-segment-size+)))))
+                            (physical-bootstrap-inventory)))
+             (manifest (list :version 3 :system-id system-id
+                             :cluster-identity (catalog-cluster-identity *catalog*) :timeline *wal-insert-timeline*
+                             :checkpoint checkpoint :checkpoint-start (wal-checkpoint-record-start checkpoint)
+                             :end end :next-xid *next-xid*
+                             :source-pin (physical-source-pin-name pin) :files files :auth-policy-required 1)))
+        (physical-bootstrap-test-point :before-manifest target)
+        (let* ((*print-readably* t)
+               (text (physical-bootstrap-manifest-text manifest))
+               (bytes (string->bytes text))
+               (crc (wal-crc32 bytes))
+               (image (string->bytes (format nil "PGPHYSICALBACKUP1 ~8,'0X~%~a~%" crc text))))
+          (physical-source-pin-bind-manifest pin (physical-store-update-digest #xCBF29CE484222325 image))
+          (physical-bootstrap-test-point :after-pin-binding target)
+          (wal-atomic-write-bytes (merge-pathnames "physical-backup.manifest" target) image))
+        (fsync-directory target)
+        (physical-bootstrap-test-point :after-manifest target)
+        manifest))))
 
 (defun physical-base-backup (directory pin-name)
   "Create a recovery-required native base image while SQL mutations are quiescent.
