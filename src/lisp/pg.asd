@@ -24,7 +24,8 @@
      (:module "libpq"
       :serial t
       :components ((:file "pqcomm")
-                   (:file "pqformat")))
+                   (:file "pqformat")
+                   (:file "hba")))
      (:module "storage"
       :serial t
       :components ((:file "bufpage")

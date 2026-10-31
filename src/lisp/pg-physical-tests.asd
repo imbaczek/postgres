@@ -6,6 +6,7 @@
                (:file "t/physical-store-tests")
                (:file "t/physical-pid-tests")
                (:file "t/physical-config-tests")
+               (:file "t/hba-tests")
                (:file "t/backend-admission-tests")
                (:file "t/hot-standby-tests")
                (:file "t/recovery-timeline-config-tests")
