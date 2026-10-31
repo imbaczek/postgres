@@ -715,7 +715,7 @@
         (load-count 0)
         (threads '())
         (original-load-system (symbol-function 'asdf:load-system)))
-    (setf *reload-requested* nil
+    (setf *reload-requests* 0
           (symbol-function 'asdf:load-system)
           (lambda (system &rest options)
             (declare (ignore system options))
@@ -752,7 +752,7 @@
              (request-reload)
              (start-thread
               (lambda ()
-                (loop until (sb-ext:compare-and-swap *reload-requested* t nil)
+                (loop until (claim-reload-request +reload-request-code+)
                       do (sleep 0.01))
                 (reload)
                 (sb-thread:with-mutex (test-lock)
@@ -775,14 +775,14 @@
                             nested-output))
              (check (= load-count 1)
                     "the SIGHUP coordinator performs one reload")
-             (check *reload-requested*
+             (check (reload-request-p +reload-request-code+)
                     (format nil "the nested reload request remains queued (~s, loads ~d)"
-                            *reload-requested* load-count)))
+                            *reload-requests* load-count)))
         (sb-thread:with-mutex (test-lock)
           (setf allow-control-eval t)
           (sb-thread:condition-broadcast test-cv))
         (setf (symbol-function 'asdf:load-system) original-load-system
-              *reload-requested* nil)
+              *reload-requests* 0)
         (dolist (thread threads)
           (unless (sb-thread:join-thread thread :timeout 2)
             (ignore-errors

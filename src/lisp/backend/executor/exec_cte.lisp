@@ -431,14 +431,28 @@ table.  With no query owner there is no persistent executor to record."
     (loop for owner being the hash-keys of *query-execution-owners*
             thereis (eq thread (query-execution-owner-thread owner)))))
 
-(defun wait-for-query-execution-owner-change (generation)
+(defun wait-for-reload-condition (queue mutex check-cancel)
+  "Return with MUTEX owned, including after an SBCL timed wait releases it.
+The caller's cleanup must also permit cancellation while the mutex is unowned."
+  (when check-cancel (funcall check-cancel))
+  (if check-cancel
+      (unless (sb-thread:condition-wait queue mutex :timeout 0.05)
+        (funcall check-cancel)
+        (sb-sys:without-interrupts
+          (sb-sys:allow-with-interrupts (sb-thread:grab-mutex mutex))))
+      (sb-thread:condition-wait queue mutex))
+  (when check-cancel (funcall check-cancel))
+  (values))
+
+(defun wait-for-query-execution-owner-change (generation &optional check-cancel)
   "Wait after reload admission has reopened, allowing clients to retire owners."
   (when *query-execution-owner-reload-wait-hook*
     (funcall *query-execution-owner-reload-wait-hook* generation))
   (sb-thread:with-mutex (*query-execution-owner-lock*)
     (loop while (and (= generation *query-execution-owner-generation*)
                      (plusp (hash-table-count *query-execution-owners*)))
-          do (sb-thread:condition-wait *query-execution-owner-cv* *query-execution-owner-lock*)))
+          do (wait-for-reload-condition *query-execution-owner-cv* *query-execution-owner-lock*
+                                        check-cancel)))
   (values))
 
 (defun make-query-execution-owner (&key (backend *backend*) bindings)

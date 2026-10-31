@@ -991,11 +991,15 @@ strict runtime boundary."
          (startup-prepare-installation-from-basis candidate native overrides basis nil nil)
          candidate)))))
 
-(defun startup-reload-settings ()
+(defun startup-reload-settings-under-definition-lock ()
+  (check-reload-service-running)
   (multiple-value-bind (candidate settings) (startup-prepare-reload-installation)
     (when candidate
       (startup-commit-installation candidate)
       settings)))
+
+(defun startup-reload-settings ()
+  (call-with-reload-definitions 'startup-reload-settings-under-definition-lock))
 
 (defun startup-format-unit (value kind)
   (if (<= value 0) (princ-to-string value)

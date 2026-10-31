@@ -33,6 +33,24 @@
 ;; concurrently and interleave a half-compiled image.
 (defvar *reload-run-lock* (sb-thread:make-mutex :name "pg reload run lock"))
 
+(defvar *reload-definition-lock* (sb-thread:make-mutex :name "pg reload definitions"))
+
+(defvar *reload-configuration-worker* nil)
+
+(defvar *reload-code-worker* nil)
+
+(defvar *reload-worker-wake* (sb-thread:make-semaphore :count 0))
+
+(defvar *reload-worker-join-timeout* 5)
+
+(defvar *reload-service-failure* nil)
+
+(defun call-with-reload-definitions (function)
+  (if (sb-thread:holding-mutex-p *reload-definition-lock*)
+      (funcall function)
+      (sb-thread:with-mutex (*reload-definition-lock*)
+        (funcall function))))
+
 ;; A reload closes admission to SQL operations and waits for current queries to
 ;; leave before redefining functions used by backend threads.
 (defvar *live-operation-lock*
@@ -84,16 +102,50 @@ statement registrations captured while parked."
 (declaim (ftype function lookup-backend cancel-key-matches-p))
 (declaim (special *backend*))
 
-(defvar *reload-requested* nil)
+(defconstant +reload-request-configuration+ 1)
+
+(defconstant +reload-request-code+ 2)
+
+(defconstant +reload-service-stopped+ 4)
+
+(defvar *reload-requests* 0)
+
+(define-condition reload-service-stopped (error) ())
+
+(defvar *live-operation-drain-cancel-check* nil)
+
+(defun check-reload-service-running ()
+  (when (reload-service-stopped-p) (error 'reload-service-stopped))
+  (values))
+
+(defun reload-service-stopped-p ()
+  (logtest +reload-service-stopped+ *reload-requests*))
+
+(defun reload-request-p (mask)
+  (logtest mask *reload-requests*))
+
+(defun request-reload-bits (mask)
+  (loop for old = *reload-requests*
+        for new = (logior old mask)
+        when (logtest +reload-service-stopped+ old) return nil
+          when (eql old (sb-ext:compare-and-swap *reload-requests* old new))
+            return t))
+
+(defun claim-reload-request (mask)
+  (loop for old = *reload-requests*
+        for new = (logandc2 old mask)
+        unless (and (not (logtest +reload-service-stopped+ old)) (logtest mask old))
+          return nil
+        when (eql old (sb-ext:compare-and-swap *reload-requests* old new))
+          return t))
+
+(defun request-configuration-reload ()
+  (request-reload-bits +reload-request-configuration+))
 
 (defun request-reload (&rest signal-info)
-  "Record a reload request and return immediately.
-
-Signal handlers run in whichever thread the OS delivered the signal to, so
-this must not take a lock (the signal may land in the reloader itself). ASDF
-must not run inside a handler either; the reloader thread polls the flag."
+  "Record configuration and code requests without taking a lock."
   (declare (ignore signal-info))
-  (setf *reload-requested* t))
+  (request-reload-bits (logior +reload-request-configuration+ +reload-request-code+)))
 
 (defun live-operation-lock-owned-p ()
   (eq (sb-thread:mutex-owner *live-operation-lock*)
@@ -401,8 +453,8 @@ ownership on every exit."
   ;; but an idle transaction must not hold reload open while waiting for its
   ;; client to send another query.
   (loop while (plusp *live-operation-count*)
-        do (sb-thread:condition-wait *live-operation-cv*
-                                     *live-operation-lock*))
+        do (wait-for-reload-condition *live-operation-cv* *live-operation-lock*
+                                      *live-operation-drain-cancel-check*))
   ;; Close the drain lane atomically with observing an empty operation set.
   ;; Otherwise new drain work could overlap ASDF's function redefinitions.
   (setf *live-operation-drain-open* nil)
@@ -523,8 +575,8 @@ The primary finalizer separately holds reload exclusion."
              do (when (eq *live-operation-quiescence-owner-thread*
                           sb-thread:*current-thread*)
                   (error "nested live-operation quiescence is not allowed"))
-                (sb-thread:condition-wait *live-operation-cv*
-                                          *live-operation-lock*))
+                (wait-for-reload-condition *live-operation-cv* *live-operation-lock*
+                                           *live-operation-drain-cancel-check*))
        ;; Transaction-state setters and operation counters use this lock. Capture
        ;; both open transactions and sessions already executing admitted work.
        (multiple-value-bind (drain-backends cleanup-backends)
@@ -740,53 +792,171 @@ resume or close a portal that retains executable state."
             (query-execution-owner-thread-retains-state-p))
     (error "reload exclusion requires an outside caller"))
   (loop
+    (when *live-operation-drain-cancel-check*
+      (funcall *live-operation-drain-cancel-check*))
     (multiple-value-bind (finished values generation owner-generation)
         (try-call-with-live-operation-reload function)
       (when finished (return (values-list values)))
       (if owner-generation
-          (wait-for-query-execution-owner-change owner-generation)
+          (wait-for-query-execution-owner-change owner-generation
+                                                 *live-operation-drain-cancel-check*)
           (call-with-live-operation-lock
            (lambda ()
              (loop while (and (= generation *live-operation-park-generation*)
                               (plusp (hash-table-count *live-operation-parked*)))
-                   do (sb-thread:condition-wait *live-operation-cv*
-                                                *live-operation-lock*))))))))
+                   do (wait-for-reload-condition *live-operation-cv* *live-operation-lock*
+                                                 *live-operation-drain-cancel-check*))))))))
+
+(defun configuration-reload-attempt-under-definition-lock ()
+  (startup-reload-settings-under-definition-lock)
+  t)
+
+(defun configuration-reload-step ()
+  (loop
+    (handler-case
+        (return (call-with-reload-definitions 'configuration-reload-attempt-under-definition-lock))
+      ((or startup-configuration-changed physical-follow-generation-changed) ()
+        (when (reload-service-stopped-p) (return nil))
+        (sleep 0.01))
+      (reload-service-stopped () (return nil))
+      (error (condition)
+        (admin-log "configuration reload failed: ~a" condition)
+        (return nil)))))
+
+(defun reload-code-under-definition-lock ()
+  (check-reload-service-running)
+  (let ((*standard-output* (or *server-output* *standard-output*))
+        (*error-output* (or *server-error* *error-output*))
+        (*compile-verbose* nil) (*load-verbose* nil))
+    (asdf:load-system "pg" :force t)
+    (startup-reload-settings-under-definition-lock)
+    t))
+
+(defun execute-code-reload ()
+  (when (reload-service-stopped-p) (return-from execute-code-reload nil))
+  (format t "~&pg-lisp: reloading code...~%")
+  (finish-output)
+  (let ((ok
+          (handler-case
+              (let ((*live-operation-drain-cancel-check* #'check-reload-service-running))
+                (call-with-live-operation-reload
+                 (lambda ()
+                   (call-with-reload-definitions 'reload-code-under-definition-lock))))
+            ((or startup-configuration-changed physical-follow-generation-changed) ()
+              (configuration-reload-step))
+            (reload-service-stopped () nil)
+            (error (condition)
+              (format *error-output* "~&pg-lisp: reload failed: ~a~%" condition)
+              (finish-output *error-output*)
+              nil))))
+    (format t "~&pg-lisp: reload ~:[failed (see server log)~;complete~]~%" ok)
+    (finish-output)
+    ok))
 
 (defun reload ()
   (when (or (plusp *live-operation-depth*) *live-operation-parked-p*
             (query-execution-owner-thread-retains-state-p))
     (request-reload)
     (return-from reload :queued))
-  (format t "~&pg-lisp: reloading code...~%")
-  (finish-output)
-  (let ((ok
-          (call-with-live-operation-reload
-           (lambda ()
-             (handler-case
-                 (let ((*standard-output* (or *server-output* *standard-output*))
-                       (*error-output* (or *server-error* *error-output*))
-                       (*compile-verbose* nil) (*load-verbose* nil))
-                   (asdf:load-system "pg" :force t)
-                   (startup-reload-settings)
-                   t)
-               (error (condition)
-                 (format *error-output* "~&pg-lisp: reload failed: ~a~%" condition)
-                 (finish-output *error-output*)
-                 nil))))))
-    (format t "~&pg-lisp: reload ~:[failed (see server log)~;complete~]~%" ok)
-    (finish-output)
-    ok))
+  (request-configuration-reload)
+  (if (reload-service-stopped-p) nil (execute-code-reload)))
+
+(defun publish-reload-service-stop ()
+  (unless (sb-thread:holding-mutex-p *reload-definition-lock*)
+    (error "reload stop publication requires definition exclusion"))
+  (call-with-physical-follow-generation-publication
+   (lambda () (setf *reload-requests* +reload-service-stopped+))
+   (constantly nil)))
+
+(defun fail-reload-service (condition)
+  (sb-sys:without-interrupts
+    (sb-ext:compare-and-swap *reload-service-failure* nil condition)
+    (call-with-reload-definitions 'publish-reload-service-stop)
+    (dotimes (index 2) (sb-thread:signal-semaphore *reload-worker-wake*)))
+  (values))
+
+(defun reload-worker-loop (kind ready)
+  (let ((normal nil) (failure nil))
+    (sb-sys:without-interrupts
+      (unwind-protect
+           (sb-sys:allow-with-interrupts
+             (sb-sys:with-local-interrupts
+               (handler-case
+                   (progn
+                     (when ready (sb-thread:wait-on-semaphore ready))
+                     (let ((mask (ecase kind
+                                   (:configuration +reload-request-configuration+)
+                                   (:code +reload-request-code+))))
+                       (loop until (reload-service-stopped-p)
+                             do (if (claim-reload-request mask)
+                                    (ecase kind
+                                      (:configuration (configuration-reload-step))
+                                      (:code (execute-code-reload)))
+                                    (sb-thread:wait-on-semaphore *reload-worker-wake* :timeout 0.05))))
+                     (setf normal t))
+                 (error (condition) (setf failure condition))
+                 (sb-ext:timeout (condition) (setf failure condition)))))
+        (unless normal (fail-reload-service (or failure :abnormal-exit))))))
+  (values))
 
 (defun reload-loop ()
-  (loop
-    (if (sb-ext:compare-and-swap *reload-requested* t nil)
-        (reload)
-        (sleep 0.05))))
+  (reload-worker-loop :code nil))
+
+(defun start-reload-workers ()
+  (call-with-reload-definitions
+   (lambda ()
+     (check-reload-service-running)
+     (when (or *reload-configuration-worker* *reload-code-worker*)
+       (unless (and *reload-configuration-worker* *reload-code-worker*
+                    (sb-thread:thread-alive-p *reload-configuration-worker*)
+                    (sb-thread:thread-alive-p *reload-code-worker*))
+         (error "reload service has an incomplete worker set"))
+       (return-from start-reload-workers (values)))
+     (let ((ready (sb-thread:make-semaphore :count 0)) (published nil))
+       (sb-sys:without-interrupts
+         (unwind-protect
+              (progn
+                (setf *reload-configuration-worker*
+                      (sb-thread:make-thread
+                       (lambda () (reload-worker-loop :configuration ready))
+                       :name "pg configuration reloader"))
+                (setf *reload-code-worker*
+                      (sb-thread:make-thread
+                       (lambda () (reload-worker-loop :code ready))
+                       :name "pg code reloader"))
+                (setf published t))
+           ;; Definition exclusion is held and both children are still gated.
+           (unless published (setf *reload-requests* +reload-service-stopped+))
+           (dotimes (index 2) (sb-thread:signal-semaphore ready)))))))
+  (values))
+
+(defun stop-reload-workers ()
+  (when (or (plusp *live-operation-depth*)
+            (sb-thread:holding-mutex-p *reload-definition-lock*)
+            (sb-thread:holding-mutex-p *reload-run-lock*)
+            (sb-thread:holding-mutex-p *live-operation-lock*))
+    (error "reload service stop requires an outside caller"))
+  (let ((threads nil))
+    (sb-sys:without-interrupts
+      (call-with-reload-definitions
+       (lambda ()
+         (setf threads (remove nil (list *reload-configuration-worker* *reload-code-worker*)))
+         (when (member sb-thread:*current-thread* threads :test #'eq)
+           (error "reload workers cannot join themselves"))
+         (publish-reload-service-stop)))
+      (dotimes (index 2) (sb-thread:signal-semaphore *reload-worker-wake*))
+      (dolist (thread threads)
+        (sb-sys:allow-with-interrupts
+          (sb-sys:with-local-interrupts
+            (sb-thread:join-thread thread :timeout *reload-worker-join-timeout* :default :timed-out)))
+        (when (sb-thread:thread-alive-p thread)
+          (error "reload worker failed to stop before storage finalization")))))
+  (values))
 
 (defun enable-reload ()
-  "Install the SIGHUP handler and start the reloader thread."
+  "Install the SIGHUP handler and start one configuration and code worker."
+  (start-reload-workers)
   (sb-sys:enable-interrupt sb-unix:sighup #'request-reload)
-  (sb-thread:make-thread #'reload-loop :name "pg reloader")
   (values))
 
 ;;; ---- control REPL ----

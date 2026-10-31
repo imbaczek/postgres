@@ -107,7 +107,10 @@
       (ok (not pg::*shutdown-finished*))))
 
 (deftest postmaster-finalization-prepares-recovery-before-finished
-    (let ((pg::*physical-follow-controller-blocked-p* nil)
+    (let ((pg::*reload-requests* 0)
+          (pg::*reload-configuration-worker* nil) (pg::*reload-code-worker* nil)
+          (pg::*reload-worker-wake* (sb-thread:make-semaphore :count 0))
+          (pg::*physical-follow-controller-blocked-p* nil)
           (pg::*physical-follow-controller-stopping-p* nil)
           (pg::*physical-follow-controller-block-owner* nil)
           (pg::*shutdown-finalizing-p* t)
@@ -121,6 +124,7 @@
              (setf (symbol-function 'pg::physical-recovery-prepare-shutdown)
                    (lambda ()
                      (ok (zerop pg::*live-operation-depth*))
+                     (ok (pg::reload-service-stopped-p))
                      (ok (not pg::*shutdown-finished*))
                      (incf calls)))
              (pg::prepare-postmaster-shutdown)
@@ -131,7 +135,10 @@
         (setf (symbol-function 'pg::physical-recovery-prepare-shutdown) original))))
 
 (deftest postmaster-finalization-failure-never-reports-finished
-    (let ((pg::*physical-follow-controller-blocked-p* nil)
+    (let ((pg::*reload-requests* 0)
+          (pg::*reload-configuration-worker* nil) (pg::*reload-code-worker* nil)
+          (pg::*reload-worker-wake* (sb-thread:make-semaphore :count 0))
+          (pg::*physical-follow-controller-blocked-p* nil)
           (pg::*physical-follow-controller-stopping-p* nil)
           (pg::*physical-follow-controller-block-owner* nil)
           (pg::*shutdown-finalizing-p* t)

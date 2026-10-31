@@ -123,7 +123,7 @@
         (sb-thread:join-thread worker :timeout 5))))
 
 (rove:deftest query-owner-self-reload-queues-without-waiting
-    (let ((owner (make-query-execution-owner)) (*reload-requested* nil) (ran nil))
+    (let ((owner (make-query-execution-owner)) (*reload-requests* 0) (ran nil))
       (unwind-protect
            (progn
              (rove:ok
@@ -134,7 +134,8 @@
                 (error () t)))
              (rove:ok (not ran))
              (rove:ok (eq :queued (reload)))
-             (rove:ok *reload-requested*))
+             (rove:ok (reload-request-p +reload-request-code+))
+             (rove:ok (reload-request-p +reload-request-configuration+)))
         (close-query-execution-owner owner))))
 
 (rove:deftest query-owner-close-inside-callback-does-not-save-state
