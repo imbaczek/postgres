@@ -119,8 +119,19 @@ CancelRequest, before the rest of that packet is read."
     ((string= value "database") :database)
     (t
      (handler-case
-         (when (sql-cast-boolean-input value) :physical)
-       (pg-error () (ereport-fatal "22023" "invalid replication startup value: ~s" value))))))
+         (when (startup-parse-boolean-setting value) :physical)
+       (error ()
+         (ereport-fatal "22023" "invalid value for parameter \"replication\": \"~a\"" value
+                        :hint "Valid values are: \"false\", 0, \"true\", 1, \"database\"."))))))
+
+(defun startup-replication-parameters-mode (params)
+  (let ((enabled nil) (database-p nil))
+    (dolist (pair params)
+      (when (string= "replication" (car pair))
+        (let ((mode (startup-replication-mode (cdr pair))))
+          (setf enabled (not (null mode)))
+          (when (eq mode :database) (setf database-p t)))))
+    (when enabled (if database-p :database :physical))))
 
 (defvar *hot-standby-reported-backends* (make-hash-table :test #'eq :weakness :key))
 
@@ -143,7 +154,7 @@ Like C ReportChangedGUCOptions, recovery can only change from on to off."
     (when report (send-parameter-status stream "in_hot_standby" (if standby "on" "off")))))
 
 (defun process-startup (stream body)
-  "Parse startup mode, reject disabled hot standby, then reserve its quota.
+  "Parse startup mode, check availability and authenticate before reserving quota.
 When hot_standby is off, reject every startup mode during recovery before authentication."
   (with-live-operation
     (let* ((code (bytes-to-u32 body 0))
@@ -157,49 +168,49 @@ When hot_standby is off, reject every startup mode during recovery before authen
       (unless (conns-allowed-p)
         (ereport-fatal "57P03" "the database system is shutting down"))
       (let* ((params (parse-startup-params body))
-             (replication
-               (cdr (assoc "replication" params :test #'string=)))
-             (app (or (cdr (assoc "application_name" params :test #'string=))
-                      ""))
-             (dbname (or (cdr (assoc "database" params :test #'string=))
-                         "postgres")))
-        (setf (backend-database *backend*) dbname)
-        (setf (backend-application-name *backend*) app)
-        (setf (backend-replication-mode *backend*) (startup-replication-mode replication))
-        (when (and (recovery-in-progress-p) (not *enable-hot-standby*))
-          (ereport-fatal "57P03" "the database system is not accepting connections"
-                         :detail "Hot standby mode is disabled."))
-        (postmaster-admit-startup-backend *backend*)
-        (send-auth-ok stream)
-        (session-apply-startup-options params)
-        (with-catalog-lock
-          (unless (or (eq (backend-replication-mode *backend*) :physical)
-                      (gethash dbname (catalog-databases *catalog*)))
-            (when (recovery-in-progress-p)
-              (ereport-fatal "3D000" "database ~s does not exist" dbname))
-            (get-database dbname)
-            (save-catalog)))
-        (send-parameter-status stream "server_version" *server-version*)
-        (session-report-parameter stream "search_path" (session-search-path))
-        (send-parameter-status stream "server_version_num"
-                               (princ-to-string *server-version-num*))
-        (send-parameter-status stream "server_encoding" "UTF8")
-        (send-parameter-status stream "client_encoding" "UTF8")
-        (session-report-parameter stream "DateStyle" (session-extra-setting-value "datestyle"))
-        (session-report-parameter stream "TimeZone"
-                                  (or (gethash "timezone" (backend-settings *backend*)) "UTC"))
-        (send-parameter-status stream "integer_datetimes" "on")
-        (send-parameter-status stream "standard_conforming_strings" "on")
-        (send-parameter-status stream "IntervalStyle" "postgres")
-        (send-parameter-status stream "is_superuser" "on")
-        (send-parameter-status stream "session_authorization" "postgres")
-        (session-report-parameter stream "application_name" (sql-setting-value "application_name"))
-        (send-parameter-status stream "default_transaction_read_only" "off")
-        (report-hot-standby-status stream t)
-        (let ((key (random-cancel-key)))
-          (setf (backend-cancel-key *backend*) key)
-          (send-backend-key-data stream (backend-pid *backend*) key))
-        (send-ready-for-query stream #\I)))))
+             (replication (startup-replication-parameters-mode params))
+             (app (or (startup-last-parameter params "application_name") "")))
+        (multiple-value-bind (user dbname) (authentication-startup-identities params replication)
+          (setf (backend-database *backend*) dbname)
+          (setf (backend-application-name *backend*) app)
+          (setf (backend-replication-mode *backend*) replication)
+          (when (and (recovery-in-progress-p) (not *enable-hot-standby*))
+            (ereport-fatal "57P03" "the database system is not accepting connections"
+                           :detail "Hot standby mode is disabled."))
+          (authentication-authorize *authentication-policy* user dbname
+                                    (sb-bsd-sockets:socket-peername (backend-socket *backend*))
+                                    replication)
+          (postmaster-admit-startup-backend *backend*)
+          (send-auth-ok stream)
+          (session-apply-startup-options params)
+          (with-catalog-lock
+            (unless (or (eq (backend-replication-mode *backend*) :physical)
+                        (gethash dbname (catalog-databases *catalog*)))
+              (when (recovery-in-progress-p)
+                (ereport-fatal "3D000" "database ~s does not exist" dbname))
+              (get-database dbname)
+              (save-catalog)))
+          (send-parameter-status stream "server_version" *server-version*)
+          (session-report-parameter stream "search_path" (session-search-path))
+          (send-parameter-status stream "server_version_num"
+                                 (princ-to-string *server-version-num*))
+          (send-parameter-status stream "server_encoding" "UTF8")
+          (send-parameter-status stream "client_encoding" "UTF8")
+          (session-report-parameter stream "DateStyle" (session-extra-setting-value "datestyle"))
+          (session-report-parameter stream "TimeZone"
+                                    (or (gethash "timezone" (backend-settings *backend*)) "UTC"))
+          (send-parameter-status stream "integer_datetimes" "on")
+          (send-parameter-status stream "standard_conforming_strings" "on")
+          (send-parameter-status stream "IntervalStyle" "postgres")
+          (send-parameter-status stream "is_superuser" "on")
+          (send-parameter-status stream "session_authorization" "postgres")
+          (session-report-parameter stream "application_name" (sql-setting-value "application_name"))
+          (send-parameter-status stream "default_transaction_read_only" "off")
+          (report-hot-standby-status stream t)
+          (let ((key (random-cancel-key)))
+            (setf (backend-cancel-key *backend*) key)
+            (send-backend-key-data stream (backend-pid *backend*) key))
+          (send-ready-for-query stream #\I))))))
 
 ;;; ---- query dispatch ----
 
@@ -891,10 +902,12 @@ CL's RENAME-FILE merges a relative target with the source's directory."
           *query-temp-file-limit-bytes* temp-file-limit-bytes
           *query-sort-arena-limit-bytes* sort-arena-limit-bytes
           *max-slot-wal-keep-bytes* max-slot-wal-keep-bytes)
+    (authentication-preflight-startup startup-settings)
     (startup-install-settings startup-settings startup-native startup-overrides)
     (startup-install-resource-capacity startup-settings)
     (sb-sys:enable-interrupt sb-unix:sigusr1 #'request-physical-promotion)
     (postmaster-own-data-directory host port)
+    (setf *authentication-policy* (authentication-prepare-startup startup-settings))
     (physical-promotion-initialize-requests)
     (physical-promotion-test-point :after-promotion-request-initialization)
     ;; Reject an unsupported SBCL before pending reconstruction can open storage.

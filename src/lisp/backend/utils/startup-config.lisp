@@ -1,6 +1,10 @@
 ;;;; Startup configuration inputs and typed settings used by the native server.
 (in-package #:pg)
 
+(declaim (special *authentication-policy*))
+
+(declaim (ftype function authentication-read-policy))
+
 (defvar *startup-server-settings* nil)
 
 (defvar *startup-native-inputs* nil)
@@ -25,6 +29,8 @@
   '(("port" :postmaster :integer "5433" 1 65535 nil)
     ("listen_addresses" :postmaster :string "127.0.0.1")
     ("data_directory" :postmaster :string nil)
+    ("hba_file" :postmaster :string nil)
+    ("ident_file" :postmaster :string nil)
     ("cluster_name" :postmaster :string "")
     ("restore_command" :sighup :string "")
     ("primary_conninfo" :sighup :conninfo "")
@@ -243,7 +249,7 @@ Timeline input is validated but its original spelling is retained."
         (:string
          (when (and (string= name "restore_command") (not (equal text "")))
            (error "nonempty restore_command requires unimplemented archive recovery"))
-         (unless (or (string= name "restore_command")
+         (unless (or (member name '("restore_command" "hba_file" "ident_file") :test #'string=)
                      (member name *startup-recovery-target-settings* :test #'string=)
                      (plusp (length text)))
            (error "invalid empty configuration parameter ~a" name))
@@ -305,13 +311,13 @@ Timeline input is validated but its original spelling is retained."
 
 (defun startup-absolute-config-path (path)
   "Canonicalize lexically, like AbsoluteConfigLocation, without following symlinks."
-  (let* ((absolute (merge-pathnames path (uiop:getcwd)))
-         (parts nil))
-    (dolist (part (rest (pathname-directory absolute)))
-      (cond ((or (member part '(:up :back)) (equal part "..")) (pop parts))
-            ((member part '("" ".") :test #'equal))
+  (let ((absolute (namestring (merge-pathnames path (uiop:getcwd))))
+        (parts nil))
+    (dolist (part (uiop:split-string absolute :separator '(#\/)))
+      (cond ((string= part "..") (pop parts))
+            ((member part '("" ".") :test #'string=))
             (t (push part parts))))
-    (make-pathname :directory (cons :absolute (nreverse parts)) :defaults absolute)))
+    (pathname (format nil "/~{~a~^/~}" (nreverse parts)))))
 
 (defun startup-config-value (line position)
   "Parse a Latin-1 byte view into literal octets, without the Lisp reader.
@@ -374,7 +380,7 @@ as in a C string. Do not reencode the byte view as UTF-8."
 (defun startup-include-path (value parent)
   (merge-pathnames (startup-input-text value) (uiop:pathname-directory-pathname parent)))
 
-(defun startup-open-config (path)
+(defun startup-open-config (path &optional (maximum (* 16 1024 1024)))
   "Open a bounded regular config file as a Latin-1 byte view.
 Follow symlinks, but reject special files without blocking the reload gate."
   (let* ((fd (sb-posix:open (namestring path)
@@ -383,8 +389,8 @@ Follow symlinks, but reject special files without blocking the reload gate."
     (unwind-protect
          (let ((stat (sb-posix:fstat fd)))
            (unless (and (sb-posix:s-isreg (sb-posix:stat-mode stat))
-                        (<= (sb-posix:stat-size stat) (* 16 1024 1024)))
-             (error "configuration input must be a regular file of at most 16 MiB"))
+                        (<= 0 (sb-posix:stat-size stat) maximum))
+             (error "configuration input must be a regular file of at most ~d bytes" maximum))
            (prog1 (sb-sys:make-fd-stream fd :input t :element-type 'character
                                             :external-format :latin-1 :auto-close t)
              (setf success t)))
@@ -501,8 +507,9 @@ A reload may record a different desired value, but does not change this goal."
   (let ((settings (make-hash-table :test #'equal)))
     (dolist (spec *startup-setting-specs*)
       (setf (gethash (first spec) settings)
-            (list :value (if (string= (first spec) "data_directory")
-                             directory (startup-normalize-setting (first spec) (fourth spec)))
+            (list :value (cond ((string= (first spec) "data_directory") directory)
+                               ((member (first spec) '("hba_file" "ident_file") :test #'string=) nil)
+                               (t (startup-normalize-setting (first spec) (fourth spec))))
                   :source :default)))
     settings))
 
@@ -522,11 +529,28 @@ Return SETTINGS after validation."
       (error "nonempty ~a requires unimplemented targeted recovery" name)))
   settings)
 
+(defun startup-resolve-auth-files (settings directory)
+  (dolist (pair '(("hba_file" . "pg_hba.conf") ("ident_file" . "pg_ident.conf")))
+    (let* ((name (car pair))
+           (value (startup-setting-value settings name)))
+      (unless (or value directory)
+        (error "~a requires an explicit path or a configuration directory" name))
+      (setf (gethash name settings)
+            (list :value (namestring
+                          (startup-absolute-config-path
+                           (if value value (merge-pathnames (cdr pair) directory))))
+                  :source :override :implicit-path (null value)))))
+  settings)
+
 (defun startup-load-settings (native overrides &optional reload-directory)
   "Read primary/includes, then auto.conf, then command-line overrides.
 Check feature support after applying all sources, so later overrides take precedence."
   (let* ((directory (namestring (directory-pathname
                                  (or (gethash "pgdata" native) (uiop:getenv "PGDATA") "./pgdata"))))
+         (configuration-directory
+           (when (or (gethash "pgdata" native) (uiop:getenv "PGDATA")
+                     (not (gethash "config_file" native)))
+             directory))
          (explicit (gethash "config_file" native))
          (path (if explicit (startup-absolute-config-path explicit)
                    (merge-pathnames "postgresql.conf" directory)))
@@ -555,6 +579,7 @@ Check feature support after applying all sources, so later overrides take preced
           (getf (gethash "data_directory" settings) :source) :override)
     (setf (gethash "config_file" settings)
           (list :value (namestring (startup-absolute-config-path path)) :source :override))
+    (startup-resolve-auth-files settings configuration-directory)
     (startup-check-feature-support settings)))
 
 (defun startup-native-limit (native key environment parser fallback)
@@ -645,7 +670,9 @@ these slots."
                   *installed-resource-parameters* parameters)))))
     parameters))
 
-(defun startup-install-settings (settings native overrides)
+(defun startup-install-settings (settings native overrides &optional
+                                                             (policy (when *authentication-policy*
+                                                                       (authentication-read-policy settings))))
   "Validate and install settings, including session quotas before listen.
 Install wal_keep_size in MB on successful reload; postmaster settings such as
 hot_standby retain their active values until restart. Settings and the desired
@@ -659,7 +686,8 @@ on and off; supported native paths have no persistent hint-bit writers."
         (desired (physical-follow-plan-settings settings)))
     (physical-follow-call-with-desired-install desired
                                                (lambda ()
-                                                 (setf *startup-server-settings* settings
+                                                 (setf *authentication-policy* policy
+                                                       *startup-server-settings* settings
                                                        *startup-native-inputs* native *startup-command-overrides* overrides
                                                        *enable-hot-standby* (startup-setting-value settings "hot_standby")
                                                        *wal-level* (if (equal "logical" (startup-setting-value settings "wal_level")) :logical :replica)

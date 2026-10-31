@@ -841,7 +841,7 @@
         (ok (intake-fails-p (lambda () (pg::startup-read-config configuration table))))
         (write-startup-config configuration (format nil "include='postgresql.conf'~%"))
         (ok (intake-fails-p (lambda () (pg::startup-read-config configuration table))))
-        (write-startup-config configuration (format nil "hba_file='must-not-be-ignored'~%"))
+        (write-startup-config configuration (format nil "unsupported_future_setting='must-not-be-ignored'~%"))
         (ok (intake-fails-p (lambda () (pg::startup-read-config configuration table))))
         (write-startup-config configuration (format nil "include_if_exists='missing'~%port=5455~%"))
         (pg::startup-read-config configuration table)

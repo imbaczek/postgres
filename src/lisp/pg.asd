@@ -122,6 +122,7 @@
       :components ((:file "dest")
                    (:file "control")
                    (:file "../utils/startup-config")
+                   (:file "../libpq/auth-policy")
                    (:file "../utils/session-config")
                    (:file "../access/transam/timeline")
                    (:file "../replication/physical-bootstrap")

@@ -265,7 +265,7 @@ The saved settings allow an abort to restore the values in effect at transaction
 
 (defun session-apply-startup-options (params)
   (handler-case
-      (let ((options (cdr (assoc "options" params :test #'string=)))
+      (let ((options (startup-last-parameter params "options"))
             (*session-setting-reports-suppressed-p* t))
         ;; -c options precede additional startup GUC fields, as in postinit.c.
         (dolist (assignment
