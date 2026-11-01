@@ -17,6 +17,7 @@
                (:file "t/rove/vacuum-tests")
                (:file "t/rove/join-tests")
                (:file "t/rove/spill-tests")
+               (:file "t/rove/cleanup-domain-tests")
                (:file "t/rove/concurrency-tests")
                (:file "t/rove/relation-resource-tests")
                (:file "t/rove/resource-parameters-tests")

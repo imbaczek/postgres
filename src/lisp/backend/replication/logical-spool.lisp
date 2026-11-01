@@ -13,13 +13,11 @@
 
 (defun make-logical-spool ()
   "Create an owner whose lifetime is the transaction, not a query scope."
-  (let* ((quota (make-query-temp-quota *query-temp-file-limit-bytes*))
-         (owner (make-query-temp-scope-owner quota)))
-    (setf (query-temp-cleanup-owner-temporary-directory owner) *query-temp-directory*)
-    (%make-logical-spool :owner owner)))
+  (%make-logical-spool :owner (make-private-query-temp-scope-owner *query-temp-file-limit-bytes*)))
 
 (defun call-with-logical-spool-owner (spool function)
   "Rebind the temporary-file machinery to SPOOL's persistent cleanup owner."
+  (enter-query-temp-owner (logical-spool-owner spool))
   (let* ((owner (logical-spool-owner spool))
          (*query-temp-cleanup-owner* owner)
          (*query-temp-file-scope-active-p* t)
@@ -30,21 +28,24 @@
     (unwind-protect (funcall function)
       (setf (query-temp-cleanup-owner-directory owner) *query-temp-scope-directory*))))
 
+(defun logical-spool-write-header (spool size checksum)
+  "Reserve the complete frame before writing its length and checksum."
+  (unless (<= 1 size #xffffffff) (error "invalid logical spool event length"))
+  (let ((path (logical-spool-path spool)) (stream (logical-spool-stream spool)))
+    (query-temp-check-space path (+ 8 size))
+    (query-temp-account-space path (+ 8 size))
+    (dolist (word (list size checksum))
+      (dotimes (shift 4)
+        (write-byte (logand (ash word (* -8 shift)) #xff) stream)))))
+
 (defun logical-spool-write-event (spool event)
   "Write one length- and CRC-framed event, reserving quota before file I/O."
-  (let ((length (length event)) (path (logical-spool-path spool))
-                                (stream (logical-spool-stream spool)))
-    (unless (<= 1 length #xffffffff) (error "invalid logical spool event length"))
-    (query-temp-check-space path (+ 8 length))
-    ;; Reserve before I/O so partial writes stay charged until cleanup.
-    (query-temp-account-space path (+ 8 length))
-    (dolist (word (list length (wal-crc32 event)))
-      (dotimes (shift 4)
-        (write-byte (logand (ash word (* -8 shift)) #xff) stream)))
-    (write-sequence event stream)))
+  (logical-spool-write-header spool (length event) (wal-crc32 event))
+  (write-sequence event (logical-spool-stream spool)))
 
 (defun logical-spool-ensure-file (spool)
   "Move buffered events to a transaction-owned file if needed."
+  (enter-query-temp-owner (logical-spool-owner spool))
   (unless (logical-spool-stream spool)
     (sb-sys:without-interrupts
       (multiple-value-bind (path stream) (open-query-temp-io)
@@ -76,6 +77,7 @@
 (defun logical-spool-append (spool event)
   "Take ownership of a fresh EVENT, spilling once the memory limit is reached.
 The caller must not mutate EVENT after passing it to this function."
+  (enter-query-temp-owner (logical-spool-owner spool))
   (when (or (logical-spool-sealed-p spool) (logical-spool-closed-p spool)
             (logical-spool-failed-p spool))
     (error "logical spool is not writable"))
@@ -102,6 +104,7 @@ The caller must not mutate EVENT after passing it to this function."
 
 (defun logical-spool-append-cursor (spool cursor expected-crc)
   "Copy a validated, rewound event into SPOOL without materializing its bytes."
+  (enter-query-temp-owner (logical-spool-owner spool))
   (when (or (logical-spool-sealed-p spool) (logical-spool-closed-p spool)
             (logical-spool-failed-p spool))
     (error "logical spool is not writable"))
@@ -124,13 +127,8 @@ The caller must not mutate EVENT after passing it to this function."
                 spool
                 (lambda ()
                   (logical-spool-ensure-file spool)
-                  (let ((path (logical-spool-path spool))
-                        (stream (logical-spool-stream spool)))
-                    (query-temp-check-space path (+ 8 size))
-                    (query-temp-account-space path (+ 8 size))
-                    (dolist (word (list size checksum))
-                      (dotimes (shift 4)
-                        (write-byte (logand (ash word (* -8 shift)) #xff) stream)))
+                  (let ((stream (logical-spool-stream spool)))
+                    (logical-spool-write-header spool size checksum)
                     (multiple-value-bind (writer written) (logical-encoding-sink size stream)
                       (loop while (< (logical-cursor-offset cursor) size)
                             do (funcall writer (logical-read-octets cursor
@@ -146,6 +144,7 @@ The caller must not mutate EVENT after passing it to this function."
 
 (defun logical-spool-append-change (spool change remaining &key after-measure)
   "Encode CHANGE into SPOOL without retaining a large encoded event vector."
+  (enter-query-temp-owner (logical-spool-owner spool))
   (when (or (logical-spool-sealed-p spool) (logical-spool-closed-p spool)
             (logical-spool-failed-p spool))
     (error "logical spool is not writable"))
@@ -168,12 +167,8 @@ The caller must not mutate EVENT after passing it to this function."
                   spool
                   (lambda ()
                     (logical-spool-ensure-file spool)
-                    (let ((path (logical-spool-path spool)) (stream (logical-spool-stream spool)))
-                      (query-temp-check-space path (+ 8 size))
-                      (query-temp-account-space path (+ 8 size))
-                      (dolist (word (list size checksum))
-                        (dotimes (shift 4)
-                          (write-byte (logand (ash word (* -8 shift)) #xff) stream)))
+                    (let ((stream (logical-spool-stream spool)))
+                      (logical-spool-write-header spool size checksum)
                       (multiple-value-bind (writer written) (logical-encoding-sink size stream)
                         (logical-encode-change change writer)
                         (multiple-value-bind (actual-size actual-checksum) (funcall written)
@@ -187,6 +182,7 @@ The caller must not mutate EVENT after passing it to this function."
 
 (defun logical-spool-seal (spool)
   "Flush completed events before a caller enters the WAL critical section."
+  (enter-query-temp-owner (logical-spool-owner spool))
   (when (or (logical-spool-closed-p spool) (logical-spool-failed-p spool))
     (error "logical spool cannot be sealed"))
   (unless (logical-spool-sealed-p spool)
@@ -208,6 +204,7 @@ The caller must not mutate EVENT after passing it to this function."
 
 (defun call-with-logical-spool-visit (spool function)
   "Prevent another visitor from changing this spool's shared stream position."
+  (enter-query-temp-owner (logical-spool-owner spool))
   (sb-sys:without-interrupts
     (sb-thread:with-mutex ((logical-spool-visit-lock spool))
       (when (logical-spool-visiting-p spool) (error "logical spool is already being visited"))

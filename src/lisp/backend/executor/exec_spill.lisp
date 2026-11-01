@@ -33,6 +33,7 @@
 (defstruct (query-temp-quota (:constructor make-query-temp-quota (limit)))
   limit
   (used-bytes 0)
+  private-owner
   (file-sizes (make-hash-table :test #'equal))
   (stream-paths (make-hash-table :test #'eq)))
 
@@ -57,11 +58,19 @@ A scope without a backend gets a private quota. Refresh the limit on reuse."
   "Scope ownership of a temporary stream and, when required, its pathname."
   pathname stream delete-p)
 
+(defstruct (query-temp-cleanup-domain
+            (:constructor make-query-temp-cleanup-domain (lock identity)))
+  (lock nil :read-only t)
+  (identity nil :read-only t)
+  owners)
+
+(defvar *query-temp-cleanup-domain* nil)
+
 (defstruct query-temp-cleanup-owner
   "Retain a scope's streams, paths, quota and private directory through cleanup.
 
 Unresolved owners remain reachable for retry by their original thread."
-  thread quota entries directory temporary-directory link state failure-path failure)
+  thread domain domain-link unused-private-p quota entries directory temporary-directory link state failure-path failure)
 
 (defvar *query-temp-cleanup-owner* nil)
 
@@ -72,19 +81,129 @@ Unresolved owners remain reachable for retry by their original thread."
 
 (defun make-query-temp-scope-owner (quota)
   "Create the scope owner and its pending-list link before running the body."
-  (let ((owner (make-query-temp-cleanup-owner
-                :thread sb-thread:*current-thread* :quota quota :state :active)))
-    (setf (query-temp-cleanup-owner-link owner) (list owner))
+  (let* ((owner (make-query-temp-cleanup-owner
+                 :thread sb-thread:*current-thread* :quota quota :state :active))
+         (link (list owner)))
+    (sb-thread:with-mutex (*query-temp-pending-cleanup-lock*)
+      (let ((private (query-temp-quota-private-owner quota)))
+        (when private
+          (when (query-temp-cleanup-owner-domain private)
+            (error "domain temporary quota cannot be shared by another owner"))
+          (setf (query-temp-cleanup-owner-unused-private-p private) nil
+                (query-temp-quota-private-owner quota) nil)))
+      (setf (query-temp-cleanup-owner-link owner) link))
     owner))
+
+(defun check-query-temp-cleanup-domain (domain identity)
+  (unless (and (query-temp-cleanup-domain-p domain)
+               (eq identity (query-temp-cleanup-domain-identity domain))
+               (sb-thread:holding-mutex-p (query-temp-cleanup-domain-lock domain)))
+    (error "temporary cleanup domain identity or lock is invalid"))
+  domain)
+
+(defun call-with-query-temp-cleanup-domain (domain identity function)
+  (check-query-temp-cleanup-domain domain identity)
+  (let ((*query-temp-cleanup-domain* domain))
+    (funcall function)))
+
+(defun check-query-temp-owner-domain (owner)
+  (when owner
+    (let ((domain (query-temp-cleanup-owner-domain owner)))
+      (when domain
+        (unless (and (eq domain *query-temp-cleanup-domain*)
+                     (sb-thread:holding-mutex-p (query-temp-cleanup-domain-lock domain))
+                     (or (eq :resolved (query-temp-cleanup-owner-state owner))
+                         (member owner (query-temp-cleanup-domain-owners domain) :test #'eq)))
+          (error "temporary scope requires its cleanup domain authority")))))
+  (values))
+
+(defun enter-query-temp-owner (owner)
+  (when owner
+    (sb-thread:with-mutex (*query-temp-pending-cleanup-lock*)
+      (check-query-temp-owner-domain owner)
+      (setf (query-temp-cleanup-owner-unused-private-p owner) nil)))
+  (values))
+
+(defun make-private-query-temp-scope-owner (limit)
+  (let* ((quota (make-query-temp-quota limit))
+         (owner (make-query-temp-scope-owner quota)))
+    (sb-thread:with-mutex (*query-temp-pending-cleanup-lock*)
+      (setf (query-temp-quota-private-owner quota) owner
+            (query-temp-cleanup-owner-unused-private-p owner) t
+            (query-temp-cleanup-owner-temporary-directory owner) *query-temp-directory*))
+    owner))
+
+(defun adopt-query-temp-owner-by-domain (owner domain)
+  (unless (and (eq domain *query-temp-cleanup-domain*)
+               (query-temp-cleanup-domain-p domain)
+               (sb-thread:holding-mutex-p (query-temp-cleanup-domain-lock domain)))
+    (error "temporary cleanup adoption requires domain authority"))
+  (let ((link (list owner)))
+    (sb-sys:without-interrupts
+      (sb-thread:with-mutex (*query-temp-pending-cleanup-lock*)
+        (unless (and (query-temp-cleanup-owner-p owner)
+                     (eq (query-temp-cleanup-owner-thread owner) sb-thread:*current-thread*)
+                     (not (eq owner *query-temp-cleanup-owner*))
+                     (eq :active (query-temp-cleanup-owner-state owner))
+                     (query-temp-cleanup-owner-unused-private-p owner)
+                     (eq owner (query-temp-quota-private-owner (query-temp-cleanup-owner-quota owner)))
+                     (null (query-temp-cleanup-owner-domain owner))
+                     (null (query-temp-cleanup-owner-entries owner))
+                     (null (query-temp-cleanup-owner-directory owner)))
+          (error "temporary cleanup adoption needs an unused private owner"))
+        (setf (query-temp-cleanup-owner-domain owner) domain
+              (query-temp-cleanup-owner-domain-link owner) link
+              (query-temp-cleanup-owner-unused-private-p owner) nil
+              (cdr link) (query-temp-cleanup-domain-owners domain)
+              (query-temp-cleanup-domain-owners domain) link))))
+  owner)
+
+(defun query-temp-cleanup-domain-empty-p (domain)
+  (assert (sb-thread:holding-mutex-p (query-temp-cleanup-domain-lock domain)))
+  (null (query-temp-cleanup-domain-owners domain)))
+
+(defun query-temp-owner-retry-authorized-p (owner domain)
+  (if domain
+      (eq domain (query-temp-cleanup-owner-domain owner))
+      (and (null (query-temp-cleanup-owner-domain owner))
+           (eq (query-temp-cleanup-owner-thread owner) sb-thread:*current-thread*))))
+
+(defun claim-query-temp-owner-cleanup (owner &key finish-p)
+  (sb-thread:with-mutex (*query-temp-pending-cleanup-lock*)
+    (check-query-temp-owner-domain owner)
+    (case (query-temp-cleanup-owner-state owner)
+      (:active
+       (when finish-p
+         (when (member owner *query-temp-pending-cleanups* :test #'eq)
+           (error "active temporary owner is already pending cleanup"))
+         (setf (query-temp-cleanup-owner-unused-private-p owner) nil
+               (query-temp-cleanup-owner-state owner) :cleaning
+               (cdr (query-temp-cleanup-owner-link owner)) *query-temp-pending-cleanups*
+               *query-temp-pending-cleanups* (query-temp-cleanup-owner-link owner))
+         t))
+      (:pending
+       (when (query-temp-owner-retry-authorized-p owner (query-temp-cleanup-owner-domain owner))
+         (setf (query-temp-cleanup-owner-state owner) :cleaning)
+         t)))))
+
+(defun retry-query-temp-owner-cleanup (owner)
+  (sb-sys:without-interrupts
+    (sb-sys:with-deadline (:seconds nil :override t)
+      (when (claim-query-temp-owner-cleanup owner)
+        (run-query-temp-owner-cleanup owner))))
+  (values))
 
 (defun call-with-query-temp-owner (owner function &optional (retry-pending-p t))
   "Use an existing scope without cleaning it when FUNCTION returns.
 Restore its directory and shared quota for this thread, retaining the directory
 on exit unless cleanup has resolved the owner."
-  (unless (eq (query-temp-cleanup-owner-thread owner) sb-thread:*current-thread*)
+  (unless (or (query-temp-cleanup-owner-domain owner)
+              (eq (query-temp-cleanup-owner-thread owner) sb-thread:*current-thread*))
     (error "temporary scope belongs to another thread"))
-  (setf (query-temp-quota-limit (query-temp-cleanup-owner-quota owner))
-        *query-temp-file-limit-bytes*)
+  (enter-query-temp-owner owner)
+  (unless (query-temp-cleanup-owner-domain owner)
+    (setf (query-temp-quota-limit (query-temp-cleanup-owner-quota owner))
+          *query-temp-file-limit-bytes*))
   (if (eq owner *query-temp-cleanup-owner*)
       (funcall function)
       (let ((*query-temp-cleanup-owner* owner)
@@ -95,7 +214,8 @@ on exit unless cleanup has resolved the owner."
             (*query-temp-files* nil))
         (unwind-protect
              (progn
-               (when retry-pending-p (retry-pending-query-temp-cleanup))
+               (when retry-pending-p
+                 (retry-pending-query-temp-cleanup (query-temp-cleanup-owner-domain owner)))
                (funcall function))
           (unless (eq (query-temp-cleanup-owner-state owner) :resolved)
             (setf (query-temp-cleanup-owner-directory owner) *query-temp-scope-directory*))))))
@@ -107,7 +227,9 @@ on exit unless cleanup has resolved the owner."
    (lambda ()
      (case (query-temp-cleanup-owner-state owner)
        (:active (finish-query-temp-scope))
-       (:pending (retry-pending-query-temp-cleanup)))))
+       (:pending (retry-query-temp-owner-cleanup owner))))
+   (and (null (query-temp-cleanup-owner-domain owner))
+        (eq :active (query-temp-cleanup-owner-state owner))))
   (values))
 
 (defstruct query-temp-namespace-report
@@ -504,6 +626,7 @@ on exit unless cleanup has resolved the owner."
 
 (defun query-temp-scope-directory ()
   "Return the configured directory or create and publish a private scope directory."
+  (enter-query-temp-owner *query-temp-cleanup-owner*)
   (or *query-temp-scope-directory*
       (if *query-temp-directory*
           (setf *query-temp-scope-directory*
@@ -525,6 +648,7 @@ on exit unless cleanup has resolved the owner."
   (delete-file pathname))
 
 (defun forget-query-temp-file-space (pathname)
+  (check-query-temp-owner-domain *query-temp-cleanup-owner*)
   (when *query-temp-quota*
     (let* ((quota *query-temp-quota*)
            (size (gethash pathname (query-temp-quota-file-sizes quota) 0)))
@@ -548,6 +672,7 @@ on exit unless cleanup has resolved the owner."
 
 (defun call-with-query-temp-cleanup (pathname function)
   "Run cleanup and retain or report its failure without replacing the original exit."
+  (check-query-temp-owner-domain *query-temp-cleanup-owner*)
   (labels ((failed (condition)
              (if *query-temp-cleanup-owner*
                  (setf (query-temp-cleanup-owner-failure-path *query-temp-cleanup-owner*) pathname
@@ -603,6 +728,7 @@ on exit unless cleanup has resolved the owner."
   "Make bounded abort-close attempts without a deadline, then discharge if closed.
 
 Use the stream API; unresolved streams remain owned for later cleanup."
+  (check-query-temp-owner-domain *query-temp-cleanup-owner*)
   (when stream
     (sb-sys:without-interrupts
       (sb-sys:with-deadline (:seconds nil :override t)
@@ -631,6 +757,7 @@ Use the stream API; unresolved streams remain owned for later cleanup."
   "Close this owner's streams and check all known streams before deleting PATHNAME.
 
 A foreign pending owner can block deletion; this function does not close it."
+  (check-query-temp-owner-domain *query-temp-cleanup-owner*)
   (when *query-temp-cleanup-owner*
     (dolist (entry (query-temp-cleanup-owner-entries *query-temp-cleanup-owner*))
       (when (equal pathname (query-temp-stream-entry-pathname entry))
@@ -672,6 +799,7 @@ A failed deletion retains ownership unless lstat confirms the file is absent."
 
 Retain unresolved files and their charges.  Do not remove a configured shared
 temporary directory."
+  (check-query-temp-owner-domain *query-temp-cleanup-owner*)
   (sb-sys:without-interrupts
     (sb-sys:with-deadline (:seconds nil :override t)
       (loop repeat 2 do
@@ -713,6 +841,9 @@ temporary directory."
   "Clean OWNER while it remains reachable in the pending list.
 
 The pending lock protects list and state changes, not file I/O."
+  (sb-thread:with-mutex (*query-temp-pending-cleanup-lock*)
+    (check-query-temp-owner-domain owner)
+    (assert (eq :cleaning (query-temp-cleanup-owner-state owner))))
   (let ((*query-temp-cleanup-owner* owner)
         (*query-temp-quota* (query-temp-cleanup-owner-quota owner))
         (*query-temp-scope-directory* (query-temp-cleanup-owner-directory owner))
@@ -729,6 +860,11 @@ The pending lock protects list and state changes, not file I/O."
             (progn
               (setf *query-temp-pending-cleanups*
                     (delete owner *query-temp-pending-cleanups* :test #'eq))
+              (let ((domain (query-temp-cleanup-owner-domain owner)))
+                (when domain
+                  (setf (query-temp-cleanup-domain-owners domain)
+                        (delete owner (query-temp-cleanup-domain-owners domain) :test #'eq)
+                        (cdr (query-temp-cleanup-owner-domain-link owner)) nil)))
               (setf (cdr (query-temp-cleanup-owner-link owner)) nil
                     (query-temp-cleanup-owner-state owner) :resolved)))))
     (when (query-temp-cleanup-owner-failure owner)
@@ -741,42 +877,45 @@ The pending lock protects list and state changes, not file I/O."
   (sb-sys:without-interrupts
     (sb-sys:with-deadline (:seconds nil :override t)
       (let ((owner *query-temp-cleanup-owner*))
-        (setf (query-temp-cleanup-owner-directory owner) *query-temp-scope-directory*)
-        (sb-thread:with-mutex (*query-temp-pending-cleanup-lock*)
-          (setf (query-temp-cleanup-owner-state owner) :cleaning
-                (cdr (query-temp-cleanup-owner-link owner)) *query-temp-pending-cleanups*
-                *query-temp-pending-cleanups* (query-temp-cleanup-owner-link owner)))
-        (run-query-temp-owner-cleanup owner)))))
+        (enter-query-temp-owner owner)
+        (when (claim-query-temp-owner-cleanup owner :finish-p t)
+          (setf (query-temp-cleanup-owner-directory owner) *query-temp-scope-directory*)
+          (run-query-temp-owner-cleanup owner)))))
+  (values))
 
-(defun retry-pending-query-temp-cleanup ()
-  "Retry pending cleanup owned by this thread; leave other owners untouched.
-
-Owners of dead threads remain reachable until process exit."
+(defun retry-pending-query-temp-cleanup (&optional domain)
+  "Retry pending cleanup owned by this thread; leave other owners untouched."
+  (when domain
+    (unless (and (query-temp-cleanup-domain-p domain)
+                 (eq domain *query-temp-cleanup-domain*)
+                 (sb-thread:holding-mutex-p (query-temp-cleanup-domain-lock domain)))
+      (error "temporary cleanup retry requires domain authority")))
   (sb-sys:without-interrupts
     (sb-sys:with-deadline (:seconds nil :override t)
       (let ((owners
               (sb-thread:with-mutex (*query-temp-pending-cleanup-lock*)
                 (loop for owner in *query-temp-pending-cleanups*
-                      when (and (eq (query-temp-cleanup-owner-thread owner) sb-thread:*current-thread*)
-                                (eq (query-temp-cleanup-owner-state owner) :pending))
+                      when (and (query-temp-owner-retry-authorized-p owner domain)
+                                (eq :pending (query-temp-cleanup-owner-state owner)))
                         collect owner))))
         (dolist (owner owners)
-          (when (sb-thread:with-mutex (*query-temp-pending-cleanup-lock*)
-                  (when (eq (query-temp-cleanup-owner-state owner) :pending)
-                    (setf (query-temp-cleanup-owner-state owner) :cleaning)))
-            (run-query-temp-owner-cleanup owner))))))
+          (retry-query-temp-owner-cleanup owner)))))
   (values))
 
 (defun ensure-query-temp-acquisition-ready ()
-  "Require a scope owner and reject new files while this thread has pending cleanup."
-  (when (sb-thread:with-mutex (*query-temp-pending-cleanup-lock*)
-          (some (lambda (owner)
-                  (eq (query-temp-cleanup-owner-thread owner) sb-thread:*current-thread*))
-                *query-temp-pending-cleanups*))
-    (ereport "58030" "previous temporary file cleanup remains incomplete"))
-  (unless (and *query-temp-cleanup-owner*
-               (eq (query-temp-cleanup-owner-state *query-temp-cleanup-owner*) :active))
-    (error "query temporary stream requires an active scope owner")))
+  "Require a scope owner and reject new files while its cleanup remains pending."
+  (let ((owner *query-temp-cleanup-owner*))
+    (unless owner (error "query temporary stream requires an active scope owner"))
+    (enter-query-temp-owner owner)
+    (sb-thread:with-mutex (*query-temp-pending-cleanup-lock*)
+      (unless (eq :active (query-temp-cleanup-owner-state owner))
+        (error "query temporary stream requires an active scope owner"))
+      (when (some (lambda (pending)
+                    (query-temp-owner-retry-authorized-p
+                     pending (query-temp-cleanup-owner-domain owner)))
+                  *query-temp-pending-cleanups*)
+        (ereport "58030" "previous temporary file cleanup remains incomplete"))))
+  (values))
 
 (defun query-temp-pending-cleanup-status (&optional (limit 10))
   "Return pending counts and up to LIMIT paths.
@@ -820,6 +959,7 @@ attempt bounded cleanup without replacing an error, FATAL or nonlocal exit."
              (finish-query-temp-scope))))))
 
 (defun query-temp-file-pathname ()
+  (ensure-query-temp-acquisition-ready)
   (let* ((sequence (next-query-temp-sequence))
          (directory (query-temp-scope-directory))
          (name (format nil "pg-query-~36r-~36r-~36r.tmp"
@@ -913,6 +1053,7 @@ Publish the actual stream under interrupt masking before fallible registration."
   "Close normally on success, or make guarded abort cleanup on abnormal exit.
 
 Normal close errors propagate; a still-open stream remains owned."
+  (check-query-temp-owner-domain *query-temp-cleanup-owner*)
   (when stream
     (if normal-p
         (unwind-protect (close stream) (discharge-query-temp-stream stream))
