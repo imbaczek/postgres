@@ -6,12 +6,16 @@
 
 (defstruct (wal-writer-epoch
             (:constructor make-wal-writer-epoch (incarnation timeline ownership)))
+  "Immutable storage authority captured for a writer cycle.
+A new epoch may be installed during a writer's lifetime."
   (incarnation nil :read-only t)
   (timeline nil :read-only t)
   (ownership nil :read-only t))
 
 (defstruct (primary-wal-writer
             (:constructor %make-primary-wal-writer (generation epoch output error-output)))
+  "Writer lifetime and mutable state, separate from its current storage epoch.
+When both locks are needed, take WAL before the writer state lock."
   (generation 0 :read-only t)
   epoch
   (output nil :read-only t)
@@ -41,6 +45,8 @@
         (primary-wal-writer-stop-p writer))))
 
 (defun wake-primary-wal-writer-under-state-lock (writer)
+  "Coalesce wakeups into one pending signal under the state lock.
+A future loop must consume the signal and clear the pending flag coherently."
   (assert (sb-thread:holding-mutex-p *primary-wal-writer-lock*))
   (unless (primary-wal-writer-wake-pending-p writer)
     (setf (primary-wal-writer-wake-pending-p writer) t)
@@ -56,6 +62,9 @@
   (values))
 
 (defun validate-primary-wal-writer-under-lock (writer epoch)
+  "Check writer and storage authority before a cycle has effects.
+The stop check under the state lock decides whether this cycle may proceed;
+a cycle accepted before a stop request may finish."
   (assert (sb-thread:holding-mutex-p *wal-lock*))
   (sb-thread:with-mutex (*primary-wal-writer-lock*)
     (unless (and (eq writer *primary-wal-writer*)
@@ -77,6 +86,8 @@
   t)
 
 (defun primary-wal-writer-drain-under-lock (writer epoch)
+  "Settle the FIFO and record the captured tail's exact terminal end.
+The caller must fence failures after releasing WAL; this function does not."
   (unless (validate-primary-wal-writer-under-lock writer epoch)
     (return-from primary-wal-writer-drain-under-lock :stop))
   (wal-check-healthy)

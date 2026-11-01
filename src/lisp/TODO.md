@@ -1,5 +1,15 @@
 # Development TODO
 
+- [x] Add the primary WAL writer authority and FIFO drain foundation. No writer
+  loop or startup is enabled. The checkpoint passed 842 unit checks and strict
+  cold compilation. The scoped property ran 100 trials at seed 4007 (digest
+  `fnv1a64-v1:e5f7a51c19219c1c`); it has no Function Spec, and coverage and
+  rejection counts were not measured. Before activation, add the loop and its
+  start, stop and join lifecycle; reject storage adoption while a live or unjoined
+  writer remains; prepare and publish CLOG reset epochs; add pressure control;
+  and review the
+  empty-FIFO WAL flush path. OFF, Patroni and coordination remain open.
+
 - [x] Add the generic transferable temporary cleanup domain foundation. At that
   checkpoint fresh private owners could be adopted before use, but no production
   caller adopted one; WAL integration and later work remained open. The checkpoint
