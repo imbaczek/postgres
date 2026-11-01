@@ -330,11 +330,75 @@ lifecycle quiescence."
 
 (declaim (ftype function clog-require-no-pending-commits))
 
+(declaim (special *query-temp-file-limit-bytes*)
+         (notinline query-temp-cleanup-domain-identity query-temp-cleanup-domain-lock
+                    query-temp-cleanup-owner-domain query-temp-cleanup-owner-state
+                    logical-spool-owner logical-spool-closed-p logical-spool-failed-p))
+
+(defvar *wal-temp-cleanup-domain* nil)
+
+(defun wal-temp-cleanup-domain-under-lock ()
+  (assert (sb-thread:holding-mutex-p *wal-lock*))
+  (let ((domain *wal-temp-cleanup-domain*))
+    (when (and domain (not (eq *wal-lock* (query-temp-cleanup-domain-lock domain))))
+      (wal-invalid-input "temporary cleanup belongs to another WAL lock"))
+    (when (and domain
+               (not (eq *wal-storage-incarnation* (query-temp-cleanup-domain-identity domain))))
+      (unless (query-temp-cleanup-domain-empty-p domain)
+        (wal-invalid-input "temporary cleanup belongs to the previous WAL store"))
+      (setf domain nil))
+    (or domain
+        (setf *wal-temp-cleanup-domain*
+              (make-query-temp-cleanup-domain *wal-lock* *wal-storage-incarnation*)))))
+
+(defun call-with-wal-temp-cleanup-domain (function)
+  (let ((domain (wal-temp-cleanup-domain-under-lock)))
+    (call-with-query-temp-cleanup-domain domain *wal-storage-incarnation* function)))
+
+(defun make-wal-owned-spool ()
+  (call-with-wal-temp-cleanup-domain
+   (lambda ()
+     (let* ((*query-temp-file-limit-bytes* nil)
+            (spool (make-logical-spool)))
+       (adopt-query-temp-owner-by-domain (logical-spool-owner spool) *wal-temp-cleanup-domain*)
+       spool))))
+
+(defun call-with-wal-spool-owner (spool function)
+  (call-with-wal-temp-cleanup-domain
+   (lambda ()
+     (unless (eq *wal-temp-cleanup-domain*
+                 (query-temp-cleanup-owner-domain (logical-spool-owner spool)))
+       (wal-invalid-input "temporary spool does not belong to this WAL store"))
+     (call-with-logical-spool-owner spool function))))
+
+(defun wal-close-owned-spool (spool)
+  (call-with-wal-spool-owner
+   spool
+   (lambda ()
+     (if (logical-spool-closed-p spool)
+         (retry-query-temp-owner-cleanup (logical-spool-owner spool))
+         (close-logical-spool spool))
+     (unless (eq :resolved (query-temp-cleanup-owner-state (logical-spool-owner spool)))
+       (error "WAL temporary spool cleanup failed"))))
+  (values))
+
+(defun wal-retry-pending-temp-cleanup-under-lock ()
+  (call-with-wal-temp-cleanup-domain
+   (lambda () (retry-pending-query-temp-cleanup *wal-temp-cleanup-domain*)))
+  (values))
+
+(defun wal-require-no-temp-cleanup-under-lock ()
+  (let ((domain (wal-temp-cleanup-domain-under-lock)))
+    (unless (query-temp-cleanup-domain-empty-p domain)
+      (wal-invalid-input "temporary cleanup prevents WAL storage replacement")))
+  (values))
+
 (defun wal-replace-storage-incarnation-under-lock ()
   "Rotate local WAL store identity only after pending page and CLOG debt is gone.
 This identity is separate from the source used for remote acknowledgments."
   (assert (sb-thread:holding-mutex-p *wal-lock*))
   (wal-require-no-pending-storage)
+  (wal-require-no-temp-cleanup-under-lock)
   (setf *wal-storage-incarnation* (gensym "WAL-STORE-")))
 
 (defun wal-replace-storage-incarnation ()
@@ -375,12 +439,6 @@ short check alone cannot do so."
 (defvar *wal-recovery-page-spool-enabled* nil)
 
 (defvar *wal-recovery-page-spool* nil)
-
-(declaim (notinline query-temp-cleanup-owner-state))
-
-(declaim (notinline logical-spool-owner))
-
-(declaim (special *query-temp-file-limit-bytes*))
 
 (defvar *wal-recovery-catalog-chunks* '())
 (defvar *wal-recovery-catalog-chunk-count* nil)
@@ -609,10 +667,11 @@ Legacy 16-hex segment names always belong to timeline 1."
 (defun wal-dirty-ensure-spool (store)
   (unless (wal-dirty-store-spool store)
     (sb-sys:without-interrupts
-      (let ((*query-temp-file-limit-bytes* nil))
-        (setf (wal-dirty-store-spool store) (make-logical-spool)))))
+      (setf (wal-dirty-store-spool store) (make-wal-owned-spool))))
   (let ((spool (wal-dirty-store-spool store)))
-    (call-with-logical-spool-owner spool (lambda () (logical-spool-ensure-file spool)))
+    (when (or (logical-spool-closed-p spool) (logical-spool-failed-p spool))
+      (error "dirty page scratch is not writable"))
+    (call-with-wal-spool-owner spool (lambda () (logical-spool-ensure-file spool)))
     spool))
 
 (defun wal-dirty-new-reference (key page)
@@ -620,6 +679,10 @@ Legacy 16-hex segment names always belong to timeline 1."
   (unless (= (length page) +blcksz+)
     (error 'wal-dirty-store-error :cause "invalid dirty page size"))
   (sb-sys:without-interrupts
+    (when (and *wal-dirty-store*
+               (wal-dirty-store-spool *wal-dirty-store*)
+               (logical-spool-closed-p (wal-dirty-store-spool *wal-dirty-store*)))
+      (wal-dirty-close-empty-store))
     (let ((store (or *wal-dirty-store* (setf *wal-dirty-store* (make-wal-dirty-store)))))
       (if (< (wal-dirty-store-resident store) *wal-dirty-resident-limit-pages*)
           (progn
@@ -632,7 +695,7 @@ Legacy 16-hex segment names always belong to timeline 1."
                                (prog1 (wal-dirty-store-next-slot store)
                                  (incf (wal-dirty-store-next-slot store)))))
                      (checksum (wal-dirty-checksum key page)))
-                (call-with-logical-spool-owner
+                (call-with-wal-spool-owner
                  spool
                  (lambda ()
                    (unless free
@@ -657,7 +720,7 @@ Legacy 16-hex segment names always belong to timeline 1."
                 (let* ((store (wal-dirty-reference-store reference))
                        (spool (wal-dirty-store-spool store))
                        (page (make-array +blcksz+ :element-type '(unsigned-byte 8))))
-                  (call-with-logical-spool-owner
+                  (call-with-wal-spool-owner
                    spool
                    (lambda ()
                      (unless (file-position (logical-spool-stream spool)
@@ -722,9 +785,7 @@ Legacy 16-hex segment names always belong to timeline 1."
       (handler-case
           (let ((spool (wal-dirty-store-spool *wal-dirty-store*)))
             (when spool
-              (close-logical-spool spool)
-              (unless (eq :resolved (query-temp-cleanup-owner-state (logical-spool-owner spool)))
-                (error "scratch cleanup failed")))
+              (wal-close-owned-spool spool))
             (setf *wal-dirty-store* nil))
         (error (condition) (error 'wal-dirty-store-error :cause condition)))))
   (values))
@@ -1450,35 +1511,33 @@ the transaction (see SnapBuildCommitTxn and CreateInitDecodingContext)."
 
 (defun wal-close-primary-page-spool (spool)
   "Close SPOOL and require its temporary-file cleanup to finish."
-  (close-logical-spool spool)
-  (unless (eq :resolved (query-temp-cleanup-owner-state (logical-spool-owner spool)))
-    (error "primary WAL page spool cleanup failed"))
-  (values))
+  (wal-close-owned-spool spool))
 
 (defun call-with-wal-primary-page-spool (function)
   "Call FUNCTION with a stack-owned spool and its publication owner.
 Cleanup closes an untransferred spool unless a transaction's terminal attempt has
 begun. Its CLOG reservation then retains the owner even if queue handoff fails."
-  (when (or *wal-pending-page-publication* *wal-pending-page-publication-tail*)
-    (wal-check-page-publication-queue-under-lock)
-    (when (wal-page-publication-resets *wal-pending-page-publication-tail*)
-      (wal-invalid-input "relation reset publication must finish before another publisher")))
-  (let* ((owner (%make-wal-page-publication :incarnation *wal-storage-incarnation*
-                                            :timeline *wal-insert-timeline*))
-         (*wal-page-publication-appender* owner))
-    (unwind-protect
-         (progn
-           (sb-sys:without-interrupts
-             (let ((*query-temp-file-limit-bytes* nil))
-               (setf (wal-page-publication-spool owner) (make-logical-spool))))
-           (funcall function (wal-page-publication-spool owner) owner))
-      (when (and (eq :stack (wal-page-publication-state owner))
-                 (or (null (wal-page-publication-completion owner))
-                     (clog-release-unattempted-publication-under-wal-lock
-                      (wal-page-publication-completion owner) owner)))
-        (when (wal-page-publication-spool owner)
-          (wal-close-primary-page-spool (wal-page-publication-spool owner)))
-        (setf (wal-page-publication-state owner) :released)))))
+  (call-with-wal-temp-cleanup-domain
+   (lambda ()
+     (when (or *wal-pending-page-publication* *wal-pending-page-publication-tail*)
+       (wal-check-page-publication-queue-under-lock)
+       (when (wal-page-publication-resets *wal-pending-page-publication-tail*)
+         (wal-invalid-input "relation reset publication must finish before another publisher")))
+     (let* ((owner (%make-wal-page-publication :incarnation *wal-storage-incarnation*
+                                               :timeline *wal-insert-timeline*))
+            (*wal-page-publication-appender* owner))
+       (unwind-protect
+            (progn
+              (sb-sys:without-interrupts
+                (setf (wal-page-publication-spool owner) (make-wal-owned-spool)))
+              (funcall function (wal-page-publication-spool owner) owner))
+         (when (and (eq :stack (wal-page-publication-state owner))
+                    (or (null (wal-page-publication-completion owner))
+                        (clog-release-unattempted-publication-under-wal-lock
+                         (wal-page-publication-completion owner) owner)))
+           (when (wal-page-publication-spool owner)
+             (wal-close-primary-page-spool (wal-page-publication-spool owner)))
+           (setf (wal-page-publication-state owner) :released)))))))
 
 (defun wal-prepare-page-publication-under-lock (owner xid resets split-p &key (kind :transaction))
   "Seal the spool and prepare empty replacement maps before the terminal record.
@@ -1497,7 +1556,9 @@ Record the current maps and WAL identity while the caller holds *WAL-LOCK*."
                (null (wal-page-publication-next owner))
                (or (null resets) (null *wal-pending-page-publication*)))
     (wal-invalid-input "invalid page publication preparation"))
-  (logical-spool-seal (wal-page-publication-spool owner))
+  (call-with-wal-spool-owner
+   (wal-page-publication-spool owner)
+   (lambda () (logical-spool-seal (wal-page-publication-spool owner))))
   (let ((replacement-pages (make-hash-table :test #'equal))
         (replacement-contributors (make-hash-table :test #'equal)))
     (setf (wal-page-publication-pages owner) *wal-page-cache*
@@ -1669,18 +1730,21 @@ nonlocal exit to an error so the caller can fence failure after unlocking."
 
 (defun wal-primary-map-page-spool (spool function)
   "Validate and visit staged page records in their original order."
-  (logical-spool-map-events
+  (call-with-wal-spool-owner
    spool
-   (lambda (event)
-     (unless (>= (length event) 12) (error "invalid primary WAL page spool record"))
-     (let ((version (wal-u32 event 0)) (lsn (wal-u64 event 4)))
-       (unless (= version +wal-version+) (error "invalid primary WAL page spool version"))
-       (funcall function (wal-decode-page-images (subseq event 12) lsn version)))))
+   (lambda ()
+     (logical-spool-map-events
+      spool
+      (lambda (event)
+        (unless (>= (length event) 12) (error "invalid primary WAL page spool record"))
+        (let ((version (wal-u32 event 0)) (lsn (wal-u64 event 4)))
+          (unless (= version +wal-version+) (error "invalid primary WAL page spool version"))
+          (funcall function (wal-decode-page-images (subseq event 12) lsn version)))))))
   (values))
 
 (defun wal-primary-seal-page-spool (spool)
   "Preflight every staged record before publishing a terminal WAL record."
-  (logical-spool-seal spool)
+  (call-with-wal-spool-owner spool (lambda () (logical-spool-seal spool)))
   (wal-primary-map-page-spool spool (lambda (images) (declare (ignore images))))
   (values))
 
@@ -3306,6 +3370,12 @@ Refresh its modification time. Update memory only after atomic publication."
 Reject surviving page and CLOG debt before replacement and establish a fresh
 local identity; pending owners are not cleared."
   (wal-require-no-pending-storage)
+  (sb-thread:with-mutex (*wal-lock*)
+    (when (and *wal-dirty-store*
+               (zerop (wal-dirty-store-resident *wal-dirty-store*))
+               (zerop (wal-dirty-store-disk-refs *wal-dirty-store*)))
+      (wal-dirty-close-empty-store))
+    (wal-require-no-temp-cleanup-under-lock))
   ;; Control identities must be accepted before even syncing directories: a child
   ;; control cannot cause legacy segment scanning, truncation, or tail adoption.
   (multiple-value-bind (checkpoint-lsn durable-lsn snapshot insertion checkpoint-timeline namespace metadata)

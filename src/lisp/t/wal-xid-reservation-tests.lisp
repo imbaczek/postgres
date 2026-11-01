@@ -306,6 +306,7 @@
                  (sb-thread:make-thread
                   (lambda ()
                     (let ((pg::*wal-lock* (sb-thread:make-mutex :name "direct publication WAL"))
+                          (pg::*wal-temp-cleanup-domain* nil)
                           (pg::*xid-lock* (sb-thread:make-mutex :name "direct publication XID")))
                       (funcall
                        (if (eq kind :resource)
@@ -388,6 +389,7 @@
                  (sb-thread:make-thread
                   (lambda ()
                     (let ((pg::*wal-lock* (sb-thread:make-mutex :name "XID owner WAL"))
+                          (pg::*wal-temp-cleanup-domain* nil)
                           (pg::*xid-lock* (sb-thread:make-mutex :name "XID owner allocation"))
                           (pg::*logical-capture-xid-modes* (make-hash-table :test #'eql))
                           (pg::*logical-capture-arming* (make-hash-table :test #'eq)))

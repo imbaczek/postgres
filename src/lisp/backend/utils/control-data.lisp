@@ -22,6 +22,8 @@ Require no pending storage debt before any control write. Retain its checkpoint
 and identity. Legacy controls have no lifecycle state;
 leave that state unknown until successful initialization publishes production."
   (wal-require-no-pending-storage)
+  (sb-thread:with-mutex (*wal-lock*)
+    (wal-require-no-temp-cleanup-under-lock))
   (multiple-value-bind (checkpoint durable snapshot insertion checkpoint-id namespace metadata)
       (wal-read-control-fields)
     (when metadata
@@ -82,6 +84,8 @@ possibly published clean state."
     (postmaster-retire-abandoned-backends)
     (wal-checkpoint)
     (sb-thread:with-mutex (*wal-lock*)
+      (wal-retry-pending-temp-cleanup-under-lock)
+      (wal-require-no-temp-cleanup-under-lock)
       (when *wal-slot-recycling-pending*
         (error "primary shutdown left an active replication slot owner")))
     (native-control-test-point :after-primary-shutdown-checkpoint)

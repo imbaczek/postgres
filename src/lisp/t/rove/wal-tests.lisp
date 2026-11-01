@@ -385,6 +385,12 @@ Each entry in SEGMENTS contains a segment number followed by its byte vectors."
           (sb-thread:with-mutex (*wal-lock*) (dispose)))))
   (values))
 
+(defun clear-wal-test-page-cache ()
+  (sb-thread:with-mutex (*wal-lock*) (wal-clear-page-cache)))
+
+(defun wal-test-read-dirty-reference (key reference)
+  (sb-thread:with-mutex (*wal-lock*) (wal-dirty-read-reference key reference)))
+
 (defun call-with-page-publication-test (function &key (resident-limit 0))
   (let* ((*pgdata* (merge-pathnames
                     (format nil "pg-page-owner-~d-~d/" (sb-posix:getpid) (random 1000000))
@@ -400,6 +406,7 @@ Each entry in SEGMENTS contains a segment number followed by its byte vectors."
          (*wal-pending-btree-split* nil) (*wal-pending-page-publication* nil)
          (*wal-pending-page-publication-tail* nil)
          (*wal-storage-incarnation* (gensym "TEST-PAGE-STORE-"))
+         (*wal-temp-cleanup-domain* nil)
          (*wal-insert-timeline* 1) (*wal-ready* t) (*wal-poisoned* nil)
          (*physical-recovery-failed-p* nil)
          (*wal-end-lsn* 200) (*wal-durable-lsn* 100)
@@ -408,7 +415,7 @@ Each entry in SEGMENTS contains a segment number followed by its byte vectors."
     (unwind-protect
          (funcall function)
       (dispose-page-publication-test-owner *wal-pending-page-publication*)
-      (wal-clear-page-cache)
+      (sb-thread:with-mutex (*wal-lock*) (wal-clear-page-cache))
       (smgr-close-all)
       (when *clog-stream* (close *clog-stream*))
       (uiop:delete-directory-tree *pgdata* :validate t :if-does-not-exist :ignore))))
@@ -717,7 +724,8 @@ Each entry in SEGMENTS contains a segment number followed by its byte vectors."
                    (symbol-function 'wal-fail-stop) stop)
              (when (and owner (not (eq owner *wal-pending-page-publication*))
                         (not (logical-spool-closed-p (wal-page-publication-spool owner))))
-               (wal-close-primary-page-spool (wal-page-publication-spool owner)))))))))
+               (sb-thread:with-mutex (*wal-lock*)
+                 (wal-close-primary-page-spool (wal-page-publication-spool owner))))))))))
 
 (defun page-publication-test-refcount ()
   (if *wal-dirty-store*
@@ -1477,6 +1485,7 @@ Each entry in SEGMENTS contains a segment number followed by its byte vectors."
                        (format nil "pg-primary-pages-~d-~d/" (sb-posix:getpid) (random 1000000))
                        (uiop:temporary-directory)))
            (*query-temp-directory* directory)
+           (*wal-temp-cleanup-domain* nil)
            (*query-temp-file-limit-bytes* 0)
            (*logical-capture-memory-bytes* 1)
            (*wal-page-cache* (make-hash-table :test #'equal))
@@ -1507,21 +1516,22 @@ Each entry in SEGMENTS contains a segment number followed by its byte vectors."
                (wal-append-page-images legacy)
                (let ((expected (nreverse records)))
                  (setf records nil position 100)
-                 (with-wal-primary-page-spool (spool)
-                   (wal-primary-preflight-page-keys keys)
-                   (wal-primary-append-pages keys spool)
-                   (wal-primary-seal-page-spool spool)
-                   (rove:ok (= 2 (length records)))
-                   (rove:ok (equalp expected (nreverse records)))
-                   (let ((count 0) (last-block -1))
-                     (wal-primary-map-page-spool
-                      spool
-                      (lambda (images)
-                        (dolist (image images)
-                          (incf count)
-                          (rove:ok (> (wal-page-image-block image) last-block))
-                          (setf last-block (wal-page-image-block image)))))
-                     (rove:ok (= 513 count)))))
+                 (sb-thread:with-mutex (*wal-lock*)
+                   (with-wal-primary-page-spool (spool)
+                     (wal-primary-preflight-page-keys keys)
+                     (wal-primary-append-pages keys spool)
+                     (wal-primary-seal-page-spool spool)
+                     (rove:ok (= 2 (length records)))
+                     (rove:ok (equalp expected (nreverse records)))
+                     (let ((count 0) (last-block -1))
+                       (wal-primary-map-page-spool
+                        spool
+                        (lambda (images)
+                          (dolist (image images)
+                            (incf count)
+                            (rove:ok (> (wal-page-image-block image) last-block))
+                            (setf last-block (wal-page-image-block image)))))
+                       (rove:ok (= 513 count))))))
                (rove:ok (null (uiop:directory-files directory)))))
         (setf (symbol-function 'wal-next-record-start) old-start
               (symbol-function 'wal-append-record) old-append)
@@ -1532,6 +1542,7 @@ Each entry in SEGMENTS contains a segment number followed by its byte vectors."
                        (format nil "pg-primary-split-~d-~d/" (sb-posix:getpid) (random 1000000))
                        (uiop:temporary-directory)))
            (*query-temp-directory* directory)
+           (*wal-temp-cleanup-domain* nil)
            (*logical-capture-memory-bytes* 1)
            (*wal-page-cache* (make-hash-table :test #'equal))
            (*wal-page-cache-xids* (make-hash-table :test #'equal))
@@ -1563,12 +1574,13 @@ Each entry in SEGMENTS contains a segment number followed by its byte vectors."
                    (symbol-function 'wal-test-pause)
                    (lambda (point)
                      (when (eq point :after-btree-split-page-write) (incf pauses))))
-             (let ((keys (wal-primary-page-keys)))
-               (with-wal-primary-page-spool (spool)
-                 (wal-primary-preflight-page-keys keys)
-                 (wal-primary-append-pages keys spool)
-                 (wal-primary-seal-page-spool spool)
-                 (wal-primary-apply-page-spool spool :split-p t :fault-on-first-write t)))
+             (sb-thread:with-mutex (*wal-lock*)
+               (let ((keys (wal-primary-page-keys)))
+                 (with-wal-primary-page-spool (spool)
+                   (wal-primary-preflight-page-keys keys)
+                   (wal-primary-append-pages keys spool)
+                   (wal-primary-seal-page-spool spool)
+                   (wal-primary-apply-page-spool spool :split-p t :fault-on-first-write t))))
              (rove:ok (= 1026 writes))
              (rove:ok (= 1 pauses))
              (rove:ok (null (uiop:directory-files directory))))
@@ -1606,18 +1618,20 @@ Each entry in SEGMENTS contains a segment number followed by its byte vectors."
                        (format nil "pg-primary-empty-~d-~d/" (sb-posix:getpid) (random 1000000))
                        (uiop:temporary-directory)))
            (*query-temp-directory* directory)
+           (*wal-temp-cleanup-domain* nil)
            (*wal-page-cache* (make-hash-table :test #'equal))
            (visits 0))
       (ensure-directories-exist directory)
       (unwind-protect
            (progn
-             (with-wal-primary-page-spool (spool)
-               (let ((keys (wal-primary-page-keys)))
-                 (wal-primary-preflight-page-keys keys)
-                 (wal-primary-append-pages keys spool)
-                 (wal-primary-seal-page-spool spool)
-                 (wal-primary-map-page-spool spool
-                                             (lambda (images) (declare (ignore images)) (incf visits)))))
+             (sb-thread:with-mutex (*wal-lock*)
+               (with-wal-primary-page-spool (spool)
+                 (let ((keys (wal-primary-page-keys)))
+                   (wal-primary-preflight-page-keys keys)
+                   (wal-primary-append-pages keys spool)
+                   (wal-primary-seal-page-spool spool)
+                   (wal-primary-map-page-spool spool
+                                               (lambda (images) (declare (ignore images)) (incf visits))))))
              (rove:ok (zerop visits))
              (rove:ok (null (uiop:directory-files directory))))
         (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))
@@ -1842,6 +1856,7 @@ Each entry in SEGMENTS contains a segment number followed by its byte vectors."
                        (uiop:temporary-directory)))
            (*pgdata* directory)
            (*query-temp-directory* directory)
+           (*wal-temp-cleanup-domain* nil)
            (*query-temp-file-limit-bytes* 0)
            (*wal-dirty-resident-limit-pages* 0)
            (*wal-dirty-store* nil)
@@ -1881,10 +1896,10 @@ Each entry in SEGMENTS contains a segment number followed by its byte vectors."
              (let ((next (wal-dirty-store-next-slot *wal-dirty-store*)))
                (dotimes (i 5) (wal-buffer-write 7310 0 page))
                (rove:ok (<= (wal-dirty-store-next-slot *wal-dirty-store*) (1+ next))))
-             (wal-clear-page-cache)
+             (clear-wal-test-page-cache)
              (rove:ok (null *wal-dirty-store*))
              (rove:ok (null (uiop:directory-files directory))))
-        (wal-clear-page-cache)
+        (clear-wal-test-page-cache)
         (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))
 
 (rove:deftest test-wal-dirty-scratch-seeded-batch-model
@@ -1894,6 +1909,7 @@ Each entry in SEGMENTS contains a segment number followed by its byte vectors."
                        (uiop:temporary-directory)))
            (*pgdata* directory)
            (*query-temp-directory* directory)
+           (*wal-temp-cleanup-domain* nil)
            (*query-temp-file-limit-bytes* 0)
            (*wal-dirty-resident-limit-pages* 0)
            (*wal-dirty-store* nil)
@@ -1941,10 +1957,10 @@ Each entry in SEGMENTS contains a segment number followed by its byte vectors."
              (rove:ok (= (hash-table-count *wal-page-cache*) (wal-dirty-store-disk-refs *wal-dirty-store*)))
              ;; At most 12 shared and five private references coexist.
              (rove:ok (<= (wal-dirty-store-next-slot *wal-dirty-store*) 17))
-             (wal-clear-page-cache)
+             (clear-wal-test-page-cache)
              (rove:ok (null *wal-dirty-store*))
              (rove:ok (null (uiop:directory-files directory))))
-        (wal-clear-page-cache)
+        (clear-wal-test-page-cache)
         (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))
 
 (rove:deftest test-wal-dirty-scratch-resident-budget
@@ -1952,6 +1968,7 @@ Each entry in SEGMENTS contains a segment number followed by its byte vectors."
                        (format nil "pg-dirty-budget-~d-~d/" (sb-posix:getpid) (random 1000000))
                        (uiop:temporary-directory)))
            (*query-temp-directory* directory)
+           (*wal-temp-cleanup-domain* nil)
            (*wal-dirty-resident-limit-pages* 2)
            (*wal-dirty-store* nil)
            (*wal-page-cache* (make-hash-table :test #'equal))
@@ -1970,10 +1987,10 @@ Each entry in SEGMENTS contains a segment number followed by its byte vectors."
              (dotimes (block 6)
                (rove:ok (= block (aref (wal-buffer-read 7310 block) 100))))
              (rove:ok (= 2 (wal-dirty-store-resident *wal-dirty-store*)))
-             (wal-clear-page-cache)
+             (clear-wal-test-page-cache)
              (rove:ok (null *wal-dirty-store*))
              (rove:ok (null (uiop:directory-files directory))))
-        (wal-clear-page-cache)
+        (clear-wal-test-page-cache)
         (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))
 
 (rove:deftest test-wal-dirty-scratch-corruption-fails-stop
@@ -1981,6 +1998,7 @@ Each entry in SEGMENTS contains a segment number followed by its byte vectors."
                        (format nil "pg-dirty-corrupt-~d-~d/" (sb-posix:getpid) (random 1000000))
                        (uiop:temporary-directory)))
            (*query-temp-directory* directory)
+           (*wal-temp-cleanup-domain* nil)
            (*wal-dirty-resident-limit-pages* 0)
            (*wal-dirty-store* nil)
            (*wal-page-cache* (make-hash-table :test #'equal))
@@ -2006,12 +2024,12 @@ Each entry in SEGMENTS contains a segment number followed by its byte vectors."
                           (search "checksum mismatch" (princ-to-string condition)))))
              (rove:ok *wal-poisoned*)
              (rove:ok (not fallback))
-             (wal-clear-page-cache)
+             (clear-wal-test-page-cache)
              (rove:ok (null *wal-dirty-store*))
              (rove:ok (null (uiop:directory-files directory))))
         (setf (symbol-function 'wal-fail-stop) old-fail
               (symbol-function 'smgr-read) old-read)
-        (wal-clear-page-cache)
+        (clear-wal-test-page-cache)
         (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))
 
 (rove:deftest test-wal-dirty-scratch-write-and-batch-failures-preserve-shared
@@ -2019,6 +2037,7 @@ Each entry in SEGMENTS contains a segment number followed by its byte vectors."
                        (format nil "pg-dirty-failure-~d-~d/" (sb-posix:getpid) (random 1000000))
                        (uiop:temporary-directory)))
            (*query-temp-directory* directory)
+           (*wal-temp-cleanup-domain* nil)
            (*wal-dirty-resident-limit-pages* 1)
            (*wal-dirty-store* nil)
            (*wal-page-cache* (make-hash-table :test #'equal))
@@ -2044,7 +2063,7 @@ Each entry in SEGMENTS contains a segment number followed by its byte vectors."
                         (wal-dirty-store-error (condition)
                           (search "injected scratch failure" (princ-to-string condition)))))
              (rove:ok *wal-poisoned*)
-             (rove:ok (= 1 (aref (wal-dirty-read-reference key (gethash key *wal-page-cache*)) 100)))
+             (rove:ok (= 1 (aref (wal-test-read-dirty-reference key (gethash key *wal-page-cache*)) 100)))
              (rove:ok (equal '(44 1) (gethash key *wal-page-cache-xids*)))
              (setf (symbol-function 'wal-dirty-ensure-spool) old-ensure
                    *wal-poisoned* nil)
@@ -2059,13 +2078,13 @@ Each entry in SEGMENTS contains a segment number followed by its byte vectors."
                           (search "injected batch publication failure" (princ-to-string condition)))))
              (rove:ok *wal-poisoned*)
              (rove:ok (= 1 (hash-table-count *wal-page-cache*)))
-             (rove:ok (= 1 (aref (wal-dirty-read-reference key (gethash key *wal-page-cache*)) 100)))
+             (rove:ok (= 1 (aref (wal-test-read-dirty-reference key (gethash key *wal-page-cache*)) 100)))
              (rove:ok (= 1 (wal-dirty-store-resident *wal-dirty-store*)))
              (rove:ok (zerop (wal-dirty-store-disk-refs *wal-dirty-store*))))
         (setf (symbol-function 'wal-fail-stop) old-fail
               (symbol-function 'wal-dirty-ensure-spool) old-ensure
               (symbol-function 'wal-dirty-batch-contributors) old-merge)
-        (wal-clear-page-cache)
+        (clear-wal-test-page-cache)
         (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))
 
 (rove:deftest test-wal-dirty-batch-publication-error-fails-stop-with-owned-pages
@@ -2073,6 +2092,7 @@ Each entry in SEGMENTS contains a segment number followed by its byte vectors."
                        (format nil "pg-dirty-publish-~d-~d/" (sb-posix:getpid) (random 1000000))
                        (uiop:temporary-directory)))
            (*query-temp-directory* directory)
+           (*wal-temp-cleanup-domain* nil)
            (*wal-dirty-resident-limit-pages* 0)
            (*wal-dirty-store* nil)
            (*wal-page-cache* (make-hash-table :test #'equal))
@@ -2110,21 +2130,21 @@ Each entry in SEGMENTS contains a segment number followed by its byte vectors."
                (rove:ok (not (member (wal-dirty-reference-slot
                                       (gethash (wal-page-key 7310 block) *wal-page-cache*))
                                      (wal-dirty-store-free-slots *wal-dirty-store*)))))
-             (rove:ok (= 2 (aref (wal-dirty-read-reference key (gethash key *wal-page-cache*)) 100)))
-             (rove:ok (= 2 (aref (wal-dirty-read-reference
+             (rove:ok (= 2 (aref (wal-test-read-dirty-reference key (gethash key *wal-page-cache*)) 100)))
+             (rove:ok (= 2 (aref (wal-test-read-dirty-reference
                                   (wal-page-key 7310 1)
                                   (gethash (wal-page-key 7310 1) *wal-page-cache*)) 100))))
         (setf (symbol-function 'wal-fail-stop) old-fail
               (symbol-function 'wal-dirty-release-reference) old-release)
         (when previous (wal-dirty-release-reference previous))
-        (wal-clear-page-cache)
+        (clear-wal-test-page-cache)
         (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))
 
 (rove:deftest test-wal-dirty-scratch-cross-thread-contributors
     (let* ((directory (merge-pathnames
                        (format nil "pg-dirty-threads-~d-~d/" (sb-posix:getpid) (random 1000000))
                        (uiop:temporary-directory)))
-           (names '(*query-temp-directory* *wal-dirty-resident-limit-pages* *wal-dirty-store*
+           (names '(*wal-temp-cleanup-domain* *query-temp-directory* *wal-dirty-resident-limit-pages* *wal-dirty-store*
                     *wal-page-cache* *wal-page-cache-xids* *wal-ready* *wal-poisoned*))
            (saved (mapcar (lambda (name) (cons name (symbol-value name))) names))
            (key (wal-page-key 7310 0)))
@@ -2132,7 +2152,8 @@ Each entry in SEGMENTS contains a segment number followed by its byte vectors."
       (unwind-protect
            (progn
              ;; Child threads use the same global WAL cache and scratch owner.
-             (setf *query-temp-directory* directory
+             (setf *wal-temp-cleanup-domain* nil
+                   *query-temp-directory* directory
                    *wal-dirty-resident-limit-pages* 0
                    *wal-dirty-store* nil
                    *wal-page-cache* (make-hash-table :test #'equal)
@@ -2157,9 +2178,9 @@ Each entry in SEGMENTS contains a segment number followed by its byte vectors."
              (rove:ok (equal '(44 55) (sort (remove-if (lambda (xid) (< xid 3))
                                                        (copy-list (gethash key *wal-page-cache-xids*))) #'<)))
              (rove:ok (= 1 (wal-dirty-store-disk-refs *wal-dirty-store*)))
-             (wal-clear-page-cache)
+             (clear-wal-test-page-cache)
              (rove:ok (null (uiop:directory-files directory))))
-        (wal-clear-page-cache)
+        (clear-wal-test-page-cache)
         (dolist (entry saved) (setf (symbol-value (car entry)) (cdr entry)))
         (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))
 

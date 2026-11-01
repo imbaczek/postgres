@@ -325,6 +325,8 @@ during smart shutdown. The signal worker remains available for immediate shutdow
     (stop-reload-workers)
     (managed-worker-shutdown)
     (physical-follow-controller-stop-worker)
+    (sb-thread:with-mutex (*wal-lock*)
+      (wal-retry-pending-temp-cleanup-under-lock))
     (if (recovery-in-progress-p)
         (progn
           (call-with-live-operation #'postmaster-retire-abandoned-backends)

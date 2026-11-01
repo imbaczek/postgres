@@ -39,6 +39,284 @@
 (rove:deftest cleanup-domain-adoption-contract
     (unit-check-property 'cleanup-domain-adoption-preserves-private-owner-and-quota))
 
+(rove:deftest wal-cleanup-domain-adopts-spool-before-use
+    (call-with-cleanup-domain-file-test
+     (lambda (root lock identity domain)
+       (declare (ignore lock identity domain))
+       (let ((*wal-storage-incarnation* (gensym "WAL-TEST-"))
+             (*wal-temp-cleanup-domain* nil)
+             (*logical-capture-memory-bytes* 0)
+             (*query-temp-file-limit-bytes* 0))
+         (sb-thread:with-mutex (*wal-lock*)
+           (let* ((spool (make-wal-owned-spool))
+                  (owner (logical-spool-owner spool))
+                  (quota (query-temp-cleanup-owner-quota owner)))
+             (unwind-protect
+                  (call-with-wal-spool-owner
+                   spool
+                   (lambda ()
+                     (rove:ok (eq *wal-temp-cleanup-domain* (query-temp-cleanup-owner-domain owner)))
+                     (rove:ok (null (query-temp-quota-limit quota)))
+                     (logical-spool-append spool (cleanup-domain-test-octets 1 2 3))
+                     (rove:ok (probe-file (logical-spool-path spool)))
+                     (rove:ok (equal root (query-temp-cleanup-owner-temporary-directory owner)))))
+               (wal-close-owned-spool spool))
+             (rove:ok (query-temp-cleanup-domain-empty-p *wal-temp-cleanup-domain*))))))))
+
+(rove:deftest wal-cleanup-domain-fences-storage-before-mutation
+    (let* ((*wal-storage-incarnation* (gensym "WAL-FENCE-"))
+           (*wal-temp-cleanup-domain* nil)
+           (*wal-dirty-store* nil)
+           (*wal-pending-page-publication* nil)
+           (*wal-pending-page-publication-tail* nil)
+           (*clog-pending-commits* (make-hash-table :test #'eql))
+           (read-control (symbol-function 'wal-read-control-fields))
+           (reads 0) (writes 0) (spool nil))
+      (rove:ok (handler-case (progn (make-wal-owned-spool) nil) (error () t)))
+      (rove:ok (null *wal-temp-cleanup-domain*))
+      (sb-thread:with-mutex (*wal-lock*) (setf spool (make-wal-owned-spool)))
+      (unwind-protect
+           (progn
+             (setf (symbol-function 'wal-read-control-fields)
+                   (lambda () (incf reads) (error "unexpected storage inspection")))
+             (rove:ok (handler-case (progn (wal-init) nil) (wal-input-validation-error () t)))
+             (rove:ok (handler-case (progn (wal-mark-primary-startup) nil)
+                        (wal-input-validation-error () t)))
+             (rove:ok (handler-case (progn (startup-check-cold-installation-state) nil)
+                        (wal-input-validation-error () t)))
+             (sb-thread:with-mutex (*wal-lock*)
+               (rove:ok
+                (handler-case
+                    (progn
+                      (clog-reset-file-under-wal-lock
+                       (lambda (&rest args) (declare (ignore args)) (incf writes))
+                       (lambda (&rest args) (declare (ignore args)) (incf writes)))
+                      nil)
+                  (wal-input-validation-error () t)))
+               (let ((*wal-storage-incarnation* (gensym "FOREIGN-"))
+                     (old-domain *wal-temp-cleanup-domain*))
+                 (rove:ok (handler-case (progn (wal-temp-cleanup-domain-under-lock) nil)
+                            (wal-input-validation-error () t)))
+                 (rove:ok (eq old-domain *wal-temp-cleanup-domain*))))
+             (let ((*wal-lock* (sb-thread:make-mutex :name "foreign WAL test lock")))
+               (sb-thread:with-mutex (*wal-lock*)
+                 (rove:ok
+                  (handler-case (progn (wal-temp-cleanup-domain-under-lock) nil)
+                    (wal-input-validation-error () t)))))
+             (rove:ok (zerop reads))
+             (rove:ok (zerop writes)))
+        (setf (symbol-function 'wal-read-control-fields) read-control)
+        (sb-thread:with-mutex (*wal-lock*) (wal-close-owned-spool spool)))))
+
+(rove:deftest wal-cleanup-domain-retains-preterminal-nonlocal-exit-debt
+    (call-with-cleanup-domain-file-test
+     (lambda (root lock identity domain)
+       (declare (ignore root lock identity domain))
+       (let ((*wal-storage-incarnation* (gensym "WAL-PRETERMINAL-"))
+             (*wal-temp-cleanup-domain* nil)
+             (*wal-pending-page-publication* nil) (*wal-pending-page-publication-tail* nil)
+             (*clog-pending-commits* (make-hash-table :test #'eql))
+             (*logical-capture-memory-bytes* 0)
+             (unlink (symbol-function 'unlink-query-temp-file))
+             (path nil) (owner nil))
+         (unwind-protect
+              (sb-thread:with-mutex (*wal-lock*)
+                (rove:ok
+                 (eq :cleanup-failed
+                     (handler-case
+                         (catch 'leave
+                           (call-with-wal-primary-page-spool
+                            (lambda (spool publication)
+                              (declare (ignore publication))
+                              (logical-spool-append spool (cleanup-domain-test-octets 1 2))
+                              (setf owner (logical-spool-owner spool)
+                                    path (logical-spool-path spool))
+                              (call-with-wal-spool-owner
+                               spool (lambda () (finish-query-temp-stream (logical-spool-stream spool) t)))
+                              (setf (symbol-function 'unlink-query-temp-file)
+                                    (lambda (candidate)
+                                      (if (equal candidate path)
+                                          (error "retained preterminal file")
+                                          (funcall unlink candidate))))
+                              (throw 'leave :left))))
+                       (error () :cleanup-failed))))
+                (rove:ok (eq :pending (query-temp-cleanup-owner-state owner)))
+                (rove:ok (plusp (query-temp-quota-used-bytes (query-temp-cleanup-owner-quota owner))))
+                (wal-require-no-pending-storage)
+                (rove:ok
+                 (handler-case (progn (wal-replace-storage-incarnation-under-lock) nil)
+                   (wal-input-validation-error () t)))
+                (setf (symbol-function 'unlink-query-temp-file) unlink)
+                (wal-retry-pending-temp-cleanup-under-lock)
+                (rove:ok (query-temp-cleanup-domain-empty-p *wal-temp-cleanup-domain*))
+                (rove:ok (not (probe-file path))))
+           (setf (symbol-function 'unlink-query-temp-file) unlink)
+           (sb-thread:with-mutex (*wal-lock*)
+             (wal-retry-pending-temp-cleanup-under-lock)))))))
+
+(rove:deftest wal-cleanup-domain-replaces-scratch-only-after-retained-cleanup
+    (call-with-cleanup-domain-file-test
+     (lambda (root lock identity domain)
+       (declare (ignore lock identity domain))
+       (let* ((store-id (gensym "WAL-SCRATCH-"))
+              (wal-domain (make-query-temp-cleanup-domain *wal-lock* store-id))
+              (*wal-storage-incarnation* store-id)
+              (*wal-temp-cleanup-domain* wal-domain)
+              (*wal-dirty-store* nil)
+              (*wal-dirty-resident-limit-pages* 0)
+              (unlink (symbol-function 'unlink-query-temp-file))
+              (store nil) (spool nil) (path nil) (quota nil) (attempts 0) (failure nil))
+         (unwind-protect
+              (progn
+                (setf (symbol-function 'unlink-query-temp-file)
+                      (lambda (candidate)
+                        (if (equal candidate path)
+                            (progn (incf attempts) (error "retained WAL scratch"))
+                            (funcall unlink candidate))))
+                (let ((creator
+                        (sb-thread:make-thread
+                         (lambda ()
+                           (handler-case
+                               (let ((*wal-storage-incarnation* store-id)
+                                     (*wal-temp-cleanup-domain* wal-domain)
+                                     (*wal-dirty-store* nil)
+                                     (*wal-dirty-resident-limit-pages* 0)
+                                     (*wal-page-cache* (make-hash-table :test #'equal))
+                                     (*wal-page-cache-xids* (make-hash-table :test #'equal))
+                                     (*wal-page-batch* nil) (*wal-ready* t) (*wal-poisoned* nil)
+                                     (*backend* nil) (*query-temp-directory* root)
+                                     (*error-output* (make-string-output-stream)))
+                                 (wal-buffer-write 7310 0 (page-init (make-page)))
+                                 (sb-thread:with-mutex (*wal-lock*)
+                                   (setf store *wal-dirty-store*
+                                         spool (wal-dirty-store-spool store)
+                                         path (logical-spool-path spool)
+                                         quota (query-temp-cleanup-owner-quota (logical-spool-owner spool)))
+                                   (call-with-wal-spool-owner
+                                    spool (lambda () (finish-query-temp-stream (logical-spool-stream spool) t)))
+                                   (unless (handler-case (progn (wal-clear-page-cache) nil)
+                                             (wal-dirty-store-error () t))
+                                     (error "scratch cleanup unexpectedly succeeded")))
+                                 (let ((before attempts))
+                                   (retry-pending-query-temp-cleanup)
+                                   (unless (= before attempts) (error "creator retried WAL scratch")))
+                                 t)
+                             (error (condition) (setf failure (princ-to-string condition)) nil)))
+                         :name "WAL scratch creator")))
+                  (rove:ok (sb-thread:join-thread creator)))
+                (rove:ok (null failure) (or failure "scratch creator succeeded"))
+                (setf *wal-dirty-store* store)
+                (rove:ok (logical-spool-closed-p spool))
+                (rove:ok (plusp (query-temp-quota-used-bytes quota)))
+                (rove:ok (zerop (wal-dirty-store-disk-refs store)))
+                (sb-thread:with-mutex (*wal-lock*)
+                  (rove:ok
+                   (handler-case
+                       (progn (wal-dirty-new-reference (wal-page-key 7310 1) (page-init (make-page))) nil)
+                     (wal-dirty-store-error () t)))
+                  (rove:ok (eq store *wal-dirty-store*)))
+                (setf (symbol-function 'unlink-query-temp-file) unlink)
+                (let ((successor
+                        (sb-thread:make-thread
+                         (lambda ()
+                           (let ((*wal-storage-incarnation* store-id)
+                                 (*wal-temp-cleanup-domain* wal-domain)
+                                 (*wal-poisoned* t))
+                             (sb-thread:with-mutex (*wal-lock*)
+                               (wal-retry-pending-temp-cleanup-under-lock))
+                             *wal-poisoned*))
+                         :name "WAL scratch cleanup successor")))
+                  (rove:ok (sb-thread:join-thread successor)))
+                (rove:ok (zerop (query-temp-quota-used-bytes quota)))
+                (rove:ok (not (probe-file path)))
+                (sb-thread:with-mutex (*wal-lock*)
+                  (let ((reference (wal-dirty-new-reference (wal-page-key 7310 1) (page-init (make-page)))))
+                    (rove:ok (not (eq store *wal-dirty-store*)))
+                    (rove:ok (not (eq spool (wal-dirty-store-spool *wal-dirty-store*))))
+                    (wal-dirty-release-reference reference)
+                    (wal-dirty-close-empty-store))
+                  (rove:ok (query-temp-cleanup-domain-empty-p wal-domain))))
+           (setf (symbol-function 'unlink-query-temp-file) unlink)
+           (when store
+             (sb-thread:with-mutex (*wal-lock*)
+               (let ((*wal-dirty-store* store)) (wal-dirty-close-empty-store)))))))))
+
+(rove:deftest wal-cleanup-domain-retries-a-closed-spool-after-creator-exit
+    (dolist (failure-kind '(:close :unlink))
+      (call-with-cleanup-domain-file-test
+       (lambda (root lock identity domain)
+         (declare (ignore lock identity domain))
+         (let* ((store-id (gensym "WAL-TEST-"))
+                (wal-domain (make-query-temp-cleanup-domain *wal-lock* store-id))
+                (*wal-storage-incarnation* store-id)
+                (*wal-temp-cleanup-domain* wal-domain)
+                (unlink (symbol-function 'unlink-query-temp-file))
+                (abort-stream (symbol-function 'abort-query-temp-stream))
+                (path nil) (spool nil) (retained-stream nil) (failure nil) (attempts 0) (thread nil))
+           (unwind-protect
+                (progn
+                  (setf (symbol-function 'unlink-query-temp-file)
+                        (lambda (candidate)
+                          (if (and (eq failure-kind :unlink) (equal candidate path))
+                              (progn (incf attempts) (error "retained WAL spool"))
+                              (funcall unlink candidate)))
+                        (symbol-function 'abort-query-temp-stream)
+                        (lambda (stream pathname)
+                          (if (and (eq failure-kind :close) (eq stream retained-stream))
+                              (progn (incf attempts) nil)
+                              (funcall abort-stream stream pathname))))
+                  (setf thread
+                        (sb-thread:make-thread
+                         (lambda ()
+                           (handler-case
+                               (let ((*wal-storage-incarnation* store-id)
+                                     (*wal-temp-cleanup-domain* wal-domain)
+                                     (*query-temp-directory* root)
+                                     (*logical-capture-memory-bytes* 0)
+                                     (*error-output* (make-string-output-stream)))
+                                 (sb-thread:with-mutex (*wal-lock*)
+                                   (setf spool (make-wal-owned-spool))
+                                   (call-with-wal-spool-owner
+                                    spool
+                                    (lambda ()
+                                      (logical-spool-append spool (cleanup-domain-test-octets 7 8))
+                                      (setf path (logical-spool-path spool)
+                                            retained-stream (logical-spool-stream spool))
+                                      (when (eq failure-kind :unlink)
+                                        (finish-query-temp-stream retained-stream t))))
+                                   (unless (handler-case (progn (wal-close-owned-spool spool) nil)
+                                             (error () t))
+                                     (error "WAL close unexpectedly succeeded")))
+                                 (let ((before attempts))
+                                   (retry-pending-query-temp-cleanup)
+                                   (unless (= before attempts) (error "ordinary cleanup stole WAL debt")))
+                                 t)
+                             (error (condition) (setf failure (princ-to-string condition)) nil)))
+                         :name "WAL spool creator"))
+                  (rove:ok (sb-thread:join-thread thread))
+                  (rove:ok (null failure) (or failure "creator succeeded"))
+                  (rove:ok (plusp attempts))
+                  (rove:ok (logical-spool-closed-p spool))
+                  (rove:ok (eq :pending (query-temp-cleanup-owner-state (logical-spool-owner spool))))
+                  (rove:ok (probe-file path))
+                  (rove:ok (eql (eq failure-kind :close) (open-stream-p retained-stream)))
+                  (sb-thread:with-mutex (*wal-lock*)
+                    (rove:ok
+                     (handler-case (progn (wal-replace-storage-incarnation-under-lock) nil)
+                       (error () t)))
+                    (rove:ok (eq store-id *wal-storage-incarnation*))
+                    (setf (symbol-function 'unlink-query-temp-file) unlink
+                          (symbol-function 'abort-query-temp-stream) abort-stream)
+                    (wal-close-owned-spool spool)
+                    (rove:ok (query-temp-cleanup-domain-empty-p wal-domain)))
+                  (rove:ok (not (probe-file path)))
+                  (rove:ok (zerop (query-temp-quota-used-bytes
+                                   (query-temp-cleanup-owner-quota (logical-spool-owner spool)))))))
+           (setf (symbol-function 'unlink-query-temp-file) unlink
+                 (symbol-function 'abort-query-temp-stream) abort-stream)
+           (when spool
+             (sb-thread:with-mutex (*wal-lock*) (wal-close-owned-spool spool))))))))
+
 (rove:deftest cleanup-domain-rejects-wrong-authority-before-directory-effects
     (let* ((root (merge-pathnames
                   (format nil "pg-cleanup-domain-~d-~d/" (sb-posix:getpid) (random 1000000))

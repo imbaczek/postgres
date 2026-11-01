@@ -390,6 +390,7 @@ compatibility and tests. Production publication uses reserved completions."
 Rotate the storage incarnation after the file and its directory are durable."
   (assert (sb-thread:holding-mutex-p *wal-lock*))
   (wal-require-no-pending-page-publication)
+  (wal-require-no-temp-cleanup-under-lock)
   (sb-thread:with-mutex (*clog-lock*)
     (clog-require-no-pending-under-lock)
     (when *clog-stream*
