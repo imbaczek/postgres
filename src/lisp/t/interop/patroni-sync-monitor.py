@@ -197,28 +197,33 @@ def stop_follower(node):
                 process.wait(timeout=10)
 
 
+def start_follower(connection, server, name, cleanup):
+    root = server.root / name
+    data = root / 'data'
+    data.mkdir(parents=True, mode=0o700)
+    scalar(connection, f"SELECT pg_create_physical_replication_slot('{name}',true)")
+    server.control(f'(physical-base-backup "{data}/" "monitor_{name}")')
+    (data / 'postgresql.conf').write_text('# Native base managed by Patroni.\n')
+    with socket.socket() as reservation:
+        reservation.bind(('127.0.0.1', 0))
+        port = reservation.getsockname()[1]
+    config = follow['configuration'](data, port, root)
+    config['name'] = name
+    node = Postgresql(config, Null())
+    cleanup.callback(stop_follower, node)
+    member = Member(0, 'source', None,
+                    {'conn_url': f'postgres://127.0.0.1:{server.port}/postgres'})
+    assert node.follow(member, timeout=90) is True
+    return node
+
+
 def check_native_streaming(connection, server):
     cleanup = ExitStack()
     monitor_node, trace = monitor(connection, PostgresqlRole.PRIMARY, server.data)
     cleanup.callback(monitor_node.connection_pool.close)
     try:
         for name in ('sync_a', 'sync_b'):
-            root = server.root / name
-            data = root / 'data'
-            data.mkdir(parents=True, mode=0o700)
-            scalar(connection, f"SELECT pg_create_physical_replication_slot('{name}',true)")
-            server.control(f'(physical-base-backup "{data}/" "monitor_{name}")')
-            (data / 'postgresql.conf').write_text('# Native base managed by Patroni.\n')
-            with socket.socket() as reservation:
-                reservation.bind(('127.0.0.1', 0))
-                port = reservation.getsockname()[1]
-            config = follow['configuration'](data, port, root)
-            config['name'] = name
-            node = Postgresql(config, Null())
-            cleanup.callback(stop_follower, node)
-            member = Member(0, 'source', None,
-                            {'conn_url': f'postgres://127.0.0.1:{server.port}/postgres'})
-            assert node.follow(member, timeout=90) is True
+            start_follower(connection, server, name, cleanup)
         monitor_node._should_query_slots = True
         slot_row = monitor_node.query(monitor_node.cluster_info_query)[0]
         assert len(slot_row) == 16
