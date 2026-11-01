@@ -177,6 +177,23 @@
          (ok (not (member writer pg::*active-xids*)))
          (ok (member other pg::*active-xids*))))))
 
+(deftest source-running-snapshot-excludes-committed-sync-wait-owners
+    (call-with-wal-allocation-fixture
+     (lambda ()
+       (let ((waiting (pg::assign-xid)) (writer (pg::assign-xid)) (records nil))
+         (pg::wal-commit-transaction waiting (lambda (end) (declare (ignore end)))
+                                     :source-id :fixture-source)
+         (ok (member waiting pg::*active-xids*))
+         (ok (= pg::+clog-committed+ (pg::clog-get waiting)))
+         (pg::wal-commit-transaction writer (lambda (end) (declare (ignore end)))
+                                     :source-id :fixture-source)
+         (pg::wal-scan
+          (lambda (record)
+            (when (= (pg::wal-record-type record) pg::+wal-record-running-xacts+)
+              (push (pg::wal-running-xacts-record-info record) records))))
+         (ok (equal (list writer) (getf (first records) :running)))
+         (ok (member waiting pg::*active-xids*) "snapshot filtering preserves transaction ownership")))))
+
 (deftest source-running-snapshot-holds-wal-and-xid-locks-through-insertion
     (call-with-wal-allocation-fixture
      (lambda ()

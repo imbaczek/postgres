@@ -97,6 +97,21 @@
     (list :version 1 :anchor lsn :through lsn :next-xid next
           :running (copy-list running) :complete complete)))
 
+(defun running-xacts-reanchor (prior snapshot lsn)
+  (let ((anchor (running-xacts-anchor snapshot lsn)))
+    (when (and prior (getf prior :complete) (getf anchor :complete))
+      (running-xacts-check-state prior)
+      (unless (and (<= (getf prior :next-xid) (getf anchor :next-xid))
+                   (<= (getf prior :through) lsn))
+        (error "source transaction anchor moved backwards"))
+      (let ((known (getf prior :running))
+            (cutoff (getf prior :next-xid)))
+        (setf (getf anchor :running)
+              (loop for xid in (getf anchor :running)
+                    do (loop while (and known (< (first known) xid)) do (pop known))
+                    when (or (>= xid cutoff) (eql xid (first known))) collect xid))))
+    anchor))
+
 (defun running-xacts-check-state (state)
   (unless (and (listp state) (eql (list-length state) 12)
                (loop for key in '(:version :anchor :through :next-xid :running :complete)
@@ -194,13 +209,15 @@ NIL state stays unknown until an anchor. Inferred XIDs may already have aborted.
 (defun wal-append-running-xacts-under-lock (committer)
   "Append a running-XID snapshot for a registered COMMITTER under the WAL lock."
   (sb-thread:with-mutex (*xid-lock*)
-    ;; Standalone WAL callers do not necessarily register transactions.
-    ;; Only the actual allocator registry can provide coverage.
     (when (member committer *active-xids* :test #'eql)
-      (let* ((complete (<= (length *active-xids*) +running-xacts-limit+))
-             (payload (wal-encode-running-xacts
-                       *next-xid*
-                       (when complete (sort (copy-list *active-xids*) #'<))
-                       complete)))
-        (wal-append-batch-start)
-        (wal-append-record +wal-record-running-xacts+ 0 payload)))))
+      (let ((running nil) (count 0) (complete t))
+        (loop for xid in *active-xids*
+              unless (= (clog-get xid) +clog-committed+)
+                do (push xid running)
+                   (when (> (incf count) +running-xacts-limit+)
+                     (setf complete nil)
+                     (return)))
+        (let ((payload (wal-encode-running-xacts
+                        *next-xid* (when complete (sort running #'<)) complete)))
+          (wal-append-batch-start)
+          (wal-append-record +wal-record-running-xacts+ 0 payload))))))

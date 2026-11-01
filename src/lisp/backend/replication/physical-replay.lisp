@@ -325,7 +325,7 @@ EOR clears this proof. A later running-transaction anchor can establish it again
          (unless (and (= observed-next (getf snapshot :next-xid))
                       (or (null prior) (<= (getf prior :next-xid) observed-next)))
            (error "source running snapshot differs from observed actual next XID"))
-         (running-xacts-anchor snapshot end)))
+         (running-xacts-reanchor prior snapshot end)))
       ((member type (list +wal-record-clog-reset+ +wal-record-end-of-recovery+)) nil)
       ((null prior) nil)
       (t

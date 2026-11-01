@@ -615,6 +615,73 @@ Each entry in SEGMENTS contains a segment number followed by its byte vectors."
 (rove:deftest accepted-clog-is-visible-without-writing-nondurable-status
     (unit-check-property 'accepted-clog-neighbor-writes-preserve-wal-order))
 
+(rove:deftest running-anchor-excludes-accepted-commit-without-releasing-xid
+    (call-with-queued-clog-test
+     (lambda ()
+       (let ((*active-xids* '(44 45))
+             (*next-xid* 46)
+             (captured nil)
+             (original-start (symbol-function 'wal-append-batch-start))
+             (original-record (symbol-function 'wal-append-record)))
+         (sb-thread:with-mutex (*wal-lock*)
+           (let ((owner (wal-admit-transaction-under-lock 44 nil)))
+             (clog-accept-publication-under-wal-lock owner)
+             (rove:ok (= +clog-in-progress+ (pending-clog-raw-status 44)))
+             (rove:ok (= +clog-committed+ (clog-get 44)))
+             (unwind-protect
+                  (progn
+                    (setf (symbol-function 'wal-append-batch-start) (lambda () nil)
+                          (symbol-function 'wal-append-record)
+                          (lambda (type xid payload)
+                            (declare (ignore xid))
+                            (when (= type +wal-record-running-xacts+)
+                              (setf captured (wal-decode-running-xacts payload)))))
+                    (wal-append-running-xacts-under-lock 45)
+                    (rove:ok (equal '(45) (getf captured :running)))
+                    (rove:ok (getf captured :complete))
+                    (rove:ok (equal '(44 45) *active-xids*)))
+               (setf (symbol-function 'wal-append-batch-start) original-start
+                     (symbol-function 'wal-append-record) original-record))
+             (wal-settle-page-publications-under-lock)))))))
+
+(rove:deftest running-anchor-bounds-eligible-membership-not-active-ownership
+    (let* ((*wal-lock* (sb-thread:make-mutex :name "test anchor WAL"))
+           (*xid-lock* (sb-thread:make-mutex :name "test anchor XIDs"))
+           (eligible (loop for xid from 3 below (+ 3 +running-xacts-limit+) collect xid))
+           (committed (loop for xid from (+ 4 +running-xacts-limit+)
+                              below (+ 24 +running-xacts-limit+) collect xid))
+           (*active-xids* (append committed eligible))
+           (*next-xid* (+ 25 +running-xacts-limit+))
+           (captured nil)
+           (original-status (symbol-function 'clog-get))
+           (original-start (symbol-function 'wal-append-batch-start))
+           (original-record (symbol-function 'wal-append-record)))
+      (unwind-protect
+           (progn
+             (setf (symbol-function 'clog-get)
+                   (lambda (xid)
+                     (assert (sb-thread:holding-mutex-p *wal-lock*))
+                     (assert (sb-thread:holding-mutex-p *xid-lock*))
+                     (if (member xid committed) +clog-committed+ +clog-in-progress+))
+                   (symbol-function 'wal-append-batch-start) (lambda () nil)
+                   (symbol-function 'wal-append-record)
+                   (lambda (type xid payload)
+                     (declare (ignore xid))
+                     (when (= type +wal-record-running-xacts+)
+                       (setf captured (wal-decode-running-xacts payload)))))
+             (sb-thread:with-mutex (*wal-lock*)
+               (wal-append-running-xacts-under-lock 3)
+               (rove:ok (getf captured :complete))
+               (rove:ok (= +running-xacts-limit+ (length (getf captured :running))))
+               (rove:ok (> (length *active-xids*) +running-xacts-limit+))
+               (push (+ 3 +running-xacts-limit+) *active-xids*)
+               (wal-append-running-xacts-under-lock 3)
+               (rove:ok (not (getf captured :complete)))
+               (rove:ok (null (getf captured :running)))))
+        (setf (symbol-function 'clog-get) original-status
+              (symbol-function 'wal-append-batch-start) original-start
+              (symbol-function 'wal-append-record) original-record))))
+
 (rove:deftest accepted-clog-rejects-unlinked-stale-and-repeated-acceptance
     (call-with-queued-clog-test
      (lambda ()

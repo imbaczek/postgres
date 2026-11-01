@@ -4,6 +4,48 @@
 (defun source-xids-record (type start payload &optional (xid 0))
   (pg::wal-decode-record (pg::wal-encode-record type xid start payload) start))
 
+(cl-spec:defproperty source-anchors-cannot-resurrect-proven-completions
+    ((epoch (range integer 0 4294967294)) (offset (range integer 3 4090)))
+  (:about pg::physical-source-xids-next)
+  (:trials (:normal 100))
+  (let* ((done (+ (ash epoch 32) offset))
+         (live (1+ done))
+         (fresh (+ done 2))
+         (prior (pg::running-xacts-anchor
+                 (list :next-xid fresh :running (list live) :complete t) 100))
+         (record (source-xids-record
+                  pg::+wal-record-running-xacts+ 100
+                  (pg::wal-encode-running-xacts (1+ fresh) (list done live fresh) t)))
+         (after (pg::physical-source-xids-next prior record (1+ fresh))))
+    (and (equal (list live fresh) (getf after :running))
+         (equal (list live) (getf prior :running))
+         (getf after :complete)
+         (= (pg::wal-record-end record) (getf after :anchor)))))
+
+(deftest generated-source-anchors-preserve-completion-exclusions
+    (let ((data (cl-spec:result-data
+                 (cl-spec:run-property 'source-anchors-cannot-resurrect-proven-completions
+                                       :seed 4017))))
+      (ok (eq :passed (getf data :status)) (format nil "~s" data))))
+
+(deftest source-anchors-preserve-ordered-commit-exclusions
+    (let* ((first (source-xids-record pg::+wal-record-running-xacts+ 100
+                                      (pg::wal-encode-running-xacts 8 '(5 7) t)))
+           (initial (pg::physical-source-xids-next nil first 8))
+           (commit (source-xids-record pg::+wal-record-commit+ (pg::wal-record-end first)
+                                       (empty-octets) 5))
+           (completed (pg::physical-source-xids-next initial commit 8))
+           (later (source-xids-record pg::+wal-record-running-xacts+ (pg::wal-record-end commit)
+                                      (pg::wal-encode-running-xacts 9 '(5 7 8) t)))
+           (after (pg::physical-source-xids-next completed later 9)))
+      (ok (equal '(7 8) (getf after :running)))
+      (ok (equal '(7) (getf completed :running)))
+      (ok (equal '(5 7) (getf initial :running)))
+      (let ((unknown (copy-tree completed)))
+        (setf (getf unknown :complete) nil (getf unknown :running) nil)
+        (ok (equal '(5 7 8)
+                   (getf (pg::physical-source-xids-next unknown later 9) :running))))))
+
 (deftest source-xids-follow-ordered-anchors-gaps-and-commit-terminals
     (let* ((pg::*active-xids* '(999))
            (anchor (source-xids-record pg::+wal-record-running-xacts+ 100
