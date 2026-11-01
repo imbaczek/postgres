@@ -57,6 +57,19 @@ isolated pg-lisp and unmodified C peers through `PG_INTEROP_TARGET_PORT` and
 `PG_INTEROP_REFERENCE_PORT`; `PG_INTEROP_REFERENCE_USER` defaults to postgres.
 The apply suite creates fixtures and must start against fresh databases.
 
+Run the pinned Patroni 4.1.5 synchronous monitor oracle from `src/lisp` with
+the pinned environment, C binaries and matching libpq development files:
+
+```sh
+PATRONI_PYTHON=/path/to/pinned-venv/bin/python3
+PG_CONFIG=/path/to/c/bin/pg_config "$PATRONI_PYTHON" t/interop/patroni-sync-monitor.py --reference-bin /path/to/c/bin
+```
+
+It uses Patroni's connection pool, complete cluster info query and sync handler,
+and starts owned C and native peers. C physical feedback clients and two native
+replicas started through real `Postgresql.follow` exercise FIRST/ANY monitoring.
+It does not run DCS, election or the HA loop.
+
 `patroni-follow-config.py` constructs the pinned unmodified Patroni 4.1.5
 `Postgresql` and `ConfigHandler` and checks the complete attach, replace and
 clear writer output with C `postgres -C`. Use the pinned requirements, the C 20

@@ -34,9 +34,26 @@ Inline PL/pgSQL supports nested BEGIN/END, NULL, SET, RESET and PERFORM. Source
 remains opaque until execution; variables and control flow are unsupported. The
 checkpoint passed 896 unit and 201 wire checks, strict cold compilation, 36
 C/native SQL cases and four extended-protocol cycles. A property ran 100 trials
-at seed 4016 (digest `6004b366b0be3dec`). Acceptance of the unchanged full
-Patroni path remains open. Run the C comparison from `src/lisp` with
+at seed 4016 (digest `6004b366b0be3dec`). At that checkpoint acceptance of the
+unchanged Patroni path remained open. Run the C comparison from `src/lisp` with
 `python3 t/do-perform.py --reference-bin /path/to/c/bin`.
+
+### Patroni synchronous monitoring
+
+The pinned Patroni 4.1.5 connection pool and sync handler now pass the complete
+16-field cluster info query and unchanged sync-change DO on C and native
+primaries, with Patroni's role set to PRIMARY or PROMOTED. The test checks
+same-connection LOCAL restoration, cache invalidation, WAL traffic and the
+unchanged-value skip. C physical feedback clients check FIRST/ANY sender state
+and positions. Two native replicas started with real `Postgresql.follow` also
+check those fields and one sync handler's FIRST-to-ANY transition. This uses no DCS,
+election or HA loop; the standby-leader `pg_control_checkpoint` branch remains
+unsupported. The passing log is
+`/home/imbaczek/proj/pg-ha-artifacts/patroni-sync/final.log`; owned traces are
+under `/tmp/pg-transaction-response-859cu0aw` and the C oracle under
+`/tmp/pg-patroni-sync-monitor-c-oracle-0xyran3t`. The 12 C/native dollar-quote
+cases also passed. See [the interop inventory](t/interop/README.md#running) for
+the command.
 
 ### Configured native follow
 

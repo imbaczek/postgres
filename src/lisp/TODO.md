@@ -12,7 +12,8 @@
   `parse-from-relation` and `expand-select-targets` ran 100 trials at seed 4014
   (digest `fnv1a64-v1:996181b0f1e156ab`); neither target has a registered
   Function Spec, and input coverage and rejection counts were not measured.
-  DO, PERFORM, `txid_current()` and full Patroni acceptance remain open.
+  At that checkpoint DO, PERFORM, `txid_current()` and full Patroni acceptance
+  remained open.
 
 - [x] Scan dollar-quoted strings and parameter boundaries (`1a831afe4bc`).
   At that checkpoint DO, PERFORM, `txid_current()` and scalar FROM support remained
@@ -420,15 +421,19 @@
 - [ ] Match C background flushing of unrelated WAL when the publication FIFO is
   empty. Audit which native WAL frontiers can safely advance before enabling it.
 
-- [ ] Complete the unchanged Patroni monitoring query and synchronous-replication
-  backend contract. Preserve the complete real query as the acceptance oracle.
-  Patroni's sync handler also emits a DO block containing SET LOCAL
-  synchronous_commit=off and PERFORM txid_current(); these remain dependencies
-  of unchanged-method acceptance. Complete public FIRST/ANY integration against
-  C `syncrep.c`, with independent acknowledgment/crash tests;
-  this item adds no coordination. Preserve the
-  different-upstream, descendant and rejoin acceptance work alongside this path,
-  and finish the cold-load audit and broader C-style documentation.
+- [x] Implement `txid_current()` (`34044987044`) and the inline DO/PERFORM
+  subset (`90fed2d98ff`) required by Patroni's unchanged sync-change method.
+  The pinned monitor oracle (`f46d7c0ad0c`) passes its full query and unchanged
+  sync handler on C and native primaries with an empty sender registry. C feedback
+  clients check FIRST/ANY monitoring; real native Patroni followers also check
+  one handler's FIRST-to-ANY transition. Evidence is
+  `/home/imbaczek/proj/pg-ha-artifacts/patroni-sync/final.log`.
+
+- [ ] Complete the broader synchronous-replication backend contract, including
+  independent FIRST/ANY acknowledgment and crash tests against C `syncrep.c`.
+  The standby-leader `pg_control_checkpoint` monitor branch is unimplemented.
+  Preserve different-upstream, descendant and rejoin acceptance work, and finish
+  the cold-load audit and broader C-style documentation. No coordination is added.
 
 - [x] Publish an allocated backend XID with its active registration under the XID
   lock and interrupt mask, following C's ownership-before-unlock ordering. Raw
