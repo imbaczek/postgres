@@ -1,10 +1,20 @@
 # Development TODO
 
+- [x] Integrate private asynchronous acceptance with receipts, CLOG and backend
+  cleanup (`280dc7f3541`, `0ff4a132af7`). A queued owner retains its resources
+  after backend cleanup; pressure, resets or writer unavailability force a flush.
+  Final DDL and remote waiting also force local flush. Public OFF remains disabled.
+  The checkpoint passed 881 unit checks through the tool, 1,413 physical checks,
+  strict cold compilation, six native crash/acceptance, eight native writer and
+  eight native receipt cases. Logs are in
+  `/home/imbaczek/proj/pg-ha-artifacts/async-acceptance/`: `physical-final.log`,
+  `cold-reviewed.log`, `native-crash-final.log`, `native-writer.log` and
+  `native-receipts.log`. No new cl-spec contract was added for this milestone.
+
 - [x] Add the logical CLOG acceptance transition for a linked pending
-  publication (`d4a0b22ab30`). The helper is not yet called by production;
-  receipt and backend cleanup integration remain open, and OFF stays disabled.
-  Preserve snapshot settlement when integrating acceptance. The checkpoint passed
-  874 unit and 1,413 physical checks and strict cold compilation. Evidence is in
+  publication (`d4a0b22ab30`). At that checkpoint the helper had no production
+  caller and receipt and backend cleanup integration remained open. The checkpoint
+  passed 874 unit and 1,413 physical checks and strict cold compilation. Evidence is in
   `/home/imbaczek/proj/pg-ha-artifacts/accepted-clog/` (`physical.log` and
   `cold.log`); unit checks ran through the tool. The property
   `accepted-clog-neighbor-writes-preserve-wal-order` ran 100 trials at seed 4011
@@ -14,8 +24,8 @@
 - [x] Add retained WAL publication pressure accounting and admission
   (`e8673faf91a`). Pressure can settle predecessors and require synchronous
   completion; the limits bound asynchronous acceptance, not a transaction's
-  transient allocations. OFF remains disabled, and a future asynchronous caller
-  must honor the admission helper's third return value. The checkpoint passed 871
+  transient allocations. At that checkpoint OFF remained disabled and integration
+  still needed to honor the admission helper's third return value. It passed 871
   unit, 1,413 physical, 1,161 legacy and 201 wire checks, strict cold compilation,
   eight native writer cases including pressure and SIGKILL, 21 native page and five
   native CLOG cases. Logs are in `/home/imbaczek/proj/pg-ha-artifacts/wal-pressure/`.

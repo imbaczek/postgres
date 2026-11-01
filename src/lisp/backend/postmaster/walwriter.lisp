@@ -69,6 +69,7 @@ The descriptors are immutable; CONSUMED-P prevents reuse."
              (or (null thread) (not (sb-thread:thread-alive-p thread)))))))
 
 (defun primary-wal-writer-storage-current-under-lock-p (epoch)
+  "Test whether EPOCH still names this owned, ready primary store under WAL lock."
   (assert (sb-thread:holding-mutex-p *wal-lock*))
   (and *wal-ready* (not (recovery-in-progress-p))
        (= +db-in-production+ (or (getf *wal-control-metadata* :db-state) -1))
@@ -217,6 +218,7 @@ The wait path consumes signals and clears the pending flag under this lock."
   (values))
 
 (defun primary-wal-writer-available-under-lock-p ()
+  "Check the running writer and its current storage authority under WAL then state lock."
   (assert (sb-thread:holding-mutex-p *wal-lock*))
   (sb-thread:with-mutex (*primary-wal-writer-lock*)
     (let ((writer *primary-wal-writer*))
@@ -231,6 +233,8 @@ The wait path consumes signals and clears the pending flag under this lock."
            (primary-wal-writer-storage-current-under-lock-p (primary-wal-writer-epoch writer))))))
 
 (defun settle-stopped-primary-wal-writer ()
+  "After stop, settle pending work if WAL is healthy under definition then WAL lock.
+Leave poisoned work intact; fail-stop on settlement failure after releasing both."
   (sb-sys:without-interrupts
     (let ((failure nil))
       (handler-case
@@ -409,7 +413,8 @@ ready primary after installing source identity and before enabling reload."
   "Stop and join outside live admission and the lifecycle locks checked below.
 Ordinary stop permits restart; SHUTDOWN-P closes startup permanently. Publish
 the joined state under WAL then state lock after the thread exits. Final shutdown
-joins after reload workers stop and before storage finalization."
+joins after reload workers stop and before storage finalization. After joining,
+settle healthy FIFO debt under definition then WAL lock, even without a writer."
   (when (or (sb-thread:holding-mutex-p *wal-lock*)
             (sb-thread:holding-mutex-p *primary-wal-writer-lock*)
             (sb-thread:holding-mutex-p *reload-definition-lock*)

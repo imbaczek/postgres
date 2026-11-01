@@ -2526,8 +2526,9 @@ Run outside publication locks, clean up the transaction, then handle the outcome
   (values))
 
 ;; Check the accepted historical facts against this call and its observed
-;; durable callback.  WAL-ready commits require both the exact end and proof;
-;; a no-WAL receipt has neither, even when CLOG was synced directly.
+;; durable callback and captured local requirement. An asynchronous receipt can
+;; record an exact end without durability proof or a durable callback. A no-WAL
+;; receipt has neither end nor proof, even when CLOG was synced directly.
 
 (defun validate-wal-commit-receipt
     (receipt accepted xid source end durable-end wal-ready-p &optional (local-durability :flush))
@@ -2572,8 +2573,8 @@ Run outside publication locks, clean up the transaction, then handle the outcome
                         (logical-preflight-spool (backend-logical-spool b)))))))
           ;; Validate the spool before publishing any WAL batch. Subsequent I/O
           ;; failure during WAL insertion follows the normal critical-failure path.
-          ;; Keep the XID through local storage apply.  Mask interrupts across
-          ;; publication and lexical ownership of cleanup.  A poisoned WAL can
+          ;; Keep the XID through acceptance or local storage apply. Mask interrupts
+          ;; across publication and lexical ownership of cleanup.  A poisoned WAL can
           ;; leave the outcome indeterminate: retire resources without inventing
           ;; a CLOG commit or abort.
           (multiple-value-bind (obligation source)

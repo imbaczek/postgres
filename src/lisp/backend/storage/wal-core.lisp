@@ -87,8 +87,8 @@ This policy is a choice, distinct from a WAL receipt's historical facts."
   (remote-wait nil :read-only t))
 
 (defun wal-require-local-commit-durability (mode)
-  "Require local flush before publication, including the no-WAL path.
-Async is unsupported (0A000); an unknown policy is an internal error (XX000)."
+  "Validate the internal local durability policy before publication.
+Public synchronous_commit=off remains disabled."
   (unless (member mode '(:flush :async))
     (ereport "XX000" "invalid local commit durability policy"))
   mode)
@@ -1236,8 +1236,9 @@ flush I/O can themselves call fail-stop while the mutex is held."
 
 (defmacro with-wal-publication-fence ((begin-publication) &body body)
   "Fence publication begun by BEGIN-PUBLICATION through completion of BODY.
-After publication begins, fence cleanup fail-stops after releasing WAL on an
-error or nonlocal exit. Legacy append and flush I/O handlers may fail-stop earlier
+After publication begins, an incomplete body poisons WAL before releasing its
+lock. Fence cleanup fail-stops after release on an error or nonlocal exit.
+Legacy append and flush I/O handlers may fail-stop earlier
 while WAL is held. Retain the first error even if cleanup fails. Mask interrupts
 during cleanup, and keep backend termination from replacing a latched WAL failure."
   (let ((started (gensym "STARTED-"))
@@ -1853,8 +1854,7 @@ unattempted reservation can be cancelled; an ambiguous attempt retains its owner
 for fail-stop handling. Return the owner and actual terminal end.
 Caller masks interrupts through handoff and fences incomplete publication.
 Pressure may settle predecessors before this batch starts. The third value
-requires synchronous completion of this owner before any asynchronous acceptance;
-a future asynchronous caller must consume it.
+requires synchronous completion of this owner before any asynchronous acceptance.
 This helper does not flush the new owner or provide an acceptance receipt."
   (assert (sb-thread:holding-mutex-p *wal-lock*))
   (wal-check-page-publication-queue-under-lock)
@@ -1921,31 +1921,24 @@ This may be called again after materialization while page retirement is pending.
     (xid after-durable-function &key logical-changes terminal-durable-function
                                   (source-id nil source-id-supplied-p) accepted-function
                                   (local-durability :flush))
-  "Flush storage resets, page images and XID's commit as one WAL boundary.
-LOCAL-DURABILITY defaults to :FLUSH for internal callers and is validated
-before publication even without WAL. The reset descriptors are owned across
-AFTER-DURABLE-FUNCTION, which may release the transaction's private replacements.
-Preflight the page spool before the terminal and transfer the dirty maps to a
-pending owner at that exact end. Flush WAL before truncating any relation fork.
-After the durable observer, drain predecessors before completing this owner's
-CLOG status and calling AFTER-DURABLE-FUNCTION. Resets, pages, checked spool
-close and reference retirement finish before acceptance.
+  "Publish XID's commit and return its end and immutable historical receipt.
+LOCAL-DURABILITY defaults to :FLUSH. Private :ASYNC can accept a queued owner
+without flushing when pressure, resets and writer availability permit it. The
+FIFO retains the owner's pages, spool and CLOG completion independent of the
+backend. Otherwise flush and apply through this owner before acceptance; reset
+descriptors remain owned through AFTER-DURABLE-FUNCTION.
 
-With WAL ready, return this transaction's numeric commit end and an immutable
-receipt after local apply. TERMINAL-DURABLE-FUNCTION receives the exact end
-immediately after flush, before AFTER-DURABLE-FUNCTION. The FIFO owns CLOG
-completion with WAL ready; without WAL the latter callback must write status.
-It receives this transaction's own end, or NIL without WAL, independently of
-the observer callback and cannot manufacture proof that the observer ran. For incomplete
-publication, fence cleanup fail-stops after releasing WAL and retains the first
-error. Legacy append and flush I/O handlers may fail-stop earlier while WAL is held.
+A receipt records whether durability was observed at acceptance; it is not
+upgraded later. The async path calls neither durable callback. On the flush path
+TERMINAL-DURABLE-FUNCTION observes the exact end after flush and before
+AFTER-DURABLE-FUNCTION. Without WAL, the latter must write the commit status and the
+receipt has no WAL end or proof. Incomplete publication is fail-stopped by the
+publication fence.
 
 SOURCE-ID must be an explicit immutable symbol or integer when WAL is ready;
-NIL is valid. ACCEPTED-FUNCTION receives the same receipt returned as the second
-value, after apply and spool cleanup under the publication fence, WAL mutex and
-interrupt mask. It must only latch the receipt and ownership, without allocation,
-I/O or locks. Without WAL, return NIL and a receipt without WAL proof; acceptance
-runs under the interrupt mask after the direct commit callback."
+NIL is valid. ACCEPTED-FUNCTION receives the returned receipt under the interrupt
+mask and must only latch scalar ownership and receipt state, without allocation,
+I/O or locks. With WAL it runs under the publication fence and WAL mutex."
   (wal-require-local-commit-durability local-durability)
   (when (and *wal-ready* (not source-id-supplied-p))
     (error "WAL commit requires an explicit source identity"))
