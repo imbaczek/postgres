@@ -1711,6 +1711,23 @@ fail-stop handling."
   (wal-drain-page-publication-prefix-under-lock
    target :include-target-p t :fault-on-first-write fault-on-first-write))
 
+(defmacro with-wal-poison-on-incomplete ((message) &body body)
+  (let ((complete (gensym "COMPLETE-"))
+        (failure (gensym "FAILURE-"))
+        (condition (gensym "CONDITION-")))
+    `(progn
+       (assert (sb-thread:holding-mutex-p *wal-lock*))
+       (let ((,complete nil) (,failure nil))
+         (sb-sys:without-interrupts
+           (unwind-protect
+                (handler-bind ((error (lambda (,condition)
+                                        (unless ,failure (setf ,failure ,condition)))))
+                  (multiple-value-prog1 (progn ,@body)
+                    (setf ,complete t)))
+             (unless ,complete
+               (setf *wal-poisoned* t)
+               (unless ,failure (error ,message)))))))))
+
 (defun wal-settle-page-publications-under-lock ()
   "Flush and drain the captured FIFO prefix under WAL exclusion.
 Incomplete settlement poisons WAL. Preserve ordinary errors; convert a bare
@@ -1721,18 +1738,9 @@ nonlocal exit to an error so the caller can fence failure after unlocking."
   (clog-check-queued-commits-under-wal-lock)
   (let ((target *wal-pending-page-publication-tail*))
     (when target
-      (let ((complete nil) (failure nil))
-        (sb-sys:without-interrupts
-          (unwind-protect
-               (handler-bind ((error (lambda (condition)
-                                       (unless failure (setf failure condition)))))
-                 (wal-flush-core)
-                 (wal-drain-page-publications-through-under-lock target :fault-on-first-write t)
-                 (setf complete t))
-            (unless complete
-              (setf *wal-poisoned* t)
-              (unless failure
-                (error "WAL predecessor drain exited before completion")))))))
+      (with-wal-poison-on-incomplete ("WAL predecessor drain exited before completion")
+        (wal-flush-core)
+        (wal-drain-page-publications-through-under-lock target :fault-on-first-write t)))
     target))
 
 (defmacro with-wal-primary-page-spool ((spool &optional publication) &body body)
