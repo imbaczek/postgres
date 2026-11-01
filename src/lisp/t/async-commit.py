@@ -1,4 +1,4 @@
-"""Exercise private async acceptance before enabling the public OFF setting."""
+"""Verify public asynchronous commit acknowledgment and crash recovery."""
 from pathlib import Path
 import runpy
 
@@ -19,6 +19,8 @@ def run_case(case):
         server.start()
         actor = Connection(server.port)
         actor.query('CREATE TABLE async_rows (id int PRIMARY KEY)')
+        actor.query('SET synchronous_commit=off')
+        assert actor.query('SHOW synchronous_commit') == [['off']]
         pid = int(actor.query('SELECT pg_backend_pid()')[0][0])
         paused = pause_writer(server, case)
         failure_case = case in ('missing', 'wrong-source', 'nonlocal')
@@ -33,9 +35,7 @@ def run_case(case):
             '(defvar *async-test-backend* nil) '
             '(defvar *async-test-wal* (symbol-function \'wal-commit-transaction)) '
             '(defvar *async-test-available* (symbol-function \'primary-wal-writer-available-under-lock-p)) '
-            '(setf (symbol-function \'synchronous-commit-policy) '
-            '(lambda () (%make-commit-policy :async nil)) '
-            '(symbol-function \'wal-commit-transaction) '
+            '(setf (symbol-function \'wal-commit-transaction) '
             '(lambda (&rest arguments) '
             '(multiple-value-bind (end receipt) (apply *async-test-wal* arguments) '
             '(setf *async-test-receipt* receipt *async-test-backend* *backend*) '
