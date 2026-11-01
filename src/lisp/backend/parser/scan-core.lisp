@@ -85,6 +85,8 @@
               i))))
 
 (defun sql-dollar-tag-character-p (character &optional continuation-p)
+  "Recognize a dollar tag character; digits are allowed only in continuation.
+Like C's scanner, non-ASCII characters are allowed in tags."
   (and character
        (or (char= character #\_)
            (char<= #\a character #\z)
@@ -93,6 +95,9 @@
            (and continuation-p (sql-number-digit-p character 10)))))
 
 (defun scan-dollar-quoted-text (sql start)
+  "Return raw quoted text and the position after its matching delimiter.
+START must point at a dollar sign. Tags match exactly, including case. A non-opener returns NIL, NIL for the
+caller to handle; an unterminated valid opener reports an error at START."
   (let ((tag-end (1+ start)) (size (length sql)))
     (when (and (< tag-end size) (sql-dollar-tag-character-p (char sql tag-end)))
       (incf tag-end)
@@ -108,6 +113,8 @@
       (values (subseq sql begin end) (+ end (length delimiter))))))
 
 (defun scan-sql-parameter (sql start)
+  "Scan the parameter digits and reject trailing identifier junk.
+A dollar after the digits begins the next token."
   (let ((position (1+ start)) (index 0))
     (loop for digit = (and (< position (length sql))
                            (sql-number-digit-p (char sql position) 10))

@@ -1,5 +1,17 @@
 # Development TODO
 
+- [x] Scan dollar-quoted strings and parameter boundaries (`1a831afe4bc`).
+  This is a parser prerequisite; DO, PERFORM, `txid_current()` and scalar FROM
+  support remain open. The checkpoint passed 885 unit and 201 wire checks and
+  strict cold compilation. The native C comparison passed 12 value and error
+  position cases, including Unicode tags, overlapping delimiters, parameter
+  boundaries and a one-million-character literal. Evidence is in
+  `/home/imbaczek/proj/pg-ha-artifacts/dollar-quoting/`:
+  `cold-final.log`, `wire.log` and `native-c-reviewed.log`; unit checks ran through the
+  tool. The helper/tokenizer property ran 100 trials at seed 4013 (digest
+  `fnv1a64-v1:9318d3c8888b3fa3`); neither target has a registered Function Spec,
+  and rejection counts and input coverage were not measured.
+
 - [x] Enable public `synchronous_commit=off` (`0ce95c4e409`, `24cebb6d345`).
   The checkpoint passed 882 unit, 1,413 physical, 201 wire and 1,161 legacy
   checks, strict cold compilation, six native public OFF crash cases and the
