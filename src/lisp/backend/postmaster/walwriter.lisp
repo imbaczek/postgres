@@ -2,7 +2,8 @@
 (in-package #:pg)
 
 (declaim (special *reload-definition-lock* *reload-run-lock* *live-operation-depth*
-                  *postmaster-data-lock* *server-output* *server-error*))
+                  *postmaster-data-lock* *server-output* *server-error*
+                  *physical-follow-generation-lock* *live-operation-lock*))
 
 (defstruct (wal-writer-epoch
             (:constructor make-wal-writer-epoch (incarnation timeline ownership)))
@@ -47,6 +48,9 @@ The descriptors are immutable; CONSUMED-P prevents reuse."
 
 (defvar *primary-wal-writer* nil)
 (defvar *primary-wal-writer-generation* 0)
+
+(defvar *primary-wal-writer-shutdown-p* nil)
+
 (defvar *primary-wal-writer-lock* (sb-thread:make-mutex :name "primary WAL writer state"))
 (defvar *primary-wal-writer-delay* 0.2)
 (defvar *primary-wal-writer-join-timeout* 5)
@@ -245,13 +249,139 @@ The caller must fence failures after releasing WAL; this function does not."
     (when (primary-wal-writer-stopping-p writer) (return-from primary-wal-writer-step :stop))
     (primary-wal-writer-drain-under-lock writer (primary-wal-writer-epoch writer))))
 
-(defun request-primary-wal-writer-stop (&optional (writer *primary-wal-writer*))
+(defun request-primary-wal-writer-stop-under-state-lock (writer)
+  (assert (sb-thread:holding-mutex-p *primary-wal-writer-lock*))
   (when writer
-    (sb-thread:with-mutex (*primary-wal-writer-lock*)
-      (sb-sys:without-interrupts
-        (setf (primary-wal-writer-stop-p writer) t)
-        (when (member (primary-wal-writer-state writer) '(:starting :running))
-          (setf (primary-wal-writer-state writer) :stopping))
-        (wake-primary-wal-writer-under-state-lock writer))))
+    (sb-sys:without-interrupts
+      (setf (primary-wal-writer-stop-p writer) t)
+      (when (member (primary-wal-writer-state writer) '(:starting :running))
+        (setf (primary-wal-writer-state writer) :stopping))
+      (wake-primary-wal-writer-under-state-lock writer)))
   writer)
 
+(defun request-primary-wal-writer-shutdown ()
+  (sb-thread:with-mutex (*primary-wal-writer-lock*)
+    (setf *primary-wal-writer-shutdown-p* t)
+    (request-primary-wal-writer-stop-under-state-lock *primary-wal-writer*)))
+
+(defun request-primary-wal-writer-stop (&optional (writer nil supplied-p))
+  (sb-thread:with-mutex (*primary-wal-writer-lock*)
+    (request-primary-wal-writer-stop-under-state-lock
+     (if supplied-p writer *primary-wal-writer*))))
+
+(defun finish-primary-wal-writer (writer failure normal-p)
+  (let ((fence nil))
+    (sb-sys:without-interrupts
+      (sb-thread:with-mutex (*wal-lock*)
+        (sb-thread:with-mutex (*primary-wal-writer-lock*)
+          (let ((current-p (and (eq writer *primary-wal-writer*)
+                                (= (primary-wal-writer-generation writer)
+                                   *primary-wal-writer-generation*))))
+            (cond
+              ((and normal-p (or (not current-p) (primary-wal-writer-stop-p writer)))
+               (setf (primary-wal-writer-state writer) (if current-p :stopped :retired)))
+              (t
+               (setf (primary-wal-writer-failure writer)
+                     (or (primary-wal-writer-failure writer) failure
+                         (make-condition 'simple-error
+                                         :format-control "primary WAL writer exited unexpectedly"))
+                     (primary-wal-writer-state writer) :failed)
+               (when current-p
+                 (setf *wal-poisoned* t fence (primary-wal-writer-failure writer))))))))
+      (when fence
+        (let ((*print-circle* t) (*print-level* 6) (*print-length* 20))
+          (ignore-errors (admin-log "primary WAL writer failed: ~a" fence)))
+        (handler-case (wal-fail-stop fence) (error () nil)))))
+  (values))
+
+(defun primary-wal-writer-wait (writer)
+  (sb-thread:wait-on-semaphore (primary-wal-writer-wake writer)
+                               :timeout *primary-wal-writer-delay*)
+  (sb-thread:with-mutex (*primary-wal-writer-lock*)
+    (loop while (sb-thread:try-semaphore (primary-wal-writer-wake writer)))
+    (setf (primary-wal-writer-wake-pending-p writer) nil))
+  (values))
+
+(defun primary-wal-writer-main (writer)
+  (let ((*backend* nil) (*live-operation-depth* 0)
+                        (*standard-output* (primary-wal-writer-output writer))
+                        (*error-output* (primary-wal-writer-error-output writer))
+                        (failure nil) (normal-p nil))
+    (unwind-protect
+         (handler-case
+             (progn
+               (sb-thread:wait-on-semaphore (primary-wal-writer-ready writer))
+               (loop
+                 (when (primary-wal-writer-stopping-p writer) (return))
+                 (primary-wal-writer-test-point :before-cycle writer)
+                 (when (eq :stop
+                           (call-with-reload-definitions
+                            (lambda () (primary-wal-writer-step writer))))
+                   (return))
+                 (primary-wal-writer-test-point :after-cycle writer)
+                 (primary-wal-writer-wait writer))
+               (setf normal-p t))
+           (error (condition) (setf failure condition)))
+      (finish-primary-wal-writer writer failure normal-p))))
+
+(defun make-primary-wal-writer-thread (writer)
+  (sb-thread:make-thread (lambda () (primary-wal-writer-main writer))
+                         :name "pg primary WAL writer"))
+
+(defun start-primary-wal-writer-under-lock ()
+  (assert (sb-thread:holding-mutex-p *wal-lock*))
+  (wal-check-healthy)
+  (unless (and *wal-ready* (not (recovery-in-progress-p))
+               (= +db-in-production+ (or (getf *wal-control-metadata* :db-state) -1))
+               *postmaster-data-lock* (postmaster-pid-owned-p)
+               (not (shutdown-in-progress-p)))
+    (wal-invalid-input "primary WAL writer requires an owned ready primary"))
+  (sb-thread:with-mutex (*primary-wal-writer-lock*)
+    (when *primary-wal-writer-shutdown-p*
+      (wal-invalid-input "primary WAL writer startup is closed for shutdown"))
+    (unless (and (primary-wal-writer-retired-under-state-lock-p *primary-wal-writer*)
+                 (or (null *primary-wal-writer*)
+                     (null (primary-wal-writer-failure *primary-wal-writer*))))
+      (wal-invalid-input "previous primary WAL writer has not retired cleanly"))
+    (let ((writer (%make-primary-wal-writer
+                   (1+ *primary-wal-writer-generation*)
+                   (make-wal-writer-epoch *wal-storage-incarnation* *wal-insert-timeline*
+                                          *postmaster-data-lock*)
+                   (or *server-output* *standard-output*) (or *server-error* *error-output*))))
+      (sb-sys:without-interrupts
+        (setf (primary-wal-writer-thread writer) (make-primary-wal-writer-thread writer))
+        (setf *primary-wal-writer* writer
+              *primary-wal-writer-generation* (primary-wal-writer-generation writer)
+              (primary-wal-writer-state writer) :running)
+        (sb-thread:signal-semaphore (primary-wal-writer-ready writer)))
+      writer)))
+
+(defun start-primary-wal-writer ()
+  (if (sb-thread:holding-mutex-p *wal-lock*)
+      (start-primary-wal-writer-under-lock)
+      (sb-thread:with-mutex (*wal-lock*) (start-primary-wal-writer-under-lock))))
+
+(defun stop-primary-wal-writer (&key shutdown-p)
+  (when (or (sb-thread:holding-mutex-p *wal-lock*)
+            (sb-thread:holding-mutex-p *primary-wal-writer-lock*)
+            (sb-thread:holding-mutex-p *reload-definition-lock*)
+            (sb-thread:holding-mutex-p *reload-run-lock*)
+            (sb-thread:holding-mutex-p *physical-follow-generation-lock*)
+            (sb-thread:holding-mutex-p *live-operation-lock*)
+            (plusp *live-operation-depth*))
+    (error "primary WAL writer join requires an outside lifecycle caller"))
+  (let ((writer (if shutdown-p
+                    (request-primary-wal-writer-shutdown)
+                    (request-primary-wal-writer-stop))))
+    (when writer
+      (when (eq sb-thread:*current-thread* (primary-wal-writer-thread writer))
+        (error "primary WAL writer cannot join itself"))
+      (let* ((timeout (list :timeout))
+             (result (sb-thread:join-thread (primary-wal-writer-thread writer)
+                                            :timeout *primary-wal-writer-join-timeout*
+                                            :default timeout)))
+        (when (eq timeout result) (error "primary WAL writer did not stop"))
+        (sb-thread:with-mutex (*wal-lock*)
+          (sb-thread:with-mutex (*primary-wal-writer-lock*)
+            (setf (primary-wal-writer-joined-p writer) t))))))
+  (values))
