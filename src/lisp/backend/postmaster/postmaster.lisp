@@ -324,6 +324,7 @@ including during smart shutdown. The signal worker remains available for immedia
     ;; Like C ShutdownXLOG, recovery shutdown publishes an applied restartpoint.
     ;; The signal worker remains free to process SIGQUIT while this waits.
     (stop-reload-workers)
+    (stop-primary-wal-writer :shutdown-p t)
     (managed-worker-shutdown)
     (physical-follow-controller-stop-worker)
     (sb-thread:with-mutex (*wal-lock*)

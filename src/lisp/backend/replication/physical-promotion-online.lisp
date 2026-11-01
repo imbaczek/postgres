@@ -83,8 +83,10 @@ under the fence; notify exact old senders after release."
                        (physical-promotion-install-prefix)
                        (multiple-value-prog1
                            (physical-promotion-complete-child publication)
-                         (setf *physical-promotion-stopping-p* nil
-                               (physical-promotion-publication-completed-p publication) t)))
+                         (sb-thread:with-mutex (*wal-lock*)
+                           (start-primary-wal-writer-under-lock)
+                           (setf *physical-promotion-stopping-p* nil
+                                 (physical-promotion-publication-completed-p publication) t))))
                   (setf obsolete (physical-promotion-publication-obsolete publication))))))))
        publication))))
 

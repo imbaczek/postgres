@@ -974,6 +974,7 @@ Then check the cached handles and workers under startup exclusion."
           (assert (nth-value 0 (sync-replication-configuration-state)))
           (with-live-operation-quiescence
             (sync-replication-new-source-incarnation)))
+      (unless (recovery-in-progress-p) (start-primary-wal-writer))
       (enable-reload)
       (enable-shutdown-handlers)
       (start-swank-listener swank-port swank-bind-address)

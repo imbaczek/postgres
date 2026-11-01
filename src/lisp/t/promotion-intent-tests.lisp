@@ -6,6 +6,8 @@
     (sb-thread:with-mutex (pg::*reload-run-lock*)
       (pg::with-live-operation-quiescence (funcall function)))))
 
+(defvar *promotion-test-writer-starts* 0)
+
 (defun call-with-promotion-fixture (function &key (namespace :legacy) (system-id 123) (applied 216))
   (call-with-restartpoint-fixture
    (lambda (root old-store)
@@ -38,9 +40,20 @@
               (or pg::*installed-resource-parameters* (pg::make-resource-parameters 100 8 10 0 64)))
             (pg::*wal-ready* t) (pg::*wal-insert-timeline* 1) (pg::*wal-checkpoint-timeline* 1)
             (pg::*wal-checkpoint-lsn* 152) (pg::*wal-end-lsn* 152) (pg::*wal-durable-lsn* 152)
-            (pg::*wal-segment-namespace* namespace) (pg::*last-replay-lsn* applied))
+            (pg::*wal-segment-namespace* namespace) (pg::*last-replay-lsn* applied)
+            (*promotion-test-writer-starts* 0)
+            (start-writer (symbol-function 'pg::start-primary-wal-writer-under-lock)))
        (unwind-protect
             (progn
+              (setf (symbol-function 'pg::start-primary-wal-writer-under-lock)
+                    (lambda ()
+                      (assert (sb-thread:holding-mutex-p pg::*wal-lock*))
+                      (assert (sb-thread:holding-mutex-p pg::*physical-follow-generation-lock*))
+                      (assert (not (pg::recovery-in-progress-p)))
+                      (assert (= pg::+db-in-production+
+                                 (getf pg::*wal-control-metadata* :db-state)))
+                      (assert (pg::postmaster-pid-owned-p))
+                      (incf *promotion-test-writer-starts*)))
               (when (eq namespace :timeline) (delete-file (pg::wal-segment-path 0 1 :legacy)))
               (pg::wal-atomic-write-bytes (merge-pathnames name root) base)
               (pg::wal-atomic-write-bytes (pg::wal-control-path) control)
@@ -82,6 +95,7 @@
               (pg::physical-store-flush store)
               (pg::physical-store-compact store applied #'pg::physical-restartpoint-publish)
               (funcall function root store))
+         (setf (symbol-function 'pg::start-primary-wal-writer-under-lock) start-writer)
          (pg::physical-store-close store))))
    :system-id system-id))
 

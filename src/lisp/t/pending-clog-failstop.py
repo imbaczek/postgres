@@ -8,6 +8,8 @@ import time
 
 api = runpy.run_path(str(Path(__file__).with_name('synchronous-ddl.py')))
 OwnedLisp, Connection, expect_closed = api['OwnedLisp'], api['Connection'], api['expect_closed']
+writer_controls = runpy.run_path(str(Path(__file__).with_name('wal-writer-control.py')))
+OwnedLisp = writer_controls['paused_writer_server'](OwnedLisp)
 
 
 def install_failure(server, pid, after_write):

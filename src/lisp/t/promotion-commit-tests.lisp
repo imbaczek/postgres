@@ -359,7 +359,7 @@
            (ok (not pg::*physical-recovery-failed-p*)))))))
 
 (deftest live-promotion-source-publication-preserves-completion-and-debt
-    (dolist (mode '(:complete :interrupt :error))
+    (dolist (mode '(:complete :interrupt :error :writer-error :notify-error))
       (call-with-live-child-fixture
        (lambda (root store)
          (declare (ignore root store))
@@ -372,6 +372,7 @@
                 (pg::*wal-sender-registry* (make-hash-table :test #'eq))
                 (owner (pg::make-backend :pid 914 :replication-mode :physical))
                 (terminate (symbol-function 'pg::terminate-backend))
+                (start-writer (symbol-function 'pg::start-primary-wal-writer-under-lock))
                 (events nil))
            (setf (gethash 1 pg::*backend-registry*) pg::*backend*)
            (pg::ensure-transaction-snapshot pg::*backend* 1)
@@ -386,7 +387,12 @@
                     (setf (symbol-function 'pg::terminate-backend)
                           (lambda (backend)
                             (unless (eq backend owner) (error "wrong promotion sender"))
-                            (record :notify)))
+                            (record :notify)
+                            (when (eq mode :notify-error) (error "obsolete notification failed")))
+                          (symbol-function 'pg::start-primary-wal-writer-under-lock)
+                          (lambda ()
+                            (funcall start-writer)
+                            (when (eq mode :writer-error) (error "primary writer startup failed"))))
                     (let* ((pg::*physical-promotion-test-hook*
                              (lambda (point)
                                (case point
@@ -409,20 +415,24 @@
                                   (error (condition)
                                     (push (list :failure (princ-to-string condition)) events)
                                     :failed))))))
-                      (ok (eql (case mode (:complete 424) (:interrupt :interrupted) (:error :failed)) result)))
+                      (ok (eql (case mode (:complete 424) (:interrupt :interrupted) (otherwise :failed)) result)))
                     (let ((ordered (reverse events)))
                       (ok (equal '((:intent t t) (:ready t t) (:notify t nil))
                                  (subseq ordered 0 (min 3 (length ordered)))))
                       (when (eq mode :interrupt)
                         (ok (eq :interrupt (first (fourth ordered))))
                         (ok (null (third (fourth ordered))))))
+                    (ok (= (if (eq mode :error) 0 1) *promotion-test-writer-starts*))
                     (ok (not (pg::recovery-in-progress-p)))
-                    (ok (eql (eq mode :error) pg::*physical-recovery-failed-p*))
-                    (unless (eq mode :error) (ok (not pg::*physical-promotion-stopping-p*)))
+                    (ok (eql (not (null (member mode '(:error :writer-error))))
+                             pg::*physical-recovery-failed-p*))
+                    (unless (member mode '(:error :writer-error))
+                      (ok (not pg::*physical-promotion-stopping-p*)))
                     (ok (zerop (hash-table-count pg::*wal-sender-registry*)))
                     (ok (not (eq :source-a (pg::sync-replication-state-source-id
                                             pg::*sync-replication-state*)))))
-               (setf (symbol-function 'pg::terminate-backend) terminate)))))
+               (setf (symbol-function 'pg::terminate-backend) terminate
+                     (symbol-function 'pg::start-primary-wal-writer-under-lock) start-writer)))))
        :committed-child nil)))
 
 (deftest live-promotion-completes-with-readers-enrolled-before-intent

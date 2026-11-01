@@ -1628,7 +1628,8 @@ Install the preallocated empty maps by pointer, without changing references."
     (if *wal-pending-page-publication-tail*
         (setf (wal-page-publication-next *wal-pending-page-publication-tail*) owner)
         (setf *wal-pending-page-publication* owner))
-    (setf *wal-pending-page-publication-tail* owner))
+    (setf *wal-pending-page-publication-tail* owner)
+    (notify-primary-wal-writer-under-lock))
   owner)
 
 (defun wal-drain-page-publication-under-lock (owner &key fault-on-first-write)
