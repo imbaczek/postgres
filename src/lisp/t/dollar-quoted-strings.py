@@ -70,7 +70,7 @@ def check_dollar_quotes(native, reference):
           flush=True)
 
 
-def run(binary, check=check_dollar_quotes, label='dollar-quotes'):
+def run(binary, check=check_dollar_quotes, label='dollar-quotes', with_server=False):
     root = Path(tempfile.mkdtemp(prefix=f'pg-{label}-c-oracle-'))
     server = OwnedLisp()
     process = native = reference = None
@@ -89,7 +89,10 @@ def run(binary, check=check_dollar_quotes, label='dollar-quotes'):
         reference = connect(port, process)
         server.start()
         native = connect(server.port, server.process)
-        check(native, reference)
+        if with_server:
+            check(native, reference, server)
+        else:
+            check(native, reference)
     finally:
         if native is not None:
             native.close()
