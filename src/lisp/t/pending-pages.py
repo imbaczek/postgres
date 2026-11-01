@@ -264,6 +264,45 @@ def stage_maintenance_predecessor(server, oid):
         '(setf *queue-test-prior* owner) (wal-flush))))')
 
 
+def run_with_predecessor_after_snapshot(server, actor, pid, statement, oid):
+    ready, release = server.root / 'snapshot-ready', server.root / 'snapshot-release'
+    server.control(
+        '(defvar *queue-statement-pause* (symbol-function \'wal-test-pause-once)) '
+        '(defvar *queue-statement-paused* nil) '
+        '(setf (symbol-function \'wal-test-pause-once) (lambda (point) '
+        f'(when (and *backend* (= (backend-pid *backend*) {pid}) '
+        '(eq point :after-statement-snapshot) (not *queue-statement-paused*)) '
+        '(assert (not (sb-thread:holding-mutex-p *wal-lock*))) '
+        '(assert (not (sb-thread:holding-mutex-p *xid-lock*))) '
+        '(setf *queue-statement-paused* t) '
+        f'(with-open-file (out #p"{ready}" :direction :output) (write-line "ready" out)) '
+        '(let ((deadline (+ (get-internal-real-time) (* 20 internal-time-units-per-second)))) '
+        f'(loop until (probe-file #p"{release}") '
+        'do (when (>= (get-internal-real-time) deadline) (error "statement release timeout")) '
+        '(sleep 0.01)))) (funcall *queue-statement-pause* point)))')
+    # Capture happens before staging, so the new snapshot barrier cannot consume
+    # this predecessor. The resumed real statement still writes the newer page.
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(actor.query, statement)
+        try:
+            deadline = time.monotonic() + 10
+            while not ready.exists():
+                if future.done():
+                    future.result()
+                    raise AssertionError('statement completed without its snapshot barrier')
+                if server.process.poll() is not None:
+                    raise AssertionError('owned server exited before snapshot barrier')
+                if time.monotonic() >= deadline:
+                    raise TimeoutError('statement did not reach snapshot barrier')
+                time.sleep(0.01)
+            stage_maintenance_predecessor(server, oid)
+        finally:
+            release.touch()
+        result = future.result(timeout=20)
+    server.control('(setf (symbol-function \'wal-test-pause-once) *queue-statement-pause*) (values)')
+    return result
+
+
 def run_queued_predecessor_case(maintenance=False, reset=False):
     server = OwnedLisp()
     actor = None
@@ -278,7 +317,11 @@ def run_queued_predecessor_case(maintenance=False, reset=False):
             actor.query('BEGIN')
             if not reset:
                 actor.query('INSERT INTO queued_prefix_rows VALUES (2)')
-        stage_maintenance_predecessor(server, oid)
+        if reset:
+            stage_maintenance_predecessor(server, oid)
+        else:
+            server.control('(defvar *queue-test-prior* nil) (defvar *queue-test-seen* nil) '
+                           '(defvar *queue-test-pause* (symbol-function \'wal-test-pause))')
         kind = ':maintenance' if maintenance else ':transaction'
         if reset:
             server.control(
@@ -295,7 +338,8 @@ def run_queued_predecessor_case(maintenance=False, reset=False):
             '(assert (eq *wal-pending-page-publication* *wal-pending-page-publication-tail*)) '
             '(assert (wal-page-publication-resets *wal-pending-page-publication*)) '
             if reset else
-            '(assert (eq *queue-test-prior* *wal-pending-page-publication*)) '
+            '(unless (eq *queue-test-prior* *wal-pending-page-publication*) '
+            '(error "queued predecessor is no longer the head")) '
             '(let ((current (wal-page-publication-next *queue-test-prior*))) '
             '(assert current) (assert (eq current *wal-pending-page-publication-tail*)) '
             '(assert (null (wal-page-publication-next current))) '
@@ -307,7 +351,7 @@ def run_queued_predecessor_case(maintenance=False, reset=False):
             f'{inspect}'
             '(setf *queue-test-seen* t)) (funcall *queue-test-pause* point)))')
         if maintenance:
-            actor.query('VACUUM queued_prefix_rows')
+            run_with_predecessor_after_snapshot(server, actor, pid, 'VACUUM queued_prefix_rows', oid)
             expected = [['1']]
         elif reset:
             actor.query('TRUNCATE queued_prefix_rows')
@@ -315,7 +359,8 @@ def run_queued_predecessor_case(maintenance=False, reset=False):
             actor.query('COMMIT')
             expected = [['9']]
         else:
-            actor.query('INSERT INTO queued_prefix_rows VALUES (3)')
+            run_with_predecessor_after_snapshot(
+                server, actor, pid, 'INSERT INTO queued_prefix_rows VALUES (3)', oid)
             actor.query('COMMIT')
             expected = [['1'], ['2'], ['3']]
         server.control('(assert *queue-test-seen*) '

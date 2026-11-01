@@ -1472,9 +1472,36 @@ snapshot retains its coverage and XIP for its lifetime."
       (when register (register-active-snapshot snapshot register))
       snapshot)))
 
+(defun call-with-settled-primary-snapshot (function)
+  (let ((failure nil) (settling nil) (settled nil))
+    (sb-sys:without-interrupts
+      (unwind-protect
+           (sb-sys:with-local-interrupts
+             (sb-thread:with-mutex (*wal-lock*)
+               (unless (and *wal-ready* (not (recovery-in-progress-p)))
+                 (error "primary snapshot capture requires stable primary storage"))
+               (handler-case
+                   (progn
+                     (wal-check-healthy)
+                     (setf settling t)
+                     (wal-settle-page-publications-under-lock)
+                     (setf settled t))
+                 (error (condition)
+                   (if *wal-poisoned* (setf failure condition) (error condition))))
+               (unless failure (funcall function))))
+        (cond
+          (failure (wal-fail-stop failure))
+          ((and settling (not settled) *wal-poisoned*)
+           (when (fboundp 'request-fast-shutdown)
+             (ignore-errors (funcall (symbol-function 'request-fast-shutdown))))))))))
+
 (defun make-snapshot (curcid &key register)
-  (sb-thread:with-mutex (*xid-lock*)
-    (make-snapshot-under-xid-lock curcid :register register)))
+  (flet ((capture ()
+           (sb-thread:with-mutex (*xid-lock*)
+             (make-snapshot-under-xid-lock curcid :register register))))
+    (if (and *wal-ready* (not (recovery-in-progress-p)))
+        (call-with-settled-primary-snapshot #'capture)
+        (capture))))
 
 (defvar *wal-test-after-snapshot-boundary-registration-hook* nil)
 
@@ -1492,40 +1519,40 @@ AFTER-CAPTURE runs under *WAL-LOCK* but after *XID-LOCK* is released."
     (error "WAL snapshot boundaries require a snapshot-registration token"))
   (unless *wal-ready*
     (ereport "55000" "cannot capture a replication snapshot before WAL startup"))
-  (sb-thread:with-mutex (*wal-lock*)
-    (wal-check-healthy)
-    (multiple-value-bind (snapshot boundary-lsn restart-lsn)
-        (sb-thread:with-mutex (*xid-lock*)
-          (let* ((snapshot (make-snapshot-under-xid-lock
-                            curcid :register register))
-                 (boundary-lsn *wal-durable-lsn*)
-                 (restart-lsn boundary-lsn))
-            (when *wal-test-after-snapshot-boundary-registration-hook*
-              (funcall *wal-test-after-snapshot-boundary-registration-hook*
-                       register))
-            (dolist (xid (snapshot-xip snapshot))
-              (let ((first-lsn (gethash xid *wal-xid-first-lsn*)))
-                (when (and first-lsn (< first-lsn restart-lsn))
-                  (setf restart-lsn first-lsn))))
-            ;; Keep the returned restart point alive after active XIDs finish.
-            ;; The registered snapshot owns this pin until its caller releases
-            ;; the registration or a durable replication slot takes over.
-            (sb-thread:with-mutex (*snapshot-count-lock*)
-              (unless (and (snapshot-registration-active-p register)
-                           (eq snapshot
-                               (snapshot-registration-snapshot register)))
-                (error "snapshot registration was released during WAL boundary capture"))
-              (sb-sys:without-interrupts
-                (setf (gethash register *wal-snapshot-retention-pins*)
-                      restart-lsn
-                      (snapshot-registration-wal-retention-lsn register)
-                      restart-lsn)))
-            (values snapshot boundary-lsn restart-lsn)))
-      ;; Checkpoint recycling sees the temporary snapshot pin until durable
-      ;; slot publication completes, because WAL remains locked throughout.
-      (when after-capture
-        (funcall after-capture snapshot boundary-lsn restart-lsn))
-      (values snapshot boundary-lsn restart-lsn))))
+  (call-with-settled-primary-snapshot
+   (lambda ()
+     (multiple-value-bind (snapshot boundary-lsn restart-lsn)
+         (sb-thread:with-mutex (*xid-lock*)
+           (let* ((snapshot (make-snapshot-under-xid-lock
+                             curcid :register register))
+                  (boundary-lsn *wal-durable-lsn*)
+                  (restart-lsn boundary-lsn))
+             (when *wal-test-after-snapshot-boundary-registration-hook*
+               (funcall *wal-test-after-snapshot-boundary-registration-hook*
+                        register))
+             (dolist (xid (snapshot-xip snapshot))
+               (let ((first-lsn (gethash xid *wal-xid-first-lsn*)))
+                 (when (and first-lsn (< first-lsn restart-lsn))
+                   (setf restart-lsn first-lsn))))
+             ;; Keep the returned restart point alive after active XIDs finish.
+             ;; The registered snapshot owns this pin until its caller releases
+             ;; the registration or a durable replication slot takes over.
+             (sb-thread:with-mutex (*snapshot-count-lock*)
+               (unless (and (snapshot-registration-active-p register)
+                            (eq snapshot
+                                (snapshot-registration-snapshot register)))
+                 (error "snapshot registration was released during WAL boundary capture"))
+               (sb-sys:without-interrupts
+                 (setf (gethash register *wal-snapshot-retention-pins*)
+                       restart-lsn
+                       (snapshot-registration-wal-retention-lsn register)
+                       restart-lsn)))
+             (values snapshot boundary-lsn restart-lsn)))
+       ;; Checkpoint recycling sees the temporary snapshot pin until durable
+       ;; slot publication completes, because WAL remains locked throughout.
+       (when after-capture
+         (funcall after-capture snapshot boundary-lsn restart-lsn))
+       (values snapshot boundary-lsn restart-lsn)))))
 
 (declaim (ftype function catalog-sequence-bootstrap-snapshot))
 

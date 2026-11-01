@@ -435,6 +435,124 @@ Each entry in SEGMENTS contains a segment number followed by its byte vectors."
          (when *wal-output-stream* (close *wal-output-stream*))
          (when *clog-stream* (close *clog-stream*)))))))
 
+(rove:deftest fresh-snapshot-settles-pending-page-and-clog-prefix
+    (dolist (boundary-p '(nil t))
+      (call-with-queued-clog-test
+       (lambda ()
+         (let ((capture (symbol-function 'make-snapshot-under-xid-lock))
+               (registration (make-snapshot-registration))
+               (*physical-recovery-state* nil)
+               (captures 0) (last-end nil))
+           (unwind-protect
+                (progn
+                  (loop for xid in '(44 45) for block from 0 do
+                    (let ((page (page-init (make-page))) (*wal-row-page-write-p* t))
+                      (setf (backend-xid *backend*) xid (aref page 100) (+ 10 block))
+                      (wal-buffer-write 7310 block page))
+                    (sb-thread:with-mutex (*wal-lock*)
+                      (setf last-end
+                            (wal-page-publication-terminal-end
+                             (wal-admit-transaction-under-lock xid nil)))))
+                  (setf (symbol-function 'make-snapshot-under-xid-lock)
+                        (lambda (curcid &key register)
+                          (assert (sb-thread:holding-mutex-p *wal-lock*))
+                          (assert (sb-thread:holding-mutex-p *xid-lock*))
+                          (assert (null *wal-pending-page-publication*))
+                          (assert (= +clog-committed+ (pending-clog-raw-status 44)))
+                          (assert (= +clog-committed+ (pending-clog-raw-status 45)))
+                          (assert (= 10 (aref (smgr-read 7310 0) 100)))
+                          (assert (= 11 (aref (smgr-read 7310 1) 100)))
+                          (incf captures)
+                          (funcall capture curcid :register register)))
+                  (if boundary-p
+                      (sb-thread:with-mutex (*write-lock*)
+                        (multiple-value-bind (snapshot boundary restart)
+                            (wal-capture-snapshot-boundary-under-writer-lock 7 registration)
+                          (rove:ok (= last-end boundary restart))
+                          (rove:ok (null (snapshot-xip snapshot)))))
+                      (rove:ok (null (snapshot-xip (make-snapshot 7 :register registration)))))
+                  (rove:ok (= 1 captures))
+                  (rove:ok (snapshot-registration-active-p registration)))
+             (setf (symbol-function 'make-snapshot-under-xid-lock) capture)
+             (release-snapshot-registration registration)))))))
+
+(rove:deftest fresh-snapshot-settlement-failure-skips-xid-capture
+    (dolist (boundary-p '(nil t))
+      (dolist (exit-kind '(:error :nonlocal))
+        (call-with-queued-clog-test
+         (lambda ()
+           (let ((flush (symbol-function 'wal-flush-core))
+                 (capture (symbol-function 'make-snapshot-under-xid-lock))
+                 (stop (symbol-function 'wal-fail-stop))
+                 (registration (make-snapshot-registration))
+                 (*physical-recovery-state* nil)
+                 (failure (make-condition 'simple-error :format-control "snapshot prefix flush failed"))
+                 (owner nil) (captures 0) (stops 0) (observed nil))
+             (unwind-protect
+                  (progn
+                    (sb-thread:with-mutex (*wal-lock*)
+                      (setf owner (wal-admit-transaction-under-lock 44 nil)))
+                    (setf (symbol-function 'wal-flush-core)
+                          (lambda ()
+                            (assert (sb-thread:holding-mutex-p *wal-lock*))
+                            (assert (not (sb-thread:holding-mutex-p *xid-lock*)))
+                            (if (eq exit-kind :error) (error failure) (throw 'leave :left)))
+                          (symbol-function 'make-snapshot-under-xid-lock)
+                          (lambda (curcid &key register)
+                            (incf captures)
+                            (funcall capture curcid :register register))
+                          (symbol-function 'wal-fail-stop)
+                          (lambda (condition)
+                            (assert (not (sb-thread:holding-mutex-p *wal-lock*)))
+                            (assert (not (sb-thread:holding-mutex-p *xid-lock*)))
+                            (incf stops)
+                            (error condition)))
+                    (setf observed
+                          (handler-case
+                              (catch 'leave
+                                (if boundary-p
+                                    (sb-thread:with-mutex (*write-lock*)
+                                      (wal-capture-snapshot-boundary-under-writer-lock 3 registration))
+                                    (make-snapshot 3 :register registration)))
+                            (error (condition) condition)))
+                    (rove:ok (typep observed 'error))
+                    (when (eq exit-kind :error) (rove:ok (eq failure observed)))
+                    (rove:ok (= 1 stops))
+                    (rove:ok (zerop captures))
+                    (rove:ok *wal-poisoned*)
+                    (rove:ok (eq owner *wal-pending-page-publication*))
+                    (rove:ok (not (snapshot-registration-active-p registration)))
+                    (rove:ok (null (gethash registration *wal-snapshot-retention-pins*))))
+               (setf (symbol-function 'wal-flush-core) flush
+                     (symbol-function 'make-snapshot-under-xid-lock) capture
+                     (symbol-function 'wal-fail-stop) stop)
+               (release-snapshot-registration registration))))))))
+
+(rove:deftest snapshot-construction-errors-do-not-poison-settled-wal
+    (call-with-queued-clog-test
+     (lambda ()
+       (let ((capture (symbol-function 'make-snapshot-under-xid-lock))
+             (stop (symbol-function 'wal-fail-stop))
+             (*physical-recovery-state* nil)
+             (registration (make-snapshot-registration))
+             (failure (make-condition 'simple-error :format-control "snapshot construction failed"))
+             (stops 0))
+         (unwind-protect
+              (progn
+                (setf (symbol-function 'make-snapshot-under-xid-lock)
+                      (lambda (&rest arguments) (declare (ignore arguments)) (error failure))
+                      (symbol-function 'wal-fail-stop)
+                      (lambda (condition) (incf stops) (error condition)))
+                (rove:ok (eq failure (handler-case (make-snapshot 0 :register registration)
+                                       (error (condition) condition))))
+                (rove:ok (zerop stops))
+                (rove:ok (not *wal-poisoned*))
+                (rove:ok (not (snapshot-registration-active-p registration)))
+                (rove:ok (not (sb-thread:holding-mutex-p *wal-lock*))))
+           (setf (symbol-function 'make-snapshot-under-xid-lock) capture
+                 (symbol-function 'wal-fail-stop) stop)
+           (release-snapshot-registration registration))))))
+
 (rove:deftest queued-transaction-owns-clog-completion-through-drain
     (call-with-queued-clog-test
      (lambda ()
