@@ -89,10 +89,12 @@ def run_case(case):
                                '(assert (primary-wal-writer-joined-p *primary-wal-writer*))')
             wait_control(server, '(list :drained (null *wal-pending-page-publication*))', ':DRAINED T')
             server.control(
+                '(with-wal-critical '
+                '(assert (<= (wal-commit-receipt-terminal-end *async-test-receipt*) *wal-durable-lsn*))) '
                 '(sb-thread:with-mutex (*clog-lock*) '
                 '(assert (= +clog-committed+ '
                 '(clog-read-status-under-lock (wal-commit-receipt-xid *async-test-receipt*)))))')
-            server.stop()
+            server.stop(immediate=True)
         server.start()
         actor = Connection(server.port)
         assert actor.query('SELECT id FROM async_rows') == ([] if case == 'crash' else [['1']])
