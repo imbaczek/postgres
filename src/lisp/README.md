@@ -189,6 +189,9 @@ it flushes WAL and validates the captured prefix, then completes each head's
 CLOG status before applying its pages and retiring its resources. A fresh primary
 snapshot settles pending publications before capturing its XID horizon; retained
 transaction and portal snapshots keep their existing horizons.
+When the FIFO is empty, an eligible writer cycle also flushes outstanding WAL.
+Native cycles hold the WAL mutex and sync the complete tail; they do not implement
+C's page rounding or background flush timing policy.
 
 With `synchronous_commit=off`, a transaction can return before its WAL is
 durable and can be lost in a crash. Its queued owner retains the pages, spool and

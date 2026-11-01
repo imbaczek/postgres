@@ -269,7 +269,8 @@ a cycle accepted before a stop request may finish."
 
 (defun primary-wal-writer-drain-under-lock (writer epoch)
   "Settle the FIFO and record the captured tail's exact terminal end.
-The caller must fence failures after releasing WAL; this function does not."
+With no FIFO owner, flush outstanding WAL without changing that metric.
+The caller must request fail-stop after releasing WAL."
   (unless (validate-primary-wal-writer-under-lock writer epoch)
     (return-from primary-wal-writer-drain-under-lock :stop))
   (wal-check-healthy)
@@ -350,7 +351,7 @@ Only the installed writer poisons WAL. Request fail-stop after releasing locks."
 (defun primary-wal-writer-main (writer)
   "Run the auxiliary writer outside backend and live-operation admission.
 Wait for registration, then take definition exclusion before WAL each cycle.
-This drains the publication FIFO; it does not flush unrelated WAL when empty."
+Each cycle drains the publication FIFO or flushes outstanding WAL if it is empty."
   (let ((*backend* nil) (*live-operation-depth* 0)
                         (*standard-output* (primary-wal-writer-output writer))
                         (*error-output* (primary-wal-writer-error-output writer))

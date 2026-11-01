@@ -1,5 +1,16 @@
 # Development TODO
 
+- [x] Flush outstanding WAL on an eligible writer cycle with an empty publication
+  FIFO (`cc9ea0202c3`, `68785ed66c4`, `07c9368c734`). The checkpoint passed 903
+  unit, 1,416 physical, 201 wire and 1,161 legacy checks and strict cold
+  compilation. Six native idle-writer cases, eight FIFO regressions and one C
+  unassigned read-only WAL flush case passed. Logs are in
+  `/home/imbaczek/proj/pg-ha-artifacts/idle-writer/`. Properties ran 100 trials
+  at seeds 4020 and 4021 with respective digests `08daeb35cb803c4f` and
+  `e5f7a51c19219c1c`; the authority target has no Function Spec, and input
+  coverage and rejection counts were not measured. C's page rounding and
+  background flush timing policy remain different.
+
 - [x] Expose the native checkpoint SQL record and scalar oid8 subset
   (`f6cc550e1f8`, `2b2236e4aed`). The 20-column descriptor uses selected durable
   facts; eleven unavailable fields and additional missing legacy facts are NULL.
@@ -83,7 +94,7 @@
   Two cl-spec properties ran 100 trials each at seeds 4009 and 4010, with respective
   digests `491b955b8bd3e744` and `19c520ff03696461`. Neither pressure property
   has a Function Spec; coverage and rejection counts were not measured. Asynchronous acceptance, OFF,
-  and unrelated WAL flushing with an empty FIFO remain open.
+  and unrelated WAL flushing with an empty FIFO remained open at that checkpoint.
 
 - [x] Add the primary WAL writer authority and FIFO drain foundation. No writer
   loop or startup is enabled. The checkpoint passed 842 unit checks and strict
@@ -103,8 +114,8 @@
   checkpoint the loop and lifecycle had not yet been activated.
 
 - [x] Activate the primary WAL writer lifecycle (`09d10de9ca7`, `1ece86c5993`).
-  The auxiliary writer drains the captured publication FIFO; unrelated WAL flushes
-  with an empty FIFO remain open. The checkpoint passed 858 unit, 1,413 physical,
+  At that checkpoint the auxiliary writer drained the publication FIFO; unrelated
+  WAL flushes with an empty FIFO remained open. It passed 858 unit, 1,413 physical,
   1,161 legacy and 201 wire checks, strict cold compilation, six native writer
   cases including SQL XID wrap, 21 native page, five native CLOG and two snapshot
   cases, native promotion and shutdown. Evidence is in
@@ -430,8 +441,8 @@
   Preserve WAL-to-CLOG lock order and never put pending committed bits on disk
   before WAL. No coordination was added.
 
-- [ ] Match C background flushing of unrelated WAL when the publication FIFO is
-  empty. Audit which native WAL frontiers can safely advance before enabling it.
+- [ ] Match C background WAL write and flush timing and page-rounding policy;
+  native eligible cycles currently sync the complete tail under WAL exclusion.
 
 - [x] Implement `txid_current()` (`34044987044`) and the inline DO/PERFORM
   subset (`90fed2d98ff`) required by Patroni's unchanged sync-change method.

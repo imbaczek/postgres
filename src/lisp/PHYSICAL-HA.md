@@ -18,6 +18,24 @@ original C source is the behavior oracle.
 
 ## Verified starting points
 
+### Empty-FIFO WAL writer
+
+An eligible primary writer cycle flushes outstanding WAL even when no page
+publication is queued. The native path holds WAL exclusion and syncs the complete
+tail; C's page rounding and background flush timing policy are not reproduced.
+Flushing does not itself publish the resource position; replay does that.
+
+The checkpoint passed 903 unit, 1,416 physical, 201 wire and 1,161 legacy checks,
+strict cold compilation, six native idle-writer cases, eight FIFO regressions and
+a C read-only `pg_log_standby_snapshot` flush before COMMIT. Logs are in
+`/home/imbaczek/proj/pg-ha-artifacts/idle-writer/`. No natural SQL producer of
+native empty-FIFO debt was found; the native test appends a valid same-values
+parameter batch through a test helper. In the middle fault case WAL bytes and
+names were synced while durable control stayed old. Startup scans and adopts the
+longer complete tail, so its terminal is recovered. Before/exit cases independently
+proved the file ended before the terminal after death; they do not establish a
+general rule that unadvertised WAL is lost.
+
 ### Transaction ID prerequisite
 
 `txid_current()` assigns or returns the backend's top-level transaction ID at

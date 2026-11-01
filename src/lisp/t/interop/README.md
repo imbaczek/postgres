@@ -81,6 +81,18 @@ persisted facts. It also exercises the unchanged Patroni standby-leader query on
 a real native follower through restartpoint publication, source-offline cold
 restart and corrupt-pointer rejection. Unpersisted native fields remain NULL.
 
+The independent C idle-writer check can be run from `src/lisp` with:
+
+```sh
+"$PATRONI_PYTHON" t/interop/wal-writer-idle-c.py --reference-bin /path/to/c/bin
+```
+
+It checks an unassigned read-only transaction's `pg_log_standby_snapshot` WAL
+flush before COMMIT. `python3 t/wal-writer-idle.py` separately exercises the
+native writer's SIGKILL and fault recovery boundaries with a test-only valid
+parameter batch. A synced tail beyond old durable control can be adopted at
+startup; the test does not assume all unadvertised WAL is lost.
+
 Using the same pinned environment and C binaries, run the independent feedback
 and crash oracles from `src/lisp`:
 

@@ -1712,6 +1712,10 @@ fail-stop handling."
    target :include-target-p t :fault-on-first-write fault-on-first-write))
 
 (defmacro with-wal-poison-on-incomplete ((message) &body body)
+  "Run BODY under the held WAL lock with interrupts masked.
+On incomplete exit, poison WAL before unlock and preserve the first error.
+Signal MESSAGE for a bare nonlocal exit. This macro does not request shutdown;
+callers must do that after releasing locks."
   (let ((complete (gensym "COMPLETE-"))
         (failure (gensym "FAILURE-"))
         (condition (gensym "CONDITION-")))
