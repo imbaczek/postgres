@@ -1,5 +1,17 @@
 # Development TODO
 
+- [x] Expose the native checkpoint SQL record and scalar oid8 subset
+  (`f6cc550e1f8`, `2b2236e4aed`). The 20-column descriptor uses selected durable
+  facts; eleven unavailable fields and additional missing legacy facts are NULL.
+  The checkpoint passed 901 unit, 1,416 physical, 201 wire and 1,161 legacy
+  checks and strict cold compilation. An independent C/native oracle checked
+  metadata, text and numeric input/casts, JSON, primary control facts and the
+  unchanged Patroni standby-leader query, including source-offline cold recovery
+  and corrupt-pointer rejection. Logs are in
+  `/home/imbaczek/proj/pg-ha-artifacts/control-checkpoint/`. Two properties ran
+  100 trials each at seeds 4018 and 4019, with respective digests
+  `b9ea210f07666dd1` and `0aa6a19aa62a5126`.
+
 - [x] Support typed scalar and fixed-descriptor composite functions in FROM
   (`b984839c702`, `de6637b686e`). The checkpoint passed 891 unit, 1,413
   physical, 201 wire and 1,161 legacy checks and strict cold compilation. Native C
@@ -440,7 +452,8 @@
   `fnv1a64-v1:23e4bc80c1e52a8e`.
 
 - [ ] Complete the broader synchronous-replication backend contract.
-  The standby-leader `pg_control_checkpoint` monitor branch is unimplemented.
+  Persist missing checkpoint policy, freeze, MultiXact, commit-timestamp and
+  checksum facts before claiming the complete C checkpoint contract.
   Preserve different-upstream, descendant and rejoin acceptance work, and finish
   the cold-load audit and broader C-style documentation. No coordination is added.
 

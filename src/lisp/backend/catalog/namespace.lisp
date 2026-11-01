@@ -22,7 +22,8 @@
     ("oldest_xid" :xid) ("oldest_xid_dbid" :oid) ("oldest_active_xid" :xid)
     ("oldest_multi_xid" :xid) ("oldest_multi_dbid" :oid)
     ("oldest_commit_ts_xid" :xid) ("newest_commit_ts_xid" :xid)
-    ("data_page_checksum_version" :int4) ("checkpoint_time" :timestamptz)))
+    ("data_page_checksum_version" :int4) ("checkpoint_time" :timestamptz))
+  "Fixed 20-column SQL descriptor for pg_control_checkpoint().")
 
 (defstruct sql-array
   ;; Elements are flat in row-major order and may contain +null+. Dimensions

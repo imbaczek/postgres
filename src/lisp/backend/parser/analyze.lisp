@@ -2046,6 +2046,7 @@ syntax is checked before the final signed-width range check for TYPE."
         result))))
 
 (defun sql-oid8-input (text)
+  "Read scalar oid8 text with the unsigned 64-bit input rules."
   (sql-oid-input text :oid8))
 
 (defun sql-array-space-p (character)
@@ -2308,6 +2309,8 @@ are supported."
       (if (logbitp (1- bits) number) (- number (ash 1 bits)) number))))
 
 (defun sql-cast-container-value (value source target typmod)
+  "Handle supported JSON, bytea, and array casts and report whether one applied.
+The second value distinguishes a valid NIL result from an unhandled cast."
   (values
    (block cast-result
      (when (and (eq source :jsonb)
@@ -2387,6 +2390,8 @@ are supported."
    t))
 
 (defun sql-cast-temporal-value (value source target typmod interval-literal-p)
+  "Convert supported temporal values and return whether a conversion applied.
+The second value distinguishes a valid NIL result from an unhandled cast."
   (values
    (block cast-result
      (when (and (eq source :timestamptz) (member target '(:date :time :timestamp)))

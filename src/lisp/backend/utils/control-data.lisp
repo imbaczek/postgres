@@ -283,6 +283,9 @@ the base files are still checked against the manifest read from disk."
     (error "native control files changed throughout inspection")))
 
 (defun native-control-checkpoint-record (facts)
+  "Build the checkpoint SQL record from validated, captured control facts.
+Fields without persisted native facts are SQL NULL; legacy snapshots can leave
+additional fields unknown. REDO and the checkpoint timeline select the filename."
   (let* ((snapshot (getf facts :snapshot))
          (timeline (or (getf snapshot :timeline) (getf facts :checkpoint-timeline)))
          (redo (getf snapshot :redo))
@@ -311,6 +314,7 @@ the base files are still checked against the manifest read from disk."
                (if time (* (- time 946684800) 1000000) +null+))))))
 
 (defun native-control-checkpoint-result ()
+  "Read the selected durable control state before producing its SQL record."
   (native-control-checkpoint-record (native-control-read *pgdata*)))
 
 (defun native-control-time-text (unix-time)

@@ -47,8 +47,8 @@ same-connection LOCAL restoration, cache invalidation, WAL traffic and the
 unchanged-value skip. C physical feedback clients check FIRST/ANY sender state
 and positions. Two native replicas started with real `Postgresql.follow` also
 check those fields and one sync handler's FIRST-to-ANY transition. This uses no DCS,
-election or HA loop; the standby-leader `pg_control_checkpoint` branch remains
-unsupported. The passing log is
+election or HA loop. At that checkpoint the standby-leader
+`pg_control_checkpoint` branch remained unsupported. The passing log is
 `/home/imbaczek/proj/pg-ha-artifacts/patroni-sync/final.log`; owned traces are
 under `/tmp/pg-transaction-response-859cu0aw` and the C oracle under
 `/tmp/pg-patroni-sync-monitor-c-oracle-0xyran3t`. The 12 C/native dollar-quote
@@ -3777,28 +3777,32 @@ Servers already running a definition from before this capture was introduced
 need a one-time process restart; a reload cannot reconstruct an unrecorded
 initialization timestamp. Output uses the existing UTC timestamptz subset.
 
-The standby-leader query remains blocked by the full `pg_control_checkpoint()`
-contract, not by startup-time reporting. Pinned C20 has **20** OUT columns in
-`pg_proc.dat` (OID 3442); its function reads CRC-checked durable control data, not the
-current allocator state. These are required compatibility fields:
+`pg_control_checkpoint()` now exposes the C20 20-column SQL descriptor from
+validated, selected durable native control state. Checkpoint and redo positions,
+redo filename, timeline lineage, next XID and OID, oldest active XID and time
+come from persisted facts. Eleven fields without native persisted facts are SQL
+NULL; legacy controls without a snapshot can leave additional fields NULL.
+Policy flags, freeze and MultiXact metadata, commit-timestamp bounds and checksum
+policy remain open. Native WAL CRCs are not C data-page checksums.
 
-| Fields | Native evidence/dependency before SQL exposure |
+The eleven fields that remain NULL are:
+
+| Missing persisted facts | SQL fields |
 | --- | --- |
-| `checkpoint_lsn`, `redo_lsn`, `redo_wal_file` | Native snapshots now persist record start/end and synchronous redo. Map C's checkpoint record start and redo filename explicitly; do not expose native checkpoint-end or a local restartpoint as C's checkpoint LSN. |
-| `timeline_id`, `prev_timeline_id` | Native snapshots persist both as 1. Promotion/history must supply real changing lineage before dynamic reporting. |
-| `full_page_writes`, `logical_decoding` | Persist the actual checkpoint policy flags; full native page images and logical events alone are not a C control snapshot. |
-| `next_xid`, `next_oid` | Native snapshots now preserve actual source counters, separately from reservation bounds and standby visibility. The API still needs C's `epoch:xid` text and C20 `oid8` type contract. |
-| `next_multixact_id`, `next_multi_offset`, `oldest_multi_xid`, `oldest_multi_dbid` | MultiXact lifecycle/control fields are not implemented. |
-| `oldest_xid`, `oldest_xid_dbid`, `oldest_active_xid` | Native checkpoints now capture the oldest active FullXID, including C's no-active nextXid sentinel. Durable C-compatible freeze/retention metadata and SQL type mapping remain. |
-| `oldest_commit_ts_xid`, `newest_commit_ts_xid` | Implement truthful commit-timestamp tracking/control state; logical commit timestamps are a separate facility. |
-| `data_page_checksum_version`, `checkpoint_time` | Signed Unix checkpoint time is now durable. Page-checksum policy/control state and the complete SQL record remain; native WAL CRCs are not C data-page checksums. |
+| Checkpoint policy | `full_page_writes`, `logical_decoding` |
+| Freeze bounds | `oldest_xid`, `oldest_xid_dbid` |
+| MultiXact state | `next_multixact_id`, `next_multi_offset`, `oldest_multi_xid`, `oldest_multi_dbid` |
+| Commit-timestamp bounds | `oldest_commit_ts_xid`, `newest_commit_ts_xid` |
+| Data-page checksum policy | `data_page_checksum_version` |
 
-SQL `xid`/`oid8` output contracts and coherent publication of all these fields
-remain necessary. No partial all-NULL record or invented constants were added
-to make Patroni's standby-leader query pass. The cl-mcp reader fix now permits
-the necessary writer/control edits to valid `#.` source files. The
-ordinary Patroni cluster query remains verified separately; enabled slots,
-synchronous replication and standby-leader variants are not yet complete.
+The unchanged Patroni 4.1.5 standby-leader query passed against a real native
+follower. Its facts stayed unchanged during replay, advanced at restartpoint
+publication and survived a source-offline cold restart; a corrupt selected pointer
+raised XX000 without falling back to older state. Independent C/native tests also
+checked descriptor metadata, scalar oid8 input and casts, and nine primary facts
+decoded independently. Evidence is in
+`/home/imbaczek/proj/pg-ha-artifacts/control-checkpoint/`. This does not provide
+all C control facts or C physical disk compatibility.
 
 ### Automatic smart/fast standby shutdown
 

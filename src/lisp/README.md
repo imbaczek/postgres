@@ -338,6 +338,9 @@ and `string_to_array` support the corresponding text and array operations,
 including optional NULL replacement arguments.
 The deprecated `txid_current()` assigns or returns the current top-level
 transaction ID when executed, and rejects calls during recovery.
+Scalar `oid8` supports text input and output, casts from signed integers and
+`oid`, casts to `bigint`, implicit integer coercion and JSON conversion. General
+storage, array and binary type parity are not provided.
 `DO` supports a limited inline PL/pgSQL block containing nested BEGIN/END,
 NULL, SET, RESET and PERFORM statements. Variables and control flow are not
 supported. Inline source is compiled when the command executes.
@@ -1781,9 +1784,10 @@ Changed active main/accept-loop frames require a fresh process rather than reloa
 `pg_postmaster_start_time()` reports the captured server-initialization timestamp
 as timestamptz and remains unchanged across connections and reloads. The pinned
 Patroni method is included in direct-start acceptance. An already-running image
-from before this capture was added needs a one-time process restart. The full
-20-field `pg_control_checkpoint()` interface remains unfinished; see the field
-inventory in [PHYSICAL-HA.md](PHYSICAL-HA.md).
+from before this capture was added needs a one-time process restart.
+`pg_control_checkpoint()` exposes the 20-field descriptor using selected durable
+native facts. Eleven fields without persisted facts are NULL; legacy snapshots may
+have additional NULLs. See [PHYSICAL-HA.md](PHYSICAL-HA.md) for remaining facts.
 These tests check process discovery, start-time validation, direct startup, fast stop,
 configuration precedence, SIGHUP and the pinned ConfigHandler's settings queries
 through real psycopg2. The configuration subset supports `port`,

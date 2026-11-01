@@ -70,6 +70,17 @@ and starts owned C and native peers. C physical feedback clients and two native
 replicas started through real `Postgresql.follow` exercise FIRST/ANY monitoring.
 It does not run DCS, election or the HA loop.
 
+The checkpoint oracle uses the same pinned environment and C binary directory:
+
+```sh
+PG_CONFIG=/path/to/c/bin/pg_config "$PATRONI_PYTHON" t/interop/control-checkpoint.py --reference-bin /path/to/c/bin
+```
+
+It compares the 20-column descriptor, scalar oid8 values and casts, and native
+persisted facts. It also exercises the unchanged Patroni standby-leader query on
+a real native follower through restartpoint publication, source-offline cold
+restart and corrupt-pointer rejection. Unpersisted native fields remain NULL.
+
 Using the same pinned environment and C binaries, run the independent feedback
 and crash oracles from `src/lisp`:
 
