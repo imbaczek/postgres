@@ -429,8 +429,17 @@
   one handler's FIRST-to-ANY transition. Evidence is
   `/home/imbaczek/proj/pg-ha-artifacts/patroni-sync/final.log`.
 
-- [ ] Complete the broader synchronous-replication backend contract, including
-  independent FIRST/ANY acknowledgment and crash tests against C `syncrep.c`.
+- [x] Exercise independent FIRST/ANY acknowledgment and crash boundaries against
+  C and native peers (`b97973dab93`, `d36f2f45a0e`). The checkpoint passed 898
+  unit, 1,416 physical, 201 wire and 1,161 legacy checks, strict cold compilation,
+  50 C/native feedback cases and the Patroni regression. Native ANY 2 crash
+  recovery cold-started both credited followers while the source stayed down.
+  Evidence is `/home/imbaczek/proj/pg-ha-artifacts/sync-ack/`; the 100-trial
+  reanchor property at seed 4017 had digest `fnv1a64-v1:a46ee7aac2e86822`, with no Function
+  Spec for its target. The existing 200-trial property at seed 42 retained digest
+  `fnv1a64-v1:23e4bc80c1e52a8e`.
+
+- [ ] Complete the broader synchronous-replication backend contract.
   The standby-leader `pg_control_checkpoint` monitor branch is unimplemented.
   Preserve different-upstream, descendant and rejoin acceptance work, and finish
   the cold-load audit and broader C-style documentation. No coordination is added.

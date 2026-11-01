@@ -70,6 +70,18 @@ and starts owned C and native peers. C physical feedback clients and two native
 replicas started through real `Postgresql.follow` exercise FIRST/ANY monitoring.
 It does not run DCS, election or the HA loop.
 
+Using the same pinned environment and C binaries, run the independent feedback
+and crash oracles from `src/lisp`:
+
+```sh
+PG_CONFIG=/path/to/c/bin/pg_config "$PATRONI_PYTHON" t/interop/synchronous-ack.py --reference-bin /path/to/c/bin
+PG_CONFIG=/path/to/c/bin/pg_config "$PATRONI_PYTHON" t/interop/synchronous-crash.py --reference-bin /path/to/c/bin
+```
+
+The C feedback clients simulate apply credit; native followers replay WAL. The
+native after-ACK crash case keeps the source down and cold-starts both credited
+followers from their own PGDATA to check recovery and the committed row.
+
 `patroni-follow-config.py` constructs the pinned unmodified Patroni 4.1.5
 `Postgresql` and `ConfigHandler` and checks the complete attach, replace and
 clear writer output with C `postgres -C`. Use the pinned requirements, the C 20

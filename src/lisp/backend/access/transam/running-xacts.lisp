@@ -82,7 +82,7 @@
       (running-xacts-check next running complete)
       (list :next-xid next :running running :complete complete))))
 
-;;; An anchor replaces the known state with an exact or incomplete snapshot
+;;; An initial anchor establishes an exact or incomplete snapshot
 ;;; at LSN.  ANCHOR identifies that snapshot; THROUGH is the position through
 ;;; which later progress has been applied.  Copy the list so the caller retains
 ;;; ownership of the snapshot.
@@ -98,6 +98,10 @@
           :running (copy-list running) :complete complete)))
 
 (defun running-xacts-reanchor (prior snapshot lsn)
+  "Apply an anchor without reintroducing XIDs excluded by complete prior coverage.
+For prior next XID N and running set R, keep new members at or above N or in R.
+Unknown or incomplete prior coverage cannot supply those exclusions. Use only
+ordered source evidence, not target CLOG or later WAL."
   (let ((anchor (running-xacts-anchor snapshot lsn)))
     (when (and prior (getf prior :complete) (getf anchor :complete))
       (running-xacts-check-state prior)
@@ -203,11 +207,15 @@ NIL state stays unknown until an anchor. Inferred XIDs may already have aborted.
 ;;; the normal commit flush makes the records durable together.
 ;;;
 ;;; Only a registered committer can establish coverage.  A standalone caller
-;;; without a registered XID emits no anchor.  If the active set exceeds the
+;;; without a registered XID emits no anchor.  If the eligible running set exceeds the
 ;;; bound, emit an explicit incomplete snapshot instead of a partial set.
 
 (defun wal-append-running-xacts-under-lock (committer)
-  "Append a running-XID snapshot for a registered COMMITTER under the WAL lock."
+  "Append a bounded running-XID snapshot for a registered COMMITTER.
+The caller holds WAL; keep the XID lock through capture and insertion. Exclude
+logically committed XIDs, including accepted async commits: their COMMIT records
+precede this anchor in WAL. Keep their registry ownership until normal cleanup.
+Bound the eligible running set, rather than all registered owners."
   (sb-thread:with-mutex (*xid-lock*)
     (when (member committer *active-xids* :test #'eql)
       (let ((running nil) (count 0) (complete t))

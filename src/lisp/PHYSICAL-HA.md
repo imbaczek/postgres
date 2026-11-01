@@ -55,6 +55,29 @@ under `/tmp/pg-transaction-response-859cu0aw` and the C oracle under
 cases also passed. See [the interop inventory](t/interop/README.md#running) for
 the command.
 
+### Independent synchronous feedback and crash recovery
+
+Running-XID anchors exclude source transactions already logically committed but
+still registered while waiting for synchronous feedback. Replay preserves prior
+complete exclusions when reanchoring; it does not consult target CLOG, which can
+be ahead of the applied WAL position. Unknown or incomplete history cannot prove
+those exclusions, and an already poisoned restartpoint cannot be repaired from
+that state alone.
+
+The checkpoint passed 898 unit, 1,416 physical, 201 wire and 1,161 legacy checks,
+strict cold compilation, and the Patroni monitor regression. The independent
+feedback oracle passed 50 C/native cases including disconnects. Crash tests
+covered source recovery before and after ACK on C and before ACK on native. After
+native ANY 2 ACK, the source stayed down while both credited followers were killed
+and cold-started from their own PGDATA; each recovered the committed row. Logs are
+in `/home/imbaczek/proj/pg-ha-artifacts/sync-ack/`, including `native-c-final.log`,
+`physical-reviewed.log`, `cold.log`, `legacy.log`, and `patroni-regression.log`.
+The property ran 100 trials at seed 4017 (digest `fnv1a64-v1:a46ee7aac2e86822`),
+with no Function Spec for its target. Input coverage and rejection counts were
+not measured. See [the interop inventory](t/interop/README.md#running) for the
+commands. Overflow or reset gaps discard prior exclusions; reanchoring does not
+reconstruct that lost proof.
+
 ### Configured native follow
 
 `primary_conninfo` and `primary_slot_name` are SIGHUP settings. Reload installs

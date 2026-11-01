@@ -304,8 +304,9 @@ restore proof before promotion; observed next XID must stay within that bound."
       (error "observed XID exceeds the source's durable allocation reservation"))
     (list :version 1 :through (wal-record-end record) :bound bound :complete complete)))
 
-;;; Compute prospective membership for each record in WAL order.  An anchor
-;;; replaces prior coverage; a reset or missing prior state leaves it unknown.
+;;; Compute prospective membership for each record in WAL order.  A complete
+;;; reanchor preserves prior exclusions; reset or missing state leaves coverage
+;;; unknown until a later anchor.
 ;;; The set is conservative: aborted transactions can remain because native
 ;;; ABORT has no WAL record.  Between anchors, only an ordered commit removes
 ;;; its XID.
@@ -313,7 +314,9 @@ restore proof before promotion; observed next XID must stay within that bound."
 
 (defun physical-source-xids-next (prior record observed-next)
   "Track prospective source membership independently of existing reader snapshots.
-EOR clears this proof. A later running-transaction anchor can establish it again."
+EOR clears this proof. A later running-transaction anchor can establish it again.
+Complete prior coverage preserves known exclusions when a new anchor arrives.
+Do not consult replay CLOG: it may be ahead of this record's applied position."
   (when prior
     (running-xacts-check-state prior)
     (when (> (getf prior :through) (wal-record-start record))
