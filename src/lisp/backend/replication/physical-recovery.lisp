@@ -685,6 +685,7 @@ Restore a missing empty base directory only after the backup is verified; missin
 listed relation forks still fail validation. The caller supplies startup
 exclusion; reject pending page and CLOG debt and rotate local WAL identity before
 installing the recovery store."
+  (require-primary-wal-writer-retired)
   (wal-require-no-pending-storage)
   (unless (recovery-in-progress-p) (error "physical recovery image was not verified"))
   (physical-follow-check-startup-admission *physical-recovery-state*)

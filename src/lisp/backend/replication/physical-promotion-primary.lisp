@@ -315,6 +315,7 @@ readers, retention state and the parent replay position.  Any failure fences
 recovery; restart must classify durable control. Under the existing quiescence
 requirements, reject pending page and CLOG debt and rotate the local WAL identity before
 installing the child's state."
+  (require-primary-wal-writer-retired)
   (let ((finished nil))
     (unwind-protect
          (progn

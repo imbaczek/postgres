@@ -410,6 +410,7 @@ This is separate from the checks for pending page and CLOG debt."
   "Rotate local WAL store identity only after pending page and CLOG debt is gone.
 This identity is separate from the source used for remote acknowledgments."
   (assert (sb-thread:holding-mutex-p *wal-lock*))
+  (require-primary-wal-writer-retired-under-lock)
   (wal-require-no-pending-storage)
   (wal-require-no-temp-cleanup-under-lock)
   (setf *wal-storage-incarnation* (gensym "WAL-STORE-")))
@@ -3388,6 +3389,7 @@ Refresh its modification time. Update memory only after atomic publication."
 Reject surviving page and CLOG debt and a nonempty cleanup domain before
 replacement. Establish a fresh local identity; cleanup owners are released only
 after cleanup is confirmed."
+  (require-primary-wal-writer-retired)
   (wal-require-no-pending-storage)
   (sb-thread:with-mutex (*wal-lock*)
     (when (and *wal-dirty-store*

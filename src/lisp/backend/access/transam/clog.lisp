@@ -385,13 +385,17 @@ compatibility and tests. Production publication uses reserved completions."
     (when *clog-stream*
       (fsync-stream *clog-stream*))))
 
-(defun clog-reset-file-under-wal-lock (fsync-function fsync-directory-function)
+(defun clog-reset-file-under-wal-lock (fsync-function fsync-directory-function &optional epoch-plan)
   "Replace CLOG only after page, CLOG and temporary cleanup debt are absent.
 Check under WAL lock before touching the file. Rotate the storage incarnation
 after the file and its directory are durable."
   (assert (sb-thread:holding-mutex-p *wal-lock*))
   (wal-require-no-pending-page-publication)
   (wal-require-no-temp-cleanup-under-lock)
+  (unless epoch-plan
+    (require-primary-wal-writer-retired-under-lock)
+    (setf epoch-plan (prepare-primary-wal-writer-clog-reset-under-lock)))
+  (validate-primary-wal-writer-clog-reset-plan-under-lock epoch-plan)
   (sb-thread:with-mutex (*clog-lock*)
     (clog-require-no-pending-under-lock)
     (when *clog-stream*
@@ -405,17 +409,22 @@ after the file and its directory are durable."
       (setf *clog-stream*
             (open path :direction :io :element-type '(unsigned-byte 8)
                        :if-exists :overwrite :if-does-not-exist :create))))
-  (wal-replace-storage-incarnation-under-lock)
+  (publish-primary-wal-writer-clog-reset-under-lock epoch-plan)
   (values))
 
-(defun clog-reset-under-wal-lock (fsync-function fsync-directory-function wal-reset-p)
+(defun clog-reset-under-wal-lock
+    (fsync-function fsync-directory-function wal-reset-p &optional begin-publication)
   "Settle primary page debt, then require no debt through reset and epoch change.
 Caller holds WAL lock. Replay and cold reset require debt to be absent already."
   (assert (sb-thread:holding-mutex-p *wal-lock*))
   (when (and wal-reset-p *wal-ready*) (wal-settle-page-publications-under-lock))
   (wal-require-no-pending-storage)
-  (when (and wal-reset-p *wal-ready*) (wal-log-clog-reset-under-lock))
-  (clog-reset-file-under-wal-lock fsync-function fsync-directory-function))
+  (unless (and wal-reset-p *wal-ready*)
+    (require-primary-wal-writer-retired-under-lock))
+  (let ((plan (prepare-primary-wal-writer-clog-reset-under-lock)))
+    (when begin-publication (funcall begin-publication))
+    (when (and wal-reset-p *wal-ready*) (wal-log-clog-reset-under-lock))
+    (clog-reset-file-under-wal-lock fsync-function fsync-directory-function plan)))
 
 (defun clog-reset (&key (fsync-function #'fsync-stream)
                      (fsync-directory-function #'fsync-directory)
@@ -428,10 +437,8 @@ its own critical publication fence."
   (if (sb-thread:holding-mutex-p *wal-lock*)
       (clog-reset-under-wal-lock fsync-function fsync-directory-function wal-reset-p)
       (with-wal-publication-fence (begin-publication)
-        (when (and wal-reset-p *wal-ready*) (wal-settle-page-publications-under-lock))
-        (wal-require-no-pending-storage)
-        (begin-publication)
-        (clog-reset-under-wal-lock fsync-function fsync-directory-function wal-reset-p)))
+        (clog-reset-under-wal-lock fsync-function fsync-directory-function
+                                   wal-reset-p #'begin-publication)))
   (values))
 
 (defun clog-recover (next-xid)

@@ -22,6 +22,7 @@ Require no pending page, CLOG or WAL temporary cleanup debt before any control
 write. Retain its checkpoint and identity. Legacy controls have no lifecycle
 state; leave that state unknown until successful initialization publishes
 production."
+  (require-primary-wal-writer-retired)
   (wal-require-no-pending-storage)
   (sb-thread:with-mutex (*wal-lock*)
     (wal-require-no-temp-cleanup-under-lock))
