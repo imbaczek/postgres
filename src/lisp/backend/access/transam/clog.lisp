@@ -192,7 +192,8 @@ Rotate the storage incarnation after the file and its directory are durable."
   (values))
 
 (defun clog-reset-under-wal-lock (fsync-function fsync-directory-function wal-reset-p)
-  "Reject page and CLOG debt and keep WAL locked through record, file and epoch change."
+  "Settle primary page debt, then require no debt through reset and epoch change.
+Caller holds WAL lock. Replay and cold reset require debt to be absent already."
   (assert (sb-thread:holding-mutex-p *wal-lock*))
   (when (and wal-reset-p *wal-ready*) (wal-settle-page-publications-under-lock))
   (wal-require-no-pending-storage)

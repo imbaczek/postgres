@@ -236,14 +236,29 @@
   its recovery-failure flag. Native tests caught a pre-flush response leak and
   a guard outside WAL that rejected a healthy competing commit; both are fixed.
 
-- [ ] Implement true asynchronous OFF using the captured policy and acceptance
-  receipts. Keep CLOG dependencies volatile until WAL is durable. Extend the page
-  overlay to multiple pending batches and add a common FIFO flush and materialization
-  path for all publishers, checkpoints and deletes, with a tracked primary WAL
-  writer, checkpoint drain and further lifecycle scoping. Preserve WAL-to-CLOG
-  lock order and the truthful durable frontier; never
-  put pending committed bits on disk before WAL. Enable OFF only when ordinary DML
-  can acknowledge before the durable frontier advances. This adds no coordination.
+- [x] Order transaction and maintenance page publications in a common FIFO
+  (`63c3684d70c`). Normal calls flush and drain immediately. Synchronous barriers
+  settle predecessors; cold installation and identity changes reject debt. Resets
+  force sync and settle predecessors before private publication. Catalog and drop
+  closures are not queued. The native WAL format is unchanged.
+  The checkpoint passed 807 unit, 1,413 physical, 201 wire and 1,161 legacy checks,
+  strict cold compilation, 21 native page cases, eight receipt and seven user
+  cases, DDL and reload checks, and four CLOG failure/crash cases. The prefix
+  property ran 100 trials each at seeds 42 and 3282750418480750988, digest
+  `fnv1a64-v1:81cff11f8481e2b2`; the ownership property ran 100 each at seeds
+  42 and 145193323930899829, digest `fnv1a64-v1:a52e06a995fdb660`. Rejection
+  counts and input coverage were not measured for either property.
+
+- [ ] Implement true asynchronous OFF using captured policy and acceptance
+  receipts. First give the queue ownership of CLOG completion and reservation:
+  hash membership currently means committed, so the current tag cannot be
+  preinserted. Give WAL a transferable temporary-spool cleanup claim; cleanup
+  currently retains the owner thread/backend's retry authority. Then add a tracked
+  primary writer with bounded pressure, wakeup, stop/join, reload, shutdown and
+  role lifecycle. Prove distinct asynchronous acceptance and settle the snapshot
+  prefix before acquiring the XID lock during snapshot capture. Preserve
+  WAL-to-CLOG lock order and never put pending committed bits on disk before WAL.
+  Enable public OFF only after real acceptance coverage. No coordination is added.
 
 - [ ] Complete the unchanged Patroni monitoring query and synchronous-replication
   backend contract. Preserve the complete real query as the acceptance oracle.
@@ -252,7 +267,8 @@
   of unchanged-method acceptance. Complete public FIRST/ANY integration against
   C `syncrep.c`, with independent acknowledgment/crash tests;
   this item adds no coordination. Preserve the
-  different-upstream, descendant and rejoin acceptance work alongside this path.
+  different-upstream, descendant and rejoin acceptance work alongside this path,
+  and finish the cold-load audit and broader C-style documentation.
 
 - [x] Publish an allocated backend XID with its active registration under the XID
   lock and interrupt mask, following C's ownership-before-unlock ordering. Raw

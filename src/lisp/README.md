@@ -178,15 +178,22 @@ number of pages.
 Primary WAL publication also stages copied page records in an internal spool,
 building bounded record-sized chunks in sorted page-key order and validating the
 spool before the terminal record. Its temporary file is independent of the SQL
-temporary-file quota. A transaction hands the sealed spool and dirty maps to
-one pending owner at its terminal record, then flushes WAL and immediately
-applies the pages and retires that owner before accepting the commit. Pending
-pages remain visible to reads until retirement. This is not a general FIFO or
-a background writer; true `synchronous_commit=off` remains rejected. The primary
-retains at most 512 dirty page vectors across its shared cache, private batch and
-pending owner; further pages use process-owned scratch slots with checksums bound
-to the page identity. Scratch
-is transient, exempt from the SQL temporary-file quota, and released when its
+temporary-file quota. Transactions and maintenance hand sealed spools and dirty
+maps to a WAL-locked FIFO at their terminal records. Reads find the newest queued
+page together with its contributor metadata. Settlement flushes WAL and validates
+the captured prefix before applying and retiring owners from the head through the
+captured target. Normal calls settle immediately before returning; there is no
+background writer, and `synchronous_commit=off` still returns 0A000. Catalog,
+checkpoint, CLOG reset, XID reservation, resource, recycling and namespace changes
+are synchronous barriers. Relation resets force synchronous completion, with prior
+owners settled before private replacement pages are published. Storage installation,
+adoption and identity replacement require no outstanding debt. These barriers do not make
+catalog operations or resets asynchronously owned.
+
+The primary retains at most 512 dirty page vectors across its shared cache,
+private batch and pending owners; further pages use process-owned scratch slots
+with checksums bound to the page identity. Scratch is transient, exempt from
+the SQL temporary-file quota, and released when its
 last reference is gone. Page keys, contributor metadata and the sorted key list
 remain in memory and grow with dirty pages; temporary record buffers also use
 memory. This is not a total process memory bound and does not remove logical

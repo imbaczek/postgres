@@ -80,6 +80,7 @@
   (values))
 
 (defun transaction-has-relation-replacements-p (backend)
+  "Check BACKEND's private reset work while the caller holds WAL lock."
   (let ((replacements (gethash backend *transaction-relation-replacements*)))
     (and replacements (plusp (hash-table-count replacements)))))
 

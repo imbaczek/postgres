@@ -119,6 +119,9 @@ printf '(pg::reload)\n(quit)\n' |
 ```
 
 Check the response and server log for reload success before repeating SQL.
+The control REPL prints the result of every top-level form. Settlement can return
+an owner with cyclic cleanup metadata, so suppress such diagnostic output with one
+form, `(progn ... (values))`; a separate following `(values)` is too late.
 The native interop harness uses this mechanism to load
 `t/interop/native-failpoints.lisp` into the publisher and install COPY,
 publication-race, commit-end and feedback hooks. Reuse those bounded hooks when

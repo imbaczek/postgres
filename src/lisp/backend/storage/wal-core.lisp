@@ -252,20 +252,23 @@ Owners are process-local; the appropriate codec stores durable slot fields."
 It is separate from the source identity used for remote acknowledgments.")
 
 (defstruct (wal-page-publication (:constructor %make-wal-page-publication))
-  ;; The stack owns SPOOL until handoff.  Pending ownership retains the sealed
-  ;; spool, dirty maps and WAL identity until durable application and retirement.
+  ;; The stack owns SPOOL until the masked terminal handoff links this owner.
+  ;; The FIFO retains its sealed spool, dirty maps and WAL identity through
+  ;; durable application and head retirement. KIND distinguishes transaction
+  ;; from maintenance (XID zero); NEXT links owners in terminal order.
   spool (state :stack) prepared-p pages contributors resets split-p xid
   next (kind :transaction)
   incarnation timeline terminal-end replacement-pages replacement-contributors)
 
 (defvar *wal-pending-page-publication* nil
-  "The single page publication awaiting materialization, protected by *WAL-LOCK*.")
+  "Head of the page publication FIFO, protected with its tail by *WAL-LOCK*.")
 
 (defvar *wal-pending-page-publication-tail* nil)
 
 (defvar *wal-page-publication-appender* nil)
 
 (defun wal-check-page-publication-queue-under-lock ()
+  "Validate FIFO links, identity and increasing terminal ends under WAL lock."
   (assert (sb-thread:holding-mutex-p *wal-lock*))
   (let ((last nil) (previous-end 0))
     (loop for owner = *wal-pending-page-publication* then (wal-page-publication-next owner)
@@ -286,8 +289,10 @@ It is separate from the source identity used for remote acknowledgments.")
   (values))
 
 (defun wal-require-no-pending-page-publication ()
-  "Reject another publisher while the pending owner retains page debt.
-Caller holds *WAL-LOCK* or has lifecycle quiescence."
+  "Reject page debt at a storage identity or lifecycle boundary.
+Transaction and maintenance publishers enqueue and settle before return;
+synchronous barriers settle predecessors first. Caller holds *WAL-LOCK* or has
+lifecycle quiescence."
   (when (or *wal-pending-page-publication* *wal-pending-page-publication-tail*)
     (wal-invalid-input "pending page publication prevents another storage publisher"))
   (values))
@@ -305,6 +310,7 @@ Caller holds *WAL-LOCK* or has lifecycle quiescence."
   owner)
 
 (defun wal-pending-page-reference (key)
+  "Return the newest queued page, presence flag and matching contributors under WAL lock."
   (when *wal-pending-page-publication*
     (wal-check-page-publication-queue-under-lock)
     (let ((reference nil) (present nil) (contributors nil))
@@ -1104,8 +1110,10 @@ Re-signal CONDITION after requesting shutdown."
   "Hold the WAL mutex while BODY publishes shared state.
 Waiting for the mutex is interruptible unless the caller already masks interrupts.
 Once acquired, mask interrupts through body execution, error recording and mutex
-release. Validation errors propagate without poisoning; other errors fail-stop
-after release. Nonlocal exits need a publication fence."
+release. Clean preflight validation errors propagate without poisoning. If WAL
+is already poisoned, validation also triggers fail-stop after release; other
+errors do likewise. Nonlocal exits need a publication fence. Legacy append and
+flush I/O can themselves call fail-stop while the mutex is held."
   (let ((failure (gensym "FAILURE-"))
         (condition (gensym "CONDITION-"))
         (mutex (gensym "MUTEX-"))
@@ -1130,9 +1138,10 @@ after release. Nonlocal exits need a publication fence."
 
 (defmacro with-wal-publication-fence ((begin-publication) &body body)
   "Fence publication begun by BEGIN-PUBLICATION through completion of BODY.
-After it begins, an error or nonlocal exit fail-stops after releasing WAL. Retain
-the first error even if cleanup fails. Mask interrupts during cleanup, and keep
-pending backend termination from replacing a latched WAL failure."
+After publication begins, fence cleanup fail-stops after releasing WAL on an
+error or nonlocal exit. Legacy append and flush I/O handlers may fail-stop earlier
+while WAL is held. Retain the first error even if cleanup fails. Mask interrupts
+during cleanup, and keep backend termination from replacing a latched WAL failure."
   (let ((started (gensym "STARTED-"))
         (complete (gensym "COMPLETE-"))
         (failure (gensym "FAILURE-"))
@@ -1246,6 +1255,7 @@ pending backend termination from replacing a latched WAL failure."
   (when sync-names (fsync-directory (wal-directory))))
 
 (defun wal-flush-core ()
+  "Sync WAL bytes and names, then durable control; caller supplies failure fences."
   (wal-sync-output-bytes *wal-output-stream* *wal-new-segments*)
   (setf *wal-new-segments* '())
   (wal-test-pause :after-wal-bytes-flush)
@@ -1536,7 +1546,8 @@ Install the preallocated empty maps by pointer, without changing references."
 
 (defun wal-drain-page-publication-under-lock (owner &key fault-on-first-write)
   "Apply a durable owner, close its spool and retire its references.
-The global owner is removed last.  Failure leaves debt for fail-stop handling."
+Only the FIFO head can retire, and it is removed last. Failure leaves debt for
+fail-stop handling."
   (assert (sb-thread:holding-mutex-p *wal-lock*))
   (sb-sys:without-interrupts
     (wal-check-healthy)
@@ -1569,6 +1580,7 @@ The global owner is removed last.  Failure leaves debt for fail-stop handling."
   (values))
 
 (defun wal-drain-page-publications-through-under-lock (target &key fault-on-first-write)
+  "Validate TARGET and its durable prefix before effects; retire through TARGET only."
   (assert (sb-thread:holding-mutex-p *wal-lock*))
   (sb-sys:without-interrupts
     (wal-check-healthy)
@@ -1581,6 +1593,9 @@ The global owner is removed last.  Failure leaves debt for fail-stop handling."
   (values))
 
 (defun wal-settle-page-publications-under-lock ()
+  "Flush and drain the captured FIFO prefix under WAL exclusion.
+Incomplete settlement poisons WAL. Preserve ordinary errors; convert a bare
+nonlocal exit to an error so the caller can fence failure after unlocking."
   (assert (sb-thread:holding-mutex-p *wal-lock*))
   (wal-check-healthy)
   (wal-check-page-publication-queue-under-lock)
@@ -1733,8 +1748,9 @@ With WAL ready, return this transaction's numeric commit end and an immutable
 receipt after local apply. TERMINAL-DURABLE-FUNCTION receives the exact end
 immediately after flush, before AFTER-DURABLE-FUNCTION. The latter receives this
 transaction's own end, or NIL without WAL; it is independent of the observer
-callback and cannot manufacture proof that the observer ran. Incomplete publication
-fail-stops after releasing WAL, retaining the first error if cleanup also fails.
+callback and cannot manufacture proof that the observer ran. For incomplete
+publication, fence cleanup fail-stops after releasing WAL and retains the first
+error. Legacy append and flush I/O handlers may fail-stop earlier while WAL is held.
 
 SOURCE-ID must be an explicit immutable symbol or integer when WAL is ready;
 NIL is valid. ACCEPTED-FUNCTION receives the same receipt returned as the second
@@ -3358,7 +3374,8 @@ local identity; pending owners are not cleared."
   "Write all cached pages, sync durable state, and advance the redo pointer.
 Under the WAL lock, freeze resource facts before planning placement and rotation.
 Check the encoded size against that plan before appending the checkpoint.
-Reject pending page and CLOG debt before appending any checkpoint batch records."
+Settle pending pages, then require page and CLOG debt to be empty before appending
+any checkpoint batch records."
   ;; CHECKPOINT follows the global write-lock -> WAL-lock order.
   (with-write-lock
     (with-wal-critical

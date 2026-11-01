@@ -18,7 +18,8 @@
 
 (defun wal-mark-primary-startup ()
   "Mark an existing primary unclean before storage startup can change files.
-Retain its checkpoint and identity. Legacy controls have no lifecycle state;
+Require no pending storage debt before any control write. Retain its checkpoint
+and identity. Legacy controls have no lifecycle state;
 leave that state unknown until successful initialization publishes production."
   (wal-require-no-pending-storage)
   (multiple-value-bind (checkpoint durable snapshot insertion checkpoint-id namespace metadata)
@@ -36,8 +37,9 @@ leave that state unknown until successful initialization publishes production."
 
 (defun wal-set-primary-state (state)
   "Publish STATE with the initialized catalog's system identifier.
-Hold the WAL lock across publication. Install the in-memory metadata only after
-the durable control write succeeds; an existing identity must match the catalog."
+Hold WAL across publication and require debt already empty; the caller must drain
+first. Install in-memory metadata only after the durable control write succeeds;
+an existing identity must match the catalog."
   (prevent-recovery-primary-operation "primary control publication")
   (unless (and *wal-ready* *catalog*) (error "primary storage has not been initialized"))
   (let ((system-id (catalog-system-identifier)))
