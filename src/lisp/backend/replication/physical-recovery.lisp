@@ -682,7 +682,9 @@ Publish dirty recovery control before installing state and allowing redo."
 receive store and redo its retained prefix before loading slots and serving SQL.
 A saved binding must have been reconciled and admitted before this point.
 Restore a missing empty base directory only after the backup is verified; missing
-listed relation forks still fail validation."
+listed relation forks still fail validation. The caller supplies startup
+exclusion; reject pending CLOG debt and rotate local WAL identity before
+installing the recovery store."
   (clog-require-no-pending-commits)
   (unless (recovery-in-progress-p) (error "physical recovery image was not verified"))
   (physical-follow-check-startup-admission *physical-recovery-state*)

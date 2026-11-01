@@ -119,7 +119,9 @@ Use the verified pending base identity and the recovery retained archive."
      (list :files (getf metadata :forks)) (make-hash-table :test #'eql))))
 
 (defun physical-promotion-restore-cold-state (state store)
-  "Restore only the selected restartpoint; never redo or publish ordinary progress."
+  "Restore only the selected restartpoint; never redo or publish ordinary progress.
+The caller establishes cold storage and quiescence. Rotate local WAL identity,
+which rejects pending CLOG debt, before installing the selected state."
   (wal-replace-storage-incarnation)
   (setf *physical-recovery-state* state *physical-receive-store* store
         *wal-segment-namespace* (getf state :wal-namespace)

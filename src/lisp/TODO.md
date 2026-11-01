@@ -211,11 +211,26 @@
   measured. True `synchronous_commit=off` remains pending CLOG/page overlay,
   common FIFO and WAL writer work; Patroni acceptance remains open.
 
+- [x] Add the pending CLOG foundation (`8a2a92a720d`). Production commits
+  still materialize immediately after WAL flush, so pending CLOG after return is
+  not enabled. The checkpoint passed 1,413 physical, 797 unit, 201 wire and
+  1,161 legacy checks, strict cold compilation, native receipt (8), user (7),
+  DDL and reload checks. Four failure cases cover fail-stop and restart before
+  and after the byte write, SIGKILL after staging, and SIGKILL after reset WAL
+  flush before replacement; the last proves redo because a previously committed
+  CLOG slot is zero after restart while a frozen row survives. Process kills do
+  not simulate power loss. The
+  fresh-process legacy fixture now resets poison and epoch, with two assertions;
+  no old tests were ported. The property ran 100 trials each at seeds 42 and
+  3263075368047784275, digest `fnv1a64-v1:0aa70a24580bcf9c`; rejection counts
+  and input coverage were not measured.
+
 - [ ] Implement true asynchronous OFF using the captured policy and acceptance
   receipts. Keep CLOG dependencies volatile until WAL is durable. Add an owned
   pending batch spool and page overlay, and a common FIFO flush and materialization
   path for all publishers, checkpoints and deletes, with a tracked primary WAL
-  writer. Preserve WAL-to-CLOG lock order and the truthful durable frontier; never
+  writer, checkpoint drain and further lifecycle scoping. Preserve WAL-to-CLOG
+  lock order and the truthful durable frontier; never
   put pending committed bits on disk before WAL. Enable OFF only when ordinary DML
   can acknowledge before the durable frontier advances. This adds no coordination.
 

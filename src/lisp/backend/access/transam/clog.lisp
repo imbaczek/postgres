@@ -23,10 +23,16 @@
 (defun clog-byte-index (xid) (floor (xid32-of xid) 4))
 (defun clog-bit-shift (xid) (* 2 (mod (xid32-of xid) 4)))
 
-(defvar *clog-pending-commits* (make-hash-table :test #'eql))
+(defvar *clog-pending-commits* (make-hash-table :test #'eql)
+  "Process-local map from 32-bit XID to full commit tag, protected by CLOG lock.
+Readers take CLOG lock alone; staging and materialization take WAL then CLOG.
+This is not a queue. Current successful commits leave it empty; failure debt
+is not cleared by reload.")
 
 (defstruct (clog-commit-tag
             (:constructor %make-clog-commit-tag (xid incarnation timeline terminal-end)))
+  ;; Full XID, local WAL store incarnation, timeline and exact terminal end
+  ;; identify the owner of a pending commit; none may change after staging.
   (xid 0 :read-only t)
   (incarnation nil :read-only t)
   (timeline 0 :read-only t)
@@ -39,10 +45,14 @@
   (values))
 
 (defun clog-require-no-pending-commits ()
+  "Check pending debt under CLOG lock.
+Callers must also provide their existing quiescence or WAL exclusion: this
+snapshot alone cannot prevent a new stage."
   (sb-thread:with-mutex (*clog-lock*)
     (clog-require-no-pending-under-lock)))
 
 (defun clog-init-under-lock ()
+  ;; Reopening storage cannot discard pending commits.
   (assert (sb-thread:holding-mutex-p *clog-lock*))
   (clog-require-no-pending-under-lock)
   (let* ((path (clog-path))
@@ -62,6 +72,8 @@
       +clog-in-progress+))
 
 (defun clog-write-status-under-lock (xid status &key fsync)
+  ;; Read the raw byte, not the logical overlay, so another pending slot in
+  ;; this byte cannot leak into storage through this read-modify-write.
   (assert (sb-thread:holding-mutex-p *clog-lock*))
   (unless *clog-stream* (clog-init-under-lock))
   (let ((pos (clog-byte-index xid)) (shift (clog-bit-shift xid)))
@@ -94,6 +106,11 @@
   (values))
 
 (defun clog-stage-commit-under-wal-lock (xid end)
+  "Install or return the matching tag for XID and its exact terminal end.
+The factory checks the current WAL store and timeline under WAL lock, then
+acquires CLOG lock. A new tag requires an in-progress raw slot. The helper
+returns a matching existing tag even if a partial write left the raw slot
+committed. Production I/O failure poisons WAL and fail-stops the server."
   (clog-check-commit-boundary-under-wal-lock xid end)
   (sb-thread:with-mutex (*clog-lock*)
     (let* ((key (xid32-of xid)) (old (gethash key *clog-pending-commits*)))
@@ -111,6 +128,9 @@
         tag))))
 
 (defun clog-materialize-commit-under-wal-lock (tag &key fsync)
+  "Write TAG only after the authoritative WAL durable frontier reaches it.
+The installed owner must be EQ to TAG. Remove it only after the write and
+finish-output or requested fsync succeed; an I/O error retains the debt."
   (clog-check-commit-tag-under-wal-lock tag)
   (unless (<= (clog-commit-tag-terminal-end tag) *wal-durable-lsn*)
     (wal-invalid-input "pending CLOG commit WAL is not durable"))
@@ -124,16 +144,20 @@
   (values))
 
 (defun clog-commit-durable-under-wal-lock (xid end)
+  "Stage and immediately write a commit after WAL flush, not asynchronous acceptance."
   (clog-materialize-commit-under-wal-lock
    (clog-stage-commit-under-wal-lock xid end)))
 
 (defun clog-get (xid)
+  "Return logical status, including a staged commit indexed by 32-bit XID.
+The overlay is process-local and does not itself change the raw file bits."
   (sb-thread:with-mutex (*clog-lock*)
     (if (gethash (xid32-of xid) *clog-pending-commits*)
         +clog-committed+
         (clog-read-status-under-lock xid))))
 
 (defun clog-set (xid status &key fsync)
+  "Write raw status, rejecting a slot owned by a pending commit."
   (sb-thread:with-mutex (*clog-lock*)
     (when (gethash (xid32-of xid) *clog-pending-commits*)
       (wal-invalid-input "direct CLOG write would replace a pending commit"))
@@ -141,6 +165,7 @@
   (values))
 
 (defun clog-fsync ()
+  "Sync raw CLOG bytes; this does not materialize pending commits."
   (sb-thread:with-mutex (*clog-lock*)
     (when *clog-stream*
       (fsync-stream *clog-stream*))))
@@ -164,6 +189,7 @@
   (values))
 
 (defun clog-reset-under-wal-lock (fsync-function fsync-directory-function wal-reset-p)
+  "Reject pending debt and keep WAL locked through record, file and epoch change."
   (assert (sb-thread:holding-mutex-p *wal-lock*))
   (clog-require-no-pending-commits)
   (when (and wal-reset-p *wal-ready*) (wal-log-clog-reset-under-lock))
@@ -172,6 +198,11 @@
 (defun clog-reset (&key (fsync-function #'fsync-stream)
                      (fsync-directory-function #'fsync-directory)
                      (wal-reset-p t))
+  "Reset CLOG under the WAL publication fence.
+On the primary, freeze every heap reference from the old XID cycle before
+emptying the file. Replay with WAL-RESET-P NIL applies the already logged
+freeze, page and reset transition. A caller already holding WAL must supply
+its own critical publication fence."
   (if (sb-thread:holding-mutex-p *wal-lock*)
       (clog-reset-under-wal-lock fsync-function fsync-directory-function wal-reset-p)
       (with-wal-publication-fence (begin-publication)

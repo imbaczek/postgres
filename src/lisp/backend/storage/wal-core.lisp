@@ -247,16 +247,23 @@ Owners are process-local; the appropriate codec stores durable slot fields."
 
 (defvar *wal-durable-lsn* 0)
 
-(defvar *wal-storage-incarnation* (gensym "WAL-STORE-"))
+(defvar *wal-storage-incarnation* (gensym "WAL-STORE-")
+  "WAL-owned token for the local insertion domain, retained across reload.
+It is separate from the source identity used for remote acknowledgments.")
 
 (declaim (ftype function clog-require-no-pending-commits))
 
 (defun wal-replace-storage-incarnation-under-lock ()
+  "Rotate local WAL store identity only after pending CLOG debt is gone.
+This identity is separate from the source used for remote acknowledgments."
   (assert (sb-thread:holding-mutex-p *wal-lock*))
   (clog-require-no-pending-commits)
   (setf *wal-storage-incarnation* (gensym "WAL-STORE-")))
 
 (defun wal-replace-storage-incarnation ()
+  "Check debt and rotate identity under WAL lock.
+The caller must already exclude writers for the whole storage adoption; this
+short check alone cannot do so."
   (sb-thread:with-mutex (*wal-lock*)
     (wal-replace-storage-incarnation-under-lock)))
 
@@ -1471,7 +1478,9 @@ any relation fork.
 
 With WAL ready, return this transaction's numeric commit end and an immutable
 receipt after local apply. TERMINAL-DURABLE-FUNCTION receives the exact end
-immediately after flush, before AFTER-DURABLE-FUNCTION. Incomplete publication
+immediately after flush, before AFTER-DURABLE-FUNCTION. The latter receives this
+transaction's own end, or NIL without WAL; it is independent of the observer
+callback and cannot manufacture proof that the observer ran. Incomplete publication
 fail-stops after releasing WAL, retaining the first error if cleanup also fails.
 
 SOURCE-ID must be an explicit immutable symbol or integer when WAL is ready;
@@ -2947,6 +2956,9 @@ Refresh its modification time. Update memory only after atomic publication."
 (declaim (ftype function wal-reconcile-namespace-at-startup))
 
 (defun wal-init ()
+  "Initialize WAL under startup or equivalent quiescence.
+Reject surviving CLOG debt before replacement and establish a fresh local
+identity; pending commits are not cleared."
   (clog-require-no-pending-commits)
   ;; Control identities must be accepted before even syncing directories: a child
   ;; control cannot cause legacy segment scanning, truncation, or tail adoption.
@@ -3080,7 +3092,8 @@ Refresh its modification time. Update memory only after atomic publication."
 (defun wal-checkpoint-core ()
   "Write all cached pages, sync durable state, and advance the redo pointer.
 Under the WAL lock, freeze resource facts before planning placement and rotation.
-Check the encoded size against that plan before appending the checkpoint."
+Check the encoded size against that plan before appending the checkpoint.
+Reject pending CLOG debt before appending any checkpoint batch records."
   ;; CHECKPOINT follows the global write-lock -> WAL-lock order.
   (with-write-lock
     (with-wal-critical
@@ -3152,6 +3165,9 @@ each calculation captures the current retention settings."
   (values))
 
 (defun wal-log-clog-reset-under-lock ()
+  "Append and flush the reset record with staged pages under WAL lock.
+The caller keeps WAL locked through subsequent CLOG file replacement; this
+function does not replace the file itself."
   (assert (sb-thread:holding-mutex-p *wal-lock*))
   (let* ((next-xid (symbol-value '*next-xid*))
          (keys (wal-primary-page-keys))
@@ -3169,6 +3185,7 @@ each calculation captures the current retention settings."
   (values))
 
 (defun wal-log-clog-reset ()
+  "Log a CLOG reset under WAL exclusion after checking pending debt."
   (when *wal-ready*
     (with-wal-critical
       (clog-require-no-pending-commits)
