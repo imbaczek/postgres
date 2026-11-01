@@ -171,7 +171,7 @@ An already materialized completion may be checked again."
     (let ((tag (clog-commit-completion-tag completion)))
       (clog-check-commit-tag-under-wal-lock tag)
       (unless (and (member (clog-commit-completion-state completion)
-                           '(:published :committed :materialized))
+                           '(:published :accepted :committed :materialized))
                    (<= (clog-commit-tag-terminal-end tag) *wal-durable-lsn*))
         (wal-invalid-input "reserved CLOG commit is not durably published"))
       (unless (eq :materialized (clog-commit-completion-state completion))
@@ -204,7 +204,7 @@ A queued completion may already be materialized and absent from the map."
                            (and (eq :published (clog-commit-completion-state completion))
                                 (eq installed completion))
                            (case (clog-commit-completion-state completion)
-                             ((:published :committed) (eq installed completion))
+                             ((:published :accepted :committed) (eq installed completion))
                              (:materialized (not present-p)))))
             (wal-invalid-input "queued CLOG completion differs from its publication"))))))
   (values))
@@ -233,6 +233,25 @@ Caller has already validated the FIFO links."
                             while queued thereis (eq owner queued)))
            (wal-invalid-input "pending CLOG completion has no queued owner"))))
      *clog-pending-commits*))
+  (values))
+
+(defun clog-accept-publication-under-wal-lock (owner)
+  (assert (sb-thread:holding-mutex-p *wal-lock*))
+  (wal-check-page-publication-queue-under-lock)
+  (clog-check-queued-commits-under-wal-lock)
+  (unless (and (wal-page-publication-p owner)
+               (eq :pending (wal-page-publication-state owner))
+               (loop for queued = *wal-pending-page-publication*
+                       then (wal-page-publication-next queued)
+                     while queued thereis (eq owner queued)))
+    (wal-invalid-input "CLOG acceptance requires a linked pending publication"))
+  (sb-thread:with-mutex (*clog-lock*)
+    (clog-check-publication-under-lock owner)
+    (let ((completion (wal-page-publication-completion owner)))
+      (unless (and completion
+                   (eq :published (clog-commit-completion-state completion)))
+        (wal-invalid-input "CLOG acceptance requires an unaccepted transaction"))
+      (setf (clog-commit-completion-state completion) :accepted)))
   (values))
 
 (defun clog-release-unattempted-publication-under-wal-lock (completion owner)
@@ -368,7 +387,7 @@ compatibility and tests. Production publication uses reserved completions."
       (if completion
           (ecase (clog-commit-completion-state completion)
             ((:reserved :inserting :published) +clog-in-progress+)
-            (:committed +clog-committed+))
+            ((:accepted :committed) +clog-committed+))
           (clog-read-status-under-lock xid)))))
 
 (defun clog-set (xid status &key fsync)

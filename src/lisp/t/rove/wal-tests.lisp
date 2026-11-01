@@ -576,6 +576,118 @@ Each entry in SEGMENTS contains a segment number followed by its byte vectors."
              (rove:ok (zerop (hash-table-count *clog-pending-commits*)))
              (rove:ok (null *wal-pending-page-publication*))))))))
 
+(defun accepted-clog-neighbor-result (slot committed-neighbor-p)
+  (call-with-queued-clog-test
+   (lambda ()
+     (sb-thread:with-mutex (*wal-lock*)
+       (let* ((xid (+ 44 slot))
+              (neighbor (+ 44 (mod (1+ slot) 4)))
+              (owner (wal-admit-transaction-under-lock xid nil))
+              (completion (wal-page-publication-completion owner))
+              (end (wal-page-publication-terminal-end owner))
+              (neighbor-status (if committed-neighbor-p +clog-committed+ +clog-aborted+)))
+         (clog-accept-publication-under-wal-lock owner)
+         (clog-set neighbor neighbor-status :fsync t)
+         (clog-fsync)
+         (let ((pending-p
+                 (and (eq :accepted (clog-commit-completion-state completion))
+                      (= +clog-committed+ (clog-get xid))
+                      (= +clog-in-progress+ (pending-clog-raw-status xid))
+                      (= neighbor-status (pending-clog-raw-status neighbor))
+                      (< *wal-durable-lsn* end)
+                      (handler-case
+                          (progn (clog-complete-reserved-commit-under-wal-lock completion owner) nil)
+                        (wal-input-validation-error () t)))))
+           (clog-check-queued-commits-under-wal-lock)
+           (wal-settle-page-publications-under-lock)
+           (and pending-p
+                (eq :released (wal-page-publication-state owner))
+                (eq :materialized (clog-commit-completion-state completion))
+                (= +clog-committed+ (pending-clog-raw-status xid))
+                (zerop (hash-table-count *clog-pending-commits*)))))))))
+
+(cl-spec:defproperty accepted-clog-neighbor-writes-preserve-wal-order
+    ((slot (range integer 0 3)) (committed-neighbor-p boolean))
+  (:about clog-accept-publication-under-wal-lock)
+  (:trials (:normal 100))
+  (accepted-clog-neighbor-result slot committed-neighbor-p))
+
+(rove:deftest accepted-clog-is-visible-without-writing-nondurable-status
+    (unit-check-property 'accepted-clog-neighbor-writes-preserve-wal-order))
+
+(rove:deftest accepted-clog-rejects-unlinked-stale-and-repeated-acceptance
+    (call-with-queued-clog-test
+     (lambda ()
+       (sb-thread:with-mutex (*wal-lock*)
+         (let* ((owner (wal-admit-transaction-under-lock 44 nil))
+                (completion (wal-page-publication-completion owner))
+                (end (wal-page-publication-terminal-end owner))
+                (incarnation (wal-page-publication-incarnation owner)))
+           (dolist (fault '(:foreign :unlinked :end :incarnation))
+             (unwind-protect
+                  (progn
+                    (ecase fault
+                      (:foreign)
+                      (:unlinked
+                       (setf *wal-pending-page-publication* nil
+                             *wal-pending-page-publication-tail* nil)
+                       (remhash 44 *clog-pending-commits*))
+                      (:end (incf (wal-page-publication-terminal-end owner)))
+                      (:incarnation
+                       (setf (wal-page-publication-incarnation owner) (gensym))))
+                    (rove:ok
+                     (handler-case
+                         (progn
+                           (clog-accept-publication-under-wal-lock
+                            (if (eq fault :foreign) (%make-wal-page-publication) owner))
+                           nil)
+                       (wal-input-validation-error () t)))
+                    (rove:ok (eq :published (clog-commit-completion-state completion)))
+                    (rove:ok (= +clog-in-progress+ (pending-clog-raw-status 44))))
+               (setf *wal-pending-page-publication* owner
+                     *wal-pending-page-publication-tail* owner
+                     (gethash 44 *clog-pending-commits*) completion
+                     (wal-page-publication-terminal-end owner) end
+                     (wal-page-publication-incarnation owner) incarnation)))
+           (clog-accept-publication-under-wal-lock owner)
+           (rove:ok
+            (handler-case
+                (progn (clog-accept-publication-under-wal-lock owner) nil)
+              (wal-input-validation-error () t)))
+           (rove:ok (eq :accepted (clog-commit-completion-state completion)))
+           (rove:ok (= +clog-in-progress+ (pending-clog-raw-status 44)))
+           (wal-settle-page-publications-under-lock))))))
+
+(rove:deftest accepted-clog-preserves-predecessor-and-poison-boundaries
+    (call-with-queued-clog-test
+     (lambda ()
+       (sb-thread:with-mutex (*wal-lock*)
+         (let* ((first (wal-admit-transaction-under-lock 44 nil))
+                (second (wal-admit-transaction-under-lock 45 nil))
+                (first-completion (wal-page-publication-completion first))
+                (second-completion (wal-page-publication-completion second)))
+           (let ((*wal-poisoned* t))
+             (rove:ok
+              (handler-case
+                  (progn (clog-accept-publication-under-wal-lock second) nil)
+                (error () t))))
+           (rove:ok (eq :published (clog-commit-completion-state second-completion)))
+           (clog-accept-publication-under-wal-lock second)
+           (rove:ok (eq :published (clog-commit-completion-state first-completion)))
+           (rove:ok (= +clog-in-progress+ (clog-get 44)))
+           (rove:ok (= +clog-committed+ (clog-get 45)))
+           (rove:ok (= +clog-in-progress+ (pending-clog-raw-status 45)))
+           (rove:ok (eq first *wal-pending-page-publication*))
+           (rove:ok (eq second (wal-page-publication-next first)))
+           (wal-flush)
+           (wal-drain-page-publications-through-under-lock first)
+           (rove:ok (eq second *wal-pending-page-publication*))
+           (rove:ok (eq :accepted (clog-commit-completion-state second-completion)))
+           (rove:ok (= +clog-in-progress+ (pending-clog-raw-status 45)))
+           (wal-drain-page-publications-through-under-lock second)
+           (rove:ok (null *wal-pending-page-publication*))
+           (rove:ok (= +clog-committed+ (pending-clog-raw-status 45))))))))
+
 (rove:deftest queued-transaction-keeps-materialized-status-after-page-failure
     (call-with-queued-clog-test
      (lambda ()
