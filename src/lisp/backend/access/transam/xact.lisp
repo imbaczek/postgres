@@ -75,7 +75,7 @@
   ;; maximum for that source; USER-END is this transaction's commit terminal.
   ;; A source mismatch is sticky.
   source-id catalog-end user-end (source-changed-p nil)
-  ;; DDL captures its mode before publication. FINAL-DDL-P records publication
+  ;; DDL captures its policy before publication. FINAL-DDL-P records publication
   ;; even without WAL; FINAL-DDL-END is its exact durable catalog end when present.
   (ddl-prepared-p nil) ddl-policy (final-ddl-p nil) final-ddl-end)
 
@@ -115,6 +115,8 @@ The flag remains set even when END is NIL or the source has changed."
   (values))
 
 (defun prepare-backend-final-ddl (backend)
+  "Capture one policy before final DDL publication for either completion path.
+The published context retains it for both XID and no-XID completion."
   (let ((policy (synchronous-commit-policy)))
     (multiple-value-bind (context source) (prepare-backend-wal-obligation backend)
       (declare (ignore source))
@@ -2388,6 +2390,7 @@ On commit, retire the saved settings snapshot; abort leaves it for whole-table u
   (values))
 
 (defun synchronous-commit-policy ()
+  "Capture the session policy at the caller's commit publication boundary."
   (session-synchronous-commit-policy))
 
 (defun wait-for-committed-wal-obligation
@@ -2466,7 +2469,8 @@ The caller keeps interrupts masked through this cleanup."
 
 (defun commit-final-ddl-without-xid (backend)
   "Wait for the final DDL catalog end without an XID.
-BACKEND must retain its prepared, published DDL context.
+BACKEND must retain its prepared, published DDL context and captured policy.
+Unlike C's no-XID path, this catalog boundary can require a remote wait.
 Run outside publication locks, clean up the transaction, then handle the outcome."
   (let* ((context (backend-wal-obligation backend))
          (outcome nil))
@@ -2534,7 +2538,9 @@ Run outside publication locks, clean up the transaction, then handle the outcome
                     (values nil (nth-value 0 (sync-replication-configuration-state)))))
             (sb-sys:without-interrupts
               (let ((irreversible nil) (accepted nil) (durable-end nil) (completion-safe nil)
-                                       ;; XID-bearing DDL waits for its user commit with the captured DDL mode.
+                                       ;; XID-bearing DDL waits for its user commit with the captured DDL policy.
+                                       ;; Its published catalog boundary forces local flush, without
+                                       ;; changing the request or adding a remote wait.
                                        (policy (if (backend-final-ddl-committed-p b)
                                                    (transaction-wal-obligation-ddl-policy (backend-wal-obligation b))
                                                    (synchronous-commit-policy)))

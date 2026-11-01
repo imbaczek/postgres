@@ -197,6 +197,9 @@ and a default entry. When CONFIGURATION is supplied, use that root for fallback.
     (getf entry :value)))
 
 (defun session-synchronous-commit-policy ()
+  "Capture and normalize the setting once as local durability and remote wait.
+LOCAL requests flush without remote waiting; ON, REMOTE_WRITE and REMOTE_APPLY
+request flush and the corresponding remote boundary. OFF remains unsupported."
   (let* ((value (session-normalize-synchronous-commit (session-synchronous-commit-value)))
          (remote (cond ((string= value "on") :flush)
                        ((string= value "remote_write") :write)
@@ -205,6 +208,7 @@ and a default entry. When CONFIGURATION is supplied, use that root for fallback.
     (%make-commit-policy :flush remote)))
 
 (defun session-synchronous-commit-wait-mode ()
+  "Return the remote component of the captured policy for existing callers."
   (commit-policy-remote-wait (session-synchronous-commit-policy)))
 
 (defun session-synchronous-commit-settings-row (configuration)

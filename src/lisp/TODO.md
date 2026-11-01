@@ -196,8 +196,23 @@
   `fnv1a64-v1:92a441ee7fa3a065`); rejection counts and input coverage were not
   measured.
 
-- [ ] Implement true asynchronous OFF. Separate policy and accepted versus durable
-  receipts; keep CLOG dependencies volatile until WAL is durable. Add an owned
+- [x] Capture a commit policy once before publication (`e01e84fadb3`), keeping
+  requested local durability and remote wait distinct from receipt facts. Final
+  DDL retains that policy for both XID and no-XID completion; an XID after a
+  published final catalog boundary forces effective local flush without changing
+  the request or adding a remote wait. C likewise forces a flush for forced-sync
+  commits and non-temporary relation deletion before files can be deleted; Lisp
+  additionally waits on the final catalog boundary for no-XID DDL when requested.
+  The structure layout change requires a fresh worker. Strict cold compilation,
+  1,413 physical, 790 unit, 201 wire and 1,159 legacy checks passed. Native
+  receipt (8), user (7), DDL and reload checks passed. The scoped property ran
+  100 trials each at seeds 42 and 4538924396900646344, digest
+  `fnv1a64-v1:11f68abafa1ea68c`; rejection counts and input coverage were not
+  measured. True `synchronous_commit=off` remains pending CLOG/page overlay,
+  common FIFO and WAL writer work; Patroni acceptance remains open.
+
+- [ ] Implement true asynchronous OFF using the captured policy and acceptance
+  receipts. Keep CLOG dependencies volatile until WAL is durable. Add an owned
   pending batch spool and page overlay, and a common FIFO flush and materialization
   path for all publishers, checkpoints and deletes, with a tracked primary WAL
   writer. Preserve WAL-to-CLOG lock order and the truthful durable frontier; never

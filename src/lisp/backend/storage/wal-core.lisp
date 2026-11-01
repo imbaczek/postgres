@@ -79,23 +79,27 @@ Runtime retention requires a captured installed policy.")
 
 (declaim (ftype function cleanup-invalidated-logical-replication-state))
 
-;; Historical facts for one accepted commit: XID, immutable source identity,
-;; that transaction's terminal end, and whether WAL durability was observed.
-;; NIL is a valid explicit source.  Without WAL the end and proof are NIL;
-;; the direct CLOG commit can nevertheless be durable.
-
 (defstruct (commit-policy
             (:constructor %make-commit-policy (local-durability remote-wait)))
+  "Requested local durability and remote wait, captured before publication.
+This policy is a choice, distinct from a WAL receipt's historical facts."
   (local-durability :flush :read-only t)
   (remote-wait nil :read-only t))
 
 (defun wal-require-local-commit-durability (mode)
+  "Require local flush before publication, including the no-WAL path.
+Async is unsupported (0A000); an unknown policy is an internal error (XX000)."
   (unless (eq mode :flush)
     (ereport (if (eq mode :async) "0A000" "XX000")
              (if (eq mode :async)
                  "asynchronous commit is not supported"
                  "invalid local commit durability policy")))
   mode)
+
+;; Historical facts for one accepted commit: XID, immutable source identity,
+;; that transaction's terminal end, and whether WAL durability was observed.
+;; NIL is a valid explicit source.  Without WAL the end and proof are NIL;
+;; the direct CLOG commit can nevertheless be durable.
 
 (defstruct (wal-commit-receipt
             (:constructor %make-wal-commit-receipt (xid source-id terminal-end wal-durable-p)))
@@ -1445,9 +1449,11 @@ the transaction (see SnapBuildCommitTxn and CreateInitDecodingContext)."
                                   (source-id nil source-id-supplied-p) accepted-function
                                   (local-durability :flush))
   "Flush storage resets, page images and XID's commit as one WAL boundary.
-The reset descriptors are owned across AFTER-DURABLE-FUNCTION, which may release
-the transaction's private replacements. Preflight the page spool before the
-terminal, then flush WAL before truncating any relation fork.
+LOCAL-DURABILITY defaults to :FLUSH for internal callers and is validated
+before publication even without WAL. The reset descriptors are owned across
+AFTER-DURABLE-FUNCTION, which may release the transaction's private replacements.
+Preflight the page spool before the terminal, then flush WAL before truncating
+any relation fork.
 
 With WAL ready, return this transaction's numeric commit end and an immutable
 receipt after local apply. TERMINAL-DURABLE-FUNCTION receives the exact end
