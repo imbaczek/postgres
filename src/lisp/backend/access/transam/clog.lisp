@@ -25,8 +25,9 @@
 
 (defvar *clog-pending-commits* (make-hash-table :test #'eql)
   "Process-local map from 32-bit XID to completion, protected by CLOG lock.
-Reserved, inserting and published entries read as IN_PROGRESS; committed entries
-provide a committed overlay without changing raw bits. Readers take CLOG alone;
+Reserved, inserting and published entries read as IN_PROGRESS. Accepted entries
+provide a committed overlay while raw bits remain IN_PROGRESS. Committed entries
+remain logically committed during materialization. Readers take CLOG alone;
 writers take WAL then CLOG. Production transaction owners hold their completions;
 the FIFO retains queued owners. This map provides status lookup and retains debt
 across reload.")
@@ -45,7 +46,10 @@ across reload.")
   ;; TAG fixes the WAL identity and planned terminal end. OWNER links back to
   ;; the publication holding this completion. The map retains both through an
   ;; ambiguous terminal attempt. STATE is protected by CLOG lock. Only an
-  ;; unattempted reservation can be cancelled.
+  ;; unattempted reservation can be cancelled. Published is still invisible;
+  ;; accepted is logically committed while raw CLOG remains IN_PROGRESS.
+  ;; Committed enters durable materialization; materialized has left the map.
+  ;; The legacy ownerless API also uses committed before materialization.
   (tag nil :read-only t)
   (owner nil :read-only t)
   (state :reserved))
@@ -139,7 +143,7 @@ The caller must retain the completion and fence an incomplete attempt."
 
 (defun clog-publish-reserved-commit-under-wal-lock (completion owner end)
   "Publish after append using its actual END, which must match the reservation.
-The status remains IN_PROGRESS until durable completion."
+The status remains IN_PROGRESS until acceptance or durable completion."
   (sb-thread:with-mutex (*clog-lock*)
     (clog-check-completion-under-lock completion owner)
     (let ((tag (clog-commit-completion-tag completion)))
@@ -236,6 +240,9 @@ Caller has already validated the FIFO links."
   (values))
 
 (defun clog-accept-publication-under-wal-lock (owner)
+  "Make a linked pending transaction logically committed without writing CLOG.
+Validate the exact FIFO owner and completion before changing its state under WAL
+then CLOG lock. The transition performs no I/O or callbacks."
   (assert (sb-thread:holding-mutex-p *wal-lock*))
   (wal-check-page-publication-queue-under-lock)
   (clog-check-queued-commits-under-wal-lock)
@@ -381,7 +388,8 @@ compatibility and tests. Production publication uses reserved completions."
    (clog-stage-commit-under-wal-lock xid end)))
 
 (defun clog-get (xid)
-  "Return logical status from completion state or raw CLOG bits."
+  "Return logical status from the pending completion or raw CLOG bits.
+An accepted completion reads committed while its raw status remains IN_PROGRESS."
   (sb-thread:with-mutex (*clog-lock*)
     (let ((completion (gethash (xid32-of xid) *clog-pending-commits*)))
       (if completion

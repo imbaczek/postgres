@@ -1,5 +1,16 @@
 # Development TODO
 
+- [x] Add the logical CLOG acceptance transition for a linked pending
+  publication (`d4a0b22ab30`). The helper is not yet called by production;
+  receipt and backend cleanup integration remain open, and OFF stays disabled.
+  Preserve snapshot settlement when integrating acceptance. The checkpoint passed
+  874 unit and 1,413 physical checks and strict cold compilation. Evidence is in
+  `/home/imbaczek/proj/pg-ha-artifacts/accepted-clog/` (`physical.log` and
+  `cold.log`); unit checks ran through the tool. The property
+  `accepted-clog-neighbor-writes-preserve-wal-order` ran 100 trials at seed 4011
+  (digest `fnv1a64-v1:dadd7089ff788acf`); its target has no registered Function Spec,
+  and rejection counts and input coverage were not measured.
+
 - [x] Add retained WAL publication pressure accounting and admission
   (`e8673faf91a`). Pressure can settle predecessors and require synchronous
   completion; the limits bound asynchronous acceptance, not a transaction's
