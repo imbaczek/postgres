@@ -15,9 +15,19 @@ api = runpy.run_path(str(Path(__file__).with_name('command-complete.py')))
 OwnedLisp = api['OwnedLisp']
 
 
-def connect(port):
+def connect(port, process=None):
     deadline = time.monotonic() + 20
     while True:
+        if process is not None:
+            if process.poll() is not None:
+                raise RuntimeError('owned SQL server exited before connection readiness')
+            listener = subprocess.check_output(
+                ['ss', '-H', '-ltnp', f'sport = :{port}'], text=True)
+            if f'pid={process.pid},' not in listener:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError('owned SQL listener did not become ready')
+                time.sleep(0.02)
+                continue
         try:
             connection = psycopg2.connect(host='127.0.0.1', port=port, user='postgres',
                                           dbname='postgres', connect_timeout=1)
@@ -38,8 +48,30 @@ def result(connection, query):
             return ('error', error.pgcode, error.diag.statement_position)
 
 
-def run(binary):
-    root = Path(tempfile.mkdtemp(prefix='pg-dollar-quotes-c-oracle-'))
+def check_dollar_quotes(native, reference):
+    queries = [
+        'SELECT $$$$',
+        r"SELECT $$a'b\c; -- not a comment$$",
+        'SELECT $Tag$a$tag$b$Tag$',
+        'SELECT $_a12$BEGIN\nPERFORM 1;\nEND;$_a12$',
+        'SELECT $é$🙂\nquoted\'"$é$',
+        'SELECT $a$x$junk$a$',
+        'SELECT $$' + ('x' * 1000000) + '$$',
+        'SELECT $$unterminated',
+        'SELECT $Tag$x$tag$',
+        'SELECT $1$x$1$',
+        'SELECT $a-b$x$a-b$',
+        'SELECT $$a$$$',
+    ]
+    for index, query in enumerate(queries, 1):
+        expected, actual = result(reference, query), result(native, query)
+        assert actual == expected, (index, query[:120], expected, actual)
+    print(f'dollar-quoted-strings: {len(queries)} C/native value and error-position cases PASS',
+          flush=True)
+
+
+def run(binary, check=check_dollar_quotes, label='dollar-quotes'):
+    root = Path(tempfile.mkdtemp(prefix=f'pg-{label}-c-oracle-'))
     server = OwnedLisp()
     process = native = reference = None
     with socket.socket() as reservation:
@@ -54,28 +86,10 @@ def run(binary):
             process = subprocess.Popen([str(binary / 'postgres'), '-D', str(root / 'data'),
                                         '-p', str(port), '-h', '127.0.0.1', '-k', str(root)],
                                        stdout=log, stderr=log)
-        reference = connect(port)
+        reference = connect(port, process)
         server.start()
-        native = connect(server.port)
-        queries = [
-            'SELECT $$$$',
-            r"SELECT $$a'b\c; -- not a comment$$",
-            'SELECT $Tag$a$tag$b$Tag$',
-            'SELECT $_a12$BEGIN\nPERFORM 1;\nEND;$_a12$',
-            'SELECT $é$🙂\nquoted\'"$é$',
-            'SELECT $a$x$junk$a$',
-            'SELECT $$' + ('x' * 1000000) + '$$',
-            'SELECT $$unterminated',
-            'SELECT $Tag$x$tag$',
-            'SELECT $1$x$1$',
-            'SELECT $a-b$x$a-b$',
-            'SELECT $$a$$$',
-        ]
-        for index, query in enumerate(queries, 1):
-            expected, actual = result(reference, query), result(native, query)
-            assert actual == expected, (index, query[:120], expected, actual)
-        print(f'dollar-quoted-strings: {len(queries)} C/native value and error-position cases PASS',
-              flush=True)
+        native = connect(server.port, server.process)
+        check(native, reference)
     finally:
         if native is not None:
             native.close()
