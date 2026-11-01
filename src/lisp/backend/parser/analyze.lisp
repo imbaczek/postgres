@@ -1596,11 +1596,11 @@ only when a non-NULL call executes; explicit text arguments arrive here then."
      (when (eq (expr-type (first args)) :char)
        (setf args (list (list :cast (first args) :type :text :typmod -1))))
      (list :func name args :type :int4 :typmod -1))
-    ((string= name "pg_backend_pid")
+    ((member name '("pg_backend_pid" "txid_current") :test #'string=)
      (when args
        (ereport "42883" "function ~a(~a) does not exist"
                 name (call-signature args)))
-     (list :func name args :type :int4 :typmod -1))
+     (list :func name args :type (if (string= name "txid_current") :int8 :int4) :typmod -1))
     ((string= name "pg_cancel_backend")
      (unless (and (= (length args) 1)
                   (admin-arg-coercible-p (first args) :int4))
@@ -3763,7 +3763,7 @@ checks still apply."
                                    "current_catalog" "current_user" "session_user" "user" "pg_postmaster_start_time"
                                    "json_typeof" "jsonb_typeof" "json_array_length" "jsonb_array_length" "jsonb_set" "jsonb_insert" "to_jsonb" "to_json" "json_build_array" "json_build_object"
                                    "jsonb_build_array" "jsonb_build_object" "get_byte" "set_byte" "get_bit" "set_bit"
-                                   "substr" "substring" "length" "char_length" "character_length" "octet_length" "pg_backend_pid"
+                                   "substr" "substring" "length" "char_length" "character_length" "octet_length" "pg_backend_pid" "txid_current"
                                    "chr" "array_to_string" "string_to_array" "greatest" "least"
                                    "abs" "numeric_abs" "sign" "round" "trunc" "ceil" "ceiling" "floor"
                                    "sqrt" "numeric_sqrt" "exp" "numeric_exp" "ln" "numeric_ln"
@@ -4496,6 +4496,11 @@ aliases share the corresponding numeric operator implementation."
                                    (t "%"))))
                (sql-numeric-arithmetic operator left right))))))
 
+(defun sql-txid-current ()
+  (prevent-recovery-primary-operation "pg_current_xact_id()")
+  (let ((xid (get-current-xid)))
+    (if (logbitp 63 xid) (- xid (ash 1 64)) xid)))
+
 (defun eval-func (name args)
   (cond
     ((physical-slot-function-signature name) (eval-physical-slot-function name args))
@@ -4577,6 +4582,8 @@ aliases share the corresponding numeric operator implementation."
      (backend-database *backend*))
     ((string= name "pg_backend_pid")
      (if *backend* (backend-pid *backend*) 0))
+    ((string= name "txid_current")
+     (sql-txid-current))
     ((string= name "pg_cancel_backend")
      (admin-cancel-backend (admin-pid-arg (first args))))
     ((string= name "pg_terminate_backend")

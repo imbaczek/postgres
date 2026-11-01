@@ -183,6 +183,71 @@
          (map 'vector #'subquery-test-expected value))
         (t value)))
 
+(cl-spec:defproperty txid-current-preserves-full-xid-bits
+    ((high (range integer 0 4294967295)) (low (range integer 3 4294967295)))
+  (:about eval-func)
+  (:trials (:normal 100))
+  (let* ((xid (+ (ash high 32) low))
+         (*backend* (make-backend :xid xid))
+         (*physical-recovery-state* nil)
+         (expected (if (>= xid (expt 2 63)) (- xid (expt 2 64)) xid)))
+    (= expected (eval-func "txid_current" nil))))
+
+(rove:deftest txid-current-analysis-does-not-allocate
+    (let ((*backend* (make-backend)))
+      (dolist (sql '("SELECT txid_current()" "SELECT * FROM pg_catalog.txid_current()"))
+        (let* ((plan (plan-select-query (first (parse-statements sql))))
+               (target (first (getf (query-plan-prepared plan) :targets))))
+          (rove:ok (eq :int8 (expr-type (getf target :expr))) sql)
+          (rove:ok (null (backend-xid *backend*)) "planning does not assign an XID")))
+      (dolist (sql '("SELECT txid_current(1)" "SELECT public.txid_current()"))
+        (rove:ok (handler-case
+                     (progn (plan-select-query (first (parse-statements sql))) nil)
+                   (pg-error (condition) (string= "42883" (pg-error-sqlstate condition))))
+                 sql))))
+
+(rove:deftest txid-current-reuses-transaction-owner-and-full-width
+    (unit-check-property 'txid-current-preserves-full-xid-bits)
+  (dolist (xid (list 3 (+ (ash 1 32) 3) (1- (ash 1 63)) (+ (ash 1 63) 3)))
+    (let* ((*backend* (make-backend :xid xid))
+           (*physical-recovery-state* nil)
+           (expected (if (logbitp 63 xid) (- xid (ash 1 64)) xid)))
+      (rove:ok (equal (list (list expected expected))
+                      (subquery-test-rows "SELECT txid_current(),txid_current()")))
+      (rove:ok (equal (list (list expected expected))
+                      (subquery-test-rows "SELECT f,f.f FROM txid_current() f")))
+      (rove:ok (= xid (backend-xid *backend*))))))
+
+(rove:deftest txid-current-allocates-on-first-execution-and-rejects-recovery
+    (let ((original (symbol-function 'assign-xid))
+          (allocations 0)
+          (*physical-recovery-state* nil)
+          (*backend* (make-backend)))
+      (unwind-protect
+           (progn
+             (setf (symbol-function 'assign-xid)
+                   (lambda (&optional owner)
+                     (incf allocations)
+                     (setf (backend-xid owner) (+ (ash 1 32) 3))))
+             (let* ((plan (plan-select-query
+                           (first (parse-statements "SELECT txid_current(),txid_current()"))))
+                    (relations (getf (query-plan-prepared plan) :relations))
+                    (rows nil))
+               (rove:ok (zerop allocations))
+               (execute-query-plan plan relations (lambda (row) (push (car row) rows)))
+               (rove:ok (= allocations 1) "one allocation for repeated calls")
+               (rove:ok (equalp rows (list (vector (+ (ash 1 32) 3) (+ (ash 1 32) 3))))))
+             (setf (backend-xid *backend*) nil)
+             (let ((*physical-recovery-state* :standby))
+               (rove:ok
+                (handler-case (progn (eval-func "txid_current" nil) nil)
+                  (pg-error (condition)
+                    (and (string= "55000" (pg-error-sqlstate condition))
+                         (search "pg_current_xact_id()" (princ-to-string condition)))))))
+             (rove:ok (= allocations 1) "recovery is rejected before allocation")
+             (rove:ok (null (backend-xid *backend*))))
+        (setf (symbol-function 'assign-xid) original))))
+
 (cl-spec:defproperty scalar-function-from-preserves-value-and-column-alias
     ((value (range integer -10000 10000)) (alias-index (range integer 0 2)))
   (:about parse-from-relation expand-select-targets)
