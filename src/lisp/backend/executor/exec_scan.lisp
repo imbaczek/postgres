@@ -789,6 +789,9 @@ COLUMN-OFFSET maps the query-wide Var numbers back to this relation's attnums."
         (list :name alias :alias alias :table table :offset offset
               :width (length targets) :columns (pg-class-columns table)
               :virtual-p t :origins targets :subquery-prepared prepared
+              :scalar-function-p
+              (and (getf query :from-function)
+                   (getf (first (getf prepared :targets)) :scalar-function-p))
               ;; Legality includes unused CTEs; runtime dependencies need only
               ;; the outer frames reached by executable expressions.
               :lateral-reference (and (getf query :lateral)
@@ -801,6 +804,7 @@ COLUMN-OFFSET maps the query-wide Var numbers back to this relation's attnums."
 (defun select-source-scope-relation (source)
   (make-select-relation :name (getf source :name) :alias (getf source :alias)
                         :table (getf source :table) :origins (getf source :origins)
+                        :scalar-function-p (getf source :scalar-function-p)
                         :identity (ensure-select-source-identity source)
                         :offset (getf source :offset) :width (getf source :width)))
 

@@ -183,6 +183,86 @@
          (map 'vector #'subquery-test-expected value))
         (t value)))
 
+(cl-spec:defproperty scalar-function-from-preserves-value-and-column-alias
+    ((value (range integer -10000 10000)) (alias-index (range integer 0 2)))
+  (:about parse-from-relation expand-select-targets)
+  (:trials (:normal 100))
+  (let* ((suffix (nth alias-index '("" " AS f" " AS f(v)")))
+         (name (nth alias-index '("abs" "f" "v")))
+         (sql (format nil "SELECT * FROM abs(~d)~a" value suffix))
+         (plan (plan-select-query (first (parse-statements sql)))))
+    (and (equal (list name) (mapcar (lambda (target) (getf target :name))
+                                    (getf (query-plan-prepared plan) :targets)))
+         (equal (list (list (abs value))) (subquery-test-rows sql)))))
+
+(rove:deftest scalar-functions-in-from-preserve-types-values-and-aliases
+    (unit-check-property 'scalar-function-from-preserves-value-and-column-alias)
+  (dolist (entry '(("SELECT * FROM length('abcd')" ((4)))
+                   ("SELECT f FROM length('abcd') AS f" ((4)))
+                   ("SELECT f.v FROM length('abcd') AS f(v)" ((4)))
+                   ("SELECT * FROM length(NULL::text)" ((:null)))
+                   ("SELECT * FROM pg_is_in_recovery()" ((nil)))
+                   ("SELECT * FROM abs((SELECT row_number() OVER ())) f" ((1)))
+                   ("SELECT d.x,f.v FROM (SELECT 'a' AS x UNION ALL SELECT 'abcd') d, length(d.x) f(v) ORDER BY f.v" (("a" 1) ("abcd" 4)))
+                   ("SELECT * FROM abs((SELECT sum(d.x) FROM (SELECT -2 AS x UNION ALL SELECT -3) d)) AS f" ((5)))))
+    (rove:ok (equalp (subquery-test-expected (second entry))
+                     (subquery-test-rows (first entry))) (first entry))))
+
+(rove:deftest scalar-function-from-keeps-query-level-aggregate-and-window-guards
+    (dolist (entry '(("SELECT * FROM sum(1)" . "42803")
+                     ("SELECT * FROM abs(sum(1))" . "42803")
+                     ("SELECT * FROM abs(row_number() OVER ())" . "42P20")
+                     ("SELECT * FROM no_such_scalar_function()" . "42883")
+                     ("SELECT * FROM row_number() OVER ()" . "42601")
+                     ("SELECT * FROM length('a') f(a,b)" . "42P10")
+                     ("SELECT (length('a')).*" . "42809")
+                     ("SELECT * FROM (SELECT 1 AS x) d RIGHT JOIN abs(d.x) f(v) ON true" . "42P10")
+                     ("SELECT * FROM (SELECT 1 AS x) d FULL JOIN abs(d.x) f(v) ON true" . "42P10")))
+      (rove:ok (equal (cdr entry)
+                      (handler-case (progn (subquery-test-rows (car entry)) nil)
+                        (pg-error (condition) (pg-error-sqlstate condition))))
+               (car entry))))
+
+(rove:deftest scalar-function-whole-row-reference-keeps-scalar-shape
+    (dolist (entry '(("SELECT f.v,f FROM length('abc') AS f(v)" ((3 3)))
+                     ("SELECT to_json(f)::text,to_json(f.*)::text FROM length('abc') AS f(v)" (("3" "3")))
+                     ("SELECT to_json(d)::text FROM (SELECT * FROM length('abc') f(v)) d" (("{\"v\":3}")))
+                     ("SELECT (SELECT f) FROM length('abc') f(v)" ((3)))
+                     ("SELECT to_json(f)::text FROM (SELECT 0 AS n) d LEFT JOIN LATERAL length('abc') f(v) ON false" ((:null)))))
+      (rove:ok (equalp (subquery-test-expected (second entry))
+                       (subquery-test-rows (first entry))) (first entry))))
+
+(rove:deftest scalar-function-from-retains-type-typmod-and-virtual-origin
+    (dolist (entry '(("SELECT * FROM pg_catalog.int2abs(-2::smallint) f(v)" :int2 "v")
+                     ("SELECT * FROM numeric_abs(1.20::numeric(8,2)) f(v)" :numeric "v")
+                     ("SELECT * FROM length('abc') AS \"MiX\"" :int4 "MiX")))
+      (let* ((plan (plan-select-query (first (parse-statements (first entry)))))
+             (target (first (getf (query-plan-prepared plan) :targets))))
+        (rove:ok (eq (second entry) (getf target :type)))
+        (rove:ok (equal (third entry) (getf target :name)))
+        (rove:ok (= -1 (getf target :typmod)))
+        (rove:ok (zerop (getf target :table-oid)))
+        (rove:ok (zerop (getf target :attnum))))))
+
+(rove:deftest scalar-function-from-rejects-nested-set-results
+    (dolist (sql '("SELECT * FROM to_json(pg_stat_get_activity(NULL))"
+                   "SELECT * FROM json_build_array(pg_stat_get_wal_senders())"))
+      (rove:ok
+       (equal "0A000" (handler-case (progn (subquery-test-rows sql) nil)
+                        (pg-error (condition) (pg-error-sqlstate condition)))) sql)))
+
+(rove:deftest scalar-function-from-plan-reuses-parameter-bindings
+    (let* ((*query-parameter-types* #(:int4))
+           (*query-parameter-values* #(-3))
+           (plan (plan-select-query
+                  (first (parse-statements "SELECT f.v,f FROM abs($1) f(v)"))))
+           (relations (getf (query-plan-prepared plan) :relations))
+           (rows nil))
+      (execute-query-plan plan relations (lambda (row) (push (coerce (car row) 'list) rows)))
+      (setf *query-parameter-values* #(-8))
+      (execute-query-plan plan relations (lambda (row) (push (coerce (car row) 'list) rows)))
+      (rove:ok (equal '((3 3) (8 8)) (nreverse rows)))))
+
 (rove:deftest subquery-execution-results
     (dolist (case '(("SELECT (SELECT 7)" ((7)))
                     ("SELECT (SELECT 7 WHERE false)" ((:null)))

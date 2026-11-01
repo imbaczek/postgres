@@ -367,10 +367,10 @@ Range and negative checks occur when the LIMIT executes."
            (schema (when (match-punct p #\.)
                      (prog1 name (setf name (pident p))))))
       (if (match-punct p #\()
-          (let ((call (parse-function-call p name schema)))
+          (let ((call (parse-function-call p name schema nil t)))
             (values (make-sql-derived-relation
                      :query (list :type :select :lateral t :from-function t
-                                  :targets (list (list :expr (list :record-expand call :once t)))))
+                                  :targets (list (list :expr (list :from-function call)))))
                     name))
           (if lateral (syntax-error p "LATERAL requires a subquery or function")
               (if schema (make-sql-relation-name :schema schema :name name) name))))))
@@ -383,6 +383,10 @@ Range and negative checks occur when the LIMIT executes."
           (when (and (eq (pkind p) :ident)
                      (or (token-quoted-p (pcur p)) (not (clause-keyword-p (pval p)))))
             (setf alias (pident p))))
+      (when (and (sql-derived-relation-p source)
+                 (getf (sql-derived-relation-query source) :from-function))
+        (setf (getf (first (getf (sql-derived-relation-query source) :targets)) :function-alias)
+              alias))
       (when (and alias (match-punct p #\())
         (unless (sql-derived-relation-p source)
           (ereport "0A000" "column aliases for base tables are not supported"))
@@ -1663,7 +1667,7 @@ Arithmetic binds more tightly; comparison and boolean operators bind less tightl
         (expect-punct p #\))
         (values (nreverse arguments) variadic order))))
 
-(defun parse-function-call (p name &optional schema minmax-syntax-p)
+(defun parse-function-call (p name &optional schema minmax-syntax-p windowless-p)
   "Parse a call or OVER expression, preserving special GREATEST/LEAST syntax."
   (when (and minmax-syntax-p (kw-p p "all"))
     (syntax-error p))
@@ -1694,6 +1698,7 @@ Arithmetic binds more tightly; comparison and boolean operators bind less tightl
                  (pnext probe)
                  (punct-p probe #\()))
       (ereport "0A000" "aggregate FILTER clauses are not supported"))
+    (when (and windowless-p (kw-p p "over")) (syntax-error p))
     (if (match-kw p "over")
         (list :window call (if (punct-p p #\() (parse-window-definition p) (pident p)))
         call)))

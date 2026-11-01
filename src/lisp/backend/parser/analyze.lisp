@@ -39,6 +39,7 @@
   table
   origins
   lateral-forbidden-p
+  (scalar-function-p nil :read-only t)
   (offset 0)
   (width 0))
 
@@ -142,6 +143,9 @@
   ;; Named composite types and whole-row RETURNING are not supported here.
   (multiple-value-bind (relation depth owner)
       (resolve-select-qualified-relation scope qualifier)
+    (when (select-relation-scalar-function-p relation)
+      (return-from resolve-select-whole-row
+        (select-outer-reference (select-column-expr (first (select-relation-columns relation))) depth)))
     (when (eq (getf (select-scope-analysis-frame owner) :kind) :returning)
       (ereport "0A000" "whole-row RETURNING requires named composite types"))
     (let* ((columns (select-relation-columns relation))
@@ -3456,6 +3460,28 @@ candidate selection."
           do (setf (getf target :expr) (select-outer-reference (getf target :expr) depth))
           collect target)))
 
+(defun analyze-from-function-target (target scope)
+  (let* ((analyzed (analyze-target (list :expr (second (getf target :expr))
+                                         :alias (getf target :function-alias)) scope))
+         (call (getf analyzed :expr)))
+    (when (if (eq (first call) :set-func)
+              (some #'analyzed-expression-contains-set-p (third call))
+              (analyzed-expression-contains-set-p call))
+      (ereport "0A000" "set-returning functions must appear at top level of FROM"))
+    (if (eq (expr-type call) :record)
+        (let ((fields (getf (cdddr call) :fields))
+              (record (if (eq (first call) :set-func) call (cons :single-record (cdr call)))))
+          (unless fields
+            (ereport "42809" "function result has no supported record descriptor"))
+          (loop for (name type) in fields for position from 0
+                collect (list :expr (list :record-field record position :type type :typmod -1)
+                              :name name :type type :typmod -1 :table-oid 0 :attnum 0)))
+        (progn
+          (setf (getf analyzed :scalar-function-p) t
+                (getf analyzed :table-oid) 0
+                (getf analyzed :attnum) 0)
+          (list analyzed)))))
+
 (defun expand-select-targets (targets scope)
   "Expand records before analysis, as C ExpandRowReference does with FieldSelect."
   (loop for target in targets for raw = (getf target :expr)
@@ -3473,6 +3499,8 @@ candidate selection."
                           (select-relation-columns
                            (make-select-relation :table scope :width (length (pg-class-columns scope))))))
                  (t (ereport "42601" "SELECT * requires a FROM clause"))))
+          ((eq (first raw) :from-function)
+           (analyze-from-function-target target scope))
           ((eq (first raw) :record-expand)
            (loop for (name type) in (sql-composite-call-fields (second raw))
                  collect (list :expr (list :record-field
