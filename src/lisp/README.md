@@ -336,6 +336,8 @@ arms, and derived tables, including recursive CTE seeds. Multiple rows in a
 type and ignore NULL inputs unless all inputs are NULL. `chr`, `array_to_string`
 and `string_to_array` support the corresponding text and array operations,
 including optional NULL replacement arguments.
+The deprecated `txid_current()` assigns or returns the current top-level
+transaction ID when executed, and rejects calls during recovery.
 
 Supported scalar and fixed-descriptor composite functions can appear in `FROM`.
 A scalar function produces one row even when its value is NULL or FALSE. Its

@@ -4497,6 +4497,9 @@ aliases share the corresponding numeric operator implementation."
                (sql-numeric-arithmetic operator left right))))))
 
 (defun sql-txid-current ()
+  "Return the backend's top-level transaction ID, assigning it at execution.
+Reject recovery before assignment. The deprecated SQL int8 result interprets
+the full 64-bit ID as a signed value."
   (prevent-recovery-primary-operation "pg_current_xact_id()")
   (let ((xid (get-current-xid)))
     (if (logbitp 63 xid) (- xid (ash 1 64)) xid)))

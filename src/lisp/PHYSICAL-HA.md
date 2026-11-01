@@ -18,6 +18,16 @@ original C source is the behavior oracle.
 
 ## Verified starting points
 
+### Transaction ID prerequisite
+
+`txid_current()` assigns or returns the backend's top-level transaction ID at
+execution and rejects recovery before assignment. The deprecated SQL result is
+an `int8` interpretation of the full 64-bit ID. The checkpoint passed 894 unit
+checks, a 100-trial property, strict cold compilation and nine compared C/native
+SQL cases, plus transaction-ownership and OFF-commit checks. Run the native oracle
+from `src/lisp` with `python3 t/txid-current.py --reference-bin /path/to/c/bin`.
+DO and PERFORM support remain open for the Patroni path.
+
 ### Configured native follow
 
 `primary_conninfo` and `primary_slot_name` are SIGHUP settings. Reload installs
