@@ -898,12 +898,15 @@
                                   :dirty-relations (when xid-p '(99))))
          (*wal-ready* t) (*wal-poisoned* nil)
          (*sync-replication-state* (make-sync-replication-state :source-id :policy-source))
-         (names '(wal-commit-transaction clog-set clog-commit-durable-under-wal-lock release-xid wait-for-committed-wal-obligation))
+         (names '(wal-commit-transaction clog-set clog-commit-durable-under-wal-lock release-xid wait-for-committed-wal-obligation synchronous-commit-policy))
          (saved (mapcar (lambda (name) (cons name (symbol-function name))) names))
          (local nil) (remote :not-called) (end nil) (captured nil))
     (unwind-protect
          (progn
            (setf (gethash "synchronous_commit" (backend-settings *backend*)) "remote_apply")
+           (when (and requested-policy (not ddl-p))
+             (setf (symbol-function 'synchronous-commit-policy) (lambda () requested-policy)
+                   captured requested-policy))
            (when ddl-p
              (prepare-backend-final-ddl *backend*)
              (let ((context (backend-wal-obligation *backend*)))
@@ -963,13 +966,24 @@
           (rove:ok (null remote))
           (rove:ok (eq :idle state))))))
 
+(rove:deftest remote-wait-forces-local-flush-for-an-internal-async-request
+    (let ((requested (%make-commit-policy :async :apply)))
+      (destructuring-bind (local remote end captured state)
+          (commit-policy-test-boundary-result nil t requested)
+        (rove:ok (eq :flush local))
+        (rove:ok (eq :apply remote))
+        (rove:ok (= 140 end))
+        (rove:ok (eq requested captured))
+        (rove:ok (eq :async (commit-policy-local-durability captured)))
+        (rove:ok (eq :idle state)))))
+
 (rove:deftest wal-commit-rejects-unsupported-local-policy-before-publication
     (dolist (ready-p '(nil t))
       (let ((*wal-ready* ready-p) (*wal-poisoned* nil)
                                   (*wal-end-lsn* 123) (called nil))
-        (dolist (mode '(:async :invalid nil))
+        (dolist (mode '(:invalid nil))
           (rove:ok
-           (equal (if (eq mode :async) "0A000" "XX000")
+           (equal "XX000"
                   (handler-case
                       (progn
                         (wal-commit-transaction 777 (lambda (end) (declare (ignore end)) (setf called t))
@@ -994,6 +1008,23 @@
           (rove:ok (eq receipt
                        (validate-wal-commit-receipt
                         receipt receipt 44 :source-a end durable-end wal-ready-p)))))))
+
+(rove:deftest async-receipt-distinguishes-acceptance-from-durability
+    (dolist (case '((:async nil nil t) (:async t 140 t)
+                    (:flush t 140 t) (:flush nil nil nil)
+                    (:async nil 140 nil) (:async t nil nil)
+                    (:unknown nil nil nil)))
+      (destructuring-bind (requirement proof durable-end valid-p) case
+        (let* ((receipt (%make-wal-commit-receipt 44 :source-a 140 proof))
+               (result
+                 (handler-case
+                     (eq receipt
+                         (validate-wal-commit-receipt
+                          receipt receipt 44 :source-a 140 durable-end t requirement))
+                   (pg-error (condition)
+                     (assert (fatal-error-p condition))
+                     nil))))
+          (rove:ok (eql valid-p result))))))
 
 (rove:deftest commit-receipt-rejects-missing-and-inconsistent-facts
     (dolist (fault '(:missing :different-object :xid :source :end :proof :missing-durability :bad-terminal :absent-flush))

@@ -2529,16 +2529,20 @@ Run outside publication locks, clean up the transaction, then handle the outcome
 ;; durable callback.  WAL-ready commits require both the exact end and proof;
 ;; a no-WAL receipt has neither, even when CLOG was synced directly.
 
-(defun validate-wal-commit-receipt (receipt accepted xid source end durable-end wal-ready-p)
-  (unless (and (wal-commit-receipt-p receipt)
+(defun validate-wal-commit-receipt
+    (receipt accepted xid source end durable-end wal-ready-p &optional (local-durability :flush))
+  (unless (and (member local-durability '(:flush :async))
+               (wal-commit-receipt-p receipt)
                (eq receipt accepted)
                (eql xid (wal-commit-receipt-xid receipt))
                (eql source (wal-commit-receipt-source-id receipt))
                (eql end (wal-commit-receipt-terminal-end receipt))
                (if wal-ready-p
                    (and (typep end '(integer 1 18446744073709551615))
-                        (eql end durable-end)
-                        (eq t (wal-commit-receipt-wal-durable-p receipt)))
+                        (if (wal-commit-receipt-wal-durable-p receipt)
+                            (and (eq t (wal-commit-receipt-wal-durable-p receipt))
+                                 (eql end durable-end))
+                            (and (eq :async local-durability) (null durable-end))))
                    (and (null end) (null durable-end)
                         (null (wal-commit-receipt-wal-durable-p receipt)))))
     (ereport-fatal "XX000" "invalid commit acceptance receipt"))
@@ -2578,16 +2582,19 @@ Run outside publication locks, clean up the transaction, then handle the outcome
                     (prepare-backend-wal-obligation b)
                     (values nil (nth-value 0 (sync-replication-configuration-state)))))
             (sb-sys:without-interrupts
-              (let ((irreversible nil) (accepted nil) (durable-end nil) (completion-safe nil)
-                                       ;; XID-bearing DDL waits for its user commit with the captured DDL policy.
-                                       ;; Its published catalog boundary forces local flush, without
-                                       ;; changing the request or adding a remote wait.
-                                       (policy (if (backend-final-ddl-committed-p b)
-                                                   (transaction-wal-obligation-ddl-policy (backend-wal-obligation b))
-                                                   (synchronous-commit-policy)))
-                                       (outcome nil)
-                                       (wal-ready-at-entry-p *wal-ready*)
-                                       (xid (backend-xid b)))
+              (let* ((irreversible nil) (accepted nil) (durable-end nil) (completion-safe nil)
+                                        ;; XID-bearing DDL waits for its user commit with the captured DDL policy.
+                                        ;; Its published catalog boundary forces local flush, without
+                                        ;; changing the request or adding a remote wait.
+                                        (policy (if (backend-final-ddl-committed-p b)
+                                                    (transaction-wal-obligation-ddl-policy (backend-wal-obligation b))
+                                                    (synchronous-commit-policy)))
+                                        (local-durability (if (or (backend-final-ddl-committed-p b)
+                                                                  (commit-policy-remote-wait policy))
+                                                              :flush (commit-policy-local-durability policy)))
+                                        (outcome nil)
+                                        (wal-ready-at-entry-p *wal-ready*)
+                                        (xid (backend-xid b)))
                 (unwind-protect
                      (unwind-protect
                           (multiple-value-bind (end receipt)
@@ -2606,15 +2613,14 @@ Run outside publication locks, clean up the transaction, then handle the outcome
                                  (setf irreversible t durable-end end)
                                  (record-transaction-wal-boundary obligation source end nil))
                                :source-id source
-                               :local-durability (if (backend-final-ddl-committed-p b)
-                                                     :flush
-                                                     (commit-policy-local-durability policy))
+                               :local-durability local-durability
                                :accepted-function (lambda (receipt)
                                                     (setf irreversible t accepted receipt)))
                             ;; A normal storage return is postcommit even if its receipt is malformed.
                             (setf irreversible t)
                             (validate-wal-commit-receipt
-                             receipt accepted xid source end durable-end wal-ready-at-entry-p)
+                             receipt accepted xid source end durable-end wal-ready-at-entry-p
+                             local-durability)
                             (setf outcome (wait-for-committed-wal-obligation
                                            b obligation (commit-policy-remote-wait policy)))
                             (setf completion-safe t))

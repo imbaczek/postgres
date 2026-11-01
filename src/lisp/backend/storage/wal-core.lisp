@@ -89,11 +89,8 @@ This policy is a choice, distinct from a WAL receipt's historical facts."
 (defun wal-require-local-commit-durability (mode)
   "Require local flush before publication, including the no-WAL path.
 Async is unsupported (0A000); an unknown policy is an internal error (XX000)."
-  (unless (eq mode :flush)
-    (ereport (if (eq mode :async) "0A000" "XX000")
-             (if (eq mode :async)
-                 "asynchronous commit is not supported"
-                 "invalid local commit durability policy")))
+  (unless (member mode '(:flush :async))
+    (ereport "XX000" "invalid local commit durability policy"))
   mode)
 
 ;; Historical facts for one accepted commit: XID, immutable source identity,
@@ -1245,10 +1242,11 @@ while WAL is held. Retain the first error even if cleanup fails. Mask interrupts
 during cleanup, and keep backend termination from replacing a latched WAL failure."
   (let ((started (gensym "STARTED-"))
         (complete (gensym "COMPLETE-"))
+        (body-complete (gensym "BODY-COMPLETE-"))
         (failure (gensym "FAILURE-"))
         (condition (gensym "CONDITION-"))
         (record (gensym "RECORD-")))
-    `(let ((,started nil) (,complete nil) (,failure nil))
+    `(let ((,started nil) (,complete nil) (,body-complete nil) (,failure nil))
        (flet ((,begin-publication () (setf ,started t))
               (,record (,condition)
                 (when (and ,started (not ,failure))
@@ -1259,8 +1257,12 @@ during cleanup, and keep backend termination from replacing a latched WAL failur
                   (multiple-value-prog1
                       (sb-sys:allow-with-interrupts
                         (with-wal-critical
-                          (handler-bind ((error #',record))
-                            ,@body)))
+                          (unwind-protect
+                               (handler-bind ((error #',record))
+                                 (multiple-value-prog1 (progn ,@body)
+                                   (setf ,body-complete t)))
+                            (when (and ,started (not ,body-complete))
+                              (setf *wal-poisoned* t)))))
                     (setf ,complete t)))
              (when (and ,started (not ,complete))
                (wal-fail-stop
@@ -1972,17 +1974,27 @@ runs under the interrupt mask after the direct commit callback."
           (wal-settle-page-publications-under-lock)
           (wal-require-no-pending-storage))
         (begin-publication)
-        (multiple-value-bind (publication end) (wal-admit-transaction-under-lock xid logical-changes)
+        (multiple-value-bind (publication end forced-p)
+            (wal-admit-transaction-under-lock xid logical-changes)
           (setf commit-lsn end)
-          (wal-flush)
-          (when terminal-durable-function (funcall terminal-durable-function commit-lsn))
-          (wal-drain-page-publication-prefix-under-lock publication :fault-on-first-write t)
-          (wal-slot-record-xid-commit-under-wal-lock xid commit-lsn)
-          (wal-test-pause :after-wal-flush)
-          (wal-complete-publication-status-under-lock publication)
-          (funcall after-durable-function commit-lsn)
-          (wal-drain-page-publications-through-under-lock publication :fault-on-first-write t))
-        (setf receipt (%make-wal-commit-receipt xid source-id commit-lsn t))
+          (if (and (eq :async local-durability)
+                   (not forced-p)
+                   (null (wal-page-publication-resets publication))
+                   (primary-wal-writer-available-under-lock-p))
+              (progn
+                (setf receipt (%make-wal-commit-receipt xid source-id commit-lsn nil))
+                (wal-slot-record-xid-commit-under-wal-lock xid commit-lsn)
+                (clog-accept-publication-under-wal-lock publication))
+              (progn
+                (wal-flush)
+                (when terminal-durable-function (funcall terminal-durable-function commit-lsn))
+                (wal-drain-page-publication-prefix-under-lock publication :fault-on-first-write t)
+                (wal-slot-record-xid-commit-under-wal-lock xid commit-lsn)
+                (wal-test-pause :after-wal-flush)
+                (wal-complete-publication-status-under-lock publication)
+                (funcall after-durable-function commit-lsn)
+                (wal-drain-page-publications-through-under-lock publication :fault-on-first-write t)
+                (setf receipt (%make-wal-commit-receipt xid source-id commit-lsn t)))))
         (when accepted-function (funcall accepted-function receipt))))
     (values commit-lsn receipt)))
 

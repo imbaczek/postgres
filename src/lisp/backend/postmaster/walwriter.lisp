@@ -68,14 +68,18 @@ The descriptors are immutable; CONSUMED-P prevents reuse."
            (let ((thread (primary-wal-writer-thread writer)))
              (or (null thread) (not (sb-thread:thread-alive-p thread)))))))
 
+(defun primary-wal-writer-storage-current-under-lock-p (epoch)
+  (assert (sb-thread:holding-mutex-p *wal-lock*))
+  (and *wal-ready* (not (recovery-in-progress-p))
+       (= +db-in-production+ (or (getf *wal-control-metadata* :db-state) -1))
+       (eq *wal-storage-incarnation* (wal-writer-epoch-incarnation epoch))
+       (eql *wal-insert-timeline* (wal-writer-epoch-timeline epoch))
+       (eq *postmaster-data-lock* (wal-writer-epoch-ownership epoch))
+       *postmaster-data-lock* (postmaster-pid-owned-p)))
+
 (defun validate-primary-wal-writer-storage-under-lock (epoch)
   (assert (sb-thread:holding-mutex-p *wal-lock*))
-  (unless (and *wal-ready* (not (recovery-in-progress-p))
-               (= +db-in-production+ (or (getf *wal-control-metadata* :db-state) -1))
-               (eq *wal-storage-incarnation* (wal-writer-epoch-incarnation epoch))
-               (eql *wal-insert-timeline* (wal-writer-epoch-timeline epoch))
-               (eq *postmaster-data-lock* (wal-writer-epoch-ownership epoch))
-               *postmaster-data-lock* (postmaster-pid-owned-p))
+  (unless (primary-wal-writer-storage-current-under-lock-p epoch)
     (wal-invalid-input "primary WAL writer storage authority is stale"))
   t)
 
@@ -210,6 +214,36 @@ The wait path consumes signals and clears the pending flag under this lock."
                (not (primary-wal-writer-stop-p *primary-wal-writer*))
                (not (primary-wal-writer-failure *primary-wal-writer*)))
       (wake-primary-wal-writer-under-state-lock *primary-wal-writer*)))
+  (values))
+
+(defun primary-wal-writer-available-under-lock-p ()
+  (assert (sb-thread:holding-mutex-p *wal-lock*))
+  (sb-thread:with-mutex (*primary-wal-writer-lock*)
+    (let ((writer *primary-wal-writer*))
+      (and writer
+           (not *primary-wal-writer-shutdown-p*)
+           (= (primary-wal-writer-generation writer) *primary-wal-writer-generation*)
+           (eq :running (primary-wal-writer-state writer))
+           (not (primary-wal-writer-stop-p writer))
+           (not (primary-wal-writer-failure writer))
+           (primary-wal-writer-thread writer)
+           (sb-thread:thread-alive-p (primary-wal-writer-thread writer))
+           (primary-wal-writer-storage-current-under-lock-p (primary-wal-writer-epoch writer))))))
+
+(defun settle-stopped-primary-wal-writer ()
+  (sb-sys:without-interrupts
+    (let ((failure nil))
+      (handler-case
+          (call-with-reload-definitions
+           (lambda ()
+             (sb-thread:with-mutex (*wal-lock*)
+               (when (and (not *wal-poisoned*)
+                          (or *wal-pending-page-publication* *wal-pending-page-publication-tail*))
+                 (wal-settle-page-publications-under-lock)))))
+        (error (condition) (setf failure condition)))
+      (when failure
+        (wal-fail-stop failure)
+        (error failure))))
   (values))
 
 (defun validate-primary-wal-writer-under-lock (writer epoch)
@@ -398,4 +432,5 @@ joins after reload workers stop and before storage finalization."
         (sb-thread:with-mutex (*wal-lock*)
           (sb-thread:with-mutex (*primary-wal-writer-lock*)
             (setf (primary-wal-writer-joined-p writer) t))))))
+  (settle-stopped-primary-wal-writer)
   (values))

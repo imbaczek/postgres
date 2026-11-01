@@ -688,6 +688,128 @@ Each entry in SEGMENTS contains a segment number followed by its byte vectors."
            (rove:ok (null *wal-pending-page-publication*))
            (rove:ok (= +clog-committed+ (pending-clog-raw-status 45))))))))
 
+(rove:deftest async-storage-receipt-keeps-owned-debt-and-forces-required-flushes
+    (dolist (mode '(:async :unavailable :pressure :flush))
+      (call-with-queued-clog-test
+       (lambda ()
+         (let ((available (symbol-function 'primary-wal-writer-available-under-lock-p))
+               (*wal-publication-pressure-limits* (copy-list *wal-publication-pressure-limits*))
+               (durable-end nil) (after nil) (accepted nil))
+           (unwind-protect
+                (progn
+                  (setf (symbol-function 'primary-wal-writer-available-under-lock-p)
+                        (lambda () (not (eq mode :unavailable))))
+                  (when (eq mode :pressure)
+                    (setf (getf *wal-publication-pressure-limits* :owners) 0))
+                  (multiple-value-bind (end receipt)
+                      (wal-commit-transaction
+                       44 (lambda (end) (setf after end))
+                       :source-id :async-source
+                       :local-durability (if (eq mode :flush) :flush :async)
+                       :terminal-durable-function (lambda (end) (setf durable-end end))
+                       :accepted-function (lambda (receipt) (setf accepted receipt)))
+                    (rove:ok (eq receipt accepted))
+                    (rove:ok (eq receipt (validate-wal-commit-receipt
+                                          receipt accepted 44 :async-source end durable-end t
+                                          (if (eq mode :flush) :flush :async))))
+                    (if (eq mode :async)
+                        (progn
+                          (rove:ok (null after))
+                          (rove:ok (null durable-end))
+                          (rove:ok (null (wal-commit-receipt-wal-durable-p receipt)))
+                          (rove:ok (< *wal-durable-lsn* end))
+                          (rove:ok (= +clog-committed+ (clog-get 44)))
+                          (rove:ok (= +clog-in-progress+ (pending-clog-raw-status 44)))
+                          (rove:ok (eq :accepted
+                                       (clog-commit-completion-state
+                                        (wal-page-publication-completion *wal-pending-page-publication*))))
+                          (sb-thread:with-mutex (*wal-lock*)
+                            (wal-settle-page-publications-under-lock)))
+                        (progn
+                          (rove:ok (= end after durable-end))
+                          (rove:ok (wal-commit-receipt-wal-durable-p receipt))
+                          (rove:ok (null *wal-pending-page-publication*))))
+                    (rove:ok (= +clog-committed+ (pending-clog-raw-status 44)))))
+             (setf (symbol-function 'primary-wal-writer-available-under-lock-p) available)))))))
+
+(rove:deftest async-request-flushes-real-relation-replacement-before-reset
+    (call-with-queued-clog-test
+     (lambda ()
+       (let ((available (symbol-function 'primary-wal-writer-available-under-lock-p))
+             (page (page-init (make-page)))
+             (durable-end nil) (after nil))
+         (setf (aref page 100) 42)
+         (smgr-write 7315 0 page)
+         (smgr-write 7315 1 page)
+         (transaction-replace-relation 7315)
+         (setf (aref page 100) 99)
+         (replacement-write-page (current-relation-replacement 7315 :main) 0 page)
+         (unwind-protect
+              (progn
+                (setf (symbol-function 'primary-wal-writer-available-under-lock-p) (lambda () t))
+                (multiple-value-bind (end receipt)
+                    (wal-commit-transaction
+                     44 (lambda (end)
+                          (setf after end)
+                          (discard-transaction-replacements *backend*))
+                     :source-id :reset-source :local-durability :async
+                     :terminal-durable-function
+                     (lambda (end)
+                       (setf durable-end end)
+                       (rove:ok (= 2 (smgr-nblocks 7315)))))
+                  (rove:ok (= end after durable-end))
+                  (rove:ok (wal-commit-receipt-wal-durable-p receipt))
+                  (rove:ok (null *wal-pending-page-publication*))
+                  (rove:ok (= 1 (smgr-nblocks 7315)))
+                  (rove:ok (= 99 (aref (smgr-read 7315 0) 100)))))
+           (setf (symbol-function 'primary-wal-writer-available-under-lock-p) available)
+           (discard-transaction-replacements *backend*))))))
+
+(rove:deftest stopped-writer-settles-accepted-debt-without-an-installed-thread
+    (call-with-queued-clog-test
+     (lambda ()
+       (let ((*primary-wal-writer* nil) (*live-operation-depth* 0))
+         (sb-thread:with-mutex (*wal-lock*)
+           (let ((owner (wal-admit-transaction-under-lock 44 nil)))
+             (clog-accept-publication-under-wal-lock owner)))
+         (stop-primary-wal-writer)
+         (rove:ok (null *wal-pending-page-publication*))
+         (rove:ok (= +clog-committed+ (pending-clog-raw-status 44)))))))
+
+(rove:deftest stopped-writer-retains-poisoned-debt-and-fences-settlement-errors
+    (dolist (poisoned-p '(nil t))
+      (call-with-queued-clog-test
+       (lambda ()
+         (let ((*primary-wal-writer* nil) (*live-operation-depth* 0)
+                                          (flush (symbol-function 'wal-flush-core))
+                                          (stop (symbol-function 'wal-fail-stop))
+                                          (failure (make-condition 'simple-error :format-control "stop settlement failure"))
+                                          (fenced nil) (flushed nil))
+           (sb-thread:with-mutex (*wal-lock*)
+             (clog-accept-publication-under-wal-lock (wal-admit-transaction-under-lock 44 nil)))
+           (unwind-protect
+                (progn
+                  (setf *wal-poisoned* poisoned-p
+                        (symbol-function 'wal-flush-core)
+                        (lambda () (setf flushed t) (error failure))
+                        (symbol-function 'wal-fail-stop)
+                        (lambda (condition)
+                          (rove:ok (not (sb-thread:holding-mutex-p *wal-lock*)))
+                          (rove:ok (not (sb-thread:holding-mutex-p *reload-definition-lock*)))
+                          (setf fenced condition)))
+                  (let ((result (handler-case (progn (stop-primary-wal-writer) :stopped)
+                                  (error (condition) condition))))
+                    (rove:ok (if poisoned-p (eq :stopped result) (eq failure result))))
+                  (rove:ok (eql (not poisoned-p) flushed))
+                  (rove:ok (if poisoned-p (null fenced) (eq failure fenced)))
+                  (rove:ok *wal-poisoned*)
+                  (rove:ok *wal-pending-page-publication*)
+                  (rove:ok (= +clog-in-progress+ (pending-clog-raw-status 44))))
+             (setf (symbol-function 'wal-flush-core) flush
+                   (symbol-function 'wal-fail-stop) stop
+                   *wal-poisoned* nil)
+             (sb-thread:with-mutex (*wal-lock*) (wal-settle-page-publications-under-lock))))))))
+
 (rove:deftest queued-transaction-keeps-materialized-status-after-page-failure
     (call-with-queued-clog-test
      (lambda ()
@@ -2805,6 +2927,26 @@ Each entry in SEGMENTS contains a segment number followed by its byte vectors."
                (rove:ok (not *wal-poisoned*))
                (rove:ok (null seen))))
         (setf (symbol-function 'wal-fail-stop) fail-stop))))
+
+(rove:deftest wal-publication-nonlocal-exit-poisons-before-unlock
+    (let ((*wal-poisoned* nil)
+          (stop (symbol-function 'wal-fail-stop))
+          (poisoned-before-fence nil) (fenced-outside-lock nil))
+      (unwind-protect
+           (progn
+             (setf (symbol-function 'wal-fail-stop)
+                   (lambda (condition)
+                     (declare (ignore condition))
+                     (setf poisoned-before-fence *wal-poisoned*
+                           fenced-outside-lock (not (sb-thread:holding-mutex-p *wal-lock*)))))
+             (rove:ok (eq :escaped
+                          (catch 'publication-exit
+                            (with-wal-publication-fence (begin-publication)
+                              (begin-publication)
+                              (throw 'publication-exit :escaped)))))
+             (rove:ok poisoned-before-fence)
+             (rove:ok fenced-outside-lock))
+        (setf (symbol-function 'wal-fail-stop) stop))))
 
 (defun wal-lock-cancellation-probe (masked-p)
   (let ((lock (sb-thread:make-mutex :name "owned WAL lock wait"))
