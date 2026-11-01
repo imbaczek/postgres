@@ -158,6 +158,17 @@ appropriate instead of replacing the native C peer or adding a message relay.
   cleaning up owned fixture state.
 - Catch background test errors inside `with-open-file` to preserve their log,
   and bind error and trace output as well as standard output to that stream.
+- Rove's failure report can recursively print cyclic owner/domain/quota metadata
+  and exhaust the control stack, hiding the original assertion. In an isolated
+  verification image, use `*print-circle* t` and bounded `*print-level*` and
+  `*print-length*`. This exposed missing WAL-lock assertions in fixtures. A
+  tracked child process with output captured at launch also preserves errors
+  from test actors whose unhandled conditions terminate the whole image.
+- A fixture that replaces `*wal-lock*` must bind a fresh
+  `*wal-temp-cleanup-domain*` too: the domain retains its mutex. Fault wrappers
+  must match the original argument list and count actual attempts. A one-argument
+  wrapper for `abort-query-temp-stream`, which takes a stream and pathname,
+  initially passed through an arity error rather than the intended close fault.
 - A replaceable worker-step function can make an older loop exit safely at an
   iteration boundary. Check that the current thread is the registered worker,
   then use SBCL's synchronous `return-from-thread` before taking admission or

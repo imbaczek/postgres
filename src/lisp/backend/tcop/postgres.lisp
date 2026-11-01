@@ -916,7 +916,8 @@ CL's RENAME-FILE merges a relative target with the source's directory."
   (complete-xid-wraparound))
 
 (defun startup-check-cold-installation-state ()
-  "Require no storage debt before checking cached handles for a cold stage."
+  "Require no page, CLOG or WAL temporary cleanup debt before a cold stage.
+Then check the cached handles and workers under startup exclusion."
   (wal-require-no-pending-storage)
   (sb-thread:with-mutex (*wal-lock*)
     (wal-require-no-temp-cleanup-under-lock))

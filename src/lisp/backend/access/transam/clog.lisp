@@ -386,8 +386,9 @@ compatibility and tests. Production publication uses reserved completions."
       (fsync-stream *clog-stream*))))
 
 (defun clog-reset-file-under-wal-lock (fsync-function fsync-directory-function)
-  "Replace CLOG only after page and CLOG debt are absent under WAL lock.
-Rotate the storage incarnation after the file and its directory are durable."
+  "Replace CLOG only after page, CLOG and temporary cleanup debt are absent.
+Check under WAL lock before touching the file. Rotate the storage incarnation
+after the file and its directory are durable."
   (assert (sb-thread:holding-mutex-p *wal-lock*))
   (wal-require-no-pending-page-publication)
   (wal-require-no-temp-cleanup-under-lock)

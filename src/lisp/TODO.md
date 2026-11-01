@@ -1,9 +1,9 @@
 # Development TODO
 
-- [x] Add the generic transferable temporary cleanup domain foundation. Fresh
-  private owners can be adopted before use; no production caller adopts one yet.
-  WAL cleanup integration, its writer, `synchronous_commit=off`, and Patroni work
-  remain open below. The checkpoint passed 829 unit, 1,413 physical, 201 wire,
+- [x] Add the generic transferable temporary cleanup domain foundation. At that
+  checkpoint fresh private owners could be adopted before use, but no production
+  caller adopted one; WAL integration and later work remained open. The checkpoint
+  passed 829 unit, 1,413 physical, 201 wire,
   and 1,161 legacy tests, strict fresh compilation, native spill and live reload.
   Evidence is in `/home/imbaczek/proj/pg-ha-artifacts/cleanup-domain/`:
   `physical-suite.log`, `cold-final.log`, `native-spill-reviewed.log`,
@@ -12,6 +12,20 @@
   each at seeds 42 and 2707969488570409574 (digest
   `fnv1a64-v1:320a49a385e9fcd9`). This adoption contract has no Function Spec;
   input coverage and rejection counts were not measured.
+
+- [x] Give primary WAL spools and shared dirty scratch store-owned cleanup
+  authority (`ff63d497263`). Cleanup retries retain unresolved ownership across
+  threads and storage boundaries reject remaining debt. Recovery page spools
+  retain ordinary creator-thread cleanup ownership. This adds no tracked primary
+  writer, asynchronous OFF, snapshot-prefix handling, or coordination. The
+  checkpoint passed 834 unit, 1,413 physical, 201 wire and
+  1,161 legacy checks, strict fresh compilation, 21 native page and five native
+  CLOG cases (including production SQL FIFO completion on another thread), native
+  spill and live reload. Evidence is in `/home/imbaczek/proj/pg-ha-artifacts/wal-cleanup/`:
+  `physical-current.log`, `cold-final.log`, `native-pages.log`, `native-clog.log`,
+  `native-spill.log`, `reload.log`, `wire-current.log`, and `legacy-current.log`.
+  The 834 unit checks ran through the tool; there is no `unit-final.log` and no
+  new cl-spec contract for this milestone.
 
 - [x] Implement the source sender-status foundation. The sender and activity
   SRFs can be joined by PID. Captured registration tokens enforce ownership;
@@ -284,18 +298,9 @@
   `/home/imbaczek/proj/pg-ha-artifacts/queued-clog/`.
 
 - [ ] Implement true asynchronous OFF using captured policy and acceptance
-  receipts. Give WAL a cleanup authority domain on the existing temporary owners,
-  preserving creator provenance. Transfer primary spools immediately after
-  construction and shared dirty scratch at creation, before opening files; ordinary
-  backend cleanup must exclude the WAL domain. Under WAL serialization, claim
-  cleanup state and authority under the registry lock, then do I/O outside that
-  lock while retaining retry ownership for a closed spool. Keep quota, path and
-  stream charges until close and unlink are confirmed. Storage identity changes
-  must also reject preterminal cleanup debt and old scratch. Shared scratch does
-  not belong to one publication. Then add a tracked
-  primary writer with bounded pressure, wakeup, stop/join, reload, shutdown and
-  role lifecycle. Prove distinct asynchronous acceptance and settle the snapshot
-  prefix before acquiring the XID lock during snapshot capture. Preserve
+  receipts. Add a tracked primary writer with bounded pressure, wakeup, stop/join,
+  reload, shutdown and role lifecycle. Prove distinct asynchronous acceptance and
+  settle the snapshot prefix before acquiring the XID lock during snapshot capture. Preserve
   WAL-to-CLOG lock order and never put pending committed bits on disk before WAL.
   Enable public OFF only after real acceptance coverage. No coordination is added.
 

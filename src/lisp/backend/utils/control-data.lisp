@@ -18,9 +18,10 @@
 
 (defun wal-mark-primary-startup ()
   "Mark an existing primary unclean before storage startup can change files.
-Require no pending storage debt before any control write. Retain its checkpoint
-and identity. Legacy controls have no lifecycle state;
-leave that state unknown until successful initialization publishes production."
+Require no pending page, CLOG or WAL temporary cleanup debt before any control
+write. Retain its checkpoint and identity. Legacy controls have no lifecycle
+state; leave that state unknown until successful initialization publishes
+production."
   (wal-require-no-pending-storage)
   (sb-thread:with-mutex (*wal-lock*)
     (wal-require-no-temp-cleanup-under-lock))
@@ -71,9 +72,10 @@ The caller must finish those steps before calling this function."
   "Finish smart or fast shutdown in the owning postmaster, outside admission.
 Clients must already be gone. Serialize with reload, close admission permanently,
 retire abandoned transactions, then sync a checkpoint before recording clean
-shutdown. An unexpected active slot owner leaves recycling pending and prevents
-clean shutdown publication. An error keeps admission closed. Do not roll back a
-possibly published clean state."
+shutdown. Retry WAL temporary cleanup and require the domain to be empty before
+the clean state is published. An unexpected active slot owner leaves recycling
+pending and prevents clean shutdown publication. An error keeps admission closed.
+Do not roll back a possibly published clean state."
   (unless (and *postmaster-data-lock* (postmaster-pid-owned-p)
                *shutdown-finalizing-p* (zerop *live-operation-depth*))
     (error "primary shutdown requires the owning unadmitted postmaster"))

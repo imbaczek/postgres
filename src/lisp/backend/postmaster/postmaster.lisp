@@ -313,8 +313,9 @@ command (idle) is ignored; the connection and its transaction state survive."
 (defun prepare-postmaster-shutdown ()
   "Stop reload, managed and controller workers before finalizing storage from MAIN.
 Wait outside live admission so workers can finish; a worker timeout prevents
-storage finalization. Reload remains available until final shutdown, including
-during smart shutdown. The signal worker remains available for immediate shutdown."
+storage finalization. After workers stop, retry pending WAL temporary cleanup
+before health-checked storage work. Reload remains available until final shutdown,
+including during smart shutdown. The signal worker remains available for immediate shutdown."
   (when (plusp *live-operation-depth*)
     (error "postmaster shutdown finalization requires an unadmitted main thread"))
   (unless *shutdown-finalizing-p*

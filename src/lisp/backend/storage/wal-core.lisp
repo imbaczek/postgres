@@ -335,9 +335,13 @@ lifecycle quiescence."
                     query-temp-cleanup-owner-domain query-temp-cleanup-owner-state
                     logical-spool-owner logical-spool-closed-p logical-spool-failed-p))
 
-(defvar *wal-temp-cleanup-domain* nil)
+(defvar *wal-temp-cleanup-domain* nil
+  "Cleanup authority for primary WAL spools, tied to the WAL lock and store identity.
+Publication and shared scratch references still determine each spool's lifetime.")
 
 (defun wal-temp-cleanup-domain-under-lock ()
+  "Return this store's domain under the WAL lock; reject stale authority.
+An empty previous domain can be replaced after the store incarnation changes."
   (assert (sb-thread:holding-mutex-p *wal-lock*))
   (let ((domain *wal-temp-cleanup-domain*))
     (when (and domain (not (eq *wal-lock* (query-temp-cleanup-domain-lock domain))))
@@ -356,6 +360,8 @@ lifecycle quiescence."
     (call-with-query-temp-cleanup-domain domain *wal-storage-incarnation* function)))
 
 (defun make-wal-owned-spool ()
+  "Create and adopt a private spool before it can be used or published.
+The caller must keep allocation, adoption and publication uninterruptible."
   (call-with-wal-temp-cleanup-domain
    (lambda ()
      (let* ((*query-temp-file-limit-bytes* nil)
@@ -364,6 +370,7 @@ lifecycle quiescence."
        spool))))
 
 (defun call-with-wal-spool-owner (spool function)
+  "Rebind SPOOL's owner under the current WAL domain for later use."
   (call-with-wal-temp-cleanup-domain
    (lambda ()
      (unless (eq *wal-temp-cleanup-domain*
@@ -372,6 +379,7 @@ lifecycle quiescence."
      (call-with-logical-spool-owner spool function))))
 
 (defun wal-close-owned-spool (spool)
+  "Close SPOOL or retry its closed owner's cleanup, requiring resolution."
   (call-with-wal-spool-owner
    spool
    (lambda ()
@@ -383,11 +391,16 @@ lifecycle quiescence."
   (values))
 
 (defun wal-retry-pending-temp-cleanup-under-lock ()
+  "Retry WAL temporary cleanup even when WAL is poisoned.
+Shutdown calls this before health-checked finalization. It does not settle
+pending page publications or CLOG debt."
   (call-with-wal-temp-cleanup-domain
    (lambda () (retry-pending-query-temp-cleanup *wal-temp-cleanup-domain*)))
   (values))
 
 (defun wal-require-no-temp-cleanup-under-lock ()
+  "Require the domain to be empty at a storage identity or shutdown boundary.
+This is separate from the checks for pending page and CLOG debt."
   (let ((domain (wal-temp-cleanup-domain-under-lock)))
     (unless (query-temp-cleanup-domain-empty-p domain)
       (wal-invalid-input "temporary cleanup prevents WAL storage replacement")))
@@ -438,7 +451,8 @@ short check alone cannot do so."
 
 (defvar *wal-recovery-page-spool-enabled* nil)
 
-(defvar *wal-recovery-page-spool* nil)
+(defvar *wal-recovery-page-spool* nil
+  "Recovery page spool, with an ordinary cleanup owner rather than WAL's domain.")
 
 (defvar *wal-recovery-catalog-chunks* '())
 (defvar *wal-recovery-catalog-chunk-count* nil)
@@ -665,6 +679,7 @@ Legacy 16-hex segment names always belong to timeline 1."
     (wal-crc32 bytes)))
 
 (defun wal-dirty-ensure-spool (store)
+  "Adopt scratch before publishing it in STORE or opening its file."
   (unless (wal-dirty-store-spool store)
     (sb-sys:without-interrupts
       (setf (wal-dirty-store-spool store) (make-wal-owned-spool))))
@@ -777,7 +792,9 @@ Legacy 16-hex segment names always belong to timeline 1."
   (values))
 
 (defun wal-dirty-close-empty-store ()
-  "Release scratch after the last shared, private or pending reference disappears."
+  "Release scratch after the last shared, private or pending reference disappears.
+Scratch can span publications. Keep the store until its spool cleanup resolves,
+so a closed spool is retried before a new store can be used."
   (sb-sys:without-interrupts
     (when (and *wal-dirty-store*
                (zerop (wal-dirty-store-resident *wal-dirty-store*))
@@ -1515,8 +1532,9 @@ the transaction (see SnapBuildCommitTxn and CreateInitDecodingContext)."
 
 (defun call-with-wal-primary-page-spool (function)
   "Call FUNCTION with a stack-owned spool and its publication owner.
-Cleanup closes an untransferred spool unless a transaction's terminal attempt has
-begun. Its CLOG reservation then retains the owner even if queue handoff fails."
+The spool is adopted before it is published to the owner. Cleanup closes an
+untransferred spool unless a transaction's terminal attempt has begun. Its CLOG
+reservation then retains the owner even if queue handoff fails."
   (call-with-wal-temp-cleanup-domain
    (lambda ()
      (when (or *wal-pending-page-publication* *wal-pending-page-publication-tail*)
@@ -3367,8 +3385,9 @@ Refresh its modification time. Update memory only after atomic publication."
 
 (defun wal-init ()
   "Initialize WAL under startup or equivalent quiescence.
-Reject surviving page and CLOG debt before replacement and establish a fresh
-local identity; pending owners are not cleared."
+Reject surviving page and CLOG debt and a nonempty cleanup domain before
+replacement. Establish a fresh local identity; cleanup owners are released only
+after cleanup is confirmed."
   (wal-require-no-pending-storage)
   (sb-thread:with-mutex (*wal-lock*)
     (when (and *wal-dirty-store*
