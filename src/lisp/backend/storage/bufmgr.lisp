@@ -79,6 +79,10 @@
   (when (fboundp 'heap-fsm-forget) (funcall 'heap-fsm-forget relfilenode))
   (values))
 
+(defun transaction-has-relation-replacements-p (backend)
+  (let ((replacements (gethash backend *transaction-relation-replacements*)))
+    (and replacements (plusp (hash-table-count replacements)))))
+
 (defun publish-transaction-replacements-under-wal-lock (backend &optional direct-p)
   "Publish private pages and return owned fork-reset descriptors for commit.
 The descriptors remain valid across the durable commit callback, which may

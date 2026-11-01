@@ -194,6 +194,7 @@ Rotate the storage incarnation after the file and its directory are durable."
 (defun clog-reset-under-wal-lock (fsync-function fsync-directory-function wal-reset-p)
   "Reject page and CLOG debt and keep WAL locked through record, file and epoch change."
   (assert (sb-thread:holding-mutex-p *wal-lock*))
+  (when (and wal-reset-p *wal-ready*) (wal-settle-page-publications-under-lock))
   (wal-require-no-pending-storage)
   (when (and wal-reset-p *wal-ready*) (wal-log-clog-reset-under-lock))
   (clog-reset-file-under-wal-lock fsync-function fsync-directory-function))
@@ -209,6 +210,7 @@ its own critical publication fence."
   (if (sb-thread:holding-mutex-p *wal-lock*)
       (clog-reset-under-wal-lock fsync-function fsync-directory-function wal-reset-p)
       (with-wal-publication-fence (begin-publication)
+        (when (and wal-reset-p *wal-ready*) (wal-settle-page-publications-under-lock))
         (wal-require-no-pending-storage)
         (begin-publication)
         (clog-reset-under-wal-lock fsync-function fsync-directory-function wal-reset-p)))

@@ -20,6 +20,7 @@
   "Mark an existing primary unclean before storage startup can change files.
 Retain its checkpoint and identity. Legacy controls have no lifecycle state;
 leave that state unknown until successful initialization publishes production."
+  (wal-require-no-pending-storage)
   (multiple-value-bind (checkpoint durable snapshot insertion checkpoint-id namespace metadata)
       (wal-read-control-fields)
     (when metadata
@@ -44,6 +45,7 @@ the durable control write succeeds; an existing identity must match the catalog.
                (/= system-id (getf *wal-control-metadata* :system-id)))
       (error "primary control and catalog system identifiers differ"))
     (with-wal-critical
+      (wal-require-no-pending-storage)
       (let ((*wal-control-metadata* (if *wal-control-metadata*
                                         (wal-refresh-control-metadata *wal-control-metadata* state)
                                         (make-wal-control-metadata system-id state))))

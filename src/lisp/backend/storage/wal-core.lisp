@@ -255,15 +255,40 @@ It is separate from the source identity used for remote acknowledgments.")
   ;; The stack owns SPOOL until handoff.  Pending ownership retains the sealed
   ;; spool, dirty maps and WAL identity until durable application and retirement.
   spool (state :stack) prepared-p pages contributors resets split-p xid
+  next (kind :transaction)
   incarnation timeline terminal-end replacement-pages replacement-contributors)
 
 (defvar *wal-pending-page-publication* nil
   "The single page publication awaiting materialization, protected by *WAL-LOCK*.")
 
+(defvar *wal-pending-page-publication-tail* nil)
+
+(defvar *wal-page-publication-appender* nil)
+
+(defun wal-check-page-publication-queue-under-lock ()
+  (assert (sb-thread:holding-mutex-p *wal-lock*))
+  (let ((last nil) (previous-end 0))
+    (loop for owner = *wal-pending-page-publication* then (wal-page-publication-next owner)
+          while owner
+          do (unless (and (wal-page-publication-p owner)
+                          (member (wal-page-publication-state owner) '(:pending :applied :retiring))
+                          (or (null last) (eq :pending (wal-page-publication-state owner)))
+                          (eq *wal-storage-incarnation* (wal-page-publication-incarnation owner))
+                          (eql *wal-insert-timeline* (wal-page-publication-timeline owner))
+                          (typep (wal-page-publication-terminal-end owner)
+                                 '(integer 1 18446744073709551615))
+                          (< previous-end (wal-page-publication-terminal-end owner))
+                          (<= (wal-page-publication-terminal-end owner) *wal-end-lsn*))
+               (wal-invalid-input "invalid pending page publication queue"))
+             (setf last owner previous-end (wal-page-publication-terminal-end owner)))
+    (unless (eq last *wal-pending-page-publication-tail*)
+      (wal-invalid-input "pending page publication tail differs from its chain")))
+  (values))
+
 (defun wal-require-no-pending-page-publication ()
   "Reject another publisher while the pending owner retains page debt.
 Caller holds *WAL-LOCK* or has lifecycle quiescence."
-  (when *wal-pending-page-publication*
+  (when (or *wal-pending-page-publication* *wal-pending-page-publication-tail*)
     (wal-invalid-input "pending page publication prevents another storage publisher"))
   (values))
 
@@ -273,29 +298,27 @@ Caller holds *WAL-LOCK* or has lifecycle quiescence."
   (clog-require-no-pending-commits))
 
 (defun wal-check-page-publication-owner-under-lock (owner)
-  "Check that OWNER still belongs to this WAL store and insertion timeline."
-  (assert (sb-thread:holding-mutex-p *wal-lock*))
-  (unless (and (wal-page-publication-p owner)
-               (eq owner *wal-pending-page-publication*)
-               (member (wal-page-publication-state owner) '(:pending :applied :retiring))
-               (eq *wal-storage-incarnation* (wal-page-publication-incarnation owner))
-               (eql *wal-insert-timeline* (wal-page-publication-timeline owner))
-               (typep (wal-page-publication-terminal-end owner) '(integer 1 18446744073709551615))
-               (<= (wal-page-publication-terminal-end owner) *wal-end-lsn*))
-    (wal-invalid-input "pending page publication belongs to another WAL store"))
+  (wal-check-page-publication-queue-under-lock)
+  (unless (loop for entry = *wal-pending-page-publication* then (wal-page-publication-next entry)
+                while entry thereis (eq owner entry))
+    (wal-invalid-input "page publication is not installed in this WAL store"))
   owner)
 
 (defun wal-pending-page-reference (key)
-  "Look up KEY in the pending owner's pages with *WAL-LOCK* held."
   (when *wal-pending-page-publication*
-    (let ((owner (wal-check-page-publication-owner-under-lock *wal-pending-page-publication*)))
-      (gethash key (wal-page-publication-pages owner)))))
+    (wal-check-page-publication-queue-under-lock)
+    (let ((reference nil) (present nil) (contributors nil))
+      (loop for owner = *wal-pending-page-publication* then (wal-page-publication-next owner)
+            while owner
+            do (multiple-value-bind (candidate found)
+                   (gethash key (wal-page-publication-pages owner))
+                 (when found
+                   (setf reference candidate present t
+                         contributors (gethash key (wal-page-publication-contributors owner))))))
+      (values reference present contributors))))
 
 (defun wal-pending-page-contributors (key)
-  "Look up KEY's retained contributors with *WAL-LOCK* held."
-  (when *wal-pending-page-publication*
-    (let ((owner (wal-check-page-publication-owner-under-lock *wal-pending-page-publication*)))
-      (gethash key (wal-page-publication-contributors owner)))))
+  (nth-value 2 (wal-pending-page-reference key)))
 
 (declaim (ftype function clog-require-no-pending-commits))
 
@@ -792,8 +815,9 @@ The zero marker remains sticky for uncertified writes; XIDs are full XIDs."
                             (setf nblocks (max nblocks (1+ (third key))))))
                         map))))
       (when *wal-pending-page-publication*
-        (count-map (wal-page-publication-pages
-                    (wal-check-page-publication-owner-under-lock *wal-pending-page-publication*))))
+        (wal-check-page-publication-queue-under-lock)
+        (loop for owner = *wal-pending-page-publication* then (wal-page-publication-next owner)
+              while owner do (count-map (wal-page-publication-pages owner))))
       (count-map *wal-page-cache*)
       (count-map *wal-page-batch*))
     nblocks))
@@ -1096,6 +1120,7 @@ after release. Nonlocal exits need a publication fence."
                      (handler-case
                          (progn (wal-check-healthy) ,@body)
                        (wal-input-validation-error (,condition)
+                         (when *wal-poisoned* (setf ,failure ,condition))
                          (error ,condition))
                        (error (,condition)
                          (setf ,failure ,condition *wal-poisoned* t)
@@ -1188,7 +1213,16 @@ pending backend termination from replacing a latched WAL failure."
     record))
 
 (defun wal-append-record (type xid payload)
-  (wal-require-no-pending-page-publication)
+  (when (or *wal-pending-page-publication* *wal-pending-page-publication-tail*)
+    (if (and (sb-thread:holding-mutex-p *wal-lock*)
+             (wal-page-publication-p *wal-page-publication-appender*)
+             (eq :stack (wal-page-publication-state *wal-page-publication-appender*))
+             (eq *wal-storage-incarnation*
+                 (wal-page-publication-incarnation *wal-page-publication-appender*))
+             (eql *wal-insert-timeline*
+                  (wal-page-publication-timeline *wal-page-publication-appender*)))
+        (wal-check-page-publication-queue-under-lock)
+        (wal-require-no-pending-page-publication)))
   (wal-require-ordinary-record-type type)
   (wal-check-healthy)
   (handler-case
@@ -1211,20 +1245,17 @@ pending backend termination from replacing a latched WAL failure."
   (when stream (finish-output stream) (fsync-stream stream))
   (when sync-names (fsync-directory (wal-directory))))
 
+(defun wal-flush-core ()
+  (wal-sync-output-bytes *wal-output-stream* *wal-new-segments*)
+  (setf *wal-new-segments* '())
+  (wal-test-pause :after-wal-bytes-flush)
+  (wal-save-durable-lsn *wal-end-lsn*)
+  (values))
+
 (defun wal-flush ()
   (wal-check-healthy)
-  (handler-case
-      (progn
-        (wal-sync-output-bytes *wal-output-stream* *wal-new-segments*)
-        (setf *wal-new-segments* '())
-        (wal-test-pause :after-wal-bytes-flush)
-        ;; Record the durable end only after the WAL bytes and segment names
-        ;; have reached stable storage. Recovery uses it to distinguish an
-        ;; unflushed tail from damage inside acknowledged WAL.
-        (wal-save-durable-lsn *wal-end-lsn*)
-        (values))
-    (error (condition)
-      (wal-fail-stop condition))))
+  (handler-case (wal-flush-core)
+    (error (condition) (wal-fail-stop condition))))
 
 (defun wal-append-page-images (images)
   (labels ((append-chunk (chunk)
@@ -1415,8 +1446,13 @@ the transaction (see SnapBuildCommitTxn and CreateInitDecodingContext)."
 (defun call-with-wal-primary-page-spool (function)
   "Call FUNCTION with a stack-owned spool and its publication owner.
 Cleanup closes only a stack-owned spool; handoff leaves it with the pending owner."
-  (wal-require-no-pending-page-publication)
-  (let ((owner (%make-wal-page-publication)))
+  (when (or *wal-pending-page-publication* *wal-pending-page-publication-tail*)
+    (wal-check-page-publication-queue-under-lock)
+    (when (wal-page-publication-resets *wal-pending-page-publication-tail*)
+      (wal-invalid-input "relation reset publication must finish before another publisher")))
+  (let* ((owner (%make-wal-page-publication :incarnation *wal-storage-incarnation*
+                                            :timeline *wal-insert-timeline*))
+         (*wal-page-publication-appender* owner))
     (unwind-protect
          (progn
            (sb-sys:without-interrupts
@@ -1428,18 +1464,22 @@ Cleanup closes only a stack-owned spool; handoff leaves it with the pending owne
           (wal-close-primary-page-spool (wal-page-publication-spool owner)))
         (setf (wal-page-publication-state owner) :released)))))
 
-(defun wal-prepare-page-publication-under-lock (owner xid resets split-p)
+(defun wal-prepare-page-publication-under-lock (owner xid resets split-p &key (kind :transaction))
   "Seal the spool and prepare empty replacement maps before the terminal record.
 Record the current maps and WAL identity while the caller holds *WAL-LOCK*."
   (assert (sb-thread:holding-mutex-p *wal-lock*))
   (wal-check-healthy)
-  (wal-require-no-pending-page-publication)
+  (wal-check-page-publication-queue-under-lock)
   (unless (and *wal-ready* (wal-page-publication-p owner)
                (eq :stack (wal-page-publication-state owner))
                (not (wal-page-publication-prepared-p owner))
                (wal-page-publication-spool owner)
-               (typep xid '(integer 3 18446744073709551615))
-               (>= (logand xid #xffffffff) 3))
+               (or (and (eq kind :transaction)
+                        (typep xid '(integer 3 18446744073709551615))
+                        (>= (logand xid #xffffffff) 3))
+                   (and (eq kind :maintenance) (eql xid 0) (null resets)))
+               (null (wal-page-publication-next owner))
+               (or (null resets) (null *wal-pending-page-publication*)))
     (wal-invalid-input "invalid page publication preparation"))
   (logical-spool-seal (wal-page-publication-spool owner))
   (let ((replacement-pages (make-hash-table :test #'equal))
@@ -1449,6 +1489,7 @@ Record the current maps and WAL identity while the caller holds *WAL-LOCK*."
           (wal-page-publication-resets owner) resets
           (wal-page-publication-split-p owner) split-p
           (wal-page-publication-xid owner) xid
+          (wal-page-publication-kind owner) kind
           (wal-page-publication-incarnation owner) *wal-storage-incarnation*
           (wal-page-publication-timeline owner) *wal-insert-timeline*
           (wal-page-publication-replacement-pages owner) replacement-pages
@@ -1462,7 +1503,7 @@ Install the preallocated empty maps by pointer, without changing references."
   (assert (sb-thread:holding-mutex-p *wal-lock*))
   (sb-sys:without-interrupts
     (wal-check-healthy)
-    (wal-require-no-pending-page-publication)
+    (wal-check-page-publication-queue-under-lock)
     (unless (and (wal-page-publication-p owner)
                  (eq :stack (wal-page-publication-state owner))
                  (wal-page-publication-prepared-p owner)
@@ -1472,6 +1513,9 @@ Install the preallocated empty maps by pointer, without changing references."
                  (eql *wal-insert-timeline* (wal-page-publication-timeline owner))
                  (typep end '(integer 1 18446744073709551615))
                  (<= end *wal-end-lsn*)
+                 (null (wal-page-publication-next owner))
+                 (or (null *wal-pending-page-publication-tail*)
+                     (> end (wal-page-publication-terminal-end *wal-pending-page-publication-tail*)))
                  (hash-table-p (wal-page-publication-replacement-pages owner))
                  (zerop (hash-table-count (wal-page-publication-replacement-pages owner)))
                  (hash-table-p (wal-page-publication-replacement-contributors owner))
@@ -1479,12 +1523,15 @@ Install the preallocated empty maps by pointer, without changing references."
       (wal-invalid-input "page publication preparation changed before handoff"))
     (setf (wal-page-publication-terminal-end owner) end
           (wal-page-publication-state owner) :pending
-          *wal-pending-page-publication* owner
           *wal-page-cache* (wal-page-publication-replacement-pages owner)
           *wal-page-cache-xids* (wal-page-publication-replacement-contributors owner)
           *wal-pending-btree-split* nil
           (wal-page-publication-replacement-pages owner) nil
-          (wal-page-publication-replacement-contributors owner) nil))
+          (wal-page-publication-replacement-contributors owner) nil)
+    (if *wal-pending-page-publication-tail*
+        (setf (wal-page-publication-next *wal-pending-page-publication-tail*) owner)
+        (setf *wal-pending-page-publication* owner))
+    (setf *wal-pending-page-publication-tail* owner))
   owner)
 
 (defun wal-drain-page-publication-under-lock (owner &key fault-on-first-write)
@@ -1494,6 +1541,8 @@ The global owner is removed last.  Failure leaves debt for fail-stop handling."
   (sb-sys:without-interrupts
     (wal-check-healthy)
     (wal-check-page-publication-owner-under-lock owner)
+    (unless (eq owner *wal-pending-page-publication*)
+      (wal-invalid-input "page publication drain must start at the queue head"))
     (unless (<= (wal-page-publication-terminal-end owner) *wal-durable-lsn*)
       (wal-invalid-input "pending page publication WAL is not durable"))
     (when (eq :pending (wal-page-publication-state owner))
@@ -1512,9 +1561,45 @@ The global owner is removed last.  Failure leaves debt for fail-stop handling."
                (remhash key (wal-page-publication-contributors owner)))
              (wal-page-publication-pages owner))
     (wal-dirty-close-empty-store)
-    (setf (wal-page-publication-state owner) :released
-          *wal-pending-page-publication* nil))
+    (let ((next (wal-page-publication-next owner)))
+      (setf (wal-page-publication-state owner) :released
+            *wal-pending-page-publication* next
+            (wal-page-publication-next owner) nil)
+      (unless next (setf *wal-pending-page-publication-tail* nil))))
   (values))
+
+(defun wal-drain-page-publications-through-under-lock (target &key fault-on-first-write)
+  (assert (sb-thread:holding-mutex-p *wal-lock*))
+  (sb-sys:without-interrupts
+    (wal-check-healthy)
+    (wal-check-page-publication-owner-under-lock target)
+    (unless (<= (wal-page-publication-terminal-end target) *wal-durable-lsn*)
+      (wal-invalid-input "captured page publication prefix is not durable"))
+    (loop for head = *wal-pending-page-publication*
+          do (wal-drain-page-publication-under-lock head :fault-on-first-write fault-on-first-write)
+          until (eq head target)))
+  (values))
+
+(defun wal-settle-page-publications-under-lock ()
+  (assert (sb-thread:holding-mutex-p *wal-lock*))
+  (wal-check-healthy)
+  (wal-check-page-publication-queue-under-lock)
+  (clog-require-no-pending-commits)
+  (let ((target *wal-pending-page-publication-tail*))
+    (when target
+      (let ((complete nil) (failure nil))
+        (sb-sys:without-interrupts
+          (unwind-protect
+               (handler-bind ((error (lambda (condition)
+                                       (unless failure (setf failure condition)))))
+                 (wal-flush-core)
+                 (wal-drain-page-publications-through-under-lock target :fault-on-first-write t)
+                 (setf complete t))
+            (unless complete
+              (setf *wal-poisoned* t)
+              (unless failure
+                (error "WAL predecessor drain exited before completion")))))))
+    target))
 
 (defmacro with-wal-primary-page-spool ((spool &optional publication) &body body)
   "Keep stack cleanup responsible for SPOOL until PUBLICATION transfers ownership."
@@ -1676,8 +1761,13 @@ runs under the interrupt mask after the direct commit callback."
   (let ((commit-lsn nil) (receipt nil))
     (sb-sys:without-interrupts
       (with-wal-publication-fence (begin-publication)
-        (wal-require-no-pending-storage)
+        (clog-require-no-pending-commits)
         (wal-validate-logical-binary-capability-under-lock xid)
+        (when (and (fboundp 'transaction-has-relation-replacements-p)
+                   (funcall 'transaction-has-relation-replacements-p
+                            (when (boundp '*backend*) (symbol-value '*backend*))))
+          (wal-settle-page-publications-under-lock)
+          (wal-require-no-pending-storage))
         (begin-publication)
         (let* ((resets
                  (when (fboundp 'publish-transaction-replacements-under-wal-lock)
@@ -1708,7 +1798,7 @@ runs under the interrupt mask after the direct commit callback."
             (wal-slot-record-xid-commit-under-wal-lock xid commit-lsn)
             (wal-test-pause :after-wal-flush)
             (funcall after-durable-function commit-lsn)
-            (wal-drain-page-publication-under-lock publication :fault-on-first-write t)))
+            (wal-drain-page-publications-through-under-lock publication :fault-on-first-write t)))
         (setf receipt (%make-wal-commit-receipt xid source-id commit-lsn t))
         (when accepted-function (funcall accepted-function receipt))))
     (values commit-lsn receipt)))
@@ -1717,21 +1807,23 @@ runs under the interrupt mask after the direct commit callback."
   "Durably publish staged storage maintenance without committing a user XID."
   (unless *wal-ready*
     (return-from wal-commit-maintenance (values)))
-  (with-wal-critical
-    (wal-require-no-pending-storage)
+  (with-wal-publication-fence (begin-publication)
+    (clog-require-no-pending-commits)
     (let ((keys (wal-primary-page-keys)) (split-p *wal-pending-btree-split*))
       (wal-primary-preflight-page-keys keys)
-      (with-wal-primary-page-spool (spool)
+      (with-wal-primary-page-spool (spool publication)
+        (begin-publication)
         (wal-primary-record-page-xids keys (wal-append-batch-start))
         (wal-primary-append-pages keys spool)
         (wal-primary-seal-page-spool spool)
-        (wal-append-record +wal-record-maintenance+ 0
-                           (make-array 0 :element-type '(unsigned-byte 8)))
+        (wal-prepare-page-publication-under-lock publication 0 nil split-p :kind :maintenance)
+        (let ((end (wal-append-record +wal-record-maintenance+ 0
+                                      (make-array 0 :element-type '(unsigned-byte 8)))))
+          (wal-publish-page-publication-under-lock publication end))
+        (wal-test-pause :after-page-publication-transfer)
         (wal-flush)
         (wal-test-pause :after-wal-flush)
-        (wal-primary-apply-page-spool spool :split-p split-p :fault-on-first-write t)
-        (wal-clear-page-cache)
-        (setf *wal-pending-btree-split* nil))))
+        (wal-drain-page-publications-through-under-lock publication :fault-on-first-write t))))
   (values))
 
 ;; TODO: Stream catalog serialization into a temporary file and write bounded
@@ -1923,6 +2015,7 @@ Without WAL, write the catalog, call ON-DURABLE with NIL, and return no values."
     (return-from wal-commit-catalog (values)))
   (let ((commit-lsn nil))
     (with-wal-publication-fence (begin-publication)
+      (wal-settle-page-publications-under-lock)
       (wal-require-no-pending-storage)
       (let* ((logical-event (wal-prepare-logical-catalog-event-under-lock logical-event))
              (deletes (sort (remove-duplicates
@@ -3269,6 +3362,7 @@ Reject pending page and CLOG debt before appending any checkpoint batch records.
   ;; CHECKPOINT follows the global write-lock -> WAL-lock order.
   (with-write-lock
     (with-wal-critical
+      (wal-settle-page-publications-under-lock)
       (wal-require-no-pending-storage)
       (let ((keys (wal-primary-page-keys)))
         (wal-primary-preflight-page-keys keys)
@@ -3312,6 +3406,7 @@ Active standard-policy owners defer removal in a process-local ticket; the calle
 retries outside locks after stopping them. Independent XID and snapshot floors
 also constrain removal. CURRENT freezes the endpoint across that retry, while
 each calculation captures the current retention settings."
+  (wal-settle-page-publications-under-lock)
   (wal-require-no-pending-page-publication)
   (let ((checkpoint-segment (wal-checkpoint-recycling-segment checkpoint-lsn)))
     (multiple-value-bind (keep-segment requests)
@@ -3362,6 +3457,7 @@ function does not replace the file itself."
   "Log a CLOG reset under WAL exclusion after checking pending debt."
   (when *wal-ready*
     (with-wal-critical
+      (wal-settle-page-publications-under-lock)
       (wal-require-no-pending-storage)
       (wal-log-clog-reset-under-lock)))
   (values))

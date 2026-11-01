@@ -194,25 +194,29 @@ lock, and protected cleanup requests fail-stop after the lock unwinds."
                (wal-check-healthy)
                (unless (and *wal-ready* (wal-control-metadata-valid-p *wal-control-metadata*))
                  (error "primary control identity is not initialized"))
-               (if (equal (resource-parameters-values parameters)
-                          (getf *wal-control-metadata* :resource-parameters))
-                   (setf result (getf *wal-control-metadata* :resource-lsn))
-                   (sb-sys:without-interrupts
-                     (unwind-protect
-                          (handler-case
-                              (progn
-                                (setf started t)
-                                (wal-append-batch-start)
-                                (wal-append-record +wal-record-parameter-change+ 0
-                                                   (wal-encode-resource-parameters parameters))
-                                (wal-flush)
-                                (wal-resource-parameters-test-point :after-wal-flush *wal-end-lsn*)
-                                (wal-publish-resource-parameters-under-lock
-                                 parameters *wal-end-lsn* *wal-insert-timeline*)
-                                (wal-resource-parameters-test-point :after-control-save *wal-end-lsn*)
-                                (setf result *wal-end-lsn* completed t))
-                            (error (condition) (setf failure condition)))
-                       (unless completed (setf *wal-poisoned* t)))))))
+               (handler-case (wal-settle-page-publications-under-lock)
+                 (error (condition)
+                   (if *wal-poisoned* (setf failure condition) (error condition))))
+               (unless failure
+                 (if (equal (resource-parameters-values parameters)
+                            (getf *wal-control-metadata* :resource-parameters))
+                     (setf result (getf *wal-control-metadata* :resource-lsn))
+                     (sb-sys:without-interrupts
+                       (unwind-protect
+                            (handler-case
+                                (progn
+                                  (setf started t)
+                                  (wal-append-batch-start)
+                                  (wal-append-record +wal-record-parameter-change+ 0
+                                                     (wal-encode-resource-parameters parameters))
+                                  (wal-flush)
+                                  (wal-resource-parameters-test-point :after-wal-flush *wal-end-lsn*)
+                                  (wal-publish-resource-parameters-under-lock
+                                   parameters *wal-end-lsn* *wal-insert-timeline*)
+                                  (wal-resource-parameters-test-point :after-control-save *wal-end-lsn*)
+                                  (setf result *wal-end-lsn* completed t))
+                              (error (condition) (setf failure condition)))
+                         (unless completed (setf *wal-poisoned* t))))))))
         (cond
           (failure (wal-fail-stop failure))
           ((and started (not completed))

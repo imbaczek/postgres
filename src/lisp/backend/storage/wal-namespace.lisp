@@ -70,13 +70,14 @@ Control remains authoritative: legacy rolls staging back; timeline finishes clea
 (defun wal-migrate-namespace-under-lock ()
   "Caller owns quiescence, writer and WAL locks; reject pending storage debt.
 Any uncertain publication fences WAL."
-  (wal-require-no-pending-storage)
   (unless (and (eq *live-operation-quiescence-owner-thread* sb-thread:*current-thread*)
                (not *live-operation-drain-open*))
     (wal-invalid-input "WAL namespace migration requires owned operation quiescence"))
   (wal-require-supported-timelines *wal-insert-timeline* *wal-checkpoint-timeline*)
   (unless (member *wal-segment-namespace* '(:legacy :timeline)) (wal-invalid-input "invalid WAL namespace"))
   (unless *wal-ready* (wal-invalid-input "WAL namespace migration requires initialized WAL"))
+  (wal-settle-page-publications-under-lock)
+  (wal-require-no-pending-storage)
   (let* ((cleanup-only (eq *wal-segment-namespace* :timeline))
          (plan (wal-namespace-migration-plan :cleanup cleanup-only))
          (finished nil))

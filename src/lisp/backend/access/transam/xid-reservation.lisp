@@ -64,18 +64,22 @@ and protected cleanup requests fail-stop after they unwind."
            (sb-sys:with-local-interrupts
              (sb-thread:with-mutex (*wal-lock*)
                (wal-check-healthy)
-               (sb-thread:with-mutex (*xid-lock*)
-                 (xid-check-allocation-owner owner)
-                 (xid-check-allocation-under-lock oldest)
-                 (when (>= *next-xid* *xid-batch-end*)
-                   (sb-sys:without-interrupts
-                     (setf started t)
-                     (unwind-protect
-                          (handler-case
-                              (progn (xid-reserve-wal-batch-under-lock) (setf completed t))
-                            (error (condition) (setf failure condition)))
-                       (unless completed (setf *wal-poisoned* t)))))
-                 (unless failure (setf result (xid-allocate-under-lock owner))))))
+               (handler-case (wal-settle-page-publications-under-lock)
+                 (error (condition)
+                   (if *wal-poisoned* (setf failure condition) (error condition))))
+               (unless failure
+                 (sb-thread:with-mutex (*xid-lock*)
+                   (xid-check-allocation-owner owner)
+                   (xid-check-allocation-under-lock oldest)
+                   (when (>= *next-xid* *xid-batch-end*)
+                     (sb-sys:without-interrupts
+                       (setf started t)
+                       (unwind-protect
+                            (handler-case
+                                (progn (xid-reserve-wal-batch-under-lock) (setf completed t))
+                              (error (condition) (setf failure condition)))
+                         (unless completed (setf *wal-poisoned* t)))))
+                   (unless failure (setf result (xid-allocate-under-lock owner)))))))
         (cond
           (failure (wal-fail-stop failure))
           ((and started (not completed))

@@ -242,6 +242,209 @@ def run_competing_commit_case():
         print(f'artifacts: {server.root}', flush=True)
 
 
+def stage_maintenance_predecessor(server, oid):
+    # This private operation returns no transaction acceptance receipt.
+    server.control(
+        '(defvar *queue-test-node* (let ((*backend* (make-backend))) '
+        f'(pg-class-relfilenode (find-table-by-oid {oid})))) '
+        '(defvar *queue-test-prior* nil) (defvar *queue-test-seen* nil) '
+        '(defvar *queue-test-pause* (symbol-function \'wal-test-pause)) '
+        '(with-wal-publication-fence (begin-publication) '
+        '(wal-require-no-pending-storage) (begin-publication) '
+        '(wal-dirty-install-page (wal-page-key *queue-test-node* 0) '
+        '(wal-copy-dirty-page (wal-visible-page-under-lock *queue-test-node* 0 :main))) '
+        '(let ((keys (wal-primary-page-keys))) '
+        '(with-wal-primary-page-spool (spool owner) '
+        '(wal-primary-record-page-xids keys (wal-append-batch-start)) '
+        '(wal-primary-append-pages keys spool) (wal-primary-seal-page-spool spool) '
+        '(wal-prepare-page-publication-under-lock owner 0 nil nil :kind :maintenance) '
+        '(wal-publish-page-publication-under-lock owner '
+        '(wal-append-record +wal-record-maintenance+ 0 '
+        '(make-array 0 :element-type \'(unsigned-byte 8)))) '
+        '(setf *queue-test-prior* owner) (wal-flush))))')
+
+
+def run_queued_predecessor_case(maintenance=False, reset=False):
+    server = OwnedLisp()
+    actor = None
+    try:
+        server.start()
+        actor = Connection(server.port)
+        actor.query('CREATE TABLE queued_prefix_rows (id int PRIMARY KEY)')
+        actor.query('INSERT INTO queued_prefix_rows VALUES (1)')
+        oid = int(actor.query("SELECT oid FROM pg_class WHERE relname = 'queued_prefix_rows'")[0][0])
+        pid = int(actor.query('SELECT pg_backend_pid()')[0][0])
+        if not maintenance:
+            actor.query('BEGIN')
+            if not reset:
+                actor.query('INSERT INTO queued_prefix_rows VALUES (2)')
+        stage_maintenance_predecessor(server, oid)
+        kind = ':maintenance' if maintenance else ':transaction'
+        if reset:
+            server.control(
+                '(defvar *queue-test-publish* '
+                '(symbol-function \'publish-transaction-replacements-under-wal-lock)) '
+                '(setf (symbol-function \'publish-transaction-replacements-under-wal-lock) '
+                '(lambda (backend &optional direct-p) '
+                f'(when (and backend (= (backend-pid backend) {pid})) '
+                '(assert (eq :released (wal-page-publication-state *queue-test-prior*))) '
+                '(assert (null *wal-pending-page-publication*))) '
+                '(funcall *queue-test-publish* backend direct-p)))')
+        inspect = (
+            '(assert (eq :released (wal-page-publication-state *queue-test-prior*))) '
+            '(assert (eq *wal-pending-page-publication* *wal-pending-page-publication-tail*)) '
+            '(assert (wal-page-publication-resets *wal-pending-page-publication*)) '
+            if reset else
+            '(assert (eq *queue-test-prior* *wal-pending-page-publication*)) '
+            '(let ((current (wal-page-publication-next *queue-test-prior*))) '
+            '(assert current) (assert (eq current *wal-pending-page-publication-tail*)) '
+            '(assert (null (wal-page-publication-next current))) '
+            f'(assert (eq {kind} (wal-page-publication-kind current)))) ')
+        server.control(
+            '(setf (symbol-function \'wal-test-pause) (lambda (point) '
+            f'(when (and *backend* (= (backend-pid *backend*) {pid}) '
+            '(eq point :after-page-publication-transfer) (not *queue-test-seen*)) '
+            f'{inspect}'
+            '(setf *queue-test-seen* t)) (funcall *queue-test-pause* point)))')
+        if maintenance:
+            actor.query('VACUUM queued_prefix_rows')
+            expected = [['1']]
+        elif reset:
+            actor.query('TRUNCATE queued_prefix_rows')
+            actor.query('INSERT INTO queued_prefix_rows VALUES (9)')
+            actor.query('COMMIT')
+            expected = [['9']]
+        else:
+            actor.query('INSERT INTO queued_prefix_rows VALUES (3)')
+            actor.query('COMMIT')
+            expected = [['1'], ['2'], ['3']]
+        server.control('(assert *queue-test-seen*) '
+                       '(assert (eq :released (wal-page-publication-state *queue-test-prior*))) '
+                       '(assert (null *wal-pending-page-publication*)) '
+                       '(assert (null *wal-pending-page-publication-tail*)) '
+                       '(assert (not *wal-poisoned*))')
+        assert actor.query('SELECT id FROM queued_prefix_rows ORDER BY id') == expected
+        actor.close()
+        actor = None
+        server.stop()
+        server.start()
+        actor = Connection(server.port)
+        assert actor.query('SELECT id FROM queued_prefix_rows ORDER BY id') == expected
+        print(f'pending-pages: maintenance={maintenance} reset={reset} real publisher drains its predecessor PASS',
+              flush=True)
+    finally:
+        if actor is not None:
+            actor.close()
+        server.stop(immediate=True)
+        print(f'artifacts: {server.root}', flush=True)
+
+
+def run_synchronous_barrier_case(operation):
+    server = OwnedLisp()
+    actor = None
+    try:
+        server.start()
+        actor = Connection(server.port)
+        actor.query('CREATE TABLE queued_barrier_rows (id int PRIMARY KEY)')
+        actor.query('INSERT INTO queued_barrier_rows VALUES (1)')
+        oid = int(actor.query("SELECT oid FROM pg_class WHERE relname = 'queued_barrier_rows'")[0][0])
+        if operation == 'clog-reset':
+            server.control('(vacuum-all-relations-for-xid-wraparound *next-xid* '
+                           ':fsync-function #\'smgr-fsync)')
+        stage_maintenance_predecessor(server, oid)
+        hook = {'recycling': 'wal-prepare-slot-recycling-under-lock',
+                'namespace': 'wal-namespace-migration-plan'}.get(operation, 'wal-append-batch-start')
+        server.control(
+            '(defvar *queue-barrier-seen* nil) '
+            f'(defvar *queue-barrier-batch* (symbol-function \'{hook})) '
+            f'(setf (symbol-function \'{hook}) (lambda (&rest arguments) '
+            '(unless *queue-barrier-seen* '
+            '(assert (eq :released (wal-page-publication-state *queue-test-prior*))) '
+            '(assert (null *wal-pending-page-publication*)) '
+            '(assert (null *wal-pending-page-publication-tail*)) '
+            '(setf *queue-barrier-seen* t)) (apply *queue-barrier-batch* arguments)))')
+        if operation == 'catalog':
+            actor.query('CREATE TABLE after_queued_prefix (id int)')
+        elif operation == 'checkpoint':
+            server.control('(wal-checkpoint-core)')
+        elif operation == 'clog-reset':
+            server.control('(clog-reset)')
+        elif operation == 'xid-reservation':
+            server.control(
+                '(sb-thread:with-mutex (*wal-lock*) '
+                '(sb-thread:with-mutex (*xid-lock*) (assert (null *active-xids*)) '
+                '(setf *next-xid* *xid-batch-end*))) '
+                '(defvar *queue-settlement-outside-xid* nil) '
+                '(defvar *queue-barrier-flush* (symbol-function \'wal-flush-core)) '
+                '(setf (symbol-function \'wal-flush-core) (lambda () '
+                '(when *wal-pending-page-publication* '
+                '(assert (not (sb-thread:holding-mutex-p *xid-lock*))) '
+                '(setf *queue-settlement-outside-xid* t)) '
+                '(funcall *queue-barrier-flush*)))')
+            actor.query('INSERT INTO queued_barrier_rows VALUES (9)')
+            server.control('(assert *queue-settlement-outside-xid*)')
+        elif operation == 'resources':
+            server.control(
+                '(let ((current (wal-control-resource-parameters *wal-control-metadata*))) '
+                '(wal-report-resource-parameters '
+                '(%make-resource-parameters (1+ (resource-parameters-connections current)) '
+                '(resource-parameters-workers current) (resource-parameters-senders current) '
+                '(resource-parameters-prepared current) (resource-parameters-locks current))))')
+        elif operation == 'recycling':
+            server.control('(wal-remove-checkpointed-segments *wal-checkpoint-lsn* :wait nil)')
+        elif operation == 'namespace':
+            server.control(
+                '(defvar *queue-migration-error* nil) (defvar *queue-migration-done* nil) '
+                '(defvar *queue-migration-worker* (sb-thread:make-thread (lambda () '
+                '(handler-case (progn '
+                '(let ((deadline (+ (get-internal-real-time) (* 20 internal-time-units-per-second)))) '
+                f'(loop until (probe-file #p"{server.root / "migrate"}") '
+                'do (when (>= (get-internal-real-time) deadline) (error "migration release timeout")) '
+                '(sleep 0.01))) (wal-migrate-timeline-namespace)) '
+                '(error (condition) (setf *queue-migration-error* (princ-to-string condition)))) '
+                '(setf *queue-migration-done* t)) :name "owned queued namespace migration"))')
+            (server.root / 'migrate').touch()
+            deadline = time.monotonic() + 20
+            while ':DONE T' not in server.control(
+                    '(assert (null *queue-migration-error*)) (list :done *queue-migration-done*)'):
+                assert server.process.poll() is None
+                assert time.monotonic() < deadline, 'namespace migration did not finish'
+                time.sleep(0.02)
+        elif operation in ('startup-guard', 'state-guard'):
+            action = '(wal-mark-primary-startup)' if operation == 'startup-guard' else \
+                '(wal-set-primary-state +db-shutdowned+)'
+            server.control(
+                '(let ((before (recovery-read-bytes (wal-control-path))) (rejected nil)) '
+                f'(handler-case {action} '
+                '(wal-input-validation-error () (setf rejected t))) '
+                '(assert rejected) '
+                '(assert (equalp before (recovery-read-bytes (wal-control-path)))) '
+                '(assert (eq *queue-test-prior* *wal-pending-page-publication*)) '
+                '(assert (not *wal-poisoned*)) (setf *queue-barrier-seen* t)) '
+                '(progn (with-wal-critical (wal-settle-page-publications-under-lock)) (values))')
+        else:
+            raise AssertionError(f'unknown barrier operation {operation}')
+        server.control('(assert *queue-barrier-seen*) (assert (not *wal-poisoned*)) '
+                       '(assert (null *wal-pending-page-publication*)) '
+                       '(assert (null *wal-pending-page-publication-tail*))')
+        expected = [['1'], ['9']] if operation == 'xid-reservation' else [['1']]
+        assert actor.query('SELECT id FROM queued_barrier_rows ORDER BY id') == expected
+        actor.close()
+        actor = None
+        server.stop()
+        server.start()
+        actor = Connection(server.port)
+        assert actor.query('SELECT id FROM queued_barrier_rows ORDER BY id') == expected
+        behavior = 'rejects debt before control publication' if operation.endswith('-guard') else \
+            'settles its predecessor before publication'
+        print(f'pending-pages: {operation} {behavior} PASS', flush=True)
+    finally:
+        if actor is not None:
+            actor.close()
+        server.stop(immediate=True)
+        print(f'artifacts: {server.root}', flush=True)
+
+
 if __name__ == '__main__':
     run_case('transfer')
     run_case('flush')
@@ -252,3 +455,9 @@ if __name__ == '__main__':
     run_case('reset', crash=True)
     run_contributor_case()
     run_competing_commit_case()
+    run_queued_predecessor_case()
+    run_queued_predecessor_case(maintenance=True)
+    run_queued_predecessor_case(reset=True)
+    for operation in ('catalog', 'checkpoint', 'clog-reset', 'xid-reservation', 'resources',
+                      'recycling', 'namespace', 'startup-guard', 'state-guard'):
+        run_synchronous_barrier_case(operation)
