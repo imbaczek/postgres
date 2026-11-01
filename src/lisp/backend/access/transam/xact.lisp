@@ -2482,6 +2482,21 @@ Run outside publication locks, clean up the transaction, then handle the outcome
       (finish-synchronous-commit-response backend outcome)))
   (values))
 
+(defun validate-wal-commit-receipt (receipt accepted xid source end durable-end wal-ready-p)
+  (unless (and (wal-commit-receipt-p receipt)
+               (eq receipt accepted)
+               (eql xid (wal-commit-receipt-xid receipt))
+               (eql source (wal-commit-receipt-source-id receipt))
+               (eql end (wal-commit-receipt-terminal-end receipt))
+               (if wal-ready-p
+                   (and (typep end '(integer 1 18446744073709551615))
+                        (eql end durable-end)
+                        (eq t (wal-commit-receipt-wal-durable-p receipt)))
+                   (and (null end) (null durable-end)
+                        (null (wal-commit-receipt-wal-durable-p receipt)))))
+    (ereport-fatal "XX000" "invalid commit acceptance receipt"))
+  receipt)
+
 (defun commit-transaction ()
   (ensure-exported-snapshot-scope-can-end *backend*)
   (prepare-backend-portal-transaction-end *backend* t)
@@ -2506,32 +2521,43 @@ Run outside publication locks, clean up the transaction, then handle the outcome
           ;; leave the outcome indeterminate: retire resources without inventing
           ;; a CLOG commit or abort.
           (multiple-value-bind (obligation source)
-              (when (and *wal-ready*
-                         (or changes (backend-own-wal-effects-p b)))
-                (prepare-backend-wal-obligation b))
+              (when *wal-ready*
+                (if (or changes (backend-own-wal-effects-p b))
+                    (prepare-backend-wal-obligation b)
+                    (values nil (nth-value 0 (sync-replication-configuration-state)))))
             (sb-sys:without-interrupts
-              (let ((irreversible nil)
-                    ;; XID-bearing DDL waits for its user commit with the captured DDL mode.
-                    (mode (if (backend-final-ddl-committed-p b)
-                              (transaction-wal-obligation-ddl-wait-mode (backend-wal-obligation b))
-                              (synchronous-commit-wait-mode)))
-                    (outcome nil)
-                    (wal-ready-at-entry-p *wal-ready*)
-                    (xid (backend-xid b)))
+              (let ((irreversible nil) (accepted nil) (durable-end nil) (completion-safe nil)
+                                       ;; XID-bearing DDL waits for its user commit with the captured DDL mode.
+                                       (mode (if (backend-final-ddl-committed-p b)
+                                                 (transaction-wal-obligation-ddl-wait-mode (backend-wal-obligation b))
+                                                 (synchronous-commit-wait-mode)))
+                                       (outcome nil)
+                                       (wal-ready-at-entry-p *wal-ready*)
+                                       (xid (backend-xid b)))
                 (unwind-protect
-                     (progn
-                       (wal-commit-transaction
-                        xid
-                        (lambda ()
-                          (clog-set xid +clog-committed+ :fsync (not wal-ready-at-entry-p))
-                          (setf irreversible t))
-                        changes
-                        (lambda (end)
-                          (setf irreversible t)
-                          ;; Capture this terminal after marking the commit irreversible.
-                          (record-transaction-wal-boundary obligation source end nil)))
-                       ;; Wait after local commit and apply, before releasing the XID.
-                       (setf outcome (wait-for-committed-wal-obligation b obligation mode)))
+                     (unwind-protect
+                          (multiple-value-bind (end receipt)
+                              (wal-commit-transaction
+                               xid
+                               (lambda ()
+                                 (clog-set xid +clog-committed+ :fsync (not wal-ready-at-entry-p))
+                                 (setf irreversible t))
+                               :logical-changes changes
+                               :terminal-durable-function
+                               (lambda (end)
+                                 (setf irreversible t durable-end end)
+                                 (record-transaction-wal-boundary obligation source end nil))
+                               :source-id source
+                               :accepted-function (lambda (receipt)
+                                                    (setf irreversible t accepted receipt)))
+                            ;; A normal storage return is postcommit even if its receipt is malformed.
+                            (setf irreversible t)
+                            (validate-wal-commit-receipt
+                             receipt accepted xid source end durable-end wal-ready-at-entry-p)
+                            (setf outcome (wait-for-committed-wal-obligation b obligation mode))
+                            (setf completion-safe t))
+                       (when (and irreversible (not completion-safe))
+                         (suppress-backend-frontend-output b :invalid-commit-receipt)))
                   (when (or irreversible (and wal-ready-at-entry-p *wal-poisoned*))
                     (finish-committed-transaction b xid)))
                 (finish-synchronous-commit-response b outcome)))))

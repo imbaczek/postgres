@@ -1027,7 +1027,8 @@ Each entry in SEGMENTS contains a segment number followed by its byte vectors."
                          44 (lambda ()
                               (rove:ok flushed)
                               (setf callback t)
-                              (incf *wal-end-lsn* 1000)))))
+                              (incf *wal-end-lsn* 1000))
+                         :source-id :fixture-source)))
                (rove:ok callback)
                (rove:ok (eql end terminal)
                         "return the transaction terminal, not subsequent global WAL progress"))
@@ -1036,6 +1037,145 @@ Each entry in SEGMENTS contains a segment number followed by its byte vectors."
                         "a no-WAL commit has no replication boundary")))
         (dolist (entry saved) (setf (symbol-function (car entry)) (cdr entry)))
         (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))
+
+(defun commit-receipt-test-result (&key (source :source-a) (supply-source t) fault)
+  (let* ((directory (merge-pathnames
+                     (format nil "pg-commit-receipt-~d-~d/" (sb-posix:getpid) (random 1000000))
+                     (uiop:temporary-directory)))
+         (*query-temp-directory* directory)
+         (*backend* nil) (*wal-ready* t) (*wal-poisoned* nil) (*wal-output-stream* nil)
+         (*wal-dirty-store* nil) (*wal-page-cache* (make-hash-table :test #'equal))
+         (*wal-page-cache-xids* (make-hash-table :test #'equal)) (*wal-end-lsn* 100)
+         (names '(wal-append-running-xacts-under-lock wal-append-batch-start wal-append-record
+                  wal-flush wal-slot-record-xid-commit-under-wal-lock wal-test-pause
+                  wal-primary-apply-page-spool close-logical-spool wal-fail-stop))
+         (saved (mapcar (lambda (name) (cons name (symbol-function name))) names))
+         (close (symbol-function 'close-logical-spool))
+         (events nil) (accepted nil) (end nil) (receipt nil) (failure nil))
+    (ensure-directories-exist directory)
+    (unwind-protect
+         (progn
+           (setf (symbol-function 'wal-append-running-xacts-under-lock)
+                 (lambda (xid) (declare (ignore xid)))
+                 (symbol-function 'wal-append-batch-start) (lambda () 100)
+                 (symbol-function 'wal-append-record)
+                 (lambda (type xid payload)
+                   (declare (ignore payload))
+                   (unless (and (= type +wal-record-commit+) (= xid 44)) (error "unexpected record"))
+                   (push :terminal events) (setf *wal-end-lsn* 140))
+                 (symbol-function 'wal-flush) (lambda () (push :flush events))
+                 (symbol-function 'wal-slot-record-xid-commit-under-wal-lock)
+                 (lambda (&rest arguments) (declare (ignore arguments)))
+                 (symbol-function 'wal-test-pause)
+                 (lambda (point)
+                   (when (eq point :after-wal-flush)
+                     (push :hook events)
+                     (when (eq fault :hook) (error "receipt hook failure"))))
+                 (symbol-function 'wal-primary-apply-page-spool)
+                 (lambda (&rest arguments)
+                   (declare (ignore arguments))
+                   (push :apply events)
+                   (when (eq fault :apply) (error "receipt apply failure")))
+                 (symbol-function 'close-logical-spool)
+                 (lambda (spool)
+                   (funcall close spool)
+                   (push :close events)
+                   (when (eq fault :close) (error "receipt close failure")))
+                 (symbol-function 'wal-fail-stop)
+                 (lambda (condition)
+                   (when (sb-thread:holding-mutex-p *wal-lock*) (error "fail-stop still holds WAL"))
+                   (setf *wal-poisoned* t)
+                   (error condition)))
+           (handler-case
+               (catch 'receipt-exit
+                 (multiple-value-setq (end receipt)
+                   (apply #'wal-commit-transaction
+                          44 (lambda () (push :local events) (incf *wal-end-lsn* 1000))
+                          (append
+                           (list :terminal-durable-function
+                                 (lambda (terminal)
+                                   (unless (= terminal 140) (error "wrong durable terminal"))
+                                   (push :durable events))
+                                 :accepted-function
+                                 (lambda (value)
+                                   (unless (sb-thread:holding-mutex-p *wal-lock*) (error "acceptance lost WAL exclusion"))
+                                   (when sb-sys:*interrupts-enabled* (error "acceptance permits interrupts"))
+                                   (setf accepted value)
+                                   (push :accepted events)
+                                   (when (eq fault :accept) (error "receipt acceptance failure"))
+                                   (when (eq fault :nonlocal-accept) (throw 'receipt-exit :escaped))))
+                           (when supply-source (list :source-id source))))))
+             (error (condition) (setf failure (princ-to-string condition))))
+           (list :events (nreverse events) :accepted accepted :end end :receipt receipt
+                 :failure failure :poisoned *wal-poisoned* :global-end *wal-end-lsn*))
+      (dolist (entry saved) (setf (symbol-function (car entry)) (cdr entry)))
+      (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))
+
+(cl-spec:defproperty commit-receipt-keeps-exact-source-and-terminal
+    ((source (range integer 0 1000000)))
+  (:about wal-commit-transaction)
+  (:trials (:normal 100))
+  (let* ((result (commit-receipt-test-result :source source))
+         (receipt (getf result :receipt)))
+    (and (not (getf result :failure))
+         (wal-commit-receipt-p receipt)
+         (eq receipt (getf result :accepted))
+         (= 44 (wal-commit-receipt-xid receipt))
+         (= source (wal-commit-receipt-source-id receipt))
+         (= 140 (wal-commit-receipt-terminal-end receipt) (getf result :end))
+         (wal-commit-receipt-wal-durable-p receipt)
+         (= 1140 (getf result :global-end))
+         (equal '(:terminal :flush :durable :hook :local :apply :close :accepted)
+                (getf result :events)))))
+
+(rove:deftest wal-commit-acceptance-receipt-contract
+    (unit-check-property 'commit-receipt-keeps-exact-source-and-terminal))
+
+(rove:deftest wal-commit-receipt-rejects-source-before-publication
+    (dolist (arguments '((:supply-source nil) (:source "mutable") (:source #(1))))
+      (let ((result (apply #'commit-receipt-test-result arguments)))
+        (rove:ok (and (getf result :failure) (search "source" (getf result :failure))))
+        (rove:ok (null (getf result :events)))
+        (rove:ok (null (getf result :accepted)))
+        (rove:ok (null (getf result :poisoned)))
+        (rove:ok (= 100 (getf result :global-end))))))
+
+(rove:deftest wal-commit-receipt-failures-preserve-durable-callback-order
+    (dolist (fault '(:hook :apply :close :accept :nonlocal-accept))
+      (let ((result (commit-receipt-test-result :fault fault)))
+        (rove:ok (getf result :failure))
+        (rove:ok (getf result :poisoned))
+        (rove:ok (member :durable (getf result :events)))
+        (rove:ok (null (getf result :receipt)))
+        (rove:ok (null (getf result :end)))
+        (unless (member fault '(:accept :nonlocal-accept))
+          (rove:ok (null (getf result :accepted)))))))
+
+(rove:deftest wal-commit-receipt-allows-an-explicit-nil-source
+    (let* ((result (commit-receipt-test-result :source nil))
+           (receipt (getf result :receipt)))
+      (rove:ok (null (getf result :failure)))
+      (rove:ok (wal-commit-receipt-p receipt))
+      (rove:ok (null (wal-commit-receipt-source-id receipt)))
+      (rove:ok (wal-commit-receipt-wal-durable-p receipt))))
+
+(rove:deftest wal-commit-receipt-without-wal-has-no-wal-proof
+    (let ((*wal-ready* nil) (*backend* nil) (events nil) (accepted nil))
+      (multiple-value-bind (end receipt)
+          (wal-commit-transaction
+           44 (lambda () (push :local events))
+           :terminal-durable-function (lambda (end) (declare (ignore end)) (error "no-WAL completion reported WAL durability"))
+           :source-id nil
+           :accepted-function (lambda (value)
+                                (when sb-sys:*interrupts-enabled* (error "unmasked acceptance"))
+                                (setf accepted value)
+                                (push :accepted events)))
+        (rove:ok (null end))
+        (rove:ok (eq receipt accepted))
+        (rove:ok (= 44 (wal-commit-receipt-xid receipt)))
+        (rove:ok (null (wal-commit-receipt-terminal-end receipt)))
+        (rove:ok (null (wal-commit-receipt-wal-durable-p receipt)))
+        (rove:ok (equal '(:local :accepted) (nreverse events))))))
 
 (defun call-with-catalog-boundary-test (function &key chunked fault (wal-ready t))
   (let* ((directory (merge-pathnames
@@ -1315,7 +1455,7 @@ Each entry in SEGMENTS contains a segment number followed by its byte vectors."
                            (finish-output file)))
                        (funcall old-map spool function)))
                (rove:ok (handler-case
-                            (progn (wal-commit-transaction 44 (lambda () (setf callback t))) nil)
+                            (progn (wal-commit-transaction 44 (lambda () (setf callback t)) :source-id :fixture-source) nil)
                           (error (condition) (search "checksum mismatch" (princ-to-string condition)))))
                (rove:ok *wal-poisoned*)
                (rove:ok (zerop writes))

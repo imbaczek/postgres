@@ -79,6 +79,13 @@ Runtime retention requires a captured installed policy.")
 
 (declaim (ftype function cleanup-invalidated-logical-replication-state))
 
+(defstruct (wal-commit-receipt
+            (:constructor %make-wal-commit-receipt (xid source-id terminal-end wal-durable-p)))
+  (xid nil :read-only t)
+  (source-id nil :read-only t)
+  (terminal-end nil :read-only t)
+  (wal-durable-p nil :read-only t))
+
 (defstruct wal-record
   version type xid start end payload)
 
@@ -1413,24 +1420,36 @@ the transaction (see SnapBuildCommitTxn and CreateInitDecodingContext)."
 
 (declaim (ftype function wal-validate-logical-binary-capability-under-lock))
 
-(defun wal-commit-transaction (xid after-durable-function &optional logical-changes terminal-durable-function)
+(defun wal-commit-transaction
+    (xid after-durable-function &key logical-changes terminal-durable-function
+                                  (source-id nil source-id-supplied-p) accepted-function)
   "Flush storage resets, page images and XID's commit as one WAL boundary.
 The reset descriptors are owned here across AFTER-DURABLE-FUNCTION, which may
 release the transaction's private replacements. Preflight the page spool before
 the terminal, then flush WAL before truncating any relation fork. Return this
 transaction's commit record end LSN after local storage apply completes. When
-WAL is unavailable, return no values. With WAL ready, TERMINAL-DURABLE-FUNCTION,
+WAL is unavailable, return NIL and a receipt without WAL proof. With WAL ready, TERMINAL-DURABLE-FUNCTION,
 when supplied, receives the exact end LSN immediately after the flush, before
 AFTER-DURABLE-FUNCTION. In that WAL-ready path, incomplete publication fail-stops
-after releasing WAL; the first error is retained even if cleanup also fails."
+after releasing WAL; the first error is retained even if cleanup also fails.
+Return an immutable acceptance receipt as the second value. SOURCE-ID must be
+explicit for WAL-ready publication. ACCEPTED-FUNCTION receives that receipt after
+successful apply and spool cleanup, under the publication fence."
+  (when (and *wal-ready* (not source-id-supplied-p))
+    (error "WAL commit requires an explicit source identity"))
+  (unless (typep source-id '(or symbol integer))
+    (error "WAL commit source identity must be immutable"))
   (unless *wal-ready*
-    (when (fboundp 'publish-transaction-replacements-under-wal-lock)
-      (with-wal-critical
-        (funcall 'publish-transaction-replacements-under-wal-lock
-                 (when (boundp '*backend*) (symbol-value '*backend*)) t)))
-    (funcall after-durable-function)
-    (return-from wal-commit-transaction (values)))
-  (let ((commit-lsn nil))
+    (sb-sys:without-interrupts
+      (when (fboundp 'publish-transaction-replacements-under-wal-lock)
+        (with-wal-critical
+          (funcall 'publish-transaction-replacements-under-wal-lock
+                   (when (boundp '*backend*) (symbol-value '*backend*)) t)))
+      (funcall after-durable-function)
+      (let ((receipt (%make-wal-commit-receipt xid source-id nil nil)))
+        (when accepted-function (funcall accepted-function receipt))
+        (return-from wal-commit-transaction (values nil receipt)))))
+  (let ((commit-lsn nil) (receipt nil))
     (sb-sys:without-interrupts
       (with-wal-publication-fence (begin-publication)
         (wal-validate-logical-binary-capability-under-lock xid)
@@ -1465,8 +1484,10 @@ after releasing WAL; the first error is retained even if cleanup also fails."
             (when resets (wal-test-pause :after-relation-resets))
             (wal-primary-apply-page-spool spool :split-p split-p :fault-on-first-write t)
             (wal-clear-page-cache)
-            (setf *wal-pending-btree-split* nil)))))
-    commit-lsn))
+            (setf *wal-pending-btree-split* nil)))
+        (setf receipt (%make-wal-commit-receipt xid source-id commit-lsn t))
+        (when accepted-function (funcall accepted-function receipt))))
+    (values commit-lsn receipt)))
 
 (defun wal-commit-maintenance ()
   "Durably publish staged storage maintenance without committing a user XID."

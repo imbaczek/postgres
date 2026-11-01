@@ -161,7 +161,8 @@
      (lambda ()
        (let ((writer (pg::assign-xid)) (other (pg::assign-xid)) (records nil))
          (pg::wal-commit-transaction writer
-                                     (lambda () (pg::clog-set writer 1) (pg::release-xid writer)))
+                                     (lambda () (pg::clog-set writer 1) (pg::release-xid writer))
+                                     :source-id :fixture-source)
          (pg::wal-scan (lambda (record) (push record records)))
          (setf records (nreverse records))
          (ok (equal '(6 12 6 14 6 2) (mapcar #'pg::wal-record-type records)))
@@ -190,7 +191,8 @@
                           (incf checked))
                         (funcall append-record type xid payload)))
                 (pg::wal-commit-transaction writer
-                                            (lambda () (pg::clog-set writer 1) (pg::release-xid writer)))
+                                            (lambda () (pg::clog-set writer 1) (pg::release-xid writer))
+                                            :source-id :fixture-source)
                 (ok (= 2 checked)))
            (setf (symbol-function 'pg::wal-append-record) append-record))))))
 

@@ -1280,7 +1280,7 @@
       (logical-require-binary-bytea-for-xid 101 42)
       (setf (gethash "text_slot" *wal-replication-slots*) slot)
       (rove:ok (handler-case
-                   (progn (wal-commit-transaction 101 (lambda () (setf committed t))) nil)
+                   (progn (wal-commit-transaction 101 (lambda () (setf committed t)) :source-id :fixture-source) nil)
                  (wal-input-validation-error () t)))
       (rove:ok (and (not committed) (not *wal-poisoned*)
                     (= *wal-end-lsn* 123) (= *wal-durable-lsn* 100)))

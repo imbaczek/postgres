@@ -571,6 +571,11 @@
        (rove:ok (zerop *active-snapshots*))
        (rove:ok (zerop (hash-table-count (extended-query-state-portals *extended-query-state*)))))))
 
+(defun complete-test-commit-receipt (xid source end accepted-function)
+  (let ((receipt (%make-wal-commit-receipt xid source end (not (null end)))))
+    (when accepted-function (funcall accepted-function receipt))
+    (values end receipt)))
+
 (rove:deftest select-portal-precommit-closes-before-wal-and-xid-release
     (call-with-select-portal-test
      (lambda (stream)
@@ -587,18 +592,19 @@
                   (query-execution-owner-add-cleanup owner (lambda () (push :owner events))))
                 (setf (backend-xid *backend*) 777
                       (symbol-function 'wal-commit-transaction)
-                      (lambda (xid after &optional changes terminal-durable)
-                        (declare (ignore xid changes))
+                      (lambda (xid after &key logical-changes terminal-durable-function source-id accepted-function)
+                        (declare (ignore logical-changes))
                         (push :wal events)
                         (rove:ok (zerop *active-snapshots*))
-                        (when (and *wal-ready* terminal-durable)
-                          (funcall terminal-durable 140))
+                        (when (and *wal-ready* terminal-durable-function)
+                          (funcall terminal-durable-function 140))
                         (funcall after)
                         (rove:ok (eql (backend-xid *backend*) 777)
                                  "durable publication retains the transaction identity")
                         (rove:ok (not (member :release events))
                                  "storage apply precedes XID release")
-                        (push :storage-applied events))
+                        (push :storage-applied events)
+                        (complete-test-commit-receipt xid source-id (when *wal-ready* 140) accepted-function))
                       (symbol-function 'clog-set)
                       (lambda (&rest arguments) (declare (ignore arguments)))
                       (symbol-function 'release-xid)
@@ -637,14 +643,15 @@
                             (declare (ignore arguments))
                             (when (eq phase :clog) (error "CLOG publication failure")))
                           (symbol-function 'wal-commit-transaction)
-                          (lambda (xid after &optional changes terminal-durable)
-                            (declare (ignore xid changes))
+                          (lambda (xid after &key logical-changes terminal-durable-function source-id accepted-function)
+                            (declare (ignore logical-changes))
                             (when (eq phase :before) (error "before durable terminal"))
-                            (when (and *wal-ready* terminal-durable)
-                              (funcall terminal-durable 140))
+                            (when (and *wal-ready* terminal-durable-function)
+                              (funcall terminal-durable-function 140))
                             (funcall after)
                             (when (eq phase :storage) (error "storage apply failure"))
-                            140))
+                            (complete-test-commit-receipt xid source-id (when *wal-ready* 140)
+                                                          accepted-function)))
                     (let ((failed (handler-case (progn (commit-transaction) nil)
                                     (error () t))))
                       (rove:ok (eql failed (not (eq phase :success)))))
@@ -815,12 +822,13 @@
                    (symbol-function 'release-xid)
                    (lambda (&rest arguments) (declare (ignore arguments)))
                    (symbol-function 'wal-commit-transaction)
-                   (lambda (xid after &optional changes durable)
-                     (declare (ignore xid changes))
-                     (funcall durable 140)
+                   (lambda (xid after &key logical-changes terminal-durable-function source-id accepted-function)
+                     (declare (ignore logical-changes))
+                     (rove:ok (eq :own source-id))
+                     (funcall terminal-durable-function 140)
                      (funcall after)
                      (setf *wal-end-lsn* 999)
-                     999))
+                     (complete-test-commit-receipt xid source-id 140 accepted-function)))
              (dolist (writes '(nil t))
                (let* ((*backend* (make-backend :xid 777 :state :in-progress :read-only nil
                                                :dirty-relations (when writes '(123))))
@@ -837,6 +845,127 @@
         (setf (symbol-function 'wal-commit-transaction) wal
               (symbol-function 'clog-set) clog
               (symbol-function 'release-xid) release))))
+
+(rove:deftest commit-receipt-validates-acceptance-without-inventing-wal-proof
+    (dolist (case '((t 140 140 t) (nil nil nil nil)))
+      (destructuring-bind (wal-ready-p end durable-end proof) case
+        (let ((receipt (%make-wal-commit-receipt 44 :source-a end proof)))
+          (rove:ok (eq receipt
+                       (validate-wal-commit-receipt
+                        receipt receipt 44 :source-a end durable-end wal-ready-p)))))))
+
+(rove:deftest commit-receipt-rejects-missing-and-inconsistent-facts
+    (dolist (fault '(:missing :different-object :xid :source :end :proof :missing-durability :bad-terminal :absent-flush))
+      (let* ((receipt (%make-wal-commit-receipt
+                       (if (eq fault :xid) 45 44) (if (eq fault :source) :source-b :source-a)
+                       (case fault (:end 141) (:bad-terminal 0) (t 140))
+                       (not (member fault '(:proof :absent-flush)))))
+             (accepted receipt)
+             (returned (case fault (:missing nil)
+                             (:different-object (%make-wal-commit-receipt 44 :source-a 140 t))
+                             (t receipt)))
+             (end (if (eq fault :bad-terminal) 0 140))
+             (durable-end (case fault ((:missing-durability :absent-flush) nil) (:bad-terminal 0) (t 140))))
+        (rove:ok (handler-case
+                     (progn (validate-wal-commit-receipt returned accepted 44 :source-a end durable-end t) nil)
+                   (pg-error (condition) (fatal-error-p condition)))))))
+
+(rove:deftest commit-receipt-failure-closes-output-and-finishes-committed-cleanup
+    (dolist (fault '(:missing :wrong-source :nonlocal :missing-durable-callback))
+      (call-with-select-portal-test
+       (lambda (stream)
+         (let* ((*wal-ready* t) (*wal-poisoned* nil)
+                                (names '(wal-commit-transaction clog-set release-xid validate-wal-commit-receipt))
+                                (saved (mapcar (lambda (name) (cons name (symbol-function name))) names))
+                                (validate (symbol-function 'validate-wal-commit-receipt))
+                                (committed nil) (released nil) (outcome nil))
+           (unwind-protect
+                (progn
+                  (setf (backend-stream *backend*) stream
+                        (backend-xid *backend*) 777
+                        (backend-dirty-relations *backend*) '(999)
+                        (symbol-function 'clog-set)
+                        (lambda (xid status &key fsync)
+                          (declare (ignore xid fsync))
+                          (setf committed (= status +clog-committed+)))
+                        (symbol-function 'release-xid)
+                        (lambda (&rest arguments) (declare (ignore arguments)) (setf released t))
+                        (symbol-function 'validate-wal-commit-receipt)
+                        (lambda (&rest arguments)
+                          (when (eq fault :nonlocal) (throw 'receipt-check-exit :escaped))
+                          (apply validate arguments))
+                        (symbol-function 'wal-commit-transaction)
+                        (lambda (xid after &key logical-changes terminal-durable-function source-id accepted-function)
+                          (declare (ignore logical-changes))
+                          (unless (eq fault :missing-durable-callback)
+                            (funcall terminal-durable-function 140))
+                          (funcall after)
+                          (let ((receipt (%make-wal-commit-receipt
+                                          xid (if (eq fault :wrong-source) :wrong-source source-id) 140
+                                          (not (eq fault :missing-durable-callback)))))
+                            (funcall accepted-function receipt)
+                            (values 140 (unless (eq fault :missing) receipt)))))
+                  (setf outcome (handler-case
+                                    (catch 'receipt-check-exit (commit-transaction) :returned)
+                                  (pg-error (condition) (if (fatal-error-p condition) :fatal :ordinary-error))))
+                  (rove:ok (eq outcome (if (eq fault :nonlocal) :escaped :fatal)))
+                  (rove:ok committed)
+                  (rove:ok released)
+                  (rove:ok (null (backend-xid *backend*)))
+                  (rove:ok (eq :idle (backend-state *backend*)))
+                  (rove:ok (null (backend-wal-obligation *backend*)))
+                  (rove:ok (backend-frontend-output-suppressed-p stream))
+                  (rove:ok (not *wal-poisoned*))
+                  (send-command-complete stream "COMMIT")
+                  (rove:ok (zerop (file-length stream))))
+             (dolist (entry saved) (setf (symbol-function (car entry)) (cdr entry)))
+             (setf (backend-xid *backend*) nil)))))))
+
+(rove:deftest no-wal-acceptance-tail-failure-is-terminal-after-direct-commit
+    (dolist (fault '(:error :nonlocal))
+      (call-with-select-portal-test
+       (lambda (stream)
+         (let* ((*wal-ready* nil) (*wal-poisoned* nil)
+                                  (wal (symbol-function 'wal-commit-transaction))
+                                  (clog (symbol-function 'clog-set))
+                                  (release (symbol-function 'release-xid))
+                                  (committed nil) (released nil) (outcome nil))
+           (unwind-protect
+                (progn
+                  (setf (backend-stream *backend*) stream
+                        (backend-xid *backend*) 777
+                        (symbol-function 'clog-set)
+                        (lambda (xid status &key fsync)
+                          (declare (ignore xid fsync))
+                          (setf committed (= status +clog-committed+)))
+                        (symbol-function 'release-xid)
+                        (lambda (&rest arguments) (declare (ignore arguments)) (setf released t))
+                        (symbol-function 'wal-commit-transaction)
+                        (lambda (xid after &rest options)
+                          (let ((accepted (getf options :accepted-function)))
+                            (setf (getf options :accepted-function)
+                                  (lambda (receipt)
+                                    (funcall accepted receipt)
+                                    (if (eq fault :error)
+                                        (error "no-WAL acceptance failure")
+                                        (throw 'no-wal-acceptance-exit :escaped))))
+                            (apply wal xid after options))))
+                  (setf outcome (handler-case
+                                    (catch 'no-wal-acceptance-exit (commit-transaction) :returned)
+                                  (error () :failed)))
+                  (rove:ok (eq outcome (if (eq fault :error) :failed :escaped)))
+                  (rove:ok committed)
+                  (rove:ok released)
+                  (rove:ok (null (backend-xid *backend*)))
+                  (rove:ok (eq :idle (backend-state *backend*)))
+                  (rove:ok (not *wal-poisoned*))
+                  (rove:ok (backend-frontend-output-suppressed-p stream))
+                  (send-command-complete stream "COMMIT")
+                  (rove:ok (zerop (file-length stream))))
+             (setf (symbol-function 'wal-commit-transaction) wal
+                   (symbol-function 'clog-set) clog
+                   (symbol-function 'release-xid) release
+                   (backend-xid *backend*) nil)))))))
 
 (rove:deftest catalog-save-records-only-active-backend-durable-ends
     (let* ((names '(catalog-compute-oldest-relfrozenxid catalog-image-bytes wal-commit-catalog
