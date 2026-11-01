@@ -48,6 +48,137 @@ Each entry in SEGMENTS contains a segment number followed by its byte vectors."
     (file-position in (clog-byte-index xid))
     (ldb (byte 2 (clog-bit-shift xid)) (read-byte in nil 0))))
 
+(defun pending-clog-reservation-result (slot)
+  (call-with-pending-clog-test
+   (lambda ()
+     (let* ((xid (+ 12 slot))
+            (neighbor (+ 12 (mod (1+ slot) 4)))
+            (owner (list :prepared-owner))
+            (completion nil))
+       (sb-thread:with-mutex (*wal-lock*)
+         (setf completion (clog-reserve-commit-under-wal-lock xid 240 owner)))
+       (clog-set neighbor +clog-aborted+ :fsync t)
+       (clog-fsync)
+       (and (= +clog-in-progress+ (clog-get xid))
+            (= +clog-in-progress+ (pending-clog-raw-status xid))
+            (= +clog-aborted+ (pending-clog-raw-status neighbor))
+            (eq owner (clog-commit-completion-owner completion))
+            (eq :reserved (clog-commit-completion-state completion))
+            (handler-case (progn (clog-set xid +clog-aborted+) nil)
+              (wal-input-validation-error () t))
+            (handler-case (progn (clog-init) nil)
+              (wal-input-validation-error () t))
+            (sb-thread:with-mutex (*wal-lock*)
+              (clog-cancel-reserved-commit-under-wal-lock completion owner)
+              (zerop (hash-table-count *clog-pending-commits*))))))))
+
+(cl-spec:defproperty reserved-clog-neighbor-writes-remain-in-progress
+    ((slot (range integer 0 3)))
+  (:about clog-reserve-commit-under-wal-lock)
+  (:trials (:normal 100))
+  (pending-clog-reservation-result slot))
+
+(rove:deftest reserved-clog-is-invisible-but-excludes-storage-writers
+    (unit-check-property 'reserved-clog-neighbor-writes-remain-in-progress))
+
+(rove:deftest reserved-clog-retains-ambiguous-terminal-attempt
+    (call-with-pending-clog-test
+     (lambda ()
+       (sb-thread:with-mutex (*wal-lock*)
+         (let* ((owner (list :prepared-owner))
+                (completion (clog-reserve-commit-under-wal-lock 12 240 owner)))
+           (rove:ok
+            (handler-case
+                (progn (clog-check-commit-boundary-under-wal-lock 12 240) nil)
+              (wal-input-validation-error () t)))
+           (clog-begin-reserved-commit-under-wal-lock completion owner)
+           (rove:ok
+            (handler-case
+                (progn (clog-cancel-reserved-commit-under-wal-lock completion owner) nil)
+              (wal-input-validation-error () t)))
+           (rove:ok (eq completion (gethash 12 *clog-pending-commits*)))
+           (rove:ok (eq owner (clog-commit-completion-owner completion)))
+           (rove:ok (= +clog-in-progress+ (clog-get 12)))
+           (setf *wal-end-lsn* 241)
+           (rove:ok
+            (handler-case
+                (progn (clog-publish-reserved-commit-under-wal-lock completion owner 240) nil)
+              (wal-input-validation-error () t)))
+           (rove:ok (eq :inserting (clog-commit-completion-state completion)))
+           (setf *wal-end-lsn* 240)
+           (clog-publish-reserved-commit-under-wal-lock completion owner 240)
+           (rove:ok (= +clog-in-progress+ (clog-get 12)))
+           (rove:ok
+            (handler-case
+                (progn (clog-complete-reserved-commit-under-wal-lock completion owner) nil)
+              (wal-input-validation-error () t)))
+           (rove:ok (= +clog-in-progress+ (pending-clog-raw-status 12)))
+           (setf *wal-durable-lsn* 240)
+           (clog-complete-reserved-commit-under-wal-lock completion owner)
+           (rove:ok (eq :materialized (clog-commit-completion-state completion)))
+           (rove:ok (zerop (hash-table-count *clog-pending-commits*)))
+           (rove:ok (= +clog-committed+ (pending-clog-raw-status 12)))
+           (clog-complete-reserved-commit-under-wal-lock completion owner))))))
+
+(rove:deftest reserved-clog-write-failure-retains-completion-for-retry
+    (call-with-pending-clog-test
+     (lambda ()
+       (let ((write (symbol-function 'clog-write-status-under-lock))
+             (calls 0))
+         (unwind-protect
+              (sb-thread:with-mutex (*wal-lock*)
+                (let* ((owner (list :prepared-owner))
+                       (completion (clog-reserve-commit-under-wal-lock 12 240 owner))
+                       (failure (make-condition 'simple-error :format-control "CLOG write failure")))
+                  (clog-begin-reserved-commit-under-wal-lock completion owner)
+                  (setf *wal-end-lsn* 240 *wal-durable-lsn* 240)
+                  (clog-publish-reserved-commit-under-wal-lock completion owner 240)
+                  (setf (symbol-function 'clog-write-status-under-lock)
+                        (lambda (&rest arguments)
+                          (declare (ignore arguments))
+                          (incf calls)
+                          (error failure)))
+                  (rove:ok
+                   (eq failure
+                       (handler-case
+                           (clog-complete-reserved-commit-under-wal-lock completion owner)
+                         (error (condition) condition))))
+                  (rove:ok (eq completion (gethash 12 *clog-pending-commits*)))
+                  (rove:ok (eq :committed (clog-commit-completion-state completion)))
+                  (rove:ok (= +clog-committed+ (clog-get 12)))
+                  (rove:ok (= +clog-in-progress+ (pending-clog-raw-status 12)))
+                  (setf (symbol-function 'clog-write-status-under-lock)
+                        (lambda (&rest arguments) (incf calls) (apply write arguments)))
+                  (clog-complete-reserved-commit-under-wal-lock completion owner)
+                  (clog-complete-reserved-commit-under-wal-lock completion owner)
+                  (rove:ok (= calls 2))
+                  (rove:ok (eq :materialized (clog-commit-completion-state completion)))
+                  (rove:ok (zerop (hash-table-count *clog-pending-commits*)))))
+           (setf (symbol-function 'clog-write-status-under-lock) write))))))
+
+(rove:deftest reserved-clog-rejects-foreign-identity-and-conflicting-slot
+    (call-with-pending-clog-test
+     (lambda ()
+       (sb-thread:with-mutex (*wal-lock*)
+         (let* ((owner (list :prepared-owner))
+                (completion (clog-reserve-commit-under-wal-lock 12 240 owner))
+                (token *wal-storage-incarnation*))
+           (dolist (fault '(:owner :alias :end :store :timeline))
+             (let ((*wal-storage-incarnation* (if (eq fault :store) (gensym "OTHER-") token))
+                   (*wal-insert-timeline* (if (eq fault :timeline) 2 1)))
+               (rove:ok
+                (handler-case
+                    (progn
+                      (case fault
+                        (:alias (clog-reserve-commit-under-wal-lock (+ 12 (ash 1 32)) 240 owner))
+                        (:end (clog-reserve-commit-under-wal-lock 12 241 owner))
+                        (t (clog-begin-reserved-commit-under-wal-lock
+                            completion (if (eq fault :owner) (list :foreign) owner))))
+                      nil)
+                  (wal-input-validation-error () t)))))
+           (rove:ok (eq :reserved (clog-commit-completion-state completion)))
+           (clog-cancel-reserved-commit-under-wal-lock completion owner))))))
+
 (defun pending-clog-neighbor-result (slot status)
   (call-with-pending-clog-test
    (lambda ()
@@ -61,7 +192,7 @@ Each entry in SEGMENTS contains a segment number followed by its byte vectors."
               (= +clog-committed+ (clog-get (+ xid (ash 1 32))))
               (= +clog-in-progress+ (pending-clog-raw-status xid))
               (= status (pending-clog-raw-status neighbor))
-              (eq tag (gethash (xid32-of xid) *clog-pending-commits*))))))))
+              (eq tag (clog-commit-completion-tag (gethash (xid32-of xid) *clog-pending-commits*)))))))))
 
 (cl-spec:defproperty pending-clog-neighbor-writes-preserve-wal-dependency
     ((slot (range integer 0 3)) (status (range integer 1 2)))
@@ -80,7 +211,7 @@ Each entry in SEGMENTS contains a segment number followed by its byte vectors."
          (let ((tag (clog-stage-commit-under-wal-lock 12 140)))
            (rove:ok (handler-case (progn (clog-materialize-commit-under-wal-lock tag) nil)
                       (wal-input-validation-error () t)))
-           (rove:ok (eq tag (gethash 12 *clog-pending-commits*)))
+           (rove:ok (eq tag (clog-commit-completion-tag (gethash 12 *clog-pending-commits*))))
            (rove:ok (= +clog-in-progress+ (pending-clog-raw-status 12)))
            (setf *wal-durable-lsn* 140)
            (clog-materialize-commit-under-wal-lock tag)
@@ -112,7 +243,7 @@ Each entry in SEGMENTS contains a segment number followed by its byte vectors."
                         (t (clog-materialize-commit-under-wal-lock tag)))
                       nil)
                   (wal-input-validation-error () t)))))
-           (rove:ok (eq tag (gethash 12 *clog-pending-commits*)))
+           (rove:ok (eq tag (clog-commit-completion-tag (gethash 12 *clog-pending-commits*))))
            (rove:ok (= +clog-in-progress+ (pending-clog-raw-status 12)))
            (clog-materialize-commit-under-wal-lock tag))))))
 
@@ -159,7 +290,7 @@ Each entry in SEGMENTS contains a segment number followed by its byte vectors."
                            nil)
                        (error (condition)
                          (if (eq phase :finish) (typep condition 'stream-error) t))))
-                    (rove:ok (eq tag (gethash 12 *clog-pending-commits*)))
+                    (rove:ok (eq tag (clog-commit-completion-tag (gethash 12 *clog-pending-commits*))))
                     (rove:ok (= +clog-committed+ (clog-get 12)))
                     (setf (symbol-function 'clog-write-status-under-lock) write
                           (symbol-function 'fsync-stream) sync)
