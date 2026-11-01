@@ -32,6 +32,8 @@ When both locks are needed, take WAL before the writer state lock."
             (:constructor %make-clog-reset-epoch-plan
                 (service generation thread epoch old-incarnation new-incarnation
                  timeline ownership replacement)))
+  "Preallocated reset identities and writer registration for one publication.
+The descriptors are immutable; CONSUMED-P prevents reuse."
   (service nil :read-only t)
   (generation 0 :read-only t)
   (thread nil :read-only t)
@@ -74,6 +76,9 @@ When both locks are needed, take WAL before the writer state lock."
   t)
 
 (defun prepare-primary-wal-writer-clog-reset-under-lock ()
+  "Prepare the reset identity and replacement epoch under WAL then state lock.
+A writer already stopping cannot be prepared; a later stop remains in effect.
+Do not require an empty temp domain here: reset WAL can retire dirty scratch."
   (assert (sb-thread:holding-mutex-p *wal-lock*))
   (wal-require-no-pending-storage)
   (sb-thread:with-mutex (*primary-wal-writer-lock*)
@@ -99,6 +104,8 @@ When both locks are needed, take WAL before the writer state lock."
          (make-wal-writer-epoch incarnation *wal-insert-timeline* *postmaster-data-lock*))))))
 
 (defun validate-primary-wal-writer-clog-reset-plan-under-state-lock (plan)
+  "Check one unused plan and its captured writer and storage descriptors.
+An accepted plan permits a subsequent stop without clearing that request."
   (assert (sb-thread:holding-mutex-p *wal-lock*))
   (assert (sb-thread:holding-mutex-p *primary-wal-writer-lock*))
   (unless (and (clog-reset-epoch-plan-p plan)
@@ -152,6 +159,8 @@ When both locks are needed, take WAL before the writer state lock."
     (validate-primary-wal-writer-clog-reset-plan-under-state-lock plan)))
 
 (defun publish-primary-wal-writer-clog-reset-under-lock (plan)
+  "Revalidate and publish the paired identities under WAL then state lock.
+Consume PLAN in the same critical section so it cannot be reused."
   (assert (sb-thread:holding-mutex-p *wal-lock*))
   (sb-thread:with-mutex (*primary-wal-writer-lock*)
     (validate-primary-wal-writer-clog-reset-plan-under-state-lock plan)
@@ -164,6 +173,7 @@ When both locks are needed, take WAL before the writer state lock."
   (values))
 
 (defun require-primary-wal-writer-retired-under-lock ()
+  "Require any registered writer to be stopped, joined and no longer live."
   (assert (sb-thread:holding-mutex-p *wal-lock*))
   (sb-thread:with-mutex (*primary-wal-writer-lock*)
     (unless (primary-wal-writer-retired-under-state-lock-p *primary-wal-writer*)

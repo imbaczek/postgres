@@ -387,8 +387,9 @@ compatibility and tests. Production publication uses reserved completions."
 
 (defun clog-reset-file-under-wal-lock (fsync-function fsync-directory-function &optional epoch-plan)
   "Replace CLOG only after page, CLOG and temporary cleanup debt are absent.
-Check under WAL lock before touching the file. Rotate the storage incarnation
-after the file and its directory are durable."
+Check under WAL lock before closing the file. After the replacement file and
+its directory are durable and the file is reopened, publish the new store
+identity and any prepared writer epoch from the validated plan."
   (assert (sb-thread:holding-mutex-p *wal-lock*))
   (wal-require-no-pending-page-publication)
   (wal-require-no-temp-cleanup-under-lock)
@@ -415,7 +416,10 @@ after the file and its directory are durable."
 (defun clog-reset-under-wal-lock
     (fsync-function fsync-directory-function wal-reset-p &optional begin-publication)
   "Settle primary page debt, then require no debt through reset and epoch change.
-Caller holds WAL lock. Replay and cold reset require debt to be absent already."
+Caller holds WAL lock. Prepare the plan before logging the reset; that log applies
+dirty pages and can retire their shared scratch. The file helper then requires
+an empty temp domain before closing CLOG. Replay and cold reset require debt to
+be absent already."
   (assert (sb-thread:holding-mutex-p *wal-lock*))
   (when (and wal-reset-p *wal-ready*) (wal-settle-page-publications-under-lock))
   (wal-require-no-pending-storage)

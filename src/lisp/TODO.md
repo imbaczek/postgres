@@ -4,11 +4,20 @@
   loop or startup is enabled. The checkpoint passed 842 unit checks and strict
   cold compilation. The scoped property ran 100 trials at seed 4007 (digest
   `fnv1a64-v1:e5f7a51c19219c1c`); it has no Function Spec, and coverage and
-  rejection counts were not measured. Before activation, add the loop and its
-  start, stop and join lifecycle; reject storage adoption while a live or unjoined
-  writer remains; prepare and publish CLOG reset epochs; add pressure control;
-  and review the
-  empty-FIFO WAL flush path. OFF, Patroni and coordination remain open.
+  rejection counts were not measured. At that checkpoint, adoption guards and
+  CLOG reset epoch preparation and publication remained open.
+
+- [x] Guard storage adoption against live or unjoined writers and prepare and
+  publish CLOG reset epochs (`cf1a4a95d8d`). The checkpoint passed 851 unit,
+  1,413 physical, 1,161 legacy and five native CLOG checks, plus strict cold
+  compilation. Evidence is in `/home/imbaczek/proj/pg-ha-artifacts/wal-writer-epoch/`:
+  `physical-current.log`, `legacy-current.log`, `native-clog-current.log`, and
+  `cold-final.log`. The property `stale-clog-reset-plans-have-no-storage-effects`
+  ran 100 trials at seed 4008 (digest `fnv1a64-v1:c2552cb71de45bf9`); there is
+  no Function Spec, and coverage and rejection counts were not measured. Before
+  activation, add the loop and lifecycle, address concurrent join races, add
+  pressure control and review empty-FIFO WAL flushing. OFF and Patroni remain
+  open; no coordination was added.
 
 - [x] Add the generic transferable temporary cleanup domain foundation. At that
   checkpoint fresh private owners could be adopted before use, but no production
