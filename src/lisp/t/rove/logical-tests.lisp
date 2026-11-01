@@ -1928,6 +1928,45 @@
                (progn (tokenize "b'101") nil)
              (error (condition) (search "unterminated quoted string" (princ-to-string condition))))))
 
+(cl-spec:defproperty dollar-quoted-token-preserves-verbatim-body
+    ((tag-index (range integer 0 4)) (body-index (range integer 0 4)))
+  (:about scan-dollar-quoted-text tokenize)
+  (:trials (:normal 100))
+  (let* ((tag (nth tag-index '("" "Tag" "_a12" "é" "aB")))
+         (body (nth body-index
+                    (list "" "plain" "'quoted'; -- comment" "$different$ $1 $tag$ tail"
+                          (format nil "BEGIN~%PERFORM 'a\\b';~%END;"))))
+         (opening (format nil "$~a$" tag))
+         (sql (concatenate 'string "SELECT " opening body opening "; $2"))
+         (tokens (tokenize sql))
+         (literal (second tokens)))
+    (and (= 5 (length tokens))
+         (eq :string (token-kind literal))
+         (= 7 (token-pos literal))
+         (string= body (token-value literal))
+         (eq :parameter (token-kind (fourth tokens)))
+         (= 2 (token-value (fourth tokens))))))
+
+(rove:deftest dollar-quoted-strings-preserve-content-and-parameters
+    (unit-check-property 'dollar-quoted-token-preserves-verbatim-body))
+
+(rove:deftest dollar-quoted-delimiters-are-exact-and-errors-point-to-opening
+    (let ((tokens (tokenize "SELECT $Tag$a$tag$b$Tag$, ident$tag$;")))
+      (rove:ok (string= "a$tag$b" (token-value (second tokens))))
+      (rove:ok (string= "ident$tag$" (token-value (fourth tokens)))))
+  (dolist (entry '(("SELECT $$unterminated" . 8) ("SELECT $Tag$x$tag$" . 8)
+                   ("SELECT $1$x$1$" . 10) ("SELECT $a-b$x$a-b$" . 8)))
+    (rove:ok
+     (handler-case (progn (tokenize (car entry)) nil)
+       (pg-error (condition)
+         (and (string= "42601" (pg-error-sqlstate condition))
+              (= (cdr entry) (pg-error-position condition))))))))
+
+(rove:deftest dollar-quote-closing-delimiter-can-overlap-a-trailing-dollar
+    (multiple-value-bind (body end) (scan-dollar-quoted-text "$$a$$$" 0)
+      (rove:ok (string= "a" body))
+      (rove:ok (= 5 end))))
+
 (rove:deftest test-select-streamed-datarow-matches-legacy
     (let* ((base (format nil "pg-select-row-~d-~d" (sb-posix:getpid) (random 1000000)))
            (path-a (merge-pathnames (concatenate 'string base "-a") (uiop:temporary-directory)))
