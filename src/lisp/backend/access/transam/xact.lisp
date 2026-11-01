@@ -2554,11 +2554,9 @@ Run outside publication locks, clean up the transaction, then handle the outcome
                               (wal-commit-transaction
                                xid
                                (lambda (end)
-                                 (if wal-ready-at-entry-p
-                                     ;; After WAL flush, stage and immediately materialize; success leaves
-                                     ;; no pending commit. Without WAL the direct path fsyncs CLOG.
-                                     (clog-commit-durable-under-wal-lock xid end)
-                                     (clog-set xid +clog-committed+ :fsync t))
+                                 (declare (ignore end))
+                                 (unless wal-ready-at-entry-p
+                                   (clog-set xid +clog-committed+ :fsync t))
                                  (setf irreversible t))
                                :logical-changes changes
                                :terminal-durable-function

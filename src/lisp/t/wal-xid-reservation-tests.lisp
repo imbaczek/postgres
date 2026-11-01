@@ -73,6 +73,10 @@
     (let* ((pg::*pgdata* root) (pg::*backend* nil) (pg::*catalog* nil)
                                (pg::*catalog-oldest-relfrozenxid* nil) (pg::*physical-recovery-state* nil)
                                (pg::*wal-ready* nil) (pg::*wal-poisoned* nil)
+                               (pg::*physical-recovery-failed-p* nil)
+                               (pg::*wal-pending-page-publication* nil)
+                               (pg::*wal-pending-page-publication-tail* nil)
+                               (pg::*clog-pending-commits* (make-hash-table :test #'eql))
                                (pg::*startup-installed-configuration*
                                  (physical-slot-test-configuration
                                   (pg::make-wal-slot-retention-policy :mode :bytes :limit 1073741824) 0))

@@ -61,16 +61,18 @@ def instrumentation(case, pid):
 def instrument_pending_clog(server, pid):
     server.control(
         '(setf *receipt-test-staged* nil '
-        '(symbol-function \'clog-stage-commit-under-wal-lock) '
-        '(lambda (xid end) '
-        '(let ((tag (funcall *receipt-test-stage* xid end))) '
+        '(symbol-function \'clog-materialize-completion-under-lock) '
+        '(lambda (completion &key fsync) '
         f'(when (and *backend* (= (backend-pid *backend*) {pid})) '
         '(assert (sb-thread:holding-mutex-p *wal-lock*)) '
-        '(assert (<= end *wal-durable-lsn*)) '
-        '(assert (= +clog-committed+ (clog-get xid))) '
-        '(sb-thread:with-mutex (*clog-lock*) '
+        '(assert (sb-thread:holding-mutex-p *clog-lock*)) '
+        '(let* ((tag (clog-commit-completion-tag completion)) '
+        '(xid (clog-commit-tag-xid tag))) '
+        '(assert (<= (clog-commit-tag-terminal-end tag) *wal-durable-lsn*)) '
+        '(assert (eq :committed (clog-commit-completion-state completion))) '
         '(assert (= +clog-in-progress+ (clog-read-status-under-lock xid)))) '
-        '(setf *receipt-test-staged* tag)) tag)))')
+        '(setf *receipt-test-staged* completion)) '
+        '(funcall *receipt-test-materialize* completion :fsync fsync)))')
 
 
 def check_pending_clog(server):
@@ -82,7 +84,7 @@ def check_pending_clog(server):
 def restore(server):
     server.control('(setf (symbol-function \'wal-commit-transaction) *receipt-test-wal* '
                    '(symbol-function \'validate-wal-commit-receipt) *receipt-test-validate* '
-                   '(symbol-function \'clog-stage-commit-under-wal-lock) *receipt-test-stage*)')
+                    '(symbol-function \'clog-materialize-completion-under-lock) *receipt-test-materialize*)')
 
 
 def run():
@@ -94,7 +96,7 @@ def run():
         witness.query('CREATE TABLE receipt_rows (id int PRIMARY KEY)')
         server.control('(defvar *receipt-test-wal* (symbol-function \'wal-commit-transaction))')
         server.control('(defvar *receipt-test-validate* (symbol-function \'validate-wal-commit-receipt))')
-        server.control('(defvar *receipt-test-stage* (symbol-function \'clog-stage-commit-under-wal-lock))')
+        server.control('(defvar *receipt-test-materialize* (symbol-function \'clog-materialize-completion-under-lock))')
         server.control('(defvar *receipt-test-staged* nil)')
         server.control('(defvar *receipt-test-xid* nil)')
         server.control('(defvar *receipt-test-backend* nil)')

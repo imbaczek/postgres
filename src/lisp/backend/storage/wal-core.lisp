@@ -257,7 +257,7 @@ It is separate from the source identity used for remote acknowledgments.")
   ;; durable application and head retirement. KIND distinguishes transaction
   ;; from maintenance (XID zero); NEXT links owners in terminal order.
   spool (state :stack) prepared-p pages contributors resets split-p xid
-  next (kind :transaction)
+  next completion (kind :transaction)
   incarnation timeline terminal-end replacement-pages replacement-contributors)
 
 (defvar *wal-pending-page-publication* nil
@@ -1469,7 +1469,10 @@ Cleanup closes only a stack-owned spool; handoff leaves it with the pending owne
              (let ((*query-temp-file-limit-bytes* nil))
                (setf (wal-page-publication-spool owner) (make-logical-spool))))
            (funcall function (wal-page-publication-spool owner) owner))
-      (when (eq :stack (wal-page-publication-state owner))
+      (when (and (eq :stack (wal-page-publication-state owner))
+                 (or (null (wal-page-publication-completion owner))
+                     (clog-release-unattempted-publication-under-wal-lock
+                      (wal-page-publication-completion owner) owner)))
         (when (wal-page-publication-spool owner)
           (wal-close-primary-page-spool (wal-page-publication-spool owner)))
         (setf (wal-page-publication-state owner) :released)))))
@@ -1531,6 +1534,7 @@ Install the preallocated empty maps by pointer, without changing references."
                  (hash-table-p (wal-page-publication-replacement-contributors owner))
                  (zerop (hash-table-count (wal-page-publication-replacement-contributors owner))))
       (wal-invalid-input "page publication preparation changed before handoff"))
+    (clog-check-publication-handoff-under-wal-lock owner end)
     (setf (wal-page-publication-terminal-end owner) end
           (wal-page-publication-state owner) :pending
           *wal-page-cache* (wal-page-publication-replacement-pages owner)
@@ -1556,6 +1560,7 @@ fail-stop handling."
       (wal-invalid-input "page publication drain must start at the queue head"))
     (unless (<= (wal-page-publication-terminal-end owner) *wal-durable-lsn*)
       (wal-invalid-input "pending page publication WAL is not durable"))
+    (wal-complete-publication-status-under-lock owner)
     (when (eq :pending (wal-page-publication-state owner))
       (wal-apply-relation-resets (wal-page-publication-resets owner))
       (when (wal-page-publication-resets owner) (wal-test-pause :after-relation-resets))
@@ -1579,18 +1584,24 @@ fail-stop handling."
       (unless next (setf *wal-pending-page-publication-tail* nil))))
   (values))
 
-(defun wal-drain-page-publications-through-under-lock (target &key fault-on-first-write)
-  "Validate TARGET and its durable prefix before effects; retire through TARGET only."
+(defun wal-drain-page-publication-prefix-under-lock (target &key include-target-p fault-on-first-write)
   (assert (sb-thread:holding-mutex-p *wal-lock*))
   (sb-sys:without-interrupts
     (wal-check-healthy)
     (wal-check-page-publication-owner-under-lock target)
+    (clog-check-queued-commits-under-wal-lock)
     (unless (<= (wal-page-publication-terminal-end target) *wal-durable-lsn*)
       (wal-invalid-input "captured page publication prefix is not durable"))
     (loop for head = *wal-pending-page-publication*
+          until (and (eq head target) (not include-target-p))
           do (wal-drain-page-publication-under-lock head :fault-on-first-write fault-on-first-write)
-          until (eq head target)))
+          when (eq head target) return nil))
   (values))
+
+(defun wal-drain-page-publications-through-under-lock (target &key fault-on-first-write)
+  "Validate TARGET and its durable prefix before effects; retire through TARGET only."
+  (wal-drain-page-publication-prefix-under-lock
+   target :include-target-p t :fault-on-first-write fault-on-first-write))
 
 (defun wal-settle-page-publications-under-lock ()
   "Flush and drain the captured FIFO prefix under WAL exclusion.
@@ -1599,7 +1610,7 @@ nonlocal exit to an error so the caller can fence failure after unlocking."
   (assert (sb-thread:holding-mutex-p *wal-lock*))
   (wal-check-healthy)
   (wal-check-page-publication-queue-under-lock)
-  (clog-require-no-pending-commits)
+  (clog-check-queued-commits-under-wal-lock)
   (let ((target *wal-pending-page-publication-tail*))
     (when target
       (let ((complete nil) (failure nil))
@@ -1731,6 +1742,63 @@ nonlocal exit to an error so the caller can fence failure after unlocking."
 
 (declaim (ftype function wal-validate-logical-binary-capability-under-lock))
 
+(defun wal-admit-transaction-under-lock (xid logical-changes)
+  (assert (sb-thread:holding-mutex-p *wal-lock*))
+  (wal-check-page-publication-queue-under-lock)
+  (clog-check-queued-commits-under-wal-lock)
+  (wal-validate-logical-binary-capability-under-lock xid)
+  (when (and (fboundp 'transaction-has-relation-replacements-p)
+             (funcall 'transaction-has-relation-replacements-p
+                      (when (boundp '*backend*) (symbol-value '*backend*))))
+    (wal-settle-page-publications-under-lock)
+    (wal-require-no-pending-storage))
+  (let* ((resets
+           (when (fboundp 'publish-transaction-replacements-under-wal-lock)
+             (funcall 'publish-transaction-replacements-under-wal-lock
+                      (when (boundp '*backend*) (symbol-value '*backend*)))))
+         (keys (wal-primary-page-keys))
+         (split-p *wal-pending-btree-split*))
+    (wal-primary-preflight-page-keys keys)
+    (with-wal-primary-page-spool (spool publication)
+      (wal-append-running-xacts-under-lock xid)
+      (wal-primary-record-page-xids keys (wal-append-batch-start))
+      (dolist (reset resets)
+        (wal-append-record +wal-record-relation-reset+ xid
+                           (wal-encode-relation-reset (first reset) (second reset))))
+      (wal-primary-append-pages keys spool)
+      (wal-primary-seal-page-spool spool)
+      (wal-prepare-page-publication-under-lock publication xid resets split-p)
+      (when logical-changes (wal-append-logical-changes xid logical-changes))
+      (when *wal-output-stream* (finish-output *wal-output-stream*))
+      (wal-test-pause :after-page-images)
+      (let* ((payload (wal-encode-commit-timestamp (postgres-current-timestamp)))
+             (size (+ +wal-header-size+ (length payload)))
+             (planned-end (+ (wal-next-record-start size) size))
+             (completion (clog-reserve-commit-under-wal-lock xid planned-end publication)))
+        (assert (eq completion (wal-page-publication-completion publication)))
+        (wal-test-pause :after-clog-reservation)
+        (clog-begin-reserved-commit-under-wal-lock completion publication)
+        (wal-test-pause :before-terminal-append)
+        (let ((end (wal-append-record +wal-record-commit+ xid payload)))
+          (clog-publish-reserved-commit-under-wal-lock completion publication end)
+          (wal-test-pause :before-page-publication-transfer)
+          (wal-publish-page-publication-under-lock publication end)
+          (wal-test-pause :after-page-publication-transfer)
+          (values publication end))))))
+
+(defun wal-complete-publication-status-under-lock (owner)
+  (assert (sb-thread:holding-mutex-p *wal-lock*))
+  (wal-check-page-publication-owner-under-lock owner)
+  (unless (eq owner *wal-pending-page-publication*)
+    (wal-invalid-input "CLOG completion must start at the queue head"))
+  (clog-check-queued-commits-under-wal-lock)
+  (let ((completion (wal-page-publication-completion owner)))
+    (when completion
+      (wal-slot-record-xid-commit-under-wal-lock
+       (wal-page-publication-xid owner) (wal-page-publication-terminal-end owner))
+      (clog-complete-reserved-commit-under-wal-lock completion owner)))
+  (values))
+
 (defun wal-commit-transaction
     (xid after-durable-function &key logical-changes terminal-durable-function
                                   (source-id nil source-id-supplied-p) accepted-function
@@ -1777,7 +1845,8 @@ runs under the interrupt mask after the direct commit callback."
   (let ((commit-lsn nil) (receipt nil))
     (sb-sys:without-interrupts
       (with-wal-publication-fence (begin-publication)
-        (clog-require-no-pending-commits)
+        (wal-check-page-publication-queue-under-lock)
+        (clog-check-queued-commits-under-wal-lock)
         (wal-validate-logical-binary-capability-under-lock xid)
         (when (and (fboundp 'transaction-has-relation-replacements-p)
                    (funcall 'transaction-has-relation-replacements-p
@@ -1785,36 +1854,16 @@ runs under the interrupt mask after the direct commit callback."
           (wal-settle-page-publications-under-lock)
           (wal-require-no-pending-storage))
         (begin-publication)
-        (let* ((resets
-                 (when (fboundp 'publish-transaction-replacements-under-wal-lock)
-                   (funcall 'publish-transaction-replacements-under-wal-lock
-                            (when (boundp '*backend*) (symbol-value '*backend*)))))
-               (keys (wal-primary-page-keys))
-               (split-p *wal-pending-btree-split*))
-          (wal-primary-preflight-page-keys keys)
-          (with-wal-primary-page-spool (spool publication)
-            (wal-append-running-xacts-under-lock xid)
-            (wal-primary-record-page-xids keys (wal-append-batch-start))
-            (dolist (reset resets)
-              (wal-append-record +wal-record-relation-reset+ xid
-                                 (wal-encode-relation-reset (first reset) (second reset))))
-            (wal-primary-append-pages keys spool)
-            (wal-primary-seal-page-spool spool)
-            (wal-prepare-page-publication-under-lock publication xid resets split-p)
-            (when logical-changes (wal-append-logical-changes xid logical-changes))
-            (when *wal-output-stream* (finish-output *wal-output-stream*))
-            (wal-test-pause :after-page-images)
-            (setf commit-lsn
-                  (wal-append-record +wal-record-commit+ xid
-                                     (wal-encode-commit-timestamp (postgres-current-timestamp))))
-            (wal-publish-page-publication-under-lock publication commit-lsn)
-            (wal-test-pause :after-page-publication-transfer)
-            (wal-flush)
-            (when terminal-durable-function (funcall terminal-durable-function commit-lsn))
-            (wal-slot-record-xid-commit-under-wal-lock xid commit-lsn)
-            (wal-test-pause :after-wal-flush)
-            (funcall after-durable-function commit-lsn)
-            (wal-drain-page-publications-through-under-lock publication :fault-on-first-write t)))
+        (multiple-value-bind (publication end) (wal-admit-transaction-under-lock xid logical-changes)
+          (setf commit-lsn end)
+          (wal-flush)
+          (when terminal-durable-function (funcall terminal-durable-function commit-lsn))
+          (wal-drain-page-publication-prefix-under-lock publication :fault-on-first-write t)
+          (wal-slot-record-xid-commit-under-wal-lock xid commit-lsn)
+          (wal-test-pause :after-wal-flush)
+          (wal-complete-publication-status-under-lock publication)
+          (funcall after-durable-function commit-lsn)
+          (wal-drain-page-publications-through-under-lock publication :fault-on-first-write t))
         (setf receipt (%make-wal-commit-receipt xid source-id commit-lsn t))
         (when accepted-function (funcall accepted-function receipt))))
     (values commit-lsn receipt)))
@@ -1824,7 +1873,8 @@ runs under the interrupt mask after the direct commit callback."
   (unless *wal-ready*
     (return-from wal-commit-maintenance (values)))
   (with-wal-publication-fence (begin-publication)
-    (clog-require-no-pending-commits)
+    (wal-check-page-publication-queue-under-lock)
+    (clog-check-queued-commits-under-wal-lock)
     (let ((keys (wal-primary-page-keys)) (split-p *wal-pending-btree-split*))
       (wal-primary-preflight-page-keys keys)
       (with-wal-primary-page-spool (spool publication)

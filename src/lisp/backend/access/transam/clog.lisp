@@ -60,7 +60,7 @@ reload retains debt.")
     (wal-invalid-input "invalid planned CLOG commit boundary"))
   (values))
 
-(defun clog-check-completion-under-lock (completion owner &key materialized-p)
+(defun clog-check-completion-under-lock (completion owner &key materialized-p uninstalled-reservation-p)
   "Check owner, WAL identity and map membership with WAL and CLOG locks held.
 MATERIALIZED-P also permits an already retired completion."
   (assert (sb-thread:holding-mutex-p *wal-lock*))
@@ -73,7 +73,12 @@ MATERIALIZED-P also permits an already retired completion."
     (unless (and (clog-commit-tag-p tag)
                  (eq *wal-storage-incarnation* (clog-commit-tag-incarnation tag))
                  (eql *wal-insert-timeline* (clog-commit-tag-timeline tag))
-                 (or (and materialized-p
+                 (or (and uninstalled-reservation-p
+                          (eq :reserved (clog-commit-completion-state completion))
+                          (not (nth-value 1
+                                          (gethash (xid32-of (clog-commit-tag-xid tag))
+                                                   *clog-pending-commits*))))
+                     (and materialized-p
                           (eq :materialized (clog-commit-completion-state completion)))
                      (eq completion
                          (gethash (xid32-of (clog-commit-tag-xid tag))
@@ -97,6 +102,11 @@ The map retains OWNER if the outcome is ambiguous."
         (wal-invalid-input "CLOG reservation would replace a terminal status"))
       (let* ((tag (%make-clog-commit-tag xid *wal-storage-incarnation* *wal-insert-timeline* end))
              (completion (%make-clog-commit-completion tag owner :reserved)))
+        (when (wal-page-publication-p owner)
+          (unless (null (wal-page-publication-completion owner))
+            (wal-invalid-input "publication already owns a CLOG reservation"))
+          (setf (wal-page-publication-completion owner) completion)
+          (wal-test-pause :before-clog-reservation-install))
         (setf (gethash key *clog-pending-commits*) completion)
         completion))))
 
@@ -162,6 +172,69 @@ An already materialized completion may be checked again."
         (setf (clog-commit-completion-state completion) :committed)
         (clog-materialize-completion-under-lock completion :fsync fsync))))
   (values))
+
+(defun clog-check-publication-under-lock
+    (owner &key (terminal-end (wal-page-publication-terminal-end owner)) publishing-p)
+  (assert (sb-thread:holding-mutex-p *clog-lock*))
+  (let ((completion (wal-page-publication-completion owner)))
+    (unless (case (wal-page-publication-kind owner)
+              (:transaction (clog-commit-completion-p completion))
+              (:maintenance (and (null completion)
+                                 (eql 0 (wal-page-publication-xid owner))
+                                 (null (wal-page-publication-resets owner)))))
+      (wal-invalid-input "publication has an invalid CLOG obligation"))
+    (when completion
+      (clog-check-completion-under-lock completion owner :materialized-p (not publishing-p))
+      (let ((tag (clog-commit-completion-tag completion)))
+        (clog-check-commit-tag-under-wal-lock tag)
+        (multiple-value-bind (installed present-p)
+            (gethash (xid32-of (clog-commit-tag-xid tag)) *clog-pending-commits*)
+          (unless (and (eql (clog-commit-tag-xid tag) (wal-page-publication-xid owner))
+                       (eql (clog-commit-tag-terminal-end tag) terminal-end)
+                       (if publishing-p
+                           (and (eq :published (clog-commit-completion-state completion))
+                                (eq installed completion))
+                           (case (clog-commit-completion-state completion)
+                             ((:published :committed) (eq installed completion))
+                             (:materialized (not present-p)))))
+            (wal-invalid-input "queued CLOG completion differs from its publication"))))))
+  (values))
+
+(defun clog-check-publication-handoff-under-wal-lock (owner end)
+  (sb-thread:with-mutex (*clog-lock*)
+    (clog-check-publication-under-lock owner :terminal-end end :publishing-p t))
+  (values))
+
+(defun clog-check-queued-commits-under-wal-lock ()
+  (assert (sb-thread:holding-mutex-p *wal-lock*))
+  (sb-thread:with-mutex (*clog-lock*)
+    (loop for owner = *wal-pending-page-publication* then (wal-page-publication-next owner)
+          while owner do (clog-check-publication-under-lock owner))
+    (maphash
+     (lambda (key completion)
+       (let ((owner (clog-commit-completion-owner completion)))
+         (unless (and (wal-page-publication-p owner)
+                      (eq completion (wal-page-publication-completion owner))
+                      (eql key (xid32-of (clog-commit-tag-xid (clog-commit-completion-tag completion))))
+                      (loop for queued = *wal-pending-page-publication*
+                              then (wal-page-publication-next queued)
+                            while queued thereis (eq owner queued)))
+           (wal-invalid-input "pending CLOG completion has no queued owner"))))
+     *clog-pending-commits*))
+  (values))
+
+(defun clog-release-unattempted-publication-under-wal-lock (completion owner)
+  (unless (and (wal-page-publication-p owner)
+               (eq completion (wal-page-publication-completion owner)))
+    (wal-invalid-input "publication lost its CLOG reservation"))
+  (sb-thread:with-mutex (*clog-lock*)
+    (clog-check-completion-under-lock completion owner :uninstalled-reservation-p t)
+    (when (eq :reserved (clog-commit-completion-state completion))
+      (remhash (xid32-of (clog-commit-tag-xid (clog-commit-completion-tag completion)))
+               *clog-pending-commits*)
+      (setf (clog-commit-completion-state completion) :cancelled)
+      (return-from clog-release-unattempted-publication-under-wal-lock t)))
+  nil)
 
 (defun clog-require-no-pending-under-lock ()
   (assert (sb-thread:holding-mutex-p *clog-lock*))

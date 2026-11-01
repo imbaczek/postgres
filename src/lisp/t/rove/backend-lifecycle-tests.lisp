@@ -659,6 +659,7 @@
                             (when (eq phase :before) (error "before durable terminal"))
                             (when (and *wal-ready* terminal-durable-function)
                               (funcall terminal-durable-function 140))
+                            (when *wal-ready* (clog-set xid +clog-committed+))
                             (funcall after (when *wal-ready* 140))
                             (when (eq phase :storage) (error "storage apply failure"))
                             (complete-test-commit-receipt xid source-id (when *wal-ready* 140)
@@ -692,6 +693,9 @@
                           (format nil "pg-commit-exit-~d-~d/" (sb-posix:getpid) (random 1000000))
                           (uiop:temporary-directory)))
               (*query-temp-directory* directory)
+              (*pgdata* (merge-pathnames "data/" directory))
+              (*clog-stream* nil)
+              (*wal-pending-page-publication-tail* nil)
               (*wal-ready* t)
               (*wal-pending-page-publication* nil)
               (*wal-output-stream* nil)
@@ -700,12 +704,13 @@
               (*wal-page-cache-xids* (make-hash-table :test #'equal))
               (names '(wal-append-running-xacts-under-lock wal-append-batch-start
                        wal-append-record wal-flush wal-slot-record-xid-commit-under-wal-lock
-                       wal-primary-apply-page-spool wal-fail-stop clog-set clog-commit-durable-under-wal-lock release-xid))
+                       wal-primary-apply-page-spool wal-fail-stop clog-set clog-complete-reserved-commit-under-wal-lock release-xid))
               (saved (mapcar (lambda (name) (cons name (symbol-function name))) names)))
-         (ensure-directories-exist directory)
+         (ensure-directories-exist *pgdata*)
          (unwind-protect
               (dolist (phase '(:flush :slot :clog :apply :release))
                 (let ((*wal-poisoned* nil)
+                      (*clog-pending-commits* (make-hash-table :test #'eql))
                       (*wal-end-lsn* 100)
                       (*wal-durable-lsn* 100)
                       (statuses nil)
@@ -729,8 +734,14 @@
                         (lambda (&rest arguments)
                           (declare (ignore arguments))
                           (when (eq phase :slot) (throw 'publication-exit :escaped)))
-                        (symbol-function 'clog-commit-durable-under-wal-lock)
-                        (lambda (xid end) (declare (ignore end)) (clog-set xid +clog-committed+))
+                        (symbol-function 'clog-complete-reserved-commit-under-wal-lock)
+                        (lambda (completion owner &key fsync)
+                          (declare (ignore owner fsync))
+                          (let ((xid (clog-commit-tag-xid (clog-commit-completion-tag completion))))
+                            (unless (eq :materialized (clog-commit-completion-state completion))
+                              (clog-set xid +clog-committed+)
+                              (remhash (xid32-of xid) *clog-pending-commits*)
+                              (setf (clog-commit-completion-state completion) :materialized))))
                         (symbol-function 'clog-set)
                         (lambda (xid status &key fsync)
                           (declare (ignore xid fsync))
@@ -774,6 +785,7 @@
            (dispose-page-publication-test-owner *wal-pending-page-publication*)
            (setf (backend-xid *backend*) nil
                  (backend-settings-transaction-start *backend*) nil)
+           (when *clog-stream* (close *clog-stream*))
            (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))))
 
 (rove:deftest committed-cleanup-preserves-first-error
@@ -1032,6 +1044,7 @@
                           (rove:ok (eq :flush local-durability))
                           (unless (eq fault :missing-durable-callback)
                             (funcall terminal-durable-function 140))
+                          (when *wal-ready* (clog-set xid +clog-committed+))
                           (funcall after 140)
                           (let ((receipt (%make-wal-commit-receipt
                                           xid (if (eq fault :wrong-source) :wrong-source source-id) 140
