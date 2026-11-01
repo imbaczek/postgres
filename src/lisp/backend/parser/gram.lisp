@@ -146,6 +146,7 @@ Range and negative checks occur when the LIMIT executes."
          (syntax-error p "expected \";\" or end of input"))))))
 
 (defun parse-do (p)
+  "Collect DO options while leaving the inline source opaque until execution."
   (let ((options nil))
     (loop
       (cond
@@ -161,6 +162,7 @@ Range and negative checks occur when the LIMIT executes."
     (list :type :do :options (nreverse options))))
 
 (defun parse-do-block (p)
+  "Parse a BEGIN/END block of supported procedural statements."
   (expect-kw p "begin")
   (let ((statements nil))
     (loop until (kw-p p "end")
@@ -171,6 +173,7 @@ Range and negative checks occur when the LIMIT executes."
     (list :type :do-block :statements (nreverse statements))))
 
 (defun parse-do-procedural-statement (p)
+  "Parse nested blocks, NULL, SET, RESET or PERFORM; reject other statements."
   (cond
     ((kw-p p "begin") (parse-do-block p))
     ((match-kw p "null") (list :type :do-null))
@@ -180,6 +183,7 @@ Range and negative checks occur when the LIMIT executes."
     (t (ereport "0A000" "unsupported statement in inline PL/pgSQL block: ~a" (pval p)))))
 
 (defun compile-do-source (source)
+  "Compile the inline source at execution and require a complete block."
   (let* ((p (make-sql-parser :tokens (tokenize source)))
          (block (parse-do-block p)))
     (match-punct p #\;)

@@ -2533,6 +2533,7 @@ Compare the advertised column shape, independently of result format codes."
   columns)
 
 (defun exec-perform (ast)
+  "Execute a SELECT plan for its effects, discarding rows and checking interrupts."
   (let* ((plan (plan-select-query ast))
          (relations (getf (query-plan-prepared plan) :relations)))
     (flet ((discard-row (row) (declare (ignore row)) (check-for-interrupts)))

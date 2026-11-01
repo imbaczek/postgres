@@ -338,6 +338,9 @@ and `string_to_array` support the corresponding text and array operations,
 including optional NULL replacement arguments.
 The deprecated `txid_current()` assigns or returns the current top-level
 transaction ID when executed, and rejects calls during recovery.
+`DO` supports a limited inline PL/pgSQL block containing nested BEGIN/END,
+NULL, SET, RESET and PERFORM statements. Variables and control flow are not
+supported. Inline source is compiled when the command executes.
 
 Supported scalar and fixed-descriptor composite functions can appear in `FROM`.
 A scalar function produces one row even when its value is NULL or FALSE. Its

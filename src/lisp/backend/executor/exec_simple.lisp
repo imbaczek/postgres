@@ -1542,6 +1542,7 @@ before this removal horizon is captured."
   (flush-logical-ddl-deferred-responses responses))
 
 (defun do-statement-block (ast)
+  "Validate DO options and compile the supported PL/pgSQL source."
   (let ((source nil) (source-p nil) (language nil) (language-p nil))
     (dolist (option (getf ast :options))
       (ecase (car option)
@@ -1559,6 +1560,9 @@ before this removal horizon is captured."
     (compile-do-source source)))
 
 (defun execute-do-statement (stream ast)
+  "Run an inline statement without starting or ending a transaction.
+SQL children register a statement snapshot and advance the command ID; cleanup
+restores the caller's snapshot. Blocks and NULL need no snapshot of their own."
   (check-for-interrupts)
   (case (getf ast :type)
     (:do-null (values))
@@ -1581,6 +1585,10 @@ before this removal horizon is captured."
          (setf (backend-snapshot *backend*) saved-snapshot))))))
 
 (defun exec-do (stream ast)
+  "Compile and execute an inline block in the surrounding transaction.
+The caller owns commit and abort. Save settings for rollback and retain LOCAL
+bindings until transaction end. Discard child command tags and emit one DO
+completion after success; anonymous source cannot inherit Bind parameters."
   (let ((block (do-statement-block ast))
         (*executing-do-p* t)
         (*query-parameter-types* nil)

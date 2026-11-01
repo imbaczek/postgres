@@ -26,7 +26,17 @@ an `int8` interpretation of the full 64-bit ID. The checkpoint passed 894 unit
 checks, a 100-trial property, strict cold compilation and nine compared C/native
 SQL cases, plus transaction-ownership and OFF-commit checks. Run the native oracle
 from `src/lisp` with `python3 t/txid-current.py --reference-bin /path/to/c/bin`.
-DO and PERFORM support remain open for the Patroni path.
+At that checkpoint DO and PERFORM support remained open for the Patroni path.
+
+### Inline DO prerequisite
+
+Inline PL/pgSQL supports nested BEGIN/END, NULL, SET, RESET and PERFORM. Source
+remains opaque until execution; variables and control flow are unsupported. The
+checkpoint passed 896 unit and 201 wire checks, strict cold compilation, 36
+C/native SQL cases and four extended-protocol cycles. A property ran 100 trials
+at seed 4016 (digest `6004b366b0be3dec`). Acceptance of the unchanged full
+Patroni path remains open. Run the C comparison from `src/lisp` with
+`python3 t/do-perform.py --reference-bin /path/to/c/bin`.
 
 ### Configured native follow
 
