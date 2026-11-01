@@ -20,7 +20,7 @@ sql() {
 }
 start_server() {
     rm -f "$TMP/control.sock"
-    "$BASE/pg-lisp.sh" -p "$PORT" -D "$TMP/data" --control-socket "$TMP/control.sock" >>"$TMP/server.log" 2>&1 &
+    "$BASE/pg-lisp.sh" -p "$PORT" -D "$TMP/data" -c wal_level=logical --control-socket "$TMP/control.sock" >>"$TMP/server.log" 2>&1 &
     SERVER=$!
     test_wait_owned_sql_server "$SERVER" "$PORT" psql 300
 }
@@ -81,6 +81,11 @@ wait "$SERVER" 2>/dev/null || :
 SERVER=
 start_server
 [ "$(sql 'SELECT id,value FROM spool_rows ORDER BY id')" = "$(printf '1|first\n2|second')" ]
+# Preserve the original failure even if fast shutdown closes the SQL connection
+# before it can report the checksum error.
+printf '%s\n(quit)\n' '(let ((original (symbol-function '\''wal-fail-stop))) (setf (symbol-function '\''wal-fail-stop) (lambda (condition) (ignore-errors (with-open-file (out "'"$TMP"'/wal-failure.log" :direction :output :if-exists :append :if-does-not-exist :create) (format out "~a~%" condition))) (funcall original condition))))' |
+    sbcl --script "$BASE/t/control-client.lisp" unix "$TMP/control.sock" >"$TMP/control-failure.log"
+if grep -q ';; error:' "$TMP/control-failure.log"; then cat "$TMP/control-failure.log" >&2; exit 1; fi
 # Corrupt the second event only after the first fragment is in WAL. The reader
 # must detect the changed spool and leave the transaction without a terminal.
 printf '%s\n(quit)\n' '(progn (setf *logical-capture-memory-bytes* 0) (setf *logical-spool-test-after-wal-record* (lambda (spool index) (cond ((= index 1) (wal-flush) (let* ((stream (logical-spool-stream spool)) (resume (file-position stream))) (file-position stream 0) (let* ((first-size (logical-spool-read-u32 stream)) (position (+ 16 first-size))) (file-position stream position) (let ((byte (read-byte stream))) (file-position stream position) (write-byte (logxor byte 255) stream) (finish-output stream))) (file-position stream resume))) ((= index 2) (setf *logical-spool-test-after-wal-record* nil) (wal-flush) (with-open-file (out "'"$TMP"'/fragment-durable" :direction :output :if-exists :supersede) (write-line "durable" out)))))))' |
@@ -91,14 +96,10 @@ if PGCONNECT_TIMEOUT=2 psql -X -qAt -v ON_ERROR_STOP=1 -h 127.0.0.1 -p "$PORT" -
     echo 'logical-capture-spill: corrupted spool unexpectedly committed' >&2
     exit 1
 fi
-grep -F 'logical spool checksum mismatch' "$TMP/corrupt.out" >/dev/null
+grep -F 'logical spool checksum mismatch' "$TMP/wal-failure.log" >/dev/null
 [ "$(cat "$TMP/fragment-durable")" = durable ]
-if sql "INSERT INTO spool_rows VALUES (12, 'must fail')" >"$TMP/poison.out" 2>&1; then
-    echo 'logical-capture-spill: WAL did not fail-stop after partial publication' >&2
-    exit 1
-fi
 i=0
-until grep -Fq 'WAL I/O previously failed' "$TMP/poison.out" || grep -Fq 'WAL I/O previously failed' "$TMP/server.log"; do
+until grep -Fq 'received fast shutdown request' "$TMP/server.log"; do
     i=$((i + 1)); [ "$i" -lt 300 ] || exit 1; sleep 0.1
 done
 kill -KILL "$SERVER" 2>/dev/null || :
