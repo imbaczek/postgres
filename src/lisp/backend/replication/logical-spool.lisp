@@ -11,6 +11,9 @@
   owner (events '()) (bytes 0) (count 0) path stream sealed-p closed-p failed-p
   (visit-lock (sb-thread:make-mutex :name "logical spool visitor")) visiting-p)
 
+(defun logical-spool-resource-size (spool)
+  (values (logical-spool-bytes spool) (logical-spool-count spool)))
+
 (defun make-logical-spool ()
   "Create a private owner whose lifetime is the transaction, not a query scope.
 A caller that transfers cleanup to a domain must adopt it before first use."

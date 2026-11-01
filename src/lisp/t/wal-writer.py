@@ -1,6 +1,7 @@
 """Verify the real primary writer without a foreground snapshot draining its queue."""
 from pathlib import Path
 import runpy
+import signal
 
 
 api = runpy.run_path(str(Path(__file__).with_name('synchronous-ddl.py')))
@@ -157,7 +158,7 @@ def run_flush_failure(after_flush):
         print(f'artifacts: {server.root}', flush=True)
 
 
-def run_queued_wakeups():
+def run_queued_wakeups(count=12, pressure=False):
     server = OwnedLisp()
     actors = []
     paused = None
@@ -169,9 +170,13 @@ def run_queued_wakeups():
         finally:
             setup.close()
         server.control('(setf *wal-dirty-resident-limit-pages* 0 *logical-capture-memory-bytes* 0)')
+        if pressure:
+            server.control('(with-wal-critical '
+                           '(let ((limits (copy-list *wal-publication-pressure-limits*))) '
+                           '(setf (getf limits :owners) 2 *wal-publication-pressure-limits* limits)))')
         paused = pause_writer(server, 'queued-wakeups')
         pids = []
-        for value in range(12):
+        for value in range(count):
             actor = Connection(server.port)
             actors.append(actor)
             actor.query('BEGIN')
@@ -185,9 +190,16 @@ def run_queued_wakeups():
             '(push *writer-test-backend* *writer-pressure-backends*)) '
             '(sb-thread:with-mutex (*wal-lock*) '
             '(dotimes (index 100) (notify-primary-wal-writer-under-lock)) '
-            '(assert (= 12 (length *writer-pressure-owners*))) '
+            f'(assert (= {count} (length *writer-pressure-owners*))) '
             '(assert (zerop (hash-table-count (wal-page-publication-pages *writer-test-owner*)))) '
             '(assert (= 1 (sb-thread:semaphore-count (primary-wal-writer-wake *primary-wal-writer*)))))')
+        if pressure:
+            remaining = 1 + (count - 1) % 2
+            server.control(
+                '(with-wal-critical '
+                f'(assert (= {remaining} (getf (wal-publication-pressure-footprint) :owners))) '
+                f'(assert (= {count - remaining} (count :released *writer-pressure-owners* '
+                ':key #\'wal-page-publication-state))))')
         resume_writer(server, paused)
         paused = None
         wait_control(server, '(list :drained (wal-writer-test-prefix-drained-p))', ':DRAINED T')
@@ -197,7 +209,7 @@ def run_queued_wakeups():
             '(dolist (backend *writer-pressure-backends*) '
             '(finish-committed-transaction backend (backend-xid backend))) '
             '(assert (null (primary-wal-writer-failure *primary-wal-writer*)))')
-        assert actors[0].query('SELECT count(*) FROM writer_queue_rows') == [['12']]
+        assert actors[0].query('SELECT count(*) FROM writer_queue_rows') == [[str(count)]]
         for actor in actors:
             actor.close()
         actors.clear()
@@ -207,10 +219,11 @@ def run_queued_wakeups():
         server.start()
         check = Connection(server.port)
         try:
-            assert check.query('SELECT count(*) FROM writer_queue_rows') == [['12']]
+            assert check.query('SELECT count(*) FROM writer_queue_rows') == [[str(count)]]
         finally:
             check.close()
-        print('wal-writer: coalesced wakeups drained twelve owners including zero-page commits PASS', flush=True)
+        label = 'pre-admission pressure settled predecessors' if pressure else 'coalesced wakeups'
+        print(f'wal-writer: {label}; drained {count} owners including zero-page commits PASS', flush=True)
     finally:
         resume_writer(server, paused)
         for actor in actors:
@@ -260,6 +273,66 @@ def run_xid_wraparound():
         print(f'artifacts: {server.root}', flush=True)
 
 
+def run_pressure_prefix_crash():
+    server = OwnedLisp()
+    actors = []
+    paused = None
+    incoming_ready = server.root / 'incoming-pressure-ready'
+    incoming_release = server.root / 'incoming-pressure-release'
+    try:
+        server.start()
+        setup = Connection(server.port)
+        try:
+            setup.query('CREATE TABLE pressure_crash_rows (id int PRIMARY KEY)')
+        finally:
+            setup.close()
+        paused = pause_writer(server, 'pressure-crash')
+        pids = []
+        for value in (1, 2):
+            actor = Connection(server.port)
+            actors.append(actor)
+            actor.query('BEGIN')
+            actor.query(f'INSERT INTO pressure_crash_rows VALUES ({value})')
+            pids.append(int(actor.query('SELECT pg_backend_pid()')[0][0]))
+        server.control(
+            f'(wal-writer-test-admit-backend {pids[0]}) '
+            '(defvar *pressure-crash-old* *writer-test-owner*) '
+            '(with-wal-critical (let ((limits (copy-list *wal-publication-pressure-limits*))) '
+            '(setf (getf limits :owners) 1 *wal-publication-pressure-limits* limits))) '
+            f'(wal-pressure-test-start-incoming-at-page-boundary {pids[1]} '
+            f'#p"{incoming_ready}" #p"{incoming_release}")')
+        wait_file(server, incoming_ready)
+        # The incoming actor holds WAL. Read only stable fields while it is paused.
+        server.control(
+            '(assert (null *writer-test-pressure-error*)) '
+            '(assert (eq :released (wal-page-publication-state *pressure-crash-old*))) '
+            '(assert (null *wal-pending-page-publication*)) '
+            '(assert (>= *wal-durable-lsn* (wal-page-publication-terminal-end *pressure-crash-old*)))')
+        process = server.process
+        server.stop(immediate=True)
+        assert process.returncode == -signal.SIGKILL
+        resume_writer(server, paused)
+        paused = None
+        for actor in actors:
+            actor.close()
+        actors.clear()
+        server.start()
+        check = Connection(server.port)
+        try:
+            assert check.query('SELECT id FROM pressure_crash_rows ORDER BY id') == [['1']]
+        finally:
+            check.close()
+        print('wal-writer: pressure made predecessor durable before incoming terminal; SIGKILL recovery PASS',
+              flush=True)
+    finally:
+        incoming_release.touch()
+        resume_writer(server, paused)
+        for actor in actors:
+            actor.close()
+        server.stop(immediate=True)
+        print(f'artifacts: {server.root}', flush=True)
+
+
 if __name__ == '__main__':
     run_idle_drain_and_reload()
     run_reset_stop_race()
@@ -267,3 +340,5 @@ if __name__ == '__main__':
         run_flush_failure(after_flush)
     run_queued_wakeups()
     run_xid_wraparound()
+    run_queued_wakeups(count=5, pressure=True)
+    run_pressure_prefix_crash()

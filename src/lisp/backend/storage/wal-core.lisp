@@ -259,7 +259,7 @@ It is separate from the source identity used for remote acknowledgments.")
   ;; completion points back to this owner; maintenance has XID zero and no
   ;; completion. NEXT links owners in terminal order.
   spool (state :stack) prepared-p pages contributors resets split-p xid
-  next completion (kind :transaction)
+  next completion pressure-ticket (kind :transaction)
   incarnation timeline terminal-end replacement-pages replacement-contributors)
 
 (defvar *wal-pending-page-publication* nil
@@ -1058,13 +1058,32 @@ The zero marker remains sticky for uncertified writes; XIDs are full XIDs."
                                            ((member 1 xids :test #'eql) :row)
                                            (t :unknown)))))
 
+(defun wal-primary-page-key-image-size (key)
+  (let* ((xids (gethash key *wal-page-cache-xids*))
+         (size (+ 12 +blcksz+ 4 (* 8 (count-if (lambda (xid) (>= xid 3)) xids)))))
+    (when (> (+ +wal-header-size+ 4 size) +wal-segment-size+)
+      (error "WAL page image has too many transaction contributors"))
+    size))
+
+(defun map-wal-primary-page-key-chunks (keys function)
+  (assert (sb-thread:holding-mutex-p *wal-lock*))
+  (let ((chunk nil) (count 0) (bytes 0))
+    (dolist (key keys)
+      (let ((size (wal-primary-page-key-image-size key)))
+        (when (and chunk
+                   (or (>= count +wal-max-page-images-per-record+)
+                       (> (+ +wal-header-size+ 4 bytes size) +wal-segment-size+)))
+          (funcall function (nreverse chunk) bytes)
+          (setf chunk nil count 0 bytes 0))
+        (push key chunk)
+        (incf count)
+        (incf bytes size)))
+    (when chunk (funcall function (nreverse chunk) bytes)))
+  (values))
+
 (defun wal-primary-preflight-page-keys (keys)
   "Reject a too-large individual image before the batch begins."
-  (dolist (key keys)
-    (let* ((xids (gethash key *wal-page-cache-xids*))
-           (size (+ 12 +blcksz+ 4 (* 8 (count-if (lambda (xid) (>= xid 3)) xids)))))
-      (when (> (+ +wal-header-size+ 4 size) +wal-segment-size+)
-        (error "WAL page image has too many transaction contributors"))))
+  (dolist (key keys) (wal-primary-page-key-image-size key))
   (values))
 
 (defun wal-page-image-encoded-size (image)
@@ -1591,6 +1610,7 @@ Record the current maps and WAL identity while the caller holds *WAL-LOCK*."
           (wal-page-publication-replacement-pages owner) replacement-pages
           (wal-page-publication-replacement-contributors owner) replacement-contributors
           (wal-page-publication-prepared-p owner) t))
+  (setf (wal-page-publication-pressure-ticket owner) (wal-actual-publication-pressure owner))
   owner)
 
 (defun wal-publish-page-publication-under-lock (owner end)
@@ -1722,30 +1742,22 @@ nonlocal exit to an error so the caller can fence failure after unlocking."
 
 (defun wal-primary-append-pages (keys spool)
   "Append and stage bounded WAL page records in sorted key order."
-  (labels ((append-chunk (chunk)
-             (let* ((length (+ +wal-header-size+ (wal-page-payload-length chunk)))
-                    (lsn (+ (wal-next-record-start length) length))
-                    (payload (wal-encode-page-images chunk lsn))
-                    (event (make-array (+ 12 (length payload)) :element-type '(unsigned-byte 8))))
-               (unless (= lsn (wal-append-record +wal-record-pages+ 0 payload))
-                 (error "WAL page-image LSN changed while appending"))
-               (wal-set-u32 event 0 +wal-version+)
-               (wal-set-u64 event 4 lsn)
-               (replace event payload :start1 12)
-               (logical-spool-append spool event))))
-    (let ((chunk nil) (chunk-count 0) (chunk-bytes (+ +wal-header-size+ 4)))
-      (dolist (key keys)
-        (let* ((image (wal-primary-page-image key))
-               (image-size (wal-page-image-encoded-size image)))
-          (when (and chunk
-                     (or (>= chunk-count +wal-max-page-images-per-record+)
-                         (> (+ chunk-bytes image-size) +wal-segment-size+)))
-            (append-chunk (nreverse chunk))
-            (setf chunk nil chunk-count 0 chunk-bytes (+ +wal-header-size+ 4)))
-          (push image chunk)
-          (incf chunk-count)
-          (incf chunk-bytes image-size)))
-      (when chunk (append-chunk (nreverse chunk)))))
+  (map-wal-primary-page-key-chunks
+   keys
+   (lambda (chunk image-bytes)
+     (let* ((images (mapcar #'wal-primary-page-image chunk))
+            (length (+ +wal-header-size+ 4 image-bytes))
+            (lsn (+ (wal-next-record-start length) length))
+            (payload (wal-encode-page-images images lsn))
+            (event (make-array (+ 12 (length payload)) :element-type '(unsigned-byte 8))))
+       (unless (= (length payload) (+ 4 image-bytes))
+         (error "WAL page-image size changed after planning"))
+       (unless (= lsn (wal-append-record +wal-record-pages+ 0 payload))
+         (error "WAL page-image LSN changed while appending"))
+       (wal-set-u32 event 0 +wal-version+)
+       (wal-set-u64 event 4 lsn)
+       (replace event payload :start1 12)
+       (logical-spool-append spool event))))
   (values))
 
 (defun wal-primary-map-page-spool (spool function)
@@ -1837,7 +1849,9 @@ only after the actual end matches, then hand the owner to the FIFO. An
 unattempted reservation can be cancelled; an ambiguous attempt retains its owner
 for fail-stop handling. Return the owner and actual terminal end.
 Caller masks interrupts through handoff and fences incomplete publication.
-This helper does not flush WAL or provide an acceptance receipt."
+Pressure may settle predecessors before this batch starts. The third value
+requires synchronous completion of this owner before any asynchronous acceptance.
+This helper does not flush the new owner or provide an acceptance receipt."
   (assert (sb-thread:holding-mutex-p *wal-lock*))
   (wal-check-page-publication-queue-under-lock)
   (clog-check-queued-commits-under-wal-lock)
@@ -1854,32 +1868,35 @@ This helper does not flush WAL or provide an acceptance receipt."
          (keys (wal-primary-page-keys))
          (split-p *wal-pending-btree-split*))
     (wal-primary-preflight-page-keys keys)
-    (with-wal-primary-page-spool (spool publication)
-      (wal-append-running-xacts-under-lock xid)
-      (wal-primary-record-page-xids keys (wal-append-batch-start))
-      (dolist (reset resets)
-        (wal-append-record +wal-record-relation-reset+ xid
-                           (wal-encode-relation-reset (first reset) (second reset))))
-      (wal-primary-append-pages keys spool)
-      (wal-primary-seal-page-spool spool)
-      (wal-prepare-page-publication-under-lock publication xid resets split-p)
-      (when logical-changes (wal-append-logical-changes xid logical-changes))
-      (when *wal-output-stream* (finish-output *wal-output-stream*))
-      (wal-test-pause :after-page-images)
-      (let* ((payload (wal-encode-commit-timestamp (postgres-current-timestamp)))
-             (size (+ +wal-header-size+ (length payload)))
-             (planned-end (+ (wal-next-record-start size) size))
-             (completion (clog-reserve-commit-under-wal-lock xid planned-end publication)))
-        (assert (eq completion (wal-page-publication-completion publication)))
-        (wal-test-pause :after-clog-reservation)
-        (clog-begin-reserved-commit-under-wal-lock completion publication)
-        (wal-test-pause :before-terminal-append)
-        (let ((end (wal-append-record +wal-record-commit+ xid payload)))
-          (clog-publish-reserved-commit-under-wal-lock completion publication end)
-          (wal-test-pause :before-page-publication-transfer)
-          (wal-publish-page-publication-under-lock publication end)
-          (wal-test-pause :after-page-publication-transfer)
-          (values publication end))))))
+    (multiple-value-bind (projection forced-p) (wal-preflight-publication-pressure keys resets)
+      (with-wal-primary-page-spool (spool publication)
+        (wal-append-running-xacts-under-lock xid)
+        (wal-primary-record-page-xids keys (wal-append-batch-start))
+        (dolist (reset resets)
+          (wal-append-record +wal-record-relation-reset+ xid
+                             (wal-encode-relation-reset (first reset) (second reset))))
+        (wal-primary-append-pages keys spool)
+        (wal-primary-seal-page-spool spool)
+        (wal-prepare-page-publication-under-lock publication xid resets split-p)
+        (setf forced-p
+              (wal-publication-pressure-requires-flush-p publication projection forced-p))
+        (when logical-changes (wal-append-logical-changes xid logical-changes))
+        (when *wal-output-stream* (finish-output *wal-output-stream*))
+        (wal-test-pause :after-page-images)
+        (let* ((payload (wal-encode-commit-timestamp (postgres-current-timestamp)))
+               (size (+ +wal-header-size+ (length payload)))
+               (planned-end (+ (wal-next-record-start size) size))
+               (completion (clog-reserve-commit-under-wal-lock xid planned-end publication)))
+          (assert (eq completion (wal-page-publication-completion publication)))
+          (wal-test-pause :after-clog-reservation)
+          (clog-begin-reserved-commit-under-wal-lock completion publication)
+          (wal-test-pause :before-terminal-append)
+          (let ((end (wal-append-record +wal-record-commit+ xid payload)))
+            (clog-publish-reserved-commit-under-wal-lock completion publication end)
+            (wal-test-pause :before-page-publication-transfer)
+            (wal-publish-page-publication-under-lock publication end)
+            (wal-test-pause :after-page-publication-transfer)
+            (values publication end forced-p)))))))
 
 (defun wal-complete-publication-status-under-lock (owner)
   "Complete the durable FIFO head's CLOG obligation, if it has one.

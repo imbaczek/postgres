@@ -130,3 +130,25 @@
         (setf *next-xid* boundary *xid-batch-end* boundary)
         (xid-reserve-wal-batch-under-lock))))
   (values))
+
+(defvar *writer-test-pressure-worker* nil)
+
+(defvar *writer-test-pressure-error* nil)
+
+(defun wal-pressure-test-start-incoming-at-page-boundary (pid ready release)
+  (let ((pause (symbol-function 'wal-test-pause)))
+    (setf (symbol-function 'wal-test-pause)
+          (lambda (point)
+            (when (and (eq point :after-page-images) *backend*
+                       (= pid (backend-pid *backend*)))
+              (wal-writer-test-file-barrier ready release))
+            (funcall pause point))))
+  (setf *writer-test-pressure-error* nil
+        *writer-test-pressure-worker*
+        (sb-thread:make-thread
+         (lambda ()
+           (handler-case
+               (with-live-operation (wal-writer-test-admit-backend pid))
+             (error (condition) (setf *writer-test-pressure-error* (princ-to-string condition)))))
+         :name "owned incoming pressure batch"))
+  (values))

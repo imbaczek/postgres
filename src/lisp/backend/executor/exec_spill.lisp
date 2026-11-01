@@ -173,6 +173,26 @@ private, and its creating thread remains recorded."
   (assert (sb-thread:holding-mutex-p (query-temp-cleanup-domain-lock domain)))
   (null (query-temp-cleanup-domain-owners domain)))
 
+(defun query-temp-cleanup-domain-resource-counts (domain)
+  (assert (sb-thread:holding-mutex-p (query-temp-cleanup-domain-lock domain)))
+  (let ((owners 0) (entries 0) (streams 0) (directories 0) (bytes 0)
+                   (paths (make-hash-table :test #'equal)))
+    (dolist (owner (query-temp-cleanup-domain-owners domain))
+      (incf owners)
+      (when (query-temp-cleanup-owner-directory owner) (incf directories))
+      (let ((quota (query-temp-cleanup-owner-quota owner)))
+        (incf bytes (query-temp-quota-used-bytes quota))
+        (maphash (lambda (path size) (declare (ignore size)) (setf (gethash path paths) t))
+                 (query-temp-quota-file-sizes quota)))
+      (dolist (entry (query-temp-cleanup-owner-entries owner))
+        (incf entries)
+        (when (query-temp-entry-open-p entry) (incf streams))
+        (when (query-temp-stream-entry-delete-p entry)
+          (setf (gethash (query-temp-stream-entry-pathname entry) paths) t))))
+    (list :cleanup-owners owners :cleanup-entries entries :open-streams streams
+          :private-directories directories :temporary-bytes bytes
+          :temporary-paths (hash-table-count paths))))
+
 (defun query-temp-owner-retry-authorized-p (owner domain)
   (if domain
       (eq domain (query-temp-cleanup-owner-domain owner))
