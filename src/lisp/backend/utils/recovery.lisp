@@ -134,7 +134,7 @@
   (check-recovery-available)
   (when (and (recovery-in-progress-p)
              (not (member (getf ast :type)
-                          '(:select :copy-to :explain :begin :commit :rollback :set :reset :show :checkpoint))))
+                          '(:select :copy-to :explain :begin :commit :rollback :set :reset :show :checkpoint :do))))
     (prevent-recovery-write (getf ast :type))))
 
 (defun recovery-check-read-write ()

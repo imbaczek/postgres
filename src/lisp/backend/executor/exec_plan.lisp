@@ -2532,6 +2532,16 @@ Compare the advertised column shape, independently of result format codes."
     (ereport "0A000" "cached plan must not change result type"))
   columns)
 
+(defun exec-perform (ast)
+  (let* ((plan (plan-select-query ast))
+         (relations (getf (query-plan-prepared plan) :relations)))
+    (flet ((discard-row (row) (declare (ignore row)) (check-for-interrupts)))
+      (if relations
+          (with-registered-select-relations (registered relations)
+            (reconcile-query-plan-access-paths plan registered)
+            (execute-query-plan plan registered #'discard-row))
+          (execute-query-plan plan nil #'discard-row)))))
+
 (defun exec-select (stream ast)
   (let* ((plan (plan-select-query ast))
          (prepared (query-plan-prepared plan))

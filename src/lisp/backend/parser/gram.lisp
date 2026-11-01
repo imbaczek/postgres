@@ -145,9 +145,51 @@ Range and negative checks occur when the LIMIT executes."
         (t
          (syntax-error p "expected \";\" or end of input"))))))
 
+(defun parse-do (p)
+  (let ((options nil))
+    (loop
+      (cond
+        ((eq (pkind p) :string)
+         (push (cons :source (parse-string-literal p)) options))
+        ((match-kw p "language")
+         (push (cons :language (if (eq (pkind p) :string)
+                                   (parse-string-literal p)
+                                   (pident p)))
+               options))
+        (t (return))))
+    (unless options (syntax-error p "expected inline code or LANGUAGE"))
+    (list :type :do :options (nreverse options))))
+
+(defun parse-do-block (p)
+  (expect-kw p "begin")
+  (let ((statements nil))
+    (loop until (kw-p p "end")
+          do (when (at-eof-p p) (syntax-error p "expected END"))
+             (push (parse-do-procedural-statement p) statements)
+             (expect-punct p #\;))
+    (expect-kw p "end")
+    (list :type :do-block :statements (nreverse statements))))
+
+(defun parse-do-procedural-statement (p)
+  (cond
+    ((kw-p p "begin") (parse-do-block p))
+    ((match-kw p "null") (list :type :do-null))
+    ((match-kw p "perform") (list :type :perform :query (parse-select p)))
+    ((match-kw p "set") (parse-set p))
+    ((match-kw p "reset") (parse-reset p))
+    (t (ereport "0A000" "unsupported statement in inline PL/pgSQL block: ~a" (pval p)))))
+
+(defun compile-do-source (source)
+  (let* ((p (make-sql-parser :tokens (tokenize source)))
+         (block (parse-do-block p)))
+    (match-punct p #\;)
+    (unless (at-eof-p p) (syntax-error p "unexpected input after END"))
+    block))
+
 (defun parse-statement (p)
   (cond
     ((match-kw p "explain") (parse-explain p))
+    ((match-kw p "do") (parse-do p))
     ((kw-p p "with") (parse-with-select p))
     ((match-kw p "select") (parse-select p))
     ((kw-p p "values") (parse-select-expression p))

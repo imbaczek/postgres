@@ -183,6 +183,58 @@
          (map 'vector #'subquery-test-expected value))
         (t value)))
 
+(cl-spec:defproperty do-options-preserve-uncompiled-source
+    ((value (range integer -10000 10000)) (language-first (member t nil)))
+  (:about parse-statements)
+  (:trials (:normal 100))
+  (let* ((body (format nil "BEGIN PERFORM ~d; END;" value))
+         (sql (if language-first
+                  (format nil "DO LANGUAGE plpgsql $body$~a$body$" body)
+                  (format nil "DO $body$~a$body$ LANGUAGE 'plpgsql'" body)))
+         (ast (first (parse-statements sql)))
+         (options (getf ast :options)))
+    (and (eq (getf ast :type) :do)
+         (string= body (cdr (assoc :source options)))
+         (string= "plpgsql" (cdr (assoc :language options))))))
+
+(rove:deftest do-options-retain-source-until-execution
+    (unit-check-property 'do-options-preserve-uncompiled-source)
+  (dolist (body '("BEGIN PERFORM 1; END;" "not valid plpgsql" ""))
+    (let ((ast (first (parse-statements (format nil "DO $body$~a$body$" body)))))
+      (rove:ok (eq :do (getf ast :type)))
+      (rove:ok (equal (list (cons :source body)) (getf ast :options)))))
+  (let ((ast (first (parse-statements "DO LANGUAGE plpgsql 'a' LANGUAGE sql 'b'"))))
+    (rove:ok (equal '((:language . "plpgsql") (:source . "a")
+                      (:language . "sql") (:source . "b"))
+                    (getf ast :options))
+             "C defers duplicate option validation to execution"))
+  (dolist (sql '("DO" "DO LANGUAGE" "DO 1"))
+    (rove:ok (handler-case (progn (parse-statements sql) nil)
+               (pg-error (condition) (string= "42601" (pg-error-sqlstate condition))))
+             sql)))
+
+(rove:deftest do-block-compiles-supported-statements-and-nesting
+    (let* ((block (compile-do-source
+                   "BEGIN SET LOCAL synchronous_commit = 'off'; BEGIN NULL; PERFORM * FROM pg_catalog.txid_current(); END; RESET application_name; END;"))
+           (statements (getf block :statements))
+           (nested (getf (second statements) :statements)))
+      (rove:ok (equal '(:set :do-block :reset)
+                      (mapcar (lambda (statement) (getf statement :type)) statements)))
+      (rove:ok (getf (first statements) :local-p))
+      (rove:ok (equal '(:do-null :perform)
+                      (mapcar (lambda (statement) (getf statement :type)) nested)))
+      (rove:ok (eq :select (getf (getf (second nested) :query) :type))))
+  (rove:ok (null (getf (compile-do-source "BEGIN END") :statements)))
+  (dolist (source '("BEGIN NULL END;" "BEGIN" "BEGIN END; NULL;" "BEGIN BEGIN END END"))
+    (rove:ok (handler-case (progn (compile-do-source source) nil)
+               (pg-error (condition) (string= "42601" (pg-error-sqlstate condition))))
+             source))
+  (dolist (source '("BEGIN COMMIT; END;" "BEGIN EXECUTE 'SELECT 1'; END;"
+                    "BEGIN IF true THEN NULL; END IF; END;"))
+    (rove:ok (handler-case (progn (compile-do-source source) nil)
+               (pg-error (condition) (string= "0A000" (pg-error-sqlstate condition))))
+             source)))
+
 (cl-spec:defproperty txid-current-preserves-full-xid-bits
     ((high (range integer 0 4294967295)) (low (range integer 3 4294967295)))
   (:about eval-func)

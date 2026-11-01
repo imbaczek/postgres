@@ -555,7 +555,7 @@ HANDLE-SIMPLE-QUERY-FRAME so decoding occurs after admission."
             (when (and parsed-p
                        (not (every (lambda (statement)
                                      (member (getf statement :type)
-                                             '(:select :insert :update :delete :set :reset :show
+                                             '(:select :insert :update :delete :set :reset :show :do
                                                :begin :commit :rollback)))
                                    statements)))
               (setf parsed-p nil)

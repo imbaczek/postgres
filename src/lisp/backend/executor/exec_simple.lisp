@@ -651,6 +651,8 @@ Do not perform wire I/O while restoring transaction state."
      (ereport "22023" "invalid value for parameter \"transaction_isolation\": ~s"
               value))))
 
+(defvar *executing-do-p* nil)
+
 (defun exec-set (stream ast)
   (let* ((name (or (and (getf ast :name)
                         (string-downcase (getf ast :name)))
@@ -671,7 +673,7 @@ Do not perform wire I/O while restoring transaction state."
     (cond
       ((and (member name *session-local-setting-names* :test #'string=)
             (getf ast :local-p))
-       (if (or (backend-explicit *backend*) (backend-implicit-query-block *backend*))
+       (if (or *executing-do-p* (backend-explicit *backend*) (backend-implicit-query-block *backend*))
            (if (string= name "application_name")
                (session-set-application-name raw-value t)
                (session-set-synchronous-commit raw-value t))
@@ -1539,6 +1541,56 @@ before this removal horizon is captured."
   (commit-transaction)
   (flush-logical-ddl-deferred-responses responses))
 
+(defun do-statement-block (ast)
+  (let ((source nil) (source-p nil) (language nil) (language-p nil))
+    (dolist (option (getf ast :options))
+      (ecase (car option)
+        (:source
+         (when source-p (ereport "42601" "conflicting or redundant options"))
+         (setf source (cdr option) source-p t))
+        (:language
+         (when language-p (ereport "42601" "conflicting or redundant options"))
+         (setf language (cdr option) language-p t))))
+    (unless source-p (ereport "42601" "no inline code specified"))
+    (unless (or (not language-p) (string= language "plpgsql"))
+      (if (member language '("sql" "c" "internal") :test #'string=)
+          (ereport "0A000" "language ~a does not support inline code execution" language)
+          (ereport "42704" "language ~a does not exist" language)))
+    (compile-do-source source)))
+
+(defun execute-do-statement (stream ast)
+  (check-for-interrupts)
+  (case (getf ast :type)
+    (:do-null (values))
+    (:do-block
+        (dolist (statement (getf ast :statements))
+          (execute-do-statement stream statement)))
+    (otherwise
+     (let ((saved-snapshot (backend-snapshot *backend*))
+           (*statement-snapshot-override* nil))
+       (unwind-protect
+            (with-statement-snapshot (snapshot
+                                      (lambda (registration) (statement-start registration t)))
+              (recovery-check-statement
+               (if (eq (getf ast :type) :perform) (getf ast :query) ast))
+              (case (getf ast :type)
+                (:perform (exec-perform (getf ast :query)))
+                (:set (exec-set stream ast))
+                (:reset (exec-reset stream ast))
+                (t (ereport "0A000" "unsupported inline statement"))))
+         (setf (backend-snapshot *backend*) saved-snapshot))))))
+
+(defun exec-do (stream ast)
+  (let ((block (do-statement-block ast))
+        (*executing-do-p* t)
+        (*query-parameter-types* nil)
+        (*query-parameter-values* nil))
+    (session-remember-settings)
+    (let ((*defer-command-complete-p* t)
+          (*deferred-command-completes* nil))
+      (execute-do-statement stream block))
+    (send-command-complete stream "DO")))
+
 (defun execute-in-transaction-body (stream ast)
   (let ((implicit (not (or (backend-explicit *backend*)
                            (backend-implicit-query-block *backend*))))
@@ -1560,6 +1612,7 @@ before this removal horizon is captured."
           (flet ((execute-body ()
                    (case (getf ast :type)
                      (:select (exec-select stream ast))
+                     (:do (exec-do stream ast))
                      (:copy-to (setf copy-row-count (exec-copy-to stream ast)))
                      (:explain (exec-explain stream ast))
                      (:analyze (exec-analyze stream ast))
@@ -1683,7 +1736,7 @@ retires the transaction without undoing the catalog."
 Transaction options and session characteristics are excluded."
   (and (rest statements)
        (every (lambda (statement)
-                (and (member (getf statement :type) '(:select :insert :update :delete :set :reset :show))
+                (and (member (getf statement :type) '(:select :insert :update :delete :set :reset :show :do))
                      (not (getf statement :transaction-options-p))
                      (not (getf statement :session-characteristics-p))))
               statements)))
