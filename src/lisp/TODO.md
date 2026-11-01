@@ -257,10 +257,29 @@
   seeds 42 and 265648549833292381, digest `fnv1a64-v1:93537ecfe22d4395`;
   rejection counts and input coverage were not measured.
 
+- [x] Integrate CLOG completion with the publication FIFO (`ec9f21ebe3f`).
+  Transaction owners reserve before terminal insertion, publish against the actual
+  end, and materialize CLOG at the durable queue head before page retirement.
+  Normal production commits still flush and drain synchronously; OFF remains
+  disabled. The checkpoint passed 820 unit, 1,413 physical, 201 wire and 1,161
+  legacy checks, strict cold compilation, five native CLOG cases (including
+  cross-thread SQL and restart), 21 page, eight receipt and seven user cases,
+  DDL and reload checks. The `queued-clog-and-pages-retire-the-same-prefix`
+  property passed 100 trials each at seeds 42 and 4575550243879747699, digest
+  `fnv1a64-v1:71d269dfe392cfa8`; rejection counts and input coverage were not
+  measured, and there is no function spec. Logs are in
+  `/home/imbaczek/proj/pg-ha-artifacts/queued-clog/`.
+
 - [ ] Implement true asynchronous OFF using captured policy and acceptance
-  receipts. Integrate CLOG completion and reservation ownership with the queue.
-  Give WAL a transferable temporary-spool cleanup claim; cleanup
-  currently retains the owner thread/backend's retry authority. Then add a tracked
+  receipts. Give WAL a cleanup authority domain on the existing temporary owners,
+  preserving creator provenance. Transfer primary spools immediately after
+  construction and shared dirty scratch at creation, before opening files; ordinary
+  backend cleanup must exclude the WAL domain. Under WAL serialization, claim
+  cleanup state and authority under the registry lock, then do I/O outside that
+  lock while retaining retry ownership for a closed spool. Keep quota, path and
+  stream charges until close and unlink are confirmed. Storage identity changes
+  must also reject preterminal cleanup debt and old scratch. Shared scratch does
+  not belong to one publication. Then add a tracked
   primary writer with bounded pressure, wakeup, stop/join, reload, shutdown and
   role lifecycle. Prove distinct asynchronous acceptance and settle the snapshot
   prefix before acquiring the XID lock during snapshot capture. Preserve

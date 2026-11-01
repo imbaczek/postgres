@@ -2555,6 +2555,8 @@ Run outside publication locks, clean up the transaction, then handle the outcome
                                xid
                                (lambda (end)
                                  (declare (ignore end))
+                                 ;; WAL publication completes CLOG before this callback.
+                                 ;; Without WAL, write and sync the status here.
                                  (unless wal-ready-at-entry-p
                                    (clog-set xid +clog-committed+ :fsync t))
                                  (setf irreversible t))

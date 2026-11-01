@@ -27,8 +27,9 @@
   "Process-local map from 32-bit XID to completion, protected by CLOG lock.
 Reserved, inserting and published entries read as IN_PROGRESS; committed entries
 provide a committed overlay without changing raw bits. Readers take CLOG alone;
-writers take WAL then CLOG. This is not a queue. Successful commits leave it empty;
-reload retains debt.")
+writers take WAL then CLOG. Production transaction owners hold their completions;
+the FIFO retains queued owners. This map provides status lookup and retains debt
+across reload.")
 
 (defstruct (clog-commit-tag
             (:constructor %make-clog-commit-tag (xid incarnation timeline terminal-end)))
@@ -41,9 +42,10 @@ reload retains debt.")
 
 (defstruct (clog-commit-completion
             (:constructor %make-clog-commit-completion (tag owner state)))
-  ;; TAG fixes the WAL identity and planned terminal end. The map retains this
-  ;; completion and OWNER through an ambiguous terminal attempt. STATE is
-  ;; protected by CLOG lock. Only an unattempted reservation can be cancelled.
+  ;; TAG fixes the WAL identity and planned terminal end. OWNER links back to
+  ;; the publication holding this completion. The map retains both through an
+  ;; ambiguous terminal attempt. STATE is protected by CLOG lock. Only an
+  ;; unattempted reservation can be cancelled.
   (tag nil :read-only t)
   (owner nil :read-only t)
   (state :reserved))
@@ -62,7 +64,9 @@ reload retains debt.")
 
 (defun clog-check-completion-under-lock (completion owner &key materialized-p uninstalled-reservation-p)
   "Check owner, WAL identity and map membership with WAL and CLOG locks held.
-MATERIALIZED-P also permits an already retired completion."
+MATERIALIZED-P also permits an already retired completion.
+UNINSTALLED-RESERVATION-P permits a reserved completion absent from the map
+when installation failed."
   (assert (sb-thread:holding-mutex-p *wal-lock*))
   (assert (sb-thread:holding-mutex-p *clog-lock*))
   (wal-check-healthy)
@@ -90,7 +94,9 @@ MATERIALIZED-P also permits an already retired completion."
   "Reserve an IN_PROGRESS slot for OWNER and a planned terminal end.
 Caller holds WAL lock, masks interrupts through ownership handoff, and must
 cancel before beginning the insertion attempt or finish under a failure fence.
-The map retains OWNER if the outcome is ambiguous."
+For a publication, link the completion to OWNER before installing it in the
+map, so unwind can find even an uninstalled reservation. The map retains OWNER
+if the terminal outcome is ambiguous."
   (clog-check-planned-commit-under-wal-lock xid end)
   (unless owner (wal-invalid-input "CLOG reservation needs an owner"))
   (sb-thread:with-mutex (*clog-lock*)
@@ -175,6 +181,9 @@ An already materialized completion may be checked again."
 
 (defun clog-check-publication-under-lock
     (owner &key (terminal-end (wal-page-publication-terminal-end owner)) publishing-p)
+  "Check the publication's CLOG obligation under WAL and CLOG locks.
+Transactions need a matching completion; maintenance has XID zero and none.
+A queued completion may already be materialized and absent from the map."
   (assert (sb-thread:holding-mutex-p *clog-lock*))
   (let ((completion (wal-page-publication-completion owner)))
     (unless (case (wal-page-publication-kind owner)
@@ -201,11 +210,14 @@ An already materialized completion may be checked again."
   (values))
 
 (defun clog-check-publication-handoff-under-wal-lock (owner end)
+  "Check a published completion against the actual end before queue handoff."
   (sb-thread:with-mutex (*clog-lock*)
     (clog-check-publication-under-lock owner :terminal-end end :publishing-p t))
   (values))
 
 (defun clog-check-queued-commits-under-wal-lock ()
+  "Check both the FIFO's obligations and the pending map under WAL then CLOG.
+Caller has already validated the FIFO links."
   (assert (sb-thread:holding-mutex-p *wal-lock*))
   (sb-thread:with-mutex (*clog-lock*)
     (loop for owner = *wal-pending-page-publication* then (wal-page-publication-next owner)
@@ -224,6 +236,8 @@ An already materialized completion may be checked again."
   (values))
 
 (defun clog-release-unattempted-publication-under-wal-lock (completion owner)
+  "Cancel an unattempted reservation, including one not yet installed.
+Return NIL after an insertion attempt, leaving its owner for failure handling."
   (unless (and (wal-page-publication-p owner)
                (eq completion (wal-page-publication-completion owner)))
     (wal-invalid-input "publication lost its CLOG reservation"))
@@ -305,8 +319,8 @@ snapshot alone cannot prevent a new stage."
 
 (defun clog-stage-commit-under-wal-lock (xid end)
   "Install or return the matching tag for XID and its exact terminal end.
-This legacy staging API exposes committed status immediately; production calls
-it only after flush. Reservations use the separate inactive preparation path."
+This legacy staging API exposes committed status immediately and remains for
+compatibility and tests. Production publication uses reserved completions."
   (clog-check-commit-boundary-under-wal-lock xid end)
   (sb-thread:with-mutex (*clog-lock*)
     (let* ((key (xid32-of xid)) (old (gethash key *clog-pending-commits*)))

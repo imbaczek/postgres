@@ -179,10 +179,14 @@ Primary WAL publication also stages copied page records in an internal spool,
 building bounded record-sized chunks in sorted page-key order and validating the
 spool before the terminal record. Its temporary file is independent of the SQL
 temporary-file quota. Transactions and maintenance hand sealed spools and dirty
-maps to a WAL-locked FIFO at their terminal records. Reads find the newest queued
-page together with its contributor metadata. Settlement flushes WAL and validates
-the captured prefix before applying and retiring owners from the head through the
-captured target. Normal calls settle immediately before returning; there is no
+maps to a WAL-locked FIFO at their terminal records. Each transaction owner also
+holds its CLOG completion, reserved before the terminal insertion attempt and
+published against the actual terminal end. Maintenance owners have no completion.
+Reads find the newest queued page together with its contributor metadata.
+Settlement flushes WAL and validates the captured prefix, then completes each
+head's CLOG status before applying its pages and retiring its resources. A
+synchronous successor drains predecessors before its own status and callback.
+Normal calls settle immediately before returning; there is no
 background writer, and `synchronous_commit=off` still returns 0A000. Catalog,
 checkpoint, CLOG reset, XID reservation, resource, recycling and namespace changes
 are synchronous barriers. Relation resets force synchronous completion, with prior

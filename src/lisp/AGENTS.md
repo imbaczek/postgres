@@ -145,6 +145,11 @@ appropriate instead of replacing the native C peer or adding a message relay.
 - Dissect can fault while collecting SBCL mutex-frame locals for an ordinary
   missing-root error. A direct `handler-bind` can expose the original condition;
   the TODO tracks this diagnostic issue.
+- After CLOG completion moved into the publication FIFO, an older physical
+  running-xacts fixture still completed CLOG in its callback. The duplicate
+  terminal status error was hidden by a Dissect fault and leaked fixture state.
+  The callback now checks durable WAL and committed CLOG; the fixture isolates
+  the FIFO, pending CLOG map and physical failure state.
 - A warm test worker can retain orphan fixture XIDs and cached relation streams
   pointing into deleted legacy PGDATA. A direct REPL `macrolet` reproduction
   without Rove exposed an ordinary promotion error hidden by Dissect's mutex-frame

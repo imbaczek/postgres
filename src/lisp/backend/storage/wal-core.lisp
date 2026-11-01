@@ -252,10 +252,12 @@ Owners are process-local; the appropriate codec stores durable slot fields."
 It is separate from the source identity used for remote acknowledgments.")
 
 (defstruct (wal-page-publication (:constructor %make-wal-page-publication))
-  ;; The stack owns SPOOL until the masked terminal handoff links this owner.
-  ;; The FIFO retains its sealed spool, dirty maps and WAL identity through
-  ;; durable application and head retirement. KIND distinguishes transaction
-  ;; from maintenance (XID zero); NEXT links owners in terminal order.
+  ;; Before FIFO handoff the stack normally closes SPOOL on exit. A transaction's
+  ;; CLOG reservation retains the owner after its terminal attempt starts, so
+  ;; cleanup leaves the spool even if handoff fails. The FIFO retains the sealed
+  ;; spool, dirty maps, CLOG completion and WAL identity through head retirement. A transaction
+  ;; completion points back to this owner; maintenance has XID zero and no
+  ;; completion. NEXT links owners in terminal order.
   spool (state :stack) prepared-p pages contributors resets split-p xid
   next completion (kind :transaction)
   incarnation timeline terminal-end replacement-pages replacement-contributors)
@@ -1455,7 +1457,8 @@ the transaction (see SnapBuildCommitTxn and CreateInitDecodingContext)."
 
 (defun call-with-wal-primary-page-spool (function)
   "Call FUNCTION with a stack-owned spool and its publication owner.
-Cleanup closes only a stack-owned spool; handoff leaves it with the pending owner."
+Cleanup closes an untransferred spool unless a transaction's terminal attempt has
+begun. Its CLOG reservation then retains the owner even if queue handoff fails."
   (when (or *wal-pending-page-publication* *wal-pending-page-publication-tail*)
     (wal-check-page-publication-queue-under-lock)
     (when (wal-page-publication-resets *wal-pending-page-publication-tail*)
@@ -1549,7 +1552,7 @@ Install the preallocated empty maps by pointer, without changing references."
   owner)
 
 (defun wal-drain-page-publication-under-lock (owner &key fault-on-first-write)
-  "Apply a durable owner, close its spool and retire its references.
+  "Complete CLOG and apply a durable owner, then retire its spool and references.
 Only the FIFO head can retire, and it is removed last. Failure leaves debt for
 fail-stop handling."
   (assert (sb-thread:holding-mutex-p *wal-lock*))
@@ -1585,6 +1588,7 @@ fail-stop handling."
   (values))
 
 (defun wal-drain-page-publication-prefix-under-lock (target &key include-target-p fault-on-first-write)
+  "Validate and drain the durable FIFO prefix before TARGET, optionally including it."
   (assert (sb-thread:holding-mutex-p *wal-lock*))
   (sb-sys:without-interrupts
     (wal-check-healthy)
@@ -1628,7 +1632,7 @@ nonlocal exit to an error so the caller can fence failure after unlocking."
     target))
 
 (defmacro with-wal-primary-page-spool ((spool &optional publication) &body body)
-  "Keep stack cleanup responsible for SPOOL until PUBLICATION transfers ownership."
+  "Close an abandoned SPOOL before a terminal attempt; retain attempted transaction owners."
   (let ((owner (or publication (gensym "PAGE-PUBLICATION-"))))
     `(call-with-wal-primary-page-spool
       (lambda (,spool ,owner)
@@ -1743,6 +1747,13 @@ nonlocal exit to an error so the caller can fence failure after unlocking."
 (declaim (ftype function wal-validate-logical-binary-capability-under-lock))
 
 (defun wal-admit-transaction-under-lock (xid logical-changes)
+  "Prepare and queue a transaction's pages and CLOG completion under WAL lock.
+Reserve against the planned terminal end before attempting insertion. Publish
+only after the actual end matches, then hand the owner to the FIFO. An
+unattempted reservation can be cancelled; an ambiguous attempt retains its owner
+for fail-stop handling. Return the owner and actual terminal end.
+Caller masks interrupts through handoff and fences incomplete publication.
+This helper does not flush WAL or provide an acceptance receipt."
   (assert (sb-thread:holding-mutex-p *wal-lock*))
   (wal-check-page-publication-queue-under-lock)
   (clog-check-queued-commits-under-wal-lock)
@@ -1787,6 +1798,8 @@ nonlocal exit to an error so the caller can fence failure after unlocking."
           (values publication end))))))
 
 (defun wal-complete-publication-status-under-lock (owner)
+  "Complete the durable FIFO head's CLOG obligation, if it has one.
+This may be called again after materialization while page retirement is pending."
   (assert (sb-thread:holding-mutex-p *wal-lock*))
   (wal-check-page-publication-owner-under-lock owner)
   (unless (eq owner *wal-pending-page-publication*)
@@ -1809,14 +1822,16 @@ before publication even without WAL. The reset descriptors are owned across
 AFTER-DURABLE-FUNCTION, which may release the transaction's private replacements.
 Preflight the page spool before the terminal and transfer the dirty maps to a
 pending owner at that exact end. Flush WAL before truncating any relation fork.
-The durable observer and slot update precede the CLOG callback; resets, pages,
-checked spool close and reference retirement finish before acceptance.
+After the durable observer, drain predecessors before completing this owner's
+CLOG status and calling AFTER-DURABLE-FUNCTION. Resets, pages, checked spool
+close and reference retirement finish before acceptance.
 
 With WAL ready, return this transaction's numeric commit end and an immutable
 receipt after local apply. TERMINAL-DURABLE-FUNCTION receives the exact end
-immediately after flush, before AFTER-DURABLE-FUNCTION. The latter receives this
-transaction's own end, or NIL without WAL; it is independent of the observer
-callback and cannot manufacture proof that the observer ran. For incomplete
+immediately after flush, before AFTER-DURABLE-FUNCTION. The FIFO owns CLOG
+completion with WAL ready; without WAL the latter callback must write status.
+It receives this transaction's own end, or NIL without WAL, independently of
+the observer callback and cannot manufacture proof that the observer ran. For incomplete
 publication, fence cleanup fail-stops after releasing WAL and retains the first
 error. Legacy append and flush I/O handlers may fail-stop earlier while WAL is held.
 
