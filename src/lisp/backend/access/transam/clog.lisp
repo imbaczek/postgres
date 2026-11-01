@@ -172,6 +172,7 @@ The overlay is process-local and does not itself change the raw file bits."
 
 (defun clog-reset-file-under-wal-lock (fsync-function fsync-directory-function)
   (assert (sb-thread:holding-mutex-p *wal-lock*))
+  (wal-require-no-pending-page-publication)
   (sb-thread:with-mutex (*clog-lock*)
     (clog-require-no-pending-under-lock)
     (when *clog-stream*
@@ -191,7 +192,7 @@ The overlay is process-local and does not itself change the raw file bits."
 (defun clog-reset-under-wal-lock (fsync-function fsync-directory-function wal-reset-p)
   "Reject pending debt and keep WAL locked through record, file and epoch change."
   (assert (sb-thread:holding-mutex-p *wal-lock*))
-  (clog-require-no-pending-commits)
+  (wal-require-no-pending-storage)
   (when (and wal-reset-p *wal-ready*) (wal-log-clog-reset-under-lock))
   (clog-reset-file-under-wal-lock fsync-function fsync-directory-function))
 
@@ -206,7 +207,7 @@ its own critical publication fence."
   (if (sb-thread:holding-mutex-p *wal-lock*)
       (clog-reset-under-wal-lock fsync-function fsync-directory-function wal-reset-p)
       (with-wal-publication-fence (begin-publication)
-        (clog-require-no-pending-commits)
+        (wal-require-no-pending-storage)
         (begin-publication)
         (clog-reset-under-wal-lock fsync-function fsync-directory-function wal-reset-p)))
   (values))

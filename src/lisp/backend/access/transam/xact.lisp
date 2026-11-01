@@ -2382,6 +2382,7 @@ On commit, retire the saved settings snapshot; abort leaves it for whole-table u
                  (finish-backend-transaction backend t)))
              (setf complete t))
         (unless complete
+          (suppress-backend-frontend-output backend :committed-cleanup-failure)
           (wal-fail-stop
            (or failure
                (make-condition 'simple-error
@@ -2577,7 +2578,8 @@ Run outside publication locks, clean up the transaction, then handle the outcome
                             (setf outcome (wait-for-committed-wal-obligation
                                            b obligation (commit-policy-remote-wait policy)))
                             (setf completion-safe t))
-                       (when (and irreversible (not completion-safe))
+                       (when (and (or irreversible (and wal-ready-at-entry-p *wal-poisoned*))
+                                  (not completion-safe))
                          (suppress-backend-frontend-output b :invalid-commit-receipt)))
                   (when (or irreversible (and wal-ready-at-entry-p *wal-poisoned*))
                     (finish-committed-transaction b xid)))

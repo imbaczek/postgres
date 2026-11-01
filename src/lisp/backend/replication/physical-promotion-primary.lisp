@@ -318,7 +318,7 @@ installing the child's state."
   (let ((finished nil))
     (unwind-protect
          (progn
-           (clog-require-no-pending-commits)
+           (wal-require-no-pending-storage)
            (physical-promotion-check-context 3 :preserve-readers t)
            (unless (and *postmaster-data-lock* (postmaster-pid-owned-p)
                         *clog-stream* (open-stream-p *clog-stream*)

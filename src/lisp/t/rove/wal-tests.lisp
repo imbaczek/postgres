@@ -226,6 +226,224 @@ Each entry in SEGMENTS contains a segment number followed by its byte vectors."
            (when (and waiter (sb-thread:thread-alive-p waiter))
              (sb-thread:join-thread waiter :timeout 2 :default :timeout)))))))
 
+(declaim (special *wal-pending-page-publication*))
+
+(defun dispose-page-publication-test-owner (owner)
+  (when owner
+    (flet ((dispose ()
+             (assert (eq owner *wal-pending-page-publication*))
+             (wal-close-primary-page-spool (wal-page-publication-spool owner))
+             (let ((stores nil))
+               (maphash (lambda (key reference)
+                          (when (wal-dirty-reference-p reference)
+                            (pushnew (wal-dirty-reference-store reference) stores))
+                          (wal-dirty-release-reference reference)
+                          (remhash key (wal-page-publication-pages owner))
+                          (remhash key (wal-page-publication-contributors owner)))
+                        (wal-page-publication-pages owner))
+               (dolist (store stores)
+                 (let ((*wal-dirty-store* store)) (wal-dirty-close-empty-store))))
+             (setf *wal-pending-page-publication* nil)))
+      (if (sb-thread:holding-mutex-p *wal-lock*)
+          (dispose)
+          (sb-thread:with-mutex (*wal-lock*) (dispose)))))
+  (values))
+
+(defun call-with-page-publication-test (function &key (resident-limit 0))
+  (let* ((*pgdata* (merge-pathnames
+                    (format nil "pg-page-owner-~d-~d/" (sb-posix:getpid) (random 1000000))
+                    (uiop:temporary-directory)))
+         (*query-temp-directory* *pgdata*) (*query-temp-file-limit-bytes* 0)
+         (*logical-capture-memory-bytes* 0)
+         (*relation-streams* (make-hash-table :test #'equal))
+         (*wal-dirty-store* nil) (*wal-dirty-resident-limit-pages* resident-limit)
+         (*wal-page-cache* (make-hash-table :test #'equal))
+         (*wal-page-cache-xids* (make-hash-table :test #'equal))
+         (*wal-page-batch* nil) (*wal-page-batch-xids* nil) (*wal-page-batch-split* nil)
+         (*wal-pending-btree-split* nil) (*wal-pending-page-publication* nil)
+         (*wal-storage-incarnation* (gensym "TEST-PAGE-STORE-"))
+         (*wal-insert-timeline* 1) (*wal-ready* t) (*wal-poisoned* nil)
+         (*physical-recovery-failed-p* nil)
+         (*wal-end-lsn* 200) (*wal-durable-lsn* 100)
+         (*backend* (make-backend :xid 44)))
+    (ensure-directories-exist (merge-pathnames "base/" *pgdata*))
+    (unwind-protect
+         (funcall function)
+      (dispose-page-publication-test-owner *wal-pending-page-publication*)
+      (wal-clear-page-cache)
+      (smgr-close-all)
+      (uiop:delete-directory-tree *pgdata* :validate t :if-does-not-exist :ignore))))
+
+(defun page-publication-test-refcount ()
+  (if *wal-dirty-store*
+      (+ (wal-dirty-store-resident *wal-dirty-store*)
+         (wal-dirty-store-disk-refs *wal-dirty-store*))
+      0))
+
+(defun page-publication-test-spool (spool)
+  (let* ((images (mapcar #'wal-primary-page-image (wal-primary-page-keys)))
+         (payload (wal-encode-page-images images 100))
+         (event (make-array (+ 12 (length payload)) :element-type '(unsigned-byte 8))))
+    (wal-set-u32 event 0 +wal-version+)
+    (wal-set-u64 event 4 100)
+    (replace event payload :start1 12)
+    (logical-spool-append spool event)
+    (wal-primary-seal-page-spool spool)))
+
+(defun page-publication-model-result (marker resident-limit fork)
+  (call-with-page-publication-test
+   (lambda ()
+     (let ((page (page-init (make-page)))
+           (key (wal-page-key 7310 2 fork))
+           (other (if (eq fork :main) :visibility :main))
+           (owner nil) (old-map nil) (reference nil) (private-seen nil))
+       (setf (aref page 100) marker)
+       (wal-buffer-write 7310 0 page fork)
+       (wal-buffer-write 7310 2 page fork)
+       (let ((*backend* (make-backend :xid 66)) (*wal-row-page-write-p* t))
+         (wal-buffer-write 7310 2 page fork))
+       (sb-thread:with-mutex (*wal-lock*)
+         (setf old-map *wal-page-cache* reference (gethash key old-map))
+         (call-with-wal-primary-page-spool
+          (lambda (spool publication)
+            (page-publication-test-spool spool)
+            (wal-prepare-page-publication-under-lock publication 44 nil nil)
+            (wal-publish-page-publication-under-lock publication 140)
+            (setf owner publication))))
+       (unless (and (eq owner *wal-pending-page-publication*)
+                    (eq old-map (wal-page-publication-pages owner))
+                    (eq reference (gethash key (wal-page-publication-pages owner)))
+                    (eq :pending (wal-page-publication-state owner))
+                    (not (logical-spool-closed-p (wal-page-publication-spool owner)))
+                    (zerop (hash-table-count *wal-page-cache*))
+                    (= 2 (page-publication-test-refcount))
+                    (= marker (aref (wal-buffer-read 7310 2 fork) 100))
+                    (= 3 (wal-buffer-nblocks 7310 fork))
+                    (zerop (wal-buffer-nblocks 7310 other))
+                    (null (smgr-read 7310 2 fork)))
+         (return-from page-publication-model-result nil))
+       (let ((changed (copy-seq page)))
+         (setf (aref changed 100) (mod (1+ marker) 256))
+         (catch 'private-rollback
+           (with-wal-page-batch
+             (wal-buffer-write 7310 2 changed fork)
+             (setf private-seen (aref (wal-buffer-read 7310 2 fork) 100))
+             (throw 'private-rollback :rolled-back)))
+         (unless (and (= private-seen (aref changed 100))
+                      (= marker (aref (wal-buffer-read 7310 2 fork) 100))
+                      (= 2 (page-publication-test-refcount)))
+           (return-from page-publication-model-result nil))
+         (let ((*backend* (make-backend :xid 55)) (*wal-row-page-write-p* t))
+           (with-wal-page-batch
+             (wal-buffer-write 7310 2 changed fork)
+             (unless (= 3 (wal-buffer-extend 7310 changed fork))
+               (return-from page-publication-model-result nil))))
+         (unless (and (= 4 (wal-buffer-nblocks 7310 fork))
+                      (= 4 (page-publication-test-refcount))
+                      (every (lambda (xid) (member xid (gethash key *wal-page-cache-xids*)))
+                             '(0 1 44 55 66)))
+           (return-from page-publication-model-result nil))
+         (let ((new (gethash key *wal-page-cache*)))
+           (sb-thread:with-mutex (*wal-lock*)
+             (setf *wal-durable-lsn* 140)
+             (wal-drain-page-publication-under-lock owner))
+           (and (null *wal-pending-page-publication*)
+                (eq :released (wal-page-publication-state owner))
+                (logical-spool-closed-p (wal-page-publication-spool owner))
+                (eq new (gethash key *wal-page-cache*))
+                (= 2 (page-publication-test-refcount))
+                (= (aref changed 100) (aref (wal-buffer-read 7310 2 fork) 100))
+                (= marker (aref (smgr-read 7310 2 fork) 100))
+                (= 4 (wal-buffer-nblocks 7310 fork)))))))
+   :resident-limit resident-limit))
+
+(cl-spec:defproperty page-publication-keeps-owned-pages-and-newer-dirt
+    ((marker (range integer 0 255)) (resident-limit (range integer 0 2))
+                                    (fork-choice (range integer 0 1)))
+  (:about wal-publish-page-publication-under-lock)
+  (:trials (:normal 100))
+  (page-publication-model-result marker resident-limit (if (zerop fork-choice) :main :visibility)))
+
+(rove:deftest page-publication-ownership-and-visibility-contract
+    (unit-check-property 'page-publication-keeps-owned-pages-and-newer-dirt))
+
+(rove:deftest page-publication-rejects-undurable-or-foreign-drain
+    (call-with-page-publication-test
+     (lambda ()
+       (let ((page (page-init (make-page))) (owner nil))
+         (wal-buffer-write 7310 0 page)
+         (sb-thread:with-mutex (*wal-lock*)
+           (call-with-wal-primary-page-spool
+            (lambda (spool publication)
+              (page-publication-test-spool spool)
+              (wal-prepare-page-publication-under-lock publication 44 nil nil)
+              (wal-publish-page-publication-under-lock publication 140)
+              (setf owner publication)))
+           (dolist (fault '(:undurable :incarnation :timeline :owner))
+             (let ((*wal-durable-lsn* (if (eq fault :undurable) 100 200))
+                   (*wal-storage-incarnation*
+                     (if (eq fault :incarnation) (gensym "OTHER-") *wal-storage-incarnation*))
+                   (*wal-insert-timeline* (if (eq fault :timeline) 2 1)))
+               (rove:ok
+                (handler-case
+                    (progn
+                      (wal-drain-page-publication-under-lock
+                       (if (eq fault :owner) (%make-wal-page-publication) owner))
+                      nil)
+                  (wal-input-validation-error () t))))
+             (rove:ok (eq owner *wal-pending-page-publication*))
+             (rove:ok (not (logical-spool-closed-p (wal-page-publication-spool owner))))
+             (rove:ok (null (smgr-read 7310 0))))
+           (setf *wal-durable-lsn* 140)
+           (wal-drain-page-publication-under-lock owner))))))
+
+(rove:deftest page-publication-blocks-lifecycle-and-later-publishers
+    (call-with-page-publication-test
+     (lambda ()
+       (wal-buffer-write 7310 0 (page-init (make-page)))
+       (let ((owner nil) (token *wal-storage-incarnation*)
+                         (end *wal-end-lsn*) (durable *wal-durable-lsn*))
+         (sb-thread:with-mutex (*wal-lock*)
+           (call-with-wal-primary-page-spool
+            (lambda (spool publication)
+              (page-publication-test-spool spool)
+              (wal-prepare-page-publication-under-lock publication 44 nil nil)
+              (wal-publish-page-publication-under-lock publication 140)
+              (setf owner publication))))
+         (dolist (operation
+                  (list #'wal-init #'wal-checkpoint-core #'clog-reset
+                        #'physical-recovery-open-storage
+                        #'physical-promotion-adopt-live-child-runtime
+                        (lambda () (physical-promotion-restore-cold-state nil nil))
+                        #'wal-commit-maintenance
+                        (lambda () (wal-commit-transaction 55 #'identity :source-id :later))
+                        (lambda () (let ((*wal-ready* nil))
+                                     (wal-commit-transaction 55 #'identity)))
+                        (lambda () (let ((*wal-ready* nil))
+                                     (wal-commit-catalog #() #'identity)))
+                        (lambda () (wal-forget-relation 7310))
+                        (lambda ()
+                          (sb-thread:with-mutex (*wal-lock*)
+                            (wal-append-record +wal-record-commit+ 55 #())))
+                        (lambda ()
+                          (sb-thread:with-mutex (*wal-lock*)
+                            (wal-replace-storage-incarnation-under-lock)))
+                        (lambda ()
+                          (sb-thread:with-mutex (*wal-lock*)
+                            (wal-remove-checkpointed-segments-under-wal-lock 100)))
+                        (lambda ()
+                          (sb-thread:with-mutex (*wal-lock*)
+                            (wal-migrate-namespace-under-lock)))))
+           (rove:ok (handler-case (progn (funcall operation) nil)
+                      (wal-input-validation-error () t)))
+           (rove:ok (eq owner *wal-pending-page-publication*))
+           (rove:ok (eq token *wal-storage-incarnation*))
+           (rove:ok (= end *wal-end-lsn*))
+           (rove:ok (= durable *wal-durable-lsn*))
+           (rove:ok (not *wal-poisoned*))
+           (rove:ok (not (logical-spool-closed-p (wal-page-publication-spool owner))))
+           (rove:ok (null (smgr-read 7310 0))))))))
+
 (rove:deftest test-wal-scan-rejects-impossible-rotation-gap
     (let* ((size +wal-segment-size+)
            (end (+ size 64))
@@ -1202,7 +1420,7 @@ Each entry in SEGMENTS contains a segment number followed by its byte vectors."
            (*wal-dirty-store* nil)
            (*wal-page-cache* (make-hash-table :test #'equal))
            (*wal-page-cache-xids* (make-hash-table :test #'equal))
-           (*wal-end-lsn* 100)
+           (*wal-end-lsn* 100) (*wal-durable-lsn* 100) (*wal-pending-page-publication* nil)
            (names '(wal-append-running-xacts-under-lock wal-append-batch-start
                     wal-append-record wal-flush wal-slot-record-xid-commit-under-wal-lock))
            (saved (mapcar (lambda (name) (cons name (symbol-function name))) names))
@@ -1220,7 +1438,7 @@ Each entry in SEGMENTS contains a segment number followed by its byte vectors."
                      (rove:ok (= type +wal-record-commit+))
                      (rove:ok (= xid 44))
                      (setf terminal (incf *wal-end-lsn* (+ +wal-header-size+ (length payload)))))
-                   (symbol-function 'wal-flush) (lambda () (setf flushed t))
+                   (symbol-function 'wal-flush) (lambda () (setf flushed t *wal-durable-lsn* *wal-end-lsn*))
                    (symbol-function 'wal-slot-record-xid-commit-under-wal-lock)
                    (lambda (xid lsn)
                      (rove:ok (= xid 44))
@@ -1239,6 +1457,7 @@ Each entry in SEGMENTS contains a segment number followed by its byte vectors."
                (rove:ok (null (wal-commit-transaction 45 (lambda (end) (rove:ok (null end)))))
                         "a no-WAL commit has no replication boundary")))
         (dolist (entry saved) (setf (symbol-function (car entry)) (cdr entry)))
+        (dispose-page-publication-test-owner *wal-pending-page-publication*)
         (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))
 
 (defun commit-receipt-test-result (&key (source :source-a) (supply-source t) fault)
@@ -1248,7 +1467,7 @@ Each entry in SEGMENTS contains a segment number followed by its byte vectors."
          (*query-temp-directory* directory)
          (*backend* nil) (*wal-ready* t) (*wal-poisoned* nil) (*wal-output-stream* nil)
          (*wal-dirty-store* nil) (*wal-page-cache* (make-hash-table :test #'equal))
-         (*wal-page-cache-xids* (make-hash-table :test #'equal)) (*wal-end-lsn* 100)
+         (*wal-page-cache-xids* (make-hash-table :test #'equal)) (*wal-end-lsn* 100) (*wal-durable-lsn* 100) (*wal-pending-page-publication* nil)
          (names '(wal-append-running-xacts-under-lock wal-append-batch-start wal-append-record
                   wal-flush wal-slot-record-xid-commit-under-wal-lock wal-test-pause
                   wal-primary-apply-page-spool close-logical-spool wal-fail-stop))
@@ -1266,11 +1485,20 @@ Each entry in SEGMENTS contains a segment number followed by its byte vectors."
                    (declare (ignore payload))
                    (unless (and (= type +wal-record-commit+) (= xid 44)) (error "unexpected record"))
                    (push :terminal events) (setf *wal-end-lsn* 140))
-                 (symbol-function 'wal-flush) (lambda () (push :flush events))
+                 (symbol-function 'wal-flush)
+                 (lambda ()
+                   (when (eq fault :flush) (error "receipt flush failure"))
+                   (setf *wal-durable-lsn* *wal-end-lsn*)
+                   (push :flush events))
                  (symbol-function 'wal-slot-record-xid-commit-under-wal-lock)
                  (lambda (&rest arguments) (declare (ignore arguments)))
                  (symbol-function 'wal-test-pause)
                  (lambda (point)
+                   (when (and (eq point :after-page-images) (eq fault :before-transfer))
+                     (throw 'receipt-exit :escaped))
+                   (when (and (eq point :after-page-publication-transfer)
+                              (eq fault :after-transfer))
+                     (throw 'receipt-exit :escaped))
                    (when (eq point :after-wal-flush)
                      (push :hook events)
                      (when (eq fault :hook) (error "receipt hook failure"))))
@@ -1300,7 +1528,8 @@ Each entry in SEGMENTS contains a segment number followed by its byte vectors."
                            (list :terminal-durable-function
                                  (lambda (terminal)
                                    (unless (= terminal 140) (error "wrong durable terminal"))
-                                   (push :durable events))
+                                   (push :durable events)
+                                   (when (eq fault :durable) (error "receipt observer failure")))
                                  :accepted-function
                                  (lambda (value)
                                    (unless (sb-thread:holding-mutex-p *wal-lock*) (error "acceptance lost WAL exclusion"))
@@ -1312,8 +1541,14 @@ Each entry in SEGMENTS contains a segment number followed by its byte vectors."
                            (when supply-source (list :source-id source))))))
              (error (condition) (setf failure (princ-to-string condition))))
            (list :events (nreverse events) :accepted accepted :end end :receipt receipt
-                 :failure failure :poisoned *wal-poisoned* :global-end *wal-end-lsn*))
+                 :failure failure :poisoned *wal-poisoned* :global-end *wal-end-lsn*
+                 :page-state (when *wal-pending-page-publication*
+                               (wal-page-publication-state *wal-pending-page-publication*))
+                 :page-spool-closed (when *wal-pending-page-publication*
+                                      (logical-spool-closed-p
+                                       (wal-page-publication-spool *wal-pending-page-publication*)))))
       (dolist (entry saved) (setf (symbol-function (car entry)) (cdr entry)))
+      (dispose-page-publication-test-owner *wal-pending-page-publication*)
       (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))
 
 (cl-spec:defproperty commit-receipt-keeps-exact-source-and-terminal
@@ -1335,6 +1570,24 @@ Each entry in SEGMENTS contains a segment number followed by its byte vectors."
 
 (rove:deftest wal-commit-acceptance-receipt-contract
     (unit-check-property 'commit-receipt-keeps-exact-source-and-terminal))
+
+(rove:deftest page-publication-faults-retain-owner-until-complete-drain
+    (dolist (fault '(:before-transfer :after-transfer :flush :durable :hook :apply :close :accept :nonlocal-accept))
+      (let* ((result (commit-receipt-test-result :fault fault))
+             (pending-p (member fault '(:after-transfer :flush :durable :hook :apply :close))))
+        (rove:ok (getf result :failure) (format nil "~a is fenced" fault))
+        (rove:ok (getf result :poisoned))
+        (rove:ok (null (getf result :receipt)))
+        (rove:ok (null (getf result :end)))
+        (rove:ok (eq (cond ((eq fault :close) :applied) (pending-p :pending))
+                     (getf result :page-state))
+                 (format nil "~a preserves the publication lifecycle" fault))
+        (when pending-p
+          (rove:ok (eql (eq fault :close) (getf result :page-spool-closed))
+                   "lexical unwinding cannot close a transferred spool"))
+        (unless (member fault '(:accept :nonlocal-accept))
+          (rove:ok (null (getf result :accepted))
+                   "incomplete publication cannot reach acceptance")))))
 
 (rove:deftest wal-commit-receipt-rejects-source-before-publication
     (dolist (arguments '((:supply-source nil) (:source "mutable") (:source #(1))))
@@ -1615,6 +1868,9 @@ Each entry in SEGMENTS contains a segment number followed by its byte vectors."
            (*query-temp-directory* directory)
            (*logical-capture-memory-bytes* 0)
            (*wal-ready* t)
+           (*wal-end-lsn* 100)
+           (*wal-durable-lsn* 100)
+           (*wal-pending-page-publication* nil)
            (*wal-output-stream* nil)
            (*wal-page-cache* (make-hash-table :test #'equal))
            (*wal-page-cache-xids* (make-hash-table :test #'equal))
@@ -1642,8 +1898,10 @@ Each entry in SEGMENTS contains a segment number followed by its byte vectors."
                      (lambda (type xid payload)
                        (declare (ignore xid))
                        (push type records)
-                       (incf position (+ +wal-header-size+ (length payload))))
-                     (symbol-function 'wal-flush) (lambda () (setf flushed t))
+                       (setf *wal-end-lsn*
+                             (incf position (+ +wal-header-size+ (length payload)))))
+                     (symbol-function 'wal-flush)
+                     (lambda () (setf flushed t *wal-durable-lsn* *wal-end-lsn*))
                      (symbol-function 'wal-slot-record-xid-commit-under-wal-lock)
                      (lambda (xid lsn) (declare (ignore xid lsn)))
                      (symbol-function 'smgr-write)
@@ -1664,13 +1922,23 @@ Each entry in SEGMENTS contains a segment number followed by its byte vectors."
                           (error (condition) (search "checksum mismatch" (princ-to-string condition)))))
                (rove:ok *wal-poisoned*)
                (rove:ok (zerop writes))
-               (rove:ok (= 1 (hash-table-count *wal-page-cache*)))
+               (rove:ok (= (if (= corrupt-pass 1) 1 0)
+                           (hash-table-count *wal-page-cache*)))
+               (rove:ok (if (= corrupt-pass 2)
+                            (and *wal-pending-page-publication*
+                                 (= 1 (hash-table-count
+                                       (wal-page-publication-pages *wal-pending-page-publication*)))
+                                 (not (logical-spool-closed-p
+                                       (wal-page-publication-spool *wal-pending-page-publication*))))
+                            (null *wal-pending-page-publication*)))
                (rove:ok (eql (= corrupt-pass 2) flushed))
                (rove:ok (eql (= corrupt-pass 2) callback))
                (rove:ok (eql (= corrupt-pass 2)
                              (not (null (member +wal-record-commit+ records)))))
-               (rove:ok (null (uiop:directory-files directory)))))
+               (rove:ok (eql (= corrupt-pass 1)
+                             (null (uiop:directory-files directory))))))
         (dolist (entry saved) (setf (symbol-function (car entry)) (cdr entry)))
+        (dispose-page-publication-test-owner *wal-pending-page-publication*)
         (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))
 
 (rove:deftest test-wal-recovery-page-spool-preflight-and-order
