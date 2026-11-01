@@ -174,6 +174,8 @@ private, and its creating thread remains recorded."
   (null (query-temp-cleanup-domain-owners domain)))
 
 (defun query-temp-cleanup-domain-resource-counts (domain)
+  "Count DOMAIN's retained resources under its lock, including pending cleanup.
+Count each pathname once and retain quota charges until cleanup discharges them."
   (assert (sb-thread:holding-mutex-p (query-temp-cleanup-domain-lock domain)))
   (let ((owners 0) (entries 0) (streams 0) (directories 0) (bytes 0)
                    (paths (make-hash-table :test #'equal)))

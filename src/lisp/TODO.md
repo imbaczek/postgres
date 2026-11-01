@@ -1,5 +1,18 @@
 # Development TODO
 
+- [x] Add retained WAL publication pressure accounting and admission
+  (`e8673faf91a`). Pressure can settle predecessors and require synchronous
+  completion; the limits bound asynchronous acceptance, not a transaction's
+  transient allocations. OFF remains disabled, and a future asynchronous caller
+  must honor the admission helper's third return value. The checkpoint passed 871
+  unit, 1,413 physical, 1,161 legacy and 201 wire checks, strict cold compilation,
+  eight native writer cases including pressure and SIGKILL, 21 native page and five
+  native CLOG cases. Logs are in `/home/imbaczek/proj/pg-ha-artifacts/wal-pressure/`.
+  Two cl-spec properties ran 100 trials each at seeds 4009 and 4010, with respective
+  digests `491b955b8bd3e744` and `19c520ff03696461`. Neither pressure property
+  has a Function Spec; coverage and rejection counts were not measured. Asynchronous acceptance, OFF,
+  and unrelated WAL flushing with an empty FIFO remain open.
+
 - [x] Add the primary WAL writer authority and FIFO drain foundation. No writer
   loop or startup is enabled. The checkpoint passed 842 unit checks and strict
   cold compilation. The scoped property ran 100 trials at seed 4007 (digest

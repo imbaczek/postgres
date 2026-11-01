@@ -1066,6 +1066,7 @@ The zero marker remains sticky for uncertified writes; XIDs are full XIDs."
     size))
 
 (defun map-wal-primary-page-key-chunks (keys function)
+  "Visit page keys in the same bounded chunks used for WAL and pressure sizing."
   (assert (sb-thread:holding-mutex-p *wal-lock*))
   (let ((chunk nil) (count 0) (bytes 0))
     (dolist (key keys)
@@ -1850,7 +1851,8 @@ unattempted reservation can be cancelled; an ambiguous attempt retains its owner
 for fail-stop handling. Return the owner and actual terminal end.
 Caller masks interrupts through handoff and fences incomplete publication.
 Pressure may settle predecessors before this batch starts. The third value
-requires synchronous completion of this owner before any asynchronous acceptance.
+requires synchronous completion of this owner before any asynchronous acceptance;
+a future asynchronous caller must consume it.
 This helper does not flush the new owner or provide an acceptance receipt."
   (assert (sb-thread:holding-mutex-p *wal-lock*))
   (wal-check-page-publication-queue-under-lock)

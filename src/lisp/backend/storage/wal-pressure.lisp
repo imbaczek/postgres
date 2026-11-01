@@ -4,6 +4,7 @@
 (declaim (special *logical-capture-memory-bytes* *query-temp-directory*))
 
 (defstruct wal-pressure-ticket
+  "A publication's retained resource counts, captured before FIFO handoff."
   (page-entries 0 :read-only t)
   (contributor-entries 0 :read-only t)
   (page-capacity 0 :read-only t)
@@ -21,7 +22,9 @@
         :spool-bytes (* 32 1024 1024) :spool-records 512
         :scratch-disk-references 4096 :scratch-bytes (* 32 1024 1024)
         :cleanup-owners 24 :cleanup-entries 64 :temporary-paths 24
-        :open-streams 24 :private-directories 24 :temporary-bytes (* 64 1024 1024)))
+        :open-streams 24 :private-directories 24 :temporary-bytes (* 64 1024 1024))
+  "Limits for asynchronous acceptance of retained publication resources.
+They do not bound the transient allocation of an individual transaction.")
 
 (defparameter *wal-publication-pressure-keys*
   '(:owners :page-map-entries :contributor-map-entries :page-map-capacity
@@ -93,6 +96,8 @@
   target)
 
 (defun wal-publication-pressure-footprint (&optional incoming projected-p)
+  "Count queued tickets and live domain resources, plus an optional incoming ticket.
+Projection includes the expected owner and file resources for a new spool."
   (assert (sb-thread:holding-mutex-p *wal-lock*))
   (let ((cost (loop for key in *wal-publication-pressure-keys* append (list key 0))))
     (loop for owner = *wal-pending-page-publication* then (wal-page-publication-next owner)
@@ -116,6 +121,9 @@
     cost))
 
 (defun wal-preflight-publication-pressure (keys resets)
+  "Project the incoming publication and settle predecessors if it exceeds a limit.
+Return the revised ticket and whether this publication must complete synchronously
+before asynchronous acceptance."
   (assert (sb-thread:holding-mutex-p *wal-lock*))
   (let ((ticket (wal-project-publication-pressure keys resets)))
     (when (and *wal-pending-page-publication*
@@ -128,6 +136,9 @@
                         (wal-publication-pressure-footprint ticket t)))))))
 
 (defun wal-publication-pressure-requires-flush-p (owner projection forced-p)
+  "Recheck the prepared owner's actual cost before publication.
+Force synchronous completion if the actual ticket exceeds its projection,
+a limit is exceeded, or preflight already required it."
   (assert (sb-thread:holding-mutex-p *wal-lock*))
   (unless (and (eq :stack (wal-page-publication-state owner))
                (wal-page-publication-prepared-p owner))

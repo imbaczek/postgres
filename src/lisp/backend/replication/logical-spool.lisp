@@ -12,6 +12,7 @@
   (visit-lock (sb-thread:make-mutex :name "logical spool visitor")) visiting-p)
 
 (defun logical-spool-resource-size (spool)
+  "Return the retained event bytes and record count for pressure accounting."
   (values (logical-spool-bytes spool) (logical-spool-count spool)))
 
 (defun make-logical-spool ()
