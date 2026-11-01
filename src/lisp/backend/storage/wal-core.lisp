@@ -79,8 +79,15 @@ Runtime retention requires a captured installed policy.")
 
 (declaim (ftype function cleanup-invalidated-logical-replication-state))
 
+;; Historical facts for one accepted commit: XID, immutable source identity,
+;; that transaction's terminal end, and whether WAL durability was observed.
+;; NIL is a valid explicit source.  Without WAL the end and proof are NIL;
+;; the direct CLOG commit can nevertheless be durable.
+
 (defstruct (wal-commit-receipt
             (:constructor %make-wal-commit-receipt (xid source-id terminal-end wal-durable-p)))
+  ;; This data-only snapshot owns no backend, spool or callback and is never
+  ;; upgraded later.
   (xid nil :read-only t)
   (source-id nil :read-only t)
   (terminal-end nil :read-only t)
@@ -1424,17 +1431,21 @@ the transaction (see SnapBuildCommitTxn and CreateInitDecodingContext)."
     (xid after-durable-function &key logical-changes terminal-durable-function
                                   (source-id nil source-id-supplied-p) accepted-function)
   "Flush storage resets, page images and XID's commit as one WAL boundary.
-The reset descriptors are owned here across AFTER-DURABLE-FUNCTION, which may
-release the transaction's private replacements. Preflight the page spool before
-the terminal, then flush WAL before truncating any relation fork. Return this
-transaction's commit record end LSN after local storage apply completes. When
-WAL is unavailable, return NIL and a receipt without WAL proof. With WAL ready, TERMINAL-DURABLE-FUNCTION,
-when supplied, receives the exact end LSN immediately after the flush, before
-AFTER-DURABLE-FUNCTION. In that WAL-ready path, incomplete publication fail-stops
-after releasing WAL; the first error is retained even if cleanup also fails.
-Return an immutable acceptance receipt as the second value. SOURCE-ID must be
-explicit for WAL-ready publication. ACCEPTED-FUNCTION receives that receipt after
-successful apply and spool cleanup, under the publication fence."
+The reset descriptors are owned across AFTER-DURABLE-FUNCTION, which may release
+the transaction's private replacements. Preflight the page spool before the
+terminal, then flush WAL before truncating any relation fork.
+
+With WAL ready, return this transaction's numeric commit end and an immutable
+receipt after local apply. TERMINAL-DURABLE-FUNCTION receives the exact end
+immediately after flush, before AFTER-DURABLE-FUNCTION. Incomplete publication
+fail-stops after releasing WAL, retaining the first error if cleanup also fails.
+
+SOURCE-ID must be an explicit immutable symbol or integer when WAL is ready;
+NIL is valid. ACCEPTED-FUNCTION receives the same receipt returned as the second
+value, after apply and spool cleanup under the publication fence, WAL mutex and
+interrupt mask. It must only latch the receipt and ownership, without allocation,
+I/O or locks. Without WAL, return NIL and a receipt without WAL proof; acceptance
+runs under the interrupt mask after the direct commit callback."
   (when (and *wal-ready* (not source-id-supplied-p))
     (error "WAL commit requires an explicit source identity"))
   (unless (typep source-id '(or symbol integer))

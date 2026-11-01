@@ -2482,6 +2482,10 @@ Run outside publication locks, clean up the transaction, then handle the outcome
       (finish-synchronous-commit-response backend outcome)))
   (values))
 
+;; Check the accepted historical facts against this call and its observed
+;; durable callback.  WAL-ready commits require both the exact end and proof;
+;; a no-WAL receipt has neither, even when CLOG was synced directly.
+
 (defun validate-wal-commit-receipt (receipt accepted xid source end durable-end wal-ready-p)
   (unless (and (wal-commit-receipt-p receipt)
                (eq receipt accepted)
@@ -2496,6 +2500,11 @@ Run outside publication locks, clean up the transaction, then handle the outcome
                         (null (wal-commit-receipt-wal-durable-p receipt)))))
     (ereport-fatal "XX000" "invalid commit acceptance receipt"))
   receipt)
+
+;; Capture the source for every WAL-ready XID, creating a remote obligation
+;; only when its effects require one.  Guard the whole storage call, receipt
+;; consumption and wait: after an irreversible commit, errors or nonlocal
+;; exits suppress frontend output and still perform committed cleanup.
 
 (defun commit-transaction ()
   (ensure-exported-snapshot-scope-can-end *backend*)

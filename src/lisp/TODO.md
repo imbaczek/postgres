@@ -187,6 +187,15 @@
   each at seeds 42 and 98749024680794852 (digest `cdce92d88fc2e9ad`); input
   coverage and rejection counts were not measured.
 
+- [x] Capture and validate immutable commit acceptance receipts (`44f402191f6`).
+  For WAL-ready commits, the validator requires the observed durable callback and
+  WAL proof. OFF remains rejected with 0A000. The checkpoint passed 1,413 physical, 786 unit,
+  201 wire and 1,159 legacy checks, strict cold compilation, native receipt (8
+  PASS) and user (7 PASS) tests, and DDL and reload tests. The property ran 100
+  trials each at seeds 42 and 3286687836371262213 (digest
+  `fnv1a64-v1:92a441ee7fa3a065`); rejection counts and input coverage were not
+  measured.
+
 - [ ] Implement true asynchronous OFF. Separate policy and accepted versus durable
   receipts; keep CLOG dependencies volatile until WAL is durable. Add an owned
   pending batch spool and page overlay, and a common FIFO flush and materialization
