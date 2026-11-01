@@ -60,6 +60,10 @@ A scope without a backend gets a private quota. Refresh the limit on reuse."
 
 (defstruct (query-temp-cleanup-domain
             (:constructor make-query-temp-cleanup-domain (lock identity)))
+  "Authority for adopted owners. Hold LOCK and establish IDENTITY in the
+current context before using them. The domain list tracks active and unresolved
+cleanup owners; the pending registry tracks :pending and :cleaning owners.
+When both locks are needed, take the domain lock before the pending lock."
   (lock nil :read-only t)
   (identity nil :read-only t)
   owners)
@@ -69,7 +73,9 @@ A scope without a backend gets a private quota. Refresh the limit on reuse."
 (defstruct query-temp-cleanup-owner
   "Retain a scope's streams, paths, quota and private directory through cleanup.
 
-Unresolved owners remain reachable for retry by their original thread."
+The creating thread remains recorded as provenance. Unadopted owners are
+retried by that thread; adopted owners are retried under their domain's
+authority. Unresolved files retain their quota charges until deletion."
   thread domain domain-link unused-private-p quota entries directory temporary-directory link state failure-path failure)
 
 (defvar *query-temp-cleanup-owner* nil)
@@ -102,6 +108,7 @@ Unresolved owners remain reachable for retry by their original thread."
   domain)
 
 (defun call-with-query-temp-cleanup-domain (domain identity function)
+  "Establish DOMAIN in this context after checking IDENTITY and its held lock."
   (check-query-temp-cleanup-domain domain identity)
   (let ((*query-temp-cleanup-domain* domain))
     (funcall function)))
@@ -125,6 +132,7 @@ Unresolved owners remain reachable for retry by their original thread."
   (values))
 
 (defun make-private-query-temp-scope-owner (limit)
+  "Create a fresh owner and quota that can be adopted before first use."
   (let* ((quota (make-query-temp-quota limit))
          (owner (make-query-temp-scope-owner quota)))
     (sb-thread:with-mutex (*query-temp-pending-cleanup-lock*)
@@ -134,6 +142,9 @@ Unresolved owners remain reachable for retry by their original thread."
     owner))
 
 (defun adopt-query-temp-owner-by-domain (owner domain)
+  "Adopt an unused private owner created by this thread under DOMAIN authority.
+Adoption must precede entering the owner or acquiring files. Its quota stays
+private, and its creating thread remains recorded."
   (unless (and (eq domain *query-temp-cleanup-domain*)
                (query-temp-cleanup-domain-p domain)
                (sb-thread:holding-mutex-p (query-temp-cleanup-domain-lock domain)))
@@ -169,6 +180,8 @@ Unresolved owners remain reachable for retry by their original thread."
            (eq (query-temp-cleanup-owner-thread owner) sb-thread:*current-thread*))))
 
 (defun claim-query-temp-owner-cleanup (owner &key finish-p)
+  "Claim a pending retry, or publish an active owner when FINISH-P is true.
+A cleaning or resolved owner cannot be claimed again."
   (sb-thread:with-mutex (*query-temp-pending-cleanup-lock*)
     (check-query-temp-owner-domain owner)
     (case (query-temp-cleanup-owner-state owner)
@@ -840,7 +853,9 @@ temporary directory."
 (defun run-query-temp-owner-cleanup (owner)
   "Clean OWNER while it remains reachable in the pending list.
 
-The pending lock protects list and state changes, not file I/O."
+The pending lock protects list and state changes, not file I/O. For an
+adopted owner the domain lock remains held during I/O. An unresolved owner
+returns to pending; a resolved owner leaves both lists."
   (sb-thread:with-mutex (*query-temp-pending-cleanup-lock*)
     (check-query-temp-owner-domain owner)
     (assert (eq :cleaning (query-temp-cleanup-owner-state owner))))
@@ -884,7 +899,7 @@ The pending lock protects list and state changes, not file I/O."
   (values))
 
 (defun retry-pending-query-temp-cleanup (&optional domain)
-  "Retry pending cleanup owned by this thread; leave other owners untouched."
+  "Retry this thread's unadopted owners, or DOMAIN's owners under its authority."
   (when domain
     (unless (and (query-temp-cleanup-domain-p domain)
                  (eq domain *query-temp-cleanup-domain*)

@@ -12,7 +12,8 @@
   (visit-lock (sb-thread:make-mutex :name "logical spool visitor")) visiting-p)
 
 (defun make-logical-spool ()
-  "Create an owner whose lifetime is the transaction, not a query scope."
+  "Create a private owner whose lifetime is the transaction, not a query scope.
+A caller that transfers cleanup to a domain must adopt it before first use."
   (%make-logical-spool :owner (make-private-query-temp-scope-owner *query-temp-file-limit-bytes*)))
 
 (defun call-with-logical-spool-owner (spool function)
@@ -29,7 +30,9 @@
       (setf (query-temp-cleanup-owner-directory owner) *query-temp-scope-directory*))))
 
 (defun logical-spool-write-header (spool size checksum)
-  "Reserve the complete frame before writing its length and checksum."
+  "Charge the complete frame before writing its length and checksum.
+The charge remains with the file until cleanup confirms deletion, including
+when a later write fails."
   (unless (<= 1 size #xffffffff) (error "invalid logical spool event length"))
   (let ((path (logical-spool-path spool)) (stream (logical-spool-stream spool)))
     (query-temp-check-space path (+ 8 size))

@@ -1,5 +1,18 @@
 # Development TODO
 
+- [x] Add the generic transferable temporary cleanup domain foundation. Fresh
+  private owners can be adopted before use; no production caller adopts one yet.
+  WAL cleanup integration, its writer, `synchronous_commit=off`, and Patroni work
+  remain open below. The checkpoint passed 829 unit, 1,413 physical, 201 wire,
+  and 1,161 legacy tests, strict fresh compilation, native spill and live reload.
+  Evidence is in `/home/imbaczek/proj/pg-ha-artifacts/cleanup-domain/`:
+  `physical-suite.log`, `cold-final.log`, `native-spill-reviewed.log`,
+  `reload.log`, `wire.log`, and `legacy.log`. The cl-spec property
+  `cleanup-domain-adoption-preserves-private-owner-and-quota` ran 100 trials
+  each at seeds 42 and 2707969488570409574 (digest
+  `fnv1a64-v1:320a49a385e9fcd9`). This adoption contract has no Function Spec;
+  input coverage and rejection counts were not measured.
+
 - [x] Implement the source sender-status foundation. The sender and activity
   SRFs can be joined by PID. Captured registration tokens enforce ownership;
   snapshots are detached copies with independent, nullable feedback positions.
