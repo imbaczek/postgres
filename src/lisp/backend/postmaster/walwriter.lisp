@@ -197,7 +197,7 @@ Consume PLAN in the same critical section so it cannot be reused."
 
 (defun wake-primary-wal-writer-under-state-lock (writer)
   "Coalesce wakeups into one pending signal under the state lock.
-A future loop must consume the signal and clear the pending flag coherently."
+The wait path consumes signals and clears the pending flag under this lock."
   (assert (sb-thread:holding-mutex-p *primary-wal-writer-lock*))
   (unless (primary-wal-writer-wake-pending-p writer)
     (setf (primary-wal-writer-wake-pending-p writer) t)
@@ -260,6 +260,8 @@ The caller must fence failures after releasing WAL; this function does not."
   writer)
 
 (defun request-primary-wal-writer-shutdown ()
+  "Close startup and capture the writer to stop in one state-lock section.
+The gate stays closed even when there is no writer."
   (sb-thread:with-mutex (*primary-wal-writer-lock*)
     (setf *primary-wal-writer-shutdown-p* t)
     (request-primary-wal-writer-stop-under-state-lock *primary-wal-writer*)))
@@ -270,6 +272,8 @@ The caller must fence failures after releasing WAL; this function does not."
      (if supplied-p writer *primary-wal-writer*))))
 
 (defun finish-primary-wal-writer (writer failure normal-p)
+  "Retain the first failure, including an unexpected exit without a condition.
+Only the installed writer poisons WAL. Request fail-stop after releasing locks."
   (let ((fence nil))
     (sb-sys:without-interrupts
       (sb-thread:with-mutex (*wal-lock*)
@@ -303,6 +307,9 @@ The caller must fence failures after releasing WAL; this function does not."
   (values))
 
 (defun primary-wal-writer-main (writer)
+  "Run the auxiliary writer outside backend and live-operation admission.
+Wait for registration, then take definition exclusion before WAL each cycle.
+This drains the publication FIFO; it does not flush unrelated WAL when empty."
   (let ((*backend* nil) (*live-operation-depth* 0)
                         (*standard-output* (primary-wal-writer-output writer))
                         (*error-output* (primary-wal-writer-error-output writer))
@@ -329,6 +336,9 @@ The caller must fence failures after releasing WAL; this function does not."
                          :name "pg primary WAL writer"))
 
 (defun start-primary-wal-writer-under-lock ()
+  "Register one writer under WAL then state lock before releasing its ready gate.
+The thread is independent of managed worker slots. Startup calls this for a
+ready primary after installing source identity and before enabling reload."
   (assert (sb-thread:holding-mutex-p *wal-lock*))
   (wal-check-healthy)
   (unless (and *wal-ready* (not (recovery-in-progress-p))
@@ -362,6 +372,10 @@ The caller must fence failures after releasing WAL; this function does not."
       (sb-thread:with-mutex (*wal-lock*) (start-primary-wal-writer-under-lock))))
 
 (defun stop-primary-wal-writer (&key shutdown-p)
+  "Stop and join outside live admission and the lifecycle locks checked below.
+Ordinary stop permits restart; SHUTDOWN-P closes startup permanently. Publish
+the joined state under WAL then state lock after the thread exits. Final shutdown
+joins after reload workers stop and before storage finalization."
   (when (or (sb-thread:holding-mutex-p *wal-lock*)
             (sb-thread:holding-mutex-p *primary-wal-writer-lock*)
             (sb-thread:holding-mutex-p *reload-definition-lock*)

@@ -14,10 +14,21 @@
   `physical-current.log`, `legacy-current.log`, `native-clog-current.log`, and
   `cold-final.log`. The property `stale-clog-reset-plans-have-no-storage-effects`
   ran 100 trials at seed 4008 (digest `fnv1a64-v1:c2552cb71de45bf9`); there is
-  no Function Spec, and coverage and rejection counts were not measured. Before
-  activation, add the loop and lifecycle, address concurrent join races, add
-  pressure control and review empty-FIFO WAL flushing. OFF and Patroni remain
-  open; no coordination was added.
+  no Function Spec, and coverage and rejection counts were not measured. At that
+  checkpoint the loop and lifecycle had not yet been activated.
+
+- [x] Activate the primary WAL writer lifecycle (`09d10de9ca7`, `1ece86c5993`).
+  The auxiliary writer drains the captured publication FIFO; unrelated WAL flushes
+  with an empty FIFO remain open. The checkpoint passed 858 unit, 1,413 physical,
+  1,161 legacy and 201 wire checks, strict cold compilation, six native writer
+  cases including SQL XID wrap, 21 native page, five native CLOG and two snapshot
+  cases, native promotion and shutdown. Evidence is in
+  `/home/imbaczek/proj/pg-ha-artifacts/wal-writer-lifecycle/`: `physical.log`,
+  `legacy.log`, `wire.log`, `cold.log`, `native-final.log`, `native-wrap.log`,
+  `native-pages.log`, `native-clog-current.log`, `native-snapshot.log`,
+  `native-promotion-current.log`, and `shutdown.log`. No new cl-spec contract
+  was added. Bounded pressure, asynchronous acceptance proof, the logical CLOG
+  overlay, OFF and full Patroni acceptance remain open; no coordination was added.
 
 - [x] Add the generic transferable temporary cleanup domain foundation. At that
   checkpoint fresh private owners could be adopted before use, but no production

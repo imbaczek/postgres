@@ -135,6 +135,14 @@ appropriate instead of replacing the native C peer or adding a message relay.
   the final change and reload its system before acceptance. A function reload
   affects subsequent calls; it does not rewind active stack frames, reconstruct
   old closures or migrate structure instances. Reinstall changed test hooks.
+- A new service thread does not inherit a fixture's dynamic storage bindings.
+  Mock its startup boundary in those fixtures and assert the required state and
+  locks. Verify the real thread in an owned server whose globals hold its storage;
+  join any escaped test thread before resetting the test image.
+- Inspect raw queue and durable state before SQL when proving background writer
+  progress: a fresh snapshot can drain the queue itself. Manual queue and snapshot
+  tests pause the writer before a cycle, outside admission and storage locks, and
+  release it during cleanup. Separate native cases verify the running writer.
 - Verify strict compilation in a fresh Lisp process too. A live image can
   already know a special variable defined by a later module and hide a missing
   forward declaration. A fresh receiver-shutdown test exposed such a warning

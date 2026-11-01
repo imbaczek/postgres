@@ -59,7 +59,9 @@ An unsafe complete batch defers the attempt; otherwise publish the child.
 A resource pause found while draining the backlog stops before intent. Drain
 and restartpoint work precede the generation fence. Intent through final
 completion, including the ready hook and stopping and context markers, is masked
-under the fence; notify exact old senders after release."
+under the fence. Start the primary writer after child completion and before the
+completed marker, without waiting for definition exclusion; notify old senders
+after release."
   (sb-thread:with-mutex (*reload-run-lock*)
     (with-live-operation-quiescence
       (physical-promotion-check-online)

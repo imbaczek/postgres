@@ -311,9 +311,10 @@ command (idle) is ignored; the connection and its transaction state survive."
 (declaim (ftype function managed-worker-request-shutdown managed-worker-shutdown stop-reload-workers))
 
 (defun prepare-postmaster-shutdown ()
-  "Stop reload, managed and controller workers before finalizing storage from MAIN.
-Wait outside live admission so workers can finish; a worker timeout prevents
-storage finalization. After workers stop, retry pending WAL temporary cleanup
+  "Stop reload, WAL writer, managed and controller workers before finalizing storage.
+Close WAL writer startup and join it after stopping reload workers. Wait outside
+live admission so workers can finish. A worker timeout prevents storage
+finalization. After workers stop, retry pending WAL temporary cleanup
 before health-checked storage work. Reload remains available until final shutdown,
 including during smart shutdown. The signal worker remains available for immediate shutdown."
   (when (plusp *live-operation-depth*)
