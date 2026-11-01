@@ -282,6 +282,37 @@ the base files are still checked against the manifest read from disk."
              (sleep 0.01))
     (error "native control files changed throughout inspection")))
 
+(defun native-control-checkpoint-record (facts)
+  (let* ((snapshot (getf facts :snapshot))
+         (timeline (or (getf snapshot :timeline) (getf facts :checkpoint-timeline)))
+         (redo (getf snapshot :redo))
+         (next (getf snapshot :next-xid))
+         (active (getf snapshot :oldest-active-xid))
+         (time (getf snapshot :time)))
+    (flet ((value (plist key) (or (getf plist key) +null+))
+           (timeline-value (value)
+             (if value (- (logxor value #x80000000) #x80000000) +null+)))
+      (make-sql-record
+       :fields +control-checkpoint-result-fields+
+       :values
+       (vector (value facts :checkpoint)
+               (value snapshot :redo)
+               (if (and redo timeline)
+                   (subseq (wal-segment-filename (floor redo +wal-segment-size+) timeline :timeline) 0 24)
+                   +null+)
+               (timeline-value timeline) (timeline-value (getf snapshot :prev-timeline))
+               +null+ +null+
+               (cond ((null next) +null+)
+                     ((= next +max-xid-one-past+) "exhausted")
+                     (t (format nil "~d:~d" (ldb (byte 32 32) next) (ldb (byte 32 0) next))))
+               (value snapshot :next-oid) +null+ +null+ +null+ +null+
+               (if active (ldb (byte 32 0) active) +null+)
+               +null+ +null+ +null+ +null+ +null+
+               (if time (* (- time 946684800) 1000000) +null+))))))
+
+(defun native-control-checkpoint-result ()
+  (native-control-checkpoint-record (native-control-read *pgdata*)))
+
 (defun native-control-time-text (unix-time)
   "Format Unix seconds in local time, or return ??? for an unsupported time."
   (handler-case

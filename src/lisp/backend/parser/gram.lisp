@@ -1596,6 +1596,7 @@ Arithmetic binds more tightly; comparison and boolean operators bind less tightl
       ((string= name "jsonb") (values :jsonb -1))
       ((string= name "name") (values :name -1))
       ((string= name "oid") (values :oid -1))
+      ((string= name "oid8") (values :oid8 -1))
       ((string= name "pg_lsn") (values :pg-lsn -1))
       ((string= name "bit")
        (when (and (not quoted) (not qualified) (match-kw p "varying"))

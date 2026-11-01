@@ -14,6 +14,16 @@
 (defparameter +physical-slot-advance-result-fields+
   '(("slot_name" :name) ("end_lsn" :pg-lsn)))
 
+(defparameter +control-checkpoint-result-fields+
+  '(("checkpoint_lsn" :pg-lsn) ("redo_lsn" :pg-lsn) ("redo_wal_file" :text)
+    ("timeline_id" :int4) ("prev_timeline_id" :int4)
+    ("full_page_writes" :bool) ("logical_decoding" :bool) ("next_xid" :text)
+    ("next_oid" :oid8) ("next_multixact_id" :xid) ("next_multi_offset" :int8)
+    ("oldest_xid" :xid) ("oldest_xid_dbid" :oid) ("oldest_active_xid" :xid)
+    ("oldest_multi_xid" :xid) ("oldest_multi_dbid" :oid)
+    ("oldest_commit_ts_xid" :xid) ("newest_commit_ts_xid" :xid)
+    ("data_page_checksum_version" :int4) ("checkpoint_time" :timestamptz)))
+
 (defstruct sql-array
   ;; Elements are flat in row-major order and may contain +null+. Dimensions
   ;; and lower bounds have equal lengths; their dimension product is the element

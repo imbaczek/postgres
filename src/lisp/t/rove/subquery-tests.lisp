@@ -183,6 +183,108 @@
          (map 'vector #'subquery-test-expected value))
         (t value)))
 
+(defun checkpoint-test-facts (next oid)
+  (let ((start +wal-segment-size+))
+    (list :checkpoint start :checkpoint-timeline 2 :state-time 1700001000
+          :snapshot (list :start start :redo start :timeline 2 :prev-timeline 1
+                          :next-xid next :next-oid oid :time 1700000000
+                          :oldest-active-xid (+ (ash (ldb (byte 32 32) next) 32) 3)))))
+
+(cl-spec:defproperty checkpoint-record-preserves-persisted-counters
+    ((epoch (range integer 0 4294967295)) (low (range integer 3 4294967295))
+                                          (oid-high (range integer 0 4294967295)) (oid-low (range integer 0 4294967295)))
+  (:about native-control-checkpoint-record)
+  (:trials (:normal 100))
+  (let* ((next (+ (ash epoch 32) low))
+         (oid (+ (ash oid-high 32) oid-low))
+         (*next-xid* 3)
+         (*wal-insert-timeline* 17)
+         (record (funcall 'native-control-checkpoint-record (checkpoint-test-facts next oid)))
+         (values (sql-record-values record)))
+    (and (= 20 (length values))
+         (= 2 (aref values 3))
+         (= 1 (aref values 4))
+         (string= (format nil "~d:~d" epoch low) (aref values 7))
+         (= oid (aref values 8))
+         (string= (format nil "~d" oid) (value->text (aref values 8) :oid8))
+         (= 3 (aref values 13))
+         (= (* (- 1700000000 946684800) 1000000) (aref values 19))
+         (every (lambda (index) (eq +null+ (aref values index)))
+                '(5 6 9 10 11 12 14 15 16 17 18)))))
+
+(rove:deftest checkpoint-record-analysis-is-nullary-typed-and-lazy
+    (let ((original (symbol-function 'native-control-read))
+          (reads 0))
+      (unwind-protect
+           (progn
+             (setf (symbol-function 'native-control-read)
+                   (lambda (directory) (declare (ignore directory)) (incf reads)
+                           (checkpoint-test-facts (+ (ash 1 32) 9) 4294967301)))
+             (let* ((plan (plan-select-query
+                           (first (parse-statements "SELECT * FROM pg_catalog.pg_control_checkpoint()"))))
+                    (targets (getf (query-plan-prepared plan) :targets)))
+               (rove:ok (= 20 (length targets)))
+               (rove:ok (= 6437 (type-oid (expr-type (getf (nth 8 targets) :expr)))))
+               (rove:ok (zerop reads) "planning does not inspect control files"))
+             (rove:ok (equal '((2 1 "1:9"))
+                             (subquery-test-rows
+                              "SELECT timeline_id,prev_timeline_id,next_xid FROM pg_control_checkpoint()")))
+             (rove:ok (= 1 reads) "one scalar FROM row reads one control generation")
+             (rove:ok (equal '(("\"4294967301\"" "\"3\""))
+                             (subquery-test-rows
+                              "SELECT to_json(next_oid),to_json(oldest_active_xid) FROM pg_control_checkpoint()"))))
+        (setf (symbol-function 'native-control-read) original)))
+  (dolist (sql '("SELECT pg_control_checkpoint(1)" "SELECT public.pg_control_checkpoint()"))
+    (rove:ok (handler-case (progn (plan-select-query (first (parse-statements sql))) nil)
+               (pg-error (condition) (string= "42883" (pg-error-sqlstate condition))))
+             sql)))
+
+(rove:deftest checkpoint-record-counter-property-and-json
+    (unit-check-property 'checkpoint-record-preserves-persisted-counters)
+  (let* ((record (funcall 'native-control-checkpoint-record
+                          (checkpoint-test-facts (+ (ash 1 32) 9) 18446744073709551615)))
+         (json (sql-to-json record :record)))
+    (rove:ok (search "\"next_oid\":\"18446744073709551615\"" json))
+    (rove:ok (search "\"oldest_active_xid\":\"3\"" json)))
+  (let ((record (funcall 'native-control-checkpoint-record
+                         '(:checkpoint 0 :checkpoint-timeline 1))))
+    (rove:ok (= 1 (aref (sql-record-values record) 3)))
+    (rove:ok (eq +null+ (aref (sql-record-values record) 7))))
+  (let* ((record (native-control-checkpoint-record
+                  (checkpoint-test-facts +max-xid-one-past+ 0)))
+         (values (sql-record-values record)))
+    (rove:ok (string= "exhausted" (aref values 7)))
+    (rove:ok (string= "000000020000000000000001" (aref values 2))
+             "a segment-boundary REDO names its containing segment"))
+  (let ((facts (checkpoint-test-facts 3 0)))
+    (setf (getf (getf facts :snapshot) :timeline) #xffffffff
+          (getf (getf facts :snapshot) :prev-timeline) #x80000000)
+    (let ((values (sql-record-values (native-control-checkpoint-record facts))))
+      (rove:ok (= -1 (aref values 3)))
+      (rove:ok (= -2147483648 (aref values 4)))
+      (rove:ok (string= "FFFFFFFF0000000000000001" (aref values 2))))))
+
+(cl-spec:defproperty oid8-input-preserves-unsigned-width
+    ((number (range integer 0 18446744073709551615)))
+  (:about sql-oid8-input)
+  (:trials (:normal 100))
+  (and (= number (funcall 'sql-oid8-input (format nil "~d" number)))
+       (= (mod (- number) (ash 1 64))
+          (funcall 'sql-oid8-input (format nil "-~d" number)))))
+
+(rove:deftest oid8-text-input-preserves-width-and-rejects-invalid-values
+    (unit-check-property 'oid8-input-preserves-unsigned-width)
+  (rove:ok (equal '((18446744073709551615 -1 4294967295 t))
+                  (subquery-test-rows
+                   "SELECT (-1::bigint)::oid8,('18446744073709551615'::oid8)::bigint,('4294967295'::oid)::oid8,'18446744073709551615'::oid8 > '9223372036854775807'::oid8")))
+  (dolist (case '(("4294967296" 4294967296) ("-1" 18446744073709551615)
+                  ("0xFFFFFFFFFFFFFFFF" 18446744073709551615) ("017" 15) ("0b101" 5)))
+    (rove:ok (= (second case) (funcall 'sql-oid8-input (first case)))))
+  (dolist (case '(("" "22P02") ("08" "22P02") ("1_0" "22P02") ("0x" "22P02")
+                  ("18446744073709551616" "22003") ("-18446744073709551616" "22003")))
+    (rove:ok (handler-case (progn (funcall 'sql-oid8-input (first case)) nil)
+               (pg-error (condition) (string= (second case) (pg-error-sqlstate condition)))))))
+
 (cl-spec:defproperty do-options-preserve-uncompiled-source
     ((value (range integer -10000 10000)) (language-first (member t nil)))
   (:about parse-statements)

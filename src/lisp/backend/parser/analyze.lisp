@@ -245,7 +245,7 @@
     (:varchar-array 1015 -1) (:oid-array 1028 -1) (:date-array 1182 -1)
     (:time-array 1183 -1) (:timetz-array 1270 -1) (:timestamp-array 1115 -1)
     (:timestamptz-array 1185 -1) (:interval-array 1187 -1) (:pg-lsn-array 3221 -1)
-    (:bit-array 1561 -1) (:oid 26 4) (:xid 28 4) (:pg-node-tree 194 -1) (:record 2249 -1)
+    (:bit-array 1561 -1) (:oid 26 4) (:oid8 6437 8) (:xid 28 4) (:pg-node-tree 194 -1) (:record 2249 -1)
     (:void 2278 4) (:pg-lsn 3220 8) (:numeric 1700 -1) (:float4 700 4)
     (:float8 701 8) (:date 1082 4) (:time 1083 8) (:timetz 1266 12)
     (:timestamp 1114 8) (:interval 1186 16) (:bit 1560 -1)))
@@ -279,6 +279,7 @@ exist\" messages."
     (:int8 "bigint")
     (:pg-lsn "pg_lsn")
     (:oid "oid")
+    (:oid8 "oid8")
     (:void "void")
     (:record "record")
     (:pg-node-tree "pg_node_tree")
@@ -478,7 +479,7 @@ result is text for typeof and int4 for array_length."
       (ereport "42804" "could not determine polymorphic type because input has type unknown"))
     (unless (or *defer-function-constant-coercion-p*
                 (member element-type '(:record :text :varchar :name :bool :int2 :int4 :int8
-                                       :numeric :float4 :float8 :json :jsonb :bytea :oid :char :bit :date
+                                       :numeric :float4 :float8 :json :jsonb :bytea :oid :oid8 :xid :char :bit :date
                                        :time :timetz :timestamp :timestamptz :interval :pg-lsn :int2vector)))
       (ereport "0A000" "to_jsonb for type ~a is not supported" type))
     (list :func name arguments :type (if (string= name "to_json") :json :jsonb) :typmod -1)))
@@ -703,10 +704,10 @@ Omit NULL elements unless a non-NULL replacement is supplied."
           (toast-map-text-characters toast pointer snapshot nil
                                      :index-reader #'select-toast-index-reader)))))
 
-(defun analyze-wal-receiver-function (name arguments)
+(defun analyze-nullary-record-function (name arguments fields)
   (when arguments
     (ereport "42883" "function ~a(~a) does not exist" name (call-signature arguments)))
-  (list :func name nil :type :record :typmod -1 :fields +wal-receiver-result-fields+))
+  (list :func name nil :type :record :typmod -1 :fields fields))
 
 (defun analyze-record-set-call (name arguments fields)
   "Build a record-valued set call after checking its expression context."
@@ -1683,7 +1684,10 @@ only when a non-NULL call executes; explicit text arguments arrive here then."
                    (getf (cdddr expr) :call-order))))
          (analyze-jsonb-set-function name args)))
       ((string= name "pg_promote") (list :func name args :type :bool :typmod -1))
-      ((string= name "pg_stat_get_wal_receiver") (analyze-wal-receiver-function name args))
+      ((string= name "pg_stat_get_wal_receiver")
+       (analyze-nullary-record-function name args +wal-receiver-result-fields+))
+      ((string= name "pg_control_checkpoint")
+       (analyze-nullary-record-function name args +control-checkpoint-result-fields+))
       ((member name '("pg_stat_get_wal_senders" "pg_stat_get_activity") :test #'string=)
        (analyze-source-status-function name args))
       ((member name '("json_typeof" "jsonb_typeof" "json_array_length" "jsonb_array_length")
@@ -1802,6 +1806,11 @@ JSON has no comparison operators, even though its stored value is text."
      (setf left (coerce-in-constant left (expr-type right))))
     ((and (in-unknown-constant-p right) (not (in-unknown-constant-p left)))
      (setf right (coerce-in-constant right (expr-type left)))))
+  (when (and (or (eq (expr-type left) :oid8) (eq (expr-type right) :oid8))
+             (every (lambda (expression) (member (expr-type expression) '(:int2 :int4 :int8 :oid8)))
+                    (list left right)))
+    (unless (eq (expr-type left) :oid8) (setf left (list :cast left :type :oid8 :typmod -1)))
+    (unless (eq (expr-type right) :oid8) (setf right (list :cast right :type :oid8 :typmod -1))))
   (when (and (or (eq (expr-type left) :oid) (eq (expr-type right) :oid))
              (every (lambda (expression) (member (expr-type expression) '(:int2 :int4 :int8 :oid)))
                     (list left right)))
@@ -1860,6 +1869,8 @@ JSON has no comparison operators, even though its stored value is text."
 (defun sql-cast-allowed-p (source target)
   "Supported explicit casts from pg_cast and CoerceViaIO's string rules."
   (or (eq source target)
+      (and (eq target :oid8) (member source '(:int2 :int4 :int8 :oid)))
+      (and (eq source :oid8) (eq target :int8))
       (and (eq source :jsonb)
            (member target '(:bool :numeric :int2 :int4 :int8 :float4 :float8)))
       (and (member source '(:json :jsonb)) (member target '(:json :jsonb)))
@@ -1998,8 +2009,8 @@ syntax is checked before the final signed-width range check for TYPE."
     (logior (ash (parse-integer text :end slash :radix 16) 32)
             (parse-integer text :start (1+ slash) :radix 16))))
 
-(defun sql-oid-input (text)
-  "Match oidin's strtoul(base 0), including signed int32 compatibility."
+(defun sql-oid-input (text &optional (type :oid))
+  "Read oid or oid8 through C's unsigned base-zero input rules."
   (labels ((space-p (character) (member (char-code character) '(9 10 11 12 13 32)))
            (ascii-digit (character radix)
              (and (< (char-code character) 128) (digit-char-p character radix))))
@@ -2021,19 +2032,21 @@ syntax is checked before the final signed-width range check for TYPE."
             for digit = (ascii-digit (char text position) radix)
             while digit
             do (when (> value (floor (- #xffffffffffffffff digit) radix))
-                 (ereport "22003" "value ~s is out of range for type oid" text))
+                 (ereport "22003" "value ~s is out of range for type ~a" text (string-downcase type)))
                (setf value (+ (* value radix) digit))
                (incf position) (incf digits))
-      (when (> value #xffffffffffffffff)
-        (ereport "22003" "value ~s is out of range for type oid" text))
       (unless (and (plusp digits) (every #'space-p (subseq text position)))
-        (ereport "22P02" "invalid input syntax for type oid: ~s" text))
+        (ereport "22P02" "invalid input syntax for type ~a: ~s" (string-downcase type) text))
       (let* ((converted (mod (* sign value) (ash 1 64)))
              (result (logand converted #xffffffff))
              (signed (if (>= result #x80000000) (- result (ash 1 32)) result)))
+        (when (eq type :oid8) (return-from sql-oid-input converted))
         (unless (or (= converted result) (= converted (mod signed (ash 1 64))))
           (ereport "22003" "value ~s is out of range for type oid" text))
         result))))
+
+(defun sql-oid8-input (text)
+  (sql-oid-input text :oid8))
 
 (defun sql-array-space-p (character)
   (and character (find (char-code character) '(9 10 11 12 13 32))))
@@ -2294,81 +2307,146 @@ are supported."
                         finally (return (or n 0)))))
       (if (logbitp (1- bits) number) (- number (ash 1 bits)) number))))
 
+(defun sql-cast-container-value (value source target typmod)
+  (values
+   (block cast-result
+     (when (and (eq source :jsonb)
+                (member target '(:bool :numeric :int2 :int4 :int8 :float4 :float8)))
+       (let ((scalar (sql-jsonb-value value)))
+         (return-from cast-result
+           (cond ((eq scalar :json-null) +null+)
+                 ((eq target :bool)
+                  (case scalar (:json-true t) (:json-false nil)
+                        (otherwise (ereport "22023" "cannot cast jsonb value to boolean"))))
+                 ((sql-numeric-p scalar)
+                  (sql-cast-value scalar :numeric target typmod))
+                 (t (ereport "22023" "cannot cast jsonb value to ~a" target))))))
+     (when (eq target :jsonb)
+       (return-from cast-result
+         (if (eq source :jsonb) value (sql-jsonb-input (value->text value source)))))
+     (when (eq target :json)
+       (return-from cast-result
+         (if (eq source :json) value (sql-json-input (value->text value source)))))
+     (when (eq target :bytea)
+       (return-from cast-result
+         (cond ((eq source :bytea) value)
+               ((member source '(:int2 :int4 :int8)) (sql-integer-to-bytea value source))
+               (t (sql-bytea-input (value->text value source))))))
+     (when (and (eq source :bytea) (member target '(:int2 :int4 :int8)))
+       (return-from cast-result (sql-bytea-to-integer value target)))
+     (when (and (eq source :bytea) (member target '(:text :varchar :name)))
+       (return-from cast-result
+         (sql-cast-value (value->text value :bytea) :text target typmod)))
+     ;; A directly cast ARRAY constructor has already been analyzed as int2[].
+     ;; Keep its shape and nulls; a general array-to-int2vector cast is rejected
+     ;; by analysis before this function is reached.
+     (when (and (eq target :int2vector) (sql-array-p value))
+       (return-from cast-result value))
+     ;; A binary-compatible int2[] cast retains even a zero-length dimension.
+     ;; Element conversion uses array mapping, which normalizes an empty result
+     ;; to zero dimensions, as in the C array coercion path.
+     (when (and (eq source :int2vector) (sql-array-p value) (sql-array-element-type target))
+       (return-from cast-result
+         (make-sql-array :element-type-id (sql-array-element-type target)
+                         :elements (map 'vector (lambda (element)
+                                                  (sql-cast-value element :int2 (sql-array-element-type target) typmod))
+                                        (sql-array-elements value))
+                         :dimensions (unless (and (zerop (length (sql-array-elements value)))
+                                                  (not (eq (sql-array-element-type target) :int2)))
+                                       (sql-array-dimensions value))
+                         :lower-bounds (unless (and (zerop (length (sql-array-elements value)))
+                                                    (not (eq (sql-array-element-type target) :int2)))
+                                         (sql-array-lower-bounds value)))))
+     (when (and (eq source :int2vector) (sql-array-element-type target))
+       (return-from cast-result
+         (make-sql-array :element-type-id (sql-array-element-type target)
+                         :elements (map 'vector (lambda (element)
+                                                  (sql-cast-value element :int2 (sql-array-element-type target) typmod)) value)
+                         :dimensions (unless (and (zerop (length value))
+                                                  (not (eq (sql-array-element-type target) :int2)))
+                                       (list (length value)))
+                         :lower-bounds (unless (and (zerop (length value))
+                                                    (not (eq (sql-array-element-type target) :int2)))
+                                         (list 0)))))
+     (when (sql-array-element-type target)
+       (let ((element-type (sql-array-element-type target)))
+         (return-from cast-result
+           (if (sql-array-p value)
+               (make-sql-array :element-type-id element-type
+                               :elements (map 'vector (lambda (element)
+                                                        (sql-cast-value element (sql-array-element-type source) element-type typmod))
+                                              (sql-array-elements value))
+                               :dimensions (unless (and (zerop (length (sql-array-elements value)))
+                                                        (not (eq (sql-array-element-type source) element-type)))
+                                             (sql-array-dimensions value))
+                               :lower-bounds (unless (and (zerop (length (sql-array-elements value)))
+                                                          (not (eq (sql-array-element-type source) element-type)))
+                                               (sql-array-lower-bounds value)))
+               (sql-array-input value element-type typmod)))))
+     (return-from sql-cast-container-value (values nil nil)))
+   t))
+
+(defun sql-cast-temporal-value (value source target typmod interval-literal-p)
+  (values
+   (block cast-result
+     (when (and (eq source :timestamptz) (member target '(:date :time :timestamp)))
+       (setf value (sql-timezone-instant-to-local (sql-session-timezone) value))
+       (when (and (eq target :timestamp)
+                  (not (member value '(#x7fffffffffffffff -9223372036854775808)))
+                  (not (<= -211813488000000000 value 9223371331199999999)))
+         (ereport "22008" "timestamp out of range")))
+     (when (and (eq target :date) (member source '(:timestamp :timestamptz)))
+       (return-from cast-result (sql-timestamp-to-date value)))
+     (when (eq target :interval)
+       (return-from cast-result
+         (sql-interval-adjust-typmod
+          (if (member source '(:text :varchar :name))
+              (sql-interval-input value (if interval-literal-p typmod -1)) value)
+          typmod)))
+     (when (member target '(:timestamp :timestamptz))
+       (return-from cast-result
+         (if (member source '(:text :varchar :name))
+             (sql-timestamp-input value typmod (eq target :timestamptz)
+                                  (sql-session-timezone) (sql-session-date-order)
+                                  (sql-session-unix-microseconds))
+             (let* ((local (if (eq source :date) (sql-date-to-timestamp value) value))
+                    (timestamp (if (and (eq target :timestamptz) (member source '(:date :timestamp)))
+                                   (sql-timezone-local-to-instant (sql-session-timezone) local)
+                                   local)))
+               (when (and (eq target :timestamptz) (member source '(:date :timestamp))
+                          (not (member timestamp '(#x7fffffffffffffff -9223372036854775808)))
+                          (not (<= -211813488000000000 timestamp 9223371331199999999)))
+                 (ereport "22008" "timestamp out of range"))
+               (if (member timestamp '(#x7fffffffffffffff -9223372036854775808)) timestamp
+                   (sql-time-adjust-typmod timestamp typmod))))))
+     (when (and (eq source :time) (eq target :timetz))
+       (return-from cast-result
+         (sql-timetz-input (sql-time-output value) typmod (sql-session-timezone)
+                           nil (sql-session-unix-microseconds))))
+     (when (and (eq source :timetz) (eq target :time))
+       (return-from cast-result (sql-time-adjust-typmod (sql-timetz-microseconds value) typmod)))
+     (when (eq target :timetz)
+       (return-from cast-result
+         (if (member source '(:text :varchar :name)) (sql-timetz-input value typmod (sql-session-timezone)
+                                                                       (when *backend* (backend-transaction-start-unix *backend*))
+                                                                       (sql-session-unix-microseconds))
+             (make-sql-timetz (sql-time-adjust-typmod (sql-timetz-microseconds value) typmod)
+                              (sql-timetz-zone-west value)))))
+     (when (eq target :time)
+       (return-from cast-result
+         (cond ((member source '(:text :varchar :name)) (sql-time-input value typmod (sql-session-local-microseconds)))
+               ((member source '(:timestamp :timestamptz))
+                (when (member value '(#x7fffffffffffffff -9223372036854775808))
+                  (ereport "22008" "cannot convert infinite timestamp to time"))
+                (sql-time-adjust-typmod (mod value +sql-microseconds-per-day+) typmod))
+               (t (sql-time-adjust-typmod value typmod)))))
+     (return-from sql-cast-temporal-value (values nil nil)))
+   t))
+
 (defun sql-cast-value (value source target typmod &optional interval-literal-p)
   (when (eq value +null+) (return-from sql-cast-value +null+))
-  (when (and (eq source :jsonb)
-             (member target '(:bool :numeric :int2 :int4 :int8 :float4 :float8)))
-    (let ((scalar (sql-jsonb-value value)))
-      (return-from sql-cast-value
-        (cond ((eq scalar :json-null) +null+)
-              ((eq target :bool)
-               (case scalar (:json-true t) (:json-false nil)
-                     (otherwise (ereport "22023" "cannot cast jsonb value to boolean"))))
-              ((sql-numeric-p scalar)
-               (sql-cast-value scalar :numeric target typmod))
-              (t (ereport "22023" "cannot cast jsonb value to ~a" target))))))
-  (when (eq target :jsonb)
-    (return-from sql-cast-value
-      (if (eq source :jsonb) value (sql-jsonb-input (value->text value source)))))
-  (when (eq target :json)
-    (return-from sql-cast-value
-      (if (eq source :json) value (sql-json-input (value->text value source)))))
-  (when (eq target :bytea)
-    (return-from sql-cast-value
-      (cond ((eq source :bytea) value)
-            ((member source '(:int2 :int4 :int8)) (sql-integer-to-bytea value source))
-            (t (sql-bytea-input (value->text value source))))))
-  (when (and (eq source :bytea) (member target '(:int2 :int4 :int8)))
-    (return-from sql-cast-value (sql-bytea-to-integer value target)))
-  (when (and (eq source :bytea) (member target '(:text :varchar :name)))
-    (return-from sql-cast-value
-      (sql-cast-value (value->text value :bytea) :text target typmod)))
-  ;; A directly cast ARRAY constructor has already been analyzed as int2[].
-  ;; Keep its shape and nulls; a general array-to-int2vector cast is rejected
-  ;; by analysis before this function is reached.
-  (when (and (eq target :int2vector) (sql-array-p value))
-    (return-from sql-cast-value value))
-  ;; A binary-compatible int2[] cast retains even a zero-length dimension.
-  ;; Element conversion uses array mapping, which normalizes an empty result
-  ;; to zero dimensions, as in the C array coercion path.
-  (when (and (eq source :int2vector) (sql-array-p value) (sql-array-element-type target))
-    (return-from sql-cast-value
-      (make-sql-array :element-type-id (sql-array-element-type target)
-                      :elements (map 'vector (lambda (element)
-                                               (sql-cast-value element :int2 (sql-array-element-type target) typmod))
-                                     (sql-array-elements value))
-                      :dimensions (unless (and (zerop (length (sql-array-elements value)))
-                                               (not (eq (sql-array-element-type target) :int2)))
-                                    (sql-array-dimensions value))
-                      :lower-bounds (unless (and (zerop (length (sql-array-elements value)))
-                                                 (not (eq (sql-array-element-type target) :int2)))
-                                      (sql-array-lower-bounds value)))))
-  (when (and (eq source :int2vector) (sql-array-element-type target))
-    (return-from sql-cast-value
-      (make-sql-array :element-type-id (sql-array-element-type target)
-                      :elements (map 'vector (lambda (element)
-                                               (sql-cast-value element :int2 (sql-array-element-type target) typmod)) value)
-                      :dimensions (unless (and (zerop (length value))
-                                               (not (eq (sql-array-element-type target) :int2)))
-                                    (list (length value)))
-                      :lower-bounds (unless (and (zerop (length value))
-                                                 (not (eq (sql-array-element-type target) :int2)))
-                                      (list 0)))))
-  (when (sql-array-element-type target)
-    (let ((element-type (sql-array-element-type target)))
-      (return-from sql-cast-value
-        (if (sql-array-p value)
-            (make-sql-array :element-type-id element-type
-                            :elements (map 'vector (lambda (element)
-                                                     (sql-cast-value element (sql-array-element-type source) element-type typmod))
-                                           (sql-array-elements value))
-                            :dimensions (unless (and (zerop (length (sql-array-elements value)))
-                                                     (not (eq (sql-array-element-type source) element-type)))
-                                          (sql-array-dimensions value))
-                            :lower-bounds (unless (and (zerop (length (sql-array-elements value)))
-                                                       (not (eq (sql-array-element-type source) element-type)))
-                                            (sql-array-lower-bounds value)))
-            (sql-array-input value element-type typmod)))))
+  (multiple-value-bind (result handled-p) (sql-cast-container-value value source target typmod)
+    (when handled-p (return-from sql-cast-value result)))
   (when (member target '(:float4 :float8))
     (return-from sql-cast-value
       (cond ((member source '(:text :varchar :name)) (sql-float-input value target))
@@ -2378,57 +2456,8 @@ are supported."
     (when (or (sb-ext:float-nan-p value) (sb-ext:float-infinity-p value))
       (ereport "22003" "~a out of range" (case target (:int2 "smallint") (:int8 "bigint") (t "integer"))))
     (return-from sql-cast-value (sql-cast-value (round value) :int8 target typmod)))
-  (when (and (eq source :timestamptz) (member target '(:date :time :timestamp)))
-    (setf value (sql-timezone-instant-to-local (sql-session-timezone) value))
-    (when (and (eq target :timestamp)
-               (not (member value '(#x7fffffffffffffff -9223372036854775808)))
-               (not (<= -211813488000000000 value 9223371331199999999)))
-      (ereport "22008" "timestamp out of range")))
-  (when (and (eq target :date) (member source '(:timestamp :timestamptz)))
-    (return-from sql-cast-value (sql-timestamp-to-date value)))
-  (when (eq target :interval)
-    (return-from sql-cast-value
-      (sql-interval-adjust-typmod
-       (if (member source '(:text :varchar :name))
-           (sql-interval-input value (if interval-literal-p typmod -1)) value)
-       typmod)))
-  (when (member target '(:timestamp :timestamptz))
-    (return-from sql-cast-value
-      (if (member source '(:text :varchar :name))
-          (sql-timestamp-input value typmod (eq target :timestamptz)
-                               (sql-session-timezone) (sql-session-date-order)
-                               (sql-session-unix-microseconds))
-          (let* ((local (if (eq source :date) (sql-date-to-timestamp value) value))
-                 (timestamp (if (and (eq target :timestamptz) (member source '(:date :timestamp)))
-                                (sql-timezone-local-to-instant (sql-session-timezone) local)
-                                local)))
-            (when (and (eq target :timestamptz) (member source '(:date :timestamp))
-                       (not (member timestamp '(#x7fffffffffffffff -9223372036854775808)))
-                       (not (<= -211813488000000000 timestamp 9223371331199999999)))
-              (ereport "22008" "timestamp out of range"))
-            (if (member timestamp '(#x7fffffffffffffff -9223372036854775808)) timestamp
-                (sql-time-adjust-typmod timestamp typmod))))))
-  (when (and (eq source :time) (eq target :timetz))
-    (return-from sql-cast-value
-      (sql-timetz-input (sql-time-output value) typmod (sql-session-timezone)
-                        nil (sql-session-unix-microseconds))))
-  (when (and (eq source :timetz) (eq target :time))
-    (return-from sql-cast-value (sql-time-adjust-typmod (sql-timetz-microseconds value) typmod)))
-  (when (eq target :timetz)
-    (return-from sql-cast-value
-      (if (member source '(:text :varchar :name)) (sql-timetz-input value typmod (sql-session-timezone)
-                                                                    (when *backend* (backend-transaction-start-unix *backend*))
-                                                                    (sql-session-unix-microseconds))
-          (make-sql-timetz (sql-time-adjust-typmod (sql-timetz-microseconds value) typmod)
-                           (sql-timetz-zone-west value)))))
-  (when (eq target :time)
-    (return-from sql-cast-value
-      (cond ((member source '(:text :varchar :name)) (sql-time-input value typmod (sql-session-local-microseconds)))
-            ((member source '(:timestamp :timestamptz))
-             (when (member value '(#x7fffffffffffffff -9223372036854775808))
-               (ereport "22008" "cannot convert infinite timestamp to time"))
-             (sql-time-adjust-typmod (mod value +sql-microseconds-per-day+) typmod))
-            (t (sql-time-adjust-typmod value typmod)))))
+  (multiple-value-bind (result handled-p) (sql-cast-temporal-value value source target typmod interval-literal-p)
+    (when handled-p (return-from sql-cast-value result)))
   (when (eq target :numeric)
     (return-from sql-cast-value
       (sql-numeric-apply-typmod
@@ -2467,6 +2496,10 @@ are supported."
     (unless (if (eq target :int4) (<= +int4-min+ value +int4-max+)
                 (<= +int8-min+ value +int8-max+))
       (ereport "22003" "~a out of range" (if (eq target :int4) "integer" "bigint"))))
+  (when (and (eq target :oid8) (member source '(:int2 :int4 :int8 :oid)))
+    (return-from sql-cast-value (ldb (byte 64 0) value)))
+  (when (and (eq source :oid8) (eq target :int8))
+    (return-from sql-cast-value (- (logxor value #x8000000000000000) #x8000000000000000)))
   (when (eq source :int2) (setf source :int4))
   (when (and (member target '(:int4 :int8)) (eq source target))
     (unless (if (eq target :int4) (<= +int4-min+ value +int4-max+)
@@ -2495,6 +2528,7 @@ are supported."
        (:int2vector (sql-int2vector-input value))
        (:text-array (sql-text-array-input value))
        (:oid (sql-oid-input value))
+       (:oid8 (sql-oid8-input value))
        (:pg-lsn (sql-pg-lsn-input value))
        (otherwise (ereport "0A000" "text input for ~a is not implemented" target))))
     ((eq target :bool) (not (zerop value)))
@@ -3448,6 +3482,7 @@ candidate selection."
   (let ((name (builtin-function-name (second raw) (getf (cdddr raw) :schema))))
     (cond ((string= name "pg_get_publication_tables") +publication-table-result-fields+)
           ((string= name "pg_stat_get_wal_receiver") +wal-receiver-result-fields+)
+          ((string= name "pg_control_checkpoint") +control-checkpoint-result-fields+)
           ((string= name "pg_stat_get_wal_senders") +wal-sender-result-fields+)
           ((string= name "pg_stat_get_activity") +activity-result-fields+)
           ((string= name "pg_get_replication_slots") +replication-slot-result-fields+)
@@ -4018,7 +4053,7 @@ checks still apply."
           (push (cons expression (getf item :desc)) result))))))
 
 (defun sql-type-category (type)
-  (cond ((member type '(:int2 :int4 :int8 :oid :numeric :float4 :float8)) :numeric)
+  (cond ((member type '(:int2 :int4 :int8 :oid :oid8 :numeric :float4 :float8)) :numeric)
         ((member type '(:date :time :timetz :timestamp :timestamptz)) :datetime)
         ((member type '(:text :varchar :name)) :string)
         ((or (eq type :int2vector) (sql-array-element-type type)) :array)
@@ -4028,6 +4063,7 @@ checks still apply."
 (defun sql-implicit-coercion-p (source target)
   "The supported implicit pg_cast edges; explicit I/O casts are broader."
   (or (eq source target)
+      (and (eq target :oid8) (member source '(:int2 :int4 :int8)))
       (and (eq source :int2vector) (sql-array-element-type target)
            (sql-implicit-coercion-p :int2 (sql-array-element-type target)))
       (and (sql-array-element-type source) (sql-array-element-type target)
@@ -4517,6 +4553,7 @@ the full 64-bit ID as a signed value."
          (sql-numeric-basic-function name (first args) (if (rest args) (second args) 0))))
     ((string= name "pg_promote") (pg-promote (first args) (second args)))
     ((string= name "pg_stat_get_wal_receiver") (wal-receiver-result))
+    ((string= name "pg_control_checkpoint") (native-control-checkpoint-result))
     ((string= name "pg_postmaster_start_time") (postmaster-start-timestamp))
     ((member name '("json_typeof" "jsonb_typeof" "json_array_length" "jsonb_array_length")
              :test #'string=)
@@ -5255,6 +5292,7 @@ truncate and interpret the result at TYPE's signed width."
   (cond
     ((eq v +null+) nil)
     ((eq type :void) "")
+    ((eq type :oid8) (format nil "~d" v))
     ((eq type :bytea)
      (sql-bytea-output v (or (session-extra-setting-value "bytea_output") "hex")))
     ((eq type :jsonb) (sql-jsonb-output v))
@@ -5336,7 +5374,7 @@ truncate and interpret the result at TYPE's signed width."
                   (if (sql-array-p item)
                       (array-value item :int2)
                       (map 'vector (lambda (number) (scalar number :int2)) item)))
-                 ((member scalar-type '(:bytea :oid :char :bit :time :timetz :interval :pg-lsn))
+                 ((member scalar-type '(:bytea :oid :oid8 :xid :char :bit :time :timetz :interval :pg-lsn))
                   (value->text item scalar-type))
                  ((eq scalar-type :json) (sql-jsonb-value (sql-jsonb-input item)))
                  ((eq scalar-type :jsonb) (sql-jsonb-value item))
