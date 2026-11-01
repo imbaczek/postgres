@@ -376,13 +376,27 @@
     (unit-check-property 'synchronous-commit-on-aliases-are-canonical)
   (dolist (value '("local" "remote_write" "remote_apply"))
     (rove:ok (string= value (session-normalize-synchronous-commit (string-upcase value)))))
-  (dolist (entry '(("off" . "0A000") ("false" . "0A000") ("no" . "0A000")
-                   ("0" . "0A000") ("t" . "22023") (" on " . "22023")
-                   ("remote" . "22023")))
+  (dolist (entry '(("t" . "22023") (" on " . "22023") ("remote" . "22023")))
     (rove:ok (equal (cdr entry)
                     (handler-case
                         (progn (session-normalize-synchronous-commit (car entry)) nil)
                       (pg-error (condition) (pg-error-sqlstate condition)))))))
+
+(cl-spec:defproperty synchronous-commit-off-aliases-capture-async-policy
+    ((choice (range integer 0 3)))
+  (:about session-normalize-synchronous-commit session-synchronous-commit-policy)
+  (:trials (:normal 100))
+  (let* ((*backend* (make-backend :state :in-progress))
+         (alias (nth choice '("OFF" "false" "NO" "0"))))
+    (session-set-synchronous-commit alias)
+    (let ((policy (session-synchronous-commit-policy)))
+      (session-set-synchronous-commit "local")
+      (and (string= "off" (session-normalize-synchronous-commit alias))
+           (eq :async (commit-policy-local-durability policy))
+           (null (commit-policy-remote-wait policy))))))
+
+(rove:deftest synchronous-commit-off-contract
+    (unit-check-property 'synchronous-commit-off-aliases-capture-async-policy))
 
 (cl-spec:defproperty synchronous-commit-policy-separates-local-and-remote
     ((choice (range integer 0 3)))
@@ -412,9 +426,9 @@
       (rove:ok (null (commit-policy-remote-wait (synchronous-commit-policy)))))
     (dolist (value '("off" "false" "no" "0"))
       (setf (gethash "synchronous_commit" (backend-settings *backend*)) value)
-      (rove:ok (equal "0A000"
-                      (handler-case (progn (synchronous-commit-policy) nil)
-                        (pg-error (condition) (pg-error-sqlstate condition))))))))
+      (let ((policy (synchronous-commit-policy)))
+        (rove:ok (eq :async (commit-policy-local-durability policy)))
+        (rove:ok (null (commit-policy-remote-wait policy)))))))
 
 (rove:deftest session-raw-binding-preserves-absence-and-source
     (dolist (value-p '(nil t))
@@ -455,7 +469,7 @@
 (rove:deftest session-invalid-commit-setting-does-not-save-or-mutate
     (let* ((*backend* (make-backend :state :in-progress))
            (settings (backend-settings *backend*)))
-      (dolist (value '("off" "invalid"))
+      (dolist (value '("invalid" "remote"))
         (rove:ok (handler-case (progn (session-set-synchronous-commit value t) nil)
                    (pg-error () t)))
         (rove:ok (zerop (hash-table-count settings)))

@@ -131,7 +131,7 @@ OFF and false aliases are rejected until asynchronous commit is supported."
       ((member text '("on" "true" "yes" "1") :test #'string=) "on")
       ((member text '("local" "remote_write" "remote_apply") :test #'string=) text)
       ((member text '("off" "false" "no" "0") :test #'string=)
-       (ereport "0A000" "asynchronous commit is not supported"))
+       "off")
       (t (ereport "22023" "invalid value for parameter synchronous_commit")))))
 
 (defun session-capture-raw-binding (settings name)
@@ -205,7 +205,7 @@ request flush and the corresponding remote boundary. OFF remains unsupported."
                        ((string= value "remote_write") :write)
                        ((string= value "remote_apply") :apply)
                        ((string= value "local") nil))))
-    (%make-commit-policy :flush remote)))
+    (%make-commit-policy (if (string= value "off") :async :flush) remote)))
 
 (defun session-synchronous-commit-wait-mode ()
   "Return the remote component of the captured policy for existing callers."
