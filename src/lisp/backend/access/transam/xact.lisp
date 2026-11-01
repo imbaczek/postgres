@@ -1473,6 +1473,15 @@ snapshot retains its coverage and XIP for its lifetime."
       snapshot)))
 
 (defun call-with-settled-primary-snapshot (function)
+  "Settle pending primary WAL publications before capturing a fresh snapshot.
+Admission or startup quiescence keeps the primary role stable. Hold WAL through
+FUNCTION so its XID lock follows WAL and another thread cannot publish between
+settlement and capture. A poisoned settlement triggers fail-stop after releasing
+WAL. Errors from FUNCTION do not themselves poison WAL.
+
+C's GetSnapshotData reads the process array. Buffer and SLRU writes separately
+check LSNs to flush WAL before data. This queue settlement is an additional step
+in this server's snapshot capture."
   (let ((failure nil) (settling nil) (settled nil))
     (sb-sys:without-interrupts
       (unwind-protect
@@ -1496,6 +1505,9 @@ snapshot retains its coverage and XIP for its lifetime."
              (ignore-errors (funcall (symbol-function 'request-fast-shutdown))))))))))
 
 (defun make-snapshot (curcid &key register)
+  "Capture a fresh snapshot after settling the pending primary WAL prefix.
+In recovery or before WAL startup, take only the XID lock. Callers handle reuse
+of transaction and portal snapshots."
   (flet ((capture ()
            (sb-thread:with-mutex (*xid-lock*)
              (make-snapshot-under-xid-lock curcid :register register))))
@@ -1511,7 +1523,8 @@ snapshot retains its coverage and XIP for its lifetime."
 
 The caller holds *WRITE-LOCK*. This establishes the same brief writer barrier
 used by logical slot startpoint selection in PostgreSQL; holding WAL before XID
-publication makes the snapshot and durable WAL end one boundary. The returned
+publication makes the snapshot and durable WAL end one boundary. Pending page
+publications are settled before selecting the durable LSN. The returned
 restart LSN reaches back to the earliest page batch that contains an XID still
 active in the snapshot. Its registration pins that WAL position until release.
 AFTER-CAPTURE runs under *WAL-LOCK* but after *XID-LOCK* is released."

@@ -27,6 +27,19 @@
   The 834 unit checks ran through the tool; there is no `unit-final.log` and no
   new cl-spec contract for this milestone.
 
+- [x] Settle the pending primary WAL publication prefix before capturing a fresh
+  snapshot (`034d03464c4`), keeping WAL locked through XID capture and selecting
+  logical snapshot boundaries after settlement. Existing transaction and portal
+  snapshot reuse remains unchanged. This adds no tracked primary WAL writer,
+  OFF, or coordination.
+  The checkpoint passed 837 unit checks through the tool, 1,413 physical, 1,161
+  legacy, 201 wire, strict cold compilation, 21 native page and five native CLOG
+  cases, and two native snapshot reuse cases. Evidence is in
+  `/home/imbaczek/proj/pg-ha-artifacts/snapshot-prefix/`: `physical-initial.log`,
+  `legacy.log`, `wire.log`, `cold-initial.log`, `native-pages-final.log`,
+  `native-clog.log`, and `native.log`. There is no final unit log or new cl-spec
+  contract for this milestone.
+
 - [x] Implement the source sender-status foundation. The sender and activity
   SRFs can be joined by PID. Captured registration tokens enforce ownership;
   snapshots are detached copies with independent, nullable feedback positions.
@@ -300,8 +313,8 @@
 - [ ] Implement true asynchronous OFF using captured policy and acceptance
   receipts. Add a tracked primary writer with bounded pressure, wakeup, stop/join,
   reload, shutdown and role lifecycle. Prove distinct asynchronous acceptance and
-  settle the snapshot prefix before acquiring the XID lock during snapshot capture. Preserve
-  WAL-to-CLOG lock order and never put pending committed bits on disk before WAL.
+  complete the CLOG overlay for that path. Preserve WAL-to-CLOG lock order and
+  never put pending committed bits on disk before WAL.
   Enable public OFF only after real acceptance coverage. No coordination is added.
 
 - [ ] Complete the unchanged Patroni monitoring query and synchronous-replication
