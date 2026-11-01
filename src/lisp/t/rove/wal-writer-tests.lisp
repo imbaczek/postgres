@@ -17,6 +17,11 @@
          (*physical-recovery-state* nil)
          (*wal-ready* t)
          (*wal-poisoned* nil)
+         (*wal-end-lsn* (if isolate 0 *wal-end-lsn*))
+         (*wal-durable-lsn* (if isolate 0 *wal-durable-lsn*))
+         (*wal-pending-page-publication* (unless isolate *wal-pending-page-publication*))
+         (*clog-pending-commits* (if isolate (make-hash-table :test #'eql)
+                                     *clog-pending-commits*))
          (*wal-control-metadata* (make-wal-control-metadata 1 +db-in-production+))
          (*wal-pending-page-publication-tail* nil)
          (*primary-wal-writer*
@@ -33,12 +38,76 @@
            (funcall function *primary-wal-writer*))
       (setf (symbol-function 'postmaster-pid-owned-p) owned))))
 
+(defun primary-writer-idle-flush-result (debt)
+  (call-with-primary-writer-authority-test
+   (lambda (writer)
+     (let ((flush (symbol-function 'wal-flush-core)) (calls 0))
+       (setf *wal-durable-lsn* 1024 *wal-end-lsn* (+ 1024 debt)
+             (primary-wal-writer-last-drained-end writer) 77)
+       (unwind-protect
+            (progn
+              (setf (symbol-function 'wal-flush-core)
+                    (lambda ()
+                      (assert (sb-thread:holding-mutex-p *wal-lock*))
+                      (assert (null *wal-pending-page-publication*))
+                      (assert (null *wal-pending-page-publication-tail*))
+                      (incf calls)
+                      (setf *wal-durable-lsn* *wal-end-lsn*)))
+              (let ((first (primary-wal-writer-step writer))
+                    (second (primary-wal-writer-step writer)))
+                (and (eq :continue first) (eq :continue second)
+                     (= (if (plusp debt) 1 0) calls)
+                     (= *wal-end-lsn* *wal-durable-lsn*)
+                     (= 2 (primary-wal-writer-cycles writer))
+                     (= 77 (primary-wal-writer-last-drained-end writer))
+                     (not *wal-poisoned*))))
+         (setf (symbol-function 'wal-flush-core) flush))))))
+
+(cl-spec:defproperty primary-writer-idle-cycles-flush-complete-tail
+    ((debt (range integer 0 65536)))
+  (:about primary-wal-writer-drain-under-lock)
+  (:trials (:normal 100))
+  (primary-writer-idle-flush-result debt))
+
+(rove:deftest primary-writer-idle-flushes-once-and-preserves-fifo-metric
+    (rove:ok (primary-writer-idle-flush-result 0))
+  (rove:ok (primary-writer-idle-flush-result 4096))
+  (unit-check-property 'primary-writer-idle-cycles-flush-complete-tail))
+
+(rove:deftest primary-writer-idle-flush-fences-errors-before-unlock
+    (dolist (escape '(nil t))
+      (call-with-primary-writer-authority-test
+       (lambda (writer)
+         (let ((flush (symbol-function 'wal-flush-core))
+               (failure (make-condition 'simple-error :format-control "idle flush failed"))
+               (observed nil) (poisoned-before-unlock nil))
+           (setf *wal-end-lsn* 32 *wal-durable-lsn* 0)
+           (unwind-protect
+                (progn
+                  (setf (symbol-function 'wal-flush-core)
+                        (lambda () (if escape (throw 'idle-flush-escape :escaped) (error failure))))
+                  (handler-case
+                      (catch 'idle-flush-escape
+                        (sb-thread:with-mutex (*wal-lock*)
+                          (unwind-protect
+                               (primary-wal-writer-drain-under-lock writer (primary-wal-writer-epoch writer))
+                            (setf poisoned-before-unlock *wal-poisoned*))))
+                    (error (condition) (setf observed condition)))
+                  (rove:ok poisoned-before-unlock)
+                  (rove:ok (not (sb-thread:holding-mutex-p *wal-lock*)))
+                  (rove:ok (if escape (typep observed 'error) (eq failure observed)))
+                  (rove:ok (zerop (primary-wal-writer-cycles writer)))
+                  (rove:ok (zerop *wal-durable-lsn*)))
+             (setf (symbol-function 'wal-flush-core) flush)))))))
+
 (defun primary-writer-authority-result (mismatch)
   (call-with-primary-writer-authority-test
    (lambda (writer)
      (let ((epoch (primary-wal-writer-epoch writer))
            (settle (symbol-function 'wal-settle-page-publications-under-lock))
-           (calls 0))
+           (flush (symbol-function 'wal-flush-core))
+           (calls 0) (flushes 0))
+       (setf *wal-end-lsn* 32 *wal-durable-lsn* 0)
        (case mismatch
          (1 (setf *wal-storage-incarnation* (gensym "REPLACED-STORE-")))
          (2 (incf *wal-insert-timeline*))
@@ -58,19 +127,22 @@
        (unwind-protect
             (progn
               (setf (symbol-function 'wal-settle-page-publications-under-lock)
-                    (lambda () (incf calls)))
+                    (lambda () (incf calls))
+                    (symbol-function 'wal-flush-core)
+                    (lambda () (incf flushes) (setf *wal-durable-lsn* *wal-end-lsn*)))
               (let ((outcome
                       (handler-case
                           (sb-thread:with-mutex (*wal-lock*)
                             (primary-wal-writer-drain-under-lock writer epoch))
                         (wal-input-validation-error () :rejected))))
                 (and (if (zerop mismatch)
-                         (and (eq :continue outcome) (= 1 calls)
+                         (and (eq :continue outcome) (= 1 calls) (= 1 flushes)
                               (= 1 (primary-wal-writer-cycles writer)))
-                         (and (eq :rejected outcome) (zerop calls)
+                         (and (eq :rejected outcome) (zerop calls) (zerop flushes)
                               (zerop (primary-wal-writer-cycles writer))))
                      (not *wal-poisoned*))))
-         (setf (symbol-function 'wal-settle-page-publications-under-lock) settle))))))
+         (setf (symbol-function 'wal-settle-page-publications-under-lock) settle
+               (symbol-function 'wal-flush-core) flush))))))
 
 (cl-spec:defproperty primary-writer-rejects-stale-authority-before-settlement
     ((mismatch (range integer 0 12)))
@@ -87,9 +159,13 @@
     (call-with-primary-writer-authority-test
      (lambda (writer)
        (let ((settle (symbol-function 'wal-settle-page-publications-under-lock))
-             (calls 0))
+             (flush (symbol-function 'wal-flush-core))
+             (calls 0) (flushes 0))
+         (setf *wal-end-lsn* 32 *wal-durable-lsn* 0)
          (unwind-protect
               (progn
+                (setf (symbol-function 'wal-flush-core)
+                      (lambda () (incf flushes) (setf *wal-durable-lsn* *wal-end-lsn*)))
                 (setf (symbol-function 'wal-settle-page-publications-under-lock)
                       (lambda () (incf calls)))
                 (request-primary-wal-writer-stop writer)
@@ -99,16 +175,22 @@
                                       writer (primary-wal-writer-epoch writer)))))
                 (rove:ok (zerop calls))
                 (rove:ok (zerop (primary-wal-writer-cycles writer)))
+                (rove:ok (= 0 flushes))
                 (rove:ok (not *wal-poisoned*)))
-           (setf (symbol-function 'wal-settle-page-publications-under-lock) settle))))))
+           (setf (symbol-function 'wal-settle-page-publications-under-lock) settle
+                 (symbol-function 'wal-flush-core) flush))))))
 
 (rove:deftest primary-writer-cooperative-stop-allows-an-accepted-cycle-to-finish
     (call-with-primary-writer-authority-test
      (lambda (writer)
        (let ((settle (symbol-function 'wal-settle-page-publications-under-lock))
-             (calls 0))
+             (flush (symbol-function 'wal-flush-core))
+             (calls 0) (flushes 0))
+         (setf *wal-end-lsn* 32 *wal-durable-lsn* 0)
          (unwind-protect
               (progn
+                (setf (symbol-function 'wal-flush-core)
+                      (lambda () (incf flushes) (setf *wal-durable-lsn* *wal-end-lsn*)))
                 (setf (symbol-function 'wal-settle-page-publications-under-lock)
                       (lambda ()
                         (incf calls)
@@ -118,8 +200,10 @@
                 (rove:ok (= 1 (primary-wal-writer-cycles writer)))
                 (rove:ok (eq :stop (primary-wal-writer-step writer)))
                 (rove:ok (= 1 calls))
+                (rove:ok (= 1 flushes))
                 (rove:ok (not *wal-poisoned*)))
-           (setf (symbol-function 'wal-settle-page-publications-under-lock) settle))))))
+           (setf (symbol-function 'wal-settle-page-publications-under-lock) settle
+                 (symbol-function 'wal-flush-core) flush))))))
 
 (rove:deftest primary-writer-drains-real-page-and-clog-prefix
     (call-with-queued-clog-test

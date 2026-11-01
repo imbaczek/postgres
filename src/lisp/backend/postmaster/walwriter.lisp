@@ -276,6 +276,9 @@ The caller must fence failures after releasing WAL; this function does not."
   (let ((end (when *wal-pending-page-publication-tail*
                (wal-page-publication-terminal-end *wal-pending-page-publication-tail*))))
     (wal-settle-page-publications-under-lock)
+    (when (and (null end) (> *wal-end-lsn* *wal-durable-lsn*))
+      (with-wal-poison-on-incomplete ("primary WAL writer flush exited before completion")
+        (wal-flush-core)))
     (sb-thread:with-mutex (*primary-wal-writer-lock*)
       (incf (primary-wal-writer-cycles writer))
       (when end (setf (primary-wal-writer-last-drained-end writer) end))))

@@ -4,6 +4,7 @@
 (defun make-wal-writer-service-test-thread (function)
   (let* ((names '(*wal-lock* *primary-wal-writer-lock* *reload-definition-lock*
                   *wal-ready* *wal-poisoned* *wal-storage-incarnation*
+                  *wal-end-lsn* *wal-durable-lsn*
                   *wal-insert-timeline* *wal-control-metadata* *postmaster-data-lock*
                   *physical-recovery-state* *wal-pending-page-publication*
                   *wal-pending-page-publication-tail* *clog-pending-commits*
@@ -20,6 +21,7 @@
          (*primary-wal-writer-lock* (sb-thread:make-mutex :name "writer service test state"))
          (*reload-definition-lock* (sb-thread:make-mutex :name "writer service test definitions"))
          (*wal-ready* t) (*wal-poisoned* nil)
+         (*wal-end-lsn* 0) (*wal-durable-lsn* 0)
          (*wal-storage-incarnation* (gensym "WRITER-SERVICE-TEST-"))
          (*wal-insert-timeline* 1)
          (*wal-control-metadata* (make-wal-control-metadata 1 +db-in-production+))
