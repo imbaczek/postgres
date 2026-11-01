@@ -87,8 +87,7 @@ This policy is a choice, distinct from a WAL receipt's historical facts."
   (remote-wait nil :read-only t))
 
 (defun wal-require-local-commit-durability (mode)
-  "Validate the internal local durability policy before publication.
-Public synchronous_commit=off remains disabled."
+  "Validate the local durability policy before publication."
   (unless (member mode '(:flush :async))
     (ereport "XX000" "invalid local commit durability policy"))
   mode)
@@ -1922,7 +1921,7 @@ This may be called again after materialization while page retirement is pending.
                                   (source-id nil source-id-supplied-p) accepted-function
                                   (local-durability :flush))
   "Publish XID's commit and return its end and immutable historical receipt.
-LOCAL-DURABILITY defaults to :FLUSH. Private :ASYNC can accept a queued owner
+LOCAL-DURABILITY defaults to :FLUSH. :ASYNC can accept a queued owner
 without flushing when pressure, resets and writer availability permit it. The
 FIFO retains the owner's pages, spool and CLOG completion independent of the
 backend. Otherwise flush and apply through this owner before acceptance; reset

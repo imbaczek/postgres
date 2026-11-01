@@ -182,13 +182,21 @@ temporary-file quota. Transactions and maintenance hand sealed spools and dirty
 maps to a WAL-locked FIFO at their terminal records. Each transaction owner also
 holds its CLOG completion, reserved before the terminal insertion attempt and
 published against the actual terminal end. Maintenance owners have no completion.
-Reads find the newest queued page together with its contributor metadata.
-Settlement flushes WAL and validates the captured prefix, then completes each
-head's CLOG status before applying its pages and retiring its resources. A
-synchronous successor drains predecessors before its own status and callback.
-Normal calls settle immediately before returning; there is no
-background writer, and `synchronous_commit=off` still returns 0A000. Catalog,
-checkpoint, CLOG reset, XID reservation, resource, recycling and namespace changes
+Reads find the newest queued page together with its contributor metadata. An
+accepted asynchronous commit reads as committed through the CLOG overlay while
+its raw CLOG bits remain in progress. The primary WAL writer settles the FIFO:
+it flushes WAL and validates the captured prefix, then completes each head's
+CLOG status before applying its pages and retiring its resources. A fresh primary
+snapshot settles pending publications before capturing its XID horizon; retained
+transaction and portal snapshots keep their existing horizons.
+
+With `synchronous_commit=off`, a transaction can return before its WAL is
+durable and can be lost in a crash. Its queued owner retains the pages, spool and
+CLOG completion after backend cleanup. Pressure limits, relation resets or an
+unavailable writer force synchronous completion; final DDL and remote waiting
+also force a local flush. A synchronous successor drains predecessors before its
+own status and callback. Catalog, checkpoint, CLOG reset, XID reservation,
+resource, recycling and namespace changes
 are synchronous barriers. Relation resets force synchronous completion, with prior
 owners settled before private replacement pages are published. Storage installation,
 adoption and identity replacement require no outstanding debt. These barriers do not make
@@ -200,9 +208,10 @@ with checksums bound to the page identity. Scratch is transient, exempt from
 the SQL temporary-file quota, and released when its
 last reference is gone. Page keys, contributor metadata and the sorted key list
 remain in memory and grow with dirty pages; temporary record buffers also use
-memory. This is not a total process memory bound and does not remove logical
-transaction size limits. WAL is flushed before commit visibility and page
-application.
+memory. The retained-publication pressure limits bound asynchronous acceptance,
+not a transaction's transient allocations or total process memory. They do not
+remove logical transaction size limits. WAL is flushed before raw CLOG commit
+bits and page application, even when the logical overlay is already committed.
 `TRUNCATE` records one compact storage reset per replaced fork instead of
 writing empty page images for its old blocks. Replacement pages remain private
 until commit; recovery applies the reset and replacement images only after the

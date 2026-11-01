@@ -1,9 +1,21 @@
 # Development TODO
 
+- [x] Enable public `synchronous_commit=off` (`0ce95c4e409`, `24cebb6d345`).
+  The checkpoint passed 882 unit, 1,413 physical, 201 wire and 1,161 legacy
+  checks, strict cold compilation, six native public OFF crash cases and the
+  settings and fallback checks. Evidence is in
+  `/home/imbaczek/proj/pg-ha-artifacts/public-async/`: `cold.log`,
+  `physical.log`, `wire.log`, `legacy.log`, `native.log`, and
+  `settings-final-reviewed.log`; unit checks ran through the
+  tool. The normalization and policy property ran 100 trials at seed 4012
+  (digest `fnv1a64-v1:db34c9708e1d3c6f`); neither target has a registered
+  Function Spec, and rejection counts and input coverage were not measured.
+
 - [x] Integrate private asynchronous acceptance with receipts, CLOG and backend
   cleanup (`280dc7f3541`, `0ff4a132af7`). A queued owner retains its resources
   after backend cleanup; pressure, resets or writer unavailability force a flush.
-  Final DDL and remote waiting also force local flush. Public OFF remains disabled.
+  Final DDL and remote waiting also force local flush. At that checkpoint public
+  OFF remained disabled.
   The checkpoint passed 881 unit checks through the tool, 1,413 physical checks,
   strict cold compilation, six native crash/acceptance, eight native writer and
   eight native receipt cases. Logs are in
@@ -374,12 +386,13 @@
   measured, and there is no function spec. Logs are in
   `/home/imbaczek/proj/pg-ha-artifacts/queued-clog/`.
 
-- [ ] Implement true asynchronous OFF using captured policy and acceptance
-  receipts. Add a tracked primary writer with bounded pressure, wakeup, stop/join,
-  reload, shutdown and role lifecycle. Prove distinct asynchronous acceptance and
-  complete the CLOG overlay for that path. Preserve WAL-to-CLOG lock order and
-  never put pending committed bits on disk before WAL.
-  Enable public OFF only after real acceptance coverage. No coordination is added.
+- [x] Implement asynchronous OFF using captured policy and acceptance receipts,
+  a tracked primary writer, bounded retained-resource pressure and CLOG overlay.
+  Preserve WAL-to-CLOG lock order and never put pending committed bits on disk
+  before WAL. No coordination was added.
+
+- [ ] Match C background flushing of unrelated WAL when the publication FIFO is
+  empty. Audit which native WAL frontiers can safely advance before enabling it.
 
 - [ ] Complete the unchanged Patroni monitoring query and synchronous-replication
   backend contract. Preserve the complete real query as the acceptance oracle.

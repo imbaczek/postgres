@@ -125,7 +125,7 @@ Search-path reporting is an existing native extension."
 (defun session-normalize-synchronous-commit (value)
   "Normalize supported synchronous_commit values.
 ON and its true aliases select remote flush. LOCAL keeps local durability;
-OFF and false aliases are rejected until asynchronous commit is supported."
+OFF and its false aliases request asynchronous local commit."
   (let ((text (string-downcase (princ-to-string value))))
     (cond
       ((member text '("on" "true" "yes" "1") :test #'string=) "on")
@@ -199,7 +199,8 @@ and a default entry. When CONFIGURATION is supplied, use that root for fallback.
 (defun session-synchronous-commit-policy ()
   "Capture and normalize the setting once as local durability and remote wait.
 LOCAL requests flush without remote waiting; ON, REMOTE_WRITE and REMOTE_APPLY
-request flush and the corresponding remote boundary. OFF remains unsupported."
+request flush and the corresponding remote boundary. OFF requests asynchronous
+local commit without a remote wait."
   (let* ((value (session-normalize-synchronous-commit (session-synchronous-commit-value)))
          (remote (cond ((string= value "on") :flush)
                        ((string= value "remote_write") :write)
