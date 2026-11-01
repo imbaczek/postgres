@@ -592,8 +592,10 @@
                   (query-execution-owner-add-cleanup owner (lambda () (push :owner events))))
                 (setf (backend-xid *backend*) 777
                       (symbol-function 'wal-commit-transaction)
-                      (lambda (xid after &key logical-changes terminal-durable-function source-id accepted-function)
+                      (lambda (xid after &key logical-changes terminal-durable-function source-id accepted-function
+                                           local-durability)
                         (declare (ignore logical-changes))
+                        (rove:ok (eq :flush local-durability))
                         (push :wal events)
                         (rove:ok (zerop *active-snapshots*))
                         (when (and *wal-ready* terminal-durable-function)
@@ -643,8 +645,10 @@
                             (declare (ignore arguments))
                             (when (eq phase :clog) (error "CLOG publication failure")))
                           (symbol-function 'wal-commit-transaction)
-                          (lambda (xid after &key logical-changes terminal-durable-function source-id accepted-function)
+                          (lambda (xid after &key logical-changes terminal-durable-function source-id accepted-function
+                                               local-durability)
                             (declare (ignore logical-changes))
+                            (rove:ok (eq :flush local-durability))
                             (when (eq phase :before) (error "before durable terminal"))
                             (when (and *wal-ready* terminal-durable-function)
                               (funcall terminal-durable-function 140))
@@ -822,8 +826,10 @@
                    (symbol-function 'release-xid)
                    (lambda (&rest arguments) (declare (ignore arguments)))
                    (symbol-function 'wal-commit-transaction)
-                   (lambda (xid after &key logical-changes terminal-durable-function source-id accepted-function)
+                   (lambda (xid after &key logical-changes terminal-durable-function source-id accepted-function
+                                        local-durability)
                      (declare (ignore logical-changes))
+                     (rove:ok (eq :flush local-durability))
                      (rove:ok (eq :own source-id))
                      (funcall terminal-durable-function 140)
                      (funcall after)
@@ -845,6 +851,98 @@
         (setf (symbol-function 'wal-commit-transaction) wal
               (symbol-function 'clog-set) clog
               (symbol-function 'release-xid) release))))
+
+(defun commit-policy-test-boundary-result (ddl-p xid-p &optional requested-policy)
+  (let* ((*backend* (make-backend :xid (when xid-p 777) :state :in-progress
+                                  :dirty-relations (when xid-p '(99))))
+         (*wal-ready* t) (*wal-poisoned* nil)
+         (*sync-replication-state* (make-sync-replication-state :source-id :policy-source))
+         (names '(wal-commit-transaction clog-set release-xid wait-for-committed-wal-obligation))
+         (saved (mapcar (lambda (name) (cons name (symbol-function name))) names))
+         (local nil) (remote :not-called) (end nil) (captured nil))
+    (unwind-protect
+         (progn
+           (setf (gethash "synchronous_commit" (backend-settings *backend*)) "remote_apply")
+           (when ddl-p
+             (prepare-backend-final-ddl *backend*)
+             (let ((context (backend-wal-obligation *backend*)))
+               (when requested-policy
+                 (setf (transaction-wal-obligation-ddl-policy context) requested-policy))
+               (setf captured (transaction-wal-obligation-ddl-policy context))
+               (record-final-ddl-wal-boundary context :policy-source 80))
+             (session-set-synchronous-commit "local"))
+           (setf (symbol-function 'clog-set)
+                 (lambda (&rest arguments) (declare (ignore arguments)))
+                 (symbol-function 'release-xid)
+                 (lambda (&rest arguments) (declare (ignore arguments)))
+                 (symbol-function 'wal-commit-transaction)
+                 (lambda (xid after &key logical-changes terminal-durable-function
+                                      source-id accepted-function local-durability)
+                   (declare (ignore logical-changes))
+                   (setf local local-durability)
+                   (session-set-synchronous-commit "local")
+                   (funcall terminal-durable-function 140)
+                   (funcall after)
+                   (complete-test-commit-receipt xid source-id 140 accepted-function))
+                 (symbol-function 'wait-for-committed-wal-obligation)
+                 (lambda (backend obligation mode &optional terminal)
+                   (declare (ignore backend))
+                   (setf remote mode
+                         end (or terminal (transaction-wal-obligation-user-end obligation)))
+                   :acknowledged))
+           (commit-transaction)
+           (list local remote end captured (backend-state *backend*)))
+      (dolist (entry saved) (setf (symbol-function (car entry)) (cdr entry)))
+      (setf (backend-xid *backend*) nil))))
+
+(rove:deftest commit-policy-is-captured-before-publication-and-final-ddl
+    (dolist (case '((nil t) (t t) (t nil)))
+      (destructuring-bind (ddl-p xid-p) case
+        (destructuring-bind (local remote end captured state)
+            (commit-policy-test-boundary-result ddl-p xid-p)
+          (rove:ok (eql (when xid-p :flush) local))
+          (rove:ok (eq :apply remote))
+          (rove:ok (= (if xid-p 140 80) end))
+          (when ddl-p
+            (rove:ok (eq :flush (commit-policy-local-durability captured)))
+            (rove:ok (eq :apply (commit-policy-remote-wait captured))))
+          (rove:ok (eq :idle state))))))
+
+(rove:deftest final-ddl-forces-local-flush-without-adding-a-remote-wait
+    (dolist (xid-p '(nil t))
+      (let ((requested (%make-commit-policy :async nil)))
+        (destructuring-bind (local remote end captured state)
+            (commit-policy-test-boundary-result t xid-p requested)
+          (declare (ignore end))
+          (rove:ok (eq requested captured))
+          (rove:ok (eq :async (commit-policy-local-durability requested)))
+          (rove:ok (eql (when xid-p :flush) local))
+          (rove:ok (null remote))
+          (rove:ok (eq :idle state))))))
+
+(rove:deftest wal-commit-rejects-unsupported-local-policy-before-publication
+    (dolist (ready-p '(nil t))
+      (let ((*wal-ready* ready-p) (*wal-poisoned* nil)
+                                  (*wal-end-lsn* 123) (called nil))
+        (dolist (mode '(:async :invalid nil))
+          (rove:ok
+           (equal (if (eq mode :async) "0A000" "XX000")
+                  (handler-case
+                      (progn
+                        (wal-commit-transaction 777 (lambda () (setf called t))
+                                                :source-id :policy-source
+                                                :local-durability mode
+                                                :terminal-durable-function (lambda (end)
+                                                                             (declare (ignore end))
+                                                                             (setf called t))
+                                                :accepted-function (lambda (receipt)
+                                                                     (declare (ignore receipt))
+                                                                     (setf called t)))
+                        nil)
+                    (pg-error (condition) (pg-error-sqlstate condition)))))
+          (rove:ok (not called))
+          (rove:ok (= 123 *wal-end-lsn*))
+          (rove:ok (not *wal-poisoned*))))))
 
 (rove:deftest commit-receipt-validates-acceptance-without-inventing-wal-proof
     (dolist (case '((t 140 140 t) (nil nil nil nil)))
@@ -895,8 +993,10 @@
                           (when (eq fault :nonlocal) (throw 'receipt-check-exit :escaped))
                           (apply validate arguments))
                         (symbol-function 'wal-commit-transaction)
-                        (lambda (xid after &key logical-changes terminal-durable-function source-id accepted-function)
+                        (lambda (xid after &key logical-changes terminal-durable-function source-id accepted-function
+                                             local-durability)
                           (declare (ignore logical-changes))
+                          (rove:ok (eq :flush local-durability))
                           (unless (eq fault :missing-durable-callback)
                             (funcall terminal-durable-function 140))
                           (funcall after)

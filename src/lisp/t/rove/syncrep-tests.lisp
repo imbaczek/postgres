@@ -384,6 +384,38 @@
                         (progn (session-normalize-synchronous-commit (car entry)) nil)
                       (pg-error (condition) (pg-error-sqlstate condition)))))))
 
+(cl-spec:defproperty synchronous-commit-policy-separates-local-and-remote
+    ((choice (range integer 0 3)))
+  (:about session-synchronous-commit-policy)
+  (:trials (:normal 100))
+  (let* ((*backend* (make-backend :state :in-progress))
+         (entry (nth choice '(("local" nil) ("remote_write" :write)
+                              ("on" :flush) ("remote_apply" :apply)))))
+    (setf (gethash "synchronous_commit" (backend-settings *backend*)) (first entry))
+    (let ((policy (session-synchronous-commit-policy)))
+      (session-set-synchronous-commit "local")
+      (and (eq :flush (commit-policy-local-durability policy))
+           (eql (second entry) (commit-policy-remote-wait policy))))))
+
+(rove:deftest synchronous-commit-policy-contract
+    (unit-check-property 'synchronous-commit-policy-separates-local-and-remote)
+  (let* ((*backend* (make-backend :state :in-progress))
+         (settings (make-hash-table :test #'equal))
+         (*startup-installed-configuration* (make-startup-configuration :settings settings)))
+    (setf (gethash "synchronous_commit" settings) (list :value "remote_apply" :source :file))
+    (let ((policy (synchronous-commit-policy))
+          (replacement (make-hash-table :test #'equal)))
+      (setf (gethash "synchronous_commit" replacement) (list :value "local" :source :file)
+            *startup-installed-configuration* (make-startup-configuration :settings replacement))
+      (rove:ok (eq :flush (commit-policy-local-durability policy)))
+      (rove:ok (eq :apply (commit-policy-remote-wait policy)))
+      (rove:ok (null (commit-policy-remote-wait (synchronous-commit-policy)))))
+    (dolist (value '("off" "false" "no" "0"))
+      (setf (gethash "synchronous_commit" (backend-settings *backend*)) value)
+      (rove:ok (equal "0A000"
+                      (handler-case (progn (synchronous-commit-policy) nil)
+                        (pg-error (condition) (pg-error-sqlstate condition))))))))
+
 (rove:deftest session-raw-binding-preserves-absence-and-source
     (dolist (value-p '(nil t))
       (dolist (source-p '(nil t))

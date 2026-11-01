@@ -5,6 +5,8 @@
                 session-set-synchronous-commit session-synchronous-commit-value
                 session-synchronous-commit-wait-mode session-synchronous-commit-settings-row))
 
+(declaim (ftype function session-synchronous-commit-policy))
+
 (defparameter *session-local-setting-names* '("application_name" "synchronous_commit"))
 
 (declaim (ftype function sync-replication-monitoring-snapshots-under-lock))

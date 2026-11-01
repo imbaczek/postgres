@@ -77,7 +77,7 @@
   source-id catalog-end user-end (source-changed-p nil)
   ;; DDL captures its mode before publication. FINAL-DDL-P records publication
   ;; even without WAL; FINAL-DDL-END is its exact durable catalog end when present.
-  (ddl-prepared-p nil) ddl-wait-mode (final-ddl-p nil) final-ddl-end)
+  (ddl-prepared-p nil) ddl-policy (final-ddl-p nil) final-ddl-end)
 
 (defun prepare-backend-wal-obligation (backend)
   "Snapshot the source and prepare an obligation before WAL publication.
@@ -115,12 +115,11 @@ The flag remains set even when END is NIL or the source has changed."
   (values))
 
 (defun prepare-backend-final-ddl (backend)
-  "Prepare a backend context and capture the wait mode before DDL publication."
-  (let ((mode (synchronous-commit-wait-mode)))
+  (let ((policy (synchronous-commit-policy)))
     (multiple-value-bind (context source) (prepare-backend-wal-obligation backend)
       (declare (ignore source))
       (setf (transaction-wal-obligation-ddl-prepared-p context) t
-            (transaction-wal-obligation-ddl-wait-mode context) mode)))
+            (transaction-wal-obligation-ddl-policy context) policy)))
   (values))
 
 (defun backend-own-wal-effects-p (backend)
@@ -2388,9 +2387,8 @@ On commit, retire the saved settings snapshot; abort leaves it for whole-table u
                                :format-arguments nil)))))))
   (values))
 
-(defun synchronous-commit-wait-mode ()
-  "Read the effective session setting at the commit boundary."
-  (session-synchronous-commit-wait-mode))
+(defun synchronous-commit-policy ()
+  (session-synchronous-commit-policy))
 
 (defun wait-for-committed-wal-obligation
     (backend obligation mode &optional (end (and obligation (transaction-wal-obligation-user-end obligation))))
@@ -2476,7 +2474,7 @@ Run outside publication locks, clean up the transaction, then handle the outcome
       (unwind-protect
            (setf outcome
                  (wait-for-committed-wal-obligation
-                  backend context (transaction-wal-obligation-ddl-wait-mode context)
+                  backend context (commit-policy-remote-wait (transaction-wal-obligation-ddl-policy context))
                   (transaction-wal-obligation-final-ddl-end context)))
         (finish-committed-transaction backend nil))
       (finish-synchronous-commit-response backend outcome)))
@@ -2537,9 +2535,9 @@ Run outside publication locks, clean up the transaction, then handle the outcome
             (sb-sys:without-interrupts
               (let ((irreversible nil) (accepted nil) (durable-end nil) (completion-safe nil)
                                        ;; XID-bearing DDL waits for its user commit with the captured DDL mode.
-                                       (mode (if (backend-final-ddl-committed-p b)
-                                                 (transaction-wal-obligation-ddl-wait-mode (backend-wal-obligation b))
-                                                 (synchronous-commit-wait-mode)))
+                                       (policy (if (backend-final-ddl-committed-p b)
+                                                   (transaction-wal-obligation-ddl-policy (backend-wal-obligation b))
+                                                   (synchronous-commit-policy)))
                                        (outcome nil)
                                        (wal-ready-at-entry-p *wal-ready*)
                                        (xid (backend-xid b)))
@@ -2557,13 +2555,17 @@ Run outside publication locks, clean up the transaction, then handle the outcome
                                  (setf irreversible t durable-end end)
                                  (record-transaction-wal-boundary obligation source end nil))
                                :source-id source
+                               :local-durability (if (backend-final-ddl-committed-p b)
+                                                     :flush
+                                                     (commit-policy-local-durability policy))
                                :accepted-function (lambda (receipt)
                                                     (setf irreversible t accepted receipt)))
                             ;; A normal storage return is postcommit even if its receipt is malformed.
                             (setf irreversible t)
                             (validate-wal-commit-receipt
                              receipt accepted xid source end durable-end wal-ready-at-entry-p)
-                            (setf outcome (wait-for-committed-wal-obligation b obligation mode))
+                            (setf outcome (wait-for-committed-wal-obligation
+                                           b obligation (commit-policy-remote-wait policy)))
                             (setf completion-safe t))
                        (when (and irreversible (not completion-safe))
                          (suppress-backend-frontend-output b :invalid-commit-receipt)))

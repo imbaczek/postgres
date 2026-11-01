@@ -84,6 +84,19 @@ Runtime retention requires a captured installed policy.")
 ;; NIL is a valid explicit source.  Without WAL the end and proof are NIL;
 ;; the direct CLOG commit can nevertheless be durable.
 
+(defstruct (commit-policy
+            (:constructor %make-commit-policy (local-durability remote-wait)))
+  (local-durability :flush :read-only t)
+  (remote-wait nil :read-only t))
+
+(defun wal-require-local-commit-durability (mode)
+  (unless (eq mode :flush)
+    (ereport (if (eq mode :async) "0A000" "XX000")
+             (if (eq mode :async)
+                 "asynchronous commit is not supported"
+                 "invalid local commit durability policy")))
+  mode)
+
 (defstruct (wal-commit-receipt
             (:constructor %make-wal-commit-receipt (xid source-id terminal-end wal-durable-p)))
   ;; This data-only snapshot owns no backend, spool or callback and is never
@@ -1429,7 +1442,8 @@ the transaction (see SnapBuildCommitTxn and CreateInitDecodingContext)."
 
 (defun wal-commit-transaction
     (xid after-durable-function &key logical-changes terminal-durable-function
-                                  (source-id nil source-id-supplied-p) accepted-function)
+                                  (source-id nil source-id-supplied-p) accepted-function
+                                  (local-durability :flush))
   "Flush storage resets, page images and XID's commit as one WAL boundary.
 The reset descriptors are owned across AFTER-DURABLE-FUNCTION, which may release
 the transaction's private replacements. Preflight the page spool before the
@@ -1446,6 +1460,7 @@ value, after apply and spool cleanup under the publication fence, WAL mutex and
 interrupt mask. It must only latch the receipt and ownership, without allocation,
 I/O or locks. Without WAL, return NIL and a receipt without WAL proof; acceptance
 runs under the interrupt mask after the direct commit callback."
+  (wal-require-local-commit-durability local-durability)
   (when (and *wal-ready* (not source-id-supplied-p))
     (error "WAL commit requires an explicit source identity"))
   (unless (typep source-id '(or symbol integer))

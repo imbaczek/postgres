@@ -196,14 +196,16 @@ and a default entry. When CONFIGURATION is supplied, use that root for fallback.
     (unless entry (error "synchronous_commit has no installed default"))
     (getf entry :value)))
 
+(defun session-synchronous-commit-policy ()
+  (let* ((value (session-normalize-synchronous-commit (session-synchronous-commit-value)))
+         (remote (cond ((string= value "on") :flush)
+                       ((string= value "remote_write") :write)
+                       ((string= value "remote_apply") :apply)
+                       ((string= value "local") nil))))
+    (%make-commit-policy :flush remote)))
+
 (defun session-synchronous-commit-wait-mode ()
-  "Return the remote wait mode for the effective setting.
-LOCAL skips the remote wait but does not skip local durability."
-  (let ((value (session-normalize-synchronous-commit (session-synchronous-commit-value))))
-    (cond ((string= value "on") :flush)
-          ((string= value "remote_write") :write)
-          ((string= value "remote_apply") :apply)
-          ((string= value "local") nil))))
+  (commit-policy-remote-wait (session-synchronous-commit-policy)))
 
 (defun session-synchronous-commit-settings-row (configuration)
   "Build one effective user enum row with its session or installed provenance."
