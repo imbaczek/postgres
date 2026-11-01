@@ -316,6 +316,7 @@ recovery; restart must classify durable control."
   (let ((finished nil))
     (unwind-protect
          (progn
+           (clog-require-no-pending-commits)
            (physical-promotion-check-context 3 :preserve-readers t)
            (unless (and *postmaster-data-lock* (postmaster-pid-owned-p)
                         *clog-stream* (open-stream-p *clog-stream*)
@@ -373,6 +374,7 @@ recovery; restart must classify durable control."
                    (error "live child allocation proof differs from committed checkpoint")))
                (wal-ensure-directory-durable (wal-replication-slot-directory))
                (sb-thread:with-mutex (*wal-lock*)
+                 (wal-replace-storage-incarnation-under-lock)
                  (sb-thread:with-mutex (*xid-lock*)
                    (unless (null *active-xids*) (error "live child has real active transactions"))
                    (sb-thread:with-mutex (*snapshot-count-lock*)

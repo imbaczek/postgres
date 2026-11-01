@@ -246,6 +246,20 @@ Owners are process-local; the appropriate codec stores durable slot fields."
 (defvar *wal-xid-reserved-through* nil)
 
 (defvar *wal-durable-lsn* 0)
+
+(defvar *wal-storage-incarnation* (gensym "WAL-STORE-"))
+
+(declaim (ftype function clog-require-no-pending-commits))
+
+(defun wal-replace-storage-incarnation-under-lock ()
+  (assert (sb-thread:holding-mutex-p *wal-lock*))
+  (clog-require-no-pending-commits)
+  (setf *wal-storage-incarnation* (gensym "WAL-STORE-")))
+
+(defun wal-replace-storage-incarnation ()
+  (sb-thread:with-mutex (*wal-lock*)
+    (wal-replace-storage-incarnation-under-lock)))
+
 (defvar *wal-ready* nil)
 (defvar *wal-output-stream* nil)
 (defvar *wal-output-segment* nil)
@@ -1477,7 +1491,7 @@ runs under the interrupt mask after the direct commit callback."
         (with-wal-critical
           (funcall 'publish-transaction-replacements-under-wal-lock
                    (when (boundp '*backend*) (symbol-value '*backend*)) t)))
-      (funcall after-durable-function)
+      (funcall after-durable-function nil)
       (let ((receipt (%make-wal-commit-receipt xid source-id nil nil)))
         (when accepted-function (funcall accepted-function receipt))
         (return-from wal-commit-transaction (values nil receipt)))))
@@ -1511,7 +1525,7 @@ runs under the interrupt mask after the direct commit callback."
             (when terminal-durable-function (funcall terminal-durable-function commit-lsn))
             (wal-slot-record-xid-commit-under-wal-lock xid commit-lsn)
             (wal-test-pause :after-wal-flush)
-            (funcall after-durable-function)
+            (funcall after-durable-function commit-lsn)
             (wal-apply-relation-resets resets)
             (when resets (wal-test-pause :after-relation-resets))
             (wal-primary-apply-page-spool spool :split-p split-p :fault-on-first-write t)
@@ -2933,11 +2947,13 @@ Refresh its modification time. Update memory only after atomic publication."
 (declaim (ftype function wal-reconcile-namespace-at-startup))
 
 (defun wal-init ()
+  (clog-require-no-pending-commits)
   ;; Control identities must be accepted before even syncing directories: a child
   ;; control cannot cause legacy segment scanning, truncation, or tail adoption.
   (multiple-value-bind (checkpoint-lsn durable-lsn snapshot insertion checkpoint-timeline namespace metadata)
       (wal-read-control-fields)
     (when checkpoint-lsn (wal-require-supported-timelines insertion checkpoint-timeline))
+    (wal-replace-storage-incarnation)
     (setf *wal-control-metadata* metadata
           *wal-segment-namespace* (or namespace :legacy)
           *wal-insert-timeline* (or insertion 1)
@@ -3068,6 +3084,7 @@ Check the encoded size against that plan before appending the checkpoint."
   ;; CHECKPOINT follows the global write-lock -> WAL-lock order.
   (with-write-lock
     (with-wal-critical
+      (clog-require-no-pending-commits)
       (let ((keys (wal-primary-page-keys)))
         (wal-primary-preflight-page-keys keys)
         (with-wal-primary-page-spool (spool)
@@ -3134,20 +3151,26 @@ each calculation captures the current retention settings."
         (when removed (fsync-directory (wal-directory))))))
   (values))
 
+(defun wal-log-clog-reset-under-lock ()
+  (assert (sb-thread:holding-mutex-p *wal-lock*))
+  (let* ((next-xid (symbol-value '*next-xid*))
+         (keys (wal-primary-page-keys))
+         (payload (make-array 8 :element-type '(unsigned-byte 8) :initial-element 0)))
+    (wal-primary-preflight-page-keys keys)
+    (with-wal-primary-page-spool (spool)
+      (wal-primary-record-page-xids keys (wal-append-batch-start))
+      (wal-primary-append-pages keys spool)
+      (wal-primary-seal-page-spool spool)
+      (wal-set-u64 payload 0 next-xid)
+      (wal-append-record +wal-record-clog-reset+ next-xid payload)
+      (wal-flush)
+      (wal-primary-apply-page-spool spool)
+      (wal-clear-page-cache)))
+  (values))
+
 (defun wal-log-clog-reset ()
   (when *wal-ready*
     (with-wal-critical
-      (let* ((next-xid (symbol-value '*next-xid*))
-             (keys (wal-primary-page-keys))
-             (payload (make-array 8 :element-type '(unsigned-byte 8) :initial-element 0)))
-        (wal-primary-preflight-page-keys keys)
-        (with-wal-primary-page-spool (spool)
-          (wal-primary-record-page-xids keys (wal-append-batch-start))
-          (wal-primary-append-pages keys spool)
-          (wal-primary-seal-page-spool spool)
-          (wal-set-u64 payload 0 next-xid)
-          (wal-append-record +wal-record-clog-reset+ next-xid payload)
-          (wal-flush)
-          (wal-primary-apply-page-spool spool)
-          (wal-clear-page-cache)))))
+      (clog-require-no-pending-commits)
+      (wal-log-clog-reset-under-lock)))
   (values))

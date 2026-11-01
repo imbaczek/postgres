@@ -120,6 +120,7 @@ Use the verified pending base identity and the recovery retained archive."
 
 (defun physical-promotion-restore-cold-state (state store)
   "Restore only the selected restartpoint; never redo or publish ordinary progress."
+  (wal-replace-storage-incarnation)
   (setf *physical-recovery-state* state *physical-receive-store* store
         *wal-segment-namespace* (getf state :wal-namespace)
         *wal-insert-timeline* (getf state :timeline)

@@ -58,9 +58,31 @@ def instrumentation(case, pid):
             '(values end receipt)))))')
 
 
+def instrument_pending_clog(server, pid):
+    server.control(
+        '(setf *receipt-test-staged* nil '
+        '(symbol-function \'clog-stage-commit-under-wal-lock) '
+        '(lambda (xid end) '
+        '(let ((tag (funcall *receipt-test-stage* xid end))) '
+        f'(when (and *backend* (= (backend-pid *backend*) {pid})) '
+        '(assert (sb-thread:holding-mutex-p *wal-lock*)) '
+        '(assert (<= end *wal-durable-lsn*)) '
+        '(assert (= +clog-committed+ (clog-get xid))) '
+        '(sb-thread:with-mutex (*clog-lock*) '
+        '(assert (= +clog-in-progress+ (clog-read-status-under-lock xid)))) '
+        '(setf *receipt-test-staged* tag)) tag)))')
+
+
+def check_pending_clog(server):
+    server.control('(assert *receipt-test-staged*) '
+                   '(sb-thread:with-mutex (*clog-lock*) '
+                   '(assert (zerop (hash-table-count *clog-pending-commits*))))')
+
+
 def restore(server):
     server.control('(setf (symbol-function \'wal-commit-transaction) *receipt-test-wal* '
-                   '(symbol-function \'validate-wal-commit-receipt) *receipt-test-validate*)')
+                   '(symbol-function \'validate-wal-commit-receipt) *receipt-test-validate* '
+                   '(symbol-function \'clog-stage-commit-under-wal-lock) *receipt-test-stage*)')
 
 
 def run():
@@ -72,6 +94,8 @@ def run():
         witness.query('CREATE TABLE receipt_rows (id int PRIMARY KEY)')
         server.control('(defvar *receipt-test-wal* (symbol-function \'wal-commit-transaction))')
         server.control('(defvar *receipt-test-validate* (symbol-function \'validate-wal-commit-receipt))')
+        server.control('(defvar *receipt-test-stage* (symbol-function \'clog-stage-commit-under-wal-lock))')
+        server.control('(defvar *receipt-test-staged* nil)')
         server.control('(defvar *receipt-test-xid* nil)')
         server.control('(defvar *receipt-test-backend* nil)')
         cases = ('missing', 'wrong-source', 'missing-durable', 'error', 'nonlocal',
@@ -80,6 +104,7 @@ def run():
             actor = Connection(server.port)
             pid = int(actor.query('SELECT pg_backend_pid()')[0][0])
             try:
+                instrument_pending_clog(server, pid)
                 server.control(instrumentation(case, pid))
                 actor.send(b'Q', f'INSERT INTO receipt_rows VALUES ({number})'.encode() + b'\0')
                 expect_closed(actor)
@@ -88,6 +113,7 @@ def run():
                 actor.close()
                 actor = None
             assert witness.query('SELECT count(*) FROM receipt_rows') == [[str(number)]]
+            check_pending_clog(server)
             server.control('(assert (not *wal-poisoned*)) '
                            '(assert (not (member *receipt-test-xid* *active-xids*))) '
                            '(assert (backend-frontend-output-suppressed-reason *receipt-test-backend*)) '
@@ -98,11 +124,13 @@ def run():
         pid = int(actor.query('SELECT pg_backend_pid()')[0][0])
         server.control(f'(let ((*backend* (lookup-backend {pid}))) (assign-xid *backend*))')
         try:
+            instrument_pending_clog(server, pid)
             server.control(instrumentation('xid-only', pid))
             actor.query('COMMIT')
         finally:
             restore(server)
         assert actor.query('SELECT 1') == [['1']]
+        check_pending_clog(server)
         print('commit-receipts: XID-only commit completes with its source receipt PASS', flush=True)
     finally:
         if actor is not None:

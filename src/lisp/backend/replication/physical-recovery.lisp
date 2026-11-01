@@ -683,8 +683,10 @@ receive store and redo its retained prefix before loading slots and serving SQL.
 A saved binding must have been reconciled and admitted before this point.
 Restore a missing empty base directory only after the backup is verified; missing
 listed relation forks still fail validation."
+  (clog-require-no-pending-commits)
   (unless (recovery-in-progress-p) (error "physical recovery image was not verified"))
   (physical-follow-check-startup-admission *physical-recovery-state*)
+  (wal-replace-storage-incarnation)
   (wal-ensure-directory-durable (merge-pathnames "base/" *pgdata*))
   (let ((streaming (= 2 (getf *physical-recovery-state* :phase))))
     (setf (getf *physical-recovery-state* :replay-timeline) (getf *physical-recovery-state* :timeline)

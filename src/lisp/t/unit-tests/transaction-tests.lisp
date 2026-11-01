@@ -572,7 +572,10 @@
     catalog))
 
 (defun test-restart-wraparound-fixture (relfilenode)
-  ;; Reopen heap and CLOG files and rebuild XID state from durable storage.
+  ;; Model a new process, including its WAL health and local store identity.
+  ;; A failed live image cannot resume by merely reopening CLOG.
+  (wal-replace-storage-incarnation)
+  (setf *wal-poisoned* nil)
   (smgr-forget relfilenode)
   (when *clog-stream*
     (close *clog-stream*)
@@ -588,6 +591,8 @@
 (defun test-xid-wraparound-fault-recovery ()
   (let ((*backend* nil)
         (*catalog* nil)
+        (*wal-poisoned* *wal-poisoned*)
+        (*wal-storage-incarnation* *wal-storage-incarnation*)
         (*next-xid* *next-xid*)
         (*xid-batch-end* *xid-batch-end*)
         (*active-xids* *active-xids*)
@@ -609,6 +614,9 @@
                               nil)
                           (error () t))
                         (format nil "~a failure is reported" name))
+                 (when (member name '("CLOG file fsync" "CLOG directory fsync") :test #'string=)
+                   (check *wal-poisoned*
+                          (format nil "~a poisons the failed live WAL runtime" name)))
                  (check (and *xid-wrap-pending* *xid-wrap-failure*)
                         (format nil "~a keeps the XID gate closed" name))
                  (check (= shutdown-count 1)

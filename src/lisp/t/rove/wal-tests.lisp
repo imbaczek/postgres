@@ -25,6 +25,207 @@ Each entry in SEGMENTS contains a segment number followed by its byte vectors."
            (funcall function))
       (uiop:delete-directory-tree *pgdata* :validate t :if-does-not-exist :ignore))))
 
+(declaim (special *clog-pending-commits* *wal-storage-incarnation*))
+
+(defun call-with-pending-clog-test (function)
+  (let* ((*pgdata* (merge-pathnames
+                    (format nil "pg-pending-clog-~d-~d/" (sb-posix:getpid) (random 1000000))
+                    (uiop:temporary-directory)))
+         (*clog-stream* nil)
+         (*clog-pending-commits* (make-hash-table :test #'eql))
+         (*wal-storage-incarnation* (gensym "TEST-WAL-STORE-"))
+         (*wal-ready* t) (*wal-poisoned* nil) (*physical-recovery-failed-p* nil)
+         (*wal-insert-timeline* 1) (*wal-end-lsn* 200) (*wal-durable-lsn* 100))
+    (declare (special *clog-pending-commits* *wal-storage-incarnation*))
+    (ensure-directories-exist *pgdata*)
+    (unwind-protect
+         (progn (clog-init) (funcall function))
+      (when *clog-stream* (ignore-errors (close *clog-stream*)))
+      (uiop:delete-directory-tree *pgdata* :validate t :if-does-not-exist :ignore))))
+
+(defun pending-clog-raw-status (xid)
+  (with-open-file (in (clog-path) :element-type '(unsigned-byte 8))
+    (file-position in (clog-byte-index xid))
+    (ldb (byte 2 (clog-bit-shift xid)) (read-byte in nil 0))))
+
+(defun pending-clog-neighbor-result (slot status)
+  (call-with-pending-clog-test
+   (lambda ()
+     (let ((xid (+ 12 slot)) (neighbor (+ 12 (mod (1+ slot) 4))))
+       (clog-set xid +clog-in-progress+ :fsync t)
+       (let ((tag (sb-thread:with-mutex (*wal-lock*)
+                    (clog-stage-commit-under-wal-lock xid 140))))
+         (clog-set neighbor status :fsync t)
+         (clog-fsync)
+         (and (= +clog-committed+ (clog-get xid))
+              (= +clog-committed+ (clog-get (+ xid (ash 1 32))))
+              (= +clog-in-progress+ (pending-clog-raw-status xid))
+              (= status (pending-clog-raw-status neighbor))
+              (eq tag (gethash (xid32-of xid) *clog-pending-commits*))))))))
+
+(cl-spec:defproperty pending-clog-neighbor-writes-preserve-wal-dependency
+    ((slot (range integer 0 3)) (status (range integer 1 2)))
+  (:about clog-stage-commit-under-wal-lock)
+  (:trials (:normal 100))
+  (pending-clog-neighbor-result slot status))
+
+(rove:deftest pending-clog-logical-visibility-does-not-write-commit-bits
+    (unit-check-property 'pending-clog-neighbor-writes-preserve-wal-dependency))
+
+(rove:deftest pending-clog-materializes-only-its-exact-durable-tag
+    (call-with-pending-clog-test
+     (lambda ()
+       (clog-set 13 +clog-aborted+ :fsync t)
+       (sb-thread:with-mutex (*wal-lock*)
+         (let ((tag (clog-stage-commit-under-wal-lock 12 140)))
+           (rove:ok (handler-case (progn (clog-materialize-commit-under-wal-lock tag) nil)
+                      (wal-input-validation-error () t)))
+           (rove:ok (eq tag (gethash 12 *clog-pending-commits*)))
+           (rove:ok (= +clog-in-progress+ (pending-clog-raw-status 12)))
+           (setf *wal-durable-lsn* 140)
+           (clog-materialize-commit-under-wal-lock tag)
+           (rove:ok (zerop (hash-table-count *clog-pending-commits*)))
+           (rove:ok (= +clog-committed+ (clog-get 12)))
+           (rove:ok (= +clog-committed+ (pending-clog-raw-status 12)))
+           (rove:ok (= +clog-aborted+ (pending-clog-raw-status 13))))))))
+
+(rove:deftest pending-clog-rejects-stale-incarnations-timelines-and-aliases
+    (call-with-pending-clog-test
+     (lambda ()
+       (sb-thread:with-mutex (*wal-lock*)
+         (let* ((xid (+ 12 (ash 1 32)))
+                (tag (clog-stage-commit-under-wal-lock xid 140))
+                (original *wal-storage-incarnation*))
+           (setf *wal-durable-lsn* 200)
+           (dolist (fault '(:incarnation :timeline :identity :alias :end))
+             (let ((*wal-storage-incarnation* (if (eq fault :incarnation) (gensym "OTHER-") original))
+                   (*wal-insert-timeline* (if (eq fault :timeline) 2 1)))
+               (rove:ok
+                (handler-case
+                    (progn
+                      (case fault
+                        (:alias (clog-stage-commit-under-wal-lock 12 140))
+                        (:end (clog-stage-commit-under-wal-lock xid 141))
+                        (:identity
+                         (clog-materialize-commit-under-wal-lock
+                          (%make-clog-commit-tag xid original 1 140)))
+                        (t (clog-materialize-commit-under-wal-lock tag)))
+                      nil)
+                  (wal-input-validation-error () t)))))
+           (rove:ok (eq tag (gethash 12 *clog-pending-commits*)))
+           (rove:ok (= +clog-in-progress+ (pending-clog-raw-status 12)))
+           (clog-materialize-commit-under-wal-lock tag))))))
+
+(rove:deftest pending-clog-rejects-direct-overwrite-and-invalid-boundaries
+    (call-with-pending-clog-test
+     (lambda ()
+       (sb-thread:with-mutex (*wal-lock*)
+         (dolist (entry '((2 140) (12 0) (12 201) (4294967296 140)))
+           (rove:ok (handler-case
+                        (progn (apply #'clog-stage-commit-under-wal-lock entry) nil)
+                      (wal-input-validation-error () t))))
+         (rove:ok (zerop (hash-table-count *clog-pending-commits*)))
+         (clog-stage-commit-under-wal-lock 12 140))
+       (dolist (xid (list 12 (+ 12 (ash 1 32))))
+         (dolist (status (list +clog-committed+ +clog-aborted+))
+           (rove:ok (handler-case (progn (clog-set xid status :fsync t) nil)
+                      (wal-input-validation-error () t)))))
+       (rove:ok (= +clog-committed+ (clog-get 12)))
+       (rove:ok (= +clog-in-progress+ (pending-clog-raw-status 12))))))
+
+(rove:deftest pending-clog-write-and-fsync-failures-retain-the-owned-tag
+    (dolist (phase '(:before-write :after-write :fsync :finish))
+      (call-with-pending-clog-test
+       (lambda ()
+         (let ((write (symbol-function 'clog-write-status-under-lock))
+               (sync (symbol-function 'fsync-stream)))
+           (unwind-protect
+                (sb-thread:with-mutex (*wal-lock*)
+                  (let ((tag (clog-stage-commit-under-wal-lock 12 140)))
+                    (setf *wal-durable-lsn* 200)
+                    (if (eq phase :fsync)
+                        (setf (symbol-function 'fsync-stream)
+                              (lambda (stream) (declare (ignore stream)) (error "CLOG fsync failure")))
+                        (setf (symbol-function 'clog-write-status-under-lock)
+                              (lambda (&rest arguments)
+                                (when (member phase '(:after-write :finish)) (apply write arguments))
+                                (if (eq phase :finish)
+                                    (close *clog-stream*)
+                                    (error "CLOG byte write failure")))))
+                    (rove:ok
+                     (handler-case
+                         (progn
+                           (clog-materialize-commit-under-wal-lock tag :fsync (not (eq phase :finish)))
+                           nil)
+                       (error (condition)
+                         (if (eq phase :finish) (typep condition 'stream-error) t))))
+                    (rove:ok (eq tag (gethash 12 *clog-pending-commits*)))
+                    (rove:ok (= +clog-committed+ (clog-get 12)))
+                    (setf (symbol-function 'clog-write-status-under-lock) write
+                          (symbol-function 'fsync-stream) sync)
+                    (unless (eq phase :finish)
+                      (clog-materialize-commit-under-wal-lock tag)
+                      (rove:ok (zerop (hash-table-count *clog-pending-commits*))))))
+             (setf (symbol-function 'clog-write-status-under-lock) write
+                   (symbol-function 'fsync-stream) sync)))))))
+
+(rove:deftest pending-clog-blocks-destructive-lifecycle-before-effects
+    (call-with-pending-clog-test
+     (lambda ()
+       (sb-thread:with-mutex (*wal-lock*) (clog-stage-commit-under-wal-lock 12 140))
+       (let ((stream *clog-stream*) (token *wal-storage-incarnation*)
+                                    (append (symbol-function 'wal-append-record)) (appended nil))
+         (unwind-protect
+              (progn
+                (setf (symbol-function 'wal-append-record)
+                      (lambda (&rest arguments) (declare (ignore arguments)) (setf appended t)))
+                (dolist (operation (list #'clog-init #'clog-reset #'wal-init #'wal-checkpoint-core
+                                         #'physical-recovery-open-storage
+                                         #'physical-promotion-adopt-live-child-runtime
+                                         (lambda () (physical-promotion-restore-cold-state nil nil))))
+                  (rove:ok (handler-case (progn (funcall operation) nil)
+                             (wal-input-validation-error () t)))
+                  (rove:ok (eq token *wal-storage-incarnation*))
+                  (rove:ok (eq stream *clog-stream*))
+                  (rove:ok (open-stream-p stream))
+                  (rove:ok (not appended)))
+                (rove:ok (= +clog-in-progress+ (pending-clog-raw-status 12))))
+           (setf (symbol-function 'wal-append-record) append))))))
+
+(rove:deftest clog-reset-holds-wal-through-file-replacement
+    (call-with-pending-clog-test
+     (lambda ()
+       (let ((record (symbol-function 'wal-log-clog-reset-under-lock))
+             (attempted (sb-thread:make-semaphore))
+             (acquired (sb-thread:make-semaphore))
+             (waiter nil) (calls 0))
+         (unwind-protect
+              (progn
+                (setf (symbol-function 'wal-log-clog-reset-under-lock)
+                      (lambda ()
+                        (rove:ok (sb-thread:holding-mutex-p *wal-lock*))
+                        (incf calls)))
+                (clog-reset
+                 :fsync-directory-function
+                 (lambda (path)
+                   (fsync-directory path)
+                   (rove:ok (sb-thread:holding-mutex-p *wal-lock*))
+                   (setf waiter
+                         (sb-thread:make-thread
+                          (lambda ()
+                            (sb-thread:signal-semaphore attempted)
+                            (sb-thread:with-mutex (*wal-lock*)
+                              (sb-thread:signal-semaphore acquired)))
+                          :name "CLOG reset competing WAL owner"))
+                   (rove:ok (sb-thread:wait-on-semaphore attempted :timeout 2))
+                   (rove:ok (not (sb-thread:wait-on-semaphore acquired :timeout 0.05)))))
+                (rove:ok (= 1 calls))
+                (rove:ok (sb-thread:wait-on-semaphore acquired :timeout 2))
+                (sb-thread:join-thread waiter))
+           (setf (symbol-function 'wal-log-clog-reset-under-lock) record)
+           (when (and waiter (sb-thread:thread-alive-p waiter))
+             (sb-thread:join-thread waiter :timeout 2 :default :timeout)))))))
+
 (rove:deftest test-wal-scan-rejects-impossible-rotation-gap
     (let* ((size +wal-segment-size+)
            (end (+ size 64))
@@ -485,7 +686,8 @@ Each entry in SEGMENTS contains a segment number followed by its byte vectors."
              (buf-extend 7310 replacement)
              (wal-commit-transaction
               44
-              (lambda ()
+              (lambda (end)
+                (rove:ok (null end))
                 (rove:ok (= 99 (aref (smgr-read 7310 0) 100))
                          "replacement reaches storage before commit completion")
                 (discard-transaction-replacements *backend*)
@@ -1024,7 +1226,8 @@ Each entry in SEGMENTS contains a segment number followed by its byte vectors."
                      (rove:ok (= xid 44))
                      (rove:ok (= lsn terminal))))
              (let ((end (wal-commit-transaction
-                         44 (lambda ()
+                         44 (lambda (end)
+                              (rove:ok (= end terminal))
                               (rove:ok flushed)
                               (setf callback t)
                               (incf *wal-end-lsn* 1000))
@@ -1033,7 +1236,7 @@ Each entry in SEGMENTS contains a segment number followed by its byte vectors."
                (rove:ok (eql end terminal)
                         "return the transaction terminal, not subsequent global WAL progress"))
              (let ((*wal-ready* nil))
-               (rove:ok (null (wal-commit-transaction 45 (lambda () nil)))
+               (rove:ok (null (wal-commit-transaction 45 (lambda (end) (rove:ok (null end)))))
                         "a no-WAL commit has no replication boundary")))
         (dolist (entry saved) (setf (symbol-function (car entry)) (cdr entry)))
         (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))
@@ -1090,7 +1293,9 @@ Each entry in SEGMENTS contains a segment number followed by its byte vectors."
                (catch 'receipt-exit
                  (multiple-value-setq (end receipt)
                    (apply #'wal-commit-transaction
-                          44 (lambda () (push :local events) (incf *wal-end-lsn* 1000))
+                          44 (lambda (end)
+                               (unless (= end 140) (error "wrong local terminal"))
+                               (push :local events) (incf *wal-end-lsn* 1000))
                           (append
                            (list :terminal-durable-function
                                  (lambda (terminal)
@@ -1163,7 +1368,7 @@ Each entry in SEGMENTS contains a segment number followed by its byte vectors."
     (let ((*wal-ready* nil) (*backend* nil) (events nil) (accepted nil))
       (multiple-value-bind (end receipt)
           (wal-commit-transaction
-           44 (lambda () (push :local events))
+           44 (lambda (end) (rove:ok (null end)) (push :local events))
            :terminal-durable-function (lambda (end) (declare (ignore end)) (error "no-WAL completion reported WAL durability"))
            :source-id nil
            :accepted-function (lambda (value)
@@ -1455,7 +1660,7 @@ Each entry in SEGMENTS contains a segment number followed by its byte vectors."
                            (finish-output file)))
                        (funcall old-map spool function)))
                (rove:ok (handler-case
-                            (progn (wal-commit-transaction 44 (lambda () (setf callback t)) :source-id :fixture-source) nil)
+                            (progn (wal-commit-transaction 44 (lambda (end) (declare (ignore end)) (setf callback t)) :source-id :fixture-source) nil)
                           (error (condition) (search "checksum mismatch" (princ-to-string condition)))))
                (rove:ok *wal-poisoned*)
                (rove:ok (zerop writes))

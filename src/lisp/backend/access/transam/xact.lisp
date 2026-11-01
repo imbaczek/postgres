@@ -2552,8 +2552,10 @@ Run outside publication locks, clean up the transaction, then handle the outcome
                           (multiple-value-bind (end receipt)
                               (wal-commit-transaction
                                xid
-                               (lambda ()
-                                 (clog-set xid +clog-committed+ :fsync (not wal-ready-at-entry-p))
+                               (lambda (end)
+                                 (if wal-ready-at-entry-p
+                                     (clog-commit-durable-under-wal-lock xid end)
+                                     (clog-set xid +clog-committed+ :fsync t))
                                  (setf irreversible t))
                                :logical-changes changes
                                :terminal-durable-function
