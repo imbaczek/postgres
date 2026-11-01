@@ -25,9 +25,10 @@
 
 (defvar *clog-pending-commits* (make-hash-table :test #'eql)
   "Process-local map from 32-bit XID to completion, protected by CLOG lock.
-Readers take CLOG lock alone; staging and materialization take WAL then CLOG.
-This is not a queue. Current successful commits leave it empty; failure debt
-is not cleared by reload.")
+Reserved, inserting and published entries read as IN_PROGRESS; committed entries
+provide a committed overlay without changing raw bits. Readers take CLOG alone;
+writers take WAL then CLOG. This is not a queue. Successful commits leave it empty;
+reload retains debt.")
 
 (defstruct (clog-commit-tag
             (:constructor %make-clog-commit-tag (xid incarnation timeline terminal-end)))
@@ -40,11 +41,15 @@ is not cleared by reload.")
 
 (defstruct (clog-commit-completion
             (:constructor %make-clog-commit-completion (tag owner state)))
+  ;; TAG fixes the WAL identity and planned terminal end. The map retains this
+  ;; completion and OWNER through an ambiguous terminal attempt. STATE is
+  ;; protected by CLOG lock. Only an unattempted reservation can be cancelled.
   (tag nil :read-only t)
   (owner nil :read-only t)
   (state :reserved))
 
 (defun clog-check-planned-commit-under-wal-lock (xid end)
+  "Validate a future terminal boundary while the caller holds WAL lock."
   (assert (sb-thread:holding-mutex-p *wal-lock*))
   (wal-check-healthy)
   (unless (and *wal-ready* *wal-storage-incarnation*
@@ -56,6 +61,8 @@ is not cleared by reload.")
   (values))
 
 (defun clog-check-completion-under-lock (completion owner &key materialized-p)
+  "Check owner, WAL identity and map membership with WAL and CLOG locks held.
+MATERIALIZED-P also permits an already retired completion."
   (assert (sb-thread:holding-mutex-p *wal-lock*))
   (assert (sb-thread:holding-mutex-p *clog-lock*))
   (wal-check-healthy)
@@ -75,6 +82,10 @@ is not cleared by reload.")
   (values))
 
 (defun clog-reserve-commit-under-wal-lock (xid end owner)
+  "Reserve an IN_PROGRESS slot for OWNER and a planned terminal end.
+Caller holds WAL lock, masks interrupts through ownership handoff, and must
+cancel before beginning the insertion attempt or finish under a failure fence.
+The map retains OWNER if the outcome is ambiguous."
   (clog-check-planned-commit-under-wal-lock xid end)
   (unless owner (wal-invalid-input "CLOG reservation needs an owner"))
   (sb-thread:with-mutex (*clog-lock*)
@@ -90,6 +101,7 @@ is not cleared by reload.")
         completion))))
 
 (defun clog-cancel-reserved-commit-under-wal-lock (completion owner)
+  "Release OWNER's reservation before any terminal insertion attempt."
   (sb-thread:with-mutex (*clog-lock*)
     (clog-check-completion-under-lock completion owner)
     (unless (eq :reserved (clog-commit-completion-state completion))
@@ -100,6 +112,8 @@ is not cleared by reload.")
   (values))
 
 (defun clog-begin-reserved-commit-under-wal-lock (completion owner)
+  "Mark the terminal insertion attempt before append; cancellation is now unsafe.
+The caller must retain the completion and fence an incomplete attempt."
   (sb-thread:with-mutex (*clog-lock*)
     (clog-check-completion-under-lock completion owner)
     (unless (eq :reserved (clog-commit-completion-state completion))
@@ -108,6 +122,8 @@ is not cleared by reload.")
   (values))
 
 (defun clog-publish-reserved-commit-under-wal-lock (completion owner end)
+  "Publish after append using its actual END, which must match the reservation.
+The status remains IN_PROGRESS until durable completion."
   (sb-thread:with-mutex (*clog-lock*)
     (clog-check-completion-under-lock completion owner)
     (let ((tag (clog-commit-completion-tag completion)))
@@ -120,6 +136,8 @@ is not cleared by reload.")
   (values))
 
 (defun clog-materialize-completion-under-lock (completion &key fsync)
+  "Write and retire a committed completion with CLOG lock held.
+Caller must first verify its WAL boundary is durable and fence write failure."
   (assert (sb-thread:holding-mutex-p *clog-lock*))
   (let ((tag (clog-commit-completion-tag completion)))
     (clog-write-status-under-lock (clog-commit-tag-xid tag) +clog-committed+ :fsync fsync)
@@ -129,6 +147,9 @@ is not cleared by reload.")
   (values))
 
 (defun clog-complete-reserved-commit-under-wal-lock (completion owner &key fsync)
+  "Materialize OWNER's published completion only after its terminal WAL is durable.
+Caller holds WAL lock and must fail-stop on an incomplete or ambiguous write.
+An already materialized completion may be checked again."
   (sb-thread:with-mutex (*clog-lock*)
     (clog-check-completion-under-lock completion owner :materialized-p t)
     (let ((tag (clog-commit-completion-tag completion)))

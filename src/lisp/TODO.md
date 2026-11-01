@@ -249,10 +249,17 @@
   42 and 145193323930899829, digest `fnv1a64-v1:a52e06a995fdb660`. Rejection
   counts and input coverage were not measured for either property.
 
+- [x] Add the CLOG completion reservation prerequisite (`f87ede05484`). A
+  reservation can precede the terminal append without exposing committed status;
+  completion requires durable WAL. Production queue integration remains open,
+  and OFF remains disabled. The checkpoint passed 811 unit tests, four native
+  cases and strict cold compilation. The scoped property ran 100 trials each at
+  seeds 42 and 265648549833292381, digest `fnv1a64-v1:93537ecfe22d4395`;
+  rejection counts and input coverage were not measured.
+
 - [ ] Implement true asynchronous OFF using captured policy and acceptance
-  receipts. First give the queue ownership of CLOG completion and reservation:
-  hash membership currently means committed, so the current tag cannot be
-  preinserted. Give WAL a transferable temporary-spool cleanup claim; cleanup
+  receipts. Integrate CLOG completion and reservation ownership with the queue.
+  Give WAL a transferable temporary-spool cleanup claim; cleanup
   currently retains the owner thread/backend's retry authority. Then add a tracked
   primary writer with bounded pressure, wakeup, stop/join, reload, shutdown and
   role lifecycle. Prove distinct asynchronous acceptance and settle the snapshot
