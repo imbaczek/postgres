@@ -337,6 +337,13 @@ type and ignore NULL inputs unless all inputs are NULL. `chr`, `array_to_string`
 and `string_to_array` support the corresponding text and array operations,
 including optional NULL replacement arguments.
 
+Supported scalar and fixed-descriptor composite functions can appear in `FROM`.
+A scalar function produces one row even when its value is NULL or FALSE. Its
+whole-row alias denotes the scalar value, including with a column alias; a
+one-column derived table still denotes a record. A set-returning call must be at
+the top level of a FROM item; scalar subqueries keep their own query context.
+Dynamic RECORD results without a supported descriptor are not supported.
+
 Table columns support `smallint`/`int2`, `int`/`integer`/`int4`, `bigint`/`int8`,
 `numeric`/`decimal` (including precision and scale), `real`/`float4`,
 `double precision`/`float8`, `date`, `time` and `timestamp` with or without time

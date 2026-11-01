@@ -741,7 +741,8 @@ COLUMN-OFFSET maps the query-wide Var numbers back to this relation's attnums."
     found))
 
 (defun prepare-select-source (source alias offset &optional preceding-scope)
-  "Prepare a FROM namespace entry; callers hold the catalog view lock."
+  "Prepare a FROM namespace entry; callers hold the catalog view lock.
+Mark direct scalar function sources through their aliases."
   (let ((definition (cte-source-definition source)))
     (when definition
       (return-from prepare-select-source (make-cte-relation-spec definition alias offset))))

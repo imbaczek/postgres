@@ -1,8 +1,22 @@
 # Development TODO
 
+- [x] Support typed scalar and fixed-descriptor composite functions in FROM
+  (`b984839c702`, `de6637b686e`). The checkpoint passed 891 unit, 1,413
+  physical, 201 wire and 1,161 legacy checks and strict cold compilation. Native C
+  comparison covered 36 SQL cases for values, metadata and errors and two binary TEXT
+  Bind/rebind cases; the 12 dollar-quote cases also passed. Existing binary INTEGER
+  formats remain unsupported. Logs are in
+  `/home/imbaczek/proj/pg-ha-artifacts/scalar-from/`: `cold.log`, `physical.log`,
+  `wire.log`, `legacy.log`, `native-c-reviewed.log`, `dollar-c-reviewed.log` and
+  `live-format-diagnosis.log`; unit checks ran through the tool. The property over
+  `parse-from-relation` and `expand-select-targets` ran 100 trials at seed 4014
+  (digest `fnv1a64-v1:996181b0f1e156ab`); neither target has a registered
+  Function Spec, and input coverage and rejection counts were not measured.
+  DO, PERFORM, `txid_current()` and full Patroni acceptance remain open.
+
 - [x] Scan dollar-quoted strings and parameter boundaries (`1a831afe4bc`).
-  This is a parser prerequisite; DO, PERFORM, `txid_current()` and scalar FROM
-  support remain open. The checkpoint passed 885 unit and 201 wire checks and
+  At that checkpoint DO, PERFORM, `txid_current()` and scalar FROM support remained
+  open. The checkpoint passed 885 unit and 201 wire checks and
   strict cold compilation. The native C comparison passed 12 value and error
   position cases, including Unicode tags, overlapping delimiters, parameter
   boundaries and a one-million-character literal. Evidence is in

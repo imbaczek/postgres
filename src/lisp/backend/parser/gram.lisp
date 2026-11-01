@@ -376,6 +376,7 @@ Range and negative checks occur when the LIMIT executes."
               (if schema (make-sql-relation-name :schema schema :name name) name))))))
 
 (defun parse-from-relation (p)
+  "Parse a FROM source and retain its function alias for column naming."
   (multiple-value-bind (source default-alias) (parse-from-item p)
     (let ((alias default-alias))
       (if (match-kw p "as")
@@ -1668,7 +1669,8 @@ Arithmetic binds more tightly; comparison and boolean operators bind less tightl
         (values (nreverse arguments) variadic order))))
 
 (defun parse-function-call (p name &optional schema minmax-syntax-p windowless-p)
-  "Parse a call or OVER expression, preserving special GREATEST/LEAST syntax."
+  "Parse a call or OVER expression, preserving special GREATEST/LEAST syntax.
+WINDOWLESS-P excludes OVER where the FROM grammar requires a plain call."
   (when (and minmax-syntax-p (kw-p p "all"))
     (syntax-error p))
   (let* ((distinct (match-kw p "distinct"))

@@ -39,6 +39,7 @@
   table
   origins
   lateral-forbidden-p
+  ;; Distinguish a scalar function source from a one-column derived record.
   (scalar-function-p nil :read-only t)
   (offset 0)
   (width 0))
@@ -139,7 +140,8 @@
           (ereport "42703" "column \"~a\" does not exist" name))))
 
 (defun resolve-select-whole-row (scope qualifier)
-  ;; Unlike target-list star expansion, this builds one record expression.
+  ;; A scalar function alias denotes its scalar column, even with a column alias.
+  ;; Other sources build a record, including one-column derived relations.
   ;; Named composite types and whole-row RETURNING are not supported here.
   (multiple-value-bind (relation depth owner)
       (resolve-select-qualified-relation scope qualifier)
@@ -3461,6 +3463,10 @@ candidate selection."
           collect target)))
 
 (defun analyze-from-function-target (target scope)
+  "Analyze one FROM call and build typed scalar or fixed-descriptor fields.
+Set-returning calls must be at the top level of this query's FROM call.
+Dynamic records without fields are unsupported. Query-level aggregate and window
+checks still apply."
   (let* ((analyzed (analyze-target (list :expr (second (getf target :expr))
                                          :alias (getf target :function-alias)) scope))
          (call (getf analyzed :expr)))
