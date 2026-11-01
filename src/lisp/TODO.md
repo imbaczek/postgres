@@ -225,9 +225,20 @@
   3263075368047784275, digest `fnv1a64-v1:0aa70a24580bcf9c`; rejection counts
   and input coverage were not measured.
 
+- [x] Own pending page publication through durable materialization (`65409e21153`). A single
+  owner retains the sealed spool and dirty maps at the exact terminal boundary;
+  the current commit flushes and drains it immediately before acceptance.
+  The checkpoint passed 801 unit, 1,413 physical, 201 wire and 1,161 legacy
+  checks, strict cold compilation, nine native page, eight receipt and four
+  CLOG failure cases. The ownership property ran 100 trials each at seeds 42 and
+  3483828763443979182, digest `fnv1a64-v1:a52e06a995fdb660`; rejection counts
+  and input coverage were not measured. A lifecycle fault fixture now isolates
+  its recovery-failure flag. Native tests caught a pre-flush response leak and
+  a guard outside WAL that rejected a healthy competing commit; both are fixed.
+
 - [ ] Implement true asynchronous OFF using the captured policy and acceptance
-  receipts. Keep CLOG dependencies volatile until WAL is durable. Add an owned
-  pending batch spool and page overlay, and a common FIFO flush and materialization
+  receipts. Keep CLOG dependencies volatile until WAL is durable. Extend the page
+  overlay to multiple pending batches and add a common FIFO flush and materialization
   path for all publishers, checkpoints and deletes, with a tracked primary WAL
   writer, checkpoint drain and further lifecycle scoping. Preserve WAL-to-CLOG
   lock order and the truthful durable frontier; never

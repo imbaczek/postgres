@@ -171,6 +171,8 @@ The overlay is process-local and does not itself change the raw file bits."
       (fsync-stream *clog-stream*))))
 
 (defun clog-reset-file-under-wal-lock (fsync-function fsync-directory-function)
+  "Replace CLOG only after page and CLOG debt are absent under WAL lock.
+Rotate the storage incarnation after the file and its directory are durable."
   (assert (sb-thread:holding-mutex-p *wal-lock*))
   (wal-require-no-pending-page-publication)
   (sb-thread:with-mutex (*clog-lock*)
@@ -190,7 +192,7 @@ The overlay is process-local and does not itself change the raw file bits."
   (values))
 
 (defun clog-reset-under-wal-lock (fsync-function fsync-directory-function wal-reset-p)
-  "Reject pending debt and keep WAL locked through record, file and epoch change."
+  "Reject page and CLOG debt and keep WAL locked through record, file and epoch change."
   (assert (sb-thread:holding-mutex-p *wal-lock*))
   (wal-require-no-pending-storage)
   (when (and wal-reset-p *wal-ready*) (wal-log-clog-reset-under-lock))

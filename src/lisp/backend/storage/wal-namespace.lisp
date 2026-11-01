@@ -68,7 +68,8 @@ Control remains authoritative: legacy rolls staging back; timeline finishes clea
   (values))
 
 (defun wal-migrate-namespace-under-lock ()
-  "Caller owns quiescence, writer and WAL locks; any uncertain publication fences WAL."
+  "Caller owns quiescence, writer and WAL locks; reject pending storage debt.
+Any uncertain publication fences WAL."
   (wal-require-no-pending-storage)
   (unless (and (eq *live-operation-quiescence-owner-thread* sb-thread:*current-thread*)
                (not *live-operation-drain-open*))

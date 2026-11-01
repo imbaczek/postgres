@@ -683,7 +683,7 @@ receive store and redo its retained prefix before loading slots and serving SQL.
 A saved binding must have been reconciled and admitted before this point.
 Restore a missing empty base directory only after the backup is verified; missing
 listed relation forks still fail validation. The caller supplies startup
-exclusion; reject pending CLOG debt and rotate local WAL identity before
+exclusion; reject pending page and CLOG debt and rotate local WAL identity before
 installing the recovery store."
   (wal-require-no-pending-storage)
   (unless (recovery-in-progress-p) (error "physical recovery image was not verified"))

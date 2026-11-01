@@ -185,7 +185,7 @@ Owners are process-local; the appropriate codec stores durable slot fields."
 (defvar *wal-page-cache-xids* (make-hash-table :test #'equal))
 
 (defparameter *wal-dirty-resident-limit-pages* 512
-  "Maximum dirty page vectors retained across the shared cache and private batch.")
+  "Maximum dirty page vectors across the shared cache, private batch and pending owner.")
 
 (defstruct wal-dirty-store spool (next-slot 0) (free-slots nil) (resident 0) (disk-refs 0))
 
@@ -252,21 +252,28 @@ Owners are process-local; the appropriate codec stores durable slot fields."
 It is separate from the source identity used for remote acknowledgments.")
 
 (defstruct (wal-page-publication (:constructor %make-wal-page-publication))
+  ;; The stack owns SPOOL until handoff.  Pending ownership retains the sealed
+  ;; spool, dirty maps and WAL identity until durable application and retirement.
   spool (state :stack) prepared-p pages contributors resets split-p xid
   incarnation timeline terminal-end replacement-pages replacement-contributors)
 
-(defvar *wal-pending-page-publication* nil)
+(defvar *wal-pending-page-publication* nil
+  "The single page publication awaiting materialization, protected by *WAL-LOCK*.")
 
 (defun wal-require-no-pending-page-publication ()
+  "Reject another publisher while the pending owner retains page debt.
+Caller holds *WAL-LOCK* or has lifecycle quiescence."
   (when *wal-pending-page-publication*
     (wal-invalid-input "pending page publication prevents another storage publisher"))
   (values))
 
 (defun wal-require-no-pending-storage ()
+  "Require both page and CLOG debt to be absent before changing storage."
   (wal-require-no-pending-page-publication)
   (clog-require-no-pending-commits))
 
 (defun wal-check-page-publication-owner-under-lock (owner)
+  "Check that OWNER still belongs to this WAL store and insertion timeline."
   (assert (sb-thread:holding-mutex-p *wal-lock*))
   (unless (and (wal-page-publication-p owner)
                (eq owner *wal-pending-page-publication*)
@@ -279,11 +286,13 @@ It is separate from the source identity used for remote acknowledgments.")
   owner)
 
 (defun wal-pending-page-reference (key)
+  "Look up KEY in the pending owner's pages with *WAL-LOCK* held."
   (when *wal-pending-page-publication*
     (let ((owner (wal-check-page-publication-owner-under-lock *wal-pending-page-publication*)))
       (gethash key (wal-page-publication-pages owner)))))
 
 (defun wal-pending-page-contributors (key)
+  "Look up KEY's retained contributors with *WAL-LOCK* held."
   (when *wal-pending-page-publication*
     (let ((owner (wal-check-page-publication-owner-under-lock *wal-pending-page-publication*)))
       (gethash key (wal-page-publication-contributors owner)))))
@@ -291,7 +300,7 @@ It is separate from the source identity used for remote acknowledgments.")
 (declaim (ftype function clog-require-no-pending-commits))
 
 (defun wal-replace-storage-incarnation-under-lock ()
-  "Rotate local WAL store identity only after pending CLOG debt is gone.
+  "Rotate local WAL store identity only after pending page and CLOG debt is gone.
 This identity is separate from the source used for remote acknowledgments."
   (assert (sb-thread:holding-mutex-p *wal-lock*))
   (wal-require-no-pending-storage)
@@ -674,7 +683,7 @@ Legacy 16-hex segment names always belong to timeline 1."
   (values))
 
 (defun wal-dirty-close-empty-store ()
-  "Release scratch after the last shared or private reference disappears."
+  "Release scratch after the last shared, private or pending reference disappears."
   (sb-sys:without-interrupts
     (when (and *wal-dirty-store*
                (zerop (wal-dirty-store-resident *wal-dirty-store*))
@@ -690,6 +699,8 @@ Legacy 16-hex segment names always belong to timeline 1."
   (values))
 
 (defun wal-visible-page-under-lock (relfilenode block fork)
+  "Read the newest private, shared or pending page, falling back to disk.
+Caller holds *WAL-LOCK*.  The key includes the exact fork."
   (let* ((key (wal-page-key relfilenode block fork))
          (reference (or (and *wal-page-batch* (gethash key *wal-page-batch*))
                         (gethash key *wal-page-cache*)
@@ -698,6 +709,8 @@ Legacy 16-hex segment names always belong to timeline 1."
         (smgr-read relfilenode block fork))))
 
 (defun wal-note-page-xid-under-lock (key)
+  "Carry contributors from the visible dirty page into the new version.
+The zero marker remains sticky for uncertified writes; XIDs are full XIDs."
   (let* ((local (and *wal-page-batch* (nth-value 1 (gethash key *wal-page-batch*))))
          (shared (nth-value 1 (gethash key *wal-page-cache*)))
          (pending (and (not local) (not shared) (nth-value 1 (wal-pending-page-reference key))))
@@ -768,6 +781,7 @@ Legacy 16-hex segment names always belong to timeline 1."
   (values))
 
 (defun wal-visible-nblocks-under-lock (relfilenode fork)
+  "Return the block count, including dirty pages, for this exact relation and fork."
   (let ((nblocks (smgr-nblocks relfilenode fork)))
     (flet ((count-map (map)
              (when map
@@ -1392,12 +1406,15 @@ the transaction (see SnapBuildCommitTxn and CreateInitDecodingContext)."
   (values))
 
 (defun wal-close-primary-page-spool (spool)
+  "Close SPOOL and require its temporary-file cleanup to finish."
   (close-logical-spool spool)
   (unless (eq :resolved (query-temp-cleanup-owner-state (logical-spool-owner spool)))
     (error "primary WAL page spool cleanup failed"))
   (values))
 
 (defun call-with-wal-primary-page-spool (function)
+  "Call FUNCTION with a stack-owned spool and its publication owner.
+Cleanup closes only a stack-owned spool; handoff leaves it with the pending owner."
   (wal-require-no-pending-page-publication)
   (let ((owner (%make-wal-page-publication)))
     (unwind-protect
@@ -1412,6 +1429,8 @@ the transaction (see SnapBuildCommitTxn and CreateInitDecodingContext)."
         (setf (wal-page-publication-state owner) :released)))))
 
 (defun wal-prepare-page-publication-under-lock (owner xid resets split-p)
+  "Seal the spool and prepare empty replacement maps before the terminal record.
+Record the current maps and WAL identity while the caller holds *WAL-LOCK*."
   (assert (sb-thread:holding-mutex-p *wal-lock*))
   (wal-check-healthy)
   (wal-require-no-pending-page-publication)
@@ -1438,6 +1457,8 @@ the transaction (see SnapBuildCommitTxn and CreateInitDecodingContext)."
   owner)
 
 (defun wal-publish-page-publication-under-lock (owner end)
+  "Transfer both whole dirty maps to OWNER at the terminal record's END.
+Install the preallocated empty maps by pointer, without changing references."
   (assert (sb-thread:holding-mutex-p *wal-lock*))
   (sb-sys:without-interrupts
     (wal-check-healthy)
@@ -1467,6 +1488,8 @@ the transaction (see SnapBuildCommitTxn and CreateInitDecodingContext)."
   owner)
 
 (defun wal-drain-page-publication-under-lock (owner &key fault-on-first-write)
+  "Apply a durable owner, close its spool and retire its references.
+The global owner is removed last.  Failure leaves debt for fail-stop handling."
   (assert (sb-thread:holding-mutex-p *wal-lock*))
   (sb-sys:without-interrupts
     (wal-check-healthy)
@@ -1494,6 +1517,7 @@ the transaction (see SnapBuildCommitTxn and CreateInitDecodingContext)."
   (values))
 
 (defmacro with-wal-primary-page-spool ((spool &optional publication) &body body)
+  "Keep stack cleanup responsible for SPOOL until PUBLICATION transfers ownership."
   (let ((owner (or publication (gensym "PAGE-PUBLICATION-"))))
     `(call-with-wal-primary-page-spool
       (lambda (,spool ,owner)
@@ -1615,8 +1639,10 @@ the transaction (see SnapBuildCommitTxn and CreateInitDecodingContext)."
 LOCAL-DURABILITY defaults to :FLUSH for internal callers and is validated
 before publication even without WAL. The reset descriptors are owned across
 AFTER-DURABLE-FUNCTION, which may release the transaction's private replacements.
-Preflight the page spool before the terminal, then flush WAL before truncating
-any relation fork.
+Preflight the page spool before the terminal and transfer the dirty maps to a
+pending owner at that exact end. Flush WAL before truncating any relation fork.
+The durable observer and slot update precede the CLOG callback; resets, pages,
+checked spool close and reference retirement finish before acceptance.
 
 With WAL ready, return this transaction's numeric commit end and an immutable
 receipt after local apply. TERMINAL-DURABLE-FUNCTION receives the exact end
@@ -3103,8 +3129,8 @@ Refresh its modification time. Update memory only after atomic publication."
 
 (defun wal-init ()
   "Initialize WAL under startup or equivalent quiescence.
-Reject surviving CLOG debt before replacement and establish a fresh local
-identity; pending commits are not cleared."
+Reject surviving page and CLOG debt before replacement and establish a fresh
+local identity; pending owners are not cleared."
   (wal-require-no-pending-storage)
   ;; Control identities must be accepted before even syncing directories: a child
   ;; control cannot cause legacy segment scanning, truncation, or tail adoption.
@@ -3239,7 +3265,7 @@ identity; pending commits are not cleared."
   "Write all cached pages, sync durable state, and advance the redo pointer.
 Under the WAL lock, freeze resource facts before planning placement and rotation.
 Check the encoded size against that plan before appending the checkpoint.
-Reject pending CLOG debt before appending any checkpoint batch records."
+Reject pending page and CLOG debt before appending any checkpoint batch records."
   ;; CHECKPOINT follows the global write-lock -> WAL-lock order.
   (with-write-lock
     (with-wal-critical

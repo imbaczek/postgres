@@ -2578,6 +2578,8 @@ Run outside publication locks, clean up the transaction, then handle the outcome
                             (setf outcome (wait-for-committed-wal-obligation
                                            b obligation (commit-policy-remote-wait policy)))
                             (setf completion-safe t))
+                       ;; A pre-publication rejection can return an error normally.
+                       ;; Suppress output only when the outcome may be committed.
                        (when (and (or irreversible (and wal-ready-at-entry-p *wal-poisoned*))
                                   (not completion-safe))
                          (suppress-backend-frontend-output b :invalid-commit-receipt)))

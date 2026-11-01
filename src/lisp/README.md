@@ -178,9 +178,14 @@ number of pages.
 Primary WAL publication also stages copied page records in an internal spool,
 building bounded record-sized chunks in sorted page-key order and validating the
 spool before the terminal record. Its temporary file is independent of the SQL
-temporary-file quota and is cleaned up on exit. The primary retains at most 512
-dirty page vectors across its shared cache and private batch; further pages use
-process-owned scratch slots with checksums bound to the page identity. Scratch
+temporary-file quota. A transaction hands the sealed spool and dirty maps to
+one pending owner at its terminal record, then flushes WAL and immediately
+applies the pages and retires that owner before accepting the commit. Pending
+pages remain visible to reads until retirement. This is not a general FIFO or
+a background writer; true `synchronous_commit=off` remains rejected. The primary
+retains at most 512 dirty page vectors across its shared cache, private batch and
+pending owner; further pages use process-owned scratch slots with checksums bound
+to the page identity. Scratch
 is transient, exempt from the SQL temporary-file quota, and released when its
 last reference is gone. Page keys, contributor metadata and the sorted key list
 remain in memory and grow with dirty pages; temporary record buffers also use
