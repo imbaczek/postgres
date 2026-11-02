@@ -30,6 +30,81 @@
                history start end options)
       (values (nreverse records) cursor files complete))))
 
+(cl-spec:defproperty lineage-reader-preserves-original-record-bytes
+    ((length (range integer 32 512)) (version (range integer 2 8)))
+  (:about pg::wal-scan-lineage)
+  (:trials (:normal 100))
+  (with-physical-store-directory (root)
+    (let* ((pg::*pgdata* root)
+           (raw (pg::wal-encode-record pg::+wal-record-commit+ 7 0
+                                       (make-array (- length 32) :element-type '(unsigned-byte 8)
+                                                                 :initial-element 42)))
+           (seen nil))
+      (pg::wal-set-u16 raw 4 version)
+      (pg::wal-set-u32 raw 28 0)
+      (pg::wal-set-u32 raw 28 (pg::wal-crc32 raw))
+      (lineage-test-file 1 0 raw)
+      (multiple-value-bind (cursor files complete)
+          (pg::wal-scan-lineage
+           (lambda (record owner carrier bytes)
+             (setf seen (and (= owner carrier 1)
+                             (= version (pg::wal-record-version record))
+                             (equalp raw bytes))))
+           (pg::timeline-parse-history 1 "") 0 length :include-raw t)
+        (and seen complete (= cursor length) (equal files '((1 0)))
+             (equalp raw (lineage-test-bytes (pg::wal-segment-path 0 1 :timeline))))))))
+
+(deftest generated-lineage-reader-original-record-bytes
+    (let ((data (cl-spec:result-data
+                 (cl-spec:run-property 'lineage-reader-preserves-original-record-bytes :seed 73))))
+      (ok (eq :passed (getf data :status)) (format nil "~s" data))))
+
+(deftest lineage-reader-raw-callback-keeps-validation-stop-and-rotation-rules
+    (with-physical-store-directory (root)
+      (let* ((pg::*pgdata* root)
+             (size pg::+wal-segment-size+)
+             (fork (- size 64))
+             (history (lineage-test-history fork))
+             (first (lineage-test-record 0 fork))
+             (second (lineage-test-record size 96 2))
+             (seen nil))
+        (lineage-test-file 1 0 first)
+        (lineage-test-file 2 1 second)
+        (multiple-value-bind (cursor files complete)
+            (pg::wal-scan-lineage
+             (lambda (record owner carrier raw)
+               (push (list (pg::wal-record-start record) owner carrier
+                           (pg::physical-store-update-digest #xCBF29CE484222325 raw)) seen))
+             history 0 (+ size 96) :include-raw t)
+          (ok complete)
+          (ok (= cursor (+ size 96)))
+          (ok (equal files '((1 0) (2 1))))
+          (ok (equal (nreverse seen)
+                     (list (list 0 1 1 (pg::physical-store-update-digest #xCBF29CE484222325 first))
+                           (list size 2 2 (pg::physical-store-update-digest #xCBF29CE484222325 second))))))
+        (setf seen nil)
+        (multiple-value-bind (cursor files complete)
+            (pg::wal-scan-lineage
+             (lambda (record owner carrier raw)
+               (declare (ignore record owner carrier raw))
+               (push :called seen)
+               :stop)
+             history 0 (+ size 96) :include-raw t)
+          (declare (ignore files))
+          (ok (= cursor fork))
+          (ok (not complete))
+          (ok (equal seen '(:called))))
+        (setf (aref second 28) (logxor 1 (aref second 28))
+              seen nil)
+        (let ((path (lineage-test-file 2 1 second)))
+          (ok (intake-fails-p
+               (lambda ()
+                 (pg::wal-scan-lineage
+                  (lambda (&rest args) (declare (ignore args)) (push :called seen))
+                  history size (+ size 96) :include-raw t))))
+          (ok (null seen))
+          (ok (equalp second (lineage-test-bytes path)))))))
+
 (cl-spec:defproperty lineage-reader-preserves-generated-branch-ownership
     ((parent-length (range integer 32 256)) (child-length (range integer 32 256))
                                             (timeline (range integer 2 4294967295)))

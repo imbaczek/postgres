@@ -58,7 +58,7 @@ returned record uses SEGMENT and OFFSET for its logical WAL location."
                                   :start2 (+ offset +wal-header-size+) :end2 (+ offset length))
             (unless (= (read-sequence bytes source :start +wal-header-size+) length)
               (error "short lineage WAL record at ~d" lsn)))
-        (wal-decode-record bytes lsn)))))
+        (values (wal-decode-record bytes lsn) bytes)))))
 
 (defun wal-lineage-check-gap (previous-end record history)
   "Native rotation skips capacity only when the following record cannot fit."
@@ -73,30 +73,33 @@ returned record uses SEGMENT and OFFSET for its logical WAL location."
                            history))
         (error "invalid lineage WAL rotation gap after ~d" previous-end)))))
 
-(defun wal-lineage-scan-segment (function stream segment size offset end history file-timeline gap)
+(defun wal-lineage-scan-segment (function stream segment size offset end history file-timeline gap &optional include-raw)
   "Visit complete records in one immutable segment; return cursor and stop flag."
   (let ((cursor (+ (* segment +wal-segment-size+) offset)))
     (when (> offset size) (error "lineage WAL start is past segment EOF"))
     (loop while (and (< offset size) (< cursor end))
-          for record = (wal-lineage-read-record stream segment offset size)
-          for owner = (timeline-at-point cursor history)
-          for entry = (find owner history :key #'timeline-history-entry-timeline)
-          do (wal-lineage-check-gap gap record history)
-             (setf gap nil)
-             (unless (and (>= file-timeline owner)
-                          (<= (wal-record-end record) end)
-                          (or (null (timeline-history-entry-end entry))
-                              (<= (wal-record-end record) (timeline-history-entry-end entry))))
-               (error "lineage WAL record crosses a fork/end or comes from an ancestor file at ~d" cursor))
-             (setf cursor (wal-record-end record)
-                   offset (mod cursor +wal-segment-size+))
-             (when (eq (funcall function record owner file-timeline) :stop)
-               (return-from wal-lineage-scan-segment (values cursor t)))
-             (when (zerop offset) (return)))
+          do (multiple-value-bind (record raw)
+                 (wal-lineage-read-record stream segment offset size)
+               (let* ((owner (timeline-at-point cursor history))
+                      (entry (find owner history :key #'timeline-history-entry-timeline)))
+                 (wal-lineage-check-gap gap record history)
+                 (setf gap nil)
+                 (unless (and (>= file-timeline owner)
+                              (<= (wal-record-end record) end)
+                              (or (null (timeline-history-entry-end entry))
+                                  (<= (wal-record-end record) (timeline-history-entry-end entry))))
+                   (error "lineage WAL record crosses a fork/end or comes from an ancestor file at ~d" cursor))
+                 (setf cursor (wal-record-end record)
+                       offset (mod cursor +wal-segment-size+))
+                 (when (eq (if include-raw
+                               (funcall function record owner file-timeline raw)
+                               (funcall function record owner file-timeline)) :stop)
+                   (return-from wal-lineage-scan-segment (values cursor t)))
+                 (when (zerop offset) (return)))))
     (when gap (error "lineage WAL rotation destination is empty"))
     (values cursor nil)))
 
-(defun wal-scan-lineage (function history start end &key (namespace :timeline))
+(defun wal-scan-lineage (function history start end &key (namespace :timeline) include-raw)
   "Inspect [START,END) without mutating storage or asserting it is durable.
 The caller owns an immutable segment set, a previously verified START cursor,
 and independently verified history and cluster/prefix provenance. WAL7 headers cannot establish those facts. Callback
@@ -123,7 +126,7 @@ This is not yet an operational recovery path and grants no writer authority."
                             (wal-lineage-scan-segment function stream segment
                                                       (wal-lineage-effective-size size segment timeline history)
                                                       offset end
-                                                      history timeline gap)
+                                                      history timeline gap include-raw)
                           (setf cursor scanned-end gap nil)
                           (when stopped (return-from wal-scan-lineage (values cursor (nreverse used) (= cursor end))))
                           (when (< cursor end)
