@@ -4,6 +4,43 @@
 
 (in-package #:pg)
 
+(defun adoption-install-native-check (state stage proved expected-root)
+  (let* ((owner (getf state :owner))
+         (root (physical-adoption-owner-directory owner))
+         (workspace (uiop:ensure-directory-pathname (uiop:getenv "PG_ADOPTION_INSTALL_WORKSPACE")))
+         (root-inode (physical-adoption-owner-inode owner))
+         (lock-inode (physical-adoption-owner-lock-inode owner))
+         (installed (physical-adoption-install-start owner workspace))
+         (plan (getf installed :plan)))
+    (assert (= (physical-adoption-install-last-step plan) (getf installed :step)))
+    (assert (eq :installed (getf (physical-adoption-attempt-read owner) :phase)))
+    (assert (= root-inode (sb-posix:stat-ino (sb-posix:lstat (namestring root)))))
+    (assert (= lock-inode (sb-posix:stat-ino (sb-posix:lstat (namestring (merge-pathnames ".pg_lisp.lock" root))))))
+    (assert (equal (getf plan :old)
+                   (physical-adoption-install-snapshot (merge-pathnames "quarantine/" workspace)
+                                                       :exclude *physical-adoption-install-retained-names*)))
+    (assert (equal (getf plan :stage-tree) (physical-adoption-install-snapshot (getf stage :directory))))
+    (assert (physical-adoption-install-check-image root proved :installed t))
+    (assert (equal installed (physical-adoption-install-resume owner)))
+    (let ((*pgdata* root))
+      (assert (handler-case (progn (physical-adoption-check-startup) nil) (error () t))))
+    (multiple-value-bind (profile frozen) (physical-follow-source-profile (getf proved :source))
+      (declare (ignore profile))
+      (let ((client (physical-libpq-connect-frozen (physical-libpq-helper-path) frozen))
+            (anchor (physical-follow-anchor-copy
+                     (physical-adoption-attempt-with-history
+                      (getf proved :anchor) *physical-follow-anchor-keys* (getf proved :source-history)))))
+        (unwind-protect
+             (let ((remote (pg-client-native-prove-retained
+                            client (getf (getf proved :stage) :source-pin) anchor
+                            (physical-adoption-attempt-origin-request (getf proved :origin-proof)))))
+               (assert (= expected-root (getf remote :root-id)))
+               (assert (= (getf (getf proved :origin-proof) :end-digest) (getf remote :end-digest)))
+               (assert (equal (getf proved :source-history) (getf remote :history-text))))
+          (physical-client-close client))))
+    (format t "~&adoption-install: E/Mnew installed, originals quarantined, stable ownership and source pin retained PASS~%")
+    installed))
+
 (defun adoption-stage-native-prove (stage state proof port expected-root)
   (let* ((profile (make-physical-libpq-profile
                    (format nil "host=127.0.0.1 port=~d user=postgres dbname=postgres connect_timeout=3" port)
@@ -22,6 +59,12 @@
            (assert (physical-adoption-attempt-validate-context (getf state :owner) record))
            (assert (not (probe-file (physical-adoption-attempt-path
                                      (physical-adoption-owner-directory (getf state :owner))))))
+           (when (equal "1" (uiop:getenv "PG_ADOPTION_INSTALL_TEST"))
+             (let ((proved (physical-adoption-attempt-start-proof state stage client profile)))
+               (physical-client-close client)
+               (setf client nil)
+               (return-from adoption-stage-native-prove
+                 (adoption-install-native-check state stage proved expected-root))))
            (when (equal "1" (uiop:getenv "PG_ADOPTION_PROOF_TEST"))
              (let* ((owner (getf state :owner))
                     (proved (physical-adoption-attempt-start-proof state stage client profile)))
