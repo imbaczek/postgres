@@ -1,5 +1,8 @@
 # Development TODO
 
+- [ ] Support schema-qualified INSERT targets such as `INSERT INTO public.t`;
+  the current parser returns 42601 although an unqualified target parses.
+
 - [x] Flush outstanding WAL on an eligible writer cycle with an empty publication
   FIFO (`cc9ea0202c3`, `68785ed66c4`, `07c9368c734`). The checkpoint passed 903
   unit, 1,416 physical, 201 wire and 1,161 legacy checks and strict cold
@@ -465,8 +468,8 @@
 - [ ] Complete the broader synchronous-replication backend contract.
   Persist missing checkpoint policy, freeze, MultiXact, commit-timestamp and
   checksum facts before claiming the complete C checkpoint contract.
-  Preserve different-upstream, descendant and rejoin acceptance work, and finish
-  the cold-load audit and broader C-style documentation. No coordination is added.
+  Complete remaining bootstrap and rejoin work, and finish the cold-load audit
+  and broader C-style documentation. No coordination is added.
 
 - [x] Publish an allocated backend XID with its active registration under the XID
   lock and interrupt mask, following C's ownership-before-unlock ordering. Raw
@@ -483,11 +486,16 @@
   is active at cold startup and changes require restart. Archive-only recovery
   remains unsupported; coordination is outside this scope.
 
-- [ ] Extend real `Postgresql.follow` acceptance with the pinned Patroni path.
-  The owned test now covers start, changed-host reload, restart, clear, reattach,
-  source fencing, Patroni promotion and child writes. Switching to a different
-  upstream, following a descendant and rejoining remain open; this test has no
-  DCS or coordination.
+- [ ] Complete native bootstrap and rejoin for the pinned Patroni path. Real
+  `Postgresql.follow` and promotion now cover a descendant handoff, ancestry
+  rejection and explicit local reseeding (`53b16b79f49`); the oracle has no DCS
+  or coordination. The shared-filesystem operator reseed is not the stock/default
+  or remote Patroni bootstrap clone. Native authenticated export and installation
+  need staged fsync/rename, cancellation cleanup, WAL through backup end for
+  `-X stream`, and default `pg_basebackup` arguments. A configurable local replica
+  method could be an intermediate step. Even a nondivergent former primary lacks
+  verified recovery provenance; safe offline prefix-proved adoption remains open.
+  Native rewind and divergent rewind are unimplemented, and C tools are incompatible.
   The complete unchanged Patroni writer oracle now passes, including `hba_file`
   and `ident_file`. These settings accept only disabled or unset values:
   `max_prepared_transactions`,

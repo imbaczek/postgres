@@ -1,4 +1,8 @@
-"""Exercise unchanged Patroni follow across promotion and explicit native reseeding."""
+"""Exercise unchanged Patroni follow and promotion with owned native peers.
+
+Reseeding uses an explicit local native backup, not Patroni's bootstrap clone.
+No DCS, election or HA loop is involved.
+"""
 import argparse
 from contextlib import ExitStack
 import hashlib
@@ -88,6 +92,7 @@ def hash_base(data):
 
 
 def reseed_from_promoted(node, promoted, archive, backup_label, control_socket=None):
+    """Archive stopped PGDATA and install a local native base from the child."""
     assert node.is_running() is None, 'reseed requires a stopped, owned node'
     node.connection_pool.close()
     data = Path(node.data_dir)
@@ -100,6 +105,7 @@ def reseed_from_promoted(node, promoted, archive, backup_label, control_socket=N
 
 
 def descendant(source, connection, cleanup):
+    """Follow a promoted descendant without restarting the compatible sibling."""
     promoted = api['start_follower'](connection, source, 'descendant_b', cleanup)
     sibling = api['start_follower'](connection, source, 'descendant_c', cleanup)
     follow['wait_for'](lambda: rows(promoted) == [(1,)] and rows(sibling) == [(1,)])
@@ -139,6 +145,7 @@ def descendant(source, connection, cleanup):
 
 
 def reseed_former_primary(source, promoted, sibling, cleanup):
+    """Reject direct follow of a fenced divergent primary, then reseed it."""
     # Make divergence explicit in this isolated fixture. The old primary has no
     # followers now; fence it again before attempting any recovery conversion.
     source.start()
@@ -191,6 +198,7 @@ def node_control(node, form):
 
 
 def applied_divergence(source, connection, cleanup):
+    """Reject an applied prefix past the child fork, then explicitly reseed."""
     promoted = api['start_follower'](connection, source, 'divergent_b', cleanup)
     sibling = api['start_follower'](connection, source, 'divergent_c', cleanup)
     follow['wait_for'](lambda: rows(promoted) == [(1,)] and rows(sibling) == [(1,)])

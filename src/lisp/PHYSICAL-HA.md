@@ -18,6 +18,31 @@ original C source is the behavior oracle.
 
 ## Verified starting points
 
+### Descendant follow and explicit reseeding
+
+The unchanged pinned Patroni follow and promote methods passed two isolated
+three-peer scenarios without DCS or coordination (`53b16b79f49`). A detached
+sibling followed a promoted descendant on timeline 2 without a process restart,
+with the expected history fork, rows, sender identity and active slot, then
+survived a cold restart. A fenced former primary with divergent data could not
+follow directly because it lacked a verified native recovery base. An explicit
+operator-initiated local native backup from the promoted node enabled follow and
+cold restart while preserving the archived old data.
+
+An independent negative case placed the sibling's applied prefix beyond the
+child fork. Reload succeeded but the controller rejected the common ancestry;
+the process, data, accepted binding and store state remained intact, while SHOW
+exposed the new desired source and the controller stayed disabled. Explicitly
+reseeding the stopped sibling from the child removed its orphan from the new
+copy without changing the archive. Both scenarios and the reviewed negative rerun
+passed; evidence is in `/home/imbaczek/proj/pg-ha-artifacts/patroni-descendant/`.
+
+This local shared-filesystem reseed is not Patroni's default or remote bootstrap
+clone. A former primary, even without divergence, lacks the native provenance
+required for direct follow. Safe offline prefix-proved adoption, authenticated
+native backup export and installation, and native rewind remain open; C rewind
+tools are not compatible with native storage.
+
 ### Empty-FIFO WAL writer
 
 An eligible primary writer cycle flushes outstanding WAL even when no page
@@ -171,8 +196,8 @@ remain outside this checkpoint; no coordinator or election mechanism was added.
 start, changed-host reload, restart, clear, reattach, source fencing, promotion and
 child writes. It builds the native libpq helper and uses a private control socket
 for setup and debugging; it does not run a DCS or HA loop. The run passed at
-`/tmp/pg-real-follow-promotion-final.log`. Switching to a different upstream,
-following a descendant and rejoining remain open. The exercised source shutdown
+`/tmp/pg-real-follow-promotion-final.log`. At that checkpoint switching upstream,
+descendant follow and rejoin acceptance remained open. The exercised source shutdown
 and crash paths now reconnect on the same binding and catch up before promotion;
 the previous COPY completion error is covered by bounded protocol regressions.
 The restart and reconnect run is `/tmp/pg-copy-wal-reconnect-clean-final.log`;
@@ -1257,8 +1282,8 @@ emitted and recovery settings with C `postgres -C`. It verifies passfile mode
 and escaping, connection options, slot name, local configuration and signal
 files. The C and full native writer comparisons pass. This is a writer and
 metadata oracle; the separate real `Postgresql.follow` test covers configured
-first attachment, same-timeline changes and promotion. Full GUC behavior and
-switching upstream, descendant follow and rejoin acceptance remain open.
+first attachment, same-timeline changes and promotion. At that checkpoint full
+GUC behavior and switching upstream, descendant follow and rejoin remained open.
 
 Native startup now installs independent `max_connections` (default 100) and
 `max_wal_senders` (default 10) session quotas before listening. Startup packets

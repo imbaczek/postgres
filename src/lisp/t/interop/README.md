@@ -70,6 +70,18 @@ and starts owned C and native peers. C physical feedback clients and two native
 replicas started through real `Postgresql.follow` exercise FIRST/ANY monitoring.
 It does not run DCS, election or the HA loop.
 
+The descendant oracle uses the same pinned environment and C binary directory:
+
+```sh
+PG_CONFIG=/path/to/c/bin/pg_config "$PATRONI_PYTHON" t/interop/patroni-descendant.py --reference-bin /path/to/c/bin
+```
+
+It runs isolated three-peer descendant and applied-divergence cases using real
+Patroni follow and promotion. Reseeding is an explicit local native backup with
+shared filesystem access, not the default or remote Patroni bootstrap clone. It
+does not run DCS, election or the HA loop. All database peers are native; the C
+binary directory supplies `pg_config` and `pg_isready`.
+
 The checkpoint oracle uses the same pinned environment and C binary directory:
 
 ```sh

@@ -111,6 +111,12 @@ receiver. `physical-follow-stop` rejects an unattached standby; use replay pause
 to pause replay. The original bootstrap pin remains of unknown ownership and is
 not retired by this attachment.
 
+The unchanged Patroni follow method has also been tested against a promoted
+descendant and an explicit local native reseed. This reseed uses shared filesystem
+access and is not Patroni's default or remote bootstrap clone. A former primary
+cannot directly follow without verified native recovery provenance; native rewind
+and safe offline primary adoption remain open.
+
 An existing verified native recovery base and control can also start with
 `standby.signal`. Startup samples the signal names once, enables streaming recovery
 before listeners open, and durably disables receipt while retaining the saved
