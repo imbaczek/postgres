@@ -5,11 +5,11 @@ case "${1:-}" in
     --version|-V) echo 'pg_basebackup (PostgreSQL) 20devel'; exit 0 ;;
     --help|'-?') echo 'usage: pg_basebackup --pgdata=DIR -X stream --dbname=CONNINFO'; exit 0 ;;
 esac
-HELPER_BUILD_DIR=
+HELPER_RESULT=
 CHILD_PID=
 cleanup() {
-    if [ -n "$HELPER_BUILD_DIR" ]; then
-        rm -rf -- "$HELPER_BUILD_DIR"
+    if [ -n "$HELPER_RESULT" ]; then
+        rm -f -- "$HELPER_RESULT"
     fi
 }
 trap cleanup EXIT
@@ -24,13 +24,14 @@ cancel() {
 }
 trap cancel HUP INT TERM
 if [ -z "${PG_LIBPQ_HELPER:-}" ]; then
-    if [ -x "$UTILITY_DIR/pg-libpq-helper" ]; then
-        PG_LIBPQ_HELPER="$UTILITY_DIR/pg-libpq-helper"
-    else
-        HELPER_BUILD_DIR=$(mktemp -d "${TMPDIR:-/tmp}/pg-basebackup-helper.XXXXXX")
-        "$UTILITY_DIR/../t/build-libpq-helper.sh" "$HELPER_BUILD_DIR/helper"
-        PG_LIBPQ_HELPER="$HELPER_BUILD_DIR/helper"
-    fi
+    HELPER_RESULT=$(mktemp "${TMPDIR:-/tmp}/pg-basebackup-path.XXXXXX")
+    "$UTILITY_DIR/pg-libpq-helper-path" > "$HELPER_RESULT" &
+    CHILD_PID=$!
+    wait "$CHILD_PID"
+    CHILD_PID=
+    IFS= read -r PG_LIBPQ_HELPER < "$HELPER_RESULT"
+    rm -f -- "$HELPER_RESULT"
+    HELPER_RESULT=
     export PG_LIBPQ_HELPER
 fi
 "${SBCL:-sbcl}" --script "$UTILITY_DIR/pg-basebackup.lisp" "$@" &

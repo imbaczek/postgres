@@ -9,5 +9,5 @@ CC=${CC:-cc}
 PG_CONFIG=${PG_CONFIG:-pg_config}
 INCLUDE=$("$PG_CONFIG" --includedir)
 LIBRARY=$("$PG_CONFIG" --libdir)
-"$CC" -std=c11 -Wall -Wextra -Werror -O2 -I"$INCLUDE" \
+exec "$CC" -std=c11 -Wall -Wextra -Werror -O2 -I"$INCLUDE" \
     "$BASE/port/libpq-helper.c" -L"$LIBRARY" -Wl,-rpath,"$LIBRARY" -lpq -o "$1"

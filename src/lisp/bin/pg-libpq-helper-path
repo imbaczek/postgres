@@ -1,0 +1,86 @@
+#!/bin/sh
+set -eu
+umask 077
+UTILITY_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+BASE=$(CDPATH= cd -- "$UTILITY_DIR/.." && pwd)
+if [ -n "${PG_LIBPQ_HELPER:-}" ]; then
+    test -f "$PG_LIBPQ_HELPER" && test -x "$PG_LIBPQ_HELPER"
+    readlink -f -- "$PG_LIBPQ_HELPER"
+    exit 0
+fi
+if [ -f "$UTILITY_DIR/pg-libpq-helper" ] && [ -x "$UTILITY_DIR/pg-libpq-helper" ]; then
+    readlink -f -- "$UTILITY_DIR/pg-libpq-helper"
+    exit 0
+fi
+if [ "${1:-}" != --worker ]; then
+    exec timeout --kill-after=2 60 "$0" --worker
+fi
+if [ -n "${XDG_CACHE_HOME:-}" ]; then
+    CACHE_BASE=$XDG_CACHE_HOME
+elif [ -n "${HOME:-}" ]; then
+    CACHE_BASE="$HOME/.cache"
+else
+    ACCOUNT_HOME=$(getent passwd "$(id -u)" | cut -d: -f6)
+    if [ -z "$ACCOUNT_HOME" ]; then
+        echo 'libpq-helper: no account home; set XDG_CACHE_HOME or install the helper' >&2
+        exit 1
+    fi
+    CACHE_BASE="$ACCOUNT_HOME/.cache"
+fi
+CACHE_DIR="$CACHE_BASE/pg-lisp/libpq-helper"
+mkdir -p -m 700 -- "$CACHE_DIR"
+if [ -L "$CACHE_DIR" ] || [ "$(stat -c %u -- "$CACHE_DIR")" != "$(id -u)" ] ||
+   [ "$(stat -c %a -- "$CACHE_DIR")" != 700 ]; then
+    echo 'libpq-helper: cache directory must be private and owned by this user' >&2
+    exit 1
+fi
+CACHE_DIR=$(CDPATH= cd -- "$CACHE_DIR" && pwd -P)
+BUILD_DIR=$(mktemp -d "$CACHE_DIR/build.XXXXXX")
+BUILD_PID=
+cleanup() {
+    rm -rf -- "$BUILD_DIR"
+}
+cancel() {
+    trap '' HUP INT TERM
+    BUILD_PID=${BUILD_PID:-${!:-}}
+    if [ -n "$BUILD_PID" ]; then
+        kill -TERM "$BUILD_PID" 2>/dev/null || true
+        wait "$BUILD_PID" 2>/dev/null || true
+    fi
+    exit 130
+}
+trap cleanup EXIT
+trap cancel HUP INT TERM
+CC=${CC:-cc}
+PG_CONFIG=${PG_CONFIG:-pg_config}
+CC_PATH=$(command -v "$CC")
+PG_CONFIG_PATH=$(command -v "$PG_CONFIG")
+FINGERPRINT="$BUILD_DIR/fingerprint"
+sha256sum "$BASE/port/libpq-helper.c" "$BASE/t/build-libpq-helper.sh" > "$FINGERPRINT"
+readlink -f -- "$CC_PATH" >> "$FINGERPRINT"
+readlink -f -- "$PG_CONFIG_PATH" >> "$FINGERPRINT"
+"$CC" --version >> "$FINGERPRINT"
+"$PG_CONFIG" --version >> "$FINGERPRINT"
+"$PG_CONFIG" --includedir >> "$FINGERPRINT"
+"$PG_CONFIG" --libdir >> "$FINGERPRINT"
+KEY=$(sha256sum "$FINGERPRINT")
+KEY=${KEY%% *}
+HELPER="$CACHE_DIR/helper-$KEY"
+valid_helper() {
+    [ ! -L "$HELPER" ] && [ -f "$HELPER" ] && [ -x "$HELPER" ] &&
+    [ "$(stat -c %u -- "$HELPER")" = "$(id -u)" ] &&
+    [ "$(stat -c %a -- "$HELPER")" = 700 ]
+}
+if [ -e "$HELPER" ] || [ -L "$HELPER" ]; then
+    valid_helper || { echo 'libpq-helper: invalid cached executable' >&2; exit 1; }
+else
+    "$BASE/t/build-libpq-helper.sh" "$BUILD_DIR/helper" >&2 &
+    BUILD_PID=$!
+    wait "$BUILD_PID"
+    BUILD_PID=
+    chmod 700 "$BUILD_DIR/helper"
+    if ! ln -- "$BUILD_DIR/helper" "$HELPER" 2>/dev/null; then
+        valid_helper || { echo 'libpq-helper: cache publication failed' >&2; exit 1; }
+    fi
+fi
+printf '%s\n' "$HELPER"
