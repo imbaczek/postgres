@@ -171,6 +171,7 @@
                    (:file "../replication/physical-promotion-primary")
                    (:file "../utils/control-data")
                    (:file "../replication/physical-adoption")
+                   (:file "../replication/physical-adoption-stage")
                    (:file "../replication/physical-promotion-online")
                    (:file "../replication/standard")
                    (:file "../replication/worker")
