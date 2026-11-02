@@ -1677,6 +1677,15 @@ A completed retained fork launches replay without contacting the source."
      :started
      )))
 
+(defun physical-follow-check-receiver-stop-admission ()
+  (unless (sb-thread:holding-mutex-p *reload-run-lock*)
+    (error "receiver stop admission check requires reload exclusion"))
+  (unless (call-with-live-operation-lock
+           (lambda () (and *live-operation-admission-open*
+                           (not *live-operation-terminal-shutdown*))))
+    (error "receiver quiescence requires open admission"))
+  (values))
+
 (defun physical-follow-quiesce-receiver ()
   "Stop and join receipt, preserving replay, pause state, config and runtime.
 The lifecycle owner must first block the controller and cancel its operation
@@ -1688,24 +1697,30 @@ outside the fence and admission; a failed join or exit flush signals an error."
     (error "receiver quiescence must join outside admission"))
   (unless (sb-thread:holding-mutex-p *physical-follow-command-lock*)
     (error "receiver quiescence requires follow command exclusion"))
-  (let ((runtime *physical-follow-runtime*))
-    (when runtime
-      (let ((client (call-with-physical-follow-generation-fence
-                     (lambda ()
-                       (sb-thread:with-mutex (*physical-follow-lock*)
-                         (setf (physical-follow-runtime-receiver-stopped-p runtime) t
-                               (physical-follow-runtime-transition runtime) nil)
-                         (physical-follow-runtime-client runtime))))))
-        (when client (ignore-errors (physical-client-stop client))))
-      (let ((thread (physical-follow-runtime-receiver-thread runtime)))
-        (when thread
-          (sb-thread:join-thread thread :timeout 15 :default :timeout)
-          (when (sb-thread:thread-alive-p thread)
-            (error "native physical receiver has not stopped"))))
-      (physical-follow-flush-on-exit runtime)
-      (physical-follow-check-exit)
-      (physical-follow-monitor-stop runtime)))
-  :stopped)
+  (flet ((stop-receipt ()
+           (let ((runtime *physical-follow-runtime*))
+             (when runtime
+               (physical-follow-check-receiver-stop-admission)
+               (let ((client (call-with-physical-follow-generation-fence
+                              (lambda ()
+                                (sb-thread:with-mutex (*physical-follow-lock*)
+                                  (setf (physical-follow-runtime-receiver-stopped-p runtime) t
+                                        (physical-follow-runtime-transition runtime) nil)
+                                  (physical-follow-runtime-client runtime))))))
+                 (when client (ignore-errors (physical-client-stop client))))
+               (let ((thread (physical-follow-runtime-receiver-thread runtime)))
+                 (when thread
+                   (sb-thread:join-thread thread :timeout 15 :default :timeout)
+                   (when (sb-thread:thread-alive-p thread)
+                     (error "native physical receiver has not stopped"))))
+               (physical-follow-flush-on-exit runtime)
+               (physical-follow-check-exit)
+               (physical-follow-monitor-stop runtime)))
+           :stopped))
+    (if (sb-thread:holding-mutex-p *reload-run-lock*)
+        (stop-receipt)
+        (sb-thread:with-mutex (*reload-run-lock*)
+          (stop-receipt)))))
 
 (defun physical-follow-quiesce-runtime ()
   "Stop and join both workers and preserve durable follow configuration.
@@ -1716,6 +1731,8 @@ join workers outside it."
   (when (plusp *live-operation-depth*) (error "follow quiescence must join outside admission"))
   (let ((runtime *physical-follow-runtime*))
     (when runtime
+      (when (sb-thread:holding-mutex-p *reload-run-lock*)
+        (physical-follow-check-receiver-stop-admission))
       (call-with-physical-follow-generation-fence
        (lambda ()
          (sb-thread:with-mutex (*physical-follow-lock*)

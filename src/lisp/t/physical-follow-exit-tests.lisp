@@ -388,3 +388,107 @@
 (deftest receiver-only-quiescence-cannot-join-inside-admission
     (let ((pg::*live-operation-depth* 1))
       (ok (intake-fails-p #'pg::physical-follow-quiesce-receiver))))
+
+(deftest receiver-quiescence-waits-for-reload-before-stopping-and-flushing
+    (call-with-exit-flush-store
+     (lambda (root store runtime)
+       (declare (ignore root))
+       (let* ((reload-lock (sb-thread:make-mutex :name "receiver reload exclusion fixture"))
+              (command-lock (sb-thread:make-mutex :name "receiver command exclusion fixture"))
+              (state pg::*physical-recovery-state*)
+              (record (sample-physical-record))
+              (receiver nil) (stopper nil) (waiting nil)
+              (receiver-error nil) (stop-result nil) (flush-owners nil))
+         (pg::physical-store-input store 0 record)
+         (labels ((run (function)
+                    (let ((pg::*reload-run-lock* reload-lock)
+                          (pg::*physical-follow-command-lock* command-lock)
+                          (pg::*physical-follow-runtime* runtime)
+                          (pg::*physical-follow-desired* nil)
+                          (pg::*physical-receive-store* store)
+                          (pg::*physical-recovery-state* state)
+                          (pg::*physical-recovery-failed-p* nil)
+                          (pg::*physical-shutdown-state* nil)
+                          (pg::*live-operation-depth* 0)
+                          (pg::*physical-store-test-hook*
+                            (lambda (point ignored)
+                              (declare (ignore ignored))
+                              (when (eq point :before-control-fsync)
+                                (push (eq stopper (sb-thread:mutex-owner reload-lock)) flush-owners)))))
+                      (funcall function))))
+           (unwind-protect
+                (progn
+                  (setf receiver
+                        (sb-thread:make-thread
+                         (lambda ()
+                           (run (lambda ()
+                                  (handler-case
+                                      (progn
+                                        (loop until (pg::physical-follow-receiver-stopped-p runtime)
+                                              do (sleep 0.001))
+                                        (pg::physical-follow-flush-on-exit runtime))
+                                    (error (condition) (setf receiver-error condition))))))
+                         :name "receiver waiting for stop")
+                        (pg::physical-follow-runtime-receiver-thread runtime) receiver)
+                  (sb-thread:with-mutex (reload-lock)
+                    (setf stopper
+                          (sb-thread:make-thread
+                           (lambda ()
+                             (run (lambda ()
+                                    (handler-case
+                                        (setf stop-result
+                                              (sb-thread:with-mutex (command-lock)
+                                                (pg::physical-follow-quiesce-receiver)))
+                                      (error (condition) (setf stop-result condition))))))
+                           :name "receiver stop waiting for reload"))
+                    (loop repeat 2000
+                          when (eq reload-lock (sb-thread::thread-waiting-for stopper))
+                            do (setf waiting t) (return)
+                          when (not (sb-thread:thread-alive-p stopper)) do (return)
+                            do (sleep 0.001))
+                    (ok waiting)
+                    (ok (not (pg::physical-follow-runtime-receiver-stopped-p runtime)))
+                    (ok (sb-thread:thread-alive-p receiver))
+                    (ok (zerop (pg::physical-store-flushed-lsn store))))
+                  (sb-thread:join-thread stopper :timeout 5 :default :pending)
+                  (ok (not (sb-thread:thread-alive-p stopper)))
+                  (ok (eq :stopped stop-result))
+                  (ok (null receiver-error))
+                  (ok (not (sb-thread:thread-alive-p receiver)))
+                  (ok (= (length record) (pg::physical-store-flushed-lsn store)))
+                  (ok (= (length record) (getf state :receive-lsn)))
+                  (ok (and flush-owners (every #'identity flush-owners)))
+                  (ok (not (pg::physical-follow-runtime-stopped-p runtime))))
+             (setf (pg::physical-follow-runtime-receiver-stopped-p runtime) t)
+             (dolist (thread (list receiver stopper))
+               (when thread (sb-thread:join-thread thread :timeout 5 :default :pending)))))))))
+
+(deftest receiver-quiescence-reuses-caller-reload-exclusion
+    (call-with-exit-flush-store
+     (lambda (root store runtime)
+       (declare (ignore root runtime))
+       (let* ((pg::*reload-run-lock* (sb-thread:make-mutex :name "receiver reentrant reload fixture"))
+              (record (sample-physical-record)))
+         (pg::physical-store-input store 0 record)
+         (sb-thread:with-mutex (pg::*physical-follow-command-lock*)
+           (sb-thread:with-mutex (pg::*reload-run-lock*)
+             (ok (eq :stopped (pg::physical-follow-quiesce-receiver)))
+             (ok (sb-thread:holding-mutex-p pg::*reload-run-lock*))))
+         (ok (= (length record) (pg::physical-store-flushed-lsn store)))))))
+
+(deftest receiver-quiescence-rejects-caller-owned-closed-admission
+    (dolist (terminal '(nil t))
+      (dolist (function '(pg::physical-follow-quiesce-receiver pg::physical-follow-quiesce-runtime))
+        (let* ((runtime (pg::make-physical-follow-runtime))
+               (pg::*physical-follow-runtime* runtime)
+               (pg::*reload-run-lock* (sb-thread:make-mutex :name "closed receiver reload fixture"))
+               (pg::*live-operation-lock* (sb-thread:make-mutex :name "closed receiver admission fixture"))
+               (pg::*live-operation-admission-open* nil)
+               (pg::*live-operation-terminal-shutdown* terminal)
+               (pg::*live-operation-depth* 0))
+          (sb-thread:with-mutex (pg::*physical-follow-command-lock*)
+            (sb-thread:with-mutex (pg::*reload-run-lock*)
+              (ok (intake-fails-p function))
+              (ok (not (pg::physical-follow-runtime-receiver-stopped-p runtime)))
+              (ok (not (pg::physical-follow-runtime-stopped-p runtime)))
+              (ok (sb-thread:holding-mutex-p pg::*reload-run-lock*))))))))
