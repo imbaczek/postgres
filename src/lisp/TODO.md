@@ -1,5 +1,18 @@
 # Development TODO
 
+- [x] Stage a verified canonical E/Mnew image from a cooperatively owned, clean
+  former primary. The guarded, private target is verified with the ordinary base
+  and authentication checks, while historical B/M/H_E remains a separate witness.
+  This does not install or start the image or grant writer authority. Failure can
+  leave a guarded partial target that must not be retried as an empty directory.
+  Validation passed 1,496 physical, 903 unit and 201 wire tests, strict cold
+  compilation and eight new Rove tests. The manifest property passed 100 trials
+  at seed 75, digest `fnv1a64-v1:8e1df9be1a4e8493`; no Function Spec is registered
+  and rejection counts and input coverage were not measured. Native staging,
+  PREPARE and retained proof passed with independent H_E/root comparison; the old
+  primary's files and inode identities remained unchanged. Evidence is in
+  `/home/imbaczek/proj/pg-ha-artifacts/adoption-stage/`.
+
 - [x] Prove retained origin history on the promoted source for an initial READY
   pin. The source hashes the selected root from historical B/M through E while
   holding a root-reader lease, and rechecks the pin and source context before
@@ -26,7 +39,7 @@
   nonempty suffixes, incomplete records and corruption.
   Evidence: `/home/imbaczek/proj/pg-ha-artifacts/adoption-preflight/`.
   These helpers grant no writer or recovery-installation authority.
-  A canonical E image and journaled installation remain open.
+  Durable attempt recording and journaled installation remain open.
 
 - [x] Preserve source-owned history commitments for verified remote exports.
   A durable origin binds the original system, timeline, base and manifest to a
@@ -44,7 +57,7 @@
 
 - [ ] Implement offline former-primary adoption using genuine source history
   commitments and an independently validated descendant retained root. Require
-  stable PGDATA ownership and exact clean endpoint validation before constructing
+  stable PGDATA ownership and exact clean endpoint validation before staging
   a canonical recovery image. Journal installation before changing files; every
   interrupted startup must resume the exact installation or refuse writer startup.
   Prepare normal follow at E/Mnew with the empty-prefix seed and independently

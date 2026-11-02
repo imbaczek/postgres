@@ -349,6 +349,7 @@ The new base receives its own archive; the old primary archive is not copied."
     (with-standard-io-syntax (prin1-to-string (literal manifest)))))
 
 (defun physical-bootstrap-manifest-image (manifest)
+  "Encode the canonical manifest text with its CRC envelope."
   (let* ((text (physical-bootstrap-manifest-text manifest))
          (bytes (string->bytes text))
          (crc (wal-crc32 bytes)))

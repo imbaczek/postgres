@@ -40,6 +40,36 @@ tests, strict cold compilation and the existing shutdown test. Logs are in
 
 ## Verified starting points
 
+### Canonical adoption stage prerequisite
+
+A cooperatively owned, stopped former primary can now produce a guarded canonical
+E/Mnew base in an existing empty private 0700 nonsymlink directory on the same
+filesystem and outside the source hierarchy. Phase-zero recovery guards precede
+copies. Source path components and regular files are checked without following
+symlinks; bounded hashes and path/open-file identities are rechecked before and
+after copying and target verification. The WAL window runs from the checkpoint
+start through E, preserving the first segment prefix. Only the copied control
+loses its retained-root reference; actual next XID remains distinct from reserved
+allocator capacity.
+
+The complete stage passes the unchanged base and authentication verifiers. Exact
+authentication adjunct copies are checked outside the immutable inventory. The
+canonical disk input checks reject observed redirects, but cannot establish a
+historic policy installed by an unknown earlier command line. The manifest pin
+name is a label; staging creates no source pin. Historical B/M/H_E is returned
+separately from E/Mnew. A failure may leave a guarded nonempty partial target;
+staging does not install, start or authorize the image. Durable attempt recording
+before PREPARE and journaled installation remain open.
+
+The milestone passed 1,496 physical, 903 unit and 201 wire tests, eight new Rove
+tests and strict cold compilation. The manifest property passed 100 trials at
+seed 75, digest `fnv1a64-v1:8e1df9be1a4e8493`; it has no Function Spec, and
+rejection counts and input coverage were not measured. A native staged image was
+used for PREPARE and PROVE_RETAINED with independent H_E and root comparison; no
+installation or startup was claimed. A final native check found the old primary's
+file bytes and inode identities unchanged. Evidence is in
+`/home/imbaczek/proj/pg-ha-artifacts/adoption-stage/`.
+
 ### Retained origin proof prerequisite
 
 The promoted source can prove its retained historical B/M prefix through E for
@@ -54,7 +84,7 @@ The typed client verifies the response against the prepared anchor and request.
 The digest and root identity remain source claims; typed decoding alone does not
 authenticate them. Adoption must compare H_E with independently checked local
 history. This is a read-only prerequisite, not image installation, adoption or
-writer authority. A canonical image and journaled installation remain open.
+writer authority. Durable attempt recording and journaled installation remain open.
 
 Validation passed 1,488 physical, 903 unit and 201 wire tests and strict cold
 compilation. The query property passed 100 trials at seed 74, digest

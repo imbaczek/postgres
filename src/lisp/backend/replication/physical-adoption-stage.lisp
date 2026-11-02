@@ -1,3 +1,5 @@
+;;;; Build a guarded canonical base from a cooperatively owned stopped primary.
+;;;; Staging preserves separate historical evidence and does not install the image.
 (in-package #:pg)
 
 (defvar *physical-adoption-stage-test-hook* nil)
@@ -7,6 +9,7 @@
     (funcall *physical-adoption-stage-test-hook* point value)))
 
 (defun physical-adoption-stage-directory-identity (directory)
+  "Check and identify an owned, private, nonsymlink stage directory."
   (let ((stat (sb-posix:lstat (string-right-trim "/" (namestring directory)))))
     (unless (and (sb-posix:s-isdir (sb-posix:stat-mode stat))
                  (= (sb-posix:geteuid) (sb-posix:stat-uid stat))
@@ -19,6 +22,7 @@
         (sb-posix:stat-size stat) (sb-posix:stat-mtime stat) (sb-posix:stat-ctime stat)))
 
 (defun physical-adoption-stage-check-components (relative)
+  "Reject symlink or non-directory source components and nonregular source files."
   (let ((parts (uiop:split-string relative :separator "/")))
     (loop for count from 1 below (length parts)
           for path = (format nil "~a~{~a~^/~}" (namestring *pgdata*) (subseq parts 0 count))
@@ -29,6 +33,8 @@
       (error "adoption source is not a regular nonsymlink file: ~a" relative))))
 
 (defun physical-adoption-stage-file-state (relative &key limit (maximum 18446744073709551615))
+  "Hash a bounded source file or prefix while checking path and open-file identity.
+The caller must keep the stopped source stable under cooperative offline ownership."
   (physical-adoption-stage-check-components relative)
   (let* ((path (merge-pathnames relative *pgdata*))
          (before (physical-adoption-stage-stat-identity (sb-posix:lstat (namestring path)))))
@@ -56,6 +62,9 @@
         (close stream)))))
 
 (defun physical-adoption-stage-auth-inputs ()
+  "Check canonical on-disk authentication paths and validate their inputs.
+These checks reject observed redirects; they cannot prove the policy installed by
+an unknown earlier command line."
   (let ((native (make-hash-table :test #'equal))
         (overrides (make-hash-table :test #'equal))
         (names '("authentication.initialized" "pg_hba.conf" "pg_ident.conf")))
@@ -74,6 +83,8 @@
     names))
 
 (defun physical-adoption-stage-copy-plan (auth)
+  "Plan the checkpoint-start through E WAL window and the remaining base files.
+The first WAL segment keeps its prefix; the final segment is bounded at E."
   (let* ((end *wal-durable-lsn*)
          (last (concatenate 'string "pg_wal/"
                             (file-namestring (wal-segment-path (floor (1- end) +wal-segment-size+)))))
@@ -87,12 +98,14 @@
      files)))
 
 (defun physical-adoption-stage-check-proof (state proof)
+  "Recompute the source origin witness and reject any change."
   (let ((fresh (physical-adoption-prove-primary-origin state (getf proof :identity))))
     (unless (equalp proof fresh)
       (error "adoption stage origin proof changed"))
     fresh))
 
 (defun physical-adoption-stage-check-auth-copy (target names source-files)
+  "Read back authentication adjuncts exactly; they are outside the file inventory."
   (let ((*pgdata* target))
     (dolist (name names)
       (let ((expected (find name source-files :key #'first :test #'equal))
@@ -101,6 +114,7 @@
           (error "adoption authentication copy differs from its source: ~a" name))))))
 
 (defun physical-adoption-stage-recheck-context (state proof target identity plan before)
+  "Recheck source file hashes and identities, origin proof and target identity."
   (let* ((owner (physical-adoption-check-owner (getf state :owner)))
          (*pgdata* (physical-adoption-owner-directory owner)))
     (unless (equalp before
@@ -112,6 +126,10 @@
     (error "adoption stage directory changed during verification")))
 
 (defun physical-adoption-stage-build (state proof target source-pin)
+  "Guard the target in phase zero before copying and verify the completed image.
+The copied WAL control drops the retained-root reference; the source is unchanged.
+Use actual next XID, not allocator capacity. Failure can leave a guarded, nonempty
+target which cannot be retried as an empty stage."
   (let* ((auth (physical-adoption-stage-auth-inputs))
          (identity (physical-adoption-stage-directory-identity target)))
     (multiple-value-bind (plan names) (physical-adoption-stage-copy-plan auth)
@@ -162,6 +180,12 @@
                     :origin-proof (copy-tree proof)))))))))
 
 (defun physical-adoption-stage-base (state origin-proof directory source-pin)
+  "Build a verified canonical E/Mnew image from an unchanged stopped primary.
+The caller owns the existing source lock and must keep its files stable. DIRECTORY
+must be an empty private 0700 nonsymlink on the same filesystem, disjoint from
+the source. SOURCE-PIN is only a manifest label; no source pin is created.
+Return the historical B/M/H_E witness separately from the new manifest digest.
+This does not install, follow, start, or grant writer authority."
   (unless (wal-valid-replication-slot-name-p source-pin)
     (error "invalid adoption stage manifest pin name"))
   (let* ((owner (physical-adoption-check-owner (getf state :owner)))
