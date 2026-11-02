@@ -40,6 +40,7 @@
                (:file "t/running-xacts-tests")
                (:file "t/wal-namespace-tests")
                (:file "t/wal-lineage-tests")
+               (:file "t/physical-adoption-tests")
                (:file "t/wal-timeline-tests")
                (:file "t/wal-eor-tests")
                (:file "t/physical-history-tests")
