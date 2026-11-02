@@ -17,10 +17,16 @@
         (error condition))))
   (values))
 
+(defun physical-adoption-handoff-path (&optional (directory *pgdata*))
+  (merge-pathnames "physical-adoption.handoff" directory))
+
 (defun physical-adoption-check-no-install (directory)
   (physical-adoption-require-absent
    (physical-adoption-install-path directory)
-   "offline adoption installation requires journal reconciliation"))
+   "offline adoption installation requires journal reconciliation")
+  (physical-adoption-require-absent
+   (physical-adoption-handoff-path directory)
+   "offline adoption handoff requires journal reconciliation"))
 
 (defun physical-adoption-check-startup ()
   "Refuse startup on any attempt or installation journal entry or inspection error."
