@@ -1,3 +1,7 @@
+;; Make follow authority and move progress durable.
+;; Each rename's source and destination directories are synced before recording
+;; its STEP.  A torn progress record is truncated and synced before replacement;
+;; validation must first show the corresponding move already completed.
 (in-package #:pg)
 
 (defvar *physical-adoption-follow-write-limit* nil)
@@ -48,6 +52,7 @@
       (fsync-directory directory)
       (physical-adoption-install-test-point (car pair) directory))))
 
+;; Sync the completed move before appending and syncing its progress record.
 (defun physical-adoption-follow-append-step (owner state)
   (let* ((value (getf state :plan)) (step (getf state :step))
                                     (moves (physical-adoption-follow-moves value))

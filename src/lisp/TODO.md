@@ -1,5 +1,22 @@
 # Development TODO
 
+- [x] Prepare offline follow metadata from a ready adoption handoff. A fixed
+  derived plan in a private third workspace uses a durable no-replace rename
+  journal, accepting its recorded prefix or one completed move ahead. The
+  terminal state is active-fenced; original controls and pending configuration
+  are saved, and A/J/H/F, quarantine and the source pin remain in place.
+  Validation passed 1,604 physical, 903 unit and 201 wire tests, 16 focused
+  tests, 66 move cuts, five prepublication and four authority cuts, four negative
+  mutations, seven fresh-process SIGKILL cases and strict cold compilation.
+  Native publication and a refused cold startup passed; the startup probe
+  preserved protected files. Two properties ran
+  100 trials each at seeds 83 and 84, digests `e49d091c22d1d20d` and
+  `682b6cb65b8ddf0e`; input coverage and rejection counts were not measured.
+  Evidence: `/home/imbaczek/proj/pg-ha-artifacts/adoption-follow/evidence.json`.
+  Code commits: `9fe2159fd5b`, `fb2e059d880`, `70eb4942613`. Real postmaster
+  startup reconciliation and fence retirement, actual catch-up, and divergent
+  rewind or reseed remain open. Coordination is not provided.
+
 - [x] Encode and privately publish bounded adoption attempt records under the
   active offline owner. The CRC-protected record preserves clean control facts,
   one bounded source history and monotone phase/proof state. Publication syncs

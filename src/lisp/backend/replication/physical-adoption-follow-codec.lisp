@@ -1,3 +1,11 @@
+;; Image bytes also use the journal's recorded time.  The plan freezes each
+;; staged file's identity as well as its expected bytes.
+
+;; Encode and check the follow journal's fixed plan and progress.
+;; The plan derives all images and moves from the saved handoff.  Its :reuse-wal
+;; field is required and must be NIL: a valid base has history only through its
+;; base timeline, while the selected child is newer.  When selection is needed,
+;; the child's own native history artifact is always published.
 (in-package #:pg)
 
 (defconstant +physical-adoption-follow-body-maximum+
@@ -34,6 +42,7 @@
     (when (or (getf value :reuse-wal) (and name (assoc name rows :test #'equal)))
       (error "adoption follow requires the child history to be absent from its frozen base"))))
 
+;; Validate the plan and its staged image identities, then return a copy.
 (defun physical-adoption-follow-copy (value)
   (physical-follow-check-plist
    value '(:version :handoff :handoff-file :workspace :staged :saved :journal :time :entries :reuse-wal))
@@ -79,6 +88,7 @@
               (error "adoption follow staged metadata differs from its derived image")))))
       copy)))
 
+;; Derive the ordered no-replace moves; the journal stores progress as a prefix.
 (defun physical-adoption-follow-moves (value)
   (let* ((binding (physical-adoption-follow-planned-binding (physical-adoption-follow-record value)))
          (after (getf binding :after))

@@ -1,5 +1,19 @@
+;; A is physical-adoption.attempt, J is physical-adoption.install, H is
+;; physical-adoption.handoff, and F is physical-adoption.follow.  W3 is the
+;; caller's fresh third workspace.
+
+;; Finish an offline adoption handoff by preparing follow metadata.
+;; W3 is private workspace for staged images and saved originals.  Publishing F
+;; makes its fixed plan authoritative; resume performs its no-replace renames
+;; and records each durable prefix.  A failure before F is published leaves a
+;; private W3; retry with a fresh workspace path.
+;;
+;; The terminal state is active-fenced.  A, J, H and F, the quarantine and the
+;; source pin remain in place.  This code does not start network, redo or
+;; workers, retire startup artifacts, or coordinate the next phase.
 (in-package #:pg)
 
+;; Verify the installed base and empty receive spool before preparing images.
 (defun physical-adoption-follow-preflight (owner handoff)
   (unless (eq :ready (physical-adoption-handoff-validate owner handoff))
     (error "adoption follow requires a published empty receive spool"))
@@ -69,6 +83,7 @@
     (physical-adoption-handoff-validate owner handoff)
     value))
 
+;; Publish F only after the private workspace and its images are durable.
 (defun physical-adoption-follow-publish-journal (owner value)
   (let* ((workspace (physical-adoption-follow-directory value :workspace))
          (pending (merge-pathnames "journal.pending" workspace))
@@ -116,6 +131,7 @@
           (physical-adoption-follow-check-prepared owner value)
           (physical-adoption-follow-publish-journal owner value))))))
 
+;; Reconcile one move ahead, then advance the fixed plan to active-fenced.
 (defun physical-adoption-follow-resume (owner)
   (let* ((state (physical-adoption-follow-read owner))
          (value (getf state :plan))

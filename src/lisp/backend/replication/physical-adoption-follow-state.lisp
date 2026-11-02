@@ -1,3 +1,7 @@
+;; Verify the follow journal against the offline directory state.
+;; A state must match the recorded move prefix or be exactly one move ahead.
+;; The latter is the rename completed before its progress record became durable.
+;; Identity, contents and directory context are checked before resuming.
 (in-package #:pg)
 
 (defun physical-adoption-follow-directory (value role)
@@ -172,6 +176,8 @@
              (physical-follow-check-active-state store base config :policy nil)
           (physical-store-close store))))))
 
+;; Accept the recorded prefix or one completed but unrecorded move.
+;; Recheck the context and journal after inspecting names and contents.
 (defun physical-adoption-follow-validate (owner state)
   (unless (equal state (physical-adoption-follow-read owner))
     (error "adoption follow journal changed"))

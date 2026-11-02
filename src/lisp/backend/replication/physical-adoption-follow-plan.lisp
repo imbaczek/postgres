@@ -1,5 +1,17 @@
+;; The source XID here is the stopped primary's actual next XID copied into
+;; the stage, not the remote source's current allocator or XID.
+
+;; Plan the offline transition from the published adoption handoff to follow.
+;; The binding keeps the staged base, source pin, source XID and resource
+;; witness together with the proved source history.  The child history is a
+;; prefix of that history, not a newly chosen lineage.
+;;
+;; At the fork (E = fork), the initial recovery image still describes the old
+;; history.  Separate selected images publish the child history and controls.
+;; Before the fork, selection is left for later follow processing.
 (in-package #:pg)
 
+;; Copy the source history through the selected child, preserving its ancestry.
 (defun physical-adoption-follow-history-prefix (source child text)
   (unless (and (typep source '(integer 2 4294967295))
                (typep child `(integer 2 ,source))
@@ -42,6 +54,7 @@
    (physical-adoption-attempt-with-history
     (getf record :anchor) *physical-follow-anchor-keys* (getf record :source-history))))
 
+;; Refuse a binding that changes the saved stage, source or recovery witness.
 (defun physical-adoption-follow-check-binding (record binding)
   (physical-follow-binding-check binding)
   (let* ((record (physical-adoption-attempt-copy record))
@@ -131,6 +144,7 @@
                           :base-lsn end :floor-lsn end :written-lsn end :flushed-lsn end
                           :retained-identity (physical-recovery-retained-identity stage))))
 
+;; Derive the same binding from the saved attempt when reading the journal.
 (defun physical-adoption-follow-planned-binding (record)
   (let* ((record (physical-adoption-attempt-copy record))
          (stage (getf record :stage))
@@ -180,6 +194,7 @@
             (cons "recovery.selected"
                   (physical-adoption-follow-control-image record binding time :selected t))))))
 
+;; Build the pending, initial, selected and active images needed by the plan.
 (defun physical-adoption-follow-images (record binding time)
   (physical-adoption-follow-check-binding record binding)
   (let* ((pending (physical-adoption-follow-config record binding))
