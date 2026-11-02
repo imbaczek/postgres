@@ -225,7 +225,7 @@ The CRC detects accidental corruption; it does not authenticate the payload."
       (error "retained WAL inventory differs from required identity or history"))
     payload))
 
-(defun physical-retained-inventory-verify-entries (entries history loader &optional overlap)
+(defun physical-retained-inventory-verify-entries (entries history loader &optional overlap on-record)
   "Validate checked, ordered entries using bounded LOADER reads.
 Keep only the current segment's shared prefix between images."
   (let ((segment (when overlap (floor (1- (getf (first overlap) :base)) +wal-segment-size+)))
@@ -238,7 +238,7 @@ Keep only the current segment's shared prefix between images."
         (multiple-value-bind (metadata bytes) (physical-retained-extent-decode image)
           (unless (equal metadata (third entry))
             (error "retained WAL image differs from indexed metadata"))
-          (physical-retained-extent-scan metadata bytes history)
+          (physical-retained-extent-scan metadata bytes history nil on-record)
           (unless (eql segment (getf metadata :segment))
             (setf segment (getf metadata :segment) prefix nil))
           (when (and prefix
@@ -249,7 +249,7 @@ Keep only the current segment's shared prefix between images."
             (setf prefix bytes))))))
   t)
 
-(defun physical-retained-inventory-load (directory id identity history)
+(defun physical-retained-inventory-load (directory id identity history &key on-record)
   "Read an inventory and validate all referenced extents sequentially.
 
 Return the freshly decoded payload."
@@ -258,7 +258,7 @@ Return the freshly decoded payload."
      (getf payload :entries) history
      (lambda (image-id)
        (physical-retained-object-read directory :extent image-id +physical-retained-image-limit+))
-     (physical-retained-inventory-read-overlap directory payload))
+     (physical-retained-inventory-read-overlap directory payload) on-record)
     payload))
 
 (defun physical-retained-inventory-keep-entries (entries ids)

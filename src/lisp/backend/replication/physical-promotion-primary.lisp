@@ -12,12 +12,12 @@
 
 (in-package #:pg)
 
-(defun physical-promotion-check-child-control (insertion checkpoint-timeline)
-  "Verify child control, its checkpoint record and timeline history without writes.
-Return the checkpoint snapshot and parsed history. This check must precede WAL
+(defun physical-promotion-check-child-checkpoint (insertion checkpoint-timeline)
+  "Verify child checkpoint control, its WAL record and history without writes.
+Return the checkpoint snapshot, parsed history and metadata. This check must precede WAL
 scanning or tail repair. It deliberately needs no old generation, receive spool
-or backup manifest: child control is now the recovery authority.  An optional
-retained archive is checked against the child history, including its fixed fork.
+or backup manifest: child control is now the recovery authority. Callers must separately validate
+any selected retained archive before using it as proof or granting writer authority.
 Read the checkpoint's actual encoded size and check any resource origin against
 that history before accepting the control copy."
   (multiple-value-bind (checkpoint durable snapshot timeline checkpoint-id namespace metadata) (wal-read-control-fields)
@@ -47,8 +47,13 @@ that history before accepting the control copy."
                             (equal snapshot (wal-checkpoint-record-snapshot (wal-decode-record bytes start))))
                  (error "child checkpoint differs from durable control")))
           (close stream)))
-      (physical-promotion-check-primary-retained snapshot history metadata)
-      (values snapshot history))))
+      (values snapshot history metadata))))
+
+(defun physical-promotion-check-child-control (insertion checkpoint-timeline)
+  (multiple-value-bind (snapshot history metadata)
+      (physical-promotion-check-child-checkpoint insertion checkpoint-timeline)
+    (physical-promotion-check-primary-retained snapshot history metadata)
+    (values snapshot history)))
 
 (defun physical-promotion-check-retiring-control (snapshot history &optional system-id)
   "Check any remaining pending request against the committed child.

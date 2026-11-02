@@ -39,7 +39,7 @@
     (timeline-check-lineage projected)
     (values parent fork projected)))
 
-(defun physical-promotion-check-retained-reference (system-id reference parent history &key end digest)
+(defun physical-promotion-check-retained-reference (system-id reference parent history &key end digest on-record)
   "Validate the root, ancestry, base overlap and extent coverage without mutation."
   (handler-case
       (let* ((identity (physical-promotion-retained-identity system-id reference))
@@ -61,10 +61,12 @@
           (physical-store-check-retained-coverage
            (%make-physical-store :base-lsn base :floor-lsn fork :floor-digest (getf reference :end-digest))
            (getf index :entries))
-          (physical-retained-inventory-load directory (getf reference :root-id) identity history)))
+          (physical-retained-inventory-load directory (getf reference :root-id) identity history
+                                            :on-record on-record)))
+    (pg-error (condition) (error condition))
     (error (condition) (error "invalid retained promotion archive: ~a" condition))))
 
-(defun physical-promotion-check-primary-retained (snapshot history metadata)
+(defun physical-promotion-check-primary-retained (snapshot history metadata &key on-record)
   "Validate an optional primary archive against the child history fork.
 A later checkpoint does not move that fork."
   (let ((reference (getf metadata :retained-reference)))
@@ -73,7 +75,7 @@ A later checkpoint does not move that fork."
         (unless (eql parent (getf snapshot :prev-timeline))
           (error "retained promotion archive differs from checkpoint parent"))
         (physical-promotion-check-retained-reference
-         (getf metadata :system-id) reference parent projected :end fork)))))
+         (getf metadata :system-id) reference parent projected :end fork :on-record on-record)))))
 
 (defun physical-promotion-check-pending-retained (control metadata &optional source-history)
   "Validate an optional pending archive against the applied boundary and digest.
