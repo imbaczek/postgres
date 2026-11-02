@@ -638,3 +638,105 @@ quiescence end. It is not the final online base-backup protocol."
               (physical-recovery-verify-base-state)
               (authentication-check-backup-policy directory))
             manifest))))))
+
+(defun physical-backup-destination (directory)
+  (let* ((target (directory-pathname (namestring (pathname directory))))
+         (parts (pathname-directory target))
+         (leaf (car (last parts))))
+    (unless (and (stringp leaf) (not (wild-pathname-p target)))
+      (error "invalid native backup destination"))
+    (let* ((parent (truename (make-pathname :directory (butlast parts) :defaults target)))
+           (resolved (merge-pathnames (make-pathname :directory (list :relative leaf)) parent)))
+      (when (directory-entry-names resolved)
+        (error "native backup destination is not empty"))
+      (values resolved parent))))
+
+(defun physical-backup-next-copy-frame (channel)
+  (loop
+    (multiple-value-bind (kind bytes)
+        (physical-libpq-receive-copy-out channel "BASE_BACKUP_NATIVE" :maximum 65536)
+      (case kind
+        (#\D (return bytes))
+        (#\C (error "native backup COPY completed before its bundle"))
+        (#\I nil)))))
+
+(defun physical-backup-finish-copy (channel)
+  (loop
+    (multiple-value-bind (kind bytes)
+        (physical-libpq-receive-copy-out channel "BASE_BACKUP_NATIVE" :maximum 65536)
+      (declare (ignore bytes))
+      (case kind
+        (#\C (return t))
+        (#\D (error "native backup COPY has trailing bundle data"))
+        (#\I nil)))))
+
+(declaim (special +physical-native-format+))
+
+(defun physical-base-backup-remote (directory conninfo &key (helper (physical-libpq-helper-path)))
+  (multiple-value-bind (target parent) (physical-backup-destination directory)
+    (let ((stage nil) (channel nil))
+      (unwind-protect
+           (progn
+             (sb-sys:without-interrupts
+               (setf stage (uiop:ensure-directory-pathname
+                            (sb-posix:mkdtemp
+                             (namestring (merge-pathnames ".pg-native-backup.XXXXXX" parent))))))
+             (setf channel
+                   (physical-libpq-connect helper
+                                           (make-physical-libpq-profile conninfo :mode :physical
+                                                                                 :fallback "pg_basebackup")
+                                           :on-spawn (lambda (spawned) (setf channel spawned))))
+             (physical-libpq-start-copy-out
+              channel (format nil "BASE_BACKUP_NATIVE (native_format '~a')" +physical-native-format+))
+             (let ((manifest (physical-backup-receive-bundle
+                              stage (lambda () (physical-backup-next-copy-frame channel)))))
+               (physical-backup-finish-copy channel)
+               (physical-libpq-close channel)
+               (setf channel nil)
+               (wal-atomic-write-bytes (merge-pathnames "postgresql.conf" stage)
+                                       (make-array 0 :element-type '(unsigned-byte 8)))
+               (fsync-directory stage)
+               (physical-backup-destination target)
+               (sb-posix:rename (string-right-trim "/" (namestring stage))
+                                (string-right-trim "/" (namestring target)))
+               (fsync-directory parent)
+               (setf stage nil)
+               manifest))
+        (unwind-protect
+             (when channel (physical-libpq-close channel))
+          (when stage (uiop:delete-directory-tree stage :validate t :if-does-not-exist :ignore)))))))
+
+(defun native-basebackup-options (arguments)
+  (let ((directory nil) (conninfo "") (method "stream"))
+    (labels ((value ()
+               (or (pop arguments) (error "native base backup option requires a value")))
+             (long-value (argument prefix)
+               (subseq argument (length prefix))))
+      (loop while arguments for argument = (pop arguments)
+            do (cond
+                 ((member argument '("-D" "--pgdata") :test #'equal)
+                  (setf directory (value)))
+                 ((uiop:string-prefix-p "--pgdata=" argument)
+                  (setf directory (long-value argument "--pgdata=")))
+                 ((member argument '("-d" "--dbname") :test #'equal)
+                  (setf conninfo (value)))
+                 ((uiop:string-prefix-p "--dbname=" argument)
+                  (setf conninfo (long-value argument "--dbname=")))
+                 ((member argument '("-X" "--wal-method" "--xlog-method") :test #'equal)
+                  (setf method (value)))
+                 ((uiop:string-prefix-p "--wal-method=" argument)
+                  (setf method (long-value argument "--wal-method=")))
+                 ((member argument '("-w" "--no-password" "-v" "--verbose") :test #'equal) nil)
+                 (t (error "unsupported native base backup option")))))
+    (unless (and directory (plusp (length directory)) (equal method "stream"))
+      (error "native base backup requires --pgdata and WAL method stream"))
+    (values directory conninfo)))
+
+(defun native-basebackup-main (arguments)
+  (handler-case
+      (multiple-value-bind (directory conninfo) (native-basebackup-options arguments)
+        (physical-base-backup-remote directory conninfo)
+        0)
+    (error (condition)
+      (format *error-output* "pg_basebackup: ~a~%" condition)
+      1)))

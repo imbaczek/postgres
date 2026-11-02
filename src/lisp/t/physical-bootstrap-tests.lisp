@@ -138,6 +138,34 @@
           (write-line "incomplete manifest" stream))
         (ok (intake-fails-p #'pg::physical-bootstrap-check-startup)))))
 
+(deftest native-basebackup-cli-accepts-patroni-arguments-and-rejects-unsupported-modes
+    (let ((long '("--pgdata=/tmp/clone" "-X" "stream" "--dbname=host=example dbname=postgres"))
+          (short '("-D" "/tmp/clone" "-d" "postgres://example/postgres" "--no-password")))
+      (ok (equal '("/tmp/clone" "host=example dbname=postgres")
+                 (multiple-value-list (pg::native-basebackup-options long))))
+      (ok (equal '("/tmp/clone" "postgres://example/postgres")
+                 (multiple-value-list (pg::native-basebackup-options short)))))
+  (dolist (arguments '(nil ("-D") ("-D" "/tmp/clone" "-X" "fetch")
+                       ("--pgdata=/tmp/clone" "--format=tar") ("--dbname=secret")))
+    (ok (intake-fails-p (lambda () (pg::native-basebackup-options arguments))))))
+
+(deftest physical-backup-destination-allows-only-absent-or-empty-directories
+    (with-physical-store-directory (root)
+      (let* ((target (merge-pathnames "target/" root))
+             (link (merge-pathnames "link" root)))
+        (ok (equal target (pg::physical-backup-destination target)))
+        (ensure-directories-exist (merge-pathnames "unused" target))
+        (ok (equal target (pg::physical-backup-destination target)))
+        (with-open-file (out (merge-pathnames ".witness" target) :direction :output)
+          (write-line "preserve" out))
+        (ok (intake-fails-p (lambda () (pg::physical-backup-destination target))))
+        (delete-file (merge-pathnames ".witness" target))
+        (sb-posix:symlink "/missing-native-backup-target" (namestring link))
+        (ok (intake-fails-p (lambda () (pg::physical-backup-destination link))))
+        (sb-posix:unlink (namestring link))
+        (sb-posix:symlink (namestring target) (namestring link))
+        (ok (intake-fails-p (lambda () (pg::physical-backup-destination link)))))))
+
 (deftest physical-standard-recovery-signals-cannot-create-native-base-provenance
     (dolist (name '("standby.signal" "recovery.signal"))
       (with-physical-store-directory (root)
