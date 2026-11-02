@@ -47,8 +47,13 @@ static PGconn *connection;
 static PGresult *result;
 static unsigned char *request_body;
 static char *copy_data;
-/* COPY IN follows the server's CopyDone and still permits final feedback. */
+/*
+ * COPY BOTH carries WAL and feedback; after server CopyDone, COPY IN still
+ * permits final feedback. COPY OUT carries only server data and returns to
+ * command mode after its completion result is drained and idle is verified.
+ */
 static enum { COMMAND_MODE, COPY_BOTH_MODE, COPY_IN_MODE, COPY_OUT_MODE } phase;
+/* Bound selected by the query for the eventual COPY OUT command result. */
 static uint32_t copy_result_maximum;
 
 static void
@@ -665,7 +670,9 @@ receive_copy(const unsigned char *body, uint32_t size)
 		}
 		if (count == -2)
 			fail("08P01", "native COPY receive failed");
-		/* End of COPY can mean a source error, a completed stream, or COPY IN.
+		/* End of COPY can mean a source error, COPY OUT completion, or the
+		 * end of COPY BOTH. COPY OUT must yield one command result, no extra
+		 * results, and an idle connection before command mode is restored.
 		 * Only COPY IN sends 'F', leaving input open for final feedback; the
 		 * caller checks any timeline switch and fork proof. */
 		if (count == -1)

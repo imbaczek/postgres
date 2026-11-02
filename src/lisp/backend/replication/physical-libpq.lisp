@@ -549,6 +549,7 @@ cannot be established, so another child cannot silently exceed the limit."
   (values))
 
 (defun physical-libpq-check-copy-out-format (bytes)
+  "Require the binary, zero-column COPY OUT format used by backup streams."
   (unless (and (= 5 (length bytes)) (= 1 (aref bytes 0))
                (zerop (bytes-to-u32 bytes 1)))
     (pg-client-native-reject "native backup requires binary COPY OUT with no columns"))
@@ -770,6 +771,8 @@ supported. A failed open attempts to close the reserved channel."
             (physical-libpq-switch-result kind bytes))))))
 
 (defun physical-libpq-start-copy-out (channel query)
+  "Start QUERY as binary COPY OUT and return :COPY-OUT after format validation.
+The eventual command result is bounded to 4096 bytes and checked on receive."
   (with-physical-libpq-operation (channel)
     (let ((body (make-payload)))
       (payload-push-u32 body 4096)
@@ -780,6 +783,7 @@ supported. A failed open attempts to close the reserved channel."
         (physical-libpq-check-copy-out-format bytes)))))
 
 (defun physical-libpq-receive-frame (channel kinds wait-ms maximum reply-maximum)
+  "Request one COPY reply with bounded wait, payload, and overall reply sizes."
   (unless (and (typep wait-ms '(integer 0 10000))
                (typep maximum '(integer 1 131097)))
     (error "invalid libpq copy receive bound"))
@@ -794,6 +798,12 @@ supported. A failed open attempts to close the reserved channel."
   (physical-libpq-receive-frame channel '(#\D #\F #\I) wait-ms maximum maximum))
 
 (defun physical-libpq-receive-copy-out (channel tag &key (wait-ms 1000) (maximum +physical-libpq-copy-maximum+))
+  "Receive COPY OUT data, idle, or command completion as kind and bytes.
+D carries at most MAXIMUM bytes; I means no complete reply was available
+within WAIT-MS.
+C has no returned bytes and requires a command-only result matching TAG. The
+helper has drained the result and checked idle before the channel can be reused.
+COPY BOTH continues to use PHYSICAL-LIBPQ-RECEIVE and its own finish path."
   (with-physical-libpq-operation (channel)
     (multiple-value-bind (kind bytes)
         (physical-libpq-receive-frame channel '(#\D #\C #\I) wait-ms maximum (max maximum 4096))
