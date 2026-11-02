@@ -365,7 +365,8 @@ leave that registry intact."
 (declaim (ftype function physical-export-origin-publish-proof-under-lock))
 
 (defun physical-source-confirm-receipt (name owner lsn digest &optional origin-proof)
-  "Publish only a verified complete-record flush, durably before releasing WAL."
+  "Publish a verified complete-record flush before releasing WAL.
+Persist any origin proof first, so pin advancement cannot outrun its evidence."
   (with-wal-publication-fence (begin-publication)
     (let ((pin (physical-source-validate-receipt-under-lock name owner lsn digest)))
       (physical-export-origin-publish-proof-under-lock

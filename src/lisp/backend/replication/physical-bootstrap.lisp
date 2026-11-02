@@ -463,6 +463,8 @@ quiescence end. It is not the final online base-backup protocol."
 ;; the image while quiescent, then drop that slot even on failure.  The local
 ;; bootstrap path's private pin is separate and is not retired by this export.
 (defun physical-export-base-backup (directory name)
+  "Produce and verify an export under a temporary WAL slot and origin reservation.
+The slot is dropped on every exit; a verified origin remains after cancellation."
   (unless *backend* (error "native backup export requires a backend owner"))
   (when (plusp *live-operation-depth*)
     (error "native backup export must start outside a live operation"))

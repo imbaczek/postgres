@@ -1,6 +1,12 @@
+;;;; Source-owned receipts for verified native exports and proven WAL history.
+;;;; Receipts record evidence independently of WAL retention and clone provenance.
 (in-package #:pg)
 
 (defstruct physical-export-origin
+  "Source-owned evidence for one verified export and its proven WAL prefix.
+SYSTEM-ID, TIMELINE, base B and manifest digest M identify the image. PROVEN-LSN
+P and PREFIX-DIGEST H commit to source history through P. This receipt neither
+retains WAL nor becomes clone provenance; further checks are required to adopt."
   system-id timeline base manifest-digest proven-lsn prefix-digest)
 
 (defconstant +physical-export-origin-maximum-bytes+ 1024)
@@ -55,9 +61,12 @@
             (error "noncanonical or corrupt physical export origin"))
           origin)))))
 
-(defstruct physical-export-origin-entry origin)
+(defstruct physical-export-origin-entry
+  "Registry entry whose object identity guards the origin generation during proof."
+  origin)
 
 (defstruct physical-export-origin-reservation
+  "Capacity and source ownership held by one export until cleanup."
   backend thread system-id timeline namespace incarnation identity (state :reserved))
 
 (defvar *physical-export-origins* (make-hash-table :test #'equal))
@@ -84,6 +93,7 @@
    (physical-export-origin-directory)))
 
 (defun physical-export-origin-save (origin)
+  "Durably write ORIGIN while the caller owns WAL exclusion and publication fence."
   (unless (sb-thread:holding-mutex-p *wal-lock*)
     (error "export origin publication requires WAL exclusion"))
   (physical-export-origin-test-point :before-save origin)
@@ -101,6 +111,8 @@
     origin))
 
 (defun physical-export-origin-load ()
+  "Validate all durable receipts before replacing the registry at cold startup.
+Loading receipts does not reconstruct old WAL or establish retention."
   (with-wal-critical
     (unless (and (zerop (hash-table-count *physical-export-origin-reservations*))
                  (zerop (hash-table-count *physical-source-senders*)))
@@ -125,6 +137,10 @@
   (values))
 
 (defun physical-export-origin-reserve ()
+  "Reserve finite origin capacity before producing an export; the default is 1024.
+The token belongs to this backend, thread and source incarnation; cleanup releases
+it on every exit. Pending reservations free capacity when released. Forgetting
+unused stored origins restores capacity occupied by completed receipts."
   (with-live-operation
     (prevent-recovery-primary-operation "native export origin reservation")
     (with-wal-critical
@@ -158,6 +174,8 @@
   token)
 
 (defun physical-export-origin-note-image (token manifest digest)
+  "Capture the source-produced base endpoint B and manifest digest M under quiescence.
+The reservation binds these values to this exact export and source incarnation."
   (unless (and (eq *live-operation-quiescence-owner-thread* sb-thread:*current-thread*)
                *live-operation-quiescence-owner* (not *live-operation-admission-open*))
     (error "export origin capture requires owned quiescence"))
@@ -241,6 +259,9 @@
   manifest)
 
 (defun physical-export-origin-record-backup (directory manifest slot token)
+  "Verify the immutable base and publish its source-owned origin before export.
+Initially P is B and H is the empty-prefix digest. A completed verified receipt
+may remain if the client later cancels; this is intentional and does not retain WAL."
   (multiple-value-bind (actual digest) (recovery-read-manifest directory)
     (unless (and (equal manifest actual)
                  (equal (list (getf actual :system-id) (getf actual :timeline)
@@ -279,6 +300,8 @@
                            (equal identity (physical-export-origin-pin-identity (physical-sender-pin owner)))))))
 
 (defun physical-export-origin-forget (identity)
+  "Durably forget an unused origin on the primary, refusing active owners.
+Origin receipts are evidence, not retention pins or clone provenance."
   (with-live-operation
     (prevent-recovery-primary-operation "native export origin removal")
     (with-wal-publication-fence (begin-publication)
@@ -296,15 +319,20 @@
   (values))
 
 (defun physical-export-origin-list ()
+  "Return copies of the source's origin receipts for private control inspection."
   (sb-thread:with-mutex (*wal-lock*)
     (sort (loop for entry being the hash-values of *physical-export-origins*
                 collect (copy-physical-export-origin (physical-export-origin-entry-origin entry)))
           #'string< :key (lambda (origin) (file-namestring (physical-export-origin-path origin))))))
 
 (defstruct physical-export-origin-proof
+  "Captured sender and source context for checking and publishing a WAL proof."
   entry origin owner pin backend thread namespace incarnation requested verified-end digest)
 
 (defun physical-export-origin-start-proof (name owner cursor requested)
+  "Capture an eligible origin for proof from retained source WAL.
+Progress is possible only on the original timeline and when CURSOR is at or
+before P. Origin evidence alone does not complete adoption of a receiver."
   (unless (sb-thread:holding-mutex-p *wal-lock*)
     (error "export origin proof capture requires WAL exclusion"))
   (when (physical-sender-p owner)
@@ -324,6 +352,7 @@
          :digest (physical-export-origin-prefix-digest origin))))))
 
 (defun physical-export-origin-proof-record (proof cursor record raw)
+  "Extend H over consecutive genuine source records after P, rejecting gaps."
   (when proof
     (let ((start (physical-export-origin-proven-lsn (physical-export-origin-proof-origin proof)))
           (end (wal-record-end record)))
@@ -338,6 +367,9 @@
   (values))
 
 (defun physical-export-origin-publish-proof-under-lock (proof name owner endpoint begin-publication)
+  "Recheck ownership and durably publish proven P and H before pin advancement.
+Stale ownership or source context and incomplete proofs fail; conflicting
+commitments at the same endpoint are errors."
   (when proof
     (unless (sb-thread:holding-mutex-p *wal-lock*)
       (error "export origin proof publication requires WAL exclusion"))

@@ -137,6 +137,8 @@ Only explicit proof_kind retained_timeline selects the retained proof."
 ;; connection and attempt stage cleanup when this backend unwinds.  Startup
 ;; retries cleanup of abandoned stages in the current owned namespace.
 (defun start-native-physical-backup (stream command)
+  "Stage and stream a native backup, cleaning the stage on every exit.
+A verified origin may outlive a failed or cancelled stream for later inspection."
   (declare (ignore command))
   (with-live-operation
     (unless (and *backend* (eq :physical (backend-replication-mode *backend*))
@@ -508,7 +510,8 @@ Explicit follow START admission acquires a ready follow pin."
 
 (defun physical-source-prove-range (name owner cursor requested digest &optional progress)
   "Hash only a newly acknowledged suffix, rejecting an interior record cursor.
-The source reader bounds retained-timeline proof at the requested fork."
+The source reader bounds retained-timeline proof at the requested fork. An
+eligible origin proof also extends its digest over the same source records."
   (let ((origin-proof nil))
     (with-live-operation
       (sb-thread:with-mutex (*wal-lock*)
@@ -558,7 +561,7 @@ saves. The caller must fence interrupted publication before releasing WAL."
               (wal-replication-slot-restart-timeline slot) timeline)))))
 
 (defun physical-source-confirm-feedback (command owner received digest &optional origin-proof)
-  "Validate feedback under WAL, save public flush first, then confirm the pin.
+  "Validate feedback under WAL, persist origin proof, then publish flush and pin.
 An interrupted positive public publication poisons WAL under lock and requests
 shutdown after unlocking; the private pin remains retained."
   (with-wal-publication-fence (begin-publication)

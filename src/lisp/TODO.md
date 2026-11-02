@@ -1,5 +1,27 @@
 # Development TODO
 
+- [x] Preserve source-owned history commitments for verified remote exports.
+  A durable origin binds the original system, timeline, base and manifest to a
+  source-proved prefix. Confirmation saves that commitment before advancing the
+  private retention cursor. Origins retain no WAL and are excluded from clones;
+  completed receipts survive client cancellation. The bounded registry has private
+  list/forget operations. Progress currently requires the original timeline and a
+  retained cursor at or before the saved proof endpoint.
+  The milestone passed 1,464 physical, 903 unit and 201 wire tests, strict cold
+  compilation, native backup fault/capacity checks and six shutdown scenarios.
+  An independent multisegment oracle proved recycling, source restart and promotion.
+  Offline origin loading left source file contents unchanged. Evidence is
+  in `/home/imbaczek/proj/pg-ha-artifacts/export-origins/`.
+  This supplies historical evidence; it does not yet implement offline adoption.
+
+- [ ] Implement offline former-primary adoption using genuine source history
+  commitments and an independently validated descendant retained root. Require
+  stable PGDATA ownership and exact clean endpoint validation before constructing
+  a canonical recovery image. Journal installation before changing files; every
+  interrupted startup must resume the exact installation or refuse writer startup.
+  Then add native divergent rewind or explicit reseed fallback. Do not add
+  coordination, elections or DCS management in this backend work.
+
 - [x] Keep ready native physical senders through the primary shutdown checkpoint.
   Frozen stream capabilities drain to the validated flush target under a narrow
   shutdown and cleanup lane, then release all claims before clean state. An empty
