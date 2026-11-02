@@ -96,6 +96,7 @@ WAL control is stored as bounded hex; these checks do not reinspect disk."
     copy))
 
 (defun physical-adoption-attempt-auth-copy (entries)
+  "Check and copy the three ordered authentication commitments outside Mnew."
   (unless (and (listp entries) (= 3 (length entries)))
     (error "invalid adoption authentication commitments"))
   (loop for entry in entries

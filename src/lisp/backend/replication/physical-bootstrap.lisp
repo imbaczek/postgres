@@ -279,6 +279,8 @@ Validate the selected lineage before constructing the inventory."
     (sort (append files (physical-bootstrap-history-inventory *wal-insert-timeline*)) #'string<)))
 
 (defun physical-bootstrap-derived-wal-image ()
+  "Return derived control bytes and their decoded tuple when a retained reference exists.
+Remove only that superseded reference. Return NIL otherwise; do not change the source."
   (multiple-value-bind (checkpoint durable snapshot insertion checkpoint-timeline namespace metadata)
       (wal-read-control-fields)
     (let ((reference (getf metadata :retained-reference)))

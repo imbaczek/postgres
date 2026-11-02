@@ -126,6 +126,7 @@ The first WAL segment keeps its prefix; the final segment is bounded at E."
     (error "adoption stage directory changed during verification")))
 
 (defun physical-adoption-stage-check-base-facts (state verified control expected-digest)
+  "Check verified base and recovery control against the clean source endpoint."
   (unless (and (eql 3 (getf verified :version)) (eql 1 (getf verified :auth-policy-required))
                (eql 3 (getf control :control-version)) (zerop (getf control :phase))
                (= +db-startup+ (getf control :db-state))
@@ -192,6 +193,7 @@ target which cannot be retried as an empty stage."
                     :origin-proof (copy-tree proof)))))))))
 
 (defun call-with-physical-adoption-source (state function)
+  "Call FUNCTION with the stopped primary's inspected state bound as the source."
   (let* ((owner (physical-adoption-check-owner (getf state :owner)))
          (*pgdata* (physical-adoption-owner-directory owner))
          (*catalog* (getf state :catalog))

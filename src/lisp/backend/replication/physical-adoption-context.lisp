@@ -1,3 +1,10 @@
+;;; Fresh context checks for offline former-primary adoption.
+;;;
+;;; The record codec checks saved facts for structural consistency. This module
+;;; checks those facts against the stopped primary, its private stage and an
+;;; observed source connection. The caller owns the stopped primary and keeps
+;;; the stage immutable. These checks do not install an image or publish an attempt.
+
 (in-package #:pg)
 
 (defvar *physical-adoption-context-test-hook* nil)
@@ -7,6 +14,7 @@
     (funcall *physical-adoption-context-test-hook* point path)))
 
 (defun physical-adoption-attempt-local-facts (state)
+  "Capture the owner, clean control and artifact commitments saved by an attempt."
   (let* ((owner (physical-adoption-check-owner (getf state :owner)))
          (capture (getf state :capture)))
     (physical-adoption-attempt-local-copy
@@ -26,6 +34,7 @@
                              capture))))))
 
 (defun physical-adoption-attempt-stage-directory (state directory &optional expected)
+  "Check the canonical private stage directory and, if given, its saved identity."
   (let* ((requested (uiop:ensure-directory-pathname directory))
          (identity (physical-adoption-stage-directory-identity requested))
          (target (uiop:ensure-directory-pathname (truename requested)))
@@ -45,6 +54,7 @@
     (values target identity)))
 
 (defun physical-adoption-attempt-source-snapshot (state)
+  "Capture source files, expected base inventory and authentication commitments."
   (call-with-physical-adoption-source
    state
    (lambda ()
@@ -75,6 +85,7 @@
    (physical-adoption-attempt-local-facts state)))
 
 (defun physical-adoption-attempt-check-stage-root (target source)
+  "Reject missing, extra or wrongly typed stage root entries."
   (let* ((expected
            (remove-duplicates
             (append '("base" "physical-backup.manifest" "physical-recovery.control" "recovery.required")
@@ -101,6 +112,7 @@
 
 (defun physical-adoption-attempt-check-image (state proof directory expected-digest
                                               &key expected snapshot)
+  "Verify the complete stage once, with source, authentication and identity rechecks."
   (multiple-value-bind (target identity)
       (physical-adoption-attempt-stage-directory state directory expected)
     (let* ((source (or snapshot (physical-adoption-attempt-source-snapshot state)))
@@ -136,6 +148,8 @@
               (physical-adoption-attempt-image-facts state target identity verified auth)))))
 
 (defun physical-adoption-attempt-validate-context (owner record)
+  "Revalidate local attempt and stage facts without observing the remote source.
+The caller must keep the offline private stage immutable during validation."
   (let* ((record (physical-adoption-attempt-copy record))
          (owner (physical-adoption-attempt-check-owner owner record))
          (state (physical-adoption-inspect-primary owner)))
@@ -161,6 +175,7 @@
       (values state base overlap))))
 
 (defun physical-adoption-attempt-accepted-source (client profile)
+  "Save the actual accepted connection route with the supplied profile."
   (physical-libpq-require-owner client)
   (when (or (physical-libpq-channel-closed client) (physical-libpq-channel-stopped client))
     (error "adoption source channel is closed or stopped"))
@@ -194,6 +209,7 @@
     (values timeline flush)))
 
 (defun physical-adoption-attempt-observe-source (client source state)
+  "Read identity, history and identity again to reject a promotion race."
   (physical-adoption-attempt-check-client client source)
   (multiple-value-bind (timeline flush) (physical-adoption-attempt-source-identity client state)
     (let ((history (bytes->string (pg-client-native-history client timeline))))
@@ -204,6 +220,9 @@
       (values timeline history))))
 
 (defun physical-adoption-attempt-create (state image client profile)
+  "Build a checked attempt from the stopped primary, private stage and live source.
+The caller must keep the offline private stage immutable during construction.
+This does not publish the record or send PREPARE or PROVE."
   (let* ((owner (physical-adoption-check-owner (getf state :owner)))
          (fresh (physical-adoption-inspect-primary owner))
          (local (physical-adoption-attempt-local-facts fresh))

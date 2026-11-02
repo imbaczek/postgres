@@ -59,14 +59,39 @@ no PREPARE or installation authority. The startup presence fence applies to ever
 phase. CRC and FNV are integrity checks under cooperative ownership, not
 authentication. The record contains private credentials; hex is not encryption
 and payloads must not be logged.
-Full context validation, accepted route construction, network PREPARE/PROVE and
-ABORT retirement remain open.
+Network PREPARE/PROVE and ABORT retirement remain open.
 
 Validation passed 1,509 physical, 903 unit and 201 wire tests, ten new Rove tests
 and strict cold compilation. The property passed 100 trials at seed 76, digest
 `fnv1a64-v1:6f8d577637fba897`; no Function Spec is registered and rejection counts
 and input coverage were not measured. Evidence is in
 `/home/imbaczek/proj/pg-ha-artifacts/adoption-attempt-record/evidence.json`.
+
+### Adoption context and attempt construction
+
+The attempt factory now checks the stopped primary and its canonical private stage,
+observes a descendant source, and constructs a preparing record. It saves the actual
+accepted connection route and three ordered authentication file commitments outside
+Mnew. The stage check requires exactly the planned root entries and their expected
+file types. One full base verification is surrounded by source, authentication,
+proof and stage identity rechecks. The caller must keep the offline private stage
+immutable during construction and validation.
+
+Source observation reads IDENTIFY, history, and IDENTIFY again, rejecting a timeline
+change or backward position during the observation. The local context validator
+rechecks the saved local and stage facts but does not observe the remote source. A
+future orchestrator must reobserve the saved source before side effects and compare
+actual PREPARE and PROVE history before the codec strips and reattaches history.
+The factory does not publish the attempt, orchestrate PREPARE, PROVE or ABORT,
+install or start an image, or provide coordination.
+
+Validation passed 1,522 physical, 903 unit and 201 wire tests, 13 new context Rove
+tests, 14 focused tests including the rooted stage case, and strict cold compilation.
+The authentication freeze property passed 100 trials at seed 77, digest
+`fnv1a64-v1:2bedea2c9cd70a68`; no Function Spec is registered, and rejection counts
+and input coverage were not measured. Native full export-origin and final recheck
+passed. Evidence is in
+`/home/imbaczek/proj/pg-ha-artifacts/adoption-context/evidence.json`.
 
 ### Adoption attempt startup fence
 
