@@ -77,5 +77,11 @@ if [ -f "$TMP/expected-target-sigkill" ]; then
 else
     signal_owned "$TARGET" "$TMP/copy" INT 20; wait "$TARGET"; TARGET=
 fi
-signal_owned "$SOURCE" "$TMP/source" INT 20; wait "$SOURCE"; SOURCE=
+if [ -f "$TMP/expected-source-shutdown" ]; then
+    [ ! -L "$TMP/expected-source-shutdown" ]
+    [ "$(cat "$TMP/expected-source-shutdown")" = "$SOURCE" ]
+    wait "$SOURCE"; SOURCE=
+else
+    signal_owned "$SOURCE" "$TMP/source" INT 20; wait "$SOURCE"; SOURCE=
+fi
 echo 'live-operation-parking: driver assertions and owned peer cleanup PASS'
