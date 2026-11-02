@@ -1,5 +1,19 @@
 # Development TODO
 
+- [x] Encode and privately publish bounded adoption attempt records under the
+  active offline owner. The CRC-protected record preserves clean control facts,
+  one bounded source history and monotone phase/proof state. Publication syncs
+  and reads back an owned copy. These are structural checks, not fresh source or
+  stage validation or authority to prepare or install. The record contains private
+  credentials; hex encoding does not encrypt them.
+  Validation passed 1,509 physical, 903 unit and 201 wire tests, ten new Rove
+  tests and strict cold compilation. The property passed 100 trials at seed 76,
+  digest `fnv1a64-v1:6f8d577637fba897`; it has no Function Spec and rejection
+  counts and input coverage were not measured. Evidence is in
+  `/home/imbaczek/proj/pg-ha-artifacts/adoption-attempt-record/evidence.json`.
+  Full context validation, route construction, network PREPARE/PROVE and ABORT
+  retirement remain open.
+
 - [x] Fence startup on any `physical-adoption.attempt` directory entry before
   backup-stage cleanup or authentication completion. Only ENOENT permits startup;
   the check does not parse or follow the entry. A future attempt writer must use
@@ -7,7 +21,7 @@
   Rove tests, native corrupt-file, dangling-symlink and directory fence cases,
   normal restart, and strict cold compilation passed. Evidence is in
   `/home/imbaczek/proj/pg-ha-artifacts/adoption-attempt-fence/`.
-  A bounded attempt codec, producer, network retry and installation remain open.
+  Full context validation, network retry and installation remain open.
 
 - [x] Stage a verified canonical E/Mnew image from a cooperatively owned, clean
   former primary. The guarded, private target is verified with the ordinary base

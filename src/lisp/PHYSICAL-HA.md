@@ -40,6 +40,34 @@ tests, strict cold compilation and the existing shutdown test. Logs are in
 
 ## Verified starting points
 
+### Private adoption attempt record
+
+A bounded CRC-protected record saves clean local control facts, including
+actual and allocator next XID, raw small WAL control in hex and seven ordered
+absent-or-length/FNV capture commitments. One source history of at most 16 MiB
+is shared by the detached anchor and proof and reattached for existing validators;
+the typed source proof must match the saved local H_E. Preparing may become proved
+or aborting; proved may become aborting; aborting may become aborted. Repeating
+an identical state is idempotent. Saved operation fields and proof cannot be rebound.
+Cancellation phases are encoding only; network ABORT is not implemented.
+
+The active offline owner publishes owned copies to a private single-link 0600
+file in its own PGDATA, with file sync, rename, directory sync and readback.
+The reader and publisher establish structural coherence only: they do not re-read
+current source, control or stage files or re-request the remote proof, and grant
+no PREPARE or installation authority. The startup presence fence applies to every
+phase. CRC and FNV are integrity checks under cooperative ownership, not
+authentication. The record contains private credentials; hex is not encryption
+and payloads must not be logged.
+Full context validation, accepted route construction, network PREPARE/PROVE and
+ABORT retirement remain open.
+
+Validation passed 1,509 physical, 903 unit and 201 wire tests, ten new Rove tests
+and strict cold compilation. The property passed 100 trials at seed 76, digest
+`fnv1a64-v1:6f8d577637fba897`; no Function Spec is registered and rejection counts
+and input coverage were not measured. Evidence is in
+`/home/imbaczek/proj/pg-ha-artifacts/adoption-attempt-record/evidence.json`.
+
 ### Adoption attempt startup fence
 
 After taking the local PGDATA flock and creating its PID file, startup checks the
@@ -49,8 +77,7 @@ dangling symlink or directory, and other inspection errors refuse startup withou
 parsing or following it. Failed ownership attempts to remove its owned PID and
 closes the lock even if PID cleanup fails. Any future attempt publisher must hold
 the same cooperative PGDATA lock to exclude the check. This fence supplies no
-attempt producer, retry, cleanup or
-installation authority; the bounded attempt codec and network retry remain open.
+network retry, cleanup or installation authority.
 
 Ten focused PID tests, including three new Rove tests, and strict cold compilation
 passed. Native tests covered corrupt, dangling-symlink and directory entries and

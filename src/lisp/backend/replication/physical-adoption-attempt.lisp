@@ -1,3 +1,5 @@
+;;;; Private, structurally checked offline adoption attempt records.
+;;;; Publication records intent; it does not validate current context or authorize adoption.
 (in-package #:pg)
 
 (defconstant +physical-adoption-attempt-maximum-bytes+ +physical-follow-config-maximum-bytes+)
@@ -37,6 +39,8 @@
        (equal value (namestring (uiop:ensure-directory-pathname value)))))
 
 (defun physical-adoption-attempt-capture-copy (capture wal)
+  "Copy seven ordered control capture commitments, preserving absent entries.
+Each present entry holds length and FNV; the first must match raw WAL control."
   (unless (and (listp capture) (= 7 (length capture)) (null (second capture)))
     (error "invalid adoption control capture"))
   (let ((copy
@@ -56,6 +60,8 @@
     copy))
 
 (defun physical-adoption-attempt-local-copy (value)
+  "Check saved clean control facts, keeping actual next XID distinct from allocation.
+WAL control is stored as bounded hex; these checks do not reinspect disk."
   (physical-follow-check-plist value *physical-adoption-attempt-local-keys*)
   (unless (and (physical-adoption-attempt-directory-p (getf value :directory))
                (physical-adoption-attempt-u64-fields-p
@@ -148,6 +154,8 @@
           (list :history-text (copy-seq history))))
 
 (defun physical-adoption-attempt-proof-copy (anchor proof request origin stage history)
+  "Reattach shared history to detached anchor and proof for existing validators.
+Check typed proof fields and equality with the saved local history digest."
   (let* ((full-anchor (physical-follow-anchor-copy
                        (physical-adoption-attempt-with-history anchor *physical-follow-anchor-keys* history)))
          (full-proof (physical-adoption-attempt-with-history
@@ -177,6 +185,9 @@
                                                    (remove :history-text (mapcar #'second *physical-origin-proof-result-fields*))))))
 
 (defun physical-adoption-attempt-copy (record)
+  "Validate and copy a structurally coherent attempt in canonical key order.
+The source history is stored once, bounded to 16 MiB. This does not reinspect
+source, stage or control files or authorize PREPARE or installation."
   (physical-follow-check-plist record *physical-adoption-attempt-keys*)
   (unless (and (eql 1 (getf record :version))
                (member (getf record :phase) '(:preparing :proved :aborting :aborted)))
@@ -203,6 +214,8 @@
           :anchor anchor :proof proof)))
 
 (defun physical-adoption-attempt-image (record)
+  "Encode a checked attempt as a bounded CRC-protected literal.
+The record contains private credentials; hex is not encryption. Do not log it."
   (let* ((checked (physical-adoption-attempt-copy record))
          (text (physical-bootstrap-manifest-text checked))
          (bytes (string->bytes text))
@@ -212,6 +225,9 @@
     image))
 
 (defun physical-adoption-attempt-decode (bytes)
+  "Decode a bounded CRC envelope and safe literal into a checked owned copy.
+CRC and FNV detect inconsistencies under cooperative ownership; they do not
+authenticate the record or establish fresh source or stage facts."
   (unless (<= (length bytes) +physical-adoption-attempt-maximum-bytes+)
     (error "adoption attempt exceeds its private record bound"))
   (let* ((text (bytes->string bytes))
@@ -227,6 +243,9 @@
       (physical-adoption-attempt-copy (recovery-parse-manifest-text body)))))
 
 (defun physical-adoption-attempt-check-transition (previous candidate)
+  "Allow idempotent phases and forward transitions without rebinding saved facts.
+Once saved, anchor and proof cannot change; cancellation phases encode state
+only and do not perform network ABORT."
   (let* ((previous (physical-adoption-attempt-copy previous))
          (candidate (physical-adoption-attempt-copy candidate))
          (old (getf previous :phase))
@@ -257,6 +276,8 @@
   owner)
 
 (defun physical-adoption-attempt-read (owner)
+  "Read a private single-link 0600 attempt belonging to the active offline owner.
+Validation establishes structural coherence, not current external facts."
   (physical-adoption-check-owner owner)
   (let* ((path (physical-adoption-attempt-path (physical-adoption-owner-directory owner)))
          (stat (sb-posix:lstat (namestring path))))
@@ -271,6 +292,9 @@
       record)))
 
 (defun physical-adoption-attempt-publish (owner candidate &key previous)
+  "Publish owned copies under the active offline owner in its PGDATA.
+Check the previous record and transition, then fsync, rename, sync the directory
+and read back. This does not revalidate source or stage or grant operation authority."
   (let* ((candidate (physical-adoption-attempt-copy candidate))
          (previous (when previous (physical-adoption-attempt-copy previous)))
          (owner (physical-adoption-attempt-check-owner owner candidate))
