@@ -209,8 +209,8 @@
     (physical-adoption-check-no-install root)
     t))
 
-(defun physical-adoption-install-allocate-journal (workspace)
-  (let* ((path (merge-pathnames "journal.pending" workspace))
+(defun physical-adoption-allocate-private (directory name)
+  (let* ((path (physical-adoption-install-entry-path directory name))
          (fd (sb-posix:open (namestring path)
                             (logior sb-posix:o-rdwr sb-posix:o-creat sb-posix:o-excl
                                     sb-posix:o-nofollow +postmaster-o-cloexec+) #o600)))
@@ -221,6 +221,9 @@
            (let ((stat (sb-posix:fstat fd)))
              (list :device (sb-posix:stat-dev stat) :inode (sb-posix:stat-ino stat))))
       (sb-posix:close fd))))
+
+(defun physical-adoption-install-allocate-journal (workspace)
+  (physical-adoption-allocate-private workspace "journal.pending"))
 
 (defun physical-adoption-install-prepare (owner directory &key client)
   (let* ((root (physical-adoption-owner-directory (physical-adoption-check-owner owner)))
