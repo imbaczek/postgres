@@ -367,7 +367,9 @@ are killed abruptly."
                         "terminating connection due to immediate shutdown command"
                         "WARNING"))))
       (admin-log "database system is shut down")))
-  (sb-ext:exit :code 0))
+  ;; A backend may be unwinding behind MAIN's shutdown quiescence.  Do not
+  ;; wait for its Lisp cleanup: the OS releases storage ownership on exit.
+  (sb-ext:exit :code 0 :timeout 0))
 
 (defun act-on-shutdown (mode)
   (when (or (= mode +smart-shutdown+) (= mode +fast-shutdown+))
