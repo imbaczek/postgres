@@ -350,25 +350,30 @@ The new base receives its own archive; the old primary archive is not copied."
 
 (declaim (ftype function physical-recovery-check-checkpoint-resources))
 
+(defun physical-bootstrap-check-export-slot-under-wal-lock (slot name checkpoint-start)
+  (unless (sb-thread:holding-mutex-p *wal-lock*)
+    (error "native backup export validation requires WAL exclusion"))
+  (wal-check-healthy)
+  (unless (and (not (recovery-in-progress-p))
+               (eq slot (gethash name *wal-replication-slots*))
+               (physical-slot-state-valid-p slot)
+               (equal name (wal-replication-slot-name slot))
+               (physical-slot-owned-by-backend-p slot *backend*)
+               (eq *backend* (wal-replication-slot-active-owner slot))
+               (eq *backend* (wal-replication-slot-active-owner-backend slot))
+               (eq :reserved (wal-replication-slot-wal-status slot))
+               (= (catalog-system-identifier) (wal-replication-slot-system-id slot))
+               (eql *wal-insert-timeline* (wal-replication-slot-restart-timeline slot))
+               (typep (wal-replication-slot-restart-lsn slot) '(integer 1 18446744073709551615))
+               (<= (wal-replication-slot-restart-lsn slot) checkpoint-start *wal-durable-lsn*))
+    (wal-invalid-input "native backup export lost its owned WAL reservation"))
+  slot)
+
 (defun physical-bootstrap-check-export-slot (slot name checkpoint-start)
   (unless (eq *live-operation-quiescence-owner-thread* sb-thread:*current-thread*)
     (error "physical export validation requires operation quiescence ownership"))
   (sb-thread:with-mutex (*wal-lock*)
-    (wal-check-healthy)
-    (unless (and (not (recovery-in-progress-p))
-                 (eq slot (gethash name *wal-replication-slots*))
-                 (physical-slot-state-valid-p slot)
-                 (equal name (wal-replication-slot-name slot))
-                 (physical-slot-owned-by-backend-p slot *backend*)
-                 (eq *backend* (wal-replication-slot-active-owner slot))
-                 (eq *backend* (wal-replication-slot-active-owner-backend slot))
-                 (eq :reserved (wal-replication-slot-wal-status slot))
-                 (= (catalog-system-identifier) (wal-replication-slot-system-id slot))
-                 (eql *wal-insert-timeline* (wal-replication-slot-restart-timeline slot))
-                 (typep (wal-replication-slot-restart-lsn slot) '(integer 1 18446744073709551615))
-                 (<= (wal-replication-slot-restart-lsn slot) checkpoint-start *wal-durable-lsn*))
-      (error "native backup export lost its owned WAL reservation")))
-  slot)
+    (physical-bootstrap-check-export-slot-under-wal-lock slot name checkpoint-start)))
 
 (defun physical-bootstrap-copy-under-quiescence (target pin-name &key export-slot)
   "Checkpoint and capture one complete native image while mutation admission is closed.
@@ -449,6 +454,11 @@ quiescence end. It is not the final online base-backup protocol."
          (physical-bootstrap-copy-under-quiescence
           (physical-bootstrap-target directory) pin-name))))))
 
+(declaim (ftype function call-with-physical-export-origin-reservation
+                physical-export-origin-note-image physical-export-origin-record-backup))
+
+(declaim (ftype function physical-export-origin-capture-backup))
+
 ;; Reserve a temporary export slot before quiescing mutations.  Copy and sync
 ;; the image while quiescent, then drop that slot even on failure.  The local
 ;; bootstrap path's private pin is separate and is not retired by this export.
@@ -458,26 +468,34 @@ quiescence end. It is not the final online base-backup protocol."
     (error "native backup export must start outside a live operation"))
   (unless (wal-valid-replication-slot-name-p name)
     (error "invalid native backup export slot name"))
-  (call-with-invalidated-slot-cleanup
-   (lambda ()
-     (sb-thread:with-mutex (*reload-run-lock*)
-       (let ((target (with-live-operation
-                       (prevent-recovery-primary-operation "native backup export")
-                       (when *swank-listener-enabled-p*
-                         (error "native backup export requires Swank to be off"))
-                       (physical-bootstrap-target directory))))
-         (sb-sys:without-interrupts
-           (let ((slot nil))
-             (unwind-protect
-                  (progn
-                    (setf slot (with-live-operation
-                                 (wal-create-physical-replication-slot
-                                  name :immediately-reserve t :temporary t)))
-                    (sb-sys:with-local-interrupts
-                      (with-live-operation-quiescence
-                        (prevent-recovery-primary-operation "native backup export")
-                        (physical-bootstrap-copy-under-quiescence target name :export-slot slot))))
-               (when slot (wal-drop-replication-slot name slot))))))))))
+  (call-with-physical-export-origin-reservation
+   (lambda (origin-reservation)
+     (call-with-invalidated-slot-cleanup
+      (lambda ()
+        (sb-thread:with-mutex (*reload-run-lock*)
+          (let ((target (with-live-operation
+                          (prevent-recovery-primary-operation "native backup export")
+                          (when *swank-listener-enabled-p*
+                            (error "native backup export requires Swank to be off"))
+                          (physical-bootstrap-target directory))))
+            (sb-sys:without-interrupts
+              (let ((slot nil))
+                (unwind-protect
+                     (progn
+                       (setf slot (with-live-operation
+                                    (wal-create-physical-replication-slot
+                                     name :immediately-reserve t :temporary t)))
+                       (sb-sys:with-local-interrupts
+                         (let ((manifest
+                                 (with-live-operation-quiescence
+                                   (prevent-recovery-primary-operation "native backup export")
+                                   (physical-export-origin-capture-backup
+                                    target (physical-bootstrap-copy-under-quiescence
+                                            target name :export-slot slot)
+                                    origin-reservation))))
+                           (physical-export-origin-record-backup target manifest slot origin-reservation)
+                           manifest)))
+                  (when slot (wal-drop-replication-slot name slot))))))))))))
 
 (defun physical-backup-bundle-path-p (name timeline)
   (or (member name '("physical-backup.manifest" "recovery.required" "physical-recovery.control"

@@ -142,6 +142,7 @@
                    (:file "../replication/physical-row-replay")
                    (:file "../replication/physical-prefix")
                    (:file "../replication/physical-follow-pin")
+                   (:file "../replication/physical-export-origin")
                    (:file "../replication/physical-follow-anchor")
                    (:file "../replication/physical-retained-extent")
                    (:file "../replication/physical-retained-overlap")

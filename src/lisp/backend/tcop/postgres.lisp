@@ -966,6 +966,7 @@ Then check the cached handles and workers under startup exclusion."
         (if (recovery-in-progress-p)
             (physical-recovery-open-storage)
             (initialize-primary-storage)))
+      (physical-export-origin-load)
       (physical-follow-prepare-managed-startup)
       (if (recovery-in-progress-p)
           (physical-recovery-check-resource-readiness)

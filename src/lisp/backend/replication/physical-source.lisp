@@ -362,10 +362,16 @@ leave that registry intact."
       (physical-source-pin-test-point :after-publish pin)
       pin)))
 
-(defun physical-source-confirm-receipt (name owner lsn digest)
+(declaim (ftype function physical-export-origin-publish-proof-under-lock))
+
+(defun physical-source-confirm-receipt (name owner lsn digest &optional origin-proof)
   "Publish only a verified complete-record flush, durably before releasing WAL."
-  (with-wal-critical
-    (physical-source-confirm-receipt-under-lock name owner lsn digest)))
+  (with-wal-publication-fence (begin-publication)
+    (let ((pin (physical-source-validate-receipt-under-lock name owner lsn digest)))
+      (physical-export-origin-publish-proof-under-lock
+       origin-proof name owner lsn #'begin-publication)
+      (unless (eql lsn (physical-source-pin-confirmed-lsn pin)) (begin-publication))
+      (physical-source-confirm-receipt-under-lock name owner lsn digest))))
 
 (defun physical-source-invalidate-lagging-pins-under-wal-lock (limit)
   "Persist lagging private pin loss before checkpoint removes required WAL.

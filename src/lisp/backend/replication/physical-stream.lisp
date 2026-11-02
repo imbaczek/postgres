@@ -509,31 +509,34 @@ Explicit follow START admission acquires a ready follow pin."
 (defun physical-source-prove-range (name owner cursor requested digest &optional progress)
   "Hash only a newly acknowledged suffix, rejecting an interior record cursor.
 The source reader bounds retained-timeline proof at the requested fork."
-  (with-live-operation
-    (sb-thread:with-mutex (*wal-lock*)
-      (let ((pin (physical-source-retained-sender-pin name owner)))
-        (unless (<= (or (physical-source-pin-confirmed-lsn pin)
-                        (physical-source-pin-consistent-lsn pin))
-                    cursor requested (physical-follow-pin-end-lsn pin))
-          (ereport "22023" "physical proof range is outside its retained sender")))))
-  (let ((last-heartbeat (get-internal-real-time))
-        (*physical-follow-source-read-cache* (or *physical-follow-source-read-cache* (list nil))))
-    (loop while (< cursor requested)
-          do (multiple-value-bind (record raw durable)
-                 (with-live-operation (physical-source-read-next name owner cursor))
-               (unless (and record (<= (wal-record-end record) requested))
-                 (ereport "22023" "physical receive acknowledgment is not a retained record end"))
-               (loop for offset from 0 below (length raw) by 65536
-                     do (setf digest
-                              (physical-store-update-digest
-                               digest (subseq raw offset (min (length raw) (+ offset 65536)))))
-                        (when (and progress
-                                   (> (- (get-internal-real-time) last-heartbeat)
-                                      (* 0.2 internal-time-units-per-second)))
-                          (funcall progress durable)
-                          (setf last-heartbeat (get-internal-real-time))))
-               (setf cursor (wal-record-end record)))))
-  digest)
+  (let ((origin-proof nil))
+    (with-live-operation
+      (sb-thread:with-mutex (*wal-lock*)
+        (let ((pin (physical-source-retained-sender-pin name owner)))
+          (unless (<= (or (physical-source-pin-confirmed-lsn pin)
+                          (physical-source-pin-consistent-lsn pin))
+                      cursor requested (physical-follow-pin-end-lsn pin))
+            (ereport "22023" "physical proof range is outside its retained sender")))
+        (setf origin-proof (physical-export-origin-start-proof name owner cursor requested))))
+    (let ((last-heartbeat (get-internal-real-time))
+          (*physical-follow-source-read-cache* (or *physical-follow-source-read-cache* (list nil))))
+      (loop while (< cursor requested)
+            do (multiple-value-bind (record raw durable)
+                   (with-live-operation (physical-source-read-next name owner cursor))
+                 (unless (and record (<= (wal-record-end record) requested))
+                   (ereport "22023" "physical receive acknowledgment is not a retained record end"))
+                 (loop for offset from 0 below (length raw) by 65536
+                       do (setf digest
+                                (physical-store-update-digest
+                                 digest (subseq raw offset (min (length raw) (+ offset 65536)))))
+                          (when (and progress
+                                     (> (- (get-internal-real-time) last-heartbeat)
+                                        (* 0.2 internal-time-units-per-second)))
+                            (funcall progress durable)
+                            (setf last-heartbeat (get-internal-real-time))))
+                 (physical-export-origin-proof-record origin-proof cursor record raw)
+                 (setf cursor (wal-record-end record)))))
+    (values digest origin-proof)))
 
 (defun physical-source-publish-public-flush-under-lock (owner lsn timeline)
   "Save positive public flush feedback with its prefix timeline under WAL.
@@ -554,37 +557,33 @@ saves. The caller must fence interrupted publication before releasing WAL."
         (setf (wal-replication-slot-restart-lsn slot) lsn
               (wal-replication-slot-restart-timeline slot) timeline)))))
 
-(defun physical-source-confirm-feedback (command owner received digest)
+(defun physical-source-confirm-feedback (command owner received digest &optional origin-proof)
   "Validate feedback under WAL, save public flush first, then confirm the pin.
 An interrupted positive public publication poisons WAL under lock and requests
 shutdown after unlocking; the private pin remains retained."
-  (let ((name (physical-stream-proof-pin command))
-        (started nil) (finished nil) (interrupted nil))
-    (unwind-protect
-         (with-wal-critical
-           (let* ((pin (physical-source-validate-receipt-under-lock name owner received digest))
-                  (public (when (physical-sender-p owner) (physical-sender-public-slot owner)))
-                  (timeline (when (and public (plusp received))
-                              (physical-slot-current-prefix-timeline received))))
-             (unless (<= (physical-source-pin-restart-lsn pin) received)
-               (wal-invalid-input "private source retention does not protect physical feedback"))
-             (unwind-protect
-                  (progn
-                    (when (and public (plusp received))
-                      (setf started t)
-                      (physical-source-publish-public-flush-under-lock owner received timeline))
-                    (prog1 (physical-source-confirm-receipt-under-lock name owner received digest)
-                      (setf finished t)))
-               (when (and started (not finished))
-                 (setf *wal-poisoned* t interrupted t)))))
-      (when interrupted (request-fast-shutdown)))))
+  (with-wal-publication-fence (begin-publication)
+    (let* ((name (physical-stream-proof-pin command))
+           (pin (physical-source-validate-receipt-under-lock name owner received digest))
+           (public (when (physical-sender-p owner) (physical-sender-public-slot owner)))
+           (timeline (when (and public (plusp received))
+                       (physical-slot-current-prefix-timeline received))))
+      (unless (<= (physical-source-pin-restart-lsn pin) received)
+        (wal-invalid-input "private source retention does not protect physical feedback"))
+      (physical-export-origin-publish-proof-under-lock
+       origin-proof name owner received #'begin-publication)
+      (when (and public (plusp received))
+        (begin-publication)
+        (physical-source-publish-public-flush-under-lock owner received timeline))
+      (unless (eql received (physical-source-pin-confirmed-lsn pin))
+        (begin-publication))
+      (physical-source-confirm-receipt-under-lock name owner received digest))))
 
-(defun physical-source-confirm-initial-status (command owner status)
+(defun physical-source-confirm-initial-status (command owner status &optional origin-proof)
   "Publish monitoring fields through the captured sender token only after durable
 receipt confirmation succeeds."
   (physical-source-confirm-feedback
    command owner (getf status :flush)
-   (physical-stream-u64 (physical-stream-option command "prefix_digest")))
+   (physical-stream-u64 (physical-stream-option command "prefix_digest")) origin-proof)
   (wal-sender-note-status *wal-sender* status)
   status)
 
@@ -594,10 +593,12 @@ receipt confirmation succeeds."
         (received (getf status :flush)))
     (multiple-value-bind (floor digest)
         (with-live-operation (physical-source-sender-floor name owner))
-      (when (> received floor)
-        (setf digest (physical-source-prove-range name owner floor received digest)))
-      (with-live-operation
-        (physical-source-confirm-feedback command owner received digest))))
+      (multiple-value-bind (proven origin-proof)
+          (if (> received floor)
+              (physical-source-prove-range name owner floor received digest)
+              (values digest nil))
+        (with-live-operation
+          (physical-source-confirm-feedback command owner received proven origin-proof)))))
   (when (physical-sender-p owner)
     (wal-sender-note-status *wal-sender* status))
   status)
@@ -611,10 +612,11 @@ receipt confirmation succeeds."
       (unless (<= floor requested)
         (ereport "55000" "physical resume precedes retained WAL; reseed is required"))
       (when progress (funcall progress requested))
-      (setf digest (physical-source-prove-range name owner floor requested digest progress))
-      (unless (= digest (physical-stream-u64 (physical-stream-option command "prefix_digest")))
-        (ereport "55000" "native physical resume prefix differs from retained source history"))
-      (values requested digest))))
+      (multiple-value-bind (proven origin-proof)
+          (physical-source-prove-range name owner floor requested digest progress)
+        (unless (= proven (physical-stream-u64 (physical-stream-option command "prefix_digest")))
+          (ereport "55000" "native physical resume prefix differs from retained source history"))
+        (values requested proven origin-proof)))))
 
 (defun physical-stream-validate-status (status previous sent base)
   (unless (and status
@@ -734,8 +736,7 @@ A historic stream stops at its fork before sending child end-of-recovery WAL."
   "Serve a negotiated native physical stream with bounded timeline completion.
 Prove the resume prefix before WalData. Resume proof alone confirms the private
 pin; only actual validated positive flush feedback updates the public slot.
-At the fork, complete without entering Copy mode.  Always release both sender
-claims."
+At the fork, complete without entering Copy mode. Always release both sender claims."
   (call-with-wal-sender-stream
    (lambda ()
      (call-with-native-physical-sender
@@ -748,28 +749,30 @@ claims."
           (handler-case
               (if (and limit (= cursor limit))
                   (progn
-                    (physical-source-validate-resume command owner)
-                    (with-live-operation
-                      (physical-source-confirm-receipt
-                       name owner cursor (physical-stream-u64 (physical-stream-option command "prefix_digest"))))
+                    (multiple-value-bind (verified digest origin-proof)
+                        (physical-source-validate-resume command owner)
+                      (declare (ignore verified))
+                      (with-live-operation
+                        (physical-source-confirm-receipt name owner cursor digest origin-proof)))
                     (physical-stream-complete stream command owner next limit))
                   (progn
                     (sb-ext:with-timeout 10 (send-copy-both-response stream))
                     (setf copy-mode t)
                     (let ((status (list :write cursor :flush cursor :apply base))
                           (feedback nil))
-                      (physical-source-validate-resume
-                       command owner
-                       (lambda (durable)
-                         (physical-stream-send-keepalive stream (if limit (min durable limit) durable))
-                         (setf status (physical-stream-read-status stream status cursor base))
-                         (unless status (error 'end-of-file :stream stream))
-                         (setf feedback status)))
-                      (with-live-operation
-                        (if feedback
-                            (physical-source-confirm-initial-status command owner feedback)
-                            (physical-source-confirm-receipt
-                             name owner cursor (physical-stream-u64 (physical-stream-option command "prefix_digest"))))))
+                      (multiple-value-bind (verified digest origin-proof)
+                          (physical-source-validate-resume
+                           command owner
+                           (lambda (durable)
+                             (physical-stream-send-keepalive stream (if limit (min durable limit) durable))
+                             (setf status (physical-stream-read-status stream status cursor base))
+                             (unless status (error 'end-of-file :stream stream))
+                             (setf feedback status)))
+                        (declare (ignore verified))
+                        (with-live-operation
+                          (if feedback
+                              (physical-source-confirm-initial-status command owner feedback origin-proof)
+                              (physical-source-confirm-receipt name owner cursor digest origin-proof)))))
                     (multiple-value-bind (result status)
                         (physical-stream-send-loop stream command owner limit)
                       (when (and (eq result :switch)
