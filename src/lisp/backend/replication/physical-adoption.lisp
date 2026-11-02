@@ -1,9 +1,14 @@
+;;;; Read-only prerequisites for inspecting a stopped primary and its origin.
+;;;; These checks do not perform adoption, remote proof, or installation.
 (in-package #:pg)
 
 (defstruct physical-adoption-owner
+  "Thread-bound ownership of an existing offline PGDATA and its dedicated lock.
+This context is invalid after its enclosing call exits."
   directory device inode lock lock-device lock-inode thread active-p)
 
 (defun physical-adoption-check-owner (owner)
+  "Recheck the active owner and the identities of its directory and lock inode."
   (unless (and (physical-adoption-owner-p owner)
                (physical-adoption-owner-active-p owner)
                (eq sb-thread:*current-thread* (physical-adoption-owner-thread owner))
@@ -26,6 +31,9 @@
   owner)
 
 (defun call-with-physical-adoption-owner (directory function)
+  "Call FUNCTION with exclusive ownership of an existing private PGDATA lock.
+Reject a PID file; invalidate the thread-bound owner and close the lock on exit.
+The caller must keep inspected files immutable throughout the operation."
   (let* ((directory (uiop:ensure-directory-pathname (truename directory)))
          (stat (sb-posix:lstat (namestring directory))))
     (unless (and (sb-posix:s-isdir (sb-posix:stat-mode stat))
@@ -57,6 +65,11 @@
             (close lock)))))))
 
 (defun physical-adoption-inspect-primary (owner)
+  "Inspect a stopped primary without creating, repairing, or replaying files.
+Require DB_SHUTDOWNED and checkpoint = durable endpoint E, then verify the
+checkpoint record, resources, catalog identity and allocator capacity. Return
+actual next XID separately from the allocator's next value. Mutable facts must
+be revalidated before any future installation."
   (physical-adoption-check-owner owner)
   (let* ((*pgdata* (physical-adoption-owner-directory owner))
          (*physical-recovery-state* nil)
@@ -110,6 +123,9 @@
               :history history :capture capture :catalog *catalog*)))))
 
 (defun physical-adoption-hash-origin-suffix (origin end history &key (namespace :timeline))
+  "Extend the origin digest through END using the caller's immutable WAL files.
+Bounds and timeline arithmetic are checked here; this alone establishes neither
+durability nor authority of ORIGIN. The caller must verify both independently."
   (physical-export-origin-check origin)
   (timeline-check-lineage history)
   (unless (and (typep end '(unsigned-byte 64))
@@ -131,6 +147,10 @@
       digest)))
 
 (defun physical-adoption-prove-primary-origin (state identity)
+  "Read the source's durable origin and hash its WAL suffix to clean endpoint E.
+Reinspect the primary, require the same system and original timeline, and recheck
+control and origin after hashing. This evidence grants no installation or writer
+authority; mutable facts need revalidation before a future installation."
   (let* ((owner (getf state :owner))
          (*pgdata* (physical-adoption-owner-directory (physical-adoption-check-owner owner)))
          (fresh (physical-adoption-inspect-primary owner)))

@@ -1,5 +1,22 @@
 # Development TODO
 
+- [x] Add read-only local checks for former-primary adoption. Keep the existing
+  PGDATA lock and directory inodes, require exact clean checkpoint/catalog,
+  resource and allocator facts, and extend a genuine durable export-origin
+  commitment through the clean endpoint using original validated WAL bytes.
+  Actual next-XID remains separate from reserved allocation capacity. An empty
+  checkpoint active-XID horizon may equal next-XID rather than zero.
+  The checkpoint passed 1,476 physical, 903 unit and 201 wire tests and strict
+  cold compilation. The raw-byte property ran 100 trials at seed 73; rejection
+  counts and input coverage were not measured. Read-only probes matched the
+  stopped former primary's commitment to the promoted descendant's selected
+  retained root, leaving all 17 and 34 files respectively byte-identical.
+  That real source receipt had P=E, so its suffix was empty; fixtures checked
+  nonempty suffixes, incomplete records and corruption.
+  Evidence: `/home/imbaczek/proj/pg-ha-artifacts/adoption-preflight/`.
+  These helpers grant no writer or recovery-installation authority. Remote
+  selected-root proof, a canonical E image and journaled installation remain open.
+
 - [x] Preserve source-owned history commitments for verified remote exports.
   A durable origin binds the original system, timeline, base and manifest to a
   source-proved prefix. Confirmation saves that commitment before advancing the
@@ -19,6 +36,12 @@
   stable PGDATA ownership and exact clean endpoint validation before constructing
   a canonical recovery image. Journal installation before changing files; every
   interrupted startup must resume the exact installation or refuse writer startup.
+  Prepare normal follow at E/Mnew with the empty-prefix seed. Add a source
+  `PROVE_RETAINED` operation on that READY pin to independently hash the selected
+  original B/M history through E under a root-reader lease. Recheck the selected
+  root, source context and pin before replying; unrelated checkpoint progress
+  must not invalidate the proof. Save the exact attempt before PREPARE, and keep
+  existing cleanup debts separate from the new base's provenance.
   Then add native divergent rewind or explicit reseed fallback. Do not add
   coordination, elections or DCS management in this backend work.
 

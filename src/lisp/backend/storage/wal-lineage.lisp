@@ -33,7 +33,8 @@
 (defun wal-lineage-read-record (source segment offset size)
   "Decode one record from a bounded file or copied segment prefix without repair.
 SIZE bounds both the header and record; a vector must contain that prefix. The
-returned record uses SEGMENT and OFFSET for its logical WAL location."
+returned record uses SEGMENT and OFFSET for its logical WAL location. The second
+value is the original encoded record bytes."
   (let ((header (make-array +wal-header-size+ :element-type '(unsigned-byte 8)))
         (lsn (+ (* segment +wal-segment-size+) offset))
         (memory (typep source '(vector (unsigned-byte 8)))))
@@ -102,8 +103,10 @@ returned record uses SEGMENT and OFFSET for its logical WAL location."
 (defun wal-scan-lineage (function history start end &key (namespace :timeline) include-raw)
   "Inspect [START,END) without mutating storage or asserting it is durable.
 The caller owns an immutable segment set, a previously verified START cursor,
-and independently verified history and cluster/prefix provenance. WAL7 headers cannot establish those facts. Callback
-arguments are RECORD, its history owner TLI, and the opened filename TLI.
+and independently verified history and cluster/prefix provenance. WAL headers
+cannot establish those facts. Callback arguments are RECORD, its history owner
+TLI, and the opened filename TLI. With INCLUDE-RAW, a fourth argument contains
+the original encoded record bytes; by default the callback takes three arguments.
 Return the actual cursor, used (file-TLI segment) pairs, and whether END was reached;
 an empty range checks no record boundary. :STOP also reports whether END was reached.
 This is not yet an operational recovery path and grants no writer authority."
