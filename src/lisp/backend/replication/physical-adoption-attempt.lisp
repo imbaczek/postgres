@@ -10,7 +10,7 @@
     :timeline :namespace :end :checkpoint-start :next-xid :allocation-next-xid :wal-control :capture))
 (defparameter *physical-adoption-attempt-stage-keys*
   '(:directory :device :inode :system-id :cluster-identity :timeline :checkpoint
-    :checkpoint-start :end :next-xid :manifest-digest :source-pin))
+    :checkpoint-start :end :next-xid :manifest-digest :source-pin :auth-files))
 (defparameter *physical-adoption-attempt-keys*
   '(:version :phase :local :stage :origin-proof :source :request :source-history :anchor :proof))
 
@@ -95,6 +95,18 @@ WAL control is stored as bounded hex; these checks do not reinspect disk."
           (getf copy :capture) (physical-adoption-attempt-capture-copy (getf value :capture) wal))
     copy))
 
+(defun physical-adoption-attempt-auth-copy (entries)
+  (unless (and (listp entries) (= 3 (length entries)))
+    (error "invalid adoption authentication commitments"))
+  (loop for entry in entries
+        for name in '("authentication.initialized" "pg_hba.conf" "pg_ident.conf")
+        unless (and (listp entry) (= 3 (length entry)) (equal name (first entry))
+                    (typep (second entry) '(integer 0 1048576))
+                    (typep (third entry) '(unsigned-byte 64))
+                    (or (plusp (second entry)) (= #xCBF29CE484222325 (third entry))))
+          do (error "invalid adoption authentication commitment")
+        collect (physical-adoption-attempt-value-copy entry)))
+
 (defun physical-adoption-attempt-stage-copy (value local)
   (physical-follow-check-plist value *physical-adoption-attempt-stage-keys*)
   (unless (and (physical-adoption-attempt-directory-p (getf value :directory))
@@ -107,7 +119,9 @@ WAL control is stored as bounded hex; these checks do not reinspect disk."
                       '(:system-id :cluster-identity :timeline :checkpoint-start :end :next-xid))
                (= (getf value :checkpoint) (getf local :end)))
     (error "adoption stage facts differ from the local clean endpoint"))
-  (physical-adoption-attempt-fields-copy value *physical-adoption-attempt-stage-keys*))
+  (let ((copy (physical-adoption-attempt-fields-copy value *physical-adoption-attempt-stage-keys*)))
+    (setf (getf copy :auth-files) (physical-adoption-attempt-auth-copy (getf value :auth-files)))
+    copy))
 
 (defun physical-adoption-attempt-origin-copy (value local)
   (physical-follow-check-plist value '(:identity :proven-lsn :prefix-digest :end :end-digest))

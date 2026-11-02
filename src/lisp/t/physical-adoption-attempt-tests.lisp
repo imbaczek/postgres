@@ -42,7 +42,10 @@
                   :device (if owner (pg::physical-adoption-owner-device owner) 1) :inode 4
                   :system-id system :cluster-identity cluster :timeline 1
                   :checkpoint 152 :checkpoint-start 32 :end 152 :next-xid (getf snapshot :next-xid)
-                  :manifest-digest manifest :source-pin name)
+                  :manifest-digest manifest :source-pin name
+                  :auth-files (list (list "authentication.initialized" 8 11)
+                                    (list "pg_hba.conf" 12 22)
+                                    (list "pg_ident.conf" 0 #xCBF29CE484222325)))
      :origin-proof (list :identity (list system 1 32 77) :proven-lsn 32
                          :prefix-digest #xCBF29CE484222325 :end 152 :end-digest digest)
      :source (libpq-test-source "codec-fixture" 5439)
@@ -80,7 +83,7 @@
 
 (deftest adoption-attempt-codec-rejects-incoherent-private-records
     (dolist (mode '(:unknown :duplicate :version :phase :wal :capture :stage :request
-                    :history :origin :partial-proof :wrong-proof :wrong-anchor :nested-stage :stage-parent))
+                    :history :origin :partial-proof :wrong-proof :wrong-anchor :nested-stage :stage-parent :auth-name :auth-limit :auth-empty))
       (let ((record (adoption-attempt-codec-fixture :phase :proved)))
         (ecase mode
           (:unknown (setf record (append record (list :unknown 1))))
@@ -93,6 +96,9 @@
           (:nested-stage (setf (getf (getf record :stage) :directory)
                                (concatenate 'string (getf (getf record :local) :directory) "nested/")))
           (:stage-parent (setf (getf (getf record :stage) :directory) "/tmp/"))
+          (:auth-name (setf (first (first (getf (getf record :stage) :auth-files))) "wrong"))
+          (:auth-limit (setf (second (first (getf (getf record :stage) :auth-files))) 1048577))
+          (:auth-empty (setf (third (third (getf (getf record :stage) :auth-files))) 0))
           (:request (setf (getf (getf record :request) :manifest-digest) 111))
           (:history (setf (getf record :source-history) "not a history"))
           (:origin (setf (getf (getf record :origin-proof) :end) 151))
