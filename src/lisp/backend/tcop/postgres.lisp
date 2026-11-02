@@ -950,7 +950,7 @@ Then check the cached handles and workers under startup exclusion."
     (startup-install-initial-settings startup-settings startup-native startup-overrides)
     (startup-install-resource-capacity startup-settings)
     (sb-sys:enable-interrupt sb-unix:sigusr1 #'request-physical-promotion)
-    (postmaster-own-data-directory host port)
+    (postmaster-own-data-directory host port :startup-check #'physical-adoption-check-startup)
     (physical-backup-cleanup-stages)
     ;; Complete authentication using the captured inputs after PGDATA ownership.
     ;; Do not reread configuration files or reinstall startup resource capacity.

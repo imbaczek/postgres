@@ -2,6 +2,19 @@
 ;;;; These checks do not perform adoption, remote proof, or installation.
 (in-package #:pg)
 
+(defun physical-adoption-attempt-path (&optional (directory *pgdata*))
+  (merge-pathnames "physical-adoption.attempt" directory))
+
+(defun physical-adoption-check-startup ()
+  (handler-case
+      (progn
+        (sb-posix:lstat (namestring (physical-adoption-attempt-path)))
+        (error "pending offline adoption attempt requires reconciliation before startup"))
+    (sb-posix:syscall-error (condition)
+      (unless (= sb-posix:enoent (sb-posix:syscall-errno condition))
+        (error condition))))
+  (values))
+
 (defstruct physical-adoption-owner
   "Thread-bound ownership of an existing offline PGDATA and its dedicated lock.
 This context is invalid after its enclosing call exits."

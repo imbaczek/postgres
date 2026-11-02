@@ -110,3 +110,68 @@
         (ok (intake-fails-p (lambda () (pg::postmaster-open-data-lock))))
         (ok (= #o644 (logand #o777 (sb-posix:stat-mode (sb-posix:stat outside)))))
         (ok (equalp #(1 2 3) (pg::recovery-read-bytes outside))))))
+
+(deftest startup-check-refusal-retires-the-owned-pid-and-releases-the-lock
+    (with-physical-store-directory (root)
+      (let ((pg::*pgdata* root) (pg::*postmaster-data-lock* nil)
+                                (pg::*postmaster-pid-stream* nil) (pg::*postmaster-pid-directory* nil)
+                                (pg::*postmaster-start-time* nil) (pg::*postmaster-start-timestamp* nil)
+                                (pg::*postmaster-pid-host* nil) (pg::*postmaster-pid-port* nil)
+                                (pg::*postmaster-pid-inode* nil)
+                                (saved-exit-hooks sb-ext:*exit-hooks*))
+        (sb-posix:chmod (namestring root) #o700)
+        (unwind-protect
+             (dolist (mode '(:error :nonlocal-exit))
+               (let ((entered nil))
+                 (ok (eq :refused
+                         (catch 'startup-refused
+                           (handler-case
+                               (progn
+                                 (pg::postmaster-own-data-directory
+                                  "127.0.0.1" 5439
+                                  :startup-check
+                                  (lambda ()
+                                    (setf entered t)
+                                    (ok (pg::postmaster-pid-owned-p))
+                                    (ok (null pg::*postmaster-data-lock*))
+                                    (if (eq mode :error)
+                                        (error "startup refusal")
+                                        (throw 'startup-refused :refused))))
+                                 :accepted)
+                             (error () :refused)))))
+                 (ok entered)
+                 (ok (null pg::*postmaster-start-timestamp*))
+                 (ok (null pg::*postmaster-data-lock*))
+                 (ok (null pg::*postmaster-pid-stream*))
+                 (ok (not (probe-file (merge-pathnames "postmaster.pid" root))))
+                 (multiple-value-bind (lock size)
+                     (pg::open-bounded-regular-file (merge-pathnames ".pg_lisp.lock" root) 0)
+                   (declare (ignore size))
+                   (unwind-protect
+                        (ok (zerop (pg::physical-store-flock (sb-sys:fd-stream-fd lock) 6)))
+                     (close lock)))))
+          (setf sb-ext:*exit-hooks* saved-exit-hooks)))))
+
+(deftest adoption-attempt-presence-fences-every-file-kind-without-reading-it
+    (dolist (mode '(:empty :corrupt :record :directory :dangling-symlink))
+      (with-physical-store-directory (root)
+        (let* ((pg::*pgdata* root)
+               (path (merge-pathnames "physical-adoption.attempt" root)))
+          (ok (null (pg::physical-adoption-check-startup)))
+          (ecase mode
+            (:empty (pg::wal-atomic-write-bytes path (empty-octets)))
+            (:corrupt (pg::wal-atomic-write-bytes path (make-array 5 :element-type '(unsigned-byte 8)
+                                                                     :initial-element 255)))
+            (:record (pg::wal-atomic-write-bytes path (pg::string->bytes "PGADOPTION1 unknown")))
+            (:directory (ensure-directories-exist (merge-pathnames "physical-adoption.attempt/child" root)))
+            (:dangling-symlink (sb-posix:symlink "missing-attempt" (namestring path))))
+          (let ((inode (sb-posix:stat-ino (sb-posix:lstat (namestring path)))))
+            (ok (intake-fails-p #'pg::physical-adoption-check-startup))
+            (ok (= inode (sb-posix:stat-ino (sb-posix:lstat (namestring path))))))))))
+
+(deftest adoption-attempt-inspection-errors-do-not-count-as-absence
+    (with-physical-store-directory (root)
+      (let ((path (merge-pathnames "not-a-directory" root)))
+        (pg::wal-atomic-write-bytes path (empty-octets))
+        (let ((pg::*pgdata* (uiop:ensure-directory-pathname path)))
+          (ok (intake-fails-p #'pg::physical-adoption-check-startup))))))

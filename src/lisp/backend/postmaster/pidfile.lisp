@@ -180,7 +180,7 @@
              (setf success t)))
       (unless success (sb-posix:close fd)))))
 
-(defun postmaster-own-data-directory (host port)
+(defun postmaster-own-data-directory (host port &key startup-check)
   "Own PGDATA before any database storage initialization or recovery mutation."
   (declare (ignore host))
   (when *postmaster-data-lock* (error "this process already owns a data directory"))
@@ -196,9 +196,11 @@
              (error "data directory is already owned by another pg-lisp process"))
            (setf *postmaster-start-timestamp* (postgres-current-timestamp))
            (postmaster-create-pid-file)
+           (when startup-check (funcall startup-check))
            (setf *postmaster-data-lock* lock success t)
            *postmaster-pid-directory*)
       (unless success
         (setf *postmaster-start-timestamp* nil)
-        (when *postmaster-pid-stream* (postmaster-remove-pid-file))
-        (when lock (close lock))))))
+        (unwind-protect
+             (when *postmaster-pid-stream* (postmaster-remove-pid-file))
+          (when lock (close lock)))))))
