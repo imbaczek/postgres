@@ -74,9 +74,15 @@ to 63 UTF-8 bytes; a split character currently fails with SQLSTATE `22021`.
 
 ## Physical follow with libpq
 
-On Linux, a saved libpq connection profile requires a separately built helper
-linked with libpq 17 or later. From `src/lisp`, build it at an absolute path and
-provide that path to the server on every start that may use the profile:
+On Linux, physical follow and the backup wrapper use a helper linked with libpq
+17 or later. They use `PG_LIBPQ_HELPER` when set, then an installed sibling
+`bin/pg-libpq-helper`. Otherwise the shared resolver builds and reuses a private
+cache entry keyed by the helper source, compiler and PostgreSQL configuration.
+The cache is under `XDG_CACHE_HOME`, or `HOME/.cache`, or the account home from
+`getent` if `HOME` is unset. The fallback requires a compiler and `pg_config`;
+`CC` and `PG_CONFIG` override their names or paths. An installed or explicitly
+configured helper does not require those build tools. For example, to build and
+select a helper explicitly from `src/lisp`:
 
 ```sh
 PG_CONFIG=/path/to/pg_config t/build-libpq-helper.sh /absolute/path/libpq-helper
@@ -120,11 +126,8 @@ permanent physical follower slot before accepting a clone: the temporary export
 slot is dropped once staging is durable. If required WAL is missing before the
 follower attaches, attachment fails and the follower must be reseeded.
 
-The wrapper uses `PG_LIBPQ_HELPER` when set, then an installed
-`bin/pg-libpq-helper`; otherwise it builds a private helper using `CC` and
-`pg_config` and removes it on exit. The native follower still needs its own
-configured `PG_LIBPQ_HELPER`. Failed or interrupted clients clean up their private
-destination stage, though SIGKILL can leave a `.pg-native-backup.*` sibling.
+Failed or interrupted clients clean up their private destination stage, though
+SIGKILL can leave a `.pg-native-backup.*` sibling.
 Source startup sweeps abandoned stages only for the current cluster identity;
 stages belonging to an old reseed or relocated cluster are left alone.
 

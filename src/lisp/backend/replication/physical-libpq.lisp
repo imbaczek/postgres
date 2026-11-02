@@ -630,6 +630,7 @@ On failure or timeout, close the channel instead of reusing a partial exchange."
 (defvar *physical-helper-resolutions-lock* (sb-thread:make-mutex :name "libpq helper discovery"))
 
 (defun physical-helper-resolution-reserve ()
+  ;; Discovery has its own three-owner limit, separate from live channels.
   (sb-thread:with-mutex (*physical-helper-resolutions-lock*)
     (when (>= (hash-table-count *physical-helper-resolutions*) 3)
       (error "libpq helper discovery capacity exhausted"))
@@ -646,6 +647,8 @@ On failure or timeout, close the channel instead of reusing a partial exchange."
             (error "could not signal owned helper resolver")))))))
 
 (defun physical-helper-resolution-close (owner)
+  ;; Stop and reap the owned resolver before releasing its handle and quota.
+  ;; Escalate after bounded waits; repeated close is harmless.
   (sb-sys:without-interrupts
     (unless (physical-helper-resolution-closed owner)
       (let ((process (physical-helper-resolution-process owner)))
@@ -684,6 +687,9 @@ On failure or timeout, close the channel instead of reusing a partial exchange."
   (physical-helper-resolution-close owner))
 
 (defun physical-helper-resolve (resolver &key on-spawn)
+  ;; Publish the owner after acquiring its process handle, before waiting, so
+  ;; cancellation can stop discovery.  The resolver bounds its worker group;
+  ;; also bound the wait and returned path, and release the owner on every exit.
   (sb-sys:without-interrupts
     (let ((owner (physical-helper-resolution-reserve)))
       (unwind-protect
@@ -720,6 +726,8 @@ On failure or timeout, close the channel instead of reusing a partial exchange."
         (physical-helper-resolution-close owner)))))
 
 (defun physical-libpq-helper-path (&key on-spawn)
+  ;; An explicit helper takes precedence.  Otherwise the shared resolver finds
+  ;; an installed helper or prepares the private cached build.
   (let ((path (uiop:getenv "PG_LIBPQ_HELPER")))
     (if (and path (plusp (length path)))
         (namestring (truename path))

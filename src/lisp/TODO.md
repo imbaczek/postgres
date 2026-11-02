@@ -1,5 +1,11 @@
 # Development TODO
 
+- [ ] Resolve the admission and receiver join race during concurrent reload.
+  Monitor start and exit flush need admission, but some stop and policy paths
+  join the receiver before the reload gate reopens. Resolver ownership is now
+  published during discovery for cancellation; that fix does not resolve this
+  broader ordering race.
+
 - [x] Add a native TCP primary clone for Patroni's default backup method.
   Staging pauses mutations, then streaming permits SQL to proceed. The native
   command and image differ from C's online base backup; a permanent follower
