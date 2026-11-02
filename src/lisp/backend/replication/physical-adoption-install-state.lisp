@@ -223,6 +223,33 @@
              (list :device (sb-posix:stat-dev stat) :inode (sb-posix:stat-ino stat))))
       (sb-posix:close fd))))
 
+(defun physical-adoption-write-empty-private (path identity bytes &key limit
+                                                                    (point :after-private-write-chunk)
+                                                                    (after-sync :after-private-file-fsync))
+  (let* ((row (list (file-namestring path) :file #o600 (getf identity :device)
+                    (getf identity :inode) 0 #xCBF29CE484222325))
+         (fd (sb-posix:open (namestring path)
+                            (logior sb-posix:o-rdwr sb-posix:o-nofollow +postmaster-o-cloexec+))))
+    (unwind-protect
+         (let ((stat (sb-posix:fstat fd)))
+           (unless (and (physical-adoption-install-row-identity-p row stat)
+                        (zerop (sb-posix:stat-size stat))
+                        (equal (physical-adoption-stage-stat-identity stat)
+                               (physical-adoption-stage-stat-identity (sb-posix:lstat (namestring path)))))
+             (error "adoption scratch identity changed before writing"))
+           (physical-adoption-install-write-bytes fd bytes 0 path :limit limit :point point)
+           (sb-posix:fsync fd)
+           (physical-adoption-install-test-point after-sync path)
+           (let ((after (sb-posix:fstat fd)))
+             (unless (and (physical-adoption-install-row-identity-p row after)
+                          (= (length bytes) (sb-posix:stat-size after))
+                          (equalp bytes (read-bounded-regular-file path (length bytes)))
+                          (equal (physical-adoption-stage-stat-identity after)
+                                 (physical-adoption-stage-stat-identity (sb-posix:lstat (namestring path)))))
+               (error "adoption scratch changed during private publication"))))
+      (sb-posix:close fd)))
+  (values))
+
 (defun physical-adoption-install-allocate-journal (workspace)
   (physical-adoption-allocate-private workspace "journal.pending"))
 

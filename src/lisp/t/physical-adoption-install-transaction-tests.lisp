@@ -1,6 +1,6 @@
 (in-package #:pg-physical-tests)
 
-(defun call-with-adoption-install-prepared-fixture (function)
+(defun call-with-adoption-install-prepared-fixture (function &key (fork-distance 64) (generations 1))
   (call-with-adoption-proof-driver-fixture
    (lambda (root state stage client profile record counts)
      (declare (ignore record counts))
@@ -9,7 +9,8 @@
        (pg::physical-adoption-attempt-start-proof state stage client profile)
        (let ((prepared (pg::physical-adoption-install-prepare
                         (getf state :owner) workspace :client client)))
-         (funcall function root (getf state :owner) stage client workspace prepared))))))
+         (funcall function root (getf state :owner) stage client workspace prepared))))
+   :fork-distance fork-distance :generations generations))
 
 (deftest adoption-install-preparation-is-durable-without-moving-original-files
     (call-with-adoption-install-prepared-fixture

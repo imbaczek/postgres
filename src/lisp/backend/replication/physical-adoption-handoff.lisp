@@ -60,27 +60,11 @@
 
 (defun physical-adoption-handoff-write-pending (owner value)
   (let* ((workspace (physical-adoption-handoff-workspace value))
-         (path (merge-pathnames "intent.pending" workspace))
-         (identity (getf value :intent-file))
-         (image (physical-adoption-handoff-image value))
-         (fd (sb-posix:open (namestring path)
-                            (logior sb-posix:o-rdwr sb-posix:o-nofollow +postmaster-o-cloexec+))))
-    (unwind-protect
-         (let ((stat (sb-posix:fstat fd)))
-           (unless (and (zerop (sb-posix:stat-size stat))
-                        (sb-posix:s-isreg (sb-posix:stat-mode stat))
-                        (= #o600 (logand #o7777 (sb-posix:stat-mode stat)))
-                        (= (sb-posix:geteuid) (sb-posix:stat-uid stat))
-                        (= 1 (sb-posix:stat-nlink stat))
-                        (= (getf identity :device) (sb-posix:stat-dev stat))
-                        (= (getf identity :inode) (sb-posix:stat-ino stat)))
-             (error "adoption handoff scratch identity changed before writing"))
-           (physical-adoption-install-write-bytes
-            fd image 0 path :limit *physical-adoption-handoff-write-limit*
-            :point :after-handoff-intent-write-chunk)
-           (sb-posix:fsync fd)
-           (physical-adoption-install-test-point :after-handoff-intent-file-fsync path))
-      (sb-posix:close fd))
+         (path (merge-pathnames "intent.pending" workspace)))
+    (physical-adoption-write-empty-private
+     path (getf value :intent-file) (physical-adoption-handoff-image value)
+     :limit *physical-adoption-handoff-write-limit* :point :after-handoff-intent-write-chunk
+     :after-sync :after-handoff-intent-file-fsync)
     (physical-adoption-handoff-check-prepared owner value)
     (physical-adoption-install-sync-tree
      workspace (physical-adoption-install-snapshot workspace :exclude *physical-adoption-install-retained-names*))

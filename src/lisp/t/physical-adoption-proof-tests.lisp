@@ -2,7 +2,7 @@
 
 (defvar *adoption-proof-driver-hook* nil)
 
-(defun call-with-adoption-proof-driver-fixture (function)
+(defun call-with-adoption-proof-driver-fixture (function &key (fork-distance 64) (generations 1))
   (call-with-adoption-context-fixture
    (lambda (root state origin stage client profile events)
      (declare (ignore events))
@@ -25,7 +25,8 @@
                                      (append (copy-tree coordinates)
                                              (list :history-text (getf record :source-history)
                                                    :eor-octets (coerce (pg::wal-encode-end-of-recovery-record
-                                                                        (+ 64 (getf state :end)) 42 2 1 1) 'list))))))
+                                                                        (+ fork-distance (getf state :end)) 42
+                                                                        (1+ (getf state :timeline)) (getf state :timeline) 1) 'list))))))
                         (when *adoption-proof-driver-hook*
                           (funcall *adoption-proof-driver-hook* :prepare anchor root stage))
                         anchor))
@@ -44,7 +45,10 @@
                                     :system-id (getf request :system-id) :base-timeline (getf request :base-timeline)
                                     :base (getf request :base) :manifest-digest (getf request :manifest-digest)
                                     :end (getf request :end) :end-digest (getf origin :end-digest)
-                                    :root-id 456 :fork (nth-value 1 (pg::physical-follow-anchor-check anchor))
+                                    :root-id 456 :fork
+                                    (pg::timeline-history-entry-begin
+                                     (first (pg::timeline-parse-history
+                                             (getf anchor :source-timeline) (getf anchor :history-text))))
                                     :source-timeline (getf anchor :source-timeline)
                                     :history-text (getf record :source-history))))
                         (when *adoption-proof-driver-hook*
@@ -53,7 +57,8 @@
               (funcall function root state stage client profile record
                        (lambda () (list prepares proofs))))
          (setf (symbol-function 'pg::pg-client-native-prepare) prepare
-               (symbol-function 'pg::pg-client-native-prove-retained) prove))))))
+               (symbol-function 'pg::pg-client-native-prove-retained) prove))))
+   :fork-distance fork-distance :generations generations))
 
 (deftest adoption-proof-driver-saves-intent-and-proves-the-exact-request
     (call-with-adoption-proof-driver-fixture

@@ -3,7 +3,7 @@
 (defvar *adoption-context-source-case* nil)
 (defvar *adoption-context-observation-hook* nil)
 
-(defun call-with-adoption-context-fixture (function &key (fixture #'call-with-adoption-stage-fixture))
+(defun call-with-adoption-context-fixture (function &key (fixture #'call-with-adoption-stage-fixture) (fork-distance 64) (generations 1))
   (funcall fixture
            (lambda (root state proof)
              (with-physical-store-directory (target)
@@ -32,30 +32,38 @@
                                                      (if (eq *adoption-context-source-case* :system) 1 0)))
                                  (format nil "~d" (cond ((eq *adoption-context-source-case* :timeline) (getf state :timeline))
                                                         ((and (eq *adoption-context-source-case* :promotion)
-                                                              (> count 1)) (+ 2 (getf state :timeline)))
-                                                        (t (1+ (getf state :timeline)))))
+                                                              (> count 1)) (+ 1 generations (getf state :timeline)))
+                                                        (t (+ generations (getf state :timeline)))))
                                  (if (eq *adoption-context-source-case* :behind) "0/00000020"
-                                     (pg::wal-format-lsn (+ (max 256 (getf state :end)) count)))
+                                     (pg::wal-format-lsn (+ (max 256 (getf state :end)) (* 64 (1- generations)) count)))
                                  nil))
                               (symbol-function 'pg::pg-client-native-history)
                               (lambda (actual timeline)
                                 (assert (eq actual client))
-                                (assert (= timeline (1+ (getf state :timeline))))
+                                (assert (= timeline (+ generations (getf state :timeline))))
                                 (push :history events)
                                 (when (eq *adoption-context-source-case* :route)
                                   (incf (pg::physical-libpq-connection-info-port info)))
                                 (when *adoption-context-observation-hook*
                                   (funcall *adoption-context-observation-hook* :history root stage))
-                                (pg::string->bytes
-                                 (concatenate 'string
-                                              (if (> (getf state :timeline) 1)
-                                                  (pg::bytes->string (pg::timeline-history-bytes (getf state :timeline) root))
-                                                  "")
-                                              (format nil "~d~c~a~ccontext source~%" (getf state :timeline) #\Tab
-                                                      (pg::wal-format-lsn
-                                                       (+ (getf state :end)
-                                                          (if (eq *adoption-context-source-case* :history) -1 64)))
-                                                      #\Tab)))))
+                                (let ((bytes (pg::string->bytes
+                                              (concatenate 'string
+                                                           (if (> (getf state :timeline) 1)
+                                                               (pg::bytes->string (pg::timeline-history-bytes (getf state :timeline) root))
+                                                               "")
+                                                           (format nil "~d~c~a~ccontext source~%" (getf state :timeline) #\Tab
+                                                                   (pg::wal-format-lsn
+                                                                    (+ (getf state :end)
+                                                                       (if (eq *adoption-context-source-case* :history) -1 fork-distance)))
+                                                                   #\Tab)))))
+                                  (loop for generation from 2 to generations
+                                        for child = (+ (getf state :timeline) generation)
+                                        do (setf bytes
+                                                 (pg::timeline-encode-history
+                                                  child (1- child)
+                                                  (+ (getf state :end) fork-distance (* 64 (1- generation)))
+                                                  "later context split" bytes)))
+                                  bytes)))
                         (funcall function root state proof stage client profile (lambda () (reverse events))))
                    (setf (symbol-function 'pg::physical-client-identity-row) identity
                          (symbol-function 'pg::pg-client-native-history) history)))))))

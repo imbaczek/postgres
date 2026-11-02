@@ -87,7 +87,7 @@
       (error "adoption handoff receive spool changed while opening"))
     location))
 
-(defun physical-adoption-handoff-check-installation (owner value)
+(defun physical-adoption-check-preserved-installation (owner value)
   (let* ((state (physical-adoption-install-read owner))
          (plan (getf value :installation))
          (attempt (physical-adoption-attempt-read owner))
@@ -123,6 +123,12 @@
     (unless (equal (getf plan :stage-tree)
                    (physical-adoption-install-snapshot (physical-adoption-install-directory plan :stage)))
       (error "adoption immutable stage changed during handoff"))
+    mount))
+
+(defun physical-adoption-handoff-check-installation (owner value)
+  (let* ((plan (getf value :installation))
+         (root (physical-adoption-owner-directory owner))
+         (mount (physical-adoption-check-preserved-installation owner value)))
     (let ((budget (list 100000 16777216)))
       (dolist (entry (getf plan :new))
         (unless (equal (second entry)

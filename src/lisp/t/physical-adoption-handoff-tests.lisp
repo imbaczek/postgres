@@ -1,13 +1,14 @@
 (in-package #:pg-physical-tests)
 
-(defun call-with-adoption-handoff-fixture (function)
+(defun call-with-adoption-handoff-fixture (function &key (fork-distance 64) (generations 1))
   (call-with-adoption-install-prepared-fixture
    (lambda (root owner stage client workspace prepared)
      (declare (ignore client prepared))
      (let ((installed (pg::physical-adoption-install-resume owner)))
        (with-physical-store-directory (handoff)
          (sb-posix:chmod (namestring handoff) #o700)
-         (funcall function root owner stage workspace installed handoff))))))
+         (funcall function root owner stage workspace installed handoff))))
+   :fork-distance fork-distance :generations generations))
 
 (deftest adoption-handoff-prepares-a-durable-intent-without-changing-the-image
     (call-with-adoption-handoff-fixture

@@ -9,8 +9,11 @@
   "Return the selected receive timeline, or the original base timeline."
   (or (getf (physical-store-selection store) :target) (physical-store-timeline store)))
 
+(defun physical-store-history-filename (target digest)
+  (format nil "~8,'0X-~16,'0X.history" target digest))
+
 (defun physical-store-history-path (store target digest)
-  (physical-store-path store (format nil "~8,'0X-~16,'0X.history" target digest)))
+  (physical-store-path store (physical-store-history-filename target digest)))
 
 (defun physical-store-history-image (payload)
   "Encode a bounded receive-history payload with a CRC envelope.
