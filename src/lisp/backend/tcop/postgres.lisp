@@ -317,7 +317,7 @@ Database walsenders fall back to SQL for a leading comment or empty statement."
   (simple-query-payload-starts-with-word-p
    payload '("IDENTIFY_SYSTEM" "CREATE_REPLICATION_SLOT" "DROP_REPLICATION_SLOT"
              "START_REPLICATION" "READ_REPLICATION_SLOT" "TIMELINE_HISTORY" "PREPARE_FOLLOW" "RELEASE_FOLLOW" "RELEASE_BOOTSTRAP"
-             "BASE_BACKUP" "UPLOAD_MANIFEST" "ALTER_REPLICATION_SLOT" "SHOW")
+             "BASE_BACKUP" "BASE_BACKUP_NATIVE" "UPLOAD_MANIFEST" "ALTER_REPLICATION_SLOT" "SHOW")
    (and payload (or (position 0 payload) (length payload))) nil))
 
 (defun simple-query-frame-needs-drain-p (length-bytes payload)
@@ -949,6 +949,7 @@ Then check the cached handles and workers under startup exclusion."
     (startup-install-resource-capacity startup-settings)
     (sb-sys:enable-interrupt sb-unix:sigusr1 #'request-physical-promotion)
     (postmaster-own-data-directory host port)
+    (physical-backup-cleanup-stages)
     ;; Complete authentication using the captured inputs after PGDATA ownership.
     ;; Do not reread configuration files or reinstall startup resource capacity.
     (startup-complete-authentication)

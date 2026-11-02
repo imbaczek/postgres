@@ -1,6 +1,130 @@
 ;;;; Bootstrap file durability and startup admission boundaries.
 (in-package #:pg-physical-tests)
 
+(defun call-with-backup-stage-fixture (function)
+  (with-physical-store-directory (root)
+    (let* ((pg::*pgdata* (merge-pathnames "data/" root))
+           (pg::*catalog* (pg::make-catalog :cluster-identity "backup-stage-fixture")))
+      (ensure-directories-exist (pg::catalog-path))
+      (with-open-file (output (pg::catalog-path) :direction :output)
+        (with-standard-io-syntax (write (pg::catalog-to-sexp pg::*catalog*) :stream output)))
+      (with-open-file (pg::*postmaster-data-lock* (merge-pathnames "fixture.lock" root)
+                                                  :direction :io :if-does-not-exist :create
+                                                  :element-type '(unsigned-byte 8))
+        (funcall function root)))))
+
+(deftest physical-backup-stages-sweep-only-owned-names-without-following-links
+    (call-with-backup-stage-fixture
+     (lambda (root)
+       (let* ((stage (pg::physical-backup-create-stage))
+              (container (pg::physical-backup-stage-container))
+              (witness (merge-pathnames "witness" root))
+              (unknown (merge-pathnames "keep/" container)))
+         (ensure-directories-exist (merge-pathnames "nested/file" stage))
+         (with-open-file (output (merge-pathnames "nested/file" stage) :direction :output)
+           (write-line "staged image" output))
+         (with-open-file (output witness :direction :output) (write-line "preserve" output))
+         (sb-posix:symlink (namestring witness) (namestring (merge-pathnames "link" stage)))
+         (ensure-directories-exist (merge-pathnames "unused" unknown))
+         (pg::physical-backup-cleanup-stages)
+         (ok (not (probe-file stage)))
+         (ok (probe-file witness))
+         (ok (probe-file unknown))
+         (ok (probe-file (merge-pathnames ".owner" container)))))))
+
+(deftest physical-backup-stages-preserve-mismatched-and-unmarked-containers
+    (call-with-backup-stage-fixture
+     (lambda (root)
+       (declare (ignore root))
+       (let ((stage (pg::physical-backup-create-stage)))
+         (let ((marker (merge-pathnames ".owner" (pg::physical-backup-stage-container))))
+           (with-open-file (output marker :direction :io :element-type '(unsigned-byte 8)
+                                          :if-exists :overwrite)
+             (write-byte 88 output)
+             (pg::fsync-stream output))
+           (ok (intake-fails-p #'pg::physical-backup-create-stage))
+           (with-open-file (output marker :direction :io :element-type '(unsigned-byte 8)
+                                          :if-exists :overwrite)
+             (write-byte (char-code #\P) output)
+             (pg::fsync-stream output)))
+         (ok (probe-file stage))
+         (pg::physical-backup-delete-stage stage)
+         (ok (not (probe-file stage))))))
+  (call-with-backup-stage-fixture
+   (lambda (root)
+     (declare (ignore root))
+     (let ((container (pg::physical-backup-stage-container)))
+       (sb-posix:mkdir (string-right-trim "/" (namestring container)) #o700)
+       (ok (intake-fails-p #'pg::physical-backup-create-stage))
+       (ok (probe-file container))
+       (ok (not (probe-file (merge-pathnames ".owner" container))))))))
+
+(deftest physical-backup-stages-isolate-reseeded-data-directory-identities
+    (call-with-backup-stage-fixture
+     (lambda (root)
+       (let* ((old-stage (pg::physical-backup-create-stage))
+              (old-container (pg::physical-backup-stage-container))
+              (saved (merge-pathnames "saved/" root)))
+         (sb-posix:rename (string-right-trim "/" (namestring pg::*pgdata*))
+                          (string-right-trim "/" (namestring saved)))
+         (let ((pg::*catalog* (pg::make-catalog :cluster-identity "replacement-cluster")))
+           (ensure-directories-exist (pg::catalog-path))
+           (with-open-file (out (pg::catalog-path) :direction :output)
+             (with-standard-io-syntax (write (pg::catalog-to-sexp pg::*catalog*) :stream out)))
+           (pg::physical-backup-cleanup-stages)
+           (ok (probe-file old-stage))
+           (let ((new-stage (pg::physical-backup-create-stage))
+                 (new-container (pg::physical-backup-stage-container)))
+             (ok (not (equal old-container new-container)))
+             (pg::physical-backup-cleanup-stages)
+             (ok (not (probe-file new-stage)))
+             (ok (probe-file old-stage))
+             (ok (probe-file old-container))))))))
+
+(deftest physical-backup-stages-isolate-relocated-data-directory-paths
+    (call-with-backup-stage-fixture
+     (lambda (root)
+       (let* ((old-stage (pg::physical-backup-create-stage))
+              (old-container (pg::physical-backup-stage-container))
+              (relocated (merge-pathnames "relocated/" root)))
+         (sb-posix:rename (string-right-trim "/" (namestring pg::*pgdata*))
+                          (string-right-trim "/" (namestring relocated)))
+         (let ((pg::*pgdata* relocated))
+           (pg::physical-backup-cleanup-stages)
+           (let ((new-stage (pg::physical-backup-create-stage)))
+             (ok (not (equal old-container (pg::physical-backup-stage-container))))
+             (pg::physical-backup-cleanup-stages)
+             (ok (not (probe-file new-stage)))
+             (ok (probe-file old-stage))))))))
+
+(deftest physical-backup-command-requires-exact-native-negotiation
+    (let* ((query (format nil "BASE_BACKUP_NATIVE (native_format '~a')" pg::+physical-native-format+))
+           (command (pg::parse-replication-command query)))
+      (ok (eq :physical-backup (pg::logical-replication-command-type command)))
+      (ok (equal pg::+physical-native-format+ (pg::physical-stream-option command "native_format"))))
+  (dolist (query (list "BASE_BACKUP_NATIVE"
+                       "BASE_BACKUP_NATIVE ()"
+                       "BASE_BACKUP_NATIVE (native_format 'wrong')"
+                       (format nil "BASE_BACKUP_NATIVE (native_format '~a', other 'x')" pg::+physical-native-format+)
+                       (format nil "BASE_BACKUP_NATIVE (native_format '~a', native_format '~a')"
+                               pg::+physical-native-format+ pg::+physical-native-format+)))
+    (ok (intake-fails-p (lambda () (pg::parse-replication-command query))))))
+
+(deftest physical-backup-wire-dispatch-requires-physical-sender-and-no-transaction
+    (let* ((query (format nil "BASE_BACKUP_NATIVE (native_format '~a')" pg::+physical-native-format+))
+           (command (pg::parse-replication-command query))
+           (pg::*wal-replication-slots* (make-hash-table :test #'equal))
+           (pg::*wal-sender-registry* (make-hash-table :test #'eq))
+           (pg::*physical-recovery-state* nil))
+      (ok (pg::replication-query-payload-p (pg::string->bytes query)))
+      (dolist (backend (list nil (pg::make-backend :pid 177 :replication-mode :database)
+                             (pg::make-backend :pid 178 :replication-mode :physical)))
+        (let ((pg::*backend* backend))
+          (ok (intake-fails-p (lambda () (pg::start-native-physical-backup nil command))))
+          (ok (zerop (hash-table-count pg::*wal-replication-slots*)))))
+      (let ((pg::*backend* (pg::make-backend :pid 179 :replication-mode :physical :explicit t)))
+        (ok (intake-fails-p (lambda () (pg::validate-replication-command-context command)))))))
+
 (deftest physical-bootstrap-never-starts-writable
     (with-physical-store-directory (root)
       (let ((pg::*pgdata* root))
@@ -60,6 +184,79 @@
           (write-line "existing target" stream))
         (ok (intake-fails-p (lambda () (pg::physical-bootstrap-target target)))))))
 
+(deftest physical-backup-file-stream-bounds-chunks-and-verifies-before-end
+    (with-physical-store-directory (root)
+      (let* ((name "global/pg_control")
+             (path (merge-pathnames name root))
+             (bytes (make-array 131071 :element-type '(unsigned-byte 8)))
+             (frames nil))
+        (loop for i below (length bytes) do (setf (aref bytes i) (mod i 251)))
+        (ensure-directories-exist path)
+        (with-open-file (out path :direction :output :element-type '(unsigned-byte 8))
+          (write-sequence bytes out))
+        (let ((digest (pg::physical-store-update-digest #xCBF29CE484222325 bytes)))
+          (pg::physical-backup-send-file root (list name (length bytes) digest) 1
+                                         (lambda (frame) (push frame frames)))
+          (setf frames (nreverse frames))
+          (ok (= (char-code #\F) (aref (first frames) 0)))
+          (ok (= (char-code #\E) (aref (car (last frames)) 0)))
+          (ok (every (lambda (frame) (<= (length frame) 65536)) frames))
+          (ok (equalp bytes
+                      (apply #'concatenate '(vector (unsigned-byte 8))
+                             (mapcar (lambda (frame) (subseq frame 1))
+                                     (remove-if-not (lambda (frame) (= (char-code #\D) (aref frame 0))) frames)))))
+          (setf frames nil)
+          (ok (intake-fails-p
+               (lambda ()
+                 (pg::physical-backup-send-file root (list name (length bytes) (logxor 1 digest)) 1
+                                                (lambda (frame) (push frame frames))))))
+          (ok (notany (lambda (frame) (= (char-code #\E) (aref frame 0))) frames))
+          (dolist (size (list (1- (length bytes)) (1+ (length bytes))))
+            (ok (intake-fails-p
+                 (lambda () (pg::physical-backup-send-file root (list name size digest) 1
+                                                           (lambda (frame) (declare (ignore frame))))))))
+          (ok (intake-fails-p
+               (lambda () (pg::physical-backup-send-file root (list "../outside" 0 digest) 1
+                                                         (lambda (frame) (declare (ignore frame)))))))))))
+
+(deftest physical-backup-file-receiver-checks-order-bounds-and-digest
+    (with-physical-store-directory (source)
+      (let* ((name "global/pg_control")
+             (bytes (make-array 17 :element-type '(unsigned-byte 8) :initial-element 7))
+             (entry (list name (length bytes) (pg::physical-store-update-digest #xCBF29CE484222325 bytes)))
+             (frames nil))
+        (ensure-directories-exist (merge-pathnames name source))
+        (with-open-file (output (merge-pathnames name source) :direction :output :element-type '(unsigned-byte 8))
+          (write-sequence bytes output))
+        (pg::physical-backup-send-file source entry 1 (lambda (frame) (push frame frames)))
+        (setf frames (nreverse frames))
+        (dolist (mode '(:valid :missing-end :bad-data :wrong-file :oversize :empty-data :existing))
+          (with-physical-store-directory (target)
+            (let ((pending (mapcar #'copy-seq frames))
+                  (path (merge-pathnames name target)))
+              (case mode
+                (:missing-end (setf pending (butlast pending)))
+                (:bad-data (setf (aref (second pending) 1) 8))
+                (:wrong-file (setf (aref (first pending) 5) (char-code #\x)))
+                (:oversize (setf (aref (first pending) 20) 255))
+                (:empty-data (setf (second pending) (make-array 1 :element-type '(unsigned-byte 8)
+                                                                  :initial-element (char-code #\D))))
+                (:existing
+                 (ensure-directories-exist path)
+                 (with-open-file (output path :direction :output :element-type '(unsigned-byte 8))
+                   (write-byte 99 output))))
+              (flet ((receive-file ()
+                       (pg::physical-backup-receive-file
+                        target name (length bytes) (lambda () (pop pending)) :expected entry)))
+                (if (eq mode :valid)
+                    (progn
+                      (ok (equal entry (receive-file)))
+                      (ok (null pending))
+                      (ok (equalp bytes (pg::read-bounded-regular-file path 17))))
+                    (ok (intake-fails-p #'receive-file))))
+              (when (eq mode :existing)
+                (ok (equalp #(99) (pg::read-bounded-regular-file path 17))))))))))
+
 (deftest physical-bootstrap-file-copy-preserves-bounded-chunks
     (with-physical-store-directory (root)
       (let* ((source (merge-pathnames "source/" root))
@@ -103,6 +300,80 @@
     (with-physical-store-directory (root)
       (ok (intake-fails-p
            (lambda () (pg::physical-bootstrap-copy-under-quiescence root "copy"))))))
+
+(deftest physical-bootstrap-export-requires-current-owned-reservation
+    (let* ((pg::*backend* (pg::make-backend :pid 177))
+           (pg::*catalog* (pg::make-catalog :cluster-identity "export-test"))
+           (pg::*wal-replication-slots* (make-hash-table :test #'equal))
+           (pg::*wal-checkpoint-snapshot* (list :redo 100 :timeline 1))
+           (pg::*wal-durable-lsn* 200)
+           (pg::*wal-insert-timeline* 1)
+           (pg::*physical-recovery-state* nil)
+           (pg::*live-operation-quiescence-owner-thread* sb-thread:*current-thread*))
+      (flet ((slot (&rest options)
+               (apply #'pg::make-wal-replication-slot
+                      (append options
+                              (list :name "export_test" :kind :physical :plugin nil
+                                    :system-id (pg::catalog-system-identifier)
+                                    :restart-lsn 100 :restart-timeline 1
+                                    :temporary-p t :temporary-owner pg::*backend*
+                                    :active-owner pg::*backend*
+                                    :active-owner-backend pg::*backend*)))))
+        (let ((valid (slot)))
+          (setf (gethash "export_test" pg::*wal-replication-slots*) valid)
+          (ok (eq valid (funcall 'pg::physical-bootstrap-check-export-slot valid "export_test" 100)))
+          (ok (intake-fails-p
+               (lambda () (funcall 'pg::physical-bootstrap-check-export-slot (slot) "export_test" 100))))
+          (ok (intake-fails-p
+               (lambda () (funcall 'pg::physical-bootstrap-check-export-slot valid "other" 100))))
+          (let ((pg::*backend* (pg::make-backend :pid 178)))
+            (ok (intake-fails-p
+                 (lambda () (funcall 'pg::physical-bootstrap-check-export-slot valid "export_test" 100)))))
+          (let ((pg::*live-operation-quiescence-owner-thread* nil))
+            (ok (intake-fails-p
+                 (lambda () (funcall 'pg::physical-bootstrap-check-export-slot valid "export_test" 100))))))
+        (dolist (options (list (list :temporary-p nil)
+                               (list :active-owner nil)
+                               (list :active-owner-backend nil)
+                               (list :wal-status :lost)
+                               (list :restart-lsn nil :restart-timeline nil)
+                               (list :restart-lsn 101)
+                               (list :system-id (1+ (pg::catalog-system-identifier)))))
+          (let ((invalid (apply #'slot options)))
+            (setf (gethash "export_test" pg::*wal-replication-slots*) invalid)
+            (ok (intake-fails-p
+                 (lambda () (funcall 'pg::physical-bootstrap-check-export-slot invalid "export_test" 100)))))))))
+
+(deftest physical-bootstrap-export-drops-only-its-slot-on-success-and-error
+    (dolist (fail '(nil t))
+      (call-with-physical-slot-api-fixture
+       (lambda (root)
+         (declare (ignore root))
+         (with-physical-store-directory (target)
+           (let ((original (symbol-function 'pg::physical-bootstrap-copy-under-quiescence))
+                 (pg::*wal-checkpoint-snapshot* (list :redo 1 :timeline 1))
+                 (pg::*swank-listener-enabled-p* nil)
+                 (captured nil))
+             (unwind-protect
+                  (progn
+                    (setf (symbol-function 'pg::physical-bootstrap-copy-under-quiescence)
+                          (lambda (directory name &key export-slot)
+                            (ok (equal target directory))
+                            (ok (eq sb-thread:*current-thread* pg::*live-operation-quiescence-owner-thread*))
+                            (ok (sb-thread:holding-mutex-p pg::*reload-run-lock*))
+                            (ok (eq export-slot (gethash name pg::*wal-replication-slots*)))
+                            (ok (pg::physical-slot-owned-by-backend-p export-slot pg::*backend*))
+                            (setf captured export-slot)
+                            (when fail (error "injected stage failure"))
+                            (list :manifest)))
+                    (if fail
+                        (ok (intake-fails-p
+                             (lambda () (pg::physical-export-base-backup target "export_stage"))))
+                        (ok (equal (list :manifest) (pg::physical-export-base-backup target "export_stage"))))
+                    (ok captured)
+                    (ok (null (gethash "export_stage" pg::*wal-replication-slots*)))
+                    (ok (not (probe-file (pg::wal-replication-slot-path "export_stage")))))
+               (setf (symbol-function 'pg::physical-bootstrap-copy-under-quiescence) original))))))))
 
 (deftest physical-bootstrap-refuses-unsupported-mutation-paths
     (with-physical-store-directory (root)

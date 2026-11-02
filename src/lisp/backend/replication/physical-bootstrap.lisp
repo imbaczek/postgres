@@ -87,6 +87,143 @@ active timeline goal before recovery preparation or redo."
              (error "cannot clear recovery role by removing its metadata")))
        (values)))))
 
+(declaim (special *postmaster-data-lock*))
+
+(defvar *physical-backup-stage-lock* (sb-thread:make-mutex :name "native backup stages"))
+
+(defun physical-backup-stage-container (&optional (catalog *catalog*))
+  (unless (and *postmaster-data-lock* (open-stream-p *postmaster-data-lock*))
+    (error "native backup stages require data directory ownership"))
+  (let* ((data (truename *pgdata*))
+         (parts (pathname-directory data))
+         (stat (sb-posix:stat (namestring data))))
+    (unless (and catalog (stringp (car (last parts))))
+      (error "native backup stages require durable cluster identity"))
+    (merge-pathnames (format nil ".pg-native-backups-~x-~x-~16,'0x-~16,'0x/"
+                             (sb-posix:stat-dev stat) (sb-posix:stat-ino stat)
+                             (catalog-system-identifier catalog)
+                             (physical-store-update-digest #xCBF29CE484222325
+                                                           (string->bytes (namestring data))))
+                     (make-pathname :directory (butlast parts) :defaults data))))
+
+(defun physical-backup-stage-owner-bytes (catalog)
+  (let* ((data (truename *pgdata*)) (stat (sb-posix:stat (namestring data))))
+    (string->bytes (format nil "PGNATIVEBACKUPSTAGES1~%~d ~d ~d~%~a~%"
+                           (sb-posix:stat-dev stat) (sb-posix:stat-ino stat)
+                           (catalog-system-identifier catalog) (namestring data)))))
+
+(defun physical-backup-open-directory (path)
+  (sb-posix:open (string-right-trim "/" (namestring path))
+                 (logior sb-posix:o-rdonly sb-posix:o-directory
+                         sb-posix:o-nofollow +postmaster-o-cloexec+)))
+
+(defun physical-backup-check-stage-directory (fd)
+  (let ((stat (sb-posix:fstat fd)))
+    (unless (and (sb-posix:s-isdir (sb-posix:stat-mode stat))
+                 (= (sb-posix:stat-uid stat) (sb-posix:geteuid))
+                 (= #o700 (logand #o777 (sb-posix:stat-mode stat))))
+      (error "native backup stage directory is not private"))))
+
+(defun physical-backup-open-stage-container (catalog &key create)
+  (let* ((root (physical-backup-stage-container catalog))
+         (owner (physical-backup-stage-owner-bytes catalog))
+         (created nil))
+    (unless (query-temp-lstat root)
+      (unless create (return-from physical-backup-open-stage-container nil))
+      (sb-posix:mkdir (string-right-trim "/" (namestring root)) #o700)
+      (setf created t))
+    (let ((fd (physical-backup-open-directory root)) (success nil))
+      (unwind-protect
+           (progn
+             (physical-backup-check-stage-directory fd)
+             (let ((marker (pathname (query-temp-fd-child-path fd ".owner"))))
+               (when created
+                 (with-open-file (stream marker :direction :output :if-exists :error
+                                                :element-type '(unsigned-byte 8))
+                   (sb-posix:fchmod (sb-sys:fd-stream-fd stream) #o600)
+                   (write-sequence owner stream)
+                   (fsync-stream stream))
+                 (sb-posix:fsync fd)
+                 (fsync-directory (uiop:pathname-parent-directory-pathname root)))
+               (multiple-value-bind (stream size) (open-bounded-regular-file marker 16384)
+                 (unwind-protect
+                      (let* ((stat (sb-posix:fstat (sb-sys:fd-stream-fd stream)))
+                             (bytes (make-array size :element-type '(unsigned-byte 8))))
+                        (unless (and (= (sb-posix:stat-uid stat) (sb-posix:geteuid))
+                                     (= 1 (sb-posix:stat-nlink stat))
+                                     (= #o600 (logand #o777 (sb-posix:stat-mode stat)))
+                                     (= size (read-sequence bytes stream))
+                                     (equalp owner bytes))
+                          (error "native backup stage owner does not match PGDATA")))
+                   (close stream))))
+             (setf success t)
+             (values fd root))
+        (unless success (sb-posix:close fd))))))
+
+(defun physical-backup-stage-name-p (name)
+  (and (= 12 (length name)) (uiop:string-prefix-p "stage." name)
+       (every (lambda (char) (or (and (char<= #\a char #\z)) (and (char<= #\A char #\Z))
+                                 (and (char<= #\0 char #\9))))
+              (subseq name 6))))
+
+(defun physical-backup-remove-stage-tree (parent name)
+  (let* ((path (query-temp-fd-child-path parent name))
+         (stat (sb-posix:lstat path)))
+    (if (sb-posix:s-isdir (sb-posix:stat-mode stat))
+        (let ((fd (physical-backup-open-directory (pathname path))))
+          (unwind-protect
+               (multiple-value-bind (names complete) (query-temp-directory-entry-names fd)
+                 (unless complete (error "native backup stage enumeration failed"))
+                 (dolist (child names) (physical-backup-remove-stage-tree fd child)))
+            (sb-posix:close fd))
+          (sb-posix:rmdir path))
+        (sb-posix:unlink path))))
+
+(defun physical-backup-cleanup-stages ()
+  (sb-thread:with-mutex (*physical-backup-stage-lock*)
+    (when (probe-file (catalog-path))
+      (let* ((*catalog-identity-needs-persist-p* nil)
+             (catalog (load-catalog)))
+        (when *catalog-identity-needs-persist-p*
+          (return-from physical-backup-cleanup-stages nil))
+        (multiple-value-bind (fd root) (physical-backup-open-stage-container catalog)
+          (declare (ignore root))
+          (when fd
+            (unwind-protect
+                 (multiple-value-bind (names complete) (query-temp-directory-entry-names fd)
+                   (unless complete (error "native backup stage container enumeration failed"))
+                   (dolist (name names)
+                     (when (physical-backup-stage-name-p name)
+                       (let ((child (physical-backup-open-directory
+                                     (pathname (query-temp-fd-child-path fd name)))))
+                         (unwind-protect (physical-backup-check-stage-directory child)
+                           (sb-posix:close child)))
+                       (physical-backup-remove-stage-tree fd name)))
+                   (sb-posix:fsync fd))
+              (sb-posix:close fd))))))))
+
+(defun physical-backup-create-stage ()
+  (sb-thread:with-mutex (*physical-backup-stage-lock*)
+    (multiple-value-bind (fd root) (physical-backup-open-stage-container *catalog* :create t)
+      (unwind-protect
+           (uiop:ensure-directory-pathname
+            (sb-posix:mkdtemp (namestring (merge-pathnames "stage.XXXXXX" root))))
+        (sb-posix:close fd)))))
+
+(defun physical-backup-delete-stage (stage)
+  (sb-thread:with-mutex (*physical-backup-stage-lock*)
+    (multiple-value-bind (fd root) (physical-backup-open-stage-container *catalog*)
+      (unless fd (error "native backup stage container disappeared"))
+      (unwind-protect
+           (let ((name (car (last (pathname-directory stage)))))
+             (unless (and (physical-backup-stage-name-p name)
+                          (equal (truename root)
+                                 (truename (uiop:pathname-parent-directory-pathname stage))))
+               (error "native backup stage cleanup has a foreign path"))
+             (physical-backup-remove-stage-tree fd name)
+             (sb-posix:fsync fd))
+        (sb-posix:close fd)))))
+
 (defun physical-bootstrap-target (directory)
   "Require an existing empty target outside the source directory hierarchy."
   (let ((target (truename (uiop:ensure-directory-pathname directory)))
@@ -208,7 +345,27 @@ The new base receives its own archive; the old primary archive is not copied."
 
 (declaim (ftype function physical-recovery-check-checkpoint-resources))
 
-(defun physical-bootstrap-copy-under-quiescence (target pin-name)
+(defun physical-bootstrap-check-export-slot (slot name checkpoint-start)
+  (unless (eq *live-operation-quiescence-owner-thread* sb-thread:*current-thread*)
+    (error "physical export validation requires operation quiescence ownership"))
+  (sb-thread:with-mutex (*wal-lock*)
+    (wal-check-healthy)
+    (unless (and (not (recovery-in-progress-p))
+                 (eq slot (gethash name *wal-replication-slots*))
+                 (physical-slot-state-valid-p slot)
+                 (equal name (wal-replication-slot-name slot))
+                 (physical-slot-owned-by-backend-p slot *backend*)
+                 (eq *backend* (wal-replication-slot-active-owner slot))
+                 (eq *backend* (wal-replication-slot-active-owner-backend slot))
+                 (eq :reserved (wal-replication-slot-wal-status slot))
+                 (= (catalog-system-identifier) (wal-replication-slot-system-id slot))
+                 (eql *wal-insert-timeline* (wal-replication-slot-restart-timeline slot))
+                 (typep (wal-replication-slot-restart-lsn slot) '(integer 1 18446744073709551615))
+                 (<= (wal-replication-slot-restart-lsn slot) checkpoint-start *wal-durable-lsn*))
+      (error "native backup export lost its owned WAL reservation")))
+  slot)
+
+(defun physical-bootstrap-copy-under-quiescence (target pin-name &key export-slot)
   "Checkpoint and capture one complete native image while mutation admission is closed.
 Check checkpoint resource facts against control before creating the source pin.
 Capture the active authentication generation and write its canonical adjuncts
@@ -224,9 +381,11 @@ outside the immutable file inventory. New manifests require these adjuncts."
   (let ((policy (authentication-capture-policy)))
     (wal-checkpoint-core)
     (physical-recovery-check-checkpoint-resources *wal-checkpoint-snapshot* *wal-control-metadata*)
-    (let ((pin (physical-source-pin-create pin-name)))
-      ;; Failure after here intentionally retains the durable source pin. The
-      ;; operator must inspect the failed target and explicitly release the pin.
+    (let ((pin (unless export-slot (physical-source-pin-create pin-name))))
+      (when export-slot
+        (physical-bootstrap-check-export-slot export-slot pin-name (wal-checkpoint-record-start)))
+      ;; Local backup failure retains its private pin for operator inspection.
+      ;; Remote export owns a temporary slot and drops it in its outer cleanup.
       (physical-bootstrap-mark-target target)
       (physical-recovery-mark-target target)
       (wal-ensure-directory-durable (merge-pathnames "base/" target))
@@ -248,14 +407,16 @@ outside the immutable file inventory. New manifests require these adjuncts."
                              :cluster-identity (catalog-cluster-identity *catalog*) :timeline *wal-insert-timeline*
                              :checkpoint checkpoint :checkpoint-start (wal-checkpoint-record-start checkpoint)
                              :end end :next-xid *next-xid*
-                             :source-pin (physical-source-pin-name pin) :files files :auth-policy-required 1)))
+                             :source-pin (if export-slot (wal-replication-slot-name export-slot)
+                                             (physical-source-pin-name pin)) :files files :auth-policy-required 1)))
         (physical-bootstrap-test-point :before-manifest target)
         (let* ((*print-readably* t)
                (text (physical-bootstrap-manifest-text manifest))
                (bytes (string->bytes text))
                (crc (wal-crc32 bytes))
                (image (string->bytes (format nil "PGPHYSICALBACKUP1 ~8,'0X~%~a~%" crc text))))
-          (physical-source-pin-bind-manifest pin (physical-store-update-digest #xCBF29CE484222325 image))
+          (when pin
+            (physical-source-pin-bind-manifest pin (physical-store-update-digest #xCBF29CE484222325 image)))
           (physical-bootstrap-test-point :after-pin-binding target)
           (wal-atomic-write-bytes (merge-pathnames "physical-backup.manifest" target) image))
         (fsync-directory target)
@@ -282,3 +443,198 @@ quiescence end. It is not the final online base-backup protocol."
        (with-live-operation-quiescence
          (physical-bootstrap-copy-under-quiescence
           (physical-bootstrap-target directory) pin-name))))))
+
+(defun physical-export-base-backup (directory name)
+  (unless *backend* (error "native backup export requires a backend owner"))
+  (when (plusp *live-operation-depth*)
+    (error "native backup export must start outside a live operation"))
+  (unless (wal-valid-replication-slot-name-p name)
+    (error "invalid native backup export slot name"))
+  (call-with-invalidated-slot-cleanup
+   (lambda ()
+     (sb-thread:with-mutex (*reload-run-lock*)
+       (let ((target (with-live-operation
+                       (prevent-recovery-primary-operation "native backup export")
+                       (when *swank-listener-enabled-p*
+                         (error "native backup export requires Swank to be off"))
+                       (physical-bootstrap-target directory))))
+         (sb-sys:without-interrupts
+           (let ((slot nil))
+             (unwind-protect
+                  (progn
+                    (setf slot (with-live-operation
+                                 (wal-create-physical-replication-slot
+                                  name :immediately-reserve t :temporary t)))
+                    (sb-sys:with-local-interrupts
+                      (with-live-operation-quiescence
+                        (prevent-recovery-primary-operation "native backup export")
+                        (physical-bootstrap-copy-under-quiescence target name :export-slot slot))))
+               (when slot (wal-drop-replication-slot name slot))))))))))
+
+(defun physical-backup-bundle-path-p (name timeline)
+  (or (member name '("physical-backup.manifest" "recovery.required" "physical-recovery.control"
+                     "pg_hba.conf" "pg_ident.conf" "authentication.initialized") :test #'equal)
+      (recovery-manifest-path-p name timeline)))
+
+(defun physical-backup-send-file (directory entry timeline emit)
+  (destructuring-bind (name size expected-digest) entry
+    (unless (and (physical-backup-bundle-path-p name timeline)
+                 (typep size '(unsigned-byte 64))
+                 (typep expected-digest '(unsigned-byte 64)))
+      (error "invalid native backup bundle file"))
+    (let ((path (string->bytes name))
+          (digest #xCBF29CE484222325)
+          (buffer (make-array 65535 :element-type '(unsigned-byte 8))))
+      (unless (<= 1 (length path) 512) (error "native backup bundle path exceeds its bound"))
+      (multiple-value-bind (input actual-size)
+          (open-bounded-regular-file (merge-pathnames name directory) size)
+        (unwind-protect
+             (progn
+               (unless (= size actual-size) (error "native backup bundle file length changed"))
+               (let ((header (make-payload)))
+                 (payload-push-byte header (char-code #\F))
+                 (payload-push-u32 header (length path))
+                 (loop for byte across path do (payload-push-byte header byte))
+                 (replication-push-u64 header size)
+                 (replication-push-u64 header expected-digest)
+                 (funcall emit header))
+               (loop with remaining = size
+                     while (plusp remaining)
+                     for count = (read-sequence buffer input :end (min remaining (length buffer)))
+                     do (when (zerop count) (error "native backup bundle file was truncated"))
+                        (let ((bytes (subseq buffer 0 count))
+                              (payload (make-payload)))
+                          (setf digest (physical-store-update-digest digest bytes))
+                          (payload-push-byte payload (char-code #\D))
+                          (loop for byte across bytes do (payload-push-byte payload byte))
+                          (funcall emit payload))
+                        (decf remaining count))
+               (unless (and (eq :eof (read-byte input nil :eof)) (= digest expected-digest))
+                 (error "native backup bundle file changed"))
+               (let ((end (make-payload)))
+                 (payload-push-byte end (char-code #\E))
+                 (funcall emit end)))
+          (close input))))))
+
+(defun physical-backup-metadata-bounds ()
+  '(("physical-backup.manifest" 16777216)
+    ("recovery.required" 1024)
+    ("physical-recovery.control" 196)
+    ("pg_hba.conf" 1048576)
+    ("pg_ident.conf" 1048576)
+    ("authentication.initialized" 1024)))
+
+(defun physical-backup-bundle-entries (directory manifest)
+  (recovery-check-manifest-schema manifest)
+  (unless (equal manifest (recovery-read-manifest directory))
+    (error "native backup bundle manifest changed"))
+  (append
+   (loop for (name maximum) in
+                            (physical-backup-metadata-bounds)
+         for bytes = (read-bounded-regular-file (merge-pathnames name directory) maximum)
+         collect (list name (length bytes) (physical-store-update-digest #xCBF29CE484222325 bytes)))
+   (getf manifest :files)))
+
+(defun physical-backup-send-bundle (directory manifest emit)
+  (let* ((entries (physical-backup-bundle-entries directory manifest))
+         (digest #xCBF29CE484222325))
+    (flet ((send (payload)
+             (setf digest (physical-store-update-digest digest payload))
+             (funcall emit payload)))
+      (let ((header (make-payload)))
+        (payload-push-byte header (char-code #\B))
+        (loop for byte across (string->bytes "PGNATIVEBACKUP1") do (payload-push-byte header byte))
+        (payload-push-u32 header (length entries))
+        (send header))
+      (dolist (entry entries)
+        (physical-backup-send-file directory entry (getf manifest :timeline) #'send)))
+    (let ((end (make-payload)))
+      (payload-push-byte end (char-code #\Z))
+      (payload-push-u32 end (length entries))
+      (replication-push-u64 end digest)
+      (funcall emit end))))
+
+(defun physical-backup-read-frame (next)
+  (let ((frame (funcall next)))
+    (unless (and (typep frame '(vector (unsigned-byte 8))) (<= 1 (length frame) 65536))
+      (error "invalid or truncated native backup bundle frame"))
+    frame))
+
+(defun physical-backup-file-header (header name maximum &optional expected)
+  (unless (and (>= (length header) 21) (= (aref header 0) (char-code #\F)))
+    (error "native backup bundle lacks its expected file"))
+  (let ((length (bytes-to-u32 header 1)))
+    (unless (and (<= 1 length 512) (= (length header) (+ 21 length))
+                 (equalp (string->bytes name) (subseq header 5 (+ 5 length))))
+      (error "native backup bundle file name or header is invalid"))
+    (let ((size (replication-read-u64 header (+ 5 length)))
+          (digest (replication-read-u64 header (+ 13 length))))
+      (unless (and (<= size maximum)
+                   (or (null expected) (and (= size (second expected)) (= digest (third expected)))))
+        (error "native backup bundle file disagrees with its manifest or bound"))
+      (values size digest))))
+
+(defun physical-backup-receive-file (directory name maximum next &key expected (timeline 1))
+  (unless (physical-backup-bundle-path-p name timeline)
+    (error "invalid native backup destination path"))
+  (multiple-value-bind (size expected-digest)
+      (physical-backup-file-header (physical-backup-read-frame next) name maximum expected)
+    (let* ((path (merge-pathnames name directory))
+           (parent (uiop:pathname-directory-pathname path))
+           (digest #xCBF29CE484222325))
+      (wal-ensure-directory-durable parent)
+      (with-open-file (output path :direction :output :if-exists :error
+                                   :if-does-not-exist :create :element-type '(unsigned-byte 8))
+        (loop with remaining = size
+              while (plusp remaining)
+              for frame = (physical-backup-read-frame next)
+              for count = (1- (length frame))
+              do (unless (and (= (aref frame 0) (char-code #\D)) (<= 1 count remaining))
+                   (error "invalid native backup file data extent"))
+                 (let ((bytes (subseq frame 1)))
+                   (setf digest (physical-store-update-digest digest bytes))
+                   (write-sequence bytes output))
+                 (decf remaining count))
+        (let ((end (physical-backup-read-frame next)))
+          (unless (and (= (length end) 1) (= (aref end 0) (char-code #\E))
+                       (= expected-digest digest))
+            (error "native backup file end or checksum is invalid")))
+        (fsync-stream output))
+      (fsync-directory parent)
+      (list name size digest))))
+
+(defun physical-backup-receive-bundle (directory next)
+  (let ((digest #xCBF29CE484222325)
+        (magic (string->bytes "PGNATIVEBACKUP1")))
+    (flet ((receive-frame ()
+             (let ((frame (physical-backup-read-frame next)))
+               (setf digest (physical-store-update-digest digest frame))
+               frame)))
+      (let* ((header (receive-frame))
+             (count-offset (1+ (length magic))))
+        (unless (and (= (length header) (+ count-offset 4))
+                     (= (aref header 0) (char-code #\B))
+                     (equalp magic (subseq header 1 count-offset)))
+          (error "invalid native backup bundle header"))
+        (let ((count (bytes-to-u32 header count-offset)))
+          (unless (<= 6 count 1000000) (error "invalid native backup bundle file count"))
+          (physical-backup-receive-file directory "physical-backup.manifest" 16777216 #'receive-frame)
+          (let ((manifest (recovery-check-manifest-schema (recovery-read-manifest directory))))
+            (unless (and (eql 3 (getf manifest :version))
+                         (= count (+ 6 (length (getf manifest :files)))))
+              (error "native backup bundle inventory disagrees with its manifest"))
+            (dolist (entry (rest (physical-backup-metadata-bounds)))
+              (physical-backup-receive-file directory (first entry) (second entry) #'receive-frame))
+            (dolist (entry (getf manifest :files))
+              (physical-backup-receive-file directory (first entry) (second entry) #'receive-frame
+                                            :expected entry :timeline (getf manifest :timeline)))
+            (let ((end (physical-backup-read-frame next)))
+              (unless (and (= 13 (length end)) (= (aref end 0) (char-code #\Z))
+                           (= count (bytes-to-u32 end 1)) (= digest (replication-read-u64 end 5)))
+                (error "native backup bundle completion or checksum is invalid")))
+            (let ((*pgdata* directory))
+              (unless (zerop (getf (physical-recovery-read-control directory) :phase))
+                (error "native backup bundle is not an immutable base image"))
+              (physical-recovery-verify-base-state)
+              (authentication-check-backup-policy directory))
+            manifest))))))
