@@ -1,3 +1,16 @@
+;;; Publish the empty receive spool for an installed adoption.
+;;;
+;;; With offline ownership, prepare a separate guarded workspace and create an
+;;; empty spool at the proved stage end.  Sync its tree and ancestors before
+;;; publishing the immutable handoff intent in PGDATA.  The intent authorizes
+;;; one no-replace rename of the spool into PGDATA; sync both parents.
+;;;
+;;; Resume validates the intent and either spool location before proceeding.
+;;; A pre-intent interruption can leave a guarded workspace orphan; retry
+;;; preparation with a new empty workspace.  After intent publication use
+;;; handoff resume, since installation resume does not accept this namespace.
+;;; Ready means the spool is published, not that startup is admitted.
+
 (in-package #:pg)
 
 (defvar *physical-adoption-handoff-write-limit* nil)
@@ -94,6 +107,9 @@
     value))
 
 (defun physical-adoption-handoff-prepare (owner directory)
+  "Prepare and publish handoff intent under an existing offline OWNER.
+DIRECTORY must be a new empty private workspace, disjoint from the protected
+installation directories and on the same filesystem and mount."
   (let* ((directory (uiop:ensure-directory-pathname directory))
          (root (physical-adoption-owner-directory owner))
          (installation (physical-adoption-install-read owner))
@@ -120,6 +136,9 @@
         (physical-adoption-handoff-publish owner value)))))
 
 (defun physical-adoption-handoff-resume (owner)
+  "Resume a published handoff under an existing offline OWNER.
+Return the intent and :READY once the empty receive spool is published.
+This does not admit startup or perform follow configuration."
   (let* ((value (physical-adoption-handoff-read owner))
          (root (physical-adoption-owner-directory owner))
          (location (physical-adoption-handoff-validate owner value))
@@ -146,5 +165,7 @@
     (values value :ready)))
 
 (defun physical-adoption-handoff-start (owner directory)
+  "Prepare and publish the empty receive spool under offline OWNER.
+DIRECTORY is a new empty private workspace for this handoff."
   (physical-adoption-handoff-prepare owner directory)
   (physical-adoption-handoff-resume owner))

@@ -725,6 +725,13 @@
   cold compile. Moving the slot module after its dependencies fixed that case;
   the wider audit remains open.
 
+- [ ] Audit destructive sequence operations on quoted or shared lists, including
+  `SORT`, `NREVERSE`, `NCONC` and the final argument to `APPEND`. Installation
+  verification once changed a quoted `APPEND` tail, breaking the next clone in
+  the same image. A handoff negative test also changed a quoted fixture plist
+  reused by later checks. Those cases now use fresh lists; check for other cases
+  and exercise repeated operations in the same Lisp image.
+
 - [ ] Reproduce and report Dissect's SBCL frame-local inspection fault. While Rove
   reported a missing installed configuration in a retention fixture, Dissect's
   `FRAME-LOCALS` called `SB-DI::SUB-ACCESS-DEBUG-VAR-SLOT` on a mutex frame and

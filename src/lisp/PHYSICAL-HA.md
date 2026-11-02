@@ -40,6 +40,42 @@ tests, strict cold compilation and the existing shutdown test. Logs are in
 
 ## Verified starting points
 
+### Offline adoption receive spool handoff
+
+With existing offline ownership and a terminal installed attempt and journal,
+`physical-adoption-handoff-start` prepares a new empty private workspace
+disjoint from PGDATA, stage and the installation workspace, on the same
+filesystem and mount. It builds a spool with a private 68-byte empty receive
+control and lock at the proved stage end. It creates `intent.pending` exclusively,
+without following symlinks, with mode 0600. The guarded workspace and its full
+tree and directory ancestors are synced before the no-replace publication of
+`physical-adoption.handoff` in PGDATA. The intent binds the terminal
+installation plan, attempt and journal file facts, and the new workspace,
+spool and intent identities. Both parents are synced and the intent is read
+back after publication.
+
+The handoff validator checks the installed image, stage, incoming tree and
+quarantine, and permits the spool only in the workspace or its destination.
+Resume moves it once to `PGDATA/pg_physical_receive` with a no-replace rename
+and syncs both parents. Repeated resume is idempotent; its `:ready` result means
+the spool is published, not that startup is admitted. An interruption before
+intent publication can leave a guarded external workspace orphan; retry
+preparation with a new empty workspace. After publication, use
+`physical-adoption-handoff-resume`; installation resume does not accept the
+extended namespace.
+
+The attempt, journal, quarantine, stage and canonical recovery control remain
+unchanged. The installer does not release the source pin, whose survival depends
+on the source. Follow configuration, control phase 2, active binding, startup
+reconciliation, redo, network activity, workers and coordination remain outside
+this handoff.
+
+The native fixture passed at end position 33752368. Real cold startup refused,
+with the image, workspace, stage, quarantine, reference and source bytes and
+inodes unchanged. Validation covered 13 error cuts, 10 mutation cases and seven
+SIGKILL cases with fresh ownership. Sync ordering models power-loss durability;
+SIGKILL tests exercise process interruption rather than power loss.
+
 ### Offline adoption installation
 
 `physical-adoption-install-start` prepares and installs a proved attempt;

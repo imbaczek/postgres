@@ -1,3 +1,10 @@
+;;; Encoding for the immutable offline adoption handoff intent.
+;;;
+;;; The intent binds the terminal installation plan, attempt and journal file
+;;; facts, and the new workspace, spool and intent identities.  It describes
+;;; exactly an empty receive control and lock at the proved stage end.  Its
+;;; checksum detects corruption; the validator checks the live objects.
+
 (in-package #:pg)
 
 (defconstant +physical-adoption-handoff-maximum-bytes+

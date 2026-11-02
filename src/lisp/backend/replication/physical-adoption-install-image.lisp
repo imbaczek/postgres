@@ -72,6 +72,7 @@
     local))
 
 (defun physical-adoption-installed-base (directory record)
+  "Verify installed base semantics after the caller checks its file inventory."
   (let ((*pgdata* directory) (stage (getf record :stage)))
     (authentication-check-backup-policy directory)
     (dolist (entry (getf stage :auth-files))

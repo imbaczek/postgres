@@ -1,3 +1,10 @@
+;;; Validate the namespace protected by a published handoff intent.
+;;;
+;;; Check the terminal installation, its original image, incoming tree,
+;;; quarantine and immutable stage against the saved plan.  Exact PGDATA and
+;;; workspace names permit the spool only at its prepared or published
+;;; location.  The spool identity and empty control must match in either case.
+
 (in-package #:pg)
 
 (defun physical-adoption-handoff-file-fact (path maximum)

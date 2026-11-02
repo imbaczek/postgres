@@ -210,6 +210,7 @@
     t))
 
 (defun physical-adoption-allocate-private (directory name)
+  "Create a private scratch inode without replacing or following an entry."
   (let* ((path (physical-adoption-install-entry-path directory name))
          (fd (sb-posix:open (namestring path)
                             (logior sb-posix:o-rdwr sb-posix:o-creat sb-posix:o-excl
