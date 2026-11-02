@@ -169,6 +169,7 @@ WAL control is stored as bounded hex; these checks do not reinspect disk."
           (list :history-text (copy-seq history))))
 
 (defun physical-adoption-attempt-origin-request (origin)
+  "Build the retained proof request from the original B/M/E witness."
   (let ((identity (getf origin :identity)))
     (list :system-id (first identity) :base-timeline (second identity)
           :base (third identity) :manifest-digest (fourth identity) :end (getf origin :end))))

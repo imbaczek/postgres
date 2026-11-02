@@ -58,7 +58,7 @@ no PREPARE or installation authority. The startup presence fence applies to ever
 phase. CRC and FNV are integrity checks under cooperative ownership, not
 authentication. The record contains private credentials; hex is not encryption
 and payloads must not be logged.
-The network PREPARE/PROVE driver remains open.
+Installation and startup reconciliation remain open.
 
 Validation passed 1,509 physical, 903 unit and 201 wire tests, ten new Rove tests
 and strict cold compilation. The property passed 100 trials at seed 76, digest
@@ -78,9 +78,9 @@ immutable during construction and validation.
 
 Source observation reads IDENTIFY, history, and IDENTIFY again, rejecting a timeline
 change or backward position during the observation. The local context validator
-rechecks the saved local and stage facts but does not observe the remote source. A
-future orchestrator must reobserve the saved source before side effects and compare
-actual PREPARE and PROVE history before the codec strips and reattaches history.
+rechecks the saved local and stage facts but does not observe the remote source. The
+proof driver reobserves the source before PREPARE and compares actual PREPARE and
+PROVE history before the codec strips and reattaches history.
 The factory does not publish the attempt, orchestrate PREPARE, PROVE or ABORT,
 install or start an image, or provide coordination.
 
@@ -91,6 +91,42 @@ The authentication freeze property passed 100 trials at seed 77, digest
 and input coverage were not measured. Native full export-origin and final recheck
 passed. Evidence is in
 `/home/imbaczek/proj/pg-ha-artifacts/adoption-context/evidence.json`.
+
+### Durable adoption proof driver
+
+The start path constructs an attempt and durably publishes and reads back preparing
+before PREPARE. Resume accepts preparing or proved, checks the local context and exact
+record, and uses the saved frozen client route. It observes IDENTIFY, history and
+IDENTIFY again, requiring the saved timeline and history and a flush position at least
+E. It checks the full local context and record again immediately before PREPARE.
+
+The driver compares the actual anchor history before PROVE and sends the original
+B/M/E request. It compares the actual proof history before the codec strips and
+reattaches history; the canonical codec checks H_E against the independently checked
+origin. After proof it reobserves the source, cleans up an owned client, and checks the
+local context and record again before durably publishing proved. A proved retry repeats
+the proof and must produce the saved candidate; it returns the old record without
+republishing it.
+
+Guarded local failures and nonretryable remote call errors attempt to durably save
+aborting before rethrowing the error. A failure to save that phase leaves the attempt
+fenced for reread. Retryable remote transport or availability errors leave the phase
+for exact resume. Initial client setup and acceptance checks, owned-client cleanup,
+and publication are outside those guards and preserve the saved phase or publication
+ambiguity. The
+driver does not automatically send network ABORT; cancellation is separate. It does
+not install or start an image, grant writer authority, or provide coordination.
+Installation and startup reconciliation remain open.
+
+Validation passed 1,547 physical, 903 unit and 201 wire tests, 13 new focused tests,
+strict cold compilation and the final native check. With `PG_ADOPTION_PROOF_TEST=1`,
+the native check starts the driver, independently checks H_E and root, reconnects via
+the frozen route, retries proved and cancels; the final old-primary file bytes and
+identities match the initial inventory. Two properties each passed 100 trials: seed 79, digest
+`fnv1a64-v1:829297b107cb32a2`, and seed 80, digest `fnv1a64-v1:eb1c588915bcebd7`.
+No Function Spec is registered for either function; rejection counts and input
+coverage were not measured.
+Evidence is in `/home/imbaczek/proj/pg-ha-artifacts/adoption-proof-driver/evidence.json`.
 
 ### Adoption cancellation
 
