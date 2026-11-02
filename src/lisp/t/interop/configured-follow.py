@@ -1,5 +1,6 @@
 """Configure an owned standby through files and reload, without retarget calls."""
 import os
+import runpy
 import signal
 import struct
 import subprocess
@@ -115,6 +116,7 @@ def exercise(api, peer, identity, sibling, source, promoted):
     flow.configure(conninfo, 'configured_a')
     flow.streaming('configured_a')
     flow.raw_metadata(conninfo)
+    runpy.run_path(str(Path(__file__).with_name('receiver-reload.py')))['exercise'](flow)
     query(source, "INSERT INTO promotion_sql_items VALUES (2,'configured-first')")
     flow.count(2)
     control('sibling.sock', '(defparameter *configured-before* (list *physical-follow-desired* *physical-follow-runtime* (physical-follow-runtime-receiver-thread *physical-follow-runtime*) (physical-follow-runtime-replay-thread *physical-follow-runtime*)))')
