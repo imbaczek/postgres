@@ -185,6 +185,8 @@
 
 (declaim (ftype function parse-native-physical-bootstrap-release release-native-physical-bootstrap))
 
+(declaim (ftype function parse-native-physical-prove-retained prove-native-physical-retained))
+
 (defun parse-timeline-history-command (words)
   (unless (and (= (length words) 2) (plusp (length (second words)))
                (every (lambda (character) (find character "0123456789")) (second words)))
@@ -209,6 +211,7 @@
       ((equal verb "TIMELINE_HISTORY") (parse-timeline-history-command words))
       ((equal verb "BASE_BACKUP_NATIVE") (parse-native-physical-backup words))
       ((equal verb "PREPARE_FOLLOW") (parse-native-physical-prepare words))
+      ((equal verb "PROVE_RETAINED") (parse-native-physical-prove-retained words))
       ((equal verb "RELEASE_FOLLOW") (parse-native-physical-release words))
       ((equal verb "RELEASE_BOOTSTRAP") (parse-native-physical-bootstrap-release words))
       ((equal verb "CREATE_REPLICATION_SLOT") (parse-create-replication-slot words))
@@ -1018,13 +1021,14 @@ keepalive's WAL-end field, which may include changes not yet applied."
              (eq (logical-replication-command-snapshot-action command) :export)
              (backend-explicit *backend*))
     (ereport "25001" "EXPORT_SNAPSHOT cannot run inside a transaction block"))
-  (when (and (member (logical-replication-command-type command) '(:start :physical-start :physical-backup :physical-prepare :physical-release :physical-bootstrap-release :timeline-history))
+  (when (and (member (logical-replication-command-type command) '(:start :physical-start :physical-backup :physical-prepare :physical-prove :physical-release :physical-bootstrap-release :timeline-history))
              (backend-explicit *backend*))
     (ereport "25001" "~a cannot run inside a transaction block"
              (case (logical-replication-command-type command)
                (:timeline-history "TIMELINE_HISTORY")
                (:physical-backup "BASE_BACKUP_NATIVE")
                (:physical-prepare "PREPARE_FOLLOW")
+               (:physical-prove "PROVE_RETAINED")
                (:physical-release "RELEASE_FOLLOW")
                (:physical-bootstrap-release "RELEASE_BOOTSTRAP")
                (otherwise "START_REPLICATION")))))
@@ -1063,6 +1067,7 @@ keepalive's WAL-end field, which may include changes not yet applied."
             (:physical-start (start-native-physical-replication stream command))
             (:physical-backup (start-native-physical-backup stream command))
             (:physical-prepare (prepare-native-physical-follow stream command))
+            (:physical-prove (prove-native-physical-retained stream command))
             (:physical-release (release-native-physical-follow stream command))
             (:physical-bootstrap-release (release-native-physical-bootstrap stream command))
             (:start

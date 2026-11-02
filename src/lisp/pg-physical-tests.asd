@@ -66,6 +66,7 @@
                (:file "t/promotion-resume-tests")
                (:file "t/promotion-commit-tests")
                (:file "t/promotion-retained-tests")
+               (:file "t/physical-origin-proof-tests")
                (:file "t/promotion-online-tests")
                (:file "t/promotion-sql-tests")
                (:file "t/physical-stream-tests")
