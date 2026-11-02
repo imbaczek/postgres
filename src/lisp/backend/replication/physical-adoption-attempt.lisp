@@ -4,6 +4,7 @@
 
 (defconstant +physical-adoption-attempt-maximum-bytes+ +physical-follow-config-maximum-bytes+)
 
+(declaim (ftype function physical-adoption-install-publish-attempt))
 
 (defvar *physical-adoption-attempt-test-hook* nil)
 
@@ -313,10 +314,13 @@ Validation establishes structural coherence, not current external facts."
       (physical-adoption-attempt-check-owner owner record)
       record)))
 
-(defun physical-adoption-attempt-publish (owner candidate &key previous)
+(defun physical-adoption-attempt-publish (owner candidate &key previous install-state)
   "Publish owned copies under the active offline owner in its PGDATA.
 Check the previous record and transition, then fsync, rename, sync the directory
 and read back. This does not revalidate source or stage or grant operation authority."
+  (when install-state
+    (return-from physical-adoption-attempt-publish
+      (physical-adoption-install-publish-attempt owner candidate previous install-state)))
   (let* ((candidate (physical-adoption-attempt-copy candidate))
          (previous (when previous (physical-adoption-attempt-copy previous)))
          (owner (physical-adoption-attempt-check-owner owner candidate))
