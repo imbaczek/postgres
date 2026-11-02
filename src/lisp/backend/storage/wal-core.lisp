@@ -75,6 +75,8 @@ Runtime retention requires a captured installed policy.")
 (defvar *wal-slot-recycling-pending* nil
   "One process-local pending recycling ticket, retained across cancellation.")
 
+(defvar *wal-shutdown-defer-recycling* nil)
+
 (declaim (ftype function wal-capture-slot-recycling-work))
 
 (declaim (ftype function cleanup-invalidated-logical-replication-state))
@@ -3615,6 +3617,8 @@ Active standard-policy owners defer removal in a process-local ticket; the calle
 retries outside locks after stopping them. Independent XID and snapshot floors
 also constrain removal. CURRENT freezes the endpoint across that retry, while
 each calculation captures the current retention settings."
+  (when *wal-shutdown-defer-recycling*
+    (return-from wal-remove-checkpointed-segments-under-wal-lock (values)))
   (wal-settle-page-publications-under-lock)
   (wal-require-no-pending-page-publication)
   (let ((checkpoint-segment (wal-checkpoint-recycling-segment checkpoint-lsn)))

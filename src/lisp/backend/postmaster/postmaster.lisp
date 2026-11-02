@@ -164,9 +164,9 @@ cannot change. Exhaustion raises FATAL before authentication success is sent."
   "Release deferred transactions and snapshots after the last client exits.
 The caller must exclude new storage work. ABORT-TRANSACTION preserves a commit
 already recorded in CLOG while releasing the backend's remaining registrations."
+  (unless (wal-sender-shutdown-clients-drained-p)
+    (error "shutdown still has live client connections"))
   (let ((backends (sb-thread:with-mutex (*backend-registry-lock*)
-                    (unless (and (zerop *n-connections*) (zerop *n-backends*))
-                      (error "shutdown still has live client connections"))
                     (copy-list *shutdown-abandoned-backends*))))
     (dolist (backend backends)
       (let ((*backend* backend)) (abort-transaction)))
@@ -271,14 +271,20 @@ command (idle) is ignored; the connection and its transaction state survive."
 
 ;;; ---- shutdown state machine ----
 
+(declaim (ftype function wal-sender-shutdown-requested-p wal-sender-request-stopping
+                wal-sender-shutdown-ordinary-clients-gone-p wal-sender-shutdown-clients-drained-p
+                wal-sender-shutdown-terminate-nonparticipants))
+
 (defun finish-shutdown ()
   "Request main-thread finalization after every client connection has gone."
   ;; A backend can still hold live-operation admission here. Never join recovery
   ;; workers, close admission, or exit from this cleanup stack.
   (sb-thread:with-mutex (*accept-lock*)
     (when (and (<= +smart-shutdown+ (shutdown-mode) +fast-shutdown+)
-               (sb-thread:with-mutex (*backend-registry-lock*)
-                 (zerop *n-connections*)))
+               (if (wal-sender-shutdown-requested-p)
+                   (wal-sender-shutdown-clients-drained-p)
+                   (sb-thread:with-mutex (*backend-registry-lock*)
+                     (zerop *n-connections*))))
       (sb-thread:with-mutex (*shutdown-lock*)
         (when (and (not *shutdown-finished*) (not *shutdown-finalizing-p*)
                    (<= +smart-shutdown+ *shutdown* +fast-shutdown+))
@@ -340,10 +346,17 @@ including during smart shutdown. The signal worker remains available for immedia
   (values))
 
 (defun maybe-finish-shutdown ()
-  (when (and (shutdown-in-progress-p)
-             (sb-thread:with-mutex (*backend-registry-lock*)
-               (zerop *n-connections*)))
-    (finish-shutdown)))
+  (when (shutdown-in-progress-p)
+    (when (and *wal-ready* (not (recovery-in-progress-p))
+               (not (wal-sender-shutdown-requested-p))
+               (wal-sender-shutdown-ordinary-clients-gone-p))
+      (wal-sender-request-stopping)
+      (wal-sender-shutdown-terminate-nonparticipants))
+    (when (if (wal-sender-shutdown-requested-p)
+              (wal-sender-shutdown-clients-drained-p)
+              (sb-thread:with-mutex (*backend-registry-lock*)
+                (zerop *n-connections*)))
+      (finish-shutdown))))
 
 (defun immediate-shutdown ()
   "Exit without waiting for the backends, like PostgreSQL's immediate shutdown.
@@ -382,7 +395,11 @@ are killed abruptly."
     (#.+fast-shutdown+
      (admin-log "received fast shutdown request")
      (admin-log "aborting any active transactions")
-     (terminate-all-backends)
+     (if (and *wal-ready* (not (recovery-in-progress-p)))
+         (progn
+           (wal-sender-request-stopping)
+           (wal-sender-shutdown-terminate-nonparticipants))
+         (terminate-all-backends))
      (maybe-finish-shutdown))
     (#.+immediate-shutdown+
      (admin-log "received immediate shutdown request")
@@ -433,6 +450,9 @@ are killed abruptly."
         (handler-case (process-shutdown-request target)
           (error (e)
             (admin-log "shutdown processing failed: ~a" e)))))
+    (when (<= +smart-shutdown+ (shutdown-mode) +fast-shutdown+)
+      (handler-case (maybe-finish-shutdown)
+        (error (condition) (admin-log "shutdown drain failed: ~a" condition))))
     (sleep 0.05)))
 
 (defun enable-shutdown-handlers ()

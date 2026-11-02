@@ -70,6 +70,10 @@ A symbol FUNCTION is resolved while the lock is held, after any code reload."
 
 (defvar *live-operation-terminal-shutdown* nil)
 
+(defvar *live-operation-shutdown-drain-open* nil)
+
+(defvar *live-operation-shutdown-drain-check* nil)
+
 (defvar *live-operation-drain-open* nil)
 (defvar *live-operation-count* 0)
 (defvar *live-operation-backend-counts* (make-hash-table :test #'eq))
@@ -217,6 +221,10 @@ Concurrent requests remain pending for their consumers."
   (cond
     (*live-operation-terminal-shutdown* nil)
     (*live-operation-admission-open* :normal)
+    ((and *live-operation-shutdown-drain-open*
+          *live-operation-shutdown-drain-check*
+          (funcall *live-operation-shutdown-drain-check*))
+     :shutdown-drain)
     ((and *live-operation-drain-open*
           (if (functionp drain-p) (funcall drain-p) drain-p))
      :drain)
@@ -569,7 +577,8 @@ The primary finalizer separately holds reload exclusion."
        (error "release owned quiescence before draining parked shutdown cleanup"))
      (setf *live-operation-terminal-shutdown* t
            *live-operation-admission-open* nil
-           *live-operation-drain-open* nil)
+           *live-operation-drain-open* nil
+           *live-operation-shutdown-drain-open* nil)
      (sb-thread:condition-broadcast *live-operation-cv*)
      (loop while (or (plusp *live-operation-count*)
                      (plusp (hash-table-count *live-operation-parked*)))
@@ -740,18 +749,27 @@ lane must not run query or storage work."
 
 (defmacro with-live-operation-captured-backend-cleanup (&body body)
   "Run backend bookkeeping for a session connected when reload closed admission."
-  `(with-live-operation-internal
-       ((and *backend*
-             (or (member *backend* *live-operation-cleanup-backends* :test #'eq)
-                 (member *backend* *live-operation-drain-backends* :test #'eq))))
-     ,@body))
+  `(let ((*live-operation-shutdown-drain-check*
+           (or (and (fboundp 'wal-sender-shutdown-cleanup-check)
+                    (wal-sender-shutdown-cleanup-check *backend*))
+               *live-operation-shutdown-drain-check*)))
+     (with-live-operation-internal
+         ((and *backend*
+               (or (member *backend* *live-operation-cleanup-backends* :test #'eq)
+                   (member *backend* *live-operation-drain-backends* :test #'eq))))
+       ,@body)))
 
 (defmacro with-live-operation-backend-shutdown-cleanup ((backend) &body body)
   "Bind BACKEND while admitting its shutdown and teardown cleanup."
   (let ((backend-value (gensym "BACKEND-")))
     `(let* ((,backend-value ,backend)
-            (*backend* ,backend-value))
-       (with-live-operation-shutdown-cleanup ,@body))))
+            (*backend* ,backend-value)
+            (*live-operation-shutdown-drain-check*
+              (and (fboundp 'wal-sender-shutdown-cleanup-check)
+                   (wal-sender-shutdown-cleanup-check ,backend-value))))
+       (if *live-operation-shutdown-drain-check*
+           (with-live-operation-internal (nil) ,@body)
+           (with-live-operation-shutdown-cleanup ,@body)))))
 
 (defmacro with-live-operation-query-state-cleanup (&body body)
   "Clear query admission state without waiting during backend-terminating shutdown."

@@ -184,7 +184,8 @@ Only explicit proof_kind retained_timeline selects the retained proof."
                 (ignore-errors (close stream :abort t))
                 (error condition)))
          (when stage
-           (physical-backup-delete-stage stage)))))))
+           (physical-backup-delete-stage stage)))))
+   :kind :backup))
 
 (defun parse-native-physical-prepare (words)
   "Parse PREPARE_FOLLOW and require the native format and each receiver field once.
@@ -379,6 +380,7 @@ Release does not delete the public slot or private proof pin."
     (unwind-protect
          (multiple-value-bind (claimed limit next)
              (with-live-operation (physical-source-acquire-sender command owner))
+           (wal-sender-stream-physical-ready claimed limit)
            (funcall function claimed limit next))
       (with-live-operation-captured-backend-cleanup
         (physical-source-release-sender name owner)))))
@@ -675,6 +677,15 @@ Validate and confirm any status messages received before that completion."
                status previous limit (parse-replication-lsn (physical-stream-option command "base_lsn")))))
       (physical-source-confirm-status command owner status))))
 
+(defun physical-stream-shutdown-complete-p (owner cursor status)
+  (let ((target (wal-sender-shutdown-target)))
+    (when (and target (>= cursor target) (>= (getf status :flush) target))
+      (let ((confirmed (with-live-operation
+                         (physical-source-sender-floor (physical-sender-name owner) owner))))
+        (when (>= confirmed target)
+          (wal-sender-note-shutdown-acknowledged)
+          t)))))
+
 (defun physical-stream-send-loop (stream command owner &optional limit)
   "Send records with one dynamically scoped historical source prefix cache.
 The cache belongs to this sender loop; reuse requires the same source selection.
@@ -686,6 +697,9 @@ A historic stream stops at its fork before sending child end-of-recovery WAL."
          (status (list :write cursor :flush cursor :apply base)))
     (wal-sender-note-sent *wal-sender* cursor)
     (loop
+      (wal-sender-shutdown-observe)
+      (when (physical-stream-shutdown-complete-p owner cursor status)
+        (ereport-fatal "57P01" "terminating WAL sender after shutdown checkpoint delivery"))
       (when (and limit (= cursor limit))
         (return (values :switch status)))
       (multiple-value-bind (record raw durable)
@@ -768,8 +782,10 @@ claims."
             (error (condition)
               (unless copy-mode (error condition))
               (ignore-errors
-               (send-error-response stream
-                                    (if (typep condition 'pg-error) condition
-                                        (make-condition 'pg-error :sqlstate "XX000"
-                                                                  :message (princ-to-string condition)))))
-              (ignore-errors (close stream :abort t))))))))))
+               (sb-ext:with-timeout 10
+                 (send-error-response stream
+                                      (if (typep condition 'pg-error) condition
+                                          (make-condition 'pg-error :sqlstate "XX000"
+                                                                    :message (princ-to-string condition))))))
+              (ignore-errors (close stream :abort t))))))))
+   :kind :physical))

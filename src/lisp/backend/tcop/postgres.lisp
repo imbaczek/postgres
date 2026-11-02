@@ -688,6 +688,8 @@ Preserve all dispatch values, including secondary values, for the caller."
 (defun backend-loop (stream)
   "Process frontend messages until termination or suppressed output closes the session."
   (loop
+    (when (wal-sender-backend-stopping-p *backend*)
+      (ereport-fatal "57P01" "WAL sender is stopping"))
     (check-backend-frontend-output)
     (let ((type-byte (read-byte stream nil nil)))
       (unless type-byte (return))

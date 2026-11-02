@@ -69,6 +69,40 @@ The caller must finish those steps before calling this function."
     (wal-set-primary-state +db-in-production+))
   (values))
 
+(defun prepare-primary-shutdown-with-senders ()
+  (unless (eq *live-operation-quiescence-owner-thread* sb-thread:*current-thread*)
+    (error "primary shutdown checkpoint requires quiescence ownership"))
+  (wal-set-primary-state +db-shutdowning+)
+  (native-control-test-point :after-primary-shutdown-dirty)
+  (postmaster-retire-abandoned-backends)
+  (let ((*wal-shutdown-defer-recycling* t))
+    (wal-checkpoint-core))
+  (native-control-test-point :after-primary-shutdown-checkpoint)
+  (multiple-value-bind (system-id timeline namespace endpoint)
+      (sb-thread:with-mutex (*wal-lock*)
+        (values (catalog-system-identifier) *wal-insert-timeline*
+                *wal-segment-namespace* *wal-durable-lsn*))
+    (wal-sender-publish-shutdown-target system-id timeline namespace endpoint)
+    (wal-sender-wait-shutdown-exit)
+    (wal-sender-check-shutdown-released)
+    (fence-live-operation-shutdown)
+    (call-with-invalidated-slot-cleanup
+     (lambda ()
+       (with-wal-critical
+         (unless (and (= system-id (catalog-system-identifier))
+                      (= timeline *wal-insert-timeline*)
+                      (eq namespace *wal-segment-namespace*)
+                      (= endpoint *wal-durable-lsn* *wal-checkpoint-lsn*))
+           (error "primary storage changed during shutdown sender drain"))
+         (wal-remove-checkpointed-segments-under-wal-lock *wal-checkpoint-lsn* endpoint)
+         (wal-retry-pending-temp-cleanup-under-lock)
+         (wal-require-no-temp-cleanup-under-lock)
+         (when *wal-slot-recycling-pending*
+           (error "primary shutdown left an active replication slot owner"))))))
+  (wal-set-primary-state +db-shutdowned+)
+  (native-control-test-point :after-primary-shutdown-clean)
+  (values))
+
 (defun prepare-primary-shutdown ()
   "Finish smart or fast shutdown in the owning postmaster, outside admission.
 Clients must already be gone. Serialize with reload, close admission permanently,
@@ -80,6 +114,14 @@ Do not roll back a possibly published clean state."
   (unless (and *postmaster-data-lock* (postmaster-pid-owned-p)
                *shutdown-finalizing-p* (zerop *live-operation-depth*))
     (error "primary shutdown requires the owning unadmitted postmaster"))
+  (when (wal-sender-shutdown-streams-p)
+    (call-with-live-operation-reload
+     (lambda ()
+       (unwind-protect
+            (prepare-primary-shutdown-with-senders)
+         (unless *live-operation-terminal-shutdown*
+           (fence-live-operation-shutdown)))))
+    (return-from prepare-primary-shutdown (values)))
   (sb-thread:with-mutex (*reload-run-lock*)
     (fence-live-operation-shutdown)
     (wal-set-primary-state +db-shutdowning+)
@@ -92,6 +134,7 @@ Do not roll back a possibly published clean state."
       (when *wal-slot-recycling-pending*
         (error "primary shutdown left an active replication slot owner")))
     (native-control-test-point :after-primary-shutdown-checkpoint)
+    (wal-sender-check-shutdown-released)
     (wal-set-primary-state +db-shutdowned+)
     (native-control-test-point :after-primary-shutdown-clean))
   (values))

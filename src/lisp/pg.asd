@@ -124,6 +124,7 @@
       :serial t
       :components ((:file "dest")
                    (:file "control")
+                   (:file "../replication/walsender-shutdown")
                    (:file "../utils/startup-config")
                    (:file "../libpq/auth-policy")
                    (:file "../utils/session-config")

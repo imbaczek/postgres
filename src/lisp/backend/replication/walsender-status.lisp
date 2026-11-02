@@ -116,7 +116,9 @@ private sync proof while the sender mutex still protects the feedback."
 
 (defvar *wal-sender* nil)
 
-(defun call-with-wal-sender-stream (function)
+(declaim (ftype function call-with-wal-sender-stream-scope))
+
+(defun call-with-wal-sender-stream (function &key (kind :logical))
   "Capture the backend's registration token for the stream body and reset progress.
 Feedback and cleanup use that token, so they cannot affect a replacement registration."
   (let* ((sender (wal-sender-for-backend))
@@ -134,7 +136,7 @@ Feedback and cleanup use that token, so they cannot affect a replacement registr
                          (wal-sender-status-replay-lsn sender) nil
                          (wal-sender-status-reply-time sender) nil)
                    (sync-replication-refresh-under-lock))))
-             (funcall function))
+             (call-with-wal-sender-stream-scope function kind))
         (wal-sender-set-state sender "startup")))))
 
 (defun wal-sender-snapshots ()
