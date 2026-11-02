@@ -168,6 +168,11 @@ WAL control is stored as bounded hex; these checks do not reinspect disk."
   (append (physical-adoption-attempt-fields-copy value (remove :history-text keys))
           (list :history-text (copy-seq history))))
 
+(defun physical-adoption-attempt-origin-request (origin)
+  (let ((identity (getf origin :identity)))
+    (list :system-id (first identity) :base-timeline (second identity)
+          :base (third identity) :manifest-digest (fourth identity) :end (getf origin :end))))
+
 (defun physical-adoption-attempt-proof-copy (anchor proof request origin stage history)
   "Reattach shared history to detached anchor and proof for existing validators.
 Check typed proof fields and equality with the saved local history digest."
@@ -175,9 +180,7 @@ Check typed proof fields and equality with the saved local history digest."
                        (physical-adoption-attempt-with-history anchor *physical-follow-anchor-keys* history)))
          (full-proof (physical-adoption-attempt-with-history
                       proof (mapcar #'second *physical-origin-proof-result-fields*) history))
-         (identity (getf origin :identity))
-         (original (list :system-id (first identity) :base-timeline (second identity)
-                         :base (third identity) :manifest-digest (fourth identity) :end (getf origin :end))))
+         (original (physical-adoption-attempt-origin-request origin)))
     (unless (equal request (physical-follow-request-copy
                             (loop for (key value) on full-anchor by #'cddr
                                   unless (member key '(:history-text :eor-octets))
