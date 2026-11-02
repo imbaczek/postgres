@@ -8,6 +8,70 @@ import psycopg2
 from psycopg2.extras import PhysicalReplicationConnection
 
 
+def origin_files(source):
+    directory = source.data / 'pg_physical_origins'
+    return {path.name: path.read_bytes() for path in directory.glob('*.origin')}
+
+
+def check_export_origins(base, source, follow, dsn, stages):
+    before = origin_files(source)
+    assert before, 'cancelled verified export did not retain its origin'
+    command = [str(base / 'bin/pg_basebackup'), '-X', 'stream', '--dbname=' + dsn]
+
+    def settled():
+        follow['wait_for'](lambda: sorted(path.name for path in stages.iterdir()) == ['.owner'])
+        assert follow['query'](source.port, 'SELECT slot_name FROM pg_replication_slots') == [('clone_one',)]
+
+    try:
+        for name in ('PG_VERSION', 'physical-backup.manifest', 'authentication.initialized'):
+            form = ('(setf *physical-bootstrap-test-hook* (lambda (point target) '
+                    '(when (eq point :after-manifest) '
+                    f'(with-open-file (output (merge-pathnames {json.dumps(name)} target) '
+                    ':direction :output :if-exists :overwrite) (write-char #\\X output)))))')
+            follow['control'](source.process, source.control_socket, form)
+            target = source.root / ('invalid-origin-' + name)
+            result = subprocess.run(command + ['--pgdata=' + str(target)],
+                                    capture_output=True, text=True, timeout=60)
+            assert result.returncode != 0 and not target.exists(), (name, result.stderr)
+            settled()
+            assert origin_files(source) == before, 'invalid stage published origin authority'
+    finally:
+        follow['control'](source.process, source.control_socket, '(setf *physical-bootstrap-test-hook* nil)')
+
+    limit_file = source.root / 'origin-limit'
+    follow['control'](source.process, source.control_socket,
+                      f'(with-open-file (output {json.dumps(str(limit_file))} :direction :output '
+                      ':if-exists :supersede) (format output "~d" *physical-export-origin-limit*))')
+    old_limit = int(limit_file.read_text())
+    try:
+        follow['control'](source.process, source.control_socket,
+                          f'(setf *physical-export-origin-limit* {len(before)})')
+        target = source.root / 'origin-capacity-rejected'
+        result = subprocess.run(command + ['--pgdata=' + str(target)],
+                                capture_output=True, text=True, timeout=60)
+        assert result.returncode != 0 and not target.exists()
+        settled()
+        assert origin_files(source) == before
+        assert follow['query'](source.port, 'SELECT 1') == [(1,)]
+        name, image = next(iter(before.items()))
+        fields = image.decode('ascii').split()
+        identity = ' '.join(fields[1:5])
+        follow['control'](source.process, source.control_socket,
+                          f"(physical-export-origin-forget '({identity}))")
+        assert not (source.data / 'pg_physical_origins' / name).exists()
+        target = source.root / 'origin-capacity-reused'
+        result = subprocess.run(command + ['--pgdata=' + str(target)],
+                                capture_output=True, text=True, timeout=60)
+        assert result.returncode == 0 and (target / 'physical-backup.manifest').exists(), result.stderr
+        settled()
+        assert len(origin_files(source)) == len(before)
+    finally:
+        follow['control'](source.process, source.control_socket,
+                          f'(setf *physical-export-origin-limit* {old_limit})')
+    print('native-basebackup: verified origins reject damaged stages; explicit forget restores capacity PASS',
+          flush=True)
+
+
 def check_hba_rejection(base, source, follow, dsn):
     hba = source.data / 'pg_hba.conf'
     original = hba.read_text()
@@ -114,6 +178,7 @@ def check_live(base, source, follow):
     assert follow['query'](port, 'SELECT slot_name FROM pg_replication_slots') == [('clone_one',)]
     print('native-basebackup: format/destination refusal, SQL during slow export and disconnect cleanup PASS',
           flush=True)
+    check_export_origins(base, source, follow, dsn, stages)
 
 
 def capture(ipc, port):
