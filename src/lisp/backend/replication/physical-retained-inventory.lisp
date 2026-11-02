@@ -227,7 +227,10 @@ The CRC detects accidental corruption; it does not authenticate the payload."
 
 (defun physical-retained-inventory-verify-entries (entries history loader &optional overlap on-record)
   "Validate checked, ordered entries using bounded LOADER reads.
-Keep only the current segment's shared prefix between images."
+Keep only the current segment's shared prefix between images. ON-RECORD receives
+each validated record and its original bytes; validation continues through every
+entry even when a caller only uses a prefix. Later validation can still fail, so
+callbacks must keep partial results private until this function returns."
   (let ((segment (when overlap (floor (1- (getf (first overlap) :base)) +wal-segment-size+)))
         (prefix (second overlap)))
     (dolist (entry entries)
@@ -252,7 +255,8 @@ Keep only the current segment's shared prefix between images."
 (defun physical-retained-inventory-load (directory id identity history &key on-record)
   "Read an inventory and validate all referenced extents sequentially.
 
-Return the freshly decoded payload."
+ON-RECORD receives each validated record and its original bytes, including records
+past any endpoint of interest to the caller. Return the freshly decoded payload."
   (let ((payload (physical-retained-inventory-read-index directory id identity history)))
     (physical-retained-inventory-verify-entries
      (getf payload :entries) history

@@ -1,3 +1,5 @@
+;;;; Retained source history proof for an initial canonical follow base.
+;;;; The result is evidence for comparison, not adoption or writer authority.
 (in-package #:pg)
 
 (declaim (ftype function physical-promotion-check-child-checkpoint))
@@ -69,6 +71,7 @@
                                     (format nil "~d" (getf request key)))))))
 
 (defun physical-origin-proof-check-root (fields history request)
+  "Validate the selected root against the historical B/M identity and requested E."
   (physical-origin-proof-check-request request)
   (let* ((metadata (seventh fields))
          (reference (getf metadata :retained-reference))
@@ -86,6 +89,9 @@
     reference))
 
 (defun physical-origin-proof-hash-root (fields history request)
+  "Hash historical B through E from the selected retained root.
+The complete root is validated, including records after E; only records through
+E contribute to H_E, and E must be a complete record boundary."
   (physical-origin-proof-check-root fields history request)
   (let* ((end (getf request :end))
          (cursor (getf request :base))
@@ -106,6 +112,9 @@
     digest))
 
 (defun physical-origin-proof-start-under-lock (command request)
+  "Check the exact initial READY pin under WAL exclusion.
+Its canonical base is E with the new manifest Mnew and empty FNV seed; the
+request separately names historical B and M for the retained proof."
   (unless (sb-thread:holding-mutex-p *wal-lock*)
     (error "retained origin proof claim requires WAL exclusion"))
   (let* ((name (logical-replication-command-slot-name command))
@@ -132,6 +141,7 @@
                     (cons "timeline" (format nil "~d" (getf anchor :receive-timeline)))))))
 
 (defun call-with-physical-origin-proof-claim (command request function)
+  "Own the READY sender claim for FUNCTION and release it on every exit."
   (unless *backend* (wal-invalid-input "retained origin proof requires a backend"))
   (let* ((name (logical-replication-command-slot-name command))
          (owner (make-physical-sender :name name :backend *backend*)))
@@ -147,6 +157,7 @@
         (physical-source-release-sender name owner)))))
 
 (defun physical-origin-proof-capture-under-lock (command request owner)
+  "Capture the selected root, READY pin and source context under WAL exclusion."
   (unless (sb-thread:holding-mutex-p *wal-lock*)
     (error "retained origin proof capture requires WAL exclusion"))
   (wal-check-healthy)
@@ -176,6 +187,7 @@
               :identity (physical-promotion-retained-identity system reference))))))
 
 (defun physical-origin-proof-recheck (command request owner captured)
+  "Recheck the captured root, pin and source context while allowing checkpoint progress."
   (with-live-operation
     (sb-thread:with-mutex (*wal-lock*)
       (let ((current (physical-origin-proof-capture-under-lock command request owner)))
@@ -191,6 +203,9 @@
         current))))
 
 (defun physical-origin-proof-run (command)
+  "Prove historical B/M/H_E against the selected root under a reader lease.
+Ordinary admission and the lease remain held while hashing, without holding the
+WAL or archive mutex. Recheck the captured context before and after the scan."
   (let ((request (physical-origin-proof-command-request command)))
     (call-with-physical-origin-proof-claim
      command request
@@ -231,6 +246,9 @@
                   (otherwise (format nil "~d" value)))))
 
 (defun physical-origin-proof-decode-result (row name anchor request)
+  "Validate typed source claims against the request and prepared anchor.
+The returned digest and root identity remain source claims. Typed decoding does
+not replace the caller's independent comparison with local history evidence."
   (let* ((proof
            (loop for (field key kind) in *physical-origin-proof-result-fields*
                  for index from 0 for text = (aref row index)
@@ -258,6 +276,9 @@
     proof))
 
 (defun pg-client-native-prove-retained (client name anchor request)
+  "Request a retained-origin proof for the initial canonical READY base.
+This returns source claims for independent local comparison; it does not install
+an image, authorize adoption, or grant writer authority."
   (let* ((anchor (physical-follow-anchor-copy anchor))
          (request (physical-origin-proof-check-request request))
          (end (getf request :end)))
@@ -274,6 +295,7 @@
       (physical-origin-proof-decode-result row name anchor request))))
 
 (defun prove-native-physical-retained (stream command)
+  "Serve the typed retained-origin proof result on a replication connection."
   (handler-case
       (let* ((proof (physical-origin-proof-run command))
              (columns (loop for (name oid) in (physical-origin-proof-result-schema)

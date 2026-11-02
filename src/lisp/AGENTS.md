@@ -200,6 +200,10 @@ appropriate instead of replacing the native C peer or adding a message relay.
 
 ### Network deadlines and live socket inspection
 
+- For FATAL termination wire checks, control instrumentation and a wire proxy
+  confirmed the server sent FATAL 57P01 even though `PQexecFinish` replaced the
+  error with EOF. Use an exclusive plaintext file-descriptor oracle after startup
+  to observe the frame before libpq consumes it.
 - Defer asynchronous interrupts during critical WAL publication and protect entry
   to failure cleanup. Keep nonlocal-exit fencing explicit; do not classify every
   exit as an ordinary error. Preserve source SQLSTATE 57P01 rather than treating

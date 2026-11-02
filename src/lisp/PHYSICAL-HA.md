@@ -40,6 +40,33 @@ tests, strict cold compilation and the existing shutdown test. Logs are in
 
 ## Verified starting points
 
+### Retained origin proof prerequisite
+
+The promoted source can prove its retained historical B/M prefix through E for
+an initial READY follow pin. That pin names the canonical base E/Mnew and has
+the empty FNV seed; the historical request and returned H_E describe a separate
+origin. The source validates the entire selected root, including records after E,
+while hashing only through E. Ordinary admission and a root-reader lease protect
+the scan without holding the WAL or archive mutex. Root, pin and source context
+are rechecked around the scan, allowing unrelated checkpoint progress.
+
+The typed client verifies the response against the prepared anchor and request.
+The digest and root identity remain source claims; typed decoding alone does not
+authenticate them. Adoption must compare H_E with independently checked local
+history. This is a read-only prerequisite, not image installation, adoption or
+writer authority. A canonical image and journaled installation remain open.
+
+Validation passed 1,488 physical, 903 unit and 201 wire tests and strict cold
+compilation. The query property passed 100 trials at seed 74, digest
+`fnv1a64-v1:f77e314e8f25d6cb`; it has no Function Spec, and rejection counts
+and input coverage were not measured. Direct and libpq native checks covered
+multisegment independent CRC/FNV verification, recycling, restart, promotion,
+checkpoint progress, cancellation and shutdown. The READY pin survived and the
+old primary's files stayed byte-identical. The native check used synthetic receiver
+coordinates at the real clean endpoint E=33752368, with a synthetic Mnew; it did
+not install a canonical image. Evidence is in
+`/home/imbaczek/proj/pg-ha-artifacts/retained-origin-proof/`.
+
 ### Descendant follow and explicit reseeding
 
 The unchanged pinned Patroni follow and promote methods passed two isolated

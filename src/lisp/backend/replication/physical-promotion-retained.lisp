@@ -68,7 +68,8 @@
 
 (defun physical-promotion-check-primary-retained (snapshot history metadata &key on-record)
   "Validate an optional primary archive against the child history fork.
-A later checkpoint does not move that fork."
+A later checkpoint does not move that fork. ON-RECORD sees validated records
+throughout the selected root, including those past a caller's proof endpoint."
   (let ((reference (getf metadata :retained-reference)))
     (when reference
       (multiple-value-bind (parent fork projected) (physical-promotion-retained-parent-history history)

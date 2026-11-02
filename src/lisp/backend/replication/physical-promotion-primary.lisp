@@ -14,10 +14,11 @@
 
 (defun physical-promotion-check-child-checkpoint (insertion checkpoint-timeline)
   "Verify child checkpoint control, its WAL record and history without writes.
-Return the checkpoint snapshot, parsed history and metadata. This check must precede WAL
-scanning or tail repair. It deliberately needs no old generation, receive spool
-or backup manifest: child control is now the recovery authority. Callers must separately validate
-any selected retained archive before using it as proof or granting writer authority.
+Return the checkpoint snapshot, parsed history and metadata. This check must
+precede WAL scanning or tail repair. It needs no old generation, receive spool
+or backup manifest: child control is now the recovery authority. Callers must
+separately validate any selected retained archive before using it as proof or
+granting writer authority. This lets a caller validate the root under its lease.
 Read the checkpoint's actual encoded size and check any resource origin against
 that history before accepting the control copy."
   (multiple-value-bind (checkpoint durable snapshot timeline checkpoint-id namespace metadata) (wal-read-control-fields)

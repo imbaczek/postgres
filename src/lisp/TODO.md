@@ -1,5 +1,16 @@
 # Development TODO
 
+- [x] Prove retained origin history on the promoted source for an initial READY
+  pin. The source hashes the selected root from historical B/M through E while
+  holding a root-reader lease, and rechecks the pin and source context before
+  replying. The typed result remains a claim until independently compared locally.
+  This prerequisite does not install an image or authorize adoption or writes.
+  Validation passed 1,488 physical, 903 unit and 201 wire tests and strict cold
+  compilation. The query property passed 100 trials at seed 74, digest
+  `fnv1a64-v1:f77e314e8f25d6cb`; no Function Spec is registered and rejection
+  counts and input coverage were not measured. Native evidence is in
+  `/home/imbaczek/proj/pg-ha-artifacts/retained-origin-proof/`.
+
 - [x] Add read-only local checks for former-primary adoption. Keep the existing
   PGDATA lock and directory inodes, require exact clean checkpoint/catalog,
   resource and allocator facts, and extend a genuine durable export-origin
@@ -14,8 +25,8 @@
   That real source receipt had P=E, so its suffix was empty; fixtures checked
   nonempty suffixes, incomplete records and corruption.
   Evidence: `/home/imbaczek/proj/pg-ha-artifacts/adoption-preflight/`.
-  These helpers grant no writer or recovery-installation authority. Remote
-  selected-root proof, a canonical E image and journaled installation remain open.
+  These helpers grant no writer or recovery-installation authority.
+  A canonical E image and journaled installation remain open.
 
 - [x] Preserve source-owned history commitments for verified remote exports.
   A durable origin binds the original system, timeline, base and manifest to a
@@ -36,12 +47,10 @@
   stable PGDATA ownership and exact clean endpoint validation before constructing
   a canonical recovery image. Journal installation before changing files; every
   interrupted startup must resume the exact installation or refuse writer startup.
-  Prepare normal follow at E/Mnew with the empty-prefix seed. Add a source
-  `PROVE_RETAINED` operation on that READY pin to independently hash the selected
-  original B/M history through E under a root-reader lease. Recheck the selected
-  root, source context and pin before replying; unrelated checkpoint progress
-  must not invalidate the proof. Save the exact attempt before PREPARE, and keep
-  existing cleanup debts separate from the new base's provenance.
+  Prepare normal follow at E/Mnew with the empty-prefix seed and independently
+  compare the source `PROVE_RETAINED` claim with local evidence. Save the exact
+  attempt before PREPARE, and keep existing cleanup debts separate from the new
+  base's provenance.
   Then add native divergent rewind or explicit reseed fallback. Do not add
   coordination, elections or DCS management in this backend work.
 
