@@ -182,6 +182,7 @@
                    (:file "../replication/physical-adoption-install-journal")
                    (:file "../replication/physical-adoption-install-state")
                    (:file "../replication/physical-adoption-install")
+                   (:file "../replication/physical-adoption-handoff-codec")
                    (:file "../replication/physical-promotion-online")
                    (:file "../replication/standard")
                    (:file "../replication/worker")
