@@ -201,11 +201,24 @@ def check(binary):
                 '(physical-promotion-check-primary-retained snapshot (timeline-read-history timeline) metadata) '
                 f'(with-open-file (output "{proof_path}" :direction :output :if-exists :supersede) '
                 '(let ((reference (getf metadata :retained-reference))) '
-                '(format output "~d ~d ~d ~d ~d" (getf reference :base-timeline) '
+                '(format output "~d ~d ~d ~d ~d ~d" (getf reference :base-timeline) '
                 '(getf reference :base) (getf reference :manifest-digest) '
-                '(getf reference :end) (getf reference :end-digest)))))')
-            assert tuple(map(int, proof_path.read_text().split())) == (1, base, identity[3], final_end, digest)
+                '(getf reference :end) (getf reference :end-digest) (getf reference :root-id)))))')
+            selected = tuple(map(int, proof_path.read_text().split()))
+            assert selected[:5] == (1, base, identity[3], final_end, digest)
             before = snapshot_bytes(source.data)
+            result = subprocess.run(
+                [os.environ.get('SBCL', 'sbcl'), '--noinform', '--disable-debugger', '--script',
+                 str(BASE / 't/retained-proof-native.lisp'), str(source.data), str(port),
+                 *map(str, (*identity, final_end, digest, selected[5]))],
+                capture_output=True, text=True, timeout=240)
+            (source.root / 'retained-proof-native.log').write_text(result.stdout + result.stderr)
+            assert result.returncode == 0, result.stdout + result.stderr
+            assert snapshot_bytes(source.data) == before, 'remote proof changed former-primary files'
+            print('export-origin: native and libpq commands prove the selected root independently PASS', flush=True)
+            cuts = runpy.run_path(str(Path(__file__).with_name('retained-proof-cuts.py')))
+            cuts['check'](BASE, source, node, root, port, identity, final_end, digest, selected[5], follow)
+            assert snapshot_bytes(source.data) == before, 'proof cuts changed former-primary files'
             result = subprocess.run(
                 [os.environ.get('SBCL', 'sbcl'), '--noinform', '--disable-debugger', '--script',
                  str(BASE / 't/export-origin-offline-check.lisp'), str(source.data),
