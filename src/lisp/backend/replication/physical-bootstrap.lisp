@@ -278,6 +278,21 @@ Validate the selected lineage before constructing the inventory."
               do (push (concatenate 'string "pg_wal/" (file-namestring (wal-segment-path segment))) files))))
     (sort (append files (physical-bootstrap-history-inventory *wal-insert-timeline*)) #'string<)))
 
+(defun physical-bootstrap-derived-wal-image ()
+  (multiple-value-bind (checkpoint durable snapshot insertion checkpoint-timeline namespace metadata)
+      (wal-read-control-fields)
+    (let ((reference (getf metadata :retained-reference)))
+      (when reference
+        (wal-require-supported-timelines insertion checkpoint-timeline)
+        (unless (and snapshot (> checkpoint (getf reference :end)))
+          (error "base backup checkpoint does not supersede its historical archive"))
+        (let ((copied (copy-list metadata)))
+          (remf copied :retained-reference)
+          (values (wal-encode-control-image
+                   checkpoint durable snapshot :timeline insertion
+                   :checkpoint-timeline checkpoint-timeline :namespace namespace :metadata copied)
+                  (list checkpoint durable snapshot insertion checkpoint-timeline namespace copied)))))))
+
 (defun physical-bootstrap-derived-wal-control (target)
   "Derive target control when the source has a historical archive reference.
 Validate child control and require a checkpoint beyond the old fork.  Remove only
@@ -286,28 +301,17 @@ namespace and other metadata.  Atomically write and read back the complete tuple
 then hash the actual target bytes.  Leave source control unchanged.  With no
 reference, return NIL so the ordinary copy preserves source bytes exactly.
 The new base receives its own archive; the old primary archive is not copied."
-  (multiple-value-bind (checkpoint durable snapshot insertion checkpoint-timeline namespace metadata)
-      (wal-read-control-fields)
-    (let ((reference (getf metadata :retained-reference)))
-      (when reference
-        (wal-require-supported-timelines insertion checkpoint-timeline)
-        (unless (and snapshot (> checkpoint (getf reference :end)))
-          (error "base backup checkpoint does not supersede its historical archive"))
-        (let ((copied (copy-list metadata))
-              (path (merge-pathnames "global/pg_wal_control" target)))
-          (remf copied :retained-reference)
-          (let ((bytes (wal-encode-control-image
-                        checkpoint durable snapshot :timeline insertion
-                        :checkpoint-timeline checkpoint-timeline :namespace namespace :metadata copied)))
-            (wal-ensure-directory-durable (uiop:pathname-directory-pathname path))
-            (wal-atomic-write-bytes path bytes)
-            (let ((actual (recovery-read-bytes path :maximum (1+ +wal-control-maximum-bytes+))))
-              (unless (and (equalp bytes actual)
-                           (equal (multiple-value-list (wal-decode-control-line (bytes->string actual)))
-                                  (list checkpoint durable snapshot insertion checkpoint-timeline namespace copied)))
-                (error "base backup control readback differs from its new checkpoint"))
-              (list "global/pg_wal_control" (length actual)
-                    (physical-store-update-digest #xCBF29CE484222325 actual)))))))))
+  (multiple-value-bind (bytes expected) (physical-bootstrap-derived-wal-image)
+    (when bytes
+      (let ((path (merge-pathnames "global/pg_wal_control" target)))
+        (wal-ensure-directory-durable (uiop:pathname-directory-pathname path))
+        (wal-atomic-write-bytes path bytes)
+        (let ((actual (recovery-read-bytes path :maximum (1+ +wal-control-maximum-bytes+))))
+          (unless (and (equalp bytes actual)
+                       (equal (multiple-value-list (wal-decode-control-line (bytes->string actual))) expected))
+            (error "base backup control readback differs from its new checkpoint"))
+          (list "global/pg_wal_control" (length actual)
+                (physical-store-update-digest #xCBF29CE484222325 actual)))))))
 
 (defun physical-bootstrap-copy-file (relative target &key limit)
   "Copy and fsync a stable source file or exact prefix, returning its length and checksum."

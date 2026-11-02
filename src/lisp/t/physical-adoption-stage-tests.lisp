@@ -152,63 +152,70 @@
                     (ok (not (probe-file (merge-pathnames "recovery.required" target)))))
                (when (eq mode :target-link) (delete-file alias)))))))))
 
+(defun call-with-adoption-rooted-stage-fixture (function)
+  (handoff-test-committed
+   (lambda (root store reference)
+     (declare (ignore store reference))
+     (let* ((pg::*pgdata* root)
+            (pg::*catalog* (pg::load-catalog))
+            (fields (multiple-value-list (pg::wal-read-control-fields)))
+            (metadata (copy-list (seventh fields)))
+            (timeline (fourth fields)))
+       (dolist (name '("physical-backup.manifest" "physical-follow.control"
+                       "physical-recovery.control" "physical-restartpoint.control" "recovery.required"))
+         (delete-file (merge-pathnames name root)))
+       (sb-posix:chmod (namestring root) #o700)
+       (setf (getf metadata :db-state) pg::+db-shutdowned+)
+       (pg::wal-atomic-write-bytes
+        (pg::wal-control-path)
+        (pg::wal-encode-control-image
+         (first fields) (second fields) (third fields) :timeline timeline
+         :checkpoint-timeline timeline :namespace :timeline :metadata metadata))
+       (dolist (entry (list (cons "PG_VERSION" (format nil "16~%"))
+                            (cons "authentication.initialized" pg::*authentication-marker-text*)
+                            (cons "pg_hba.conf" (format nil "host all all 127.0.0.1/32 trust~%"))
+                            (cons "pg_ident.conf" "")))
+         (pg::wal-atomic-write-bytes (merge-pathnames (car entry) root)
+                                     (pg::string->bytes (cdr entry))))
+       (dolist (name '(".pg_lisp.lock" "pg_xact"))
+         (pg::wal-atomic-write-bytes (merge-pathnames name root) (empty-octets)))
+       (let ((origin (pg::make-physical-export-origin
+                      :system-id (pg::catalog-system-identifier) :timeline timeline
+                      :base (first fields) :manifest-digest 991 :proven-lsn (first fields)
+                      :prefix-digest #xCBF29CE484222325)))
+         (pg::wal-ensure-directory-durable (pg::physical-export-origin-directory))
+         (pg::wal-atomic-write-bytes (pg::physical-export-origin-path origin)
+                                     (pg::physical-export-origin-encode origin))
+         (pg::call-with-physical-adoption-owner
+          root
+          (lambda (owner)
+            (let* ((state (pg::physical-adoption-inspect-primary owner))
+                   (proof (pg::physical-adoption-prove-primary-origin
+                           state (pg::physical-export-origin-identity origin))))
+              (funcall function root state proof)))))))))
+
 (deftest adoption-stage-new-manifest-drops-only-the-copied-retained-reference
-    (handoff-test-committed
-     (lambda (root store reference)
-       (declare (ignore store))
-       (let* ((pg::*pgdata* root)
-              (pg::*catalog* (pg::load-catalog))
-              (fields (multiple-value-list (pg::wal-read-control-fields)))
-              (metadata (copy-list (seventh fields)))
-              (timeline (fourth fields)))
-         (dolist (name '("physical-backup.manifest" "physical-follow.control"
-                         "physical-recovery.control" "physical-restartpoint.control" "recovery.required"))
-           (delete-file (merge-pathnames name root)))
-         (sb-posix:chmod (namestring root) #o700)
-         (setf (getf metadata :db-state) pg::+db-shutdowned+)
-         (pg::wal-atomic-write-bytes
-          (pg::wal-control-path)
-          (pg::wal-encode-control-image
-           (first fields) (second fields) (third fields) :timeline timeline
-           :checkpoint-timeline timeline :namespace :timeline :metadata metadata))
-         (dolist (entry (list (cons "PG_VERSION" (format nil "16~%"))
-                              (cons "authentication.initialized" pg::*authentication-marker-text*)
-                              (cons "pg_hba.conf" (format nil "host all all 127.0.0.1/32 trust~%"))
-                              (cons "pg_ident.conf" "")))
-           (pg::wal-atomic-write-bytes (merge-pathnames (car entry) root)
-                                       (pg::string->bytes (cdr entry))))
-         (dolist (name '(".pg_lisp.lock" "pg_xact"))
-           (pg::wal-atomic-write-bytes (merge-pathnames name root) (empty-octets)))
-         (let* ((origin (pg::make-physical-export-origin
-                         :system-id (pg::catalog-system-identifier) :timeline timeline
-                         :base (first fields) :manifest-digest 991 :proven-lsn (first fields)
-                         :prefix-digest #xCBF29CE484222325))
-                (before (lineage-test-bytes (pg::wal-control-path))))
-           (pg::wal-ensure-directory-durable (pg::physical-export-origin-directory))
-           (pg::wal-atomic-write-bytes (pg::physical-export-origin-path origin)
-                                       (pg::physical-export-origin-encode origin))
-           (pg::call-with-physical-adoption-owner
-            root
-            (lambda (owner)
-              (let* ((state (pg::physical-adoption-inspect-primary owner))
-                     (proof (pg::physical-adoption-prove-primary-origin
-                             state (pg::physical-export-origin-identity origin))))
-                (with-physical-store-directory (target)
-                  (sb-posix:chmod (namestring target) #o700)
-                  (let* ((result (pg::physical-adoption-stage-base state proof target "adopted_child"))
-                         (bytes (lineage-test-bytes (merge-pathnames "global/pg_wal_control" target)))
-                         (copied (multiple-value-list (pg::wal-decode-control-line (pg::bytes->string bytes))))
-                         (manifest (getf result :base-state))
-                         (entry (find "global/pg_wal_control" (getf manifest :files) :key #'first :test #'equal)))
-                    (ok (equalp before (lineage-test-bytes (pg::wal-control-path))))
-                    (ok (equal reference (getf metadata :retained-reference)))
-                    (ok (null (getf (seventh copied) :retained-reference)))
-                    (ok (not (equalp before bytes)))
-                    (ok (equal entry (list "global/pg_wal_control" (length bytes)
-                                           (pg::physical-store-update-digest #xCBF29CE484222325 bytes))))
-                    (ok (= (getf manifest :manifest-digest)
-                           (nth-value 1 (pg::recovery-read-manifest target)))))
-                  )))))))))
+    (call-with-adoption-rooted-stage-fixture
+     (lambda (root state proof)
+       (declare (ignore root))
+       (with-physical-store-directory (target)
+         (sb-posix:chmod (namestring target) #o700)
+         (let* ((before (lineage-test-bytes (pg::wal-control-path)))
+                (reference (copy-tree (getf (getf state :metadata) :retained-reference)))
+                (result (pg::physical-adoption-stage-base state proof target "adopted_child"))
+                (bytes (lineage-test-bytes (merge-pathnames "global/pg_wal_control" target)))
+                (copied (multiple-value-list (pg::wal-decode-control-line (pg::bytes->string bytes))))
+                (manifest (getf result :base-state))
+                (entry (find "global/pg_wal_control" (getf manifest :files) :key #'first :test #'equal)))
+           (ok (equalp before (lineage-test-bytes (pg::wal-control-path))))
+           (ok (equal reference (getf (seventh (multiple-value-list (pg::wal-read-control-fields)))
+                                      :retained-reference)))
+           (ok (null (getf (seventh copied) :retained-reference)))
+           (ok (not (equalp before bytes)))
+           (ok (equal entry (list "global/pg_wal_control" (length bytes)
+                                  (pg::physical-store-update-digest #xCBF29CE484222325 bytes))))
+           (ok (= (getf manifest :manifest-digest)
+                  (nth-value 1 (pg::recovery-read-manifest target)))))))))
 
 (deftest adoption-stage-rejects-valid-looking-changes-to-auth-adjuncts
     (dolist (mode '(:hba :ident :symlink))
