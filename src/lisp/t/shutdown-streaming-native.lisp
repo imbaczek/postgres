@@ -56,6 +56,12 @@
          :name "parked shutdown regression worker"))
   (values))
 
+(defun shutdown-streaming-checkpoint-end (directory)
+  (let ((path (merge-pathnames "shutdown-endpoint" directory)))
+    (when (probe-file path)
+      (with-open-file (input path)
+        (parse-integer (read-line input))))))
+
 (defun shutdown-streaming-install-feedback-barrier (directory baseline)
   (setf *shutdown-streaming-original-hook* *physical-stream-test-hook*)
   (let ((held nil))
@@ -68,7 +74,9 @@
                   (sb-thread:with-mutex ((physical-store-mutex *physical-receive-store*))
                     (values (physical-store-written-lsn *physical-receive-store*)
                             (physical-store-flushed-lsn *physical-receive-store*)))
-                (when (> flushed baseline)
+                (when (and (> flushed baseline)
+                           (let ((end (shutdown-streaming-checkpoint-end directory)))
+                             (and end (>= flushed end))))
                   (assert (zerop *live-operation-depth*))
                   (setf held t)
                   (shutdown-streaming-write-marker directory "flush-held"
@@ -85,15 +93,17 @@
   (values))
 
 (defun shutdown-streaming-install-checkpoint-cut (directory)
-  (setf *native-control-test-hook*
-        (lambda (point)
-          (when (eq point :after-primary-shutdown-checkpoint)
-            (setf *native-control-test-hook* nil)
-            (shutdown-streaming-write-marker directory "checkpoint-cut" "checkpoint")
-            (loop repeat 1500
-                  when (probe-file (merge-pathnames "release-checkpoint-cut" directory)) return t
-                    do (sleep 0.01)
-                  finally (error "shutdown checkpoint cut timed out")))))
+  (let ((original *native-control-test-hook*))
+    (setf *native-control-test-hook*
+          (lambda (point)
+            (when original (funcall original point))
+            (when (eq point :after-primary-shutdown-checkpoint)
+              (setf *native-control-test-hook* nil)
+              (shutdown-streaming-write-marker directory "checkpoint-cut" "checkpoint")
+              (loop repeat 1500
+                    when (probe-file (merge-pathnames "release-checkpoint-cut" directory)) return t
+                      do (sleep 0.01)
+                    finally (error "shutdown checkpoint cut timed out"))))))
   (values))
 
 (defun shutdown-streaming-record-outcomes (directory)
@@ -101,6 +111,10 @@
     (setf *native-control-test-hook*
           (lambda (point)
             (when original (funcall original point))
+            (when (eq point :after-primary-shutdown-checkpoint)
+              (assert (= *wal-checkpoint-lsn* *wal-durable-lsn*))
+              (shutdown-streaming-write-marker directory "shutdown-endpoint"
+                                               (format nil "~d" *wal-durable-lsn*)))
             (when (eq point :after-primary-shutdown-clean)
               (shutdown-streaming-write-marker
                directory "sender-outcomes"
@@ -156,7 +170,9 @@
                               (setf written (+ (pg-client-u64 payload 1) (- (length payload) 25))))
                             (shutdown-streaming-second-feedback client written baseline base)
                             (shutdown-streaming-write-marker directory "second-ready" "ready")
-                            (when (> written baseline)
+                            (when (and (> written baseline)
+                                       (let ((end (shutdown-streaming-checkpoint-end directory)))
+                                         (and end (>= written end))))
                               (shutdown-streaming-write-marker directory "second-final" (format nil "~d" written))
                               (loop repeat 1500
                                     when (probe-file (merge-pathnames "release-second" directory)) return t

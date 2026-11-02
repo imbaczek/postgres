@@ -117,7 +117,8 @@ def exercise(base, root, source_port, target_port, target_pid):
                     time.sleep(0.02)
                 if scenario != 'checkpoint-cut':
                     written, flushed = map(int, (root / 'flush-held').read_text().split())
-                    assert written >= flushed > before
+                    endpoint = int((root / 'shutdown-endpoint').read_text())
+                    assert written >= flushed >= endpoint > before
                 pending_control = subprocess.check_output([str(base / 'bin/pg_controldata'), '-D', str(source_data)],
                                                           text=True, timeout=10)
                 assert 'Database cluster state:               shutting down' in pending_control, pending_control
@@ -128,10 +129,7 @@ def exercise(base, root, source_port, target_port, target_pid):
                         assert not (root / 'second-error').exists(), (root / 'second-error').read_text()
                         assert time.monotonic() < deadline, 'secondary stream did not receive shutdown WAL'
                         time.sleep(0.02)
-                    pending_checkpoint = lsn(next(line.split(':', 1)[1].strip()
-                                                  for line in pending_control.splitlines()
-                                                  if line.startswith('Latest checkpoint location:')))
-                    assert int((root / 'second-final').read_text()) >= pending_checkpoint > before
+                    assert int((root / 'second-final').read_text()) >= endpoint > before
                     (root / 'release-second').touch()
                     while not (root / 'second-closed').exists():
                         assert time.monotonic() < deadline, 'secondary stream did not disconnect'
@@ -156,8 +154,10 @@ def exercise(base, root, source_port, target_port, target_pid):
             assert 'Database cluster state:               shut down' in control, control
         if scenario == 'second-disconnect':
             assert sorted((root / 'sender-outcomes').read_text().split()) == ['ABANDONED', 'ACKNOWLEDGED']
-        checkpoint = lsn(next(line.split(':', 1)[1].strip() for line in control.splitlines()
-                              if line.startswith('Latest checkpoint location:')))
+        checkpoint_start = lsn(next(line.split(':', 1)[1].strip() for line in control.splitlines()
+                                    if line.startswith('Latest checkpoint location:')))
+        checkpoint = int((root / 'shutdown-endpoint').read_text())
+        assert checkpoint_start < checkpoint, 'control checkpoint location is a start, not its durable end'
         assert checkpoint > before, 'shutdown did not publish a final checkpoint'
         positions = None
         deadline = time.monotonic() + 10
