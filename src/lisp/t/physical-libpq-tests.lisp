@@ -35,6 +35,47 @@
                (pg::physical-libpq-check-header header 42 1 '(#\T)
                                                 (if (eq change :global-bound) #xffffffff 4))))))))
 
+(deftest physical-libpq-copy-out-format-is-binary-with-no-columns
+    (let ((valid (make-array 5 :element-type '(unsigned-byte 8) :initial-contents '(1 0 0 0 0))))
+      (ok (eq :copy-out (funcall 'pg::physical-libpq-check-copy-out-format valid)))
+      (dolist (bytes (list (subseq valid 0 4)
+                           (concatenate '(vector (unsigned-byte 8)) valid #(0))
+                           (make-array 5 :element-type '(unsigned-byte 8) :initial-contents '(0 0 0 0 0))
+                           (make-array 5 :element-type '(unsigned-byte 8) :initial-contents '(1 0 0 0 1))
+                           (make-array 5 :element-type '(unsigned-byte 8) :initial-contents '(2 0 0 0 0))))
+        (ok (intake-fails-p (lambda () (funcall 'pg::physical-libpq-check-copy-out-format bytes)))))))
+
+(deftest physical-libpq-copy-out-completion-checks-tag-and-closes-on-mismatch
+    (dolist (tag '("BASE_BACKUP_NATIVE" "WRONG"))
+      (let ((channel (pg::physical-libpq-reserve-channel))
+            (exchange (symbol-function 'pg::physical-libpq-exchange)))
+        (unwind-protect
+             (progn
+               (setf (symbol-function 'pg::physical-libpq-exchange)
+                     (lambda (actual kind body kinds maximum &key timeout)
+                       (declare (ignore actual kinds timeout))
+                       (assert (char= kind #\R))
+                       (assert (= 1 (pg::bytes-to-u32 body 0)))
+                       (assert (>= maximum 4096))
+                       (let ((result (pg::make-payload)))
+                         (pg::payload-push-byte result 0)
+                         (pg::physical-libpq-push-text result tag)
+                         (pg::payload-push-u32 result 0)
+                         (pg::payload-push-u32 result 0)
+                         (values #\C result))))
+               (if (string= tag "BASE_BACKUP_NATIVE")
+                   (multiple-value-bind (kind bytes)
+                       (funcall 'pg::physical-libpq-receive-copy-out channel "BASE_BACKUP_NATIVE" :maximum 1)
+                     (ok (char= kind #\C))
+                     (ok (null bytes))
+                     (ok (not (pg::physical-libpq-channel-closed channel))))
+                   (progn
+                     (ok (intake-fails-p
+                          (lambda () (funcall 'pg::physical-libpq-receive-copy-out channel "BASE_BACKUP_NATIVE" :maximum 1))))
+                     (ok (pg::physical-libpq-channel-closed channel)))))
+          (setf (symbol-function 'pg::physical-libpq-exchange) exchange)
+          (pg::physical-libpq-close channel)))))
+
 (deftest physical-libpq-profile-copies-input-and-keeps-secrets-out-of-printing
     (let* ((original (copy-seq "host=localhost password=private-fixture-marker"))
            (fallback (copy-seq "walreceiver"))

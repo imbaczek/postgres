@@ -548,12 +548,19 @@ cannot be established, so another child cannot silently exceed the limit."
         (setf (physical-libpq-channel-closed channel) t))))
   (values))
 
+(defun physical-libpq-check-copy-out-format (bytes)
+  (unless (and (= 5 (length bytes)) (= 1 (aref bytes 0))
+               (zerop (bytes-to-u32 bytes 1)))
+    (pg-client-native-reject "native backup requires binary COPY OUT with no columns"))
+  :copy-out)
+
 (defun physical-libpq-check-success (kind body)
   (unless (case kind
             (#\H (= 16 (length body)))
             (#\O (<= 24 (length body) 1048576))
             ((#\A #\F #\I) (zerop (length body)))
             (#\B (equalp body #(0 0 0 0 0)))
+            (#\U (physical-libpq-check-copy-out-format body))
             (#\D (<= 1 (length body) +physical-libpq-copy-maximum+))
             ((#\T #\C) t)
             (otherwise nil))
@@ -762,16 +769,41 @@ supported. A failed open attempts to close the reserved channel."
         (if (char= kind #\B) :copy-both
             (physical-libpq-switch-result kind bytes))))))
 
-(defun physical-libpq-receive (channel &key (wait-ms 1000) (maximum +physical-libpq-copy-maximum+))
-  "Receive COPY data, server completion, or an idle indication within the bounds."
+(defun physical-libpq-start-copy-out (channel query)
+  (with-physical-libpq-operation (channel)
+    (let ((body (make-payload)))
+      (payload-push-u32 body 4096)
+      (physical-libpq-push-text body query)
+      (multiple-value-bind (kind bytes)
+          (physical-libpq-exchange channel #\Q body '(#\U) 4096)
+        (declare (ignore kind))
+        (physical-libpq-check-copy-out-format bytes)))))
+
+(defun physical-libpq-receive-frame (channel kinds wait-ms maximum reply-maximum)
   (unless (and (typep wait-ms '(integer 0 10000))
                (typep maximum '(integer 1 131097)))
     (error "invalid libpq copy receive bound"))
   (let ((body (make-payload)))
     (payload-push-u32 body maximum)
     (payload-push-u32 body wait-ms)
-    (physical-libpq-exchange channel #\R body '(#\D #\F #\I) maximum
+    (physical-libpq-exchange channel #\R body kinds reply-maximum
                              :timeout (+ 12 (/ wait-ms 1000)))))
+
+(defun physical-libpq-receive (channel &key (wait-ms 1000) (maximum +physical-libpq-copy-maximum+))
+  "Receive COPY data, server completion, or an idle indication within the bounds."
+  (physical-libpq-receive-frame channel '(#\D #\F #\I) wait-ms maximum maximum))
+
+(defun physical-libpq-receive-copy-out (channel tag &key (wait-ms 1000) (maximum +physical-libpq-copy-maximum+))
+  (with-physical-libpq-operation (channel)
+    (multiple-value-bind (kind bytes)
+        (physical-libpq-receive-frame channel '(#\D #\C #\I) wait-ms maximum (max maximum 4096))
+      (case kind
+        (#\D (when (> (length bytes) maximum)
+               (pg-client-native-reject "native COPY OUT payload exceeds its bound")))
+        (#\C (physical-libpq-check-result (physical-libpq-decode-result kind bytes)
+                                          nil tag :command-only t)
+         (setf bytes nil)))
+      (values kind bytes))))
 
 (defun physical-libpq-feedback (channel body)
   "Send feedback chosen by the caller from its own WAL and durability state."

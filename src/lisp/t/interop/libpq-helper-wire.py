@@ -181,6 +181,27 @@ def physical_auth_and_frozen(root, port, env):
     print('libpq-helper: physical SCRAM replication passfile, TCP/TLS/Unix and frozen mode PASS', flush=True)
 
 
+def copy_out(helper):
+    statement = 'COPY (SELECT FROM generate_series(1,3)) TO STDOUT (FORMAT binary)'
+    assert helper.call(b'Q', struct.pack('!I', 4096) + ipc.string(statement)) == (
+        b'U', b'\1\0\0\0\0')
+    chunks = []
+    deadline = time.monotonic() + 5
+    while True:
+        assert time.monotonic() < deadline, 'COPY OUT did not complete'
+        kind, body = helper.call(b'R', struct.pack('!II', 65536, 1000))
+        if kind == b'D':
+            chunks.append(body)
+        elif kind == b'C':
+            assert body == b'\0' + ipc.string('COPY 3') + struct.pack('!II', 0, 0), body
+            break
+        else:
+            assert (kind, body) == (b'I', b''), (kind, body)
+    expected = b'PGCOPY\n\xff\r\n\0' + struct.pack('!IIhhh', 0, 0, 0, 0, 0) + struct.pack('!h', -1)
+    assert b''.join(chunks) == expected
+    assert query(helper, 'SELECT 1') == [['1']]
+
+
 def exercise(observer, conninfo, expected_name, env, *, success=True):
     helper = ipc.Helper(env=env)
     try:
@@ -196,6 +217,7 @@ def exercise(observer, conninfo, expected_name, env, *, success=True):
         assert values[0][:2] == [expected_name, '1234ms'], values
         pid = int(values[0][2])
         assert observer.query(f'SELECT ssl FROM pg_stat_ssl WHERE pid={pid}') == [['t']]
+        copy_out(helper)
         assert helper.call(b'X') == (b'A', b'')
         assert helper.process.wait(timeout=2) == 0
     finally:
@@ -320,6 +342,24 @@ def run(base, root, executable, port, processes):
     physical_source_shutdown(base, root, port, env, process)
 
 
+def run_copy_out(base, root, executable, port, processes):
+    with (root / 'initdb.log').open('w') as output:
+        subprocess.run([str(executable.parent / 'initdb'), '-D', str(root / 'data'),
+                        '-A', 'trust', '-U', 'postgres', '--no-locale'],
+                       stdout=output, stderr=output, check=True)
+    peer.start(base, root, executable, port, 'server', False, processes)
+    helper = ipc.Helper()
+    try:
+        conninfo = f'host=127.0.0.1 port={port} user=postgres dbname=postgres sslmode=disable gssencmode=disable'
+        assert helper.call(b'O', ipc.string(conninfo) + ipc.string('copy-out'))[0] == b'O'
+        copy_out(helper)
+        assert helper.call(b'X') == (b'A', b'')
+        assert helper.process.wait(timeout=2) == 0
+        print('libpq-helper: real C binary COPY OUT, checked completion and subsequent query PASS', flush=True)
+    finally:
+        helper.close()
+
+
 def main():
     if not __debug__:
         raise RuntimeError('Run the assertion-based oracle without Python -O.')
@@ -328,12 +368,14 @@ def main():
     parser.add_argument('root', type=Path)
     parser.add_argument('executable', type=Path)
     parser.add_argument('port', type=int)
+    parser.add_argument('--copy-out-only', action='store_true')
     args = parser.parse_args()
     base, root = args.base.resolve(), args.root.resolve()
     root.mkdir(mode=0o700)
     processes = []
     try:
-        run(base, root, args.executable.resolve(), args.port, processes)
+        runner = run_copy_out if args.copy_out_only else run
+        runner(base, root, args.executable.resolve(), args.port, processes)
     finally:
         if (root / 'owned').exists():
             subprocess.run([sys.executable, str(base / 't/interop/owned-peer.py'),

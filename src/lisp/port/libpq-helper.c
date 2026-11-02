@@ -48,7 +48,8 @@ static PGresult *result;
 static unsigned char *request_body;
 static char *copy_data;
 /* COPY IN follows the server's CopyDone and still permits final feedback. */
-static enum { COMMAND_MODE, COPY_BOTH_MODE, COPY_IN_MODE } phase;
+static enum { COMMAND_MODE, COPY_BOTH_MODE, COPY_IN_MODE, COPY_OUT_MODE } phase;
+static uint32_t copy_result_maximum;
 
 static void
 put32(unsigned char *out, uint32_t value)
@@ -615,15 +616,18 @@ query(const unsigned char *body, uint32_t size)
 		fail("08006", "libpq query send failed");
 	flush_output(deadline);
 	result = next_result(deadline);
-	if (result && PQresultStatus(result) == PGRES_COPY_BOTH)
+	if (result && (PQresultStatus(result) == PGRES_COPY_BOTH ||
+				   PQresultStatus(result) == PGRES_COPY_OUT))
 	{
 		unsigned char format[5];
+		int output_only = PQresultStatus(result) == PGRES_COPY_OUT;
 		format[0] = PQbinaryTuples(result);
 		put32(format + 1, PQnfields(result));
 		PQclear(result);
 		result = NULL;
-		phase = COPY_BOTH_MODE;
-		reply('B', format, sizeof(format));
+		phase = output_only ? COPY_OUT_MODE : COPY_BOTH_MODE;
+		copy_result_maximum = maximum;
+		reply(output_only ? 'U' : 'B', format, sizeof(format));
 	}
 	else
 		finish_result(maximum, deadline);
@@ -632,8 +636,8 @@ query(const unsigned char *body, uint32_t size)
 static void
 receive_copy(const unsigned char *body, uint32_t size)
 {
-	if (!connection || phase != COPY_BOTH_MODE || size != 8)
-		fail("08P01", "helper receive requires COPY BOTH");
+	if (!connection || (phase != COPY_BOTH_MODE && phase != COPY_OUT_MODE) || size != 8)
+		fail("08P01", "helper receive requires COPY BOTH or COPY OUT");
 	uint32_t maximum = get32(body);
 	uint32_t timeout = get32(body + 4);
 	if (!maximum || maximum > COPY_RECEIVE_MAX || timeout > OPERATION_MS)
@@ -669,6 +673,14 @@ receive_copy(const unsigned char *body, uint32_t size)
 			result = next_result(milliseconds() + OPERATION_MS);
 			if (result && PQresultStatus(result) == PGRES_FATAL_ERROR)
 				fail(result_sqlstate(result), "native source stopped streaming");
+			if (phase == COPY_OUT_MODE)
+			{
+				if (!result || PQresultStatus(result) != PGRES_COMMAND_OK)
+					fail("08P01", "native COPY OUT lacks command completion");
+				finish_result(copy_result_maximum, milliseconds() + OPERATION_MS);
+				phase = COMMAND_MODE;
+				return;
+			}
 			/* COPY 0 followed by no extra results ends streaming and can be
 			 * retried. Wrong tags, extra results and invalid state are 08P01. */
 			if (result && PQresultStatus(result) == PGRES_COMMAND_OK)
@@ -707,7 +719,8 @@ receive_copy(const unsigned char *body, uint32_t size)
 static void
 send_copy(const unsigned char *body, uint32_t size)
 {
-	if (!connection || phase == COMMAND_MODE || !size || size > COPY_SEND_MAX)
+	if (!connection || (phase != COPY_BOTH_MODE && phase != COPY_IN_MODE) ||
+		!size || size > COPY_SEND_MAX)
 		fail("08P01", "helper send has invalid COPY state or size");
 	int64_t deadline = milliseconds() + OPERATION_MS;
 	int status;

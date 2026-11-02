@@ -282,6 +282,115 @@ class HelperProtocol(unittest.TestCase):
             self.assertIn(b'next_tli_startpos', body)
             self.assertEqual(self.helper.call(b'X'), (b'A', b''))
 
+    def test_copy_out_finishes_idle_and_allows_the_next_query(self):
+        release_data = threading.Event()
+
+        def message(connection):
+            kind = wire_read(connection, 1)
+            size = struct.unpack('!I', wire_read(connection, 4))[0]
+            return kind, wire_read(connection, size - 4)
+
+        def answer(connection):
+            self.assertEqual(message(connection), (b'Q', b'EXPORT_NATIVE\0'))
+            wire_frame(connection, b'H', b'\1\0\0')
+            self.assertTrue(release_data.wait(5), 'client did not finish idle probe')
+            for payload in (b'\0abc', b'tail'):
+                wire_frame(connection, b'd', payload)
+            wire_frame(connection, b'c')
+            wire_frame(connection, b'C', b'BASE_BACKUP_NATIVE\0')
+            wire_frame(connection, b'Z', b'I')
+            try:
+                next_message = message(connection)
+            except EOFError:
+                return
+            if next_message == (b'X', b''):
+                return
+            self.assertEqual(next_message, (b'Q', b'AFTER\0'))
+            wire_frame(connection, b'C', b'AFTER\0')
+            wire_frame(connection, b'Z', b'I')
+            self.assertEqual(message(connection), (b'X', b''))
+
+        with source(answer) as (port, _):
+            conninfo = f'host=127.0.0.1 port={port} user=postgres sslmode=disable gssencmode=disable'
+            self.assertEqual(self.helper.call(b'O', string(conninfo) + string('backup'))[0], b'O')
+            self.assertEqual(self.helper.call(b'Q', struct.pack('!I', 4096) + string('EXPORT_NATIVE')),
+                             (b'U', b'\1\0\0\0\0'))
+            try:
+                self.assertEqual(self.helper.call(b'R', struct.pack('!II', 4, 0)), (b'I', b''))
+            finally:
+                release_data.set()
+            for payload in (b'\0abc', b'tail'):
+                self.assertEqual(self.helper.call(b'R', struct.pack('!II', 4, 1000)), (b'D', payload))
+            self.assertEqual(self.helper.call(b'R', struct.pack('!II', 4, 1000)),
+                             (b'C', b'\0' + string('BASE_BACKUP_NATIVE') + struct.pack('!II', 0, 0)))
+            self.assertEqual(self.helper.call(b'Q', struct.pack('!I', 4096) + string('AFTER')),
+                             (b'C', b'\0' + string('AFTER') + struct.pack('!II', 0, 0)))
+            self.assertEqual(self.helper.call(b'X'), (b'A', b''))
+
+    def test_copy_out_rejects_feedback_and_oversized_payloads(self):
+        for operation, body in ((b'S', b'not-feedback'), (b'R', struct.pack('!II', 4, 1000))):
+            with self.subTest(operation=operation):
+                helper = Helper()
+                try:
+                    def answer(connection):
+                        self.assertEqual(wire_read(connection, 1), b'Q')
+                        size = struct.unpack('!I', wire_read(connection, 4))[0]
+                        wire_read(connection, size - 4)
+                        wire_frame(connection, b'H', b'\1\0\0')
+                        wire_frame(connection, b'd', b'large')
+                        while connection.recv(1024):
+                            pass
+
+                    with source(answer) as (port, _):
+                        conninfo = f'host=127.0.0.1 port={port} user=postgres sslmode=disable gssencmode=disable'
+                        self.assertEqual(helper.call(b'O', string(conninfo) + string('backup'))[0], b'O')
+                        self.assertEqual(helper.call(b'Q', struct.pack('!I', 4096) + string('EXPORT_NATIVE'))[0], b'U')
+                        kind, payload = helper.call(operation, body)
+                        self.assertEqual((kind, payload[:5]), (b'!', b'08P01'))
+                        self.assertNotEqual(helper.process.wait(timeout=2), 0)
+                finally:
+                    helper.close()
+
+    def test_copy_out_requires_one_idle_command_completion(self):
+        cases = (
+            ('disconnect', [(b'C', b'BASE_BACKUP_NATIVE\0')], b'08006'),
+            ('extra-source-error', [(b'C', b'BASE_BACKUP_NATIVE\0'),
+                                   (b'E', b'SERROR\0VERROR\0C57P01\0Mprivate detail\0\0'),
+                                   (b'Z', b'I')], b'08P01'),
+            ('extra', [(b'C', b'BASE_BACKUP_NATIVE\0'), (b'C', b'EXTRA\0'), (b'Z', b'I')], b'08P01'),
+            ('transaction', [(b'C', b'BASE_BACKUP_NATIVE\0'), (b'Z', b'T')], b'08P01'),
+            ('rows', [(b'T', b'\0\0'), (b'C', b'SELECT 0\0'), (b'Z', b'I')], b'08P01'),
+            ('source-error', [(b'E', b'SERROR\0VERROR\0C57P01\0Mprivate detail\0\0'),
+                              (b'Z', b'I')], b'57P01'),
+        )
+        for name, frames, state in cases:
+            with self.subTest(name=name):
+                helper = Helper()
+                try:
+                    def answer(connection):
+                        self.assertEqual(wire_read(connection, 1), b'Q')
+                        size = struct.unpack('!I', wire_read(connection, 4))[0]
+                        wire_read(connection, size - 4)
+                        wire_frame(connection, b'H', b'\1\0\0')
+                        wire_frame(connection, b'c')
+                        for kind, body in frames:
+                            wire_frame(connection, kind, body)
+                        if name == 'disconnect':
+                            return
+                        while connection.recv(1024):
+                            pass
+
+                    with source(answer) as (port, _):
+                        conninfo = f'host=127.0.0.1 port={port} user=postgres sslmode=disable gssencmode=disable'
+                        self.assertEqual(helper.call(b'O', string(conninfo) + string('backup'))[0], b'O')
+                        self.assertEqual(helper.call(b'Q', struct.pack('!I', 4096) + string('EXPORT_NATIVE'))[0], b'U')
+                        kind, payload = helper.call(b'R', struct.pack('!II', 4096, 1000))
+                        self.assertEqual((kind, payload[:5]), (b'!', state))
+                        self.assertNotIn(b'private detail', payload)
+                        self.assertNotEqual(helper.process.wait(timeout=2), 0)
+                finally:
+                    helper.close()
+
     def test_query_source_errors_validate_state_without_echoing_details(self):
         for state in (b'57P01', b'57P0!', b'bad'):
             with self.subTest(state=state):

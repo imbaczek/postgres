@@ -83,6 +83,16 @@ def copy(connection):
     assert frame(connection) == (b'X', b'')
 
 
+def copy_out(connection):
+    assert frame(connection) == (b'Q', b'EXPORT_NATIVE\0')
+    wire.wire_frame(connection, b'H', b'\1\0\0')
+    wire.wire_frame(connection, b'd', b'\0abc')
+    wire.wire_frame(connection, b'c')
+    wire.wire_frame(connection, b'C', b'BASE_BACKUP_NATIVE\0')
+    wire.wire_frame(connection, b'Z', b'I')
+    query(connection)
+
+
 frozen_connections = 0
 
 
@@ -95,7 +105,7 @@ def frozen(connection):
         query(connection)
 
 
-for mode, script in (('query', query), ('copy', copy), ('immediate', immediate),
+for mode, script in (('query', query), ('copy', copy), ('copy-out', copy_out), ('immediate', immediate),
                      ('identity', identity), ('idle', idle), ('frozen', frozen)):
     with wire.source(script, timeout=30, connections=2 if mode == 'frozen' else 1) as (port, parameters):
         environment = dict(os.environ, PG_LIBPQ_TEST_MODE=mode, PG_LIBPQ_TEST_PORT=str(port),
