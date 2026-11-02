@@ -219,6 +219,17 @@ def check(binary):
             cuts = runpy.run_path(str(Path(__file__).with_name('retained-proof-cuts.py')))
             cuts['check'](BASE, source, node, root, port, identity, final_end, digest, selected[5], follow)
             assert snapshot_bytes(source.data) == before, 'proof cuts changed former-primary files'
+            stage = source.root / 'adoption-stage'
+            stage.mkdir(mode=0o700)
+            result = subprocess.run(
+                [os.environ.get('SBCL', 'sbcl'), '--noinform', '--disable-debugger', '--script',
+                 str(BASE / 't/adoption-stage-native.lisp'), str(source.data), str(stage), str(port),
+                 *map(str, (*identity, final_end, digest, selected[5]))],
+                capture_output=True, text=True, timeout=240)
+            (source.root / 'adoption-stage-native.log').write_text(result.stdout + result.stderr)
+            assert result.returncode == 0, result.stdout + result.stderr
+            assert snapshot_bytes(source.data) == before, 'canonical staging changed former-primary files'
+            print('export-origin: verified canonical image and remote proof agree without installing it PASS', flush=True)
             result = subprocess.run(
                 [os.environ.get('SBCL', 'sbcl'), '--noinform', '--disable-debugger', '--script',
                  str(BASE / 't/export-origin-offline-check.lisp'), str(source.data),
