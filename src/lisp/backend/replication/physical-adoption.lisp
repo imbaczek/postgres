@@ -3,9 +3,13 @@
 (in-package #:pg)
 
 (defun physical-adoption-attempt-path (&optional (directory *pgdata*))
+  "Return the fixed local adoption attempt fence path."
   (merge-pathnames "physical-adoption.attempt" directory))
 
 (defun physical-adoption-check-startup ()
+  "Refuse startup if the attempt path has any entry or cannot be inspected.
+Only ENOENT permits startup; lstat neither follows nor parses the entry. A future
+publisher must hold the same cooperative PGDATA lock to exclude this check."
   (handler-case
       (progn
         (sb-posix:lstat (namestring (physical-adoption-attempt-path)))

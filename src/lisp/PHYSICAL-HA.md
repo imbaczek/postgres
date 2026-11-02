@@ -40,6 +40,25 @@ tests, strict cold compilation and the existing shutdown test. Logs are in
 
 ## Verified starting points
 
+### Adoption attempt startup fence
+
+After taking the local PGDATA flock and creating its PID file, startup checks the
+fixed `physical-adoption.attempt` path before backup-stage cleanup or authentication
+completion. `lstat` permits only ENOENT: any entry, including a corrupt file,
+dangling symlink or directory, and other inspection errors refuse startup without
+parsing or following it. Failed ownership attempts to remove its owned PID and
+closes the lock even if PID cleanup fails. Any future attempt publisher must hold
+the same cooperative PGDATA lock to exclude the check. This fence supplies no
+attempt producer, retry, cleanup or
+installation authority; the bounded attempt codec and network retry remain open.
+
+Ten focused PID tests, including three new Rove tests, and strict cold compilation
+passed. Native tests covered corrupt, dangling-symlink and directory entries and
+normal restart after removing the test-owned marker. Refused starts preserved old
+PGDATA bytes and inodes, the backup-stage sentinel and absent authentication state;
+normal startup then retired the stage, created authentication state and read row 42.
+Evidence is in `/home/imbaczek/proj/pg-ha-artifacts/adoption-attempt-fence/`.
+
 ### Canonical adoption stage prerequisite
 
 A cooperatively owned, stopped former primary can now produce a guarded canonical

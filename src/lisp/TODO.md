@@ -1,5 +1,14 @@
 # Development TODO
 
+- [x] Fence startup on any `physical-adoption.attempt` directory entry before
+  backup-stage cleanup or authentication completion. Only ENOENT permits startup;
+  the check does not parse or follow the entry. A future attempt writer must use
+  the same cooperative PGDATA lock. Ten focused PID tests, including three new
+  Rove tests, native corrupt-file, dangling-symlink and directory fence cases,
+  normal restart, and strict cold compilation passed. Evidence is in
+  `/home/imbaczek/proj/pg-ha-artifacts/adoption-attempt-fence/`.
+  A bounded attempt codec, producer, network retry and installation remain open.
+
 - [x] Stage a verified canonical E/Mnew image from a cooperatively owned, clean
   former primary. The guarded, private target is verified with the ordinary base
   and authentication checks, while historical B/M/H_E remains a separate witness.

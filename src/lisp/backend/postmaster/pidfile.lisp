@@ -181,7 +181,11 @@
       (unless success (sb-posix:close fd)))))
 
 (defun postmaster-own-data-directory (host port &key startup-check)
-  "Own PGDATA before any database storage initialization or recovery mutation."
+  "Own PGDATA before any database storage initialization or recovery mutation.
+Call STARTUP-CHECK synchronously with the local flock held and owned PID created,
+before publishing *POSTMASTER-DATA-LOCK*. The check must be read-only. If it fails
+or exits nonlocally, cleanup clears the timestamp and attempts to remove its owned
+PID. The lock closes even if PID cleanup fails."
   (declare (ignore host))
   (when *postmaster-data-lock* (error "this process already owns a data directory"))
   (postmaster-check-data-directory)
