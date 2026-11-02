@@ -348,6 +348,12 @@ The new base receives its own archive; the old primary archive is not copied."
                (t value))))
     (with-standard-io-syntax (prin1-to-string (literal manifest)))))
 
+(defun physical-bootstrap-manifest-image (manifest)
+  (let* ((text (physical-bootstrap-manifest-text manifest))
+         (bytes (string->bytes text))
+         (crc (wal-crc32 bytes)))
+    (string->bytes (format nil "PGPHYSICALBACKUP1 ~8,'0X~%~a~%" crc text))))
+
 (declaim (ftype function physical-recovery-check-checkpoint-resources))
 
 (defun physical-bootstrap-check-export-slot-under-wal-lock (slot name checkpoint-start)
@@ -420,11 +426,7 @@ outside the immutable file inventory. New manifests require these adjuncts."
                              :source-pin (if export-slot (wal-replication-slot-name export-slot)
                                              (physical-source-pin-name pin)) :files files :auth-policy-required 1)))
         (physical-bootstrap-test-point :before-manifest target)
-        (let* ((*print-readably* t)
-               (text (physical-bootstrap-manifest-text manifest))
-               (bytes (string->bytes text))
-               (crc (wal-crc32 bytes))
-               (image (string->bytes (format nil "PGPHYSICALBACKUP1 ~8,'0X~%~a~%" crc text))))
+        (let ((image (physical-bootstrap-manifest-image manifest)))
           (when pin
             (physical-source-pin-bind-manifest pin (physical-store-update-digest #xCBF29CE484222325 image)))
           (physical-bootstrap-test-point :after-pin-binding target)
