@@ -42,6 +42,7 @@
                (:file "t/wal-lineage-tests")
                (:file "t/physical-adoption-tests")
                (:file "t/physical-adoption-stage-tests")
+               (:file "t/physical-adoption-attempt-tests")
                (:file "t/wal-timeline-tests")
                (:file "t/wal-eor-tests")
                (:file "t/physical-history-tests")
