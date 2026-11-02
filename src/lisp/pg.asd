@@ -173,6 +173,7 @@
                    (:file "../replication/physical-adoption")
                    (:file "../replication/physical-adoption-stage")
                    (:file "../replication/physical-adoption-attempt")
+                   (:file "../replication/physical-adoption-context")
                    (:file "../replication/physical-promotion-online")
                    (:file "../replication/standard")
                    (:file "../replication/worker")
