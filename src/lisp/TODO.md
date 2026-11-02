@@ -1,10 +1,16 @@
 # Development TODO
 
-- [ ] Resolve the admission and receiver join race during concurrent reload.
-  Monitor start and exit flush need admission, but some stop and policy paths
-  join the receiver before the reload gate reopens. Resolver ownership is now
-  published during discovery for cancellation; that fix does not resolve this
-  broader ordering race.
+- [x] Resolve the admission and receiver join race during concurrent reload.
+  Receiver quiescence holds reload exclusion with admission open through stop,
+  join and exit flush. It releases exclusion it acquired before replay joins;
+  caller-owned exclusion remains the caller's responsibility. An
+  existing reload owner with closed or terminal admission is rejected before
+  stop is published. The checkpoint passed 1,439 physical checks and strict
+  cold compilation. The owned-server `configured-follow.sh` matrix exercised
+  manual stop and configured clear while reload admission was closed, followed
+  by resume, metadata, retarget, cold restart and promotion. Its fixture simulates
+  the reload lock and quiescence; it does not compile ASDF inside the gate.
+  Evidence is in `/home/imbaczek/proj/pg-ha-artifacts/receiver-reload/`.
 
 - [x] Add a native TCP primary clone for Patroni's default backup method.
   Staging pauses mutations, then streaming permits SQL to proceed. The native
@@ -507,11 +513,9 @@
 - [ ] Complete native bootstrap and rejoin for the pinned Patroni path. Real
   `Postgresql.follow` and promotion now cover a descendant handoff, ancestry
   rejection and explicit local reseeding (`53b16b79f49`); the oracle has no DCS
-  or coordination. The shared-filesystem operator reseed is not the stock/default
-  or remote Patroni bootstrap clone. Native authenticated export and installation
-  need staged fsync/rename, cancellation cleanup, WAL through backup end for
-  `-X stream`, and default `pg_basebackup` arguments. A configurable local replica
-  method could be an intermediate step. Even a nondivergent former primary lacks
+  or coordination. Authenticated native export and installation now support the
+  default remote Patroni bootstrap clone, with staged publication and cancellation
+  cleanup. Even a nondivergent former primary lacks
   verified recovery provenance; safe offline prefix-proved adoption remains open.
   Native rewind and divergent rewind are unimplemented, and C tools are incompatible.
   The complete unchanged Patroni writer oracle now passes, including `hba_file`

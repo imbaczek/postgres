@@ -1678,6 +1678,8 @@ A completed retained fork launches replay without contacting the source."
      )))
 
 (defun physical-follow-check-receiver-stop-admission ()
+  ;; With reload excluded, reject a closed or terminal admission gate before
+  ;; publishing a stop that would make the receiver need to exit through it.
   (unless (sb-thread:holding-mutex-p *reload-run-lock*)
     (error "receiver stop admission check requires reload exclusion"))
   (unless (call-with-live-operation-lock
@@ -1691,8 +1693,10 @@ A completed retained fork launches replay without contacting the source."
 The lifecycle owner must first block the controller and cancel its operation
 outside command, reload and admission locks, then hold the command mutex here.
 A controller operation already owns its transition when quiescing its runtime.
-Mark receipt stopped under the generation fence. Stop the client and join
-outside the fence and admission; a failed join or exit flush signals an error."
+Hold reload exclusion with admission open through client stop, receiver join,
+exit flush and checks, so reload cannot close admission while the receiver exits.
+Mark receipt stopped under the generation fence; stop and join outside that
+fence and admission. A failed join or exit flush signals an error."
   (when (plusp *live-operation-depth*)
     (error "receiver quiescence must join outside admission"))
   (unless (sb-thread:holding-mutex-p *physical-follow-command-lock*)
@@ -1727,7 +1731,10 @@ outside the fence and admission; a failed join or exit flush signals an error."
 The caller owns the command mutex and joins outside admission. A lifecycle
 owner first blocks and cancels the controller; a controller operation already
 owns its transition. Publish stop and retirement under the generation fence;
-join workers outside it."
+join workers outside it. An existing reload owner must have open admission
+before publishing stop. Receiver quiescence releases reload exclusion it
+acquired before the replay join. Caller-owned exclusion stays with the caller;
+replay and restartpoint work can need that lock."
   (when (plusp *live-operation-depth*) (error "follow quiescence must join outside admission"))
   (let ((runtime *physical-follow-runtime*))
     (when runtime
