@@ -91,6 +91,9 @@ active timeline goal before recovery preparation or redo."
 
 (defvar *physical-backup-stage-lock* (sb-thread:make-mutex :name "native backup stages"))
 
+;; A source owns only the container named for its current device, inode,
+;; system identifier and canonical path digest.  The owner record also checks
+;; the full path, so startup does not sweep an old reseed or relocated cluster.
 (defun physical-backup-stage-container (&optional (catalog *catalog*))
   (unless (and *postmaster-data-lock* (open-stream-p *postmaster-data-lock*))
     (error "native backup stages require data directory ownership"))
@@ -166,6 +169,8 @@ active timeline goal before recovery preparation or redo."
                                  (and (char<= #\0 char #\9))))
               (subseq name 6))))
 
+;; Remove children through directory descriptors, without following symlinks.
+;; Callers validate the owner and stage directory before allowing removal.
 (defun physical-backup-remove-stage-tree (parent name)
   (let* ((path (query-temp-fd-child-path parent name))
          (stat (sb-posix:lstat path)))
@@ -444,6 +449,9 @@ quiescence end. It is not the final online base-backup protocol."
          (physical-bootstrap-copy-under-quiescence
           (physical-bootstrap-target directory) pin-name))))))
 
+;; Reserve a temporary export slot before quiescing mutations.  Copy and sync
+;; the image while quiescent, then drop that slot even on failure.  The local
+;; bootstrap path's private pin is separate and is not retired by this export.
 (defun physical-export-base-backup (directory name)
   (unless *backend* (error "native backup export requires a backend owner"))
   (when (plusp *live-operation-depth*)
@@ -535,6 +543,9 @@ quiescence end. It is not the final online base-backup protocol."
          collect (list name (length bytes) (physical-store-update-digest #xCBF29CE484222325 bytes)))
    (getf manifest :files)))
 
+;; Send B (bundle header), F/D/E (file header, data and end), then Z
+;; (count and checksum).  The checksum covers all preceding payloads, including
+;; file checksums; it detects corruption and is not an authentication mechanism.
 (defun physical-backup-send-bundle (directory manifest emit)
   (let* ((entries (physical-backup-bundle-entries directory manifest))
          (digest #xCBF29CE484222325))
@@ -603,6 +614,9 @@ quiescence end. It is not the final online base-backup protocol."
       (fsync-directory parent)
       (list name size digest))))
 
+;; Bound the file count and metadata sizes before receiving the manifest and
+;; its inventory.  Check order, paths, sizes and checksums, then verify the
+;; immutable recovery image and copied authentication policy before publication.
 (defun physical-backup-receive-bundle (directory next)
   (let ((digest #xCBF29CE484222325)
         (magic (string->bytes "PGNATIVEBACKUP1")))
@@ -672,6 +686,9 @@ quiescence end. It is not the final online base-backup protocol."
 
 (declaim (special +physical-native-format+))
 
+;; Receive into a private sibling directory.  Publish only after the complete
+;; CopyOut and image verification, by rename followed by parent directory fsync.
+;; Normal errors and interrupts remove the stage; SIGKILL can leave it behind.
 (defun physical-base-backup-remote (directory conninfo &key (helper (physical-libpq-helper-path)))
   (multiple-value-bind (target parent) (physical-backup-destination directory)
     (let ((stage nil) (channel nil))
@@ -705,6 +722,9 @@ quiescence end. It is not the final online base-backup protocol."
         (unwind-protect
              (when channel (physical-libpq-close channel))
           (when stage (uiop:delete-directory-tree stage :validate t :if-does-not-exist :ignore)))))))
+
+;; Parse the pg_basebackup options used by the native clone wrapper, preserving
+;; the supplied conninfo.  Unsupported options fail instead of being ignored.
 
 (defun native-basebackup-options (arguments)
   (let ((directory nil) (conninfo "") (method "stream"))

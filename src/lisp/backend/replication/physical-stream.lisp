@@ -122,6 +122,8 @@ Only explicit proof_kind retained_timeline selects the retained proof."
                         (ereport "22023" "invalid native physical timeline"))
                    append (list key value))))))
 
+;; This private command requires exactly the negotiated native format.  It is
+;; distinct from PostgreSQL's BASE_BACKUP protocol and image format.
 (defun parse-native-physical-backup (words)
   (let ((options (parse-replication-generic-options (rest words))))
     (unless (and (= 1 (length options))
@@ -130,6 +132,10 @@ Only explicit proof_kind retained_timeline selects the retained proof."
       (ereport "0A000" "BASE_BACKUP_NATIVE requires exactly the supported native_format"))
     (make-logical-replication-command :type :physical-backup :options options)))
 
+;; Admit only a primary physical sender.  Stage the image under quiescence,
+;; then stream it after mutations resume.  On failure in CopyOut, abort the
+;; connection and attempt stage cleanup when this backend unwinds.  Startup
+;; retries cleanup of abandoned stages in the current owned namespace.
 (defun start-native-physical-backup (stream command)
   (declare (ignore command))
   (with-live-operation

@@ -1,5 +1,17 @@
 # Development TODO
 
+- [x] Add a native TCP primary clone for Patroni's default backup method.
+  Staging pauses mutations, then streaming permits SQL to proceed. The native
+  command and image differ from C's online base backup; a permanent follower
+  slot must retain WAL until attachment. The reviewed checkpoint passed 903 unit,
+  1,430 physical, 201 wire and 1,161 legacy checks and strict cold compilation.
+  The pinned Patroni 4.1.5 TCP test covers HBA, format and occupied destination
+  rejection, wrapper cancellation, SQL during streaming, damaged streams, source
+  crash cleanup, cold follow restart and cloning a promoted timeline 2 primary.
+  Evidence: `/home/imbaczek/proj/pg-ha-artifacts/native-basebackup/pg-backup-export-hba-recheck.log`.
+  Rewind, offline primary adoption, unsupported checkpoint fields, write/flush
+  parity, the cold-load audit and broader documentation remain open.
+
 - [ ] Support schema-qualified INSERT targets such as `INSERT INTO public.t`;
   the current parser returns 42601 although an unqualified target parses.
 

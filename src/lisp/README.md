@@ -111,11 +111,27 @@ receiver. `physical-follow-stop` rejects an unattached standby; use replay pause
 to pause replay. The original bootstrap pin remains of unknown ownership and is
 not retired by this attachment.
 
+Patroni's default clone method can use `bin/pg_basebackup` to copy a native
+primary over TCP. The private `BASE_BACKUP_NATIVE` command creates a consistent
+image by pausing source mutations while it stages the copy; SQL can proceed while
+the staged image is streamed. This is not C PostgreSQL's online `BASE_BACKUP`
+protocol or backup format. Only primary sources are supported. Create the
+permanent physical follower slot before accepting a clone: the temporary export
+slot is dropped once staging is durable. If required WAL is missing before the
+follower attaches, attachment fails and the follower must be reseeded.
+
+The wrapper uses `PG_LIBPQ_HELPER` when set, then an installed
+`bin/pg-libpq-helper`; otherwise it builds a private helper using `CC` and
+`pg_config` and removes it on exit. The native follower still needs its own
+configured `PG_LIBPQ_HELPER`. Failed or interrupted clients clean up their private
+destination stage, though SIGKILL can leave a `.pg-native-backup.*` sibling.
+Source startup sweeps abandoned stages only for the current cluster identity;
+stages belonging to an old reseed or relocated cluster are left alone.
+
 The unchanged Patroni follow method has also been tested against a promoted
-descendant and an explicit local native reseed. This reseed uses shared filesystem
-access and is not Patroni's default or remote bootstrap clone. A former primary
-cannot directly follow without verified native recovery provenance; native rewind
-and safe offline primary adoption remain open.
+descendant and an explicit local native reseed. A former primary cannot directly
+follow without verified native recovery provenance; native rewind and safe
+offline primary adoption remain open. No coordinator is included.
 
 An existing verified native recovery base and control can also start with
 `standby.signal`. Startup samples the signal names once, enables streaming recovery
@@ -134,8 +150,9 @@ cold retry cannot accidentally enter recovery. Symlink targets are left intact.
 `recovery_target_timeline` accepts `current`, `latest` (the default), or a numeric
 timeline ID. It is a POSTMASTER setting: cold startup applies it, and reload
 reports changes as pending restart. `SHOW` and `pg_settings` retain its spelling.
-The `primary_conninfo` and `primary_slot_name` GUCs are not implemented yet, so
-full Patroni follow remains unfinished. Coordination is outside this scope.
+For a verified native recovery base, `primary_conninfo` selects the upstream
+and `primary_slot_name` selects its public physical slot. Coordination is
+outside this scope.
 Effective multihost profiles are unsupported.
 The original conninfo is resolved again on normal reconnects. If the selected
 route changes, the receiver prepares a new binding before querying or receiving
@@ -1247,6 +1264,11 @@ it alone does not run tests. `./t/run-unit-tests.sh` executes this ASDF suite an
 then the 161 deferred legacy cases (arena cases remain conditional on runtime
 support). See the [complete test inventory](t/TEST-INVENTORY.md) for every case,
 shared helper, retained process harness, deferral reason and generated domain.
+
+`python3 t/interop/native-basebackup.py --reference-bin /path/to/bin` exercises
+the native TCP clone with pinned Patroni 4.1.5 and owned server processes. It
+also checks failure and cancellation paths, restart and follow, and cloning a
+promoted timeline 2 primary.
 
 The physical suite checks native WAL intake, durable receive progress, source
 retention, bootstrap, recovery write exclusion and streaming contracts. See
