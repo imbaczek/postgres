@@ -49,7 +49,6 @@ is shared by the detached anchor and proof and reattached for existing validator
 the typed source proof must match the saved local H_E. Preparing may become proved
 or aborting; proved may become aborting; aborting may become aborted. Repeating
 an identical state is idempotent. Saved operation fields and proof cannot be rebound.
-Cancellation phases are encoding only; network ABORT is not implemented.
 
 The active offline owner publishes owned copies to a private single-link 0600
 file in its own PGDATA, with file sync, rename, directory sync and readback.
@@ -59,7 +58,7 @@ no PREPARE or installation authority. The startup presence fence applies to ever
 phase. CRC and FNV are integrity checks under cooperative ownership, not
 authentication. The record contains private credentials; hex is not encryption
 and payloads must not be logged.
-Network PREPARE/PROVE and ABORT retirement remain open.
+The network PREPARE/PROVE driver remains open.
 
 Validation passed 1,509 physical, 903 unit and 201 wire tests, ten new Rove tests
 and strict cold compilation. The property passed 100 trials at seed 76, digest
@@ -92,6 +91,35 @@ The authentication freeze property passed 100 trials at seed 77, digest
 and input coverage were not measured. Native full export-origin and final recheck
 passed. Evidence is in
 `/home/imbaczek/proj/pg-ha-artifacts/adoption-context/evidence.json`.
+
+### Adoption cancellation
+
+Cancellation reads the owned, structurally checked saved record and durably publishes
+the aborting phase before sending ABORT. It uses the saved frozen mode and route,
+reconnecting when no client is supplied, and checks the source system ID. Cancellation
+does not require the current
+timeline or history, or fresh local stage validation. Immediately before ABORT it
+checks the owner and rereads the exact saved intent. After acknowledgment it durably
+publishes aborted, unlinks the record and syncs the directory. A retry of an aborted
+record needs no client. If the record is absent, cancellation syncs the directory and
+returns `:absent` without claiming anything about the remote source.
+
+Once aborting is durably saved, errors before acknowledgment retain that intent. After
+acknowledgment, helper cleanup, aborted publication or removal failures signal
+`physical-adoption-retirement-uncertain`: the remote pin was retired but local
+completion is uncertain. A caller-provided client remains open; a client opened by
+cancellation is cleaned up. Cancellation does not orchestrate PREPARE or PROVE,
+install or start an image, or provide coordination.
+
+The broad physical suite passed 1,533 tests before the final acknowledgment error
+classification fix and twelfth cancellation test. All 12 focused cancellation tests
+then passed on the final code, as did 903 unit tests, 201 wire tests, strict cold
+compilation and the final native check. With `PG_ADOPTION_CANCEL_TEST=1`, the native
+check publishes before a manual PREPARE, reconnects and cancels, then verifies that a
+delayed PREPARE is refused for the lifetime of that source process. The
+property passed 100 trials at seed 78, digest `fnv1a64-v1:66164b8c1dde386a`; no
+Function Spec is registered, and rejection counts and input coverage were not measured.
+Evidence is in `/home/imbaczek/proj/pg-ha-artifacts/adoption-cancel/evidence.json`.
 
 ### Adoption attempt startup fence
 

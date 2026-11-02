@@ -1,12 +1,20 @@
+;;; Resumable cancellation of an offline adoption attempt.
+;;;
+;;; Save cancellation intent before contacting the source. Keep the startup fence
+;;; until the source acknowledges retirement and the local record can be removed
+;;; durably. A damaged stage must not prevent cleanup of the saved remote intent.
+
 (in-package #:pg)
 
 (define-condition physical-adoption-retirement-uncertain (error)
   ((cause :initarg :cause :reader physical-adoption-retirement-cause))
+  (:documentation "Remote retirement was acknowledged, but local completion is uncertain.")
   (:report (lambda (condition stream)
              (declare (ignore condition))
              (write-string "remote adoption pin retired; local cancellation completion is uncertain" stream))))
 
 (defun physical-adoption-attempt-read-if-present (owner)
+  "Read the owned attempt, returning NIL if it is absent."
   (physical-adoption-check-owner owner)
   (handler-case (physical-adoption-attempt-read owner)
     (sb-posix:syscall-error (condition)
@@ -14,11 +22,13 @@
         (error condition)))))
 
 (defun physical-adoption-attempt-advance (owner record phase)
+  "Durably publish the next phase without changing the saved intent."
   (let ((candidate (copy-list record)))
     (setf (getf candidate :phase) phase)
     (physical-adoption-attempt-publish owner candidate :previous record)))
 
 (defun call-with-physical-adoption-attempt-client (record supplied function)
+  "Call FUNCTION on the saved route, closing only a client opened here."
   (let ((source (getf record :source)))
     (if supplied
         (progn
@@ -37,6 +47,7 @@
             (when client (physical-client-close client)))))))
 
 (defun physical-adoption-attempt-clear-aborted (owner record)
+  "Remove a durably aborted attempt and sync its directory."
   (unless (eq :aborted (getf record :phase))
     (error "only a durably aborted attempt can be removed"))
   (handler-case
@@ -58,6 +69,9 @@
   :retired)
 
 (defun physical-adoption-attempt-cancel (owner &key client)
+  "Retire the saved remote intent and then remove its durable local record.
+An absent record returns :ABSENT without making a claim about the remote source.
+After an ABORT acknowledgment, failures signal retirement-uncertain."
   (let ((record (physical-adoption-attempt-read-if-present owner)))
     (unless record
       (fsync-directory (physical-adoption-owner-directory owner))
