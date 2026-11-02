@@ -11,7 +11,8 @@
          (client (physical-libpq-connect (physical-libpq-helper-path) profile))
          (name nil)
          (coordinates nil)
-         (anchor nil))
+         (anchor nil)
+         (cancel-test (equal "1" (uiop:getenv "PG_ADOPTION_CANCEL_TEST"))))
     (unwind-protect
          (let* ((record (physical-adoption-attempt-create state stage client profile))
                 (identity (getf proof :identity))
@@ -21,6 +22,7 @@
            (assert (physical-adoption-attempt-validate-context (getf state :owner) record))
            (assert (not (probe-file (physical-adoption-attempt-path
                                      (physical-adoption-owner-directory (getf state :owner))))))
+           (when cancel-test (physical-adoption-attempt-publish (getf state :owner) record))
            (setf name (getf (getf record :stage) :source-pin)
                  coordinates (getf record :request)
                  anchor (pg-client-native-prepare client name coordinates))
@@ -29,9 +31,24 @@
              (assert (equal (getf record :source-history) (getf remote :history-text)))
              (assert (= (getf proof :end-digest) (getf remote :end-digest)))
              (assert (= expected-root (getf remote :root-id)))
-             (format t "~&adoption-context: fresh stage, frozen accepted route and retained proof agree PASS~%")))
+             (format t "~&adoption-context: fresh stage, frozen accepted route and retained proof agree PASS~%"))
+           (when cancel-test
+             (physical-client-close client)
+             (setf client nil)
+             (assert (eq :retired (physical-adoption-attempt-cancel (getf state :owner))))
+             (setf coordinates nil)
+             (assert (not (probe-file (physical-adoption-attempt-path
+                                       (physical-adoption-owner-directory (getf state :owner))))))
+             (multiple-value-bind (original frozen) (physical-follow-source-profile (getf record :source))
+               (declare (ignore original))
+               (let ((late (physical-libpq-connect-frozen (physical-libpq-helper-path) frozen)))
+                 (unwind-protect
+                      (assert (handler-case (progn (pg-client-native-prepare late name (getf record :request)) nil)
+                                (pg-client-error () t)))
+                   (physical-client-close late))))
+             (format t "~&adoption-cancel: frozen reconnect, durable retirement and delayed PREPARE refusal PASS~%")))
       (unwind-protect
-           (when coordinates
+           (when (and coordinates (not cancel-test))
              (if anchor
                  (pg-client-native-release client name (physical-follow-anchor-digest anchor))
                  (pg-client-native-abort client name coordinates)))
