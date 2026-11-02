@@ -1,3 +1,17 @@
+;;; Offline installation of a proved physical adoption.
+;;;
+;;; PGDATA and its ownership lock stay in place.  Preparation copies the
+;;; immutable stage to a private incoming tree and durably publishes a plan.
+;;; The installing attempt phase is a startup fence published before any move.
+;;; Each old top-level entry moves to quarantine, then each incoming entry
+;;; moves into PGDATA.  Renames do not replace existing names; both parents
+;;; are synced before the corresponding journal STEP is durable.
+;;;
+;;; Resume accepts only the recorded namespace or the next planned move.  It
+;;; completes forward; it does not roll back.  Original data remains in
+;;; quarantine.  Even installed remains startup fenced and retains the source
+;;; pin: follow handoff and startup reconciliation are not implemented here.
+
 (in-package #:pg)
 
 (defun physical-adoption-install-check-attempt-publication (owner state previous candidate)
@@ -97,6 +111,9 @@
                                           (physical-adoption-install-entry-path to (first entry)))))
 
 (defun physical-adoption-install-resume (owner)
+  "Continue a published installation under an existing offline OWNER.
+Validate the journal and namespace before every advance.  Return only after
+installation is complete; startup remains fenced pending a later handoff."
   (let* ((state (physical-adoption-install-read owner))
          (plan (getf state :plan))
          (moves (1- (physical-adoption-install-last-step plan))))
@@ -132,5 +149,8 @@
             (setf state (physical-adoption-install-append-step owner state)))))))
 
 (defun physical-adoption-install-start (owner directory &key client)
+  "Prepare and install a proved attempt under an existing offline OWNER.
+DIRECTORY is an empty private workspace disjoint from PGDATA and the stage.
+The stage must remain immutable.  Retain ownership throughout the call."
   (physical-adoption-install-prepare owner directory :client client)
   (physical-adoption-install-resume owner))

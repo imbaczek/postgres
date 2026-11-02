@@ -1,3 +1,9 @@
+;;; Build and verify an independent incoming image from the immutable stage.
+;;;
+;;; Copying creates new files rather than sharing stage objects.  The caller
+;;; must keep the stage immutable throughout preparation and installation.
+;;; Verification checks the copy before it can become installation authority.
+
 (in-package #:pg)
 
 (defun physical-adoption-install-copy-file (source target row)

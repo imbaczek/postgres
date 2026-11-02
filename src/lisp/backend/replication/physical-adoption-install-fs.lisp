@@ -1,3 +1,11 @@
+;;; Filesystem primitives and inventories for offline installation.
+;;;
+;;; Workspace, incoming and quarantine have private startup fences.  They and
+;;; PGDATA and stage must share a filesystem and mount; traversals reject
+;;; unsupported or aliased objects.  Mount IDs are checked again at runtime,
+;;; not persisted in the plan.  File and directory syncs establish the
+;;; durability ordering on which journal recovery relies.
+
 (in-package #:pg)
 
 (defconstant +physical-adoption-at-fdcwd+ -100)

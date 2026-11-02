@@ -1,3 +1,12 @@
+;;; Immutable installation plan and append-only progress encoding.
+;;;
+;;; The plan records the proved attempt, directory identities and inventories
+;;; of the old, stage and incoming trees.  Incoming content must match the
+;;; stage, but its objects have distinct identities.  A bounded, checksummed
+;;; body is followed by ordered checksummed STEP records.  Decode accepts a
+;;; torn suffix only when it is a prefix of the next expected STEP; namespace
+;;; validation must still prove that the corresponding operation happened.
+
 (in-package #:pg)
 
 (defconstant +physical-adoption-install-body-maximum+

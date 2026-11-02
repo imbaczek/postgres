@@ -1,3 +1,10 @@
+;;; Durable publication and progress for the offline installation plan.
+;;;
+;;; The plan is immutable after publication.  Progress is appended only after
+;;; the exact namespace has been verified and both parents of a move have
+;;; been synced.  A torn next STEP is truncated and rewritten on resume after
+;;; validation; it never authorizes an otherwise unexplained namespace.
+
 (in-package #:pg)
 
 (declaim (ftype function physical-adoption-install-validate physical-adoption-install-validate-prepared

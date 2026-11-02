@@ -1,3 +1,12 @@
+;;; Validate and prepare the offline installation namespace.
+;;;
+;;; The workspace is private, empty and disjoint from PGDATA and stage.
+;;; Before publishing the plan, preparation syncs the original tree and the
+;;; stage, as well as directory ancestors, so the plan does not outrun the
+;;; bytes and names it protects.  Resume rechecks identities, contents and
+;;; exact names against the recorded state or one move ahead.  A missing
+;;; journal does not clear an installing attempt's startup fence.
+
 (in-package #:pg)
 
 (defun physical-adoption-install-directory (plan role)

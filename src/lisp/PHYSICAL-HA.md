@@ -40,6 +40,33 @@ tests, strict cold compilation and the existing shutdown test. Logs are in
 
 ## Verified starting points
 
+### Offline adoption installation
+
+`physical-adoption-install-start` prepares and installs a proved attempt;
+`physical-adoption-install-resume` continues a published installation. Both
+require existing offline ownership. PGDATA and its lock stay in place. The
+caller supplies an empty private workspace disjoint from PGDATA and the
+immutable stage, on the same filesystem and mount. The workspace, incoming
+copy and quarantine carry startup fences. Mount identity is recomputed during
+validation, not saved in the plan.
+
+Preparation makes an independent copy of the stage and syncs the original
+bytes, trees and directory ancestors before publishing the immutable plan.
+The installing attempt phase is durable before the first move. Original entries
+are moved to quarantine, then incoming entries to PGDATA, using no-replace
+renames. Both parent directories are synced before each appended STEP is
+durable. Resume validates exact names, identities and contents at the recorded
+step or one move ahead; a torn STEP must be a prefix of the expected record.
+It proceeds forward and preserves the original data in quarantine. A missing
+journal does not clear an installing startup fence.
+
+Installed remains startup fenced. The installer does not release the source pin;
+its continued existence still depends on the source. Follow handoff,
+startup reconciliation, rollback, workers and coordination are not implemented
+by this installer. Native cold startup refusal has passed. SIGKILL crash tests
+exercise process interruption; the sync ordering models power-loss durability
+and those tests alone do not simulate loss of unsynced writes.
+
 ### Private adoption attempt record
 
 A bounded CRC-protected record saves clean local control facts, including
@@ -47,8 +74,10 @@ actual and allocator next XID, raw small WAL control in hex and seven ordered
 absent-or-length/FNV capture commitments. One source history of at most 16 MiB
 is shared by the detached anchor and proof and reattached for existing validators;
 the typed source proof must match the saved local H_E. Preparing may become proved
-or aborting; proved may become aborting; aborting may become aborted. Repeating
-an identical state is idempotent. Saved operation fields and proof cannot be rebound.
+or aborting; proved may become aborting or installing; aborting may become aborted;
+installing may become installed. Installation phases require the checked journal
+publisher and cannot abort or reverse. Repeating an identical state is idempotent.
+Saved operation fields and proof cannot be rebound.
 
 The active offline owner publishes owned copies to a private single-link 0600
 file in its own PGDATA, with file sync, rename, directory sync and readback.
@@ -58,7 +87,7 @@ no PREPARE or installation authority. The startup presence fence applies to ever
 phase. CRC and FNV are integrity checks under cooperative ownership, not
 authentication. The record contains private credentials; hex is not encryption
 and payloads must not be logged.
-Installation and startup reconciliation remain open.
+Startup reconciliation remains open.
 
 Validation passed 1,509 physical, 903 unit and 201 wire tests, ten new Rove tests
 and strict cold compilation. The property passed 100 trials at seed 76, digest
