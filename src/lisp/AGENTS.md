@@ -314,6 +314,10 @@ appropriate instead of replacing the native C peer or adding a message relay.
   test inspectors. Stored legacy WAL readability does not imply live mixed-version
   peer compatibility. Crash tests must inspect the durable checkpoint copy both
   before data sync and after control publication.
+- A shutdown streaming oracle must distinguish checkpoint record start from its
+  end. `pg_controldata` reports the start; an earlier WAL record can reach that
+  position without delivering the checkpoint. Capture the source's durable
+  checkpoint end and use it for feedback, receive and replay assertions.
 - Recovery counters belong to a replay position. When reconstructing a prefix
   from an older base/R-point, restore that point's visibility counter before
   comparing it with historical allocation bounds. Preserve latest durable

@@ -57,6 +57,7 @@
   (values))
 
 (defun shutdown-streaming-checkpoint-end (directory)
+  ;; The source hook records the durable end, not pg_controldata's start.
   (let ((path (merge-pathnames "shutdown-endpoint" directory)))
     (when (probe-file path)
       (with-open-file (input path)
