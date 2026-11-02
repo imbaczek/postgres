@@ -46,6 +46,8 @@
                (:file "t/physical-adoption-context-tests")
                (:file "t/physical-adoption-cancel-tests")
                (:file "t/physical-adoption-proof-tests")
+               (:file "t/physical-adoption-install-tests")
+               (:file "t/physical-adoption-install-codec-tests")
                (:file "t/wal-timeline-tests")
                (:file "t/wal-eor-tests")
                (:file "t/physical-history-tests")

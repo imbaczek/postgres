@@ -6,18 +6,28 @@
   "Return the fixed local adoption attempt fence path."
   (merge-pathnames "physical-adoption.attempt" directory))
 
-(defun physical-adoption-check-startup ()
-  "Refuse startup if the attempt path has any entry or cannot be inspected.
-Only ENOENT permits startup; lstat neither follows nor parses the entry. A future
-publisher must hold the same cooperative PGDATA lock to exclude this check."
+(defun physical-adoption-install-path (&optional (directory *pgdata*))
+  (merge-pathnames "physical-adoption.install" directory))
+
+(defun physical-adoption-require-absent (path message)
   (handler-case
-      (progn
-        (sb-posix:lstat (namestring (physical-adoption-attempt-path)))
-        (error "pending offline adoption attempt requires reconciliation before startup"))
+      (progn (sb-posix:lstat (namestring path)) (error message))
     (sb-posix:syscall-error (condition)
       (unless (= sb-posix:enoent (sb-posix:syscall-errno condition))
         (error condition))))
   (values))
+
+(defun physical-adoption-check-no-install (directory)
+  (physical-adoption-require-absent
+   (physical-adoption-install-path directory)
+   "offline adoption installation requires journal reconciliation"))
+
+(defun physical-adoption-check-startup ()
+  "Refuse startup on any attempt or installation journal entry or inspection error."
+  (physical-adoption-check-no-install *pgdata*)
+  (physical-adoption-require-absent
+   (physical-adoption-attempt-path)
+   "pending offline adoption attempt requires reconciliation before startup"))
 
 (defstruct physical-adoption-owner
   "Thread-bound ownership of an existing offline PGDATA and its dedicated lock.

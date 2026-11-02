@@ -56,6 +56,7 @@
              (path (physical-adoption-attempt-path directory)))
         (unless (equal record (physical-adoption-attempt-read owner))
           (error "adoption attempt changed before local retirement"))
+        (physical-adoption-check-no-install directory)
         (physical-adoption-attempt-test-point :before-unlink path)
         (handler-case (sb-posix:unlink (namestring path))
           (sb-posix:syscall-error (condition)
@@ -72,10 +73,13 @@
   "Retire the saved remote intent and then remove its durable local record.
 An absent record returns :ABSENT without making a claim about the remote source.
 After an ABORT acknowledgment, failures signal retirement-uncertain."
+  (physical-adoption-check-no-install (physical-adoption-owner-directory (physical-adoption-check-owner owner)))
   (let ((record (physical-adoption-attempt-read-if-present owner)))
     (unless record
       (fsync-directory (physical-adoption-owner-directory owner))
       (return-from physical-adoption-attempt-cancel :absent))
+    (when (member (getf record :phase) '(:installing :installed))
+      (error "installation authority cannot be cancelled as an ordinary attempt"))
     (unless (member (getf record :phase) '(:aborting :aborted))
       (setf record (physical-adoption-attempt-advance owner record :aborting)))
     (unless (eq :aborted (getf record :phase))
@@ -93,6 +97,7 @@ After an ABORT acknowledgment, failures signal retirement-uncertain."
                  (physical-adoption-attempt-check-owner owner record)
                  (unless (equal record (physical-adoption-attempt-read owner))
                    (error "adoption cancellation intent changed before remote retirement"))
+                 (physical-adoption-check-no-install (physical-adoption-owner-directory owner))
                  (pg-client-native-abort channel (getf (getf record :stage) :source-pin)
                                          (getf record :request))
                  (setf acknowledged t)))

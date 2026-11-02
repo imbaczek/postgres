@@ -89,7 +89,7 @@
           (:unknown (setf record (append record (list :unknown 1))))
           (:duplicate (setf record (append record (list :phase :proved))))
           (:version (setf (getf record :version) 2))
-          (:phase (setf (getf record :phase) :installing))
+          (:phase (setf (getf record :phase) :unknown-phase))
           (:wal (setf (getf (getf record :local) :wal-control) '(:bytes "00")))
           (:capture (setf (third (getf (getf record :local) :capture)) '(0 99)))
           (:stage (setf (getf (getf record :stage) :next-xid) 1003))

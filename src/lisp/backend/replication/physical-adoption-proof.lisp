@@ -21,6 +21,7 @@ Retryable remote failures leave the saved phase available for resume."
   (physical-adoption-attempt-validate-context owner record)
   (unless (equal record (physical-adoption-attempt-read owner))
     (error "adoption intent changed during proof validation"))
+  (physical-adoption-check-no-install (physical-adoption-owner-directory (physical-adoption-check-owner owner)))
   t)
 
 (defun physical-adoption-attempt-reobserve-source (client record)
@@ -53,6 +54,7 @@ A proved retry must reproduce the saved record."
 (defun physical-adoption-attempt-resume-proof (owner &key client)
   "Revalidate and prove a preparing or proved attempt against its saved source.
 Publish a new proof only after source, local context and intent rechecks."
+  (physical-adoption-check-no-install (physical-adoption-owner-directory (physical-adoption-check-owner owner)))
   (let ((record (physical-adoption-attempt-read owner)))
     (unless (member (getf record :phase) '(:preparing :proved))
       (error "cancelled adoption attempts cannot resume proof"))
@@ -89,6 +91,7 @@ Publish a new proof only after source, local context and intent rechecks."
 
 (defun physical-adoption-attempt-start-proof (state image client profile)
   "Create and durably publish a preparing attempt before requesting proof."
+  (physical-adoption-check-no-install (physical-adoption-owner-directory (physical-adoption-check-owner (getf state :owner))))
   (let* ((record (physical-adoption-attempt-create state image client profile))
          (owner (getf state :owner)))
     (physical-adoption-attempt-publish owner record)

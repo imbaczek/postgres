@@ -3,6 +3,8 @@
 (in-package #:pg)
 
 (defconstant +physical-adoption-attempt-maximum-bytes+ +physical-follow-config-maximum-bytes+)
+
+
 (defvar *physical-adoption-attempt-test-hook* nil)
 
 (defparameter *physical-adoption-attempt-local-keys*
@@ -209,7 +211,7 @@ The source history is stored once, bounded to 16 MiB. This does not reinspect
 source, stage or control files or authorize PREPARE or installation."
   (physical-follow-check-plist record *physical-adoption-attempt-keys*)
   (unless (and (eql 1 (getf record :version))
-               (member (getf record :phase) '(:preparing :proved :aborting :aborted)))
+               (member (getf record :phase) '(:preparing :proved :aborting :aborted :installing :installed)))
     (error "unsupported adoption attempt state"))
   (let* ((local (physical-adoption-attempt-local-copy (getf record :local)))
          (stage (physical-adoption-attempt-stage-copy (getf record :stage) local))
@@ -222,7 +224,7 @@ source, stage or control files or authorize PREPARE or installation."
     (unless (and (eq (null anchor) (null proof))
                  (case (getf record :phase)
                    (:preparing (null anchor))
-                   (:proved anchor)
+                   ((:proved :installing :installed) anchor)
                    (otherwise t)))
       (error "incomplete adoption attempt proof state"))
     (when anchor
@@ -275,7 +277,8 @@ only and do not perform network ABORT."
                  (or (eq old new)
                      (member (list old new)
                              '((:preparing :proved) (:preparing :aborting)
-                               (:proved :aborting) (:aborting :aborted))
+                               (:proved :aborting) (:aborting :aborted)
+                               (:proved :installing) (:installing :installed))
                              :test #'equal))
                  (or (and (eq old :preparing) (eq new :proved))
                      (and (equal (getf previous :anchor) (getf candidate :anchor))
@@ -321,6 +324,9 @@ and read back. This does not revalidate source or stage or grant operation autho
          (*pgdata* directory)
          (path (physical-adoption-attempt-path directory))
          (image (physical-adoption-attempt-image candidate)))
+    (when (member (getf candidate :phase) '(:installing :installed))
+      (error "installation phases require installation journal authority"))
+    (physical-adoption-check-no-install directory)
     (if previous
         (progn
           (unless (equal previous (physical-adoption-attempt-read owner))
