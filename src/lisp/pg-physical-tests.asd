@@ -51,6 +51,8 @@
                (:file "t/physical-adoption-install-transaction-tests")
                (:file "t/physical-adoption-handoff-codec-tests")
                (:file "t/physical-adoption-handoff-tests")
+               (:file "t/physical-adoption-follow-plan-tests")
+               (:file "t/physical-adoption-follow-codec-tests")
                (:file "t/wal-timeline-tests")
                (:file "t/wal-eor-tests")
                (:file "t/physical-history-tests")

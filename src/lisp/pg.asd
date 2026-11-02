@@ -185,6 +185,8 @@
                    (:file "../replication/physical-adoption-handoff-codec")
                    (:file "../replication/physical-adoption-handoff-state")
                    (:file "../replication/physical-adoption-handoff")
+                   (:file "../replication/physical-adoption-follow-plan")
+                   (:file "../replication/physical-adoption-follow-codec")
                    (:file "../replication/physical-promotion-online")
                    (:file "../replication/standard")
                    (:file "../replication/worker")
