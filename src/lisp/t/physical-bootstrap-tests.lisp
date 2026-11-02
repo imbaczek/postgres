@@ -379,9 +379,11 @@
          (declare (ignore root))
          (with-physical-store-directory (target)
            (let ((original (symbol-function 'pg::physical-bootstrap-copy-under-quiescence))
+                 (original-capture (symbol-function 'pg::physical-export-origin-capture-backup))
+                 (original-record (symbol-function 'pg::physical-export-origin-record-backup))
                  (pg::*wal-checkpoint-snapshot* (list :redo 1 :timeline 1))
                  (pg::*swank-listener-enabled-p* nil)
-                 (captured nil))
+                 (captured nil) (origin-captured 0) (origin-recorded 0))
              (unwind-protect
                   (progn
                     (setf (symbol-function 'pg::physical-bootstrap-copy-under-quiescence)
@@ -393,15 +395,36 @@
                             (ok (pg::physical-slot-owned-by-backend-p export-slot pg::*backend*))
                             (setf captured export-slot)
                             (when fail (error "injected stage failure"))
-                            (list :manifest)))
+                            (list :manifest))
+                          (symbol-function 'pg::physical-export-origin-capture-backup)
+                          (lambda (directory manifest token)
+                            (declare (ignore token))
+                            (ok (equal target directory))
+                            (ok (equal (list :manifest) manifest))
+                            (ok (eq sb-thread:*current-thread* pg::*live-operation-quiescence-owner-thread*))
+                            (incf origin-captured)
+                            manifest)
+                          (symbol-function 'pg::physical-export-origin-record-backup)
+                          (lambda (directory manifest slot token)
+                            (declare (ignore token))
+                            (ok (equal target directory))
+                            (ok (equal (list :manifest) manifest))
+                            (ok (eq captured slot))
+                            (ok pg::*live-operation-admission-open*)
+                            (ok (sb-thread:holding-mutex-p pg::*reload-run-lock*))
+                            (incf origin-recorded)))
                     (if fail
                         (ok (intake-fails-p
                              (lambda () (pg::physical-export-base-backup target "export_stage"))))
                         (ok (equal (list :manifest) (pg::physical-export-base-backup target "export_stage"))))
                     (ok captured)
+                    (ok (= (if fail 0 1) origin-captured origin-recorded))
                     (ok (null (gethash "export_stage" pg::*wal-replication-slots*)))
-                    (ok (not (probe-file (pg::wal-replication-slot-path "export_stage")))))
-               (setf (symbol-function 'pg::physical-bootstrap-copy-under-quiescence) original))))))))
+                    (ok (not (probe-file (pg::wal-replication-slot-path "export_stage"))))
+                    (ok (zerop (hash-table-count pg::*physical-export-origin-reservations*))))
+               (setf (symbol-function 'pg::physical-bootstrap-copy-under-quiescence) original
+                     (symbol-function 'pg::physical-export-origin-capture-backup) original-capture
+                     (symbol-function 'pg::physical-export-origin-record-backup) original-record))))))))
 
 (deftest physical-bootstrap-refuses-unsupported-mutation-paths
     (with-physical-store-directory (root)
