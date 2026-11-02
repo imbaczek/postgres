@@ -120,6 +120,7 @@ private sync proof while the sender mutex still protects the feedback."
 
 (defun call-with-wal-sender-stream (function &key (kind :logical))
   "Capture the backend's registration token for the stream body and reset progress.
+The stream scope also owns its shutdown capability until the body unwinds.
 Feedback and cleanup use that token, so they cannot affect a replacement registration."
   (let* ((sender (wal-sender-for-backend))
          (*wal-sender* sender))

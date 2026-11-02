@@ -1,5 +1,18 @@
 # Development TODO
 
+- [x] Keep ready native physical senders through the primary shutdown checkpoint.
+  Frozen stream capabilities drain to the validated flush target under a narrow
+  shutdown and cleanup lane, then release all claims before clean state. An empty
+  plan keeps the terminal fence path. Disconnect is abandonment, not an ACK;
+  clean exit does not prove delivery of the shutdown checkpoint's WAL endpoint
+  to a disconnected peer.
+  SIGQUIT's zero exit timeout avoids thread-join waiting, not every possible exit
+  delay. Six native scenarios, 1,447 physical, 903 unit and 201 wire tests, strict
+  cold compilation and the existing shutdown test passed. Logs are in
+  `/home/imbaczek/proj/pg-ha-artifacts/shutdown-streaming/`. Graceful logical and
+  pgoutput pre-checkpoint drain remains open relative to C; former-primary
+  adoption, rewind, provenance and coordination remain outside this milestone.
+
 - [x] Resolve the admission and receiver join race during concurrent reload.
   Receiver quiescence holds reload exclusion with admission open through stop,
   join and exit flush. It releases exclusion it acquired before replay joins;

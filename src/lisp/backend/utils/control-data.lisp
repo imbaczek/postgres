@@ -70,6 +70,9 @@ The caller must finish those steps before calling this function."
   (values))
 
 (defun prepare-primary-shutdown-with-senders ()
+  ;; Keep normal admission closed while the final checkpoint is streamed.
+  ;; Defer recycling until the senders have exited and released their claims;
+  ;; only then fence the drain and publish clean primary state.
   (unless (eq *live-operation-quiescence-owner-thread* sb-thread:*current-thread*)
     (error "primary shutdown checkpoint requires quiescence ownership"))
   (wal-set-primary-state +db-shutdowning+)
@@ -105,7 +108,9 @@ The caller must finish those steps before calling this function."
 
 (defun prepare-primary-shutdown ()
   "Finish smart or fast shutdown in the owning postmaster, outside admission.
-Clients must already be gone. Serialize with reload, close admission permanently,
+Ordinary clients must already be gone. Selected physical senders may drain
+through the checkpoint; an empty plan uses the terminal fence immediately.
+Serialize with reload, close normal admission,
 retire abandoned transactions, then sync a checkpoint before recording clean
 shutdown. Retry WAL temporary cleanup and require the domain to be empty before
 the clean state is published. An unexpected active slot owner leaves recycling

@@ -1,22 +1,43 @@
+;; Physical WAL sender shutdown coordination.
+;;
+;; Like WalSndInitStopping and ShutdownXLOG in the C server, freeze senders
+;; before the shutdown checkpoint, then let them deliver the durable endpoint.
+;; This native path does not yet implement C's logical sender drain.
+;;
+;; The live-operation mutex protects the plan and stream state.  The state-lock
+;; helper masks interrupts across updates; the admission predicate runs under
+;; that mutex and takes the sender registry lock afterward.  A stream token is
+;; distinct from the status registration, which can be reused by later streams.
+;; The frozen participant list stays intact through cleanup: its cleanup
+;; capability can outlive the stream scope.  Even an empty plan blocks late
+;; streams from joining the shutdown.
 (in-package #:pg)
 
 (defstruct wal-sender-stream-token
+  ;; Bound to one backend, thread and registration.  The owner and fork limit
+  ;; become fixed when a physical stream is ready.
   backend thread registration kind owner limit
   (state :starting) stopped-p target outcome)
 
 (defstruct wal-sender-shutdown-plan
+  ;; Frozen participants and the durable endpoint published after checkpoint.
   tokens (stage :stopping) endpoint system-id timeline namespace)
 
-(defvar *wal-sender-stream-token* nil)
-(defvar *wal-sender-streams* (make-hash-table :test #'eq))
-(defvar *wal-sender-shutdown-plan* nil)
+(defvar *wal-sender-stream-token* nil
+  "Dynamically bound to the current stream, not the whole connection.")
+(defvar *wal-sender-streams* (make-hash-table :test #'eq)
+  "Map backends to current streams under the live-operation lock.")
+(defvar *wal-sender-shutdown-plan* nil
+  "Plan frozen once stopping starts, under the live-operation lock.")
 
 (defun call-with-wal-sender-state-lock (function)
+  ;; Keep multi-field plan and token updates atomic against interrupts.
   (call-with-live-operation-lock
    (lambda ()
      (sb-sys:without-interrupts (funcall function)))))
 
 (defun wal-sender-stream-current-p (token)
+  ;; Check the stream, backend, thread and reused status registration together.
   (and (wal-sender-stream-token-p token)
        (eq token (gethash (wal-sender-stream-token-backend token) *wal-sender-streams*))
        (eq *backend* (wal-sender-stream-token-backend token))
@@ -24,6 +45,7 @@
        (eq *wal-sender* (wal-sender-stream-token-registration token))))
 
 (defun wal-sender-stream-drain-admitted-p ()
+  ;; Admit only the exact frozen stream and registration, never a parked caller.
   (let ((token *wal-sender-stream-token*) (plan *wal-sender-shutdown-plan*))
     (and (not *live-operation-parked-p*)
          plan (eq :draining (wal-sender-shutdown-plan-stage plan))
@@ -34,6 +56,8 @@
            (wal-sender-current-under-lock-p (wal-sender-stream-token-registration token))))))
 
 (defun call-with-wal-sender-stream-scope (function kind)
+  ;; Own the stream capability until unwind.  A disconnect without validated
+  ;; completion is abandonment, not an acknowledgement.
   (unless (member kind '(:physical :logical :backup))
     (error "invalid WAL sender stream kind"))
   (when (plusp *live-operation-depth*)
@@ -65,6 +89,8 @@
            (sb-thread:condition-broadcast *live-operation-cv*)))))))
 
 (defun wal-sender-stream-physical-ready (owner limit)
+  ;; Publish the claimed physical owner and optional historic fork limit before
+  ;; the shutdown plan can select this stream.
   (when *wal-sender-stream-token*
     (call-with-wal-sender-state-lock
      (lambda ()
@@ -82,6 +108,7 @@
   owner)
 
 (defun wal-sender-request-stopping ()
+  ;; Freeze the ready physical participants once; later streams cannot join.
   (call-with-wal-sender-state-lock
    (lambda ()
      (or *wal-sender-shutdown-plan*
@@ -102,6 +129,7 @@
             :key #'wal-sender-stream-token-backend :test #'eq))))
 
 (defun wal-sender-shutdown-observe ()
+  ;; The sender reaches its stop point before the final checkpoint begins.
   (when *wal-sender-stream-token*
     (call-with-wal-sender-state-lock
      (lambda ()
@@ -113,6 +141,8 @@
   (values))
 
 (defun wal-sender-publish-shutdown-target (system-id timeline namespace endpoint)
+  ;; Under owned quiescence, check the stopped streams against the durable
+  ;; checkpoint identity and give each its endpoint, capped at its fork.
   (call-with-wal-sender-state-lock
    (lambda ()
      (let ((plan *wal-sender-shutdown-plan*))
@@ -147,6 +177,7 @@
   (values))
 
 (defun wal-sender-shutdown-target ()
+  ;; Only the current stream can obtain its frozen post-checkpoint target.
   (call-with-wal-sender-state-lock
    (lambda ()
      (when (and *wal-sender-shutdown-plan*
@@ -155,6 +186,7 @@
        (wal-sender-stream-token-target *wal-sender-stream-token*)))))
 
 (defun wal-sender-note-shutdown-acknowledged ()
+  ;; The caller has checked sent and validated durable flush through the target.
   (call-with-wal-sender-state-lock
    (lambda ()
      (unless (and (wal-sender-stream-current-p *wal-sender-stream-token*)
@@ -174,6 +206,7 @@
   (call-with-wal-sender-state-lock (lambda () (not (null *wal-sender-shutdown-plan*)))))
 
 (defun wal-sender-shutdown-streams-p ()
+  ;; An empty frozen plan still rejects new streams, but needs no drain lane.
   (call-with-wal-sender-state-lock
    (lambda ()
      (and *wal-sender-shutdown-plan*
@@ -190,6 +223,7 @@
                always (eq :walsender (gethash backend *backend-admission-classes*))))))
 
 (defun wal-sender-shutdown-clients-drained-p ()
+  ;; Before checkpoint, require only stopped participants with no transaction.
   (call-with-wal-sender-state-lock
    (lambda ()
      (sb-thread:with-mutex (*backend-registry-lock*)
@@ -205,6 +239,7 @@
                               (not (backend-explicit backend)))))))))
 
 (defun wal-sender-shutdown-terminate-nonparticipants ()
+  ;; Logical, backup and idle senders are not selected for this physical drain.
   (let ((preserved
           (call-with-wal-sender-state-lock
            (lambda ()
@@ -216,6 +251,8 @@
   (values))
 
 (defun wal-sender-shutdown-cleanup-check (backend)
+  ;; The frozen sender's teardown may use this capability after stream scope
+  ;; exits.  A parked operation cannot use it to bypass the admission fence.
   (call-with-wal-sender-state-lock
    (lambda ()
      (let ((plan *wal-sender-shutdown-plan*)
@@ -229,6 +266,8 @@
                 (eq sb-thread:*current-thread* (wal-sender-stream-token-thread token)))))))))
 
 (defun wal-sender-wait-shutdown-exit ()
+  ;; Wait outside admission for all connections and their cleanup, then close
+  ;; the special lane before the terminal fence.
   (when (plusp *live-operation-depth*) (error "sender shutdown wait must be unadmitted"))
   (loop until (sb-thread:with-mutex (*backend-registry-lock*)
                 (and (zerop *n-connections*) (zerop *n-backends*)
@@ -243,6 +282,7 @@
   (values))
 
 (defun wal-sender-check-shutdown-released ()
+  ;; Clean primary state requires every stream, registration and slot claim gone.
   (call-with-wal-sender-state-lock
    (lambda ()
      (unless (zerop (hash-table-count *wal-sender-streams*))

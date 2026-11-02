@@ -3569,7 +3569,8 @@ after cleanup is confirmed."
 Under the WAL lock, freeze resource facts before planning placement and rotation.
 Check the encoded size against that plan before appending the checkpoint.
 Settle pending pages, then require page and CLOG debt to be empty before appending
-any checkpoint batch records."
+any checkpoint batch records. Shutdown can defer recycling until its senders
+release their claims to the retained WAL."
   ;; CHECKPOINT follows the global write-lock -> WAL-lock order.
   (with-write-lock
     (with-wal-critical

@@ -16,6 +16,28 @@ durability and remaining Patroni interfaces are unfinished. C physical WAL/disk
 compatibility remains future work. Coordination is excluded. The repository's
 original C source is the behavior oracle.
 
+## Physical sender shutdown
+
+On smart or fast primary shutdown, ready physical senders can survive the final
+checkpoint. The shutdown plan freezes each stream's capability and sends through
+its checkpoint target, requiring the validated flush floor to reach that target.
+During that drain, normal admission stays closed; only the exact sender and its
+cleanup can use the shutdown lane. Parked cleanup cannot use it to bypass the
+fence. All sender and slot claims must be released before clean state is
+published. With no selected streams, shutdown retains the existing terminal fence
+path.
+
+A disconnect is abandonment, not an acknowledgement. Clean primary exit does
+not guarantee that a disconnected peer received the shutdown checkpoint's WAL
+endpoint. SIGQUIT uses a zero exit timeout to avoid waiting for thread joins;
+it does not promise that every part of process exit is nonblocking. Graceful
+logical and pgoutput drain before the checkpoint remains open relative to C. Safe former-primary
+adoption, rewind, provenance and coordination remain outside this milestone.
+
+Validation covered six native scenarios, 1,447 physical, 903 unit and 201 wire
+tests, strict cold compilation and the existing shutdown test. Logs are in
+`/home/imbaczek/proj/pg-ha-artifacts/shutdown-streaming/`.
+
 ## Verified starting points
 
 ### Descendant follow and explicit reseeding

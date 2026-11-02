@@ -217,7 +217,9 @@ Concurrent requests remain pending for their consumers."
   (adopt-legacy-live-operation-quiescence))
 
 (defun live-operation-admitted-p (drain-p)
-  "Return the lane admitted now, evaluating DRAIN-P under the gate lock."
+  "Return the lane admitted now, evaluating DRAIN-P under the gate lock.
+The shutdown lane admits only a checked sender or its cleanup while normal
+admission remains closed; the terminal fence closes every lane."
   (cond
     (*live-operation-terminal-shutdown* nil)
     (*live-operation-admission-open* :normal)

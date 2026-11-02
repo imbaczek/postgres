@@ -346,6 +346,8 @@ including during smart shutdown. The signal worker remains available for immedia
   (values))
 
 (defun maybe-finish-shutdown ()
+  ;; Once ordinary clients are gone, freeze ready physical senders and stop
+  ;; other replication sessions.  Finalization waits for their stop points.
   (when (shutdown-in-progress-p)
     (when (and *wal-ready* (not (recovery-in-progress-p))
                (not (wal-sender-shutdown-requested-p))

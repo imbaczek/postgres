@@ -678,6 +678,8 @@ Validate and confirm any status messages received before that completion."
       (physical-source-confirm-status command owner status))))
 
 (defun physical-stream-shutdown-complete-p (owner cursor status)
+  ;; Sent position and reported flush are not enough: the source's validated
+  ;; durable confirmation must also reach this stream's target.
   (let ((target (wal-sender-shutdown-target)))
     (when (and target (>= cursor target) (>= (getf status :flush) target))
       (let ((confirmed (with-live-operation
