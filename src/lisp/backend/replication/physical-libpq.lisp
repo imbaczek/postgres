@@ -600,10 +600,8 @@ On failure or timeout, close the channel instead of reusing a partial exchange."
                (vector-push-extend byte bytes))
       (bytes->string bytes))))
 
-(defun physical-libpq-acquire-process-handle (channel)
-  "Acquire a pidfd while SBCL's process reaper lock protects the child identity."
-  (let ((process (physical-libpq-channel-process channel))
-        (failure nil))
+(defun physical-libpq-acquire-owned-process-handle (process receive &key allow-terminal)
+  (let ((failure nil))
     (sb-int:with-system-mutex (sb-impl::*active-processes-lock*)
       (if (and (member process sb-impl::*active-processes* :test #'eq)
                (not (sb-impl::process-closed-p process))
@@ -613,15 +611,122 @@ On failure or timeout, close the channel instead of reusing a partial exchange."
                 (progn
                   (sb-unix:unix-kill (sb-ext:process-pid process) 9)
                   (setf failure "could not open libpq helper process handle"))
-                (setf (physical-libpq-channel-pidfd channel) fd)))
-          (setf failure "libpq helper exited before process handle acquisition")))
+                (funcall receive fd)))
+          (unless (and allow-terminal
+                       (member (sb-impl::process-%status process) '(:exited :signaled)))
+            (setf failure "libpq helper exited before process handle acquisition"))))
     (when failure (error failure))))
 
-(defun physical-libpq-helper-path ()
+(defun physical-libpq-acquire-process-handle (channel)
+  "Acquire a pidfd while SBCL's process reaper lock protects the child identity."
+  (physical-libpq-acquire-owned-process-handle
+   (physical-libpq-channel-process channel)
+   (lambda (fd) (setf (physical-libpq-channel-pidfd channel) fd))))
+
+(defstruct physical-helper-resolution process pidfd (closed nil))
+
+(defvar *physical-helper-resolutions* (make-hash-table :test #'eq))
+
+(defvar *physical-helper-resolutions-lock* (sb-thread:make-mutex :name "libpq helper discovery"))
+
+(defun physical-helper-resolution-reserve ()
+  (sb-thread:with-mutex (*physical-helper-resolutions-lock*)
+    (when (>= (hash-table-count *physical-helper-resolutions*) 3)
+      (error "libpq helper discovery capacity exhausted"))
+    (let ((owner (make-physical-helper-resolution)))
+      (setf (gethash owner *physical-helper-resolutions*) t)
+      owner)))
+
+(defun physical-helper-resolution-signal (owner signal)
+  (sb-thread:with-mutex (*physical-helper-resolutions-lock*)
+    (let ((fd (physical-helper-resolution-pidfd owner)))
+      (when fd
+        (unless (zerop (physical-libpq-pidfd-signal fd signal (sb-sys:int-sap 0) 0))
+          (unless (= sb-posix:esrch (sb-alien:get-errno))
+            (error "could not signal owned helper resolver")))))))
+
+(defun physical-helper-resolution-close (owner)
+  (sb-sys:without-interrupts
+    (unless (physical-helper-resolution-closed owner)
+      (let ((process (physical-helper-resolution-process owner)))
+        (when process
+          (unless (member (sb-ext:process-status process) '(:exited :signaled))
+            (physical-helper-resolution-signal owner 15)
+            (loop repeat 300
+                  until (member (sb-ext:process-status process) '(:exited :signaled))
+                  do (sleep 0.01)))
+          (unless (member (sb-ext:process-status process) '(:exited :signaled))
+            (physical-helper-resolution-signal owner 9)
+            (loop repeat 200
+                  until (member (sb-ext:process-status process) '(:exited :signaled))
+                  do (sleep 0.01)))
+          (unless (member (sb-ext:process-status process) '(:exited :signaled))
+            (error "owned helper resolver has not exited"))
+          (sb-ext:process-wait process)
+          (sb-ext:process-close process))
+        (sb-thread:with-mutex (*physical-helper-resolutions-lock*)
+          (when (physical-helper-resolution-pidfd owner)
+            (sb-posix:close (physical-helper-resolution-pidfd owner))
+            (setf (physical-helper-resolution-pidfd owner) nil))))
+      (setf (physical-helper-resolution-closed owner) t)
+      (sb-thread:with-mutex (*physical-helper-resolutions-lock*)
+        (remhash owner *physical-helper-resolutions*))))
+  (values))
+
+(defmethod physical-client-stop ((owner physical-helper-resolution))
+  (sb-thread:with-mutex (*physical-helper-resolutions-lock*)
+    (when (gethash owner *physical-helper-resolutions*)
+      (setf (gethash owner *physical-helper-resolutions*) :stopped)))
+  (physical-helper-resolution-signal owner 15)
+  (values))
+
+(defmethod physical-client-close ((owner physical-helper-resolution))
+  (physical-helper-resolution-close owner))
+
+(defun physical-helper-resolve (resolver &key on-spawn)
+  (sb-sys:without-interrupts
+    (let ((owner (physical-helper-resolution-reserve)))
+      (unwind-protect
+           (progn
+             (setf (physical-helper-resolution-process owner)
+                   (sb-ext:run-program resolver nil :search nil :wait nil
+                                                    :output :stream :error t :external-format :utf-8))
+             (physical-libpq-acquire-owned-process-handle
+              (physical-helper-resolution-process owner)
+              (lambda (fd) (setf (physical-helper-resolution-pidfd owner) fd))
+              :allow-terminal t)
+             (when on-spawn (funcall on-spawn owner))
+             (sb-sys:with-local-interrupts
+               (sb-ext:with-timeout 65
+                 (let* ((process (physical-helper-resolution-process owner))
+                        (stream (sb-ext:process-output process))
+                        (output (make-array 0 :element-type 'character :adjustable t :fill-pointer 0)))
+                   (loop for char = (read-char stream nil nil) while char
+                         do (when (>= (length output) 16384)
+                              (error "libpq helper resolver output exceeds its bound"))
+                            (vector-push-extend char output))
+                   (sb-ext:process-wait process)
+                   (sb-thread:with-mutex (*physical-helper-resolutions-lock*)
+                     (when (eq :stopped (gethash owner *physical-helper-resolutions*))
+                       (error 'physical-client-stopped)))
+                   (unless (and (eq :exited (sb-ext:process-status process))
+                                (zerop (sb-ext:process-exit-code process)))
+                     (error "libpq helper resolver failed"))
+                   (let ((path (string-right-trim '(#\Newline #\Return) output)))
+                     (unless (and (plusp (length path)) (char= #\/ (char path 0))
+                                  (not (find #\Newline path)) (not (find #\Return path)))
+                       (error "libpq helper resolver did not return one absolute path"))
+                     (namestring (truename path)))))))
+        (physical-helper-resolution-close owner)))))
+
+(defun physical-libpq-helper-path (&key on-spawn)
   (let ((path (uiop:getenv "PG_LIBPQ_HELPER")))
-    (unless (and path (plusp (length path)))
-      (error "physical libpq helper is not installed"))
-    (namestring (truename path))))
+    (if (and path (plusp (length path)))
+        (namestring (truename path))
+        (physical-helper-resolve
+         (namestring (merge-pathnames "bin/pg-libpq-helper-path"
+                                      (asdf:system-source-directory "pg")))
+         :on-spawn on-spawn))))
 
 (defun physical-libpq-display-octets (bytes)
   (with-output-to-string (out)

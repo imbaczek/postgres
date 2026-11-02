@@ -54,9 +54,16 @@ def check(binary):
     os.environ['PG_CONFIG'] = str(binary / 'pg_config')
     os.environ['PATH'] = str(binary) + os.pathsep + os.environ['PATH']
     source = api['peers']['OwnedLisp']()
-    helper = source.root / 'libpq-helper'
-    subprocess.run([str(BASE / 't/build-libpq-helper.sh'), str(helper)], check=True, timeout=60)
-    os.environ['PG_LIBPQ_HELPER'] = str(helper)
+    os.environ.pop('PG_LIBPQ_HELPER', None)
+    helper = subprocess.check_output([str(BASE / 'bin/pg-libpq-helper-path')],
+                                     text=True, timeout=65).rstrip('\n')
+    # Only the wire fixture needs an explicit executable. Production children
+    # inherit no override and must discover the helper independently.
+    os.environ['PG_LIBPQ_HELPER'] = helper
+    try:
+        importlib.import_module('libpq-helper-tests')
+    finally:
+        os.environ.pop('PG_LIBPQ_HELPER')
     connection = None
     try:
         source.start()
@@ -117,6 +124,8 @@ def check(binary):
             follow['wait_for'](lambda: node.query('SELECT id FROM public.clone_rows ORDER BY id') == [(1,), (2,)])
             assert node.query('SELECT status,slot_name FROM pg_stat_get_wal_receiver()') == [
                 ('streaming', 'clone_one')]
+            assert 'PG_LIBPQ_HELPER' not in os.environ
+            print('native-basebackup: CLI and native follow discover helper without an override PASS', flush=True)
             print('native-basebackup: unchanged Patroni clone, cold startup and post-backup follow PASS', flush=True)
             process = node.is_running()
             assert process is not None

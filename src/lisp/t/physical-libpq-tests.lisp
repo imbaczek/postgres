@@ -308,7 +308,7 @@
            (seen nil))
       (unwind-protect
            (progn
-             (setf (symbol-function 'pg::physical-libpq-helper-path) (lambda () "/fixture/helper")
+             (setf (symbol-function 'pg::physical-libpq-helper-path) (lambda (&key on-spawn) (declare (ignore on-spawn)) "/fixture/helper")
                    (pg::physical-libpq-channel-info channel)
                    (pg::physical-libpq-decode-connection-info
                     (libpq-test-connection-body '(("replication" "true") ("dbname" "replication")) "replication"))
@@ -687,7 +687,7 @@
            (pg::*physical-follow-controller-stopping-p* nil))
       (unwind-protect
            (progn
-             (setf (symbol-function 'pg::physical-libpq-helper-path) (lambda () "/fixture/helper"))
+             (setf (symbol-function 'pg::physical-libpq-helper-path) (lambda (&key on-spawn) (declare (ignore on-spawn)) "/fixture/helper"))
              (setf (symbol-function 'pg::physical-libpq-connect)
                    (lambda (helper requested &key on-spawn)
                      (declare (ignore helper))
@@ -725,7 +725,7 @@
         (setf (pg::physical-libpq-channel-info channel) info)
         (unwind-protect
              (progn
-               (setf (symbol-function 'pg::physical-libpq-helper-path) (lambda () "/fixture/helper")
+               (setf (symbol-function 'pg::physical-libpq-helper-path) (lambda (&key on-spawn) (declare (ignore on-spawn)) "/fixture/helper")
                      (symbol-function 'pg::physical-follow-flush-on-exit)
                      (lambda (ignored) (declare (ignore ignored)) nil))
                (setf (symbol-function 'pg::physical-libpq-connect)
@@ -943,6 +943,260 @@
              (setf (pg::physical-libpq-channel-pidfd channel) fd))
            (funcall function channel))
       (pg::physical-libpq-close channel))))
+
+(deftest physical-helper-resolution-checks-output-and-releases-its-owner
+    (with-physical-store-directory (root)
+      (let ((script (merge-pathnames "resolver" root))
+            (pg::*physical-helper-resolutions* (make-hash-table :test #'eq))
+            (pg::*physical-helper-resolutions-lock* (sb-thread:make-mutex :name "resolver fixture")))
+        (dolist (command '("printf '%s' /bin/true" "printf '%s' relative" "exec /bin/false"
+                           "exec /usr/bin/head -c 20000 /dev/zero"))
+          (with-open-file (output script :direction :output :if-exists :supersede)
+            (format output "#!/bin/sh~%~a~%" command))
+          (sb-posix:chmod (namestring script) #o700)
+          (if (equal command "printf '%s' /bin/true")
+              (ok (equal (namestring (truename "/bin/true"))
+                         (pg::physical-helper-resolve (namestring script))))
+              (ok (intake-fails-p (lambda () (pg::physical-helper-resolve (namestring script))))))
+          (ok (zerop (hash-table-count pg::*physical-helper-resolutions*)))))))
+
+(deftest physical-helper-resolution-cancellation-reaps-owned-child-without-channel-capacity
+    (with-physical-store-directory (root)
+      (let ((script (merge-pathnames "resolver" root))
+            (registry (make-hash-table :test #'eq))
+            (lock (sb-thread:make-mutex :name "cancel resolver fixture"))
+            (result nil)
+            (process nil)
+            (channels (hash-table-count pg::*physical-libpq-channels*)))
+        (with-open-file (output script :direction :output)
+          (format output "#!/bin/sh~%exec /usr/bin/timeout --kill-after=1 20 /bin/sleep 20~%"))
+        (sb-posix:chmod (namestring script) #o700)
+        (let ((thread
+                (sb-thread:make-thread
+                 (lambda ()
+                   (let ((pg::*physical-helper-resolutions* registry)
+                         (pg::*physical-helper-resolutions-lock* lock))
+                     (handler-case (setf result (pg::physical-helper-resolve (namestring script)))
+                       (error (condition) (setf result (list :error (princ-to-string condition))))
+                       (sb-ext:timeout () (setf result :timeout)))))
+                 :name "owned resolver cancellation")))
+          (loop repeat 200
+                until (sb-thread:with-mutex (lock)
+                        (loop for owner being the hash-keys of registry
+                              when (pg::physical-helper-resolution-pidfd owner)
+                                do (setf process (pg::physical-helper-resolution-process owner))
+                                and return t))
+                do (sleep 0.01))
+          (ok process)
+          (when (sb-thread:thread-alive-p thread)
+            (sb-thread:interrupt-thread thread (lambda () (error "injected resolver cancellation"))))
+          (sb-thread:join-thread thread :timeout 10 :default :pending)
+          (ok (not (sb-thread:thread-alive-p thread)))
+          (ok (eq :error (first result)))
+          (ok (member (sb-ext:process-status process) '(:exited :signaled)))
+          (ok (zerop (hash-table-count registry)))
+          (ok (= channels (hash-table-count pg::*physical-libpq-channels*)))))))
+
+(deftest physical-follow-stop-cancels-helper-discovery-before-network-connect
+    (dolist (mode '(:controller :receiver))
+      (with-physical-store-directory (root)
+        (let* ((script (merge-pathnames "resolver" root))
+               (store (pg::physical-store-open root 123 1 :create t))
+               (registry (make-hash-table :test #'eq))
+               (registry-lock (sb-thread:make-mutex :name "follow resolver fixture"))
+               (profile (pg::make-physical-libpq-profile "host=fixture"))
+               (operation (pg::make-physical-follow-operation
+                           :context (list :requested-profile profile)))
+               (source (libpq-test-source "fixture" 5432))
+               (config (pg::physical-follow-with-controller
+                        '(1 "localhost" 5432 "current")
+                        (list :version 1 :enabled t :preparing nil :cleanup nil :source source)))
+               (runtime (pg::make-physical-follow-runtime :config config))
+               (pg::*physical-follow-operation* operation)
+               (pg::*physical-follow-runtime* runtime)
+               (pg::*physical-follow-controller-blocked-p* nil)
+               (pg::*physical-follow-controller-stopping-p* nil)
+               (pg::*physical-recovery-failed-p* nil)
+               (pg::*physical-receive-store* store)
+               (pg::*physical-follow-statistics* nil)
+               (pg::*physical-helper-resolutions* registry)
+               (pg::*physical-helper-resolutions-lock* registry-lock)
+               (path-function (symbol-function 'pg::physical-libpq-helper-path))
+               (flush-function (symbol-function 'pg::physical-follow-flush-on-exit))
+               (thread nil) (result nil) (owner nil) (process nil))
+          (with-open-file (output script :direction :output)
+            (format output "#!/bin/sh~%exec /usr/bin/timeout --kill-after=1 20 /bin/sleep 20~%"))
+          (sb-posix:chmod (namestring script) #o700)
+          (unwind-protect
+               (progn
+                 (setf (symbol-function 'pg::physical-libpq-helper-path)
+                       (lambda (&key on-spawn)
+                         (pg::physical-helper-resolve (namestring script) :on-spawn on-spawn))
+                       (symbol-function 'pg::physical-follow-flush-on-exit)
+                       (lambda (ignored) (declare (ignore ignored)) nil))
+                 (setf thread
+                       (sb-thread:make-thread
+                        (lambda ()
+                          (let ((pg::*physical-helper-resolutions* registry)
+                                (pg::*physical-helper-resolutions-lock* registry-lock)
+                                (pg::*physical-follow-operation* operation)
+                                (pg::*physical-follow-runtime* runtime)
+                                (pg::*physical-follow-controller-blocked-p* nil)
+                                (pg::*physical-follow-controller-stopping-p* nil)
+                                (pg::*physical-recovery-failed-p* nil)
+                                (pg::*physical-receive-store* store)
+                                (pg::*physical-recovery-state* (list :timeline 1))
+                                (pg::*physical-follow-statistics* nil))
+                            (handler-case
+                                (ecase mode
+                                  (:controller (pg::physical-follow-operation-connect operation))
+                                  (:receiver (pg::physical-follow-call-with-client
+                                              runtime 0 (lambda (client) (declare (ignore client))
+                                                          (error "unexpected network connection")))))
+                              (pg::physical-client-stopped () (setf result :stopped))
+                              (error (condition) (setf result (princ-to-string condition))))))
+                        :name "follow cold helper cancellation"))
+                 (setf (pg::physical-follow-operation-thread operation) thread
+                       (pg::physical-follow-runtime-receiver-thread runtime) thread)
+                 (loop repeat 300
+                       until (sb-thread:with-mutex (pg::*physical-follow-lock*)
+                               (setf owner (ecase mode
+                                             (:controller (pg::physical-follow-operation-client operation))
+                                             (:receiver (pg::physical-follow-runtime-client runtime)))))
+                       do (sleep 0.01))
+                 (ok (pg::physical-helper-resolution-p owner))
+                 (when owner (setf process (pg::physical-helper-resolution-process owner)))
+                 (let ((started (get-internal-real-time)))
+                   (ok (eq :stopped
+                           (ecase mode
+                             (:controller (pg::physical-follow-controller-cancel-join))
+                             (:receiver
+                              (sb-thread:with-mutex (pg::*physical-follow-command-lock*)
+                                (pg::physical-follow-quiesce-receiver))))))
+                   (ok (< (/ (- (get-internal-real-time) started) internal-time-units-per-second) 10)))
+                 (ok (eq :stopped result))
+                 (ok (not (sb-thread:thread-alive-p thread)))
+                 (ok (member (sb-ext:process-status process) '(:exited :signaled)))
+                 (ok (zerop (hash-table-count registry)))
+                 (ok (null (pg::physical-follow-operation-client operation)))
+                 (ok (null (pg::physical-follow-runtime-client runtime)))
+                 (ok (not pg::*physical-recovery-failed-p*)))
+            (when (and thread (sb-thread:thread-alive-p thread))
+              (when owner (pg::physical-client-stop owner))
+              (sb-thread:join-thread thread :timeout 25 :default :pending))
+            (setf (symbol-function 'pg::physical-libpq-helper-path) path-function
+                  (symbol-function 'pg::physical-follow-flush-on-exit) flush-function)
+            (pg::physical-store-close store))))))
+
+(deftest physical-follow-cancel-between-resolver-exit-and-channel-publication
+    (dolist (mode '(:controller :receiver :cleanup))
+      (let* ((profile (pg::make-physical-libpq-profile "host=fixture"))
+             (operation (pg::make-physical-follow-operation :context (list :requested-profile profile)))
+             (source (libpq-test-source "fixture" 5432))
+             (config (pg::physical-follow-with-controller
+                      '(1 "localhost" 5432 "current")
+                      (list :version 1 :enabled t :preparing nil :cleanup nil :source source)))
+             (entry (pg::physical-follow-cleanup-with-owner
+                     (list :kind :follow :host "localhost" :port 5432 :pin "retired"
+                           :request (follow-anchor-receiver-request (follow-anchor-request 123 456))) source))
+             (runtime (pg::make-physical-follow-runtime :config config))
+             (pg::*physical-follow-runtime* runtime)
+             (pg::*physical-follow-cleanup-client* nil)
+             (pg::*physical-follow-controller-blocked-p* nil)
+             (pg::*physical-follow-controller-stopping-p* nil)
+             (pg::*physical-follow-statistics* nil)
+             (pg::*physical-recovery-state* (list :timeline 1))
+             (pg::*physical-helper-resolutions* (make-hash-table :test #'eq))
+             (pg::*physical-helper-resolutions-lock* (sb-thread:make-mutex :name "handoff fixture"))
+             (owner (pg::physical-helper-resolution-reserve))
+             (channel (pg::physical-libpq-reserve-channel))
+             (names '(pg::physical-libpq-helper-path pg::physical-libpq-connect
+                      pg::physical-libpq-connect-frozen pg::physical-follow-flush-on-exit))
+             (originals (mapcar #'symbol-function names)))
+        (unwind-protect
+             (progn
+               (setf (symbol-function 'pg::physical-libpq-helper-path)
+                     (lambda (&key on-spawn)
+                       (funcall on-spawn owner)
+                       (pg::physical-client-close owner)
+                       (ecase mode
+                         (:controller (setf (pg::physical-follow-operation-cancelled-p operation) t))
+                         (:receiver (setf (pg::physical-follow-runtime-receiver-stopped-p runtime) t))
+                         (:cleanup (setf pg::*physical-follow-controller-stopping-p* t)))
+                       "/fixture/helper")
+                     (symbol-function 'pg::physical-follow-flush-on-exit)
+                     (lambda (ignored) (declare (ignore ignored)) nil))
+               (flet ((connect (helper requested &key on-spawn)
+                        (declare (ignore helper requested))
+                        (unwind-protect (funcall on-spawn channel)
+                          (pg::physical-client-close channel))
+                        (error "cancelled publication unexpectedly accepted")))
+                 (setf (symbol-function 'pg::physical-libpq-connect) #'connect
+                       (symbol-function 'pg::physical-libpq-connect-frozen) #'connect)
+                 (ok (intake-fails-p
+                      (lambda ()
+                        (ecase mode
+                          (:controller (pg::physical-follow-operation-connect operation))
+                          (:receiver (pg::physical-follow-call-with-client runtime 0 #'identity))
+                          (:cleanup (pg::physical-follow-cleanup-connect entry)))))))
+               (ok (null (pg::physical-follow-operation-client operation)))
+               (ok (null (pg::physical-follow-runtime-client runtime)))
+               (ok (null pg::*physical-follow-cleanup-client*))
+               (ok (pg::physical-helper-resolution-closed owner))
+               (ok (pg::physical-libpq-channel-closed channel))
+               (ok (zerop (hash-table-count pg::*physical-helper-resolutions*))))
+          (loop for name in names for original in originals do (setf (symbol-function name) original))
+          (pg::physical-client-close owner)
+          (pg::physical-client-close channel)))))
+
+(deftest physical-follow-rejects-resolver-with-terminal-admission-closed
+    (with-physical-store-directory (root)
+      (let* ((script (merge-pathnames "resolver" root))
+             (runtime (pg::make-physical-follow-runtime))
+             (pg::*physical-follow-runtime* runtime)
+             (pg::*physical-helper-resolutions* (make-hash-table :test #'eq))
+             (pg::*physical-helper-resolutions-lock* (sb-thread:make-mutex :name "closed gate resolver"))
+             (pg::*live-operation-lock* (sb-thread:make-mutex :name "closed gate fixture"))
+             (pg::*live-operation-cv* (sb-thread:make-waitqueue))
+             (pg::*live-operation-admission-open* nil)
+             (pg::*live-operation-terminal-shutdown* t)
+             (pg::*live-operation-depth* 0)
+             (pg::*live-operation-admission-wait-hook*
+               (lambda () (error "resolver publication must not wait for admission")))
+             (published nil))
+        (with-open-file (output script :direction :output)
+          (format output "#!/bin/sh~%exec /usr/bin/timeout --kill-after=1 20 /bin/sleep 20~%"))
+        (sb-posix:chmod (namestring script) #o700)
+        (unwind-protect
+             (ok (signals
+                  (pg::physical-helper-resolve
+                   (namestring script)
+                   :on-spawn (lambda (owner)
+                               (setf published owner)
+                               (pg::physical-follow-register-runtime-client runtime owner)
+                               (error "terminal receiver publication unexpectedly accepted")))
+                  'pg::physical-follow-receiver-stopped))
+          (setf (pg::physical-follow-runtime-client runtime) nil))
+        (ok (pg::physical-helper-resolution-p published))
+        (ok (pg::physical-helper-resolution-closed published))
+        (ok (zerop (hash-table-count pg::*physical-helper-resolutions*)))
+        (ok (member (sb-ext:process-status (pg::physical-helper-resolution-process published))
+                    '(:exited :signaled))))))
+
+(deftest physical-follow-publishes-client-while-reload-admission-closed
+    (let* ((runtime (pg::make-physical-follow-runtime))
+           (pg::*physical-follow-runtime* runtime)
+           (pg::*live-operation-lock* (sb-thread:make-mutex :name "closed reload gate fixture"))
+           (pg::*live-operation-cv* (sb-thread:make-waitqueue))
+           (pg::*live-operation-admission-open* nil)
+           (pg::*live-operation-terminal-shutdown* nil)
+           (pg::*live-operation-depth* 0)
+           (pg::*live-operation-admission-wait-hook*
+             (lambda () (error "lifecycle publication must not wait for admission")))
+           (owner (pg::make-physical-helper-resolution)))
+      (ok (eq owner (pg::physical-follow-register-runtime-client runtime owner)))
+      (ok (eq owner (pg::physical-follow-runtime-client runtime)))
+      (setf (pg::physical-follow-runtime-client runtime) nil)))
 
 (deftest physical-libpq-terminal-child-does-not-acquire-reused-pid
     (let ((channel (pg::physical-libpq-reserve-channel))

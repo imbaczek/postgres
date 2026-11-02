@@ -504,10 +504,14 @@ object remains the operation's authority until completion or cancellation."
                (progn
                  (setf client
                        (physical-libpq-connect
-                        (physical-libpq-helper-path) profile
+                        (physical-libpq-helper-path
+                         :on-spawn (lambda (resolver)
+                                     (setf client resolver)
+                                     (physical-follow-operation-register-client operation resolver))) profile
                         :on-spawn (lambda (channel)
-                                    (setf client channel)
-                                    (physical-follow-operation-register-client operation channel))))
+                                    (sb-sys:without-interrupts
+                                      (physical-follow-operation-register-client operation channel)
+                                      (setf client channel)))))
                  (let* ((info (physical-libpq-channel-info client))
                         (host (physical-libpq-display-octets
                                (physical-libpq-connection-info-host info)))
@@ -1162,11 +1166,15 @@ binding and restart reconciliation; the old slot may not be restored."
            (if (getf entry :connection)
                (setf client
                      (physical-libpq-connect-frozen
-                      (physical-libpq-helper-path)
+                      (physical-libpq-helper-path
+                       :on-spawn (lambda (resolver)
+                                   (setf client resolver)
+                                   (physical-follow-cleanup-register-client resolver)))
                       (physical-libpq-frozen-profile-from-datum (getf entry :connection))
                       :on-spawn (lambda (channel)
-                                  (setf client channel)
-                                  (physical-follow-cleanup-register-client channel))))
+                                  (sb-sys:without-interrupts
+                                    (physical-follow-cleanup-register-client channel)
+                                    (setf client channel)))))
                (progn
                  (setf client
                        (sb-ext:with-timeout 10

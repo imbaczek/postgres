@@ -1323,16 +1323,19 @@ nothing. A storage failure closes recovery instead of reporting a clean exit."
       (physical-store-check-live *physical-receive-store*))))
 
 (defun physical-follow-register-runtime-client (runtime client)
-  (with-physical-follow-generation-operation
-    (sb-thread:with-mutex (*physical-follow-lock*)
-      (physical-follow-require-runtime-generation runtime)
-      (unless (eq runtime *physical-follow-runtime*)
-        (setf (physical-follow-runtime-stopped-p runtime) t)
-        (error "native physical receiver no longer owns its runtime"))
-      (when (physical-follow-receiver-stopped-p runtime)
-        (error 'physical-follow-receiver-stopped))
-      (setf (physical-follow-runtime-client runtime) client))
-    client))
+  (when (call-with-live-operation-lock (lambda () *live-operation-terminal-shutdown*))
+    (error 'physical-follow-receiver-stopped))
+  (call-with-physical-follow-generation-fence
+   (lambda ()
+     (sb-thread:with-mutex (*physical-follow-lock*)
+       (physical-follow-require-runtime-generation runtime)
+       (unless (eq runtime *physical-follow-runtime*)
+         (setf (physical-follow-runtime-stopped-p runtime) t)
+         (error "native physical receiver no longer owns its runtime"))
+       (when (physical-follow-receiver-stopped-p runtime)
+         (error 'physical-follow-receiver-stopped))
+       (setf (physical-follow-runtime-client runtime) client))
+     client)))
 
 (defun physical-follow-open-runtime-client (runtime publish)
   "Reconnect using the original settings, then compare the selected route.
@@ -1342,7 +1345,7 @@ is not authentication or proof of source identity."
   (let ((source (physical-follow-config-source (physical-follow-runtime-config runtime))))
     (if source
         (multiple-value-bind (profile owner) (physical-follow-source-profile source)
-          (let ((client (physical-libpq-connect (physical-libpq-helper-path) profile :on-spawn publish)))
+          (let ((client (physical-libpq-connect (physical-libpq-helper-path :on-spawn publish) profile :on-spawn publish)))
             (unless (equal (physical-libpq-connection-route (physical-libpq-channel-info client))
                            (physical-libpq-frozen-route owner))
               (error 'physical-follow-route-changed
@@ -1365,8 +1368,9 @@ is not authentication or proof of source identity."
            (setf client
                  (physical-follow-open-runtime-client
                   runtime (lambda (opened)
-                            (setf client opened)
-                            (physical-follow-register-runtime-client runtime opened))))
+                            (sb-sys:without-interrupts
+                              (physical-follow-register-runtime-client runtime opened)
+                              (setf client opened)))))
            (physical-follow-register-runtime-client runtime client)
            (funcall function client))
       (unwind-protect
