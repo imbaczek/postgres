@@ -5,9 +5,9 @@
 ;;; operations.  This is a record layer: it does not retain WAL, validate a
 ;;; READY record against a live pin or origin, run a backup, or release pins.
 ;;;
-;;; Before live integration, load this index before the primary pin reader and,
-;;; on both roles, before listeners.  Streaming, unlink, and name creation must
-;;; then be gated by the loaded records.
+;;; Load this index before the primary pin reader and, on both roles, before
+;;; listeners.  The authority layer gates streaming, unlink, and name creation
+;;; using the loaded records and reconciles them with pins and origins.
 (defvar *physical-backup-lease-records* (make-hash-table :test #'equal))
 (defvar *physical-backup-lease-limit* 65536)
 (defvar *physical-backup-lease-test-hook* nil)
@@ -148,6 +148,10 @@
                (<= count *physical-backup-lease-limit*))
     (wal-invalid-input "backup lease inventory is at capacity")))
 
+;; AFTER must already be the result of a validated transition from BEFORE.
+;; The caller holds write and WAL exclusion and supplies the callback for an
+;; active publication fence.  Recheck memory and disk under those locks, then
+;; begin publication before writing disk and installing the new memory record.
 (defun physical-backup-lease-publish-checked-under-lock (before after begin-publication)
   (physical-backup-lease-require-locks)
   (let* ((request (getf after :request)) (name (getf request :name)))

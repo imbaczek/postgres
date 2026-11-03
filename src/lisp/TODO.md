@@ -1,5 +1,22 @@
 # Development TODO
 
+- [x] Enforce backup lease pin ownership and reconcile leases at startup.
+  Indexed names, including closed tombstones, reject ordinary pin creation,
+  streaming, feedback and release. Checked retirement requires the exact durable
+  closing request; a primary also requires the registered pin generation.
+  Startup loads the lease index before source pins. READY requires a matching
+  pin and durable origin. Explicit loss, a changed timeline or standby startup
+  persists pin loss before removing its retention floor; unexplained missing
+  READY pins or WAL remain fatal. Closing cleanup resumes without old WAL.
+  Validation passed 1,683 physical tests and one additional fault test run
+  separately, 903 unit tests, 201 wire tests, 72 selected tests, strict fresh
+  compilation, four pin-creation and four startup-loss nonlocal cuts. Two real
+  postmaster SIGKILL/restarts verified interruption and closing reconciliation.
+  The ownership property passed 100 trials at seed 91, digest
+  `03055e58a9eeb791`; input coverage and rejection counts were not measured.
+  Evidence: `/home/imbaczek/proj/pg-ha-artifacts/backup-lease-authority/evidence.json`.
+  Capture, STATUS/ABORT commands, follow handoff and target reseed remain open.
+
 - [x] Add checked source backup request records and private durable publication.
   Request identity is immutable, interrupted capture cannot restart under the
   same identity, and closed records count toward capacity without eviction.
@@ -12,9 +29,9 @@
   passed 100 trials at seeds 89 and 90, digests `f44aabb064b11e6d` and
   `e5ffed3f68a4677f`; input coverage and rejection counts were not measured.
   Evidence: `/home/imbaczek/proj/pg-ha-artifacts/backup-lease-codec/evidence.json`.
-  This is internal metadata only. Live capture, READY-to-pin/origin validation,
-  STATUS/ABORT commands, pin authority checks and startup wiring remain open;
-  these records do not yet retain WAL or authorize pin release.
+  At this checkpoint the records were internal metadata only. Pin authority,
+  READY-to-pin/origin validation and startup wiring were added in the next
+  checkpoint above; capture and STATUS/ABORT commands remain open.
 
 - [x] Add stopped-target ownership and a pre-PID fence for future full reseed.
   Only ESRCH proves that an existing PID is dead. Preserve its complete bytes

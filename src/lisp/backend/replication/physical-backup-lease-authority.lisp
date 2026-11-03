@@ -1,5 +1,15 @@
 (in-package #:pg)
 
+;;; Enforce ownership of private source pins reserved by backup leases.  The
+;;; durable lease inventory is authoritative even after a lease is closed, so
+;;; ordinary pin operations must not reuse those names.  These checks also
+;;; protect the origin receipt until the lease reaches CLOSED.
+;;;
+;;; This module supplies the ownership checks and pin creation primitive; it
+;;; does not implement a capture owner or a backup command interface.
+
+;; The caller holds WAL exclusion while using the record or making a decision
+;; based on it.  Publication also requires write exclusion.
 (defun physical-backup-lease-record-under-lock (name)
   (unless (sb-thread:holding-mutex-p *wal-lock*)
     (error "backup lease lookup requires WAL exclusion"))
@@ -9,6 +19,9 @@
   (when (physical-backup-lease-record-under-lock name)
     (wal-invalid-input "backup lease owns private source pin ~a" name)))
 
+;; A lease may create its pin only for the exact CAPTURING request, while the
+;; caller owns operation quiescence and the matching record is still on disk.
+;; Ordinary creation may not take any name in the lease inventory.
 (defun physical-backup-lease-check-pin-create (name request)
   (let ((record (physical-backup-lease-record-under-lock name)))
     (cond
@@ -52,6 +65,10 @@
       (error "backup lease pin differs from its recorded ownership")))
   pin)
 
+;; Recovery may retire a disk-only pin; a primary requires the registered object.
+
+;; Retirement requires the matching durable CLOSING intent and no sender.
+;; Check both the registered generation and the disk image before unlinking.
 (defun physical-backup-lease-check-pin-unlink (pin request)
   (physical-backup-lease-require-locks)
   (let* ((name (physical-source-pin-name pin))
@@ -76,6 +93,8 @@
       (request (wal-invalid-input "backup lease retirement has no recorded owner"))))
   pin)
 
+;; A receipt remains owned through interruption and closing; only CLOSED
+;; releases it.  The closed lease name itself remains reserved.
 (defun physical-backup-lease-origin-in-use-p (identity)
   (unless (sb-thread:holding-mutex-p *wal-lock*)
     (error "backup lease origin lookup requires WAL exclusion"))
@@ -86,6 +105,9 @@
                        (equal identity (list (getf request :system-id) (getf request :timeline)
                                              (getf base :base) (getf base :manifest-digest))))))
 
+;; Decode and match ownership before deciding whether WAL must be checked.
+;; An already lost pin needs no old WAL.  Standby, CLOSING, and a changed
+;; timeline mark a pin lost for the caller to persist before publishing it.
 (defun physical-backup-lease-startup-pin (path &optional standby)
   (physical-backup-lease-require-locks)
   (let* ((name (pathname-name path))
@@ -105,6 +127,7 @@
          (values pin t))
         (t (physical-source-pin-check-wal pin) (values pin nil))))))
 
+;; A READY lease without a pin is inconsistent metadata, not ordinary loss.
 (defun physical-backup-lease-check-startup-inventory (candidates)
   (physical-backup-lease-require-locks)
   (maphash (lambda (name record)

@@ -1,5 +1,12 @@
 (in-package #:pg)
 
+;;; Reconcile durable backup lease ownership before admitting server work.
+;;; Record loading has already interrupted requests and captures left by a
+;;; previous process.  Pin and origin inventories must be loaded before the
+;;; remaining READY and CLOSING records can be reconciled here.
+
+;; Under write and WAL exclusion, verify both the indexed owner and its disk
+;; image before using it to change a pin or publish another lease phase.
 (defun physical-backup-lease-current-record (request)
   (physical-backup-lease-require-locks)
   (let ((record (physical-backup-lease-record-under-lock (getf request :name))))
@@ -10,6 +17,9 @@
       (error "backup lease ownership changed on disk"))
     record))
 
+;; A standby cannot retain source WAL for these leases.  Validate all pins
+;; first, then durably mark newly lost pins before installing the candidates.
+;; The publication fence covers disk and memory changes, including failures.
 (defun physical-backup-lease-load-standby-pins ()
   (unless (recovery-in-progress-p)
     (error "backup lease standby pin load requires recovery"))
@@ -59,6 +69,10 @@
       (when pin (physical-backup-lease-check-pin-unlink pin request))
       pin)))
 
+;; Complete an existing closing intent without requiring the old WAL.  Remove
+;; and sync the pin first, then publish CLOSED.  A restart can repeat this after
+;; a failure at either step.  The caller holds both locks and supplies the
+;; publication fence callback.
 (defun physical-backup-lease-finish-closing-under-lock (request begin-publication)
   (let* ((record (physical-backup-lease-current-record request))
          (name (getf request :name)))
@@ -86,6 +100,9 @@
       (with-wal-publication-fence (begin-publication)
         (physical-backup-lease-finish-closing-under-lock request #'begin-publication)))))
 
+;; Missing or mismatched pin and origin metadata is a startup error.  A valid
+;; READY lease with an explicitly lost pin, a changed timeline, or a standby
+;; source instead becomes INTERRUPTED during reconciliation.
 (defun physical-backup-lease-ready-startup-action (record)
   (let* ((request (getf record :request))
          (base (getf record :base))
@@ -128,6 +145,9 @@
        nil)
       (t (error "backup lease startup found an active capture")))))
 
+;; Validate every action before publishing any of them.  Hold write and WAL
+;; exclusion throughout, and fence each durable transition with its memory
+;; publication so a failed publication cannot admit unsafe work.
 (defun physical-backup-lease-reconcile-startup ()
   (with-write-lock
     (with-wal-publication-fence (begin-publication)
