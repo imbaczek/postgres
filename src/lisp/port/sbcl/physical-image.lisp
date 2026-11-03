@@ -14,6 +14,10 @@
 (defstruct (physical-image-context (:constructor %make-physical-image-context))
   root-fd root-path children (owner sb-thread:*current-thread*) (active t))
 
+(defstruct (physical-image-read-context
+            (:include physical-image-context)
+            (:constructor %make-physical-image-read-context)))
+
 (defvar *physical-image-context* nil)
 
 (defvar *physical-image-test-hook* nil)
@@ -40,13 +44,18 @@
 ;; and retain its descriptor for subsequent access.  An empty opened child is
 ;; required, but does not prove it is the inode created by mkdirat.
 
-(defun physical-image-open-child (context name)
+(defun physical-image-open-child (context name &key existing)
   (physical-image-check-context context)
+  (unless (member name '("base" "global" "pg_wal") :test #'equal)
+    (error "invalid physical image child directory"))
+  (when (and (physical-image-read-context-p context) (not existing))
+    (error "physical image read scope cannot create directories"))
   (let ((root (physical-image-context-root-fd context))
         (fd nil))
-    (unless (zerop (physical-image-mkdirat root name #o700))
-      (error "cannot create exclusive physical image child directory"))
-    (when *physical-image-test-hook* (funcall *physical-image-test-hook* :after-mkdir name))
+    (unless existing
+      (unless (zerop (physical-image-mkdirat root name #o700))
+        (error "cannot create exclusive physical image child directory"))
+      (when *physical-image-test-hook* (funcall *physical-image-test-hook* :after-mkdir name)))
     (sb-sys:without-interrupts
       (unwind-protect
            (progn
@@ -56,7 +65,7 @@
                                sb-posix:o-nofollow +postmaster-o-cloexec+) 0))
              (when (minusp fd) (setf fd nil) (error "cannot open physical image child directory"))
              (physical-image-check-directory fd (sb-posix:stat-dev (sb-posix:fstat root)))
-             (unless (null (directory-entry-names (physical-image-fd-path fd) :follow-symlinks t))
+             (unless (or existing (null (directory-entry-names (physical-image-fd-path fd) :follow-symlinks t)))
                (error "new physical image child directory is not empty"))
              (push (cons name fd) (physical-image-context-children context))
              (setf fd nil))
@@ -111,39 +120,47 @@
 ;; Duplicate the borrowed root, hold the children throughout receipt, and sync
 ;; them and the root on success.  Cleanup closes only descriptors owned here.
 
-(defun call-with-physical-backup-receive-directory (borrowed-fd function)
-  (let ((context (%make-physical-image-context)))
+(defun call-with-physical-image-directory (borrowed-fd function read-only)
+  (let ((context (if read-only (%make-physical-image-read-context) (%make-physical-image-context))))
     (sb-sys:without-interrupts
       (unwind-protect
            (progn
-             ;; 1030 is Linux F_DUPFD_CLOEXEC; the duplicate belongs to this scope.
-             (setf (physical-image-context-root-fd context)
-                   (sb-posix:fcntl borrowed-fd 1030 0))
+             (setf (physical-image-context-root-fd context) (sb-posix:fcntl borrowed-fd 1030 0))
              (let ((fd (physical-image-context-root-fd context)))
                (physical-image-check-directory fd)
                (setf (physical-image-context-root-path context) (physical-image-fd-path fd))
-               (unless (null (directory-entry-names (physical-image-context-root-path context)
-                                                    :follow-symlinks t))
+               (unless (or read-only
+                           (null (directory-entry-names (physical-image-context-root-path context)
+                                                        :follow-symlinks t)))
                  (error "physical image receive directory is not empty")))
              (sb-sys:with-local-interrupts
-               (dolist (name '("base" "global" "pg_wal")) (physical-image-open-child context name))
+               (dolist (name '("base" "global" "pg_wal"))
+                 (physical-image-open-child context name :existing read-only))
                (let ((*physical-image-context* context))
                  (multiple-value-prog1
                      (funcall function (physical-image-context-root-path context))
                    (physical-image-check-children context)
-                   (dolist (entry (physical-image-context-children context)) (sb-posix:fsync (cdr entry)))
-                   (sb-posix:fsync (physical-image-context-root-fd context))))))
+                   (unless read-only
+                     (dolist (entry (physical-image-context-children context)) (sb-posix:fsync (cdr entry)))
+                     (sb-posix:fsync (physical-image-context-root-fd context)))))))
         (setf (physical-image-context-active context) nil)
         (dolist (entry (physical-image-context-children context)) (sb-posix:close (cdr entry)))
         (when (physical-image-context-root-fd context)
           (sb-posix:close (physical-image-context-root-fd context)))))))
+
+(defun call-with-physical-backup-receive-directory (borrowed-fd function)
+  (call-with-physical-image-directory borrowed-fd function nil))
+
+(defun call-with-physical-backup-image-directory (borrowed-fd function)
+  (call-with-physical-image-directory borrowed-fd function t))
 
 ;; Create a private 0600 file exclusively relative to a held directory, without
 ;; following symlinks.  Sync the file and parent before reporting success.
 
 (defun call-with-physical-image-output (directory name function)
   (let ((context *physical-image-context*))
-    (unless (and context (equal (pathname directory) (physical-image-context-root-path context)))
+    (unless (and context (not (physical-image-read-context-p context))
+                 (equal (pathname directory) (physical-image-context-root-path context)))
       (error "physical image output requires its descriptor scope"))
     (multiple-value-bind (parent leaf) (physical-image-parent context name)
       (let ((fd nil) (stream nil))

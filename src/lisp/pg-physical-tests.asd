@@ -66,6 +66,7 @@
                (:file "t/physical-reseed-owner-tests")
                (:file "t/physical-reseed-attempt-tests")
                (:file "t/physical-image-tests")
+               (:file "t/physical-image-read-tests")
                (:file "t/physical-reseed-stage-tests")
                (:file "t/physical-reseed-remote-tests")
                (:file "t/physical-reseed-install-tests")
