@@ -68,6 +68,7 @@
                (:file "t/physical-image-tests")
                (:file "t/physical-reseed-stage-tests")
                (:file "t/physical-reseed-remote-tests")
+               (:file "t/physical-reseed-install-tests")
                (:file "t/physical-adoption-retire-tests")
                (:file "t/physical-adoption-startup-entry-tests")
                (:file "t/wal-timeline-tests")

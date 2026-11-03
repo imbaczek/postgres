@@ -11,14 +11,21 @@
 (defun physical-reseed-attempt-temporary-path (&optional (directory *pgdata*))
   (merge-pathnames "physical-reseed.attempt.tmp" directory))
 
+(defun physical-reseed-install-path (&optional (directory *pgdata*))
+  (merge-pathnames "physical-reseed.install" directory))
+
+(defun physical-reseed-install-temporary-path (&optional (directory *pgdata*))
+  (merge-pathnames "physical-reseed.install.tmp" directory))
+
+(defun physical-reseed-check-no-install (&optional (directory *pgdata*))
+  (physical-directory-check-reseed-intent directory :install-only t))
+
 ;; Check both names before any PID mutation.  Even a completed abort remains a
 ;; fence until a later reconciliation protocol decides what to do with it.
 
 (defun physical-reseed-check-before-pid ()
-  "Refuse startup on any attempt entry before changing PID metadata."
-  (dolist (path (list (physical-reseed-attempt-path) (physical-reseed-attempt-temporary-path)))
-    (physical-adoption-require-absent
-     path "pending offline reseed requires reconciliation before PID changes")))
+  "Refuse startup on reseed intent or install entries before changing PID metadata."
+  (physical-directory-check-reseed-intent *pgdata*))
 
 (defstruct (physical-reseed-owner (:include physical-adoption-owner))
   ;; NIL means absent; otherwise retain the original PID, identity, and bytes.
@@ -88,6 +95,7 @@ Normalize a negative single-user PID for probing while preserving its bytes."
 
 (defmethod physical-adoption-check-owner-role ((owner physical-reseed-owner))
   ;; Recheck both absence and exact contents, then require a dead recorded PID.
+  (physical-reseed-check-no-install (physical-adoption-owner-directory owner))
   (let* ((old (physical-reseed-owner-old-pid owner))
          (current (physical-reseed-read-pid (physical-adoption-owner-directory owner))))
     (unless (equalp old current)
@@ -101,4 +109,6 @@ Normalize a negative single-user PID for probing while preserving its bytes."
 Keep the original PID file and dirty data intact; this does not perform reseed."
   (call-with-physical-adoption-directory-owner
    directory function :constructor #'make-physical-reseed-owner
-   :initial-arguments (lambda (root) (list :old-pid (physical-reseed-read-pid root)))))
+   :initial-arguments (lambda (root)
+                        (physical-reseed-check-no-install root)
+                        (list :old-pid (physical-reseed-read-pid root)))))

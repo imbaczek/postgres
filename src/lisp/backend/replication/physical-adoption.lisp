@@ -21,6 +21,17 @@
   (when (physical-adoption-path-present-p path) (error message))
   (values))
 
+(defun physical-directory-check-reseed-intent (directory &key install-only)
+  (dolist (name '("physical-reseed.attempt" "physical-reseed.attempt.tmp"
+                  "physical-reseed.install" "physical-reseed.install.tmp"))
+    (let ((installation (uiop:string-prefix-p "physical-reseed.install" name)))
+      (when (or installation (not install-only))
+        (physical-adoption-require-absent
+         (merge-pathnames name directory)
+         (if installation
+             "pending offline reseed installation requires journal reconciliation"
+             "pending offline reseed requires reconciliation before PID changes"))))))
+
 (defun physical-adoption-handoff-path (&optional (directory *pgdata*))
   (merge-pathnames "physical-adoption.handoff" directory))
 
@@ -54,6 +65,7 @@ This context is invalid after its enclosing call exits."
   (:documentation "Recheck role-specific conditions after the common owner checks."))
 
 (defmethod physical-adoption-check-owner-role ((owner physical-adoption-owner))
+  (physical-directory-check-reseed-intent (physical-adoption-owner-directory owner))
   owner)
 
 (defgeneric physical-adoption-owner-extra-root-names (owner)

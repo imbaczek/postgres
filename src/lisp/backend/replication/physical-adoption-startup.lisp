@@ -26,12 +26,14 @@
 
 (defun physical-adoption-startup-preflight ()
   "Allow a terminal follow journal through read-only preflight; fence other cases."
+  (physical-directory-check-reseed-intent *pgdata*)
   (if (physical-adoption-path-present-p (physical-adoption-follow-path))
       (physical-adoption-startup-follow-state)
       (physical-adoption-check-startup)))
 
 (defun physical-adoption-reconcile-startup ()
   "Retire terminal follow authority under real postmaster startup ownership."
+  (physical-directory-check-reseed-intent *pgdata*)
   (if (physical-adoption-path-present-p (physical-adoption-follow-path))
       (call-with-physical-adoption-startup-owner #'physical-adoption-retire-resume)
       (physical-adoption-check-startup)))

@@ -17,6 +17,7 @@
     (error "adoption startup reconciliation requires unopened storage and stopped workers")))
 
 (defmethod physical-adoption-check-owner-role ((owner physical-adoption-startup-owner))
+  (physical-directory-check-reseed-intent (physical-adoption-owner-directory owner))
   (physical-adoption-check-startup-quiescence)
   (unless (and (eq (physical-adoption-owner-lock owner) *postmaster-data-lock*)
                (equal (physical-adoption-owner-directory owner) *postmaster-pid-directory*)
