@@ -56,12 +56,15 @@ or reclaim a PID file on EPERM."
     (sb-posix:syscall-error (condition)
       (if (= sb-posix:esrch (sb-posix:syscall-errno condition)) :dead :unknown))))
 
-(defun physical-reseed-pid-identity (stat)
-  "Select the metadata used to detect changes to the PID file."
+(defun physical-reseed-file-facts (stat)
   (list (sb-posix:stat-dev stat) (sb-posix:stat-ino stat)
         (sb-posix:stat-mode stat) (sb-posix:stat-nlink stat)
         (sb-posix:stat-uid stat) (sb-posix:stat-size stat)
         (sb-posix:stat-mtime stat) (sb-posix:stat-ctime stat)))
+
+(defun physical-reseed-pid-identity (stat)
+  "Select the metadata used to detect changes to the PID file."
+  (physical-reseed-file-facts stat))
 
 (defun physical-reseed-read-pid (directory)
   "Capture the PID file's bytes and identity, or NIL when absent.
