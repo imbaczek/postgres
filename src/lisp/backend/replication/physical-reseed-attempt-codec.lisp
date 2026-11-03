@@ -9,6 +9,9 @@
 (defconstant +physical-reseed-attempt-maximum-bytes+ (* 3 1024 1024))
 
 (defparameter *physical-reseed-attempt-keys* '(:version :phase :local :request :source))
+
+(defparameter *physical-reseed-attempt-identity-keys* '(:version :local :request :source :stage))
+
 (defparameter *physical-reseed-local-keys* '(:directory :device :inode :lock-device :lock-inode :pid))
 
 ;; Preserve the complete PID file as opaque evidence.  A negative single-user
@@ -118,7 +121,7 @@
          (old (getf previous :phase))
          (new (getf candidate :phase)))
     (unless (and (every (lambda (key) (equal (getf previous key) (getf candidate key)))
-                        '(:version :local :request :source :stage))
+                        *physical-reseed-attempt-identity-keys*)
                  (or (eq old new)
                      (member (list old new) '((:premanifest :aborting) (:aborting :aborted)) :test #'equal)))
       (error "reseed attempt cannot rebind or reverse its saved intent"))
@@ -127,8 +130,7 @@
 ;; Bind the attempt to the stopped root, its held lock, and exact PID evidence.
 ;; This ownership does not confer the clean-adoption capability.
 
-(defun physical-reseed-attempt-local-facts (owner)
-  (physical-reseed-check-owner owner)
+(defun physical-reseed-attempt-local-evidence (owner)
   (let ((pid (physical-reseed-owner-old-pid owner)))
     (physical-reseed-attempt-local-copy
      (list :directory (namestring (physical-adoption-owner-directory owner))
@@ -138,3 +140,7 @@
            :pid (when pid
                   (list :pid (getf pid :pid) :identity (getf pid :identity)
                         :bytes (physical-libpq-octets-datum (getf pid :bytes))))))))
+
+(defun physical-reseed-attempt-local-facts (owner)
+  (physical-reseed-check-owner owner)
+  (physical-reseed-attempt-local-evidence owner))

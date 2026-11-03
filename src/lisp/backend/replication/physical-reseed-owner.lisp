@@ -102,9 +102,8 @@ Normalize a negative single-user PID for probing while preserving its bytes."
                    (list :pid (abs pid) :identity before :bytes bytes)))
             (close stream)))))))
 
-(defmethod physical-adoption-check-owner-role ((owner physical-reseed-owner))
+(defun physical-reseed-check-original-pid (owner)
   ;; Recheck both absence and exact contents, then require a dead recorded PID.
-  (physical-reseed-check-no-install (physical-adoption-owner-directory owner))
   (let* ((old (physical-reseed-owner-old-pid owner))
          (current (physical-reseed-read-pid (physical-adoption-owner-directory owner))))
     (unless (equalp old current)
@@ -112,6 +111,10 @@ Normalize a negative single-user PID for probing while preserving its bytes."
     (when (and old (not (eq :dead (physical-reseed-process-state (getf old :pid)))))
       (error "reseed target process is live or its state is unknown")))
   owner)
+
+(defmethod physical-adoption-check-owner-role ((owner physical-reseed-owner))
+  (physical-reseed-check-no-install (physical-adoption-owner-directory owner))
+  (physical-reseed-check-original-pid owner))
 
 ;; Check installation fences before reading PID evidence, and again whenever
 ;; the constructed owner is checked.  Neither check grants install authority.
