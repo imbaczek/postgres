@@ -6,13 +6,16 @@
 (sb-alien:define-alien-routine ("mkdirat" physical-image-mkdirat) sb-alien:int
   (directory sb-alien:int) (name sb-alien:c-string) (mode sb-alien:unsigned-int))
 
-;; A receive scope owns a duplicate of the caller's root descriptor and the
+;; An image scope owns a duplicate of the caller's root descriptor and the
 ;; cached child descriptors.  The caller retains ownership of its descriptor.
 ;; The scope and its /proc/self/fd paths are valid only in the owning thread
 ;; until cleanup closes the descriptors, including on a nonlocal exit.
 
 (defstruct (physical-image-context (:constructor %make-physical-image-context))
   root-fd root-path children (owner sb-thread:*current-thread*) (active t))
+
+;; This subtype marks an existing image scope as read-only for these image APIs;
+;; it does not make the underlying filesystem immutable.
 
 (defstruct (physical-image-read-context
             (:include physical-image-context)
@@ -40,9 +43,10 @@
       (error "physical image directory is not private and owned"))
     stat))
 
-;; Create each private child exclusively, open it without following symlinks,
-;; and retain its descriptor for subsequent access.  An empty opened child is
-;; required, but does not prove it is the inode created by mkdirat.
+;; Open and retain each private child without following symlinks.  A receive
+;; scope creates it exclusively and requires it empty; that does not prove
+;; the opened inode is the one created by mkdirat.  A read scope opens existing
+;; children.
 
 (defun physical-image-open-child (context name &key existing)
   (physical-image-check-context context)
@@ -117,14 +121,16 @@
                      (= (sb-posix:stat-ino held) (sb-posix:stat-ino named)))
           (error "physical image child directory was replaced"))))))
 
-;; Duplicate the borrowed root, hold the children throughout receipt, and sync
-;; them and the root on success.  Cleanup closes only descriptors owned here.
+;; Duplicate the borrowed root and hold the child descriptors for the scope.
+;; Receive scopes create children and sync them and the root on success; read
+;; scopes open existing children.  Cleanup closes only descriptors owned here.
 
 (defun call-with-physical-image-directory (borrowed-fd function read-only)
   (let ((context (if read-only (%make-physical-image-read-context) (%make-physical-image-context))))
     (sb-sys:without-interrupts
       (unwind-protect
            (progn
+             ;; 1030 is Linux F_DUPFD_CLOEXEC; the duplicate belongs to this scope.
              (setf (physical-image-context-root-fd context) (sb-posix:fcntl borrowed-fd 1030 0))
              (let ((fd (physical-image-context-root-fd context)))
                (physical-image-check-directory fd)
@@ -230,7 +236,7 @@
                (sb-sys:with-local-interrupts (funcall function stream)))
           (if stream (close stream) (when fd (sb-posix:close fd))))))))
 
-;; Outside a receive scope, retain the ordinary pathname-based input behavior.
+;; Outside an image scope, retain ordinary pathname-based input behavior.
 
 (defmacro with-physical-image-input ((stream path &rest options) &body body)
   `(if *physical-image-context*

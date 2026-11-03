@@ -16,6 +16,9 @@
     (error "reseed journal changed during the remote operation"))
   record)
 
+;; Match the private held directory to its name and, when supplied, the saved
+;; identity.  Empty is required for a new destination, not for a received stage.
+
 (defun physical-reseed-stage-facts (owner directory fd &key empty expected)
   (physical-reseed-check-owner owner)
   (let* ((directory (truename (uiop:ensure-directory-pathname directory)))
@@ -36,8 +39,8 @@
         (error "reseed receive stage is not empty"))
       facts)))
 
-;; Hold an exclusive lock on the private, initially empty stage while its
-;; pathname and descriptor identities are checked around capture.
+;; Hold an exclusive lock and check the private stage's pathname and descriptor
+;; identities.  New destinations must be empty; a saved stage may be nonempty.
 
 (defun call-with-physical-reseed-stage (owner directory function &key (empty t) expected)
   (physical-reseed-check-owner owner)

@@ -71,6 +71,9 @@
   (from-directory sb-alien:int) (from sb-alien:c-string)
   (to-directory sb-alien:int) (to sb-alien:c-string) (flags sb-alien:unsigned-int))
 
+;; With a descriptor, statx AT_EMPTY_PATH identifies the held directory's
+;; mount without resolving its pathname again.  Refuse a missing mount ID.
+
 (defun physical-adoption-install-mount-id (path &key directory-fd)
   (sb-alien:with-alien ((buffer (sb-alien:array sb-alien:unsigned-char 256)))
     (unless (zerop (physical-adoption-statx

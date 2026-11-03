@@ -528,6 +528,17 @@ this mode.
 
 ### SBCL descriptor streams and global variables
 
+- Keep read-only image scopes separate from receive scopes. Both own duplicated
+  root and child descriptors, but reopening an existing image must not create
+  directories, sync them or grant the output API. Pair named workspace paths
+  with their held descriptors before and after the operation. Compare statx
+  mount IDs through the held directory descriptors when bind mounts matter.
+- A backup manifest does not cover every metadata file. For an independent
+  incoming copy, compare the six fixed metadata digests too; a syntactically
+  valid changed HBA file otherwise passes policy validation. Recheck the saved
+  source lease around copying and keep the result observational until a durable
+  installation journal binds and revalidates it.
+
 - On the local SBCL, `run-program :use-posix-spawn t` with its default NULL
   environment passes an empty environment. Regular exec inherits raw environment
   bytes; do not decode `posix-environ`, which can contain non-UTF-8 bytes.

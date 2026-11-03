@@ -1,5 +1,9 @@
 (in-package #:pg)
 
+;; Copy from a read scope into an exclusive receive scope.  Check length, digest,
+;; and descriptor and pathname facts before accepting the file.  An error leaves
+;; any partial destination in place for the caller to inspect or clean up.
+
 (defun physical-image-copy-file (source-context target-context relative size expected-digest)
   (physical-image-check-context source-context)
   (physical-image-check-context target-context)
@@ -43,6 +47,10 @@
   (when *physical-reseed-image-test-hook*
     (funcall *physical-reseed-image-test-hook* point directory)))
 
+;; Verify the phase-zero image and its inventory, including digests for all six
+;; metadata files as well as manifest files.  Rechecking against EXPECTED detects
+;; changes during preparation; it is not durable installation proof.
+
 (defun physical-reseed-image-check (directory &optional expected)
   (multiple-value-bind (manifest digest) (recovery-read-manifest directory)
     (recovery-check-manifest-schema manifest)
@@ -58,6 +66,9 @@
         (error "reseed image changed during preparation"))
       actual)))
 
+;; Return current file identity observations alongside the verified sizes and
+;; digests.  A later installation must check them again.
+
 (defun physical-reseed-image-file-facts (directory image)
   (loop for (name size digest) in (getf image :files)
         collect
@@ -70,6 +81,9 @@
                            (equal facts (physical-reseed-file-facts (sb-posix:lstat (namestring path)))))
                 (error "reseed incoming file identity changed"))
               (list name size digest facts))))))
+
+;; Compare mount IDs through held descriptors, including the rechecked target,
+;; so equal device numbers alone do not conceal distinct mounts.
 
 (defun physical-reseed-image-check-mounts (owner stage-fd incoming-fd)
   (let ((root-fd nil))
@@ -87,10 +101,18 @@
                (error "reseed workspaces must share the owned target mount"))))
       (when root-fd (sb-posix:close root-fd)))))
 
+;; READY must describe this manifest and the original lease request.
+
 (defun physical-reseed-image-check-source (client record image)
   (physical-backup-lease-check-received-status
    (getf image :manifest) (getf image :manifest-digest) (getf record :request)
    (pg-client-native-backup-lease-status client (getf record :request))))
+
+;; Copy a verified received stage into a separate empty incoming directory.
+;; Check the original source is READY before and after the copy, and recheck the
+;; journal, both images, and workspace identities.  The returned facts are
+;; observations only: no install journal, moves, handoff, or startup retirement
+;; are performed here.  Failed copies retain their partial incoming contents.
 
 (defun physical-reseed-prepare-image (owner incoming &key helper)
   (unless (eq (type-of owner) 'physical-reseed-owner)

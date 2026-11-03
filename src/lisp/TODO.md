@@ -208,6 +208,24 @@
   identity before dispatch. Initial capture requires the saved source timeline;
   cancellation after source promotion must still accept the same system ID.
 
+- [x] Prepare an independent incoming image for full reseed.
+  Reopen the frozen receive stage through held read-only directory descriptors,
+  verify its exact inventory and complete base, and check the original source
+  lease is READY before writing the separate empty incoming workspace. Copy
+  files into independent inodes, checking length, checksum and stable source
+  identity. Compare all six metadata file digests as well as manifest contents,
+  then recheck the source image, lease, original journal and incoming image.
+  Require ordinary stopped ownership and a common descriptor-verified mount.
+  Leave partial incoming files in place and do not abort the source lease on
+  failure; saved STATUS and checked ABORT remain available. The returned facts
+  are observations, not a durable installation proof. No old data moves or
+  startup retirement occur.
+  Verification: 1,760 distinct physical tests, 28 focused tests, 40 generated
+  copy trials (seed 96), fresh strict compilation and 13 native cases passed.
+  The two successful native copies independently checked equal bytes and
+  distinct inodes for every one of their 13 files. Evidence:
+  `/home/imbaczek/proj/pg-ha-artifacts/reseed-image/evidence.json`.
+
 - [ ] Install a full reseed image while preserving the opaque old data tree.
   Introduce a separate `physical-reseed.install` plan and install owner. Select
   that owner whenever a valid install journal exists, including before the first
@@ -240,6 +258,16 @@
   not its old-tree snapshot, clean proof, codec or ownership validator. Cover
   every move/publication cut, fresh-image reopening and cleanup after the PID
   moves. Sol xhigh design notes are in the reseed-remote evidence file above.
+  Bind immutable attempt fields rather than the attempt file's inode: checked
+  cancellation republishes that file. A partial initial install temporary must
+  still permit cleanup-only ownership after proving the original attempt and
+  root PID; it must never grant capture, preparation, moves or startup authority.
+  Preserve old hardlinked names independently rather than rejecting shared
+  inodes. A rename can change their shared ctime even through an unmoved alias.
+  Use stable membership identities across steps and stabilize complete current
+  stat observations within each read. Parent directory timestamps, size and link
+  count also change during moves; check identity and the expected namespace.
+  Keep the PID's stronger byte and identity rule described above.
 
 - [x] Retire terminal adoption fences during real postmaster startup. A durable
   terminal RETIRE marker permits checked removal of handoff, install and attempt

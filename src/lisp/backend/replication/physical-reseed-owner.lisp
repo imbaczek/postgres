@@ -56,6 +56,9 @@ or reclaim a PID file on EPERM."
     (sb-posix:syscall-error (condition)
       (if (= sb-posix:esrch (sb-posix:syscall-errno condition)) :dead :unknown))))
 
+;; Capture identity and change-detection fields shared by PID evidence and
+;; image copy checks.  These observations do not lock the file against writes.
+
 (defun physical-reseed-file-facts (stat)
   (list (sb-posix:stat-dev stat) (sb-posix:stat-ino stat)
         (sb-posix:stat-mode stat) (sb-posix:stat-nlink stat)
