@@ -143,6 +143,7 @@
                    (:file "../replication/physical-prefix")
                    (:file "../replication/physical-follow-pin")
                    (:file "../replication/physical-backup-lease-codec")
+                   (:file "../replication/physical-backup-lease-store")
                    (:file "../replication/physical-export-origin")
                    (:file "../replication/physical-follow-anchor")
                    (:file "../replication/physical-retained-extent")
