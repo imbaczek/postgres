@@ -702,19 +702,19 @@ The slot is dropped on every exit; a verified origin remains after cancellation.
         (error "native backup destination is not empty"))
       (values resolved parent))))
 
-(defun physical-backup-next-copy-frame (channel)
+(defun physical-backup-next-copy-frame (channel &optional (tag "BASE_BACKUP_NATIVE"))
   (loop
     (multiple-value-bind (kind bytes)
-        (physical-libpq-receive-copy-out channel "BASE_BACKUP_NATIVE" :maximum 65536)
+        (physical-libpq-receive-copy-out channel tag :maximum 65536)
       (case kind
         (#\D (return bytes))
         (#\C (error "native backup COPY completed before its bundle"))
         (#\I nil)))))
 
-(defun physical-backup-finish-copy (channel)
+(defun physical-backup-finish-copy (channel &optional (tag "BASE_BACKUP_NATIVE"))
   (loop
     (multiple-value-bind (kind bytes)
-        (physical-libpq-receive-copy-out channel "BASE_BACKUP_NATIVE" :maximum 65536)
+        (physical-libpq-receive-copy-out channel tag :maximum 65536)
       (declare (ignore bytes))
       (case kind
         (#\C (return t))

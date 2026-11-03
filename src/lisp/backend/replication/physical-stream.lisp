@@ -132,6 +132,54 @@ Only explicit proof_kind retained_timeline selects the retained proof."
       (ereport "0A000" "BASE_BACKUP_NATIVE requires exactly the supported native_format"))
     (make-logical-replication-command :type :physical-backup :options options)))
 
+(defun native-backup-command-condition (condition copy-mode)
+  (let ((failure (if (typep condition 'pg-error) condition
+                     (make-condition 'pg-error
+                                     :sqlstate (if (typep condition 'wal-input-validation-error) "55000" "XX000")
+                                     :message "native backup export failed"))))
+    (if (and copy-mode (not (fatal-error-p failure)))
+        (make-condition 'pg-error :sqlstate (pg-error-sqlstate failure)
+                                  :message (pg-error-message failure) :severity "FATAL"
+                                  :detail (pg-error-detail failure) :position (pg-error-position failure)
+                                  :hint (pg-error-hint failure))
+        failure)))
+
+(defun call-with-native-backup-copy-out (stream tag producer)
+  (call-with-wal-sender-stream
+   (lambda ()
+     (let ((stage nil) (copy-mode nil))
+       (handler-case
+           (progn
+             (unwind-protect
+                  (progn
+                    (sb-sys:without-interrupts (setf stage (physical-backup-create-stage)))
+                    (flet ((begin-copy ()
+                             (when copy-mode (error "native backup COPY already started"))
+                             (let ((response (make-payload)))
+                               (payload-push-byte response 1)
+                               (payload-push-u16 response 0)
+                               (setf copy-mode t)
+                               (copy-write-frame stream #\H response)
+                               (finish-output stream))))
+                      (let ((manifest (funcall producer stage #'begin-copy)))
+                        (unless copy-mode (error "native backup producer did not start COPY"))
+                        (physical-bootstrap-test-point :before-stream stage)
+                        (physical-backup-send-bundle
+                         stage manifest
+                         (lambda (payload) (copy-write-frame stream #\d payload) (finish-output stream))))))
+               (when stage (physical-backup-delete-stage stage)))
+             (copy-write-frame stream #\c (make-payload))
+             (send-command-complete stream tag)
+             (send-ready-for-query stream (transaction-status-char)))
+         (error (condition)
+           (let ((failure (native-backup-command-condition condition copy-mode)))
+             (when copy-mode
+               (when (open-stream-p stream)
+                 (ignore-errors (send-error-response stream failure)))
+               (ignore-errors (close stream :abort t)))
+             (error failure))))))
+   :kind :backup))
+
 ;; Admit only a primary physical sender.  Stage the image under quiescence,
 ;; then stream it after mutations resume.  On failure in CopyOut, abort the
 ;; connection and attempt stage cleanup when this backend unwinds.  Startup
@@ -150,44 +198,13 @@ A verified origin may outlive a failed or cancelled stream for later inspection.
     (sb-thread:with-mutex (*wal-lock*)
       (wal-check-healthy)
       (wal-check-replication-slot-capacity)))
-  (call-with-wal-sender-stream
-   (lambda ()
-     (let ((stage nil) (copy-mode nil))
-       (unwind-protect
-            (handler-case
-                (progn
-                  (let ((response (make-payload)))
-                    (payload-push-byte response 1)
-                    (payload-push-u16 response 0)
-                    (copy-write-frame stream #\H response)
-                    (finish-output stream))
-                  (setf copy-mode t)
-                  (sb-sys:without-interrupts
-                    (setf stage (physical-backup-create-stage)))
-                  (let* ((name (string-downcase (format nil "pg_basebackup_~d_~36r" (backend-pid *backend*) (random (ash 1 64)))))
-                         (manifest (physical-export-base-backup stage name)))
-                    (physical-bootstrap-test-point :before-stream stage)
-                    (physical-backup-send-bundle
-                     stage manifest
-                     (lambda (payload)
-                       (copy-write-frame stream #\d payload)
-                       (finish-output stream))))
-                  (copy-write-frame stream #\c (make-payload))
-                  (send-command-complete stream "BASE_BACKUP_NATIVE")
-                  (send-ready-for-query stream (transaction-status-char)))
-              (error (condition)
-                (unless copy-mode (error condition))
-                (when (open-stream-p stream)
-                  (ignore-errors
-                   (send-error-response
-                    stream (if (typep condition 'pg-error) condition
-                               (make-condition 'pg-error :sqlstate "XX000"
-                                                         :message "native backup export failed")))))
-                (ignore-errors (close stream :abort t))
-                (error condition)))
-         (when stage
-           (physical-backup-delete-stage stage)))))
-   :kind :backup))
+  (call-with-native-backup-copy-out
+   stream "BASE_BACKUP_NATIVE"
+   (lambda (stage begin-copy)
+     (funcall begin-copy)
+     (let ((name (string-downcase (format nil "pg_basebackup_~d_~36r" (backend-pid *backend*)
+                                          (random (ash 1 64))))))
+       (physical-export-base-backup stage name)))))
 
 (defun parse-native-physical-prepare (words)
   "Parse PREPARE_FOLLOW and require the native format and each receiver field once.

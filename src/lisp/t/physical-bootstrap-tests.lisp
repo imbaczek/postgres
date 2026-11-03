@@ -125,6 +125,56 @@
       (let ((pg::*backend* (pg::make-backend :pid 179 :replication-mode :physical :explicit t)))
         (ok (intake-fails-p (lambda () (pg::validate-replication-command-context command)))))))
 
+(deftest physical-backup-completion-waits-for-stage-cleanup
+    (dolist (fail '(nil t))
+      (call-with-backup-lease-authority-fixture
+       (lambda (root)
+         (let* ((path (merge-pathnames "capture-response.wire" root))
+                (pg::*physical-bootstrap-test-hook* nil)
+                (symbols '(pg::call-with-wal-sender-stream pg::physical-backup-create-stage
+                           pg::physical-backup-send-bundle pg::physical-backup-delete-stage))
+                (originals (mapcar #'symbol-function symbols))
+                (cleaned nil))
+           (unwind-protect
+                (progn
+                  (setf (symbol-function 'pg::call-with-wal-sender-stream)
+                        (lambda (function &key kind) (declare (ignore kind)) (funcall function))
+                        (symbol-function 'pg::physical-backup-create-stage) (lambda () root)
+                        (symbol-function 'pg::physical-backup-send-bundle)
+                        (lambda (stage manifest emit)
+                          (declare (ignore stage manifest))
+                          (funcall emit (make-array 1 :element-type '(unsigned-byte 8) :initial-element 42)))
+                        (symbol-function 'pg::physical-backup-delete-stage)
+                        (lambda (stage)
+                          (declare (ignore stage))
+                          (setf cleaned t)
+                          (when fail (error "injected stage cleanup failure"))))
+                  (with-open-file (initial path :direction :output :element-type '(unsigned-byte 8))
+                    (finish-output initial))
+                  (with-open-file (output path :direction :io :if-exists :overwrite :if-does-not-exist :error
+                                               :element-type '(unsigned-byte 8))
+                    (flet ((produce (stage begin-copy)
+                             (declare (ignore stage))
+                             (funcall begin-copy)
+                             nil))
+                      (if fail
+                          (ok (intake-fails-p
+                               (lambda () (pg::call-with-native-backup-copy-out
+                                           output "BASE_BACKUP_NATIVE" #'produce))))
+                          (pg::call-with-native-backup-copy-out output "BASE_BACKUP_NATIVE" #'produce))))
+                  (ok cleaned)
+                  (let* ((bytes (lineage-test-bytes path))
+                         (types (loop for offset = 0 then (+ offset 1 (pg::bytes-to-u32 bytes (1+ offset)))
+                                      while (< offset (length bytes))
+                                      for type = (code-char (aref bytes offset))
+                                      when (find type '(#\H #\d #\c #\C #\Z #\E)) collect type)))
+                    (if fail
+                        (progn (ok (member #\H types)) (ok (member #\d types))
+                               (ok (notany (lambda (type) (find type '(#\c #\C #\Z))) types)))
+                        (ok (equal '(#\H #\d #\c #\C #\Z) types)))))
+             (loop for symbol in symbols for original in originals
+                   do (setf (symbol-function symbol) original))))))))
+
 (deftest physical-bootstrap-never-starts-writable
     (with-physical-store-directory (root)
       (let ((pg::*pgdata* root))
