@@ -1,3 +1,9 @@
+;; Validation for crash-resumable retirement of terminal adoption authority.
+;;
+;; The complete retirement marker permits only an ordered missing prefix of
+;; handoff, install, and attempt files.  The follow plan retains the facts needed
+;; to validate the remaining namespace, preserved trees, workspaces, WAL, and
+;; active recovery state after those files have gone.
 (in-package #:pg)
 
 (defun physical-adoption-retire-check-owner (owner)
@@ -15,6 +21,7 @@
                 +physical-adoption-attempt-maximum-bytes+))))
 
 (defun physical-adoption-retire-presence-prefix (presence)
+  "Return the length of the missing authority prefix, rejecting any gap."
   (unless (and (listp presence) (= 3 (length presence))
                (every (lambda (value) (member value '(nil t))) presence))
     (error "invalid adoption retirement authority presence"))
@@ -55,6 +62,9 @@
          (physical-adoption-follow-position-namespace-p value positions mount))))
 
 (defun physical-adoption-retire-validate (owner state)
+  "Revalidate a complete marker, its cleanup prefix, and retained follow state.
+Return the number of old authority files already removed.  Recheck the context
+and journal after validating content so changes during inspection are rejected."
   (physical-adoption-retire-check-owner owner)
   (let* ((value (getf state :plan))
          (last (length (physical-adoption-follow-moves value))))

@@ -113,7 +113,9 @@
     (postmaster-update-pid-status "ready   ")))
 
 (defun postmaster-remove-pid-file ()
-  "Keep the stable ownership descriptor open until OS process exit."
+  "Remove our PID file and sync its directory, then close and clear its stream.
+Close and clear the PID stream even when removal or sync fails.  This function
+leaves the separate data ownership lock to its owner."
   (when *postmaster-pid-stream*
     (let ((stream *postmaster-pid-stream*))
       (unwind-protect
@@ -188,7 +190,8 @@
   "Own PGDATA before any database storage initialization or recovery mutation.
 Call STARTUP-CHECK synchronously with the local flock held and owned PID created,
 before publishing *POSTMASTER-DATA-LOCK*. The check must be read-only.
-Run STARTUP-RECONCILE after publishing ownership and before returning to startup.
+Run STARTUP-RECONCILE after publishing ownership and before returning to startup,
+where stage cleanup, authentication completion, storage, listeners, and workers follow.
 If either callback fails or exits nonlocally, clear ownership and the timestamp,
 remove the owned PID, and close the lock even if PID cleanup fails."
   (declare (ignore host))

@@ -107,6 +107,7 @@
   t)
 
 (defun physical-adoption-check-preserved-installation (owner value)
+  "Check terminal installation authority and the preserved trees it describes."
   (let* ((state (physical-adoption-install-read owner))
          (plan (getf value :installation))
          (attempt (physical-adoption-attempt-read owner))

@@ -1,9 +1,16 @@
+;; Startup ownership for terminal physical adoption retirement.
+;;
+;; This capability borrows the postmaster's published lock and PID file.  It is
+;; valid only on the creating thread while startup is quiescent; ending the call
+;; invalidates it without closing either borrowed descriptor.
 (in-package #:pg)
 
 (defstruct (physical-adoption-startup-owner (:include physical-adoption-owner))
+  "Startup capability borrowing the postmaster lock and PID stream and identities."
   pid-stream pid-device pid-inode)
 
 (defun physical-adoption-check-startup-quiescence ()
+  "Require no live operation, ready WAL, receive store, follow runtime, or restartpoint worker."
   (unless (and (zerop *live-operation-depth*) (not *wal-ready*)
                (not *physical-receive-store*) (not *physical-follow-runtime*)
                (not *physical-restartpoint-worker*))
@@ -34,6 +41,9 @@
   (list "postmaster.pid"))
 
 (defun call-with-physical-adoption-startup-owner (function)
+  "Call FUNCTION with a thread-bound capability for the actual postmaster owner.
+Recheck the published flock, PID stream and inode, and current PID.  Invalidate
+this capability on exit without closing the postmaster's borrowed streams."
   (physical-adoption-check-startup-quiescence)
   (unless (and *postmaster-data-lock* (open-stream-p *postmaster-data-lock*)
                *postmaster-pid-stream* (open-stream-p *postmaster-pid-stream*)

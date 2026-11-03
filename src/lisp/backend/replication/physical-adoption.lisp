@@ -50,12 +50,14 @@
 This context is invalid after its enclosing call exits."
   directory device inode lock lock-device lock-inode thread active-p)
 
-(defgeneric physical-adoption-check-owner-role (owner))
+(defgeneric physical-adoption-check-owner-role (owner)
+  (:documentation "Recheck role-specific conditions after the common owner checks."))
 
 (defmethod physical-adoption-check-owner-role ((owner physical-adoption-owner))
   owner)
 
-(defgeneric physical-adoption-owner-extra-root-names (owner))
+(defgeneric physical-adoption-owner-extra-root-names (owner)
+  (:documentation "Return root entries allowed by this ownership role."))
 
 (defmethod physical-adoption-owner-extra-root-names ((owner physical-adoption-owner))
   nil)

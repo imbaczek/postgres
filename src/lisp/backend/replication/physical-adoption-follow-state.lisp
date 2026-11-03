@@ -108,6 +108,7 @@
           #'string< :key #'first)))
 
 (defun physical-adoption-follow-root-names (value positions &optional owner)
+  "Compute the exact root namespace, including entries allowed by OWNER's role."
   (append (remove "physical-recovery.control"
                   (mapcar #'first (getf (getf (getf value :handoff) :installation) :new)) :test #'equal)
           (copy-list *physical-adoption-install-retained-names*)
@@ -171,6 +172,7 @@
         (error "adoption follow published metadata differs from its planned image")))))
 
 (defun physical-adoption-follow-check-active (owner value)
+  "Verify active follow configuration and its retained recovery state."
   (let* ((*pgdata* (physical-adoption-owner-directory owner))
          (record (physical-adoption-follow-record value))
          (binding (physical-adoption-follow-planned-binding record))

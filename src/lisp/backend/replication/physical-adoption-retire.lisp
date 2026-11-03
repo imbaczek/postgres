@@ -1,8 +1,16 @@
+;; Retire a completed physical adoption during owned postmaster startup.
+;;
+;; Durable terminal follow publication and intact old authority precede the
+;; retirement marker.  Once the marker is durable, remove each older authority
+;; file in order and sync the root after each removal; remove follow last.
+;; Retirement itself does not contact the source, run redo, or grant write
+;; authority.  Normal startup continues in standby recovery afterwards.
 (in-package #:pg)
 
 (defvar *physical-adoption-retire-write-limit* nil)
 
 (defun physical-adoption-retire-check-unmarked (owner state)
+  "Require terminal follow publication and all old authority before marking."
   (let ((last (length (physical-adoption-follow-moves (getf state :plan)))))
     (unless (and (not (getf state :retiring)) (not (getf state :partial))
                  (= last (getf state :step))
@@ -10,6 +18,9 @@
       (error "adoption retirement requires complete follow publication"))))
 
 (defun physical-adoption-retire-mark (owner state)
+  "Publish or verify the CRC-bound retirement marker on the follow journal.
+A torn marker may be repaired only while the old authority remains intact.  Sync
+the terminal journal before writing and syncing the complete marker."
   (physical-adoption-retire-check-owner owner)
   (if (getf state :retiring)
       (progn
@@ -42,6 +53,7 @@
           actual))))
 
 (defun physical-adoption-retire-unlink-authority (owner state prefix)
+  "Recheck and remove the next authority file, then sync the root directory."
   (let* ((root (physical-adoption-owner-directory owner))
          (name (first (nth prefix (physical-adoption-retire-files (getf state :plan)))))
          (path (merge-pathnames name root)))
@@ -54,6 +66,7 @@
     (physical-adoption-install-test-point :after-retire-authority-fsync root)))
 
 (defun physical-adoption-retire-finish (owner state)
+  "Remove the follow fence last, sync the root, and recheck startup ownership."
   (let* ((root (physical-adoption-owner-directory owner))
          (path (physical-adoption-follow-path root)))
     (physical-adoption-install-test-point :before-retire-follow-unlink path)
@@ -68,6 +81,7 @@
     :retired))
 
 (defun physical-adoption-retire-resume (owner)
+  "Mark an unmarked terminal follow, or resume from its durable marker and exact authority prefix."
   (physical-adoption-retire-check-owner owner)
   (let ((state (physical-adoption-retire-mark owner (physical-adoption-follow-read owner))))
     (loop for prefix = (physical-adoption-retire-validate owner state)

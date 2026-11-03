@@ -1,5 +1,28 @@
 # Development TODO
 
+- [x] Retire terminal adoption fences during real postmaster startup. A durable
+  terminal RETIRE marker permits checked removal of handoff, install and attempt
+  in that order, with follow removed last. Nonterminal follow progress remains
+  fenced. Retirement leaves the server a standby; old quarantine
+  and the source pin remain, and no coordinator, DCS or election is provided.
+  Validation passed 1,624 physical, 903 unit, 201 wire and 20 focused tests,
+  strict fresh compilation, 30 error cuts, 12 real-postmaster SIGKILL cases,
+  16 valid prefix cases, five mutations and two late ownership faults. Two
+  properties ran 100 trials at seeds 85 and 86, digests `4e5b9b5a61762595` and
+  `c3fb2f17a0456875`; input coverage and rejection counts were not measured.
+  Native startup retired the fences; with the helper configured it caught up from
+  E=33752368, applied a new source commit (`proof_progress=703001`), and rejected
+  a standby write with 25006. It passed a target cold restart; before restart,
+  receive and replay matched at `0/02046CCB`. Root and lock inodes and preserved
+  workspaces, stage and reference files remained unchanged. The first native
+  attempt lacked `pg_config`; the rerun used an explicit local `PG_CONFIG` without
+  a production logic change. A helper build needs `pg_config` on PATH or explicit
+  `PG_CONFIG`; `PG_LIBPQ_HELPER` can select an installed helper. Evidence:
+  `/home/imbaczek/proj/pg-ha-artifacts/adoption-startup/evidence.json`.
+  Code commits: `eab9aa41730`, `bd7b43dabcd`, `09bca60b619`. Divergent rewind
+  or explicit reseed, logical/pgoutput drain, checkpoint facts, WAL policy,
+  audits and Patroni acceptance remain open.
+
 - [x] Prepare offline follow metadata from a ready adoption handoff. A fixed
   derived plan in a private third workspace uses a durable no-replace rename
   journal, accepting its recorded prefix or one completed move ahead. The

@@ -66,6 +66,7 @@
         #'string< :key #'first))
 
 (defun physical-adoption-install-top-p (directory entry mount)
+  "Check the planned top-level inode and mount, treating absence as false."
   (handler-case
       (let* ((row (first (second entry)))
              (path (physical-adoption-install-entry-path directory (first entry)))
