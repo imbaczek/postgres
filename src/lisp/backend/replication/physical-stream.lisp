@@ -132,6 +132,9 @@ Only explicit proof_kind retained_timeline selects the retained proof."
       (ereport "0A000" "BASE_BACKUP_NATIVE requires exactly the supported native_format"))
     (make-logical-replication-command :type :physical-backup :options options)))
 
+;; Once CopyOutResponse has been sent, a failure must end the connection.
+;; Propagate a fatal condition so the outer command loop cannot send a second
+;; error or ReadyForQuery.  Before COPY, ordinary query error handling applies.
 (defun native-backup-command-condition (condition copy-mode)
   (let ((failure (if (typep condition 'pg-error) condition
                      (make-condition 'pg-error
@@ -144,6 +147,10 @@ Only explicit proof_kind retained_timeline selects the retained proof."
                                   :hint (pg-error-hint failure))
         failure)))
 
+;; Own the temporary stage and offer PRODUCER a one-shot begin-copy callback.
+;; Allocate the stage before CopyOutResponse, and delete it on every exit,
+;; including before CopyDone and successful command completion.  After COPY
+;; starts, report errors if possible and abort the stream before propagating.
 (defun call-with-native-backup-copy-out (stream tag producer)
   (call-with-wal-sender-stream
    (lambda ()

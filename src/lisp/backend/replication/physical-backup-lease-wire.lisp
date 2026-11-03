@@ -1,11 +1,17 @@
 (in-package #:pg)
 
+;;; Native backup lease commands for admitted physical replication senders.
+;;; Each verb requires exactly the six native options, with single-quoted
+;;; values.  The request token is an ownership credential and is never echoed
+;;; in a result or an error.
 
 (defparameter *physical-backup-lease-wire-verbs*
   '(("CAPTURE_BACKUP_NATIVE" . :physical-lease-capture)
     ("BACKUP_LEASE_STATUS" . :physical-lease-status)
     ("BACKUP_LEASE_ABORT" . :physical-lease-abort)))
 
+;; STATUS and ABORT return one row of eight text columns.  UNKNOWN has no
+;; state fields; outcome, base identity and successor identity may be null.
 (defparameter *physical-backup-lease-result-schema*
   '(("lease_name" 25) ("phase" 25) ("outcome" 25 :nullable)
     ("checkpoint_start" 25 :nullable) ("base_lsn" 25 :nullable)
@@ -100,6 +106,8 @@
     (pg-error (condition) (error condition))
     (error () (ereport "XX000" "native backup lease command failed"))))
 
+;; Start COPY only after a new claim is durably CAPTURING.  An existing claim
+;; returns an error before COPY; it cannot retransmit an earlier stage.
 (defun start-native-backup-lease-capture (stream command)
   (handler-case
       (progn

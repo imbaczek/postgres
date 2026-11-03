@@ -2,7 +2,7 @@
 
 ;;; Internal driver for a leased native base image.  READY proves the source
 ;;; image and its retained source position; it does not prove delivery to a
-;;; receiver.  There is no target installation or client interface here.
+;;; receiver.  Target installation and handoff are outside this driver.
 
 (defun physical-backup-lease-capture-active (owner)
   (with-live-operation
@@ -48,6 +48,8 @@
 ;; Hold reload exclusion through copying, verification, READY publication and
 ;; owner cleanup.  Copying also requires operation quiescence.  The caller
 ;; owns DIRECTORY and any partial contents; this driver does not delete them.
+;; ON-START runs only for a new claim, after CAPTURING is durable and before
+;; the long copy, allowing a wire caller to begin COPY within its deadline.
 (defun physical-backup-lease-capture (directory request &key on-start)
   (let ((request (physical-backup-lease-request-copy request)))
     (when (plusp *live-operation-depth*)

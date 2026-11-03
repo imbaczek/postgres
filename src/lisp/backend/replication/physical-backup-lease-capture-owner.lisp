@@ -2,7 +2,7 @@
 
 ;;; Internal capture ownership and lease status operations.  A request ID gets
 ;;; one capture claim; a retry returns its existing record without recapturing.
-;;; These operations do not provide a wire or client interface.
+;;; The wire and client interfaces use these same ownership operations.
 
 ;; The owner ties a capture to its backend, thread and source incarnation.
 ;; The registry and the durable record must still agree when it is used.
@@ -15,7 +15,8 @@
     (physical-backup-lease-current-record request)))
 
 ;; STATUS uses ordinary live-operation admission and can wait for a copy that
-;; has closed admission for quiescence.
+;; has closed admission for quiescence.  Recheck READY and durably interrupt a
+;; lease whose source retention is known lost, preserving its base identity.
 (defun physical-backup-lease-status (request)
   (let ((request (physical-backup-lease-request-copy request)))
     (with-live-operation

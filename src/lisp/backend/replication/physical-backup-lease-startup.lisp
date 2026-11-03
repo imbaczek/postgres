@@ -102,9 +102,9 @@
       (with-wal-publication-fence (begin-publication)
         (physical-backup-lease-finish-closing-under-lock request #'begin-publication)))))
 
-;; Missing or mismatched pin and origin metadata is a startup error.  A valid
-;; READY lease with an explicitly lost pin, a changed timeline, or a standby
-;; source instead becomes INTERRUPTED during reconciliation.
+;; Startup and STATUS share this READY check under write and WAL exclusion.
+;; Missing or mismatched pin, origin, or required WAL is an error.  An explicit
+;; pin loss, changed timeline, or standby source instead requests interruption.
 (defun physical-backup-lease-ready-action (record)
   (let* ((request (getf record :request))
          (base (getf record :base))

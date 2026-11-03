@@ -1,5 +1,20 @@
 # Development TODO
 
+- [x] Expose remote backup lease capture, status, cancellation and strict clients.
+  CAPTURE_BACKUP_NATIVE, BACKUP_LEASE_STATUS and BACKUP_LEASE_ABORT now have
+  source dispatch and strict clients. COPY completion follows stage cleanup;
+  READY status rechecks the pin, origin and required WAL. Fresh closeout passed
+  1,705 physical tests and strict compilation. Twelve focused tests passed;
+  final STATUS cancellation assertions and formatting were followed by another
+  three-test run. Earlier verification passed 903 unit tests, 201 wire tests
+  and 16 native scenario checks. The wire property passed 100 trials at seed 93,
+  digest `8aa4973e17643a0b`; input coverage and rejection counts were not measured.
+  Terra wrote the source documentation; primary and Sol reviews checked it
+  separately from the code review.
+  Evidence: `/home/imbaczek/proj/pg-ha-artifacts/backup-lease-wire/evidence.json`.
+  Target request persistence, frozen connection ownership, follow handoff and
+  preserved-data installation remain open; there is no coordination.
+
 - [x] Capture verified native backups under durable lease ownership.
   One runtime owner claims a new request; retries return status without
   recapturing. Recoverable errors and nonlocal exits interrupt unfinished
@@ -22,9 +37,10 @@
   READY, durable READY before memory publication, and later READY recovery;
   retained pins and checked aborts remained usable, and SQL writes resumed.
   Evidence: `/home/imbaczek/proj/pg-ha-artifacts/backup-lease-capture/evidence.json`.
-  These are internal source APIs. Remote capture/STATUS/ABORT commands and
-  clients, target attempt persistence, follow handoff and preserved-data reseed
-  installation remain open. No coordination is implemented.
+  These internal source APIs gained remote capture/STATUS/ABORT commands and
+  clients in the checkpoint above. Target attempt persistence, follow handoff
+  and preserved-data reseed installation remain open. No coordination is
+  implemented.
 
 - [x] Enforce backup lease pin ownership and reconcile leases at startup.
   Indexed names, including closed tombstones, reject ordinary pin creation,
@@ -42,7 +58,8 @@
   `03055e58a9eeb791`; input coverage and rejection counts were not measured.
   Evidence: `/home/imbaczek/proj/pg-ha-artifacts/backup-lease-authority/evidence.json`.
   Internal capture and checked STATUS/ABORT APIs followed in the checkpoint
-  above. Remote commands, follow handoff and target reseed remain open.
+  above. Remote commands followed later; follow handoff and target reseed
+  remain open.
 
 - [x] Add checked source backup request records and private durable publication.
   Request identity is immutable, interrupted capture cannot restart under the
@@ -58,7 +75,7 @@
   Evidence: `/home/imbaczek/proj/pg-ha-artifacts/backup-lease-codec/evidence.json`.
   At this checkpoint the records were internal metadata only. Pin authority,
   READY-to-pin/origin validation and startup wiring were added in the next
-  checkpoint above. Internal capture followed later; remote commands remain open.
+  checkpoint above. Internal capture and remote commands followed later.
 
 - [x] Add stopped-target ownership and a pre-PID fence for future full reseed.
   Only ESRCH proves that an existing PID is dead. Preserve its complete bytes
@@ -84,6 +101,33 @@
   attempt. Keep the source pin until a matching ready follow pin and durable
   target follow configuration own retention. Interrupted attempts must not
   silently recapture a different base under the same identity.
+
+- [ ] Persist the target's reseed request before its first remote operation.
+  Use the stopped-target owner, not the clean-adoption capability. Save the
+  original lease request and the accepted source route with its credential
+  owner in a private bounded record at `physical-reseed.attempt`. Reuse the
+  checked frozen-source representation; do not resolve a new host on retry.
+  Keep PID evidence and dirty data untouched. A missing manifest must still
+  permit STATUS and checked ABORT with the original request. Cover durable
+  publication cuts, reopen, changed local ownership, changed source route and
+  delayed capture after cancellation. This record must precede source capture;
+  the existing clean-adoption attempt is created too late and requires clean
+  control facts. Installation and retention handoff follow separately.
+  Use `:premanifest`, `:aborting` and `:aborted` as target intent phases; do not
+  guess source progress from a disconnected client. Open resumed operations
+  from the saved frozen credential owner, not merely a supplied connection at
+  the same route. UNKNOWN never authorizes recapture under the original ID.
+  Save abort intent before the source RPC; wait through CLOSING until the source
+  confirms CLOSED/ABORTED. The target's ABORTED record remains a startup fence:
+  canceled source retention does not make the old divergent primary safe to
+  start writable. Do not add journal retirement in this milestone.
+  Before any lease RPC, require exclusive temporary creation, file fsync,
+  rename, directory fsync and exact readback under the stopped-target owner.
+  Publication errors or nonlocal exits stop RPCs. Reopen the original record
+  conservatively; malformed or ambiguous final/temporary state cannot authorize
+  a new identity. Extend the pre-PID startup check to reject the reserved
+  temporary pathname too. A temporary-only failure precedes remote effects,
+  but it still marks an interrupted attempt and must not lift the local fence.
 
 - [x] Retire terminal adoption fences during real postmaster startup. A durable
   terminal RETIRE marker permits checked removal of handoff, install and attempt

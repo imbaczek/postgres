@@ -1,6 +1,16 @@
 (in-package #:pg)
 
+;;; Client primitives for native lease commands and bundle receipt.  Before
+;;; the first RPC, the caller must durably save the original lease ID, token,
+;;; source context, frozen route and credential owner.  The caller owns the
+;;; channel, empty target directory, and cleanup after errors.  These functions
+;;; do not journal the request, install the target, retry, or create a new ID.
+;;;
+;;; The helper closes its channel on any query error.  Reconnect to the
+;;; original frozen route to ask STATUS or ABORT after an uncertain result.
 
+;;; Here, helper refers to the libpq transport. A raw pg-client connection
+;;; remains open after an ordinary SQL error.
 (defun pg-client-native-backup-lease-literal (value)
   (unless (and (stringp value) (not (find (code-char 0) value)))
     (error "invalid native backup lease query value"))
@@ -28,6 +38,8 @@
                (format output "~a ~a" name (pg-client-native-backup-lease-literal value)))
       (write-char #\) output))))
 
+;; Validate the typed row and its owner.  UNKNOWN returns NIL; base and
+;; successor fields must each be entirely present or entirely null.
 (defun pg-client-native-backup-lease-record (row request)
   (let* ((request (physical-backup-lease-request-copy request))
          (row (physical-client-check-row row *physical-backup-lease-result-schema*))
@@ -97,6 +109,9 @@
       (pg-client-native-reject "native backup lease differs from the received image")))
   (physical-backup-lease-copy record))
 
+;; Receive into the caller's empty directory, verify the manifest, then check
+;; STATUS against the received image.  READY describes source retention at
+;; that check, not a permanent guarantee; follow or handoff must revalidate.
 (defun physical-backup-lease-capture-remote (directory channel request)
   (let ((request (physical-backup-lease-request-copy request))
         (target (physical-bootstrap-target directory)))

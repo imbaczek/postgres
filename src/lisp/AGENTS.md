@@ -190,6 +190,18 @@ appropriate instead of replacing the native C peer or adding a message relay.
 - Use `unwind-protect` to restore temporary `symbol-function` replacements and
   hooks; untrace after debugging. Release paused actors during cleanup. These
   changes live in a persistent image and otherwise contaminate later tests.
+- Distinguish the libpq helper from a raw `pg-client` when recovering a failed
+  query. The helper closes its channel on any command error; reconnect to the
+  saved route for STATUS or ABORT. A raw client can remain open after an ordinary
+  SQL error and its ReadyForQuery response. Do not assume the transports have
+  identical connection lifetimes.
+- SBCL abort-close can delete an output file created by that stream. For an
+  independent wire oracle that must survive an intentional abort, create and
+  close the file first, then reopen it with `:if-exists :overwrite`. Otherwise a
+  missing oracle file can hide the frames actually sent before the abort.
+- Canonicalize checked request plists before comparing their identity. Equivalent
+  plists can have different key order; the live received-image check exposed this
+  when native capture succeeded but STATUS binding rejected the same request.
 - Serialize forced ASDF rebuilds, FASL deletion, server startup/reload and the
   Emacs/SLIME formatter when they share an output cache. A formatter inferior
   exited during an overlapping rebuild in this session; a serialized retry
@@ -243,6 +255,10 @@ appropriate instead of replacing the native C peer or adding a message relay.
 - Use cl-mcp structural edits for Lisp. A rejected patch that would add an extra
   closing parenthesis leaves the source intact; correct the patch rather than
   bypassing that guard.
+- Current cl-mcp `lisp-edit-form` accepts comment-only `insert_before` and
+  `insert_after` content. Use it to add comments beside leading file trivia,
+  which `lisp-patch-form` cannot target because it patches within a definition.
+  Inspect the readback; the existing header remains in place.
 - Collapsed cl-mcp outlines can abbreviate long test names. Use a full raw Lisp
   read or runtime Rove metadata for exact selectors: one abbreviated name made a
   159-test selector batch fail immediately; corrected names ran all 159 tests.
