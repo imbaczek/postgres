@@ -25,6 +25,7 @@
                (:file "t/retained-overlap-tests")
                (:file "t/retained-project-tests")
                (:file "t/physical-bootstrap-tests")
+               (:file "t/physical-backup-lease-tests")
                (:file "t/export-origin-tests")
                (:file "t/physical-recovery-tests")
                (:file "t/auth-backup-tests")
