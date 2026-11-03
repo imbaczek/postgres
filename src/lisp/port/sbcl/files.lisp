@@ -118,12 +118,15 @@ callers needing a coherent view across publications must compare control images.
          (sb-posix:fsync fd)
       (sb-posix:close fd))))
 
-(defun directory-entry-names (path &key follow-symlinks)
+(defun directory-entry-names (path &key follow-symlinks maximum-entries maximum-name-bytes)
   "Return the raw entry names in PATH, or NIL if PATH is initially absent.
 
 Do not resolve child names; hidden entries and dangling links are included.
 FOLLOW-SYMLINKS permits the directory itself to be a symlink.  An enumeration
 error is reported rather than returning a partial inventory."
+  (unless (every (lambda (bound) (or (null bound) (typep bound '(integer 0 *))))
+                 (list maximum-entries maximum-name-bytes))
+    (error "invalid directory inventory bound"))
   (let* ((trimmed (string-right-trim "/" (namestring path)))
          (name (if (zerop (length trimmed)) "/" trimmed))
          (stat (handler-case (funcall (if follow-symlinks #'sb-posix:stat #'sb-posix:lstat) name)
@@ -135,14 +138,21 @@ error is reported rather than returning a partial inventory."
         (error "directory inventory requires an ordinary directory: ~a" path))
       (let ((directory (sb-posix:opendir name)))
         (unwind-protect
-             (loop for entry = (progn (sb-alien:set-errno 0) (sb-posix:readdir directory))
+             (loop with count = 0 and name-bytes = 0
+                   for entry = (progn (sb-alien:set-errno 0) (sb-posix:readdir directory))
                    for errno = (sb-alien:get-errno)
                    for item = (unless (sb-alien:null-alien entry) (sb-posix:dirent-name entry))
                    do (when (and (sb-alien:null-alien entry) (not (zerop errno)))
                         (error "could not read directory ~a: errno ~d" path errno))
                    until (sb-alien:null-alien entry)
                    unless (member item '("." "..") :test #'string=)
-                     collect item)
+                     do (when (or (and maximum-entries (> (incf count) maximum-entries))
+                                  (and maximum-name-bytes
+                                       (> (incf name-bytes
+                                                (length (sb-ext:string-to-octets item :external-format :utf-8)))
+                                          maximum-name-bytes)))
+                          (error "directory inventory exceeds its entry or name bound"))
+                     and collect item)
           (sb-posix:closedir directory))))))
 
 (defun durable-state-file-paths (directory type)

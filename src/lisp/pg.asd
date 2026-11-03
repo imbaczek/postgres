@@ -192,6 +192,7 @@
                    (:file "../replication/physical-adoption-proof")
                    (:file "../replication/physical-adoption-install-fs")
                    (:file "../replication/physical-reseed-image")
+                   (:file "../replication/physical-reseed-install-inventory")
                    (:file "../replication/physical-adoption-install-codec")
                    (:file "../replication/physical-adoption-install-image")
                    (:file "../replication/physical-adoption-install-journal")
