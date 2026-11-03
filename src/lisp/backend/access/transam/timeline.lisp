@@ -184,7 +184,7 @@ before applying EOR. This check grants neither recovery completion nor writer ad
   (format nil "~8,'0X.history" timeline))
 
 (defun timeline-history-path (timeline directory)
-  (merge-pathnames (concatenate 'string "pg_wal/" (timeline-history-filename timeline)) directory))
+  (pgdata-resolve-path (concatenate 'string "pg_wal/" (timeline-history-filename timeline)) directory))
 
 (defun timeline-encode-history (child parent switchpoint reason parent-bytes)
   "Copy parent bytes and append C writeTimeLineHistory's exact split-line layout.
@@ -225,7 +225,8 @@ Native ancestry requires the parent history and a forward fork; no role is chang
   (let* ((path (timeline-history-path timeline directory))
          (fd (handler-case
                  (sb-posix:open (namestring path)
-                                (logior sb-posix:o-rdonly sb-posix:o-nonblock +postmaster-o-cloexec+))
+                                (logior sb-posix:o-rdonly sb-posix:o-nonblock +postmaster-o-cloexec+
+                                        (if *physical-image-context* sb-posix:o-nofollow 0)))
                (sb-posix:syscall-error (condition)
                  (ereport (if (= (sb-posix:syscall-errno condition) sb-posix:enoent) "58P01" "58030")
                           "could not open timeline history file ~s" (namestring path)))))

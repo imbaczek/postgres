@@ -622,34 +622,52 @@ The slot is dropped on every exit; a verified origin remains after cancellation.
         (error "native backup bundle file disagrees with its manifest or bound"))
       (values size digest))))
 
+(defun physical-backup-receive-file-content (size expected-digest next output)
+  (let ((digest #xCBF29CE484222325))
+    (loop with remaining = size
+          while (plusp remaining)
+          for frame = (physical-backup-read-frame next)
+          for count = (1- (length frame))
+          do (unless (and (= (aref frame 0) (char-code #\D)) (<= 1 count remaining))
+               (error "invalid native backup file data extent"))
+             (let ((bytes (subseq frame 1)))
+               (setf digest (physical-store-update-digest digest bytes))
+               (write-sequence bytes output))
+             (decf remaining count))
+    (let ((end (physical-backup-read-frame next)))
+      (unless (and (= (length end) 1) (= (aref end 0) (char-code #\E))
+                   (= expected-digest digest))
+        (error "native backup file end or checksum is invalid")))
+    digest))
+
 (defun physical-backup-receive-file (directory name maximum next &key expected (timeline 1))
   (unless (physical-backup-bundle-path-p name timeline)
     (error "invalid native backup destination path"))
   (multiple-value-bind (size expected-digest)
       (physical-backup-file-header (physical-backup-read-frame next) name maximum expected)
-    (let* ((path (merge-pathnames name directory))
-           (parent (uiop:pathname-directory-pathname path))
-           (digest #xCBF29CE484222325))
-      (wal-ensure-directory-durable parent)
-      (with-open-file (output path :direction :output :if-exists :error
-                                   :if-does-not-exist :create :element-type '(unsigned-byte 8))
-        (loop with remaining = size
-              while (plusp remaining)
-              for frame = (physical-backup-read-frame next)
-              for count = (1- (length frame))
-              do (unless (and (= (aref frame 0) (char-code #\D)) (<= 1 count remaining))
-                   (error "invalid native backup file data extent"))
-                 (let ((bytes (subseq frame 1)))
-                   (setf digest (physical-store-update-digest digest bytes))
-                   (write-sequence bytes output))
-                 (decf remaining count))
-        (let ((end (physical-backup-read-frame next)))
-          (unless (and (= (length end) 1) (= (aref end 0) (char-code #\E))
-                       (= expected-digest digest))
-            (error "native backup file end or checksum is invalid")))
-        (fsync-stream output))
-      (fsync-directory parent)
+    (let ((digest
+            (if *physical-image-context*
+                (call-with-physical-image-output
+                 directory name
+                 (lambda (output)
+                   (physical-backup-receive-file-content size expected-digest next output)))
+                (let* ((path (merge-pathnames name directory))
+                       (parent (uiop:pathname-directory-pathname path))
+                       (digest nil))
+                  (wal-ensure-directory-durable parent)
+                  (with-open-file (output path :direction :output :if-exists :error
+                                               :if-does-not-exist :create :element-type '(unsigned-byte 8))
+                    (setf digest (physical-backup-receive-file-content size expected-digest next output))
+                    (fsync-stream output))
+                  (fsync-directory parent)
+                  digest))))
       (list name size digest))))
+
+(defun physical-backup-check-received-inventory (directory manifest)
+  (when *physical-image-context*
+    (physical-image-check-inventory
+     directory (append (mapcar #'first (physical-backup-metadata-bounds))
+                       (mapcar #'first (getf manifest :files))))))
 
 ;; Bound the file count and metadata sizes before receiving the manifest and
 ;; its inventory.  Check order, paths, sizes and checksums, then verify the
@@ -687,7 +705,8 @@ The slot is dropped on every exit; a verified origin remains after cancellation.
               (unless (zerop (getf (physical-recovery-read-control directory) :phase))
                 (error "native backup bundle is not an immutable base image"))
               (physical-recovery-verify-base-state)
-              (authentication-check-backup-policy directory))
+              (authentication-check-backup-policy directory)
+              (physical-backup-check-received-inventory directory manifest))
             manifest))))))
 
 (defun physical-backup-destination (directory)

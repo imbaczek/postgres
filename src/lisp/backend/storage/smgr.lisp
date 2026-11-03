@@ -6,7 +6,7 @@
 (defvar *smgr-lock* (sb-thread:make-mutex :name "pg smgr lock"))
 
 (defun relation-file-path (relfilenode &optional (fork :main))
-  (merge-pathnames
+  (pgdata-resolve-path
    (format nil "base/~a~a" relfilenode
            (case fork
              (:main "")

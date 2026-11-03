@@ -277,7 +277,7 @@ or :QUERY-STATE for the wire dispatch's existing reload/shutdown cleanup lane."
 ;;; ---- pg_control: nextXid, fsynced write-ahead of XID allocation ----
 
 (defun pgdata-path (relative)
-  (merge-pathnames relative *pgdata*))
+  (pgdata-resolve-path relative *pgdata*))
 
 (defun control-path ()
   (pgdata-path "global/pg_control"))
@@ -295,7 +295,7 @@ or :QUERY-STATE for the wire dispatch's existing reload/shutdown cleanup lane."
   (let ((path (control-path)))
     (if (probe-file path)
         (handler-case
-            (with-open-file (s path :direction :input :if-does-not-exist nil)
+            (with-physical-image-input (s path :direction :input :if-does-not-exist nil)
               (let* ((line (read-line s nil nil))
                      (xid (and line (parse-integer line :junk-allowed nil))))
                 (unless (and xid

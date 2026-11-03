@@ -109,19 +109,28 @@
       (pg-client-native-reject "native backup lease differs from the received image")))
   (physical-backup-lease-copy record))
 
+(defun physical-backup-lease-receive-remote (target channel request)
+  (physical-libpq-start-copy-out channel
+                                 (pg-client-native-backup-lease-query "CAPTURE_BACKUP_NATIVE" request))
+  (let ((manifest (physical-backup-receive-bundle
+                   target (lambda () (physical-backup-next-copy-frame channel "CAPTURE_BACKUP_NATIVE")))))
+    (physical-backup-finish-copy channel "CAPTURE_BACKUP_NATIVE")
+    (multiple-value-bind (actual digest) (recovery-read-manifest target)
+      (unless (equal manifest actual) (pg-client-native-reject "received backup manifest changed"))
+      (let ((record (physical-backup-lease-check-received-status
+                     actual digest request (pg-client-native-backup-lease-status channel request))))
+        (physical-backup-check-received-inventory target manifest)
+        (values manifest record)))))
+
 ;; Receive into the caller's empty directory, verify the manifest, then check
 ;; STATUS against the received image.  READY describes source retention at
 ;; that check, not a permanent guarantee; follow or handoff must revalidate.
-(defun physical-backup-lease-capture-remote (directory channel request)
+(defun physical-backup-lease-capture-remote (directory channel request &key directory-fd)
   (let ((request (physical-backup-lease-request-copy request))
         (target (physical-bootstrap-target directory)))
-    (physical-libpq-start-copy-out channel
-                                   (pg-client-native-backup-lease-query "CAPTURE_BACKUP_NATIVE" request))
-    (let ((manifest (physical-backup-receive-bundle
-                     target (lambda () (physical-backup-next-copy-frame channel "CAPTURE_BACKUP_NATIVE")))))
-      (physical-backup-finish-copy channel "CAPTURE_BACKUP_NATIVE")
-      (multiple-value-bind (actual digest) (recovery-read-manifest target)
-        (unless (equal manifest actual) (pg-client-native-reject "received backup manifest changed"))
-        (let ((record (physical-backup-lease-check-received-status
-                       actual digest request (pg-client-native-backup-lease-status channel request))))
-          (values manifest record))))))
+    (if directory-fd
+        (progn
+          (physical-image-check-target target directory-fd)
+          (call-with-physical-backup-receive-directory
+           directory-fd (lambda (anchored) (physical-backup-lease-receive-remote anchored channel request))))
+        (physical-backup-lease-receive-remote target channel request))))

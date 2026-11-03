@@ -545,7 +545,7 @@ cleanup, ordinary sequence and maintenance saves do not use this marker."
 (defun load-catalog ()
   (let ((path (catalog-path)))
     (if (probe-file path)
-        (with-open-file (s path :direction :input :if-does-not-exist nil)
+        (with-physical-image-input (s path :direction :input :if-does-not-exist nil)
           (if s
               (with-standard-io-syntax
                 (let ((*read-eval* nil))

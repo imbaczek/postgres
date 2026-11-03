@@ -14,7 +14,8 @@
     :components ((:module "sbcl"
                   :serial t
                   :components ((:file "sockets")
-                               (:file "files")))))
+                               (:file "files")
+                               (:file "physical-image")))))
    (:module "backend"
     :serial t
     :components

@@ -65,6 +65,7 @@
                (:file "t/physical-adoption-startup-tests")
                (:file "t/physical-reseed-owner-tests")
                (:file "t/physical-reseed-attempt-tests")
+               (:file "t/physical-image-tests")
                (:file "t/physical-reseed-stage-tests")
                (:file "t/physical-adoption-retire-tests")
                (:file "t/physical-adoption-startup-entry-tests")

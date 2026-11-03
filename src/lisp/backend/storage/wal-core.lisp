@@ -479,7 +479,7 @@ short check alone cannot do so."
                     database-tables database-indexes catalog-databases))
 
 (defun wal-directory ()
-  (merge-pathnames "pg_wal/" *pgdata*))
+  (pgdata-resolve-path "pg_wal/" *pgdata*))
 
 (defun wal-parent-directory (directory)
   (let* ((path (pathname directory))
@@ -538,7 +538,7 @@ Legacy 16-hex segment names always belong to timeline 1."
   (merge-pathnames (wal-segment-filename segment timeline namespace) (wal-directory)))
 
 (defun wal-control-path ()
-  (merge-pathnames "global/pg_wal_control" *pgdata*))
+  (pgdata-resolve-path "global/pg_wal_control" *pgdata*))
 
 (defun wal-replication-slot-directory ()
   (merge-pathnames "pg_replslot/" *pgdata*))

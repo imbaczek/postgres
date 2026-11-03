@@ -82,13 +82,20 @@ component fixtures retain their explicit rule trees."
 
 (defun authentication-read-text (path)
   "Read at most 1 MiB from a bounded regular file and decode it as UTF-8."
-  (with-open-stream (stream (startup-open-config path 1048576))
-    (let* ((buffer (make-string 1048577))
-           (count (read-sequence buffer stream)))
-      (when (> count 1048576) (error "authentication input exceeds 1 MiB: ~a" path))
-      (sb-ext:octets-to-string
-       (map '(vector (unsigned-byte 8)) #'char-code (subseq buffer 0 count))
-       :external-format :utf-8))))
+  (labels ((read-text (stream)
+             (let* ((buffer (make-string 1048577))
+                    (count (read-sequence buffer stream)))
+               (when (> count 1048576) (error "authentication input exceeds 1 MiB: ~a" path))
+               (sb-ext:octets-to-string
+                (map '(vector (unsigned-byte 8)) #'char-code (subseq buffer 0 count))
+                :external-format :utf-8))))
+    (if *physical-image-context*
+        (with-physical-image-input (stream path :external-format :latin-1)
+          (when (> (physical-image-stream-length stream) 1048576)
+            (error "authentication input exceeds 1 MiB: ~a" path))
+          (read-text stream))
+        (with-open-stream (stream (startup-open-config path 1048576))
+          (read-text stream)))))
 
 (defun hba-read-file (path)
   "Return parsed HBA rules and their source text as two values."
