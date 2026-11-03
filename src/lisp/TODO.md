@@ -299,6 +299,30 @@
   must precede progress-tail repair, with full image verification before the
   terminal step. The codec supplies the record format for that implementation.
 
+- [x] Hold guarded incoming and quarantine directories for reseed installation.
+  A checked scope retains target and auxiliary descriptors, directory and startup
+  file locks, private single-link guards, and exact guard bytes and identities.
+  Reopening requires saved guard facts. Fresh descriptor mount IDs must match
+  the held target mount. Preparation checks ordinary stopped ownership before
+  guard creation and before the callback, then permits common ownership checks
+  after the callback so future journal publication can supersede that role.
+  The scope revokes its check closure on exit and returns independent copies of
+  facts. Guard files remain after errors or nonlocal exits.
+  Guarded image inventory admits only the two fixed root guard names under a
+  descriptor scope. Default receipt and all child inventories remain strict.
+  The future publisher must check guard identities and contents around image
+  verification and sync copied image files before creating the root journal.
+  All 1,800 distinct physical tests, ten new Rove tests, 95 focused checks and
+  fresh strict compilation passed.
+  Tests cover both locks, saved reopen, scope/thread revocation, mutable copies,
+  three arriving-intent cuts, directory replacement, guard corruption and unsafe
+  guard entry kinds. Luna and Sol reviewed the code. Sol found no useful macro
+  refactor. Terra wrote the comments, followed by primary and separate Sol review.
+  Evidence is in
+  `/home/imbaczek/proj/pg-ha-artifacts/reseed-install-publication/auxiliary-evidence.json`.
+  Guarded initial journal publication and install ownership remain the next
+  coupled milestone, followed by moves and progress recovery.
+
 - [ ] Add explicit reconciliation for a partial cancellation attempt temporary.
   A valid final attempt can identify the original source, but existing recovery
   keeps a partial or malformed `physical-reseed.attempt.tmp` fenced before RPC.

@@ -51,6 +51,10 @@
 ;; metadata files as well as manifest files.  Rechecking against EXPECTED detects
 ;; changes during preparation; it is not durable installation proof.
 
+;; The optional reseed installation flag defaults to NIL.  When true, the
+;; descriptor inventory admits the auxiliary guard names at the root.  The
+;; auxiliary scope must check their bytes and identities before and after this
+;; image verification.
 (defun physical-reseed-image-check (directory &optional expected reseed-installation)
   (multiple-value-bind (manifest digest) (recovery-read-manifest directory)
     (recovery-check-manifest-schema manifest)

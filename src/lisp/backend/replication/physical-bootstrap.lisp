@@ -672,6 +672,10 @@ The slot is dropped on every exit; a verified origin remains after cancellation.
 ;; The descriptor route checks all received names, including metadata, against
 ;; the manifest.  This snapshot is not a substitute for an installation check.
 
+;; Reseed installation mode requires a descriptor scope and admits only the two
+;; auxiliary guard names at the root.  Child inventories remain strict.
+;; A future caller must check guard contents and identities before and after
+;; image verification.
 (defun physical-backup-check-received-inventory (directory manifest &key reseed-installation)
   (unless (member reseed-installation '(nil t)) (error "invalid reseed installation inventory mode"))
   (when (and reseed-installation (null *physical-image-context*))

@@ -1,3 +1,14 @@
+;;;-------------------------------------------------------------------------
+;;;
+;;; physical-reseed-install-auxiliary.lisp
+;;;   Hold and check a guarded physical reseed auxiliary directory.
+;;;
+;;; The scope holds the target root and auxiliary directory descriptors, a
+;;; directory lock, and the startup lock.  It checks both guard files and
+;;; their named identities throughout the callback.  These facts support a
+;;; future installation publisher and do not publish a journal or move files.
+;;;
+;;;-------------------------------------------------------------------------
 (in-package #:pg)
 
 (defparameter *physical-reseed-install-guard-text* "offline reseed auxiliary directory")
@@ -14,6 +25,8 @@
     ((equal name "physical-reseed.install") (string->bytes *physical-reseed-install-guard-text*))
     (t (error "unexpected reseed auxiliary guard name"))))
 
+;; Create or open a guard without following symlinks.  Hold the startup lock
+;; for the scope and sync each newly written guard before returning control.
 (defun call-with-physical-reseed-install-guard (directory-fd name prepare function)
   (let ((fd nil) (stream nil) (bytes (physical-reseed-install-guard-bytes name)))
     (unwind-protect
@@ -39,6 +52,8 @@
            (funcall function stream))
       (if stream (close stream) (when fd (sb-posix:close fd))))))
 
+;; Check private metadata, exact contents, mount and the identities of both
+;; the held file and its name.  Recheck after reading to detect replacement.
 (defun physical-reseed-install-guard-facts (directory-fd stream name device mount)
   (let* ((fd (sb-sys:fd-stream-fd stream))
          (path (merge-pathnames name (physical-image-fd-path directory-fd)))
@@ -71,6 +86,9 @@
      (list :directory (namestring directory) :device (sb-posix:stat-dev stat) :inode (sb-posix:stat-ino stat))
      (physical-reseed-attempt-local-evidence owner))))
 
+;; Collect owned copies of the directory and guard identities after checking
+;; the held root and auxiliary directory.  Reject aliases of the owned root
+;; and its lock.
 (defun physical-reseed-install-auxiliary-facts (owner root-fd directory fd lock fence)
   (let* ((local (physical-reseed-attempt-local-evidence owner))
          (base (physical-reseed-install-auxiliary-base-facts owner root-fd directory fd))
@@ -85,6 +103,20 @@
                    :fence-inode (physical-reseed-install-guard-facts fd fence "physical-reseed.install" device mount)))
      local identities)))
 
+;; Prepare guards under ordinary stopped ownership or reopen saved guard facts.
+;; Preparation checks the full owner role after each test point and before the
+;; callback.  It syncs the guard files, auxiliary directory and naming ancestors
+;; before the callback can use the directory.
+;;
+;; The callback receives the directory, copied facts, held directory descriptor
+;; and a check function.  The check is valid only in this scope and under the
+;; owner's thread and lifetime rules.  It checks common root ownership and the
+;; saved directory and guard facts.  Reopening leaves role authority with the
+;; caller.  The post-callback check also uses common ownership, allowing a future
+;; publisher to supersede the ordinary role during the callback.
+;;
+;; Guard files remain in place on a nonlocal exit.  Their removal and eventual
+;; publication of an installation journal belong to later work.
 (defun call-with-physical-reseed-install-auxiliary (owner directory function &key prepare empty expected)
   (unless (physical-reseed-owner-p owner) (error "reseed auxiliary requires stopped directory ownership"))
   (when prepare
