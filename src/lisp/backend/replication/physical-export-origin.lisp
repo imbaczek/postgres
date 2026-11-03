@@ -258,6 +258,9 @@ The reservation binds these values to this exact export and source incarnation."
     (physical-export-origin-note-image token manifest digest))
   manifest)
 
+;; Read back the produced manifest and verify the immutable base against the
+;; reserved source identity, endpoint B and manifest digest M.  Return the
+;; candidate receipt without publishing it; the caller controls publication.
 (defun physical-export-origin-verify-backup (directory manifest token)
   (multiple-value-bind (actual digest) (recovery-read-manifest directory)
     (unless (and (equal manifest actual)

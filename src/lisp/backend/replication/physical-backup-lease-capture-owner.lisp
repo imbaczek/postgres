@@ -1,5 +1,11 @@
 (in-package #:pg)
 
+;;; Internal capture ownership and lease status operations.  A request ID gets
+;;; one capture claim; a retry returns its existing record without recapturing.
+;;; These operations do not provide a wire or client interface.
+
+;; The owner ties a capture to its backend, thread and source incarnation.
+;; The registry and the durable record must still agree when it is used.
 (defstruct physical-backup-lease-capture-owner request backend thread namespace incarnation)
 
 (defun physical-backup-lease-status-under-lock (request)
@@ -8,6 +14,8 @@
   (when (physical-backup-lease-record-under-lock (getf request :name))
     (physical-backup-lease-current-record request)))
 
+;; STATUS uses ordinary live-operation admission and can wait for a copy that
+;; has closed admission for quiescence.
 (defun physical-backup-lease-status (request)
   (let ((request (physical-backup-lease-request-copy request)))
     (with-live-operation
@@ -39,6 +47,8 @@
             (setf (gethash (copy-seq name) *physical-backup-lease-capture-owners*) owner)
             (values published owner)))))))
 
+;; Caller holds write and WAL exclusion.  Check the dynamic and registered
+;; owner, source context, phase, and matching durable record before proceeding.
 (defun physical-backup-lease-check-capture-owner (owner &optional (phases '(:capturing)))
   (physical-backup-lease-require-locks)
   (unless (and (physical-backup-lease-capture-owner-p owner)
@@ -66,6 +76,16 @@
           (physical-backup-lease-publish-checked-under-lock
            record (physical-backup-lease-transition record next) #'begin-publication))))))
 
+;; Claim once, enter CAPTURING, and run FUNCTION with the owner.  The copied
+;; request is the private cleanup key even if FUNCTION changes the owner's
+;; request.  The local cleanup functions are not passed to FUNCTION.
+;;
+;; On error or nonlocal exit, interrupt an unfinished capture if WAL is healthy.
+;; Otherwise leave the durable record for cold startup; retain any private pin.
+;; A pending CLOSING intent is completed after releasing the
+;; owner.  The final unregister is also attempted if durable cleanup fails,
+;; including when WAL is poisoned; it does not remove the pin in that case.
+;; This scope alone does not hold reload exclusion for FUNCTION's work.
 (defun call-with-physical-backup-lease-capture (request function)
   (let ((request (physical-backup-lease-request-copy request)))
     (when (plusp *live-operation-depth*)
@@ -113,6 +133,10 @@
               (unwind-protect (finish-owner)
                 (release-owner)))))))))
 
+;; Persist CLOSING before retiring the pin.  If a capture owner is active,
+;; leave retirement to its cleanup after the owner has stopped using it.
+;; ABORT uses ordinary admission, so it is not an out-of-band way to preempt
+;; a copy holding quiescence.
 (defun physical-backup-lease-abort (request)
   (let ((request (physical-backup-lease-request-copy request)))
     (with-live-operation

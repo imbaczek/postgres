@@ -415,6 +415,7 @@ outside the immutable file inventory. New manifests require these adjuncts."
       (when export-slot
         (physical-bootstrap-check-export-slot export-slot pin-name (wal-checkpoint-record-start)))
       ;; Local backup failure retains its private pin for operator inspection.
+      ;; Leased copies keep their pin after capture; checked lease retirement removes it.
       ;; Remote export owns a temporary slot and drops it in its outer cleanup.
       (physical-bootstrap-mark-target target)
       (physical-recovery-mark-target target)

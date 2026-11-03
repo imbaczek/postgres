@@ -1,5 +1,31 @@
 # Development TODO
 
+- [x] Capture verified native backups under durable lease ownership.
+  One runtime owner claims a new request; retries return status without
+  recapturing. Recoverable errors and nonlocal exits interrupt unfinished
+  attempts. Poisoned-WAL cleanup leaves the durable record for cold startup;
+  both paths keep any private retention pin. ABORT saves closing intent first
+  and defers pin removal until the capture owner exits. Cleanup keeps its own
+  request copy and cannot be called early through the callback's owner token.
+  The driver holds reload exclusion through copying, verification, publication
+  and owner cleanup. It checks the actual base, manifest, source and pin, then
+  publishes the origin and READY under one WAL fence. READY proves source
+  capture, not delivery to a receiver. STATUS/ABORT use ordinary admission and
+  wait while copying holds quiescence.
+  Validation passed 1,694 physical tests, 903 unit tests, 201 wire tests,
+  82 selected tests and strict fresh compilation. Ten new tests cover ownership,
+  retries, cancellation and cleanup. The ownership-context property passed 100
+  trials at seed 92, digest `a137ea3f9125d99e`; input coverage and rejection
+  counts were not measured. A real server captured SQL data, rejected recapture
+  into the nonempty stage, and canceled after copying and after verification
+  without publishing an origin. Three SIGKILL/restarts covered origin-before-
+  READY, durable READY before memory publication, and later READY recovery;
+  retained pins and checked aborts remained usable, and SQL writes resumed.
+  Evidence: `/home/imbaczek/proj/pg-ha-artifacts/backup-lease-capture/evidence.json`.
+  These are internal source APIs. Remote capture/STATUS/ABORT commands and
+  clients, target attempt persistence, follow handoff and preserved-data reseed
+  installation remain open. No coordination is implemented.
+
 - [x] Enforce backup lease pin ownership and reconcile leases at startup.
   Indexed names, including closed tombstones, reject ordinary pin creation,
   streaming, feedback and release. Checked retirement requires the exact durable
@@ -15,7 +41,8 @@
   The ownership property passed 100 trials at seed 91, digest
   `03055e58a9eeb791`; input coverage and rejection counts were not measured.
   Evidence: `/home/imbaczek/proj/pg-ha-artifacts/backup-lease-authority/evidence.json`.
-  Capture, STATUS/ABORT commands, follow handoff and target reseed remain open.
+  Internal capture and checked STATUS/ABORT APIs followed in the checkpoint
+  above. Remote commands, follow handoff and target reseed remain open.
 
 - [x] Add checked source backup request records and private durable publication.
   Request identity is immutable, interrupted capture cannot restart under the
@@ -31,7 +58,7 @@
   Evidence: `/home/imbaczek/proj/pg-ha-artifacts/backup-lease-codec/evidence.json`.
   At this checkpoint the records were internal metadata only. Pin authority,
   READY-to-pin/origin validation and startup wiring were added in the next
-  checkpoint above; capture and STATUS/ABORT commands remain open.
+  checkpoint above. Internal capture followed later; remote commands remain open.
 
 - [x] Add stopped-target ownership and a pre-PID fence for future full reseed.
   Only ESRCH proves that an existing PID is dead. Preserve its complete bytes

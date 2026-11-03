@@ -5,8 +5,8 @@
 ;;; ordinary pin operations must not reuse those names.  These checks also
 ;;; protect the origin receipt until the lease reaches CLOSED.
 ;;;
-;;; This module supplies the ownership checks and pin creation primitive; it
-;;; does not implement a capture owner or a backup command interface.
+;;; This module supplies the ownership checks and pin creation primitive; the
+;;; capture owner is managed separately from any backup command interface.
 
 ;; The caller holds WAL exclusion while using the record or making a decision
 ;; based on it.  Publication also requires write exclusion.
@@ -21,8 +21,8 @@
 
 (declaim (ftype function physical-backup-lease-check-capture-owner))
 
-;; A lease may create its pin only for the exact CAPTURING request, while the
-;; caller owns operation quiescence and the matching record is still on disk.
+;; A lease may create its pin only for the exact CAPTURING request and owner,
+;; while the caller owns quiescence and the matching record is still on disk.
 ;; Ordinary creation may not take any name in the lease inventory.
 (defun physical-backup-lease-check-pin-create (name request)
   (let ((record (physical-backup-lease-record-under-lock name)))

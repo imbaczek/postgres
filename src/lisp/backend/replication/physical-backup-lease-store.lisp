@@ -10,6 +10,8 @@
 ;;; using the loaded records and reconciles them with pins and origins.
 (defvar *physical-backup-lease-records* (make-hash-table :test #'equal))
 
+;; Active owners are process-local and protected by write and WAL exclusion.
+;; The durable record, rather than this registry, reserves a name at restart.
 (defvar *physical-backup-lease-capture-owners* (make-hash-table :test #'equal))
 
 (defvar *physical-backup-lease-capture-owner* nil)

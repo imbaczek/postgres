@@ -1,5 +1,9 @@
 (in-package #:pg)
 
+;;; Internal driver for a leased native base image.  READY proves the source
+;;; image and its retained source position; it does not prove delivery to a
+;;; receiver.  There is no target installation or client interface here.
+
 (defun physical-backup-lease-capture-active (owner)
   (with-live-operation
     (with-write-lock
@@ -17,6 +21,9 @@
              target (getf request :name) :lease-request request)
      reservation)))
 
+;; Recheck the owner, source context, and exact retained pin under write and WAL
+;; exclusion.  Install the verified origin and publish READY under the same
+;; WAL publication fence, so failure cannot expose an unsafe memory state.
 (defun physical-backup-lease-publish-capture (owner reservation origin manifest digest)
   (with-live-operation
     (with-write-lock
@@ -38,6 +45,9 @@
           (physical-backup-lease-test-point :after-capture-origin next)
           (physical-backup-lease-publish-checked-under-lock record next #'begin-publication))))))
 
+;; Hold reload exclusion through copying, verification, READY publication and
+;; owner cleanup.  Copying also requires operation quiescence.  The caller
+;; owns DIRECTORY and any partial contents; this driver does not delete them.
 (defun physical-backup-lease-capture (directory request)
   (let ((request (physical-backup-lease-request-copy request)))
     (when (plusp *live-operation-depth*)
