@@ -1,9 +1,18 @@
 (in-package #:pg)
 
+;; The attempt freezes the original lease request, physical source connection,
+;; and stopped local directory, lock, and PID evidence before a future lease RPC.
+;; It is a foundation for reconciliation, not a driver or installation authority.
+;; The source contains reversible credentials and the request contains a bearer
+;; token.  Never log the record or its encoded bytes.
+
 (defconstant +physical-reseed-attempt-maximum-bytes+ (* 3 1024 1024))
 
 (defparameter *physical-reseed-attempt-keys* '(:version :phase :local :request :source))
 (defparameter *physical-reseed-local-keys* '(:directory :device :inode :lock-device :lock-inode :pid))
+
+;; Preserve the complete PID file as opaque evidence.  A negative single-user
+;; PID is normalized only for liveness checks, never in the saved bytes.
 
 (defun physical-reseed-attempt-pid-copy (pid)
   (when pid
@@ -55,6 +64,9 @@
       (error "reseed attempt exceeds its private record bound"))
     image))
 
+;; The checksum, literal parser, and canonical re-encoding validate structure.
+;; They do not establish that the source is live or the control file is clean.
+
 (defun physical-reseed-attempt-decode (bytes)
   (unless (and (typep bytes '(vector (unsigned-byte 8)))
                (<= (length bytes) +physical-reseed-attempt-maximum-bytes+))
@@ -74,6 +86,9 @@
           (error "noncanonical reseed attempt record"))
         record))))
 
+;; Phases describe durable intent.  Keep all other fields fixed so a retry
+;; cannot silently select another request, source, or local PID generation.
+
 (defun physical-reseed-attempt-check-transition (previous candidate)
   (let* ((previous (physical-reseed-attempt-copy previous))
          (candidate (physical-reseed-attempt-copy candidate))
@@ -85,6 +100,9 @@
                      (member (list old new) '((:premanifest :aborting) (:aborting :aborted)) :test #'equal)))
       (error "reseed attempt cannot rebind or reverse its saved intent"))
     t))
+
+;; Bind the attempt to the stopped root, its held lock, and exact PID evidence.
+;; This ownership does not confer the clean-adoption capability.
 
 (defun physical-reseed-attempt-local-facts (owner)
   (physical-reseed-check-owner owner)

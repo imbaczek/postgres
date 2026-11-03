@@ -11,6 +11,9 @@
 (defun physical-reseed-attempt-temporary-path (&optional (directory *pgdata*))
   (merge-pathnames "physical-reseed.attempt.tmp" directory))
 
+;; Check both names before any PID mutation.  Even a completed abort remains a
+;; fence until a later reconciliation protocol decides what to do with it.
+
 (defun physical-reseed-check-before-pid ()
   "Refuse startup on any attempt entry before changing PID metadata."
   (dolist (path (list (physical-reseed-attempt-path) (physical-reseed-attempt-temporary-path)))

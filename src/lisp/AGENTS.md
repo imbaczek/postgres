@@ -209,6 +209,10 @@ appropriate instead of replacing the native C peer or adding a message relay.
   truncated or a poll timed out; check the original process/session first.
 - Repeated recompilation exhausted immobile code space in one long-lived SBCL
   worker. A full `(sb-ext:gc :full t)` recovered it without resetting the worker.
+- A replacement cl-mcp worker loses tracked child-process handles. Check the
+  original PID and log before starting another run. An absent PID and an
+  incomplete or NUL-padded log do not prove success; preserve that log and record
+  the exit as unknown. A fresh verification run needs its own log and handle.
 
 ### Network deadlines and live socket inspection
 

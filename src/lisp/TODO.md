@@ -1,5 +1,26 @@
 # Development TODO
 
+- [x] Add the stopped-target reseed journal foundation.
+  Freeze the original lease request, physical source settings and credential
+  owner, and local directory/lock/PID evidence in a canonical private record.
+  Publication uses exclusive temporary creation, file sync, rename, directory
+  sync and exact readback. Reopen only under the same stopped ownership.
+  Complete temporary records can finish a valid transition; partial or malformed
+  entries remain fenced. Both names refuse startup before PID mutation.
+  ABORTED publication requires a caller-supplied typed CLOSED/ABORTED receipt
+  for the original request; live observation belongs to the future RPC driver.
+  Recovery can finish an already receipt-checked complete temporary publication.
+  ABORTED retains the startup fence because the old divergent tree remains.
+  Validation passed a fresh 1,718-test physical run before the final receipt
+  guard, followed by all 15 new tests with that guard, including 24 SIGKILL cuts
+  and 24 fresh-image reopens, and fresh strict compilation. The codec property
+  passed 100 trials at seed 94, digest `50e18d5e3bfcd5b3`; input coverage and
+  rejection counts were not measured. An earlier interrupted full run is not
+  counted as a pass. Evidence:
+  `/home/imbaczek/proj/pg-ha-artifacts/reseed-attempt/evidence.json`.
+  Connecting this journal to remote capture/status/cancellation, binding the
+  receive stage, preserved-data installation and follow handoff remain open.
+
 - [x] Expose remote backup lease capture, status, cancellation and strict clients.
   CAPTURE_BACKUP_NATIVE, BACKUP_LEASE_STATUS and BACKUP_LEASE_ABORT now have
   source dispatch and strict clients. COPY completion follows stage cleanup;
@@ -12,8 +33,9 @@
   Terra wrote the source documentation; primary and Sol reviews checked it
   separately from the code review.
   Evidence: `/home/imbaczek/proj/pg-ha-artifacts/backup-lease-wire/evidence.json`.
-  Target request persistence, frozen connection ownership, follow handoff and
-  preserved-data installation remain open; there is no coordination.
+  Target journal persistence followed in the checkpoint above. Connecting it
+  to the remote commands, follow handoff and preserved-data installation remain
+  open; there is no coordination.
 
 - [x] Capture verified native backups under durable lease ownership.
   One runtime owner claims a new request; retries return status without
@@ -102,7 +124,7 @@
   target follow configuration own retention. Interrupted attempts must not
   silently recapture a different base under the same identity.
 
-- [ ] Persist the target's reseed request before its first remote operation.
+- [ ] Connect the target journal to one-shot remote capture and cancellation.
   Use the stopped-target owner, not the clean-adoption capability. Save the
   original lease request and the accepted source route with its credential
   owner in a private bounded record at `physical-reseed.attempt`. Reuse the
@@ -128,6 +150,14 @@
   a new identity. Extend the pre-PID startup check to reject the reserved
   temporary pathname too. A temporary-only failure precedes remote effects,
   but it still marks an interrupted attempt and must not lift the local fence.
+  Expose CAPTURE only through a new-start entrypoint that requires both journal
+  names absent. Reopening or recovering any journal permits STATUS/ABORT only,
+  even when source status is UNKNOWN. Bind a private empty receive stage outside
+  PGDATA by canonical path, device and inode before the first lease RPC; missing
+  or damaged stage contents must not prevent remote cancellation. Reconnect from
+  the saved frozen credential owner and recheck owner, journal, route and source
+  identity before dispatch. Initial capture requires the saved source timeline;
+  cancellation after source promotion must still accept the same system ID.
 
 - [x] Retire terminal adoption fences during real postmaster startup. A durable
   terminal RETIRE marker permits checked removal of handoff, install and attempt
