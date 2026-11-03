@@ -20,8 +20,14 @@
   (let ((request (physical-backup-lease-request-copy request)))
     (with-live-operation
       (with-write-lock
-        (with-wal-critical
+        (with-wal-publication-fence (begin-publication)
           (let ((record (physical-backup-lease-status-under-lock request)))
+            (when (and (eq :ready (getf record :phase))
+                       (eq :interrupt (physical-backup-lease-ready-action record)))
+              (let ((next (copy-list record)))
+                (setf (getf next :phase) :interrupted
+                      record (physical-backup-lease-publish-checked-under-lock
+                              record (physical-backup-lease-transition record next) #'begin-publication))))
             (when record (physical-backup-lease-copy record))))))))
 
 (defun physical-backup-lease-claim-capture (request)

@@ -105,14 +105,16 @@
 ;; Missing or mismatched pin and origin metadata is a startup error.  A valid
 ;; READY lease with an explicitly lost pin, a changed timeline, or a standby
 ;; source instead becomes INTERRUPTED during reconciliation.
-(defun physical-backup-lease-ready-startup-action (record)
+(defun physical-backup-lease-ready-action (record)
   (let* ((request (getf record :request))
          (base (getf record :base))
          (identity (list (getf request :system-id) (getf request :timeline)
                          (getf base :base) (getf base :manifest-digest)))
          (entry (gethash identity *physical-export-origins*)))
     (physical-backup-lease-pin-directory-stat)
-    (multiple-value-bind (pin disk) (physical-source-retirement-pins (getf request :name))
+    (multiple-value-bind (pin disk)
+        (handler-case (physical-source-retirement-pins (getf request :name))
+          (wal-input-validation-error () (error "ready backup lease pin registry and disk disagree")))
       (declare (ignore disk))
       (unless pin (error "ready backup lease has no source pin"))
       (physical-backup-lease-check-pin-record pin record)
@@ -124,16 +126,17 @@
                             (physical-export-origin-path (physical-export-origin-entry-origin entry))
                             :stabilize t)))
         (error "ready backup lease lacks its durable origin receipt"))
-      (when (or (recovery-in-progress-p) (physical-source-pin-lost-p pin)
-                (/= (getf request :timeline) *wal-insert-timeline*))
-        :interrupt))))
+      (if (or (recovery-in-progress-p) (physical-source-pin-lost-p pin)
+              (/= (getf request :timeline) *wal-insert-timeline*))
+          :interrupt
+          (progn (physical-source-pin-check-wal pin) nil)))))
 
 (defun physical-backup-lease-startup-action (record)
   (let* ((request (getf record :request))
          (name (getf request :name)))
     (physical-backup-lease-current-record request)
     (case (getf record :phase)
-      (:ready (physical-backup-lease-ready-startup-action record))
+      (:ready (physical-backup-lease-ready-action record))
       (:closing (physical-backup-lease-closing-pin record) :close)
       (:closed
        (when (or (gethash name *physical-source-pins*)
