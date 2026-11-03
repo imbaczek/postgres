@@ -66,7 +66,8 @@ This context is invalid after its enclosing call exits."
   nil)
 
 (defun physical-directory-check-owner (owner)
-  "Recheck the active owner and the identities of its directory and lock inode."
+  "Recheck the thread-bound owner, directory and lock inode, then its role.
+This common check does not itself authorize clean adoption."
   (unless (and (physical-adoption-owner-p owner)
                (physical-adoption-owner-active-p owner)
                (eq sb-thread:*current-thread* (physical-adoption-owner-thread owner))
@@ -96,7 +97,8 @@ This context is invalid after its enclosing call exits."
 
 (defun call-with-physical-adoption-directory-owner
     (directory function &key (constructor #'make-physical-adoption-owner) initial-arguments)
-  "Acquire the stable directory lock and revoke the constructed owner on exit."
+  "Acquire the stable directory lock and revoke the constructed owner on exit.
+Construct and check the owner under the lock; its role determines authority."
   (let* ((directory (uiop:ensure-directory-pathname (truename directory)))
          (stat (sb-posix:lstat (namestring directory))))
     (unless (and (sb-posix:s-isdir (sb-posix:stat-mode stat))

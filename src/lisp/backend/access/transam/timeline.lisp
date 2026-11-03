@@ -58,6 +58,11 @@
   history)
 
 (defun timeline-common-ancestor (left right)
+  "Return the last common timeline and its shared end, or signal an error.
+Compare timeline and begin from oldest forward, as pg_rewind does.  The shared
+end is the lesser end of that entry, treating NIL as infinity.  This establishes
+history geometry, not cluster identity, WAL equivalence, or authority to adopt
+either directory."
   (timeline-check-lineage left)
   (timeline-check-lineage right)
   (let ((shared nil))

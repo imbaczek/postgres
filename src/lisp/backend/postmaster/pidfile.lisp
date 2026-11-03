@@ -188,7 +188,8 @@ leaves the separate data ownership lock to its owner."
 
 (defun postmaster-own-data-directory (host port &key startup-before-pid startup-check startup-reconcile)
   "Own PGDATA before any database storage initialization or recovery mutation.
-Call read-only STARTUP-BEFORE-PID with the flock held before changing PID metadata.
+Call read-only STARTUP-BEFORE-PID with the flock held before the startup
+timestamp or PID metadata changes.  A failure leaves stale PID evidence intact.
 Call STARTUP-CHECK synchronously with the local flock held and owned PID created,
 before publishing *POSTMASTER-DATA-LOCK*. The check must be read-only.
 Run STARTUP-RECONCILE after publishing ownership and before returning to startup,

@@ -40,6 +40,35 @@ tests, strict cold compilation and the existing shutdown test. Logs are in
 
 ## Verified starting points
 
+### Stopped-target ownership for full reseed
+
+`call-with-physical-reseed-owner` acquires the existing private PGDATA lock
+without starting recovery or changing the old PID file. An existing PID must
+be demonstrably dead: only ESRCH qualifies. Live or uncertain processes,
+malformed metadata, links and special files are rejected. Rechecks require the
+same PID-file identity and complete bytes, including unchanged absence.
+
+The directory and lock checks are shared with adoption. The concrete reseed
+owner is rejected by the clean-adoption checker and its publication and install
+APIs. It grants stopped-directory ownership, not installation authority.
+The real postmaster checks `physical-reseed.attempt` under the directory lock
+before changing its startup timestamp or repairing stale PID metadata. Any
+directory entry at that name refuses startup; terminal reseed reconciliation
+has not been implemented.
+
+`timeline-common-ancestor` compares timeline ID and interval begin from oldest
+forward, following C pg_rewind. Its shared end is the earlier finite end, with
+NIL representing infinity. This is a history comparison, not proof of cluster
+identity or equivalent WAL bytes. Full reseed will preserve the old dirty tree
+and install a separately verified source image; source leases and that journal
+remain open.
+
+The checkpoint passed 1,640 physical, 903 unit and 201 wire tests and strict
+fresh compilation. A real crashed server's old files and inode identities
+survived offline ownership and fenced main startup. Normal startup and cold
+restart passed as well. Evidence is in
+`/home/imbaczek/proj/pg-ha-artifacts/reseed-owner/evidence.json`.
+
 ### Offline adoption receive spool handoff
 
 With existing offline ownership and a terminal installed attempt and journal,

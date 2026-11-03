@@ -1,26 +1,38 @@
+;; Stopped-directory ownership for a future offline physical reseed.
+;; This capability preserves the old data and PID evidence; it does not replay
+;; WAL, produce a clean endpoint, or authorize an installation.
+
 (in-package #:pg)
 
 (defun physical-reseed-attempt-path (&optional (directory *pgdata*))
+  "Return the fixed startup fence path for an interrupted reseed."
   (merge-pathnames "physical-reseed.attempt" directory))
 
 (defun physical-reseed-check-before-pid ()
+  "Refuse startup on any attempt entry before changing PID metadata."
   (physical-adoption-require-absent
    (physical-reseed-attempt-path)
    "pending offline reseed requires reconciliation before PID changes"))
 
 (defstruct (physical-reseed-owner (:include physical-adoption-owner))
+  ;; NIL means absent; otherwise retain the original PID, identity, and bytes.
   old-pid)
 
 (defmethod physical-adoption-check-owner ((owner physical-reseed-owner))
+  ;; Storage inheritance does not grant the clean-adoption capability.
   (declare (ignore owner))
   (error "stopped reseed ownership does not authorize clean adoption"))
 
 (defun physical-reseed-check-owner (owner)
+  "Recheck directory ownership and the stopped target's PID evidence."
   (unless (physical-reseed-owner-p owner)
     (error "stopped reseed ownership is required"))
   (physical-directory-check-owner owner))
 
 (defun physical-reseed-process-state (pid &optional (probe #'sb-posix:kill))
+  "Return :ALIVE on success, :DEAD for ESRCH, and :UNKNOWN for other syscall errors.
+Unlike C stale PID reclamation, do not exempt this process or its ancestors,
+or reclaim a PID file on EPERM."
   (unless (typep pid '(integer 1 2147483647))
     (error "invalid process ID for stopped reseed ownership"))
   (handler-case
@@ -29,12 +41,16 @@
       (if (= sb-posix:esrch (sb-posix:syscall-errno condition)) :dead :unknown))))
 
 (defun physical-reseed-pid-identity (stat)
+  "Select the metadata used to detect changes to the PID file."
   (list (sb-posix:stat-dev stat) (sb-posix:stat-ino stat)
         (sb-posix:stat-mode stat) (sb-posix:stat-nlink stat)
         (sb-posix:stat-uid stat) (sb-posix:stat-size stat)
         (sb-posix:stat-mtime stat) (sb-posix:stat-ctime stat)))
 
 (defun physical-reseed-read-pid (directory)
+  "Capture the PID file's bytes and identity, or NIL when absent.
+Reject unsafe metadata and changes across the pathname and descriptor reads.
+Normalize a negative single-user PID for probing while preserving its bytes."
   (let ((path (merge-pathnames "postmaster.pid" directory)))
     (when (physical-adoption-path-present-p path)
       (let* ((stat (sb-posix:lstat (namestring path)))
@@ -65,6 +81,7 @@
             (close stream)))))))
 
 (defmethod physical-adoption-check-owner-role ((owner physical-reseed-owner))
+  ;; Recheck both absence and exact contents, then require a dead recorded PID.
   (let* ((old (physical-reseed-owner-old-pid owner))
          (current (physical-reseed-read-pid (physical-adoption-owner-directory owner))))
     (unless (equalp old current)
@@ -74,6 +91,8 @@
   owner)
 
 (defun call-with-physical-reseed-owner (directory function)
+  "Call FUNCTION with a thread-bound stopped-directory capability.
+Keep the original PID file and dirty data intact; this does not perform reseed."
   (call-with-physical-adoption-directory-owner
    directory function :constructor #'make-physical-reseed-owner
    :initial-arguments (lambda (root) (list :old-pid (physical-reseed-read-pid root)))))

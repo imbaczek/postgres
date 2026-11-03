@@ -1,5 +1,30 @@
 # Development TODO
 
+- [x] Add stopped-target ownership and a pre-PID fence for future full reseed.
+  Only ESRCH proves that an existing PID is dead. Preserve its complete bytes
+  and identity, reject changes or uncertain liveness, and keep the reseed owner
+  out of clean-adoption APIs. Any `physical-reseed.attempt` entry refuses real
+  startup before stale PID repair. A common-ancestor helper follows C pg_rewind's
+  timeline/begin walk; it establishes history geometry only.
+  Validation passed 1,640 physical, 903 unit and 201 wire tests and strict fresh
+  compilation. Real crashed-server ownership and fenced startup preserved old
+  file contents and inodes; normal startup and cold restart also passed.
+  Two properties ran 100 trials at seeds 87 and 88, digests
+  `f08e33b11713bba1` and `9f51140381ef0a7e`; input coverage and rejection counts
+  were not measured. Code commits: `401d71c1195`, `a532100c533`. Evidence:
+  `/home/imbaczek/proj/pg-ha-artifacts/reseed-owner/evidence.json`.
+  Source backup leases, preserved-data reseed installation and terminal startup
+  reconciliation remain open. No reseed operation or coordination is provided.
+
+- [ ] Retain source WAL across remote reseed capture and follow handoff.
+  Save the original request identity before creating its private bootstrap pin;
+  bind the actual verified base and manifest, and support STATUS and checked
+  ABORT even when the client never received a manifest. Persist cancellation
+  before releasing retention so delayed requests cannot recreate a canceled
+  attempt. Keep the source pin until a matching ready follow pin and durable
+  target follow configuration own retention. Interrupted attempts must not
+  silently recapture a different base under the same identity.
+
 - [x] Retire terminal adoption fences during real postmaster startup. A durable
   terminal RETIRE marker permits checked removal of handoff, install and attempt
   in that order, with follow removed last. Nonterminal follow progress remains

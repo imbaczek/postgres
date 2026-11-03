@@ -950,6 +950,7 @@ Then check the cached handles and workers under startup exclusion."
     (startup-install-initial-settings startup-settings startup-native startup-overrides)
     (startup-install-resource-capacity startup-settings)
     (sb-sys:enable-interrupt sb-unix:sigusr1 #'request-physical-promotion)
+    ;; Fence pending reseed before stale PID repair or startup timestamp changes.
     (postmaster-own-data-directory host port
                                    :startup-before-pid #'physical-reseed-check-before-pid
                                    :startup-check #'physical-adoption-startup-preflight
