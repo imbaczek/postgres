@@ -51,7 +51,7 @@
 ;; metadata files as well as manifest files.  Rechecking against EXPECTED detects
 ;; changes during preparation; it is not durable installation proof.
 
-(defun physical-reseed-image-check (directory &optional expected)
+(defun physical-reseed-image-check (directory &optional expected reseed-installation)
   (multiple-value-bind (manifest digest) (recovery-read-manifest directory)
     (recovery-check-manifest-schema manifest)
     (unless (zerop (getf (physical-recovery-read-control directory) :phase))
@@ -59,7 +59,7 @@
     (let ((*pgdata* directory))
       (physical-recovery-verify-base-state)
       (authentication-check-backup-policy directory))
-    (physical-backup-check-received-inventory directory manifest)
+    (physical-backup-check-received-inventory directory manifest :reseed-installation reseed-installation)
     (let ((actual (list :manifest manifest :manifest-digest digest
                         :files (physical-backup-bundle-entries directory manifest))))
       (when (and expected (not (equal actual expected)))

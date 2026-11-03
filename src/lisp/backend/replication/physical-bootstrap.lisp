@@ -672,11 +672,15 @@ The slot is dropped on every exit; a verified origin remains after cancellation.
 ;; The descriptor route checks all received names, including metadata, against
 ;; the manifest.  This snapshot is not a substitute for an installation check.
 
-(defun physical-backup-check-received-inventory (directory manifest)
+(defun physical-backup-check-received-inventory (directory manifest &key reseed-installation)
+  (unless (member reseed-installation '(nil t)) (error "invalid reseed installation inventory mode"))
+  (when (and reseed-installation (null *physical-image-context*))
+    (error "guarded reseed inventory requires its descriptor scope"))
   (when *physical-image-context*
     (physical-image-check-inventory
      directory (append (mapcar #'first (physical-backup-metadata-bounds))
-                       (mapcar #'first (getf manifest :files))))))
+                       (mapcar #'first (getf manifest :files))
+                       (when reseed-installation '(".pg_lisp.lock" "physical-reseed.install"))))))
 
 ;; Bound the file count and metadata sizes before receiving the manifest and
 ;; its inventory.  Check order, paths, sizes and checksums, then verify the
