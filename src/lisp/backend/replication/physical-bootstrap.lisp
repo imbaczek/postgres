@@ -388,7 +388,9 @@ The new base receives its own archive; the old primary archive is not copied."
   (sb-thread:with-mutex (*wal-lock*)
     (physical-bootstrap-check-export-slot-under-wal-lock slot name checkpoint-start)))
 
-(defun physical-bootstrap-copy-under-quiescence (target pin-name &key export-slot)
+(declaim (ftype function physical-backup-lease-create-pin))
+
+(defun physical-bootstrap-copy-under-quiescence (target pin-name &key export-slot lease-request)
   "Checkpoint and capture one complete native image while mutation admission is closed.
 Check checkpoint resource facts against control before creating the source pin.
 Capture the active authentication generation and write its canonical adjuncts
@@ -401,10 +403,15 @@ outside the immutable file inventory. New manifests require these adjuncts."
   (when (or (not (active-xids-empty-p)) *xid-wrap-pending*
             (probe-file (xid-wrap-marker-path)))
     (error "physical base backup requires no active transaction IDs or pending XID wrap"))
+  (when (or (and export-slot lease-request)
+            (and lease-request (not (equal pin-name (getf lease-request :name)))))
+    (wal-invalid-input "physical backup has inconsistent retention owners"))
   (let ((policy (authentication-capture-policy)))
     (wal-checkpoint-core)
     (physical-recovery-check-checkpoint-resources *wal-checkpoint-snapshot* *wal-control-metadata*)
-    (let ((pin (unless export-slot (physical-source-pin-create pin-name))))
+    (let ((pin (unless export-slot
+                 (if lease-request (physical-backup-lease-create-pin lease-request)
+                     (physical-source-pin-create pin-name)))))
       (when export-slot
         (physical-bootstrap-check-export-slot export-slot pin-name (wal-checkpoint-record-start)))
       ;; Local backup failure retains its private pin for operator inspection.

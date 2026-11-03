@@ -258,10 +258,7 @@ The reservation binds these values to this exact export and source incarnation."
     (physical-export-origin-note-image token manifest digest))
   manifest)
 
-(defun physical-export-origin-record-backup (directory manifest slot token)
-  "Verify the immutable base and publish its source-owned origin before export.
-Initially P is B and H is the empty-prefix digest. A completed verified receipt
-may remain if the client later cancels; this is intentional and does not retain WAL."
+(defun physical-export-origin-verify-backup (directory manifest token)
   (multiple-value-bind (actual digest) (recovery-read-manifest directory)
     (unless (and (equal manifest actual)
                  (equal (list (getf actual :system-id) (getf actual :timeline)
@@ -274,11 +271,19 @@ may remain if the client later cancels; this is intentional and does not retain 
                      (= (getf state :manifest-digest) digest))
           (error "export origin requires a fully verified immutable base")))
       (authentication-check-backup-policy directory))
+    (values (make-physical-export-origin
+             :system-id (getf actual :system-id) :timeline (getf actual :timeline)
+             :base (getf actual :end) :manifest-digest digest
+             :proven-lsn (getf actual :end) :prefix-digest #xCBF29CE484222325)
+            actual digest)))
+
+(defun physical-export-origin-record-backup (directory manifest slot token)
+  "Verify the immutable base and publish its source-owned origin before export.
+Initially P is B and H is the empty-prefix digest. A completed verified receipt
+may remain if the client later cancels; this is intentional and does not retain WAL."
+  (multiple-value-bind (origin actual) (physical-export-origin-verify-backup directory manifest token)
     (physical-export-origin-initialize
-     token (make-physical-export-origin
-            :system-id (getf actual :system-id) :timeline (getf actual :timeline)
-            :base (getf actual :end) :manifest-digest digest
-            :proven-lsn (getf actual :end) :prefix-digest #xCBF29CE484222325)
+     token origin
      (lambda ()
        (physical-bootstrap-check-export-slot-under-wal-lock
         slot (wal-replication-slot-name slot) (physical-manifest-checkpoint-start actual))))))

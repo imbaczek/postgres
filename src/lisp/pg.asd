@@ -148,6 +148,7 @@
                    (:file "../replication/physical-export-origin")
                    (:file "../replication/physical-backup-lease-startup")
                    (:file "../replication/physical-backup-lease-capture-owner")
+                   (:file "../replication/physical-backup-lease-capture")
                    (:file "../replication/physical-follow-anchor")
                    (:file "../replication/physical-retained-extent")
                    (:file "../replication/physical-retained-overlap")
