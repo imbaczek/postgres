@@ -115,11 +115,15 @@
 (defun postmaster-remove-pid-file ()
   "Keep the stable ownership descriptor open until OS process exit."
   (when *postmaster-pid-stream*
-    (when (postmaster-pid-owned-p)
-      (delete-file (postmaster-data-path "postmaster.pid"))
-      (fsync-directory *postmaster-pid-directory*))
-    (close *postmaster-pid-stream*)
-    (setf *postmaster-pid-stream* nil))
+    (let ((stream *postmaster-pid-stream*))
+      (unwind-protect
+           (when (postmaster-pid-owned-p)
+             (delete-file (postmaster-data-path "postmaster.pid"))
+             (fsync-directory *postmaster-pid-directory*))
+        (unwind-protect
+             (close stream)
+          (when (eq stream *postmaster-pid-stream*)
+            (setf *postmaster-pid-stream* nil))))))
   (values))
 
 (defun postmaster-create-pid-file ()
@@ -180,12 +184,13 @@
              (setf success t)))
       (unless success (sb-posix:close fd)))))
 
-(defun postmaster-own-data-directory (host port &key startup-check)
+(defun postmaster-own-data-directory (host port &key startup-check startup-reconcile)
   "Own PGDATA before any database storage initialization or recovery mutation.
 Call STARTUP-CHECK synchronously with the local flock held and owned PID created,
-before publishing *POSTMASTER-DATA-LOCK*. The check must be read-only. If it fails
-or exits nonlocally, cleanup clears the timestamp and attempts to remove its owned
-PID. The lock closes even if PID cleanup fails."
+before publishing *POSTMASTER-DATA-LOCK*. The check must be read-only.
+Run STARTUP-RECONCILE after publishing ownership and before returning to startup.
+If either callback fails or exits nonlocally, clear ownership and the timestamp,
+remove the owned PID, and close the lock even if PID cleanup fails."
   (declare (ignore host))
   (when *postmaster-data-lock* (error "this process already owns a data directory"))
   (postmaster-check-data-directory)
@@ -201,9 +206,13 @@ PID. The lock closes even if PID cleanup fails."
            (setf *postmaster-start-timestamp* (postgres-current-timestamp))
            (postmaster-create-pid-file)
            (when startup-check (funcall startup-check))
-           (setf *postmaster-data-lock* lock success t)
+           (setf *postmaster-data-lock* lock)
+           (when startup-reconcile (funcall startup-reconcile))
+           (setf success t)
            *postmaster-pid-directory*)
       (unless success
+        (when (eq *postmaster-data-lock* lock)
+          (setf *postmaster-data-lock* nil))
         (setf *postmaster-start-timestamp* nil)
         (unwind-protect
              (when *postmaster-pid-stream* (postmaster-remove-pid-file))
