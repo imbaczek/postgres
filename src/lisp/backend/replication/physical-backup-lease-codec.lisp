@@ -1,5 +1,14 @@
 (in-package #:pg)
 
+;;; Immutable request and record format for source-side physical backup leases.
+;;; This layer records intent and state; READY and successor fields do not prove
+;;; that a source pin, backup, or handoff exists.  Live operations must establish
+;;; those facts separately.
+;;;
+;;; Requests bind a reseed_ name and token to a UTF-8 cluster identity, its FNV
+;;; system identifier, and a timeline.  Copies validate and detach mutable input.
+;;; The bounded, checksummed image has one canonical encoding; decoding rejects
+;;; malformed or alternate encodings rather than accepting ambiguous metadata.
 (defconstant +physical-backup-lease-maximum-bytes+ 8192)
 
 (defun physical-backup-lease-hex-p (value length)
@@ -68,6 +77,13 @@
       (error "incoherent physical backup lease state"))
     (list :version 1 :request request :phase phase :base base :outcome outcome :successor successor)))
 
+;; The base restriction applies to transitions from an existing record; an initial
+;; aborted closing record may also carry a structurally valid base.
+
+;; The request never changes.  Only capturing -> ready can introduce a base;
+;; interrupted records cannot resume capture.  Closing freezes its outcome and
+;; successor, and closed records remain tombstones rather than being evicted.
+;; An initial aborted closing record is permitted, including an abort before capture.
 (defun physical-backup-lease-transition (previous candidate)
   (let* ((before (when previous (physical-backup-lease-copy previous)))
          (after (physical-backup-lease-copy candidate))

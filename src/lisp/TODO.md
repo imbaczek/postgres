@@ -1,5 +1,21 @@
 # Development TODO
 
+- [x] Add checked source backup request records and private durable publication.
+  Request identity is immutable, interrupted capture cannot restart under the
+  same identity, and closed records count toward capacity without eviction.
+  File publication and cold loading use the WAL publication fence; final bytes
+  are synced and read back before the new memory index is visible. Loading
+  interrupts unfinished records and preserves source pins.
+  Validation passed 52 selected lease, source-pin and export-origin tests,
+  including 24 new tests, strict fresh compilation, twelve error/nonlocal cuts,
+  twelve real SIGKILL cuts and twelve fresh-image reopen probes. Two properties
+  passed 100 trials at seeds 89 and 90, digests `f44aabb064b11e6d` and
+  `e5ffed3f68a4677f`; input coverage and rejection counts were not measured.
+  Evidence: `/home/imbaczek/proj/pg-ha-artifacts/backup-lease-codec/evidence.json`.
+  This is internal metadata only. Live capture, READY-to-pin/origin validation,
+  STATUS/ABORT commands, pin authority checks and startup wiring remain open;
+  these records do not yet retain WAL or authorize pin release.
+
 - [x] Add stopped-target ownership and a pre-PID fence for future full reseed.
   Only ESRCH proves that an existing PID is dead. Preserve its complete bytes
   and identity, reject changes or uncertain liveness, and keep the reseed owner

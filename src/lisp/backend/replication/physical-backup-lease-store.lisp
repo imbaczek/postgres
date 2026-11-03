@@ -1,5 +1,13 @@
 (in-package #:pg)
 
+;;; Private durable inventory of physical backup lease records.
+;;; Publication and cold loading update this index only after durable metadata
+;;; operations.  This is a record layer: it does not retain WAL, validate a
+;;; READY record against a live pin or origin, run a backup, or release pins.
+;;;
+;;; Before live integration, load this index before the primary pin reader and,
+;;; on both roles, before listeners.  Streaming, unlink, and name creation must
+;;; then be gated by the loaded records.
 (defvar *physical-backup-lease-records* (make-hash-table :test #'equal))
 (defvar *physical-backup-lease-limit* 65536)
 (defvar *physical-backup-lease-test-hook* nil)
@@ -76,6 +84,11 @@
   (unless (and (sb-thread:holding-mutex-p *write-lock*) (sb-thread:holding-mutex-p *wal-lock*))
     (error "backup lease publication requires write and WAL exclusion")))
 
+;; Caller owns write and WAL exclusion and an active publication fence.  This
+;; low-level writer checks the locks but does not establish the fence itself.
+;; Capture the exclusive temporary inode before validating it, so cleanup can
+;; unlink only the inode created here.  Sync, rename, sync the directory, and
+;; stabilize and read back the final file before the caller publishes memory.
 (defun physical-backup-lease-write (record)
   (physical-backup-lease-require-locks)
   (let* ((request (getf record :request))
@@ -185,6 +198,9 @@
       (fsync-directory directory)
       (values (sort records #'string< :key #'namestring) temporaries))))
 
+;; Validate the entire inventory before changing disk or memory.  Checked private
+;; temporary files are discarded and incomplete captures are durably interrupted;
+;; source pins are preserved.  A failure leaves the new index unpublished.
 (defun physical-backup-lease-load-records ()
   (with-write-lock
     (with-wal-publication-fence (begin-publication)

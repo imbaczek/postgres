@@ -69,6 +69,32 @@ survived offline ownership and fenced main startup. Normal startup and cold
 restart passed as well. Evidence is in
 `/home/imbaczek/proj/pg-ha-artifacts/reseed-owner/evidence.json`.
 
+### Source backup request record prerequisite
+
+The backup lease record layer binds one private attempt name and token to a
+source identity and timeline. Its canonical bounded encoding freezes that
+request and any recorded base across forward state transitions. Interrupted
+records cannot capture again, and closed tombstones remain within a finite
+inventory rather than being evicted.
+
+Publication creates a private temporary inode exclusively, syncs its bytes,
+renames it, and syncs and verifies the final file before replacing memory state.
+The WAL publication fence handles errors and nonlocal exits. Cold loading
+validates the full inventory before replacing the index, removes only checked
+private temporary files, and durably interrupts unfinished captures. It leaves
+source pins untouched.
+
+This is internal metadata support. A structural READY record is not proof of
+an actual pin, backup or handoff. Live capture, pin/origin checks, STATUS/ABORT
+commands, generic stream/release/name gates, and primary/standby startup wiring
+remain to be implemented. The index must be loaded before the primary pin reader
+and before either role admits clients when those operations are integrated.
+
+The checkpoint passed 52 selected lease, source-pin and export-origin tests,
+strict fresh compilation, twelve error/nonlocal cuts, twelve real SIGKILL cuts
+and twelve fresh-image reopen probes. Evidence is in
+`/home/imbaczek/proj/pg-ha-artifacts/backup-lease-codec/evidence.json`.
+
 ### Offline adoption receive spool handoff
 
 With existing offline ownership and a terminal installed attempt and journal,
