@@ -8,11 +8,14 @@
   "Return the fixed startup fence path for an interrupted reseed."
   (merge-pathnames "physical-reseed.attempt" directory))
 
+(defun physical-reseed-attempt-temporary-path (&optional (directory *pgdata*))
+  (merge-pathnames "physical-reseed.attempt.tmp" directory))
+
 (defun physical-reseed-check-before-pid ()
   "Refuse startup on any attempt entry before changing PID metadata."
-  (physical-adoption-require-absent
-   (physical-reseed-attempt-path)
-   "pending offline reseed requires reconciliation before PID changes"))
+  (dolist (path (list (physical-reseed-attempt-path) (physical-reseed-attempt-temporary-path)))
+    (physical-adoption-require-absent
+     path "pending offline reseed requires reconciliation before PID changes")))
 
 (defstruct (physical-reseed-owner (:include physical-adoption-owner))
   ;; NIL means absent; otherwise retain the original PID, identity, and bytes.
