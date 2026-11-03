@@ -12,6 +12,8 @@ SB-POSIX does not export this flag in the supported SBCL.")
 (sb-alien:define-alien-routine ("mkostemp" port-mkostemp) sb-alien:int
   (template (* (sb-alien:unsigned 8))) (flags sb-alien:int))
 
+;; Rename names relative to held directory descriptors for anchored publication.
+
 (sb-alien:define-alien-routine ("renameat" port-renameat) sb-alien:int
   (from-directory sb-alien:int) (from sb-alien:c-string)
   (to-directory sb-alien:int) (to sb-alien:c-string))

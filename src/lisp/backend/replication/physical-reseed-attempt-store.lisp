@@ -29,6 +29,11 @@
         (sb-posix:stat-mode stat) (sb-posix:stat-uid stat) (sb-posix:stat-nlink stat)
         (sb-posix:stat-size stat) (sb-posix:stat-mtime stat) (sb-posix:stat-ctime stat)))
 
+;; Borrow ROOT-FD and own the opened file descriptor or stream.  Only the two
+;; fixed names are accepted.  Check private file identity and exact bytes, with
+;; optional file and root sync, before decoding.  The caller supplies the
+;; lock and root ownership proof.
+
 (defun physical-reseed-attempt-read-at (root-fd name &key stabilize)
   (unless (member name '("physical-reseed.attempt" "physical-reseed.attempt.tmp") :test #'equal)
     (error "unexpected reseed metadata name"))
@@ -56,6 +61,9 @@
                (error "reseed metadata changed while reading"))
              (physical-reseed-attempt-decode bytes)))
       (if stream (close stream) (when fd (sb-posix:close fd))))))
+
+;; Anchor the raw read to the checked root without calling the role method.
+;; Cleanup needs this path while its role check is verifying the attempt itself.
 
 (defun physical-reseed-attempt-read-owned (owner name &key stabilize)
   (call-with-physical-directory-root
@@ -90,8 +98,8 @@
     (physical-reseed-attempt-read-file owner (physical-reseed-attempt-path directory))))
 
 ;; An ABORTED intent requires a caller-supplied typed CLOSED/ABORTED receipt
-;; matching the original canonical request.  The future RPC driver must observe
-;; the source.  This structural check runs before any I/O, including direct
+;; matching the original canonical request.  The RPC driver supplies its checked
+;; source observation.  This structural check runs before any I/O, including direct
 ;; calls to the temporary writer.
 
 (defun physical-reseed-attempt-check-abort-receipt (candidate receipt)
@@ -119,6 +127,7 @@
        (let ((fd nil) (stream nil))
          (unwind-protect
               (progn
+                ;; Create relative to the checked root and keep failures fenced.
                 (sb-sys:without-interrupts
                   (setf fd (physical-image-openat
                             root-fd "physical-reseed.attempt.tmp"
@@ -137,6 +146,9 @@
                 (physical-reseed-attempt-test-point :after-file-fsync path)
                 (physical-reseed-attempt-file-identity (sb-posix:fstat fd)))
            (if stream (close stream) (when fd (sb-posix:close fd)))))))))
+
+;; Before publication, check the predecessor identity and contents through
+;; the held root, or require the final name to be absent for a new attempt.
 
 (defun physical-reseed-attempt-check-previous (owner previous identity)
   (when previous (physical-reseed-attempt-check-owner owner previous))
@@ -171,6 +183,7 @@
                       (equal candidate (physical-reseed-attempt-read-at root-fd "physical-reseed.attempt.tmp" :stabilize t)))
            (error "reseed temporary intent changed before publication"))
          (physical-reseed-attempt-check-previous owner previous previous-identity)
+         ;; Publish under the same held root, then sync it before readback.
          (unless (zerop (port-renameat root-fd "physical-reseed.attempt.tmp" root-fd "physical-reseed.attempt"))
            (error "cannot publish reseed metadata: errno ~d" (sb-alien:get-errno)))
          (physical-reseed-attempt-test-point :after-rename path)

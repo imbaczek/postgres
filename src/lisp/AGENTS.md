@@ -528,6 +528,18 @@ this mode.
 
 ### SBCL descriptor streams and global variables
 
+- Keep offline metadata operations on a held root descriptor across create,
+  rename, sync and readback. Rechecking an absolute pathname before an operation
+  still leaves a replacement window. Two reseed regressions created a temporary
+  or renamed entries in a substitute root after the last ownership check.
+- Role checks that read their own journal need a raw, bounded reader under the
+  held directory lock. Separate common root/lock checks and pure local evidence
+  from role dispatch to keep that validation finite. Entry points still check
+  the complete role before authorizing operations.
+- Give owners containing saved attempts an opaque printer. A default structure
+  printer includes bearer tokens and reversible connection credentials in its
+  fields, even when the underlying frozen-profile object has its own printer.
+
 - For an opaque old-tree inventory, track names independently of inode identity:
   hardlinked names can share an inode, and moving one changes their shared ctime.
   Keep nanosecond times for stability within a snapshot; use the intended

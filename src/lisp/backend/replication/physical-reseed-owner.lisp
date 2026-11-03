@@ -1,4 +1,4 @@
-;; Stopped-directory ownership for a future offline physical reseed.
+;; Stopped-directory ownership for offline physical reseed.
 ;; This capability preserves the old data and PID evidence; it does not replay
 ;; WAL, produce a clean endpoint, or authorize an installation.
 
@@ -38,6 +38,10 @@
   ;; Storage inheritance does not grant the clean-adoption capability.
   (declare (ignore owner))
   (error "stopped reseed ownership does not authorize clean adoption"))
+
+;; The role check distinguishes ordinary stopped ownership from cleanup
+;; ownership.  Operations such as capture, preparation, inventory and clean
+;; adoption retain their own authority gates.
 
 (defun physical-reseed-check-owner (owner)
   "Recheck directory ownership and the stopped target's PID evidence."
@@ -101,6 +105,9 @@ Normalize a negative single-user PID for probing while preserving its bytes."
                      (error "reseed PID metadata has an invalid process ID"))
                    (list :pid (abs pid) :identity before :bytes bytes)))
             (close stream)))))))
+
+;; Both stopped-owner roles retain the original PID bytes and inode evidence.
+;; A recorded process must still be known dead before either role proceeds.
 
 (defun physical-reseed-check-original-pid (owner)
   ;; Recheck both absence and exact contents, then require a dead recorded PID.

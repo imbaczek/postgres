@@ -246,6 +246,38 @@
   compilation after the full suite had started. Evidence and next-journal notes:
   `/home/imbaczek/proj/pg-ha-artifacts/reseed-inventory/evidence.json`.
 
+- [x] Anchor reseed attempt I/O and recover initial-install source cleanup.
+  Hold a checked root descriptor across metadata reads, exclusive temporary
+  creation, renameat promotion, parent sync and readback. Root replacement
+  regressions reproduced temporary creation and rename into a substitute tree
+  before this change. The descriptor paths preserve the owned tree through
+  those cuts, and ownership rechecks stop remote commands when the name changes.
+  A separate cleanup owner uses the valid final attempt under the held lock,
+  original stopped PID evidence, and immutable request/source/local bindings.
+  It permits saved STATUS and checked ABORT with an initial install temporary
+  present and final install journal absent. Every temporary inode kind stays
+  intact, and a missing receive stage permits source cleanup. Forward phases
+  may replace the attempt inode while preserving its identity fields.
+  Use opaque owner printing because the saved attempt contains credentials.
+  Verification passed 1,784 distinct physical tests including 11 new tests,
+  81 focused checks, fresh strict compilation and six native libpq cases.
+  Native checks covered four install temporary kinds, reopened cancellation
+  cuts after write/rename, preserved old bytes/inodes, late capture refusal,
+  released source retention and writable SQL. The shared immutable-field-list
+  refactor passed focused checks and strict compilation after broader runs began.
+  Evidence is in
+  `/home/imbaczek/proj/pg-ha-artifacts/reseed-cleanup/evidence.json`.
+
+- [ ] Add explicit reconciliation for a partial cancellation attempt temporary.
+  A valid final attempt can identify the original source, but existing recovery
+  keeps a partial or malformed `physical-reseed.attempt.tmp` fenced before RPC.
+  Design and review a cancellation-only recovery under the root lock, with exact
+  private temporary inode checks and parent sync, followed by durable ABORTING
+  before ABORT. Complete canonical forward temporaries keep existing recovery.
+  A partial temporary without a valid final attempt lacks a trusted source route.
+  Cover publication cuts under both initial-install cleanup and future moved-PID
+  install ownership, preserving startup fences and the original request.
+
 - [ ] Install a full reseed image while preserving the opaque old data tree.
   Introduce a separate `physical-reseed.install` plan and install owner. Select
   that owner whenever a valid install journal exists, including before the first

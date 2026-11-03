@@ -81,6 +81,9 @@ This context is invalid after its enclosing call exits."
 (defmethod physical-adoption-owner-extra-root-names ((owner null))
   nil)
 
+;; Check the common thread, root and lock identities.
+;; Callers that need role authority must also perform the role check.
+
 (defun physical-directory-check-owner-common (owner)
   (unless (and (physical-adoption-owner-p owner)
                (physical-adoption-owner-active-p owner)
@@ -102,6 +105,11 @@ This context is invalid after its enclosing call exits."
                  (= (physical-adoption-owner-lock-inode owner) (sb-posix:stat-ino lock)))
       (error "offline adoption data directory or lock inode changed")))
   owner)
+
+;; Open the owned root and lend its descriptor and scoped path to FUNCTION.
+;; Check common ownership before and after the call and close the descriptor
+;; on exit.  Role checks remain the caller's responsibility.  This scope can
+;; also support a future private initial publisher.
 
 (defun call-with-physical-directory-root (owner function)
   (physical-directory-check-owner-common owner)

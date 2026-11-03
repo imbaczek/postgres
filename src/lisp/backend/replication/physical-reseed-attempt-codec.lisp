@@ -1,7 +1,7 @@
 (in-package #:pg)
 
 ;; The attempt freezes the original lease request, physical source connection,
-;; and stopped local directory, lock, and PID evidence before a future lease RPC.
+;; and stopped local directory, lock, and PID evidence before a lease RPC.
 ;; It is a foundation for reconciliation, not a driver or installation authority.
 ;; The source contains reversible credentials and the request contains a bearer
 ;; token.  Never log the record or its encoded bytes.
@@ -9,6 +9,8 @@
 (defconstant +physical-reseed-attempt-maximum-bytes+ (* 3 1024 1024))
 
 (defparameter *physical-reseed-attempt-keys* '(:version :phase :local :request :source))
+
+;; These fields bind all phases to the same original attempt and source.
 
 (defparameter *physical-reseed-attempt-identity-keys* '(:version :local :request :source :stage))
 
@@ -129,6 +131,10 @@
 
 ;; Bind the attempt to the stopped root, its held lock, and exact PID evidence.
 ;; This ownership does not confer the clean-adoption capability.
+
+;; Copy saved owner evidence without invoking its role check.  Cleanup uses
+;; this after the common root check to avoid recursing through its own role.
+;; Local facts below perform the full owner check before taking the same copy.
 
 (defun physical-reseed-attempt-local-evidence (owner)
   (let ((pid (physical-reseed-owner-old-pid owner)))
