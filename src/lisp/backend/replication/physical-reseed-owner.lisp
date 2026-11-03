@@ -86,25 +86,30 @@ Normalize a negative single-user PID for probing while preserving its bytes."
                      (= (sb-posix:geteuid) (sb-posix:stat-uid stat))
                      (<= 1 (sb-posix:stat-size stat) 16384))
           (error "reseed PID metadata is not a bounded owned single-link regular file"))
-        (multiple-value-bind (stream size) (open-bounded-regular-file path 16384)
-          (unwind-protect
-               (let ((bytes (make-array size :element-type '(unsigned-byte 8))))
-                 (flet ((descriptor-identity ()
-                          (physical-reseed-pid-identity
-                           (sb-posix:fstat (sb-sys:fd-stream-fd stream)))))
-                   (unless (equal before (descriptor-identity))
-                     (error "reseed PID metadata changed before reading"))
-                   (unless (and (= size (read-sequence bytes stream))
-                                (equal before (descriptor-identity))
-                                (equal before (physical-reseed-pid-identity
-                                               (sb-posix:lstat (namestring path)))))
-                     (error "reseed PID metadata changed while reading")))
-                 (let* ((line (bytes->string (subseq bytes 0 (position 10 bytes))))
-                        (pid (ignore-errors (parse-integer line))))
-                   (unless (and pid (not (zerop pid)) (<= (abs pid) 2147483647))
-                     (error "reseed PID metadata has an invalid process ID"))
-                   (list :pid (abs pid) :identity before :bytes bytes)))
-            (close stream)))))))
+        ;; Defer interrupts until cleanup owns the stream.  Allow them again
+        ;; while reading under that cleanup scope.
+        (sb-sys:without-interrupts
+          (multiple-value-bind (stream size) (open-bounded-regular-file path 16384)
+            (unwind-protect
+                 (sb-sys:with-local-interrupts
+                   (let ((bytes (make-array size :element-type '(unsigned-byte 8))))
+                     (flet ((descriptor-identity ()
+                              (physical-reseed-pid-identity
+                               (sb-posix:fstat (sb-sys:fd-stream-fd stream)))))
+                       (unless (and (= size (sixth before)) (equal before (descriptor-identity)))
+                         (error "reseed PID metadata changed before reading"))
+                       (unless (and (= size (read-sequence bytes stream))
+                                    (eq :eof (read-byte stream nil :eof))
+                                    (equal before (descriptor-identity))
+                                    (equal before (physical-reseed-pid-identity
+                                                   (sb-posix:lstat (namestring path)))))
+                         (error "reseed PID metadata changed while reading")))
+                     (let* ((line (bytes->string (subseq bytes 0 (position 10 bytes))))
+                            (pid (ignore-errors (parse-integer line))))
+                       (unless (and pid (not (zerop pid)) (<= (abs pid) 2147483647))
+                         (error "reseed PID metadata has an invalid process ID"))
+                       (list :pid (abs pid) :identity before :bytes bytes))))
+              (close stream))))))))
 
 ;; Both stopped-owner roles retain the original PID bytes and inode evidence.
 ;; A recorded process must still be known dead before either role proceeds.

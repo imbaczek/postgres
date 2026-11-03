@@ -295,3 +295,45 @@
                    (cl-spec:run-property 'reseed-pid-probe-only-esrch-proves-death
                                          :seed 88 :profile :normal))))
       (ok (eq :passed (getf result :status)))))
+
+(defun call-with-reseed-pid-reader-fixture (function)
+  (call-with-reaped-reseed-pid
+   (lambda (dead)
+     (call-with-reseed-owner-directory
+      (lambda (root)
+        (reseed-test-write-pid root (- dead))
+        (funcall function root))))))
+
+(deftest reseed-install-owner-pid-reader-rejects-an-understated-open-size
+    (call-with-reseed-pid-reader-fixture
+     (lambda (root)
+       (let ((open (symbol-function 'pg::open-bounded-regular-file)) (captured nil))
+         (unwind-protect
+              (progn
+                (setf (symbol-function 'pg::open-bounded-regular-file)
+                      (lambda (path maximum &optional writable)
+                        (multiple-value-bind (stream size) (funcall open path maximum writable)
+                          (setf captured stream)
+                          (values stream (1- size)))))
+                (ok (intake-fails-p (lambda () (pg::physical-reseed-read-pid root))))
+                (ok (not (open-stream-p captured))))
+           (setf (symbol-function 'pg::open-bounded-regular-file) open)
+           (when (and captured (open-stream-p captured)) (close captured)))))))
+
+(deftest reseed-install-owner-pid-reader-closes-an-open-before-delivering-interrupt
+    (call-with-reseed-pid-reader-fixture
+     (lambda (root)
+       (let ((open (symbol-function 'pg::open-bounded-regular-file)) (captured nil))
+         (unwind-protect
+              (progn
+                (setf (symbol-function 'pg::open-bounded-regular-file)
+                      (lambda (path maximum &optional writable)
+                        (multiple-value-bind (stream size) (funcall open path maximum writable)
+                          (setf captured stream)
+                          (sb-thread:interrupt-thread sb-thread:*current-thread* (lambda () (throw 'pid-read-cut :cut)))
+                          (values stream size))))
+                (ok (eq :cut (catch 'pid-read-cut (pg::physical-reseed-read-pid root))))
+                (ok captured)
+                (ok (not (open-stream-p captured))))
+           (setf (symbol-function 'pg::open-bounded-regular-file) open)
+           (when (and captured (open-stream-p captured)) (close captured)))))))
