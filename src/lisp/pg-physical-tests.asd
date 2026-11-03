@@ -62,6 +62,7 @@
                (:file "t/wal-eor-tests")
                (:file "t/physical-history-tests")
                (:file "t/timeline-tests")
+               (:file "t/physical-rejoin-history-tests")
                (:file "t/timeline-publication-tests")
                (:file "t/fork-follow-tests")
                (:file "t/physical-store-history-tests")

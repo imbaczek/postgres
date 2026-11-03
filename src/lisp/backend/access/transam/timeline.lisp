@@ -57,6 +57,23 @@
         (setf previous-timeline timeline previous-end end))))
   history)
 
+(defun timeline-common-ancestor (left right)
+  (timeline-check-lineage left)
+  (timeline-check-lineage right)
+  (let ((shared nil))
+    (loop for a in (reverse left)
+          for b in (reverse right)
+          while (and (= (timeline-history-entry-timeline a) (timeline-history-entry-timeline b))
+                     (= (timeline-history-entry-begin a) (timeline-history-entry-begin b)))
+          do (setf shared (cons a b)))
+    (unless shared (error "source and target histories have no common ancestor timeline"))
+    (let ((a-end (timeline-history-entry-end (car shared)))
+          (b-end (timeline-history-entry-end (cdr shared))))
+      (values (timeline-history-entry-timeline (car shared))
+              (cond ((null a-end) b-end)
+                    ((null b-end) a-end)
+                    (t (min a-end b-end)))))))
+
 (defun timeline-at-point (point history)
   "Follow tliOfPointInHistory: a switchpoint belongs to the child, not its parent."
   (unless (typep point '(unsigned-byte 64)) (error "invalid WAL point"))
