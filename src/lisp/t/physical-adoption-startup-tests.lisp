@@ -105,3 +105,54 @@
            (ok (null pg::*postmaster-data-lock*))
            (ok (null pg::*postmaster-start-timestamp*))
            (ok (not (probe-file (merge-pathnames "postmaster.pid" root)))))))))
+
+(deftest adoption-startup-owner-validates-terminal-follow-under-the-real-pid
+    (call-with-adoption-follow-transaction-fixture
+     (lambda (root owner handoff directory)
+       (declare (ignore handoff))
+       (pg::physical-adoption-follow-start owner directory)
+       (sb-posix:chmod (namestring (merge-pathnames ".pg_lisp.lock" root)) #o600)
+       (let ((before (pg::physical-adoption-install-snapshot root))
+             (borrowed nil))
+         (setf (pg::physical-adoption-owner-active-p owner) nil)
+         (close (pg::physical-adoption-owner-lock owner))
+         (call-with-adoption-postmaster-fixture
+          root
+          (lambda ()
+            (flet ((validate-owner (startup-owner)
+                     (setf borrowed startup-owner)
+                     (ok (pg::physical-adoption-startup-owner-p startup-owner))
+                     (ok (= 11 (pg::physical-adoption-follow-validate
+                                startup-owner (pg::physical-adoption-follow-read startup-owner))))
+                     (ok (equal before (remove "postmaster.pid" (pg::physical-adoption-install-snapshot root)
+                                               :key #'first :test #'equal)))))
+              (pg::postmaster-own-data-directory
+               "127.0.0.1" 5439 :startup-reconcile
+               (lambda () (pg::call-with-physical-adoption-startup-owner #'validate-owner))))
+            (ok (not (pg::physical-adoption-owner-active-p borrowed)))
+            (ok (intake-fails-p (lambda () (pg::physical-adoption-check-owner borrowed))))
+            (ok (open-stream-p pg::*postmaster-data-lock*))
+            (ok (pg::postmaster-pid-owned-p)))))) 
+     :fork-distance 0))
+
+(deftest adoption-startup-owner-rejects-unowned-and-replaced-pid-context
+    (with-physical-store-directory (root)
+      (call-with-adoption-postmaster-fixture
+       root
+       (lambda ()
+         (ok (intake-fails-p
+              (lambda () (pg::call-with-physical-adoption-startup-owner #'identity))))
+         (pg::postmaster-own-data-directory "127.0.0.1" 5439)
+         (pg::call-with-physical-adoption-startup-owner
+          (lambda (owner)
+            (ok (eq owner (pg::physical-adoption-check-owner owner)))
+            (rename-file (merge-pathnames "postmaster.pid" root)
+                         (merge-pathnames "postmaster.saved" root))
+            (with-open-file (stream (merge-pathnames "postmaster.pid" root)
+                                    :direction :output :if-exists :error)
+              (write-line (format nil "~d" (sb-posix:getpid)) stream))
+            (ok (intake-fails-p (lambda () (pg::physical-adoption-check-owner owner))))
+            (delete-file (merge-pathnames "postmaster.pid" root))
+            (rename-file (merge-pathnames "postmaster.saved" root)
+                         (merge-pathnames "postmaster.pid" root))
+            (ok (eq owner (pg::physical-adoption-check-owner owner)))))))))

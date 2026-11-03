@@ -40,20 +40,14 @@
   (physical-adoption-follow-read-file
    owner (physical-adoption-follow-path (physical-adoption-owner-directory owner))))
 
-(defun physical-adoption-follow-check-context (owner value)
-  (let* ((handoff (getf value :handoff))
-         (root (physical-adoption-owner-directory owner))
-         (mount (physical-adoption-check-preserved-installation owner handoff))
-         (actual (physical-adoption-handoff-read owner)))
-    (unless (and (equal handoff actual)
-                 (equal (getf value :handoff-file)
-                        (physical-adoption-handoff-file-fact
-                         (physical-adoption-handoff-path root) +physical-adoption-handoff-maximum-bytes+))
-                 (= mount (physical-adoption-install-mount-id (physical-adoption-handoff-path root)))
-                 (= mount (physical-adoption-handoff-check-workspace owner handoff))
-                 (physical-adoption-install-names-p (physical-adoption-handoff-workspace handoff)
-                                                    '(".pg_lisp.lock" "physical-adoption.install")))
-      (error "adoption follow lost its preserved handoff authority"))
+(defun physical-adoption-follow-check-workspaces (owner value mount)
+  (let ((handoff (getf value :handoff))
+        (root (physical-adoption-owner-directory owner)))
+    (unless (and (= mount (physical-adoption-handoff-check-workspace owner handoff))
+                 (physical-adoption-install-names-p
+                  (physical-adoption-handoff-workspace handoff)
+                  '(".pg_lisp.lock" "physical-adoption.install")))
+      (error "adoption follow handoff workspace changed"))
     (let ((workspace (physical-adoption-install-auxiliary-fact
                       (physical-adoption-follow-directory value :workspace))))
       (unless (and (equal (getf value :workspace)
@@ -88,6 +82,19 @@
           (error "adoption follow directory identity or mount changed"))))
     mount))
 
+(defun physical-adoption-follow-check-context (owner value)
+  (let* ((handoff (getf value :handoff))
+         (root (physical-adoption-owner-directory owner))
+         (mount (physical-adoption-check-preserved-installation owner handoff))
+         (actual (physical-adoption-handoff-read owner)))
+    (unless (and (equal handoff actual)
+                 (equal (getf value :handoff-file)
+                        (physical-adoption-handoff-file-fact
+                         (physical-adoption-handoff-path root) +physical-adoption-handoff-maximum-bytes+))
+                 (= mount (physical-adoption-install-mount-id (physical-adoption-handoff-path root))))
+      (error "adoption follow lost its preserved handoff authority"))
+    (physical-adoption-follow-check-workspaces owner value mount)))
+
 (defun physical-adoption-follow-position-entries (positions role)
   (sort (loop for (where name row) in positions when (eq where role)
               collect (list name (list (cons name (copy-list (rest row))))))
@@ -100,25 +107,23 @@
                         collect (cons (concatenate 'string "pg_wal/" name) (copy-list (rest row)))))
           #'string< :key #'first)))
 
-(defun physical-adoption-follow-root-names (value positions)
+(defun physical-adoption-follow-root-names (value positions &optional owner)
   (append (remove "physical-recovery.control"
                   (mapcar #'first (getf (getf (getf value :handoff) :installation) :new)) :test #'equal)
           (copy-list *physical-adoption-install-retained-names*)
           (list "physical-adoption.handoff" "physical-adoption.follow" "pg_physical_receive")
+          (physical-adoption-owner-extra-root-names owner)
           (loop for (role name) in positions when (eq role :root) collect name)))
 
-(defun physical-adoption-follow-namespace-p (value step mount)
-  (let* ((positions (physical-adoption-follow-positions value step))
-         (wal-rows (physical-adoption-follow-wal-rows value positions))
+(defun physical-adoption-follow-position-namespace-p (value positions mount)
+  (let* ((wal-rows (physical-adoption-follow-wal-rows value positions))
          (wal-names
            (remove-duplicates
             (loop for row in wal-rows unless (equal "pg_wal" (first row))
                   collect (let* ((tail (subseq (first row) 7)) (slash (position #\/ tail)))
                             (subseq tail 0 slash)))
             :test #'equal)))
-    (and (physical-adoption-install-names-p (physical-adoption-follow-directory value :root)
-                                            (physical-adoption-follow-root-names value positions))
-         (physical-adoption-install-names-p (physical-adoption-follow-directory value :workspace)
+    (and (physical-adoption-install-names-p (physical-adoption-follow-directory value :workspace)
                                             '(".pg_lisp.lock" "physical-adoption.install" "saved" "staged"))
          (loop for role in '(:staged :saved)
                always (physical-adoption-install-names-p
@@ -131,6 +136,13 @@
          (loop for (role name row) in positions
                always (physical-adoption-install-top-p
                        (physical-adoption-follow-directory value role) (list name (list row)) mount)))))
+
+(defun physical-adoption-follow-namespace-p (value step mount &optional owner)
+  (let ((positions (physical-adoption-follow-positions value step)))
+    (and (physical-adoption-install-names-p
+          (physical-adoption-follow-directory value :root)
+          (physical-adoption-follow-root-names value positions owner))
+         (physical-adoption-follow-position-namespace-p value positions mount))))
 
 (defun physical-adoption-follow-check-content (owner value step mount)
   (let* ((positions (physical-adoption-follow-positions value step))
@@ -186,8 +198,8 @@
          (step (getf state :step))
          (last (length (physical-adoption-follow-moves value)))
          (observed
-           (cond ((physical-adoption-follow-namespace-p value step mount) step)
-                 ((and (< step last) (physical-adoption-follow-namespace-p value (1+ step) mount)) (1+ step))
+           (cond ((physical-adoption-follow-namespace-p value step mount owner) step)
+                 ((and (< step last) (physical-adoption-follow-namespace-p value (1+ step) mount owner)) (1+ step))
                  (t (error "adoption follow namespace is not its recorded prefix or one move ahead")))))
     (when (and (getf state :partial) (/= observed (1+ step)))
       (error "partial adoption follow progress has no completed move"))
@@ -196,7 +208,7 @@
     (unless (and (= mount (physical-adoption-follow-check-context owner value))
                  (= mount (physical-adoption-install-mount-id
                            (physical-adoption-follow-path (physical-adoption-owner-directory owner))))
-                 (physical-adoption-follow-namespace-p value observed mount)
+                 (physical-adoption-follow-namespace-p value observed mount owner)
                  (equal state (physical-adoption-follow-read owner)))
       (error "adoption follow context changed during verification"))
     observed))

@@ -87,6 +87,25 @@
       (error "adoption handoff receive spool changed while opening"))
     location))
 
+(defun physical-adoption-check-preserved-trees (plan)
+  (unless (physical-adoption-install-names-p
+           (physical-adoption-install-directory plan :workspace)
+           '(".pg_lisp.lock" "incoming" "physical-adoption.install" "quarantine"))
+    (error "adoption installation workspace changed during handoff"))
+  (dolist (pair (list (list :incoming nil) (list :quarantine (getf plan :old))))
+    (let ((directory (physical-adoption-install-directory plan (first pair))))
+      (unless (and (physical-adoption-install-names-p
+                    directory (append (list ".pg_lisp.lock" "physical-adoption.install")
+                                      (mapcar #'first (second pair))))
+                   (equal (second pair)
+                          (physical-adoption-install-snapshot
+                           directory :exclude *physical-adoption-install-retained-names*)))
+        (error "adoption preserved quarantine or incoming tree changed"))))
+  (unless (equal (getf plan :stage-tree)
+                 (physical-adoption-install-snapshot (physical-adoption-install-directory plan :stage)))
+    (error "adoption immutable stage changed during handoff"))
+  t)
+
 (defun physical-adoption-check-preserved-installation (owner value)
   (let* ((state (physical-adoption-install-read owner))
          (plan (getf value :installation))
@@ -107,22 +126,7 @@
                         (physical-adoption-handoff-file-fact
                          (physical-adoption-install-path root) +physical-adoption-install-maximum-bytes+)))
       (error "adoption handoff lost its terminal installation authority"))
-    (unless (physical-adoption-install-names-p
-             (physical-adoption-install-directory plan :workspace)
-             '(".pg_lisp.lock" "incoming" "physical-adoption.install" "quarantine"))
-      (error "adoption installation workspace changed during handoff"))
-    (dolist (pair (list (list :incoming nil) (list :quarantine (getf plan :old))))
-      (let ((directory (physical-adoption-install-directory plan (first pair))))
-        (unless (and (physical-adoption-install-names-p
-                      directory (append (list ".pg_lisp.lock" "physical-adoption.install")
-                                        (mapcar #'first (second pair))))
-                     (equal (second pair)
-                            (physical-adoption-install-snapshot
-                             directory :exclude *physical-adoption-install-retained-names*)))
-          (error "adoption preserved quarantine or incoming tree changed"))))
-    (unless (equal (getf plan :stage-tree)
-                   (physical-adoption-install-snapshot (physical-adoption-install-directory plan :stage)))
-      (error "adoption immutable stage changed during handoff"))
+    (physical-adoption-check-preserved-trees plan)
     mount))
 
 (defun physical-adoption-handoff-check-installation (owner value)

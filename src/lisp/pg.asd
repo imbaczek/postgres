@@ -171,6 +171,7 @@
                    (:file "../replication/physical-promotion-primary")
                    (:file "../utils/control-data")
                    (:file "../replication/physical-adoption")
+                   (:file "../replication/physical-adoption-startup-owner")
                    (:file "../replication/physical-adoption-stage")
                    (:file "../replication/physical-adoption-attempt")
                    (:file "../replication/physical-adoption-context")

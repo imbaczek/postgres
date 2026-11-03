@@ -9,12 +9,16 @@
 (defun physical-adoption-install-path (&optional (directory *pgdata*))
   (merge-pathnames "physical-adoption.install" directory))
 
-(defun physical-adoption-require-absent (path message)
+(defun physical-adoption-path-present-p (path)
   (handler-case
-      (progn (sb-posix:lstat (namestring path)) (error message))
+      (progn (sb-posix:lstat (namestring path)) t)
     (sb-posix:syscall-error (condition)
       (unless (= sb-posix:enoent (sb-posix:syscall-errno condition))
-        (error condition))))
+        (error condition))
+      nil)))
+
+(defun physical-adoption-require-absent (path message)
+  (when (physical-adoption-path-present-p path) (error message))
   (values))
 
 (defun physical-adoption-handoff-path (&optional (directory *pgdata*))
@@ -46,6 +50,19 @@
 This context is invalid after its enclosing call exits."
   directory device inode lock lock-device lock-inode thread active-p)
 
+(defgeneric physical-adoption-check-owner-role (owner))
+
+(defmethod physical-adoption-check-owner-role ((owner physical-adoption-owner))
+  owner)
+
+(defgeneric physical-adoption-owner-extra-root-names (owner))
+
+(defmethod physical-adoption-owner-extra-root-names ((owner physical-adoption-owner))
+  nil)
+
+(defmethod physical-adoption-owner-extra-root-names ((owner null))
+  nil)
+
 (defun physical-adoption-check-owner (owner)
   "Recheck the active owner and the identities of its directory and lock inode."
   (unless (and (physical-adoption-owner-p owner)
@@ -67,7 +84,7 @@ This context is invalid after its enclosing call exits."
                  (= (physical-adoption-owner-lock-device owner) (sb-posix:stat-dev lock))
                  (= (physical-adoption-owner-lock-inode owner) (sb-posix:stat-ino lock)))
       (error "offline adoption data directory or lock inode changed")))
-  owner)
+  (physical-adoption-check-owner-role owner))
 
 (defun call-with-physical-adoption-owner (directory function)
   "Call FUNCTION with exclusive ownership of an existing private PGDATA lock.

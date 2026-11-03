@@ -53,6 +53,7 @@
                (:file "t/physical-adoption-handoff-tests")
                (:file "t/physical-adoption-follow-plan-tests")
                (:file "t/physical-adoption-follow-codec-tests")
+               (:file "t/physical-adoption-retire-codec-tests")
                (:file "t/physical-adoption-follow-tests")
                (:file "t/physical-adoption-startup-tests")
                (:file "t/wal-timeline-tests")
