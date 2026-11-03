@@ -37,6 +37,8 @@
        (typep (seventh row) '(signed-byte 64))
        (every (lambda (time) (typep time '(signed-byte 96))) (nthcdr 7 row))))
 
+;; Convert row facts to the seconds-resolution stat representation used for
+;; descriptor comparison.  The original row retains nanosecond timestamps.
 (defun physical-reseed-install-row-file-facts (row)
   (append (subseq row 1 7)
           (list (floor (eighth row) 1000000000) (floor (ninth row) 1000000000))))
@@ -114,6 +116,9 @@
             (physical-reseed-install-statx-time sap #x70)
             (physical-reseed-install-statx-time sap #x60)))))
 
+;; Before each scan that excludes a fixed install entry, the caller must match
+;; that named entry to its held journal descriptor.  All other unresolved
+;; management names fail the scan, including the other install journal name.
 (defun physical-reseed-install-old-scan (fd mount device forbidden &key install-entry)
   (unless (member install-entry '(nil "physical-reseed.install.tmp" "physical-reseed.install") :test #'equal)
     (error "invalid reseed install inventory exclusion"))

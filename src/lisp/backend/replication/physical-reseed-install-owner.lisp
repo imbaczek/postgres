@@ -1,5 +1,11 @@
 (in-package #:pg)
 
+;; Install journal ownership for source cleanup and recovery checks.  An install
+;; owner can perform source STATUS and ABORT through the cleanup role.  It has
+;; no authority to move files or use an image.
+;;
+;; Require a private, bounded, single-link journal and return its stat facts.
+;; Empty files are accepted only while the publisher holds a new generation.
 (defun physical-reseed-install-file-identity (stat &optional allow-empty)
   (unless (and (= #o100600 (sb-posix:stat-mode stat))
                (= (sb-posix:geteuid) (sb-posix:stat-uid stat))
@@ -8,6 +14,10 @@
     (error "reseed install journal is not a bounded private single-link regular file"))
   (physical-reseed-file-facts stat))
 
+;; Read a named journal through a held descriptor.  Check its mount before
+;; reading and compare named and descriptor stat facts around the read.  Bind
+;; the decoded plan to this journal generation and root.  Stabilization also
+;; syncs file and directory.  A malformed or changed final journal fails closed.
 (defun physical-reseed-install-read-at (root-fd name &key stabilize)
   (unless (member name '("physical-reseed.install" "physical-reseed.install.tmp") :test #'equal)
     (error "unexpected reseed install journal name"))
@@ -46,14 +56,21 @@
                (append state (list :identity before)))))
       (if stream (close stream) (when fd (sb-posix:close fd))))))
 
+;; Keep the owner's plan and attempt evidence out of printed representations.
 (defun print-physical-reseed-install-owner (owner stream depth)
   (declare (ignore depth))
   (print-unreadable-object (owner stream :type t :identity t)))
 
 (defstruct (physical-reseed-install-owner (:include physical-reseed-cleanup-owner)
                                           (:print-function print-physical-reseed-install-owner))
-  plan (step 0))
+  ;; Private copy of the recovered plan, fixed for this ownership scope.
+  plan
+  ;; Greatest validated journal step seen by this owner.
+  (step 0))
 
+;; Borrow ROOT-FD and hold the quarantine directory descriptor and two input
+;; streams for its management files.  Compare the saved guard facts on both
+;; sides of the callback.  The held PGDATA lock serializes this read-only scope.
 (defun call-with-physical-reseed-install-quarantine-pid (owner root-fd fact function)
   (let ((directory (pathname (getf fact :directory))) (fd nil) (lock nil) (fence nil))
     (unwind-protect
@@ -74,6 +91,8 @@
       (when lock (close lock))
       (when fd (sb-posix:close fd)))))
 
+;; Read PID evidence only while its named statx observation remains stable.
+;; A moved entry may have a different ctime after rename.
 (defun physical-reseed-install-read-pid-at (fd expected &optional moved)
   (when (physical-adoption-path-present-p (merge-pathnames "postmaster.pid" (physical-image-fd-path fd)))
     (let* ((mount (physical-adoption-install-mount-id nil :directory-fd fd))
@@ -85,10 +104,16 @@
         (error "reseed PID stat evidence changed"))
       current)))
 
+;; A live process or an indeterminate process state prevents cleanup.
 (defun physical-reseed-install-check-dead-pid (old)
   (unless (eq :dead (physical-reseed-process-state (getf old :pid)))
     (error "reseed original process is live or its state is unknown")))
 
+;; Check the original PID at its expected location and require it to be dead.
+;; The quarantine location is permitted one move ahead of the recorded step,
+;; since a crash can occur between a rename and its progress record.  Compare
+;; moved identity and bytes while allowing rename to change ctime, and check
+;; that no second root PID appears.
 (defun physical-reseed-install-check-pid (owner root-fd plan step)
   (let* ((old (physical-reseed-owner-old-pid owner))
          (pid-row (assoc "postmaster.pid" (getf plan :old) :test #'equal))
@@ -119,6 +144,8 @@
                       (error "reseed installation gained a second root PID"))))))))))
     owner))
 
+;; Recover the plan only when no temporary intent remains and the final journal
+;; binds to the current attempt and directory.
 (defun physical-reseed-install-initial-arguments (directory)
   (physical-adoption-require-absent (physical-reseed-install-temporary-path directory)
                                     "reseed install temporary requires reconciliation")
@@ -138,6 +165,8 @@
                    :old-pid (physical-reseed-cleanup-pid-evidence original))))
       (when fd (sb-posix:close fd)))))
 
+;; Recheck the fixed plan, attempt binding, PID evidence, and nondecreasing
+;; journal progress whenever install ownership is used.
 (defmethod physical-adoption-check-owner-role ((owner physical-reseed-install-owner))
   (physical-directory-check-owner-common owner)
   (physical-adoption-require-absent
@@ -161,11 +190,15 @@
              (physical-reseed-cleanup-owner-attempt owner) attempt))))
   owner)
 
+;; Acquire stopped directory ownership with the recovered install evidence.
 (defun call-with-physical-reseed-install-owner (directory function)
   (call-with-physical-adoption-directory-owner
    directory function :constructor #'make-physical-reseed-install-owner
    :initial-arguments #'physical-reseed-install-initial-arguments))
 
+;; Choose the final install journal first.  Failure to read or validate it is an
+;; error and never falls back to cleanup or ordinary ownership.  A temporary
+;; journal alone selects cleanup ownership.
 (defun call-with-physical-reseed-operation-owner (directory function)
   (cond
     ((physical-adoption-path-present-p (physical-reseed-install-path directory))

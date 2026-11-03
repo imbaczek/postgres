@@ -1,5 +1,9 @@
 (in-package #:pg)
 
+;; Durable publication of the initial install intent.  The held descriptor
+;; identifies the actual journal generation throughout creation and promotion.
+;;
+;; Match the retained descriptor to its name, generation, and root mount.
 (defun physical-reseed-install-check-held-journal (root-fd fd name generation)
   (physical-reseed-install-check-journal-name name)
   (let* ((facts (physical-reseed-install-file-identity (sb-posix:fstat fd) t))
@@ -10,10 +14,13 @@
                     (physical-adoption-install-mount-id nil :directory-fd fd)))
       (error "reseed retained journal no longer matches its named generation"))))
 
+;; Restrict publication checks to the two fixed journal names.
 (defun physical-reseed-install-check-journal-name (name)
   (unless (member name '("physical-reseed.install.tmp" "physical-reseed.install") :test #'equal)
     (error "unexpected reseed publication journal name")))
 
+;; Sync and decode the supplied name while retaining the original descriptor.
+;; Require complete bytes, the exact initial plan, and zero progress.
 (defun physical-reseed-install-check-initial-readback (root-fd fd name generation plan)
   (physical-reseed-install-check-held-journal root-fd fd name generation)
   (let ((state (physical-reseed-install-read-at root-fd name :stabilize t)))
@@ -21,6 +28,16 @@
       (error "reseed initial journal readback differs"))
     (physical-reseed-install-check-held-journal root-fd fd name generation)))
 
+;; Publish one initial intent with exclusive creation and NOREPLACE promotion.
+;; ROOT-FD is borrowed.  Retain the new journal descriptor and derive its
+;; device and inode before encoding SEED.  CHECK receives NIL before creation.
+;; After creation it receives the fixed entry name only after the held journal
+;; descriptor is matched to that name.  CHECK must signal if its ownership or
+;; namespace proof fails, including before excluding that entry from a scan.
+;;
+;; Sync and read back before rename and after directory sync, retaining the
+;; descriptor and repeating checks at each boundary.  Failure leaves any
+;; created intent and existing startup fences for reconciliation.
 (defun physical-reseed-install-publish-journal (root-fd seed check)
   (let ((fd nil) (stream nil) (generation nil)
                  (name "physical-reseed.install.tmp") (plan nil))

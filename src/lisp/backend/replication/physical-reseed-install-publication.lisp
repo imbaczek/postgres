@@ -1,5 +1,11 @@
 (in-package #:pg)
 
+;; Publish installation intent for the original frozen image and attempt.
+;; The seed records the old namespace, synced incoming rows, and auxiliary
+;; directory identities.  Recheck them along with PID, source, and ownership
+;; evidence throughout journal publication.  After intent creation the ordinary
+;; owner role is superseded, so use its common directory checks while proving
+;; the original attempt and the held journal generation separately.
 (defun physical-reseed-install-publish-prepared
     (owner root-fd record client image source-context source-root incoming-context incoming-root
      incoming-facts quarantine-facts quarantine-fd stage-check incoming-check quarantine-check)
@@ -40,6 +46,8 @@
              (physical-directory-check-owner-common owner)))
       (physical-reseed-install-publish-journal root-fd seed #'check))))
 
+;; Preflight the incoming image, then hold and check both auxiliary directories
+;; while capturing and publishing their facts.
 (defun physical-reseed-install-publish-workspaces
     (owner root-fd record client image source-context source-root stage-check incoming quarantine)
   (let ((expected (physical-reseed-install-preflight-incoming owner incoming image)))
@@ -63,6 +71,9 @@
         :prepare t :empty t))
      :prepare t :expected expected)))
 
+;; Publish intent from the original active attempt and frozen stage.  Reconnect
+;; for STATUS using the original frozen profile and saved request, and require
+;; READY.  Return T on success and keep the plan private.
 (defun physical-reseed-publish-install (owner incoming quarantine &key helper)
   (unless (eq (type-of owner) 'physical-reseed-owner)
     (error "reseed installation publication requires ordinary stopped ownership"))

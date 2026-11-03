@@ -1,5 +1,8 @@
 (in-package #:pg)
 
+;; Installation image inspection.  Hold the original frozen stage and its lock
+;; for the callback, checking its identity before and after use.  The check
+;; closure is valid only within this scope.
 (defun call-with-physical-reseed-install-stage (owner root-fd record function)
   (physical-reseed-require-journal owner record)
   (let* ((expected (physical-reseed-attempt-stage-copy (getf record :stage) (getf record :local)))
@@ -19,6 +22,9 @@
       (setf active nil)
       (when fd (sb-posix:close fd)))))
 
+;; Bind each image entry to the named statx observation and held descriptor.
+;; Read exactly the expected size and digest, optionally sync the file, and
+;; recheck both observations before returning its inventory row.
 (defun physical-reseed-install-image-file-row (context entry mount synchronize)
   (destructuring-bind (name size expected-digest) entry
     (let ((directory (physical-image-context-root-path context)))
@@ -48,6 +54,8 @@
                 (error "reseed incoming file changed while capturing its identity"))
               (append (list (copy-seq name)) (rest before) (list digest)))))))))
 
+;; Bind a named image directory to its held descriptor and optionally sync it.
+;; A changed name or descriptor invalidates the captured row.
 (defun physical-reseed-install-image-directory-row (context name mount synchronize)
   (let* ((fd (cdr (assoc name (physical-image-context-children context) :test #'equal)))
          (root (physical-image-context-root-fd context))
@@ -62,6 +70,8 @@
       (error "reseed incoming directory changed while capturing its identity"))
     (append (list (copy-seq name)) (rest before) (list nil))))
 
+;; Capture sorted file and directory rows within a read scope.  Synchronization
+;; flushes each file and child directory, then the image root directory.
 (defun physical-reseed-install-image-rows (context image &key synchronize)
   (unless (physical-image-read-context-p context) (error "reseed install inventory requires a read scope"))
   (physical-image-check-children context)
@@ -76,12 +86,15 @@
     (physical-image-check-children context)
     (sort (append files directories) #'string< :key #'first)))
 
+;; Only the auxiliary lock and install fence may occupy a new quarantine.
 (defun physical-reseed-install-check-empty-quarantine (fd)
   (unless (equal '(".pg_lisp.lock" "physical-reseed.install")
                  (sort (directory-entry-names (physical-image-fd-path fd)
                                               :follow-symlinks t :maximum-entries 2 :maximum-name-bytes 128) #'string<))
     (error "reseed quarantine has unexpected entries")))
 
+;; Verify the incoming image before preparing its auxiliary ownership and return
+;; the directory facts that the later scope must match.
 (defun physical-reseed-install-preflight-incoming (owner incoming image)
   (call-with-physical-reseed-stage
    owner incoming
