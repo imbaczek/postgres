@@ -74,6 +74,7 @@
                (:file "t/physical-reseed-install-tests")
                (:file "t/physical-reseed-inventory-tests")
                (:file "t/physical-reseed-cleanup-tests")
+               (:file "t/physical-reseed-install-codec-tests")
                (:file "t/physical-adoption-retire-tests")
                (:file "t/physical-adoption-startup-entry-tests")
                (:file "t/wal-timeline-tests")
