@@ -187,6 +187,7 @@
                    (:file "../replication/physical-adoption-context")
                    (:file "../replication/physical-reseed-attempt-codec")
                    (:file "../replication/physical-reseed-attempt-store")
+                   (:file "../replication/physical-reseed-remote")
                    (:file "../replication/physical-adoption-cancel")
                    (:file "../replication/physical-adoption-proof")
                    (:file "../replication/physical-adoption-install-fs")
