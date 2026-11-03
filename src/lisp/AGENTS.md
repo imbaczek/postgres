@@ -528,6 +528,14 @@ this mode.
 
 ### SBCL descriptor streams and global variables
 
+- For an opaque old-tree inventory, track names independently of inode identity:
+  hardlinked names can share an inode, and moving one changes their shared ctime.
+  Keep nanosecond times for stability within a snapshot; use the intended
+  rename-aware comparison across installation steps. Obtain entry metadata and
+  mount ID from one descriptor-relative statx call so a swap cannot pair facts
+  from different entries. Enforce entry/name limits during readdir, before
+  collecting the full inventory or issuing every metadata read.
+
 - Keep read-only image scopes separate from receive scopes. Both own duplicated
   root and child descriptors, but reopening an existing image must not create
   directories, sync them or grant the output API. Pair named workspace paths

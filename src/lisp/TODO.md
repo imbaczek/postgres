@@ -226,6 +226,26 @@
   distinct inodes for every one of their 13 files. Evidence:
   `/home/imbaczek/proj/pg-ha-artifacts/reseed-image/evidence.json`.
 
+- [x] Add the opaque old-entry inventory for a full reseed install plan.
+  Read only the old root's immediate entries through a paired directory
+  descriptor. A single no-follow statx observation binds each entry's mount,
+  inode and metadata; require two complete matching scans, including nanosecond
+  modification/change times, and recheck the original owner and attempt.
+  Preserve hardlinked names and unreadable files/directories without opening
+  contents, traversing children or following symlink referents. Keep management
+  names out of the move inventory and reject their inode aliases.
+  Enforce entry and encoded-name byte limits during readdir, before allocating
+  the complete list or inspecting every entry. Invalid UTF-8 filenames remain
+  unsupported and fail before any future install-journal publication. Descendant
+  mounts are not inspected; later unsupported rename interactions must leave
+  startup fenced.
+  These are observations for a future plan, with no moves or new ownership role.
+  Verification: 1,773 distinct physical tests including 13 new tests, 49 focused
+  checks, 100 generated trials (seed 97), and fresh strict compilation passed.
+  The shared management-name refactor also passed focused checks and strict
+  compilation after the full suite had started. Evidence and next-journal notes:
+  `/home/imbaczek/proj/pg-ha-artifacts/reseed-inventory/evidence.json`.
+
 - [ ] Install a full reseed image while preserving the opaque old data tree.
   Introduce a separate `physical-reseed.install` plan and install owner. Select
   that owner whenever a valid install journal exists, including before the first

@@ -118,6 +118,10 @@ callers needing a coherent view across publications must compare control images.
          (sb-posix:fsync fd)
       (sb-posix:close fd))))
 
+;; Optional limits are enforced during readdir, counting entries and encoded
+;; UTF-8 name bytes.  NIL imposes no limit; cleanup closes the
+;; directory even when decoding, enumeration, or a bound check fails.
+
 (defun directory-entry-names (path &key follow-symlinks maximum-entries maximum-name-bytes)
   "Return the raw entry names in PATH, or NIL if PATH is initially absent.
 
