@@ -245,6 +245,16 @@ appropriate instead of replacing the native C peer or adding a message relay.
 
 ### Reader and test-discovery checks
 
+- A reader-form comparison must normalize SBCL's comma objects inside backquote
+  as well as uninterned symbols and vectors. Two reads of unchanged macro source
+  can contain distinct comma structures and fail `equal`. Compare their
+  `sb-int:comma-kind` and recursively normalized `sb-int:comma-expr`; keep strings
+  case-sensitive and include existing docstrings. This session's comment-only
+  documentation check exposed that false difference in `with-physical-image-input`.
+- Stop after a failed balance or reader check before writing a new Lisp file.
+  `fs-write-file` can save invalid text; its diagnosis does not undo the write.
+  Use the structural editor for existing forms and inspect the parsed scope too:
+  balanced parentheses alone do not prove that cleanup is inside `unwind-protect`.
 - A changed macro needs its callers recompiled. Clear the `pg` FASLs and reload
   before testing expanded call sites; redefining the macro alone leaves old code.
 - Renamed Rove tests can remain in a warm registry. Check `get-test` for obsolete

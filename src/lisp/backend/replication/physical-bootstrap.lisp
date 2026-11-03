@@ -622,6 +622,9 @@ The slot is dropped on every exit; a verified origin remains after cancellation.
         (error "native backup bundle file disagrees with its manifest or bound"))
       (values size digest))))
 
+;; Consume exactly the declared data extent and its end frame while checking
+;; the digest; the caller owns the output stream and its durability.
+
 (defun physical-backup-receive-file-content (size expected-digest next output)
   (let ((digest #xCBF29CE484222325))
     (loop with remaining = size
@@ -639,6 +642,9 @@ The slot is dropped on every exit; a verified origin remains after cancellation.
                    (= expected-digest digest))
         (error "native backup file end or checksum is invalid")))
     digest))
+
+;; Descriptor-scoped receipt creates relative to held directories; the legacy
+;; path retains its existing pathname-based file creation and sync behavior.
 
 (defun physical-backup-receive-file (directory name maximum next &key expected (timeline 1))
   (unless (physical-backup-bundle-path-p name timeline)
@@ -662,6 +668,9 @@ The slot is dropped on every exit; a verified origin remains after cancellation.
                   (fsync-directory parent)
                   digest))))
       (list name size digest))))
+
+;; The descriptor route checks all received names, including metadata, against
+;; the manifest.  This snapshot is not a substitute for an installation check.
 
 (defun physical-backup-check-received-inventory (directory manifest)
   (when *physical-image-context*

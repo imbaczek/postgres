@@ -454,6 +454,9 @@ The optional flag is exactly 1 and follows the legacy keys."
     (error "child physical recovery manifest lacks its timeline history"))
   manifest)
 
+;; In a receive scope, resolve and read through held descriptors; ordinary
+;; recovery retains its pathname and symlink checks.
+
 (defun recovery-check-manifest-files (manifest directory)
   "Verify every declared immutable base file before any storage initializer runs."
   (let ((root (if *physical-image-context* directory (truename directory)))
@@ -485,6 +488,9 @@ unknown, even if the copied control has known resource metadata."
   (if (getf snapshot :resource-parameters)
       (timeline-check-resource-origin snapshot (timeline-read-history (getf snapshot :timeline)))
       (wal-copy-control-resource-fields snapshot)))
+
+;; Scoped verification enumerates the held child directories.  Its inventory
+;; check describes this verification, not a later installation of the image.
 
 (defun recovery-check-image-metadata (manifest directory)
   "Bind catalog identity, exact file inventory, WAL checkpoint and XID reservation."

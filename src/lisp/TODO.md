@@ -1,5 +1,34 @@
 # Development TODO
 
+- [x] Connect the stopped-target journal to remote capture and cancellation.
+  A new start freezes a separate private stage and the accepted source route
+  with its effective credential owner before sending CAPTURE once. Reopening
+  uses the saved request and credentials for STATUS/ABORT only, including when
+  no manifest arrived or the source reports UNKNOWN. Abort intent is durable
+  before the RPC; only CLOSED/ABORTED permits the local ABORTED phase. Both
+  journal names remain startup fences, and cancellation does not need the stage
+  or a matching current source timeline.
+  Receipt duplicates the held stage descriptor and keeps descriptors for its
+  base, global and pg_wal children through verification. Exclusive nofollow
+  creation prevents overwriting existing files; scoped readers and exact
+  descriptor inventories reject unsafe leaves and unexpected names. A new
+  child must be empty when opened; this does not prove it is the inode created
+  by mkdirat. Final stage identity checks reject a renamed root or child.
+  Validation passed 1,740 distinct physical tests, 22 focused tests and fresh
+  strict compilation. Nine native cases covered normal capture, root and child
+  replacement during receipt, pre-RPC and post-capture cuts, lost local ABORT
+  acknowledgment, a nonlocal connection exit, source failure before streaming,
+  and an unexpected stage entry. Each case preserved the old file bytes,
+  inodes and inventory apart from the deliberate journal fence, reacquired
+  stopped ownership for STATUS/ABORT, and rejected late CAPTURE after cancellation.
+  Source SQL remained intact and writable, with no helper channels, capture
+  owners or retained source pins left. The stage property passed 100 trials at
+  seed 95, digest `e731cd00462a62f1`; input coverage was not collected.
+  Code commits: `f74ee6c4a2b`, `cd9b2e172ff`, `00f929a4584`. Evidence:
+  `/home/imbaczek/proj/pg-ha-artifacts/reseed-remote/evidence.json`.
+  Preserved-data installation, actual follow handoff and startup reconciliation
+  remain open. No coordinator is implemented.
+
 - [x] Add the stopped-target reseed journal foundation.
   Freeze the original lease request, physical source settings and credential
   owner, and local directory/lock/PID evidence in a canonical private record.
@@ -124,7 +153,7 @@
   target follow configuration own retention. Interrupted attempts must not
   silently recapture a different base under the same identity.
 
-- [ ] Connect the target journal to one-shot remote capture and cancellation.
+- [x] Connect the target journal to one-shot remote capture and cancellation.
   Use the stopped-target owner, not the clean-adoption capability. Save the
   original lease request and the accepted source route with its credential
   owner in a private bounded record at `physical-reseed.attempt`. Reuse the
@@ -158,6 +187,34 @@
   the saved frozen credential owner and recheck owner, journal, route and source
   identity before dispatch. Initial capture requires the saved source timeline;
   cancellation after source promotion must still accept the same system ID.
+
+- [ ] Install a full reseed image while preserving the opaque old data tree.
+  Introduce a separate `physical-reseed.install` plan and install owner. Select
+  that owner whenever a valid install journal exists, including before the first
+  move; do not grant clean-adoption authority or require clean control/WAL facts
+  from the divergent target. Reverify the external stage and source READY, clone
+  a separate incoming image, and verify its exact inventory before publishing
+  the immutable move plan. Bind the original attempt, request, frozen source,
+  root/lock identities and all workspace identities.
+  Preserve the root lock and attempt fence in place. Move the other original
+  top-level entries, including the original PID inode, into a private external
+  quarantine on the same mount. Treat dirty contents and symlinks as opaque;
+  do not parse or follow them. Use checked no-replace renames and sync both
+  parents before recording each completed step. Recovery may accept the recorded
+  namespace or exactly one proven planned rename ahead; both/neither locations,
+  changed identity or ambiguous progress must fail closed.
+  The install owner must check the original PID bytes, inode and stopped-process
+  evidence at the location derived from the journal, with absence at the other
+  location. STATUS/checked ABORT must remain usable under this owner even if the
+  stage or incoming image is damaged. Advancing installation requires healthy
+  image evidence; remote cleanup does not. Keep the attempt/install startup
+  fences after installation or cancellation, retain the old tree, and do not
+  roll back or permit writable startup automatically. Real follow-successor
+  handoff and terminal startup reconciliation follow separately.
+  Reuse adoption's no-replace rename, mount/sync and one-step-ahead mechanics,
+  not its old-tree snapshot, clean proof, codec or ownership validator. Cover
+  every move/publication cut, fresh-image reopening and cleanup after the PID
+  moves. Sol xhigh design notes are in the reseed-remote evidence file above.
 
 - [x] Retire terminal adoption fences during real postmaster startup. A durable
   terminal RETIRE marker permits checked removal of handoff, install and attempt

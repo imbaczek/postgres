@@ -42,6 +42,12 @@
         :lock-device (getf local :lock-device) :lock-inode (getf local :lock-inode)
         :pid (physical-reseed-attempt-pid-copy (getf local :pid))))
 
+;; The optional stage identity is part of the saved intent and must remain
+;; fixed across transitions, just like the local and source identities.
+
+;; This pure check validates the shape and separation of the saved identity;
+;; the remote driver checks that the filesystem still matches it.
+
 (defun physical-reseed-attempt-stage-copy (stage local)
   (physical-follow-check-plist stage '(:directory :device :inode))
   (unless (and (physical-adoption-attempt-directory-p (getf stage :directory))

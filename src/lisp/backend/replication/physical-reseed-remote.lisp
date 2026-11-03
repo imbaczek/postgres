@@ -1,5 +1,10 @@
 (in-package #:pg)
 
+;; Offline reseed receipt journals the original request, frozen source and
+;; stage identity before one CAPTURE.  Reopened attempts can ask STATUS or
+;; ABORT; they cannot issue another CAPTURE.  This layer does not install or
+;; hand off an image, or coordinate a replacement server.
+
 (defvar *physical-reseed-remote-test-hook* nil)
 
 (defun physical-reseed-remote-test-point (point)
@@ -31,6 +36,9 @@
         (error "reseed receive stage is not empty"))
       facts)))
 
+;; Hold an exclusive lock on the private, initially empty stage while its
+;; pathname and descriptor identities are checked around capture.
+
 (defun call-with-physical-reseed-stage (owner directory function)
   (physical-reseed-check-owner owner)
   (let ((directory (truename (uiop:ensure-directory-pathname directory))) (fd nil))
@@ -51,6 +59,9 @@
       (error "reseed source identity or capture timeline changed")))
   t)
 
+;; Identify the source and capture timeline before freezing its connection
+;; facts, as base backup identifies its source before starting the backup.
+
 (defun physical-reseed-discover-source (request profile helper)
   (unless (eq :physical (physical-libpq-profile-mode profile))
     (error "reseed requires a physical replication profile"))
@@ -64,6 +75,10 @@
            (physical-reseed-source-identity client request :current-timeline t)
            (values (physical-adoption-attempt-accepted-source client profile) resolved))
       (when client (physical-client-close client)))))
+
+;; Reconnect using the saved route and credential owner, then recheck the
+;; journal and source before the callback.  Track the helper as soon as it is
+;; spawned so every exit closes the owned client.
 
 (defun call-with-physical-reseed-client (owner record function &key helper capture)
   (physical-reseed-require-journal owner record)
@@ -130,6 +145,11 @@
        (physical-reseed-source-result
         record (pg-client-native-backup-lease-status client (getf record :request))))
      :helper helper)))
+
+;; Persist abort intent before contacting the source.  Remote cancellation does
+;; not need a healthy stage or the current timeline, but checks the same system
+;; identifier.  An already-aborted attempt returns locally.  Neither path
+;; removes the local startup fence.
 
 (defun physical-reseed-cancel (owner &key helper)
   (let ((record (physical-reseed-attempt-recover owner)))

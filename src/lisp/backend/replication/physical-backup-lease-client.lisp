@@ -109,6 +109,9 @@
       (pg-client-native-reject "native backup lease differs from the received image")))
   (physical-backup-lease-copy record))
 
+;; Finish the stream, reread the manifest, and bind it to a READY status for
+;; the original request before accepting the received inventory.
+
 (defun physical-backup-lease-receive-remote (target channel request)
   (physical-libpq-start-copy-out channel
                                  (pg-client-native-backup-lease-query "CAPTURE_BACKUP_NATIVE" request))
@@ -121,6 +124,9 @@
                      actual digest request (pg-client-native-backup-lease-status channel request))))
         (physical-backup-check-received-inventory target manifest)
         (values manifest record)))))
+
+;; A supplied descriptor selects scoped descriptor-relative receipt.  Without
+;; it, preserve the existing pathname-based receiver.
 
 ;; Receive into the caller's empty directory, verify the manifest, then check
 ;; STATUS against the received image.  READY describes source retention at

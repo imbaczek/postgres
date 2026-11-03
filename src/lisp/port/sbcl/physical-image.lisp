@@ -6,6 +6,11 @@
 (sb-alien:define-alien-routine ("mkdirat" physical-image-mkdirat) sb-alien:int
   (directory sb-alien:int) (name sb-alien:c-string) (mode sb-alien:unsigned-int))
 
+;; A receive scope owns a duplicate of the caller's root descriptor and the
+;; cached child descriptors.  The caller retains ownership of its descriptor.
+;; The scope and its /proc/self/fd paths are valid only in the owning thread
+;; until cleanup closes the descriptors, including on a nonlocal exit.
+
 (defstruct (physical-image-context (:constructor %make-physical-image-context))
   root-fd root-path children (owner sb-thread:*current-thread*) (active t))
 
@@ -30,6 +35,10 @@
                  (or (null device) (= device (sb-posix:stat-dev stat))))
       (error "physical image directory is not private and owned"))
     stat))
+
+;; Create each private child exclusively, open it without following symlinks,
+;; and retain its descriptor for subsequent access.  An empty opened child is
+;; required, but does not prove it is the inode created by mkdirat.
 
 (defun physical-image-open-child (context name)
   (physical-image-check-context context)
@@ -99,11 +108,15 @@
                      (= (sb-posix:stat-ino held) (sb-posix:stat-ino named)))
           (error "physical image child directory was replaced"))))))
 
+;; Duplicate the borrowed root, hold the children throughout receipt, and sync
+;; them and the root on success.  Cleanup closes only descriptors owned here.
+
 (defun call-with-physical-backup-receive-directory (borrowed-fd function)
   (let ((context (%make-physical-image-context)))
     (sb-sys:without-interrupts
       (unwind-protect
            (progn
+             ;; 1030 is Linux F_DUPFD_CLOEXEC; the duplicate belongs to this scope.
              (setf (physical-image-context-root-fd context)
                    (sb-posix:fcntl borrowed-fd 1030 0))
              (let ((fd (physical-image-context-root-fd context)))
@@ -124,6 +137,9 @@
         (dolist (entry (physical-image-context-children context)) (sb-posix:close (cdr entry)))
         (when (physical-image-context-root-fd context)
           (sb-posix:close (physical-image-context-root-fd context)))))))
+
+;; Create a private 0600 file exclusively relative to a held directory, without
+;; following symlinks.  Sync the file and parent before reporting success.
 
 (defun call-with-physical-image-output (directory name function)
   (let ((context *physical-image-context*))
@@ -165,6 +181,10 @@
       (unless fd (error "physical image input escaped its descriptor scope"))
       (values fd leaf))))
 
+;; Open only within the active descriptor scope, without following symlinks;
+;; require a private owned single-link regular file.  A permitted missing file
+;; calls FUNCTION with NIL.  Close the owned descriptor or stream on every exit.
+
 (defun call-with-physical-image-input (path function
                                        &key (direction :input) (element-type 'character)
                                          (if-does-not-exist :error) (external-format :default))
@@ -193,6 +213,8 @@
                (sb-sys:with-local-interrupts (funcall function stream)))
           (if stream (close stream) (when fd (sb-posix:close fd))))))))
 
+;; Outside a receive scope, retain the ordinary pathname-based input behavior.
+
 (defmacro with-physical-image-input ((stream path &rest options) &body body)
   `(if *physical-image-context*
        (call-with-physical-image-input ,path (lambda (,stream) ,@body) ,@options)
@@ -210,6 +232,10 @@
                  (= (sb-posix:stat-dev held) (sb-posix:stat-dev named))
                  (= (sb-posix:stat-ino held) (sb-posix:stat-ino named)))
       (error "physical image target path does not name its held directory"))))
+
+;; Compare exact root and child inventories through held descriptors, then open
+;; each expected file under the same scope.  This is a snapshot; installation
+;; must recheck the image before using it.
 
 (defun physical-image-check-inventory (directory names)
   (let ((context *physical-image-context*))

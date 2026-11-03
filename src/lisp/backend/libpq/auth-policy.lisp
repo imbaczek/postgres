@@ -80,6 +80,9 @@ component fixtures retain their explicit rule trees."
        :hba-text hba-text :ident-text ident-text
        :hba-path hba-path :ident-path ident-path))))
 
+;; During descriptor-scoped image verification, read policy through the held
+;; image directory; ordinary startup continues to use its configuration reader.
+
 (defun authentication-read-text (path)
   "Read at most 1 MiB from a bounded regular file and decode it as UTF-8."
   (labels ((read-text (stream)
