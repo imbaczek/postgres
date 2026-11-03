@@ -10,6 +10,9 @@
 
 (defconstant +physical-adoption-at-fdcwd+ -100)
 (defconstant +physical-adoption-at-symlink-nofollow+ #x100)
+
+(defconstant +physical-adoption-at-empty-path+ 4096)
+
 (defconstant +physical-adoption-statx-mount+ #x1000)
 (defconstant +physical-adoption-rename-noreplace+ 1)
 
@@ -68,11 +71,13 @@
   (from-directory sb-alien:int) (from sb-alien:c-string)
   (to-directory sb-alien:int) (to sb-alien:c-string) (flags sb-alien:unsigned-int))
 
-(defun physical-adoption-install-mount-id (path)
+(defun physical-adoption-install-mount-id (path &key directory-fd)
   (sb-alien:with-alien ((buffer (sb-alien:array sb-alien:unsigned-char 256)))
     (unless (zerop (physical-adoption-statx
-                    +physical-adoption-at-fdcwd+ (string-right-trim "/" (namestring path))
-                    +physical-adoption-at-symlink-nofollow+ +physical-adoption-statx-mount+
+                    (or directory-fd +physical-adoption-at-fdcwd+)
+                    (if directory-fd "" (string-right-trim "/" (namestring path)))
+                    (if directory-fd +physical-adoption-at-empty-path+ +physical-adoption-at-symlink-nofollow+)
+                    +physical-adoption-statx-mount+
                     (sb-alien:cast (sb-alien:addr buffer) (* sb-alien:unsigned-char))))
       (error "cannot inspect adoption mount identity: errno ~d" (sb-alien:get-errno)))
     (let ((sap (sb-alien:alien-sap (sb-alien:addr buffer))))

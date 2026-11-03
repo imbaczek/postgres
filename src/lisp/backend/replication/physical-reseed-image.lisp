@@ -37,3 +37,110 @@
                  (error "physical image copy source identity or checksum changed"))
                (list relative size digest)))))))))
 
+(defvar *physical-reseed-image-test-hook* nil)
+
+(defun physical-reseed-image-test-point (point directory)
+  (when *physical-reseed-image-test-hook*
+    (funcall *physical-reseed-image-test-hook* point directory)))
+
+(defun physical-reseed-image-check (directory &optional expected)
+  (multiple-value-bind (manifest digest) (recovery-read-manifest directory)
+    (recovery-check-manifest-schema manifest)
+    (unless (zerop (getf (physical-recovery-read-control directory) :phase))
+      (error "reseed preparation requires an immutable phase-zero base"))
+    (let ((*pgdata* directory))
+      (physical-recovery-verify-base-state)
+      (authentication-check-backup-policy directory))
+    (physical-backup-check-received-inventory directory manifest)
+    (let ((actual (list :manifest manifest :manifest-digest digest
+                        :files (physical-backup-bundle-entries directory manifest))))
+      (when (and expected (not (equal actual expected)))
+        (error "reseed image changed during preparation"))
+      actual)))
+
+(defun physical-reseed-image-file-facts (directory image)
+  (loop for (name size digest) in (getf image :files)
+        collect
+        (let ((path (pgdata-resolve-path name directory)))
+          (with-physical-image-input (input path :element-type '(unsigned-byte 8))
+            (let* ((fd (sb-sys:fd-stream-fd input))
+                   (facts (physical-reseed-file-facts (sb-posix:fstat fd))))
+              (unless (and (= size (sixth facts))
+                           (equal facts (physical-reseed-file-facts (sb-posix:fstat fd)))
+                           (equal facts (physical-reseed-file-facts (sb-posix:lstat (namestring path)))))
+                (error "reseed incoming file identity changed"))
+              (list name size digest facts))))))
+
+(defun physical-reseed-image-check-mounts (owner stage-fd incoming-fd)
+  (let ((root-fd nil))
+    (unwind-protect
+         (progn
+           (sb-sys:without-interrupts
+             (setf root-fd (physical-backup-open-directory (physical-adoption-owner-directory owner))))
+           (physical-reseed-check-owner owner)
+           (let ((root (sb-posix:fstat root-fd)))
+             (unless (and (= (physical-adoption-owner-device owner) (sb-posix:stat-dev root))
+                          (= (physical-adoption-owner-inode owner) (sb-posix:stat-ino root))
+                          (= (physical-adoption-install-mount-id nil :directory-fd root-fd)
+                             (physical-adoption-install-mount-id nil :directory-fd stage-fd)
+                             (physical-adoption-install-mount-id nil :directory-fd incoming-fd)))
+               (error "reseed workspaces must share the owned target mount"))))
+      (when root-fd (sb-posix:close root-fd)))))
+
+(defun physical-reseed-image-check-source (client record image)
+  (physical-backup-lease-check-received-status
+   (getf image :manifest) (getf image :manifest-digest) (getf record :request)
+   (pg-client-native-backup-lease-status client (getf record :request))))
+
+(defun physical-reseed-prepare-image (owner incoming &key helper)
+  (unless (eq (type-of owner) 'physical-reseed-owner)
+    (error "reseed image preparation requires ordinary stopped-reseed ownership"))
+  (let ((record (physical-reseed-attempt-recover owner)))
+    (unless (and (eq :premanifest (getf record :phase)) (getf record :stage))
+      (error "reseed preparation requires the original active attempt and frozen stage"))
+    (call-with-physical-reseed-stage
+     owner (getf (getf record :stage) :directory)
+     (lambda (stage stage-facts stage-fd)
+       (call-with-physical-reseed-stage
+        owner incoming
+        (lambda (incoming incoming-facts incoming-fd)
+          (when (or (uiop:subpathp (pathname stage) (pathname incoming))
+                    (uiop:subpathp (pathname incoming) (pathname stage)))
+            (error "reseed incoming workspace must be separate from its stage"))
+          (physical-reseed-image-check-mounts owner stage-fd incoming-fd)
+          (call-with-physical-reseed-client
+           owner record
+           (lambda (client)
+             (call-with-physical-backup-image-directory
+              stage-fd
+              (lambda (source-root)
+                (let ((source-context *physical-image-context*)
+                      (image (physical-reseed-image-check source-root)))
+                  (physical-reseed-image-check-source client record image)
+                  (physical-reseed-image-test-point :before-clone incoming)
+                  (physical-reseed-require-journal owner record)
+                  (physical-reseed-stage-facts owner stage stage-fd :expected stage-facts)
+                  (physical-reseed-stage-facts owner incoming incoming-fd :empty t :expected incoming-facts)
+                  (call-with-physical-backup-receive-directory
+                   incoming-fd
+                   (lambda (target-root)
+                     (let ((target-context *physical-image-context*))
+                       (dolist (entry (getf image :files))
+                         (destructuring-bind (name size digest) entry
+                           (physical-image-copy-file source-context target-context name size digest)))
+                       (physical-reseed-image-check target-root image)
+                       (physical-reseed-image-test-point :after-clone incoming)
+                       (let ((*physical-image-context* source-context))
+                         (physical-reseed-image-check source-root image))
+                       (physical-reseed-image-check-source client record image)
+                       (physical-reseed-require-journal owner record)
+                       (physical-reseed-image-check target-root image)
+                       (physical-reseed-stage-facts owner stage stage-fd :expected stage-facts)
+                       (physical-reseed-stage-facts owner incoming incoming-fd :expected incoming-facts)
+                       (list :incoming incoming-facts :stage stage-facts
+                             :manifest (getf image :manifest)
+                             :manifest-digest (getf image :manifest-digest)
+                             :files (physical-reseed-image-file-facts target-root image)))))))))
+           :helper helper))
+        :empty t))
+     :empty nil :expected (getf record :stage))))

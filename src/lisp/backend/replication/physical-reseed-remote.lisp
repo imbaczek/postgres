@@ -21,7 +21,7 @@
   (let* ((directory (truename (uiop:ensure-directory-pathname directory)))
          (stat (sb-posix:fstat fd))
          (path-stat (sb-posix:lstat (string-right-trim "/" (namestring directory)))))
-    (physical-backup-check-stage-directory fd)
+    (physical-image-check-directory fd)
     (unless (and (sb-posix:s-isdir (sb-posix:stat-mode path-stat))
                  (= (sb-posix:stat-dev stat) (sb-posix:stat-dev path-stat))
                  (= (sb-posix:stat-ino stat) (sb-posix:stat-ino path-stat)))
@@ -32,14 +32,14 @@
                   (physical-reseed-attempt-local-facts owner))))
       (when (and expected (not (equal expected facts)))
         (error "reseed receive stage identity changed"))
-      (when (and empty (directory-entry-names directory))
+      (when (and empty (directory-entry-names (physical-image-fd-path fd) :follow-symlinks t))
         (error "reseed receive stage is not empty"))
       facts)))
 
 ;; Hold an exclusive lock on the private, initially empty stage while its
 ;; pathname and descriptor identities are checked around capture.
 
-(defun call-with-physical-reseed-stage (owner directory function)
+(defun call-with-physical-reseed-stage (owner directory function &key (empty t) expected)
   (physical-reseed-check-owner owner)
   (let ((directory (truename (uiop:ensure-directory-pathname directory))) (fd nil))
     (unwind-protect
@@ -47,8 +47,9 @@
            (sb-sys:without-interrupts (setf fd (physical-backup-open-directory directory)))
            (unless (zerop (physical-store-flock fd 6))
              (error "reseed receive stage is already owned"))
-           (let ((facts (physical-reseed-stage-facts owner directory fd :empty t)))
-             (funcall function directory facts fd)))
+           (let ((facts (physical-reseed-stage-facts owner directory fd :empty empty :expected expected)))
+             (multiple-value-prog1 (funcall function directory facts fd)
+               (physical-reseed-stage-facts owner directory fd :expected facts))))
       (when fd (sb-posix:close fd)))))
 
 (defun physical-reseed-source-identity (client request &key current-timeline)
