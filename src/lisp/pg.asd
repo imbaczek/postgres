@@ -196,6 +196,7 @@
                    (:file "../replication/physical-reseed-install-inventory")
                    (:file "../replication/physical-reseed-install-codec")
                    (:file "../replication/physical-reseed-install-auxiliary")
+                   (:file "../replication/physical-reseed-install-owner")
                    (:file "../replication/physical-adoption-install-codec")
                    (:file "../replication/physical-adoption-install-image")
                    (:file "../replication/physical-adoption-install-journal")
