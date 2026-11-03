@@ -196,6 +196,9 @@
     (make-logical-replication-command
      :type :timeline-history :options (list (cons "timeline" timeline)))))
 
+(declaim (ftype function parse-native-backup-lease-command
+                execute-native-backup-lease-command start-native-backup-lease-capture))
+
 (defun parse-replication-command (query)
   (let* ((words (replication-command-words query))
          (verb (and words (string-upcase (first words)))))
@@ -210,6 +213,8 @@
         :type :show :options (list (cons "name" (replication-command-identifier (second words))))))
       ((equal verb "TIMELINE_HISTORY") (parse-timeline-history-command words))
       ((equal verb "BASE_BACKUP_NATIVE") (parse-native-physical-backup words))
+      ((member verb '("CAPTURE_BACKUP_NATIVE" "BACKUP_LEASE_STATUS" "BACKUP_LEASE_ABORT") :test #'equal)
+       (parse-native-backup-lease-command words))
       ((equal verb "PREPARE_FOLLOW") (parse-native-physical-prepare words))
       ((equal verb "PROVE_RETAINED") (parse-native-physical-prove-retained words))
       ((equal verb "RELEASE_FOLLOW") (parse-native-physical-release words))
@@ -1015,18 +1020,23 @@ keepalive's WAL-end field, which may include changes not yet applied."
              (member (logical-replication-command-type command) '(:create :start)))
     (ereport "55000" "logical decoding requires a database connection"))
   ;; All non-read-only commands retain their recovery write guard.
-  (unless (member (logical-replication-command-type command) '(:identify :timeline-history :show :physical-release :physical-bootstrap-release))
+  (unless (member (logical-replication-command-type command) '(:identify :timeline-history :show :physical-release :physical-bootstrap-release
+                                                               :physical-lease-status :physical-lease-abort))
     (prevent-recovery-write "logical replication state change"))
   (when (and (eq (logical-replication-command-type command) :create)
              (eq (logical-replication-command-snapshot-action command) :export)
              (backend-explicit *backend*))
     (ereport "25001" "EXPORT_SNAPSHOT cannot run inside a transaction block"))
-  (when (and (member (logical-replication-command-type command) '(:start :physical-start :physical-backup :physical-prepare :physical-prove :physical-release :physical-bootstrap-release :timeline-history))
+  (when (and (member (logical-replication-command-type command) '(:start :physical-start :physical-backup :physical-prepare :physical-prove :physical-release :physical-bootstrap-release :timeline-history
+                                                                  :physical-lease-capture :physical-lease-status :physical-lease-abort))
              (backend-explicit *backend*))
     (ereport "25001" "~a cannot run inside a transaction block"
              (case (logical-replication-command-type command)
                (:timeline-history "TIMELINE_HISTORY")
                (:physical-backup "BASE_BACKUP_NATIVE")
+               (:physical-lease-capture "CAPTURE_BACKUP_NATIVE")
+               (:physical-lease-status "BACKUP_LEASE_STATUS")
+               (:physical-lease-abort "BACKUP_LEASE_ABORT")
                (:physical-prepare "PREPARE_FOLLOW")
                (:physical-prove "PROVE_RETAINED")
                (:physical-release "RELEASE_FOLLOW")
@@ -1066,6 +1076,9 @@ keepalive's WAL-end field, which may include changes not yet applied."
             (:drop (drop-replication-slot-command stream command))
             (:physical-start (start-native-physical-replication stream command))
             (:physical-backup (start-native-physical-backup stream command))
+            (:physical-lease-capture (start-native-backup-lease-capture stream command))
+            ((:physical-lease-status :physical-lease-abort)
+             (execute-native-backup-lease-command stream command))
             (:physical-prepare (prepare-native-physical-follow stream command))
             (:physical-prove (prove-native-physical-retained stream command))
             (:physical-release (release-native-physical-follow stream command))

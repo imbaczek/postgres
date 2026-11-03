@@ -48,7 +48,7 @@
 ;; Hold reload exclusion through copying, verification, READY publication and
 ;; owner cleanup.  Copying also requires operation quiescence.  The caller
 ;; owns DIRECTORY and any partial contents; this driver does not delete them.
-(defun physical-backup-lease-capture (directory request)
+(defun physical-backup-lease-capture (directory request &key on-start)
   (let ((request (physical-backup-lease-request-copy request)))
     (when (plusp *live-operation-depth*)
       (error "backup lease capture must start outside a live operation"))
@@ -58,6 +58,7 @@
          (call-with-physical-backup-lease-capture
           request
           (lambda (owner)
+            (when on-start (funcall on-start))
             (call-with-physical-export-origin-reservation
              (lambda (reservation)
                (let* ((target (with-live-operation

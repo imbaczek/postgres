@@ -162,6 +162,8 @@
                    (:file "../replication/physical-stream")
                    (:file "../replication/physical-client")
                    (:file "../replication/physical-libpq")
+                   (:file "../replication/physical-backup-lease-wire")
+                   (:file "../replication/physical-backup-lease-client")
                    (:file "../replication/physical-follow-desired")
                    (:file "../replication/physical-follow-config")
                    (:file "../replication/physical-follow")
