@@ -23,6 +23,8 @@
 ;; Distinct hard-link names are allowed, but aliases of retained management
 ;; objects are not.  Copy the name and row so callers own the result.
 
+;; Check the common stat fields carried by old and incoming inventory rows.
+;; Names and any additional fields are checked by their respective callers.
 (defun physical-reseed-install-row-facts-p (row device)
   (and (listp row) (= 9 (length row))
        (typep (second row) '(unsigned-byte 64)) (= device (second row))

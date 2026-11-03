@@ -1,9 +1,28 @@
+;;;-------------------------------------------------------------------------
+;;;
+;;; physical-reseed-install-codec.lisp
+;;;   Encode and check the durable physical reseed installation record.
+;;;
+;;; The record describes the original attempt, its directories and control
+;;; files, and the old and incoming inventories.  The codec checks their
+;;; structure and relationships and returns copies of the supplied facts.
+;;; It does not open files or establish that those facts still hold.
+;;;
+;;; A future publisher must prove the held descriptors, guards, incoming image
+;;; and source READY state before publishing.  An executor must validate the
+;;; actual namespace before recovering a torn tail or moving entries.  The
+;;; attempt-file identity records the initial alias-exclusion observation.
+;;; Cancellation may replace the actual attempt inode.
+;;;
+;;;-------------------------------------------------------------------------
 (in-package #:pg)
 
 (defconstant +physical-reseed-install-body-maximum+ (* 64 1024 1024))
 (defconstant +physical-reseed-install-maximum-bytes+
   (+ +physical-reseed-install-body-maximum+ (* 4 1024 1024)))
 
+;; Bound the work and allocation needed to inspect an untrusted plan.  Shared
+;; lists are allowed, but cycles and values outside the literal format are not.
 (defun physical-reseed-install-check-literal (value)
   (let ((todo (list (cons :enter value))) (active (make-hash-table :test #'eq))
                                           (cells 0) (weight 0))
@@ -77,6 +96,8 @@
                            ((stringp value) (copy-seq value))
                            (t value)))))
 
+;; Check the private incoming inventory against the manifest and the fixed
+;; metadata and directory entries.  Each incoming object has its own identity.
 (defun physical-reseed-install-new-copy (rows manifest manifest-digest device identities)
   (let ((expected (make-hash-table :test #'equal)) (previous nil) (name-bytes 0))
     (dolist (name '("base" "global" "pg_wal")) (setf (gethash name expected) '(:directory)))
@@ -118,6 +139,9 @@
               (setf previous name)
               (cons (copy-seq name) (copy-list (rest row))))))))
 
+;; Old non-directory entries may be hardlinked.  All rows for an inode must
+;; carry consistent facts, and their count must fit the recorded link count.
+;; No old entry may alias an installation object.
 (defun physical-reseed-install-check-old-aliases (rows identities)
   (let ((aliases (make-hash-table :test #'equal)))
     (dolist (row rows)
@@ -146,6 +170,9 @@
                 (null row))
       (error "reseed old PID entry differs from its original evidence"))))
 
+;; Check the plan and make a private copy of its mutable components.  Identity
+;; checks compare recorded device and inode values, so callers must still
+;; establish ownership and verify the objects through held descriptors.
 (defun physical-reseed-install-copy (plan)
   (physical-reseed-install-check-literal plan)
   (physical-follow-check-plist
@@ -177,6 +204,9 @@
               :journal journal
               :manifest manifest :manifest-digest (getf plan :manifest-digest) :old old :new new)))))
 
+;; Progress covers the sorted old entries, then the top-level incoming entries,
+;; followed by a terminal step.  The executor must verify the full image before
+;; recording that final step.
 (defun physical-reseed-install-last-step (plan)
   (+ 1 (length (getf plan :old))
      (count-if (lambda (row) (not (find #\/ (first row)))) (getf plan :new))))
@@ -186,6 +216,8 @@
    (format nil "STEP ~d ~8,'0X~%" step
            (wal-crc32 (string->bytes (format nil "~8,'0X ~d" crc step))))))
 
+;; Write a canonical body with its length and CRC, followed by consecutive
+;; checksummed progress lines.  The initial image has no progress lines.
 (defun physical-reseed-install-image (plan step)
   (let* ((plan (physical-reseed-install-copy plan))
          (body (string->bytes (physical-bootstrap-manifest-text plan)))
@@ -203,6 +235,10 @@
             (incf position (length part)))
           image)))))
 
+;; Accept only the canonical body and consecutive progress lines.  A trailing
+;; prefix of the next line is reported as partial, with valid-length marking
+;; the end of the last complete line.  The caller must validate the namespace
+;; before using that boundary for recovery.
 (defun physical-reseed-install-decode (bytes)
   (unless (and (typep bytes '(vector (unsigned-byte 8)))
                (<= (length bytes) +physical-reseed-install-maximum-bytes+))

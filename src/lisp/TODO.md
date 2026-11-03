@@ -268,6 +268,37 @@
   Evidence is in
   `/home/imbaczek/proj/pg-ha-artifacts/reseed-cleanup/evidence.json`.
 
+- [x] Encode the dedicated full-reseed installation plan and progress record.
+  Keep the original active attempt, initial attempt-file identity, source manifest,
+  guarded workspace identities and old/new inventories in a bounded canonical
+  CRC-protected image. Check alias exclusion, consistent old hardlinks, private
+  incoming objects and original PID facts. Decode consecutive progress lines and
+  report only a prefix of the next line as partial. Cache the terminal step once
+  while decoding so long progress histories do not repeatedly traverse the plan.
+  Validation passed 1,790 distinct physical tests, 87 focused Rove tests and
+  fresh strict compilation. The
+  generated property passed 100 trials at seed 98, declaration digest
+  `fnv1a64-v1:e15893845e333891`. Input coverage and rejection counts were not
+  measured. Luna and Sol reviewed the code. Terra wrote the source comments,
+  followed by primary and separate Sol documentation reviews.
+  The first full run exposed an existing PID fixture mutating a quoted identity
+  list across warm executions. A two-iteration regression reproduced the failure
+  after a fresh test load. Allocate the list for each iteration and retain the
+  original assertions. Focused checks and repeated warm executions then passed;
+  Luna and Sol reviewed this separate fixture fix.
+  Evidence is in
+  `/home/imbaczek/proj/pg-ha-artifacts/reseed-install-codec/evidence.json`.
+  Guarded publication and install ownership are the next milestone. Publish
+  them together so a final install journal retains saved STATUS/ABORT access.
+  Before creating the root temporary, sync workspace guards, copied files,
+  directories and naming parents. Hold both startup lock-file and directory
+  locks. Derive the journal identity from its retained exclusive descriptor.
+  Persist device/inode identities and compare fresh mount IDs within each
+  operation. The initial attempt-file identity excludes aliases at publication;
+  checked cancellation may replace that inode later. Actual namespace proof
+  must precede progress-tail repair, with full image verification before the
+  terminal step. The codec supplies the record format for that implementation.
+
 - [ ] Add explicit reconciliation for a partial cancellation attempt temporary.
   A valid final attempt can identify the original source, but existing recovery
   keeps a partial or malformed `physical-reseed.attempt.tmp` fenced before RPC.
