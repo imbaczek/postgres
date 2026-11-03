@@ -65,7 +65,7 @@ This context is invalid after its enclosing call exits."
 (defmethod physical-adoption-owner-extra-root-names ((owner null))
   nil)
 
-(defun physical-adoption-check-owner (owner)
+(defun physical-directory-check-owner (owner)
   "Recheck the active owner and the identities of its directory and lock inode."
   (unless (and (physical-adoption-owner-p owner)
                (physical-adoption-owner-active-p owner)
@@ -88,10 +88,15 @@ This context is invalid after its enclosing call exits."
       (error "offline adoption data directory or lock inode changed")))
   (physical-adoption-check-owner-role owner))
 
-(defun call-with-physical-adoption-owner (directory function)
-  "Call FUNCTION with exclusive ownership of an existing private PGDATA lock.
-Reject a PID file; invalidate the thread-bound owner and close the lock on exit.
-The caller must keep inspected files immutable throughout the operation."
+(defgeneric physical-adoption-check-owner (owner)
+  (:documentation "Require an active directory owner authorized for clean adoption."))
+
+(defmethod physical-adoption-check-owner ((owner physical-adoption-owner))
+  (physical-directory-check-owner owner))
+
+(defun call-with-physical-adoption-directory-owner
+    (directory function &key (constructor #'make-physical-adoption-owner) initial-arguments)
+  "Acquire the stable directory lock and revoke the constructed owner on exit."
   (let* ((directory (uiop:ensure-directory-pathname (truename directory)))
          (stat (sb-posix:lstat (namestring directory))))
     (unless (and (sb-posix:s-isdir (sb-posix:stat-mode stat))
@@ -109,18 +114,29 @@ The caller must keep inspected files immutable throughout the operation."
                               (= (sb-posix:geteuid) (sb-posix:stat-uid locked))
                               (zerop (physical-store-flock (sb-sys:fd-stream-fd lock) 6)))
                    (error "offline adoption could not own the dedicated PGDATA lock"))
-                 (setf owner (make-physical-adoption-owner
-                              :directory directory :device (sb-posix:stat-dev stat)
-                              :inode (sb-posix:stat-ino stat) :lock lock
-                              :lock-device (sb-posix:stat-dev locked)
-                              :lock-inode (sb-posix:stat-ino locked)
-                              :thread sb-thread:*current-thread* :active-p t))
-                 (physical-adoption-check-owner owner)
-                 (when (native-control-optional-bytes (merge-pathnames "postmaster.pid" directory))
-                   (error "offline adoption requires a stopped primary without a PID file"))
+                 (setf owner (apply constructor
+                                    :directory directory :device (sb-posix:stat-dev stat)
+                                    :inode (sb-posix:stat-ino stat) :lock lock
+                                    :lock-device (sb-posix:stat-dev locked)
+                                    :lock-inode (sb-posix:stat-ino locked)
+                                    :thread sb-thread:*current-thread* :active-p t
+                                    (when initial-arguments (funcall initial-arguments directory))))
+                 (physical-directory-check-owner owner)
                  (sb-sys:with-local-interrupts (funcall function owner)))
             (when owner (setf (physical-adoption-owner-active-p owner) nil))
             (close lock)))))))
+
+(defun call-with-physical-adoption-owner (directory function)
+  "Call FUNCTION with exclusive ownership of an existing private PGDATA lock.
+Reject a PID file; invalidate the thread-bound owner and close the lock on exit.
+The caller must keep inspected files immutable throughout the operation."
+  (call-with-physical-adoption-directory-owner
+   directory
+   (lambda (owner)
+     (when (native-control-optional-bytes
+            (merge-pathnames "postmaster.pid" (physical-adoption-owner-directory owner)))
+       (error "offline adoption requires a stopped primary without a PID file"))
+     (funcall function owner))))
 
 (defun physical-adoption-inspect-primary (owner)
   "Inspect a stopped primary without creating, repairing, or replaying files.

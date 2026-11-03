@@ -951,6 +951,7 @@ Then check the cached handles and workers under startup exclusion."
     (startup-install-resource-capacity startup-settings)
     (sb-sys:enable-interrupt sb-unix:sigusr1 #'request-physical-promotion)
     (postmaster-own-data-directory host port
+                                   :startup-before-pid #'physical-reseed-check-before-pid
                                    :startup-check #'physical-adoption-startup-preflight
                                    :startup-reconcile #'physical-adoption-reconcile-startup)
     (physical-backup-cleanup-stages)

@@ -186,13 +186,14 @@ leaves the separate data ownership lock to its owner."
              (setf success t)))
       (unless success (sb-posix:close fd)))))
 
-(defun postmaster-own-data-directory (host port &key startup-check startup-reconcile)
+(defun postmaster-own-data-directory (host port &key startup-before-pid startup-check startup-reconcile)
   "Own PGDATA before any database storage initialization or recovery mutation.
+Call read-only STARTUP-BEFORE-PID with the flock held before changing PID metadata.
 Call STARTUP-CHECK synchronously with the local flock held and owned PID created,
 before publishing *POSTMASTER-DATA-LOCK*. The check must be read-only.
 Run STARTUP-RECONCILE after publishing ownership and before returning to startup,
 where stage cleanup, authentication completion, storage, listeners, and workers follow.
-If either callback fails or exits nonlocally, clear ownership and the timestamp,
+If a callback fails or exits nonlocally, clear ownership and the timestamp,
 remove the owned PID, and close the lock even if PID cleanup fails."
   (declare (ignore host))
   (when *postmaster-data-lock* (error "this process already owns a data directory"))
@@ -206,6 +207,7 @@ remove the owned PID, and close the lock even if PID cleanup fails."
                  lock (postmaster-open-data-lock))
            (unless (zerop (physical-store-flock (sb-sys:fd-stream-fd lock) 6))
              (error "data directory is already owned by another pg-lisp process"))
+           (when startup-before-pid (funcall startup-before-pid))
            (setf *postmaster-start-timestamp* (postgres-current-timestamp))
            (postmaster-create-pid-file)
            (when startup-check (funcall startup-check))

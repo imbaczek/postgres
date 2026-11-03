@@ -56,6 +56,7 @@
                (:file "t/physical-adoption-retire-codec-tests")
                (:file "t/physical-adoption-follow-tests")
                (:file "t/physical-adoption-startup-tests")
+               (:file "t/physical-reseed-owner-tests")
                (:file "t/physical-adoption-retire-tests")
                (:file "t/physical-adoption-startup-entry-tests")
                (:file "t/wal-timeline-tests")
