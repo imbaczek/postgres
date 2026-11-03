@@ -19,6 +19,8 @@
   (when (physical-backup-lease-record-under-lock name)
     (wal-invalid-input "backup lease owns private source pin ~a" name)))
 
+(declaim (ftype function physical-backup-lease-check-capture-owner))
+
 ;; A lease may create its pin only for the exact CAPTURING request, while the
 ;; caller owns operation quiescence and the matching record is still on disk.
 ;; Ordinary creation may not take any name in the lease inventory.
@@ -31,9 +33,9 @@
                     (equal request (getf record :request))
                     (eq *live-operation-quiescence-owner-thread* sb-thread:*current-thread*))
          (wal-invalid-input "backup lease creation lacks its capturing owner"))
-       (physical-backup-lease-check-source request :current-timeline t)
-       (unless (equal record (physical-backup-lease-read (physical-backup-lease-path request)))
-         (error "backup lease creation record changed on disk")))
+       (unless (eq record (physical-backup-lease-check-capture-owner
+                           *physical-backup-lease-capture-owner*))
+         (wal-invalid-input "backup lease pin has a different capture owner")))
       (record (wal-invalid-input "backup lease reserves private source pin ~a" name)))))
 
 (defun physical-backup-lease-create-pin (request)
@@ -77,7 +79,8 @@
       (record
        (unless (and request (eq :closing (getf record :phase))
                     (equal request (getf record :request))
-                    (null (gethash name *physical-source-senders*)))
+                    (null (gethash name *physical-source-senders*))
+                    (null (gethash name *physical-backup-lease-capture-owners*)))
          (wal-invalid-input "backup lease retirement lacks its closing owner"))
        (physical-backup-lease-pin-directory-stat)
        (physical-backup-lease-check-pin-record pin record)

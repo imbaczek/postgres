@@ -13,6 +13,7 @@
           (pg::*wal-insert-timeline* 2)
           (pg::*physical-recovery-state* nil)
           (pg::*physical-backup-lease-records* (make-hash-table :test #'equal))
+          (pg::*physical-backup-lease-capture-owners* (make-hash-table :test #'equal))
           (pg::*physical-backup-lease-limit* 2)
           (pg::*physical-backup-lease-test-hook* nil)
           (pg::*physical-source-senders* (make-hash-table :test #'equal))

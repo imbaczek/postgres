@@ -76,6 +76,8 @@
 (defun physical-backup-lease-finish-closing-under-lock (request begin-publication)
   (let* ((record (physical-backup-lease-current-record request))
          (name (getf request :name)))
+    (when (gethash name *physical-backup-lease-capture-owners*)
+      (wal-invalid-input "backup lease still has an active capture owner"))
     (when (eq :closed (getf record :phase))
       (when (or (gethash name *physical-source-pins*)
                 (physical-backup-lease-lstat (physical-source-pin-path name)))

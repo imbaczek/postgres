@@ -9,6 +9,11 @@
 ;;; listeners.  The authority layer gates streaming, unlink, and name creation
 ;;; using the loaded records and reconciles them with pins and origins.
 (defvar *physical-backup-lease-records* (make-hash-table :test #'equal))
+
+(defvar *physical-backup-lease-capture-owners* (make-hash-table :test #'equal))
+
+(defvar *physical-backup-lease-capture-owner* nil)
+
 (defvar *physical-backup-lease-limit* 65536)
 (defvar *physical-backup-lease-test-hook* nil)
 
@@ -211,8 +216,9 @@
 (defun physical-backup-lease-load-records ()
   (with-write-lock
     (with-wal-publication-fence (begin-publication)
-      (unless (zerop (hash-table-count *physical-source-senders*))
-        (wal-invalid-input "cannot reload backup lease records with active source senders"))
+      (unless (and (zerop (hash-table-count *physical-source-senders*))
+                   (zerop (hash-table-count *physical-backup-lease-capture-owners*)))
+        (wal-invalid-input "cannot reload backup lease records with active source owners"))
       (multiple-value-bind (paths temporaries) (physical-backup-lease-inventory)
         (let ((candidates (make-hash-table :test #'equal))
               (interrupted nil))

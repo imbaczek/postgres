@@ -29,6 +29,17 @@
          (pg::fsync-stream stream))
        (funcall function root)))))
 
+(defun call-with-backup-lease-test-capture-owner (request function)
+  (let* ((name (getf request :name))
+         (owner (pg::make-physical-backup-lease-capture-owner
+                 :request (pg::physical-backup-lease-request-copy request)
+                 :backend pg::*backend* :thread sb-thread:*current-thread*
+                 :namespace pg::*wal-segment-namespace* :incarnation pg::*wal-storage-incarnation*))
+         (pg::*physical-backup-lease-capture-owner* owner))
+    (setf (gethash name pg::*physical-backup-lease-capture-owners*) owner)
+    (unwind-protect (funcall function)
+      (remhash name pg::*physical-backup-lease-capture-owners*))))
+
 (defun backup-lease-authority-prepare (&optional ready request (digest 991))
   (let* ((requested (backup-lease-test-record))
          (request (pg::physical-backup-lease-request-copy
@@ -38,8 +49,10 @@
       (setf (getf capturing :phase) :capturing)
       (pg::physical-backup-lease-publish nil requested)
       (pg::physical-backup-lease-publish requested capturing)
-      (let ((pin (pg::with-live-operation-quiescence
-                   (pg::physical-backup-lease-create-pin request))))
+      (let ((pin (call-with-backup-lease-test-capture-owner
+                  request (lambda ()
+                            (pg::with-live-operation-quiescence
+                              (pg::physical-backup-lease-create-pin request))))))
         (when ready
           (pg::physical-source-pin-bind-manifest pin digest)
           (let ((next (copy-list capturing)))
@@ -90,8 +103,10 @@
            (setf (getf wrong :token) (make-string 64 :initial-element #\b))
            (pg::with-live-operation-quiescence
              (ok (backup-lease-authority-error-p (lambda () (pg::physical-backup-lease-create-pin wrong))))))
-         (let ((pin (pg::with-live-operation-quiescence
-                      (pg::physical-backup-lease-create-pin request))))
+         (let ((pin (call-with-backup-lease-test-capture-owner
+                     request (lambda ()
+                               (pg::with-live-operation-quiescence
+                                 (pg::physical-backup-lease-create-pin request))))))
            (ok (eq pin (gethash name pg::*physical-source-pins*)))
            (ok (= 32 (gethash pin pg::*wal-snapshot-retention-pins*))))
          (ok (not pg::*wal-poisoned*))))))
@@ -149,8 +164,10 @@
                     (lambda ()
                       (catch 'lease-pin-cut
                         (if (eq kind :lease)
-                            (pg::with-live-operation-quiescence
-                              (pg::physical-backup-lease-create-pin request))
+                            (call-with-backup-lease-test-capture-owner
+                             request (lambda ()
+                                       (pg::with-live-operation-quiescence
+                                         (pg::physical-backup-lease-create-pin request))))
                             (pg::physical-source-pin-create name)))))))
              (ok seen)
              (ok pg::*wal-poisoned*)
