@@ -146,6 +146,7 @@
                    (:file "../replication/physical-backup-lease-store")
                    (:file "../replication/physical-backup-lease-authority")
                    (:file "../replication/physical-export-origin")
+                   (:file "../replication/physical-backup-lease-startup")
                    (:file "../replication/physical-follow-anchor")
                    (:file "../replication/physical-retained-extent")
                    (:file "../replication/physical-retained-overlap")

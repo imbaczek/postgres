@@ -28,6 +28,7 @@
                (:file "t/physical-backup-lease-tests")
                (:file "t/physical-backup-lease-store-tests")
                (:file "t/physical-backup-lease-authority-tests")
+               (:file "t/physical-backup-lease-startup-tests")
                (:file "t/export-origin-tests")
                (:file "t/physical-recovery-tests")
                (:file "t/auth-backup-tests")
