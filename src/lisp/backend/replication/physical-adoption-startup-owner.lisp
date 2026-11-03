@@ -16,6 +16,9 @@
                (not *physical-restartpoint-worker*))
     (error "adoption startup reconciliation requires unopened storage and stopped workers")))
 
+;; This more specific role replaces the base method, so it must repeat the
+;; reseed fence check while validating postmaster ownership.
+
 (defmethod physical-adoption-check-owner-role ((owner physical-adoption-startup-owner))
   (physical-directory-check-reseed-intent (physical-adoption-owner-directory owner))
   (physical-adoption-check-startup-quiescence)

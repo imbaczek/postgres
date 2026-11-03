@@ -17,11 +17,14 @@
 (defun physical-reseed-install-temporary-path (&optional (directory *pgdata*))
   (merge-pathnames "physical-reseed.install.tmp" directory))
 
+;; Plain stopped ownership rejects installation entries but permits its own
+;; attempt journal, so STATUS and ABORT can reconcile an interrupted capture.
+
 (defun physical-reseed-check-no-install (&optional (directory *pgdata*))
   (physical-directory-check-reseed-intent directory :install-only t))
 
-;; Check both names before any PID mutation.  Even a completed abort remains a
-;; fence until a later reconciliation protocol decides what to do with it.
+;; Check all four reserved names before any PID mutation.  Even a completed
+;; abort remains a fence until a later reconciliation protocol resolves it.
 
 (defun physical-reseed-check-before-pid ()
   "Refuse startup on reseed intent or install entries before changing PID metadata."
@@ -103,6 +106,9 @@ Normalize a negative single-user PID for probing while preserving its bytes."
     (when (and old (not (eq :dead (physical-reseed-process-state (getf old :pid)))))
       (error "reseed target process is live or its state is unknown")))
   owner)
+
+;; Check installation fences before reading PID evidence, and again whenever
+;; the constructed owner is checked.  Neither check grants install authority.
 
 (defun call-with-physical-reseed-owner (directory function)
   "Call FUNCTION with a thread-bound stopped-directory capability.

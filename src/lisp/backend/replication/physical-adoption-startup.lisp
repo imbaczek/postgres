@@ -24,12 +24,16 @@
       (error "adoption startup requires an unchanged terminal follow journal"))
     state))
 
+;; Recheck after the earlier pre-PID guard; an entry can appear between checks.
+
 (defun physical-adoption-startup-preflight ()
   "Allow a terminal follow journal through read-only preflight; fence other cases."
   (physical-directory-check-reseed-intent *pgdata*)
   (if (physical-adoption-path-present-p (physical-adoption-follow-path))
       (physical-adoption-startup-follow-state)
       (physical-adoption-check-startup)))
+
+;; Check again before reconciliation, including changes since preflight.
 
 (defun physical-adoption-reconcile-startup ()
   "Retire terminal follow authority under real postmaster startup ownership."

@@ -1,5 +1,25 @@
 # Development TODO
 
+- [x] Fence reserved reseed installation state across startup and owner roles.
+  Both `physical-reseed.install` and `physical-reseed.install.tmp` refuse startup
+  before PID inspection or creation, even without an attempt journal. Ordinary
+  stopped reseed ownership refuses them before reading PID bytes and on later
+  checks. Clean adoption refuses all four reseed intent names, including after
+  PID removal. Its specialized startup owner and both startup entrypoints repeat
+  the shared guard, so intent appearing between callbacks cannot pass through
+  an inherited-method gap or retire pending adoption journals.
+  Eight new Rove tests first failed against the previous behavior, then passed.
+  Validation passed 21 selected tests, fresh strict compilation and 16 actual
+  startup attempts covering both install names, four entry types and present or
+  absent opaque PID data. All original names, bytes, inodes and modes survived.
+  The refactor review found no useful macro; the shared guard keeps the policy
+  in an early module without a later startup dependency. Code commit:
+  `3bfca57247b`. Evidence:
+  `/home/imbaczek/proj/pg-ha-artifacts/reseed-install/fence-evidence.json`.
+  This reserves and enforces fences only. The install journal format, dedicated
+  owner, quarantine moves, crash recovery and source cleanup after a PID move
+  remain open; no install authority or coordination has been added.
+
 - [x] Connect the stopped-target journal to remote capture and cancellation.
   A new start freezes a separate private stage and the accepted source route
   with its effective credential owner before sending CAPTURE once. Reopening
@@ -205,7 +225,12 @@
   changed identity or ambiguous progress must fail closed.
   The install owner must check the original PID bytes, inode and stopped-process
   evidence at the location derived from the journal, with absence at the other
-  location. STATUS/checked ABORT must remain usable under this owner even if the
+  location. An actual rename probe preserved bytes and identity fields 1–7 but
+  changed field 8, ctime. After a journal-proven PID move, permit only that saved
+  ctime difference; still stabilize the current complete lstat/descriptor/lstat
+  identity and retain the attempt's original local facts unchanged. The ordinary
+  stopped owner must keep its exact original root-PID check.
+  STATUS/checked ABORT must remain usable under this owner even if the
   stage or incoming image is damaged. Advancing installation requires healthy
   image evidence; remote cleanup does not. Keep the attempt/install startup
   fences after installation or cancellation, retain the old tree, and do not

@@ -245,6 +245,11 @@ appropriate instead of replacing the native C peer or adding a message relay.
 
 ### Reader and test-discovery checks
 
+- A more-specific CLOS role method bypasses its base method unless it calls
+  `call-next-method`. Put shared ownership policy in an early helper and check
+  every specialized role that needs it. The startup adoption owner initially
+  bypassed a new base reseed fence; tests now inject intent between the real
+  pre-PID, preflight and reconciliation callbacks and recheck an existing owner.
 - A reader-form comparison must normalize SBCL's comma objects inside backquote
   as well as uninterned symbols and vectors. Two reads of unchanged macro source
   can contain distinct comma structures and fail `equal`. Compare their

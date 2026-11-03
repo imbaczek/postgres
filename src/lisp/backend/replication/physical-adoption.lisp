@@ -21,6 +21,10 @@
   (when (physical-adoption-path-present-p path) (error message))
   (values))
 
+;; Treat each reserved name as a fence, including temporary names.  This check
+;; does not parse an installation journal or authorize installation.  The
+;; install-only variant permits a stopped reseed owner to inspect its attempt.
+
 (defun physical-directory-check-reseed-intent (directory &key install-only)
   (dolist (name '("physical-reseed.attempt" "physical-reseed.attempt.tmp"
                   "physical-reseed.install" "physical-reseed.install.tmp"))
