@@ -37,6 +37,10 @@
        (typep (seventh row) '(signed-byte 64))
        (every (lambda (time) (typep time '(signed-byte 96))) (nthcdr 7 row))))
 
+(defun physical-reseed-install-row-file-facts (row)
+  (append (subseq row 1 7)
+          (list (floor (eighth row) 1000000000) (floor (ninth row) 1000000000))))
+
 (defun physical-reseed-install-old-row-copy (row device forbidden)
   (unless (and (physical-reseed-install-row-facts-p row device)
                (physical-reseed-install-old-name-p (first row))
@@ -110,14 +114,21 @@
             (physical-reseed-install-statx-time sap #x70)
             (physical-reseed-install-statx-time sap #x60)))))
 
-(defun physical-reseed-install-old-scan (fd mount device forbidden)
-  (let ((names (sort (directory-entry-names (physical-image-fd-path fd) :follow-symlinks t
-                                                                        :maximum-entries 100002 :maximum-name-bytes (+ 16777216 256)) #'string<)))
-    (when (intersection names *physical-reseed-install-unresolved-names* :test #'equal)
+(defun physical-reseed-install-old-scan (fd mount device forbidden &key install-entry)
+  (unless (member install-entry '(nil "physical-reseed.install.tmp" "physical-reseed.install") :test #'equal)
+    (error "invalid reseed install inventory exclusion"))
+  (let ((names (sort (directory-entry-names
+                      (physical-image-fd-path fd) :follow-symlinks t
+                      :maximum-entries (if install-entry 100003 100002)
+                      :maximum-name-bytes (+ 16777216 256))
+                     #'string<)))
+    (when (intersection (remove install-entry names :test #'equal)
+                        *physical-reseed-install-unresolved-names* :test #'equal)
       (error "reseed old inventory has unresolved management intent"))
     (physical-reseed-install-old-copy
      (loop for name in names
-           unless (member name *physical-reseed-install-retained-names* :test #'equal)
+           unless (or (equal name install-entry)
+                      (member name *physical-reseed-install-retained-names* :test #'equal))
              collect (physical-reseed-install-old-observe fd name mount))
      device :forbidden forbidden)))
 

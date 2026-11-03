@@ -16,7 +16,7 @@
                      (profile (pg::make-physical-libpq-profile
                                "host=localhost password=driver-supplied-secret" :fallback "reseed" :mode :physical))
                      (state (list :captures 0 :discovery 0 :frozen 0 :closes 0 :channels nil :requests nil
-                                  :statuses 0 :aborts 0 :capture-fd nil :capture-write-witness t
+                                  :statuses 0 :aborts 0 :reader-owner nil :capture-fd nil :capture-write-witness t
                                   :capture-action nil :frozen-action nil :discovery-action nil :identity-action nil
                                   :system (getf request :system-id) :timeline (getf request :timeline)
                                   :status-result nil :abort-phases '(:closed) :abort-action nil :frozen-owner nil))
@@ -55,7 +55,7 @@
                                (lambda (helper frozen &key on-spawn)
                                  (declare (ignore helper))
                                  (incf (getf state :frozen))
-                                 (let ((expected (getf (getf (pg::physical-reseed-attempt-read owner) :source) :owner)))
+                                 (let ((expected (getf (getf (pg::physical-reseed-attempt-read (or (getf state :reader-owner) owner)) :source) :owner)))
                                    (ok (equal expected (pg::physical-libpq-frozen-profile-datum frozen)))
                                    (setf (getf state :frozen-owner) expected))
                                  (let ((client (channel)))

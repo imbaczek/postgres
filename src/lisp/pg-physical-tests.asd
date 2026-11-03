@@ -77,6 +77,7 @@
                (:file "t/physical-reseed-install-codec-tests")
                (:file "t/physical-reseed-install-auxiliary-tests")
                (:file "t/physical-reseed-install-owner-tests")
+               (:file "t/physical-reseed-install-publication-tests")
                (:file "t/physical-adoption-retire-tests")
                (:file "t/physical-adoption-startup-entry-tests")
                (:file "t/wal-timeline-tests")

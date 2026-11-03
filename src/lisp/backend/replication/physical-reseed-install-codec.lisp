@@ -165,8 +165,7 @@
     (unless (if pid
                 (and row (sb-posix:s-isreg (fourth row)) (= 1 (fifth row))
                      (equal (getf pid :identity)
-                            (append (subseq row 1 7)
-                                    (list (floor (eighth row) 1000000000) (floor (ninth row) 1000000000)))))
+                            (physical-reseed-install-row-file-facts row)))
                 (null row))
       (error "reseed old PID entry differs from its original evidence"))))
 
