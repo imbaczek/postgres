@@ -293,7 +293,8 @@ may remain if the client later cancels; this is intentional and does not retain 
               (physical-source-pin-consistent-lsn pin) (physical-source-pin-manifest-digest pin)))))
 
 (defun physical-export-origin-in-use-p (identity)
-  (or (loop for token being the hash-keys of *physical-export-origin-reservations*
+  (or (physical-backup-lease-origin-in-use-p identity)
+      (loop for token being the hash-keys of *physical-export-origin-reservations*
               thereis (equal identity (physical-export-origin-reservation-identity token)))
       (loop for owner being the hash-values of *physical-source-senders*
               thereis (and (physical-sender-p owner)

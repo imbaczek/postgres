@@ -1,6 +1,12 @@
 ;;;; Durable physical bootstrap WAL pins; no leader or writer-authority coordination.
 (in-package #:pg)
 
+(declaim (ftype function physical-backup-lease-check-ordinary-pin
+                physical-backup-lease-check-pin-create
+                physical-backup-lease-check-pin-unlink
+                physical-backup-lease-startup-pin
+                physical-backup-lease-check-startup-inventory))
+
 (defstruct physical-source-pin
   "A retained source position and its timeline and optional backup manifest digest.
 The digest binds a backup to its stream request; the prefix digest separately
@@ -20,6 +26,7 @@ The backend and source identity fence use after release or source replacement."
 (defun physical-source-check-sender-under-lock (name owner)
   "Validate the pin, sender and optional public claim under WAL; return the pin.
 For a sender context also check the calling backend and source incarnation."
+  (physical-backup-lease-check-ordinary-pin name)
   (let ((pin (gethash name *physical-source-pins*)))
     (unless (and pin (physical-source-pin-stream-ready-p pin)
                  (not (physical-source-pin-lost-p pin))
@@ -270,13 +277,14 @@ their endpoint; lost pins need no WAL."
   (and (not (physical-source-pin-lost-p pin))
        (or (not (physical-follow-pin-p pin)) (physical-follow-pin-ready-p pin))))
 
-(defun physical-source-pin-create (name)
+(defun physical-source-pin-create (name &optional lease-request)
   "Retain the bootstrap checkpoint until a verified receiver durably confirms WAL."
   (prevent-recovery-primary-operation "physical source pin creation")
   (unless (wal-valid-replication-slot-name-p name)
     (ereport "42602" "invalid physical source pin name ~s" name))
   (with-write-lock
-    (with-wal-critical
+    (with-wal-publication-fence (begin-publication)
+      (physical-backup-lease-check-pin-create name lease-request)
       (when (gethash name *physical-source-pins*)
         (wal-invalid-input "physical source pin ~a already exists" name))
       (when (probe-file (physical-source-pin-path name))
@@ -287,6 +295,7 @@ their endpoint; lost pins need no WAL."
                    :consistent-lsn end
                    :restart-lsn (wal-checkpoint-record-start end))))
         (physical-source-pin-check-wal pin)
+        (begin-publication)
         (wal-ensure-directory-durable (physical-source-pin-directory))
         (physical-source-pin-save pin)
         (setf (gethash pin *wal-snapshot-retention-pins*)
@@ -323,15 +332,21 @@ Under write and WAL exclusion, stabilize the inventory and every selected file.
 Validate all candidates before replacing the existing pin registry; on failure
 leave that registry intact."
   (with-write-lock
-    (with-wal-critical
-      (let ((candidates (make-hash-table :test #'equal)))
+    (with-wal-publication-fence (begin-publication)
+      (let ((candidates (make-hash-table :test #'equal))
+            (invalidated nil))
         (dolist (path (durable-state-file-paths (physical-source-pin-directory) "pin"))
-          (let* ((pin (physical-source-pin-read path :stabilize t))
-                 (name (physical-source-pin-name pin)))
-            (when (gethash name candidates)
-              (error "duplicate physical source pin ~a" name))
-            (setf (gethash name candidates) pin)))
-        ;; Validate the complete registry before replacing any existing pins.
+          (multiple-value-bind (leased invalidate) (physical-backup-lease-startup-pin path)
+            (let* ((pin (or leased (physical-source-pin-read path :stabilize t)))
+                   (name (physical-source-pin-name pin)))
+              (when (gethash name candidates)
+                (error "duplicate physical source pin ~a" name))
+              (when invalidate (push pin invalidated))
+              (setf (gethash name candidates) pin))))
+        (physical-backup-lease-check-startup-inventory candidates)
+        (when invalidated
+          (begin-publication)
+          (dolist (pin invalidated) (physical-source-pin-save pin)))
         (maphash (lambda (name pin)
                    (declare (ignore name))
                    (remhash pin *wal-snapshot-retention-pins*))
@@ -392,10 +407,11 @@ The caller holds WAL. LIMIT is an exact-byte cap independent of wal_keep_size."
      *physical-source-pins*))
   (values))
 
-(defun physical-source-pin-unlink (pin)
+(defun physical-source-pin-unlink (pin &optional lease-request)
   "Unlink PIN and sync its directory before removing in-memory retention.
 The caller owns the write and WAL critical section. An I/O failure fences WAL;
 restart must resolve an ambiguous deletion before recycling."
+  (physical-backup-lease-check-pin-unlink pin lease-request)
   (let ((name (physical-source-pin-name pin)))
     (let ((path (physical-source-pin-path name)))
       (physical-source-pin-test-point :before-release-unlink pin)

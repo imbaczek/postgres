@@ -69,6 +69,7 @@ pin; an ambiguous save fences the source and keeps retention until restart."
       (prevent-recovery-primary-operation "physical follow anchor reservation")
       (with-write-lock
         (with-wal-critical
+          (physical-backup-lease-check-ordinary-pin name)
           (physical-follow-check-attempt-name name)
           (let ((existing (gethash name *physical-source-pins*)))
             (when existing
