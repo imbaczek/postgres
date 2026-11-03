@@ -81,9 +81,7 @@ This context is invalid after its enclosing call exits."
 (defmethod physical-adoption-owner-extra-root-names ((owner null))
   nil)
 
-(defun physical-directory-check-owner (owner)
-  "Recheck the thread-bound owner, directory and lock inode, then its role.
-This common check does not itself authorize clean adoption."
+(defun physical-directory-check-owner-common (owner)
   (unless (and (physical-adoption-owner-p owner)
                (physical-adoption-owner-active-p owner)
                (eq sb-thread:*current-thread* (physical-adoption-owner-thread owner))
@@ -103,6 +101,29 @@ This common check does not itself authorize clean adoption."
                  (= (physical-adoption-owner-lock-device owner) (sb-posix:stat-dev lock))
                  (= (physical-adoption-owner-lock-inode owner) (sb-posix:stat-ino lock)))
       (error "offline adoption data directory or lock inode changed")))
+  owner)
+
+(defun call-with-physical-directory-root (owner function)
+  (physical-directory-check-owner-common owner)
+  (let ((fd nil))
+    (unwind-protect
+         (progn
+           (sb-sys:without-interrupts
+             (setf fd (physical-backup-open-directory (physical-adoption-owner-directory owner))))
+           (let ((stat (sb-posix:fstat fd)))
+             (unless (and (= (physical-adoption-owner-device owner) (sb-posix:stat-dev stat))
+                          (= (physical-adoption-owner-inode owner) (sb-posix:stat-ino stat)))
+               (error "offline directory descriptor does not match its owner")))
+           (physical-directory-check-owner-common owner)
+           (multiple-value-prog1
+               (funcall function fd (physical-image-fd-path fd))
+             (physical-directory-check-owner-common owner)))
+      (when fd (sb-posix:close fd)))))
+
+(defun physical-directory-check-owner (owner)
+  "Recheck the thread-bound owner, directory and lock inode, then its role.
+This common check does not itself authorize clean adoption."
+  (physical-directory-check-owner-common owner)
   (physical-adoption-check-owner-role owner))
 
 (defgeneric physical-adoption-check-owner (owner)

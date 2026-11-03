@@ -29,34 +29,54 @@
         (sb-posix:stat-mode stat) (sb-posix:stat-uid stat) (sb-posix:stat-nlink stat)
         (sb-posix:stat-size stat) (sb-posix:stat-mtime stat) (sb-posix:stat-ctime stat)))
 
+(defun physical-reseed-attempt-read-at (root-fd name &key stabilize)
+  (unless (member name '("physical-reseed.attempt" "physical-reseed.attempt.tmp") :test #'equal)
+    (error "unexpected reseed metadata name"))
+  (let ((fd nil) (stream nil)
+                 (path (merge-pathnames name (physical-image-fd-path root-fd))))
+    (unwind-protect
+         (progn
+           (sb-sys:without-interrupts
+             (setf fd (physical-image-openat
+                       root-fd name (logior (if stabilize sb-posix:o-rdwr sb-posix:o-rdonly)
+                                            sb-posix:o-nofollow sb-posix:o-nonblock +postmaster-o-cloexec+) 0)))
+           (when (minusp fd) (setf fd nil) (error "cannot open reseed metadata: errno ~d" (sb-alien:get-errno)))
+           (let* ((before (physical-reseed-attempt-file-identity (sb-posix:fstat fd)))
+                  (size (sixth before))
+                  (bytes (make-array size :element-type '(unsigned-byte 8))))
+             (unless (equal before (physical-reseed-attempt-file-identity (sb-posix:lstat (namestring path))))
+               (error "reseed metadata changed before reading"))
+             (sb-sys:without-interrupts
+               (setf stream (sb-sys:make-fd-stream fd :input t :output stabilize :element-type '(unsigned-byte 8))))
+             (when stabilize (fsync-stream stream) (sb-posix:fsync root-fd))
+             (unless (and (= size (read-sequence bytes stream))
+                          (eq :eof (read-byte stream nil :eof))
+                          (equal before (physical-reseed-attempt-file-identity (sb-posix:fstat fd)))
+                          (equal before (physical-reseed-attempt-file-identity (sb-posix:lstat (namestring path)))))
+               (error "reseed metadata changed while reading"))
+             (physical-reseed-attempt-decode bytes)))
+      (if stream (close stream) (when fd (sb-posix:close fd))))))
+
+(defun physical-reseed-attempt-read-owned (owner name &key stabilize)
+  (call-with-physical-directory-root
+   owner
+   (lambda (fd directory)
+     (declare (ignore directory))
+     (physical-reseed-attempt-read-at fd name :stabilize stabilize))))
+
 ;; Check the bounded, owned, mode 0600 single-link file against both its open
 ;; descriptor and pathname.  Stabilization syncs the file and directory before
 ;; returning the checked record.
 
 (defun physical-reseed-attempt-read-file (owner path &key (stabilize t))
   (physical-reseed-check-owner owner)
-  (let ((directory (physical-adoption-owner-directory owner)))
-    (unless (member path (list (physical-reseed-attempt-path directory)
-                               (physical-reseed-attempt-temporary-path directory)) :test #'equal)
-      (error "unexpected reseed metadata pathname"))
-    (multiple-value-bind (stream size)
-        (open-bounded-regular-file path +physical-reseed-attempt-maximum-bytes+ stabilize)
-      (unwind-protect
-           (let* ((before (physical-reseed-attempt-file-identity
-                           (sb-posix:fstat (sb-sys:fd-stream-fd stream))))
-                  (bytes (make-array size :element-type '(unsigned-byte 8))))
-             (unless (= size (sixth before)) (error "reseed metadata changed before reading"))
-             (when stabilize (fsync-stream stream) (fsync-directory directory))
-             (unless (and (= size (read-sequence bytes stream))
-                          (equal before (physical-reseed-attempt-file-identity
-                                         (sb-posix:fstat (sb-sys:fd-stream-fd stream))))
-                          (equal before (physical-reseed-attempt-file-identity
-                                         (sb-posix:lstat (namestring path)))))
-               (error "reseed metadata changed while reading"))
-             (let ((record (physical-reseed-attempt-decode bytes)))
-               (physical-reseed-attempt-check-owner owner record)
-               record))
-        (close stream)))))
+  (let* ((directory (physical-adoption-owner-directory owner))
+         (name (cond ((equal path (physical-reseed-attempt-path directory)) "physical-reseed.attempt")
+                     ((equal path (physical-reseed-attempt-temporary-path directory)) "physical-reseed.attempt.tmp")
+                     (t (error "unexpected reseed metadata pathname"))))
+         (record (physical-reseed-attempt-read-owned owner name :stabilize stabilize)))
+    (physical-reseed-attempt-check-owner owner record)
+    record))
 
 ;; Ordinary reads require the temporary name to be absent; recovery must
 ;; reconcile it before the final record can be used.
@@ -90,37 +110,46 @@
 (defun physical-reseed-attempt-write-temporary (owner record &key receipt)
   (physical-reseed-attempt-check-abort-receipt record receipt)
   (physical-reseed-attempt-check-owner owner record)
-  (let* ((path (physical-reseed-attempt-temporary-path (physical-adoption-owner-directory owner)))
-         (bytes (physical-reseed-attempt-image record))
-         (fd nil) (stream nil))
-    (unwind-protect
-         (progn
-           (setf fd (sb-posix:open (namestring path)
-                                   (logior sb-posix:o-wronly sb-posix:o-creat sb-posix:o-excl
-                                           sb-posix:o-nofollow +postmaster-o-cloexec+) #o600))
-           (sb-posix:fchmod fd #o600)
-           (physical-reseed-attempt-file-identity (sb-posix:fstat fd) t)
-           (physical-reseed-attempt-test-point :after-create path)
-           (setf stream (sb-sys:make-fd-stream fd :output t :element-type '(unsigned-byte 8))
-                 fd nil)
-           (write-sequence bytes stream)
-           (finish-output stream)
-           (physical-reseed-attempt-test-point :after-write path)
-           (fsync-stream stream)
-           (physical-reseed-attempt-test-point :after-file-fsync path)
-           (physical-reseed-attempt-file-identity (sb-posix:fstat (sb-sys:fd-stream-fd stream))))
-      (unwind-protect
-           (when stream (close stream))
-        (when fd (sb-posix:close fd))))))
+  (let ((bytes (physical-reseed-attempt-image record))
+        (path (physical-reseed-attempt-temporary-path (physical-adoption-owner-directory owner))))
+    (call-with-physical-directory-root
+     owner
+     (lambda (root-fd directory)
+       (declare (ignore directory))
+       (let ((fd nil) (stream nil))
+         (unwind-protect
+              (progn
+                (sb-sys:without-interrupts
+                  (setf fd (physical-image-openat
+                            root-fd "physical-reseed.attempt.tmp"
+                            (logior sb-posix:o-wronly sb-posix:o-creat sb-posix:o-excl
+                                    sb-posix:o-nofollow +postmaster-o-cloexec+) #o600)))
+                (when (minusp fd) (setf fd nil) (error "cannot create exclusive reseed metadata: errno ~d" (sb-alien:get-errno)))
+                (sb-posix:fchmod fd #o600)
+                (physical-reseed-attempt-file-identity (sb-posix:fstat fd) t)
+                (physical-reseed-attempt-test-point :after-create path)
+                (sb-sys:without-interrupts
+                  (setf stream (sb-sys:make-fd-stream fd :output t :element-type '(unsigned-byte 8))))
+                (write-sequence bytes stream)
+                (finish-output stream)
+                (physical-reseed-attempt-test-point :after-write path)
+                (fsync-stream stream)
+                (physical-reseed-attempt-test-point :after-file-fsync path)
+                (physical-reseed-attempt-file-identity (sb-posix:fstat fd)))
+           (if stream (close stream) (when fd (sb-posix:close fd)))))))))
 
 (defun physical-reseed-attempt-check-previous (owner previous identity)
-  (let ((path (physical-reseed-attempt-path (physical-adoption-owner-directory owner))))
-    (if previous
-        (unless (and (equal identity
-                            (physical-reseed-attempt-file-identity (sb-posix:lstat (namestring path))))
-                     (equal previous (physical-reseed-attempt-read-file owner path)))
-          (error "reseed attempt changed before publication"))
-        (physical-adoption-require-absent path "reseed attempt already exists"))))
+  (when previous (physical-reseed-attempt-check-owner owner previous))
+  (call-with-physical-directory-root
+   owner
+   (lambda (fd directory)
+     (let ((path (physical-reseed-attempt-path directory)))
+       (if previous
+           (unless (and (equal identity
+                               (physical-reseed-attempt-file-identity (sb-posix:lstat (namestring path))))
+                        (equal previous (physical-reseed-attempt-read-at fd "physical-reseed.attempt" :stabilize t)))
+             (error "reseed attempt changed before publication"))
+           (physical-adoption-require-absent path "reseed attempt already exists"))))))
 
 ;; Promote the complete temporary inode after checking it and its predecessor.
 ;; Like slot state publication, sync before rename and sync the directory after.
@@ -129,27 +158,31 @@
 ;; remains the fence even if directory sync or readback fails.
 
 (defun physical-reseed-attempt-promote-temporary (owner candidate temporary-identity previous previous-identity)
-  ;; The caller has already written or recovered the complete temporary inode.
   (physical-reseed-attempt-check-owner owner candidate)
-  (let* ((directory (physical-adoption-owner-directory owner))
-         (path (physical-reseed-attempt-path directory))
-         (temporary (physical-reseed-attempt-temporary-path directory)))
-    (physical-reseed-attempt-test-point :before-rename path)
-    (physical-reseed-attempt-check-owner owner candidate)
-    (unless (and (equal temporary-identity
-                        (physical-reseed-attempt-file-identity (sb-posix:lstat (namestring temporary))))
-                 (equal candidate (physical-reseed-attempt-read-file owner temporary)))
-      (error "reseed temporary intent changed before publication"))
-    (physical-reseed-attempt-check-previous owner previous previous-identity)
-    (sb-posix:rename (namestring temporary) (namestring path))
-    (physical-reseed-attempt-test-point :after-rename path)
-    (fsync-directory directory)
-    (physical-reseed-attempt-test-point :after-directory-fsync path)
-    (physical-reseed-attempt-test-point :before-readback path)
-    (let ((actual (physical-reseed-attempt-read owner)))
-      (unless (equal candidate actual) (error "reseed attempt readback differs"))
-      (physical-reseed-attempt-test-point :after-readback path)
-      actual)))
+  (let ((path (physical-reseed-attempt-path (physical-adoption-owner-directory owner))))
+    (call-with-physical-directory-root
+     owner
+     (lambda (root-fd directory)
+       (let ((temporary (physical-reseed-attempt-temporary-path directory)))
+         (physical-reseed-attempt-test-point :before-rename path)
+         (physical-reseed-attempt-check-owner owner candidate)
+         (unless (and (equal temporary-identity
+                             (physical-reseed-attempt-file-identity (sb-posix:lstat (namestring temporary))))
+                      (equal candidate (physical-reseed-attempt-read-at root-fd "physical-reseed.attempt.tmp" :stabilize t)))
+           (error "reseed temporary intent changed before publication"))
+         (physical-reseed-attempt-check-previous owner previous previous-identity)
+         (unless (zerop (port-renameat root-fd "physical-reseed.attempt.tmp" root-fd "physical-reseed.attempt"))
+           (error "cannot publish reseed metadata: errno ~d" (sb-alien:get-errno)))
+         (physical-reseed-attempt-test-point :after-rename path)
+         (sb-posix:fsync root-fd)
+         (physical-reseed-attempt-test-point :after-directory-fsync path)
+         (physical-reseed-attempt-test-point :before-readback path)
+         (physical-adoption-require-absent temporary "reseed temporary intent requires reconciliation")
+         (let ((actual (physical-reseed-attempt-read-at root-fd "physical-reseed.attempt" :stabilize t)))
+           (physical-reseed-attempt-check-owner owner actual)
+           (unless (equal candidate actual) (error "reseed attempt readback differs"))
+           (physical-reseed-attempt-test-point :after-readback path)
+           actual))))))
 
 (defun physical-reseed-attempt-publish (owner candidate &key previous receipt)
   (let* ((candidate (physical-reseed-attempt-copy candidate))
