@@ -19,6 +19,7 @@
 ;; only.  A final install name prevents this cleanup role from opening.
 
 (defun physical-reseed-cleanup-check-intent (directory)
+  (physical-directory-check-reseed-follow-intent directory)
   (physical-adoption-require-absent
    (physical-reseed-install-path directory)
    "reseed cleanup ownership cannot reconcile a final install journal")

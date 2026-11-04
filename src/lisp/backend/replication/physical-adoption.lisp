@@ -25,7 +25,14 @@
 ;; does not parse an installation journal or authorize installation.  The
 ;; install-only variant permits a stopped reseed owner to inspect its attempt.
 
+(defun physical-directory-check-reseed-follow-intent (directory)
+  (dolist (name '("physical-reseed.follow" "physical-reseed.follow.tmp"))
+    (physical-adoption-require-absent
+     (merge-pathnames name directory)
+     "pending offline reseed follow requires journal reconciliation")))
+
 (defun physical-directory-check-reseed-intent (directory &key install-only)
+  (physical-directory-check-reseed-follow-intent directory)
   (dolist (name '("physical-reseed.attempt" "physical-reseed.attempt.tmp"
                   "physical-reseed.install" "physical-reseed.install.tmp"))
     (let ((installation (uiop:string-prefix-p "physical-reseed.install" name)))

@@ -147,6 +147,7 @@
 ;; Recover the plan only when no temporary intent remains and the final journal
 ;; binds to the current attempt and directory.
 (defun physical-reseed-install-initial-arguments (directory)
+  (physical-directory-check-reseed-follow-intent directory)
   (physical-adoption-require-absent (physical-reseed-install-temporary-path directory)
                                     "reseed install temporary requires reconciliation")
   (let ((fd nil))
@@ -169,6 +170,7 @@
 ;; journal progress whenever install ownership is used.
 (defmethod physical-adoption-check-owner-role ((owner physical-reseed-install-owner))
   (physical-directory-check-owner-common owner)
+  (physical-directory-check-reseed-follow-intent (physical-adoption-owner-directory owner))
   (physical-adoption-require-absent
    (physical-reseed-install-temporary-path (physical-adoption-owner-directory owner))
    "reseed install temporary requires reconciliation")
@@ -200,6 +202,7 @@
 ;; error and never falls back to cleanup or ordinary ownership.  A temporary
 ;; journal alone selects cleanup ownership.
 (defun call-with-physical-reseed-operation-owner (directory function)
+  (physical-directory-check-reseed-follow-intent directory)
   (cond
     ((physical-adoption-path-present-p (physical-reseed-install-path directory))
      (call-with-physical-reseed-install-owner directory function))
