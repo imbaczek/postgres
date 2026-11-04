@@ -23,25 +23,26 @@
 
 (defun physical-reseed-follow-check-local-intent (owner root-fd record)
   (physical-reseed-follow-check-binding owner record)
-  (let ((generation (first (getf record :generations))))
+  (let ((generation (first (getf record :generations))) (base nil) (control nil))
     (when generation
       (call-with-physical-backup-image-directory
        root-fd
        (lambda (directory)
-         (let* ((*pgdata* directory)
-                (base (physical-recovery-verify-base-state))
-                (coordinates (getf generation :coordinates))
-                (history (timeline-check-lineage
-                          (timeline-parse-history (getf coordinates :source-timeline)
-                                                  (getf generation :source-history))))
-                (previous (timeline-check-lineage (timeline-read-history (getf base :timeline) directory))))
-           (unless (physical-store-history-extends-p previous history)
-             (error "target follow intent changes installed timeline ancestry"))
-           (multiple-value-bind (bytes entry) (physical-recovery-read-base-overlap base directory)
-             (unless (and (= (getf coordinates :overlap-start) (- (getf base :end) (length bytes)))
-                          (= (getf coordinates :overlap-digest) (third entry)))
-               (error "target follow intent differs from its installed WAL overlap"))))))))
-  record)
+         (let ((*pgdata* directory))
+           (multiple-value-bind (verified raw) (physical-recovery-verify-base-state)
+             (setf base verified control raw))
+           (let* ((coordinates (getf generation :coordinates))
+                  (history (timeline-check-lineage
+                            (timeline-parse-history (getf coordinates :source-timeline)
+                                                    (getf generation :source-history))))
+                  (previous (timeline-check-lineage (timeline-read-history (getf base :timeline) directory))))
+             (unless (physical-store-history-extends-p previous history)
+               (error "target follow intent changes installed timeline ancestry"))
+             (multiple-value-bind (bytes entry) (physical-recovery-read-base-overlap base directory)
+               (unless (and (= (getf coordinates :overlap-start) (- (getf base :end) (length bytes)))
+                            (= (getf coordinates :overlap-digest) (third entry)))
+                 (error "target follow intent differs from its installed WAL overlap"))))))))
+    (values record base control)))
 
 (defun physical-reseed-follow-snapshot-at (root-fd)
   (multiple-value-bind (identity row) (physical-reseed-follow-entry root-fd "physical-reseed.follow")
@@ -83,6 +84,16 @@
 ;; uncertainty latched, so the owner must close and reopen.  Clear it only after
 ;; the image's post-check and the outer root scope and final metadata check pass.
 
+(defun physical-reseed-follow-attempt-snapshot-at (root-fd)
+  (let ((mount (physical-adoption-install-mount-id nil :directory-fd root-fd)))
+    (list :record (physical-reseed-attempt-read-at root-fd "physical-reseed.attempt")
+          :row (physical-reseed-install-old-observe root-fd "physical-reseed.attempt" mount))))
+
+(defun physical-reseed-follow-check-attempt-snapshot-at (root-fd expected)
+  (unless (equal expected (physical-reseed-follow-attempt-snapshot-at root-fd))
+    (error "target follow original attempt changed during publication"))
+  expected)
+
 (defun call-with-physical-reseed-follow-store (owner function)
   (physical-reseed-follow-check-idle owner)
   (setf (physical-reseed-follow-owner-busy-p owner) t)
@@ -92,10 +103,22 @@
                 owner
                 (lambda (root-fd directory)
                   (declare (ignore directory))
-                  (multiple-value-bind (record snapshot)
-                      (call-with-physical-reseed-follow-image owner function)
-                    (physical-reseed-follow-check-final-metadata root-fd snapshot)
-                    record)))))
+                  (let ((attempt (physical-reseed-follow-attempt-snapshot-at root-fd)))
+                    (flet ((attempt-check ()
+                             (physical-reseed-follow-check-attempt-snapshot-at root-fd attempt)))
+                      (multiple-value-bind (record snapshot)
+                          (call-with-physical-reseed-follow-image
+                           owner
+                           (lambda (image-fd image-check)
+                             (flet ((check ()
+                                      (funcall image-check)
+                                      (attempt-check)))
+                               (check)
+                               (funcall function image-fd #'check))))
+                        (attempt-check)
+                        (physical-reseed-follow-check-final-metadata root-fd snapshot)
+                        (attempt-check)
+                        record)))))))
          (setf (physical-reseed-follow-owner-uncertain-p owner) nil)
          result)
     (setf (physical-reseed-follow-owner-busy-p owner) nil)))
@@ -103,18 +126,15 @@
 ;; Pin the exact current attempt and its file facts around the full image and
 ;; namespace checks.  Publication also requires the attempt to remain active.
 
+(defun call-with-physical-reseed-follow-attempt-proof (owner function)
+  (call-with-physical-reseed-follow-store owner function))
+
 (defun call-with-physical-reseed-follow-store-proof (owner function)
-  (call-with-physical-reseed-follow-store
+  (call-with-physical-reseed-follow-attempt-proof
    owner
-   (lambda (root-fd image-check)
-     (let* ((mount (physical-adoption-install-mount-id nil :directory-fd root-fd))
-            (attempt (physical-reseed-attempt-read-at root-fd "physical-reseed.attempt"))
-            (row (physical-reseed-install-old-observe root-fd "physical-reseed.attempt" mount)))
-       (flet ((check ()
-                (funcall image-check)
-                (physical-reseed-follow-check-active-attempt owner)
-                (unless (and (equal attempt (physical-reseed-attempt-read-at root-fd "physical-reseed.attempt"))
-                             (equal row (physical-reseed-install-old-observe root-fd "physical-reseed.attempt" mount)))
-                  (error "target follow original attempt changed during publication"))))
-         (check)
-         (funcall function root-fd #'check))))))
+   (lambda (root-fd attempt-check)
+     (flet ((check ()
+              (funcall attempt-check)
+              (physical-reseed-follow-check-active-attempt owner)))
+       (check)
+       (funcall function root-fd #'check)))))

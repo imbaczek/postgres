@@ -292,6 +292,39 @@
                    (ok (intake-fails-p (lambda () (pg::physical-reseed-follow-recover-intent owner)))))
               (setf (symbol-function 'pg::physical-reseed-follow-write-intent) original))))))))
 
+(deftest reseed-follow-intent-keeps-attempt-identity-through-the-image-postcheck
+    (call-with-reseed-follow-installed-fixture
+     (lambda (root stage incoming quarantine plan)
+       (declare (ignore stage incoming quarantine))
+       (pg::call-with-physical-reseed-follow-owner
+        root
+        (lambda (owner)
+          (let* ((record (pg::physical-reseed-follow-initial-record owner))
+                 (attempt (pg::physical-reseed-attempt-copy (getf plan :attempt)))
+                 (original (symbol-function 'pg::physical-reseed-follow-write-intent))
+                 (returned nil) (fired 0)
+                 (pg::*physical-reseed-install-test-hook*
+                   (lambda (point path)
+                     (declare (ignore path))
+                     (when (and returned (eq point :after-install-image-validation) (zerop fired))
+                       (incf fired)
+                       (let ((temporary (merge-pathnames "replacement-attempt" root)))
+                         (setf (getf attempt :phase) :aborting)
+                         (reseed-follow-owner-test-write temporary (pg::physical-reseed-attempt-image attempt))
+                         (sb-posix:rename (namestring temporary) (namestring (pg::physical-reseed-attempt-path root)))
+                         (pg::fsync-directory root))))))
+            (unwind-protect
+                 (progn
+                   (setf (symbol-function 'pg::physical-reseed-follow-write-intent)
+                         (lambda (&rest arguments)
+                           (multiple-value-prog1 (apply original arguments) (setf returned t))))
+                   (ok (intake-fails-p (lambda () (pg::physical-reseed-follow-publish-intent owner record))))
+                   (ok (= 1 fired))
+                   (ok (not (pg::physical-reseed-follow-owner-busy-p owner)))
+                   (ok (pg::physical-reseed-follow-owner-uncertain-p owner))
+                   (ok (intake-fails-p (lambda () (pg::physical-reseed-follow-read owner)))))
+              (setf (symbol-function 'pg::physical-reseed-follow-write-intent) original))))))))
+
 (defun reseed-follow-intent-test-outcome (record phase)
   (let* ((copy (pg::physical-reseed-follow-copy record))
          (generation (first (getf copy :generations))))
