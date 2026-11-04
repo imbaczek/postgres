@@ -506,6 +506,8 @@ Return seven values, including the optional fact at the chosen seed."
               (when metadata (copy-tree (getf metadata :source-xids)))
               (physical-restartpoint-resource-seed metadata base store start)))))
 
+;; Shared read-only scan from a supplied seed and record mapper.  Callers must
+;; establish the seed and durable-position authority appropriate to their use.
 (defun physical-follow-scan-replay-from-seed-core
     (candidate verified-base applied required observed seed map-records allow-open-tail &optional witness)
   "Scan a stable candidate without redo or publication. SEED supplies the replay
@@ -592,6 +594,8 @@ A policy fence must leave a clean batch boundary; an allowed open tail may remai
             :applied-resource-fact applied-resource-fact :required-resource-fact required-resource-fact
             :reservation reservation :source-xids source-xids))))
 
+;; The ordinary replay path retains its durable required-position checks and
+;; dynamic seed context before calling the shared scanner.
 (defun physical-follow-scan-replay-from-seed
     (candidate verified-base applied required observed seed map-records allow-open-tail &optional witness)
   "Check the durable required position, then scan a stable candidate from SEED."

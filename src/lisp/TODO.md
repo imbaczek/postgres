@@ -86,8 +86,32 @@
   selected tests and two later tests, strict cold compilation, and eight SIGKILL
   cuts with 16 fresh images. A 100-trial property at seed 117 passed with digest
   `fnv1a64-v1:b04db31708e74ac1`; input coverage and rejection counts were not measured.
-  Source preparation and proof, configuration, settlement and activation remain
-  open. Evidence: `/home/imbaczek/proj/pg-ha-artifacts/reseed-target-follow/progress.md`.
+  Evidence: `/home/imbaczek/proj/pg-ha-artifacts/reseed-target-follow/progress.md`.
+
+- [x] Prepare and record the target's historical source proof. Check the frozen
+  route, writer identity, full history and flush around the exact prepare RPC,
+  then prove the installed phase-zero base locally before publishing PROVED.
+  A stable proof is historical; handoff must revalidate source authority. The
+  public intent publisher still accepts only empty and PREPARING records.
+  Validation accounted for 241 distinct selected tests (239 in a fresh image
+  and two later tests), including 18 new tests, and a strict fresh compile
+  of 204 files without warnings or errors. The empty-base property passed 100
+  trials at seed 118, digest `fnv1a64-v1:f212ed2b3a0ae697`; input coverage and
+  rejection counts were not measured, and there is no FunctionSpec. Native TLI 1
+  and SQL-promoted TLI 2 sources each passed ten cases, including eight SIGKILL
+  cuts, with ten target images and 19 fresh target processes per run. Native RPC
+  tests cover same-timeline proofs; descendant and retained proofs used local
+  installed fixtures and properties. See `prepare-notes.md`, `progress.md`, the prepare
+  check JSON files and native results under
+  `/home/imbaczek/proj/pg-ha-artifacts/reseed-target-follow/`.
+
+  Inert bound configuration, durable handoff pending, exact parent Aborted or
+  HandedOff settlement, activation, startup fence retirement and cancellation
+  remain open, as do logical drain, control metadata and WAL parity, audits and
+  pinned Patroni acceptance. No coordination is provided. During full acceptance,
+  audit older harnesses including `t/interop/child-bootstrap.py`: direct control
+  calls to physical base backup and manual follow start now fail live admission.
+  Run these operations in task-owned workers outside control after it returns.
 
 - [x] Fence the reserved target follow intent names before startup or older
   reseed ownership. Both final and temporary names reject every entry type;
@@ -96,8 +120,7 @@
   passed 80 trials at seed 114, digest `fnv1a64-v1:e93f14d6ca661cf2`; input
   coverage and rejection counts were not measured. Evidence:
   `/home/imbaczek/proj/pg-ha-artifacts/reseed-target-follow/progress.md`.
-  The target journal, proof, inert configuration, handoff and activation remain
-  open as described above.
+  Inert configuration, handoff and activation remain open as described above.
 
 - [x] Fence reserved reseed installation state across startup and owner roles.
   Both `physical-reseed.install` and `physical-reseed.install.tmp` refuse startup

@@ -1,5 +1,7 @@
 (in-package #:pg)
 
+;; Check historical anchor evidence against the installed phase-zero base and
+;; an empty replay model.  Later handoff must recheck current source authority.
 (defun physical-reseed-follow-proof-at (owner root-fd value)
   (let* ((record (physical-reseed-follow-copy value))
          (generations (getf record :generations))
@@ -26,6 +28,8 @@
              (multiple-value-bind (binding model) (physical-follow-empty-base-binding base anchor)
                (values binding model (physical-follow-validate-empty-base-replay model base binding))))))))))
 
+;; A stable proved record can be checked after the original attempt aborts.
+;; Empty and preparing records still require an active attempt.
 (defun physical-reseed-follow-check-stable-record-at (owner root-fd value)
   (let* ((record (physical-reseed-follow-copy value))
          (generations (getf record :generations)))
@@ -37,6 +41,8 @@
           (physical-reseed-follow-check-local-intent owner root-fd record)))
     record))
 
+;; Every temporary promotion requires an active attempt.  A proved temporary
+;; also needs its exact preparing predecessor and the same local proof.
 (defun physical-reseed-follow-recovery-candidate-at (owner root-fd value previous)
   (let* ((record (physical-reseed-follow-copy value))
          (generations (getf record :generations)))

@@ -1,17 +1,17 @@
 (in-package #:pg)
 
 ;;; A narrow, thread-bound owner for checking the installed target and reading
-;;; follow intent.  It can publish and recover local intent, but does not issue
-;;; RPCs or activate follow.  The inherited opaque printer protects credentials.
+;;; follow intent.  It can prepare a source proof and publish or recover local
+;;; state, but does not activate follow.  The inherited printer protects credentials.
 
 (defstruct (physical-reseed-follow-owner
             (:include physical-reseed-install-owner)
             (:print-function print-physical-reseed-install-owner))
   ;; Immutable attempt, install reference and base evidence for this owner.
   binding
-  ;; Exclude public reentry during a store operation.
+  ;; Exclude public reentry during network and store operations.
   (busy-p nil)
-  ;; An incomplete mutation requires closing this owner and opening a new one.
+  ;; An incomplete local mutation requires closing and reopening this owner.
   (uncertain-p nil))
 
 (defun physical-reseed-follow-check-idle (owner)

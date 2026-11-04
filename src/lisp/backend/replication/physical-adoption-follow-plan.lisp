@@ -11,6 +11,9 @@
 ;; Before the fork, selection is left for later follow processing.
 (in-package #:pg)
 
+;; These wrappers share pure history operations with reseed planning.  Adoption
+;; still establishes its own authority and checks before using their results.
+
 ;; Copy the source history through the selected child, preserving its ancestry.
 (defun physical-adoption-follow-history-prefix (source child text)
   (physical-follow-history-prefix source child text))

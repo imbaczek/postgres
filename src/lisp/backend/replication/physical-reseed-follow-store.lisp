@@ -1,8 +1,8 @@
 (in-package #:pg)
 
-;;; Local follow-intent store checks.  Only empty genesis and PREPARING intent
-;;; can be published or recovered here; later phases require a validated driver.
-;;; A structural read of historical phases does not grant source authority.
+;;; Local follow store checks.  Public intent publication accepts only empty
+;;; genesis and PREPARING; preparation publishes PROVED after source and local
+;;; checks.  A historical record does not grant current source authority.
 
 (defvar *physical-reseed-follow-write-limit* nil)
 
@@ -80,9 +80,8 @@
       (error "target follow temporary descriptor changed or lost its name"))
     facts))
 
-;; Block public reentry for the whole operation.  An incomplete mutation leaves
-;; uncertainty latched, so the owner must close and reopen.  Clear it only after
-;; the image's post-check and the outer root scope and final metadata check pass.
+;; Capture both the actual attempt record and its file facts, not just the
+;; immutable attempt saved in the install plan.
 
 (defun physical-reseed-follow-attempt-snapshot-at (root-fd)
   (let ((mount (physical-adoption-install-mount-id nil :directory-fd root-fd)))
@@ -93,6 +92,10 @@
   (unless (equal expected (physical-reseed-follow-attempt-snapshot-at root-fd))
     (error "target follow original attempt changed during publication"))
   expected)
+
+;; Block public reentry throughout the store operation.  Recheck the exact
+;; attempt after the image post-check and final metadata check, before clearing
+;; uncertainty.  An incomplete mutation requires closing and reopening the owner.
 
 (defun call-with-physical-reseed-follow-store (owner function)
   (physical-reseed-follow-check-idle owner)

@@ -1,8 +1,7 @@
 (in-package #:pg)
 
-;;; Publish and recover local intent without interpreting a remote outcome.
-;;; The shared promotion path performs durable file mechanics; it is not a
-;;; substitute for the checks a future source driver must perform.
+;;; Publish and recover the local follow record.  The shared promotion path
+;;; provides durable file mechanics; its caller supplies the phase-specific proof.
 
 ;; Sync the held temporary, verify canonical readback and the exact predecessor,
 ;; rename, sync the root, then read back and recheck the final image.  The caller
@@ -119,9 +118,10 @@
          (physical-reseed-follow-check-local-intent owner root-fd candidate)
          (physical-reseed-follow-write-intent owner root-fd candidate bytes snapshot check))))))
 
-;; Inspect a temporary before mutation and promote only a complete supported
-;; intent with the exact predecessor and local evidence.  Malformed or unsupported
-;; temporaries remain unchanged and fenced; no remote outcome is inferred.
+;; Inspect a temporary before mutation.  Promotion requires an active attempt,
+;; the exact predecessor and phase-specific local evidence.  A stable PROVED
+;; final can be recovered after abort, but a temporary cannot.  Malformed or
+;; unsupported temporaries remain unchanged and fenced.
 
 (defun physical-reseed-follow-recover-intent (owner)
   (physical-reseed-follow-check-idle owner)

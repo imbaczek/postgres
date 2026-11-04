@@ -11,6 +11,9 @@
       (error "target follow source differs from the saved writer or receive frontier"))
     flush))
 
+;; Check the selected writer and exact saved full history between identity
+;; observations, with sufficient monotone flush.  The original request's capture
+;; timeline need not be the selected writer timeline.
 (defun physical-reseed-follow-observe-source (client source generation &key (minimum 0))
   (let* ((coordinates (copy-list (getf generation :coordinates)))
          (history (copy-seq (getf generation :source-history)))
@@ -29,6 +32,8 @@
   (physical-reseed-follow-check-attempt-snapshot-at root-fd (getf expected :attempt))
   expected)
 
+;; Freeze the follow record and actual attempt around network work, including
+;; the installed image and final metadata checks.  A change fences publication.
 (defun physical-reseed-follow-network-snapshot (owner &optional expected)
   (unless (physical-reseed-follow-owner-busy-p owner)
     (error "target follow source proof requires an active operation"))
@@ -82,6 +87,10 @@
     (physical-reseed-follow-check-transition previous record)
     record))
 
+;; Use only the original frozen route and exact saved request.  Observe the
+;; source before and after the RPC, detach its reply before closing the client,
+;; and close owned handles on every exit.  Failed network work keeps the durable
+;; preparation intent for retry; it does not abort or bind a different source.
 (defun physical-reseed-follow-prepare-remote (owner helper)
   (physical-reseed-follow-check-idle owner)
   (setf (physical-reseed-follow-owner-busy-p owner) t)
@@ -116,6 +125,8 @@
          (values (physical-reseed-follow-proved-record record anchor) snapshot t))
     (setf (physical-reseed-follow-owner-busy-p owner) nil)))
 
+;; Finish network work before entering the store scope.  Recheck the snapshot
+;; and local proof there before publishing the proved record.
 (defun physical-reseed-follow-prepare (owner &key helper)
   (multiple-value-bind (candidate snapshot new-proof)
       (physical-reseed-follow-prepare-remote owner helper)

@@ -1,5 +1,7 @@
 (in-package #:pg)
 
+;; Copy the history prefix for the selected child from the saved full history.
+;; Check the resulting lineage before using it in a local plan.
 (defun physical-follow-history-prefix (source child text)
   (unless (and (typep source '(integer 2 4294967295))
                (typep child `(integer 2 ,source))
@@ -44,6 +46,10 @@
      :base-lsn end :floor-lsn end :written-lsn end :flushed-lsn end
      :retained-identity (physical-recovery-retained-identity base))))
 
+;; Build a private empty receive model at base end B.  Floor, write and flush
+;; all start at B with seed digests.  At a fork, select the immediate child,
+;; while applied and required remain (B, parent timeline).  The phase-2
+;; recovery witness is a plan; the installed recovery control remains phase 0.
 (defun physical-follow-empty-base-binding (base anchor)
   (let* ((base (copy-tree base))
          (anchor (physical-follow-anchor-copy anchor))
@@ -77,6 +83,9 @@
         (physical-follow-binding-check binding)
         (values binding model)))))
 
+;; Validate the empty B..B replay using the base's checkpoint, reservation,
+;; XID and resource evidence.  This adapter reads no receive files and refuses
+;; any request to advance its mapper beyond B.
 (defun physical-follow-validate-empty-base-replay (model base binding)
   (physical-follow-binding-check binding)
   (let* ((base (copy-tree base)) (end (getf base :end)) (timeline (getf base :timeline))
