@@ -65,3 +65,41 @@
            (ok (intake-fails-p (lambda () (pg::recovery-check-image-metadata core directory))))
            (ok (intake-fails-p (lambda () (pg::physical-recovery-verify-base-with-namespace))))
            (ok (equalp #(1 2 3) (lineage-test-bytes path))))))))
+
+(deftest reseed-original-base-proof-kernels-use-the-saved-original-control
+    (call-with-reseed-follow-building-fixture
+     :later-writer
+     (lambda (owner root workspace building)
+       (declare (ignore root))
+       (let ((core (pg::physical-reseed-follow-core-projection building)))
+         (pg::call-with-physical-reseed-follow-image
+          owner
+          (lambda (root-fd check)
+            (pg::call-with-physical-backup-image-directory
+             root-fd
+             (lambda (directory)
+               (let ((pg::*pgdata* directory))
+                 (multiple-value-bind (checked base control)
+                     (pg::physical-reseed-follow-check-local-intent owner root-fd core)
+                   (declare (ignore checked control))
+                   (multiple-value-bind (binding model readiness)
+                       (pg::physical-reseed-follow-proof-at owner root-fd core)
+                     (let ((expected (pg::physical-reseed-follow-configuration-images core binding model 12345))
+                           (original (pg::physical-recovery-control-path directory))
+                           (saved (merge-pathnames "saved.original" workspace)))
+                       (sb-posix:rename (namestring original) (namestring saved))
+                       (unwind-protect
+                            (let ((actual-control
+                                    (pg::physical-recovery-decode-control
+                                     (pg::recovery-read-bytes saved :maximum 196))))
+                              (ok (not (probe-file original)))
+                              (ok (pg::physical-reseed-follow-check-base-intent core base directory))
+                              (multiple-value-bind (actual-binding actual-model actual-readiness)
+                                  (pg::physical-reseed-follow-proof-for-base core base actual-control)
+                                (let ((same (equalp expected
+                                                    (pg::physical-reseed-follow-configuration-images
+                                                     core actual-binding actual-model 12345))))
+                                  (ok same))
+                                (ok (equalp readiness actual-readiness))))
+                         (sb-posix:rename (namestring saved) (namestring original)))))))))
+            (funcall check)))))))

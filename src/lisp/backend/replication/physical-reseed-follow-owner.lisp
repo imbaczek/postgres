@@ -24,14 +24,45 @@
     (error "target follow configuration requires dedicated ownership"))
   record)
 
+(defvar *physical-reseed-follow-installation-scope* nil)
+
+(defgeneric physical-reseed-follow-image-dispatch (owner function))
+
+(defvar *physical-reseed-follow-installation-request* nil)
+
+(defvar *physical-reseed-follow-installation-candidate* nil)
+
+(defgeneric physical-reseed-follow-published-snapshot (owner root-fd candidate snapshot previous))
+
+(defmethod physical-reseed-follow-published-snapshot
+    ((owner physical-reseed-follow-owner) root-fd candidate snapshot previous)
+  (declare (ignore root-fd candidate snapshot previous))
+  nil)
+
 (defun physical-reseed-follow-check-idle (owner)
   (unless (physical-reseed-follow-owner-p owner) (error "target follow ownership is required"))
   (physical-directory-check-owner-common owner)
+  (when *physical-reseed-follow-installation-scope*
+    (error "target follow operation cannot reenter an installation scope"))
   (when (physical-reseed-follow-owner-busy-p owner)
     (error "target follow journal operation is already in progress"))
   (when (physical-reseed-follow-owner-uncertain-p owner)
     (error "target follow publication is uncertain; close and reopen the owner"))
   owner)
+
+(defun physical-reseed-follow-base-projection (manifest digest control-bytes directory request)
+  (let ((*pgdata* directory))
+    (physical-reseed-follow-base-copy
+     (list :manifest-digest digest
+           :checkpoint-start (physical-manifest-checkpoint-start manifest)
+           :recovery-control (physical-libpq-octets-datum control-bytes)
+           :wal-control
+           (physical-libpq-octets-datum
+            (recovery-read-bytes (wal-control-path) :maximum (1+ +wal-control-maximum-bytes+)))
+           :auth-files
+           (loop for name in '("authentication.initialized" "pg_hba.conf" "pg_ident.conf")
+                 collect (subseq (physical-adoption-stage-file-state name :maximum 1048576) 0 3)))
+     request)))
 
 (defun physical-reseed-follow-base-at (root-fd plan)
   (call-with-physical-backup-image-directory
@@ -40,20 +71,10 @@
      (multiple-value-bind (manifest digest) (physical-reseed-image-base-state directory)
        (unless (and (equal manifest (getf plan :manifest)) (= digest (getf plan :manifest-digest)))
          (error "target follow base differs from its install plan"))
-       (let ((*pgdata* directory))
-         (physical-reseed-follow-base-copy
-          (list :manifest-digest digest
-                :checkpoint-start (physical-manifest-checkpoint-start manifest)
-                :recovery-control
-                (physical-libpq-octets-datum
-                 (recovery-read-bytes (physical-recovery-control-path directory) :maximum 196))
-                :wal-control
-                (physical-libpq-octets-datum
-                 (recovery-read-bytes (wal-control-path) :maximum (1+ +wal-control-maximum-bytes+)))
-                :auth-files
-                (loop for name in '("authentication.initialized" "pg_hba.conf" "pg_ident.conf")
-                      collect (subseq (physical-adoption-stage-file-state name :maximum 1048576) 0 3)))
-          (getf (getf plan :attempt) :request)))))))
+       (physical-reseed-follow-base-projection
+        manifest digest
+        (recovery-read-bytes (physical-recovery-control-path directory) :maximum 196)
+        directory (getf (getf plan :attempt) :request))))))
 
 (defun physical-reseed-follow-check-binding (owner record)
   (let ((binding (physical-reseed-follow-owner-binding owner)))
@@ -129,6 +150,10 @@
 
 (defun call-with-physical-reseed-follow-image (owner function)
   (unless (physical-reseed-follow-owner-p owner) (error "target follow ownership is required"))
+  (when *physical-reseed-follow-installation-scope* (error "target follow image scope is already active"))
+  (physical-reseed-follow-image-dispatch owner function))
+
+(defmethod physical-reseed-follow-image-dispatch ((owner physical-reseed-follow-owner) function)
   (call-with-physical-reseed-install-namespace
    owner
    (lambda (root-fd incoming-fd quarantine-fd state prefix check)

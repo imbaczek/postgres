@@ -1,11 +1,24 @@
 (in-package #:pg)
 
+(defun physical-reseed-follow-proof-for-base (value base control)
+  (let* ((record (physical-reseed-follow-copy value))
+         (generations (getf record :generations))
+         (request (getf (getf record :attempt) :request)))
+    (unless (and (= 1 (length generations)) (eq :proved (getf (first generations) :phase)))
+      (error "target follow historical proof requires one proved generation"))
+    (unless (and (zerop (getf control :phase))
+                 (= (getf base :manifest-digest) (getf (getf record :base) :manifest-digest))
+                 (equal (getf base :cluster-identity) (getf request :cluster-identity)))
+      (error "target follow proof differs from its immutable phase-zero base"))
+    (let ((anchor (physical-reseed-follow-generation-anchor (first generations))))
+      (multiple-value-bind (binding model) (physical-follow-empty-base-binding base anchor)
+        (values binding model (physical-follow-validate-empty-base-replay model base binding))))))
+
 ;; Check historical anchor evidence against the installed phase-zero base and
 ;; an empty replay model.  Later handoff must recheck current source authority.
 (defun physical-reseed-follow-proof-at (owner root-fd value)
   (let* ((record (physical-reseed-follow-copy value))
-         (generations (getf record :generations))
-         (request (getf (getf record :attempt) :request)))
+         (generations (getf record :generations)))
     (unless (and (= 1 (length generations)) (eq :proved (getf (first generations) :phase)))
       (error "target follow historical proof requires one proved generation"))
     (physical-reseed-check-owner owner)
@@ -20,13 +33,7 @@
          (multiple-value-bind (checked base control)
              (physical-reseed-follow-check-local-intent owner root-fd record)
            (declare (ignore checked))
-           (unless (and (zerop (getf control :phase))
-                        (= (getf base :manifest-digest) (getf (getf record :base) :manifest-digest))
-                        (equal (getf base :cluster-identity) (getf request :cluster-identity)))
-             (error "target follow proof differs from its immutable phase-zero base"))
-           (let ((anchor (physical-reseed-follow-generation-anchor (first generations))))
-             (multiple-value-bind (binding model) (physical-follow-empty-base-binding base anchor)
-               (values binding model (physical-follow-validate-empty-base-replay model base binding))))))))))
+           (physical-reseed-follow-proof-for-base record base control)))))))
 
 ;; A stable proved record can be checked after the original attempt aborts.
 ;; Empty and preparing records still require an active attempt.

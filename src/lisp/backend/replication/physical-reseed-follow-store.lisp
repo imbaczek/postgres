@@ -21,6 +21,21 @@
 ;; overlap against the installed base.  This is local evidence, not an RPC or
 ;; proof that a source has accepted the intent.
 
+(defun physical-reseed-follow-check-base-intent (record base directory)
+  (let* ((generation (first (getf record :generations)))
+         (coordinates (getf generation :coordinates))
+         (history (timeline-check-lineage
+                   (timeline-parse-history (getf coordinates :source-timeline)
+                                           (getf generation :source-history))))
+         (previous (timeline-check-lineage (timeline-read-history (getf base :timeline) directory))))
+    (unless (physical-store-history-extends-p previous history)
+      (error "target follow intent changes installed timeline ancestry"))
+    (multiple-value-bind (bytes entry) (physical-recovery-read-base-overlap base directory)
+      (unless (and (= (getf coordinates :overlap-start) (- (getf base :end) (length bytes)))
+                   (= (getf coordinates :overlap-digest) (third entry)))
+        (error "target follow intent differs from its installed WAL overlap"))))
+  t)
+
 (defun physical-reseed-follow-check-local-intent (owner root-fd record)
   (physical-reseed-follow-check-binding owner record)
   (let ((generation (first (getf record :generations))) (base nil) (control nil))
@@ -31,17 +46,7 @@
          (let ((*pgdata* directory))
            (multiple-value-bind (verified raw) (physical-recovery-verify-base-state)
              (setf base verified control raw))
-           (let* ((coordinates (getf generation :coordinates))
-                  (history (timeline-check-lineage
-                            (timeline-parse-history (getf coordinates :source-timeline)
-                                                    (getf generation :source-history))))
-                  (previous (timeline-check-lineage (timeline-read-history (getf base :timeline) directory))))
-             (unless (physical-store-history-extends-p previous history)
-               (error "target follow intent changes installed timeline ancestry"))
-             (multiple-value-bind (bytes entry) (physical-recovery-read-base-overlap base directory)
-               (unless (and (= (getf coordinates :overlap-start) (- (getf base :end) (length bytes)))
-                            (= (getf coordinates :overlap-digest) (third entry)))
-                 (error "target follow intent differs from its installed WAL overlap"))))))))
+           (physical-reseed-follow-check-base-intent record base directory)))))
     (values record base control)))
 
 (defun physical-reseed-follow-snapshot-at (root-fd)
