@@ -322,6 +322,306 @@
                   (ok (eq :aborted (getf (pg::physical-reseed-cancel owner :helper "/unused/helper") :phase)))
                   (ok (= 1 (getf state :aborts)))))))))))
 
+(deftest reseed-cleanup-cancel-retries-an-empty-phase-publication
+    (dolist (phase '(:premanifest :aborting))
+      (call-with-reseed-cleanup-fixture
+       (lambda (root owner record)
+         (when (eq phase :aborting)
+           (let ((next (copy-tree record)))
+             (setf (getf next :phase) :aborting)
+             (pg::physical-reseed-attempt-publish owner next :previous record)))
+         (call-with-reseed-cleanup-client-fixture
+          owner record
+          (lambda (state)
+            (setf (getf state :abort-phases) '(:closed))
+            (let ((fired nil))
+              (let ((pg::*physical-reseed-attempt-test-hook*
+                      (lambda (point path)
+                        (declare (ignore path))
+                        (when (and (eq point :after-create) (not fired))
+                          (setf fired t)
+                          (error "interrupted phase publication")))))
+                (ok (intake-fails-p
+                     (lambda () (pg::physical-reseed-cancel owner :helper "/unused/helper")))))
+              (ok fired))
+            (ok (probe-file (pg::physical-reseed-attempt-temporary-path root)))
+            (ok (eq :aborted
+                    (getf (pg::physical-reseed-cancel owner :helper "/unused/helper") :phase)))
+            (ok (null (probe-file (pg::physical-reseed-attempt-temporary-path root))))
+            (ok (= (if (eq phase :premanifest) 1 2) (getf state :aborts)))
+            (ok (= (getf state :opened) (getf state :closed)))))))))
+
+(cl-spec:defproperty reseed-cancellation-preserves-identity-across-canonical-prefixes
+    ((aborting boolean) (next boolean) (index (range integer 0 65535)) (complete boolean))
+  (:about pg::physical-reseed-cancel pg::physical-reseed-attempt-recover-for-cancel)
+  (:trials (:normal 80))
+  (let ((accepted nil))
+    (call-with-reseed-cleanup-fixture
+     (lambda (root owner record)
+       (let ((previous (copy-tree record)))
+         (when aborting
+           (setf (getf previous :phase) :aborting)
+           (pg::physical-reseed-attempt-publish owner previous :previous record))
+         (let* ((candidate (copy-tree previous))
+                (phase (if next (if aborting :aborted :aborting) (getf previous :phase))))
+           (setf (getf candidate :phase) phase)
+           (let ((receipt (when (eq phase :aborted) (reseed-attempt-test-abort-receipt previous))))
+             (pg::physical-reseed-attempt-check-abort-receipt candidate receipt)
+             (if complete
+                 (pg::physical-reseed-attempt-write-temporary owner candidate :receipt receipt)
+                 (let* ((image (pg::physical-reseed-attempt-image candidate))
+                        (length (mod index (length image))))
+                   (with-open-file (out (pg::physical-reseed-attempt-temporary-path root)
+                                        :direction :output :if-exists :error :element-type '(unsigned-byte 8))
+                     (sb-posix:fchmod (sb-sys:fd-stream-fd out) #o600)
+                     (write-sequence image out :end length)))))
+           (call-with-reseed-cleanup-client-fixture
+            owner record
+            (lambda (state)
+              (setf (getf state :abort-phases) '(:closed))
+              (let ((actual (pg::physical-reseed-cancel owner :helper "/unused/helper")))
+                (setf accepted
+                      (and (eq :aborted (getf actual :phase))
+                           (every (lambda (key) (equal (getf previous key) (getf actual key)))
+                                  pg::*physical-reseed-attempt-identity-keys*)
+                           (not (probe-file (pg::physical-reseed-attempt-temporary-path root)))
+                           (= (if (and complete (eq phase :aborted)) 0 1) (getf state :aborts))
+                           (= (getf state :opened) (getf state :closed)))))))))))
+    accepted))
+
+(deftest generated-reseed-cancellation-canonical-prefix-recovery
+    (let ((data (cl-spec:result-data
+                 (cl-spec:run-property 'reseed-cancellation-preserves-identity-across-canonical-prefixes
+                                       :seed 102 :profile :normal))))
+      (ok (eq :passed (getf data :status)) (format nil "~s" data))))
+
+(deftest reseed-cleanup-cancel-retries-interrupted-normalization
+    (dolist (phase '(:premanifest :aborting))
+      (dolist (cut '(:before-cancel-repair-truncate :after-cancel-repair-truncate
+                     :after-cancel-repair-empty-fsync :after-cancel-repair-write-chunk
+                     :after-cancel-repair-write :after-cancel-repair-file-fsync
+                     :before-rename :after-rename :after-directory-fsync :before-readback :after-readback))
+        (call-with-reseed-cleanup-fixture
+         (lambda (root owner record)
+           (let ((previous (copy-tree record)))
+             (when (eq phase :aborting)
+               (setf (getf previous :phase) :aborting)
+               (pg::physical-reseed-attempt-publish owner previous :previous record))
+             (let ((candidate (copy-tree previous)))
+               (setf (getf candidate :phase) (if (eq phase :premanifest) :aborting :aborted))
+               (let ((image (pg::physical-reseed-attempt-image candidate)))
+                 (with-open-file (out (pg::physical-reseed-attempt-temporary-path root)
+                                      :direction :output :if-exists :error :element-type '(unsigned-byte 8))
+                   (sb-posix:fchmod (sb-sys:fd-stream-fd out) #o600)
+                   (write-sequence image out :end (floor (length image) 2)))))
+             (call-with-reseed-cleanup-client-fixture
+              owner record
+              (lambda (state)
+                (setf (getf state :abort-phases) '(:closed))
+                (let ((fired nil))
+                  (let ((pg::*physical-reseed-cancel-write-limit* 1)
+                        (pg::*physical-reseed-attempt-test-hook*
+                          (lambda (point path)
+                            (declare (ignore path))
+                            (when (and (eq point cut) (not fired))
+                              (setf fired t)
+                              (error "interrupted cancellation normalization")))))
+                    (ok (intake-fails-p
+                         (lambda () (pg::physical-reseed-cancel owner :helper "/unused/helper")))))
+                  (ok fired))
+                (ok (zerop (getf state :aborts)))
+                (ok (eq :aborted (getf (pg::physical-reseed-cancel owner :helper "/unused/helper") :phase)))
+                (ok (= 1 (getf state :aborts)))
+                (ok (null (probe-file (pg::physical-reseed-attempt-temporary-path root))))
+                (ok (= (getf state :opened) (getf state :closed)))))))))))
+
+(deftest reseed-cleanup-cancel-refuses-unsafe-or-incompatible-temporaries
+    (dolist (kind '(:garbage :trailing :foreign :public :hardlink :symlink :directory :fifo))
+      (call-with-reseed-cleanup-fixture
+       (lambda (root owner record)
+         (let* ((temporary (pg::physical-reseed-attempt-temporary-path root))
+                (other (merge-pathnames "foreign-temporary" root))
+                (candidate (copy-tree record))
+                (before (lineage-test-bytes (pg::physical-reseed-attempt-path root))))
+           (setf (getf candidate :phase) :aborting)
+           (when (eq kind :foreign)
+             (setf (getf (getf candidate :request) :token) (make-string 64 :initial-element #\b)))
+           (let ((image (pg::physical-reseed-attempt-image candidate)))
+             (with-open-file (out temporary :direction :output :if-exists :error :element-type '(unsigned-byte 8))
+               (sb-posix:fchmod (sb-sys:fd-stream-fd out) #o600)
+               (case kind
+                 (:garbage (write-byte 0 out))
+                 (:trailing (write-sequence image out) (write-byte 0 out))
+                 (otherwise (write-sequence image out :end (1- (length image)))))))
+           (case kind
+             (:public (sb-posix:chmod (namestring temporary) #o644))
+             (:hardlink (sb-posix:link (namestring temporary) (namestring other)))
+             (:symlink (sb-posix:rename (namestring temporary) (namestring other))
+              (sb-posix:symlink (namestring other) (namestring temporary)))
+             (:directory (delete-file temporary) (sb-posix:mkdir (namestring temporary) #o700))
+             (:fifo (delete-file temporary) (sb-posix:mkfifo (namestring temporary) #o600)))
+           (call-with-reseed-cleanup-client-fixture
+            owner record
+            (lambda (state)
+              (ok (intake-fails-p (lambda () (pg::physical-reseed-cancel owner :helper "/unused/helper"))))
+              (ok (zerop (getf state :opened)))
+              (ok (zerop (getf state :aborts)))))
+           (ok (equalp before (lineage-test-bytes (pg::physical-reseed-attempt-path root))))
+           (ok (sb-posix:lstat (namestring temporary))))))))
+
+(deftest reseed-cleanup-cancel-syncs-empty-before-writing-replacement
+    (call-with-reseed-cleanup-fixture
+     (lambda (root owner record)
+       (let* ((temporary (pg::physical-reseed-attempt-temporary-path root))
+              (candidate (copy-tree record))
+              (fsync (symbol-function 'sb-posix:fsync))
+              (writer (symbol-function 'pg::physical-adoption-install-write-bytes))
+              (fail-empty t) (empty-synced nil) (writes 0))
+         (setf (getf candidate :phase) :aborting)
+         (let ((image (pg::physical-reseed-attempt-image candidate)))
+           (with-open-file (out temporary :direction :output :if-exists :error :element-type '(unsigned-byte 8))
+             (sb-posix:fchmod (sb-sys:fd-stream-fd out) #o600)
+             (write-sequence image out :end (floor (length image) 2))))
+         (let ((inode (sb-posix:stat-ino (sb-posix:lstat (namestring temporary)))))
+           (unwind-protect
+                (progn
+                  (setf (symbol-function 'sb-posix:fsync)
+                        (lambda (fd)
+                          (let* ((stat (sb-posix:fstat fd))
+                                 (empty (and (= inode (sb-posix:stat-ino stat))
+                                             (zerop (sb-posix:stat-size stat)))))
+                            (when (and empty fail-empty)
+                              (setf fail-empty nil)
+                              (error "empty barrier fsync failed"))
+                            (prog1 (funcall fsync fd)
+                              (when empty (setf empty-synced t)))))
+                        (symbol-function 'pg::physical-adoption-install-write-bytes)
+                        (lambda (fd bytes offset path &key limit point)
+                          (incf writes)
+                          (ok empty-synced)
+                          (ok (zerop (sb-posix:stat-size (sb-posix:fstat fd))))
+                          (funcall writer fd bytes offset path :limit limit :point point)))
+                  (call-with-reseed-cleanup-client-fixture
+                   owner record
+                   (lambda (state)
+                     (setf (getf state :abort-phases) '(:closed))
+                     (ok (intake-fails-p (lambda () (pg::physical-reseed-cancel owner :helper "/unused/helper"))))
+                     (ok (zerop writes))
+                     (ok (zerop (getf state :opened)))
+                     (ok (zerop (sb-posix:stat-size (sb-posix:lstat (namestring temporary)))))
+                     (ok (eq :aborted (getf (pg::physical-reseed-cancel owner :helper "/unused/helper") :phase)))
+                     (ok (= 1 writes))
+                     (ok empty-synced)
+                     (ok (= 1 (getf state :aborts))))))
+             (setf (symbol-function 'sb-posix:fsync) fsync
+                   (symbol-function 'pg::physical-adoption-install-write-bytes) writer)))))))
+
+(deftest reseed-cleanup-cancel-rechecks-metadata-at-repair-boundaries
+    (dolist (cut '(:before-cancel-repair-truncate :after-cancel-repair-empty-fsync
+                   :after-cancel-repair-write))
+      (dolist (kind '(:temporary :predecessor :bytes))
+        (call-with-reseed-cleanup-fixture
+         (lambda (root owner record)
+           (let* ((temporary (pg::physical-reseed-attempt-temporary-path root))
+                  (final (pg::physical-reseed-attempt-path root))
+                  (held (merge-pathnames "held-cancel-metadata" root))
+                  (candidate (copy-tree record))
+                  (fired nil) (foreign nil) (target nil))
+             (setf (getf candidate :phase) :aborting)
+             (let ((image (pg::physical-reseed-attempt-image candidate)))
+               (with-open-file (out temporary :direction :output :if-exists :error :element-type '(unsigned-byte 8))
+                 (sb-posix:fchmod (sb-sys:fd-stream-fd out) #o600)
+                 (write-sequence image out :end (floor (length image) 2))))
+             (unwind-protect
+                  (call-with-reseed-cleanup-client-fixture
+                   owner record
+                   (lambda (state)
+                     (let ((pg::*physical-reseed-attempt-test-hook*
+                             (lambda (point path)
+                               (declare (ignore path))
+                               (when (and (eq point cut) (not fired))
+                                 (setf fired t target (if (eq kind :predecessor) final temporary))
+                                 (if (eq kind :bytes)
+                                     (with-open-file (out target :direction :io :if-exists :overwrite :element-type '(unsigned-byte 8))
+                                       (write-byte 0 out))
+                                     (let ((saved (lineage-test-bytes target)))
+                                       (sb-posix:rename (namestring target) (namestring held))
+                                       (with-open-file (out target :direction :output :if-exists :error
+                                                                   :element-type '(unsigned-byte 8))
+                                         (sb-posix:fchmod (sb-sys:fd-stream-fd out) #o600)
+                                         (write-sequence saved out))))
+                                 (setf foreign (lineage-test-bytes target))))))
+                       (ok (intake-fails-p
+                            (lambda () (pg::physical-reseed-cancel owner :helper "/unused/helper")))))
+                     (ok fired)
+                     (ok (zerop (getf state :opened)))
+                     (ok (zerop (getf state :aborts)))
+                     (ok (equalp foreign (lineage-test-bytes target)))))
+               (when (probe-file held)
+                 (delete-file target)
+                 (sb-posix:rename (namestring held) (namestring target))))))))))
+
+(deftest reseed-cleanup-cancel-recovers-every-partial-publication-byte
+    (dolist (phase '(:premanifest :aborting))
+      (call-with-reseed-cleanup-fixture
+       (lambda (root owner record)
+         (let* ((previous (copy-tree record))
+                (final (pg::physical-reseed-attempt-path root))
+                (temporary (pg::physical-reseed-attempt-temporary-path root)))
+           (when (eq phase :aborting)
+             (setf (getf previous :phase) :aborting)
+             (pg::physical-reseed-attempt-publish owner previous :previous record))
+           (let* ((candidate (copy-tree previous))
+                  (previous-bytes (pg::physical-reseed-attempt-image previous)))
+             (setf (getf candidate :phase) (if (eq phase :premanifest) :aborting :aborted))
+             (pg::physical-reseed-attempt-check-abort-receipt
+              candidate (when (eq phase :aborting) (reseed-attempt-test-abort-receipt previous)))
+             (let ((image (pg::physical-reseed-attempt-image candidate)))
+               (call-with-reseed-cleanup-client-fixture
+                owner record
+                (lambda (state)
+                  (setf (getf state :abort-phases) '(:closed))
+                  (dotimes (index (length image))
+                    (with-open-file (out final :direction :output :if-exists :overwrite
+                                               :element-type '(unsigned-byte 8))
+                      (sb-posix:ftruncate (sb-sys:fd-stream-fd out) 0)
+                      (write-sequence previous-bytes out))
+                    (with-open-file (out temporary :direction :output :if-exists :error
+                                                   :element-type '(unsigned-byte 8))
+                      (sb-posix:fchmod (sb-sys:fd-stream-fd out) #o600)
+                      (write-sequence image out :end index))
+                    (let ((actual (pg::physical-reseed-cancel owner :helper "/unused/helper")))
+                      (unless (and (eq :aborted (getf actual :phase))
+                                   (every (lambda (key) (equal (getf previous key) (getf actual key)))
+                                          pg::*physical-reseed-attempt-identity-keys*)
+                                   (not (probe-file temporary))
+                                   (= (1+ index) (getf state :aborts)))
+                        (error "cancellation failed at partial byte ~d" index))))
+                  (ok (= (length image) (getf state :aborts)))
+                  (ok (= (getf state :opened) (getf state :closed))))))))))))
+
+(deftest reseed-cleanup-cancel-temporary-scope-closes-and-revokes
+    (dolist (escape '(nil t))
+      (call-with-reseed-cleanup-fixture
+       (lambda (root owner record)
+         (let ((fd nil) (check nil) (refresh nil))
+           (with-open-file (out (pg::physical-reseed-attempt-temporary-path root)
+                                :direction :output :if-exists :error :element-type '(unsigned-byte 8))
+             (sb-posix:fchmod (sb-sys:fd-stream-fd out) #o600))
+           (ok (eq (if escape :escaped :returned)
+                   (catch 'cancel-scope
+                     (pg::call-with-physical-reseed-cancel-temporary
+                      owner
+                      (lambda (root-fd temporary path previous bytes validate accept)
+                        (declare (ignore root-fd path previous bytes))
+                        (setf fd temporary check validate refresh accept)
+                        (when escape (throw 'cancel-scope :escaped))
+                        :returned)))))
+           (ok (intake-fails-p (lambda () (sb-posix:fstat fd))))
+           (ok (intake-fails-p check))
+           (ok (intake-fails-p (lambda () (funcall refresh (make-array 0 :element-type '(unsigned-byte 8))))))
+           (ok (equal record (pg::physical-reseed-attempt-read-owned owner "physical-reseed.attempt"))))))))
+
 (deftest reseed-cleanup-owner-printing-keeps-request-and-connection-data-private
     (call-with-reseed-cleanup-fixture
      (lambda (root owner record)

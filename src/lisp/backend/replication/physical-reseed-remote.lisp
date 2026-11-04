@@ -156,7 +156,8 @@
 ;; removes the local startup fence.
 
 (defun physical-reseed-cancel (owner &key helper)
-  (let ((record (physical-reseed-attempt-recover owner)))
+  (declare (ftype (function (t) t) physical-reseed-attempt-recover-for-cancel))
+  (let ((record (physical-reseed-attempt-recover-for-cancel owner)))
     (when (eq :aborted (getf record :phase)) (return-from physical-reseed-cancel record))
     (unless (eq :aborting (getf record :phase))
       (let ((next (copy-list record)))

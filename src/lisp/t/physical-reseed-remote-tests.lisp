@@ -328,6 +328,34 @@
                (uiop:delete-directory-tree stage :validate t)
                (rename-file saved stage))))))))
 
+(deftest reseed-remote-cancel-recovers-initial-publication-without-status
+    (dolist (cut '(:after-create :after-write :after-file-fsync :before-rename))
+      (call-with-reseed-remote-fixture
+       (lambda (root stage owner request profile state)
+         (let ((fired nil))
+           (let ((pg::*physical-reseed-attempt-test-hook*
+                   (lambda (point path)
+                     (declare (ignore path))
+                     (when (and (eq point cut) (not fired))
+                       (setf fired t)
+                       (error "initial attempt publication interrupted")))))
+             (ok (intake-fails-p
+                  (lambda () (pg::physical-reseed-start-remote owner stage request profile :helper "/unused/helper")))))
+           (ok fired))
+         (ok (null (probe-file (pg::physical-reseed-attempt-path root))))
+         (ok (probe-file (pg::physical-reseed-attempt-temporary-path root)))
+         (if (eq cut :after-create)
+             (progn
+               (ok (intake-fails-p (lambda () (pg::physical-reseed-cancel owner :helper "/unused/helper"))))
+               (ok (zerop (getf state :frozen)))
+               (ok (zerop (getf state :aborts))))
+             (progn
+               (setf (getf state :abort-phases) '(:closed))
+               (ok (eq :aborted (getf (pg::physical-reseed-cancel owner :helper "/unused/helper") :phase)))
+               (ok (= 1 (getf state :aborts)))))
+         (ok (zerop (getf state :captures)))
+         (ok (= (+ (getf state :discovery) (getf state :frozen)) (getf state :closes)))))))
+
 (deftest reseed-remote-retries-source-abort-after-losing-local-acknowledgment
     (call-with-reseed-remote-fixture
      (lambda (root stage owner request profile state)

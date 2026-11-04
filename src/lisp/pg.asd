@@ -204,6 +204,7 @@
                    (:file "../replication/physical-adoption-install-codec")
                    (:file "../replication/physical-adoption-install-image")
                    (:file "../replication/physical-adoption-install-journal")
+                   (:file "../replication/physical-reseed-cancel")
                    (:file "../replication/physical-reseed-install-progress")
                    (:file "../replication/physical-adoption-install-state")
                    (:file "../replication/physical-adoption-install")
