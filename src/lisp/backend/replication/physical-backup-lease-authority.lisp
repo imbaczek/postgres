@@ -54,10 +54,13 @@
 
 (declaim (ftype function physical-backup-lease-check-capture-owner))
 
+(declaim (ftype function physical-backup-lease-allocation-check-unowned-name))
+
 ;; A lease may create its pin only for the exact CAPTURING request and owner,
 ;; while the caller owns quiescence and the matching record is still on disk.
 ;; Ordinary creation may not take any name in the lease inventory.
 (defun physical-backup-lease-check-pin-create (name request)
+  (physical-backup-lease-allocation-check-unowned-name name)
   (physical-backup-lease-check-successor-mutation name)
   (let ((record (physical-backup-lease-record-under-lock name)))
     (cond

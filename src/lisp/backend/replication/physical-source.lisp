@@ -9,6 +9,9 @@
 
 (declaim (ftype function physical-backup-lease-closing-successor))
 
+(declaim (ftype function physical-backup-lease-allocation-check-stream
+                physical-backup-lease-allocation-check-retirement))
+
 (defstruct physical-source-pin
   "A retained source position and its timeline and optional backup manifest digest.
 The digest binds a backup to its stream request; the prefix digest separately
@@ -29,6 +32,7 @@ The backend and source identity fence use after release or source replacement."
   "Validate the pin, sender and optional public claim under WAL; return the pin.
 For a sender context also check the calling backend and source incarnation."
   (physical-backup-lease-check-ordinary-pin name)
+  (physical-backup-lease-allocation-check-stream name)
   (let ((pin (gethash name *physical-source-pins*)))
     (unless (and pin (physical-source-pin-stream-ready-p pin)
                  (not (physical-source-pin-lost-p pin))
@@ -416,6 +420,7 @@ The caller holds WAL. LIMIT is an exact-byte cap independent of wal_keep_size."
 The caller owns the write and WAL critical section. An I/O failure fences WAL;
 restart must resolve an ambiguous deletion before recycling."
   (physical-backup-lease-check-pin-unlink pin lease-request)
+  (physical-backup-lease-allocation-check-retirement (physical-source-pin-name pin) pin)
   (let ((name (physical-source-pin-name pin)))
     (let ((path (physical-source-pin-path name)))
       (physical-source-pin-test-point :before-release-unlink pin)

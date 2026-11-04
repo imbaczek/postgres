@@ -31,6 +31,7 @@
                (:file "t/physical-backup-lease-allocation-store-tests")
                (:file "t/physical-backup-lease-authority-tests")
                (:file "t/physical-backup-lease-startup-tests")
+               (:file "t/physical-backup-lease-allocation-authority-tests")
                (:file "t/physical-backup-lease-status-tests")
                (:file "t/physical-backup-lease-capture-tests")
                (:file "t/physical-backup-lease-wire-tests")

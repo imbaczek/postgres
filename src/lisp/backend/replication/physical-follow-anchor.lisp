@@ -69,6 +69,13 @@ pin; an ambiguous save fences the source and keeps retention until restart."
       (prevent-recovery-primary-operation "physical follow anchor reservation")
       (with-write-lock
         (with-wal-critical
+          (multiple-value-bind (allocation observation)
+              (physical-backup-lease-allocation-check-prepare name anchor t t)
+            (declare (ignore allocation))
+            (when observation
+              (let ((pin (gethash name *physical-source-pins*)))
+                (physical-follow-pin-check-live pin)
+                (return-from physical-source-follow-reserve pin))))
           (physical-backup-lease-check-ordinary-pin name)
           (physical-follow-check-attempt-name name)
           (let ((existing (gethash name *physical-source-pins*)))
@@ -187,6 +194,8 @@ before publishing the ready state in memory; a save failure fences the source."
       (with-live-operation
         (with-write-lock
           (with-wal-critical
+            (physical-backup-lease-allocation-check-prepare
+             (physical-source-pin-name pin) (physical-follow-pin-anchor pin) t)
             (physical-follow-pin-check-live pin)
             (unless (physical-follow-pin-ready-p pin)
               (let* ((candidate (copy-physical-source-pin pin))
@@ -276,6 +285,7 @@ The existing pin keeps any confirmation already advanced."
     (prevent-recovery-primary-operation "physical follow preparation")
     (sb-thread:with-mutex (*wal-lock*)
       (wal-check-healthy)
+      (physical-backup-lease-allocation-check-prepare name request nil t)
       (physical-follow-check-attempt-name name)
       (let ((pin (gethash name *physical-source-pins*)))
         (when pin
@@ -330,6 +340,7 @@ limit fails before acknowledgment, unlink or retention release."
               ;; Keep a closing handoff's successor until bootstrap retirement
               ;; and CLOSED publication have finished.
               (physical-backup-lease-check-successor-mutation name)
+              (physical-backup-lease-allocation-check-retirement name)
               (when (and request (/= (getf request :system-id) (catalog-system-identifier)))
                 (wal-invalid-input "physical follow cleanup belongs to another source"))
               (let ((registered (gethash name *physical-source-pins*)))

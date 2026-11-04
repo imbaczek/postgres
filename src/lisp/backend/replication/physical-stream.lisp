@@ -425,6 +425,7 @@ base and bounds apply feedback, not the anchor cursor."
            (base (parse-replication-lsn (physical-stream-option command "base_lsn")))
            (cursor (logical-replication-command-requested-lsn command)))
       (physical-backup-lease-check-ordinary-pin name)
+      (physical-backup-lease-allocation-check-stream name)
       (when (and pin (physical-source-pin-lost-p pin))
         (ereport "55000" "native physical source retention is lost; reseed is required"))
       (unless (and pin (eq follow (physical-follow-pin-p pin))

@@ -182,6 +182,10 @@
 
 (declaim (ftype function physical-backup-lease-check-handoff-publication))
 
+(declaim (ftype function physical-backup-lease-allocation-check-unowned-name))
+
+(declaim (ftype function physical-backup-lease-allocation-check-handoff))
+
 ;; AFTER must already be the result of a validated transition from BEFORE.
 ;; The caller holds write and WAL exclusion and supplies the callback for an
 ;; active publication fence.  Recheck memory and disk under those locks, then
@@ -191,6 +195,7 @@
   (let* ((request (getf after :request)) (name (getf request :name)))
     (physical-backup-lease-check-source
      request :current-timeline (member (getf after :phase) '(:requested :capturing :ready)))
+    (when (null before) (physical-backup-lease-allocation-check-unowned-name name))
     (unless (equal before (gethash name *physical-backup-lease-records*))
       (wal-invalid-input "backup lease caller has stale state"))
     (when (and (null before)
@@ -205,6 +210,7 @@
         (error "backup lease disk and registered state disagree")))
     (physical-backup-lease-check-capacity
      (+ (hash-table-count *physical-backup-lease-records*) (if before 0 1)))
+    (physical-backup-lease-allocation-check-handoff after)
     (physical-backup-lease-check-handoff-publication before after)
     (unless (equal before after)
       (funcall begin-publication)
