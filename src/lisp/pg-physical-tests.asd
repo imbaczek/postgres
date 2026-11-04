@@ -94,6 +94,8 @@
                (:file "t/physical-reseed-follow-prepare-tests")
                (:file "t/physical-reseed-follow-configuration-tests")
                (:file "t/physical-reseed-follow-configuration-codec-tests")
+               (:file "t/physical-reseed-follow-configuration-building-tests")
+               (:file "t/physical-reseed-follow-configuration-staging-tests")
                (:file "t/wal-timeline-tests")
                (:file "t/wal-eor-tests")
                (:file "t/physical-history-tests")
