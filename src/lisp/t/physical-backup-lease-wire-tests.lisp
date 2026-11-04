@@ -130,12 +130,147 @@
 (deftest backup-lease-wire-commands-require-a-physical-sender-and-no-transaction
     (let ((pg::*wal-sender-registry* (make-hash-table :test #'eq))
           (pg::*physical-recovery-state* nil))
-      (dolist (verb '("CAPTURE_BACKUP_NATIVE" "BACKUP_LEASE_STATUS" "BACKUP_LEASE_ABORT"))
+      (dolist (verb '("CAPTURE_BACKUP_NATIVE" "BACKUP_LEASE_STATUS" "BACKUP_LEASE_ABORT" "BACKUP_LEASE_HANDOFF"))
         (let ((command (pg::parse-replication-command
-                        (pg::pg-client-native-backup-lease-query verb (backup-lease-wire-request)))))
+                        (pg::pg-client-native-backup-lease-query
+                         verb (backup-lease-wire-request)
+                         (when (equal verb "BACKUP_LEASE_HANDOFF")
+                           (list :name "wire_successor" :anchor-digest 37))))))
           (dolist (backend (list nil (pg::make-backend :pid 177 :replication-mode :database)
                                  (pg::make-backend :pid 178 :replication-mode :physical)))
             (let ((pg::*backend* backend))
               (ok (intake-fails-p (lambda () (pg::physical-backup-lease-wire-preflight command))))))
           (let ((pg::*backend* (pg::make-backend :pid 179 :replication-mode :physical :explicit t)))
             (ok (intake-fails-p (lambda () (pg::validate-replication-command-context command)))))))))
+
+(deftest backup-lease-handoff-wire-checks-admitted-connection-state
+    (let ((pg::*wal-sender-registry* (make-hash-table :test #'eq))
+          (pg::*sync-replication-state* (pg::make-sync-replication-state :source-id 42))
+          (pg::*physical-recovery-failed-p* nil)
+          (pg::*backend* (pg::make-backend :pid 181 :replication-mode :physical))
+          (command (pg::parse-replication-command
+                    (pg::pg-client-native-backup-lease-query
+                     "BACKUP_LEASE_HANDOFF" (backup-lease-wire-request)
+                     (list :name "wire_successor" :anchor-digest 37)))))
+      (pg::wal-sender-register pg::*backend*)
+      (unwind-protect
+           (dolist (case '(:transaction :aborted :standby))
+             (let ((pg::*physical-recovery-state* (when (eq case :standby) (list :phase 2))))
+               (setf (pg::backend-explicit pg::*backend*) (eq case :transaction)
+                     (pg::backend-state pg::*backend*) (if (eq case :aborted) :aborted :idle))
+               (ok (equal (ecase case
+                            (:transaction "25001") (:aborted "25P02") (:standby "55000"))
+                          (handler-case
+                              (progn (pg::physical-backup-lease-wire-preflight command) nil)
+                            (pg::pg-error (condition) (pg::pg-error-sqlstate condition)))))
+               (ok (equal (ecase case
+                            (:transaction "25001") (:aborted "25P02") (:standby "25006"))
+                          (handler-case
+                              (progn (pg::validate-replication-command-context command) nil)
+                            (pg::pg-error (condition) (pg::pg-error-sqlstate condition)))))))
+        (pg::wal-sender-unregister pg::*backend*))))
+
+(cl-spec:defproperty backup-lease-handoff-wire-preserves-successor
+    ((digest (range integer 0 18446744073709551615))
+     (identity-choice (range integer 0 2)))
+  (:about pg::parse-native-backup-lease-command pg::pg-client-native-backup-lease-query)
+  (:trials (:normal 80))
+  (let* ((request (backup-lease-wire-request
+                   (nth identity-choice '("handoff" "handoff'quoted" "handoff\\literal"))))
+         (successor (list :name "wire_successor" :anchor-digest digest))
+         (query (pg::pg-client-native-backup-lease-query "BACKUP_LEASE_HANDOFF" request successor))
+         (command (pg::parse-replication-command query)))
+    (and (eq :physical-lease-handoff (pg::logical-replication-command-type command))
+         (equal request (pg::physical-backup-lease-command-request command))
+         (equal successor (cdr (assoc "successor" (pg::logical-replication-command-options command)
+                                      :test #'equal)))
+         (pg::replication-query-payload-p (pg::string->bytes query)))))
+
+(deftest generated-backup-lease-handoff-wire-successor-roundtrip
+    (let ((result (cl-spec:result-data
+                   (cl-spec:run-property 'backup-lease-handoff-wire-preserves-successor
+                                         :seed 103 :profile :normal))))
+      (ok (eq :passed (getf result :status)))))
+
+(deftest backup-lease-handoff-client-requires-the-exact-closed-successor
+    (let* ((request (backup-lease-wire-request))
+           (closed (backup-lease-wire-record 7 request))
+           (successor (getf closed :successor)))
+      (call-with-physical-client-wire
+       (lambda (client request-file)
+         (declare (ignore request-file))
+         (ok (equal closed (pg::pg-client-native-backup-lease-handoff client request successor))))
+       (lambda (output)
+         (physical-client-test-result output pg::*physical-backup-lease-result-schema*
+                                      (list (pg::physical-backup-lease-result-row request closed))
+                                      "BACKUP_LEASE_HANDOFF")))
+      (dolist (kind '(0 3 6 7 8))
+        (let ((record (backup-lease-wire-record (min kind 7) request)))
+          (case kind
+            (7 (incf (getf (getf record :successor) :anchor-digest)))
+            (8 (setf (getf record :phase) :closing)))
+          (call-with-physical-client-wire
+           (lambda (client request-file)
+             (declare (ignore request-file))
+             (ok (physical-client-test-protocol-error-p
+                  (lambda () (pg::pg-client-native-backup-lease-handoff client request successor)))))
+           (lambda (output)
+             (physical-client-test-result output pg::*physical-backup-lease-result-schema*
+                                          (list (pg::physical-backup-lease-result-row request record))
+                                          "BACKUP_LEASE_HANDOFF")))))))
+
+(deftest backup-lease-handoff-wire-executes-the-source-transition
+    (call-with-backup-lease-authority-fixture
+     (lambda (root)
+       (declare (ignore root))
+       (let ((pg::*wal-sender-registry* (make-hash-table :test #'eq))
+             (pg::*sync-replication-state* (pg::make-sync-replication-state :source-id 42)))
+         (setf (pg::backend-replication-mode pg::*backend*) :physical)
+         (pg::wal-sender-register pg::*backend*)
+         (unwind-protect
+              (multiple-value-bind (record bootstrap) (backup-lease-authority-prepare t)
+                (declare (ignore bootstrap))
+                (backup-lease-startup-save-origin record)
+                (let* ((pin (backup-lease-startup-prepare-successor record))
+                       (request (getf record :request))
+                       (successor (list :name (pg::physical-source-pin-name pin) :anchor-digest
+                                        (pg::physical-follow-anchor-digest
+                                         (pg::physical-follow-pin-anchor pin))))
+                       (command (pg::parse-replication-command
+                                 (pg::pg-client-native-backup-lease-query
+                                  "BACKUP_LEASE_HANDOFF" request successor))))
+                  (call-with-physical-client-wire
+                   (lambda (client request-file)
+                     (declare (ignore request-file))
+                     (let ((closed (pg::pg-client-native-backup-lease-handoff client request successor)))
+                       (ok (eq :closed (getf closed :phase)))
+                       (ok (eq :handed-off (getf closed :outcome)))
+                       (ok (equal successor (getf closed :successor)))))
+                   (lambda (output) (pg::execute-native-backup-lease-command output command)))
+                  (ok (not (probe-file (pg::physical-source-pin-path (getf request :name)))))
+                  (ok (= 152 (gethash pin pg::*wal-snapshot-retention-pins*)))))
+           (pg::wal-sender-unregister pg::*backend*))))))
+
+(deftest backup-lease-handoff-wire-rejects-ambiguous-successor-options
+    (let* ((request (backup-lease-wire-request))
+           (successor (list :name "wire_successor" :anchor-digest 37))
+           (query (pg::pg-client-native-backup-lease-query "BACKUP_LEASE_HANDOFF" request successor)))
+      (dolist (bad (list
+                    (backup-lease-wire-replace query ", successor_name 'wire_successor'" "")
+                    (backup-lease-wire-replace query ", successor_anchor_digest '37'" "")
+                    (backup-lease-wire-replace query "successor_name" "unknown_option")
+                    (backup-lease-wire-replace query "'wire_successor'" "wire_successor")
+                    (backup-lease-wire-replace query "'wire_successor'" "'bad-name'")
+                    (backup-lease-wire-replace query "'wire_successor'" (format nil "'~a'" (getf request :name)))
+                    (backup-lease-wire-replace query "'37'" "'-1'")
+                    (backup-lease-wire-replace query "'37'" "'18446744073709551616'")
+                    (concatenate 'string (subseq query 0 (1- (length query)))
+                                 ", successor_name 'duplicate')")))
+        (let ((condition (handler-case (progn (pg::parse-replication-command bad) nil)
+                           (error (condition) condition))))
+          (ok condition)
+          (ok (not (search (getf request :token) (princ-to-string condition))))))
+      (ok (intake-fails-p
+           (lambda () (pg::pg-client-native-backup-lease-query "BACKUP_LEASE_HANDOFF" request))))
+      (ok (intake-fails-p
+           (lambda () (pg::pg-client-native-backup-lease-query "BACKUP_LEASE_STATUS" request successor))))))

@@ -5,11 +5,6 @@
 ;;; values.  The request token is an ownership credential and is never echoed
 ;;; in a result or an error.
 
-(defparameter *physical-backup-lease-wire-verbs*
-  '(("CAPTURE_BACKUP_NATIVE" . :physical-lease-capture)
-    ("BACKUP_LEASE_STATUS" . :physical-lease-status)
-    ("BACKUP_LEASE_ABORT" . :physical-lease-abort)))
-
 ;; STATUS and ABORT return one row of eight text columns.  UNKNOWN has no
 ;; state fields; outcome, base identity and successor identity may be null.
 (defparameter *physical-backup-lease-result-schema*
@@ -23,24 +18,35 @@
       (let* ((kind (cdr (assoc (string-upcase (first words)) *physical-backup-lease-wire-verbs*
                                :test #'equal)))
              (options (parse-replication-generic-options (rest words)))
-             (keys '("native_format" "lease_name" "lease_token" "cluster_identity" "system_id" "source_timeline")))
+             (keys (append '("native_format" "lease_name" "lease_token" "cluster_identity"
+                             "system_id" "source_timeline")
+                           (when (eq kind :physical-lease-handoff)
+                             '("successor_name" "successor_anchor_digest")))))
         (unless (and kind (= (length keys) (length options))
                      (every (lambda (key) (= 1 (count key options :key #'car :test #'equal))) keys)
                      (every (lambda (option)
                               (let ((word (cdr option)))
-                                (and (stringp word) (plusp (length word)) (char= #\' (char word 0)))))
+                                (and (stringp word) (plusp (length word))
+                                     (char= #\' (char word 0)))))
                             options))
           (ereport "42601" "invalid native backup lease options"))
         (flet ((value (key) (replication-command-value (cdr (assoc key options :test #'equal)))))
           (unless (equal +physical-native-format+ (value "native_format"))
             (ereport "0A000" "unsupported native physical WAL format"))
-          (let ((request (physical-backup-lease-request-copy
-                          (list :version 1 :name (value "lease_name") :token (value "lease_token")
-                                :cluster-identity (value "cluster_identity")
-                                :system-id (physical-stream-u64 (value "system_id"))
-                                :timeline (physical-stream-u64 (value "source_timeline"))))))
-            (make-logical-replication-command :type kind :slot-name (getf request :name)
-                                              :options (list (cons "request" request))))))
+          (let* ((request (physical-backup-lease-request-copy
+                           (list :version 1 :name (value "lease_name") :token (value "lease_token")
+                                 :cluster-identity (value "cluster_identity")
+                                 :system-id (physical-stream-u64 (value "system_id"))
+                                 :timeline (physical-stream-u64 (value "source_timeline")))))
+                 (successor (when (eq kind :physical-lease-handoff)
+                              (physical-backup-lease-successor-copy
+                               (list :name (value "successor_name") :anchor-digest
+                                     (physical-stream-u64 (value "successor_anchor_digest")))
+                               request))))
+            (make-logical-replication-command
+             :type kind :slot-name (getf request :name)
+             :options (append (list (cons "request" request))
+                              (when successor (list (cons "successor" successor))))))))
     (pg-error (condition) (ereport (pg-error-sqlstate condition) "invalid native backup lease request"))
     (error () (ereport "22023" "invalid native backup lease request"))))
 
@@ -79,6 +85,9 @@
        (when *swank-listener-enabled-p*
          (ereport "55000" "leased native backup requires Swank to be off"))
        (with-wal-critical (wal-check-healthy)))
+      (:physical-lease-handoff
+       (prevent-recovery-primary-operation "backup lease handoff")
+       (with-wal-critical (wal-check-healthy)))
       ((:physical-lease-status :physical-lease-abort) nil)
       (otherwise (ereport "42601" "unsupported native backup lease command")))))
 
@@ -97,11 +106,17 @@
       (progn
         (physical-backup-lease-wire-preflight command)
         (let* ((request (physical-backup-lease-command-request command))
-               (abort-p (eq :physical-lease-abort (logical-replication-command-type command)))
-               (record (if abort-p (physical-backup-lease-abort request)
-                           (physical-backup-lease-status request))))
-          (send-native-backup-lease-result stream request record
-                                           (if abort-p "BACKUP_LEASE_ABORT" "BACKUP_LEASE_STATUS"))))
+               (kind (logical-replication-command-type command))
+               (record
+                 (ecase kind
+                   (:physical-lease-status (physical-backup-lease-status request))
+                   (:physical-lease-abort (physical-backup-lease-abort request))
+                   (:physical-lease-handoff
+                    (physical-backup-lease-handoff
+                     request (cdr (assoc "successor" (logical-replication-command-options command)
+                                         :test #'equal)))))))
+          (send-native-backup-lease-result
+           stream request record (car (rassoc kind *physical-backup-lease-wire-verbs*)))))
     (wal-input-validation-error () (ereport "55000" "backup lease request is not valid for this source"))
     (pg-error (condition) (error condition))
     (error () (ereport "XX000" "native backup lease command failed"))))
