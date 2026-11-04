@@ -234,6 +234,7 @@
                    (:file "../replication/physical-reseed-follow-configuration-images")
                    (:file "../replication/physical-reseed-follow-configuration-owner")
                    (:file "../replication/physical-reseed-follow-configuration-files")
+                   (:file "../replication/physical-reseed-follow-configuration-plan")
                    (:file "../replication/physical-reseed-follow-configuration-staging")
                    (:file "../replication/physical-adoption-follow-plan")
                    (:file "../replication/physical-adoption-follow-codec")

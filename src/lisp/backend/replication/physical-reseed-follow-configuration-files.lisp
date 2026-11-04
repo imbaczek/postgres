@@ -3,22 +3,22 @@
 ;;; Check and prepare the private workspace files for a configuration.
 ;;; Check names, descriptors and mounts before and after file operations.
 
+(defun physical-reseed-follow-configuration-layout-name (name binding)
+  (let ((after (getf binding :after)) (selected (not (equal (getf binding :before) (getf binding :after)))))
+    (values
+     (cond ((or (equal name "receive.lock") (equal name "receive.selected")
+                (equal name "history.receive") (and (equal name "receive.initial") (not selected))) "receive")
+           (t "staged"))
+     (cond ((or (equal name "receive.selected") (and (equal name "receive.initial") (not selected))) "receive.control")
+           ((equal name "history.receive") (physical-store-history-filename (eighth after) (ninth after)))
+           (t name)))))
+
 ;; Return (logical-name directory-name leaf octets) rows.  The logical image
 ;; name can differ from the physical directory and leaf used for staging.
 (defun physical-reseed-follow-configuration-layout (images binding)
-  (let* ((after (getf binding :after)) (selected (not (equal (getf binding :before) after))))
-    (loop for (name . bytes) in (sort (copy-list images) #'string< :key #'car)
-          collect
-          (list name
-                (cond ((or (equal name "receive.lock") (equal name "receive.selected")
-                           (equal name "history.receive")
-                           (and (equal name "receive.initial") (not selected))) "receive")
-                      (t "staged"))
-                (cond ((or (equal name "receive.selected")
-                           (and (equal name "receive.initial") (not selected))) "receive.control")
-                      ((equal name "history.receive") (physical-store-history-filename (eighth after) (ninth after)))
-                      (t name))
-                bytes))))
+  (loop for (name . bytes) in (sort (copy-list images) #'string< :key #'car)
+        collect (multiple-value-bind (directory leaf) (physical-reseed-follow-configuration-layout-name name binding)
+                  (list name directory leaf bytes))))
 
 ;; Read and verify one planned file, returning its checked identity and digest.
 ;; The named file and mount must still match the held descriptor after reading.
