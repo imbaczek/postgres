@@ -22,37 +22,41 @@
       (setf active nil)
       (when fd (sb-posix:close fd)))))
 
+(defun physical-reseed-install-file-row-at (parent leaf name size expected-digest mount synchronize)
+  (let ((before (physical-reseed-install-old-observe parent leaf mount)))
+    (call-with-physical-image-input-at
+     parent leaf
+     (lambda (input)
+       (let* ((fd (sb-sys:fd-stream-fd input))
+              (facts (physical-reseed-install-row-file-facts before))
+              (digest #xCBF29CE484222325)
+              (buffer (make-array 65536 :element-type '(unsigned-byte 8))))
+         (unless (and (= size (seventh before))
+                      (equal facts (physical-reseed-file-facts (sb-posix:fstat fd)))
+                      (= mount (physical-adoption-install-mount-id nil :directory-fd fd)))
+           (error "reseed image descriptor differs from its named file"))
+         (loop with remaining = size
+               while (plusp remaining)
+               for count = (read-sequence buffer input :end (min remaining (length buffer)))
+               do (when (zerop count) (error "reseed image file was truncated"))
+                  (setf digest (physical-store-update-digest digest (subseq buffer 0 count)))
+                  (decf remaining count))
+         (unless (and (eq :eof (read-byte input nil :eof)) (= digest expected-digest))
+           (error "reseed image file differs from its recorded digest"))
+         (when synchronize (sb-posix:fsync fd))
+         (unless (and (equal facts (physical-reseed-file-facts (sb-posix:fstat fd)))
+                      (equal before (physical-reseed-install-old-observe parent leaf mount)))
+           (error "reseed image file changed while capturing its identity"))
+         (append (list (copy-seq name)) (rest before) (list digest))))
+     :element-type '(unsigned-byte 8))))
+
 ;; Bind each image entry to the named statx observation and held descriptor.
 ;; Read exactly the expected size and digest, optionally sync the file, and
 ;; recheck both observations before returning its inventory row.
 (defun physical-reseed-install-image-file-row (context entry mount synchronize)
   (destructuring-bind (name size expected-digest) entry
-    (let ((directory (physical-image-context-root-path context)))
-      (multiple-value-bind (parent leaf) (physical-image-parent context name)
-        (let ((before (physical-reseed-install-old-observe parent leaf mount))
-              (*physical-image-context* context))
-          (with-physical-image-input (input (pgdata-resolve-path name directory) :element-type '(unsigned-byte 8))
-            (let* ((fd (sb-sys:fd-stream-fd input))
-                   (facts (physical-reseed-install-row-file-facts before))
-                   (digest #xCBF29CE484222325)
-                   (buffer (make-array 65536 :element-type '(unsigned-byte 8))))
-              (unless (and (= size (seventh before))
-                           (equal facts (physical-reseed-file-facts (sb-posix:fstat fd)))
-                           (= mount (physical-adoption-install-mount-id nil :directory-fd fd)))
-                (error "reseed incoming descriptor differs from its named file"))
-              (loop with remaining = size
-                    while (plusp remaining)
-                    for count = (read-sequence buffer input :end (min remaining (length buffer)))
-                    do (when (zerop count) (error "reseed incoming file was truncated"))
-                       (setf digest (physical-store-update-digest digest (subseq buffer 0 count)))
-                       (decf remaining count))
-              (unless (and (eq :eof (read-byte input nil :eof)) (= digest expected-digest))
-                (error "reseed incoming file differs from the verified image"))
-              (when synchronize (sb-posix:fsync fd))
-              (unless (and (equal facts (physical-reseed-file-facts (sb-posix:fstat fd)))
-                           (equal before (physical-reseed-install-old-observe parent leaf mount)))
-                (error "reseed incoming file changed while capturing its identity"))
-              (append (list (copy-seq name)) (rest before) (list digest)))))))))
+    (multiple-value-bind (parent leaf) (physical-image-parent context name)
+      (physical-reseed-install-file-row-at parent leaf name size expected-digest mount synchronize))))
 
 ;; Bind a named image directory to its held descriptor and optionally sync it.
 ;; A changed name or descriptor invalidates the captured row.

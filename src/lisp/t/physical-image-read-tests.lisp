@@ -63,6 +63,61 @@
          (ok (equalp bytes (lineage-test-bytes path)))
          (ok (sb-posix:fstat fd))))))
 
+(deftest physical-image-input-at-preserves-values-and-borrowed-parent-across-exits
+    (call-with-physical-image-read-fixture
+     (lambda (root parent)
+       (declare (ignore root))
+       (let ((owned nil))
+         (multiple-value-bind (first second)
+             (pg::call-with-physical-image-input-at
+              parent "PG_VERSION"
+              (lambda (input)
+                (setf owned (sb-sys:fd-stream-fd input))
+                (values (read-byte input) :read))
+              :element-type '(unsigned-byte 8))
+           (ok (= 17 first))
+           (ok (eq :read second)))
+         (ok (intake-fails-p (lambda () (sb-posix:fstat owned))))
+         (ok (sb-posix:fstat parent))
+         (ok (eq :cut
+                 (catch 'input-at-cut
+                   (pg::call-with-physical-image-input-at
+                    parent "PG_VERSION"
+                    (lambda (input)
+                      (setf owned (sb-sys:fd-stream-fd input))
+                      (throw 'input-at-cut :cut))
+                    :element-type '(unsigned-byte 8)))))
+         (ok (intake-fails-p (lambda () (sb-posix:fstat owned))))
+         (ok (sb-posix:fstat parent))
+         (ok (equal '(:missing 42)
+                    (multiple-value-list
+                     (pg::call-with-physical-image-input-at
+                      parent "missing" (lambda (input) (values (if input :present :missing) 42))
+                      :if-does-not-exist nil))))
+         (ok (sb-posix:fstat parent))))))
+
+(deftest physical-image-input-at-refuses-path-components-and-nonregular-files
+    (call-with-physical-image-read-fixture
+     (lambda (root parent)
+       (let ((called nil))
+         (flet ((refuses (leaf)
+                  (intake-fails-p
+                   (lambda ()
+                     (pg::call-with-physical-image-input-at
+                      parent leaf
+                      (lambda (input) (declare (ignore input)) (setf called t)))))))
+           (dolist (leaf (append '("" "." ".." "global/pg_control" "global/../PG_VERSION")
+                                 (list (string (code-char 0)))))
+             (ok (refuses leaf)))
+           (sb-posix:symlink "PG_VERSION" (namestring (merge-pathnames "input-link" root)))
+           (sb-posix:mkfifo (namestring (merge-pathnames "input-fifo" root)) #o600)
+           (dolist (leaf '("input-link" "input-fifo" "global")) (ok (refuses leaf)))
+           (sb-posix:link (namestring (merge-pathnames "PG_VERSION" root))
+                          (namestring (merge-pathnames "input-hardlink" root)))
+           (ok (refuses "input-hardlink"))
+           (ok (not called))
+           (ok (sb-posix:fstat parent)))))))
+
 (deftest physical-image-read-scope-closes-owned-descriptors-on-nonlocal-exit
     (call-with-physical-image-read-fixture
      (lambda (root fd)

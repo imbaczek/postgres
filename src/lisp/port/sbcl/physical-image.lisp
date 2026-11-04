@@ -208,33 +208,43 @@
 ;; require a private owned single-link regular file.  A permitted missing file
 ;; calls FUNCTION with NIL.  Close the owned descriptor or stream on every exit.
 
+(defun call-with-physical-image-input-at (parent leaf function
+                                          &key (element-type 'character)
+                                            (if-does-not-exist :error) (external-format :default))
+  (unless (and (stringp leaf) (plusp (length leaf))
+               (not (find #\/ leaf)) (not (find (code-char 0) leaf))
+               (not (member leaf '("." "..") :test #'equal)))
+    (error "physical image input requires a single file name"))
+  (let ((fd nil) (stream nil))
+    (sb-sys:without-interrupts
+      (unwind-protect
+           (progn
+             (setf fd (physical-image-openat
+                       parent leaf (logior sb-posix:o-rdonly sb-posix:o-nofollow sb-posix:o-nonblock
+                                           +postmaster-o-cloexec+) 0))
+             (when (minusp fd)
+               (setf fd nil)
+               (if (and (null if-does-not-exist) (= (sb-alien:get-errno) sb-posix:enoent))
+                   (return-from call-with-physical-image-input-at (funcall function nil))
+                   (error "cannot open physical image input file")))
+             (let ((stat (sb-posix:fstat fd)))
+               (unless (and (sb-posix:s-isreg (sb-posix:stat-mode stat))
+                            (= 1 (sb-posix:stat-nlink stat))
+                            (= (sb-posix:geteuid) (sb-posix:stat-uid stat))
+                            (= #o600 (logand #o7777 (sb-posix:stat-mode stat))))
+                 (error "physical image input is not a private regular file")))
+             (setf stream (sb-sys:make-fd-stream fd :input t :element-type element-type
+                                                    :external-format external-format))
+             (sb-sys:with-local-interrupts (funcall function stream)))
+        (if stream (close stream) (when fd (sb-posix:close fd)))))))
+
 (defun call-with-physical-image-input (path function
                                        &key (direction :input) (element-type 'character)
                                          (if-does-not-exist :error) (external-format :default))
   (unless (eq direction :input) (error "physical image reader requires input direction"))
   (multiple-value-bind (parent leaf) (physical-image-input-parent *physical-image-context* path)
-    (let ((fd nil) (stream nil))
-      (sb-sys:without-interrupts
-        (unwind-protect
-             (progn
-               (setf fd (physical-image-openat
-                         parent leaf (logior sb-posix:o-rdonly sb-posix:o-nofollow sb-posix:o-nonblock
-                                             +postmaster-o-cloexec+) 0))
-               (when (minusp fd)
-                 (setf fd nil)
-                 (if (and (null if-does-not-exist) (= (sb-alien:get-errno) sb-posix:enoent))
-                     (return-from call-with-physical-image-input (funcall function nil))
-                     (error "cannot open physical image input file")))
-               (let ((stat (sb-posix:fstat fd)))
-                 (unless (and (sb-posix:s-isreg (sb-posix:stat-mode stat))
-                              (= 1 (sb-posix:stat-nlink stat))
-                              (= (sb-posix:geteuid) (sb-posix:stat-uid stat))
-                              (= #o600 (logand #o7777 (sb-posix:stat-mode stat))))
-                   (error "physical image input is not a private regular file")))
-               (setf stream (sb-sys:make-fd-stream fd :input t :element-type element-type
-                                                      :external-format external-format))
-               (sb-sys:with-local-interrupts (funcall function stream)))
-          (if stream (close stream) (when fd (sb-posix:close fd))))))))
+    (call-with-physical-image-input-at parent leaf function :element-type element-type
+                                                            :if-does-not-exist if-does-not-exist :external-format external-format)))
 
 ;; Outside an image scope, retain ordinary pathname-based input behavior.
 

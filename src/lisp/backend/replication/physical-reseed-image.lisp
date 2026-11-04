@@ -51,11 +51,7 @@
 ;; metadata files as well as manifest files.  Rechecking against EXPECTED detects
 ;; changes during preparation; it is not durable installation proof.
 
-;; The optional reseed installation flag defaults to NIL.  When true, the
-;; descriptor inventory admits the auxiliary guard names at the root.  The
-;; auxiliary scope must check their bytes and identities before and after this
-;; image verification.
-(defun physical-reseed-image-check (directory &optional expected reseed-installation)
+(defun physical-reseed-image-base-state (directory)
   (multiple-value-bind (manifest digest) (recovery-read-manifest directory)
     (recovery-check-manifest-schema manifest)
     (unless (zerop (getf (physical-recovery-read-control directory) :phase))
@@ -63,6 +59,14 @@
     (let ((*pgdata* directory))
       (physical-recovery-verify-base-state)
       (authentication-check-backup-policy directory))
+    (values manifest digest)))
+
+;; The optional reseed installation flag defaults to NIL.  When true, the
+;; descriptor inventory admits the auxiliary guard names at the root.  The
+;; auxiliary scope must check their bytes and identities before and after this
+;; image verification.
+(defun physical-reseed-image-check (directory &optional expected reseed-installation)
+  (multiple-value-bind (manifest digest) (physical-reseed-image-base-state directory)
     (physical-backup-check-received-inventory directory manifest :reseed-installation reseed-installation)
     (let ((actual (list :manifest manifest :manifest-digest digest
                         :files (physical-backup-bundle-entries directory manifest))))
