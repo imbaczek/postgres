@@ -675,3 +675,509 @@
                              (ok (equalp before (lineage-test-bytes (merge-pathnames "physical-recovery.control" root)))))
                         (setf (symbol-function 'pg::physical-follow-check-pending-state) original))))
                (dolist (entry descriptors) (sb-posix:close (cdr entry))))))))))
+
+(deftest reseed-configuration-advance-installs-one-durable-move-and-finishes-inert
+    (dolist (kind '(:same-timeline :retained-timeline :before-fork :at-fork :later-writer))
+      (call-with-reseed-follow-building-fixture
+       kind
+       (lambda (owner root workspace building)
+         (declare (ignore building))
+         (let* ((staged (pg::physical-reseed-follow-stage-configuration owner))
+                (selected (pg::physical-reseed-follow-configuration-selected-p
+                           (pg::physical-reseed-follow-core-projection staged)))
+                (maximum (if selected 5 4))
+                (install-before (lineage-test-bytes (merge-pathnames "physical-reseed.install" root)))
+                (record nil))
+           (setf record (pg::physical-reseed-follow-advance-configuration owner))
+           (ok (eq :installing (getf (getf record :configuration) :phase)))
+           (ok (= 0 (getf (getf record :configuration) :step)))
+           (loop for step from 1 to maximum
+                 do (setf record (pg::physical-reseed-follow-advance-configuration owner))
+                    (ok (eq :installing (getf (getf record :configuration) :phase)))
+                    (ok (= step (getf (getf record :configuration) :step)))
+                    (ok (equal (getf staged :base) (getf record :base)))
+                    (ok (equal (getf staged :install) (getf record :install))))
+           (setf record (pg::physical-reseed-follow-advance-configuration owner))
+           (ok (eq :inert (getf (getf record :configuration) :phase)))
+           (ok (= maximum (getf (getf record :configuration) :step)))
+           (ok (equal record (pg::physical-reseed-follow-advance-configuration owner)))
+           (ok (equal record (pg::physical-reseed-follow-read owner)))
+           (ok (equalp install-before (lineage-test-bytes (merge-pathnames "physical-reseed.install" root))))
+           (ok (equalp (pg::physical-libpq-datum-octets
+                        (getf (getf staged :base) :recovery-control) 196)
+                       (lineage-test-bytes (merge-pathnames "saved/recovery.original" workspace))))
+           (let* ((pg::*pgdata* root) (config (pg::physical-follow-read-config)))
+             (ok (eq :pending (getf (fifth config) :phase)))
+             (ok (not (getf (sixth config) :enabled))))
+           (ok (not (pg::physical-reseed-follow-owner-uncertain-p owner)))
+           (ok (not (pg::physical-reseed-follow-owner-busy-p owner)))))
+       (lambda (root workspace)
+         (declare (ignore workspace))
+         (pg::call-with-physical-reseed-follow-configuration-owner
+          root (lambda (owner)
+                 (ok (eq :inert (getf (getf (pg::physical-reseed-follow-read owner) :configuration) :phase)))))))))
+
+(deftest reseed-configuration-advance-resumes-one-ahead-cuts-and-syncs-both-parents
+    (dolist (cut '(:after-configuration-install-move
+                   :before-configuration-install-source-fsync
+                   :after-configuration-install-source-fsync
+                   :before-configuration-install-destination-fsync
+                   :after-configuration-install-destination-fsync
+                   :before-configuration-install-progress))
+      (let ((receive-inode nil))
+        (call-with-reseed-follow-building-fixture
+         :same-timeline
+         (lambda (owner root workspace building)
+           (declare (ignore building))
+           (pg::physical-reseed-follow-stage-configuration owner)
+           (pg::physical-reseed-follow-advance-configuration owner)
+           (setf receive-inode (sb-posix:stat-ino (sb-posix:stat (merge-pathnames "receive/" workspace))))
+           (let* ((injected nil)
+                  (pg::*physical-reseed-follow-test-hook*
+                    (lambda (event path)
+                      (declare (ignore path))
+                      (when (eq cut event) (setf injected t) (error "configuration move cut")))))
+             (ok (intake-fails-p (lambda () (pg::physical-reseed-follow-advance-configuration owner))))
+             (ok injected))
+           (ok (pg::physical-reseed-follow-owner-uncertain-p owner))
+           (ok (not (pg::physical-reseed-follow-owner-busy-p owner)))
+           (ok (intake-fails-p (lambda () (pg::physical-reseed-follow-advance-configuration owner))))
+           (pg::call-with-physical-directory-root
+            owner
+            (lambda (fd directory)
+              (declare (ignore directory))
+              (ok (= 0 (getf (getf (pg::physical-reseed-follow-read-at fd "physical-reseed.follow")
+                                   :configuration) :step)))))
+           (ok (= receive-inode (sb-posix:stat-ino (sb-posix:stat (merge-pathnames "pg_physical_receive/" root))))))
+         (lambda (root workspace)
+           (let ((renames 0) (phase nil) (syncs nil)
+                             (original (symbol-function 'sb-posix:fsync)))
+             (unwind-protect
+                  (let ((pg::*physical-reseed-follow-test-hook*
+                          (lambda (event path)
+                            (declare (ignore path))
+                            (case event
+                              (:before-configuration-install-move (incf renames))
+                              (:before-configuration-install-source-fsync (setf phase :source))
+                              (:after-configuration-install-source-fsync (setf phase nil))
+                              (:before-configuration-install-destination-fsync (setf phase :destination))
+                              (:after-configuration-install-destination-fsync (setf phase nil))))))
+                    (setf (symbol-function 'sb-posix:fsync)
+                          (lambda (fd)
+                            (when phase (push (list phase (sb-posix:stat-ino (sb-posix:fstat fd))) syncs))
+                            (funcall original fd)))
+                    (pg::call-with-physical-reseed-follow-configuration-owner
+                     root (lambda (owner)
+                            (let ((record (pg::physical-reseed-follow-advance-configuration owner)))
+                              (ok (= 1 (getf (getf record :configuration) :step)))
+                              (ok (not (pg::physical-reseed-follow-owner-uncertain-p owner)))))))
+               (setf (symbol-function 'sb-posix:fsync) original))
+             (ok (= 0 renames))
+             (ok (equal (nreverse syncs)
+                        (list (list :source (sb-posix:stat-ino (sb-posix:stat workspace)))
+                              (list :destination (sb-posix:stat-ino (sb-posix:stat root))))))
+             (ok (= receive-inode
+                    (sb-posix:stat-ino (sb-posix:stat (merge-pathnames "pg_physical_receive/" root)))))))))))
+
+(deftest reseed-configuration-advance-reopens-the-published-candidate-after-journal-cuts
+    (dolist (cut '(:after-follow-rename :after-follow-directory-fsync
+                   :before-follow-readback :after-follow-readback))
+      (call-with-reseed-follow-building-fixture
+       :same-timeline
+       (lambda (owner root workspace building)
+         (declare (ignore workspace building))
+         (pg::physical-reseed-follow-stage-configuration owner)
+         (pg::physical-reseed-follow-advance-configuration owner)
+         (let* ((injected nil)
+                (pg::*physical-reseed-follow-test-hook*
+                  (lambda (event path)
+                    (declare (ignore path))
+                    (when (eq cut event) (setf injected t) (error "configuration journal cut")))))
+           (ok (intake-fails-p (lambda () (pg::physical-reseed-follow-advance-configuration owner))))
+           (ok injected))
+         (ok (pg::physical-reseed-follow-owner-uncertain-p owner))
+         (ok (not (pg::physical-reseed-follow-owner-busy-p owner)))
+         (ok (not (probe-file (merge-pathnames "physical-reseed.follow.tmp" root))))
+         (pg::call-with-physical-directory-root
+          owner (lambda (fd directory)
+                  (declare (ignore directory))
+                  (ok (= 1 (getf (getf (pg::physical-reseed-follow-read-at fd "physical-reseed.follow")
+                                       :configuration) :step))))))
+       (lambda (root workspace)
+         (declare (ignore workspace))
+         (pg::call-with-physical-reseed-follow-configuration-owner
+          root (lambda (owner)
+                 (ok (= 1 (getf (getf (pg::physical-reseed-follow-read owner) :configuration) :step)))
+                 (ok (= 2 (getf (getf (pg::physical-reseed-follow-advance-configuration owner)
+                                      :configuration) :step)))
+                 (ok (not (pg::physical-reseed-follow-owner-uncertain-p owner)))))))))
+
+(deftest reseed-configuration-recovery-promotes-complete-installation-temporaries
+    (dolist (cut-phase '(:initial :progress :terminal))
+      (let ((expected-phase nil) (expected-step nil))
+        (call-with-reseed-follow-building-fixture
+         :later-writer
+         (lambda (owner root workspace building)
+           (declare (ignore workspace building))
+           (pg::physical-reseed-follow-stage-configuration owner)
+           (ecase cut-phase
+             (:initial (setf expected-phase :installing expected-step 0))
+             (:progress
+              (pg::physical-reseed-follow-advance-configuration owner)
+              (setf expected-phase :installing expected-step 1))
+             (:terminal
+              (loop repeat 6 do (pg::physical-reseed-follow-advance-configuration owner))
+              (setf expected-phase :inert expected-step 5)))
+           (let* ((injected nil)
+                  (pg::*physical-reseed-follow-test-hook*
+                    (lambda (event path)
+                      (declare (ignore path))
+                      (when (eq event :after-follow-temporary-readback)
+                        (setf injected t)
+                        (error "complete installation temporary cut")))))
+             (ok (intake-fails-p (lambda () (pg::physical-reseed-follow-advance-configuration owner))))
+             (ok injected))
+           (ok (pg::physical-reseed-follow-owner-uncertain-p owner))
+           (ok (probe-file (merge-pathnames "physical-reseed.follow.tmp" root))))
+         (lambda (root workspace)
+           (declare (ignore workspace))
+           (pg::call-with-physical-reseed-follow-configuration-owner
+            root (lambda (owner)
+                   (let ((record (pg::physical-reseed-follow-recover-configuration owner)))
+                     (ok (eq expected-phase (getf (getf record :configuration) :phase)))
+                     (ok (= expected-step (getf (getf record :configuration) :step)))
+                     (ok (not (probe-file (merge-pathnames "physical-reseed.follow.tmp" root))))
+                     (ok (equal record (pg::physical-reseed-follow-read owner)))
+                     (ok (equal record (pg::physical-reseed-follow-recover-configuration owner)))
+                     (ok (not (pg::physical-reseed-follow-owner-uncertain-p owner)))))))))))
+
+(deftest reseed-configuration-recovery-preserves-partial-and-conflicting-temporaries
+    (dolist (damage '(:empty :skip))
+      (let ((replacement-bytes nil))
+        (call-with-reseed-follow-building-fixture
+         :same-timeline
+         (lambda (owner root workspace building)
+           (declare (ignore root workspace building))
+           (pg::physical-reseed-follow-stage-configuration owner)
+           (pg::physical-reseed-follow-advance-configuration owner)
+           (let* ((injected nil)
+                  (pg::*physical-reseed-follow-test-hook*
+                    (lambda (event path)
+                      (declare (ignore path))
+                      (when (eq event :after-follow-temporary-readback)
+                        (setf injected t) (error "complete temporary before damage")))))
+             (ok (intake-fails-p (lambda () (pg::physical-reseed-follow-advance-configuration owner))))
+             (ok injected))
+           (pg::call-with-physical-directory-root
+            owner
+            (lambda (fd directory)
+              (declare (ignore directory))
+              (let ((candidate (pg::physical-reseed-follow-read-at fd "physical-reseed.follow.tmp")))
+                (setf (getf (getf candidate :configuration) :step) 2
+                      replacement-bytes (if (eq damage :empty) #() (pg::physical-reseed-follow-image candidate)))))))
+         (lambda (root workspace)
+           (declare (ignore workspace))
+           (let* ((temporary (merge-pathnames "physical-reseed.follow.tmp" root))
+                  (replacement (merge-pathnames "fixture.follow" root))
+                  (before nil) (effects 0))
+             (reseed-follow-owner-test-write replacement replacement-bytes)
+             (sb-posix:rename replacement temporary)
+             (setf before (list (sb-posix:stat-ino (sb-posix:stat temporary)) (lineage-test-bytes temporary)))
+             (let ((pg::*physical-reseed-follow-test-hook*
+                     (lambda (event path)
+                       (declare (ignore path))
+                       (when (member event '(:before-configuration-install-move
+                                             :before-configuration-install-source-fsync
+                                             :before-follow-rename))
+                         (incf effects)))))
+               (pg::call-with-physical-reseed-follow-configuration-owner
+                root (lambda (owner)
+                       (ok (intake-fails-p (lambda () (pg::physical-reseed-follow-recover-configuration owner))))
+                       (ok (pg::physical-reseed-follow-owner-uncertain-p owner))
+                       (ok (intake-fails-p (lambda () (pg::physical-reseed-follow-advance-configuration owner)))))))
+             (ok (= 0 effects))
+             (let ((unchanged (equalp before
+                                      (list (sb-posix:stat-ino (sb-posix:stat temporary))
+                                            (lineage-test-bytes temporary)))))
+               (ok unchanged))))))))
+
+(defun reseed-mapped-test-change-first-byte (path)
+  (let ((before (lineage-test-bytes path))
+        (inode (sb-posix:stat-ino (sb-posix:stat path))))
+    (with-open-file (stream path :direction :io :element-type '(unsigned-byte 8)
+                                 :if-exists :overwrite :if-does-not-exist :error)
+      (let ((byte (read-byte stream nil :eof)))
+        (file-position stream 0)
+        (write-byte (if (eq byte :eof) 1 (logxor byte 1)) stream)))
+    (ok (= inode (sb-posix:stat-ino (sb-posix:stat path))))
+    (let ((changed (not (equalp before (lineage-test-bytes path))))) (ok changed))))
+
+(defun reseed-mapped-test-tree-facts (root)
+  (labels ((facts (path)
+             (let ((stat (sb-posix:lstat (namestring path))))
+               (list (enough-namestring path root)
+                     (sb-posix:stat-dev stat) (sb-posix:stat-ino stat)
+                     (sb-posix:stat-mode stat) (sb-posix:stat-nlink stat)
+                     (sb-posix:stat-uid stat) (sb-posix:stat-gid stat)
+                     (sb-posix:stat-size stat) (sb-posix:stat-mtime stat) (sb-posix:stat-ctime stat))))
+           (walk (directory)
+             (cons (list :directory (facts directory)
+                         (sort (pg::directory-entry-names directory :follow-symlinks t) #'string<))
+                   (append
+                    (loop for path in (sort (uiop:directory-files directory) #'string< :key #'namestring)
+                          collect (list :file (facts path) (lineage-test-bytes path)))
+                    (loop for child in (sort (uiop:subdirectories directory) #'string< :key #'namestring)
+                          append (walk child))))))
+    (walk root)))
+
+(defun check-reseed-mapped-original-file-corruption (late)
+  (dolist (kind '(:same-timeline :later-writer))
+    (dolist (name '("PG_VERSION" "authentication.initialized" "global/pg_catalog.dat"
+                    "global/pg_control" "global/pg_wal_control" "pg_hba.conf" "pg_ident.conf"
+                    "pg_wal/0000000000000000.wal" "pg_xact" "physical-backup.manifest"
+                    "physical-recovery.control" "recovery.required"))
+      (ok
+       (eq :checked
+           (catch 'mapped-original-corruption-checked
+             (call-with-reseed-follow-building-fixture
+              kind
+              (lambda (owner root workspace building)
+                (declare (ignore building))
+                (pg::physical-reseed-follow-stage-configuration owner)
+                (let ((calls 0) (before nil))
+                  (flet ((damage ()
+                           (reseed-mapped-test-change-first-byte (merge-pathnames name root))
+                           (setf before (list (reseed-mapped-test-tree-facts root)
+                                              (reseed-mapped-test-tree-facts workspace)))))
+                    (unless late (damage))
+                    (ok (intake-fails-p
+                         (lambda ()
+                           (pg::call-with-physical-reseed-follow-mapped-image
+                            owner
+                            (lambda (fd check)
+                              (declare (ignore fd check))
+                              (incf calls)
+                              (when late (damage)))))))
+                    (ok (= calls (if late 1 0)))
+                    (let ((unchanged (equalp before (list (reseed-mapped-test-tree-facts root)
+                                                          (reseed-mapped-test-tree-facts workspace)))))
+                      (ok unchanged))))
+                (throw 'mapped-original-corruption-checked :checked)))))))))
+
+(deftest reseed-mapped-operation-scope-rejects-early-original-file-corruption
+    (check-reseed-mapped-original-file-corruption nil))
+
+(deftest reseed-mapped-operation-scope-rejects-late-original-file-corruption
+    (check-reseed-mapped-original-file-corruption t))
+
+(defun call-with-reseed-mapped-rejection-fixture (kind function &key terminal stage-only before-inert installing-zero)
+  (catch 'mapped-rejection-checked
+    (call-with-reseed-follow-building-fixture
+     kind
+     (lambda (owner root workspace building)
+       (declare (ignore building))
+       (let* ((record (pg::physical-reseed-follow-stage-configuration owner))
+              (maximum (if (pg::physical-reseed-follow-configuration-selected-p
+                            (pg::physical-reseed-follow-core-projection record)) 5 4)))
+         (loop repeat (cond (stage-only 0) (installing-zero 1)
+                            (before-inert (1+ maximum)) (terminal (+ maximum 2)) (t 2))
+               do (pg::physical-reseed-follow-advance-configuration owner))
+         (funcall function owner root workspace)
+         (throw 'mapped-rejection-checked :checked))))))
+
+(defun check-reseed-mapped-path-replacement
+    (late &key (kinds '(:same-timeline :later-writer))
+            (modes '(:root-lock :workspace-lock :workspace-fence :incoming :quarantine
+                     :workspace :receive :global :root)))
+  (dolist (kind kinds)
+    (dolist (mode modes)
+      (ok (eq :checked
+              (call-with-reseed-mapped-rejection-fixture kind (lambda (owner root workspace)
+                                                                (let* ((plan (pg::physical-reseed-install-owner-plan owner))
+                                                                       (directory (member mode '(:incoming :quarantine :workspace :receive :global :root)))
+                                                                       (path (ecase mode
+                                                                               (:root-lock (merge-pathnames ".pg_lisp.lock" root))
+                                                                               (:workspace-lock (merge-pathnames ".pg_lisp.lock" workspace))
+                                                                               (:workspace-fence (merge-pathnames "physical-reseed.install" workspace))
+                                                                               (:incoming (pathname (getf (getf plan :incoming) :directory)))
+                                                                               (:quarantine (pathname (getf (getf plan :quarantine) :directory)))
+                                                                               (:workspace workspace) (:receive (merge-pathnames "pg_physical_receive/" root))
+                                                                               (:global (merge-pathnames "global/" root)) (:root root)))
+                                                                       (original-inode (sb-posix:stat-ino (sb-posix:stat path))))
+                                                                  (with-physical-store-directory (backup)
+                                                                    (sb-posix:chmod (namestring backup) #o700)
+                                                                    (let ((saved (merge-pathnames (if directory "original/" "original.lock") backup))
+                                                                          (swapped nil) (before nil) (calls 0))
+                                                                      (labels ((snapshot ()
+                                                                                 (mapcar #'reseed-mapped-test-tree-facts
+                                                                                         (append (list root workspace backup)
+                                                                                                 (when (member mode '(:incoming :quarantine)) (list path)))))
+                                                                               (swap ()
+                                                                                 (sb-posix:rename path saved)
+                                                                                 (setf swapped t)
+                                                                                 (if directory
+                                                                                     (sb-posix:mkdir (namestring path) #o700)
+                                                                                     (reseed-follow-owner-test-write path #()))
+                                                                                 (ok (/= original-inode (sb-posix:stat-ino (sb-posix:stat path))))
+                                                                                 (setf before (snapshot))))
+                                                                        (unwind-protect
+                                                                             (progn
+                                                                               (unless late (swap))
+                                                                               (ok (intake-fails-p
+                                                                                    (lambda ()
+                                                                                      (pg::call-with-physical-reseed-follow-mapped-image
+                                                                                       owner (lambda (fd check)
+                                                                                               (declare (ignore fd check))
+                                                                                               (incf calls)
+                                                                                               (when late (swap)))))))
+                                                                               (ok (= calls (if late 1 0)))
+                                                                               (let ((unchanged (equalp before (snapshot)))) (ok unchanged)))
+                                                                          (when swapped
+                                                                            (when (probe-file path)
+                                                                              (if directory
+                                                                                  (uiop:delete-directory-tree path :validate t)
+                                                                                  (delete-file path)))
+                                                                            (sb-posix:rename saved path))))))))))))))
+
+(defun reseed-mapped-test-wrong-pending-control (root)
+  (let* ((path (merge-pathnames "physical-recovery.control" root))
+         (control (pg::physical-recovery-read-control root))
+         (xid (getf control :next-xid))
+         (next (if (< xid #xffffffffffffffff) (1+ xid) (1- xid)))
+         (bytes (pg::physical-recovery-control-image
+                 2 (getf control :system-id) (getf control :timeline) (getf control :manifest-digest)
+                 (getf control :checkpoint) (getf control :applied) next
+                 :db-state (getf control :db-state) :state-time (getf control :state-time)
+                 :applied-timeline (getf control :applied-timeline (getf control :timeline))
+                 :history-target (getf control :history-target) :history-digest (getf control :history-digest)
+                 :retained-reference (getf control :retained-reference) :resource-fact (getf control :resource-fact))))
+    (ok (= next (getf (pg::physical-recovery-decode-control bytes) :next-xid)))
+    (with-open-file (stream path :direction :io :element-type '(unsigned-byte 8)
+                                 :if-exists :overwrite :if-does-not-exist :error)
+      (write-sequence bytes stream))
+    (ok (= next (getf (pg::physical-recovery-read-control root) :next-xid)))
+    (ok (/= xid next))))
+
+(deftest reseed-mapped-operation-scope-rejects-early-guard-and-path-replacement
+    (check-reseed-mapped-path-replacement nil))
+
+(deftest reseed-mapped-operation-scope-rejects-late-guard-and-path-replacement
+    (check-reseed-mapped-path-replacement t))
+
+(defun reseed-mapped-test-pending-validator-refuses-current-control (context)
+  (let* ((descriptors (pg::physical-reseed-follow-installation-context-descriptors context))
+         (calls 0) (refused nil))
+    (flet ((guard () (pg::physical-reseed-follow-installation-guard context)))
+      (pg::call-with-physical-reseed-follow-held-base-directory
+       (cdr (assoc :root descriptors)) (cdr (assoc :base descriptors))
+       (cdr (assoc :global descriptors)) (cdr (assoc :wal descriptors))
+       (lambda (directory)
+         (let ((pg::*pgdata* directory))
+           (incf calls)
+           (setf refused
+                 (handler-case
+                     (progn
+                       (pg::physical-follow-check-pending-state
+                        (pg::physical-reseed-follow-installation-context-store context)
+                        (pg::physical-reseed-follow-installation-context-base context)
+                        (pg::physical-reseed-follow-pending-config
+                         (pg::physical-reseed-follow-installation-context-record context)
+                         (pg::physical-reseed-follow-installation-context-binding context)))
+                       nil)
+                   (error (condition)
+                     (not (null (search "pending follow differs from durable recovery provenance or progress"
+                                        (princ-to-string condition)))))))))
+       #'guard))
+    (values calls refused)))
+
+(deftest reseed-mapped-operation-scope-rejects-wrong-terminal-pending-witnesses
+    (dolist (kind '(:same-timeline :later-writer))
+      (dolist (late '(nil t))
+        (ok (eq :checked
+                (call-with-reseed-mapped-rejection-fixture kind (lambda (owner root workspace)
+                                                                  (let ((calls 0) (before nil) (validator-calls 0) (validator-refused nil)
+                                                                                  (saved-before (lineage-test-bytes (merge-pathnames "saved/recovery.original" workspace))))
+                                                                    (flet ((damage ()
+                                                                             (reseed-mapped-test-wrong-pending-control root)
+                                                                             (setf before (list (reseed-mapped-test-tree-facts root)
+                                                                                                (reseed-mapped-test-tree-facts workspace)))))
+                                                                      (unless late (damage))
+                                                                      (ok (intake-fails-p
+                                                                           (lambda ()
+                                                                             (pg::call-with-physical-reseed-follow-mapped-image
+                                                                              owner (lambda (fd check)
+                                                                                      (declare (ignore fd check))
+                                                                                      (incf calls)
+                                                                                      (when late
+                                                                                        (damage)
+                                                                                        (multiple-value-setq (validator-calls validator-refused)
+                                                                                          (reseed-mapped-test-pending-validator-refuses-current-control
+                                                                                           pg::*physical-reseed-follow-installation-scope*))))))))
+                                                                      (ok (= calls (if late 1 0)))
+                                                                      (when late (ok (= 1 validator-calls)) (ok validator-refused))
+                                                                      (let ((unchanged (equalp before (list (reseed-mapped-test-tree-facts root)
+                                                                                                            (reseed-mapped-test-tree-facts workspace)))))
+                                                                        (ok unchanged))
+                                                                      (let ((original-unchanged (equalp saved-before
+                                                                                                        (lineage-test-bytes (merge-pathnames "saved/recovery.original" workspace)))))
+                                                                        (ok original-unchanged))))) :terminal t))))))
+
+(deftest reseed-configuration-advance-preflight-refuses-early-and-terminal-corruption
+    (dolist (kind '(:same-timeline :later-writer))
+      (dolist (terminal '(nil t))
+        (dolist (fault '(:catalog :workspace-fence))
+          (ok (eq :checked
+                  (call-with-reseed-mapped-rejection-fixture kind (lambda (owner root workspace)
+                                                                    (let ((effects 0)
+                                                                          (path (if (eq fault :catalog) (merge-pathnames "global/pg_catalog.dat" root)
+                                                                                    (merge-pathnames "physical-reseed.install" workspace))))
+                                                                      (pg::call-with-physical-reseed-follow-mapped-image
+                                                                       owner (lambda (fd check) (declare (ignore fd)) (funcall check)))
+                                                                      (reseed-mapped-test-change-first-byte path)
+                                                                      (let ((before (list (reseed-mapped-test-tree-facts root) (reseed-mapped-test-tree-facts workspace))))
+                                                                        (let ((pg::*physical-reseed-follow-test-hook*
+                                                                                (lambda (event where)
+                                                                                  (declare (ignore where))
+                                                                                  (when (member event '(:before-configuration-install-move :before-configuration-install-progress
+                                                                                                        :before-follow-temporary-create :before-follow-rename))
+                                                                                    (incf effects)))))
+                                                                          (ok (intake-fails-p (lambda () (pg::physical-reseed-follow-advance-configuration owner)))))
+                                                                        (ok (pg::physical-reseed-follow-owner-uncertain-p owner))
+                                                                        (ok (not (pg::physical-reseed-follow-owner-busy-p owner)))
+                                                                        (ok (= effects 0))
+                                                                        (let ((unchanged (equalp before (list (reseed-mapped-test-tree-facts root)
+                                                                                                              (reseed-mapped-test-tree-facts workspace)))))
+                                                                          (ok unchanged)))))
+                                                             :stage-only (not terminal) :before-inert terminal)))))))
+
+(deftest reseed-configuration-advance-rechecks-corruption-before-move-and-inert-publication
+    (dolist (kind '(:same-timeline :later-writer))
+      (dolist (terminal '(nil t))
+        (ok (eq :checked
+                (call-with-reseed-mapped-rejection-fixture kind (lambda (owner root workspace)
+                                                                  (let* ((before nil) (fired nil) (effects 0)
+                                                                                      (point (if terminal :before-configuration-install-progress :before-configuration-install-move))
+                                                                                      (pg::*physical-reseed-follow-test-hook*
+                                                                                        (lambda (event where)
+                                                                                          (declare (ignore where))
+                                                                                          (when (eq event point)
+                                                                                            (reseed-mapped-test-change-first-byte (merge-pathnames "global/pg_catalog.dat" root))
+                                                                                            (setf before (list (reseed-mapped-test-tree-facts root)
+                                                                                                               (reseed-mapped-test-tree-facts workspace))
+                                                                                                  fired t))
+                                                                                          (when (member event '(:after-configuration-install-move :after-follow-temporary-create
+                                                                                                                :after-follow-rename :after-configuration-install-progress))
+                                                                                            (incf effects)))))
+                                                                    (ok (intake-fails-p (lambda () (pg::physical-reseed-follow-advance-configuration owner))))
+                                                                    (ok fired)
+                                                                    (ok (pg::physical-reseed-follow-owner-uncertain-p owner))
+                                                                    (ok (not (pg::physical-reseed-follow-owner-busy-p owner)))
+                                                                    (ok (= 0 effects))
+                                                                    (let ((unchanged (equalp before (list (reseed-mapped-test-tree-facts root)
+                                                                                                          (reseed-mapped-test-tree-facts workspace)))))
+                                                                      (ok unchanged))))
+                                                           :installing-zero (not terminal) :before-inert terminal))))))
+
+(deftest reseed-mapped-replaced-auxiliary-directories-remain-unchanged
+    (check-reseed-mapped-path-replacement nil :modes '(:incoming :quarantine))
+  (check-reseed-mapped-path-replacement t :modes '(:incoming :quarantine)))
