@@ -55,6 +55,10 @@ def check_extended(native, reference):
 def check(native, reference):
     queries = [
         'DO $$BEGIN END$$',
+        'DO $$BEGIN SET TRANSACTION ISOLATION LEVEL REPEATABLE READ; PERFORM 1; END;$$',
+        'DO $$BEGIN PERFORM 1; SET TRANSACTION ISOLATION LEVEL REPEATABLE READ; END;$$',
+        'DO $$BEGIN SET TRANSACTION ISOLATION LEVEL READ COMMITTED; PERFORM 1; END;$$',
+        'DO $$BEGIN SET TRANSACTION READ ONLY; PERFORM 1; END;$$',
         'DO LANGUAGE plpgsql $$BEGIN NULL; END;$$',
         "DO $$BEGIN BEGIN PERFORM 1; NULL; END; END;$$ LANGUAGE 'plpgsql'",
         "DO $$BEGIN SET LOCAL synchronous_commit = 'off'; PERFORM * FROM pg_catalog.txid_current(); END;$$",
