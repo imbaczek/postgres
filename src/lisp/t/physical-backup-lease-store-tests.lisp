@@ -13,6 +13,9 @@
           (pg::*wal-insert-timeline* 2)
           (pg::*physical-recovery-state* nil)
           (pg::*physical-backup-lease-records* (make-hash-table :test #'equal))
+          (pg::*physical-backup-lease-allocations* (make-hash-table :test #'equal))
+          (pg::*physical-backup-lease-allocation-limit* 65536)
+          (pg::*physical-backup-lease-allocation-test-hook* nil)
           (pg::*physical-backup-lease-capture-owners* (make-hash-table :test #'equal))
           (pg::*physical-backup-lease-limit* 2)
           (pg::*physical-backup-lease-test-hook* nil)
@@ -24,6 +27,30 @@
 
 (defun backup-lease-store-test-name (record)
   (getf (getf record :request) :name))
+
+(deftest backup-lease-store-byte-writer-validates-callbacks-before-opening
+    (call-with-backup-lease-store-fixture
+     (lambda (root)
+       (declare (ignore root))
+       (let* ((record (backup-lease-test-record))
+              (path (pg::physical-backup-lease-path (getf record :request)))
+              (temporary (pg::physical-backup-lease-path (getf record :request) t))
+              (bytes (pg::physical-backup-lease-image record))
+              (directory (pg::physical-backup-lease-check-directory :create t)))
+         (pg::with-write-lock
+           (sb-thread:with-mutex (pg::*wal-lock*)
+             (dolist (options (list nil (list :check-readback :invalid)
+                                    (list :check-readback (constantly t) :test-point :invalid)))
+               (ok (intake-fails-p
+                    (lambda () (apply #'pg::physical-backup-lease-write-bytes
+                                      path temporary bytes options))))
+               (ok (null (pg::directory-entry-names directory))))
+             (pg::physical-backup-lease-write-bytes
+              path temporary bytes
+              :check-readback
+              (lambda () (ok (equal record (pg::physical-backup-lease-read path)))))
+             (ok (equal record (pg::physical-backup-lease-read path)))))
+         (ok (not pg::*wal-poisoned*))))))
 
 (deftest backup-lease-store-publishes-private-durable-copy-before-memory
     (call-with-backup-lease-store-fixture
@@ -250,11 +277,12 @@
          (unwind-protect
               (progn
                 (setf (symbol-function 'pg::physical-backup-lease-file-identity)
-                      (lambda (stat &optional allow-empty)
+                      (lambda (stat &optional allow-empty
+                                      (maximum pg::+physical-backup-lease-maximum-bytes+))
                         (when (and allow-empty (zerop (sb-posix:stat-size stat)))
                           (setf seen t)
                           (error "reject newly created temporary metadata"))
-                        (funcall original stat allow-empty)))
+                        (funcall original stat allow-empty maximum)))
                 (ok (intake-fails-p (lambda () (pg::physical-backup-lease-publish nil record)))))
            (setf (symbol-function 'pg::physical-backup-lease-file-identity) original))
          (ok seen)

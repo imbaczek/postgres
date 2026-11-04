@@ -40,9 +40,9 @@
     (sb-posix:syscall-error (condition)
       (unless (= sb-posix:enoent (sb-posix:syscall-errno condition)) (error condition)))))
 
-(defun physical-backup-lease-check-directory (&key create)
-  (let* ((directory (physical-backup-lease-directory))
-         (stat (physical-backup-lease-lstat directory)))
+(defun physical-backup-lease-check-directory
+    (&key create (directory (physical-backup-lease-directory)))
+  (let ((stat (physical-backup-lease-lstat directory)))
     (when (and create (null stat))
       (sb-posix:mkdir (namestring directory) #o700)
       (fsync-directory *pgdata*)
@@ -54,12 +54,13 @@
         (error "backup lease inventory is not an owned private directory")))
     (values directory stat)))
 
-(defun physical-backup-lease-file-identity (stat &optional allow-empty)
+(defun physical-backup-lease-file-identity
+    (stat &optional allow-empty (maximum +physical-backup-lease-maximum-bytes+))
   (unless (and (sb-posix:s-isreg (sb-posix:stat-mode stat))
                (= (sb-posix:geteuid) (sb-posix:stat-uid stat))
                (= #o600 (logand #o777 (sb-posix:stat-mode stat)))
                (= 1 (sb-posix:stat-nlink stat))
-               (<= (if allow-empty 0 1) (sb-posix:stat-size stat) +physical-backup-lease-maximum-bytes+))
+               (<= (if allow-empty 0 1) (sb-posix:stat-size stat) maximum))
     (error "backup lease metadata is not a bounded private single-link regular file"))
   (list (sb-posix:stat-dev stat) (sb-posix:stat-ino stat)
         (sb-posix:stat-mode stat) (sb-posix:stat-uid stat) (sb-posix:stat-nlink stat)
@@ -95,6 +96,53 @@
   (unless (and (sb-thread:holding-mutex-p *write-lock*) (sb-thread:holding-mutex-p *wal-lock*))
     (error "backup lease publication requires write and WAL exclusion")))
 
+(defun physical-backup-lease-write-bytes
+    (path temporary bytes &key (directory (physical-backup-lease-directory))
+                            (maximum +physical-backup-lease-maximum-bytes+)
+                            check-readback (test-point (constantly nil)))
+  (physical-backup-lease-require-locks)
+  (unless (and (functionp check-readback) (functionp test-point))
+    (wal-invalid-input "backup lease publication requires valid callbacks"))
+  (unless (and (typep bytes '(vector (unsigned-byte 8))) (<= (length bytes) maximum))
+    (wal-invalid-input "backup lease publication exceeds its byte bound"))
+  (let ((fd nil) (stream nil) (identity nil))
+    (unwind-protect
+         (progn
+           (setf fd (sb-posix:open (namestring temporary)
+                                   (logior sb-posix:o-wronly sb-posix:o-creat sb-posix:o-excl
+                                           sb-posix:o-nofollow +postmaster-o-cloexec+) #o600))
+           (let ((stat (sb-posix:fstat fd)))
+             (setf identity (list (sb-posix:stat-dev stat) (sb-posix:stat-ino stat)))
+             (physical-backup-lease-file-identity stat t maximum))
+           (setf stream (sb-sys:make-fd-stream fd :output t :element-type '(unsigned-byte 8))
+                 fd nil)
+           (funcall test-point :before-write)
+           (write-sequence bytes stream)
+           (finish-output stream)
+           (funcall test-point :after-write)
+           (fsync-stream stream)
+           (funcall test-point :after-file-fsync)
+           (close stream)
+           (setf stream nil)
+           (sb-posix:rename (namestring temporary) (namestring path))
+           (setf identity nil)
+           (funcall test-point :after-rename)
+           (fsync-directory directory)
+           (funcall check-readback)
+           (funcall test-point :after-directory-fsync))
+      (unwind-protect
+           (when stream (close stream))
+        (unwind-protect
+             (when fd (sb-posix:close fd))
+          (when identity
+            (let ((stat (physical-backup-lease-lstat temporary)))
+              (when stat
+                (unless (equal (subseq identity 0 2)
+                               (list (sb-posix:stat-dev stat) (sb-posix:stat-ino stat)))
+                  (error "backup lease temporary inode changed"))
+                (sb-posix:unlink (namestring temporary)))))))))
+  (values))
+
 ;; Caller owns write and WAL exclusion and an active publication fence.  This
 ;; low-level writer checks the locks but does not establish the fence itself.
 ;; Capture the exclusive temporary inode before validating it, so cleanup can
@@ -106,44 +154,14 @@
          (directory (physical-backup-lease-check-directory :create t))
          (path (physical-backup-lease-path request))
          (temporary (physical-backup-lease-path request t))
-         (bytes (physical-backup-lease-image record))
-         (fd nil) (stream nil) (identity nil))
-    (unwind-protect
-         (progn
-           (setf fd (sb-posix:open (namestring temporary)
-                                   (logior sb-posix:o-wronly sb-posix:o-creat sb-posix:o-excl
-                                           sb-posix:o-nofollow +postmaster-o-cloexec+) #o600))
-           (let ((stat (sb-posix:fstat fd)))
-             (setf identity (list (sb-posix:stat-dev stat) (sb-posix:stat-ino stat)))
-             (physical-backup-lease-file-identity stat t))
-           (setf stream (sb-sys:make-fd-stream fd :output t :element-type '(unsigned-byte 8))
-                 fd nil)
-           (physical-backup-lease-test-point :before-write record)
-           (write-sequence bytes stream)
-           (finish-output stream)
-           (physical-backup-lease-test-point :after-write record)
-           (fsync-stream stream)
-           (physical-backup-lease-test-point :after-file-fsync record)
-           (close stream)
-           (setf stream nil)
-           (sb-posix:rename (namestring temporary) (namestring path))
-           (setf identity nil)
-           (physical-backup-lease-test-point :after-rename record)
-           (fsync-directory directory)
-           (unless (equal record (physical-backup-lease-read path :stabilize t))
-             (error "backup lease readback differs from publication"))
-           (physical-backup-lease-test-point :after-directory-fsync record))
-      (unwind-protect
-           (when stream (close stream))
-        (unwind-protect
-             (when fd (sb-posix:close fd))
-          (when identity
-            (let ((stat (physical-backup-lease-lstat temporary)))
-              (when stat
-                (unless (equal (subseq identity 0 2)
-                               (list (sb-posix:stat-dev stat) (sb-posix:stat-ino stat)))
-                  (error "backup lease temporary inode changed"))
-                (sb-posix:unlink (namestring temporary))))))))
+         (bytes (physical-backup-lease-image record)))
+    (physical-backup-lease-write-bytes
+     path temporary bytes :directory directory
+     :check-readback
+     (lambda ()
+       (unless (equal record (physical-backup-lease-read path :stabilize t))
+         (error "backup lease readback differs from publication")))
+     :test-point (lambda (point) (physical-backup-lease-test-point point record)))
     record))
 
 (defun physical-backup-lease-check-source (request &key current-timeline)
@@ -221,6 +239,11 @@
       (fsync-directory directory)
       (values (sort records #'string< :key #'namestring) temporaries))))
 
+(declaim (ftype function physical-backup-lease-allocation-load-candidates
+                physical-backup-lease-allocation-check-graph
+                physical-backup-lease-allocation-directory
+                physical-backup-lease-allocation-install-records))
+
 ;; Validate the entire inventory before changing disk or memory.  Checked private
 ;; temporary files are discarded and incomplete captures are durably interrupted;
 ;; source pins are preserved.  A failure leaves the new index unpublished.
@@ -239,16 +262,28 @@
                    (name (getf request :name)))
               (physical-backup-lease-check-source request)
               (when (gethash name candidates) (error "duplicate backup lease request"))
-              (when (member (getf record :phase) '(:requested :capturing))
-                (let ((next (copy-list record)))
-                  (setf (getf next :phase) :interrupted
-                        record (physical-backup-lease-transition record next))
-                  (push record interrupted)))
               (setf (gethash name candidates) record)))
-          (when (or interrupted temporaries)
+          (multiple-value-bind (allocations allocation-temporaries)
+              (physical-backup-lease-allocation-load-candidates candidates)
+            (maphash
+             (lambda (name record)
+               (when (member (getf record :phase) '(:requested :capturing))
+                 (let ((next (copy-list record)))
+                   (setf (getf next :phase) :interrupted
+                         next (physical-backup-lease-transition record next))
+                   (push next interrupted)
+                   (setf (gethash name candidates) next))))
+             candidates)
+            (physical-backup-lease-allocation-check-graph candidates allocations)
             (begin-publication)
-            (dolist (path temporaries) (sb-posix:unlink (namestring path)))
-            (dolist (record interrupted) (physical-backup-lease-write record))
-            (fsync-directory (physical-backup-lease-directory)))
-          (setf *physical-backup-lease-records* candidates)))))
+            (when (or interrupted temporaries)
+              (dolist (path temporaries) (sb-posix:unlink (namestring path)))
+              (dolist (record interrupted) (physical-backup-lease-write record))
+              (fsync-directory (physical-backup-lease-directory)))
+            (when allocation-temporaries
+              (dolist (path allocation-temporaries) (sb-posix:unlink (namestring path)))
+              (fsync-directory (physical-backup-lease-allocation-directory)))
+            (physical-backup-lease-allocation-install-records allocations)
+            (setf *physical-backup-lease-successor-cache* nil
+                  *physical-backup-lease-records* candidates))))))
   (values))
