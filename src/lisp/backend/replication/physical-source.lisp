@@ -7,6 +7,8 @@
                 physical-backup-lease-startup-pin
                 physical-backup-lease-check-startup-inventory))
 
+(declaim (ftype function physical-backup-lease-closing-successor))
+
 (defstruct physical-source-pin
   "A retained source position and its timeline and optional backup manifest digest.
 The digest binds a backup to its stream request; the prefix digest separately
@@ -395,8 +397,8 @@ The caller holds WAL. LIMIT is an exact-byte cap independent of wal_keep_size."
   (when (integerp limit)
     (maphash
      (lambda (name pin)
-       (declare (ignore name))
-       (when (and (not (physical-source-pin-lost-p pin))
+       (when (and (not (physical-backup-lease-closing-successor name))
+                  (not (physical-source-pin-lost-p pin))
                   (> (- *wal-durable-lsn* (physical-source-pin-restart-lsn pin))
                      limit))
          (let ((candidate (copy-physical-source-pin pin)))

@@ -10,6 +10,8 @@
 ;;; using the loaded records and reconciles them with pins and origins.
 (defvar *physical-backup-lease-records* (make-hash-table :test #'equal))
 
+(defvar *physical-backup-lease-successor-cache* nil)
+
 ;; Active owners are process-local and protected by write and WAL exclusion.
 ;; The durable record, rather than this registry, reserves a name at restart.
 (defvar *physical-backup-lease-capture-owners* (make-hash-table :test #'equal))
@@ -155,6 +157,8 @@
                (<= count *physical-backup-lease-limit*))
     (wal-invalid-input "backup lease inventory is at capacity")))
 
+(declaim (ftype function physical-backup-lease-check-handoff-publication))
+
 ;; AFTER must already be the result of a validated transition from BEFORE.
 ;; The caller holds write and WAL exclusion and supplies the callback for an
 ;; active publication fence.  Recheck memory and disk under those locks, then
@@ -178,11 +182,13 @@
         (error "backup lease disk and registered state disagree")))
     (physical-backup-lease-check-capacity
      (+ (hash-table-count *physical-backup-lease-records*) (if before 0 1)))
+    (physical-backup-lease-check-handoff-publication before after)
     (unless (equal before after)
       (funcall begin-publication)
       (physical-backup-lease-write after)
       (physical-backup-lease-test-point :before-memory after)
-      (setf (gethash (copy-seq name) *physical-backup-lease-records*) after))
+      (setf *physical-backup-lease-successor-cache* nil
+            (gethash (copy-seq name) *physical-backup-lease-records*) after))
     (physical-backup-lease-copy after)))
 
 (defun physical-backup-lease-publish (previous candidate)

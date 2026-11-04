@@ -109,7 +109,8 @@
                                    (equal (getf before :successor) (getf after :successor)))
                               (or (not (eq to :closing))
                                   (eq :aborted (getf after :outcome))
-                                  (eq from :ready)))))))
+                                  (and (member from '(:ready :interrupted))
+                                       (getf before :base))))))))
       (error "physical backup lease cannot rebind or repeat capture"))
     after))
 

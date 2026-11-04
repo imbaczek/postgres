@@ -15,7 +15,35 @@
     (error "backup lease lookup requires WAL exclusion"))
   (gethash name *physical-backup-lease-records*))
 
+(defun physical-backup-lease-successor-records ()
+  (unless (sb-thread:holding-mutex-p *wal-lock*)
+    (error "backup lease successor lookup requires WAL exclusion"))
+  (unless (eq *physical-backup-lease-records*
+              (car *physical-backup-lease-successor-cache*))
+    (let ((owners (make-hash-table :test #'equal)))
+      (maphash
+       (lambda (name record)
+         (declare (ignore name))
+         (let ((successor (getf (getf record :successor) :name)))
+           (when successor
+             (when (gethash successor owners)
+               (wal-invalid-input "backup leases share a historical successor"))
+             (setf (gethash successor owners) record))))
+       *physical-backup-lease-records*)
+      (setf *physical-backup-lease-successor-cache*
+            (cons *physical-backup-lease-records* owners))))
+  (cdr *physical-backup-lease-successor-cache*))
+
+(defun physical-backup-lease-closing-successor (name)
+  (let ((record (gethash name (physical-backup-lease-successor-records))))
+    (when (eq :closing (getf record :phase)) record)))
+
+(defun physical-backup-lease-check-successor-mutation (name)
+  (when (physical-backup-lease-closing-successor name)
+    (wal-invalid-input "backup lease handoff still owns successor ~a" name)))
+
 (defun physical-backup-lease-check-ordinary-pin (name)
+  (physical-backup-lease-check-successor-mutation name)
   (when (physical-backup-lease-record-under-lock name)
     (wal-invalid-input "backup lease owns private source pin ~a" name)))
 
@@ -25,6 +53,7 @@
 ;; while the caller owns quiescence and the matching record is still on disk.
 ;; Ordinary creation may not take any name in the lease inventory.
 (defun physical-backup-lease-check-pin-create (name request)
+  (physical-backup-lease-check-successor-mutation name)
   (let ((record (physical-backup-lease-record-under-lock name)))
     (cond
       (request
@@ -73,6 +102,7 @@
 ;; Check both the registered generation and the disk image before unlinking.
 (defun physical-backup-lease-check-pin-unlink (pin request)
   (physical-backup-lease-require-locks)
+  (physical-backup-lease-check-successor-mutation (physical-source-pin-name pin))
   (let* ((name (physical-source-pin-name pin))
          (record (physical-backup-lease-record-under-lock name)))
     (cond
@@ -130,10 +160,43 @@
          (values pin t))
         (t (physical-source-pin-check-wal pin) (values pin nil))))))
 
+(defun physical-backup-lease-check-successor-pin (record pin)
+  (let* ((request (getf record :request))
+         (base (getf record :base))
+         (successor (getf record :successor))
+         (anchor (and (physical-follow-pin-p pin) (physical-follow-pin-anchor pin))))
+    (unless (and base successor anchor
+                 (equal (getf successor :name) (physical-source-pin-name pin))
+                 (physical-follow-pin-ready-p pin)
+                 (not (physical-source-pin-lost-p pin))
+                 (= (getf successor :anchor-digest) (physical-follow-anchor-digest anchor))
+                 (= (getf request :system-id) (getf anchor :system-id))
+                 (= (getf request :timeline) (getf anchor :base-timeline))
+                 (= (getf base :base) (getf anchor :base))
+                 (= (getf base :manifest-digest) (getf anchor :manifest-digest))
+                 (eql (physical-source-pin-confirmed-lsn pin) (getf anchor :receive-lsn))
+                 (eql (physical-source-pin-restart-lsn pin) (getf anchor :receive-lsn))
+                 (null (gethash (getf successor :name) *physical-source-senders*)))
+      (wal-invalid-input "backup lease handoff lacks its unused ready successor"))
+    (physical-follow-pin-check-fields pin)
+    pin))
+
+(declaim (ftype function physical-backup-lease-check-successor-assignment))
+
+(defun physical-backup-lease-check-successor-inventory ()
+  (physical-backup-lease-require-locks)
+  (physical-backup-lease-successor-records)
+  (values))
+
 ;; A READY lease without a pin is inconsistent metadata, not ordinary loss.
 (defun physical-backup-lease-check-startup-inventory (candidates)
   (physical-backup-lease-require-locks)
+  (physical-backup-lease-check-successor-inventory)
   (maphash (lambda (name record)
              (when (and (eq :ready (getf record :phase)) (null (gethash name candidates)))
-               (error "ready backup lease has no source pin")))
+               (error "ready backup lease has no source pin"))
+             (when (and (eq :closing (getf record :phase))
+                        (eq :handed-off (getf record :outcome)))
+               (physical-backup-lease-check-successor-pin
+                record (gethash (getf (getf record :successor) :name) candidates))))
            *physical-backup-lease-records*))

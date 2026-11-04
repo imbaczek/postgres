@@ -26,6 +26,13 @@
   (with-write-lock
     (with-wal-publication-fence (begin-publication)
       (physical-backup-lease-pin-directory-stat)
+      (physical-backup-lease-check-successor-inventory)
+      (maphash (lambda (name record)
+                 (declare (ignore name))
+                 (when (and (eq :closing (getf record :phase))
+                            (eq :handed-off (getf record :outcome)))
+                   (physical-backup-lease-closing-pin record)))
+               *physical-backup-lease-records*)
       (let ((candidates nil) (invalidated nil))
         (maphash
          (lambda (name record)
@@ -63,6 +70,13 @@
          (current (physical-backup-lease-current-record request)))
     (unless (and (eq :closing (getf current :phase)) (equal current record))
       (wal-invalid-input "backup lease has no matching closing intent"))
+    (when (eq :handed-off (getf record :outcome))
+      (let ((name (getf (getf record :successor) :name)))
+        (multiple-value-bind (successor disk) (physical-source-retirement-pins name)
+          (declare (ignore disk))
+          (physical-backup-lease-check-successor-pin record successor)
+          (physical-follow-pin-check-wal successor))))
+    (physical-backup-lease-check-successor-assignment record)
     (physical-backup-lease-pin-directory-stat)
     (multiple-value-bind (pin disk) (physical-source-retirement-pins (getf request :name))
       (declare (ignore disk))
@@ -131,6 +145,63 @@
           :interrupt
           (progn (physical-source-pin-check-wal pin) nil)))))
 
+(defun physical-backup-lease-check-successor-assignment (record)
+  (let* ((name (getf (getf record :successor) :name))
+         (owner (and name (gethash name (physical-backup-lease-successor-records)))))
+    (when (and owner
+               (not (equal (getf (getf record :request) :name)
+                           (getf (getf owner :request) :name))))
+      (wal-invalid-input "backup lease successor already belongs to another lease")))
+  record)
+
+(defun physical-backup-lease-check-handoff-publication (before after)
+  (when (eq :handed-off (getf after :outcome))
+    (physical-backup-lease-check-successor-assignment after)
+    (unless (equal before after)
+      (let* ((request (getf after :request))
+             (name (getf request :name)))
+        (when (or (gethash name *physical-backup-lease-capture-owners*)
+                  (gethash name *physical-source-senders*))
+          (wal-invalid-input "backup lease handoff still has an active bootstrap owner"))
+        (ecase (getf after :phase)
+          (:closing
+           (unless (and (member (getf before :phase) '(:ready :interrupted))
+                        (getf before :base)
+                        (not (recovery-in-progress-p)))
+             (wal-invalid-input "backup lease handoff requires a completed primary backup"))
+           (physical-backup-lease-ready-action before)
+           (let ((successor-name (getf (getf after :successor) :name)))
+             (multiple-value-bind (pin disk) (physical-source-retirement-pins successor-name)
+               (declare (ignore disk))
+               (physical-backup-lease-check-successor-pin after pin)
+               (physical-follow-pin-check-wal pin))))
+          (:closed
+           (physical-backup-lease-closing-pin before)
+           (when (or (gethash name *physical-source-pins*)
+                     (physical-backup-lease-lstat (physical-source-pin-path name)))
+             (wal-invalid-input "backup lease handoff still has its bootstrap pin")))))))
+  after)
+
+(defun physical-backup-lease-handoff (request successor)
+  (let* ((request (physical-backup-lease-request-copy request))
+         (successor (physical-backup-lease-successor-copy successor request)))
+    (with-live-operation
+      (with-write-lock
+        (with-wal-publication-fence (begin-publication)
+          (let* ((record (physical-backup-lease-current-record request))
+                 (phase (getf record :phase)))
+            (if (member phase '(:closing :closed))
+                (unless (and (eq :handed-off (getf record :outcome))
+                             (equal successor (getf record :successor)))
+                  (wal-invalid-input "backup lease already has a different terminal outcome"))
+                (let ((next (copy-list record)))
+                  (setf (getf next :phase) :closing
+                        (getf next :outcome) :handed-off
+                        (getf next :successor) successor)
+                  (physical-backup-lease-publish-checked-under-lock
+                   record (physical-backup-lease-transition record next) #'begin-publication)))
+            (physical-backup-lease-finish-closing-under-lock request #'begin-publication)))))))
+
 (defun physical-backup-lease-startup-action (record)
   (let* ((request (getf record :request))
          (name (getf request :name)))
@@ -156,6 +227,7 @@
 (defun physical-backup-lease-reconcile-startup ()
   (with-write-lock
     (with-wal-publication-fence (begin-publication)
+      (physical-backup-lease-check-successor-inventory)
       (let ((actions nil)
             (records (sort (loop for record being the hash-values of *physical-backup-lease-records*
                                  collect (physical-backup-lease-copy record))
