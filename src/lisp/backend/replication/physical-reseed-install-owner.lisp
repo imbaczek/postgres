@@ -153,8 +153,9 @@
   (physical-directory-check-reseed-follow-intent directory)
   (physical-reseed-install-seed-arguments directory))
 
-;; Recover the plan only when no temporary intent remains and the final journal
-;; binds to the current attempt and directory.
+;; Read the plan and matching current attempt after refusing temporary install
+;; intent.  The caller supplies role-specific follow-name admission.  This helper
+;; closes its root descriptor; the returned seed grants no ownership by itself.
 (defun physical-reseed-install-seed-arguments (directory)
   (physical-adoption-require-absent (physical-reseed-install-temporary-path directory)
                                     "reseed install temporary requires reconciliation")

@@ -107,8 +107,9 @@
   (funcall point :after-install-target-parent-fsync (physical-image-fd-path target-fd)))
 
 ;; At the completed move prefix, verify the immutable base and exact root
-;; inventory. The only extra names are .pg_lisp.lock, physical-reseed.attempt
-;; and physical-reseed.install.
+;; inventory.  Retain the lock, attempt and install journal; permit further
+;; entries only through the owner's checked namespace extension.  CHECK
+;; revalidates the surrounding namespace before and after image validation.
 (defun physical-reseed-install-check-image (root-fd plan check &optional owner)
   (funcall check)
   (physical-reseed-install-test-point :before-install-image-validation (physical-image-fd-path root-fd))

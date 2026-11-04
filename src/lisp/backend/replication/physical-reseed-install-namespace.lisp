@@ -138,6 +138,9 @@
         (unless (equal (subseq row 0 9) (cons (first row) (rest current)))
           (error "reseed new image changed during namespace verification"))))))
 
+;; A specialized owner may supply checked root entries for namespace proof.
+;; The default permits none; entry metadata is compared again at the boundary.
+
 (defgeneric physical-reseed-install-extra-entries (owner root-fd))
 
 (defmethod physical-reseed-install-extra-entries ((owner t) root-fd)

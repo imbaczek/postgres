@@ -76,6 +76,10 @@
   settlement. Reconcile the source outcome and activate follow only after the
   required durable checks; retire installation fences during startup reconciliation.
 
+- [x] Add the target follow codec and read-only owner foundation. Validate
+  bounded generation records and the installed predecessor and image under a
+  scoped owner. Durable publication, recovery and source operations remain open.
+
 - [x] Fence the reserved target follow intent names before startup or older
   reseed ownership. Both final and temporary names reject every entry type;
   specialized cleanup and install roles repeat the check. Validation passed 44
@@ -1233,6 +1237,11 @@
   the same image. A handoff negative test also changed a quoted fixture plist
   reused by later checks. Those cases now use fresh lists; check for other cases
   and exercise repeated operations in the same Lisp image.
+
+- [ ] Audit `wal-atomic-write-bytes` callers for temporary destination aliases.
+  Its temporary pathname uses type `tmp`, so a destination already ending in
+  `.tmp` can alias the temporary and cleanup can remove the destination. This
+  was observed in a new fixture; production callers have not been fully audited.
 
 - [ ] Reproduce and report Dissect's SBCL frame-local inspection fault. While Rove
   reported a missing installed configuration in a retention fixture, Dissect's

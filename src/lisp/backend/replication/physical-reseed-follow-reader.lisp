@@ -1,5 +1,9 @@
 (in-package #:pg)
 
+;;; Read private follow journal evidence through a held root descriptor.
+;;; The decoded record contains credentials and must not be printed.  These
+;;; readers do not publish, reconcile, or authorize remote operations.
+
 (defvar *physical-reseed-follow-test-hook* nil)
 
 (defun physical-reseed-follow-test-point (point path)
@@ -26,6 +30,11 @@
                      (equal row (physical-reseed-install-old-observe root-fd name mount)))
           (error "target follow journal metadata changed"))
         (values facts row)))))
+
+;; Match the descriptor to the named private file and mount, then recheck its
+;; identity after the bounded read.  Return the decoded record and file facts;
+;; stabilization, when requested, syncs the file and root before reading.
+;; Borrow the root descriptor and close only the journal descriptor.
 
 (defun physical-reseed-follow-read-at (root-fd name &key stabilize)
   (let ((before (physical-reseed-follow-entry root-fd name))

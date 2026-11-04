@@ -39,15 +39,18 @@
   (declare (ignore owner))
   (error "stopped reseed ownership does not authorize clean adoption"))
 
-;; The role check distinguishes ordinary stopped ownership from cleanup
-;; ownership.  Operations such as capture, preparation, inventory and clean
-;; adoption retain their own authority gates.
+;; Inherited storage layout alone does not grant legacy attempt operations to
+;; a follow owner.  Only the listed concrete roles carry that authority.
 
 (defun physical-reseed-check-attempt-authority (owner)
   (unless (member (type-of owner)
                   '(physical-reseed-owner physical-reseed-cleanup-owner physical-reseed-install-owner))
     (error "this owner does not authorize legacy reseed attempt operations"))
   owner)
+
+;; The role check distinguishes ordinary stopped ownership from cleanup
+;; ownership.  Operations such as capture, preparation, inventory and clean
+;; adoption retain their own authority gates.
 
 (defun physical-reseed-check-owner (owner)
   "Recheck directory ownership and the stopped target's PID evidence."
