@@ -42,8 +42,21 @@
   passed. Evidence is in
   `/home/imbaczek/proj/pg-ha-artifacts/reseed-follow-handoff/progress.md`.
 
+- [x] Expose backup-lease handoff through the replication protocol and client.
+  BACKUP_LEASE_HANDOFF carries the original request and exact successor identity.
+  It returns a checked CLOSED/HANDED-OFF receipt. The client snapshots ownership
+  before I/O and rejects a different outcome or successor. Native checks passed
+  both normal completion and reply loss after source commit, followed by saved
+  route status, exact retries, successor retirement and historical retries.
+  Source SQL remained writable, with no retained pins or helper owners.
+  Validation passed 1,877 physical tests, strict cold compilation and 80 generated
+  wire trials at seed 103, digest `fnv1a64-v1:702a786762318f65`. Input coverage
+  and rejection counts are unmeasured. Code and refactoring reviews passed.
+  Evidence is in
+  `/home/imbaczek/proj/pg-ha-artifacts/reseed-follow-handoff/progress.md`.
+
 - [ ] Finish reseed follow handoff and startup reconciliation.
-  Expose source handoff through the replication protocol and strict client.
+  Persist lease-owned preparation generations before invoking PREPARE_FOLLOW.
   Require actual PREPARE_FOLLOW readiness and durable target follow configuration
   before transferring the bootstrap lease. Reconcile the terminal installation
   at startup before retiring its fences.

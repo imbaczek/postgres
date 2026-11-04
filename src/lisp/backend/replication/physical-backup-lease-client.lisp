@@ -82,6 +82,10 @@
       (pg-client-error (condition) (error condition))
       (error () (pg-client-native-reject "native backup lease result has inconsistent state")))))
 
+;; Copy the request and successor before I/O so the reply is checked against
+;; the same identity sent in the query. HANDOFF accepts only CLOSED with the
+;; exact successor. The caller must settle an uncertain result after reconnecting
+;; to the original frozen route.
 (defun pg-client-native-backup-lease-command (client verb request &optional successor)
   (unless (member verb '("BACKUP_LEASE_STATUS" "BACKUP_LEASE_ABORT" "BACKUP_LEASE_HANDOFF") :test #'equal)
     (error "native backup lease command requires a status result"))

@@ -199,6 +199,8 @@
 (declaim (ftype function parse-native-backup-lease-command
                 execute-native-backup-lease-command start-native-backup-lease-capture))
 
+;; Keep the lease verbs here before the parser. The command parser, wire
+;; handlers and client use this table for the same names and command types.
 (defparameter *physical-backup-lease-wire-verbs*
   '(("CAPTURE_BACKUP_NATIVE" . :physical-lease-capture)
     ("BACKUP_LEASE_STATUS" . :physical-lease-status)

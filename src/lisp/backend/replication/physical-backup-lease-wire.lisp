@@ -1,18 +1,20 @@
 (in-package #:pg)
 
 ;;; Native backup lease commands for admitted physical replication senders.
-;;; Each verb requires exactly the six native options, with single-quoted
-;;; values.  The request token is an ownership credential and is never echoed
-;;; in a result or an error.
+;;; Each verb requires the six native options, with single-quoted values.
+;;; HANDOFF also requires the successor name and anchor digest. The request
+;;; token is an ownership credential and is never echoed in a result or error.
 
-;; STATUS and ABORT return one row of eight text columns.  UNKNOWN has no
-;; state fields; outcome, base identity and successor identity may be null.
+;; STATUS, ABORT and HANDOFF return one row of eight text columns. UNKNOWN
+;; has no state fields. Outcome, base identity and successor identity may be null.
 (defparameter *physical-backup-lease-result-schema*
   '(("lease_name" 25) ("phase" 25) ("outcome" 25 :nullable)
     ("checkpoint_start" 25 :nullable) ("base_lsn" 25 :nullable)
     ("manifest_digest" 25 :nullable) ("successor_name" 25 :nullable)
     ("successor_anchor_digest" 25 :nullable)))
 
+;; HANDOFF carries the six lease options plus the successor name and anchor
+;; digest. Require each option exactly once and decode all values as literals.
 (defun parse-native-backup-lease-command (words)
   (handler-case
       (let* ((kind (cdr (assoc (string-upcase (first words)) *physical-backup-lease-wire-verbs*
@@ -101,6 +103,9 @@
       (send-command-complete stream tag)
       (send-ready-for-query stream (transaction-status-char)))))
 
+;; A successful HANDOFF row reports the source's durable CLOSED outcome and
+;; successor. A lost reply leaves the caller to recover the outcome with STATUS
+;; or an exact retry on the original route.
 (defun execute-native-backup-lease-command (stream command)
   (handler-case
       (progn

@@ -314,6 +314,8 @@ SQL role authorization remains separate and currently uses the postgres role."
 (defun replication-query-payload-p (payload)
   "Match repl_scanner's first-token dispatch: skip whitespace, not SQL comments.
 Database walsenders fall back to SQL for a leading comment or empty statement."
+  ;; Keep lease verbs in this early dispatch list as well as the protocol
+  ;; parser table so database walsenders route them to the replication parser.
   (simple-query-payload-starts-with-word-p
    payload '("IDENTIFY_SYSTEM" "CREATE_REPLICATION_SLOT" "DROP_REPLICATION_SLOT"
              "START_REPLICATION" "READ_REPLICATION_SLOT" "TIMELINE_HISTORY" "PREPARE_FOLLOW" "PROVE_RETAINED" "RELEASE_FOLLOW" "RELEASE_BOOTSTRAP"

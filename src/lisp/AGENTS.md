@@ -284,6 +284,12 @@ appropriate instead of replacing the native C peer or adding a message relay.
 - Run the full physical package with `rove:run-suite :pg-physical-tests` in a
   tracked background thread and verify the actual test count. `rove:run` on
   the system found zero tests in this worker despite reporting success.
+- Raw Rove reports use `×` for failures. Check the process exit status, final
+  summary and actual markers. A scan for `✗` alone missed two failed fixtures
+  during a full run in this session.
+- Sender fixtures must own their synchronous-replication state and capture its
+  current source identity during registration. Passing NIL assumed an
+  unconfigured image and failed when the full suite had configured a source.
 - Use cl-mcp structural edits for Lisp. A rejected patch that would add an extra
   closing parenthesis leaves the source intact; correct the patch rather than
   bypassing that guard.
