@@ -121,6 +121,18 @@
   `fnv1a64-v1:ee7af4059f73f009`; input coverage and rejection counts were not measured.
   Evidence: `/home/imbaczek/proj/pg-ha-artifacts/reseed-target-follow/progress.md`.
 
+- [x] Define the inert configuration move plan and verification prerequisites.
+  The pure plan accounts for every image across four or five moves, including
+  the saved original control and unused staged images. Shared verification can
+  check an actual decoded original control separately from the exact namespace;
+  ordinary recovery retains both checks. A separate directory scope holds the
+  install guards without granting namespace or startup authority. Code:
+  `b1c7e895256`, `56d48cf6806` and `e302374b627`. Validation passed 79 distinct
+  selected tests in fresh processes and strict fresh compilation. The move
+  position property passed 80 trials at seed 121, digest
+  `fnv1a64-v1:38048727ed1c3732`; input coverage and rejection counts were not measured.
+  Evidence: `/home/imbaczek/proj/pg-ha-artifacts/reseed-target-follow/inert-directory-checkpoint.md`.
+
   Installed inert configuration, durable handoff pending, exact parent Aborted or
   HandedOff settlement, activation, startup fence retirement and cancellation
   remain open, as do logical drain, control metadata and WAL parity, audits and

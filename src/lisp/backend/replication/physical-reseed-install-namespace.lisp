@@ -198,6 +198,10 @@
            (error "reseed namespace changed during verification"))
          (values state prefix))))))
 
+;; Hold the root, incoming and quarantine directories and check their identity
+;; around FUNCTION.  This scope does not prove their contents.  The descriptors
+;; are closed and the check closures revoked when FUNCTION returns or exits
+;; nonlocally; the caller must not retain them.
 (defun call-with-physical-reseed-install-directories (owner function)
   (unless (physical-reseed-install-owner-p owner)
     (error "reseed directory scope requires an install owner"))
@@ -226,9 +230,9 @@
            :expected (getf plan :quarantine)))
         :expected (getf plan :incoming))))))
 
-;; Retain the root and auxiliary directory descriptors for the caller. CHECK
-;; repeats the namespace proof within that scope. The final check runs before
-;; the descriptors are closed.
+;; Prove the contents of the held directories at the observed move prefix.
+;; CHECK repeats that proof within the scope, and a final check runs before
+;; the descriptors are closed.  Neither CHECK nor the descriptors may escape.
 (defun call-with-physical-reseed-install-namespace (owner function)
   (call-with-physical-reseed-install-directories
    owner

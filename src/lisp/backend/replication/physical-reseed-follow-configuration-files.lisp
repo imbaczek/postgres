@@ -3,6 +3,8 @@
 ;;; Check and prepare the private workspace files for a configuration.
 ;;; Check names, descriptors and mounts before and after file operations.
 
+;; Map a logical image name to its workspace directory and leaf.  Selection
+;; changes which receive control is installed and names the selected history.
 (defun physical-reseed-follow-configuration-layout-name (name binding)
   (let ((after (getf binding :after)) (selected (not (equal (getf binding :before) (getf binding :after)))))
     (values

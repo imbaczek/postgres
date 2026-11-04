@@ -492,6 +492,9 @@ unknown, even if the copied control has known resource metadata."
 ;; Scoped verification enumerates the held child directories.  Its inventory
 ;; check describes this verification, not a later installation of the image.
 
+;; Check the exact immediate contents of the base image directories against
+;; the manifest.  Metadata checks can be used separately when an installation
+;; has already proved a different, complete namespace.
 (defun recovery-check-image-directories (manifest directory)
   (let ((names (sort (mapcar #'first (getf manifest :files)) #'string<)))
     (dolist (subdirectory '("base/" "global/" "pg_wal/"))
@@ -507,6 +510,8 @@ unknown, even if the copied control has known resource metadata."
           (error "unexpected files in physical recovery directory ~a" subdirectory))))
     t))
 
+;; Check the image's catalog, checkpoint and reservation facts.  This does not
+;; establish the exact contents of the image directories.
 (defun recovery-check-image-metadata-facts (manifest directory)
   "Bind catalog identity, declared file inventory, WAL checkpoint and XID reservation."
   (let* ((*pgdata* directory)
@@ -567,6 +572,10 @@ A nonpending standby cannot fall back to primary startup when validation fails."
 
 (declaim (ftype function physical-follow-check-startup-config))
 
+;; CONTROL must be decoded from the actual root or saved original recovery
+;; control file, not reconstructed from the manifest.  This core checks
+;; neither the required marker nor the exact directory namespace.  Its caller
+;; must establish those separately before using the result to authorize recovery.
 (defun physical-recovery-verify-base-control-with-namespace (control)
   "Verify base provenance in the selected namespace without publishing control.
 Return the reconstructed state and durable control; do not install runtime state.
@@ -630,6 +639,8 @@ the manifest does not add another authority for those facts."
           (getf manifest :previous-state-time) (getf control :state-time))
     (values manifest control)))
 
+;; Ordinary recovery checks the marker before reading the root control.  For a
+;; non-streaming base it also checks the exact image directory contents.
 (defun physical-recovery-verify-base-with-namespace ()
   "Verify the real root control and base without publishing recovery state."
   (physical-recovery-check-required-marker)

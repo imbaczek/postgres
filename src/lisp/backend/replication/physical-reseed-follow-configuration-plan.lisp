@@ -1,5 +1,12 @@
 (in-package #:pg)
 
+;;; Derive configuration installation moves and positions from a saved record
+;;; and binding.  These functions only describe a plan; they do not inspect or
+;;; change files, or authorize installation or startup.  Building and Staged
+;;; have drivers today; Installing and Inert are for later work.
+
+;; Copy and check the record against the pending binding and staged generation.
+;; The returned selection flag says whether the binding chooses a child.
 (defun physical-reseed-follow-configuration-plan-record (value binding)
   (let* ((record (physical-reseed-follow-copy value))
          (configuration (getf record :configuration))
@@ -20,6 +27,11 @@
         (error "configuration move binding differs from its saved pending image")))
     (values record selected)))
 
+;; Return ordered (logical-name from-role from-leaf to-role to-leaf) moves.
+;; Roles name directories, while logical names identify images independently of
+;; their current leaves.  A selected immediate child adds its WAL history.
+;; The original root control moves aside before the replacement moves in, so
+;; root control is temporarily absent between those moves.
 (defun physical-reseed-follow-configuration-moves (value binding)
   (multiple-value-bind (record selected) (physical-reseed-follow-configuration-plan-record value binding)
     (declare (ignore record))
@@ -35,6 +47,9 @@
               (list :original-recovery :root "physical-recovery.control" :saved "recovery.original")
               (list recovery :staged recovery :root "physical-recovery.control")))))))
 
+;; Return (logical-name role leaf) positions after PREFIX moves.  Include all
+;; image positions, including unused images, so a later check can preserve and
+;; account for them.  Each move needs one source and an empty destination.
 (defun physical-reseed-follow-configuration-positions (value binding prefix)
   (let* ((record (physical-reseed-follow-configuration-plan-record value binding))
          (moves (physical-reseed-follow-configuration-moves record binding))
