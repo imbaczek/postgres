@@ -195,6 +195,58 @@
             (ok (eq owner (pg::physical-reseed-check-owner owner)))
             (ok (equal '(:step 0 :observed 0 :partial nil) (pg::physical-reseed-install-observe owner)))))))))
 
+(deftest reseed-install-directory-scope-preserves-values-and-revokes-held-checks
+    (call-with-reseed-namespace-fixture
+     (lambda (root stage incoming quarantine plan)
+       (declare (ignore stage incoming quarantine plan))
+       (pg::call-with-physical-reseed-install-owner
+        root
+        (lambda (owner)
+          (dolist (cut '(nil t))
+            (let ((owned nil) (saved-check nil))
+              (ok (equal (if cut '(:cut) '(:first :second))
+                         (multiple-value-list
+                          (catch 'directory-scope-cut
+                            (pg::call-with-physical-reseed-install-directories
+                             owner
+                             (lambda (root-fd incoming-fd quarantine-fd held-plan check)
+                               (ok (equal held-plan (pg::physical-reseed-install-owner-plan owner)))
+                               (funcall check)
+                               (setf owned (list root-fd incoming-fd quarantine-fd)
+                                     saved-check check)
+                               (if cut (throw 'directory-scope-cut :cut)
+                                   (values :first :second))))))))
+              (dolist (fd owned)
+                (ok (intake-fails-p (lambda () (sb-posix:fstat fd)))))
+              (ok (intake-fails-p saved-check))
+              (ok (equal '(:step 0 :observed 0 :partial nil)
+                         (pg::physical-reseed-install-observe owner))))))))))
+
+(deftest reseed-install-directory-scope-rechecks-guards-after-callback
+    (call-with-reseed-namespace-fixture
+     (lambda (root stage incoming quarantine plan)
+       (declare (ignore stage quarantine plan))
+       (pg::call-with-physical-reseed-install-owner
+        root
+        (lambda (owner)
+          (let ((calls 0)
+                (path (merge-pathnames "physical-reseed.install" incoming)))
+            (ok (intake-fails-p
+                 (lambda ()
+                   (pg::call-with-physical-reseed-install-directories
+                    owner
+                    (lambda (root-fd incoming-fd quarantine-fd held-plan check)
+                      (declare (ignore root-fd incoming-fd quarantine-fd held-plan))
+                      (funcall check)
+                      (with-open-file (stream path :direction :io :if-exists :overwrite
+                                                   :element-type '(unsigned-byte 8))
+                        (let ((byte (read-byte stream)))
+                          (file-position stream 0)
+                          (write-byte (logxor byte 255) stream)
+                          (finish-output stream)
+                          (incf calls))))))))
+            (ok (= calls 1))))))))
+
 (deftest reseed-install-new-directory-scope-closes-children-on-nonlocal-exit
     (call-with-reseed-namespace-fixture
      (lambda (root stage incoming quarantine plan)

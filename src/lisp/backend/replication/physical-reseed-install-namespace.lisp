@@ -198,11 +198,9 @@
            (error "reseed namespace changed during verification"))
          (values state prefix))))))
 
-;; Retain the root and auxiliary directory descriptors for the caller. CHECK
-;; repeats the namespace proof within that scope. The final check runs before
-;; the descriptors are closed.
-(defun call-with-physical-reseed-install-namespace (owner function)
-  (unless (physical-reseed-install-owner-p owner) (error "reseed namespace verification requires an install owner"))
+(defun call-with-physical-reseed-install-directories (owner function)
+  (unless (physical-reseed-install-owner-p owner)
+    (error "reseed directory scope requires an install owner"))
   (physical-reseed-check-owner owner)
   (let ((plan (physical-reseed-install-copy (physical-reseed-install-owner-plan owner))))
     (call-with-physical-directory-root
@@ -217,15 +215,31 @@
            owner (getf (getf plan :quarantine) :directory)
            (lambda (quarantine quarantine-facts quarantine-fd quarantine-check)
              (declare (ignore quarantine quarantine-facts))
-             (flet ((guards-check () (funcall incoming-check) (funcall quarantine-check)))
-               (flet ((check ()
-                        (physical-reseed-install-namespace-state
-                         owner root-fd incoming-fd quarantine-fd plan #'guards-check)))
-                 (multiple-value-bind (state prefix) (check)
-                   (multiple-value-prog1 (funcall function root-fd incoming-fd quarantine-fd state prefix #'check)
-                     (check))))))
+             (flet ((guards-check ()
+                      (funcall incoming-check)
+                      (funcall quarantine-check)))
+               (guards-check)
+               (multiple-value-prog1
+                   (funcall function root-fd incoming-fd quarantine-fd plan #'guards-check)
+                 (physical-reseed-check-owner owner)
+                 (guards-check))))
            :expected (getf plan :quarantine)))
         :expected (getf plan :incoming))))))
+
+;; Retain the root and auxiliary directory descriptors for the caller. CHECK
+;; repeats the namespace proof within that scope. The final check runs before
+;; the descriptors are closed.
+(defun call-with-physical-reseed-install-namespace (owner function)
+  (call-with-physical-reseed-install-directories
+   owner
+   (lambda (root-fd incoming-fd quarantine-fd plan guards-check)
+     (flet ((check ()
+              (physical-reseed-install-namespace-state
+               owner root-fd incoming-fd quarantine-fd plan guards-check)))
+       (multiple-value-bind (state prefix) (check)
+         (multiple-value-prog1
+             (funcall function root-fd incoming-fd quarantine-fd state prefix #'check)
+           (check)))))))
 
 ;; Report both the recorded journal step and the observed move prefix.
 (defun physical-reseed-install-observe (owner)
