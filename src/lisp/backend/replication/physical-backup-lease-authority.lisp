@@ -146,6 +146,8 @@
                        (equal identity (list (getf request :system-id) (getf request :timeline)
                                              (getf base :base) (getf base :manifest-digest))))))
 
+;; Immutable successor identity remains meaningful after CLOSED, when the pin
+;; may have advanced.  CLOSING also requires the stricter unused-pin check below.
 
 (defun physical-backup-lease-successor-pin-identity-p (record pin)
   (let* ((request (getf record :request))

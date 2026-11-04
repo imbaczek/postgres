@@ -1,5 +1,12 @@
 (in-package #:pg)
 
+;;; Classify structurally validated source pins and apply startup role and WAL
+;;; policy before publishing loss or replacing the source pin registry.
+
+;; A parent pin is bootstrap retention.  An allocated pin is cleanup debt,
+;; the selected successor, or an unselected preparation; other pins are ordinary.
+;; The caller holds WAL exclusion while using the returned owners.
+
 (defun physical-backup-lease-startup-pin-class (name)
   (let ((parent (physical-backup-lease-record-under-lock name))
         (row (physical-backup-lease-allocation-record-under-lock name)))
@@ -15,6 +22,10 @@
             (values :selected row owner))
            (t (values :preparation row owner)))))
       (t (values :ordinary nil nil)))))
+
+;; Apply role and WAL policy after structural graph validation.  Among allocated
+;; pins, only unselected live preparations are marked lost for role or timeline
+;; changes.  Selected pins are never automatically invalidated here.
 
 (defun physical-backup-lease-startup-pin-candidate (pin standby)
   (multiple-value-bind (kind owner parent)
@@ -64,6 +75,10 @@
    *physical-backup-lease-records*)
   (values))
 
+;; Build the complete replacement and loss-write lists before publication.
+;; Standby keeps unmanaged registered pins and does not install ordinary or
+;; selected disk pins as new primary retention.
+
 (defun physical-backup-lease-startup-pin-plan (raw standby)
   (let ((candidates (make-hash-table :test #'equal))
         (invalidated nil))
@@ -81,6 +96,10 @@
      raw)
     (values candidates invalidated)))
 
+;; Replace the registry after loss writes.  On a primary, install retention for
+;; each non-lost candidate; on a standby, preserve unmanaged retention entries.
+;; The caller holds write and WAL exclusion and has started the publication fence.
+
 (defun physical-backup-lease-install-startup-pins (candidates standby)
   (maphash
    (lambda (name pin)
@@ -96,6 +115,11 @@
              candidates))
   (setf *physical-source-pins* candidates)
   (values))
+
+;; Validate the raw inventory and all selected closing sources before saving
+;; any pin loss or replacing the registry.  On a standby, selected pins remain
+;; disk-only and existing unmanaged entries are preserved without adding primary
+;; retention.  The publication fence covers the disk and memory changes.
 
 (defun physical-backup-lease-load-startup-pins (&optional standby)
   (when (and standby (not (recovery-in-progress-p)))

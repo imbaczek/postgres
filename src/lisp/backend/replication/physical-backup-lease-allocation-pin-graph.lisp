@@ -1,5 +1,9 @@
 (in-package #:pg)
 
+;;; Validate the durable parent, allocation and raw pin graph before record
+;;; loading interrupts captures or removes temporary files.  Source WAL and
+;;; role policy are applied later when startup loads the pins.
+
 (defun physical-backup-lease-check-parent-pin-inventory (record pins)
   (let* ((name (getf (getf record :request) :name))
          (pin (gethash name pins)))
@@ -34,6 +38,10 @@
                        (getf (getf row :coordinates) :receive-lsn)))
           (error "unselected live backup lease allocation has advanced progress"))))))
 
+;; Check ownership across the complete parent, allocation and raw pin inventory.
+;; A closing handoff requires its unused successor; a closed handoff may have
+;; advanced or retired it.  Unselected live preparations cannot have advanced.
+
 (defun physical-backup-lease-allocation-check-pin-inventory (parents allocations pins)
   (let ((histories (physical-backup-lease-allocation-check-graph parents allocations)))
     (maphash
@@ -63,6 +71,11 @@
         (when (gethash name pins) (error "duplicate physical source pin in startup inventory"))
         (setf (gethash name pins) pin)))
     pins))
+
+;; Under write and WAL exclusion, validate both the original graph and the
+;; graph with interrupted parents before rewriting records or removing temporary
+;; files.  WAL availability and role policy are checked during the later pin
+;; load, before pin loss is written or the pin registry is replaced.
 
 (defun physical-backup-lease-load-records-with-pin-preflight ()
   (with-write-lock

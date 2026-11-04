@@ -250,8 +250,9 @@
 
 (declaim (ftype function physical-backup-lease-load-records-with-pin-preflight))
 
-;; Validate the entire inventory before changing disk or memory.  Checked private
-;; temporary files are discarded and incomplete captures are durably interrupted;
-;; source pins are preserved.  A failure leaves the new index unpublished.
+;; Validate the structural inventory before rewriting records or replacing indexes.
+;; Checked private temporary files are discarded and incomplete captures are
+;; durably interrupted; source pins are preserved.  A failure leaves the new
+;; index unpublished.
 (defun physical-backup-lease-load-records ()
   (physical-backup-lease-load-records-with-pin-preflight))

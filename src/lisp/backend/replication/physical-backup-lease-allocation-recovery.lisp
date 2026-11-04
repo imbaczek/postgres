@@ -1,5 +1,12 @@
 (in-package #:pg)
 
+;;; Plan and finish allocation cleanup owed by canceled intents and aborted
+;;; leases.  Durable identities and owners are checked before any pin is retired.
+
+;; Preflight the whole history under write and WAL exclusion, including durable
+;; identity and sender checks, before retiring any allocation.  Canceled rows
+;; can still have pins: revocation alone does not prove unlink completed.
+
 (defun physical-backup-lease-allocation-cleanup-history (parent)
   (physical-backup-lease-require-locks)
   (let* ((request (getf parent :request))
@@ -20,6 +27,10 @@
       (physical-backup-lease-allocation-cleanup-pin row))
     history))
 
+;; Retire a preflighted history under write and WAL exclusion and the caller's
+;; publication fence.  Each revocation rechecks its boundary; this helper does
+;; not settle the parent lease.
+
 (defun physical-backup-lease-revoke-allocations-under-lock (history begin-publication)
   (dolist (row history)
     (let ((canceled (physical-backup-lease-allocation-copy row)))
@@ -36,6 +47,10 @@
 (defun physical-backup-lease-finish-canceled-allocations-under-lock (parent begin-publication)
   (physical-backup-lease-revoke-allocations-under-lock
    (physical-backup-lease-allocation-canceled-cleanup-plan parent) begin-publication))
+
+;; An aborted closing or closed parent owes cleanup of its allocations.  Check
+;; the entire history and bootstrap pin before starting; cleanup uses exact pin
+;; identity and does not need the old source WAL.
 
 (defun physical-backup-lease-allocation-abort-cleanup-plan (parent)
   (physical-backup-lease-require-locks)

@@ -17,7 +17,7 @@
       (error "backup lease ownership changed on disk"))
     record))
 
-;; A standby cannot retain source WAL for these leases.  Validate all pins
+;; A standby does not install primary source retention.  Validate all pins
 ;; first, then durably mark newly lost pins before installing the candidates.
 ;; The publication fence covers disk and memory changes, including failures.
 (defun physical-backup-lease-load-standby-pins ()
@@ -48,10 +48,11 @@
                 physical-backup-lease-allocation-canceled-cleanup-plan
                 physical-backup-lease-finish-canceled-allocations-under-lock))
 
-;; Complete an existing closing intent without requiring the old WAL.  Remove
-;; and sync the pin first, then publish CLOSED.  A restart can repeat this after
-;; a failure at either step.  The caller holds both locks and supplies the
-;; publication fence callback.
+;; Finish allocation cleanup for an aborted parent, including on a CLOSED retry.
+;; Retire and sync the bootstrap pin before publishing CLOSED; this does not
+;; require its old WAL.  A handed-off CLOSING parent still requires proof of
+;; the selected successor and its WAL.  The caller holds write and WAL exclusion
+;; and supplies the publication fence callback.
 (defun physical-backup-lease-finish-closing-under-lock (request begin-publication)
   (let* ((record (physical-backup-lease-current-record request))
          (name (getf request :name)))
@@ -200,9 +201,10 @@
        nil)
       (t (error "backup lease startup found an active capture")))))
 
-;; Validate every action before publishing any of them.  Hold write and WAL
-;; exclusion throughout, and fence each durable transition with its memory
-;; publication so a failed publication cannot admit unsafe work.
+;; Preflight every startup action and cleanup plan before publishing any of
+;; them, then recheck each cleanup at its mutation boundary.  Under write and
+;; WAL exclusion, fence durable changes and their memory publication.  Allocation
+;; revocation precedes pin unlink and directory sync, then retention release.
 (defun physical-backup-lease-reconcile-startup ()
   (with-write-lock
     (with-wal-publication-fence (begin-publication)
