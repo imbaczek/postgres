@@ -109,6 +109,10 @@
       (pg-client-error (condition) (error condition))
       (error () (pg-client-native-reject "native backup lease result has inconsistent state")))))
 
+;; Freeze the complete intent before I/O and validate the returned owner and
+;; anchor against it.  The proof frame has the same bound as ordinary follow
+;; preparation.  These primitives do not retry, journal, or activate a receiver.
+
 (defun pg-client-native-backup-lease-follow-prepare (client request generation name coordinates)
   (let* ((intent (physical-backup-lease-follow-intent request generation name coordinates :live))
          (request (getf intent :request))
@@ -124,6 +128,9 @@
                  (= generation (pg-client-native-u64 (aref row 1))))
       (pg-client-native-reject "native allocation preparation returned a different owner"))
     (pg-client-native-prepare-anchor (subseq row 2) name coordinates)))
+
+;; Check the bounded reply against the frozen intent and return its parent.
+;; The echoed generation and name acknowledge the request, not a child state.
 
 (defun pg-client-native-backup-lease-follow-cancel (client request generation name coordinates)
   (let* ((intent (physical-backup-lease-follow-intent request generation name coordinates :live))

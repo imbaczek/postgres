@@ -1,9 +1,9 @@
 (in-package #:pg)
 
 ;;; Native backup lease commands for admitted physical replication senders.
-;;; Each verb requires the six native options, with single-quoted values.
-;;; HANDOFF also requires the successor name and anchor digest. The request
-;;; token is an ownership credential and is never echoed in a result or error.
+;;; All use the six lease options; HANDOFF adds successor identity and allocated
+;;; follow commands add generation, name and prefixed receiver coordinates.
+;;; Values are quoted. The token is never echoed in a result or error.
 
 ;; STATUS, ABORT and HANDOFF return one row of eight text columns. UNKNOWN
 ;; has no state fields. Outcome, base identity and successor identity may be null.
@@ -16,6 +16,10 @@
 (defun physical-backup-lease-command-allocation (command)
   (physical-backup-lease-allocation-copy
    (cdr (assoc "allocation" (logical-replication-command-options command) :test #'equal))))
+
+;; Allocation commands add a generation, a name, and prefixed follow
+;; coordinates.  The lease source timeline is the capture timeline; the
+;; follow source timeline identifies the chosen writer and can differ.
 
 (defun physical-backup-lease-wire-option-keys (kind)
   (append '("native_format" "lease_name" "lease_token" "cluster_identity" "system_id" "source_timeline")
@@ -36,8 +40,8 @@
         "follow_")
        :live))))
 
-;; HANDOFF carries the six lease options plus the successor name and anchor
-;; digest. Require each option exactly once and decode all values as literals.
+;; Require each verb's options exactly once as quoted literals. Allocated follow
+;; commands also accept an optional follow_proof_kind.
 (defun parse-native-backup-lease-command (words)
   (handler-case
       (let* ((kind (cdr (assoc (string-upcase (first words)) *physical-backup-lease-wire-verbs*
@@ -141,6 +145,12 @@
   (append '(("lease_name" 25) ("allocation_generation" 20))
           (physical-follow-prepare-schema coordinates)))
 
+;; Preparation's operation context has ended.  Under fresh admission, write
+;; and WAL exclusion, recheck the durable parent and live allocation, the exact
+;; registered pin, ready anchor and source health.  Copy the row before I/O;
+;; cancellation before this snapshot rejects it, while later cancellation may
+;; follow a successful reply.
+
 (defun physical-backup-lease-follow-prepare-snapshot (row pin)
   (with-live-operation
     (with-write-lock
@@ -163,6 +173,11 @@
                          (format nil "~d" (getf row :generation)))
                    (physical-follow-prepare-anchor-row
                     (getf row :name) (physical-follow-anchor-copy (physical-follow-pin-anchor pin))))))))))
+
+;; PREPARE prefixes the ordinary anchor row with lease name and generation.
+;; CANCEL returns the checked parent and submitted allocation identity, not a
+;; claim that a canceled child row exists.  A selected closing or closed handoff
+;; is preserved, and an unknown child of a terminal parent is not created.
 
 (defun execute-native-backup-lease-follow-command (stream command)
   (let* ((row (physical-backup-lease-command-allocation command))

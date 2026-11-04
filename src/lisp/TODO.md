@@ -55,11 +55,26 @@
   Evidence is in
   `/home/imbaczek/proj/pg-ha-artifacts/reseed-follow-handoff/progress.md`.
 
-- [ ] Finish reseed follow handoff and startup reconciliation.
-  Persist lease-owned preparation generations before invoking PREPARE_FOLLOW.
-  Require actual PREPARE_FOLLOW readiness and durable target follow configuration
-  before transferring the bootstrap lease. Reconcile the terminal installation
-  at startup before retiring its fences.
+- [x] Add durable source allocation and startup cleanup for lease follow pins.
+  Persist generation and name ownership, validate the complete parent and pin
+  graph at startup, and finish canceled or aborted cleanup before releasing
+  retention. Selected handoffs retain their separate closing and closed rules.
+  Code: `b463c32c5db` and `3b59a0a6ab8`.
+
+- [x] Expose allocated follow preparation and cancellation through the source
+  protocol and strict client. The client freezes the intent before I/O; cancel
+  returns a parent receipt and submitted identity, not a child-state claim.
+  The fresh full run executed 1,962 distinct test heads with positive assertions;
+  three later tests passed separately. Strict cold compilation passed. Native
+  reply-loss checks covered four modes, restart and writable SQL. The wire
+  property passed 100 trials at seed 113, digest `fnv1a64-v1:fb2a5a7ba229d029`;
+  input coverage and rejection counts were not measured. Evidence:
+  `/home/imbaczek/proj/pg-ha-artifacts/reseed-lease-wire/progress.md`.
+
+- [ ] Finish target reseed follow handoff and startup reconciliation.
+  Persist the target's follow intent and inert configuration before source
+  settlement. Reconcile the source outcome and activate follow only after the
+  required durable checks; retire installation fences during startup reconciliation.
 
 - [x] Fence reserved reseed installation state across startup and owner roles.
   Both `physical-reseed.install` and `physical-reseed.install.tmp` refuse startup

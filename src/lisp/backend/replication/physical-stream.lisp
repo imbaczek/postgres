@@ -336,6 +336,9 @@ Retained anchors return next timeline and fork, but no child EOR."
                       (when (eq :descendant (physical-follow-anchor-kind anchor))
                         (format nil "~(~{~2,'0X~}~)" (getf anchor :eor-octets)))))))))
 
+;; Build the common anchor portion used by ordinary and allocated PREPARE.
+;; Callers copy and validate the source-owned anchor before network output.
+
 (defun physical-follow-prepare-anchor-row (name anchor)
   (append
    (list (copy-seq name))

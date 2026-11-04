@@ -301,6 +301,9 @@ Both commands carry proof_kind retained_timeline for the explicit retained kind.
   (loop for position from 0 below (length text) by 2
         collect (parse-integer text :start position :end (+ position 2) :radix 16)))
 
+;; Ordinary and allocated preparations share this anchor schema and decoder;
+;; allocation results add their owner columns before this portion of the row.
+
 (defun physical-follow-prepare-schema (coordinates)
   (let* ((kind (physical-follow-request-kind coordinates))
          (same (eq :same-timeline kind))
@@ -314,6 +317,9 @@ Both commands carry proof_kind retained_timeline for the explicit retained kind.
                                           (list "eor_hex" +textoid+))
                   collect (if (or same (and retained (equal name "eor_hex")))
                               (list name oid :nullable) (list name oid))))))
+
+;; Validate the typed anchor, immutable coordinates, history and fork proof
+;; before returning a detached copy to either preparation caller.
 
 (defun pg-client-native-prepare-anchor (row slot coordinates)
   (let* ((coordinates (physical-follow-request-copy coordinates))
@@ -350,6 +356,9 @@ Both commands carry proof_kind retained_timeline for the explicit retained kind.
       (pg-client-error (condition) (error condition))
       (error () (pg-client-native-reject "native preparation returned an invalid source anchor")))
     (physical-follow-anchor-copy anchor)))
+
+;; Freeze both validation inputs before sending the query so the reply is
+;; checked against the same pin and coordinates that were sent.
 
 (defun pg-client-native-prepare (client slot coordinates)
   "Prepare and return a checked source anchor for the supplied coordinates.
