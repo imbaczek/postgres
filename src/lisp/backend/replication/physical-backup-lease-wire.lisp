@@ -13,6 +13,29 @@
     ("manifest_digest" 25 :nullable) ("successor_name" 25 :nullable)
     ("successor_anchor_digest" 25 :nullable)))
 
+(defun physical-backup-lease-command-allocation (command)
+  (physical-backup-lease-allocation-copy
+   (cdr (assoc "allocation" (logical-replication-command-options command) :test #'equal))))
+
+(defun physical-backup-lease-wire-option-keys (kind)
+  (append '("native_format" "lease_name" "lease_token" "cluster_identity" "system_id" "source_timeline")
+          (case kind
+            (:physical-lease-handoff '("successor_name" "successor_anchor_digest"))
+            ((:physical-lease-prepare-follow :physical-lease-cancel-follow)
+             (append '("allocation_generation" "allocation_name")
+                     (loop for (name) in *physical-follow-wire-fields*
+                           collect (concatenate 'string "follow_" name)))))))
+
+(defun physical-backup-lease-wire-allocation (kind request options)
+  (when (member kind '(:physical-lease-prepare-follow :physical-lease-cancel-follow))
+    (flet ((value (key) (replication-command-value (cdr (assoc key options :test #'equal)))))
+      (physical-backup-lease-follow-intent
+       request (physical-stream-u64 (value "allocation_generation")) (value "allocation_name")
+       (physical-follow-prepare-request
+        (make-logical-replication-command :options options)
+        "follow_")
+       :live))))
+
 ;; HANDOFF carries the six lease options plus the successor name and anchor
 ;; digest. Require each option exactly once and decode all values as literals.
 (defun parse-native-backup-lease-command (words)
@@ -20,15 +43,16 @@
       (let* ((kind (cdr (assoc (string-upcase (first words)) *physical-backup-lease-wire-verbs*
                                :test #'equal)))
              (options (parse-replication-generic-options (rest words)))
-             (keys (append '("native_format" "lease_name" "lease_token" "cluster_identity"
-                             "system_id" "source_timeline")
-                           (when (eq kind :physical-lease-handoff)
-                             '("successor_name" "successor_anchor_digest")))))
-        (unless (and kind (= (length keys) (length options))
+             (keys (physical-backup-lease-wire-option-keys kind))
+             (optional (when (member kind '(:physical-lease-prepare-follow :physical-lease-cancel-follow))
+                         '("follow_proof_kind"))))
+        (unless (and kind
                      (every (lambda (key) (= 1 (count key options :key #'car :test #'equal))) keys)
                      (every (lambda (option)
-                              (let ((word (cdr option)))
-                                (and (stringp word) (plusp (length word))
+                              (let ((word (cdr option)) (key (car option)))
+                                (and (member key (append keys optional) :test #'equal)
+                                     (= 1 (count key options :key #'car :test #'equal))
+                                     (stringp word) (plusp (length word))
                                      (char= #\' (char word 0)))))
                             options))
           (ereport "42601" "invalid native backup lease options"))
@@ -44,11 +68,13 @@
                               (physical-backup-lease-successor-copy
                                (list :name (value "successor_name") :anchor-digest
                                      (physical-stream-u64 (value "successor_anchor_digest")))
-                               request))))
+                               request)))
+                 (allocation (physical-backup-lease-wire-allocation kind request options)))
             (make-logical-replication-command
              :type kind :slot-name (getf request :name)
              :options (append (list (cons "request" request))
-                              (when successor (list (cons "successor" successor))))))))
+                              (when successor (list (cons "successor" successor)))
+                              (when allocation (list (cons "allocation" allocation))))))))
     (pg-error (condition) (ereport (pg-error-sqlstate condition) "invalid native backup lease request"))
     (error () (ereport "22023" "invalid native backup lease request"))))
 
@@ -87,21 +113,76 @@
        (when *swank-listener-enabled-p*
          (ereport "55000" "leased native backup requires Swank to be off"))
        (with-wal-critical (wal-check-healthy)))
-      (:physical-lease-handoff
+      ((:physical-lease-handoff :physical-lease-prepare-follow)
        (prevent-recovery-primary-operation "backup lease handoff")
        (with-wal-critical (wal-check-healthy)))
-      ((:physical-lease-status :physical-lease-abort) nil)
+      ((:physical-lease-status :physical-lease-abort :physical-lease-cancel-follow) nil)
       (otherwise (ereport "42601" "unsupported native backup lease command")))))
 
-(defun send-native-backup-lease-result (stream request record tag)
-  (let ((row (physical-backup-lease-result-row request record))
-        (columns (loop for (name oid) in *physical-backup-lease-result-schema*
-                       collect (make-result-column :name name :type-oid oid :typlen -1))))
+(defun send-native-backup-lease-row (stream row schema tag)
+  (let ((columns (loop for (name oid) in schema
+                       collect (make-result-column :name name :type-oid oid
+                                                   :typlen (if (= oid +int8oid+) 8 -1)))))
     (with-live-operation
       (send-row-description stream columns)
       (send-data-row-text stream row)
       (send-command-complete stream tag)
       (send-ready-for-query stream (transaction-status-char)))))
+
+(defun send-native-backup-lease-result (stream request record tag)
+  (send-native-backup-lease-row
+   stream (physical-backup-lease-result-row request record) *physical-backup-lease-result-schema* tag))
+
+(defparameter *physical-backup-lease-follow-cancel-schema*
+  (append *physical-backup-lease-result-schema*
+          '(("allocation_generation" 20) ("allocation_name" 25))))
+
+(defun physical-backup-lease-follow-prepare-schema (coordinates)
+  (append '(("lease_name" 25) ("allocation_generation" 20))
+          (physical-follow-prepare-schema coordinates)))
+
+(defun physical-backup-lease-follow-prepare-snapshot (row pin)
+  (with-live-operation
+    (with-write-lock
+      (sb-thread:with-mutex (*wal-lock*)
+        (call-with-physical-backup-lease-allocation-context
+         :prepare row
+         (lambda ()
+           (physical-backup-lease-allocation-check-prepare
+            (getf row :name) (getf row :coordinates) nil t)
+           (unless (and (physical-follow-pin-p pin)
+                        (equal (getf row :name) (physical-source-pin-name pin))
+                        (eq pin (gethash (getf row :name) *physical-source-pins*)))
+             (wal-invalid-input "backup lease allocation no longer owns its prepared pin"))
+           (physical-follow-pin-check-live pin)
+           (unless (and (physical-follow-pin-ready-p pin)
+                        (physical-follow-request-matches-anchor-p
+                         (getf row :coordinates) (physical-follow-pin-anchor pin)))
+             (wal-invalid-input "backup lease allocation no longer has its ready anchor"))
+           (append (list (copy-seq (getf (getf row :request) :name))
+                         (format nil "~d" (getf row :generation)))
+                   (physical-follow-prepare-anchor-row
+                    (getf row :name) (physical-follow-anchor-copy (physical-follow-pin-anchor pin))))))))))
+
+(defun execute-native-backup-lease-follow-command (stream command)
+  (let* ((row (physical-backup-lease-command-allocation command))
+         (request (getf row :request))
+         (generation (getf row :generation))
+         (name (getf row :name))
+         (coordinates (getf row :coordinates))
+         (prepare (eq :physical-lease-prepare-follow (logical-replication-command-type command))))
+    (if prepare
+        (let* ((pin (physical-backup-lease-follow-prepare request generation name coordinates))
+               (result (physical-backup-lease-follow-prepare-snapshot row pin)))
+          (send-native-backup-lease-row
+           stream result (physical-backup-lease-follow-prepare-schema coordinates)
+           "BACKUP_LEASE_PREPARE_FOLLOW"))
+        (let ((parent (physical-backup-lease-follow-cancel request generation name coordinates)))
+          (unless parent (wal-invalid-input "backup lease allocation has no parent outcome"))
+          (send-native-backup-lease-row
+           stream (append (physical-backup-lease-result-row request parent)
+                          (list (format nil "~d" generation) name))
+           *physical-backup-lease-follow-cancel-schema* "BACKUP_LEASE_CANCEL_FOLLOW")))))
 
 ;; A successful HANDOFF row reports the source's durable CLOSED outcome and
 ;; successor. A lost reply leaves the caller to recover the outcome with STATUS
@@ -110,6 +191,10 @@
   (handler-case
       (progn
         (physical-backup-lease-wire-preflight command)
+        (when (member (logical-replication-command-type command)
+                      '(:physical-lease-prepare-follow :physical-lease-cancel-follow))
+          (return-from execute-native-backup-lease-command
+            (execute-native-backup-lease-follow-command stream command)))
         (let* ((request (physical-backup-lease-command-request command))
                (kind (logical-replication-command-type command))
                (record

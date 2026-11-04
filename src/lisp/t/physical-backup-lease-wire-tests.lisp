@@ -274,3 +274,336 @@
            (lambda () (pg::pg-client-native-backup-lease-query "BACKUP_LEASE_HANDOFF" request))))
       (ok (intake-fails-p
            (lambda () (pg::pg-client-native-backup-lease-query "BACKUP_LEASE_STATUS" request successor))))))
+
+(cl-spec:defproperty backup-lease-allocation-wire-preserves-the-exact-intent
+    ((generation (range integer 1 16)) (digest (range integer 0 18446744073709551615))
+                                       (identity-choice (range integer 0 3)) (verb-choice (range integer 0 1))
+                                       (writer (range integer 2 4)))
+  (:about pg::parse-native-backup-lease-command pg::pg-client-native-backup-lease-follow-query)
+  (:trials (:normal 100))
+  (let* ((request (backup-lease-wire-request
+                   (nth identity-choice '("allocation" "allocation'quoted" "allocation\\literal" "λź日本"))))
+         (row (backup-lease-allocation-test-record :live generation digest))
+         (coordinates (getf row :coordinates))
+         (verb (nth verb-choice '("BACKUP_LEASE_PREPARE_FOLLOW" "BACKUP_LEASE_CANCEL_FOLLOW"))))
+    (setf (getf row :request) request
+          (getf coordinates :system-id) (getf request :system-id)
+          (getf coordinates :base-timeline) (getf request :timeline)
+          (getf coordinates :source-timeline) writer)
+    (let* ((query (pg::pg-client-native-backup-lease-follow-query
+                   verb request generation (getf row :name) coordinates))
+           (command (pg::parse-replication-command query)))
+      (and (eq (if (zerop verb-choice) :physical-lease-prepare-follow :physical-lease-cancel-follow)
+               (pg::logical-replication-command-type command))
+           (equal (pg::physical-backup-lease-allocation-copy row)
+                  (pg::physical-backup-lease-command-allocation command))
+           (pg::replication-query-payload-p (pg::string->bytes query))))))
+
+(deftest generated-backup-lease-allocation-wire-roundtrip
+    (let ((result (cl-spec:result-data
+                   (cl-spec:run-property 'backup-lease-allocation-wire-preserves-the-exact-intent
+                                         :seed 113 :profile :normal))))
+      (ok (eq :passed (getf result :status)))))
+
+(deftest backup-lease-allocation-wire-rejects-unbound-and-ambiguous-intents
+    (let* ((row (backup-lease-allocation-test-record))
+           (request (getf row :request))
+           (query (pg::pg-client-native-backup-lease-follow-query
+                   "BACKUP_LEASE_PREPARE_FOLLOW" request 1 (getf row :name) (getf row :coordinates))))
+      (dolist (bad (list
+                    (backup-lease-wire-replace query ", allocation_generation '1'" "")
+                    (backup-lease-wire-replace query "allocation_generation '1'" "allocation_generation '0'")
+                    (backup-lease-wire-replace query "allocation_generation '1'" "allocation_generation '17'")
+                    (backup-lease-wire-replace query "allocation_generation '1'" "allocation_generation 1")
+                    (backup-lease-wire-replace query "allocation_name" "unknown_option")
+                    (backup-lease-wire-replace query "'allocated_follow'" "allocated_follow")
+                    (backup-lease-wire-replace query "follow_system_id '" "follow_system_id '-")
+                    (backup-lease-wire-replace query "follow_base_timeline '2'" "follow_base_timeline '3'")
+                    (backup-lease-wire-replace query "follow_source_timeline '2'" "follow_source_timeline '0'")
+                    (concatenate 'string (subseq query 0 (1- (length query))) ", allocation_generation '1')")
+                    (concatenate 'string (subseq query 0 (1- (length query))) ", follow_proof_kind 'unknown')")))
+        (let ((condition (handler-case (progn (pg::parse-replication-command bad) nil)
+                           (error (condition) condition))))
+          (ok condition)
+          (ok (not (search (getf request :token) (princ-to-string condition))))))))
+
+(defun call-with-backup-lease-allocation-wire-fixture (function)
+  (call-with-backup-lease-allocation-authority-fixture
+   (lambda (root parent row)
+     (let ((pg::*wal-sender-registry* (make-hash-table :test #'eq))
+           (pg::*sync-replication-state* (pg::make-sync-replication-state :source-id 42)))
+       (setf (pg::backend-replication-mode pg::*backend*) :physical)
+       (pg::wal-sender-register pg::*backend*)
+       (unwind-protect (funcall function root parent row)
+         (pg::wal-sender-unregister pg::*backend*))))))
+
+(defun backup-lease-allocation-wire-command (verb row)
+  (pg::parse-replication-command
+   (pg::pg-client-native-backup-lease-follow-query
+    verb (getf row :request) (getf row :generation) (getf row :name) (getf row :coordinates))))
+
+(defun backup-lease-allocation-wire-rpc (row prepare)
+  (call-with-physical-client-wire
+   (lambda (client request-file)
+     (declare (ignore request-file))
+     (funcall (if prepare #'pg::pg-client-native-backup-lease-follow-prepare
+                  #'pg::pg-client-native-backup-lease-follow-cancel)
+              client (getf row :request) (getf row :generation) (getf row :name) (getf row :coordinates)))
+   (lambda (output)
+     (pg::execute-native-backup-lease-command
+      output (backup-lease-allocation-wire-command
+              (if prepare "BACKUP_LEASE_PREPARE_FOLLOW" "BACKUP_LEASE_CANCEL_FOLLOW") row)))))
+
+(deftest backup-lease-allocation-wire-executes-prepare-retry-and-cancel
+    (call-with-backup-lease-allocation-wire-fixture
+     (lambda (root parent row)
+       (declare (ignore root))
+       (let ((first (backup-lease-allocation-wire-rpc row t)))
+         (ok (pg::physical-follow-request-matches-anchor-p (getf row :coordinates) first))
+         (ok (equal first (backup-lease-allocation-wire-rpc row t)))
+         (ok (equal parent (backup-lease-allocation-wire-rpc row nil)))
+         (ok (eq :canceled (getf (gethash (getf row :name) pg::*physical-backup-lease-allocations*) :state)))
+         (ok (null (gethash (getf row :name) pg::*physical-source-pins*)))
+         (ok (not (probe-file (pg::physical-source-pin-path (getf row :name)))))
+         (ok (intake-fails-p (lambda () (backup-lease-allocation-wire-rpc row t))))
+         (ok (not pg::*wal-poisoned*))))))
+
+(deftest backup-lease-allocation-wire-rechecks-cancellation-before-reply
+    (call-with-backup-lease-allocation-wire-fixture
+     (lambda (root parent row)
+       (declare (ignore root parent))
+       (let ((original (symbol-function 'pg::physical-backup-lease-follow-prepare))
+             (injected 0))
+         (unwind-protect
+              (progn
+                (setf (symbol-function 'pg::physical-backup-lease-follow-prepare)
+                      (lambda (&rest args)
+                        (prog1 (apply original args)
+                          (incf injected)
+                          (apply #'pg::physical-backup-lease-follow-cancel args))))
+                (ok (intake-fails-p (lambda () (backup-lease-allocation-wire-rpc row t))))
+                (ok (= 1 injected))
+                (ok (eq :canceled
+                        (getf (gethash (getf row :name) pg::*physical-backup-lease-allocations*) :state)))
+                (ok (not pg::*wal-poisoned*)))
+           (setf (symbol-function 'pg::physical-backup-lease-follow-prepare) original))))))
+
+(deftest backup-lease-allocation-wire-keeps-selected-handoff-on-cancel
+    (call-with-backup-lease-allocation-wire-fixture
+     (lambda (root parent row)
+       (declare (ignore root))
+       (let* ((anchor (backup-lease-allocation-wire-rpc row t))
+              (successor (list :name (getf row :name) :anchor-digest
+                               (pg::physical-follow-anchor-digest anchor)))
+              (closed (pg::physical-backup-lease-handoff (getf parent :request) successor)))
+         (ok (equal closed (backup-lease-allocation-wire-rpc row nil)))
+         (ok (eq :live (getf (gethash (getf row :name) pg::*physical-backup-lease-allocations*) :state)))
+         (ok (gethash (getf row :name) pg::*physical-source-pins*))
+         (ok (equal anchor (backup-lease-allocation-wire-rpc row t)))))))
+
+(deftest backup-lease-allocation-wire-checks-admission-and-transaction-state
+    (call-with-backup-lease-allocation-wire-fixture
+     (lambda (root parent row)
+       (declare (ignore root parent))
+       (dolist (verb '("BACKUP_LEASE_PREPARE_FOLLOW" "BACKUP_LEASE_CANCEL_FOLLOW"))
+         (let ((command (backup-lease-allocation-wire-command verb row)))
+           (dolist (fault '(:transaction :aborted :standby :unadmitted :database))
+             (let ((pg::*physical-recovery-state* (when (eq fault :standby) (list :phase 2)))
+                   (pg::*wal-sender-registry* (if (eq fault :unadmitted)
+                                                  (make-hash-table :test #'eq) pg::*wal-sender-registry*)))
+               (setf (pg::backend-explicit pg::*backend*) (eq fault :transaction)
+                     (pg::backend-state pg::*backend*) (if (eq fault :aborted) :aborted :idle)
+                     (pg::backend-replication-mode pg::*backend*) (if (eq fault :database) :database :physical))
+               (let ((expected (case fault
+                                 (:transaction "25001") (:aborted "25P02")
+                                 (:standby (when (equal verb "BACKUP_LEASE_PREPARE_FOLLOW") "55000"))
+                                 (otherwise "55000"))))
+                 (ok (equal expected
+                            (handler-case (progn (pg::physical-backup-lease-wire-preflight command) nil)
+                              (pg::pg-error (condition) (pg::pg-error-sqlstate condition))))))))
+           (setf (pg::backend-explicit pg::*backend*) nil
+                 (pg::backend-state pg::*backend*) :idle
+                 (pg::backend-replication-mode pg::*backend*) :physical))))))
+
+(deftest backup-lease-allocation-wire-cancel-on-standby-needs-no-old-wal
+    (call-with-backup-lease-allocation-wire-fixture
+     (lambda (root parent row)
+       (declare (ignore root))
+       (backup-lease-allocation-wire-rpc row t)
+       (delete-file (pg::wal-segment-path 0))
+       (let ((pg::*physical-recovery-state* (list :phase 2)))
+         (ok (equal parent (backup-lease-allocation-wire-rpc row nil))))
+       (ok (not (probe-file (pg::physical-source-pin-path (getf row :name)))))
+       (ok (not pg::*wal-poisoned*)))))
+
+(deftest backup-lease-allocation-wire-terminal-unknown-cancel-does-not-create-a-row
+    (call-with-backup-lease-allocation-wire-fixture
+     (lambda (root parent row)
+       (declare (ignore root))
+       (let ((closed (pg::physical-backup-lease-abort (getf parent :request))))
+         (ok (equal closed (backup-lease-allocation-wire-rpc row nil)))
+         (ok (null (gethash (getf row :name) pg::*physical-backup-lease-allocations*)))
+         (ok (not (probe-file (pg::physical-backup-lease-allocation-path row))))))))
+
+(deftest backup-lease-allocation-client-rejects-changed-result-identities
+    (call-with-backup-lease-allocation-wire-fixture
+     (lambda (root parent intent)
+       (declare (ignore root))
+       (let* ((request (getf intent :request))
+              (name (getf intent :name))
+              (coordinates (getf intent :coordinates))
+              (pin (backup-lease-allocation-call #'pg::physical-backup-lease-follow-prepare intent))
+              (prepared (pg::physical-backup-lease-follow-prepare-snapshot intent pin))
+              (canceled (append (pg::physical-backup-lease-result-row request parent) (list "1" name))))
+         (dolist (prepare '(nil t))
+           (let ((schema (if prepare
+                             (append '(("lease_name" 25) ("allocation_generation" 20))
+                                     (physical-client-test-prepare-schema))
+                             (append pg::*physical-backup-lease-result-schema*
+                                     '(("allocation_generation" 20) ("allocation_name" 25)))))
+                 (tag (if prepare "BACKUP_LEASE_PREPARE_FOLLOW" "BACKUP_LEASE_CANCEL_FOLLOW")))
+             (dolist (mutation (if prepare
+                                   '((0 "other_lease") (1 "2") (1 "-1") (2 "other_pin") (3 "0")
+                                     (4 "3") (9 "0/00000099") (10 "0") (13 "bad history") (14 "2"))
+                                   '((0 "other_lease") (1 "unknown") (8 "2") (8 "-1") (9 "other_pin"))))
+               (let ((row (copy-list (if prepare prepared canceled))))
+                 (setf (nth (first mutation) row) (second mutation))
+                 (call-with-physical-client-wire
+                  (lambda (client request-file)
+                    (declare (ignore request-file))
+                    (ok (physical-client-test-protocol-error-p
+                         (lambda ()
+                           (funcall (if prepare #'pg::pg-client-native-backup-lease-follow-prepare
+                                        #'pg::pg-client-native-backup-lease-follow-cancel)
+                                    client request 1 name coordinates)))))
+                  (lambda (output) (physical-client-test-result output schema (list row) tag)))))))))))
+
+(deftest backup-lease-allocation-wire-retained-proof-kind-roundtrip
+    (let* ((intent (backup-lease-allocation-test-record))
+           (coordinates (getf intent :coordinates)))
+      (setf (getf coordinates :source-timeline) 3
+            (getf coordinates :kind) :retained-timeline)
+      (dolist (verb '("BACKUP_LEASE_PREPARE_FOLLOW" "BACKUP_LEASE_CANCEL_FOLLOW"))
+        (let ((command (backup-lease-allocation-wire-command verb intent)))
+          (ok (equal (pg::physical-backup-lease-allocation-copy intent)
+                     (pg::physical-backup-lease-command-allocation command)))))))
+
+(deftest backup-lease-allocation-client-freezes-inputs-before-io
+    (dolist (prepare '(nil t))
+      (dolist (fault (if prepare '(:name :request :coordinates) '(:name :request)))
+        (call-with-backup-lease-allocation-wire-fixture
+         (lambda (root parent intent)
+           (declare (ignore root))
+           (let* ((before (pg::physical-backup-lease-allocation-copy intent))
+                  (request (getf intent :request))
+                  (name (getf intent :name))
+                  (coordinates (getf intent :coordinates))
+                  (pin (backup-lease-allocation-call #'pg::physical-backup-lease-follow-prepare intent))
+                  (response (if prepare
+                                (pg::physical-backup-lease-follow-prepare-snapshot intent pin)
+                                (append (pg::physical-backup-lease-result-row request parent) (list "1" name))))
+                  (changed-lease (copy-seq (getf request :name)))
+                  (original (symbol-function 'pg::physical-client-query))
+                  (injected 0))
+             (setf (char changed-lease (1- (length changed-lease))) #\e)
+             (call-with-physical-client-wire
+              (lambda (client request-file)
+                (unwind-protect
+                     (progn
+                       (setf (symbol-function 'pg::physical-client-query)
+                             (lambda (actual query schema tag &key (maximum 4096) command-only)
+                               (incf injected)
+                               (ecase fault
+                                 (:name (setf (char name 0) #\z))
+                                 (:request (setf (getf request :name) changed-lease))
+                                 (:coordinates (incf (getf coordinates :receive-digest))))
+                               (funcall original actual query schema tag
+                                        :maximum maximum :command-only command-only)))
+                       (ok (physical-client-test-protocol-error-p
+                            (lambda ()
+                              (funcall (if prepare #'pg::pg-client-native-backup-lease-follow-prepare
+                                           #'pg::pg-client-native-backup-lease-follow-cancel)
+                                       client request 1 name coordinates)))))
+                  (setf (symbol-function 'pg::physical-client-query) original))
+                (ok (= 1 injected))
+                (with-open-file (in request-file :element-type '(unsigned-byte 8))
+                  (multiple-value-bind (kind payload) (pg::pg-client-frame in)
+                    (ok (eql #\Q kind))
+                    (ok (equal before
+                               (pg::physical-backup-lease-command-allocation
+                                (pg::parse-replication-command (pg::pg-client-cstring payload 0))))))))
+              (lambda (output)
+                (let ((row (copy-list response)))
+                  (ecase fault
+                    (:name (setf (nth (if prepare 2 9) row) "zllocated_follow"))
+                    (:request (setf (first row) changed-lease))
+                    (:coordinates (setf (nth 10 row) (format nil "~d" (1+ (getf coordinates :receive-digest))))))
+                  (physical-client-test-result
+                   output (if prepare (append '(("lease_name" 25) ("allocation_generation" 20))
+                                              (physical-client-test-prepare-schema))
+                              (append pg::*physical-backup-lease-result-schema*
+                                      '(("allocation_generation" 20) ("allocation_name" 25))))
+                   (list row) (if prepare "BACKUP_LEASE_PREPARE_FOLLOW" "BACKUP_LEASE_CANCEL_FOLLOW")))))))))))
+
+(deftest backup-lease-allocation-wire-settles-selected-closing-on-cancel
+    (call-with-backup-lease-allocation-wire-fixture
+     (lambda (root parent row)
+       (declare (ignore root))
+       (let* ((anchor (backup-lease-allocation-wire-rpc row t))
+              (closing (copy-tree parent))
+              (name (getf row :name)))
+         (setf (getf closing :phase) :closing
+               (getf closing :outcome) :handed-off
+               (getf closing :successor)
+               (list :name name :anchor-digest (pg::physical-follow-anchor-digest anchor)))
+         (pg::physical-backup-lease-publish parent closing)
+         (ok (equal anchor (backup-lease-allocation-wire-rpc row t)))
+         (let ((result (backup-lease-allocation-wire-rpc row nil)))
+           (ok (eq :closed (getf result :phase)))
+           (ok (eq :handed-off (getf result :outcome)))
+           (ok (equal (getf closing :successor) (getf result :successor))))
+         (ok (eq :live (getf (gethash name pg::*physical-backup-lease-allocations*) :state)))
+         (ok (gethash name pg::*physical-source-pins*))
+         (ok (not pg::*wal-poisoned*))))))
+
+(deftest backup-lease-allocation-wire-snapshot-requires-the-exact-returned-pin
+    (call-with-backup-lease-allocation-wire-fixture
+     (lambda (root parent row)
+       (declare (ignore root parent))
+       (let* ((pin (backup-lease-allocation-call #'pg::physical-backup-lease-follow-prepare row))
+              (other (copy-structure pin)))
+         (ok (intake-fails-p
+              (lambda () (pg::physical-backup-lease-follow-prepare-snapshot row other))))
+         (ok (not pg::*wal-poisoned*))
+         (ok (pg::physical-backup-lease-follow-prepare-snapshot row pin))))))
+
+(deftest backup-lease-allocation-wire-rejects-foreign-credentials-and-rebound-intents
+    (call-with-backup-lease-allocation-wire-fixture
+     (lambda (root parent row)
+       (declare (ignore root parent))
+       (backup-lease-allocation-wire-rpc row t)
+       (let* ((name (getf row :name))
+              (pin (gethash name pg::*physical-source-pins*))
+              (before (lineage-test-bytes (pg::physical-backup-lease-allocation-path row))))
+         (dolist (verb '("BACKUP_LEASE_PREPARE_FOLLOW" "BACKUP_LEASE_CANCEL_FOLLOW"))
+           (dolist (fault '(:token :generation :coordinates))
+             (let ((bad (pg::physical-backup-lease-allocation-copy row)))
+               (ecase fault
+                 (:token (setf (char (getf (getf bad :request) :token) 0) #\b))
+                 (:generation (incf (getf bad :generation)))
+                 (:coordinates (incf (getf (getf bad :coordinates) :manifest-digest))))
+               (let ((condition
+                       (handler-case
+                           (with-open-file (out (merge-pathnames "rejected-wire" pg::*pgdata*)
+                                                :direction :output :if-exists :supersede
+                                                :element-type '(unsigned-byte 8))
+                             (pg::execute-native-backup-lease-command
+                              out (backup-lease-allocation-wire-command verb bad))
+                             nil)
+                         (pg::pg-error (condition) condition))))
+                 (ok condition)
+                 (ok (equal "55000" (pg::pg-error-sqlstate condition)))
+                 (ok (not (search (getf (getf bad :request) :token) (princ-to-string condition)))))
+               (ok (equalp before (lineage-test-bytes (pg::physical-backup-lease-allocation-path row)))))
+             (ok (eq pin (gethash name pg::*physical-source-pins*)))
+             (ok (not pg::*wal-poisoned*))))))))

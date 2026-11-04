@@ -301,32 +301,26 @@ Both commands carry proof_kind retained_timeline for the explicit retained kind.
   (loop for position from 0 below (length text) by 2
         collect (parse-integer text :start position :end (+ position 2) :radix 16)))
 
-(defun pg-client-native-prepare (client slot coordinates)
-  "Prepare and return a checked source anchor for the supplied coordinates.
-Same-timeline replies require SQL NULL in the three descendant-only fields;
-descendant replies validate the next timeline, fork and end-of-recovery record.
-Explicit retained replies require next timeline and fork, with SQL NULL for EOR.
-The caller must independently verify source identity and local durable witnesses.
-This helper does not install history, redo WAL, update recovery state or admit a receiver.
-The caller owns network deadlines, cancellation and client cleanup; it must not
-perform network I/O under recovery quiescence."
-  (let* ((slot (copy-seq slot))
-         (coordinates (physical-follow-request-copy coordinates))
+(defun physical-follow-prepare-schema (coordinates)
+  (let* ((kind (physical-follow-request-kind coordinates))
+         (same (eq :same-timeline kind))
+         (retained (eq :retained-timeline kind)))
+    (append (list (list "slot_name" +textoid+))
+            (loop for (name key kind) in *physical-follow-wire-fields*
+                  collect (list name (if (eq kind :timeline) +int8oid+ +textoid+)))
+            (list (list "history" +textoid+))
+            (loop for (name oid) in (list (list "next_tli" +int8oid+)
+                                          (list "next_tli_startpos" +textoid+)
+                                          (list "eor_hex" +textoid+))
+                  collect (if (or same (and retained (equal name "eor_hex")))
+                              (list name oid :nullable) (list name oid))))))
+
+(defun pg-client-native-prepare-anchor (row slot coordinates)
+  (let* ((coordinates (physical-follow-request-copy coordinates))
+         (row (physical-client-check-row row (physical-follow-prepare-schema coordinates)))
          (kind (physical-follow-request-kind coordinates))
          (same (eq :same-timeline kind))
          (retained (eq :retained-timeline kind))
-         (schema (append (list (list "slot_name" +textoid+))
-                         (loop for (name key kind) in *physical-follow-wire-fields*
-                               collect (list name (if (eq kind :timeline) +int8oid+ +textoid+)))
-                         (list (list "history" +textoid+))
-                         (loop for (name oid) in (list (list "next_tli" +int8oid+)
-                                                       (list "next_tli_startpos" +textoid+)
-                                                       (list "eor_hex" +textoid+))
-                               collect (if (or same (and retained (equal name "eor_hex")))
-                                           (list name oid :nullable) (list name oid)))))
-         (row (physical-client-query client (pg-client-native-prepare-query slot coordinates)
-                                     schema "PREPARE_FOLLOW"
-                                     :maximum +physical-client-proof-frame-maximum+))
          (anchor (append (copy-tree coordinates) (list :history-text (aref row 11))
                          (cond (same (list :kind :same-timeline))
                                (retained nil)
@@ -356,6 +350,22 @@ perform network I/O under recovery quiescence."
       (pg-client-error (condition) (error condition))
       (error () (pg-client-native-reject "native preparation returned an invalid source anchor")))
     (physical-follow-anchor-copy anchor)))
+
+(defun pg-client-native-prepare (client slot coordinates)
+  "Prepare and return a checked source anchor for the supplied coordinates.
+Same-timeline replies require SQL NULL in the three descendant-only fields;
+descendant replies validate the next timeline, fork and end-of-recovery record.
+Explicit retained replies require next timeline and fork, with SQL NULL for EOR.
+The caller must independently verify source identity and local durable witnesses.
+This helper does not install history, redo WAL, update recovery state or admit a receiver.
+The caller owns network deadlines, cancellation and client cleanup; it must not
+perform network I/O under recovery quiescence."
+  (let* ((slot (copy-seq slot))
+         (coordinates (physical-follow-request-copy coordinates))
+         (row (physical-client-query client (pg-client-native-prepare-query slot coordinates)
+                                     (physical-follow-prepare-schema coordinates) "PREPARE_FOLLOW"
+                                     :maximum +physical-client-proof-frame-maximum+)))
+    (pg-client-native-prepare-anchor row slot coordinates)))
 
 (defun pg-client-native-release (client slot expected-digest)
   "Request checked release of SLOT using its canonical anchor digest.

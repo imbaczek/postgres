@@ -21,30 +21,57 @@
              (when (char= character #\') (write-char character output)))
     (write-char #\' output)))
 
+(defun pg-client-native-backup-lease-options (request)
+  (let ((request (physical-backup-lease-request-copy request)))
+    (list (cons "native_format" +physical-native-format+)
+          (cons "lease_name" (getf request :name))
+          (cons "lease_token" (getf request :token))
+          (cons "cluster_identity" (getf request :cluster-identity))
+          (cons "system_id" (format nil "~d" (getf request :system-id)))
+          (cons "source_timeline" (format nil "~d" (getf request :timeline))))))
+
+(defun pg-client-native-backup-lease-option-query (verb options)
+  (with-output-to-string (output)
+    (format output "~a (" verb)
+    (loop for (name . value) in options for first-p = t then nil
+          do (unless first-p (write-string ", " output))
+             (format output "~a ~a" name (pg-client-native-backup-lease-literal value)))
+    (write-char #\) output)))
+
+(defun pg-client-native-backup-lease-follow-query (verb request generation name coordinates)
+  (unless (member verb '("BACKUP_LEASE_PREPARE_FOLLOW" "BACKUP_LEASE_CANCEL_FOLLOW") :test #'equal)
+    (error "invalid native backup lease allocation command"))
+  (let* ((row (physical-backup-lease-follow-intent request generation name coordinates :live))
+         (request (getf row :request))
+         (coordinates (getf row :coordinates)))
+    (pg-client-native-backup-lease-option-query
+     verb
+     (append
+      (pg-client-native-backup-lease-options request)
+      (list (cons "allocation_generation" (format nil "~d" (getf row :generation)))
+            (cons "allocation_name" (getf row :name)))
+      (loop for (field key kind) in *physical-follow-wire-fields*
+            for value = (getf coordinates key)
+            collect (cons (concatenate 'string "follow_" field)
+                          (if (eq kind :lsn) (wal-format-lsn value) (format nil "~d" value))))
+      (when (eq :retained-timeline (physical-follow-request-kind coordinates))
+        (list (cons "follow_proof_kind" "retained_timeline")))))))
+
 (defun pg-client-native-backup-lease-query (verb request &optional successor)
-  (unless (assoc verb *physical-backup-lease-wire-verbs* :test #'equal)
+  (unless (member verb '("CAPTURE_BACKUP_NATIVE" "BACKUP_LEASE_STATUS" "BACKUP_LEASE_ABORT"
+                         "BACKUP_LEASE_HANDOFF") :test #'equal)
     (error "invalid native backup lease query command"))
   (let* ((request (physical-backup-lease-request-copy request))
          (successor (if (equal verb "BACKUP_LEASE_HANDOFF")
                         (physical-backup-lease-successor-copy successor request)
-                        (when successor (error "unexpected backup lease successor"))))
-         (options (append
-                   (list (cons "native_format" +physical-native-format+)
-                         (cons "lease_name" (getf request :name))
-                         (cons "lease_token" (getf request :token))
-                         (cons "cluster_identity" (getf request :cluster-identity))
-                         (cons "system_id" (format nil "~d" (getf request :system-id)))
-                         (cons "source_timeline" (format nil "~d" (getf request :timeline))))
-                   (when successor
-                     (list (cons "successor_name" (getf successor :name))
-                           (cons "successor_anchor_digest"
-                                 (format nil "~d" (getf successor :anchor-digest))))))))
-    (with-output-to-string (output)
-      (format output "~a (" verb)
-      (loop for (name . value) in options for first-p = t then nil
-            do (unless first-p (write-string ", " output))
-               (format output "~a ~a" name (pg-client-native-backup-lease-literal value)))
-      (write-char #\) output))))
+                        (when successor (error "unexpected backup lease successor")))))
+    (pg-client-native-backup-lease-option-query
+     verb
+     (append (pg-client-native-backup-lease-options request)
+             (when successor
+               (list (cons "successor_name" (getf successor :name))
+                     (cons "successor_anchor_digest"
+                           (format nil "~d" (getf successor :anchor-digest)))))))))
 
 ;; Validate the typed row and its owner.  UNKNOWN returns NIL; base and
 ;; successor fields must each be entirely present or entirely null.
@@ -81,6 +108,39 @@
                               (list :name (aref row 6) :anchor-digest (pg-client-native-u64 (aref row 7)))))))
       (pg-client-error (condition) (error condition))
       (error () (pg-client-native-reject "native backup lease result has inconsistent state")))))
+
+(defun pg-client-native-backup-lease-follow-prepare (client request generation name coordinates)
+  (let* ((intent (physical-backup-lease-follow-intent request generation name coordinates :live))
+         (request (getf intent :request))
+         (generation (getf intent :generation))
+         (name (getf intent :name))
+         (coordinates (getf intent :coordinates))
+         (row (physical-client-query
+               client (pg-client-native-backup-lease-follow-query
+                       "BACKUP_LEASE_PREPARE_FOLLOW" request generation name coordinates)
+               (physical-backup-lease-follow-prepare-schema coordinates) "BACKUP_LEASE_PREPARE_FOLLOW"
+               :maximum +physical-client-proof-frame-maximum+)))
+    (unless (and (equal (getf request :name) (aref row 0))
+                 (= generation (pg-client-native-u64 (aref row 1))))
+      (pg-client-native-reject "native allocation preparation returned a different owner"))
+    (pg-client-native-prepare-anchor (subseq row 2) name coordinates)))
+
+(defun pg-client-native-backup-lease-follow-cancel (client request generation name coordinates)
+  (let* ((intent (physical-backup-lease-follow-intent request generation name coordinates :live))
+         (request (getf intent :request))
+         (generation (getf intent :generation))
+         (name (getf intent :name))
+         (coordinates (getf intent :coordinates))
+         (row (physical-client-query
+               client (pg-client-native-backup-lease-follow-query
+                       "BACKUP_LEASE_CANCEL_FOLLOW" request generation name coordinates)
+               *physical-backup-lease-follow-cancel-schema* "BACKUP_LEASE_CANCEL_FOLLOW"
+               :maximum 4096))
+         (parent (pg-client-native-backup-lease-record (subseq row 0 8) request)))
+    (unless (and parent (= generation (pg-client-native-u64 (aref row 8)))
+                 (equal name (aref row 9)))
+      (pg-client-native-reject "native allocation cancellation returned a different owner"))
+    parent))
 
 ;; Copy the request and successor before I/O so the reply is checked against
 ;; the same identity sent in the query. HANDOFF accepts only CLOSED with the

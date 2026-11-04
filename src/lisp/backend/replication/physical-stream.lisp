@@ -104,17 +104,17 @@ Missing, duplicate or unknown options fail before a sender is acquired."
   "Ordered receiver option names, anchor keys and wire value kinds for preparation.
 The same order defines the receiver fields in the result row.")
 
-(defun physical-follow-prepare-request (command)
+(defun physical-follow-prepare-request (command &optional (prefix ""))
   "Decode receiver coordinates and check their wire types.
 Only explicit proof_kind retained_timeline selects the retained proof."
-  (let ((proof (physical-stream-option command "proof_kind")))
+  (let ((proof (physical-stream-option command (concatenate 'string prefix "proof_kind"))))
     (when (and proof (not (equal proof "retained_timeline")))
       (ereport "22023" "invalid native physical proof kind"))
     (physical-follow-request-copy
      (append (list :version 1)
              (when proof (list :kind :retained-timeline))
              (loop for (name key kind) in *physical-follow-wire-fields*
-                   for text = (physical-stream-option command name)
+                   for text = (physical-stream-option command (concatenate 'string prefix name))
                    for value = (if (eq kind :lsn) (parse-replication-lsn text)
                                    (physical-stream-u64 text))
                    do (when (and (eq kind :timeline)
@@ -336,6 +336,14 @@ Retained anchors return next timeline and fork, but no child EOR."
                       (when (eq :descendant (physical-follow-anchor-kind anchor))
                         (format nil "~(~{~2,'0X~}~)" (getf anchor :eor-octets)))))))))
 
+(defun physical-follow-prepare-anchor-row (name anchor)
+  (append
+   (list (copy-seq name))
+   (loop for (field key kind) in *physical-follow-wire-fields*
+         for value = (getf anchor key)
+         collect (if (eq kind :lsn) (wal-format-lsn value) (format nil "~d" value)))
+   (physical-follow-prepare-result-tail anchor)))
+
 (defun physical-follow-prepare-row (command)
   "Prepare and recheck a live ready pin, then copy its source-owned result.
 WAL input validation errors report 55000; preserve PostgreSQL errors and report
@@ -349,14 +357,8 @@ other preparation failures as XX000."
             (physical-follow-pin-check-live pin)
             (unless (physical-follow-pin-ready-p pin)
               (wal-invalid-input "physical follow pin is not ready"))
-            (let ((anchor (physical-follow-anchor-copy (physical-follow-pin-anchor pin))))
-              (append
-               (list (copy-seq (physical-source-pin-name pin)))
-               (loop for (name key kind) in *physical-follow-wire-fields*
-                     for value = (getf anchor key)
-                     collect (if (eq kind :lsn) (wal-format-lsn value)
-                                 (format nil "~d" value)))
-               (physical-follow-prepare-result-tail anchor))))))
+            (physical-follow-prepare-anchor-row
+             (physical-source-pin-name pin) (physical-follow-anchor-copy (physical-follow-pin-anchor pin))))))
     (wal-input-validation-error (condition) (ereport "55000" "~a" condition))
     (pg-error (condition) (error condition))
     (error (condition) (ereport "XX000" "physical follow preparation failed: ~a" condition))))
