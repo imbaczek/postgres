@@ -230,6 +230,10 @@ For a retained-timeline pin that endpoint is the requested fork."
         (physical-source-pin-check-bootstrap-fields pin)
         pin))))
 
+;; Decode a bounded pin image and check its pathname and local system identity.
+;; Stabilize the file when requested.  This does not check WAL or authorize
+;; cleanup; the caller must apply the appropriate policy.
+
 (defun physical-source-pin-read-raw (path &key stabilize)
   (let* ((bytes (read-bounded-regular-file path (physical-follow-pin-image-limit)
                                            :stabilize stabilize))
