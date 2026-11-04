@@ -146,45 +146,28 @@
                        (equal identity (list (getf request :system-id) (getf request :timeline)
                                              (getf base :base) (getf base :manifest-digest))))))
 
-;; Decode and match ownership before deciding whether WAL must be checked.
-;; An already lost pin needs no old WAL.  Standby, CLOSING, and a changed
-;; timeline mark a pin lost for the caller to persist before publishing it.
-(defun physical-backup-lease-startup-pin (path &optional standby)
-  (physical-backup-lease-require-locks)
-  (let* ((name (pathname-name path))
-         (record (physical-backup-lease-record-under-lock name)))
-    (unless record (return-from physical-backup-lease-startup-pin (values nil nil)))
-    (physical-backup-lease-pin-directory-stat)
-    (let ((pin (physical-source-bootstrap-pin-decode
-                path (read-bounded-regular-file path (physical-follow-pin-image-limit) :stabilize t))))
-      (when (eq :closed (getf record :phase))
-        (error "closed backup lease still has a source pin"))
-      (physical-backup-lease-check-pin-record pin record)
-      (cond
-        ((physical-source-pin-lost-p pin) (values pin nil))
-        ((or standby (eq :closing (getf record :phase))
-             (/= (physical-source-pin-timeline pin) *wal-insert-timeline*))
-         (setf (physical-source-pin-lost-p pin) t)
-         (values pin t))
-        (t (physical-source-pin-check-wal pin) (values pin nil))))))
+
+(defun physical-backup-lease-successor-pin-identity-p (record pin)
+  (let* ((request (getf record :request))
+         (base (getf record :base))
+         (successor (getf record :successor))
+         (anchor (and (physical-follow-pin-p pin) (physical-follow-pin-anchor pin))))
+    (and base successor anchor (physical-follow-pin-ready-p pin)
+         (equal (getf successor :name) (physical-source-pin-name pin))
+         (= (getf successor :anchor-digest) (physical-follow-anchor-digest anchor))
+         (= (getf request :system-id) (getf anchor :system-id))
+         (= (getf request :timeline) (getf anchor :base-timeline))
+         (= (getf base :base) (getf anchor :base))
+         (= (getf base :manifest-digest) (getf anchor :manifest-digest)))))
 
 ;; Require the exact unused READY follow pin for this backup's original system,
 ;; timeline, base and manifest. Its saved anchor digest and receive position
 ;; bind the successor to the handoff before the old retention can be released.
 (defun physical-backup-lease-check-successor-pin (record pin)
-  (let* ((request (getf record :request))
-         (base (getf record :base))
-         (successor (getf record :successor))
+  (let* ((successor (getf record :successor))
          (anchor (and (physical-follow-pin-p pin) (physical-follow-pin-anchor pin))))
-    (unless (and base successor anchor
-                 (equal (getf successor :name) (physical-source-pin-name pin))
-                 (physical-follow-pin-ready-p pin)
+    (unless (and (physical-backup-lease-successor-pin-identity-p record pin)
                  (not (physical-source-pin-lost-p pin))
-                 (= (getf successor :anchor-digest) (physical-follow-anchor-digest anchor))
-                 (= (getf request :system-id) (getf anchor :system-id))
-                 (= (getf request :timeline) (getf anchor :base-timeline))
-                 (= (getf base :base) (getf anchor :base))
-                 (= (getf base :manifest-digest) (getf anchor :manifest-digest))
                  (eql (physical-source-pin-confirmed-lsn pin) (getf anchor :receive-lsn))
                  (eql (physical-source-pin-restart-lsn pin) (getf anchor :receive-lsn))
                  (null (gethash (getf successor :name) *physical-source-senders*)))
@@ -198,19 +181,3 @@
   (physical-backup-lease-require-locks)
   (physical-backup-lease-successor-records)
   (values))
-
-;; Check the complete candidate inventory before startup publishes pin loss or
-;; replaces retention. A handed-off CLOSING lease still needs its successor.
-
-;; A READY lease without a pin is inconsistent metadata, not ordinary loss.
-(defun physical-backup-lease-check-startup-inventory (candidates)
-  (physical-backup-lease-require-locks)
-  (physical-backup-lease-check-successor-inventory)
-  (maphash (lambda (name record)
-             (when (and (eq :ready (getf record :phase)) (null (gethash name candidates)))
-               (error "ready backup lease has no source pin"))
-             (when (and (eq :closing (getf record :phase))
-                        (eq :handed-off (getf record :outcome)))
-               (physical-backup-lease-check-successor-pin
-                record (gethash (getf (getf record :successor) :name) candidates))))
-           *physical-backup-lease-records*))

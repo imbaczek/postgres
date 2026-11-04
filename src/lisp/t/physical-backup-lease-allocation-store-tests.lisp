@@ -6,6 +6,22 @@
       (begin-publication)
       (pg::physical-backup-lease-allocation-write record))))
 
+(defun backup-lease-allocation-store-test-save-bootstrap (parent)
+  (let* ((request (getf parent :request))
+         (base (getf parent :base))
+         (pin (pg::make-physical-source-pin
+               :name (getf request :name) :system-id (getf request :system-id)
+               :timeline (getf request :timeline) :manifest-digest (getf base :manifest-digest)
+               :restart-lsn (getf base :checkpoint-start) :consistent-lsn (getf base :base))))
+    (pg::with-write-lock
+      (pg::with-wal-publication-fence (begin-publication)
+        (pg::physical-source-pin-check-bootstrap-fields pin)
+        (begin-publication)
+        (pg::physical-source-pin-save pin)
+        (setf (gethash (getf request :name) pg::*physical-source-pins*) pin
+              (gethash pin pg::*wal-snapshot-retention-pins*) (getf base :checkpoint-start))))
+    pin))
+
 (deftest backup-lease-allocation-store-roundtrip-is-private-and-separate
     (call-with-backup-lease-store-fixture
      (lambda (root)
@@ -173,6 +189,7 @@
            (pg::with-wal-publication-fence (begin-publication)
              (begin-publication)
              (pg::physical-backup-lease-write parent)))
+         (backup-lease-allocation-store-test-save-bootstrap parent)
          (backup-lease-allocation-store-test-write record)
          (with-open-file (stream temporary :direction :output :if-exists :error)
            (declare (ignore stream)))
@@ -200,6 +217,7 @@
                    (pg::with-wal-publication-fence (begin-publication)
                      (begin-publication)
                      (pg::physical-backup-lease-write parent)))
+                 (backup-lease-allocation-store-test-save-bootstrap parent)
                  (when (eq state :canceled) (backup-lease-allocation-store-test-write row))
                  (setf (getf row :state) state)
                  (let ((result
@@ -251,6 +269,7 @@
            (pg::with-wal-publication-fence (begin-publication)
              (begin-publication)
              (pg::physical-backup-lease-write parent)))
+         (backup-lease-allocation-store-test-save-bootstrap parent)
          (backup-lease-allocation-store-test-write row)
          (ok (equal row (pg::physical-backup-lease-allocation-read path)))
          (setf (getf row :coordinates) (append '(:kind :bogus) (getf row :coordinates)))

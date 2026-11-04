@@ -74,12 +74,9 @@
        (eq :handed-off (getf parent :outcome))
        (equal (getf row :name) (getf (getf parent :successor) :name))
        (or (null pin)
-           (and (physical-follow-pin-p pin) (physical-follow-pin-ready-p pin)
-                (equal (getf row :name) (physical-source-pin-name pin))
+           (and (physical-backup-lease-successor-pin-identity-p parent pin)
                 (physical-follow-request-matches-anchor-p
-                 (getf row :coordinates) (physical-follow-pin-anchor pin))
-                (= (getf (getf parent :successor) :anchor-digest)
-                   (physical-follow-anchor-digest (physical-follow-pin-anchor pin)))))))
+                 (getf row :coordinates) (physical-follow-pin-anchor pin))))))
 
 (defun physical-backup-lease-allocation-check-prepare (name request &optional anchor-p observation-p)
   (when (physical-backup-lease-allocation-record-under-lock name)

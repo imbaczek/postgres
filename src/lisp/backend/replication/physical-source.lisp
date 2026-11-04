@@ -4,8 +4,7 @@
 (declaim (ftype function physical-backup-lease-check-ordinary-pin
                 physical-backup-lease-check-pin-create
                 physical-backup-lease-check-pin-unlink
-                physical-backup-lease-startup-pin
-                physical-backup-lease-check-startup-inventory))
+                physical-backup-lease-load-startup-pins))
 
 (declaim (ftype function physical-backup-lease-closing-successor))
 
@@ -334,35 +333,7 @@ Publish the in-memory binding only after saving the candidate pin."
 Under write and WAL exclusion, stabilize the inventory and every selected file.
 Validate all candidates before replacing the existing pin registry; on failure
 leave that registry intact."
-  (with-write-lock
-    (with-wal-publication-fence (begin-publication)
-      (let ((candidates (make-hash-table :test #'equal))
-            (invalidated nil))
-        (dolist (path (durable-state-file-paths (physical-source-pin-directory) "pin"))
-          (multiple-value-bind (leased invalidate) (physical-backup-lease-startup-pin path)
-            (let* ((pin (or leased (physical-source-pin-read path :stabilize t)))
-                   (name (physical-source-pin-name pin)))
-              (when (gethash name candidates)
-                (error "duplicate physical source pin ~a" name))
-              (when invalidate (push pin invalidated))
-              (setf (gethash name candidates) pin))))
-        ;; Check disk candidates against handoffs before saving any pin loss.
-        (physical-backup-lease-check-startup-inventory candidates)
-        (when invalidated
-          (begin-publication)
-          (dolist (pin invalidated) (physical-source-pin-save pin)))
-        (maphash (lambda (name pin)
-                   (declare (ignore name))
-                   (remhash pin *wal-snapshot-retention-pins*))
-                 *physical-source-pins*)
-        (maphash (lambda (name pin)
-                   (declare (ignore name))
-                   (unless (physical-source-pin-lost-p pin)
-                     (setf (gethash pin *wal-snapshot-retention-pins*)
-                           (physical-source-pin-restart-lsn pin))))
-                 candidates)
-        (setf *physical-source-pins* candidates))))
-  (values))
+  (physical-backup-lease-load-startup-pins))
 
 (defun physical-source-confirm-receipt-under-lock (name owner lsn digest)
   "Save a validated private receipt before publishing its new retention floor."
@@ -426,7 +397,8 @@ restart must resolve an ambiguous deletion before recycling."
       (fsync-directory (physical-source-pin-directory))
       (physical-source-pin-test-point :after-release-directory-fsync pin))
     (remhash pin *wal-snapshot-retention-pins*)
-    (remhash name *physical-source-pins*)))
+    (prog1 (remhash name *physical-source-pins*)
+      (physical-source-pin-test-point :after-release-memory pin))))
 
 (defun physical-source-pin-release (name)
   "Durably remove a source pin before allowing checkpoint WAL recycling.

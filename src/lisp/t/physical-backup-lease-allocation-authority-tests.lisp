@@ -190,6 +190,20 @@
               (gethash pin pg::*wal-snapshot-retention-pins*) cursor)))
     pin))
 
+(defun backup-lease-allocation-parent-abort-stage-closed-debt (parent)
+  (let ((closing (pg::physical-backup-lease-copy parent)))
+    (setf (getf closing :phase) :closing (getf closing :outcome) :aborted
+          closing (backup-lease-startup-inject-closing parent closing))
+    (pg::with-write-lock
+      (pg::with-wal-publication-fence (begin-publication)
+        (let* ((request (getf closing :request))
+               (pin (pg::physical-backup-lease-closing-pin closing)))
+          (begin-publication)
+          (pg::physical-source-pin-unlink pin request))))
+    (let ((closed (pg::physical-backup-lease-copy closing)))
+      (setf (getf closed :phase) :closed)
+      (pg::physical-backup-lease-publish closing closed))))
+
 (deftest backup-lease-allocation-publication-waits-for-predecessor-pin-cleanup
     (call-with-backup-lease-allocation-authority-fixture
      (lambda (root parent row)
@@ -270,7 +284,7 @@
      (lambda (root parent row)
        (declare (ignore root))
        (pg::physical-backup-lease-allocation-publish nil row)
-       (let* ((closed (pg::physical-backup-lease-abort (getf parent :request)))
+       (let* ((closed (backup-lease-allocation-parent-abort-stage-closed-debt parent))
               (canceled (pg::physical-backup-lease-allocation-copy row))
               (next (pg::physical-backup-lease-allocation-copy row)))
          (ok (eq :aborted (getf closed :outcome)))

@@ -21,51 +21,7 @@
 ;; first, then durably mark newly lost pins before installing the candidates.
 ;; The publication fence covers disk and memory changes, including failures.
 (defun physical-backup-lease-load-standby-pins ()
-  (unless (recovery-in-progress-p)
-    (error "backup lease standby pin load requires recovery"))
-  (with-write-lock
-    (with-wal-publication-fence (begin-publication)
-      (physical-backup-lease-pin-directory-stat)
-      ;; Check closing handoffs, including disk-only successors, before any
-      ;; standby loss is saved or the registered pins are replaced.
-      (physical-backup-lease-check-successor-inventory)
-      (maphash (lambda (name record)
-                 (declare (ignore name))
-                 (when (and (eq :closing (getf record :phase))
-                            (eq :handed-off (getf record :outcome)))
-                   (physical-backup-lease-closing-pin record)))
-               *physical-backup-lease-records*)
-      (let ((candidates nil) (invalidated nil))
-        (maphash
-         (lambda (name record)
-           (let ((path (physical-source-pin-path name))
-                 (old (gethash name *physical-source-pins*)))
-             (when old
-               (when (eq :closed (getf record :phase))
-                 (error "closed backup lease still has a registered source pin"))
-               (physical-backup-lease-check-pin-record old record))
-             (if (physical-backup-lease-lstat path)
-                 (multiple-value-bind (pin invalidate) (physical-backup-lease-startup-pin path t)
-                   (unless pin (error "backup lease lost its indexed pin owner"))
-                   (when invalidate (push pin invalidated))
-                   (push pin candidates))
-                 (when (eq :ready (getf record :phase))
-                   (error "ready backup lease has no source pin")))))
-         *physical-backup-lease-records*)
-        (when invalidated
-          (begin-publication)
-          (dolist (pin invalidated) (physical-source-pin-save pin)))
-        (when (plusp (hash-table-count *physical-backup-lease-records*))
-          (begin-publication))
-        (maphash (lambda (name record)
-                   (declare (ignore record))
-                   (let ((old (gethash name *physical-source-pins*)))
-                     (when old (remhash old *wal-snapshot-retention-pins*)))
-                   (remhash name *physical-source-pins*))
-                 *physical-backup-lease-records*)
-        (dolist (pin candidates)
-          (setf (gethash (physical-source-pin-name pin) *physical-source-pins*) pin)))))
-  (values))
+  (physical-backup-lease-load-startup-pins t))
 
 ;; Validate the closing intent and its successor before finding the bootstrap
 ;; pin to remove. The successor may be present only on disk during startup.
@@ -87,6 +43,11 @@
       (when pin (physical-backup-lease-check-pin-unlink pin request))
       pin)))
 
+(declaim (ftype function physical-backup-lease-finish-aborted-allocations-under-lock
+                physical-backup-lease-allocation-abort-cleanup-plan
+                physical-backup-lease-allocation-canceled-cleanup-plan
+                physical-backup-lease-finish-canceled-allocations-under-lock))
+
 ;; Complete an existing closing intent without requiring the old WAL.  Remove
 ;; and sync the pin first, then publish CLOSED.  A restart can repeat this after
 ;; a failure at either step.  The caller holds both locks and supplies the
@@ -96,6 +57,8 @@
          (name (getf request :name)))
     (when (gethash name *physical-backup-lease-capture-owners*)
       (wal-invalid-input "backup lease still has an active capture owner"))
+    (when (eq :aborted (getf record :outcome))
+      (physical-backup-lease-finish-aborted-allocations-under-lock record begin-publication))
     (when (eq :closed (getf record :phase))
       (when (or (gethash name *physical-source-pins*)
                 (physical-backup-lease-lstat (physical-source-pin-path name)))
@@ -218,11 +181,17 @@
     (physical-backup-lease-current-record request)
     (case (getf record :phase)
       (:ready (physical-backup-lease-ready-action record))
-      (:closing (physical-backup-lease-closing-pin record) :close)
+      (:closing
+       (if (eq :aborted (getf record :outcome))
+           (physical-backup-lease-allocation-abort-cleanup-plan record)
+           (physical-backup-lease-closing-pin record))
+       :close)
       (:closed
        (when (or (gethash name *physical-source-pins*)
                  (physical-backup-lease-lstat (physical-source-pin-path name)))
-         (error "closed backup lease still has a source pin")))
+         (error "closed backup lease still has a source pin"))
+       (when (eq :aborted (getf record :outcome))
+         (when (physical-backup-lease-allocation-abort-cleanup-plan record) :close)))
       (:interrupted
        (physical-backup-lease-pin-directory-stat)
        (multiple-value-bind (pin disk) (physical-source-retirement-pins name)
@@ -244,10 +213,15 @@
                            #'string< :key (lambda (record) (getf (getf record :request) :name)))))
         (dolist (record records)
           (let ((action (physical-backup-lease-startup-action record)))
+            (unless (eq :aborted (getf record :outcome))
+              (when (physical-backup-lease-allocation-canceled-cleanup-plan record)
+                (push (list :cleanup record) actions)))
             (when action (push (list action record) actions))))
         (dolist (item (nreverse actions))
           (destructuring-bind (action record) item
             (ecase action
+              (:cleanup
+               (physical-backup-lease-finish-canceled-allocations-under-lock record #'begin-publication))
               (:interrupt
                (let ((next (copy-list record)))
                  (setf (getf next :phase) :interrupted)

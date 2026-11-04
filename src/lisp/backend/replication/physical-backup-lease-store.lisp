@@ -248,53 +248,10 @@
       (fsync-directory directory)
       (values (sort records #'string< :key #'namestring) temporaries))))
 
-(declaim (ftype function physical-backup-lease-allocation-load-candidates
-                physical-backup-lease-allocation-check-graph
-                physical-backup-lease-allocation-directory
-                physical-backup-lease-allocation-install-records))
+(declaim (ftype function physical-backup-lease-load-records-with-pin-preflight))
 
 ;; Validate the entire inventory before changing disk or memory.  Checked private
 ;; temporary files are discarded and incomplete captures are durably interrupted;
 ;; source pins are preserved.  A failure leaves the new index unpublished.
 (defun physical-backup-lease-load-records ()
-  (with-write-lock
-    (with-wal-publication-fence (begin-publication)
-      (unless (and (zerop (hash-table-count *physical-source-senders*))
-                   (zerop (hash-table-count *physical-backup-lease-capture-owners*)))
-        (wal-invalid-input "cannot reload backup lease records with active source owners"))
-      (multiple-value-bind (paths temporaries) (physical-backup-lease-inventory)
-        (let ((candidates (make-hash-table :test #'equal))
-              (interrupted nil))
-          (dolist (path paths)
-            (let* ((record (physical-backup-lease-read path :stabilize t))
-                   (request (getf record :request))
-                   (name (getf request :name)))
-              (physical-backup-lease-check-source request)
-              (when (gethash name candidates) (error "duplicate backup lease request"))
-              (setf (gethash name candidates) record)))
-          ;; Check the original parent and allocation graph before constructing
-          ;; interrupted parents. Check again before cleanup or record rewrites.
-          (multiple-value-bind (allocations allocation-temporaries)
-              (physical-backup-lease-allocation-load-candidates candidates)
-            (maphash
-             (lambda (name record)
-               (when (member (getf record :phase) '(:requested :capturing))
-                 (let ((next (copy-list record)))
-                   (setf (getf next :phase) :interrupted
-                         next (physical-backup-lease-transition record next))
-                   (push next interrupted)
-                   (setf (gethash name candidates) next))))
-             candidates)
-            (physical-backup-lease-allocation-check-graph candidates allocations)
-            (begin-publication)
-            (when (or interrupted temporaries)
-              (dolist (path temporaries) (sb-posix:unlink (namestring path)))
-              (dolist (record interrupted) (physical-backup-lease-write record))
-              (fsync-directory (physical-backup-lease-directory)))
-            (when allocation-temporaries
-              (dolist (path allocation-temporaries) (sb-posix:unlink (namestring path)))
-              (fsync-directory (physical-backup-lease-allocation-directory)))
-            (physical-backup-lease-allocation-install-records allocations)
-            (setf *physical-backup-lease-successor-cache* nil
-                  *physical-backup-lease-records* candidates))))))
-  (values))
+  (physical-backup-lease-load-records-with-pin-preflight))
