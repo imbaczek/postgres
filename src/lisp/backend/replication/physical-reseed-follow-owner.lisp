@@ -14,6 +14,14 @@
   ;; An incomplete local mutation requires closing and reopening this owner.
   (uncertain-p nil))
 
+(defgeneric physical-reseed-follow-check-configuration-role (owner record))
+
+(defmethod physical-reseed-follow-check-configuration-role
+    ((owner physical-reseed-follow-owner) record)
+  (when (getf record :configuration)
+    (error "target follow configuration requires dedicated ownership"))
+  record)
+
 (defun physical-reseed-follow-check-idle (owner)
   (unless (physical-reseed-follow-owner-p owner) (error "target follow ownership is required"))
   (physical-directory-check-owner-common owner)
@@ -50,7 +58,7 @@
     (unless (every (lambda (key) (equal (getf binding key) (getf record key)))
                    '(:version :attempt :install :base))
       (error "target follow journal rebound its immutable installed image")))
-  record)
+  (physical-reseed-follow-check-configuration-role owner record))
 
 ;; Bind the original attempt in the install plan, the complete terminal install
 ;; reference and installed base evidence.  The actual attempt may have a new

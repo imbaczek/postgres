@@ -3,6 +3,8 @@
 (defconstant +physical-reseed-follow-maximum-bytes+ (* 64 1024 1024))
 (defconstant +physical-reseed-follow-proof-reserve+ 8192)
 
+(defconstant +physical-reseed-follow-configuration-reserve+ 8192)
+
 ;;; Bounded structural codec for a private target follow record.  The original
 ;;; attempt includes credentials and must not be printed.  This module neither
 ;;; publishes a journal nor grants ownership, performs RPC, or activates follow.
@@ -86,7 +88,7 @@
           do (push (getf row :name) names)
           collect row)))
 
-(defun physical-reseed-follow-copy (record)
+(defun physical-reseed-follow-core-copy (record)
   (physical-reseed-install-check-literal record)
   (physical-follow-check-plist record '(:version :attempt :install :base :generations))
   (let* ((attempt (physical-reseed-attempt-copy (getf record :attempt)))
@@ -100,6 +102,21 @@
               :generations (physical-reseed-follow-generations-copy
                             (getf record :generations) request base control))))))
 
+(defun physical-reseed-follow-core-projection (record)
+  (loop for key in '(:version :attempt :install :base :generations)
+        append (list key (getf record key))))
+
+(defun physical-reseed-follow-copy (record)
+  (physical-reseed-install-check-literal record)
+  (let* ((present (loop for key in record by #'cddr thereis (eq key :configuration)))
+         (keys '(:version :attempt :install :base :generations)))
+    (physical-follow-check-plist record (if present (append keys '(:configuration)) keys))
+    (let ((core (physical-reseed-follow-core-copy (physical-reseed-follow-core-projection record))))
+      (if present
+          (append core (list :configuration (physical-reseed-follow-configuration-copy
+                                             (getf record :configuration) core)))
+          core))))
+
 ;; The original attempt, install reference and base remain immutable.  Append
 ;; only a preparing generation after canceled history, or advance the last
 ;; generation without changing older entries.
@@ -112,6 +129,11 @@
     (unless (every (lambda (key) (equal (getf before key) (getf after key)))
                    '(:version :attempt :install :base))
       (error "target follow journal cannot rebind its predecessors"))
+    (when (or (getf before :configuration) (getf after :configuration))
+      (unless (equal old new) (error "configuration intent freezes its generation history"))
+      (physical-reseed-follow-configuration-check-transition
+       (getf before :configuration) (getf after :configuration)
+       (physical-reseed-follow-core-projection after)))
     (cond
       ((= (length new) (1+ count))
        (unless (and (equal old (butlast new))
@@ -134,8 +156,10 @@
          (bytes (physical-backup-lease-encode-literal
                  "PGRESEEDFOLLOW1" record +physical-reseed-follow-maximum-bytes+))
          (phase (getf (car (last (getf record :generations))) :phase))
-         (reserve (case phase (:preparing +physical-reseed-follow-proof-reserve+)
-                        ((:proved :canceling) 32) (otherwise 0))))
+         (reserve (+ (case phase (:preparing +physical-reseed-follow-proof-reserve+)
+                           ((:proved :canceling) 32) (otherwise 0))
+                     (if (eq :building (getf (getf record :configuration) :phase))
+                         +physical-reseed-follow-configuration-reserve+ 0))))
     (unless (<= (+ (length bytes) reserve) +physical-reseed-follow-maximum-bytes+)
       (error "target follow journal lacks room for proof or cancellation"))
     bytes))
