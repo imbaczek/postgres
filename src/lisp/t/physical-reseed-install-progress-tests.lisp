@@ -81,6 +81,7 @@
      (lambda (root stage incoming quarantine plan)
        (declare (ignore stage quarantine))
        (let ((fired nil)
+             (statuses-at-mutation nil)
              (before (lineage-test-bytes (pg::physical-reseed-install-path root))))
          (call-with-reseed-step-source
           plan
@@ -89,17 +90,20 @@
                     (lambda (point directory)
                       (declare (ignore directory))
                       (when (eq point :before-install-move)
-                        (setf fired t pg::*physical-reseed-install-test-hook* nil)
+                        (setf fired t statuses-at-mutation (getf source :statuses)
+                              pg::*physical-reseed-install-test-hook* nil)
                         (with-open-file (out (merge-pathnames "base/42" incoming)
-                                             :direction :io :element-type '(unsigned-byte 8))
+                                             :direction :io :if-exists :overwrite :element-type '(unsigned-byte 8))
                           (write-byte 23 out))))))
               (pg::call-with-physical-reseed-install-owner
                root
                (lambda (owner)
                  (ok (intake-fails-p
                       (lambda () (pg::physical-reseed-install-advance owner :helper "/unused/helper")))))))
+            (ok (eql statuses-at-mutation (getf source :statuses)))
             (ok (= (getf source :connections) (getf source :closed-count)))))
          (ok fired)
+         (ok (= 23 (aref (lineage-test-bytes (merge-pathnames "base/42" incoming)) 0)))
          (ok (equalp before (lineage-test-bytes (pg::physical-reseed-install-path root))))
          (dolist (row (getf plan :old))
            (ok (sb-posix:lstat (namestring (merge-pathnames (first row) root)))))))))
@@ -118,7 +122,7 @@
                         (unless fired
                           (setf fired t)
                           (with-open-file (out (merge-pathnames "base/42" incoming)
-                                               :direction :io :element-type '(unsigned-byte 8))
+                                               :direction :io :if-exists :overwrite :element-type '(unsigned-byte 8))
                             (write-byte 23 out)))
                         (funcall original fd)))
                 (call-with-reseed-step-source
@@ -133,6 +137,7 @@
                    (ok (= (getf source :connections) (getf source :closed-count))))))
            (setf (symbol-function 'sb-posix:fsync) original))
          (ok fired)
+         (ok (= 23 (aref (lineage-test-bytes (merge-pathnames "base/42" incoming)) 0)))
          (ok (equalp before (lineage-test-bytes (pg::physical-reseed-install-path root))))
          (dolist (row (getf plan :old))
            (ok (sb-posix:lstat (namestring (merge-pathnames (first row) root)))))))))
