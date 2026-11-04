@@ -1,14 +1,17 @@
 (in-package #:pg)
 
 ;;; A narrow, thread-bound owner for checking the installed target and reading
-;;; follow intent.  It does not publish or recover a journal, issue RPCs, or
-;;; activate follow.  The inherited opaque printer protects saved credentials.
+;;; follow intent.  It can publish and recover local intent, but does not issue
+;;; RPCs or activate follow.  The inherited opaque printer protects credentials.
 
 (defstruct (physical-reseed-follow-owner
             (:include physical-reseed-install-owner)
             (:print-function print-physical-reseed-install-owner))
+  ;; Immutable attempt, install reference and base evidence for this owner.
   binding
+  ;; Exclude public reentry during a store operation.
   (busy-p nil)
+  ;; An incomplete mutation requires closing this owner and opening a new one.
   (uncertain-p nil))
 
 (defun physical-reseed-follow-check-idle (owner)
@@ -135,7 +138,7 @@
        (multiple-value-prog1 (funcall function root-fd #'verify)
          (verify))))))
 
-;; Genesis is a detached empty record, not permission to publish or prepare.
+;; Genesis is a detached empty record, not evidence of source preparation.
 ;; Both fixed follow names must be absent before it can be returned.
 
 (defun physical-reseed-follow-initial-record (owner)
@@ -153,7 +156,8 @@
      (physical-reseed-follow-copy (physical-reseed-follow-owner-binding owner)))))
 
 ;; Any temporary follow entry fences ordinary reads, even if its metadata is
-;; acceptable to the owner role.  Reconciliation is a separate future operation.
+;; acceptable to the owner role.  Intent recovery is explicit; structural
+;; historical phases confer no source authority.
 
 (defun physical-reseed-follow-read (owner)
   (physical-reseed-follow-check-idle owner)

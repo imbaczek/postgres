@@ -1,5 +1,9 @@
 (in-package #:pg)
 
+;;; Local follow-intent store checks.  Only empty genesis and PREPARING intent
+;;; can be published or recovered here; later phases require a validated driver.
+;;; A structural read of historical phases does not grant source authority.
+
 (defvar *physical-reseed-follow-write-limit* nil)
 
 (defun physical-reseed-follow-intent-copy (record &optional previous)
@@ -12,6 +16,10 @@
       (physical-reseed-follow-intent-copy previous)
       (physical-reseed-follow-check-transition previous copy))
     copy))
+
+;; Check the immutable owner binding and prove the proposed ancestry and WAL
+;; overlap against the installed base.  This is local evidence, not an RPC or
+;; proof that a source has accepted the intent.
 
 (defun physical-reseed-follow-check-local-intent (owner root-fd record)
   (physical-reseed-follow-check-binding owner record)
@@ -71,6 +79,10 @@
       (error "target follow temporary descriptor changed or lost its name"))
     facts))
 
+;; Block public reentry for the whole operation.  An incomplete mutation leaves
+;; uncertainty latched, so the owner must close and reopen.  Clear it only after
+;; the image's post-check and the outer root scope and final metadata check pass.
+
 (defun call-with-physical-reseed-follow-store (owner function)
   (physical-reseed-follow-check-idle owner)
   (setf (physical-reseed-follow-owner-busy-p owner) t)
@@ -87,6 +99,9 @@
          (setf (physical-reseed-follow-owner-uncertain-p owner) nil)
          result)
     (setf (physical-reseed-follow-owner-busy-p owner) nil)))
+
+;; Pin the exact current attempt and its file facts around the full image and
+;; namespace checks.  Publication also requires the attempt to remain active.
 
 (defun call-with-physical-reseed-follow-store-proof (owner function)
   (call-with-physical-reseed-follow-store

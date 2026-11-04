@@ -1,5 +1,13 @@
 (in-package #:pg)
 
+;;; Publish and recover local intent without interpreting a remote outcome.
+;;; The shared promotion path performs durable file mechanics; it is not a
+;;; substitute for the checks a future source driver must perform.
+
+;; Sync the held temporary, verify canonical readback and the exact predecessor,
+;; rename, sync the root, then read back and recheck the final image.  The caller
+;; retains the descriptor and keeps the owner busy and uncertain throughout.
+
 (defun physical-reseed-follow-promote-intent (owner root-fd fd fixed candidate previous check)
   (declare (notinline sb-posix:fsync))
   (unless (and (physical-reseed-follow-owner-busy-p owner)
@@ -49,6 +57,10 @@
             (funcall check)
             (values (physical-reseed-follow-copy candidate) snapshot)))))))
 
+;; Create the private temporary exclusively and retain its descriptor through
+;; writing and promotion.  Latch uncertainty before the first possible mutation;
+;; an incomplete exit preserves the temporary or final entry for a new owner.
+
 (defun physical-reseed-follow-write-intent (owner root-fd candidate bytes previous check)
   (let ((fd nil) (fixed nil)
                  (path (merge-pathnames "physical-reseed.follow.tmp" (physical-image-fd-path root-fd))))
@@ -89,6 +101,9 @@
              (physical-reseed-follow-promote-intent owner root-fd fd fixed candidate previous check)))
       (when fd (sb-posix:close fd)))))
 
+;; Freeze the candidate, predecessor and encoded bytes before file I/O.  Check
+;; the exact final snapshot and local image evidence before publishing the intent.
+
 (defun physical-reseed-follow-publish-intent (owner candidate &key previous)
   (let* ((candidate (physical-reseed-follow-intent-copy candidate previous))
          (previous (and previous (physical-reseed-follow-intent-copy previous)))
@@ -103,6 +118,10 @@
            (error "target follow publication requires its exact previous record"))
          (physical-reseed-follow-check-local-intent owner root-fd candidate)
          (physical-reseed-follow-write-intent owner root-fd candidate bytes snapshot check))))))
+
+;; Inspect a temporary before mutation and promote only a complete supported
+;; intent with the exact predecessor and local evidence.  Malformed or unsupported
+;; temporaries remain unchanged and fenced; no remote outcome is inferred.
 
 (defun physical-reseed-follow-recover-intent (owner)
   (physical-reseed-follow-check-idle owner)

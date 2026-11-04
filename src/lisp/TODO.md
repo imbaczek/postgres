@@ -78,7 +78,16 @@
 
 - [x] Add the target follow codec and read-only owner foundation. Validate
   bounded generation records and the installed predecessor and image under a
-  scoped owner. Durable publication, recovery and source operations remain open.
+  scoped owner. The next item adds durable intent publication and recovery.
+
+- [x] Publish and recover durable target follow intent. The local store accepts
+  empty genesis and PREPARING intent only, with checked predecessor and image;
+  incomplete publication fences the owner until reopen. Validation passed 200
+  selected tests and two later tests, strict cold compilation, and eight SIGKILL
+  cuts with 16 fresh images. A 100-trial property at seed 117 passed with digest
+  `fnv1a64-v1:b04db31708e74ac1`; input coverage and rejection counts were not measured.
+  Source preparation and proof, configuration, settlement and activation remain
+  open. Evidence: `/home/imbaczek/proj/pg-ha-artifacts/reseed-target-follow/progress.md`.
 
 - [x] Fence the reserved target follow intent names before startup or older
   reseed ownership. Both final and temporary names reject every entry type;
