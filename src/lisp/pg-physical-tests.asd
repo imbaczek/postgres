@@ -89,6 +89,7 @@
                (:file "t/physical-reseed-follow-tests")
                (:file "t/physical-reseed-follow-codec-tests")
                (:file "t/physical-reseed-follow-owner-tests")
+               (:file "t/physical-reseed-follow-store-tests")
                (:file "t/wal-timeline-tests")
                (:file "t/wal-eor-tests")
                (:file "t/physical-history-tests")

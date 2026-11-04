@@ -7,7 +7,18 @@
 (defstruct (physical-reseed-follow-owner
             (:include physical-reseed-install-owner)
             (:print-function print-physical-reseed-install-owner))
-  binding)
+  binding
+  (busy-p nil)
+  (uncertain-p nil))
+
+(defun physical-reseed-follow-check-idle (owner)
+  (unless (physical-reseed-follow-owner-p owner) (error "target follow ownership is required"))
+  (physical-directory-check-owner-common owner)
+  (when (physical-reseed-follow-owner-busy-p owner)
+    (error "target follow journal operation is already in progress"))
+  (when (physical-reseed-follow-owner-uncertain-p owner)
+    (error "target follow publication is uncertain; close and reopen the owner"))
+  owner)
 
 (defun physical-reseed-follow-base-at (root-fd plan)
   (call-with-physical-backup-image-directory
@@ -128,6 +139,7 @@
 ;; Both fixed follow names must be absent before it can be returned.
 
 (defun physical-reseed-follow-initial-record (owner)
+  (physical-reseed-follow-check-idle owner)
   (call-with-physical-reseed-follow-image
    owner
    (lambda (root-fd check)
@@ -144,6 +156,7 @@
 ;; acceptable to the owner role.  Reconciliation is a separate future operation.
 
 (defun physical-reseed-follow-read (owner)
+  (physical-reseed-follow-check-idle owner)
   (call-with-physical-reseed-follow-image
    owner
    (lambda (root-fd check)
