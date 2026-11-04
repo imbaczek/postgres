@@ -97,6 +97,7 @@
         (physical-follow-check-config config)
         config))))
 
+;; Check adoption's binding before using the shared recovery image builder.
 (defun physical-adoption-follow-control-image (record binding time &key selected)
   (physical-adoption-follow-check-binding record binding)
   (physical-follow-binding-recovery-image binding time :selected selected))
@@ -121,6 +122,7 @@
       (physical-adoption-follow-check-binding record binding)
       binding)))
 
+;; Adoption checks its own binding before deriving the shared selected images.
 (defun physical-adoption-follow-selected-images (record binding time)
   (physical-adoption-follow-check-binding record binding)
   (physical-follow-binding-selected-images binding (physical-adoption-follow-model-store record) time))

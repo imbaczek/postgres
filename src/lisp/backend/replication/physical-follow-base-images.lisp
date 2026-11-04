@@ -1,5 +1,10 @@
 (in-package #:pg)
 
+;;; Build recovery and selected-history images from a checked follow binding.
+;;; These helpers return bytes without writing or installing them.
+
+;; Encode the binding's phase-2 recovery witness at TIME (Unix seconds).
+;; SELECTED uses the history in the after tuple. Return bytes without writing.
 (defun physical-follow-binding-recovery-image (binding time &key selected)
   (physical-follow-binding-check binding)
   (unless (typep time '(signed-byte 64)) (error "invalid follow recovery image time"))
@@ -13,6 +18,8 @@
      :history-digest (if selected (ninth after) (getf witness :history-digest))
      :resource-fact (getf witness :resource-fact) :state-time time)))
 
+;; Build the named history and selected control byte images from a private empty
+;; model.  Check that its resulting selection agrees with the binding.
 (defun physical-follow-binding-selected-images (binding model time)
   (physical-follow-binding-check binding)
   (let* ((plain (copy-physical-store model))

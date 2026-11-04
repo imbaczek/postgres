@@ -10,8 +10,8 @@
 ;;; publishes a journal nor grants ownership, performs RPC, or activates follow.
 
 ;; The target image is bounded separately from the larger install predecessor.
-;; This reference describes the predecessor; a future owner must verify the
-;; actual install journal and its terminal state before relying on it.
+;; This reference describes the predecessor; an owner must verify the actual
+;; install journal and its terminal state before relying on it.
 
 (defun physical-reseed-follow-install-copy (value local stage)
   (physical-follow-check-plist value '(:identity :digest :body-crc :step))
@@ -88,6 +88,8 @@
           do (push (getf row :name) names)
           collect row)))
 
+;; Validate and copy the immutable attempt, install and phase-zero base evidence
+;; with its generation history.  Structural validity does not prove disk state.
 (defun physical-reseed-follow-core-copy (record)
   (physical-reseed-install-check-literal record)
   (physical-follow-check-plist record '(:version :attempt :install :base :generations))
@@ -102,10 +104,13 @@
               :generations (physical-reseed-follow-generations-copy
                             (getf record :generations) request base control))))))
 
+;; Extract the core keys for validation without the optional configuration group.
 (defun physical-reseed-follow-core-projection (record)
   (loop for key in '(:version :attempt :install :base :generations)
         append (list key (getf record key))))
 
+;; Return a detached checked record.  When present, configuration is validated as
+;; a complete group against the checked core; absence remains distinct.
 (defun physical-reseed-follow-copy (record)
   (physical-reseed-install-check-literal record)
   (let* ((present (loop for key in record by #'cddr thereis (eq key :configuration)))

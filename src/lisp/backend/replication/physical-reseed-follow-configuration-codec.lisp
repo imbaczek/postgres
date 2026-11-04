@@ -1,5 +1,8 @@
 (in-package #:pg)
 
+;;; Validate the optional configuration group in the target follow journal.
+;;; Its recorded image and directory facts still require separate disk checks.
+
 (defun physical-reseed-follow-configuration-selected-p (core)
   (let ((anchor (physical-reseed-follow-generation-anchor (car (last (getf core :generations))))))
     (and (eq :descendant (physical-follow-anchor-kind anchor))
@@ -62,6 +65,9 @@
       (physical-reseed-install-register device inode device identities))
     identities))
 
+;; Validate and copy a configuration group bound to the proved generation.
+;; Building has image specifications but no staged identities; later phases carry
+;; directory and entry facts.  This representation is not a disk proof.
 (defun physical-reseed-follow-configuration-copy (value core)
   (physical-reseed-install-check-literal (list value core))
   (setf core (physical-reseed-follow-core-copy core))
@@ -101,6 +107,9 @@
             :time (getf value :time) :workspace workspace :directories directories
             :images images :entries entries :step step))))
 
+;; Check configuration progress against the immutable core and saved image facts.
+;; The codec recognizes installing and inert states; the current driver publishes
+;; only building and staged.
 (defun physical-reseed-follow-configuration-check-transition (previous candidate core)
   (let ((before (and previous (physical-reseed-follow-configuration-copy previous core)))
         (after (and candidate (physical-reseed-follow-configuration-copy candidate core))))

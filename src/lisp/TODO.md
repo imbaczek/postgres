@@ -105,7 +105,23 @@
   check JSON files and native results under
   `/home/imbaczek/proj/pg-ha-artifacts/reseed-target-follow/`.
 
-  Inert bound configuration, durable handoff pending, exact parent Aborted or
+- [x] Durably stage disabled target follow configuration. Save Building intent
+  before creating workspace outputs, then publish Staged after checking and
+  syncing the exact guard, directory and file identities and derived bytes.
+  Reopen recognized complete prefixes; preserve torn or unexplained entries.
+  Staged retries are read-only. The installed base remains at phase zero, and
+  startup remains fenced. Code: `9fefd569231`, `0cd7cc2e9e5` and `321916a3d70`.
+  Validation passed 266 distinct selected tests in fresh processes, strict
+  compilation of 210 production files, and the 31 focused tests after splitting
+  the new test modules. Each code commit also compiled as an independent staged
+  snapshot. Native Lisp TLI 1 checks covered ten target images, 30 fresh target
+  processes and nine SIGKILL cuts, with source-off construction and recovery.
+  Native proofs were same-timeline; installed fixtures covered all five proof
+  geometries. The copy property passed 80 trials at seed 120, digest
+  `fnv1a64-v1:ee7af4059f73f009`; input coverage and rejection counts were not measured.
+  Evidence: `/home/imbaczek/proj/pg-ha-artifacts/reseed-target-follow/progress.md`.
+
+  Installed inert configuration, durable handoff pending, exact parent Aborted or
   HandedOff settlement, activation, startup fence retirement and cancellation
   remain open, as do logical drain, control metadata and WAL parity, audits and
   pinned Patroni acceptance. No coordination is provided. During full acceptance,
@@ -120,7 +136,7 @@
   passed 80 trials at seed 114, digest `fnv1a64-v1:e93f14d6ca661cf2`; input
   coverage and rejection counts were not measured. Evidence:
   `/home/imbaczek/proj/pg-ha-artifacts/reseed-target-follow/progress.md`.
-  Inert configuration, handoff and activation remain open as described above.
+  Installed inert configuration, handoff and activation remain open as described above.
 
 - [x] Fence reserved reseed installation state across startup and owner roles.
   Both `physical-reseed.install` and `physical-reseed.install.tmp` refuse startup

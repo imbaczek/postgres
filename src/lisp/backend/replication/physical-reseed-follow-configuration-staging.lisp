@@ -1,5 +1,8 @@
 (in-package #:pg)
 
+;;; Complete a building workspace and record its staged identities. This does
+;;; not install the images or start follow.
+
 (defun physical-reseed-follow-configuration-staged-record (record directories entries)
   (let* ((copy (physical-reseed-follow-copy record)) (configuration (getf copy :configuration)))
     (setf (getf configuration :phase) :staged
@@ -7,6 +10,8 @@
           (getf configuration :entries) entries)
     (physical-reseed-follow-copy copy)))
 
+;; Derive and check the workspace layout under its guards.  Building can prepare
+;; missing planned entries; staged is read-only and must already be complete.
 (defun call-with-physical-reseed-follow-staging (owner root-fd record function check)
   (let* ((configuration (getf record :configuration)) (phase (getf configuration :phase))
                                                       (prepare (eq phase :building)))
@@ -54,6 +59,9 @@
               #'namespace-check :prepare prepare)))
          check)))))
 
+;; Complete the checked building prefix and publish exact staged identities.
+;; The shared store scope retains busy, uncertainty and attempt checks.  The
+;; staged receive directory and images have not been installed in PGDATA.
 (defun physical-reseed-follow-stage-configuration (owner)
   (unless (physical-reseed-follow-configuration-owner-p owner)
     (error "configuration staging requires dedicated ownership"))
@@ -111,6 +119,8 @@
          (mount (physical-adoption-install-mount-id nil :directory-fd fd)))
     (loop for name in names collect (physical-reseed-install-old-observe fd name mount))))
 
+;; Check a stable building prefix without completing it.  Changes, torn files or
+;; unexplained entries leave the workspace fenced for inspection.
 (defun call-with-physical-reseed-follow-building-prefix-evidence (owner root-fd record function check)
   (let* ((configuration (getf record :configuration)) (time (getf configuration :time)))
     (unless (eq :building (getf configuration :phase)) (error "building prefix evidence requires building intent"))
@@ -153,6 +163,7 @@
                        (with-fence #'verify)))))))
          check)))))
 
+;; Check every staged identity and image around FUNCTION without creating leaves.
 (defun call-with-physical-reseed-follow-staged-evidence (owner root-fd record function check)
   (unless (eq :staged (getf (getf record :configuration) :phase))
     (error "staged evidence requires staged configuration"))

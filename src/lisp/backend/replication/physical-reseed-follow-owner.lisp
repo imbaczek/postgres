@@ -14,6 +14,8 @@
   ;; An incomplete local mutation requires closing and reopening this owner.
   (uncertain-p nil))
 
+;; Fence configuration state from owner roles that cannot validate it.  A role
+;; check is finite; workspace evidence is checked in operation scopes.
 (defgeneric physical-reseed-follow-check-configuration-role (owner record))
 
 (defmethod physical-reseed-follow-check-configuration-role

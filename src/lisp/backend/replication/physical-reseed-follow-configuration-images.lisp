@@ -1,5 +1,10 @@
 (in-package #:pg)
 
+;;; Derive disabled pending configuration and control images from a historical
+;;; proved base. Image lists are alists of (logical-name . octets).
+
+;; Build a disabled pending configuration from the proved generation and its
+;; frozen source.  It does not establish a live source lease.
 (defun physical-reseed-follow-pending-config (record binding)
   (let* ((record (physical-reseed-follow-copy record))
          (generations (getf record :generations)))
@@ -20,6 +25,8 @@
             (physical-follow-check-config config)
             config))))))
 
+;; Return named byte images from the checked empty model and TIME (Unix seconds).
+;; Selected history images are included only when the binding requires them.
 (defun physical-reseed-follow-configuration-images (record binding model time)
   (let ((plain (copy-physical-store model))
         (before (getf binding :before)) (after (getf binding :after)))
@@ -38,12 +45,15 @@
            (cons "recovery.initial" (physical-follow-binding-recovery-image binding time)))
      (unless (equal before after) (physical-follow-binding-selected-images binding model time)))))
 
+;; Reprove the installed historical base before deriving images and binding.
+;; The original installed phase-zero controls remain unchanged.
 (defun physical-reseed-follow-configuration-images-at (owner root-fd value time)
   (let ((record (physical-reseed-follow-copy value)))
     (unless (typep time '(signed-byte 64)) (error "invalid inert follow image time"))
     (multiple-value-bind (binding model) (physical-reseed-follow-proof-at owner root-fd record)
       (values (physical-reseed-follow-configuration-images record binding model time) binding))))
 
+;; Turn named bytes into sorted (name size digest) specifications for the journal.
 (defun physical-reseed-follow-configuration-image-specifications (images core)
   (let* ((core (physical-reseed-follow-core-copy core))
          (specifications

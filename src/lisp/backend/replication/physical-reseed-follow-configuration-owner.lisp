@@ -1,5 +1,10 @@
 (in-package #:pg)
 
+;;; Own configuration work against a stopped target. The owner checks the
+;;; installed image; operation scopes separately check the workspace.
+
+;; Dedicated owner for building and staged configuration.  Its inherited opaque
+;; printer keeps the saved source credentials private.
 (defstruct (physical-reseed-follow-configuration-owner
             (:include physical-reseed-follow-owner)
             (:print-function print-physical-reseed-install-owner)))
@@ -11,6 +16,8 @@
       (error "configuration ownership does not yet admit installed state")))
   record)
 
+;; Check the original installed image before and after FUNCTION.  Workspace
+;; evidence is established by the individual operations, not this factory.
 (defun call-with-physical-reseed-follow-configuration-owner (directory function)
   (call-with-physical-adoption-directory-owner
    directory
@@ -40,6 +47,8 @@
           (error "configuration workspace overlaps a protected directory"))))
     facts))
 
+;; Hold and check the named workspace while calling FUNCTION with its facts,
+;; descriptor and check callback.  These are valid only in this scope and thread.
 (defun call-with-physical-reseed-follow-workspace (owner root-fd directory function check)
   (let ((directory (truename (uiop:ensure-directory-pathname directory)))
         (fd nil) (active nil))
@@ -87,6 +96,9 @@
                          :images (physical-reseed-follow-configuration-image-specifications images core)
                          :entries nil :step 0))))))
 
+;; Publish building intent for an empty workspace and deterministic images.
+;; Require the current attempt to stay active and unchanged. Check the exact
+;; follow predecessor before publishing its replacement.
 (defun physical-reseed-follow-begin-configuration (owner workspace time)
   (unless (physical-reseed-follow-configuration-owner-p owner)
     (error "beginning configuration requires dedicated ownership"))
@@ -136,6 +148,10 @@
            (funcall function workspace-fd workspace-check)))
        check))))
 
+;; Reconcile configuration publication with its exact predecessor and workspace
+;; evidence.  A stable proved final without configuration can also be returned.
+;; The current attempt must remain active; partial or unexplained temporaries
+;; remain unchanged and fenced.
 (defun physical-reseed-follow-recover-configuration (owner)
   (unless (physical-reseed-follow-configuration-owner-p owner)
     (error "configuration recovery requires dedicated ownership"))
