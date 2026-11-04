@@ -76,6 +76,9 @@
         (recovery-read-bytes (physical-recovery-control-path directory) :maximum 196)
         directory (getf (getf plan :attempt) :request))))))
 
+;; The original base evidence and terminal installation reference remain fixed
+;; even while configuration files move.  Role checks must stay finite; the
+;; operation scope proves the full image without recursively acquiring the owner.
 (defun physical-reseed-follow-check-binding (owner record)
   (let ((binding (physical-reseed-follow-owner-binding owner)))
     (unless (every (lambda (key) (equal (getf binding key) (getf record key)))

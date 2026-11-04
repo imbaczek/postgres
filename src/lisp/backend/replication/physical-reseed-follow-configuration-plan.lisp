@@ -2,8 +2,9 @@
 
 ;;; Derive configuration installation moves and positions from a saved record
 ;;; and binding.  These functions only describe a plan; they do not inspect or
-;;; change files, or authorize installation or startup.  Building and Staged
-;;; have drivers today; Installing and Inert are for later work.
+;;; change files, or authorize installation or startup.  Local drivers use these
+;;; plans for Building, Staged, Installing and Inert.  Handoff and activation
+;;; are separate work.
 
 ;; Copy and check the record against the pending binding and staged generation.
 ;; The returned selection flag says whether the binding chooses a child.
@@ -76,6 +77,8 @@
           (setf (second (first sources)) to-role (third (first sources)) (copy-seq to-leaf)))))
     positions))
 
+;; Check the saved terminal installation plan against the configuration record.
+;; Configuration planning must not rewrite the original base or predecessor.
 (defun physical-reseed-follow-configuration-install-plan (value-plan value)
   (let* ((plan (physical-reseed-install-copy value-plan))
          (record (physical-reseed-follow-copy value))

@@ -3,8 +3,9 @@
 ;;; Own configuration work against a stopped target. The owner checks the
 ;;; installed image; operation scopes separately check the workspace.
 
-;; Dedicated owner for building and staged configuration.  Its inherited opaque
-;; printer keeps the saved source credentials private.
+;; Own Building, Staged, Installing and Inert configuration against a stopped
+;; target.  Keep the original install binding and the inherited opaque printer,
+;; which protects saved source credentials.
 (defstruct (physical-reseed-follow-configuration-owner
             (:include physical-reseed-follow-owner)
             (:print-function print-physical-reseed-install-owner)))
@@ -16,6 +17,10 @@
       (error "configuration ownership does not admit this phase")))
   record)
 
+;; Before locking and the full proof, seed ownership from the canonical final
+;; record and actual terminal installation journal.  This permits the interval
+;; when root control has moved aside.  An invalid final fails; only an absent
+;; configuration uses the ordinary seed.
 (defun physical-reseed-follow-configuration-initial-arguments (directory)
   (let ((fd nil))
     (unwind-protect
@@ -36,6 +41,9 @@
                (physical-reseed-follow-check-snapshot fd snapshot)
                (append arguments (list :binding (physical-reseed-follow-core-projection record))))))
       (when fd (sb-posix:close fd)))))
+
+;; Hold dedicated ownership while checking the fixed workspace and installed
+;; image.  Configuration role checks remain finite; full proofs run in scopes.
 
 ;; Check the original installed image before and after FUNCTION.  Workspace
 ;; evidence is established by the individual operations, not this factory.

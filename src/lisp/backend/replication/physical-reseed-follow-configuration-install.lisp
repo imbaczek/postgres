@@ -1,5 +1,7 @@
 (in-package #:pg)
 
+;; Only the exact next journal transition is valid at the proved move prefix.
+;; The immutable core remains bound to the original terminal installation.
 (defun physical-reseed-follow-installation-candidate (context value)
   (let* ((candidate (physical-reseed-follow-copy value))
          (before (physical-reseed-follow-installation-context-record context))
@@ -47,6 +49,9 @@
   (funcall check)
   (physical-reseed-follow-check-active-attempt (physical-reseed-follow-installation-context-owner context)))
 
+;; A move may already be one ahead of its journal after a crash.  Otherwise use
+;; an atomic no-replace rename and update the in-memory prefix only on success.
+;; Sync both parent directories before publishing the new journal step.
 (defun physical-reseed-follow-installation-next-move (context check)
   (declare (notinline sb-posix:fsync))
   (let* ((owner (physical-reseed-follow-installation-context-owner context))
@@ -97,6 +102,8 @@
       (physical-reseed-follow-installation-point context check :after-configuration-install-progress)
       (values record snapshot))))
 
+;; The common store scope excludes reentry and pins the actual attempt.  Any
+;; incomplete operation leaves the owner uncertain and requires reacquisition.
 (defun call-with-physical-reseed-follow-installation-operation (owner function)
   (unless (physical-reseed-follow-configuration-owner-p owner)
     (error "installation operation requires dedicated configuration ownership"))
@@ -108,6 +115,8 @@
            (setf completed t))
       (unless completed (setf (physical-reseed-follow-owner-uncertain-p owner) t)))))
 
+;; Advance one local transition.  Inert is a separate terminal step: it does
+;; not contact a source or activate follow, and startup remains fenced.
 (defun physical-reseed-follow-advance-configuration (owner)
   (call-with-physical-reseed-follow-installation-operation
    owner

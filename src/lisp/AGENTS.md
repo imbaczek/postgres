@@ -220,6 +220,10 @@ appropriate instead of replacing the native C peer or adding a message relay.
   exited during an overlapping rebuild in this session; a serialized retry
   succeeded. Do not start another copy of a test merely because its output was
   truncated or a poll timed out; check the original process/session first.
+  A `run-tests` request with a 600-second Lisp timeout lost its client after
+  300 seconds while the worker's test thread continued. Wait for the actual
+  thread or process to end before retrying. For longer matrices, use cl-mcp to
+  launch a tracked fresh Lisp process with a log and a private output cache.
 - Repeated recompilation exhausted immobile code space in one long-lived SBCL
   worker. A full `(sb-ext:gc :full t)` recovered it without resetting the worker.
 - A replacement cl-mcp worker loses tracked child-process handles. Check the

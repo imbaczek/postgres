@@ -1,5 +1,8 @@
 (in-package #:pg)
 
+;; The context belongs to one active thread and store operation.  Its opaque
+;; printer keeps credentials private.  It holds borrowed descriptors and proof
+;; state only for the scope; reading through it grants no mutation authority.
 (defstruct (physical-reseed-follow-installation-context
             (:constructor %make-physical-reseed-follow-installation-context)
             (:print-function physical-libpq-print-private-object))
@@ -85,6 +88,8 @@
      root (physical-reseed-follow-installation-context-attempt context)))
   t)
 
+;; Check the receive store against the derived tuple at every prefix.  At the
+;; complete prefix also prove the actual pending state against the base and store.
 (defun physical-reseed-follow-installation-check-receive (context check)
   (let* ((store (physical-reseed-follow-installation-context-store context))
          (binding (physical-reseed-follow-installation-context-binding context))
@@ -181,6 +186,9 @@
            (when store (physical-store-close store)))))
      check)))
 
+;; Hold root, incoming, quarantine, workspace, staged, saved, base, global, WAL
+;; and receive descriptors for one mapped proof.  Keep journal and attempt checks
+;; separate from the full layout proof so they cannot recurse into this scope.
 (defun call-with-physical-reseed-follow-mapped-image (owner function)
   (unless (physical-reseed-follow-configuration-owner-p owner)
     (error "mapped image requires dedicated configuration ownership"))

@@ -1,5 +1,9 @@
 (in-package #:pg)
 
+;; A complete temporary must describe the exact next transition before it is
+;; synced or promoted.  Retain its checked descriptor until promotion finishes.
+;; Progress recovery resyncs both parents without repeating the metadata move.
+;; Malformed or conflicting temporary evidence must fail rather than fall back.
 (defun physical-reseed-follow-installation-recover-temporary (context check)
   (let* ((owner (physical-reseed-follow-installation-context-owner context))
          (root (physical-reseed-follow-configuration-role-fd
@@ -30,6 +34,8 @@
                 owner root fd (subseq identity 0 5) candidate previous check))
           (when fd (sb-posix:close fd)))))))
 
+;; A stable journal can be read after an abort.  Completing a one-ahead move
+;; publishes progress and therefore requires the actual attempt to be active.
 (defun physical-reseed-follow-installation-recover-stable (context check)
   (let* ((owner (physical-reseed-follow-installation-context-owner context))
          (record (physical-reseed-follow-copy (physical-reseed-follow-installation-context-record context)))

@@ -1,5 +1,8 @@
 (in-package #:pg)
 
+;; Read the actual original control at its prescribed position: root before
+;; its move, saved afterward.  Compare its identity and bytes with the original
+;; installation evidence before decoding it.
 (defun physical-reseed-follow-configuration-original-control (root-fd saved-fd value-plan value prefix)
   (multiple-value-bind (plan record) (physical-reseed-follow-configuration-install-plan value-plan value)
     (let* ((configuration (getf record :configuration))
@@ -52,6 +55,9 @@
                  (values control actual (append logical (list (tenth expected)))))))
            :element-type '(unsigned-byte 8)))))))
 
+;; Verify the immutable original base with its actual original control even
+;; when that control has moved aside.  The mapped namespace is proved by the
+;; caller; checking the installed pending state is a separate proof.
 (defun physical-reseed-follow-configuration-base-proof
     (root-fd saved-fd base-fds value-plan value prefix check)
   (multiple-value-bind (plan record) (physical-reseed-follow-configuration-install-plan value-plan value)

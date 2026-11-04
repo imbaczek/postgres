@@ -7,6 +7,9 @@
 ;; rename, sync the root, then read back and recheck the final image.  The caller
 ;; retains the descriptor and keeps the owner busy and uncertain throughout.
 
+;; Promote only the checked temporary and retain its descriptor through the
+;; publication checks.  Adopt the canonical post-rename snapshot before hooks
+;; can observe the new journal generation.
 (defun physical-reseed-follow-promote-intent (owner root-fd fd fixed candidate previous check)
   (declare (notinline sb-posix:fsync))
   (unless (and (physical-reseed-follow-owner-busy-p owner)

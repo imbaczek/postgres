@@ -71,6 +71,8 @@
     (error "target follow temporary remains after publication"))
   t)
 
+;; Stable history can be inspected after an abort, but a mutation requires the
+;; actual current attempt to remain active.
 (defun physical-reseed-follow-check-active-attempt (owner)
   (unless (eq :premanifest (getf (physical-reseed-cleanup-owner-attempt owner) :phase))
     (error "target follow intent cannot advance an aborting attempt"))
@@ -102,6 +104,8 @@
 ;; attempt after the image post-check and final metadata check, before clearing
 ;; uncertainty.  An incomplete mutation requires closing and reopening the owner.
 
+;; The busy flag also covers mapped installation operations.  An incomplete
+;; mutation remains uncertain even though the busy flag is cleared on exit.
 (defun call-with-physical-reseed-follow-store (owner function)
   (physical-reseed-follow-check-idle owner)
   (setf (physical-reseed-follow-owner-busy-p owner) t)

@@ -1,5 +1,7 @@
 (in-package #:pg)
 
+;; Rebuild historical proof against the original base and its actual control.
+;; This establishes local evidence, not current source authority.
 (defun physical-reseed-follow-proof-for-base (value base control)
   (let* ((record (physical-reseed-follow-copy value))
          (generations (getf record :generations))

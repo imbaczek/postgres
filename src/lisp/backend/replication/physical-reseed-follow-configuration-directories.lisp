@@ -1,5 +1,7 @@
 (in-package #:pg)
 
+;; Hold the installed base, global and WAL directories by descriptor while
+;; checking their bindings to the root and the original installation plan.
 (defun call-with-physical-reseed-follow-base-directories (root-fd value-plan function parent-check)
   (let* ((plan (physical-reseed-install-copy value-plan))
          (local (getf (getf plan :attempt) :local))
@@ -47,6 +49,8 @@
         (setf active nil)
         (dolist (entry children) (sb-posix:close (third entry)))))))
 
+;; Duplicate the borrowed root and child descriptors for a read-only image
+;; context.  Close only those duplicates when the callback exits.
 (defun call-with-physical-reseed-follow-held-base-directory
     (root-fd base-fd global-fd wal-fd function parent-check)
   (let* ((context (%make-physical-image-read-context))
@@ -145,6 +149,8 @@
         (setf active nil)
         (dolist (entry children) (sb-posix:close (third entry)))))))
 
+;; Staged permits prefix zero; Installing permits the journal step or one
+;; move ahead; Inert requires the complete prefix of four or five moves.
 (defun physical-reseed-follow-configuration-initial-prefix
     (root-fd workspace-fd staged-fd saved-fd value-plan value extra)
   (multiple-value-bind (plan record) (physical-reseed-follow-configuration-install-plan value-plan value)

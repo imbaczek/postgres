@@ -61,6 +61,10 @@
        (values (physical-reseed-follow-configuration-role-fd descriptors role) (subseq name (1+ slash)) nil)))
     (t (values (physical-reseed-follow-configuration-role-fd descriptors :root) name t))))
 
+;; Top-level incoming rows have already moved to root, so their original ctime
+;; comparison uses the inherited rename allowance; nested rows remain strict.
+;; Inserting selected history can also change pg_wal's size and times.  Exact
+;; children, bytes, identities and stable current rows are checked separately.
 (defun physical-reseed-follow-configuration-original-rows (descriptors plan positions mount)
   (let ((history (assoc "history.wal" positions :test #'equal)))
     (loop for expected in (getf plan :new)
@@ -93,6 +97,8 @@
              (error "derived configuration file lost its recorded identity or stable metadata"))
         collect (list logical parent leaf before)))
 
+;; Prove the complete mapped namespace at one prefix, including unused images.
+;; Check identities, contents and exact child names again around the proof.
 (defun physical-reseed-follow-configuration-layout-state (owner descriptors value binding images prefix check)
   (unless (physical-reseed-follow-configuration-owner-p owner)
     (error "mapped layout requires configuration ownership"))

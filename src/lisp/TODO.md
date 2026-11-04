@@ -133,8 +133,29 @@
   `fnv1a64-v1:38048727ed1c3732`; input coverage and rejection counts were not measured.
   Evidence: `/home/imbaczek/proj/pg-ha-artifacts/reseed-target-follow/inert-directory-checkpoint.md`.
 
-  Installed inert configuration, durable handoff pending, exact parent Aborted or
-  HandedOff settlement, activation, startup fence retirement and cancellation
+- [x] Install and recover disabled inert target configuration. Hold the original
+  base and all ten directory roles while moving receive and control metadata.
+  Publish Installing/0 separately, then perform at most one no-replace move per
+  call, sync both parents and publish its exact progress. Reopen one-ahead
+  layouts without repeating a move. Promote only a complete, exact next
+  temporary; preserve partial or conflicting evidence. Inert publication is
+  separate, checks the actual pending state and leaves startup fenced.
+  Validation covered 111 distinct selected tests across fresh runs, including
+  all five installed proof geometries, original-file corruption, guard and path
+  replacement, actual advance preflight and hook failures, and strict pending
+  witness rejection. Strict cold compilation passed all 217 source files with
+  no warnings or errors. Native Lisp TLI 1 checks passed 13 captured images,
+  52 fresh target processes and 12 SIGKILL cuts, with the source stopped during
+  local construction and recovery. Descendant and retained installation cases
+  used local installed fixtures. The inventory and prefix-signature properties
+  each passed 80 trials at seeds 122 and 123, with digests
+  `fnv1a64-v1:0ff7e43f10c22c03` and `fnv1a64-v1:97580d0206f8561c`;
+  input coverage and rejection counts were not measured. Code: `ac52498ee2c`,
+  `d8ce64749bb`, `666e6aa3ba6` and `e545abbe9f8`. Evidence:
+  `/home/imbaczek/proj/pg-ha-artifacts/reseed-target-follow/inert-operation-scope-progress.md`.
+
+  Durable handoff pending, exact parent Aborted or HandedOff settlement,
+  activation, startup fence retirement and cancellation
   remain open, as do logical drain, control metadata and WAL parity, audits and
   pinned Patroni acceptance. No coordination is provided. During full acceptance,
   audit older harnesses including `t/interop/child-bootstrap.py`: direct control
@@ -148,7 +169,7 @@
   passed 80 trials at seed 114, digest `fnv1a64-v1:e93f14d6ca661cf2`; input
   coverage and rejection counts were not measured. Evidence:
   `/home/imbaczek/proj/pg-ha-artifacts/reseed-target-follow/progress.md`.
-  Installed inert configuration, handoff and activation remain open as described above.
+  Handoff and activation remain open as described above.
 
 - [x] Fence reserved reseed installation state across startup and owner roles.
   Both `physical-reseed.install` and `physical-reseed.install.tmp` refuse startup
