@@ -204,10 +204,9 @@
       (unless fd (error "physical image input escaped its descriptor scope"))
       (values fd leaf))))
 
-;; Open only within the active descriptor scope, without following symlinks;
-;; require a private owned single-link regular file.  A permitted missing file
-;; calls FUNCTION with NIL.  Close the owned descriptor or stream on every exit.
-
+;; Open a private owned single-link regular file relative to the held parent
+;; without following symlinks. A permitted missing file calls FUNCTION with NIL.
+;; The stream and descriptor belong to this call and close on every exit.
 (defun call-with-physical-image-input-at (parent leaf function
                                           &key (element-type 'character)
                                             (if-does-not-exist :error) (external-format :default))
@@ -238,6 +237,7 @@
              (sb-sys:with-local-interrupts (funcall function stream)))
         (if stream (close stream) (when fd (sb-posix:close fd)))))))
 
+;; Resolve PATH within the active image descriptor scope before opening it.
 (defun call-with-physical-image-input (path function
                                        &key (direction :input) (element-type 'character)
                                          (if-does-not-exist :error) (external-format :default))

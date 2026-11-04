@@ -190,6 +190,13 @@ appropriate instead of replacing the native C peer or adding a message relay.
 - Use `unwind-protect` to restore temporary `symbol-function` replacements and
   hooks; untrace after debugging. Release paused actors during cleanup. These
   changes live in a persistent image and otherwise contaminate later tests.
+- Replacing a function does not change calls that SBCL has already inlined.
+  `sb-posix:fsync` and `sb-posix:write` have inline declarations in this image.
+  A durability test initially missed its intended syscall failure because its
+  replacement never ran. Use a local `notinline` declaration at a syscall
+  boundary that needs fault injection, then recompile that caller. Count the
+  intercepted calls before trusting the failure test. For partial writes through
+  an existing compiled writer, use its chunk limit and hook when available.
 - Distinguish the libpq helper from a raw `pg-client` when recovering a failed
   query. The helper closes its channel on any command error; reconnect to the
   saved route for STATUS or ABORT. A raw client can remain open after an ordinary

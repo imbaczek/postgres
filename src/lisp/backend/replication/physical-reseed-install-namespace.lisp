@@ -1,8 +1,12 @@
 (in-package #:pg)
 
+;; Installation moves old top-level entries to quarantine, then moves incoming
+;; top-level entries into the root. Nested rows remain part of their directory.
 (defun physical-reseed-install-top-rows (plan)
   (remove-if (lambda (row) (find #\/ (first row))) (getf plan :new)))
 
+;; Describe the exact names expected after PREFIX moves. The root keeps its lock,
+;; attempt and install journal throughout movement.
 (defun physical-reseed-install-prefix-names (plan prefix)
   (let* ((old (getf plan :old)) (top (physical-reseed-install-top-rows plan))
                                 (old-count (length old)) (old-moves (min prefix old-count))
@@ -18,19 +22,24 @@
             :quarantine
             (sort (append (list ".pg_lisp.lock" "physical-reseed.install") (names (subseq old 0 old-moves))) #'string<)))))
 
+;; Bound enumeration before comparing the complete directory inventory.
 (defun physical-reseed-install-directory-names (fd)
   (sort (directory-entry-names (physical-image-fd-path fd) :follow-symlinks t
                                                            :maximum-entries 100003 :maximum-name-bytes (+ 16777216 256)) #'string<))
 
+;; Capture all three inventories for comparison with a single move prefix.
 (defun physical-reseed-install-namespace-names (root-fd incoming-fd quarantine-fd)
   (list :root (physical-reseed-install-directory-names root-fd)
         :incoming (physical-reseed-install-directory-names incoming-fd)
         :quarantine (physical-reseed-install-directory-names quarantine-fd)))
 
+;; A rename can change ctime. Other recorded metadata must still match.
 (defun physical-reseed-install-namespace-row-matches-p (expected current renamed)
   (and (equal (subseq expected 0 8) (subseq current 0 8))
        (or renamed (= (ninth expected) (ninth current)))))
 
+;; Old entries are opaque and are tracked by name. A moved hard link can change
+;; the shared inode ctime of another name, including one still in the root.
 (defun physical-reseed-install-namespace-old-rows (plan prefix root-fd quarantine-fd mount)
   (let ((moved (make-hash-table :test #'equal)) (old (getf plan :old)))
     (loop for row in old for ordinal from 1 while (<= ordinal prefix)
@@ -43,6 +52,9 @@
                (error "reseed old namespace metadata differs from its move prefix"))
           collect current)))
 
+;; Hold the three incoming data directories while resolving nested names. The
+;; closures are valid only during FUNCTION and check each named descriptor binding
+;; and child inventory before and after the caller uses them.
 (defun call-with-physical-reseed-install-new-directories (root-fd incoming-fd plan prefix mount function)
   (let ((ordinals (make-hash-table :test #'equal)) (children nil) (active nil))
     (loop for row in (physical-reseed-install-top-rows plan)
@@ -102,6 +114,8 @@
         (setf active nil)
         (dolist (entry children) (sb-posix:close (cdr entry)))))))
 
+;; Recheck every incoming file's contents and metadata at this boundary. Only a
+;; moved top-level entry gets the rename-aware ctime comparison.
 (defun physical-reseed-install-namespace-new-rows (plan mount resolve)
   (loop for row in (getf plan :new)
         collect
@@ -115,6 +129,8 @@
               (error "reseed new image metadata differs from its move prefix"))
             current))))
 
+;; Recheck the complete metadata rows after hashing before accepting the
+;; namespace observation.
 (defun physical-reseed-install-namespace-check-new-rows (rows mount resolve)
   (dolist (row rows)
     (multiple-value-bind (parent leaf) (funcall resolve (first row))
@@ -122,7 +138,12 @@
         (unless (equal (subseq row 0 9) (cons (first row) (rest current)))
           (error "reseed new image changed during namespace verification"))))))
 
+;; A crash can leave the namespace at recorded step S or one rename ahead at
+;; S+1. Reject every other inventory. The attempt, journal, old entries and
+;; new image must remain stable across the complete observation.
 (defun physical-reseed-install-namespace-state (owner root-fd incoming-fd quarantine-fd plan guards-check)
+  ;; Each proof hashes the incoming image again so a later boundary checks the
+  ;; current contents as well as the saved metadata.
   (physical-reseed-check-owner owner)
   (funcall guards-check)
   (let* ((state (physical-reseed-install-read-at root-fd "physical-reseed.install"))
@@ -160,6 +181,9 @@
            (error "reseed namespace changed during verification"))
          (values state prefix))))))
 
+;; Retain the root and auxiliary directory descriptors for the caller. CHECK
+;; repeats the namespace proof within that scope. The final check runs before
+;; the descriptors are closed.
 (defun call-with-physical-reseed-install-namespace (owner function)
   (unless (physical-reseed-install-owner-p owner) (error "reseed namespace verification requires an install owner"))
   (physical-reseed-check-owner owner)
@@ -186,6 +210,7 @@
            :expected (getf plan :quarantine)))
         :expected (getf plan :incoming))))))
 
+;; Report both the recorded journal step and the observed move prefix.
 (defun physical-reseed-install-observe (owner)
   (call-with-physical-reseed-install-namespace
    owner

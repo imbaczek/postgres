@@ -22,6 +22,8 @@
       (setf active nil)
       (when fd (sb-posix:close fd)))))
 
+;; Bind a named file to its descriptor, hash its full contents and check its
+;; identity again after reading. SYNCHRONIZE also flushes that descriptor.
 (defun physical-reseed-install-file-row-at (parent leaf name size expected-digest mount synchronize)
   (let ((before (physical-reseed-install-old-observe parent leaf mount)))
     (call-with-physical-image-input-at
@@ -50,9 +52,9 @@
          (append (list (copy-seq name)) (rest before) (list digest))))
      :element-type '(unsigned-byte 8))))
 
-;; Bind each image entry to the named statx observation and held descriptor.
-;; Read exactly the expected size and digest, optionally sync the file, and
-;; recheck both observations before returning its inventory row.
+;; Resolve the manifest path through the held image context before capturing its
+;; file identity and digest. The shared reader checks the named entry and held
+;; descriptor before returning the inventory row.
 (defun physical-reseed-install-image-file-row (context entry mount synchronize)
   (destructuring-bind (name size expected-digest) entry
     (multiple-value-bind (parent leaf) (physical-image-parent context name)

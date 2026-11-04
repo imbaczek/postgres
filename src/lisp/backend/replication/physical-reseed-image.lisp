@@ -47,10 +47,8 @@
   (when *physical-reseed-image-test-hook*
     (funcall *physical-reseed-image-test-hook* point directory)))
 
-;; Verify the phase-zero image and its inventory, including digests for all six
-;; metadata files as well as manifest files.  Rechecking against EXPECTED detects
-;; changes during preparation; it is not durable installation proof.
-
+;; Verify the phase-zero base and its authentication policy, returning the
+;; manifest and digest for comparison with the saved installation plan.
 (defun physical-reseed-image-base-state (directory)
   (multiple-value-bind (manifest digest) (recovery-read-manifest directory)
     (recovery-check-manifest-schema manifest)
@@ -61,6 +59,8 @@
       (authentication-check-backup-policy directory))
     (values manifest digest)))
 
+;; Verify the phase-zero image and inventory, including digests for all six
+;; metadata files and the manifest files. Compare with EXPECTED when supplied.
 ;; The optional reseed installation flag defaults to NIL.  When true, the
 ;; descriptor inventory admits the auxiliary guard names at the root.  The
 ;; auxiliary scope must check their bytes and identities before and after this
