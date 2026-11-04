@@ -240,6 +240,42 @@
          (physical-client-test-result out (physical-client-test-prepare-schema)
                                       (list (physical-client-test-prepare-row)) "PREPARE_FOLLOW")))))
 
+(deftest physical-client-prepare-freezes-caller-owned-validation-inputs
+    (dolist (fault '(:coordinates :slot))
+      (let* ((coordinates (follow-anchor-receiver-request (follow-anchor-request 123 456)))
+             (slot (copy-seq "bound"))
+             (original (symbol-function 'pg::physical-client-query))
+             (injected nil))
+        (call-with-physical-client-wire
+         (lambda (client request)
+           (unwind-protect
+                (progn
+                  (setf (symbol-function 'pg::physical-client-query)
+                        (lambda (actual query schema tag &key (maximum 4096) command-only)
+                          (setf injected t)
+                          (ecase fault
+                            (:coordinates (incf (getf coordinates :receive-digest)))
+                            (:slot (setf (char slot 0) #\z)))
+                          (funcall original actual query schema tag
+                                   :maximum maximum :command-only command-only)))
+                  (ok (physical-client-test-protocol-error-p
+                       (lambda () (pg::pg-client-native-prepare client slot coordinates)))))
+             (setf (symbol-function 'pg::physical-client-query) original))
+           (ok injected)
+           (with-open-file (in request :element-type '(unsigned-byte 8))
+             (multiple-value-bind (kind payload) (pg::pg-client-frame in)
+               (ok (eql kind #\Q))
+               (let ((command (pg::parse-replication-command (pg::pg-client-cstring payload 0))))
+                 (ok (equal "bound" (pg::logical-replication-command-slot-name command)))
+                 (ok (= 123 (getf (pg::physical-follow-prepare-request command) :receive-digest)))))))
+         (lambda (out)
+           (let ((row (physical-client-test-prepare-row)))
+             (ecase fault
+               (:coordinates (setf (nth 8 row) "124"))
+               (:slot (setf (first row) "zound")))
+             (physical-client-test-result out (physical-client-test-prepare-schema)
+                                          (list row) "PREPARE_FOLLOW")))))))
+
 (deftest physical-client-prepares-same-timeline-proof-with-null-descendant-fields
     (dolist (timeline '(1 2))
       (call-with-same-timeline-follow-source

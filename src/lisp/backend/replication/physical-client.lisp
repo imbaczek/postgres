@@ -310,7 +310,9 @@ The caller must independently verify source identity and local durable witnesses
 This helper does not install history, redo WAL, update recovery state or admit a receiver.
 The caller owns network deadlines, cancellation and client cleanup; it must not
 perform network I/O under recovery quiescence."
-  (let* ((kind (physical-follow-request-kind coordinates))
+  (let* ((slot (copy-seq slot))
+         (coordinates (physical-follow-request-copy coordinates))
+         (kind (physical-follow-request-kind coordinates))
          (same (eq :same-timeline kind))
          (retained (eq :retained-timeline kind))
          (schema (append (list (list "slot_name" +textoid+))
