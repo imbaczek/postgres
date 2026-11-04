@@ -11,6 +11,7 @@
     (funcall *physical-reseed-attempt-test-hook* point path)))
 
 (defun physical-reseed-attempt-check-owner (owner record)
+  (physical-reseed-check-attempt-authority owner)
   (physical-reseed-check-owner owner)
   (let ((*pgdata* (physical-adoption-owner-directory owner)))
     (physical-adoption-check-startup))
@@ -66,6 +67,7 @@
 ;; Cleanup needs this path while its role check is verifying the attempt itself.
 
 (defun physical-reseed-attempt-read-owned (owner name &key stabilize)
+  (physical-reseed-check-attempt-authority owner)
   (call-with-physical-directory-root
    owner
    (lambda (fd directory)
@@ -77,6 +79,7 @@
 ;; returning the checked record.
 
 (defun physical-reseed-attempt-read-file (owner path &key (stabilize t))
+  (physical-reseed-check-attempt-authority owner)
   (physical-reseed-check-owner owner)
   (let* ((directory (physical-adoption-owner-directory owner))
          (name (cond ((equal path (physical-reseed-attempt-path directory)) "physical-reseed.attempt")
@@ -90,6 +93,7 @@
 ;; reconcile it before the final record can be used.
 
 (defun physical-reseed-attempt-read (owner)
+  (physical-reseed-check-attempt-authority owner)
   (physical-reseed-check-owner owner)
   (let ((directory (physical-adoption-owner-directory owner)))
     (physical-adoption-require-absent
@@ -228,6 +232,7 @@
 ;; or unlink them through this interface.
 
 (defun physical-reseed-attempt-recover (owner)
+  (physical-reseed-check-attempt-authority owner)
   (physical-reseed-check-owner owner)
   (let* ((directory (physical-adoption-owner-directory owner))
          (path (physical-reseed-attempt-path directory))

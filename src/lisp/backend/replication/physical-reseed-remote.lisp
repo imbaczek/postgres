@@ -85,6 +85,7 @@
 ;; spawned so every exit closes the owned client.
 
 (defun call-with-physical-reseed-client (owner record function &key helper capture)
+  (physical-reseed-check-attempt-authority owner)
   (physical-reseed-require-journal owner record)
   (let ((client nil))
     (unwind-protect

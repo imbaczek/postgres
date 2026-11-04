@@ -9,6 +9,7 @@
 (defun physical-reseed-install-publish-prepared
     (owner root-fd record client image source-context source-root incoming-context incoming-root
      incoming-facts quarantine-facts quarantine-fd stage-check incoming-check quarantine-check)
+  (physical-reseed-check-attempt-authority owner)
   (let* ((mount (physical-adoption-install-mount-id nil :directory-fd root-fd))
          (device (physical-adoption-owner-device owner))
          (attempt-row (physical-reseed-install-old-observe root-fd "physical-reseed.attempt" mount))
@@ -50,6 +51,7 @@
 ;; while capturing and publishing their facts.
 (defun physical-reseed-install-publish-workspaces
     (owner root-fd record client image source-context source-root stage-check incoming quarantine)
+  (physical-reseed-check-attempt-authority owner)
   (let ((expected (physical-reseed-install-preflight-incoming owner incoming image)))
     (physical-reseed-image-check-source client record image)
     (call-with-physical-reseed-install-auxiliary

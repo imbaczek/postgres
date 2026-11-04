@@ -149,10 +149,13 @@
 ;; Check follow intent before reading the install plan.  The specialized owner
 ;; repeats this check on use because its role method bypasses the base method.
 
-;; Recover the plan only when no temporary intent remains and the final journal
-;; binds to the current attempt and directory.
 (defun physical-reseed-install-initial-arguments (directory)
   (physical-directory-check-reseed-follow-intent directory)
+  (physical-reseed-install-seed-arguments directory))
+
+;; Recover the plan only when no temporary intent remains and the final journal
+;; binds to the current attempt and directory.
+(defun physical-reseed-install-seed-arguments (directory)
   (physical-adoption-require-absent (physical-reseed-install-temporary-path directory)
                                     "reseed install temporary requires reconciliation")
   (let ((fd nil))

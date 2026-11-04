@@ -43,6 +43,12 @@
 ;; ownership.  Operations such as capture, preparation, inventory and clean
 ;; adoption retain their own authority gates.
 
+(defun physical-reseed-check-attempt-authority (owner)
+  (unless (member (type-of owner)
+                  '(physical-reseed-owner physical-reseed-cleanup-owner physical-reseed-install-owner))
+    (error "this owner does not authorize legacy reseed attempt operations"))
+  owner)
+
 (defun physical-reseed-check-owner (owner)
   "Recheck directory ownership and the stopped target's PID evidence."
   (unless (physical-reseed-owner-p owner)

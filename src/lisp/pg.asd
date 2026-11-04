@@ -217,6 +217,8 @@
                    (:file "../replication/physical-reseed-install-progress")
                    (:file "../replication/physical-reseed-follow-generation")
                    (:file "../replication/physical-reseed-follow-codec")
+                   (:file "../replication/physical-reseed-follow-reader")
+                   (:file "../replication/physical-reseed-follow-owner")
                    (:file "../replication/physical-adoption-install-state")
                    (:file "../replication/physical-adoption-install")
                    (:file "../replication/physical-adoption-handoff-codec")

@@ -42,6 +42,7 @@
 ;; A successful promotion changes the named entries, so the caller performs its
 ;; checks before promotion instead of applying a generic check after FUNCTION.
 (defun call-with-physical-reseed-cancel-temporary (owner function)
+  (physical-reseed-check-attempt-authority owner)
   (call-with-physical-directory-root
    owner
    (lambda (root-fd directory)
@@ -103,6 +104,7 @@
 (defun physical-reseed-cancel-normalize-temporary (owner root-fd fd path previous check refresh)
   ;; Keep calls visible to tests that inject syscall failures.
   (declare (notinline sb-posix:fsync))
+  (physical-reseed-check-attempt-authority owner)
   (let* ((candidate (physical-reseed-attempt-copy previous))
          (empty (make-array 0 :element-type '(unsigned-byte 8))))
     (setf (getf candidate :phase) :aborting)
@@ -144,6 +146,7 @@
 ;; recover a complete initial premanifest temporary and fences a partial one
 ;; without a final predecessor. This path needs no stage or incoming directory.
 (defun physical-reseed-attempt-recover-for-cancel (owner)
+  (physical-reseed-check-attempt-authority owner)
   (physical-reseed-check-owner owner)
   (let* ((directory (physical-adoption-owner-directory owner))
          (temporary (physical-reseed-attempt-temporary-path directory))

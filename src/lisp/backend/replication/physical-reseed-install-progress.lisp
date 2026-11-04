@@ -26,6 +26,7 @@
 ;; revalidates it along with the namespace and journal descriptor.
 (defun call-with-physical-reseed-install-progress
     (owner root-fd initial-state initial-prefix namespace-check client record function)
+  (physical-reseed-check-attempt-authority owner)
   (let ((fd nil) (active nil) (state initial-state) (prefix initial-prefix)
                  (path (merge-pathnames "physical-reseed.install" (physical-image-fd-path root-fd))))
     (labels ((live ()
@@ -108,7 +109,7 @@
 ;; At the completed move prefix, verify the immutable base and exact root
 ;; inventory. The only extra names are .pg_lisp.lock, physical-reseed.attempt
 ;; and physical-reseed.install.
-(defun physical-reseed-install-check-image (root-fd plan check)
+(defun physical-reseed-install-check-image (root-fd plan check &optional owner)
   (funcall check)
   (physical-reseed-install-test-point :before-install-image-validation (physical-image-fd-path root-fd))
   (funcall check)
@@ -123,6 +124,7 @@
         directory
         (append (mapcar #'first (physical-backup-metadata-bounds))
                 (mapcar #'first (getf manifest :files))
+                (mapcar #'car (physical-reseed-install-extra-entries owner root-fd))
                 '(".pg_lisp.lock" "physical-reseed.attempt" "physical-reseed.install"))))))
   (physical-reseed-install-test-point :after-install-image-validation (physical-image-fd-path root-fd))
   (funcall check)
@@ -136,6 +138,7 @@
 ;; after all M moves, and source cleanup remains a separate operation.
 (defun physical-reseed-install-advance (owner &key helper)
   (declare (notinline sb-posix:fsync))
+  (physical-reseed-check-attempt-authority owner)
   (unless (physical-reseed-install-owner-p owner) (error "reseed advancement requires an install owner"))
   (physical-reseed-check-owner owner)
   (let ((record (physical-reseed-attempt-copy (physical-reseed-cleanup-owner-attempt owner))))

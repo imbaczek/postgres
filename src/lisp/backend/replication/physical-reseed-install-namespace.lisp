@@ -138,6 +138,18 @@
         (unless (equal (subseq row 0 9) (cons (first row) (rest current)))
           (error "reseed new image changed during namespace verification"))))))
 
+(defgeneric physical-reseed-install-extra-entries (owner root-fd))
+
+(defmethod physical-reseed-install-extra-entries ((owner t) root-fd)
+  (declare (ignore owner root-fd))
+  nil)
+
+(defun physical-reseed-install-expected-names (plan prefix extra)
+  (let ((names (physical-reseed-install-prefix-names plan prefix)))
+    (setf (getf names :root)
+          (sort (append (mapcar #'car extra) (getf names :root)) #'string<))
+    names))
+
 ;; A crash can leave the namespace at recorded step S or one rename ahead at
 ;; S+1. Reject every other inventory. The attempt, journal, old entries and
 ;; new image must remain stable across the complete observation.
@@ -152,10 +164,11 @@
          (attempt (physical-reseed-attempt-read-at root-fd "physical-reseed.attempt"))
          (step (getf state :step)) (maximum (1- (physical-reseed-install-last-step plan)))
          (recorded (min step maximum))
+         (extra (physical-reseed-install-extra-entries owner root-fd))
          (names (physical-reseed-install-namespace-names root-fd incoming-fd quarantine-fd))
-         (prefix (cond ((equal names (physical-reseed-install-prefix-names plan recorded)) recorded)
+         (prefix (cond ((equal names (physical-reseed-install-expected-names plan recorded extra)) recorded)
                        ((and (< step maximum)
-                             (equal names (physical-reseed-install-prefix-names plan (1+ step))))
+                             (equal names (physical-reseed-install-expected-names plan (1+ step) extra)))
                         (1+ step))
                        (t (error "reseed namespaces disagree with recorded or single-ahead progress"))))
          (old (physical-reseed-install-namespace-old-rows plan prefix root-fd quarantine-fd mount)))
@@ -176,7 +189,8 @@
            (error "reseed attempt changed during namespace verification"))
          (physical-reseed-install-namespace-check-new-rows new mount resolve)
          (funcall check-directories)
-         (unless (and (equal old (physical-reseed-install-namespace-old-rows plan prefix root-fd quarantine-fd mount))
+         (unless (and (equal extra (physical-reseed-install-extra-entries owner root-fd))
+                      (equal old (physical-reseed-install-namespace-old-rows plan prefix root-fd quarantine-fd mount))
                       (equal names (physical-reseed-install-namespace-names root-fd incoming-fd quarantine-fd)))
            (error "reseed namespace changed during verification"))
          (values state prefix))))))
