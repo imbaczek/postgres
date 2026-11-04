@@ -3,6 +3,14 @@
 (defconstant +physical-reseed-follow-maximum-bytes+ (* 64 1024 1024))
 (defconstant +physical-reseed-follow-proof-reserve+ 8192)
 
+;;; Bounded structural codec for a private target follow record.  The original
+;;; attempt includes credentials and must not be printed.  This module neither
+;;; publishes a journal nor grants ownership, performs RPC, or activates follow.
+
+;; The target image is bounded separately from the larger install predecessor.
+;; This reference describes the predecessor; a future owner must verify the
+;; actual install journal and its terminal state before relying on it.
+
 (defun physical-reseed-follow-install-copy (value local stage)
   (physical-follow-check-plist value '(:identity :digest :body-crc :step))
   (let ((identity (getf value :identity)))
@@ -20,6 +28,11 @@
       (error "invalid target follow predecessor reference"))
     (list :identity (copy-list identity) :digest (getf value :digest)
           :body-crc (getf value :body-crc) :step (getf value :step))))
+
+;; Keep bounded exact control and authentication evidence tied to the request.
+;; These structural checks do not prove current disk contents or authentication
+;; policy.  The phase-zero control's manifest digest is intentionally zero;
+;; its exhausted next XID is the actual value, not an allocation reservation.
 
 (defun physical-reseed-follow-base-copy (value request)
   (physical-follow-check-plist
@@ -51,6 +64,9 @@
            :recovery-control (physical-libpq-octets-datum recovery)
            :wal-control (physical-libpq-octets-datum wal) :auth-files auth)
      control)))
+
+;; Generations are contiguous from 1, names are unique, and every older entry
+;; is canceled.  Coordinates bind each entry to the same base and receive point.
 
 (defun physical-reseed-follow-generations-copy (entries request base control)
   (unless (and (listp entries) (<= (length entries) +physical-backup-lease-allocation-maximum-generation+))
@@ -84,6 +100,10 @@
               :generations (physical-reseed-follow-generations-copy
                             (getf record :generations) request base control))))))
 
+;; The original attempt, install reference and base remain immutable.  Append
+;; only a preparing generation after canceled history, or advance the last
+;; generation without changing older entries.
+
 (defun physical-reseed-follow-check-transition (previous candidate)
   (let* ((before (physical-reseed-follow-copy previous))
          (after (physical-reseed-follow-copy candidate))
@@ -105,6 +125,9 @@
           (car (last old)) (car (last new)) request)))
       (t (error "target follow generation history cannot be shortened or skipped")))
     t))
+
+;; Reserve space for the remaining local proof or cancellation record before
+;; accepting an image.  This size check does not assert any source outcome.
 
 (defun physical-reseed-follow-image (record)
   (let* ((record (physical-reseed-follow-copy record))

@@ -1,5 +1,14 @@
 (in-package #:pg)
 
+;;; Structural validation of saved generation coordinates and source history.
+;;; The enclosing journal contains the original attempt's credentials; do not
+;;; print journal records.  A later owner must verify evidence and authority
+;;; before any source operation.
+
+;; Timeline 1 has empty history; a child needs at least one byte.  A valid
+;; parsed prefix need not list every ancestor, so the owner must compare the
+;; complete saved history with the actual source history.
+
 (defun physical-reseed-follow-generation-history (coordinates text)
   (unless (and (stringp text) (<= (length text) +physical-store-history-maximum-bytes+)
                (<= (if (= 1 (getf coordinates :source-timeline)) 0 1)
@@ -14,6 +23,9 @@
                   (getf coordinates :receive-timeline) (getf coordinates :receive-lsn) history))
       (error "target follow coordinates are outside saved source history")))
   (copy-seq text))
+
+;; Reattach the shared history to the kind-specific proof and return a detached
+;; anchor.  Its request coordinates must match this generation exactly.
 
 (defun physical-reseed-follow-generation-anchor (record)
   (physical-reseed-install-check-literal record)
@@ -53,6 +65,9 @@
                                     (if (eq :descendant (physical-follow-anchor-kind anchor))
                                         *physical-follow-anchor-keys*
                                         *physical-follow-same-timeline-anchor-keys*)))))))
+
+;; Identity, coordinates and history never change.  Only the forward phase
+;; transitions are allowed; once captured, a proof is retained through cancel.
 
 (defun physical-reseed-follow-generation-check-transition (previous candidate request)
   (let* ((before (physical-reseed-follow-generation-copy previous request))

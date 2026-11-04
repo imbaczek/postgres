@@ -18,6 +18,7 @@
 ;; reading and compare named and descriptor stat facts around the read.  Bind
 ;; the decoded plan to this journal generation and root.  Stabilization also
 ;; syncs file and directory.  A malformed or changed final journal fails closed.
+;; Return the decoded state, file identity and digest of the same bytes.
 (defun physical-reseed-install-read-at (root-fd name &key stabilize)
   (unless (member name '("physical-reseed.install" "physical-reseed.install.tmp") :test #'equal)
     (error "unexpected reseed install journal name"))
