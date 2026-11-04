@@ -96,6 +96,9 @@
   (unless (and (sb-thread:holding-mutex-p *write-lock*) (sb-thread:holding-mutex-p *wal-lock*))
     (error "backup lease publication requires write and WAL exclusion")))
 
+;; Publish bounded bytes through an exclusive private temporary file. Sync the
+;; file before rename, sync the directory and check the published readback.
+;; Cleanup removes a temporary only while it still names the created inode.
 (defun physical-backup-lease-write-bytes
     (path temporary bytes &key (directory (physical-backup-lease-directory))
                             (maximum +physical-backup-lease-maximum-bytes+)
@@ -263,6 +266,8 @@
               (physical-backup-lease-check-source request)
               (when (gethash name candidates) (error "duplicate backup lease request"))
               (setf (gethash name candidates) record)))
+          ;; Check the original parent and allocation graph before constructing
+          ;; interrupted parents. Check again before cleanup or record rewrites.
           (multiple-value-bind (allocations allocation-temporaries)
               (physical-backup-lease-allocation-load-candidates candidates)
             (maphash

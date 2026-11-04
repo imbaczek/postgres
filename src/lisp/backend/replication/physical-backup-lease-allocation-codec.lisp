@@ -1,8 +1,16 @@
 (in-package #:pg)
 
+;; An allocation records one follow preparation under a backup lease. LIVE
+;; means it has not been canceled. CANCELED permanently revokes preparation,
+;; even when pin cleanup is unfinished. The parent lease still determines
+;; whether preparation or handoff is allowed. The follow pin stores the
+;; prepared anchor; this record stores the allocation identity.
+
 (defconstant +physical-backup-lease-allocation-maximum-bytes+ 8192)
 (defconstant +physical-backup-lease-allocation-maximum-generation+ 16)
 
+;; Validate and copy the immutable parent request, generation, successor name
+;; and follow coordinates. Each parent has at most sixteen generations.
 (defun physical-backup-lease-allocation-copy (record)
   (physical-follow-check-plist record '(:version :request :generation :name :coordinates :state))
   (let* ((request (physical-backup-lease-request-copy (getf record :request)))
@@ -29,6 +37,8 @@
     (list :version 1 :request request :generation generation :name (copy-seq name)
           :coordinates coordinates :state state)))
 
+;; An allocation can move from LIVE to CANCELED. Its identity and coordinates
+;; remain fixed and a canceled allocation cannot be revived.
 (defun physical-backup-lease-allocation-transition (previous candidate)
   (let* ((before (when previous (physical-backup-lease-allocation-copy previous)))
          (after (physical-backup-lease-allocation-copy candidate)))

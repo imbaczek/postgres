@@ -115,6 +115,8 @@
       (error "physical backup lease cannot rebind or repeat capture"))
     after))
 
+;; Lease and allocation files use a bounded canonical literal with a magic
+;; header and checksum so recovery can reject damaged or ambiguous records.
 (defun physical-backup-lease-encode-literal (magic value maximum)
   (let* ((text (physical-bootstrap-manifest-text value))
          (bytes (string->bytes text))
@@ -123,6 +125,7 @@
       (error "physical backup lease exceeds its record bound"))
     image))
 
+;; Normalize the parsed value and re-encode it to require the canonical bytes.
 (defun physical-backup-lease-decode-literal (magic bytes maximum normalize)
   (unless (typep bytes '(vector (unsigned-byte 8)))
     (error "physical backup lease requires an octet vector"))

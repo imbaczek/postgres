@@ -1,5 +1,7 @@
 (in-package #:pg)
 
+;; Bind each row to the exact completed parent request and base. A successor
+;; name cannot also be the name of a parent lease.
 (defun physical-backup-lease-allocation-check-parent (record parents)
   (let* ((checked (physical-backup-lease-allocation-copy record))
          (request (getf checked :request))
@@ -15,6 +17,10 @@
       (error "backup lease allocation differs from its completed parent"))
     checked))
 
+;; Generations are contiguous and each predecessor must be canceled before the
+;; next exists. A selected handoff stays LIVE as historical ownership. An
+;; aborted parent with a LIVE row has cleanup debt. CANCELED records the
+;; allocation state and does not by itself prove cleanup.
 (defun physical-backup-lease-allocation-check-history (parent records)
   (let ((history (sort (copy-list records) #'< :key (lambda (row) (getf row :generation)))))
     (loop with previous = nil
@@ -31,6 +37,9 @@
           (error "backup lease handoff differs from its live allocation")))))
   (values))
 
+;; Check parent identity, successor ownership and allocation history as pure
+;; record relationships. Legacy handoffs may have no allocation rows. Pin and
+;; WAL authority require separate checks by the caller.
 (defun physical-backup-lease-allocation-check-graph (parents allocations)
   (unless (and (typep *physical-backup-lease-allocation-limit* '(integer 0 65536))
                (<= (hash-table-count allocations) *physical-backup-lease-allocation-limit*))

@@ -6,6 +6,7 @@
 (defun physical-backup-lease-allocation-directory ()
   (merge-pathnames "pg_physical_backup_allocations/" *pgdata*))
 
+;; The private filename binds the parent lease name and generation to the row.
 (defun physical-backup-lease-allocation-path (record &optional temporary)
   (let* ((checked (physical-backup-lease-allocation-copy record))
          (name (getf (getf checked :request) :name)))
@@ -13,6 +14,9 @@
      (format nil "~a.~2,'0d.~a" name (getf checked :generation) (if temporary "tmp" "alloc"))
      (physical-backup-lease-allocation-directory))))
 
+;; Read a bounded private file and verify its descriptor, name and contents.
+;; Treat invalid stored coordinates as corruption. Validation of a caller's
+;; proposed coordinates remains separate.
 (defun physical-backup-lease-allocation-read (path &key stabilize)
   (let ((directory (physical-backup-lease-allocation-directory))
         (maximum +physical-backup-lease-allocation-maximum-bytes+))
@@ -41,6 +45,8 @@
                  record)))
         (close stream)))))
 
+;; Persist and read back the raw row under write and WAL exclusion. This store
+;; records allocation identity and does not itself grant authority over a pin.
 (defun physical-backup-lease-allocation-write (record)
   (physical-backup-lease-require-locks)
   (let* ((checked (physical-backup-lease-allocation-copy record))
@@ -72,6 +78,8 @@
                 (member type '("alloc" "tmp") :test #'equal)
                 (equal entry (format nil "~a.~2,'0d.~a" (subseq stem 0 39) generation type)))))))
 
+;; Bound the inventory to 65536 records and the same number of temporaries.
+;; Reject unknown names and unsafe files before returning either list.
 (defun physical-backup-lease-allocation-inventory ()
   (unless (typep *physical-backup-lease-allocation-limit* '(integer 0 65536))
     (error "invalid backup lease allocation inventory limit"))
@@ -101,6 +109,8 @@
 
 (defvar *physical-backup-lease-allocations* (make-hash-table :test #'equal))
 
+;; Build and validate a separate registry before startup discards temporaries
+;; or installs any records. Successor names must be unique across the inventory.
 (defun physical-backup-lease-allocation-load-candidates (parents)
   (physical-backup-lease-require-locks)
   (multiple-value-bind (paths temporaries) (physical-backup-lease-allocation-inventory)
@@ -114,6 +124,8 @@
       (physical-backup-lease-allocation-check-graph parents allocations)
       (values allocations temporaries))))
 
+;; Install only the registry already checked by the startup caller under the
+;; publication fence.
 (defun physical-backup-lease-allocation-install-records (allocations)
   (physical-backup-lease-require-locks)
   (setf *physical-backup-lease-allocations* allocations)
