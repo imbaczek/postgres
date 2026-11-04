@@ -221,6 +221,7 @@
                    (:file "../replication/physical-reseed-follow-owner")
                    (:file "../replication/physical-reseed-follow-store")
                    (:file "../replication/physical-follow-base-plan")
+                   (:file "../replication/physical-follow-base-images")
                    (:file "../replication/physical-reseed-follow-proof")
                    (:file "../replication/physical-reseed-follow-publication")
                    (:file "../replication/physical-adoption-install-state")

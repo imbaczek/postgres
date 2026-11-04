@@ -99,16 +99,7 @@
 
 (defun physical-adoption-follow-control-image (record binding time &key selected)
   (physical-adoption-follow-check-binding record binding)
-  (let* ((stage (getf record :stage))
-         (witness (getf binding :recovery))
-         (after (getf binding :after)))
-    (physical-recovery-control-image
-     2 (getf stage :system-id) (getf stage :timeline) (getf stage :manifest-digest)
-     (getf stage :checkpoint) (first (getf binding :required)) (getf witness :observed-next-xid)
-     :applied-timeline (second (getf binding :required))
-     :history-target (if selected (eighth after) (getf witness :history-target))
-     :history-digest (if selected (ninth after) (getf witness :history-digest))
-     :resource-fact (getf witness :resource-fact) :state-time time)))
+  (physical-follow-binding-recovery-image binding time :selected selected))
 
 (defun physical-adoption-follow-model-store (record)
   (physical-follow-empty-base-model (getf record :stage)))
@@ -131,21 +122,8 @@
       binding)))
 
 (defun physical-adoption-follow-selected-images (record binding time)
-  (let* ((model (physical-adoption-follow-model-store record))
-         (after (getf binding :after))
-         (anchor (getf binding :anchor)))
-    (multiple-value-bind (selection bytes)
-        (physical-store-history-candidate
-         model (eighth after) (getf binding :child-history)
-         (coerce (getf anchor :eor-octets) '(vector (unsigned-byte 8))) (fifth after))
-      (setf (physical-store-selection model) selection)
-      (unless (equal after (physical-store-control-tuple model))
-        (error "planned history images differ from the proved adoption binding"))
-      (list (cons "history.receive" bytes)
-            (cons "receive.selected" (physical-store-encode-control model (fourth after)))
-            (cons "history.wal" (string->bytes (getf binding :child-history)))
-            (cons "recovery.selected"
-                  (physical-adoption-follow-control-image record binding time :selected t))))))
+  (physical-adoption-follow-check-binding record binding)
+  (physical-follow-binding-selected-images binding (physical-adoption-follow-model-store record) time))
 
 ;; Build the pending, initial, selected and active images needed by the plan.
 (defun physical-adoption-follow-images (record binding time)
