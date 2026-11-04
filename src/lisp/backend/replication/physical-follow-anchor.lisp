@@ -327,6 +327,8 @@ limit fails before acknowledgment, unlink or retention release."
   (let ((result
           (with-write-lock
             (with-wal-critical
+              ;; Keep a closing handoff's successor until bootstrap retirement
+              ;; and CLOSED publication have finished.
               (physical-backup-lease-check-successor-mutation name)
               (when (and request (/= (getf request :system-id) (catalog-system-identifier)))
                 (wal-invalid-input "physical follow cleanup belongs to another source"))

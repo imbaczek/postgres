@@ -85,6 +85,7 @@
 ;; successor, and closed records remain tombstones rather than being evicted.
 ;; An initial aborted closing record is permitted, including an abort before capture.
 (defun physical-backup-lease-transition (previous candidate)
+  ;; A completed base survives interruption and remains bound to any handoff.
   (let* ((before (when previous (physical-backup-lease-copy previous)))
          (after (physical-backup-lease-copy candidate))
          (from (getf before :phase))

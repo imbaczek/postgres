@@ -345,6 +345,7 @@ leave that registry intact."
                 (error "duplicate physical source pin ~a" name))
               (when invalidate (push pin invalidated))
               (setf (gethash name candidates) pin))))
+        ;; Check disk candidates against handoffs before saving any pin loss.
         (physical-backup-lease-check-startup-inventory candidates)
         (when invalidated
           (begin-publication)
@@ -394,6 +395,7 @@ Persist any origin proof first, so pin advancement cannot outrun its evidence."
 (defun physical-source-invalidate-lagging-pins-under-wal-lock (limit)
   "Persist lagging private pin loss before checkpoint removes required WAL.
 The caller holds WAL. LIMIT is an exact-byte cap independent of wal_keep_size."
+  ;; A closing handoff still depends on its successor retaining WAL.
   (when (integerp limit)
     (maphash
      (lambda (name pin)

@@ -28,7 +28,22 @@
   Evidence is in
   `/home/imbaczek/proj/pg-ha-artifacts/reseed-cancel-reconcile/progress.json`.
 
+- [x] Add source authority for backup-lease handoff to a proved follow pin.
+  Match the original base to an unused READY successor and durably publish
+  CLOSING/HANDED-OFF before retiring bootstrap retention. Protect the successor
+  until CLOSED, then allow normal retirement while keeping its historical lease
+  assignment. Exact handoff retries settle the recorded outcome. Primary and
+  standby startup validate successor ownership before persisting bootstrap loss.
+  A completed backup can hand off after promotion through its INTERRUPTED state.
+  Validation passed 1,872 physical tests and strict cold compilation. Fifteen
+  actual SIGKILL cuts recovered in fresh processes with unchanged successor
+  bytes and retained WAL. Tests also cover disk-only standby recovery and
+  descendant receivers before and at the fork. Code and refactoring reviews
+  passed. Evidence is in
+  `/home/imbaczek/proj/pg-ha-artifacts/reseed-follow-handoff/progress.md`.
+
 - [ ] Finish reseed follow handoff and startup reconciliation.
+  Expose source handoff through the replication protocol and strict client.
   Require actual PREPARE_FOLLOW readiness and durable target follow configuration
   before transferring the bootstrap lease. Reconcile the terminal installation
   at startup before retiring its fences.

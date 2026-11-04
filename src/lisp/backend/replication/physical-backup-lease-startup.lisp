@@ -26,6 +26,8 @@
   (with-write-lock
     (with-wal-publication-fence (begin-publication)
       (physical-backup-lease-pin-directory-stat)
+      ;; Check closing handoffs, including disk-only successors, before any
+      ;; standby loss is saved or the registered pins are replaced.
       (physical-backup-lease-check-successor-inventory)
       (maphash (lambda (name record)
                  (declare (ignore name))
@@ -65,6 +67,8 @@
           (setf (gethash (physical-source-pin-name pin) *physical-source-pins*) pin)))))
   (values))
 
+;; Validate the closing intent and its successor before finding the bootstrap
+;; pin to remove. The successor may be present only on disk during startup.
 (defun physical-backup-lease-closing-pin (record)
   (let* ((request (getf record :request))
          (current (physical-backup-lease-current-record request)))
@@ -154,6 +158,9 @@
       (wal-invalid-input "backup lease successor already belongs to another lease")))
   record)
 
+;; Check the successor and retained WAL before publishing a handoff. A completed
+;; base on an INTERRUPTED lease can be handed to a descendant source through a
+;; matching successor, while an incomplete capture cannot be handed off.
 (defun physical-backup-lease-check-handoff-publication (before after)
   (when (eq :handed-off (getf after :outcome))
     (physical-backup-lease-check-successor-assignment after)
@@ -182,6 +189,9 @@
              (wal-invalid-input "backup lease handoff still has its bootstrap pin")))))))
   after)
 
+;; Durable CLOSING is the handoff commit point. Finishing removes and syncs the
+;; bootstrap pin before publishing CLOSED. An exact CLOSED retry returns the
+;; saved outcome even after the successor has been retired normally.
 (defun physical-backup-lease-handoff (request successor)
   (let* ((request (physical-backup-lease-request-copy request))
          (successor (physical-backup-lease-successor-copy successor request)))

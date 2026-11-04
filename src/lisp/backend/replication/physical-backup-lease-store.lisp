@@ -10,6 +10,8 @@
 ;;; using the loaded records and reconciles them with pins and origins.
 (defvar *physical-backup-lease-records* (make-hash-table :test #'equal))
 
+;; Reverse successor assignments for the current lease registry, under WAL
+;; exclusion. Each successful record publication invalidates this cache.
 (defvar *physical-backup-lease-successor-cache* nil)
 
 ;; Active owners are process-local and protected by write and WAL exclusion.
@@ -187,6 +189,7 @@
       (funcall begin-publication)
       (physical-backup-lease-write after)
       (physical-backup-lease-test-point :before-memory after)
+      ;; Invalidate before exposing the newly published record to later lookups.
       (setf *physical-backup-lease-successor-cache* nil
             (gethash (copy-seq name) *physical-backup-lease-records*) after))
     (physical-backup-lease-copy after)))

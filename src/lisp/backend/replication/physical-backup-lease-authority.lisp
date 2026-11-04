@@ -15,6 +15,9 @@
     (error "backup lease lookup requires WAL exclusion"))
   (gethash name *physical-backup-lease-records*))
 
+;; Index every recorded successor, including closed leases, so an assignment
+;; cannot be reused by another lease. The cache belongs to this registry object
+;; and is rebuilt when the registry changes or publication invalidates it.
 (defun physical-backup-lease-successor-records ()
   (unless (sb-thread:holding-mutex-p *wal-lock*)
     (error "backup lease successor lookup requires WAL exclusion"))
@@ -34,6 +37,8 @@
             (cons *physical-backup-lease-records* owners))))
   (cdr *physical-backup-lease-successor-cache*))
 
+;; A historical assignment remains reserved, while CLOSING also protects the
+;; successor pin from mutation until CLOSED has been published.
 (defun physical-backup-lease-closing-successor (name)
   (let ((record (gethash name (physical-backup-lease-successor-records))))
     (when (eq :closing (getf record :phase)) record)))
@@ -160,6 +165,9 @@
          (values pin t))
         (t (physical-source-pin-check-wal pin) (values pin nil))))))
 
+;; Require the exact unused READY follow pin for this backup's original system,
+;; timeline, base and manifest. Its saved anchor digest and receive position
+;; bind the successor to the handoff before the old retention can be released.
 (defun physical-backup-lease-check-successor-pin (record pin)
   (let* ((request (getf record :request))
          (base (getf record :base))
@@ -187,6 +195,9 @@
   (physical-backup-lease-require-locks)
   (physical-backup-lease-successor-records)
   (values))
+
+;; Check the complete candidate inventory before startup publishes pin loss or
+;; replaces retention. A handed-off CLOSING lease still needs its successor.
 
 ;; A READY lease without a pin is inconsistent metadata, not ordinary loss.
 (defun physical-backup-lease-check-startup-inventory (candidates)
