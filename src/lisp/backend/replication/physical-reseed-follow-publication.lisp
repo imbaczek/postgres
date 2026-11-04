@@ -125,16 +125,16 @@
 
 (defun physical-reseed-follow-recover-intent (owner)
   (physical-reseed-follow-check-idle owner)
-  (call-with-physical-reseed-follow-store-proof
+  (call-with-physical-reseed-follow-attempt-proof
    owner
    (lambda (root-fd check)
      (block settled
        (let* ((previous (physical-reseed-follow-snapshot-at root-fd))
               (temporary (physical-reseed-follow-entry root-fd "physical-reseed.follow.tmp" t))
               (fd nil))
-         (when previous
-           (physical-reseed-follow-intent-copy (getf previous :record))
-           (physical-reseed-follow-check-local-intent owner root-fd (getf previous :record)))
+         (if previous
+             (physical-reseed-follow-check-stable-record-at owner root-fd (getf previous :record))
+             (physical-reseed-follow-check-active-attempt owner))
          (unless temporary
            (when previous
              (setf (physical-reseed-follow-owner-uncertain-p owner) t)
@@ -143,8 +143,8 @@
            (funcall check)
            (return-from settled
              (values (and previous (physical-reseed-follow-copy (getf previous :record))) previous)))
-         (let* ((candidate (physical-reseed-follow-intent-copy
-                            (physical-reseed-follow-read-at root-fd "physical-reseed.follow.tmp")
+         (let* ((candidate (physical-reseed-follow-recovery-candidate-at
+                            owner root-fd (physical-reseed-follow-read-at root-fd "physical-reseed.follow.tmp")
                             (getf previous :record)))
                 (identity (physical-reseed-follow-entry root-fd "physical-reseed.follow.tmp")))
            (physical-reseed-follow-check-local-intent owner root-fd candidate)
@@ -161,5 +161,8 @@
                   (unless (equal identity (physical-reseed-follow-file-identity (sb-posix:fstat fd)))
                     (error "target follow recovery temporary changed"))
                   (physical-reseed-follow-promote-intent
-                   owner root-fd fd (subseq identity 0 5) candidate previous check))
+                   owner root-fd fd (subseq identity 0 5) candidate previous
+                   (lambda ()
+                     (funcall check)
+                     (physical-reseed-follow-check-active-attempt owner))))
              (when fd (sb-posix:close fd)))))))))

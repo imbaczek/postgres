@@ -506,7 +506,7 @@ Return seven values, including the optional fact at the chosen seed."
               (when metadata (copy-tree (getf metadata :source-xids)))
               (physical-restartpoint-resource-seed metadata base store start)))))
 
-(defun physical-follow-scan-replay-from-seed
+(defun physical-follow-scan-replay-from-seed-core
     (candidate verified-base applied required observed seed map-records allow-open-tail &optional witness)
   "Scan a stable candidate without redo or publication. SEED supplies the replay
 position, timeline, XID, checkpoint, reservation, source XIDs and optional fact.
@@ -526,7 +526,6 @@ A policy fence must leave a clean batch boundary; an allowed open tail may remai
             (getf *physical-recovery-state* :source-checkpoint) snapshot
             (getf *physical-recovery-state* :required-applied) (first required)
             (getf *physical-recovery-state* :required-timeline) (second required))
-      (physical-recovery-check-store-point candidate (first required) (second required))
       (when (< (first required) start)
         (unless (>= next observed)
           (error "follow restartpoint loses required XID visibility"))
@@ -592,6 +591,19 @@ A policy fence must leave a clean batch boundary; an allowed open tail may remai
             :required-next-xid required-next
             :applied-resource-fact applied-resource-fact :required-resource-fact required-resource-fact
             :reservation reservation :source-xids source-xids))))
+
+(defun physical-follow-scan-replay-from-seed
+    (candidate verified-base applied required observed seed map-records allow-open-tail &optional witness)
+  "Check the durable required position, then scan a stable candidate from SEED."
+  (let ((*physical-recovery-state* (copy-tree verified-base))
+        (*physical-receive-store* candidate))
+    (setf (getf *physical-recovery-state* :replay-timeline) (second seed)
+          (getf *physical-recovery-state* :source-checkpoint) (fourth seed)
+          (getf *physical-recovery-state* :required-applied) (first required)
+          (getf *physical-recovery-state* :required-timeline) (second required))
+    (physical-recovery-check-store-point candidate (first required) (second required)))
+  (physical-follow-scan-replay-from-seed-core
+   candidate verified-base applied required observed seed map-records allow-open-tail witness))
 
 (defun physical-follow-scan-replay (candidate verified-base applied required observed restartpoint
                                     &key allow-open-tail)

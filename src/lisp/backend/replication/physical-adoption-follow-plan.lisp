@@ -13,41 +13,10 @@
 
 ;; Copy the source history through the selected child, preserving its ancestry.
 (defun physical-adoption-follow-history-prefix (source child text)
-  (unless (and (typep source '(integer 2 4294967295))
-               (typep child `(integer 2 ,source))
-               (stringp text)
-               (<= (length (string->bytes text)) +physical-store-history-maximum-bytes+))
-    (error "invalid adoption child history request"))
-  (let ((history (timeline-check-lineage (timeline-parse-history source text))))
-    (unless (member child history :key #'timeline-history-entry-timeline)
-      (error "adoption child timeline is absent from the saved source history"))
-    (when (= source child)
-      (return-from physical-adoption-follow-history-prefix (copy-seq text)))
-    (with-input-from-string (stream text)
-      (loop for position = (file-position stream)
-            for line = (read-line stream nil nil)
-            while line
-            for first = (position-if-not #'sql-array-space-p line)
-            when (and first (not (char= (char line first) #\#)))
-              do (multiple-value-bind (timeline end) (timeline-history-fields line)
-                   (declare (ignore end))
-                   (when (= timeline child)
-                     (unless (and (plusp position) (char= (char text (1- position)) #\Newline))
-                       (error "saved source history lacks the copied parent separator"))
-                     (let* ((prefix (subseq text 0 (1- position)))
-                            (previous (timeline-check-lineage (timeline-parse-history child prefix))))
-                       (unless (physical-store-history-extends-p previous history)
-                         (error "derived adoption child history changes source ancestry"))
-                       (return-from physical-adoption-follow-history-prefix prefix))))))
-    (error "saved source history has no child ancestor record")))
+  (physical-follow-history-prefix source child text))
 
 (defun physical-adoption-follow-child-history (anchor)
-  (multiple-value-bind (history fork eor) (physical-follow-anchor-check anchor)
-    (declare (ignore fork))
-    (when (eq :descendant (physical-follow-anchor-kind anchor))
-      (let ((child (timeline-check-end-of-recovery eor (getf anchor :receive-timeline) history)))
-        (physical-adoption-follow-history-prefix
-         (getf anchor :source-timeline) child (getf anchor :history-text))))))
+  (physical-follow-anchor-child-history anchor))
 
 (defun physical-adoption-follow-record-anchor (record)
   (physical-follow-anchor-copy
@@ -139,43 +108,24 @@
      :resource-fact (getf witness :resource-fact) :state-time time)))
 
 (defun physical-adoption-follow-model-store (record)
-  (let* ((stage (getf record :stage)) (end (getf stage :end)))
-    (%make-physical-store :system-id (getf stage :system-id) :timeline (getf stage :timeline)
-                          :base-lsn end :floor-lsn end :written-lsn end :flushed-lsn end
-                          :retained-identity (physical-recovery-retained-identity stage))))
+  (physical-follow-empty-base-model (getf record :stage)))
 
 ;; Derive the same binding from the saved attempt when reading the journal.
 (defun physical-adoption-follow-planned-binding (record)
   (let* ((record (physical-adoption-attempt-copy record))
          (stage (getf record :stage))
-         (end (getf stage :end))
          (anchor (physical-adoption-follow-record-anchor record))
-         (text (physical-adoption-follow-child-history anchor))
-         (model (physical-adoption-follow-model-store record))
-         (before (physical-store-control-tuple model))
-         (pair (list end (getf stage :timeline)))
-         (resource (wal-copy-control-resource-fields
-                    (getf (physical-adoption-install-image-state record) :snapshot))))
-    (multiple-value-bind (history fork eor) (physical-follow-anchor-check anchor)
-      (unless (and fork (<= end fork))
-        (error "adoption follow cannot retain a divergent stage frontier"))
-      (when (= end fork)
-        (setf (physical-store-selection model)
-              (physical-store-history-candidate
-               model (timeline-check-end-of-recovery eor (getf anchor :receive-timeline) history)
-               text (coerce (getf anchor :eor-octets) '(vector (unsigned-byte 8)))
-               #xCBF29CE484222325)))
-      (let ((binding
-              (list :version 1 :phase :pending :anchor anchor :child-history text
-                    :before before :after (physical-store-control-tuple model)
-                    :applied pair :required (copy-list pair)
-                    :recovery (append
-                               (list :phase 2 :cluster-identity (copy-seq (getf stage :cluster-identity))
-                                     :checkpoint (getf stage :checkpoint) :observed-next-xid (getf stage :next-xid)
-                                     :history-target nil :history-digest nil :restartpoint nil)
-                               (when resource (list :resource-fact (copy-tree resource)))))))
-        (physical-adoption-follow-check-binding record binding)
-        binding))))
+         (base (copy-list stage))
+         (snapshot (getf (physical-adoption-install-image-state record) :snapshot))
+         (fork (nth-value 1 (physical-follow-anchor-check anchor))))
+    (unless (and fork (<= (getf stage :end) fork))
+      (error "adoption follow cannot retain a divergent stage frontier"))
+    (setf (getf base :observed-next-xid) (getf stage :next-xid)
+          (getf base :source-checkpoint) snapshot
+          (getf base :source-resource-fact) (wal-copy-control-resource-fields snapshot))
+    (let ((binding (physical-follow-empty-base-binding base anchor)))
+      (physical-adoption-follow-check-binding record binding)
+      binding)))
 
 (defun physical-adoption-follow-selected-images (record binding time)
   (let* ((model (physical-adoption-follow-model-store record))
