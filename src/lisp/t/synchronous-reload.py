@@ -60,7 +60,8 @@ def commit_default_reload(server, witness, writer, contender):
         ':replication-mode :database :application-name "peer")))) '
         '(unwind-protect (progn (wal-sender-set-state sender "streaming") '
         '(wal-sender-note-sent sender end) (wal-sender-note-reply sender end end end 1)) '
-        '(wal-sender-unregister (wal-sender-status-backend sender)))))')
+          '(wal-sender-unregister (wal-sender-status-backend sender)))) '
+          '(quit))', append_quit=False)
     assert [kind for kind, _ in receive_ready(writer)] == [b'C', b'Z']
     # The new terminal exceeds the old acknowledged LSN. Incorrectly using ON
     # would wait indefinitely because there is no second acknowledgement.

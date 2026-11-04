@@ -10,8 +10,8 @@ configure, wait_for_commit, acknowledge = api['configure'], api['wait_for_commit
 
 
 class OwnedLisp(BaseOwnedLisp):
-    def control(self, expression):
-        output = super().control(expression)
+    def control(self, expression, append_quit=True):
+        output = super().control(expression, append_quit=append_quit)
         assert ';; read error:' not in output, output
         return output
 

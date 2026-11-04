@@ -820,11 +820,14 @@ At the fork, complete without entering Copy mode. Always release both sender cla
             (sb-bsd-sockets:socket-error () (ignore-errors (close stream :abort t)))
             (error (condition)
               (unless copy-mode (error condition))
-              (ignore-errors
-               (sb-ext:with-timeout 10
-                 (send-error-response stream
-                                      (if (typep condition 'pg-error) condition
-                                          (make-condition 'pg-error :sqlstate "XX000"
-                                                                    :message (princ-to-string condition))))))
-              (ignore-errors (close stream :abort t))))))))
+              (unwind-protect
+                   (handler-case
+                       (ignore-errors
+                        (sb-ext:with-timeout 10
+                          (send-error-response stream
+                                               (if (typep condition 'pg-error) condition
+                                                   (make-condition 'pg-error :sqlstate "XX000"
+                                                                             :message (princ-to-string condition))))))
+                     (sb-ext:timeout () nil))
+                (ignore-errors (close stream :abort t)))))))))
    :kind :physical))

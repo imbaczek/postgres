@@ -707,7 +707,7 @@ Do not perform wire I/O while restoring transaction state."
        )
       ((string= name "transaction_isolation")
        (let ((isolation-level (transaction-isolation-setting-value value)))
-         (if (and (backend-explicit *backend*)
+         (if (and (or *executing-do-p* (backend-explicit *backend*))
                   (eq (backend-state *backend*) :in-progress))
              (exec-set-transaction (list :isolation-level isolation-level))
              (unless (eq isolation-level :read-committed)
@@ -737,7 +737,7 @@ Do not perform wire I/O while restoring transaction state."
          (new-isolation (getf characteristics :isolation-level))
          (read-mode-specified-p (member :read-only characteristics))
          (new-read-only (getf characteristics :read-only)))
-    (unless (and (backend-explicit backend)
+    (unless (and (or *executing-do-p* (backend-explicit backend))
                  (eq (backend-state backend) :in-progress))
       (ereport "25001" "SET TRANSACTION can only be used in transaction blocks"))
     ;; PostgreSQL permits idempotent isolation changes after the first query.

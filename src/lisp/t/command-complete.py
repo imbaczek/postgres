@@ -69,10 +69,11 @@ class OwnedLisp:
             time.sleep(0.05)
         raise TimeoutError(f"test server not ready; see {self.root / 'server.log'}")
 
-    def control(self, expression):
+    def control(self, expression, append_quit=True):
         response = subprocess.run(
             [os.environ.get("SBCL", "sbcl"), "--script", str(LISP / "t/control-client.lisp"),
-             "unix", str(self.control_socket)], input=expression + "\n(quit)\n",
+               "unix", str(self.control_socket)],
+            input=expression + ("\n(quit)\n" if append_quit else "\n"),
             text=True, capture_output=True, check=True, timeout=15)
         output = response.stdout + response.stderr
         assert ";; error:" not in output, output
