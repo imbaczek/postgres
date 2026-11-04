@@ -18,6 +18,9 @@
 ;; Accept any entry at the temporary install name by checking its presence
 ;; only.  A final install name prevents this cleanup role from opening.
 
+;; Cleanup ownership also refuses follow intent on initial entry and recheck.
+;; Its specialized role check cannot rely on the base owner's method.
+
 (defun physical-reseed-cleanup-check-intent (directory)
   (physical-directory-check-reseed-follow-intent directory)
   (physical-adoption-require-absent

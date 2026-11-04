@@ -21,15 +21,20 @@
   (when (physical-adoption-path-present-p path) (error message))
   (values))
 
-;; Treat each reserved name as a fence, including temporary names.  This check
-;; does not parse an installation journal or authorize installation.  The
-;; install-only variant permits a stopped reseed owner to inspect its attempt.
+;; Either fixed follow name fences older owners and startup, regardless of
+;; entry type.  The presence check uses lstat; only ENOENT means absence.
+;; Presence alone does not authorize reconciliation.
 
 (defun physical-directory-check-reseed-follow-intent (directory)
   (dolist (name '("physical-reseed.follow" "physical-reseed.follow.tmp"))
     (physical-adoption-require-absent
      (merge-pathnames name directory)
      "pending offline reseed follow requires journal reconciliation")))
+
+;; Treat each reserved name as a fence, including temporary names.  This check
+;; does not parse a journal or authorize installation.  The install-only variant
+;; permits a stopped reseed owner to inspect its attempt, while retaining the
+;; installation and follow fences.
 
 (defun physical-directory-check-reseed-intent (directory &key install-only)
   (physical-directory-check-reseed-follow-intent directory)

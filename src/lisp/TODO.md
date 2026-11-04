@@ -76,6 +76,16 @@
   settlement. Reconcile the source outcome and activate follow only after the
   required durable checks; retire installation fences during startup reconciliation.
 
+- [x] Fence the reserved target follow intent names before startup or older
+  reseed ownership. Both final and temporary names reject every entry type;
+  specialized cleanup and install roles repeat the check. Validation passed 44
+  related tests, strict cold compilation and 16 fresh startup cases. The property
+  passed 80 trials at seed 114, digest `fnv1a64-v1:e93f14d6ca661cf2`; input
+  coverage and rejection counts were not measured. Evidence:
+  `/home/imbaczek/proj/pg-ha-artifacts/reseed-target-follow/progress.md`.
+  The target journal, proof, inert configuration, handoff and activation remain
+  open as described above.
+
 - [x] Fence reserved reseed installation state across startup and owner roles.
   Both `physical-reseed.install` and `physical-reseed.install.tmp` refuse startup
   before PID inspection or creation, even without an attempt journal. Ordinary

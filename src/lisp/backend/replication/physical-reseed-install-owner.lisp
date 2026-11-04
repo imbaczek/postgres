@@ -144,6 +144,9 @@
                       (error "reseed installation gained a second root PID"))))))))))
     owner))
 
+;; Check follow intent before reading the install plan.  The specialized owner
+;; repeats this check on use because its role method bypasses the base method.
+
 ;; Recover the plan only when no temporary intent remains and the final journal
 ;; binds to the current attempt and directory.
 (defun physical-reseed-install-initial-arguments (directory)
@@ -197,6 +200,9 @@
   (call-with-physical-adoption-directory-owner
    directory function :constructor #'make-physical-reseed-install-owner
    :initial-arguments #'physical-reseed-install-initial-arguments))
+
+;; Refuse follow intent before choosing any older owner; a future follow owner
+;; needs its own narrowly scoped authority to reconcile these names.
 
 ;; Choose the final install journal first.  Failure to read or validate it is an
 ;; error and never falls back to cleanup or ordinary ownership.  A temporary
