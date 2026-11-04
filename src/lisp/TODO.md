@@ -1,5 +1,38 @@
 # Development TODO
 
+- [x] Recover interrupted preserved-data reseed installation moves.
+  Verify the recorded move prefix or one completed rename ahead across the
+  target, incoming image and quarantine. Sync visible journal progress before
+  another move, then sync both move parents before recording the next step.
+  Validate the installed base before publishing the terminal step. Keep the old
+  entries in quarantine and retain the startup fences through follow handoff.
+  Validation passed 1,852 physical tests, strict compilation and eight SIGKILL
+  cases with fresh-process recovery and independent file identity checks.
+  Code commits are `7bfa3540dfd` and `a31d9f8e27b`. Documentation is in
+  `8216360fe1f`. Evidence is in
+  `/home/imbaczek/proj/pg-ha-artifacts/reseed-install-moves/namespace-progress.json`.
+
+- [x] Reconcile partial cancellation-phase publications.
+  Derive ABORTING from the trusted final attempt after checking a canonical
+  prefix in the held temporary file. Sync its empty truncation before writing
+  replacement bytes. A fresh CLOSED/ABORTED source receipt authorizes ABORTED.
+  Generic recovery also handles complete initial temporaries without a final
+  attempt and rejects partial records in that state. Source cleanup uses the
+  saved route while staging and incoming directories are unavailable.
+  Validation passed 1,861 physical tests, 86 focused tests and strict compilation.
+  Native checks covered 16 repair cuts, three complete initial-record recoveries
+  and one expected partial-record refusal through fresh processes. The prefix
+  property passed 80 trials at seed 102 with digest
+  `fnv1a64-v1:dee007a39777a2a8`. Input coverage and rejection counts are unmeasured.
+  Code is in `34165f98d0a`, with mutation-test corrections in `be47bf354b9`.
+  Evidence is in
+  `/home/imbaczek/proj/pg-ha-artifacts/reseed-cancel-reconcile/progress.json`.
+
+- [ ] Finish reseed follow handoff and startup reconciliation.
+  Require actual PREPARE_FOLLOW readiness and durable target follow configuration
+  before transferring the bootstrap lease. Reconcile the terminal installation
+  at startup before retiring its fences.
+
 - [x] Fence reserved reseed installation state across startup and owner roles.
   Both `physical-reseed.install` and `physical-reseed.install.tmp` refuse startup
   before PID inspection or creation, even without an attempt journal. Ordinary

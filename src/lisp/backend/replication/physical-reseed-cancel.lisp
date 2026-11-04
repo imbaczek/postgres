@@ -1,7 +1,10 @@
 (in-package #:pg)
 
+;; Tests can limit repair writes to exercise partial replacement images.
 (defvar *physical-reseed-cancel-write-limit* nil)
 
+;; Read the bounded temporary image through its held descriptor. Check the
+;; descriptor, mount and named entry before and after reading the exact bytes.
 (defun physical-reseed-cancel-temporary-bytes (root-fd fd stream mount)
   (let* ((name "physical-reseed.attempt.tmp")
          (before (physical-reseed-install-old-observe root-fd name mount))
@@ -20,6 +23,8 @@
       (error "cancellation temporary changed while reading"))
     (values bytes before)))
 
+;; Derive canonical same-phase and next-phase images from the trusted private
+;; predecessor. The transition check supplies the allowed phase boundaries.
 (defun physical-reseed-cancel-candidates (previous)
   (loop for phase in (ecase (getf previous :phase)
                        (:premanifest '(:premanifest :aborting))
@@ -30,6 +35,12 @@
                   (physical-reseed-attempt-check-transition previous candidate)
                   (physical-reseed-attempt-image candidate))))
 
+;; Keep the root and temporary descriptors open while FUNCTION examines or
+;; repairs the candidate. The temporary must be a private regular file with
+;; mode 0600 and one link. CHECK and REFRESH belong to this scope and recheck
+;; the predecessor and nanosecond entry metadata around their observations.
+;; A successful promotion changes the named entries, so the caller performs its
+;; checks before promotion instead of applying a generic check after FUNCTION.
 (defun call-with-physical-reseed-cancel-temporary (owner function)
   (call-with-physical-directory-root
    owner
@@ -85,7 +96,12 @@
            (setf active nil)
            (if stream (close stream) (when fd (sb-posix:close fd)))))))))
 
+;; Replace an authorized partial image with ABORTING copied from the trusted
+;; predecessor. Sync the empty file after truncation before writing any new bytes,
+;; so a crash cannot leave a new prefix followed by an old tail. Read back the
+;; complete image and sync it before using the existing checked promotion.
 (defun physical-reseed-cancel-normalize-temporary (owner root-fd fd path previous check refresh)
+  ;; Keep calls visible to tests that inject syscall failures.
   (declare (notinline sb-posix:fsync))
   (let* ((candidate (physical-reseed-attempt-copy previous))
          (empty (make-array 0 :element-type '(unsigned-byte 8))))
@@ -118,6 +134,15 @@
           (physical-reseed-attempt-promote-temporary
            owner candidate temporary-identity previous previous-identity))))))
 
+;; Full canonical candidates go through the ordinary recovery checks. This also
+;; covers a complete ABORTED candidate whose trusted publisher checked the source
+;; receipt before writing it. The receipt itself is not stored in the journal.
+;;
+;; With a predecessor, only a strict prefix of an allowed same-phase or next-phase
+;; image can be repaired, and the repair writes the predecessor as ABORTING.
+;; Missing final or temporary entries go through ordinary recovery, which can
+;; recover a complete initial premanifest temporary and fences a partial one
+;; without a final predecessor. This path needs no stage or incoming directory.
 (defun physical-reseed-attempt-recover-for-cancel (owner)
   (physical-reseed-check-owner owner)
   (let* ((directory (physical-adoption-owner-directory owner))

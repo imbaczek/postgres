@@ -156,6 +156,8 @@
 ;; removes the local startup fence.
 
 (defun physical-reseed-cancel (owner &key helper)
+  ;; This module loads before the cancellation recovery module and its shared
+  ;; filesystem and writer dependencies.
   (declare (ftype (function (t) t) physical-reseed-attempt-recover-for-cancel))
   (let ((record (physical-reseed-attempt-recover-for-cancel owner)))
     (when (eq :aborted (getf record :phase)) (return-from physical-reseed-cancel record))
@@ -163,6 +165,8 @@
       (let ((next (copy-list record)))
         (setf (getf next :phase) :aborting
               record (physical-reseed-attempt-publish owner next :previous record))))
+    ;; Use the original frozen route and publish ABORTED only after a fresh
+    ;; source response confirms both CLOSED and the ABORTED outcome.
     (call-with-physical-reseed-client
      owner record
      (lambda (client)

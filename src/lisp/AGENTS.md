@@ -197,6 +197,12 @@ appropriate instead of replacing the native C peer or adding a message relay.
   boundary that needs fault injection, then recompile that caller. Count the
   intercepted calls before trusting the failure test. For partial writes through
   an existing compiled writer, use its chunk limit and hook when available.
+- Use `:if-exists :overwrite` when a fault hook must alter an existing file
+  through `:direction :io`. Assert the changed bytes or inode independently.
+  An injection flag can be set before OPEN fails, and a generic error handler
+  can accept that failure. Two reseed mutation tests exposed this gap. Counters
+  for later operations can also prove that rejection happened at the intended
+  boundary.
 - Distinguish the libpq helper from a raw `pg-client` when recovering a failed
   query. The helper closes its channel on any command error; reconnect to the
   saved route for STATUS or ABORT. A raw client can remain open after an ordinary
