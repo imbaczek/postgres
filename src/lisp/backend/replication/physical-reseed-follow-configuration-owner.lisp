@@ -12,9 +12,30 @@
 (defmethod physical-reseed-follow-check-configuration-role
     ((owner physical-reseed-follow-configuration-owner) record)
   (let ((configuration (getf record :configuration)))
-    (when (and configuration (not (member (getf configuration :phase) '(:building :staged))))
-      (error "configuration ownership does not yet admit installed state")))
+    (when (and configuration (not (member (getf configuration :phase) '(:building :staged :installing :inert))))
+      (error "configuration ownership does not admit this phase")))
   record)
+
+(defun physical-reseed-follow-configuration-initial-arguments (directory)
+  (let ((fd nil))
+    (unwind-protect
+         (progn
+           (sb-sys:without-interrupts (setf fd (physical-backup-open-directory directory)))
+           (let ((snapshot (physical-reseed-follow-snapshot-at fd)))
+             (unless (getf (getf snapshot :record) :configuration)
+               (return-from physical-reseed-follow-configuration-initial-arguments
+                 (physical-reseed-follow-initial-arguments directory)))
+             (let* ((arguments (physical-reseed-install-seed-arguments directory))
+                    (state (physical-reseed-install-read-at fd "physical-reseed.install"))
+                    (record (physical-reseed-follow-copy (getf snapshot :record)))
+                    (plan (getf arguments :plan)))
+               (unless (and (equal plan (getf state :plan))
+                            (equal (getf record :attempt) (getf plan :attempt))
+                            (equal (getf record :install) (physical-reseed-follow-terminal-reference state)))
+                 (error "configuration seed differs from the actual terminal installation"))
+               (physical-reseed-follow-check-snapshot fd snapshot)
+               (append arguments (list :binding (physical-reseed-follow-core-projection record))))))
+      (when fd (sb-posix:close fd)))))
 
 ;; Check the original installed image before and after FUNCTION.  Workspace
 ;; evidence is established by the individual operations, not this factory.
@@ -28,7 +49,7 @@
        (verify)
        (multiple-value-prog1 (funcall function owner) (verify))))
    :constructor #'make-physical-reseed-follow-configuration-owner
-   :initial-arguments #'physical-reseed-follow-initial-arguments))
+   :initial-arguments #'physical-reseed-follow-configuration-initial-arguments))
 
 (defun physical-reseed-follow-configuration-workspace-facts (owner root-fd directory fd)
   (let* ((facts (physical-reseed-install-auxiliary-base-facts owner root-fd directory fd))
@@ -148,11 +169,19 @@
            (funcall function workspace-fd workspace-check)))
        check))))
 
+(defgeneric physical-reseed-follow-configuration-recovery-dispatch (owner))
+
 ;; Reconcile configuration publication with its exact predecessor and workspace
 ;; evidence.  A stable proved final without configuration can also be returned.
 ;; The current attempt must remain active; partial or unexplained temporaries
 ;; remain unchanged and fenced.
 (defun physical-reseed-follow-recover-configuration (owner)
+  (unless (physical-reseed-follow-configuration-owner-p owner)
+    (error "configuration recovery requires dedicated ownership"))
+  (physical-reseed-follow-check-idle owner)
+  (physical-reseed-follow-configuration-recovery-dispatch owner))
+
+(defmethod physical-reseed-follow-configuration-recovery-dispatch ((owner physical-reseed-follow-owner))
   (unless (physical-reseed-follow-configuration-owner-p owner)
     (error "configuration recovery requires dedicated ownership"))
   (physical-reseed-follow-check-idle owner)

@@ -238,6 +238,7 @@
                    (:file "../replication/physical-reseed-follow-configuration-directories")
                    (:file "../replication/physical-reseed-follow-configuration-base")
                    (:file "../replication/physical-reseed-follow-configuration-namespace")
+                   (:file "../replication/physical-reseed-follow-configuration-scope")
                    (:file "../replication/physical-reseed-follow-configuration-staging")
                    (:file "../replication/physical-adoption-follow-plan")
                    (:file "../replication/physical-adoption-follow-codec")

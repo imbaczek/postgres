@@ -514,3 +514,164 @@
               (throw 'mapped-unused-image-checked :checked))
             :later-writer)
            :fell-through))))
+
+(deftest reseed-mapped-operation-scope-pins-journals-and-revokes-held-state
+    (call-with-reseed-follow-building-fixture
+     :later-writer
+     (lambda (owner root workspace building)
+       (declare (ignore root workspace building))
+       (pg::physical-reseed-follow-stage-configuration owner)
+       (let ((saved-check nil) (saved-context nil) (receive nil))
+         (multiple-value-bind (first second)
+             (pg::call-with-physical-reseed-follow-mapped-image
+              owner
+              (lambda (root-fd check)
+                (declare (ignore root-fd))
+                (setf saved-check check
+                      saved-context pg::*physical-reseed-follow-installation-scope*
+                      receive (cdr (assoc :receive
+                                          (pg::physical-reseed-follow-installation-context-descriptors saved-context))))
+                (funcall check)
+                (ok (= 0 (pg::physical-reseed-follow-installation-context-prefix saved-context)))
+                (ok (intake-fails-p (lambda () (pg::physical-reseed-follow-read owner))))
+                (ok (sb-thread:join-thread
+                     (sb-thread:make-thread (lambda () (intake-fails-p saved-check)))))
+                (ok (intake-fails-p
+                     (lambda () (pg::call-with-physical-reseed-follow-mapped-image
+                                 owner (lambda (fd verify) (declare (ignore fd verify)))))))
+                (ok (intake-fails-p
+                     (lambda () (pg::physical-reseed-follow-installation-context owner))))
+                (values :first :second)))
+           (ok (eq :first first))
+           (ok (eq :second second)))
+         (ok (intake-fails-p saved-check))
+         (ok (intake-fails-p (lambda () (sb-posix:fstat receive))))
+         (ok (not (pg::physical-reseed-follow-installation-context-active-p saved-context)))
+         (ok (not (pg::physical-reseed-follow-owner-busy-p owner)))))))
+
+(deftest reseed-mapped-operation-scope-refuses-an-equal-replaced-final
+    (call-with-reseed-follow-building-fixture
+     :same-timeline
+     (lambda (owner root workspace building)
+       (declare (ignore workspace building))
+       (let ((record (pg::physical-reseed-follow-stage-configuration owner))
+             (calls 0))
+         (ok (intake-fails-p
+              (lambda ()
+                (pg::call-with-physical-reseed-follow-mapped-image
+                 owner
+                 (lambda (root-fd check)
+                   (declare (ignore root-fd check))
+                   (let ((temporary (merge-pathnames "replacement.follow" root))
+                         (final (merge-pathnames "physical-reseed.follow" root)))
+                     (reseed-follow-owner-test-write temporary (pg::physical-reseed-follow-image record))
+                     (sb-posix:rename temporary final)
+                     (incf calls)))))))
+         (ok (= calls 1))))))
+
+(deftest reseed-mapped-operation-scope-closes-on-nonlocal-exit
+    (call-with-reseed-follow-building-fixture
+     :same-timeline
+     (lambda (owner root workspace building)
+       (declare (ignore root workspace building))
+       (pg::physical-reseed-follow-stage-configuration owner)
+       (let ((context nil) (check nil) (receive nil))
+         (ok (eq :left
+                 (catch 'leave-mapped-scope
+                   (pg::call-with-physical-reseed-follow-mapped-image
+                    owner
+                    (lambda (fd verify)
+                      (declare (ignore fd))
+                      (setf context pg::*physical-reseed-follow-installation-scope*
+                            check verify
+                            receive (cdr (assoc :receive
+                                                (pg::physical-reseed-follow-installation-context-descriptors context))))
+                      (throw 'leave-mapped-scope :left))))))
+         (ok (not (pg::physical-reseed-follow-installation-context-active-p context)))
+         (ok (pg::physical-store-closed-p (pg::physical-reseed-follow-installation-context-store context)))
+         (ok (intake-fails-p check))
+         (ok (intake-fails-p (lambda () (sb-posix:fstat receive))))
+         (ok (eq :reopened
+                 (pg::call-with-physical-reseed-follow-mapped-image
+                  owner (lambda (fd verify) (declare (ignore fd)) (funcall verify) :reopened))))))))
+
+(defun reseed-test-replace-follow-record (root record)
+  (let ((temporary (merge-pathnames "fixture.follow" root))
+        (final (merge-pathnames "physical-reseed.follow" root)))
+    (reseed-follow-owner-test-write temporary (pg::physical-reseed-follow-image record))
+    (sb-posix:rename temporary final)))
+
+(deftest reseed-configuration-owner-reopens-every-installed-prefix-and-strict-inert-state
+    (dolist (kind '(:same-timeline :retained-timeline :before-fork :at-fork :later-writer))
+      (let ((staged nil) (binding nil))
+        (call-with-reseed-follow-building-fixture
+         kind
+         (lambda (owner root workspace building)
+           (declare (ignore workspace building))
+           (setf staged (pg::physical-reseed-follow-stage-configuration owner))
+           (pg::call-with-physical-directory-root
+            owner (lambda (fd directory)
+                    (declare (ignore directory))
+                    (setf binding (pg::physical-reseed-follow-proof-at owner fd staged)))))
+         (lambda (root workspace)
+           (let* ((moves (pg::physical-reseed-follow-configuration-moves staged binding))
+                  (descriptors nil)
+                  (record (pg::physical-reseed-follow-copy staged)))
+             (unwind-protect
+                  (progn
+                    (dolist (entry (list (cons :root root) (cons :workspace workspace)
+                                         (cons :staged (merge-pathnames "staged/" workspace))
+                                         (cons :saved (merge-pathnames "saved/" workspace))
+                                         (cons :wal (merge-pathnames "pg_wal/" root))))
+                      (push (cons (car entry) (pg::physical-backup-open-directory (cdr entry))) descriptors))
+                    (loop for prefix from 0 to (length moves)
+                          do (setf (getf (getf record :configuration) :phase) :installing
+                                   (getf (getf record :configuration) :step) prefix)
+                             (reseed-test-replace-follow-record root record)
+                             (pg::call-with-physical-reseed-follow-configuration-owner
+                              root (lambda (owner)
+                                     (ok (equal record (pg::physical-reseed-follow-read owner)))
+                                     (ok (intake-fails-p (lambda () (pg::physical-reseed-follow-initial-record owner))))))
+                             (when (plusp prefix)
+                               (setf (getf (getf record :configuration) :step) (1- prefix))
+                               (reseed-test-replace-follow-record root record)
+                               (pg::call-with-physical-reseed-follow-configuration-owner
+                                root (lambda (owner) (ok (equal record (pg::physical-reseed-follow-read owner)))))
+                               (setf (getf (getf record :configuration) :step) prefix)
+                               (reseed-test-replace-follow-record root record))
+                             (when (>= prefix 2)
+                               (setf (getf (getf record :configuration) :step) (- prefix 2))
+                               (reseed-test-replace-follow-record root record)
+                               (let ((called nil))
+                                 (ok (intake-fails-p
+                                      (lambda () (pg::call-with-physical-reseed-follow-configuration-owner
+                                                  root (lambda (owner) (declare (ignore owner)) (setf called t))))))
+                                 (ok (not called)))
+                               (setf (getf (getf record :configuration) :step) prefix)
+                               (reseed-test-replace-follow-record root record))
+                             (when (< prefix (length moves))
+                               (destructuring-bind (logical from-role from-leaf to-role to-leaf) (nth prefix moves)
+                                 (declare (ignore logical))
+                                 (unless (zerop (pg::physical-adoption-renameat2
+                                                 (cdr (assoc from-role descriptors)) from-leaf
+                                                 (cdr (assoc to-role descriptors)) to-leaf
+                                                 pg::+physical-adoption-rename-noreplace+))
+                                   (error "fixture metadata move failed")))))
+                    (setf (getf (getf record :configuration) :phase) :inert)
+                    (reseed-test-replace-follow-record root record)
+                    (let ((original (symbol-function 'pg::physical-follow-check-pending-state))
+                          (strict-calls 0)
+                          (before (lineage-test-bytes (merge-pathnames "physical-recovery.control" root))))
+                      (unwind-protect
+                           (progn
+                             (setf (symbol-function 'pg::physical-follow-check-pending-state)
+                                   (lambda (&rest arguments)
+                                     (incf strict-calls)
+                                     (apply original arguments)))
+                             (pg::call-with-physical-reseed-follow-configuration-owner
+                              root (lambda (owner) (ok (equal record (pg::physical-reseed-follow-read owner)))))
+                             (ok (plusp strict-calls))
+                             (ok (= 2 (getf (pg::physical-recovery-read-control root) :phase)))
+                             (ok (equalp before (lineage-test-bytes (merge-pathnames "physical-recovery.control" root)))))
+                        (setf (symbol-function 'pg::physical-follow-check-pending-state) original))))
+               (dolist (entry descriptors) (sb-posix:close (cdr entry))))))))))
