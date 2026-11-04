@@ -87,6 +87,7 @@
                (:file "t/physical-adoption-retire-tests")
                (:file "t/physical-adoption-startup-entry-tests")
                (:file "t/physical-reseed-follow-tests")
+               (:file "t/physical-reseed-follow-codec-tests")
                (:file "t/wal-timeline-tests")
                (:file "t/wal-eor-tests")
                (:file "t/physical-history-tests")

@@ -53,7 +53,8 @@
                             (= (getf local :device) (sb-posix:stat-dev root))
                             (= (getf local :inode) (sb-posix:stat-ino root)))
                  (error "reseed install journal generation or root binding differs"))
-               (append state (list :identity before)))))
+               (append state (list :identity before :digest
+                                   (physical-store-update-digest #xCBF29CE484222325 bytes))))))
       (if stream (close stream) (when fd (sb-posix:close fd))))))
 
 ;; Keep the owner's plan and attempt evidence out of printed representations.
