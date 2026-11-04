@@ -19,6 +19,60 @@
                (getf (getf row :coordinates) :overlap-digest) digest))
        (funcall function root parent row)))))
 
+(deftest backup-lease-startup-raw-pin-read-keeps-wal-policy-separate
+    (dolist (follow '(nil t))
+      (call-with-backup-lease-allocation-authority-fixture
+       (lambda (root parent row)
+         (declare (ignore root))
+         (let* ((pin (if follow (backup-lease-allocation-authority-save-pin row)
+                         (gethash (getf (getf parent :request) :name) pg::*physical-source-pins*)))
+                (name (pg::physical-source-pin-name pin))
+                (path (pg::physical-source-pin-path name))
+                (bytes nil))
+           (when follow
+             (setf (pg::physical-follow-pin-stage pin) :retaining
+                   (pg::physical-source-pin-confirmed-lsn pin) nil
+                   (pg::physical-source-pin-restart-lsn pin) (getf (getf row :coordinates) :overlap-start))
+             (pg::physical-source-pin-save pin))
+           (setf bytes (pg::physical-source-pin-encode pin))
+           (ok (equalp bytes (pg::physical-source-pin-encode
+                              (sb-thread:with-mutex (pg::*wal-lock*)
+                                (pg::physical-source-pin-read path :stabilize t)))))
+           (delete-file (pg::wal-segment-path 0))
+           (ok (intake-fails-p
+                (lambda ()
+                  (sb-thread:with-mutex (pg::*wal-lock*)
+                    (pg::physical-source-pin-read path :stabilize t)))))
+           (let ((raw (funcall 'pg::physical-source-pin-read-raw path :stabilize t)))
+             (ok (equalp bytes (pg::physical-source-pin-encode raw)))
+             (ok (not (pg::physical-source-pin-lost-p raw)))
+             (ok (eq pin (gethash name pg::*physical-source-pins*)))
+             (ok (equalp bytes (pg::read-bounded-regular-file path
+                                                              (pg::physical-follow-pin-image-limit)))))
+           (ok (not pg::*wal-poisoned*)))))))
+
+(deftest backup-lease-startup-raw-pin-read-rejects-foreign-metadata
+    (dolist (follow '(nil t))
+      (dolist (fault '(:name :system-id))
+        (call-with-backup-lease-allocation-authority-fixture
+         (lambda (root parent row)
+           (declare (ignore root))
+           (let* ((pin (if follow (backup-lease-allocation-authority-save-pin row)
+                           (gethash (getf (getf parent :request) :name) pg::*physical-source-pins*)))
+                  (path (pg::physical-source-pin-path (pg::physical-source-pin-name pin))))
+             (ecase fault
+               (:name
+                (let ((other (pg::physical-source-pin-path "different_raw_owner")))
+                  (uiop:copy-file path other)
+                  (setf path other)))
+               (:system-id
+                (incf (pg::physical-source-pin-system-id pin))
+                (when follow (incf (getf (pg::physical-follow-pin-anchor pin) :system-id)))
+                (pg::physical-source-pin-save pin)))
+             (ok (intake-fails-p
+                  (lambda () (funcall 'pg::physical-source-pin-read-raw path :stabilize t))))
+             (ok (not pg::*wal-poisoned*))))))))
+
 (deftest backup-lease-allocation-publication-authenticates-and-detaches
     (call-with-backup-lease-allocation-authority-fixture
      (lambda (root parent row)

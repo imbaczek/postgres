@@ -230,21 +230,19 @@ For a retained-timeline pin that endpoint is the requested fork."
         (physical-source-pin-check-bootstrap-fields pin)
         pin))))
 
-(defun physical-source-bootstrap-pin-read (path bytes)
-  (let ((pin (physical-source-bootstrap-pin-decode path bytes)))
-    (physical-source-pin-check-wal pin)
-    pin))
-
-(defun physical-source-pin-read-retirement (name)
-  (let* ((path (physical-source-pin-path name))
-         (bytes (read-bounded-regular-file path (physical-follow-pin-image-limit)))
+(defun physical-source-pin-read-raw (path &key stabilize)
+  (let* ((bytes (read-bounded-regular-file path (physical-follow-pin-image-limit)
+                                           :stabilize stabilize))
          (pin (if (physical-follow-pin-image-p bytes)
                   (physical-follow-pin-decode bytes)
                   (physical-source-bootstrap-pin-decode path bytes))))
-    (unless (and (equal name (physical-source-pin-name pin))
+    (unless (and (equal (physical-source-pin-name pin) (pathname-name path))
                  (= (physical-source-pin-system-id pin) (catalog-system-identifier)))
-      (error "retirement pin differs from its pathname or local system identifier"))
+      (error "physical source pin differs from its pathname or local system identifier"))
     pin))
+
+(defun physical-source-pin-read-retirement (name)
+  (physical-source-pin-read-raw (physical-source-pin-path name)))
 
 (defun physical-source-retirement-pins (name)
   "Read and compare registered and durable pins under caller-owned WAL exclusion.
@@ -269,14 +267,9 @@ A standby may have only the durable pin; a primary requires registry agreement."
   "Read and validate a private source pin; startup may stabilize it first.
 Reopened follow pins not marked lost check retained source coverage through
 their endpoint; lost pins need no WAL."
-  (let ((bytes (read-bounded-regular-file path (physical-follow-pin-image-limit) :stabilize stabilize)))
-    (if (physical-follow-pin-image-p bytes)
-        (let ((pin (physical-follow-pin-decode bytes)))
-          (unless (equal (physical-source-pin-name pin) (pathname-name path))
-            (error "physical follow pin pathname differs from its name"))
-          (physical-source-pin-check-wal pin)
-          pin)
-        (physical-source-bootstrap-pin-read path bytes))))
+  (let ((pin (physical-source-pin-read-raw path :stabilize stabilize)))
+    (physical-source-pin-check-wal pin)
+    pin))
 
 (defun physical-source-pin-stream-ready-p (pin)
   (declare (notinline physical-follow-pin-p))
