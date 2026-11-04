@@ -14,6 +14,10 @@
 
 (defvar *physical-backup-lease-allocation-context* nil)
 
+;; The dynamic context authorizes only this operation on this saved record.
+;; Bind it to the thread, backend and storage incarnation, and revoke it on
+;; every exit so an escaped context cannot authorize a later operation.
+
 (defun call-with-physical-backup-lease-allocation-context (operation record function)
   (unless (member operation '(:prepare :retire))
     (wal-invalid-input "invalid backup lease allocation operation"))
@@ -58,6 +62,10 @@
           (values row parent))
       (wal-input-validation-error (condition) (error condition))
       (error (condition) (wal-fail-stop condition)))))
+
+;; A live allocation is selected only by the handed-off parent and matching
+;; successor.  PIN may be absent after retirement; when present its ready anchor
+;; must match the saved coordinates and the parent's digest.
 
 (defun physical-backup-lease-allocation-selected-pin-p (row parent pin &optional closing)
   (and (eq :live (getf row :state))
@@ -119,6 +127,9 @@
       (wal-input-validation-error ()
         (error "backup lease allocation retirement registry and disk disagree"))))
   pin)
+
+;; Cancellation may retire its own unselected pin after durable revocation.
+;; Without that operation owner, retirement requires a completed handoff.
 
 (defun physical-backup-lease-allocation-check-retirement (name &optional pin)
   (let ((row (physical-backup-lease-allocation-record-under-lock name)))

@@ -2,6 +2,10 @@
 
 (defvar *physical-backup-lease-allocation-history-cache* nil)
 
+;; Histories are indexed by parent lease and ordered by generation.  Rebuild
+;; and validate the index under WAL exclusion when the registry is replaced;
+;; publication invalidates it before changing the registered records.
+
 (defun physical-backup-lease-allocation-histories ()
   (unless (sb-thread:holding-mutex-p *wal-lock*)
     (error "backup lease allocation lookup requires WAL exclusion"))
@@ -94,6 +98,10 @@
             (wal-invalid-input "backup lease allocation source is not available for preparation"))
           (physical-backup-lease-ready-action parent))))
   (values))
+
+;; AFTER is a validated transition from BEFORE.  With write and WAL exclusion,
+;; recheck the parent, history, registry and disk before starting publication.
+;; Write the durable record before exposing it in memory, and return a copy.
 
 (defun physical-backup-lease-allocation-publish-checked-under-lock (before after begin-publication)
   (physical-backup-lease-require-locks)

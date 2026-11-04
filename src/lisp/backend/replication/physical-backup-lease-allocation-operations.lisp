@@ -26,6 +26,10 @@
          (error "unregistered backup lease allocation intent file"))))
     (values parent before)))
 
+;; Publish the live intent before preparing its pin.  An exact retry can reuse
+;; the saved intent and pin; a canceled intent cannot be revived.  Return the
+;; prepared pin, with the scoped context authorizing only this preparation.
+
 (defun physical-backup-lease-follow-prepare (request generation name coordinates)
   (let ((candidate (physical-backup-lease-follow-intent request generation name coordinates :live)))
     (with-live-operation
@@ -59,6 +63,10 @@
       (physical-backup-lease-finish-closing-under-lock (getf parent :request) begin-publication)
       (physical-backup-lease-copy parent)))
 
+;; Reject an active sender before publication.  Persist cancellation before
+;; unlinking the matching pin, or sync the directory when no pin remains.
+;; The caller owns write and WAL exclusion and the publication fence.
+
 (defun physical-backup-lease-allocation-revoke-under-lock (before candidate begin-publication)
   (physical-backup-lease-require-locks)
   (let ((name (getf candidate :name)))
@@ -91,6 +99,11 @@
       (if (eq :busy (physical-backup-lease-allocation-revoke-under-lock before candidate begin-publication))
           :busy
           (physical-backup-lease-allocation-settle-parent parent begin-publication)))))
+
+;; Return the current or settled parent.  For a closing or closed parent,
+;; preserve the selected handoff and observe unknown intents without recording
+;; cancellation.  Otherwise cancel durably and retire the matching pin.
+;; Report a busy sender only after leaving the publication fence.
 
 (defun physical-backup-lease-follow-cancel (request generation name coordinates)
   (let* ((candidate (physical-backup-lease-follow-intent request generation name coordinates :canceled))
