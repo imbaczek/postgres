@@ -97,6 +97,47 @@
              (error "derived configuration file lost its recorded identity or stable metadata"))
         collect (list logical parent leaf before)))
 
+(defun physical-reseed-follow-layout-proof
+    (owner descriptors plan record positions images extra expected mount check &optional active-row)
+  (let ((root (physical-reseed-follow-configuration-role-fd descriptors :root))
+        (quarantine (physical-reseed-follow-configuration-role-fd descriptors :quarantine)))
+    (unless (= (length descriptors) 10) (error "mapped layout requires exactly ten directory roles"))
+    (unless (equal (physical-reseed-follow-configuration-image-specifications
+                    images (physical-reseed-follow-core-projection record))
+                   (getf (getf record :configuration) :images))
+      (error "mapped layout images differ from their committed specifications"))
+    (flet ((names ()
+             (loop for (role entries) on expected by #'cddr
+                   append (list role
+                                (physical-reseed-install-directory-names
+                                 (physical-reseed-follow-configuration-role-fd descriptors role))))))
+      (let* ((directories (physical-reseed-follow-configuration-directory-rows descriptors plan record positions mount))
+             (old (physical-reseed-install-namespace-old-rows
+                   plan (1- (physical-reseed-install-last-step plan)) root quarantine mount)))
+        (unless (equal expected (names)) (error "mapped configuration directory inventory differs"))
+        (let ((new (physical-reseed-follow-configuration-original-rows descriptors plan positions mount))
+              (derived (physical-reseed-follow-configuration-image-rows descriptors record positions images mount))
+              (active (when active-row (funcall active-row))))
+          (funcall check)
+          (physical-reseed-check-owner owner)
+          (physical-reseed-install-namespace-check-new-rows
+           new mount (lambda (name)
+                       (physical-reseed-follow-configuration-original-location descriptors positions name)))
+          (dolist (entry (if active-row (append derived (list active)) derived))
+            (unless (equal (fourth entry) (physical-reseed-install-old-observe (second entry) (third entry) mount))
+              (error "derived configuration file changed during the layout proof")))
+          (unless (and (or (null active-row) (equal active (funcall active-row)))
+                       (equal extra (physical-reseed-install-extra-entries owner root))
+                       (equal old (physical-reseed-install-namespace-old-rows
+                                   plan (1- (physical-reseed-install-last-step plan)) root quarantine mount))
+                       (equal directories (physical-reseed-follow-configuration-directory-rows
+                                           descriptors plan record positions mount))
+                       (equal expected (names)))
+            (error "mapped configuration layout changed during verification"))
+          (append (list :new new :images derived)
+                  (when active-row (list :active active))
+                  (list :old old :directories directories :names expected)))))))
+
 ;; Prove the complete mapped namespace at one prefix, including unused images.
 ;; Check identities, contents and exact child names again around the proof.
 (defun physical-reseed-follow-configuration-layout-state (owner descriptors value binding images prefix check)
@@ -107,40 +148,9 @@
   (multiple-value-bind (plan record)
       (physical-reseed-follow-configuration-install-plan (physical-reseed-install-owner-plan owner) value)
     (let* ((root (physical-reseed-follow-configuration-role-fd descriptors :root))
-           (quarantine (physical-reseed-follow-configuration-role-fd descriptors :quarantine))
            (mount (physical-adoption-install-mount-id nil :directory-fd root))
            (positions (physical-reseed-follow-configuration-positions record binding prefix))
            (extra (physical-reseed-install-extra-entries owner root))
            (expected (physical-reseed-follow-configuration-inventories plan record binding prefix extra)))
-      (unless (= (length descriptors) 10) (error "mapped layout requires exactly ten directory roles"))
-      (unless (equal (physical-reseed-follow-configuration-image-specifications
-                      images (physical-reseed-follow-core-projection record))
-                     (getf (getf record :configuration) :images))
-        (error "mapped layout images differ from their committed specifications"))
-      (flet ((names ()
-               (loop for (role entries) on expected by #'cddr
-                     append (list role
-                                  (physical-reseed-install-directory-names
-                                   (physical-reseed-follow-configuration-role-fd descriptors role))))))
-        (let* ((directories (physical-reseed-follow-configuration-directory-rows descriptors plan record positions mount))
-               (old (physical-reseed-install-namespace-old-rows
-                     plan (1- (physical-reseed-install-last-step plan)) root quarantine mount)))
-          (unless (equal expected (names)) (error "mapped configuration directory inventory differs"))
-          (let ((new (physical-reseed-follow-configuration-original-rows descriptors plan positions mount))
-                (derived (physical-reseed-follow-configuration-image-rows descriptors record positions images mount)))
-            (funcall check)
-            (physical-reseed-check-owner owner)
-            (physical-reseed-install-namespace-check-new-rows
-             new mount (lambda (name)
-                         (physical-reseed-follow-configuration-original-location descriptors positions name)))
-            (dolist (entry derived)
-              (unless (equal (fourth entry) (physical-reseed-install-old-observe (second entry) (third entry) mount))
-                (error "derived configuration file changed during the layout proof")))
-            (unless (and (equal extra (physical-reseed-install-extra-entries owner root))
-                         (equal old (physical-reseed-install-namespace-old-rows
-                                     plan (1- (physical-reseed-install-last-step plan)) root quarantine mount))
-                         (equal directories (physical-reseed-follow-configuration-directory-rows
-                                             descriptors plan record positions mount))
-                         (equal expected (names)))
-              (error "mapped configuration layout changed during verification"))
-            (list :new new :images derived :old old :directories directories :names expected)))))))
+      (physical-reseed-follow-layout-proof
+       owner descriptors plan record positions images extra expected mount check))))

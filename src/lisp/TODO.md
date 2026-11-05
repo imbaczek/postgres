@@ -220,9 +220,20 @@
   grant no filesystem or startup authority. Evidence: `plan-contract-check.json`,
   `plan-refactor-regression-check.json`, `plan-refactor-cold-check.json` and
   `plan-refactor-format-check.json` in the activation artifact directory.
-  Active configuration publication, real source authority checks, crash
-  recovery, archive moves and startup admission remain open; these codecs grant
-  no filesystem or startup authority. Evidence:
+  Read-only filesystem proofs now check the active image and exact mapped
+  names, identities and bytes at all three move prefixes. Building output
+  admits only absence or a complete canonical private image; partial and
+  conflicting entries stay fenced. Both layout wrappers share the filesystem
+  proof while keeping their separate plans and owner checks. Validation passed 10
+  selected tests with 270 assertions, including all five fixture geometries,
+  strict cold compilation of 229 production files and five-file formatting.
+  The tests construct proposed layouts without publishing activation intent.
+  Evidence: `layout-refactor-regression-check.json`,
+  `layout-refactor-cold-check.json` and `layout-format-check.json` in the
+  activation artifact directory.
+  Activation context and publication, current source and actual-attempt
+  checks, crash recovery, archive retirement and startup admission remain
+  open; these proof kernels grant no operation or startup authority. Evidence:
   `/home/imbaczek/proj/pg-ha-artifacts/reseed-target-activation/retirement-fixed-check.json`
   and `retirement-format-check.json` in that directory.
 

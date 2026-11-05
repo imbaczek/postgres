@@ -109,6 +109,7 @@
                (:file "t/physical-reseed-follow-retirement-codec-tests")
                (:file "t/physical-reseed-follow-capacity-tests")
                (:file "t/physical-reseed-follow-activation-plan-tests")
+               (:file "t/physical-reseed-follow-activation-layout-tests")
                (:file "t/wal-timeline-tests")
                (:file "t/wal-eor-tests")
                (:file "t/physical-history-tests")
