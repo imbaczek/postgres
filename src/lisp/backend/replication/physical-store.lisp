@@ -362,7 +362,7 @@ unflushed writes and decoder state. Errors and nonlocal exits fence the store."
            stream)
       (unless stream (sb-posix:close fd)))))
 
-(defun physical-store-open (directory system-id timeline &key create (start-lsn 0) (discard-tail t) (create-lock t) retained-identity retained-directory)
+(defun physical-store-open (directory system-id timeline &key create (start-lsn 0) (discard-tail t) (create-lock t) retained-identity retained-directory on-open)
   "Own a native receive spool, creating only in an existing empty directory.
 CREATE never overwrites an old incarnation. Opening an existing spool validates
 its control, selected history, durable prefix and referenced inventory, then
@@ -386,8 +386,9 @@ or creating a missing lock. Do not resume input in that mode."
         (success nil))
     (unwind-protect
          (progn
-           (setf (physical-store-lock-stream store)
-                 (physical-store-open-lock store create-lock))
+           (sb-sys:without-interrupts
+             (setf (physical-store-lock-stream store)
+                   (physical-store-open-lock store create-lock)))
            ;; POSIX flock LOCK_EX | LOCK_NB; per-open-description ownership also
            ;; excludes a second receiver in this Lisp process.
            (unless (zerop (physical-store-flock
@@ -412,8 +413,9 @@ or creating a missing lock. Do not resume input in that mode."
                  (physical-store-check-retained-root store)
                  (when discard-tail (physical-store-discard-tail store))))
            (setf (physical-store-decoder store)
-                 (make-physical-wal-decoder :start-lsn (physical-store-flushed-lsn store))
-                 success t)
+                 (make-physical-wal-decoder :start-lsn (physical-store-flushed-lsn store)))
+           (when on-open (funcall on-open store))
+           (setf success t)
            store)
       (unless success (physical-store-close store)))))
 

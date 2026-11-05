@@ -14,6 +14,95 @@
 (defun sample-physical-record (&optional (start 0))
   (pg::wal-encode-record pg::+wal-record-batch-start+ 0 start (empty-octets)))
 
+(cl-spec:defproperty physical-store-open-handoff-preserves-validated-store
+    ((start (range integer 0 3)))
+  (:about pg::physical-store-open)
+  (:trials (:normal 100))
+  (with-physical-store-directory (root)
+    (let ((owned nil) (calls 0) (validated nil))
+      (unwind-protect
+           (let ((returned
+                   (funcall (symbol-function 'pg::physical-store-open)
+                            root 123 1 :create t :start-lsn start
+                            :on-open (lambda (opened)
+                                       (setf owned opened)
+                                       (incf calls)
+                                       (setf validated
+                                             (and (pg::physical-store-decoder opened)
+                                                  (= start (pg::physical-store-flushed-lsn opened))
+                                                  (not (pg::physical-store-closed-p opened))))))))
+             (and (eq owned returned) (= calls 1) validated
+                  (= start (pg::physical-store-base-lsn returned))
+                  (= start (pg::physical-store-written-lsn returned))
+                  (= start (pg::physical-store-flushed-lsn returned))))
+        (when owned (pg::physical-store-close owned))))))
+
+(deftest generated-physical-store-open-handoff-contract
+    (let ((data (cl-spec:result-data
+                 (cl-spec:run-property 'physical-store-open-handoff-preserves-validated-store
+                                       :seed 142 :profile :normal))))
+      (ok (eq :passed (getf data :status)))))
+
+(deftest physical-store-open-handoff-cleans-up-interruptions-and-callback-exits
+    (dolist (kind '(:callback-error :callback-throw :callback-interrupt :prefix-interrupt :lock-interrupt))
+      (with-physical-store-directory (root)
+        (pg::physical-store-close (pg::physical-store-open root 123 1 :create t))
+        (let* ((path (merge-pathnames "receive.control" root))
+               (bytes (lineage-test-bytes path))
+               (owned nil) (opening nil) (calls 0) (result nil)
+               (old-prefix (symbol-function 'pg::physical-store-validate-prefix))
+               (old-lock (symbol-function 'pg::physical-store-open-lock)))
+          (flet ((interrupt ()
+                   (sb-thread:interrupt-thread sb-thread:*current-thread*
+                                               (lambda () (error "injected store open cut")))))
+            (unwind-protect
+                 (progn
+                   (case kind
+                     (:prefix-interrupt
+                      (setf (symbol-function 'pg::physical-store-validate-prefix)
+                            (lambda (store &rest arguments)
+                              (setf opening store)
+                              (apply old-prefix store arguments)
+                              (interrupt))))
+                     (:lock-interrupt
+                      (setf (symbol-function 'pg::physical-store-open-lock)
+                            (lambda (&rest arguments)
+                              (setf opening (first arguments))
+                              (let ((stream (apply old-lock arguments)))
+                                (interrupt)
+                                stream)))))
+                   (setf result
+                         (catch 'store-open-cut
+                           (handler-case
+                               (unwind-protect
+                                    (funcall (symbol-function 'pg::physical-store-open)
+                                             root 123 1 :discard-tail nil :create-lock nil
+                                             :on-open
+                                             (lambda (store)
+                                               (setf owned store)
+                                               (incf calls)
+                                               (case kind
+                                                 (:callback-error (error "injected store open cut"))
+                                                 (:callback-throw (throw 'store-open-cut :cut))
+                                                 (:callback-interrupt (interrupt)))))
+                                 (when owned (pg::physical-store-close owned)))
+                             (error (condition)
+                               (when (search "injected store open cut" (princ-to-string condition)) :cut))))))
+              (setf (symbol-function 'pg::physical-store-validate-prefix) old-prefix
+                    (symbol-function 'pg::physical-store-open-lock) old-lock)))
+          (ok (eq :cut result))
+          (ok (= calls (if (member kind '(:prefix-interrupt :lock-interrupt)) 0 1)))
+          (let ((store (or owned opening)))
+            (ok (and store (pg::physical-store-closed-p store)))
+            (ok (and store (not (open-stream-p (pg::physical-store-lock-stream store))))))
+          (ok (equalp bytes (lineage-test-bytes path)))
+          (let ((reopened (pg::physical-store-open root 123 1 :discard-tail nil :create-lock nil)))
+            (unwind-protect
+                 (progn
+                   (ok (zerop (pg::physical-store-flushed-lsn reopened)))
+                   (ok (not (pg::physical-store-closed-p reopened))))
+              (pg::physical-store-close reopened)))))))
+
 (deftest physical-store-compaction-preserves-unflushed-input
     (with-physical-store-directory (root)
       (let* ((segment pg::+wal-segment-size+)
