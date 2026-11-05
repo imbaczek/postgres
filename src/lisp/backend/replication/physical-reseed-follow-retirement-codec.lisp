@@ -75,6 +75,10 @@
     t))
 
 (defun physical-reseed-follow-retirement-next-record (value attempt-file)
+  ;; Advance one retirement step, using the observed attempt reference for
+  ;; the initial record and the frozen reference thereafter.  Canonical copy
+  ;; and transition checks preserve the other groups.  File and layout proof
+  ;; and publication authority belong to the caller.
   (let* ((record (physical-reseed-follow-copy value))
          (activation (getf record :activation))
          (retirement (getf record :retirement)))
