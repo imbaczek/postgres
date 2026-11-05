@@ -46,8 +46,9 @@
                     (= mount (physical-adoption-install-mount-id
                               (merge-pathnames leaf (physical-image-fd-path parent)))))
          (error "configuration file differs from its derived image or identity"))
-       (list logical :file #o600 (first before) (second before) (length bytes)
-             (physical-store-update-digest #xCBF29CE484222325 actual))))
+       (values (list logical :file #o600 (first before) (second before) (length bytes)
+                     (physical-store-update-digest #xCBF29CE484222325 actual))
+               actual)))
    :element-type '(unsigned-byte 8)))
 
 (defun physical-reseed-follow-configuration-output-check (parent fd path fixed)

@@ -26,6 +26,12 @@
 
 (defvar *physical-reseed-follow-installation-scope* nil)
 
+(defvar *physical-reseed-follow-activation-scope* nil)
+
+(defvar *physical-reseed-follow-activation-request* nil)
+
+(defvar *physical-reseed-follow-activation-candidate* nil)
+
 (defgeneric physical-reseed-follow-image-dispatch (owner function))
 
 (defvar *physical-reseed-follow-installation-request* nil)
@@ -52,7 +58,7 @@
 (defun physical-reseed-follow-check-idle (owner)
   (unless (physical-reseed-follow-owner-p owner) (error "target follow ownership is required"))
   (physical-directory-check-owner-common owner)
-  (when *physical-reseed-follow-installation-scope*
+  (when (or *physical-reseed-follow-installation-scope* *physical-reseed-follow-activation-scope*)
     (error "target follow operation cannot reenter an installation scope"))
   (when (physical-reseed-follow-owner-busy-p owner)
     (error "target follow journal operation is already in progress"))
@@ -163,7 +169,7 @@
 
 (defun call-with-physical-reseed-follow-image (owner function)
   (unless (physical-reseed-follow-owner-p owner) (error "target follow ownership is required"))
-  (when *physical-reseed-follow-installation-scope* (error "target follow image scope is already active"))
+  (when (or *physical-reseed-follow-installation-scope* *physical-reseed-follow-activation-scope*) (error "target follow image scope is already active"))
   (physical-reseed-follow-image-dispatch owner function))
 
 (defmethod physical-reseed-follow-image-dispatch ((owner physical-reseed-follow-owner) function)
