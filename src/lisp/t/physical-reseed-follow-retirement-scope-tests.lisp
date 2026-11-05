@@ -16,6 +16,115 @@
                                        (pg::physical-reseed-follow-snapshot-at fd) #'check))))
              (sb-posix:close fd))))))))
 
+(deftest reseed-retirement-resources-hold-descriptors-with-a-static-parent-check
+    (call-with-reseed-retirement-observation-fixture
+     :same-timeline
+     (lambda (owner root workspace root-fd snapshot check)
+       (declare (ignore owner workspace))
+       (let ((escaped nil) (held nil) (store nil)
+                           (path (merge-pathnames "physical-reseed.follow.tmp" root))
+                           (bytes (sb-ext:string-to-octets "partial" :external-format :utf-8)))
+         (pg::call-with-physical-reseed-follow-retirement-resources
+          root-fd (getf snapshot :record) check
+          (lambda (descriptors opened base binding verify)
+            (setf escaped verify held descriptors store opened)
+            (ok (= 10 (length descriptors)))
+            (ok (= root-fd (cdr (assoc :root descriptors))))
+            (ok (getf base :system-id))
+            (ok (equal (getf binding :after) (pg::physical-store-control-tuple opened)))
+            (reseed-follow-owner-test-write path bytes)
+            (ok (funcall verify))
+            (ok (handler-case
+                    (progn
+                      (pg::call-with-physical-reseed-follow-retirement-observation
+                       root-fd snapshot check
+                       (lambda (nested state nested-check)
+                         (declare (ignore nested state nested-check))
+                         (error "strict callback must stay unreachable")))
+                      nil)
+                  (error (condition) (search "temporary" (princ-to-string condition)))))))
+         (ok (equalp bytes (lineage-test-bytes path)))
+         (ok (handler-case (progn (funcall escaped) nil) (error () t)))
+         (ok (handler-case (progn (pg::physical-store-check-live store) nil) (error () t)))
+         (dolist (entry held)
+           (if (eq :root (car entry))
+               (ok (sb-posix:fstat (cdr entry)))
+               (ok (handler-case (progn (sb-posix:fstat (cdr entry)) nil)
+                     (sb-posix:syscall-error () t)))))))))
+
+(deftest reseed-retirement-resources-clean-up-on-every-callback-exit
+    (call-with-reseed-retirement-observation-fixture
+     :same-timeline
+     (lambda (owner root workspace root-fd snapshot check)
+       (declare (ignore owner))
+       (let* ((directories (list root workspace))
+              (before (mapcar #'reseed-mapped-test-tree-facts directories)))
+         (dolist (mode '(:normal :error :throw :interrupt))
+           (let ((held nil) (store nil) (escaped nil))
+             (ok
+              (eq :finished
+                  (catch 'retirement-resources-cut
+                    (handler-case
+                        (pg::call-with-physical-reseed-follow-retirement-resources
+                         root-fd (getf snapshot :record) check
+                         (lambda (descriptors opened base binding verify)
+                           (declare (ignore base binding))
+                           (setf held descriptors store opened escaped verify)
+                           (ok (funcall verify))
+                           (ok (sb-thread:join-thread
+                                (sb-thread:make-thread
+                                 (lambda ()
+                                   (handler-case (progn (funcall verify) nil)
+                                     (error () t))))))
+                           (ecase mode
+                             (:normal :finished)
+                             (:error (error "retirement resources cut"))
+                             (:throw (throw 'retirement-resources-cut :finished))
+                             (:interrupt
+                              (sb-thread:interrupt-thread
+                               sb-thread:*current-thread*
+                               (lambda () (throw 'retirement-resources-cut :finished)))))))
+                      (error (condition)
+                        (if (search "retirement resources cut" (princ-to-string condition))
+                            :finished
+                            (error condition)))))))
+             (ok (handler-case (progn (funcall escaped) nil) (error () t)))
+             (ok (handler-case (progn (pg::physical-store-check-live store) nil) (error () t)))
+             (dolist (entry held)
+               (if (eq :root (car entry))
+                   (ok (sb-posix:fstat (cdr entry)))
+                   (ok (handler-case (progn (sb-posix:fstat (cdr entry)) nil)
+                         (sb-posix:syscall-error () t)))))
+             (ok (reseed-activation-layout-facts-equal-p
+                  before (mapcar #'reseed-mapped-test-tree-facts directories)))))))))
+
+(deftest reseed-retirement-observation-revokes-its-check-before-store-close
+    (call-with-reseed-retirement-observation-fixture
+     :same-timeline
+     (lambda (owner root workspace root-fd snapshot check)
+       (declare (ignore owner root workspace))
+       (let ((original (symbol-function 'pg::physical-store-close))
+             (escaped nil) (checked nil))
+         (unwind-protect
+              (progn
+                (setf (symbol-function 'pg::physical-store-close)
+                      (lambda (store)
+                        (when (and escaped (not checked))
+                          (setf checked t)
+                          (ok (handler-case
+                                  (progn (funcall escaped) nil)
+                                (error (condition)
+                                  (search "scope ended" (princ-to-string condition))))))
+                        (funcall original store)))
+                (pg::call-with-physical-reseed-follow-retirement-observation
+                 root-fd snapshot check
+                 (lambda (descriptors state verify)
+                   (declare (ignore descriptors state))
+                   (setf escaped verify)
+                   (ok (funcall verify))))
+                (ok checked))
+           (setf (symbol-function 'pg::physical-store-close) original))))))
+
 (deftest reseed-retirement-observation-acquires-and-revokes-every-geometry
     (dolist (kind '(:same-timeline :retained-timeline :before-fork :at-fork :later-writer))
       (call-with-reseed-retirement-observation-fixture

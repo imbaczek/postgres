@@ -115,21 +115,62 @@
   (funcall check)
   t)
 
-(defun call-with-physical-reseed-follow-retirement-receive-at
-    (descriptors snapshot base binding function check extra-reader candidate &optional pid-evidence)
-  ;; Carry optional PID evidence through each repeated layout proof.
-  ;; Open the local store without discarding tails or creating a lock.  Normal
-  ;; process-local retained-root restoration still applies.  ON-OPEN captures
-  ;; the store for outer cleanup under the opener's failure cleanup.
-  ;; VERIFY repeats layout and active receive checks on this thread.  The
-  ;; callback gets copies and VERIFY is revoked on scope exit.
-  (let* ((record (physical-reseed-follow-copy (getf snapshot :record)))
-         (thread sb-thread:*current-thread*) (active nil)
-         (store nil) (state nil))
+(defun physical-reseed-follow-retirement-root-check (root record parent-check)
+  (physical-adoption-check-startup-quiescence)
+  (funcall parent-check)
+  (let ((local (getf (getf record :attempt) :local))
+        (stat (physical-image-check-directory root)))
+    (physical-image-check-target (pathname (getf local :directory)) root)
+    (unless (and (= (getf local :device) (sb-posix:stat-dev stat))
+                 (= (getf local :inode) (sb-posix:stat-ino stat))
+                 (= (physical-adoption-install-mount-id (pathname (getf local :directory)))
+                    (physical-adoption-install-mount-id nil :directory-fd root)))
+      (error "retirement root differs from its recorded named descriptor")))
+  t)
+
+(defun call-with-physical-reseed-follow-retirement-directories (root value function check)
+  (let* ((record (physical-reseed-follow-copy value))
+         (configuration (getf record :configuration))
+         (directories (getf configuration :directories))
+         (workspace (append (getf configuration :workspace)
+                            (list :lock-inode (getf directories :lock-inode)
+                                  :fence-inode (getf directories :fence-inode)))))
+    (call-with-physical-reseed-follow-retirement-directory
+     root workspace
+     (lambda (workspace-fd workspace-check)
+       (call-with-physical-reseed-follow-fixed-configuration-directories
+        workspace-fd record
+        (lambda (staged saved fixed-check)
+          (let ((plan (physical-reseed-follow-retirement-provisional-plan-at root saved record)))
+            (physical-reseed-follow-retirement-check-workspace record plan)
+            (call-with-physical-reseed-follow-retirement-auxiliaries
+             root plan
+             (lambda (incoming quarantine auxiliary-check)
+               (call-with-physical-reseed-follow-base-directories
+                root plan
+                (lambda (base-fds base-check)
+                  (let ((descriptors (append (list (cons :root root) (cons :workspace workspace-fd)
+                                                   (cons :staged staged) (cons :saved saved)
+                                                   (cons :incoming incoming) (cons :quarantine quarantine))
+                                             base-fds)))
+                    (multiple-value-bind (base control binding model images row)
+                        (physical-reseed-follow-configuration-base-proof
+                         root saved base-fds plan record (getf configuration :step) base-check)
+                      (declare (ignore control model images row))
+                      (call-with-physical-reseed-follow-installation-receive
+                       descriptors record binding (getf configuration :step)
+                       (lambda (held) (funcall function held base binding base-check))
+                       base-check))))
+                auxiliary-check))
+             fixed-check)))
+        workspace-check))
+     check)))
+
+(defun call-with-physical-reseed-follow-retirement-store (descriptors base function check)
+  (let ((store nil) (active nil) (thread sb-thread:*current-thread*))
     (unwind-protect
          (progn
            (funcall check)
-           (setf state (physical-reseed-follow-retirement-layout-state-at descriptors snapshot check extra-reader candidate pid-evidence))
            (physical-store-open
             (physical-image-fd-path (physical-reseed-follow-configuration-role-fd descriptors :receive))
             (getf base :system-id) (getf base :timeline) :start-lsn (getf base :end)
@@ -142,20 +183,67 @@
            (setf active t)
            (flet ((verify ()
                     (unless (and active (eq thread sb-thread:*current-thread*))
-                      (error "retirement observation scope ended or changed thread"))
+                      (error "retirement store scope ended or changed thread"))
                     (funcall check)
-                    (unless (equal state (physical-reseed-follow-retirement-layout-state-at descriptors snapshot check extra-reader candidate pid-evidence))
-                      (error "retirement layout changed during its observation scope"))
-                    (physical-reseed-follow-retirement-check-receive descriptors store record base binding check)
-                    (unless (equal state (physical-reseed-follow-retirement-layout-state-at descriptors snapshot check extra-reader candidate pid-evidence))
-                      (error "retirement layout changed around active receive validation"))
+                    (physical-store-check-live store)
                     t))
              (verify)
-             (multiple-value-prog1
-                 (funcall function (copy-tree descriptors) (physical-adoption-attempt-value-copy state) #'verify)
-               (verify))))
+             (multiple-value-prog1 (funcall function store #'verify) (verify))))
       (setf active nil)
       (when store (physical-store-close store)))))
+
+(defun call-with-physical-reseed-follow-retirement-resources (root value parent-check function)
+  (let ((record (physical-reseed-follow-copy value)))
+    (flet ((root-check ()
+             (physical-reseed-follow-retirement-root-check root record parent-check)))
+      (root-check)
+      (call-with-physical-reseed-follow-retirement-directories
+       root record
+       (lambda (descriptors base binding check)
+         (call-with-physical-reseed-follow-retirement-store
+          descriptors base
+          (lambda (store verify) (funcall function (copy-tree descriptors) store base binding verify))
+          check))
+       #'root-check))))
+
+(defun call-with-physical-reseed-follow-retirement-receive-at
+    (descriptors snapshot base binding function check extra-reader candidate &optional pid-evidence)
+  ;; Carry optional PID evidence through each repeated layout proof.
+  ;; Open the local store without discarding tails or creating a lock.  Normal
+  ;; process-local retained-root restoration still applies.  ON-OPEN captures
+  ;; the store for outer cleanup under the opener's failure cleanup.
+  ;; VERIFY repeats layout and active receive checks on this thread.  The
+  ;; callback gets copies and VERIFY is revoked on scope exit.
+  (let* ((record (physical-reseed-follow-copy (getf snapshot :record)))
+         (thread sb-thread:*current-thread*) (active nil) (state nil))
+    (funcall check)
+    (setf state (physical-reseed-follow-retirement-layout-state-at
+                 descriptors snapshot check extra-reader candidate pid-evidence))
+    (call-with-physical-reseed-follow-retirement-store
+     descriptors base
+     (lambda (store store-check)
+       (declare (ignore store-check))
+       (unwind-protect
+            (progn
+              (setf active t)
+              (flet ((verify ()
+                       (unless (and active (eq thread sb-thread:*current-thread*))
+                         (error "retirement observation scope ended or changed thread"))
+                       (funcall check)
+                       (unless (equal state (physical-reseed-follow-retirement-layout-state-at
+                                             descriptors snapshot check extra-reader candidate pid-evidence))
+                         (error "retirement layout changed during its observation scope"))
+                       (physical-reseed-follow-retirement-check-receive descriptors store record base binding check)
+                       (unless (equal state (physical-reseed-follow-retirement-layout-state-at
+                                             descriptors snapshot check extra-reader candidate pid-evidence))
+                         (error "retirement layout changed around active receive validation"))
+                       t))
+                (verify)
+                (multiple-value-prog1
+                    (funcall function (copy-tree descriptors) (physical-adoption-attempt-value-copy state) #'verify)
+                  (verify))))
+         (setf active nil)))
+     check)))
 
 (defun call-with-physical-reseed-follow-retirement-observation-at (root snapshot parent-check function extra-reader candidate &optional pid-evidence)
   ;; Pass optional PID evidence through the held-directory scope to the layout
@@ -163,56 +251,16 @@
   ;; Borrow ROOT and its parent ownership from the caller.  Hold the other nine
   ;; directory descriptors, guard streams and local store for the callback.
   (let* ((snapshot (physical-adoption-attempt-value-copy snapshot))
-         (record (physical-reseed-follow-copy (getf snapshot :record)))
-         (configuration (getf record :configuration))
-         (directories (getf configuration :directories))
-         (workspace (append (getf configuration :workspace)
-                            (list :lock-inode (getf directories :lock-inode)
-                                  :fence-inode (getf directories :fence-inode)))))
+         (record (physical-reseed-follow-copy (getf snapshot :record))))
     (flet ((root-check ()
-             (physical-adoption-check-startup-quiescence)
-             (funcall parent-check)
-             (let ((local (getf (getf record :attempt) :local))
-                   (stat (physical-image-check-directory root)))
-               (physical-image-check-target (pathname (getf local :directory)) root)
-               (unless (and (= (getf local :device) (sb-posix:stat-dev stat))
-                            (= (getf local :inode) (sb-posix:stat-ino stat))
-                            (= (physical-adoption-install-mount-id (pathname (getf local :directory)))
-                               (physical-adoption-install-mount-id nil :directory-fd root)))
-                 (error "retirement root differs from its recorded named descriptor")))
+             (physical-reseed-follow-retirement-root-check root record parent-check)
              (funcall extra-reader root)))
       (root-check)
-      (call-with-physical-reseed-follow-retirement-directory
-       root workspace
-       (lambda (workspace-fd workspace-check)
-         (call-with-physical-reseed-follow-fixed-configuration-directories
-          workspace-fd record
-          (lambda (staged saved fixed-check)
-            (let ((plan (physical-reseed-follow-retirement-provisional-plan-at root saved record)))
-              (physical-reseed-follow-retirement-check-workspace record plan)
-              (call-with-physical-reseed-follow-retirement-auxiliaries
-               root plan
-               (lambda (incoming quarantine auxiliary-check)
-                 (call-with-physical-reseed-follow-base-directories
-                  root plan
-                  (lambda (base-fds base-check)
-                    (let ((descriptors (append (list (cons :root root) (cons :workspace workspace-fd)
-                                                     (cons :staged staged) (cons :saved saved)
-                                                     (cons :incoming incoming) (cons :quarantine quarantine))
-                                               base-fds)))
-                      (multiple-value-bind (base control binding model images row)
-                          (physical-reseed-follow-configuration-base-proof
-                           root saved base-fds plan record (getf configuration :step) base-check)
-                        (declare (ignore control model images row))
-                        (call-with-physical-reseed-follow-installation-receive
-                         descriptors record binding (getf configuration :step)
-                         (lambda (held)
-                           (call-with-physical-reseed-follow-retirement-receive-at
-                            held snapshot base binding function base-check extra-reader candidate pid-evidence))
-                         base-check))))
-                  auxiliary-check))
-               fixed-check)))
-          workspace-check))
+      (call-with-physical-reseed-follow-retirement-directories
+       root record
+       (lambda (descriptors base binding check)
+         (call-with-physical-reseed-follow-retirement-receive-at
+          descriptors snapshot base binding function check extra-reader candidate pid-evidence))
        #'root-check))))
 
 (defun call-with-physical-reseed-follow-retirement-receive
