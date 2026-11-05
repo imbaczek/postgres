@@ -1,6 +1,10 @@
 (in-package #:pg)
 
 (defun physical-reseed-follow-activation-check-prefix (value prefix)
+  ;; Absent, building and staged intent require observed prefix 0.  Active
+  ;; requires 2.  While activating, the observed prefix may equal the recorded
+  ;; step or be one ahead, allowing a move completed before its journal update.
+  ;; The caller must apply this check to the observed layout before acting.
   (let* ((record (physical-reseed-follow-copy value))
          (activation (getf record :activation))
          (phase (getf activation :phase))

@@ -907,6 +907,10 @@ Accept only the saved old or post receive tuple; post recovery with old receive
 is invalid. Check the actual restartpoint and scan a disposable candidate
 outside the store mutex, then recheck control and config for changes.
 The caller must exclude recovery and reload and protect the selected root."
+  ;; READ-CONFIG must independently read and decode the bound file on each
+  ;; call.  The caller protects the selected root and excludes recovery and
+  ;; reload.  A relocated activation reader must bind the held descriptor,
+  ;; name, identity and bytes, and apply the raw guard on both reads.
   (physical-follow-check-config config)
   (unless (and (member (length config) '(5 6)) (eq :pending (getf (fifth config) :phase))
                (equal config (funcall read-config)))
@@ -945,6 +949,8 @@ The caller must exclude recovery and reload and protect the selected root."
 (defun physical-follow-check-pending-state (store verified-base config)
   "Validate a pending binding against the root config and durable recovery state.
 The caller must exclude recovery and reload and protect the selected root."
+  ;; Use the root config reader under the caller's existing exclusion and root
+  ;; protection.  The core calls it twice to detect a changed binding.
   (physical-follow-check-pending-state-core store verified-base config
                                             #'physical-follow-read-config))
 
