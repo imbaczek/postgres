@@ -1,6 +1,8 @@
 (in-package #:pg)
 
 (defun physical-reseed-follow-retirement-pid-state-at (root fd)
+  ;; Compare the named PID file with the held descriptor before and after
+  ;; reading its contents and check that it remains on the root mount.
   (let* ((mount (physical-adoption-install-mount-id nil :directory-fd root))
          (row (physical-reseed-install-old-observe root "postmaster.pid" mount))
          (held (physical-reseed-file-facts (sb-posix:fstat fd))))
@@ -16,12 +18,17 @@
       (append state (list :row row)))))
 
 (defun physical-reseed-follow-retirement-pid-state-copy (state)
+  ;; Copy the private PID evidence and its byte vector for the callback.
   (let ((copy (physical-adoption-attempt-value-copy state)))
     (when copy
       (setf (getf copy :bytes) (copy-seq (getf state :bytes))))
     copy))
 
 (defun call-with-physical-reseed-follow-retirement-pid (root parent-check policy function)
+  ;; Hold a read-only PID descriptor or observe its absence around the callback.
+  ;; VERIFY rechecks the file and policy on this thread and is revoked on exit.
+  ;; PARENT-CHECK stays independent of the layout proof.  Close the held
+  ;; descriptor on every exit.
   (let ((fd nil) (state nil) (active nil) (thread sb-thread:*current-thread*))
     (unwind-protect
          (progn
@@ -65,6 +72,7 @@
       (when fd (sb-posix:close fd)))))
 
 (defun call-with-physical-reseed-follow-retirement-before-pid (root parent-check function)
+  ;; Before PID ownership, apply the postmaster stale-PID and ancestor policy.
   (call-with-physical-reseed-follow-retirement-pid
    root parent-check
    (lambda (state)
@@ -73,6 +81,8 @@
    function))
 
 (defun call-with-physical-reseed-follow-retirement-owned-pid (root parent-check function)
+  ;; Check the held PID against the current process and the borrowed postmaster
+  ;; stream.  The PID scope closes its own descriptor and leaves that stream held.
   (let ((stream *postmaster-pid-stream*) (inode *postmaster-pid-inode*)
                                          (directory (when *postmaster-pid-directory* (copy-seq (namestring *postmaster-pid-directory*)))))
     (call-with-physical-reseed-follow-retirement-pid
@@ -94,6 +104,9 @@
      function)))
 
 (defun call-with-physical-reseed-follow-retirement-pid-observation (root snapshot parent-check function pid-scope)
+  ;; Compose PID and temporary checks with the layout proof.  PID verification
+  ;; is a parent check, so it does not recurse through the layout.  Pass copied
+  ;; private PID and temporary evidence to the callback.
   (let ((snapshot (physical-adoption-attempt-value-copy snapshot)))
     (funcall
      pid-scope root parent-check
@@ -121,9 +134,11 @@
                #'extra (getf temporary :record) evidence)))))))))
 
 (defun call-with-physical-reseed-follow-retirement-before-pid-observation (root snapshot parent-check function)
+  ;; Use the pre-ownership PID policy for the retirement observation.
   (call-with-physical-reseed-follow-retirement-pid-observation
    root snapshot parent-check function #'call-with-physical-reseed-follow-retirement-before-pid))
 
 (defun call-with-physical-reseed-follow-retirement-owned-pid-observation (root snapshot parent-check function)
+  ;; Use the current postmaster ownership policy for the retirement observation.
   (call-with-physical-reseed-follow-retirement-pid-observation
    root snapshot parent-check function #'call-with-physical-reseed-follow-retirement-owned-pid))

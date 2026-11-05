@@ -117,6 +117,7 @@
 
 (defun call-with-physical-reseed-follow-retirement-receive-at
     (descriptors snapshot base binding function check extra-reader candidate &optional pid-evidence)
+  ;; Carry optional PID evidence through each repeated layout proof.
   ;; Open the local store without discarding tails or creating a lock.  Normal
   ;; process-local retained-root restoration still applies.  ON-OPEN captures
   ;; the store for outer cleanup under the opener's failure cleanup.
@@ -157,6 +158,8 @@
       (when store (physical-store-close store)))))
 
 (defun call-with-physical-reseed-follow-retirement-observation-at (root snapshot parent-check function extra-reader candidate &optional pid-evidence)
+  ;; Pass optional PID evidence through the held-directory scope to the layout
+  ;; and receive checks.
   ;; Borrow ROOT and its parent ownership from the caller.  Hold the other nine
   ;; directory descriptors, guard streams and local store for the callback.
   (let* ((snapshot (physical-adoption-attempt-value-copy snapshot))

@@ -1,6 +1,7 @@
 (in-package #:pg)
 
 (defun physical-reseed-follow-retirement-final-extra-at (root snapshot &optional pid-evidence)
+  ;; Verify supplied PID evidence.  Without it, keep the strict PID fence.
   (physical-reseed-follow-check-snapshot root snapshot)
   (if pid-evidence
       (funcall (getf pid-evidence :verify))
@@ -34,6 +35,8 @@
       (physical-reseed-follow-retirement-check-prefix record (first matches)))))
 
 (defun physical-reseed-follow-retirement-layout-state-at (descriptors snapshot check extra-reader candidate &optional pid-evidence)
+  ;; When PID evidence is supplied, verify it and admit only its matching root
+  ;; entry.  The strict path supplies no PID evidence.
   ;; The final snapshot remains the layout authority.  The extra reader and
   ;; checks keep admitted evidence stable.
   ;; Use the provisional install read only to obtain a plan.  Prove the saved
