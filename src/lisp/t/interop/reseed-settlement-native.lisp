@@ -16,6 +16,8 @@
       (setf (symbol-function 'physical-libpq-connect-frozen) original))))
 
 (defun native-settlement-test-check (record)
+  ;; Derive the observed prefix from the saved or root control file and check
+  ;; it against the journal and the active enablement bit.
   (let* ((phase (getf (getf record :settlement) :phase))
          (expected (native-settlement-test-env "EXPECTED" "none"))
          (present (probe-file (physical-follow-config-path)))
@@ -39,8 +41,8 @@
     (assert (eq (if (= prefix 2) :active :pending) (getf (fifth config) :phase)))
     (assert (eq (= prefix 2) (not (null (getf (sixth config) :enabled)))))))
 
-;; Drive one target action.  Recovery and local checks are exercised offline;
-;; the remote actions use the native source helper.
+;; Drive target settlement and activation actions, including offline local
+;; progress and native source retries.
 (defun native-settlement-test-action (owner action)
   ;; Stage the local active image and exercise source retries and rejected
   ;; allocations through native test connections, alongside settlement actions.
@@ -52,12 +54,14 @@
        (loop repeat 8 until (eq :inert (getf (getf record :configuration) :phase))
              do (setf record (physical-reseed-follow-advance-configuration owner)))
        record))
-    ;; Check source-authorized intent, recovery and offline committed retry.
+    ;; Exercise local progress and recovery offline.  Initial intent and its
+    ;; recovery exercise native source retries, with committed retry offline.
     ((equal action "advance-activation")
      (let* ((before (physical-reseed-follow-read owner))
             (record (physical-reseed-follow-advance-activation owner)))
        (assert (equal record (physical-reseed-follow-activation-progress-record before)))
        record))
+    ;; Read the bounded final journal directly while a temporary may exist.
     ((equal action "recover-activation-progress")
      (let* ((before (call-with-physical-directory-root
                      owner (lambda (fd directory)
@@ -186,8 +190,8 @@
     ((equal action "check") (physical-reseed-follow-read owner))
     (t (error "unknown native settlement action"))))
 
-;; Install crash hooks at named target publication points and check that the
-;; resulting configuration remains disabled and startup remains fenced.
+;; Install crash hooks at named target publication points. Check the resulting
+;; configuration against the journal and verify startup remains fenced.
 (defun native-settlement-test-run ()
   (let* ((*print-circle* t) (*print-level* 5) (*print-length* 10)
                             (target (uiop:ensure-directory-pathname (native-settlement-test-env "TARGET")))

@@ -1,6 +1,6 @@
 (in-package #:pg)
 
-;;; Publish the first activation intent and recover its interrupted write.
+;;; Publish activation intent, move local controls, and recover journal writes.
 ;;; Building binds the intended active image before output creation.
 
 (defun physical-reseed-follow-activation-require-attempt (context)
@@ -164,7 +164,8 @@
   ;; and credentials.  Recheck local facts around the exchange and after client
   ;; close, keeping the owner busy until cleanup finishes.  Local validation is
   ;; read-only, so failures preserve owner certainty.  The source observation
-  ;; can become stale as the source changes.  Repeat it before advancing activation.
+  ;; can become stale as the source changes.  A fresh observation is needed
+  ;; before publishing the initial Activating step zero intent.
   (call-with-physical-reseed-follow-activation-observation owner
                                                            (lambda ()
                                                              (let* ((observe (if recovery #'physical-reseed-follow-activation-recovery-network-snapshot
@@ -251,9 +252,15 @@
 (defstruct (physical-reseed-follow-activation-progress
             (:constructor %make-physical-reseed-follow-activation-progress)
             (:print-function physical-libpq-print-private-object))
+  ;; A private, thread-bound witness for one progress publication.  It holds
+  ;; the predecessor, snapshot, candidate, synced prefix and layout facts.
+  ;; PUBLISHED records the single adopted snapshot before the scope ends.
+  ;; The context owns the borrowed descriptors and the printer keeps private
+  ;; credentials out of output.
   context thread active-p before snapshot candidate prefix facts published)
 
 (defun physical-reseed-follow-activation-progress (context)
+  ;; Require the live witness for this context and thread.
   (let ((proof *physical-reseed-follow-activation-progress*))
     (unless (and (physical-reseed-follow-activation-progress-p proof)
                  (physical-reseed-follow-activation-progress-active-p proof)
@@ -267,6 +274,9 @@
     proof))
 
 (defun physical-reseed-follow-activation-progress-observe (context)
+  ;; Capture the layout facts that must remain fixed during publication.  Root
+  ;; directory size and times, and the two journal names, can change as the
+  ;; journal is written and adopted.  Other captured facts remain checked.
   (let* ((layout (physical-reseed-follow-activation-layout
                   context (lambda () (physical-reseed-follow-activation-guard context))))
          (names (physical-adoption-attempt-value-copy (getf layout :names))))
@@ -285,6 +295,7 @@
            :names names))))
 
 (defun physical-reseed-follow-activation-check-progress-candidate (context value)
+  ;; Require the exact successor frozen by the live progress witness.
   (let* ((proof (physical-reseed-follow-activation-progress context))
          (before (physical-reseed-follow-activation-progress-before proof))
          (candidate (physical-reseed-follow-copy value))
@@ -297,6 +308,8 @@
     candidate))
 
 (defun physical-reseed-follow-activation-check-progress (context)
+  ;; Recheck the candidate, attempt, prefix, journal snapshot and synced
+  ;; layout facts before and after publication.
   (let* ((proof (physical-reseed-follow-activation-progress context))
          (published (physical-reseed-follow-activation-progress-published proof)))
     (physical-reseed-follow-activation-require-attempt context)
@@ -312,6 +325,9 @@
     t))
 
 (defun call-with-physical-reseed-follow-activation-progress (context check function &key recovery)
+  ;; The initial source authority scope must end before local progress begins.
+  ;; Sync the next move or its one-ahead layout, freeze the resulting facts,
+  ;; and revoke the thread-bound witness after the callback.
   (when (or *physical-reseed-follow-activation-progress*
             *physical-reseed-follow-activation-authority*)
     (error "activation progress overlaps an active publication authority"))
@@ -468,6 +484,8 @@
   t)
 
 (defun physical-reseed-follow-activation-publication-check (owner context candidate)
+  ;; Initial Activating intent requires source authority.  Staged and later
+  ;; progress use their respective local durability proofs.
   (physical-reseed-follow-activation-publication-scope-check owner context candidate)
   (case (getf (getf candidate :activation) :phase)
     (:staged (physical-reseed-follow-activation-check-durable-output context candidate))
@@ -481,6 +499,7 @@
 (defmethod physical-reseed-follow-configuration-publication-candidate
     ((owner physical-reseed-follow-configuration-owner)
      (context physical-reseed-follow-activation-context) candidate)
+  ;; Check the operation and validate the exact successor for its phase.
   (physical-reseed-follow-activation-publication-check owner context candidate)
   (case (getf (getf candidate :activation) :phase)
     (:building (physical-reseed-follow-activation-building-candidate context candidate))
@@ -494,6 +513,8 @@
 
 (defmethod physical-reseed-follow-published-snapshot :around
     ((owner physical-reseed-follow-configuration-owner) root-fd candidate snapshot previous)
+  ;; Adopt the checked snapshot once at the rename boundary before later
+  ;; guards run, then recheck the corresponding authority or progress proof.
   (unless *physical-reseed-follow-activation-scope*
     (return-from physical-reseed-follow-published-snapshot (call-next-method)))
   (let* ((context (physical-reseed-follow-activation-context owner))
@@ -635,6 +656,9 @@
                  context (physical-reseed-follow-activation-authority-candidate authority) check)))))))))
 
 (defun physical-reseed-follow-recover-local-activation (owner)
+  ;; Hold and preflight the temporary through resynchronization and promotion.
+  ;; Progress recovery accepts the exact next record at its moved prefix.
+  ;; Building and Staged retain their local recovery checks.
   (call-with-physical-reseed-follow-activation-operation
    owner
    (lambda (root check)
@@ -773,7 +797,8 @@
 
 (defun physical-reseed-follow-recover-activation (owner &key helper)
   ;; Fence the owner if recovery fails after its idle check.
-  ;; Building and Staged candidates use their local recovery paths.
+  ;; A complete initial Activating/0 temporary needs a fresh source observation.
+  ;; Building, Staged and later progress candidates recover locally.
   (physical-reseed-follow-check-idle owner)
   (let ((completed nil))
     (unwind-protect
@@ -888,7 +913,7 @@
               context (physical-reseed-follow-activation-staged-record record entry) check)))))))
 
 (defun physical-reseed-follow-activation-prepare-recovery (context candidate check)
-  ;; Validate the next transition before any recovery fsync.  For Staged,
+  ;; Validate a Building or Staged transition before any recovery fsync.  For Staged,
   ;; reattach the output witness and check it before promoting the temporary.
   (case (getf (getf candidate :activation) :phase)
     (:building (physical-reseed-follow-activation-building-candidate context candidate))
@@ -901,6 +926,8 @@
 
 (defun physical-reseed-follow-activation-move-file-check
     (context stream parent leaf logical bytes expected row)
+  ;; Check the held file and its current name against the captured identity,
+  ;; metadata and canonical bytes throughout the move.
   (physical-reseed-follow-activation-guard context)
   (physical-reseed-follow-activation-require-attempt context)
   (let* ((fd (sb-sys:fd-stream-fd stream))
@@ -924,6 +951,7 @@
   t)
 
 (defun physical-reseed-follow-activation-move-point (context check guard event)
+  ;; Run the scope and held-file guards around each move fault point.
   (funcall check)
   (funcall guard)
   (physical-reseed-follow-test-point
@@ -934,6 +962,9 @@
   (funcall guard))
 
 (defun physical-reseed-follow-activation-next-move (context check)
+  ;; Keep the file descriptor open through the move and sync both directories.
+  ;; Rename may change ctime while the other recorded file facts remain fixed.
+  ;; A one-ahead layout is resynced without repeating the rename.
   (declare (notinline sb-posix:fsync physical-adoption-renameat2))
   (unless (eq context
               (physical-reseed-follow-activation-context
@@ -1011,6 +1042,8 @@
          :element-type '(unsigned-byte 8))))))
 
 (defun physical-reseed-follow-advance-activation (owner)
+  ;; Advance one durable activation transition per call.  A checked Active
+  ;; record is returned again on retry.
   (call-with-physical-reseed-follow-activation-operation
    owner
    (lambda (root check)

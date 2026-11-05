@@ -124,6 +124,8 @@
    after))
 
 (defun activation-test-next-local-move (owner)
+  ;; Keep the original journal record while moving or resyncing the file.
+  ;; Leave the verified layout one step ahead for recovery checks.
   (pg::call-with-physical-reseed-follow-activation-operation
    owner
    (lambda (fd check)
@@ -181,6 +183,8 @@
                      (ok (equalp active-bytes (lineage-test-bytes pending))))))))))))
 
 (defun check-reseed-activation-local-move-cut (step event)
+  ;; Interrupt each move around rename and sync.  Reopening must preserve the
+  ;; file facts and avoid a second rename when the move is already visible.
   (let ((expected nil) (journal nil) (destination nil) (facts nil)
                        (before-rename (member event '(:before-activation-move-file-fsync
                                                       :after-activation-move-file-fsync
@@ -281,6 +285,8 @@
              (ok (equal snapshot (activation-test-snapshot owner)))))))))
 
 (defun check-reseed-activation-progress-journal-cut (step cut)
+  ;; Check journal recovery at each cut, including refusal of partial
+  ;; temporaries and preservation of unrelated layout facts.
   (let ((candidate nil) (expected nil) (before nil) (partial (eq cut :after-follow-temporary-create)))
     (call-with-reseed-activating-fixture
      :same-timeline

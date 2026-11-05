@@ -293,9 +293,29 @@
   after temporary fsync, source-offline recovery refusal with preserved files,
   fresh-source recovery through the selected CLOSED pin, and offline committed
   intent retry. See `intent-final-check.json` in the activation artifact directory.
-  The two local activation moves, Active/2 publication, archive retirement and
-  startup admission remain open. START must check current source state and
-  retention floors again.
+  The two local control moves and Active/2 publication are complete. Each move
+  holds the captured file through canonical byte and metadata checks, a
+  no-replace rename, and file and parent-directory synchronization. A layout
+  one move ahead of its journal is rechecked and resynced before progress is
+  published. After durable Activating/0, local completion and recovery work
+  offline. A private progress witness freezes the exact next transition and
+  synced facts and permits one published snapshot adoption. It starts after
+  the initial source authority scope ends. Complete progress temporaries stay
+  open and are checked before and around resync and promotion.
+  Verification passed 22 selected regressions with 992 assertions, including
+  all five move geometries, every file and parent sync cut, all three progress
+  journal transitions, late destination collisions, temporary substitution,
+  same-byte writes, witness misuse and earlier recovery paths. Strict cold
+  compilation passed 231 production files without warnings. Property seeds
+  138 and 139 passed 100 trials each under `fnv1a64-v1:5528779e6984029d`.
+  The generator selects two fixture variants and checks all three transitions
+  per trial. Input coverage and rejection counts remain unmeasured.
+  Fourteen native actions passed with three expected target SIGKILLs and
+  source-offline local completion. They preserved the original quarantined
+  bytes and unrelated file facts across the target, workspace and auxiliary trees.
+  See `progress-final-check.json` and `progress-native-v3/acceptance-check.json`.
+  Archive retirement and startup admission remain open. START must check
+  current source state and retention floors again.
 
 - [x] Fence the reserved target follow intent names before startup or older
   reseed ownership. Both final and temporary names reject every entry type;
