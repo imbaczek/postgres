@@ -1,5 +1,8 @@
 (in-package #:pg)
 
+;;; Record the closed source outcome against the exact pending predecessor.
+
+;; Accept a terminal candidate only as the exact successor of pending intent.
 (defun physical-reseed-follow-terminal-settlement-candidate (context value)
   (let ((before (physical-reseed-follow-installation-context-record context))
         (candidate (physical-reseed-follow-inert-settlement-candidate context value)))
@@ -8,6 +11,7 @@
       (error "terminal settlement requires its exact pending inert predecessor"))
     candidate))
 
+;; Compare all predecessors observed around network I/O before publication.
 (defun physical-reseed-follow-check-settlement-result-snapshot (context expected)
   (unless (equal expected
                  (list :follow (physical-reseed-follow-installation-context-snapshot context)
@@ -16,6 +20,9 @@
     (error "settlement predecessors changed before terminal publication"))
   t)
 
+;; Publish the closed receipt with an exact predecessor comparison.  The
+;; candidate and its readback remain subject to the guarded local write.
+;; Historical settlement after local abort grants no activation or cleanup rights.
 (defun physical-reseed-follow-publish-settlement-result (owner receipt expected)
   (call-with-physical-reseed-follow-installation-operation
    owner
@@ -42,6 +49,8 @@
          (physical-reseed-follow-check-settlement-result-snapshot context expected)
          (physical-reseed-follow-write-installed-intent context candidate bytes check))))))
 
+;; Settle the source outcome while leaving the configuration inert and startup
+;; fenced.  Activation and startup retirement are separate future work.
 (defun physical-reseed-follow-settle (owner &key helper)
   (let ((record (physical-reseed-follow-read owner)))
     (unless (getf record :settlement)

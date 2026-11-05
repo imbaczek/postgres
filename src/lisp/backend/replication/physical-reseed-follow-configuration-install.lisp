@@ -92,6 +92,8 @@
         (physical-reseed-follow-installation-point context check :after-configuration-install-destination-fsync)
         (1+ step)))))
 
+;; Share the guarded journal write for installation and settlement.  Latch
+;; uncertainty before writing and require adoption of the exact readback.
 (defun physical-reseed-follow-write-installed-intent (context candidate bytes check)
   (let* ((owner (physical-reseed-follow-installation-context-owner context))
          (previous (physical-reseed-follow-installation-context-snapshot context))

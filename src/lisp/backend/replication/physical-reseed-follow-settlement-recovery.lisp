@@ -1,5 +1,10 @@
 (in-package #:pg)
 
+;;; Reconcile a settlement journal after an interrupted local publication.
+
+;; Promote only a complete exact next temporary after checking its identity.
+;; Preserve partial or conflicting files and refuse to promote them.
+;; A pending temporary needs an active attempt; a terminal receipt is historical.
 (defun physical-reseed-follow-recover-settlement-temporary (context check)
   (let* ((owner (physical-reseed-follow-installation-context-owner context))
          (root (physical-reseed-follow-configuration-role-fd
@@ -32,6 +37,8 @@
                 owner root fd (subseq identity 0 5) candidate previous check))
           (when fd (sb-posix:close fd)))))))
 
+;; Recover settlement locally under the guarded installation scope.  A terminal
+;; temporary can be completed without contacting the source.
 (defun physical-reseed-follow-recover-settlement (owner)
   (call-with-physical-reseed-follow-installation-operation
    owner
@@ -45,6 +52,7 @@
            (physical-reseed-follow-recover-settlement-temporary context check)
            (physical-reseed-follow-installation-recover-stable context check))))))
 
+;; Enter the guarded scope for every inert recovery before parsing a temporary.
 (defmethod physical-reseed-follow-configuration-recovery-dispatch :around
     ((owner physical-reseed-follow-configuration-owner))
   (let ((inert

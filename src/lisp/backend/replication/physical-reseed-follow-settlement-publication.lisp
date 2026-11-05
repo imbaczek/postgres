@@ -1,5 +1,8 @@
 (in-package #:pg)
 
+;;; Authorize and publish the durable intent to settle an inert installation.
+
+;; Require the exact completed inert move prefix for either settlement write.
 (defun physical-reseed-follow-inert-settlement-candidate (context value)
   (let* ((before (physical-reseed-follow-installation-context-record context))
          (candidate (physical-reseed-follow-copy value))
@@ -14,6 +17,7 @@
     (physical-reseed-follow-image candidate)
     candidate))
 
+;; Pending intent must follow the inert record with no settlement selected.
 (defun physical-reseed-follow-pending-settlement-candidate (context value)
   (let ((before (physical-reseed-follow-installation-context-record context))
         (candidate (physical-reseed-follow-inert-settlement-candidate context value)))
@@ -22,6 +26,8 @@
       (error "pending settlement requires its exact unselected inert predecessor"))
     candidate))
 
+;; Keep installation, pending, and terminal candidates separately bound to
+;; the operation that authorized the write.
 (defmethod physical-reseed-follow-configuration-publication-candidate :around
     ((owner physical-reseed-follow-configuration-owner) context candidate)
   (let ((pending *physical-reseed-follow-settlement-candidate*)
@@ -39,6 +45,7 @@
               (physical-reseed-follow-pending-settlement-candidate context candidate)))
         (call-next-method))))
 
+;; Publish the frozen pending candidate before any source RPC.
 (defun physical-reseed-follow-publish-pending-settlement (context candidate check)
   (let* ((owner (physical-reseed-follow-installation-context-owner context))
          (candidate (physical-reseed-follow-pending-settlement-candidate context candidate))
@@ -48,6 +55,8 @@
     (funcall check)
     (physical-reseed-follow-write-installed-intent context candidate bytes check)))
 
+;; Begin settlement under the guarded installation scope.  An existing temporary
+;; requires recovery rather than replacement.
 (defun physical-reseed-follow-begin-settlement (owner)
   (call-with-physical-reseed-follow-installation-operation
    owner

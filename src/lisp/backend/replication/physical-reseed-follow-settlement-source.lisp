@@ -1,5 +1,9 @@
 (in-package #:pg)
 
+;;; Interpret source lease status against the frozen local settlement intent.
+
+;; Choose what to do with source status for a durable pending intent.  A closed
+;; historical outcome may be recorded without authority to start a handoff.
 (defun physical-reseed-follow-settlement-source-action (value source active-p)
   (let* ((record (physical-reseed-follow-copy value))
          (pending (getf record :settlement))

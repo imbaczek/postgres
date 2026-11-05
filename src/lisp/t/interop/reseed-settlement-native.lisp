@@ -27,6 +27,8 @@
     (assert (eq :pending (getf (fifth config) :phase)))
     (assert (not (getf (sixth config) :enabled)))))
 
+;; Drive one target action.  Recovery and local checks are exercised offline;
+;; the remote actions use the native source helper.
 (defun native-settlement-test-action (owner action)
   (cond
     ((equal action "install")
@@ -63,6 +65,8 @@
     ((equal action "check") (physical-reseed-follow-read owner))
     (t (error "unknown native settlement action"))))
 
+;; Install crash hooks at named target publication points and check that the
+;; resulting configuration remains disabled and startup remains fenced.
 (defun native-settlement-test-run ()
   (let* ((*print-circle* t) (*print-level* 5) (*print-length* 10)
                             (target (uiop:ensure-directory-pathname (native-settlement-test-env "TARGET")))
@@ -109,6 +113,7 @@
     (write-line "NATIVE-SETTLEMENT-CHECKED")
     (values)))
 
+;; Inspect the actual source lease and pins under the source locks.
 (defun native-settlement-test-source-audit (lease-name follow-name expected)
   (with-write-lock
     (with-wal-critical
@@ -162,6 +167,9 @@
 
 (defvar *native-settlement-test-finish-closing* nil)
 
+;; Inject lost or altered replies separately from source state changes.  The
+;; closing cut kills the source after its closing state is durable; closing
+;; reply leaves that actual state unfinished for a later retry.
 (defun native-settlement-test-source-hook (&key lose-reply closing-cut closing-reply (reply-mode "normal"))
   (unless *native-settlement-test-row-sender*
     (setf *native-settlement-test-row-sender* (symbol-function 'send-native-backup-lease-row)))

@@ -1,5 +1,9 @@
 (in-package #:pg)
 
+;;; Contact the source only after local pending intent is durable.
+
+;; Capture the mapped follow image and actual attempt and install state.  Check
+;; them again after network I/O, with no temporary awaiting local recovery.
 (defun physical-reseed-follow-settlement-network-snapshot (owner &optional expected)
   (unless (physical-reseed-follow-owner-busy-p owner)
     (error "settlement network observation requires an active owner operation"))
@@ -23,6 +27,10 @@
        (funcall check)
        current))))
 
+;; Ask STATUS first using the frozen route and credentials.  A new HANDOFF also
+;; requires an active attempt and a fresh source observation.  Keep the owner
+;; busy through client close; no borrowed store or descriptor spans the RPC.
+;; Copy the terminal receipt before client cleanup can change its input objects.
 (defun physical-reseed-follow-settle-remote (owner &key helper)
   (physical-reseed-follow-check-idle owner)
   (setf (physical-reseed-follow-owner-busy-p owner) t)

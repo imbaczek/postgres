@@ -30,12 +30,16 @@
 
 (defvar *physical-reseed-follow-installation-request* nil)
 
+;; Each publication binds exactly one candidate for the duration of its write.
+;; Installation, pending settlement, and terminal settlement are distinct.
 (defvar *physical-reseed-follow-installation-candidate* nil)
 
 (defvar *physical-reseed-follow-settlement-candidate* nil)
 
 (defvar *physical-reseed-follow-terminal-settlement-candidate* nil)
 
+;; Check the candidate authorized by the current operation and adopt only its
+;; exact published snapshot into the installation context.
 (defgeneric physical-reseed-follow-configuration-publication-candidate (owner context candidate))
 
 (defgeneric physical-reseed-follow-published-snapshot (owner root-fd candidate snapshot previous))

@@ -1,5 +1,9 @@
 (in-package #:pg)
 
+;;; Settlement journal validation and capacity checks for the target follow
+;;; record.  This is a private format, not a PostgreSQL wire or disk format.
+
+;; Derive the successor from the only proved generation and its anchor digest.
 (defun physical-reseed-follow-settlement-successor (record)
   (let* ((core (physical-reseed-follow-core-copy
                 (physical-reseed-follow-core-projection record)))
@@ -13,6 +17,7 @@
                            (physical-reseed-follow-generation-anchor generation)))
      (getf (getf core :attempt) :request))))
 
+;; Reconstruct the base bound to a closed source receipt.
 (defun physical-reseed-follow-settlement-base (record)
   (let* ((base (getf record :base))
          (control (physical-recovery-decode-control
@@ -21,6 +26,9 @@
           :base (getf control :applied)
           :manifest-digest (getf base :manifest-digest))))
 
+;; Validate settlement against the inert configuration, proved successor, and
+;; exact closed outcome.  The receipt request is the client's binding to the
+;; submitted request; it is not a full-request echo from the wire.
 (defun physical-reseed-follow-settlement-copy (value record)
   (physical-reseed-install-check-literal (list value record))
   (physical-follow-check-plist value '(:phase :successor :receipt))
@@ -51,6 +59,8 @@
           (error "settlement lacks the exact closed source outcome")))
     (list :phase phase :successor successor :receipt receipt)))
 
+;; Freeze the installed predecessors while settlement advances through pending
+;; to one terminal outcome.  A terminal outcome cannot be changed.
 (defun physical-reseed-follow-settlement-check-transition (before after)
   (let ((old (getf before :settlement)) (new (getf after :settlement)))
     (unless (every (lambda (key) (equal (getf before key) (getf after key)))
@@ -67,6 +77,7 @@
       (error "settlement cannot skip pending intent, regress or change its terminal outcome"))
     t))
 
+;; Size both canonical terminal outcomes before publishing pending intent.
 (defun physical-reseed-follow-settlement-terminal-size (record)
   (let* ((settlement (getf record :settlement))
          (successor (getf settlement :successor))
@@ -87,6 +98,7 @@
             (length (physical-backup-lease-encode-literal
                      "PGRESEEDFOLLOW1" candidate +physical-reseed-follow-maximum-bytes+))))))
 
+;; Reserve space for the larger terminal receipt as well as existing margins.
 (defun physical-reseed-follow-check-image-capacity (record encoded-length maximum)
   (let* ((phase (getf (car (last (getf record :generations))) :phase))
          (reserve (+ (case phase (:preparing +physical-reseed-follow-proof-reserve+)

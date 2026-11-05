@@ -154,9 +154,26 @@
   `d8ce64749bb`, `666e6aa3ba6` and `e545abbe9f8`. Evidence:
   `/home/imbaczek/proj/pg-ha-artifacts/reseed-target-follow/inert-operation-scope-progress.md`.
 
-  Durable handoff pending, exact parent Aborted or HandedOff settlement,
-  activation, startup fence retirement and cancellation
-  remain open, as do logical drain, control metadata and WAL parity, audits and
+- [x] Persist and reconcile target source settlement. Publish exact handoff-pending
+  intent before remote effects, observe STATUS first on the frozen source route,
+  and record only the exact CLOSED parent outcome and successor. Separate pending
+  and terminal publication authority; recheck local snapshots after network I/O.
+  Recover complete next temporaries offline and preserve partial or conflicting
+  evidence. Historical settlement after local abort grants no activation or cleanup
+  authority. Configuration remains Inert and disabled, with startup fenced.
+  Validation passed 165 distinct selected tests and 3,090 assertions in a fresh
+  process, strict compilation of 223 production files, and independent commit
+  snapshots. Native TLI 1 acceptance covered 21 cases, 119 fresh target processes,
+  11 target SIGKILLs and one source SIGKILL, including lost replies and cold reopen.
+  All five installed proof geometries passed with mocked source transport.
+  Properties passed 80 trials each at seeds 124 and 125; input coverage and
+  rejection counts were not measured. Code: `999d6d4e87e`, `7bdf47c9871`,
+  `b1a38bab591` and `1fba3d45b1d`. Evidence:
+  `/home/imbaczek/proj/pg-ha-artifacts/reseed-target-follow/progress.md` and
+  `settlement-related-regression-check.json` in that directory.
+
+  Activation, startup fence retirement, cancellation and replacement remain open,
+  as do logical drain, control metadata and WAL parity, audits and
   pinned Patroni acceptance. No coordination is provided. During full acceptance,
   audit older harnesses including `t/interop/child-bootstrap.py`: direct control
   calls to physical base backup and manual follow start now fail live admission.

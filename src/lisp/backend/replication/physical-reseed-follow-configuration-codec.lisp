@@ -108,8 +108,8 @@
             :images images :entries entries :step step))))
 
 ;; Check configuration progress against the immutable core and saved image facts.
-;; The codec recognizes installing and inert states; the current driver publishes
-;; only building and staged.
+;; The driver publishes installation progress through inert.  Activation is
+;; a separate operation.
 (defun physical-reseed-follow-configuration-check-transition (previous candidate core)
   (let ((before (and previous (physical-reseed-follow-configuration-copy previous core)))
         (after (and candidate (physical-reseed-follow-configuration-copy candidate core))))

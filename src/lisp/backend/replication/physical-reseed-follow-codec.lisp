@@ -109,8 +109,9 @@
   (loop for key in '(:version :attempt :install :base :generations)
         append (list key (getf record key))))
 
-;; Return a detached checked record.  When present, configuration is validated as
-;; a complete group against the checked core; absence remains distinct.
+;; Return a detached checked record.  Optional configuration and settlement
+;; groups are checked against their predecessors.  Missing keys differ from NIL
+;; groups; records without settlement keep their original canonical encoding.
 (defun physical-reseed-follow-copy (record)
   (physical-reseed-install-check-literal record)
   (let* ((configuration-p (loop for key in record by #'cddr thereis (eq key :configuration)))
@@ -163,9 +164,8 @@
       (t (error "target follow generation history cannot be shortened or skipped")))
     t))
 
-;; Reserve space for the remaining local proof or cancellation record before
-;; accepting an image.  This size check does not assert any source outcome.
-
+;; Reserve space for the remaining proof, cancellation or larger terminal
+;; receipt before accepting an image.  Size checks do not prove a source outcome.
 (defun physical-reseed-follow-image (record)
   (let* ((record (physical-reseed-follow-copy record))
          (bytes (physical-backup-lease-encode-literal
