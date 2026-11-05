@@ -19,28 +19,29 @@
 ;; the decoded plan to this journal generation and root.  Stabilization also
 ;; syncs file and directory.  A malformed or changed final journal fails closed.
 ;; Return the decoded state, file identity and digest of the same bytes.
-(defun physical-reseed-install-read-at (root-fd name &key stabilize)
+(defun physical-reseed-install-read-from-at (root-fd container-fd name &key stabilize)
   (unless (member name '("physical-reseed.install" "physical-reseed.install.tmp") :test #'equal)
     (error "unexpected reseed install journal name"))
   (let ((fd nil) (stream nil)
-                 (path (merge-pathnames name (physical-image-fd-path root-fd))))
+                 (path (merge-pathnames name (physical-image-fd-path container-fd))))
     (unwind-protect
          (progn
            (sb-sys:without-interrupts
              (setf fd (physical-image-openat
-                       root-fd name (logior (if stabilize sb-posix:o-rdwr sb-posix:o-rdonly)
-                                            sb-posix:o-nofollow sb-posix:o-nonblock +postmaster-o-cloexec+) 0)))
+                       container-fd name (logior (if stabilize sb-posix:o-rdwr sb-posix:o-rdonly)
+                                                 sb-posix:o-nofollow sb-posix:o-nonblock +postmaster-o-cloexec+) 0)))
            (when (minusp fd)
              (setf fd nil) (error "cannot open reseed install journal: errno ~d" (sb-alien:get-errno)))
            (let* ((before (physical-reseed-install-file-identity (sb-posix:fstat fd)))
                   (size (sixth before)) (bytes (make-array size :element-type '(unsigned-byte 8))))
              (unless (and (equal before (physical-reseed-install-file-identity (sb-posix:lstat (namestring path))))
                           (= (physical-adoption-install-mount-id nil :directory-fd root-fd)
+                             (physical-adoption-install-mount-id nil :directory-fd container-fd)
                              (physical-adoption-install-mount-id nil :directory-fd fd)))
                (error "reseed install journal changed before reading or crosses mounts"))
              (sb-sys:without-interrupts
                (setf stream (sb-sys:make-fd-stream fd :input t :output stabilize :element-type '(unsigned-byte 8))))
-             (when stabilize (fsync-stream stream) (sb-posix:fsync root-fd))
+             (when stabilize (fsync-stream stream) (sb-posix:fsync container-fd))
              (physical-reseed-install-test-point :after-journal-open path)
              (unless (and (= size (read-sequence bytes stream))
                           (eq :eof (read-byte stream nil :eof))
@@ -57,6 +58,24 @@
                (append state (list :identity before :digest
                                    (physical-store-update-digest #xCBF29CE484222325 bytes))))))
       (if stream (close stream) (when fd (sb-posix:close fd))))))
+
+(defun physical-reseed-install-read-at (root-fd name &key stabilize)
+  (physical-reseed-install-read-from-at root-fd root-fd name :stabilize stabilize))
+
+(defun physical-reseed-install-read-archive-at (root-fd saved-fd)
+  (let ((root (sb-posix:fstat root-fd)) (saved (sb-posix:fstat saved-fd)))
+    (when (and (= (sb-posix:stat-dev root) (sb-posix:stat-dev saved))
+               (= (sb-posix:stat-ino root) (sb-posix:stat-ino saved)))
+      (error "reseed archive container aliases PGDATA root")))
+  (let* ((state (physical-reseed-install-read-from-at root-fd saved-fd "physical-reseed.install"))
+         (plan (getf state :plan))
+         (image (physical-reseed-install-image plan (physical-reseed-install-last-step plan))))
+    (unless (and (not (getf state :partial))
+                 (= (getf state :step) (physical-reseed-install-last-step plan))
+                 (= (getf state :valid-length) (getf state :file-size) (length image))
+                 (= (getf state :digest) (physical-store-update-digest #xCBF29CE484222325 image)))
+      (error "archived reseed install journal is not the exact terminal image"))
+    state))
 
 ;; Keep the owner's plan and attempt evidence out of printed representations.
 (defun print-physical-reseed-install-owner (owner stream depth)

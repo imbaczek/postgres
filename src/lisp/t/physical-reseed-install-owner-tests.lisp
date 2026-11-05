@@ -268,6 +268,97 @@
                 (pg::fsync-stream out)))
             (ok (intake-fails-p (lambda () (pg::physical-reseed-check-owner owner))))))))))
 
+(deftest reseed-install-archive-reader-binds-pgdata-separately-from-container
+    (call-with-reseed-install-owner-fixture
+     (lambda (root stage incoming quarantine plan)
+       (declare (ignore incoming quarantine))
+       (reseed-install-owner-test-write root plan (pg::physical-reseed-install-last-step plan))
+       (let* ((path (pg::physical-reseed-install-path root))
+              (archive (merge-pathnames "physical-reseed.install" stage))
+              (bytes (lineage-test-bytes path))
+              (root-fd (pg::physical-backup-open-directory root))
+              (saved-fd (pg::physical-backup-open-directory stage)))
+         (unwind-protect
+              (progn
+                (sb-posix:rename (namestring path) (namestring archive))
+                (let ((state (pg::physical-reseed-install-read-archive-at root-fd saved-fd)))
+                  (ok (equal plan (getf state :plan)))
+                  (ok (= (pg::physical-reseed-install-last-step plan) (getf state :step)))
+                  (ok (= (length bytes) (getf state :valid-length) (getf state :file-size)))
+                  (ok (= (pg::physical-store-update-digest #xCBF29CE484222325 bytes)
+                         (getf state :digest))))
+                (ok (intake-fails-p
+                     (lambda () (pg::physical-reseed-install-read-at saved-fd "physical-reseed.install"))))
+                (ok (intake-fails-p
+                     (lambda () (pg::physical-reseed-install-read-archive-at saved-fd saved-fd))))
+                (ok (equalp bytes (lineage-test-bytes archive)))
+                (ok (not (probe-file path))))
+           (sb-posix:close saved-fd)
+           (sb-posix:close root-fd))))))
+
+(deftest reseed-install-archive-reader-refuses-nonterminal-and-partial-journals
+    (dolist (partial '(nil t))
+      (call-with-reseed-install-owner-fixture
+       (lambda (root stage incoming quarantine plan)
+         (declare (ignore incoming quarantine))
+         (reseed-install-owner-test-write root plan 0 partial)
+         (let* ((path (pg::physical-reseed-install-path root))
+                (archive (merge-pathnames "physical-reseed.install" stage))
+                (bytes (lineage-test-bytes path))
+                (root-fd (pg::physical-backup-open-directory root))
+                (saved-fd (pg::physical-backup-open-directory stage)))
+           (unwind-protect
+                (progn
+                  (sb-posix:rename (namestring path) (namestring archive))
+                  (ok (handler-case
+                          (progn (pg::physical-reseed-install-read-archive-at root-fd saved-fd) nil)
+                        (error (condition)
+                          (search "not the exact terminal image" (princ-to-string condition)))))
+                  (ok (equalp bytes (lineage-test-bytes archive))))
+             (sb-posix:close saved-fd)
+             (sb-posix:close root-fd)))))))
+
+(deftest reseed-install-archive-reader-refuses-root-alias-and-name-replacement
+    (call-with-reseed-install-owner-fixture
+     (lambda (root stage incoming quarantine plan)
+       (declare (ignore incoming quarantine))
+       (reseed-install-owner-test-write root plan (pg::physical-reseed-install-last-step plan))
+       (let* ((path (pg::physical-reseed-install-path root))
+              (archive (merge-pathnames "physical-reseed.install" stage))
+              (original (merge-pathnames "original-install" stage))
+              (bytes (lineage-test-bytes path))
+              (root-fd (pg::physical-backup-open-directory root))
+              (saved-fd (pg::physical-backup-open-directory stage))
+              (fired nil))
+         (unwind-protect
+              (progn
+                (ok (handler-case
+                        (progn (pg::physical-reseed-install-read-archive-at root-fd root-fd) nil)
+                      (error (condition)
+                        (search "container aliases PGDATA root" (princ-to-string condition)))))
+                (sb-posix:rename (namestring path) (namestring archive))
+                (let ((pg::*physical-reseed-install-test-hook*
+                        (lambda (point observed)
+                          (declare (ignore observed))
+                          (when (eq point :after-journal-open)
+                            (setf fired t)
+                            (sb-posix:rename (namestring archive) (namestring original))
+                            (with-open-file (out archive :direction :output
+                                                         :element-type '(unsigned-byte 8))
+                              (sb-posix:fchmod (sb-sys:fd-stream-fd out) #o600)
+                              (write-sequence bytes out))))))
+                  (ok (handler-case
+                          (progn (pg::physical-reseed-install-read-archive-at root-fd saved-fd) nil)
+                        (error (condition)
+                          (search "changed while reading" (princ-to-string condition))))))
+                (ok fired)
+                (ok (equalp bytes (lineage-test-bytes original)))
+                (ok (equalp bytes (lineage-test-bytes archive)))
+                (ok (/= (sb-posix:stat-ino (sb-posix:lstat (namestring original)))
+                        (sb-posix:stat-ino (sb-posix:lstat (namestring archive))))))
+           (sb-posix:close saved-fd)
+           (sb-posix:close root-fd))))))
+
 (deftest reseed-install-owner-raw-reader-keeps-root-and-journal-generation-bound
     (call-with-reseed-install-owner-fixture
      (lambda (root stage incoming quarantine plan)
