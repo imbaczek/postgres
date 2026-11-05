@@ -116,6 +116,8 @@
   t)
 
 (defun physical-reseed-follow-retirement-root-check (root record parent-check)
+  ;; Check the borrowed root against the recorded identity and mount after
+  ;; startup quiescence and the caller's parent check.
   (physical-adoption-check-startup-quiescence)
   (funcall parent-check)
   (let ((local (getf (getf record :attempt) :local))
@@ -129,6 +131,9 @@
   t)
 
 (defun call-with-physical-reseed-follow-retirement-directories (root value function check)
+  ;; Borrow ROOT and hold the other nine directory descriptors and guards for
+  ;; the callback.  BASE and BINDING are fresh internal facts.  Copy them
+  ;; before saving them as operation evidence.
   (let* ((record (physical-reseed-follow-copy value))
          (configuration (getf record :configuration))
          (directories (getf configuration :directories))
@@ -167,6 +172,11 @@
      check)))
 
 (defun call-with-physical-reseed-follow-retirement-store (descriptors base function check)
+  ;; Open the receive store, preserving its tail and using its existing lock.
+  ;; Normal process-local retained-root restoration still applies.  ON-OPEN
+  ;; captures the store for cleanup if opening exits nonlocally.
+  ;; VERIFY checks this thread, the parent scope and store liveness.  It is
+  ;; revoked before the store closes.  Callers supply phase-specific proof.
   (let ((store nil) (active nil) (thread sb-thread:*current-thread*))
     (unwind-protect
          (progn
@@ -193,6 +203,9 @@
       (when store (physical-store-close store)))))
 
 (defun call-with-physical-reseed-follow-retirement-resources (root value parent-check function)
+  ;; Borrow the caller's root and hold the remaining resources around the
+  ;; callback.  Its verifier covers resource lifetime and liveness.  The caller
+  ;; freezes the fresh base and binding facts and proves the relevant phase.
   (let ((record (physical-reseed-follow-copy value)))
     (flet ((root-check ()
              (physical-reseed-follow-retirement-root-check root record parent-check)))
@@ -208,12 +221,9 @@
 
 (defun call-with-physical-reseed-follow-retirement-receive-at
     (descriptors snapshot base binding function check extra-reader candidate &optional pid-evidence)
-  ;; Carry optional PID evidence through each repeated layout proof.
-  ;; Open the local store without discarding tails or creating a lock.  Normal
-  ;; process-local retained-root restoration still applies.  ON-OPEN captures
-  ;; the store for outer cleanup under the opener's failure cleanup.
-  ;; VERIFY repeats layout and active receive checks on this thread.  The
-  ;; callback gets copies and VERIFY is revoked on scope exit.
+  ;; Carry optional PID evidence through repeated layout and active receive
+  ;; checks.  The callback gets copies and its thread-bound VERIFY is revoked
+  ;; before the store scope cleans up.
   (let* ((record (physical-reseed-follow-copy (getf snapshot :record)))
          (thread sb-thread:*current-thread*) (active nil) (state nil))
     (funcall check)
