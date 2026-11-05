@@ -1,12 +1,19 @@
 (in-package #:pg)
 
 (defun physical-reseed-follow-retirement-predecessor (record)
+  ;; Validate against the core and all groups through activation, excluding
+  ;; retirement itself.
   (physical-reseed-follow-copy
    (append (physical-reseed-follow-core-projection record)
            (loop for key in '(:configuration :settlement :activation)
                  append (list key (getf record key))))))
 
 (defun physical-reseed-follow-retirement-attempt-file-copy (value record)
+  ;; The identity follows physical-reseed-attempt-file-identity: device,
+  ;; inode, mode, UID, link count, size, and two timestamps.  The digest and
+  ;; size bind this reference to the original canonical attempt image.
+  ;; Bounding the UID here does not establish ownership.  A publisher must
+  ;; check actual ownership using the held file descriptor.
   (physical-reseed-install-check-literal value)
   (physical-follow-check-plist value '(:identity :digest))
   (let* ((identity (getf value :identity))
@@ -29,6 +36,10 @@
     (list :identity (copy-list identity) :digest (getf value :digest))))
 
 (defun physical-reseed-follow-retirement-copy (value record)
+  ;; Retirement records the attempt-file identity and digest, with an archive
+  ;; prefix in steps 0 to 2.  It requires active step 2; retired is step 2.
+  ;; Retired permits final follow-fence removal; it does not say the fence
+  ;; is already absent.
   (physical-reseed-install-check-literal (list value record))
   (physical-follow-check-plist value '(:phase :step :attempt-file))
   (let* ((record (physical-reseed-follow-retirement-predecessor record))
@@ -43,6 +54,8 @@
                          (getf value :attempt-file) record))))
 
 (defun physical-reseed-follow-retirement-check-transition (before after)
+  ;; Freeze activation and the attempt-file reference while advancing one
+  ;; archive step at a time.  A completed prefix can then become retired.
   (let ((old (getf before :retirement)) (new (getf after :retirement)))
     (unless (every (lambda (key) (equal (getf before key) (getf after key)))
                    '(:version :attempt :install :base :generations :configuration :settlement :activation))

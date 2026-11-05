@@ -188,7 +188,7 @@
   611 assertions, strict cold compilation of 226 production files, and a normal
   formatter check of all nine changed Lisp/ASDF files. Luna checkpoint and Sol
   full-diff reviews passed; the Sol refactoring review found no worthwhile
-  extraction. Source documentation is being reviewed separately.
+  extraction. Source documentation was reviewed separately.
   Future-capacity admission, active configuration publication, real source
   authority checks, crash recovery, archive moves and startup admission remain
   open; these codecs grant no filesystem or startup authority. Evidence:

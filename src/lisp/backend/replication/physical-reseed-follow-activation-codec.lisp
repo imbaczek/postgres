@@ -1,6 +1,8 @@
 (in-package #:pg)
 
 (defun physical-reseed-follow-activation-predecessor (record)
+  ;; Validate only the core, configuration and settlement.  Later groups
+  ;; must not become part of their own predecessor.
   (physical-reseed-follow-copy
    (append (physical-reseed-follow-core-projection record)
            (list :configuration (getf record :configuration)
@@ -29,6 +31,10 @@
     entry))
 
 (defun physical-reseed-follow-activation-copy (value record)
+  ;; The image is (byte-count digest); entry describes the private active
+  ;; file.  Building has no entry, staged has one, and activating advances
+  ;; through steps 0 to 2 before active at step 2.
+  ;; These are structural checks, not evidence that a file was published.
   (physical-reseed-install-check-literal (list value record))
   (physical-follow-check-plist value '(:phase :step :image :entry))
   (let* ((record (physical-reseed-follow-activation-predecessor record))
@@ -51,6 +57,8 @@
           :entry (when entry (physical-reseed-follow-activation-entry-copy entry record image)))))
 
 (defun physical-reseed-follow-activation-check-transition (before after)
+  ;; Freeze the predecessor and image, then freeze the entry once staged.
+  ;; Each transition advances at most one activation step.
   (let ((old (getf before :activation)) (new (getf after :activation)))
     (unless (every (lambda (key) (equal (getf before key) (getf after key)))
                    '(:version :attempt :install :base :generations :configuration :settlement))

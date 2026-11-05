@@ -1,6 +1,8 @@
 (in-package #:pg)
 
 (defun physical-reseed-follow-activation-config (value binding)
+  ;; Derive the active configuration from the settled inert handoff.  This
+  ;; constructs and checks a value; it does not publish or start follow.
   (physical-reseed-install-check-literal (list value binding))
   (multiple-value-bind (record selected)
       (physical-reseed-follow-configuration-plan-record value binding)

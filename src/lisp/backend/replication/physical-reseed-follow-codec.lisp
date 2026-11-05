@@ -113,6 +113,8 @@
 ;; groups are checked against their predecessors.  Missing keys differ from NIL
 ;; groups; records without settlement keep their original canonical encoding.
 (defun physical-reseed-follow-copy (record)
+  ;; Check optional groups in predecessor order: configuration, settlement,
+  ;; activation, then retirement.  Presence of a key is distinct from NIL.
   (physical-reseed-install-check-literal record)
   (let* ((configuration-p (loop for key in record by #'cddr thereis (eq key :configuration)))
          (settlement-p (loop for key in record by #'cddr thereis (eq key :settlement)))
