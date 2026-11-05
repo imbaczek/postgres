@@ -179,6 +179,22 @@
   calls to physical base backup and manual follow start now fail live admission.
   Run these operations in task-owned workers outside control after it returns.
 
+- [ ] Activate settled target follow and retire startup fences. The pure active
+  configuration derivation and optional activation/retirement codecs are
+  implemented. They preserve historical predecessors, reject inode aliases and
+  advance only exact prefixes. Retirement uses the actual attempt identity order
+  (device, inode, mode, uid, nlink, size, mtime, ctime). A producer-backed
+  regression covers that boundary. Validation passed 53 selected tests with
+  611 assertions, strict cold compilation of 226 production files, and a normal
+  formatter check of all nine changed Lisp/ASDF files. Luna checkpoint and Sol
+  full-diff reviews passed; the Sol refactoring review found no worthwhile
+  extraction. Source documentation is being reviewed separately.
+  Future-capacity admission, active configuration publication, real source
+  authority checks, crash recovery, archive moves and startup admission remain
+  open; these codecs grant no filesystem or startup authority. Evidence:
+  `/home/imbaczek/proj/pg-ha-artifacts/reseed-target-activation/retirement-fixed-check.json`
+  and `retirement-format-check.json` in that directory.
+
 - [x] Fence the reserved target follow intent names before startup or older
   reseed ownership. Both final and temporary names reject every entry type;
   specialized cleanup and install roles repeat the check. Validation passed 44

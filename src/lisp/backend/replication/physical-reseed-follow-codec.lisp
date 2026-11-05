@@ -116,10 +116,13 @@
   (physical-reseed-install-check-literal record)
   (let* ((configuration-p (loop for key in record by #'cddr thereis (eq key :configuration)))
          (settlement-p (loop for key in record by #'cddr thereis (eq key :settlement)))
+         (activation-p (loop for key in record by #'cddr thereis (eq key :activation)))
+         (retirement-p (loop for key in record by #'cddr thereis (eq key :retirement)))
          (keys '(:version :attempt :install :base :generations)))
     (physical-follow-check-plist
      record (append keys (when configuration-p '(:configuration))
-                    (when settlement-p '(:settlement))))
+                    (when settlement-p '(:settlement)) (when activation-p '(:activation))
+                    (when retirement-p '(:retirement))))
     (let ((core (physical-reseed-follow-core-copy (physical-reseed-follow-core-projection record))))
       (when configuration-p
         (setf core (append core (list :configuration
@@ -129,6 +132,14 @@
         (setf core (append core (list :settlement
                                       (physical-reseed-follow-settlement-copy
                                        (getf record :settlement) core)))))
+      (when activation-p
+        (setf core (append core (list :activation
+                                      (physical-reseed-follow-activation-copy
+                                       (getf record :activation) core)))))
+      (when retirement-p
+        (setf core (append core (list :retirement
+                                      (physical-reseed-follow-retirement-copy
+                                       (getf record :retirement) core)))))
       core)))
 
 ;; The original attempt, install reference and base remain immutable.  Append
@@ -143,6 +154,10 @@
     (unless (every (lambda (key) (equal (getf before key) (getf after key)))
                    '(:version :attempt :install :base))
       (error "target follow journal cannot rebind its predecessors"))
+    (when (or (getf before :retirement) (getf after :retirement))
+      (physical-reseed-follow-retirement-check-transition before after))
+    (when (or (getf before :activation) (getf after :activation))
+      (physical-reseed-follow-activation-check-transition before after))
     (when (or (getf before :settlement) (getf after :settlement))
       (physical-reseed-follow-settlement-check-transition before after))
     (when (or (getf before :configuration) (getf after :configuration))
