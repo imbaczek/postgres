@@ -1,0 +1,88 @@
+(in-package #:pg)
+
+(defun physical-reseed-follow-retirement-next-reference (root record)
+  (or (getf (getf record :retirement) :attempt-file)
+      (let ((attempt (physical-reseed-follow-retirement-attempt-at root root record 0)))
+        (list :identity (getf attempt :identity) :digest (getf attempt :digest)))))
+
+(defun physical-reseed-follow-retirement-temporary-state-at (root stream)
+  (let* ((name "physical-reseed.follow.tmp")
+         (fd (sb-sys:fd-stream-fd stream))
+         (mount (physical-adoption-install-mount-id nil :directory-fd root)))
+    (multiple-value-bind (identity row) (physical-reseed-follow-entry root name)
+      (unless (and identity
+                   (equal identity (physical-reseed-follow-file-identity (sb-posix:fstat fd)))
+                   (= mount (physical-adoption-install-mount-id nil :directory-fd fd)))
+        (error "retirement temporary differs from its held descriptor"))
+      (file-position stream 0)
+      (let ((bytes (make-array (sixth identity) :element-type '(unsigned-byte 8))))
+        (unless (and (= (length bytes) (read-sequence bytes stream))
+                     (eq :eof (read-byte stream nil :eof))
+                     (equal identity (physical-reseed-follow-file-identity (sb-posix:fstat fd)))
+                     (equal (list identity row) (multiple-value-list (physical-reseed-follow-entry root name))))
+          (error "retirement temporary changed during its held read"))
+        (let ((record (physical-reseed-follow-decode bytes)))
+          (unless (equalp bytes (physical-reseed-follow-image record))
+            (error "retirement temporary is not a complete canonical image"))
+          (list :record record :identity identity :row row))))))
+
+(defun call-with-physical-reseed-follow-retirement-next-temporary (root snapshot parent-check function)
+  (let ((snapshot (physical-adoption-attempt-value-copy snapshot))
+        (thread sb-thread:*current-thread*) (active nil)
+        (fd nil) (stream nil) (state nil))
+    (unwind-protect
+         (progn
+           (funcall parent-check)
+           (physical-reseed-follow-check-snapshot root snapshot)
+           (when (physical-reseed-follow-entry root "physical-reseed.follow.tmp" t)
+             (sb-sys:without-interrupts
+               (setf fd (physical-image-openat
+                         root "physical-reseed.follow.tmp"
+                         (logior sb-posix:o-rdonly sb-posix:o-nofollow sb-posix:o-nonblock +postmaster-o-cloexec+) 0)))
+             (when (minusp fd) (setf fd nil) (error "cannot open retirement temporary"))
+             (sb-sys:without-interrupts
+               (setf stream (sb-sys:make-fd-stream fd :input t :element-type '(unsigned-byte 8))))
+             (setf state (physical-reseed-follow-retirement-temporary-state-at root stream))
+             (physical-reseed-follow-test-point
+              :after-retirement-temporary-open
+              (merge-pathnames "physical-reseed.follow.tmp" (physical-image-fd-path root))))
+           (flet ((verify ()
+                    (unless (and active (eq thread sb-thread:*current-thread*))
+                      (error "retirement temporary scope ended or changed thread"))
+                    (funcall parent-check)
+                    (physical-reseed-follow-check-snapshot root snapshot)
+                    (if state
+                        (let ((record (getf snapshot :record)))
+                          (unless (and (equal state (physical-reseed-follow-retirement-temporary-state-at root stream))
+                                       (equal (getf state :record)
+                                              (physical-reseed-follow-retirement-next-record
+                                               record (physical-reseed-follow-retirement-next-reference root record))))
+                            (error "retirement temporary differs from its exact next record or held facts")))
+                        (when (physical-reseed-follow-entry root "physical-reseed.follow.tmp" t)
+                          (error "retirement temporary appeared during an absent observation")))
+                    (funcall parent-check)
+                    (physical-reseed-follow-check-snapshot root snapshot)
+                    t))
+             (setf active t)
+             (verify)
+             (multiple-value-prog1
+                 (funcall function (physical-adoption-attempt-value-copy state) #'verify)
+               (verify))))
+      (setf active nil)
+      (if stream (close stream) (when fd (sb-posix:close fd))))))
+
+(defun physical-reseed-follow-retirement-check-temporary-layout
+    (descriptors record candidate prefix install attempt)
+  (let* ((root (physical-reseed-follow-configuration-role-fd descriptors :root))
+         (saved (physical-reseed-follow-configuration-role-fd descriptors :saved))
+         (expected (physical-reseed-follow-retirement-next-record
+                    record (physical-reseed-follow-retirement-next-reference root record))))
+    (unless (and (equal expected candidate)
+                 (= prefix (getf (getf candidate :retirement) :step)))
+      (error "retirement temporary requires its exact next observed archive prefix"))
+    (physical-reseed-follow-retirement-check-prefix candidate prefix)
+    (unless (and (equal install (physical-reseed-follow-retirement-install-at descriptors candidate prefix))
+                 (equal attempt (physical-reseed-follow-retirement-attempt-at
+                                 root (if (= prefix 2) saved root) candidate prefix)))
+      (error "retirement temporary differs from the proved install or attempt references"))
+    t))

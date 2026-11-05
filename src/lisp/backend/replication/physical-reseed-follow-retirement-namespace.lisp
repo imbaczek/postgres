@@ -1,14 +1,18 @@
 (in-package #:pg)
 
-(defun physical-reseed-follow-retirement-extra-at (root snapshot)
-  ;; Recheck the follow snapshot and fence the follow temporary and PID.
-  ;; The complete layout also refuses unexplained temporary entries.
+(defun physical-reseed-follow-retirement-final-extra-at (root snapshot)
   (physical-reseed-follow-check-snapshot root snapshot)
-  (dolist (name '("physical-reseed.follow.tmp" "postmaster.pid"))
-    (when (physical-adoption-path-present-p (merge-pathnames name (physical-image-fd-path root)))
-      (error "retirement read-only layout refuses temporary follow or PID entries")))
+  (when (physical-adoption-path-present-p (merge-pathnames "postmaster.pid" (physical-image-fd-path root)))
+    (error "retirement read-only layout refuses temporary follow or PID entries"))
   (list (cons (copy-seq "physical-reseed.follow")
               (nth-value 1 (physical-reseed-follow-entry root "physical-reseed.follow")))))
+
+(defun physical-reseed-follow-retirement-extra-at (root snapshot)
+  (let ((extra (physical-reseed-follow-retirement-final-extra-at root snapshot)))
+    (when (physical-adoption-path-present-p
+           (merge-pathnames "physical-reseed.follow.tmp" (physical-image-fd-path root)))
+      (error "retirement read-only layout refuses temporary follow or PID entries"))
+    extra))
 
 (defun physical-reseed-follow-retirement-initial-prefix (descriptors plan record binding extra)
   ;; Compare all ten directory inventories twice and require one matching
@@ -26,13 +30,10 @@
         (error "retirement layout lacks a unique complete archive prefix"))
       (physical-reseed-follow-retirement-check-prefix record (first matches)))))
 
-(defun physical-reseed-follow-retirement-layout-state (descriptors snapshot check)
+(defun physical-reseed-follow-retirement-layout-state-at (descriptors snapshot check extra-reader candidate)
   ;; Use the provisional install read only to obtain a plan.  Prove the saved
   ;; role, complete images and exact prefix, then recheck both journals around
   ;; the layout proof against the actual follow snapshot.
-  ;; The descriptors and check belong to the caller's scope.  This first entry
-  ;; refuses temporaries and PID entries, and does not acquire guards or prove
-  ;; receive-store semantics or startup authority.
   (let* ((root (physical-reseed-follow-configuration-role-fd descriptors :root))
          (saved (physical-reseed-follow-configuration-role-fd descriptors :saved))
          (record (physical-reseed-follow-copy (getf snapshot :record))))
@@ -43,21 +44,25 @@
                            collect (cons role (physical-reseed-follow-configuration-role-fd descriptors role)))))
       (flet ((initial-check ()
                (funcall check)
-               (physical-reseed-follow-retirement-extra-at root snapshot)))
+               (funcall extra-reader root)))
         (multiple-value-bind (base control binding model images row)
             (physical-reseed-follow-configuration-base-proof
              root saved base-fds plan record (getf (getf record :configuration) :step) #'initial-check)
           (declare (ignore base control model row))
-          (let* ((extra (physical-reseed-follow-retirement-extra-at root snapshot))
+          (let* ((extra (funcall extra-reader root))
                  (prefix (physical-reseed-follow-retirement-initial-prefix descriptors plan record binding extra))
                  (install (physical-reseed-follow-retirement-install-at descriptors record prefix))
                  (attempt (physical-reseed-follow-retirement-attempt-at root (if (= prefix 2) saved root) record prefix))
                  (positions (physical-reseed-follow-retirement-positions record binding prefix))
                  (expected (physical-reseed-follow-retirement-inventories plan record binding prefix extra))
                  (mount (physical-adoption-install-mount-id nil :directory-fd root)))
+            (unless (equal (mapcar #'car extra)
+                           (if candidate '("physical-reseed.follow" "physical-reseed.follow.tmp")
+                               '("physical-reseed.follow")))
+              (error "retirement observation has unexpected root extras"))
             (flet ((verify ()
                      (funcall check)
-                     (unless (and (equal extra (physical-reseed-follow-retirement-extra-at root snapshot))
+                     (unless (and (equal extra (funcall extra-reader root))
                                   (equal install (physical-reseed-follow-retirement-install-at descriptors record prefix))
                                   (equal attempt (physical-reseed-follow-retirement-attempt-at
                                                   root (if (= prefix 2) saved root) record prefix)))
@@ -66,9 +71,20 @@
               (let ((layout
                       (physical-reseed-follow-layout-proof-at
                        descriptors plan record positions images extra expected mount #'verify check
-                       (lambda (fd) (physical-reseed-follow-retirement-extra-at fd snapshot))
+                       extra-reader
                        (lambda () (physical-reseed-follow-activation-active-row
                                    descriptors record binding positions mount)))))
+                (when candidate
+                  (physical-reseed-follow-retirement-check-temporary-layout
+                   descriptors record candidate prefix install attempt))
                 (verify)
-                (list :prefix prefix :layout layout :install install :attempt attempt
-                      :snapshot (physical-adoption-attempt-value-copy snapshot))))))))))
+                (append (list :prefix prefix :layout layout :install install :attempt attempt
+                              :snapshot (physical-adoption-attempt-value-copy snapshot))
+                        (when candidate
+                          (list :temporary (physical-reseed-follow-copy candidate))))))))))))
+
+(defun physical-reseed-follow-retirement-layout-state (descriptors snapshot check)
+  (physical-reseed-follow-retirement-layout-state-at
+   descriptors snapshot check
+   (lambda (root) (physical-reseed-follow-retirement-extra-at root snapshot))
+   nil))

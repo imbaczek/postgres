@@ -113,6 +113,7 @@
                (:file "t/physical-reseed-follow-activation-scope-tests")
                (:file "t/physical-reseed-follow-activation-staging-tests")
                (:file "t/physical-reseed-follow-retirement-scope-tests")
+               (:file "t/physical-reseed-follow-retirement-temporary-tests")
                (:file "t/wal-timeline-tests")
                (:file "t/wal-eor-tests")
                (:file "t/physical-history-tests")

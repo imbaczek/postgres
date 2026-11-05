@@ -248,6 +248,7 @@
                    (:file "../replication/physical-reseed-follow-configuration-namespace")
                    (:file "../replication/physical-reseed-follow-activation-namespace")
                    (:file "../replication/physical-reseed-follow-retirement-files")
+                   (:file "../replication/physical-reseed-follow-retirement-temporary")
                    (:file "../replication/physical-reseed-follow-retirement-namespace")
                    (:file "../replication/physical-reseed-follow-configuration-scope")
                    (:file "../replication/physical-reseed-follow-activation-scope")
