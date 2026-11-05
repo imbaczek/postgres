@@ -218,6 +218,8 @@
                    (:file "../replication/physical-reseed-follow-generation")
                    (:file "../replication/physical-reseed-follow-codec")
                    (:file "../replication/physical-reseed-follow-configuration-codec")
+                   (:file "../replication/physical-reseed-follow-settlement-codec")
+                   (:file "../replication/physical-reseed-follow-settlement-source")
                    (:file "../replication/physical-reseed-follow-reader")
                    (:file "../replication/physical-reseed-follow-owner")
                    (:file "../replication/physical-reseed-follow-store")

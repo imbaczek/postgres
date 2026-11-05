@@ -113,14 +113,22 @@
 ;; a complete group against the checked core; absence remains distinct.
 (defun physical-reseed-follow-copy (record)
   (physical-reseed-install-check-literal record)
-  (let* ((present (loop for key in record by #'cddr thereis (eq key :configuration)))
+  (let* ((configuration-p (loop for key in record by #'cddr thereis (eq key :configuration)))
+         (settlement-p (loop for key in record by #'cddr thereis (eq key :settlement)))
          (keys '(:version :attempt :install :base :generations)))
-    (physical-follow-check-plist record (if present (append keys '(:configuration)) keys))
+    (physical-follow-check-plist
+     record (append keys (when configuration-p '(:configuration))
+                    (when settlement-p '(:settlement))))
     (let ((core (physical-reseed-follow-core-copy (physical-reseed-follow-core-projection record))))
-      (if present
-          (append core (list :configuration (physical-reseed-follow-configuration-copy
-                                             (getf record :configuration) core)))
-          core))))
+      (when configuration-p
+        (setf core (append core (list :configuration
+                                      (physical-reseed-follow-configuration-copy
+                                       (getf record :configuration) core)))))
+      (when settlement-p
+        (setf core (append core (list :settlement
+                                      (physical-reseed-follow-settlement-copy
+                                       (getf record :settlement) core)))))
+      core)))
 
 ;; The original attempt, install reference and base remain immutable.  Append
 ;; only a preparing generation after canceled history, or advance the last
@@ -134,6 +142,8 @@
     (unless (every (lambda (key) (equal (getf before key) (getf after key)))
                    '(:version :attempt :install :base))
       (error "target follow journal cannot rebind its predecessors"))
+    (when (or (getf before :settlement) (getf after :settlement))
+      (physical-reseed-follow-settlement-check-transition before after))
     (when (or (getf before :configuration) (getf after :configuration))
       (unless (equal old new) (error "configuration intent freezes its generation history"))
       (physical-reseed-follow-configuration-check-transition
@@ -159,14 +169,9 @@
 (defun physical-reseed-follow-image (record)
   (let* ((record (physical-reseed-follow-copy record))
          (bytes (physical-backup-lease-encode-literal
-                 "PGRESEEDFOLLOW1" record +physical-reseed-follow-maximum-bytes+))
-         (phase (getf (car (last (getf record :generations))) :phase))
-         (reserve (+ (case phase (:preparing +physical-reseed-follow-proof-reserve+)
-                           ((:proved :canceling) 32) (otherwise 0))
-                     (if (eq :building (getf (getf record :configuration) :phase))
-                         +physical-reseed-follow-configuration-reserve+ 0))))
-    (unless (<= (+ (length bytes) reserve) +physical-reseed-follow-maximum-bytes+)
-      (error "target follow journal lacks room for proof or cancellation"))
+                 "PGRESEEDFOLLOW1" record +physical-reseed-follow-maximum-bytes+)))
+    (physical-reseed-follow-check-image-capacity
+     record (length bytes) +physical-reseed-follow-maximum-bytes+)
     bytes))
 
 (defun physical-reseed-follow-decode (bytes)

@@ -1,0 +1,101 @@
+(in-package #:pg)
+
+(defun physical-reseed-follow-settlement-successor (record)
+  (let* ((core (physical-reseed-follow-core-copy
+                (physical-reseed-follow-core-projection record)))
+         (generation (car (last (getf core :generations)))))
+    (unless (and (= 1 (length (getf core :generations)))
+                 (eq :proved (getf generation :phase)))
+      (error "settlement requires one proved generation"))
+    (physical-backup-lease-successor-copy
+     (list :name (getf generation :name)
+           :anchor-digest (physical-follow-anchor-digest
+                           (physical-reseed-follow-generation-anchor generation)))
+     (getf (getf core :attempt) :request))))
+
+(defun physical-reseed-follow-settlement-base (record)
+  (let* ((base (getf record :base))
+         (control (physical-recovery-decode-control
+                   (physical-libpq-datum-octets (getf base :recovery-control) 196))))
+    (list :checkpoint-start (getf base :checkpoint-start)
+          :base (getf control :applied)
+          :manifest-digest (getf base :manifest-digest))))
+
+(defun physical-reseed-follow-settlement-copy (value record)
+  (physical-reseed-install-check-literal (list value record))
+  (physical-follow-check-plist value '(:phase :successor :receipt))
+  (let* ((core (physical-reseed-follow-core-copy
+                (physical-reseed-follow-core-projection record)))
+         (configuration (physical-reseed-follow-configuration-copy
+                         (getf record :configuration) core))
+         (phase (getf value :phase))
+         (successor (physical-reseed-follow-settlement-successor core))
+         (submitted (physical-backup-lease-successor-copy
+                     (getf value :successor) (getf (getf core :attempt) :request)))
+         (receipt (when (getf value :receipt)
+                    (physical-backup-lease-copy (getf value :receipt)))))
+    (unless (and (eq :inert (getf configuration :phase))
+                 (equal successor submitted)
+                 (member phase '(:handoff-pending :handed-off :source-aborted)))
+      (error "settlement differs from its inert proved successor"))
+    (if (eq :handoff-pending phase)
+        (when receipt (error "pending settlement cannot claim a source receipt"))
+        (unless (and receipt (eq :closed (getf receipt :phase))
+                     (equal (getf receipt :request) (getf (getf core :attempt) :request))
+                     (equal (getf receipt :base) (physical-reseed-follow-settlement-base core))
+                     (if (eq :handed-off phase)
+                         (and (eq :handed-off (getf receipt :outcome))
+                              (equal successor (getf receipt :successor)))
+                         (and (eq :aborted (getf receipt :outcome))
+                              (null (getf receipt :successor)))))
+          (error "settlement lacks the exact closed source outcome")))
+    (list :phase phase :successor successor :receipt receipt)))
+
+(defun physical-reseed-follow-settlement-check-transition (before after)
+  (let ((old (getf before :settlement)) (new (getf after :settlement)))
+    (unless (every (lambda (key) (equal (getf before key) (getf after key)))
+                   '(:version :attempt :install :base :generations :configuration))
+      (error "settlement freezes the installed configuration and its predecessors"))
+    (unless (and new
+                 (cond
+                   ((null old) (eq :handoff-pending (getf new :phase)))
+                   ((equal old new) t)
+                   ((eq :handoff-pending (getf old :phase))
+                    (and (member (getf new :phase) '(:handed-off :source-aborted))
+                         (equal (getf old :successor) (getf new :successor))))
+                   (t nil)))
+      (error "settlement cannot skip pending intent, regress or change its terminal outcome"))
+    t))
+
+(defun physical-reseed-follow-settlement-terminal-size (record)
+  (let* ((settlement (getf record :settlement))
+         (successor (getf settlement :successor))
+         (request (getf (getf record :attempt) :request))
+         (base (physical-reseed-follow-settlement-base record)))
+    (unless (eq :handoff-pending (getf settlement :phase))
+      (error "terminal sizing requires canonical pending intent"))
+    (loop for phase in '(:handed-off :source-aborted)
+          maximize
+          (let* ((receipt (physical-backup-lease-copy
+                           (list :version 1 :request request :phase :closed :base base
+                                 :outcome (if (eq phase :handed-off) :handed-off :aborted)
+                                 :successor (when (eq phase :handed-off) successor))))
+                 (candidate (copy-list record)))
+            (setf (getf candidate :settlement)
+                  (physical-reseed-follow-settlement-copy
+                   (list :phase phase :successor successor :receipt receipt) record))
+            (length (physical-backup-lease-encode-literal
+                     "PGRESEEDFOLLOW1" candidate +physical-reseed-follow-maximum-bytes+))))))
+
+(defun physical-reseed-follow-check-image-capacity (record encoded-length maximum)
+  (let* ((phase (getf (car (last (getf record :generations))) :phase))
+         (reserve (+ (case phase (:preparing +physical-reseed-follow-proof-reserve+)
+                           ((:proved :canceling) 32) (otherwise 0))
+                     (if (eq :building (getf (getf record :configuration) :phase))
+                         +physical-reseed-follow-configuration-reserve+ 0)))
+         (required (if (eq :handoff-pending (getf (getf record :settlement) :phase))
+                       (max encoded-length (physical-reseed-follow-settlement-terminal-size record))
+                       encoded-length)))
+    (unless (<= (+ required reserve) maximum)
+      (error "target follow journal lacks room for its next durable outcome"))
+    t))
