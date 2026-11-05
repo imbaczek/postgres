@@ -283,6 +283,235 @@
              (when pg::*postmaster-data-lock* (close pg::*postmaster-data-lock*))
              (setf sb-ext:*exit-hooks* hooks)))))))
 
+(defun check-retirement-startup-owner-context (owner)
+  (flet ((refused ()
+           (handler-case
+               (progn (pg::physical-reseed-follow-retirement-check-startup-owner owner) nil)
+             (error () t))))
+    (let ((pg::*postmaster-data-lock* nil)) (ok (refused)))
+    (let ((pg::*postmaster-pid-stream* nil)) (ok (refused)))
+    (let ((pg::*postmaster-pid-inode* nil)) (ok (refused)))
+    (let ((pg::*postmaster-pid-directory* nil)) (ok (refused)))
+    (let ((pg::*wal-ready* t)) (ok (refused)))
+    (ok (sb-thread:join-thread (sb-thread:make-thread #'refused)))
+    (let* ((fd (sb-sys:fd-stream-fd pg::*postmaster-data-lock*))
+           (flags (sb-posix:fcntl fd sb-posix:f-getfd))
+           (backup (sb-posix:dup fd)))
+      (unwind-protect
+           (progn (sb-posix:close fd) (ok (refused)))
+        (sb-posix:dup2 backup fd)
+        (sb-posix:fcntl fd sb-posix:f-setfd flags)
+        (sb-posix:close backup)))
+    (dolist (target '(:held :named))
+      (let ((original (symbol-function 'pg::physical-adoption-install-mount-id))
+            (pid-fd (sb-sys:fd-stream-fd pg::*postmaster-pid-stream*))
+            (pid-path (namestring (pg::postmaster-data-path "postmaster.pid")))
+            (visited nil))
+        (unwind-protect
+             (progn
+               (setf (symbol-function 'pg::physical-adoption-install-mount-id)
+                     (lambda (path &key directory-fd)
+                       (let ((mount (funcall original path :directory-fd directory-fd)))
+                         (if (ecase target
+                               (:held (eql directory-fd pid-fd))
+                               (:named (and path (equal pid-path (namestring path)))))
+                             (progn (setf visited t) (1+ mount))
+                             mount))))
+               (ok (refused))
+               (ok visited))
+          (setf (symbol-function 'pg::physical-adoption-install-mount-id) original))))
+    (ok (pg::physical-reseed-follow-retirement-check-startup-owner owner))))
+
+(defun check-retirement-startup-root-lifetimes (owner)
+  (dolist (mode '(:normal :error :throw :interrupt))
+    (let ((held nil) (escaped nil))
+      (ok
+       (eq :finished
+           (catch 'retirement-root-cut
+             (handler-case
+                 (pg::call-with-physical-reseed-follow-retirement-startup-root
+                  owner
+                  (lambda (fd verify)
+                    (setf held fd escaped verify)
+                    (ok (funcall verify))
+                    (ecase mode
+                      (:normal :finished)
+                      (:error (error "retirement root cut"))
+                      (:throw (throw 'retirement-root-cut :finished))
+                      (:interrupt
+                       (sb-thread:interrupt-thread
+                        sb-thread:*current-thread*
+                        (lambda () (throw 'retirement-root-cut :finished)))))))
+               (error (condition)
+                 (if (search "retirement root cut" (princ-to-string condition))
+                     :finished
+                     (error condition)))))))
+      (ok (handler-case (progn (sb-posix:fstat held) nil)
+            (sb-posix:syscall-error () t)))
+      (ok (handler-case (progn (funcall escaped) nil)
+            (error () t)))
+      (ok (open-stream-p pg::*postmaster-data-lock*))
+      (ok (open-stream-p pg::*postmaster-pid-stream*))
+      (ok (pg::physical-reseed-follow-retirement-check-startup-owner owner)))))
+
+(defun check-retirement-startup-owner-exits (expected)
+  (dolist (mode '(:error :throw :interrupt))
+    (let ((escaped nil)
+          (lock pg::*postmaster-data-lock*)
+          (pid-stream pg::*postmaster-pid-stream*)
+          (position (file-position pg::*postmaster-pid-stream*)))
+      (ok
+       (eq :finished
+           (catch 'retirement-owner-cut
+             (handler-case
+                 (pg::call-with-physical-reseed-follow-retirement-startup-owner
+                  expected
+                  (lambda (owner)
+                    (setf escaped owner)
+                    (ecase mode
+                      (:error (error "retirement owner cut"))
+                      (:throw (throw 'retirement-owner-cut :finished))
+                      (:interrupt
+                       (sb-thread:interrupt-thread
+                        sb-thread:*current-thread*
+                        (lambda () (throw 'retirement-owner-cut :finished)))))))
+               (error (condition)
+                 (if (search "retirement owner cut" (princ-to-string condition))
+                     :finished
+                     (error condition)))))))
+      (ok escaped)
+      (ok (handler-case
+              (progn (pg::physical-reseed-follow-retirement-check-startup-owner escaped) nil)
+            (error () t)))
+      (ok (and (eq lock pg::*postmaster-data-lock*) (open-stream-p lock)))
+      (ok (and (eq pid-stream pg::*postmaster-pid-stream*) (open-stream-p pid-stream)))
+      (ok (eql position (file-position pid-stream))))))
+
+(deftest reseed-retirement-startup-owner-borrows-published-postmaster-ownership
+    (call-with-reseed-retirement-observation-fixture
+     :same-timeline
+     (lambda (owner root workspace root-fd snapshot check)
+       (declare (ignore workspace check))
+       (reseed-follow-owner-test-write
+        (merge-pathnames "physical-reseed.follow.tmp" root)
+        (pg::physical-reseed-follow-image (reseed-retirement-test-initial-candidate root-fd snapshot)))
+       (close (pg::physical-adoption-owner-lock owner))
+       (setf (pg::physical-adoption-owner-active-p owner) nil)
+       (let ((pg::*pgdata* root) (pg::*postmaster-data-lock* nil)
+                                 (pg::*postmaster-pid-stream* nil) (pg::*postmaster-pid-directory* nil)
+                                 (pg::*postmaster-pid-inode* nil) (pg::*postmaster-start-time* nil)
+                                 (pg::*postmaster-start-timestamp* nil) (pg::*postmaster-pid-host* nil)
+                                 (pg::*postmaster-pid-port* nil) (hooks sb-ext:*exit-hooks*)
+                                 (before nil) (after nil) (reconciled nil) (escaped nil))
+         (unwind-protect
+              (progn
+                (pg::postmaster-own-data-directory
+                 "127.0.0.1" 5439
+                 :startup-observer
+                 (lambda (lock phase)
+                   (if (eq phase :before-pid)
+                       (setf before (pg::physical-reseed-follow-startup-observation lock phase))
+                       (setf after (pg::physical-reseed-follow-startup-observation lock phase before))))
+                 :startup-reconcile
+                 (lambda ()
+                   (setf reconciled t)
+                   (ok (open-stream-p pg::*postmaster-data-lock*))
+                   (ok (pg::postmaster-pid-owned-p))
+                   (pg::call-with-physical-reseed-follow-retirement-startup-owner
+                    after
+                    (lambda (retirement-owner)
+                      (setf escaped retirement-owner)
+                      (ok (pg::physical-reseed-follow-retirement-check-startup-owner retirement-owner))
+                      (ok (not (pg::physical-adoption-owner-p retirement-owner)))
+                      (ok (handler-case
+                              (progn (pg::physical-reseed-check-attempt-authority retirement-owner) nil)
+                            (error () t)))
+                      (check-retirement-startup-owner-context retirement-owner)
+                      (check-retirement-startup-root-lifetimes retirement-owner)
+                      (ok (handler-case (progn (pg::physical-adoption-check-owner retirement-owner) nil)
+                            (error () t)))))
+                   (check-retirement-startup-owner-exits after)))
+                (ok (eq :retirement (getf before :branch)))
+                (ok (equal before after))
+                (ok reconciled)
+                (ok (handler-case
+                        (progn (pg::physical-reseed-follow-retirement-check-startup-owner escaped) nil)
+                      (error () t)))
+                (ok (equal snapshot (pg::physical-reseed-follow-snapshot-at root-fd))))
+           (unwind-protect
+                (when pg::*postmaster-pid-stream* (pg::postmaster-remove-pid-file))
+             (when pg::*postmaster-data-lock* (close pg::*postmaster-data-lock*))
+             (setf sb-ext:*exit-hooks* hooks)))))))
+
+(deftest reseed-retirement-startup-owner-refuses-replaced-handover-evidence
+    (call-with-reseed-retirement-observation-fixture
+     :same-timeline
+     (lambda (owner root workspace root-fd snapshot check)
+       (declare (ignore workspace check))
+       (close (pg::physical-adoption-owner-lock owner))
+       (setf (pg::physical-adoption-owner-active-p owner) nil)
+       (let ((pg::*pgdata* root) (pg::*postmaster-data-lock* nil)
+                                 (pg::*postmaster-pid-stream* nil) (pg::*postmaster-pid-directory* nil)
+                                 (pg::*postmaster-pid-inode* nil) (pg::*postmaster-start-time* nil)
+                                 (pg::*postmaster-start-timestamp* nil) (pg::*postmaster-pid-host* nil)
+                                 (pg::*postmaster-pid-port* nil) (hooks sb-ext:*exit-hooks*)
+                                 (before nil) (after nil) (entered nil) (replacement-inode nil) (observed nil)
+                                 (path (merge-pathnames "physical-reseed.follow" root))
+                                 (replacement (merge-pathnames "replacement" root))
+                                 (bytes (pg::physical-reseed-follow-image (getf snapshot :record))))
+         (unwind-protect
+              (progn
+                (pg::postmaster-own-data-directory
+                 "127.0.0.1" 5439
+                 :startup-observer
+                 (lambda (lock phase)
+                   (if (eq phase :before-pid)
+                       (setf before (pg::physical-reseed-follow-startup-observation lock phase))
+                       (setf after (pg::physical-reseed-follow-startup-observation lock phase before))))
+                 :startup-reconcile
+                 (lambda ()
+                   (pg::call-with-physical-reseed-follow-retirement-startup-owner
+                    after
+                    (lambda (retirement-owner)
+                      (reseed-follow-owner-test-write replacement bytes)
+                      (setf replacement-inode (sb-posix:stat-ino (sb-posix:lstat replacement)))
+                      (sb-posix:rename replacement path)
+                      (ok (handler-case
+                              (progn
+                                (pg::call-with-physical-reseed-follow-retirement-startup-observation
+                                 retirement-owner
+                                 (lambda (descriptors state verify)
+                                   (declare (ignore descriptors state verify))
+                                   (setf observed t)))
+                                nil)
+                            (error (condition)
+                              (search "target follow final generation changed" (princ-to-string condition)))))
+                      (ok (not observed))))
+                   (let ((lock pg::*postmaster-data-lock*)
+                         (pid-stream pg::*postmaster-pid-stream*)
+                         (position (file-position pg::*postmaster-pid-stream*)))
+                     (ok (handler-case
+                             (progn
+                               (pg::call-with-physical-reseed-follow-retirement-startup-owner
+                                after (lambda (retirement-owner)
+                                        (declare (ignore retirement-owner))
+                                        (setf entered t)))
+                               nil)
+                           (error (condition)
+                             (search "target follow final generation changed" (princ-to-string condition)))))
+                     (ok (not entered))
+                     (ok (and (eq lock pg::*postmaster-data-lock*) (open-stream-p lock)))
+                     (ok (and (eq pid-stream pg::*postmaster-pid-stream*) (open-stream-p pid-stream)))
+                     (ok (eql position (file-position pid-stream))))))
+                (ok (equalp bytes (lineage-test-bytes path)))
+                (ok (= replacement-inode (sb-posix:stat-ino (sb-posix:lstat path))))
+                (ok (equal (getf snapshot :record)
+                           (getf (pg::physical-reseed-follow-snapshot-at root-fd) :record))))
+           (unwind-protect
+                (when pg::*postmaster-pid-stream* (pg::postmaster-remove-pid-file))
+             (when pg::*postmaster-data-lock* (close pg::*postmaster-data-lock*))
+             (setf sb-ext:*exit-hooks* hooks)))))))
+
 (deftest reseed-startup-observation-rejects-byte-identical-final-replacement
     (call-with-reseed-retirement-observation-fixture
      :same-timeline
