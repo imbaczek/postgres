@@ -161,7 +161,7 @@
   Recover complete next temporaries offline and preserve partial or conflicting
   evidence. Historical settlement after local abort grants no activation or cleanup
   authority. Configuration remains Inert and disabled, with startup fenced.
-  Validation passed 165 distinct selected tests and 3,090 assertions in a fresh
+  Validation passed 165 distinct selected tests and 3,089 assertions in a fresh
   process, strict compilation of 223 production files, and independent commit
   snapshots. Native TLI 1 acceptance covered 21 cases, 119 fresh target processes,
   11 target SIGKILLs and one source SIGKILL, including lost replies and cold reopen.
