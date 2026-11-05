@@ -1,6 +1,9 @@
 (in-package #:pg)
 
 (defun physical-reseed-follow-activation-plan-record (value binding)
+  ;; Check the historical pending binding against its frozen image, then
+  ;; derive and check the exact active image.  Building has no captured entry
+  ;; and cannot be planned.  This check gives no filesystem or startup authority.
   (let* ((record (physical-reseed-follow-copy value))
          (activation (getf record :activation))
          (bytes (physical-follow-config-image
@@ -15,12 +18,18 @@
     (values record terminal)))
 
 (defun physical-reseed-follow-activation-moves (value binding)
+  ;; Move the pending follow control aside before placing the active image.
+  ;; Recovery controls, history, and the receive directory are unchanged.
   (physical-reseed-follow-activation-plan-record value binding)
   (physical-adoption-attempt-value-copy
    '(("follow.pending" :root "physical-follow.control" :saved "follow.pending")
      ("follow.active" :staged "follow.active" :root "physical-follow.control"))))
 
 (defun physical-reseed-follow-activation-positions (value binding prefix)
+  ;; Describe any static prefix from 0 through 2, independent of the recorded
+  ;; activation phase.  A driver must require staged/0 at observed prefix 0,
+  ;; activating/N at N or one move ahead (up to 2), and active/2 at prefix 2.
+  ;; The returned positions describe expected names, not observed disk state.
   (multiple-value-bind (record terminal)
       (physical-reseed-follow-activation-plan-record value binding)
     (unless (typep prefix '(integer 0 2)) (error "invalid activation move prefix"))
@@ -31,6 +40,8 @@
        "activation move lacks a unique source or empty destination"))))
 
 (defun physical-reseed-follow-activation-inventories (value-plan value binding prefix extra)
+  ;; Extend the terminal installation inventories with the active image and
+  ;; apply the requested static prefix.  This does not inspect directories.
   (multiple-value-bind (record terminal)
       (physical-reseed-follow-activation-plan-record value binding)
     (unless (typep prefix '(integer 0 2)) (error "invalid activation inventory prefix"))

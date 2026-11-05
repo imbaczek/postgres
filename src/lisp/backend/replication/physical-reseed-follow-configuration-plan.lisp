@@ -49,6 +49,9 @@
               (list recovery :staged recovery :root "physical-recovery.control")))))))
 
 (defun physical-reseed-follow-apply-position-moves (positions moves error-message)
+  ;; Change the caller-owned position triples in place, copying each new leaf.
+  ;; Callers validate the prefix and pass only the moves in that prefix.  Each
+  ;; move requires one matching source and an empty destination.
   (dolist (move moves)
     (destructuring-bind (logical from-role from-leaf to-role to-leaf) move
       (let ((sources (remove-if-not
