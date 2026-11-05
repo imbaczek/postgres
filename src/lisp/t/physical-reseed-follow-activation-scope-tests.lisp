@@ -301,6 +301,40 @@
            (ok (reseed-activation-layout-facts-equal-p
                 preserved (activation-test-unrelated-tree root workspace))))))))
 
+(deftest reseed-activation-recovery-preserves-conflicting-and-identical-temporaries
+    (dolist (kind '(:wrong-image :skipped-phase :identical))
+      (call-with-reseed-activation-fixture
+       :same-timeline
+       (lambda (owner root workspace settled)
+         (declare (ignore workspace))
+         (let* ((pg::*pgdata* root)
+                (candidate (pg::physical-reseed-follow-copy settled))
+                (config (pg::physical-follow-read-config)))
+           (setf (getf (fifth config) :phase) :active
+                 (getf (sixth config) :enabled) t)
+           (let* ((bytes (pg::physical-follow-config-image config))
+                  (image (list (length bytes) (pg::physical-store-update-digest #xCBF29CE484222325 bytes))))
+             (setf (getf candidate :activation)
+                   (list :phase :building :step 0 :image image :entry nil))
+             (ecase kind
+               (:wrong-image (setf (second image) (logxor 1 (second image))))
+               (:skipped-phase
+                (setf (getf (getf candidate :activation) :phase) :staged
+                      (getf (getf candidate :activation) :entry)
+                      (list "follow.active" :file #o600
+                            (getf (getf (getf candidate :attempt) :local) :device)
+                            (1- (ash 1 64)) (first image) (second image))))
+               (:identical (setf candidate (activation-test-call 'pg::physical-reseed-follow-begin-activation owner))))
+             (let* ((temporary (merge-pathnames "physical-reseed.follow.tmp" root))
+                    (final (merge-pathnames "physical-reseed.follow" root))
+                    (before (lineage-test-bytes final))
+                    (encoded (pg::physical-reseed-follow-image candidate)))
+               (reseed-follow-owner-test-write temporary encoded)
+               (ok (intake-fails-p
+                    (lambda () (activation-test-call 'pg::physical-reseed-follow-recover-activation owner))))
+               (ok (equalp encoded (lineage-test-bytes temporary)))
+               (ok (equalp before (lineage-test-bytes final))))))))))
+
 (deftest reseed-activation-begin-publishes-only-building-and-retries-without-rewriting
     (dolist (kind '(:same-timeline :retained-timeline :before-fork :at-fork :later-writer))
       (call-with-reseed-activation-fixture
