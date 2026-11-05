@@ -2,10 +2,15 @@
 
 (defstruct (physical-reseed-follow-retirement-startup-owner
             (:conc-name retirement-startup-))
+  ;; Borrow the published lock and PID stream on the creating thread.  Keep
+  ;; root, mount and PID facts with a copy of the trusted handover evidence.
   directory root-facts mount lock lock-fd lock-facts
   pid-stream pid-inode pid-state thread active-p evidence)
 
 (defun physical-reseed-follow-retirement-check-startup-owner (owner)
+  ;; Keep the published lock, PID and root check independent of the full
+  ;; observation proof.  Reasserting flock checks current exclusivity and can
+  ;; reacquire a released lock.
   (unless (and (physical-reseed-follow-retirement-startup-owner-p owner)
                (retirement-startup-active-p owner)
                (eq (retirement-startup-thread owner) sb-thread:*current-thread*))
@@ -58,6 +63,8 @@
   owner)
 
 (defun call-with-physical-reseed-follow-retirement-startup-root (owner function)
+  ;; Open and close the root descriptor around the callback.  VERIFY is valid
+  ;; only within this scope and uses the owner's thread-bound guard.
   (physical-reseed-follow-retirement-check-startup-owner owner)
   (let ((fd nil) (active nil) (directory (retirement-startup-directory owner)))
     (unwind-protect
@@ -79,6 +86,8 @@
       (when fd (sb-posix:close fd)))))
 
 (defun call-with-physical-reseed-follow-retirement-startup-observation (owner function)
+  ;; Run a fresh owned-PID observation and compare it with the trusted
+  ;; handover evidence supplied when the owner was created.
   (call-with-physical-reseed-follow-retirement-startup-root
    owner
    (lambda (root check)
@@ -92,6 +101,8 @@
           (funcall function descriptors state verify)))))))
 
 (defun call-with-physical-reseed-follow-retirement-startup-owner (expected function)
+  ;; Bind trusted handover evidence to published postmaster ownership.
+  ;; Reprove it before the callback and revoke the owner when the scope ends.
   (unless (and (eq :retirement (getf expected :branch)) (getf expected :evidence)
                *postmaster-data-lock* (open-stream-p *postmaster-data-lock*)
                *postmaster-pid-stream* (open-stream-p *postmaster-pid-stream*))
