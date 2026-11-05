@@ -67,6 +67,7 @@
                       (:terminal (setf receipt status))
                       (:handoff
                        (progn
+                         (physical-reseed-follow-check-future-capacity record)
                          (physical-reseed-follow-observe-source client source generation)
                          (check)
                          (multiple-value-bind (result confirmed)

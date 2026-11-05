@@ -77,34 +77,41 @@
       (error "settlement cannot skip pending intent, regress or change its terminal outcome"))
     t))
 
+(defun physical-reseed-follow-completion-terminal (record phase)
+  (let* ((candidate (copy-list record))
+         (settlement (getf record :settlement))
+         (successor (getf settlement :successor))
+         (receipt (physical-backup-lease-copy
+                   (list :version 1 :request (getf (getf record :attempt) :request)
+                         :phase :closed :base (physical-reseed-follow-settlement-base record)
+                         :outcome (ecase phase (:handed-off :handed-off) (:source-aborted :aborted))
+                         :successor (when (eq phase :handed-off) successor)))))
+    (setf (getf candidate :settlement)
+          (physical-reseed-follow-settlement-copy
+           (list :phase phase :successor successor :receipt receipt) record))
+    candidate))
+
 ;; Size both canonical terminal outcomes before publishing pending intent.
 (defun physical-reseed-follow-settlement-terminal-size (record)
-  (let* ((settlement (getf record :settlement))
-         (successor (getf settlement :successor))
-         (request (getf (getf record :attempt) :request))
-         (base (physical-reseed-follow-settlement-base record)))
-    (unless (eq :handoff-pending (getf settlement :phase))
-      (error "terminal sizing requires canonical pending intent"))
-    (loop for phase in '(:handed-off :source-aborted)
-          maximize
-          (let* ((receipt (physical-backup-lease-copy
-                           (list :version 1 :request request :phase :closed :base base
-                                 :outcome (if (eq phase :handed-off) :handed-off :aborted)
-                                 :successor (when (eq phase :handed-off) successor))))
-                 (candidate (copy-list record)))
-            (setf (getf candidate :settlement)
-                  (physical-reseed-follow-settlement-copy
-                   (list :phase phase :successor successor :receipt receipt) record))
-            (length (physical-backup-lease-encode-literal
-                     "PGRESEEDFOLLOW1" candidate +physical-reseed-follow-maximum-bytes+))))))
+  (unless (eq :handoff-pending (getf (getf record :settlement) :phase))
+    (error "terminal sizing requires canonical pending intent"))
+  (loop for phase in '(:handed-off :source-aborted)
+        maximize (length (physical-backup-lease-encode-literal
+                          "PGRESEEDFOLLOW1"
+                          (physical-reseed-follow-completion-terminal record phase)
+                          +physical-reseed-follow-maximum-bytes+))))
+
+(defun physical-reseed-follow-capacity-reserve (record)
+  (+ (case (getf (car (last (getf record :generations))) :phase)
+       (:preparing +physical-reseed-follow-proof-reserve+)
+       ((:proved :canceling) 32)
+       (otherwise 0))
+     (if (eq :building (getf (getf record :configuration) :phase))
+         +physical-reseed-follow-configuration-reserve+ 0)))
 
 ;; Reserve space for the larger terminal receipt as well as existing margins.
 (defun physical-reseed-follow-check-image-capacity (record encoded-length maximum)
-  (let* ((phase (getf (car (last (getf record :generations))) :phase))
-         (reserve (+ (case phase (:preparing +physical-reseed-follow-proof-reserve+)
-                           ((:proved :canceling) 32) (otherwise 0))
-                     (if (eq :building (getf (getf record :configuration) :phase))
-                         +physical-reseed-follow-configuration-reserve+ 0)))
+  (let* ((reserve (physical-reseed-follow-capacity-reserve record))
          (required (if (eq :handoff-pending (getf (getf record :settlement) :phase))
                        (max encoded-length (physical-reseed-follow-settlement-terminal-size record))
                        encoded-length)))

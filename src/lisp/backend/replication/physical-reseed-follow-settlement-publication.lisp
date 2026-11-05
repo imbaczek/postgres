@@ -53,6 +53,7 @@
          (*physical-reseed-follow-settlement-candidate* candidate))
     (physical-reseed-follow-check-active-attempt owner)
     (funcall check)
+    (physical-reseed-follow-check-future-capacity candidate)
     (physical-reseed-follow-write-installed-intent context candidate bytes check)))
 
 ;; Begin settlement under the guarded installation scope.  An existing temporary

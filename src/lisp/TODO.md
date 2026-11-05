@@ -179,6 +179,24 @@
   calls to physical base backup and manual follow start now fail live admission.
   Run these operations in task-owned workers outside control after it returns.
 
+- [x] Reserve follow-journal room for activation and retirement before new
+  pending publication or HANDOFF. Compute a conservative completion bound from
+  exact terminal receipts and compatible activation/retirement field widths,
+  adding the existing reserve once. Keep size-only templates separate from
+  publication authority. Preserve the old exact receipt-size contract, journal
+  readability, historical STATUS reconciliation and complete pending-temporary
+  recovery. The shared terminal constructor keeps receipt invariants in one
+  place. A fresh regression passed 61 tests and 738 assertions; strengthened
+  property coverage passed 100 trials at seed 130, digest
+  `fnv1a64-v1:20733aff3238b523`, with input coverage and rejection counts
+  unmeasured. Additional focused tests cover every encoded completion from
+  each prefix, printer bindings and the shared-constructor refactor. Strict
+  cold compilation passed all 227 production files. Luna checkpoint, Sol full
+  review and the focused refactor rereview passed. Source docs are separate.
+  Evidence: `capacity-green-check.json`, `capacity-followup-check.json`,
+  `capacity-contract-check.json` and `capacity-refactor-cold-check.json` under
+  `/home/imbaczek/proj/pg-ha-artifacts/reseed-target-activation/`.
+
 - [ ] Activate settled target follow and retire startup fences. The pure active
   configuration derivation and optional activation/retirement codecs are
   implemented. They preserve historical predecessors, reject inode aliases and
@@ -189,8 +207,8 @@
   formatter check of all nine changed Lisp/ASDF files. Luna checkpoint and Sol
   full-diff reviews passed; the Sol refactoring review found no worthwhile
   extraction. Source documentation was reviewed separately.
-  Future-capacity admission, active configuration publication, real source
-  authority checks, crash recovery, archive moves and startup admission remain
+  Active configuration publication, real source authority checks, crash
+  recovery, archive moves and startup admission remain
   open; these codecs grant no filesystem or startup authority. Evidence:
   `/home/imbaczek/proj/pg-ha-artifacts/reseed-target-activation/retirement-fixed-check.json`
   and `retirement-format-check.json` in that directory.
