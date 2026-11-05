@@ -148,6 +148,169 @@
              (ok (/= (sb-posix:stat-ino (sb-posix:lstat (namestring path)))
                      (sb-posix:stat-ino (sb-posix:lstat (namestring saved)))))))))))
 
+(defun reseed-retirement-layout-write (root record)
+  (let ((bytes (pg::physical-reseed-follow-image record)))
+    (with-open-file (out (merge-pathnames "physical-reseed.follow" root)
+                         :direction :output :if-exists :overwrite
+                         :element-type '(unsigned-byte 8))
+      (write-sequence bytes out)
+      (finish-output out)
+      (sb-posix:ftruncate (sb-sys:fd-stream-fd out) (length bytes)))))
+
+(defun call-with-reseed-retirement-layout-fixture (kind function)
+  (call-with-reseed-activation-layout-fixture
+   kind
+   (lambda (owner root workspace record binding images descriptors check)
+     (declare (ignore check))
+     (dolist (move (pg::physical-reseed-follow-activation-moves record binding))
+       (destructuring-bind (logical from-role from-leaf to-role to-leaf) move
+         (declare (ignore logical))
+         (unless (zerop (pg::physical-adoption-renameat2
+                         (cdr (assoc from-role descriptors)) from-leaf
+                         (cdr (assoc to-role descriptors)) to-leaf
+                         pg::+physical-adoption-rename-noreplace+))
+           (error "retirement fixture activation move failed"))))
+     (setf (getf (getf record :activation) :phase) :active
+           (getf (getf record :activation) :step) 2)
+     (reseed-retirement-layout-write root record)
+     (flet ((root-check () (pg::physical-directory-check-owner-common owner)))
+       (funcall function owner root workspace record binding images descriptors #'root-check)))))
+
+(deftest reseed-retirement-layout-proves-every-archive-prefix-read-only
+    (dolist (kind '(:same-timeline :retained-timeline :before-fork :at-fork :later-writer))
+      (ok
+       (eq :checked
+           (call-with-reseed-retirement-layout-fixture
+            kind
+            (lambda (owner root workspace record binding images descriptors check)
+              (declare (ignore binding images))
+              (let* ((root-fd (cdr (assoc :root descriptors)))
+                     (saved-fd (cdr (assoc :saved descriptors)))
+                     (attempt (pg::physical-reseed-follow-retirement-attempt-at root-fd root-fd record 0))
+                     (reference (list :identity (getf attempt :identity) :digest (getf attempt :digest)))
+                     (plan (pg::physical-reseed-install-owner-plan owner))
+                     (directories (list root workspace
+                                        (pathname (getf (getf plan :incoming) :directory))
+                                        (pathname (getf (getf plan :quarantine) :directory)))))
+                (loop for prefix from 0 to 2
+                      do (reseed-retirement-layout-write root record)
+                         (let* ((snapshot (pg::physical-reseed-follow-snapshot-at root-fd))
+                                (before (mapcar #'reseed-mapped-test-tree-facts directories))
+                                (state (funcall (symbol-function 'pg::physical-reseed-follow-retirement-layout-state)
+                                                descriptors snapshot check)))
+                           (ok (= prefix (getf state :prefix)))
+                           (ok (= 10 (length (getf (getf state :layout) :directories))))
+                           (ok (equal snapshot (pg::physical-reseed-follow-snapshot-at root-fd)))
+                           (ok (reseed-activation-layout-facts-equal-p
+                                before (mapcar #'reseed-mapped-test-tree-facts directories))))
+                         (when (< prefix 2)
+                           (setf (getf record :retirement)
+                                 (list :phase :retiring :step prefix :attempt-file reference))
+                           (let ((name (if (zerop prefix) "physical-reseed.install" "physical-reseed.attempt")))
+                             (unless (zerop (pg::physical-adoption-renameat2
+                                             root-fd name saved-fd name pg::+physical-adoption-rename-noreplace+))
+                               (error "retirement fixture archive move failed")))))
+                (setf (getf record :retirement)
+                      (list :phase :retired :step 2 :attempt-file reference))
+                (reseed-retirement-layout-write root record)
+                (ok (= 2 (getf (pg::physical-reseed-follow-retirement-layout-state
+                                descriptors (pg::physical-reseed-follow-snapshot-at root-fd) check)
+                               :prefix))))))))))
+
+(deftest reseed-retirement-layout-refuses-fences-gaps-and-wrong-saved-role
+    (dolist (fault '(:temporary :pid :snapshot-replacement :fake-saved :attempt-gap
+                     :duplicate-install :missing-install))
+      (call-with-reseed-retirement-layout-fixture
+       :same-timeline
+       (lambda (owner root workspace record binding images descriptors check)
+         (declare (ignore owner record binding images))
+         (let* ((root-fd (cdr (assoc :root descriptors)))
+                (saved-fd (cdr (assoc :saved descriptors)))
+                (staged-fd (cdr (assoc :staged descriptors)))
+                (snapshot (pg::physical-reseed-follow-snapshot-at root-fd))
+                (journal (lineage-test-bytes (merge-pathnames "physical-reseed.follow" root)))
+                (message
+                  (ecase fault
+                    ((:temporary :pid) "refuses temporary follow or PID")
+                    (:snapshot-replacement "final generation changed")
+                    (:fake-saved "saved original control directory")
+                    (:attempt-gap "unique complete archive prefix")
+                    ((:duplicate-install :missing-install) "one root or saved location"))))
+           (ecase fault
+             ((:temporary :pid)
+              (reseed-follow-owner-test-write
+               (merge-pathnames (if (eq fault :temporary) "physical-reseed.follow.tmp" "postmaster.pid") root)
+               #(1 2 3)))
+             (:snapshot-replacement
+              (sb-posix:rename (namestring (merge-pathnames "physical-reseed.follow" root))
+                               (namestring (merge-pathnames "follow.original" root)))
+              (reseed-follow-owner-test-write (merge-pathnames "physical-reseed.follow" root) journal))
+             (:fake-saved
+              (unless (zerop (pg::physical-adoption-renameat2
+                              root-fd "physical-reseed.attempt" staged-fd "physical-reseed.attempt"
+                              pg::+physical-adoption-rename-noreplace+))
+                (error "fake archive fixture move failed"))
+              (setf (cdr (assoc :saved descriptors)) staged-fd))
+             (:attempt-gap
+              (unless (zerop (pg::physical-adoption-renameat2
+                              root-fd "physical-reseed.attempt" saved-fd "physical-reseed.attempt"
+                              pg::+physical-adoption-rename-noreplace+))
+                (error "attempt gap fixture move failed")))
+             (:duplicate-install
+              (sb-posix:link (namestring (merge-pathnames "physical-reseed.install" root))
+                             (namestring (merge-pathnames "saved/physical-reseed.install" workspace))))
+             (:missing-install
+              (sb-posix:rename (namestring (merge-pathnames "physical-reseed.install" root))
+                               (namestring (merge-pathnames "staged/physical-reseed.install" workspace)))))
+           (let ((before (mapcar #'reseed-mapped-test-tree-facts (list root workspace))))
+             (ok (handler-case
+                     (progn (pg::physical-reseed-follow-retirement-layout-state descriptors snapshot check) nil)
+                   (error (condition) (search message (princ-to-string condition)))))
+             (ok (reseed-activation-layout-facts-equal-p
+                  before (mapcar #'reseed-mapped-test-tree-facts (list root workspace))))))))))
+
+(deftest reseed-retirement-layout-rechecks-each-journal-after-content-proof
+    (dolist (kind '(:follow :install :attempt :temporary :pid))
+      (call-with-reseed-retirement-layout-fixture
+       :same-timeline
+       (lambda (owner root workspace record binding images descriptors check)
+         (declare (ignore owner workspace record binding images))
+         (let* ((root-fd (cdr (assoc :root descriptors)))
+                (snapshot (pg::physical-reseed-follow-snapshot-at root-fd))
+                (path (merge-pathnames
+                       (ecase kind (:follow "physical-reseed.follow")
+                              (:install "physical-reseed.install")
+                              (:attempt "physical-reseed.attempt")
+                              (:temporary "physical-reseed.follow.tmp")
+                              (:pid "postmaster.pid")) root))
+                (bytes (if (member kind '(:temporary :pid)) #(1 2 3) (lineage-test-bytes path)))
+                (original (symbol-function 'pg::physical-reseed-follow-activation-active-row))
+                (armed nil) (fired nil) (message nil))
+           (unwind-protect
+                (progn
+                  (setf (symbol-function 'pg::physical-reseed-follow-activation-active-row)
+                        (lambda (&rest arguments)
+                          (multiple-value-prog1 (apply original arguments)
+                            (setf armed t))))
+                  (handler-case
+                      (pg::physical-reseed-follow-retirement-layout-state
+                       descriptors snapshot
+                       (lambda ()
+                         (funcall check)
+                         (when (and armed (not fired))
+                           (setf fired t)
+                           (with-open-file (out path :direction :output :if-exists :overwrite
+                                                     :if-does-not-exist :create :element-type '(unsigned-byte 8))
+                             (write-sequence bytes out)))))
+                    (error (condition) (setf message (princ-to-string condition)))))
+             (setf (symbol-function 'pg::physical-reseed-follow-activation-active-row) original))
+           (ok fired)
+           (ok (and message (search (case kind
+                                      (:follow "final generation changed")
+                                      ((:temporary :pid) "refuses temporary follow or PID")
+                                      (t "retirement")) message)))
+           (ok (equalp bytes (lineage-test-bytes path))))))))
+
 (deftest reseed-activation-layout-proves-every-actual-move-prefix-read-only
     (dolist (kind '(:same-timeline :retained-timeline :before-fork :at-fork :later-writer))
       (ok

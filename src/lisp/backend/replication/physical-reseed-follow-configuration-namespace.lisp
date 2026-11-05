@@ -97,8 +97,8 @@
              (error "derived configuration file lost its recorded identity or stable metadata"))
         collect (list logical parent leaf before)))
 
-(defun physical-reseed-follow-layout-proof
-    (owner descriptors plan record positions images extra expected mount check &optional active-row)
+(defun physical-reseed-follow-layout-proof-at
+    (descriptors plan record positions images extra expected mount check check-owner read-extra &optional active-row)
   ;; Callers admit the owner, run the first check, and supply fixed positions
   ;; and inventories.  Capture the namespace, run the second check, and then
   ;; recheck the captured facts.  When supplied, the read-only active observer
@@ -125,7 +125,7 @@
               (derived (physical-reseed-follow-configuration-image-rows descriptors record positions images mount))
               (active (when active-row (funcall active-row))))
           (funcall check)
-          (physical-reseed-check-owner owner)
+          (funcall check-owner)
           (physical-reseed-install-namespace-check-new-rows
            new mount (lambda (name)
                        (physical-reseed-follow-configuration-original-location descriptors positions name)))
@@ -133,7 +133,7 @@
             (unless (equal (fourth entry) (physical-reseed-install-old-observe (second entry) (third entry) mount))
               (error "derived configuration file changed during the layout proof")))
           (unless (and (or (null active-row) (equal active (funcall active-row)))
-                       (equal extra (physical-reseed-install-extra-entries owner root))
+                       (equal extra (funcall read-extra root))
                        (equal old (physical-reseed-install-namespace-old-rows
                                    plan (1- (physical-reseed-install-last-step plan)) root quarantine mount))
                        (equal directories (physical-reseed-follow-configuration-directory-rows
@@ -143,6 +143,14 @@
           (append (list :new new :images derived)
                   (when active-row (list :active active))
                   (list :old old :directories directories :names expected)))))))
+
+(defun physical-reseed-follow-layout-proof
+    (owner descriptors plan record positions images extra expected mount check &optional active-row)
+  (physical-reseed-follow-layout-proof-at
+   descriptors plan record positions images extra expected mount check
+   (lambda () (physical-reseed-check-owner owner))
+   (lambda (root) (physical-reseed-install-extra-entries owner root))
+   active-row))
 
 ;; Prove the complete mapped namespace at one prefix, including unused images.
 ;; Check identities, contents and exact child names again around the proof.
