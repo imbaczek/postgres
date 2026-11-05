@@ -16,6 +16,68 @@
   (append (pg::physical-reseed-follow-copy record)
           (when group (list :retirement (pg::physical-adoption-attempt-value-copy group)))))
 
+(cl-spec:defproperty reseed-follow-retirement-next-preserves-predecessors
+    ((selected boolean) (position (range integer 0 3)))
+  (:about pg::physical-reseed-follow-retirement-next-record)
+  (:trials (:normal 100))
+  (multiple-value-bind (record groups) (reseed-follow-retirement-codec-fixture selected)
+    (let* ((expected (reseed-follow-with-retirement record (nth position groups)))
+           (previous (reseed-follow-with-retirement record (when (plusp position) (nth (1- position) groups))))
+           (reference (getf (nth position groups) :attempt-file))
+           (before (pg::physical-adoption-attempt-value-copy (list previous reference)))
+           (candidate (funcall (symbol-function 'pg::physical-reseed-follow-retirement-next-record)
+                               previous reference)))
+      (and (equal expected candidate)
+           (not (eq previous candidate))
+           (pg::physical-reseed-follow-check-transition previous candidate)
+           (equal candidate (pg::physical-reseed-follow-decode (pg::physical-reseed-follow-image candidate)))
+           (progn
+             (incf (seventh (getf (getf (getf candidate :retirement) :attempt-file) :identity)))
+             (equal before (list previous reference)))))))
+
+(deftest generated-reseed-follow-retirement-next-contract
+    (let ((data (cl-spec:result-data
+                 (cl-spec:run-property 'reseed-follow-retirement-next-preserves-predecessors
+                                       :seed 144 :profile :normal))))
+      (ok (eq :passed (getf data :status)))))
+
+(deftest reseed-follow-retirement-next-refuses-terminal-inactive-and-rebound-inputs
+    (dolist (selected '(nil t))
+      (multiple-value-bind (record groups) (reseed-follow-retirement-codec-fixture selected)
+        (dolist (kind '(:retired :missing :digest :rebound :inactive :incomplete))
+          (let* ((previous (reseed-follow-with-retirement
+                            record (case kind (:retired (fourth groups)) (:rebound (first groups)))))
+                 (reference (pg::physical-adoption-attempt-value-copy (getf (first groups) :attempt-file))))
+            (ecase kind
+              (:retired)
+              (:missing (setf reference nil))
+              (:digest (incf (getf reference :digest)))
+              (:rebound (incf (seventh (getf reference :identity))))
+              (:inactive (setf (getf (getf previous :activation) :phase) :activating))
+              (:incomplete (setf (getf (getf previous :activation) :phase) :activating
+                                 (getf (getf previous :activation) :step) 1)))
+            (let ((before (pg::physical-adoption-attempt-value-copy (list previous reference))))
+              (ok (handler-case
+                      (progn
+                        (funcall (symbol-function 'pg::physical-reseed-follow-retirement-next-record)
+                                 previous reference)
+                        nil)
+                    (error () t)))
+              (ok (equal before (list previous reference)))))))))
+
+(deftest reseed-follow-retirement-next-copies-an-aliased-attempt-reference
+    (dolist (selected '(nil t))
+      (multiple-value-bind (record groups) (reseed-follow-retirement-codec-fixture selected)
+        (dolist (group (butlast groups))
+          (let* ((previous (reseed-follow-with-retirement record group))
+                 (reference (getf (getf previous :retirement) :attempt-file))
+                 (before (pg::physical-adoption-attempt-value-copy (list previous reference)))
+                 (candidate (pg::physical-reseed-follow-retirement-next-record previous reference))
+                 (copied (getf (getf candidate :retirement) :attempt-file)))
+            (ok (not (eq reference copied)))
+            (incf (seventh (getf copied :identity)))
+            (ok (equal before (list previous reference))))))))
+
 (cl-spec:defproperty reseed-follow-retirement-copies-preserve-authority
     ((selected boolean) (position (range integer 0 3)))
   (:about pg::physical-reseed-follow-retirement-copy)
