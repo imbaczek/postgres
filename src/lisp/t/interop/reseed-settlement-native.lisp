@@ -18,14 +18,26 @@
 (defun native-settlement-test-check (record)
   (let* ((phase (getf (getf record :settlement) :phase))
          (expected (native-settlement-test-env "EXPECTED" "none"))
-         (config (physical-follow-read-config)))
+         (present (probe-file (physical-follow-config-path)))
+         (config (if present
+                     (physical-follow-read-config)
+                     (physical-follow-decode-config
+                      (recovery-read-bytes
+                       (merge-pathnames "saved/follow.pending"
+                                        (uiop:ensure-directory-pathname
+                                         (native-settlement-test-env "WORKSPACE")))
+                       :maximum +physical-follow-config-maximum-bytes+))))
+         (prefix (cond ((not present) 1)
+                       ((eq :active (getf (fifth config) :phase)) 2)
+                       (t 0))))
     (assert (eq :inert (getf (getf record :configuration) :phase)))
     (assert (equal expected
                    (ecase phase
                      ((nil) "none") (:handoff-pending "pending")
                      (:handed-off "handed-off") (:source-aborted "source-aborted"))))
-    (assert (eq :pending (getf (fifth config) :phase)))
-    (assert (not (getf (sixth config) :enabled)))))
+    (physical-reseed-follow-activation-check-prefix record prefix)
+    (assert (eq (if (= prefix 2) :active :pending) (getf (fifth config) :phase)))
+    (assert (eq (= prefix 2) (not (null (getf (sixth config) :enabled)))))))
 
 ;; Drive one target action.  Recovery and local checks are exercised offline;
 ;; the remote actions use the native source helper.
@@ -41,6 +53,27 @@
              do (setf record (physical-reseed-follow-advance-configuration owner)))
        record))
     ;; Check source-authorized intent, recovery and offline committed retry.
+    ((equal action "advance-activation")
+     (let* ((before (physical-reseed-follow-read owner))
+            (record (physical-reseed-follow-advance-activation owner)))
+       (assert (equal record (physical-reseed-follow-activation-progress-record before)))
+       record))
+    ((equal action "recover-activation-progress")
+     (let* ((before (call-with-physical-directory-root
+                     owner (lambda (fd directory)
+                             (declare (ignore directory))
+                             (physical-reseed-follow-read-at fd "physical-reseed.follow"))))
+            (expected (if (probe-file (merge-pathnames "physical-reseed.follow.tmp" *pgdata*))
+                          (physical-reseed-follow-activation-progress-record before)
+                          before))
+            (record (physical-reseed-follow-recover-activation owner)))
+       (assert (equal expected record))
+       record))
+    ((equal action "active-activation")
+     (let ((before (physical-reseed-follow-read owner)))
+       (assert (eq :active (getf (getf before :activation) :phase)))
+       (assert (equal before (physical-reseed-follow-advance-activation owner)))
+       before))
     ((equal action "start-activation")
      (let ((record (physical-reseed-follow-start-activation owner :helper (native-settlement-test-env "HELPER"))))
        (assert (eq :activating (getf (getf record :activation) :phase)))
@@ -167,7 +200,11 @@
                                                ("fsync" . :after-follow-temporary-fsync)
                                                ("rename" . :after-follow-rename)
                                                ("dirsync" . :after-follow-directory-fsync)
-                                               ("before-create" . :before-follow-temporary-create))
+                                               ("before-create" . :before-follow-temporary-create)
+                                               ("move" . :after-activation-move)
+                                               ("move-file-fsync" . :after-activation-moved-file-fsync)
+                                               ("move-source-fsync" . :after-activation-source-directory-fsync)
+                                               ("move-destination-fsync" . :after-activation-destination-directory-fsync))
                                              :test #'equal)))
                             (*physical-reseed-follow-write-limit*
                               (when (equal "yes" (native-settlement-test-env "PARTIAL" "no")) 257))
@@ -193,7 +230,8 @@
                     (let ((record (native-settlement-test-action owner action)))
                       (when record (native-settlement-test-check record))
                       (assert (not (physical-reseed-follow-owner-busy-p owner))))))))
-          (if (member action '("install" "pending" "recover" "check" "stage-activation") :test #'equal)
+          (if (member action '("install" "pending" "recover" "check" "stage-activation"
+                               "advance-activation" "recover-activation-progress" "active-activation") :test #'equal)
               (call-with-native-settlement-test-offline #'perform)
               (perform))
           (assert (handler-case (progn (physical-reseed-check-before-pid) nil) (error () t)))))
