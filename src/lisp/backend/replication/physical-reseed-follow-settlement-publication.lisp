@@ -24,16 +24,19 @@
 
 (defmethod physical-reseed-follow-configuration-publication-candidate :around
     ((owner physical-reseed-follow-configuration-owner) context candidate)
-  (let ((pending *physical-reseed-follow-settlement-candidate*))
-    (if pending
+  (let ((pending *physical-reseed-follow-settlement-candidate*)
+        (terminal *physical-reseed-follow-terminal-settlement-candidate*))
+    (if (or pending terminal)
         (progn
-          (when *physical-reseed-follow-installation-candidate*
+          (when (or *physical-reseed-follow-installation-candidate* (and pending terminal))
             (error "configuration publication has conflicting operation candidates"))
-          (unless (equal candidate pending)
+          (unless (equal candidate (or pending terminal))
             (error "settlement publication differs from its frozen candidate"))
           (unless (eq owner (physical-reseed-follow-installation-context-owner context))
             (error "settlement publication has a different owner"))
-          (physical-reseed-follow-pending-settlement-candidate context candidate))
+          (if terminal
+              (physical-reseed-follow-terminal-settlement-candidate context candidate)
+              (physical-reseed-follow-pending-settlement-candidate context candidate)))
         (call-next-method))))
 
 (defun physical-reseed-follow-publish-pending-settlement (context candidate check)

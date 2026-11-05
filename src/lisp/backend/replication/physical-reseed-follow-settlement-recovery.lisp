@@ -5,12 +5,17 @@
          (root (physical-reseed-follow-configuration-role-fd
                 (physical-reseed-follow-installation-context-descriptors context) :root))
          (previous (physical-reseed-follow-installation-context-snapshot context))
+         (terminal-p (eq :handoff-pending
+                         (getf (getf (getf previous :record) :settlement) :phase)))
          (fd nil))
-    (physical-reseed-follow-check-active-attempt owner)
+    (unless terminal-p (physical-reseed-follow-check-active-attempt owner))
     (multiple-value-bind (value identity)
         (physical-reseed-follow-read-at root "physical-reseed.follow.tmp")
-      (let* ((candidate (physical-reseed-follow-pending-settlement-candidate context value))
-             (*physical-reseed-follow-settlement-candidate* candidate))
+      (let* ((candidate (if terminal-p
+                            (physical-reseed-follow-terminal-settlement-candidate context value)
+                            (physical-reseed-follow-pending-settlement-candidate context value)))
+             (*physical-reseed-follow-settlement-candidate* (unless terminal-p candidate))
+             (*physical-reseed-follow-terminal-settlement-candidate* (when terminal-p candidate)))
         (funcall check)
         (setf (physical-reseed-follow-owner-uncertain-p owner) t)
         (unwind-protect
