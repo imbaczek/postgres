@@ -47,6 +47,8 @@
 
 ;; Publish the frozen pending candidate before any source RPC.
 (defun physical-reseed-follow-publish-pending-settlement (context candidate check)
+  ;; Check future capacity before writing new pending intent.  Existing pending
+  ;; intent and temporary-file recovery use their established recovery paths.
   (let* ((owner (physical-reseed-follow-installation-context-owner context))
          (candidate (physical-reseed-follow-pending-settlement-candidate context candidate))
          (bytes (physical-reseed-follow-image candidate))

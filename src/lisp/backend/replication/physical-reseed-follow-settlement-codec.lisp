@@ -78,6 +78,8 @@
     t))
 
 (defun physical-reseed-follow-completion-terminal (record phase)
+  ;; Construct the same canonical terminal outcome for settlement sizing and
+  ;; future completion sizing, including the closed receipt and its successor.
   (let* ((candidate (copy-list record))
          (settlement (getf record :settlement))
          (successor (getf settlement :successor))

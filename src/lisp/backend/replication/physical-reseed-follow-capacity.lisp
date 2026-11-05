@@ -1,13 +1,23 @@
 (in-package #:pg)
 
 (defun physical-reseed-follow-literal-size (value)
+  ;; The encoded image has the tag and 11 framing bytes in addition to the
+  ;; UTF-8 literal.  Count bytes rather than characters.
   (+ (length "PGRESEEDFOLLOW1") 11
      (length (string->bytes (physical-bootstrap-manifest-text value)))))
 
 (defun physical-reseed-follow-group-size (key value)
+  ;; Adding a key/value pair to a nonempty plist replaces its closing
+  ;; parenthesis with a space, the pair, and a closing parenthesis.
   (1- (length (string->bytes (physical-bootstrap-manifest-text (list key value))))))
 
 (defun physical-reseed-follow-completion-growth (record)
+  ;; These are sizing templates, not records to normalize or publish.  Maximum
+  ;; unsigned 64-bit facts and the most negative signed 64-bit timestamps
+  ;; give the widest decimal representations allowed for those fields.
+  ;; Only active step 2 can coexist with retirement; maximize over the
+  ;; compatible activation and retirement phases rather than combining
+  ;; independently chosen phases.
   (let* ((wide (1- (ash 1 64)))
          (device (getf (getf (getf record :attempt) :local) :device))
          (size +physical-follow-config-maximum-bytes+)
@@ -33,6 +43,9 @@
                  0)))))
 
 (defun physical-reseed-follow-future-completion-size-bound (value)
+  ;; Include the current record and each possible terminal outcome.  Only a
+  ;; handed-off outcome can grow into activation and retirement.  Add the
+  ;; existing capacity reserve once, after taking the maximum.
   (let* ((record (physical-reseed-follow-copy value))
          (base (physical-reseed-follow-activation-predecessor record))
          (phase (getf (getf base :settlement) :phase)))

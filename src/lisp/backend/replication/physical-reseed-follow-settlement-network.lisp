@@ -32,6 +32,9 @@
 ;; busy through client close; no borrowed store or descriptor spans the RPC.
 ;; Copy the terminal receipt before client cleanup can change its input objects.
 (defun physical-reseed-follow-settle-remote (owner &key helper)
+  ;; STATUS can discover a historical terminal outcome even when future
+  ;; capacity is short.  Check capacity only before a new HANDOFF can have an
+  ;; effect on the source.
   (physical-reseed-follow-check-idle owner)
   (setf (physical-reseed-follow-owner-busy-p owner) t)
   (unwind-protect
