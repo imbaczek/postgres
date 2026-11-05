@@ -159,3 +159,36 @@
       (ok (pg::physical-reseed-install-copy plan))
       (ok (intake-fails-p
            (lambda () (pg::physical-reseed-follow-activation-inventories plan record binding 0 nil))))))
+
+(cl-spec:defproperty reseed-follow-activation-prefix-matches-recorded-progress
+    ((selected boolean) (state (range integer 0 6)) (prefix (range integer 0 2)))
+  (:about pg::physical-reseed-follow-activation-check-prefix)
+  (:trials (:normal 100))
+  (multiple-value-bind (record groups) (reseed-follow-activation-codec-fixture selected)
+    (when (plusp state)
+      (setf (getf record :activation) (nth (1- state) groups)))
+    (let* ((before (pg::physical-adoption-attempt-value-copy record))
+           (check (symbol-function 'pg::physical-reseed-follow-activation-check-prefix))
+           (expected (not (null (member prefix (nth state '((0) (0) (0) (0 1) (1 2) (2) (2)))))))
+           (accepted (handler-case (progn (funcall check record prefix) t)
+                       (error () nil))))
+      (and (eq expected accepted) (equal before record)))))
+
+(deftest generated-reseed-follow-activation-prefix-contract
+    (let ((data (cl-spec:result-data
+                 (cl-spec:run-property 'reseed-follow-activation-prefix-matches-recorded-progress
+                                       :seed 132 :profile :normal))))
+      (ok (eq :passed (getf data :status)))))
+
+(deftest reseed-follow-activation-prefix-checks-every-recorded-state
+    (dolist (selected '(nil t))
+      (multiple-value-bind (base groups) (reseed-follow-activation-codec-fixture selected)
+        (loop for group in (cons nil groups)
+              for allowed in '((0) (0) (0) (0 1) (1 2) (2) (2))
+              do (let ((record (pg::physical-adoption-attempt-value-copy base)))
+                   (when group (setf (getf record :activation) group))
+                   (dolist (prefix '(0 1 2 -1 3 nil 1.5 "1"))
+                     (let* ((check (symbol-function 'pg::physical-reseed-follow-activation-check-prefix))
+                            (accepted (handler-case (progn (funcall check record prefix) t)
+                                        (error () nil))))
+                       (ok (eq (not (null (member prefix allowed))) accepted)))))))))

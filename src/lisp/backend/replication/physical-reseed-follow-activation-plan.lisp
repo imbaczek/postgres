@@ -1,5 +1,18 @@
 (in-package #:pg)
 
+(defun physical-reseed-follow-activation-check-prefix (value prefix)
+  (let* ((record (physical-reseed-follow-copy value))
+         (activation (getf record :activation))
+         (phase (getf activation :phase))
+         (step (getf activation :step)))
+    (unless (and (typep prefix '(integer 0 2))
+                 (case phase
+                   ((nil :building :staged) (zerop prefix))
+                   (:activating (or (= prefix step) (= prefix (min 2 (1+ step)))))
+                   (:active (= prefix 2))))
+      (error "observed activation prefix disagrees with recorded progress"))
+    prefix))
+
 (defun physical-reseed-follow-activation-plan-record (value binding)
   ;; Check the historical pending binding against its frozen image, then
   ;; derive and check the exact active image.  Building has no captured entry
