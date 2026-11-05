@@ -32,6 +32,10 @@
 
 (defvar *physical-reseed-follow-installation-candidate* nil)
 
+(defvar *physical-reseed-follow-settlement-candidate* nil)
+
+(defgeneric physical-reseed-follow-configuration-publication-candidate (owner context candidate))
+
 (defgeneric physical-reseed-follow-published-snapshot (owner root-fd candidate snapshot previous))
 
 (defmethod physical-reseed-follow-published-snapshot

@@ -22,12 +22,20 @@
       (error "configuration candidate is not the exact next transition at the proved prefix"))
     candidate))
 
+(defmethod physical-reseed-follow-configuration-publication-candidate
+    ((owner physical-reseed-follow-configuration-owner) context candidate)
+  (declare (ignore owner))
+  (unless (equal candidate *physical-reseed-follow-installation-candidate*)
+    (error "configuration publication lacks its frozen installation candidate"))
+  (physical-reseed-follow-installation-candidate context candidate))
+
 (defmethod physical-reseed-follow-published-snapshot
     ((owner physical-reseed-follow-configuration-owner) root-fd candidate snapshot previous)
   (unless *physical-reseed-follow-installation-scope*
     (return-from physical-reseed-follow-published-snapshot (call-next-method)))
   (let ((context (physical-reseed-follow-installation-context owner)))
-    (unless (and (equal candidate *physical-reseed-follow-installation-candidate*)
+    (unless (and (equal candidate (physical-reseed-follow-configuration-publication-candidate
+                                   owner context candidate))
                  (= root-fd (physical-reseed-follow-configuration-role-fd
                              (physical-reseed-follow-installation-context-descriptors context) :root))
                  (equal previous (physical-reseed-follow-installation-context-snapshot context))
@@ -35,7 +43,7 @@
                  (equal candidate (getf snapshot :record)))
       (error "published configuration differs from this operation's frozen candidate or predecessor"))
     (setf (physical-reseed-follow-installation-context-record context)
-          (physical-reseed-follow-installation-candidate context candidate)
+          (physical-reseed-follow-copy candidate)
           (physical-reseed-follow-installation-context-snapshot context) snapshot))
   t)
 
@@ -84,21 +92,26 @@
         (physical-reseed-follow-installation-point context check :after-configuration-install-destination-fsync)
         (1+ step)))))
 
-(defun physical-reseed-follow-installation-publish (context candidate check)
+(defun physical-reseed-follow-write-installed-intent (context candidate bytes check)
   (let* ((owner (physical-reseed-follow-installation-context-owner context))
          (previous (physical-reseed-follow-installation-context-snapshot context))
-         (candidate (physical-reseed-follow-installation-candidate context candidate))
-         (*physical-reseed-follow-installation-candidate* candidate)
          (root (physical-reseed-follow-configuration-role-fd
                 (physical-reseed-follow-installation-context-descriptors context) :root)))
-    (physical-reseed-follow-installation-point context check :before-configuration-install-progress)
     (setf (physical-reseed-follow-owner-uncertain-p owner) t)
     (multiple-value-bind (record snapshot)
-        (physical-reseed-follow-write-intent
-         owner root candidate (physical-reseed-follow-image candidate) previous check)
+        (physical-reseed-follow-write-intent owner root candidate bytes previous check)
       (unless (and (equal record (physical-reseed-follow-installation-context-record context))
                    (equal snapshot (physical-reseed-follow-installation-context-snapshot context)))
-        (error "configuration publication did not install its exact canonical readback"))
+        (error "installed journal publication did not adopt its exact canonical readback"))
+      (values record snapshot))))
+
+(defun physical-reseed-follow-installation-publish (context candidate check)
+  (let* ((candidate (physical-reseed-follow-installation-candidate context candidate))
+         (*physical-reseed-follow-installation-candidate* candidate))
+    (physical-reseed-follow-installation-point context check :before-configuration-install-progress)
+    (multiple-value-bind (record snapshot)
+        (physical-reseed-follow-write-installed-intent
+         context candidate (physical-reseed-follow-image candidate) check)
       (physical-reseed-follow-installation-point context check :after-configuration-install-progress)
       (values record snapshot))))
 
