@@ -48,6 +48,19 @@
               (list :original-recovery :root "physical-recovery.control" :saved "recovery.original")
               (list recovery :staged recovery :root "physical-recovery.control")))))))
 
+(defun physical-reseed-follow-apply-position-moves (positions moves error-message)
+  (dolist (move moves)
+    (destructuring-bind (logical from-role from-leaf to-role to-leaf) move
+      (let ((sources (remove-if-not
+                      (lambda (entry) (and (equal logical (first entry)) (eq from-role (second entry))
+                                           (equal from-leaf (third entry))))
+                      positions)))
+        (unless (and (= 1 (length sources))
+                     (not (find (list to-role to-leaf) positions :key #'rest :test #'equal)))
+          (error error-message))
+        (setf (second (first sources)) to-role (third (first sources)) (copy-seq to-leaf)))))
+  positions)
+
 ;; Return (logical-name role leaf) positions after PREFIX moves.  Include all
 ;; image positions, including unused images, so a later check can preserve and
 ;; account for them.  Each move needs one source and an empty destination.
@@ -65,17 +78,9 @@
                                                     (:receive :receive) (:staged :staged))
                                   (copy-seq leaf)))))))
     (unless (typep prefix `(integer 0 ,(length moves))) (error "invalid configuration installation prefix"))
-    (dolist (move (subseq moves 0 prefix))
-      (destructuring-bind (logical from-role from-leaf to-role to-leaf) move
-        (let ((sources (remove-if-not
-                        (lambda (entry) (and (equal logical (first entry)) (eq from-role (second entry))
-                                             (equal from-leaf (third entry))))
-                        positions)))
-          (unless (and (= 1 (length sources))
-                       (not (find (list to-role to-leaf) positions :key #'rest :test #'equal)))
-            (error "configuration move lacks a unique source or empty destination"))
-          (setf (second (first sources)) to-role (third (first sources)) (copy-seq to-leaf)))))
-    positions))
+    (physical-reseed-follow-apply-position-moves
+     positions (subseq moves 0 prefix)
+     "configuration move lacks a unique source or empty destination")))
 
 ;; Check the saved terminal installation plan against the configuration record.
 ;; Configuration planning must not rewrite the original base or predecessor.

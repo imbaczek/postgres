@@ -185,16 +185,15 @@
   adding the existing reserve once. Keep size-only templates separate from
   publication authority. Preserve the old exact receipt-size contract, journal
   readability, historical STATUS reconciliation and recovery of a complete
-  pending temporary. The shared terminal constructor keeps receipt invariants in one
-  place. A fresh regression passed 61 tests and 738 assertions; strengthened
+  pending temporary. The shared terminal constructor keeps receipt invariants
+  in one place. A fresh regression passed 61 tests and 738 assertions; strengthened
   property coverage passed 100 trials at seed 130, digest
   `fnv1a64-v1:20733aff3238b523`, with input coverage and rejection counts
   unmeasured. Additional focused tests cover all 11 legal completion phase
   shapes from each fixture prefix, printer bindings and the shared-constructor
-  refactor. Strict
-  cold compilation passed all 227 production files. Luna checkpoint, Sol full
-  review and the focused refactor rereview passed. Source docs were reviewed
-  separately.
+  refactor. Strict cold compilation passed all 227 production files. Luna
+  checkpoint, Sol full review and the focused refactor rereview passed. Source
+  docs were reviewed separately.
   Evidence: `capacity-green-check.json`, `capacity-followup-check.json`,
   `capacity-contract-check.json` and `capacity-refactor-cold-check.json` under
   `/home/imbaczek/proj/pg-ha-artifacts/reseed-target-activation/`.
@@ -209,9 +208,21 @@
   formatter check of all nine changed Lisp/ASDF files. Luna checkpoint and Sol
   full-diff reviews passed; the Sol refactoring review found no worthwhile
   extraction. Source documentation was reviewed separately.
+  The pure activation overlay now checks the exact captured active image and
+  describes the two configuration moves and all three inventory prefixes,
+  preserving every historical receive/history/recovery object and unused
+  image. A shared position-move helper centralizes unique-source and
+  empty-destination checks. Validation passed 19 selected tests with 206
+  assertions, strict cold compilation of 228 production files and formatting
+  of five Lisp/ASDF files. The property passed 100 trials each at seeds 131
+  and 654776489432024191, digest `fnv1a64-v1:ea8ff940de7008c7`; input
+  coverage and rejection counts were not measured. Static prefix descriptions
+  grant no filesystem or startup authority. Evidence: `plan-contract-check.json`,
+  `plan-refactor-regression-check.json`, `plan-refactor-cold-check.json` and
+  `plan-refactor-format-check.json` in the activation artifact directory.
   Active configuration publication, real source authority checks, crash
-  recovery, archive moves and startup admission remain
-  open; these codecs grant no filesystem or startup authority. Evidence:
+  recovery, archive moves and startup admission remain open; these codecs grant
+  no filesystem or startup authority. Evidence:
   `/home/imbaczek/proj/pg-ha-artifacts/reseed-target-activation/retirement-fixed-check.json`
   and `retirement-format-check.json` in that directory.
 
