@@ -1,6 +1,8 @@
 (in-package #:pg)
 
 (defun physical-reseed-follow-retirement-final-extra-at (root snapshot)
+  ;; Check the final journal snapshot and forbid PID while collecting root
+  ;; extras.  The caller handles any temporary separately.
   (physical-reseed-follow-check-snapshot root snapshot)
   (when (physical-adoption-path-present-p (merge-pathnames "postmaster.pid" (physical-image-fd-path root)))
     (error "retirement read-only layout refuses temporary follow or PID entries"))
@@ -8,6 +10,7 @@
               (nth-value 1 (physical-reseed-follow-entry root "physical-reseed.follow")))))
 
 (defun physical-reseed-follow-retirement-extra-at (root snapshot)
+  ;; The strict entry admits the final journal alone and refuses a temporary.
   (let ((extra (physical-reseed-follow-retirement-final-extra-at root snapshot)))
     (when (physical-adoption-path-present-p
            (merge-pathnames "physical-reseed.follow.tmp" (physical-image-fd-path root)))
@@ -31,6 +34,9 @@
       (physical-reseed-follow-retirement-check-prefix record (first matches)))))
 
 (defun physical-reseed-follow-retirement-layout-state-at (descriptors snapshot check extra-reader candidate)
+  ;; The final snapshot remains the layout authority.  A supplied candidate
+  ;; must match the proved prefix and files, and permits exactly one temporary
+  ;; root extra.  The extra reader and checks keep that evidence stable.
   ;; Use the provisional install read only to obtain a plan.  Prove the saved
   ;; role, complete images and exact prefix, then recheck both journals around
   ;; the layout proof against the actual follow snapshot.
@@ -84,6 +90,7 @@
                           (list :temporary (physical-reseed-follow-copy candidate))))))))))))
 
 (defun physical-reseed-follow-retirement-layout-state (descriptors snapshot check)
+  ;; Keep the strict layout policy for callers without a held temporary.
   (physical-reseed-follow-retirement-layout-state-at
    descriptors snapshot check
    (lambda (root) (physical-reseed-follow-retirement-extra-at root snapshot))

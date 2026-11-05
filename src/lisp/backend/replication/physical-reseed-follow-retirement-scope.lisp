@@ -214,12 +214,14 @@
 
 (defun call-with-physical-reseed-follow-retirement-receive
     (descriptors snapshot base binding function check)
+  ;; Use the strict extra-entry policy without a temporary candidate.
   (call-with-physical-reseed-follow-retirement-receive-at
    descriptors snapshot base binding function check
    (lambda (root) (physical-reseed-follow-retirement-extra-at root snapshot))
    nil))
 
 (defun call-with-physical-reseed-follow-retirement-observation (root snapshot parent-check function)
+  ;; Use the strict policy that refuses a temporary journal.
   (let ((snapshot (physical-adoption-attempt-value-copy snapshot)))
     (call-with-physical-reseed-follow-retirement-observation-at
      root snapshot parent-check function
@@ -227,6 +229,9 @@
      nil)))
 
 (defun call-with-physical-reseed-follow-retirement-temporary-observation (root snapshot parent-check function)
+  ;; Hold the temporary or its absence while proving the final layout and
+  ;; optional next candidate.  The callback receives copied facts and a check
+  ;; valid only in this scope.  It grants no mutation or startup authority.
   (let ((snapshot (physical-adoption-attempt-value-copy snapshot)))
     (call-with-physical-reseed-follow-retirement-next-temporary
      root snapshot parent-check

@@ -1,11 +1,15 @@
 (in-package #:pg)
 
 (defun physical-reseed-follow-retirement-next-reference (root record)
+  ;; Use the frozen attempt reference when present.  The initial transition
+  ;; obtains it from the actual root attempt observation.
   (or (getf (getf record :retirement) :attempt-file)
       (let ((attempt (physical-reseed-follow-retirement-attempt-at root root record 0)))
         (list :identity (getf attempt :identity) :digest (getf attempt :digest)))))
 
 (defun physical-reseed-follow-retirement-temporary-state-at (root stream)
+  ;; Read through the held descriptor and recheck its identity, mount and named
+  ;; nanosecond facts.  Accept only complete canonical bytes.
   (let* ((name "physical-reseed.follow.tmp")
          (fd (sb-sys:fd-stream-fd stream))
          (mount (physical-adoption-install-mount-id nil :directory-fd root)))
@@ -27,6 +31,9 @@
           (list :record record :identity identity :row row))))))
 
 (defun call-with-physical-reseed-follow-retirement-next-temporary (root snapshot parent-check function)
+  ;; Hold a read-only temporary descriptor or pin its absence during the callback.
+  ;; PARENT-CHECK stays independent of layout checks to avoid recursion.  The
+  ;; callback gets copied state and a thread-bound check revoked on exit.
   (let ((snapshot (physical-adoption-attempt-value-copy snapshot))
         (thread sb-thread:*current-thread*) (active nil)
         (fd nil) (stream nil) (state nil))
@@ -73,6 +80,8 @@
 
 (defun physical-reseed-follow-retirement-check-temporary-layout
     (descriptors record candidate prefix install attempt)
+  ;; Keep the final record as the layout basis.  Require the candidate to be
+  ;; the exact next record at the observed prefix and reprove both files.
   (let* ((root (physical-reseed-follow-configuration-role-fd descriptors :root))
          (saved (physical-reseed-follow-configuration-role-fd descriptors :saved))
          (expected (physical-reseed-follow-retirement-next-record
