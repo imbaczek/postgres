@@ -321,6 +321,12 @@
   compile and a fresh rerun of the 14-action native crash sequence. Evidence is
   `stable-recovery-check.json`. Process crashes and injected sync failures
   leave filesystem power-loss qualification and writeback-error policy open.
+  A read-only archived install reader now checks a separate container while
+  retaining the PGDATA root binding and existing root-reader behavior. It
+  requires a canonical terminal image and rejects a root/container alias.
+  Five focused heads passed 54 assertions, including same-byte name replacement;
+  strict cold compilation passed 231 files. The retirement scope must still
+  prove the actual saved-directory role before acting on this observation.
   Archive retirement and startup admission remain open. START must check
   current source state and retention floors again.
 

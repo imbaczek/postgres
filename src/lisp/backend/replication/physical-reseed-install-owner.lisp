@@ -20,6 +20,8 @@
 ;; syncs file and directory.  A malformed or changed final journal fails closed.
 ;; Return the decoded state, file identity and digest of the same bytes.
 (defun physical-reseed-install-read-from-at (root-fd container-fd name &key stabilize)
+  ;; ROOT-FD supplies the recorded PGDATA binding.  CONTAINER-FD supplies
+  ;; the journal name and may be a different directory on the same mount.
   (unless (member name '("physical-reseed.install" "physical-reseed.install.tmp") :test #'equal)
     (error "unexpected reseed install journal name"))
   (let ((fd nil) (stream nil)
@@ -60,9 +62,13 @@
       (if stream (close stream) (when fd (sb-posix:close fd))))))
 
 (defun physical-reseed-install-read-at (root-fd name &key stabilize)
+  ;; Preserve the root journal reader by using root as the container too.
   (physical-reseed-install-read-from-at root-fd root-fd name :stabilize stabilize))
 
 (defun physical-reseed-install-read-archive-at (root-fd saved-fd)
+  ;; Observe the fixed archive file as a complete canonical terminal image.
+  ;; A caller must separately establish that SAVED-FD is the authorized saved
+  ;; directory before using this observation for an operation.
   (let ((root (sb-posix:fstat root-fd)) (saved (sb-posix:fstat saved-fd)))
     (when (and (= (sb-posix:stat-dev root) (sb-posix:stat-dev saved))
                (= (sb-posix:stat-ino root) (sb-posix:stat-ino saved)))

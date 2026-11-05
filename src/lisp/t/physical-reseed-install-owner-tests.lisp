@@ -322,6 +322,7 @@
     (call-with-reseed-install-owner-fixture
      (lambda (root stage incoming quarantine plan)
        (declare (ignore incoming quarantine))
+       ;; Check both a root alias and replacement of the named file during a read.
        (reseed-install-owner-test-write root plan (pg::physical-reseed-install-last-step plan))
        (let* ((path (pg::physical-reseed-install-path root))
               (archive (merge-pathnames "physical-reseed.install" stage))
