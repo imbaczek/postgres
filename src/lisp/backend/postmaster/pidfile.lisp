@@ -196,6 +196,9 @@ Run STARTUP-RECONCILE after publishing ownership and before returning to startup
 where stage cleanup, authentication completion, storage, listeners, and workers follow.
 If a callback fails or exits nonlocally, clear ownership and the timestamp,
 remove the owned PID, and close the lock even if PID cleanup fails."
+  ;; STARTUP-OBSERVER is read-only and receives the borrowed flocked stream
+  ;; with :before-pid and :owned-pid before global lock publication.  It cannot
+  ;; be combined with the legacy PID checks.  Each call must leave the stream open.
   (declare (ignore host))
   (when *postmaster-data-lock* (error "this process already owns a data directory"))
   (when (and startup-observer (or startup-before-pid startup-check))
