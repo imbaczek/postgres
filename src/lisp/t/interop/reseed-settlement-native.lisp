@@ -38,6 +38,56 @@
        (loop repeat 8 until (eq :inert (getf (getf record :configuration) :phase))
              do (setf record (physical-reseed-follow-advance-configuration owner)))
        record))
+    ((equal action "stage-activation")
+     (physical-reseed-follow-begin-activation owner)
+     (physical-reseed-follow-stage-activation owner))
+    ((equal action "probe-activation")
+     (multiple-value-bind (anchor snapshot)
+         (physical-reseed-follow-probe-activation-source owner :helper (native-settlement-test-env "HELPER"))
+       (let ((record (getf (getf snapshot :follow) :record)))
+         (assert (equal anchor (physical-reseed-follow-generation-anchor (first (getf record :generations)))))
+         (assert (eq :staged (getf (getf record :activation) :phase)))
+         (assert (not (physical-reseed-follow-owner-uncertain-p owner)))
+         record)))
+    ((equal action "probe-activation-reject")
+     (assert (handler-case
+                 (progn
+                   (physical-reseed-follow-probe-activation-source owner :helper (native-settlement-test-env "HELPER"))
+                   nil)
+               (pg-client-error () t)))
+     (assert (not (physical-reseed-follow-owner-busy-p owner)))
+     (assert (not (physical-reseed-follow-owner-uncertain-p owner)))
+     (physical-reseed-follow-read owner))
+    ((equal action "probe-wrong-allocation")
+     (let* ((record (physical-reseed-follow-read owner))
+            (attempt (getf record :attempt))
+            (source (physical-follow-source-copy (getf attempt :source)))
+            (generation (first (getf record :generations)))
+            (frozen (nth-value 1 (physical-follow-source-profile source)))
+            (client nil))
+       (unwind-protect
+            (progn
+              (setf client
+                    (physical-libpq-connect-frozen
+                     (native-settlement-test-env "HELPER") frozen
+                     :on-spawn (lambda (actor) (setf client actor))))
+              (physical-adoption-attempt-check-client client source)
+              (assert
+               (handler-case
+                   (progn
+                     (pg-client-native-backup-lease-follow-prepare
+                      client (physical-backup-lease-request-copy (getf attempt :request))
+                      (if (equal "generation" (native-settlement-test-env "WRONG"))
+                          (1+ (getf generation :generation))
+                          (getf generation :generation))
+                      (if (equal "name" (native-settlement-test-env "WRONG"))
+                          (concatenate 'string (getf generation :name) "_wrong")
+                          (copy-seq (getf generation :name)))
+                      (physical-follow-request-copy (getf generation :coordinates)))
+                     nil)
+                 (pg-client-error () t))))
+         (when client (physical-client-close client)))
+       record))
     ((equal action "pending") (physical-reseed-follow-begin-settlement owner))
     ((equal action "settle")
      (physical-reseed-follow-settle owner :helper (native-settlement-test-env "HELPER")))
@@ -105,7 +155,7 @@
                     (let ((record (native-settlement-test-action owner action)))
                       (when record (native-settlement-test-check record))
                       (assert (not (physical-reseed-follow-owner-busy-p owner))))))))
-          (if (member action '("install" "pending" "recover" "check") :test #'equal)
+          (if (member action '("install" "pending" "recover" "check" "stage-activation") :test #'equal)
               (call-with-native-settlement-test-offline #'perform)
               (perform))
           (assert (handler-case (progn (physical-reseed-check-before-pid) nil) (error () t)))))
@@ -162,6 +212,44 @@
 (defvar *native-settlement-test-handoffs* 0)
 
 (defvar *native-settlement-test-statuses* 0)
+
+(defvar *native-activation-test-saved-pin* nil)
+
+(defun native-activation-test-source-pin-fault (name mode)
+  (with-write-lock
+    (with-wal-critical
+      (if (eq mode :restore)
+          (destructuring-bind (saved-name pin canceled-p canceled) *native-activation-test-saved-pin*
+            (assert (equal name saved-name))
+            (setf (gethash name *physical-source-pins*) pin)
+            (if canceled-p
+                (setf (gethash name *physical-follow-aborted-attempts*) canceled)
+                (remhash name *physical-follow-aborted-attempts*))
+            (setf *native-activation-test-saved-pin* nil)
+            (physical-follow-pin-check-wal pin))
+          (let ((pin (gethash name *physical-source-pins*)))
+            (assert (null *native-activation-test-saved-pin*))
+            (assert (physical-follow-pin-ready-p pin))
+            (multiple-value-bind (canceled canceled-p)
+                (gethash name *physical-follow-aborted-attempts*)
+              (setf *native-activation-test-saved-pin* (list name pin canceled-p canceled)))
+            (ecase mode
+              (:canceled (setf (gethash name *physical-follow-aborted-attempts*) t))
+              ((:unready :replaced)
+               (let* ((copy (copy-physical-follow-pin pin))
+                      (anchor (physical-follow-anchor-copy (physical-follow-pin-anchor pin))))
+                 (ecase mode
+                   (:unready
+                    (setf (physical-follow-pin-stage copy) :retaining
+                          (physical-source-pin-confirmed-lsn copy) nil
+                          (physical-source-pin-restart-lsn copy) (getf anchor :overlap-start)
+                          (physical-source-pin-prefix-digest copy) (getf anchor :receive-digest)))
+                   (:replaced
+                    (setf (getf anchor :overlap-digest) (logxor 1 (getf anchor :overlap-digest))
+                          (physical-follow-pin-anchor copy) anchor)))
+                 (physical-follow-pin-check-fields copy)
+                 (setf (gethash name *physical-source-pins*) copy))))))))
+  (values))
 
 (defvar *native-settlement-test-reply-mode* "normal")
 
