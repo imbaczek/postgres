@@ -341,6 +341,14 @@
   selected heads with 332 assertions, including legacy real SIGKILL recovery,
   233-file cold compilation, and a separate cross-mount refusal experiment.
   The actual saved-directory role and complete namespace proof remain open.
+  A borrowed-descriptor layout observer now binds the final follow snapshot,
+  derives the unique archive prefix from all ten directory inventories, and
+  checks saved-directory identity, frozen journals and reconstructed base/config
+  images around the proof. It rejects follow temporaries and PID entries.
+  Verification passed 14 unique heads with 357 assertions, 234-file cold
+  compilation and live reload. Fixtures manually construct activation and archive
+  layouts. Acquisition, guard ownership, active receive-store semantics and startup
+  authorization remain open.
   Archive retirement and startup admission remain open. START must check
   current source state and retention floors again.
 

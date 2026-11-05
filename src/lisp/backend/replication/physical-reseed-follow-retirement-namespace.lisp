@@ -1,6 +1,8 @@
 (in-package #:pg)
 
 (defun physical-reseed-follow-retirement-extra-at (root snapshot)
+  ;; Recheck the follow snapshot and fence the follow temporary and PID.
+  ;; The complete layout also refuses unexplained temporary entries.
   (physical-reseed-follow-check-snapshot root snapshot)
   (dolist (name '("physical-reseed.follow.tmp" "postmaster.pid"))
     (when (physical-adoption-path-present-p (merge-pathnames name (physical-image-fd-path root)))
@@ -9,6 +11,8 @@
               (nth-value 1 (physical-reseed-follow-entry root "physical-reseed.follow")))))
 
 (defun physical-reseed-follow-retirement-initial-prefix (descriptors plan record binding extra)
+  ;; Compare all ten directory inventories twice and require one matching
+  ;; archive prefix consistent with the recorded retirement progress.
   (flet ((names ()
            (loop for role in '(:root :incoming :quarantine :base :global :wal :workspace :staged :saved :receive)
                  append (list role (physical-reseed-install-directory-names
@@ -23,6 +27,12 @@
       (physical-reseed-follow-retirement-check-prefix record (first matches)))))
 
 (defun physical-reseed-follow-retirement-layout-state (descriptors snapshot check)
+  ;; Use the provisional install read only to obtain a plan.  Prove the saved
+  ;; role, complete images and exact prefix, then recheck both journals around
+  ;; the layout proof against the actual follow snapshot.
+  ;; The descriptors and check belong to the caller's scope.  This first entry
+  ;; refuses temporaries and PID entries, and does not acquire guards or prove
+  ;; receive-store semantics or startup authority.
   (let* ((root (physical-reseed-follow-configuration-role-fd descriptors :root))
          (saved (physical-reseed-follow-configuration-role-fd descriptors :saved))
          (record (physical-reseed-follow-copy (getf snapshot :record)))

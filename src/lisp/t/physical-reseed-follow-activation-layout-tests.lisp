@@ -158,6 +158,8 @@
       (sb-posix:ftruncate (sb-sys:fd-stream-fd out) (length bytes)))))
 
 (defun call-with-reseed-retirement-layout-fixture (kind function)
+  ;; Manually move the activation files and write a canonical Active step 2
+  ;; fixture for these layout tests.
   (call-with-reseed-activation-layout-fixture
    kind
    (lambda (owner root workspace record binding images descriptors check)

@@ -99,10 +99,11 @@
 
 (defun physical-reseed-follow-layout-proof-at
     (descriptors plan record positions images extra expected mount check check-owner read-extra &optional active-row)
-  ;; Callers admit the owner, run the first check, and supply fixed positions
-  ;; and inventories.  Capture the namespace, run the second check, and then
+  ;; Callers supply borrowed descriptors, checks, fixed positions and
+  ;; inventories.  Capture the namespace, run the supplied checks, and then
   ;; recheck the captured facts.  When supplied, the read-only active observer
-  ;; runs twice and adds :active to the result; the old wrapper omits it.
+  ;; runs twice and adds :active to the result.  Callers without that observer
+  ;; omit the key.
   ;; Rows borrow parent directory descriptors.  These observations can become
   ;; stale after return and do not by themselves authorize filesystem changes.
   (let ((root (physical-reseed-follow-configuration-role-fd descriptors :root))
@@ -146,6 +147,7 @@
 
 (defun physical-reseed-follow-layout-proof
     (owner descriptors plan record positions images extra expected mount check &optional active-row)
+  ;; Keep the stopped-owner checks and extra-entry policy for existing callers.
   (physical-reseed-follow-layout-proof-at
    descriptors plan record positions images extra expected mount check
    (lambda () (physical-reseed-check-owner owner))

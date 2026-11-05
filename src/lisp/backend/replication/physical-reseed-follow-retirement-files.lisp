@@ -51,6 +51,8 @@
         (append state (list :row row))))))
 
 (defun physical-reseed-follow-retirement-install-at (descriptors value prefix)
+  ;; Observe the install journal at the prefix location and compare it with
+  ;; the frozen terminal reference.  Saved permits the rename ctime change.
   (let* ((record (physical-reseed-follow-copy value))
          (root (physical-reseed-follow-configuration-role-fd descriptors :root))
          (saved (physical-reseed-follow-configuration-role-fd descriptors :saved))
