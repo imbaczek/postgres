@@ -192,3 +192,116 @@
                             (accepted (handler-case (progn (funcall check record prefix) t)
                                         (error () nil))))
                        (ok (eq (not (null (member prefix allowed))) accepted)))))))))
+
+(defun reseed-follow-retirement-plan-fixture (selected old-count)
+  (multiple-value-bind (record binding plan)
+      (reseed-follow-activation-plan-fixture selected old-count)
+    (setf (getf (getf record :activation) :phase) :active
+          (getf (getf record :activation) :step) 2)
+    (values (pg::physical-reseed-follow-copy record) binding plan)))
+
+(cl-spec:defproperty reseed-follow-retirement-plan-preserves-historical-layout
+    ((selected boolean) (old-count (range integer 0 3)) (prefix (range integer 0 2)))
+  (:about pg::physical-reseed-follow-retirement-inventories)
+  (:trials (:normal 100))
+  (multiple-value-bind (record binding plan)
+      (reseed-follow-retirement-plan-fixture selected old-count)
+    (let* ((before (pg::physical-adoption-attempt-value-copy (list record binding plan)))
+           (extra '(("physical-reseed.follow" nil)))
+           (original (pg::physical-reseed-follow-activation-inventories plan record binding 2 extra))
+           (actual (funcall (symbol-function 'pg::physical-reseed-follow-retirement-inventories)
+                            plan record binding prefix extra))
+           (moved (subseq '("physical-reseed.install" "physical-reseed.attempt") 0 prefix)))
+      (and (equal (getf actual :root)
+                  (remove-if (lambda (name) (member name moved :test #'equal)) (getf original :root)))
+           (equal (getf actual :saved)
+                  (sort (append (copy-list (getf original :saved)) (copy-list moved)) #'string<))
+           (loop for role in '(:incoming :quarantine :base :global :wal :workspace :staged :receive)
+                 always (equal (getf original role) (getf actual role)))
+           (= (loop for names in (cdr original) by #'cddr sum (length names))
+              (loop for names in (cdr actual) by #'cddr sum (length names)))
+           (equal before (list record binding plan))))))
+
+(deftest generated-reseed-follow-retirement-layout-contract
+    (let ((data (cl-spec:result-data
+                 (cl-spec:run-property 'reseed-follow-retirement-plan-preserves-historical-layout
+                                       :seed 140 :profile :normal))))
+      (ok (eq :passed (getf data :status)))))
+
+(deftest reseed-follow-retirement-plan-moves-journals-in-fixed-order
+    (multiple-value-bind (record binding plan) (reseed-follow-retirement-plan-fixture t 2)
+      (declare (ignore plan))
+      (ok (equal '((:install-journal :root "physical-reseed.install" :saved "physical-reseed.install")
+                   (:attempt-journal :root "physical-reseed.attempt" :saved "physical-reseed.attempt"))
+                 (funcall (symbol-function 'pg::physical-reseed-follow-retirement-moves) record binding)))
+      (dolist (prefix '(0 1 2))
+        (let ((positions (funcall (symbol-function 'pg::physical-reseed-follow-retirement-positions)
+                                  record binding prefix)))
+          (ok (equal (assoc :install-journal positions)
+                     (list :install-journal (if (zerop prefix) :root :saved) "physical-reseed.install")))
+          (ok (equal (assoc :attempt-journal positions)
+                     (list :attempt-journal (if (= prefix 2) :saved :root) "physical-reseed.attempt")))))))
+
+(deftest reseed-follow-retirement-prefix-checks-every-recorded-state
+    (dolist (selected '(nil t))
+      (multiple-value-bind (record groups) (reseed-follow-retirement-codec-fixture selected)
+        (loop for group in (cons nil groups)
+              for allowed in '((0) (0 1) (1 2) (2) (2))
+              do (let ((candidate (reseed-follow-with-retirement record group)))
+                   (dolist (prefix '(0 1 2 -1 3 nil 1.5 "1"))
+                     (let* ((check (symbol-function 'pg::physical-reseed-follow-retirement-check-prefix))
+                            (accepted (handler-case (progn (funcall check candidate prefix) t)
+                                        (error () nil))))
+                       (ok (eq (not (null (member prefix allowed))) accepted)))))))))
+
+(deftest reseed-follow-retirement-plan-rejects-incomplete-and-invalid-prefixes
+    (multiple-value-bind (record binding plan) (reseed-follow-activation-plan-fixture nil 0)
+      (dolist (state '((:staged 0) (:activating 2)))
+        (setf (getf (getf record :activation) :phase) (first state)
+              (getf (getf record :activation) :step) (second state))
+        (ok (intake-fails-p
+             (lambda () (pg::physical-reseed-follow-retirement-moves record binding))))
+        (ok (intake-fails-p
+             (lambda () (pg::physical-reseed-follow-retirement-positions record binding 0))))
+        (ok (intake-fails-p
+             (lambda () (pg::physical-reseed-follow-retirement-inventories plan record binding 0 nil)))))
+      (setf (getf (getf record :activation) :phase) :active
+            (getf (getf record :activation) :step) 2)
+      (dolist (prefix '(-1 3 nil 1.5 "1"))
+        (ok (intake-fails-p
+             (lambda () (pg::physical-reseed-follow-retirement-positions record binding prefix))))
+        (ok (intake-fails-p
+             (lambda () (pg::physical-reseed-follow-retirement-inventories plan record binding prefix nil)))))))
+
+(deftest reseed-follow-retirement-plan-owns-names-and-preserves-all-predecessors
+    (multiple-value-bind (record binding plan) (reseed-follow-retirement-plan-fixture t 3)
+      (let* ((extra (list (list (copy-seq "physical-reseed.follow") nil)))
+             (before (pg::physical-adoption-attempt-value-copy (list record binding plan extra)))
+             (moves (pg::physical-reseed-follow-retirement-moves record binding))
+             (positions (pg::physical-reseed-follow-retirement-positions record binding 2))
+             (inventory (pg::physical-reseed-follow-retirement-inventories plan record binding 2 extra)))
+        (setf (char (third (first moves)) 0) #\X
+              (char (third (assoc :attempt-journal positions)) 0) #\X
+              (char (first (getf inventory :root)) 0) #\X
+              (char (first (getf inventory :saved)) 0) #\X)
+        (ok (equal before (list record binding plan extra)))
+        (ok (string= "physical-reseed.install"
+                     (third (first (pg::physical-reseed-follow-retirement-moves record binding))))))))
+
+(deftest reseed-follow-retirement-plan-keeps-recorded-progress-separate-from-static-prefix
+    (multiple-value-bind (record binding plan) (reseed-follow-retirement-plan-fixture nil 1)
+      (let* ((bytes (pg::physical-reseed-attempt-image (getf record :attempt)))
+             (device (getf (getf (getf record :attempt) :local) :device))
+             (reference (list :identity (list device 300000 #o100600 1000 1 (length bytes) 0 0)
+                              :digest (pg::physical-store-update-digest #xCBF29CE484222325 bytes))))
+        (dolist (state '((:retiring 0) (:retiring 1) (:retiring 2) (:retired 2)))
+          (let ((candidate (append (pg::physical-reseed-follow-copy record)
+                                   (list :retirement
+                                         (list :phase (first state) :step (second state)
+                                               :attempt-file reference)))))
+            (dolist (prefix '(0 1 2))
+              (ok (equal (pg::physical-reseed-follow-retirement-positions record binding prefix)
+                         (pg::physical-reseed-follow-retirement-positions candidate binding prefix))))
+            (dolist (prefix '(0 1 2))
+              (ok (equal (pg::physical-reseed-follow-retirement-inventories plan record binding prefix nil)
+                         (pg::physical-reseed-follow-retirement-inventories plan candidate binding prefix nil)))))))))

@@ -113,6 +113,18 @@
            (setf (getf inventories role) (sort (mapcar #'copy-seq names) #'string<)))
   inventories)
 
+(defun physical-reseed-follow-apply-inventory-moves (inventories moves error-message)
+  (dolist (move moves)
+    (destructuring-bind (logical from-role from-leaf to-role to-leaf) move
+      (declare (ignore logical))
+      (unless (and (= 1 (count from-leaf (getf inventories from-role) :test #'equal))
+                   (not (member to-leaf (getf inventories to-role) :test #'equal)))
+        (error error-message))
+      (setf (getf inventories from-role)
+            (remove from-leaf (getf inventories from-role) :test #'equal :count 1))
+      (push (copy-seq to-leaf) (getf inventories to-role))))
+  inventories)
+
 (defun physical-reseed-follow-configuration-inventories (value-plan value binding prefix extra)
   (multiple-value-bind (plan record) (physical-reseed-follow-configuration-install-plan value-plan value)
     (physical-reseed-follow-configuration-plan-record record binding)

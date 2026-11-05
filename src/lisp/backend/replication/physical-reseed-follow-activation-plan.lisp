@@ -67,13 +67,7 @@
       (when (member "follow.active" (getf inventories :staged) :test #'equal)
         (error "historical staged inventory already contains the active image"))
       (push (copy-seq "follow.active") (getf inventories :staged))
-      (dolist (move (subseq (physical-reseed-follow-activation-moves record binding) 0 prefix))
-        (destructuring-bind (logical from-role from-leaf to-role to-leaf) move
-          (declare (ignore logical))
-          (unless (and (= 1 (count from-leaf (getf inventories from-role) :test #'equal))
-                       (not (member to-leaf (getf inventories to-role) :test #'equal)))
-            (error "activation inventory move lacks a unique source or empty destination"))
-          (setf (getf inventories from-role)
-                (remove from-leaf (getf inventories from-role) :test #'equal :count 1))
-          (push (copy-seq to-leaf) (getf inventories to-role))))
-      (physical-reseed-follow-configuration-sort-inventories inventories))))
+      (physical-reseed-follow-configuration-sort-inventories
+       (physical-reseed-follow-apply-inventory-moves
+        inventories (subseq (physical-reseed-follow-activation-moves record binding) 0 prefix)
+        "activation inventory move lacks a unique source or empty destination")))))

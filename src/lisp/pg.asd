@@ -242,6 +242,7 @@
                    (:file "../replication/physical-reseed-follow-configuration-plan")
                    (:file "../replication/physical-reseed-follow-activation-config")
                    (:file "../replication/physical-reseed-follow-activation-plan")
+                   (:file "../replication/physical-reseed-follow-retirement-plan")
                    (:file "../replication/physical-reseed-follow-configuration-directories")
                    (:file "../replication/physical-reseed-follow-configuration-base")
                    (:file "../replication/physical-reseed-follow-configuration-namespace")
