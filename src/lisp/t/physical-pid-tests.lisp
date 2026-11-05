@@ -152,6 +152,159 @@
                      (close lock)))))
           (setf sb-ext:*exit-hooks* saved-exit-hooks)))))
 
+(deftest startup-observer-receives-the-local-lock-at-both-pid-boundaries
+    (call-with-pid-owner
+     (lambda (root)
+       (pg::postmaster-remove-pid-file)
+       (close pg::*postmaster-data-lock*)
+       (setf pg::*postmaster-data-lock* nil
+             pg::*postmaster-start-timestamp* nil)
+       (let ((phases nil) (held-lock nil))
+         (pg::postmaster-own-data-directory
+          "127.0.0.1" 5439
+          :startup-observer
+          (lambda (lock phase)
+            (push phase phases)
+            (ok (open-stream-p lock))
+            (let ((other (pg::postmaster-open-data-lock)))
+              (unwind-protect
+                   (ok (not (zerop (pg::physical-store-flock (sb-sys:fd-stream-fd other) 6))))
+                (close other)))
+            (ok (null pg::*postmaster-data-lock*))
+            (if (eq phase :before-pid)
+                (progn
+                  (setf held-lock lock)
+                  (ok (null pg::*postmaster-start-timestamp*))
+                  (ok (null pg::*postmaster-pid-stream*))
+                  (ok (not (probe-file (merge-pathnames "postmaster.pid" root)))))
+                (progn
+                  (ok (eq phase :owned-pid))
+                  (ok (eq lock held-lock))
+                  (ok (integerp pg::*postmaster-start-timestamp*))
+                  (ok (pg::postmaster-pid-owned-p)))))
+          :startup-reconcile
+          (lambda ()
+            (push :reconcile phases)
+            (ok (eq held-lock pg::*postmaster-data-lock*))
+            (ok (pg::postmaster-pid-owned-p))))
+         (ok (equal (reverse phases) '(:before-pid :owned-pid :reconcile)))
+         (ok (eq held-lock pg::*postmaster-data-lock*))))))
+
+(deftest startup-observer-refusal-closes-the-local-lock-and-owned-pid
+    (dolist (phase '(:before-pid :owned-pid))
+      (dolist (mode '(:error :throw :interrupt :close))
+        (call-with-pid-owner
+         (lambda (root)
+           (pg::postmaster-remove-pid-file)
+           (close pg::*postmaster-data-lock*)
+           (setf pg::*postmaster-data-lock* nil
+                 pg::*postmaster-start-timestamp* nil)
+           (let ((observed-lock nil))
+             (ok
+              (eq :refused
+                  (catch 'observer-refused
+                    (handler-case
+                        (progn
+                          (pg::postmaster-own-data-directory
+                           "127.0.0.1" 5439
+                           :startup-observer
+                           (lambda (lock current-phase)
+                             (setf observed-lock lock)
+                             (when (eq phase current-phase)
+                               (ecase mode
+                                 (:close (close lock))
+                                 (:error (error "observer refusal"))
+                                 (:throw (throw 'observer-refused :refused))
+                                 (:interrupt
+                                  (sb-thread:interrupt-thread
+                                   sb-thread:*current-thread*
+                                   (lambda () (throw 'observer-refused :refused))))))))
+                          :accepted)
+                      (error () :refused)))))
+             (ok observed-lock)
+             (ok (not (open-stream-p observed-lock)))
+             (ok (null pg::*postmaster-data-lock*))
+             (ok (null pg::*postmaster-pid-stream*))
+             (ok (null pg::*postmaster-start-timestamp*))
+             (ok (not (probe-file (merge-pathnames "postmaster.pid" root))))
+             (let ((lock (pg::postmaster-open-data-lock)))
+               (unwind-protect
+                    (ok (zerop (pg::physical-store-flock (sb-sys:fd-stream-fd lock) 6)))
+                 (close lock)))))))))
+
+(deftest startup-observer-rejects-mixed-callbacks-before-changing-pid-state
+    (call-with-pid-owner
+     (lambda (root)
+       (let ((stream pg::*postmaster-pid-stream*)
+             (pg::*postmaster-data-lock* nil)
+             (timestamp pg::*postmaster-start-timestamp*)
+             (bytes (uiop:read-file-string (merge-pathnames "postmaster.pid" root))))
+         (dolist (callbacks '((:startup-before-pid) (:startup-check)
+                              (:startup-before-pid :startup-check)))
+           (let ((entered nil))
+             (ok
+              (handler-case
+                  (progn
+                    (apply #'pg::postmaster-own-data-directory "127.0.0.1" 5439
+                           :startup-observer (lambda (&rest args)
+                                               (declare (ignore args))
+                                               (setf entered t))
+                           (loop for key in callbacks
+                                 append (list key (lambda () (setf entered t)))))
+                    nil)
+                (error (condition)
+                  (search "startup observer cannot be combined" (princ-to-string condition)))))
+             (ok (not entered))
+             (ok (eq stream pg::*postmaster-pid-stream*))
+             (ok (null pg::*postmaster-data-lock*))
+             (ok (= timestamp pg::*postmaster-start-timestamp*))
+             (ok (equalp bytes (uiop:read-file-string (merge-pathnames "postmaster.pid" root))))))))))
+
+(deftest startup-observer-before-pid-refusal-preserves-stale-metadata
+    (dolist (mode '(:error :throw :interrupt))
+      (call-with-pid-owner
+       (lambda (root)
+         (let* ((path (merge-pathnames "postmaster.pid" root))
+                (text (uiop:read-file-string path))
+                (inode (sb-posix:stat-ino (sb-posix:stat path))))
+           (close pg::*postmaster-pid-stream*)
+           (close pg::*postmaster-data-lock*)
+           (setf pg::*postmaster-pid-stream* nil
+                 pg::*postmaster-pid-inode* nil
+                 pg::*postmaster-data-lock* nil
+                 pg::*postmaster-start-timestamp* nil)
+           (let ((entered nil))
+             (ok
+              (eq :refused
+                  (catch 'stale-pid-refused
+                    (handler-case
+                        (progn
+                          (pg::postmaster-own-data-directory
+                           "127.0.0.1" 5439
+                           :startup-observer
+                           (lambda (lock phase)
+                             (declare (ignore lock))
+                             (setf entered t)
+                             (ok (eq phase :before-pid))
+                             (ecase mode
+                               (:error (error "stale PID refusal"))
+                               (:throw (throw 'stale-pid-refused :refused))
+                               (:interrupt
+                                (sb-thread:interrupt-thread
+                                 sb-thread:*current-thread*
+                                 (lambda () (throw 'stale-pid-refused :refused)))))))
+                          :accepted)
+                      (error (condition)
+                        (if (search "stale PID refusal" (princ-to-string condition))
+                            :refused
+                            (error condition)))))))
+             (ok entered)
+             (ok (string= text (uiop:read-file-string path)))
+             (ok (= inode (sb-posix:stat-ino (sb-posix:stat path))))
+             (ok (null pg::*postmaster-pid-stream*))
+             (ok (null pg::*postmaster-data-lock*))
+             (ok (null pg::*postmaster-start-timestamp*))))))))
+
 (deftest adoption-attempt-presence-fences-every-file-kind-without-reading-it
     (dolist (mode '(:empty :corrupt :record :directory :dangling-symlink))
       (with-physical-store-directory (root)

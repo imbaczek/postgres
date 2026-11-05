@@ -186,7 +186,7 @@ leaves the separate data ownership lock to its owner."
              (setf success t)))
       (unless success (sb-posix:close fd)))))
 
-(defun postmaster-own-data-directory (host port &key startup-before-pid startup-check startup-reconcile)
+(defun postmaster-own-data-directory (host port &key startup-before-pid startup-check startup-reconcile startup-observer)
   "Own PGDATA before any database storage initialization or recovery mutation.
 Call read-only STARTUP-BEFORE-PID with the flock held before the startup
 timestamp or PID metadata changes.  A failure leaves stale PID evidence intact.
@@ -198,6 +198,8 @@ If a callback fails or exits nonlocally, clear ownership and the timestamp,
 remove the owned PID, and close the lock even if PID cleanup fails."
   (declare (ignore host))
   (when *postmaster-data-lock* (error "this process already owns a data directory"))
+  (when (and startup-observer (or startup-before-pid startup-check))
+    (error "startup observer cannot be combined with legacy PID checks"))
   (postmaster-check-data-directory)
   (let ((lock nil) (success nil))
     (unwind-protect
@@ -208,10 +210,20 @@ remove the owned PID, and close the lock even if PID cleanup fails."
                  lock (postmaster-open-data-lock))
            (unless (zerop (physical-store-flock (sb-sys:fd-stream-fd lock) 6))
              (error "data directory is already owned by another pg-lisp process"))
-           (when startup-before-pid (funcall startup-before-pid))
+           (if startup-observer
+               (progn
+                 (funcall startup-observer lock :before-pid)
+                 (unless (open-stream-p lock)
+                   (error "startup observer closed the data-directory lock")))
+               (when startup-before-pid (funcall startup-before-pid)))
            (setf *postmaster-start-timestamp* (postgres-current-timestamp))
            (postmaster-create-pid-file)
-           (when startup-check (funcall startup-check))
+           (if startup-observer
+               (progn
+                 (funcall startup-observer lock :owned-pid)
+                 (unless (open-stream-p lock)
+                   (error "startup observer closed the data-directory lock")))
+               (when startup-check (funcall startup-check)))
            (setf *postmaster-data-lock* lock)
            (when startup-reconcile (funcall startup-reconcile))
            (setf success t)
