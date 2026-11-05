@@ -43,6 +43,40 @@
           (ok (signals (activation-test-call 'pg::physical-reseed-follow-activation-intent-record record)))
           (ok (equal saved record))))))
 
+(cl-spec:defproperty reseed-activation-progress-preserves-intent
+    ((selected boolean))
+  (:about pg::physical-reseed-follow-activation-progress-record)
+  (:trials (:normal 100))
+  (multiple-value-bind (base groups) (reseed-follow-activation-codec-fixture selected)
+    (loop for (old new) on (cddr groups) while new
+          always
+          (let* ((before (reseed-follow-with-activation base old))
+                 (saved (pg::physical-adoption-attempt-value-copy before))
+                 (actual (funcall
+                          (symbol-function 'pg::physical-reseed-follow-activation-progress-record)
+                          before))
+                 (expected (reseed-follow-with-activation base new)))
+            (and (equal actual expected)
+                 (equal saved before)
+                 (not (eq (getf actual :activation) (getf before :activation)))
+                 (not (eq (getf (getf actual :activation) :entry)
+                          (getf (getf before :activation) :entry))))))))
+
+(deftest generated-reseed-activation-progress-contract
+    (let ((data (cl-spec:result-data
+                 (cl-spec:run-property 'reseed-activation-progress-preserves-intent
+                                       :seed 138 :profile :normal))))
+      (ok (eq :passed (getf data :status)))))
+
+(deftest reseed-activation-progress-refuses-other-phases
+    (multiple-value-bind (base groups) (reseed-follow-activation-codec-fixture t)
+      (dolist (group (list nil (first groups) (second groups) (sixth groups)))
+        (let* ((record (reseed-follow-with-activation base group))
+               (saved (pg::physical-adoption-attempt-value-copy record)))
+          (ok (signals
+               (activation-test-call 'pg::physical-reseed-follow-activation-progress-record record)))
+          (ok (equal saved record))))))
+
 (defun call-with-reseed-activation-source (owner root record function)
   (call-with-reseed-settlement-source
    owner root record

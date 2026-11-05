@@ -230,6 +230,19 @@
       (physical-reseed-follow-check-transition value candidate)
       candidate)))
 
+(defun physical-reseed-follow-activation-progress-record (value)
+  (let* ((record (physical-reseed-follow-copy value))
+         (activation (getf record :activation)))
+    (unless (and (eq :activating (getf activation :phase))
+                 (null (getf record :retirement)))
+      (error "activation progress requires an Activating predecessor"))
+    (if (< (getf activation :step) 2)
+        (incf (getf activation :step))
+        (setf (getf activation :phase) :active))
+    (let ((candidate (physical-reseed-follow-copy record)))
+      (physical-reseed-follow-check-transition value candidate)
+      candidate)))
+
 (defun physical-reseed-follow-activation-intent-candidate (context value)
   ;; Check the frozen pure successor against the original snapshot and anchor.
   ;; The context may hold the predecessor or the adopted successor.
