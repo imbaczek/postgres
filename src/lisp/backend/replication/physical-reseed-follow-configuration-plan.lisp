@@ -114,6 +114,8 @@
   inventories)
 
 (defun physical-reseed-follow-apply-inventory-moves (inventories moves error-message)
+  ;; Update caller-owned inventories for the supplied moves.  Each source
+  ;; must occur once and each destination must be empty.  Copy new leaf names.
   (dolist (move moves)
     (destructuring-bind (logical from-role from-leaf to-role to-leaf) move
       (declare (ignore logical))

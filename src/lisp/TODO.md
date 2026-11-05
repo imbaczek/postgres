@@ -327,6 +327,13 @@
   Five focused heads passed 54 assertions, including same-byte name replacement;
   strict cold compilation passed 231 files. The retirement scope must still
   prove the actual saved-directory role before acting on this observation.
+  Pure retirement plans now derive the fixed install-then-attempt archive
+  layouts from Active/2. Static layout descriptions remain separate from the
+  recorded-progress check. For Retiring, that check permits the recorded prefix
+  or one move ahead.
+  Verification passed 17 selected heads with 298 assertions, 232-file cold
+  compilation, and 100 property trials each at seeds 140 and 141. Input coverage
+  was not collected. Actual archive observation and startup authority remain open.
   Archive retirement and startup admission remain open. START must check
   current source state and retention floors again.
 

@@ -1,6 +1,8 @@
 (in-package #:pg)
 
 (defun physical-reseed-follow-retirement-check-prefix (value prefix)
+  ;; Check an observed prefix against recorded progress after Active step 2.
+  ;; Retiring permits its recorded step or one ahead, and Retired requires 2.
   (let* ((record (physical-reseed-follow-copy value))
          (activation (getf record :activation))
          (retirement (getf record :retirement))
@@ -16,6 +18,8 @@
     prefix))
 
 (defun physical-reseed-follow-retirement-plan-record (value binding)
+  ;; Require completed activation and validate the binding before planning.
+  ;; This does not establish authority to move files.
   (let* ((record (physical-reseed-follow-activation-plan-record value binding))
          (activation (getf record :activation)))
     (unless (and (eq :active (getf activation :phase)) (= 2 (getf activation :step)))
@@ -23,12 +27,16 @@
     record))
 
 (defun physical-reseed-follow-retirement-moves (value binding)
+  ;; Describe the fixed archive order.  Move the install journal first and
+  ;; the attempt journal second.
   (physical-reseed-follow-retirement-plan-record value binding)
   (physical-adoption-attempt-value-copy
    '((:install-journal :root "physical-reseed.install" :saved "physical-reseed.install")
      (:attempt-journal :root "physical-reseed.attempt" :saved "physical-reseed.attempt"))))
 
 (defun physical-reseed-follow-retirement-positions (value binding prefix)
+  ;; Describe positions for any static prefix from 0 through 2.  A caller
+  ;; checks the observed prefix against the recorded phase separately.
   (let ((record (physical-reseed-follow-retirement-plan-record value binding)))
     (unless (typep prefix '(integer 0 2)) (error "invalid retirement move prefix"))
     (physical-reseed-follow-apply-position-moves
@@ -39,6 +47,8 @@
      "retirement move lacks a unique source or empty destination")))
 
 (defun physical-reseed-follow-retirement-inventories (value-plan value binding prefix extra)
+  ;; Apply the static archive prefix to the completed activation inventories.
+  ;; These expected names do not inspect the filesystem.
   (let ((record (physical-reseed-follow-retirement-plan-record value binding)))
     (unless (typep prefix '(integer 0 2)) (error "invalid retirement inventory prefix"))
     (physical-reseed-follow-configuration-sort-inventories
