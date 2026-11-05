@@ -75,6 +75,8 @@
                  (ok (eq :staged (getf (getf (pg::physical-reseed-follow-read owner) :activation) :phase)))))))))
 
 (deftest reseed-activation-source-snapshot-is-detached-and-read-only
+    ;; Check that repeated snapshots detach their facts and leave local state
+    ;; unchanged.  The following probe cases exercise retries and changed facts.
     (call-with-reseed-activation-fixture
      :same-timeline
      (lambda (owner root workspace settled)

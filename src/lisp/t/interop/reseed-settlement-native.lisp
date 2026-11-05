@@ -30,6 +30,8 @@
 ;; Drive one target action.  Recovery and local checks are exercised offline;
 ;; the remote actions use the native source helper.
 (defun native-settlement-test-action (owner action)
+  ;; Stage the local active image and exercise source retries and rejected
+  ;; allocations through native test connections, alongside settlement actions.
   (cond
     ((equal action "install")
      (physical-reseed-follow-begin-configuration
@@ -216,6 +218,8 @@
 (defvar *native-activation-test-saved-pin* nil)
 
 (defun native-activation-test-source-pin-fault (name mode)
+  ;; Inject runtime source pin faults under the write and WAL locks.  Restore
+  ;; the saved pin and cancellation state under the same locks after each case.
   (with-write-lock
     (with-wal-critical
       (if (eq mode :restore)

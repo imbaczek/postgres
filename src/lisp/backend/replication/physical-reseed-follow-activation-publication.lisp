@@ -23,6 +23,11 @@
   t)
 
 (defun physical-reseed-follow-activation-network-snapshot (owner &optional expected)
+  ;; Capture detached journal, attempt, install, plan and active-file facts
+  ;; under the mapped proof.  Repeat the capture around the check so the caller
+  ;; can compare it after network work.  Return copied values after releasing
+  ;; the held descriptors.  Keep this tuple private because the original
+  ;; attempt contains frozen source credentials.
   (unless (physical-reseed-follow-owner-busy-p owner)
     (error "activation source observation requires an active owner operation"))
   (call-with-physical-reseed-follow-image
@@ -71,6 +76,11 @@
            current))))))
 
 (defun physical-reseed-follow-probe-activation-source (owner &key helper)
+  ;; Retry the exact selected allocation through the original frozen route
+  ;; and credentials.  Recheck local facts around the exchange and after client
+  ;; close, keeping the owner busy until cleanup finishes.  Local validation is
+  ;; read-only, so failures preserve owner certainty.  The source observation
+  ;; can become stale as the source changes.  Repeat it before advancing activation.
   (physical-reseed-follow-check-idle owner)
   (setf (physical-reseed-follow-owner-busy-p owner) t)
   (unwind-protect

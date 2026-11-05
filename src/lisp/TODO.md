@@ -261,9 +261,22 @@
   property passed 100 trials each at seeds 134 and 135 with definition digest
   `fnv1a64-v1:0d476da5846170de`. Input coverage and rejection counts were not
   measured. See `staging-final-check.json` in the activation artifact directory.
-  Fresh selected-source authority, operational activation moves, archive
-  retirement and startup admission remain open. Source liveness must be
-  checked before activation advances.
+  A read-only Staged/0 source probe now reconnects through the frozen route,
+  repeats writer/history/flush checks and retries the exact selected allocation.
+  It compares the full canonical anchor and detached local journal, attempt,
+  install, plan and active-file observations around network work and client
+  close. The owner stays busy through cleanup and keeps its certainty on failure.
+  Fresh verification passed 12 selected regressions with 236 assertions,
+  including exact retry across all five geometries, lost replies, source changes,
+  local same-byte writes and admission fencing. Strict cold compilation passed
+  231 production files and three-file formatting preserved reader forms.
+  A 13-action native matrix verified exact selected READY retry after a real
+  CLOSED handoff and source restart, wrong generation/name rejection and
+  rejection of unready, replaced, canceled and absent pins. Those pin faults
+  were controlled runtime injections. See `source-probe-final-check.json`.
+  Consuming the fresh source observation in the first Activating/0 publication,
+  operational activation moves, archive retirement and startup admission remain
+  open. START must check current source state and retention floors again.
 
 - [x] Fence the reserved target follow intent names before startup or older
   reseed ownership. Both final and temporary names reject every entry type;
