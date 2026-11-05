@@ -253,6 +253,7 @@
                    (:file "../replication/physical-reseed-follow-configuration-scope")
                    (:file "../replication/physical-reseed-follow-activation-scope")
                    (:file "../replication/physical-reseed-follow-retirement-scope")
+                   (:file "../replication/physical-reseed-follow-retirement-pid")
                    (:file "../replication/physical-reseed-follow-configuration-staging")
                    (:file "../replication/physical-reseed-follow-configuration-install")
                    (:file "../replication/physical-reseed-follow-configuration-recovery")

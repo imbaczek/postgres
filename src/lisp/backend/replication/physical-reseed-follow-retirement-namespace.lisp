@@ -1,11 +1,11 @@
 (in-package #:pg)
 
-(defun physical-reseed-follow-retirement-final-extra-at (root snapshot)
-  ;; Check the final journal snapshot and forbid PID while collecting root
-  ;; extras.  The caller handles any temporary separately.
+(defun physical-reseed-follow-retirement-final-extra-at (root snapshot &optional pid-evidence)
   (physical-reseed-follow-check-snapshot root snapshot)
-  (when (physical-adoption-path-present-p (merge-pathnames "postmaster.pid" (physical-image-fd-path root)))
-    (error "retirement read-only layout refuses temporary follow or PID entries"))
+  (if pid-evidence
+      (funcall (getf pid-evidence :verify))
+      (when (physical-adoption-path-present-p (merge-pathnames "postmaster.pid" (physical-image-fd-path root)))
+        (error "retirement read-only layout refuses temporary follow or PID entries")))
   (list (cons (copy-seq "physical-reseed.follow")
               (nth-value 1 (physical-reseed-follow-entry root "physical-reseed.follow")))))
 
@@ -33,17 +33,18 @@
         (error "retirement layout lacks a unique complete archive prefix"))
       (physical-reseed-follow-retirement-check-prefix record (first matches)))))
 
-(defun physical-reseed-follow-retirement-layout-state-at (descriptors snapshot check extra-reader candidate)
-  ;; The final snapshot remains the layout authority.  A supplied candidate
-  ;; must match the proved prefix and files, and permits exactly one temporary
-  ;; root extra.  The extra reader and checks keep that evidence stable.
+(defun physical-reseed-follow-retirement-layout-state-at (descriptors snapshot check extra-reader candidate &optional pid-evidence)
+  ;; The final snapshot remains the layout authority.  The extra reader and
+  ;; checks keep admitted evidence stable.
   ;; Use the provisional install read only to obtain a plan.  Prove the saved
   ;; role, complete images and exact prefix, then recheck both journals around
   ;; the layout proof against the actual follow snapshot.
   (let* ((root (physical-reseed-follow-configuration-role-fd descriptors :root))
          (saved (physical-reseed-follow-configuration-role-fd descriptors :saved))
-         (record (physical-reseed-follow-copy (getf snapshot :record))))
+         (record (physical-reseed-follow-copy (getf snapshot :record)))
+         (pid-entry (getf pid-evidence :entry)))
     (funcall check)
+    (when pid-evidence (funcall (getf pid-evidence :verify)))
     (physical-reseed-follow-check-snapshot root snapshot)
     (let* ((plan (physical-reseed-follow-retirement-provisional-plan-at root saved record))
            (base-fds (loop for role in '(:base :global :wal)
@@ -62,12 +63,15 @@
                  (positions (physical-reseed-follow-retirement-positions record binding prefix))
                  (expected (physical-reseed-follow-retirement-inventories plan record binding prefix extra))
                  (mount (physical-adoption-install-mount-id nil :directory-fd root)))
-            (unless (equal (mapcar #'car extra)
-                           (if candidate '("physical-reseed.follow" "physical-reseed.follow.tmp")
-                               '("physical-reseed.follow")))
+            (unless (and (equal (mapcar #'car extra)
+                                (append '("physical-reseed.follow")
+                                        (when candidate '("physical-reseed.follow.tmp"))
+                                        (when pid-entry '("postmaster.pid"))))
+                         (equal pid-entry (assoc "postmaster.pid" extra :test #'equal)))
               (error "retirement observation has unexpected root extras"))
             (flet ((verify ()
                      (funcall check)
+                     (when pid-evidence (funcall (getf pid-evidence :verify)))
                      (unless (and (equal extra (funcall extra-reader root))
                                   (equal install (physical-reseed-follow-retirement-install-at descriptors record prefix))
                                   (equal attempt (physical-reseed-follow-retirement-attempt-at

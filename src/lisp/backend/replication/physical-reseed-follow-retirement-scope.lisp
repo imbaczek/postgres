@@ -116,7 +116,7 @@
   t)
 
 (defun call-with-physical-reseed-follow-retirement-receive-at
-    (descriptors snapshot base binding function check extra-reader candidate)
+    (descriptors snapshot base binding function check extra-reader candidate &optional pid-evidence)
   ;; Open the local store without discarding tails or creating a lock.  Normal
   ;; process-local retained-root restoration still applies.  ON-OPEN captures
   ;; the store for outer cleanup under the opener's failure cleanup.
@@ -128,7 +128,7 @@
     (unwind-protect
          (progn
            (funcall check)
-           (setf state (physical-reseed-follow-retirement-layout-state-at descriptors snapshot check extra-reader candidate))
+           (setf state (physical-reseed-follow-retirement-layout-state-at descriptors snapshot check extra-reader candidate pid-evidence))
            (physical-store-open
             (physical-image-fd-path (physical-reseed-follow-configuration-role-fd descriptors :receive))
             (getf base :system-id) (getf base :timeline) :start-lsn (getf base :end)
@@ -143,10 +143,10 @@
                     (unless (and active (eq thread sb-thread:*current-thread*))
                       (error "retirement observation scope ended or changed thread"))
                     (funcall check)
-                    (unless (equal state (physical-reseed-follow-retirement-layout-state-at descriptors snapshot check extra-reader candidate))
+                    (unless (equal state (physical-reseed-follow-retirement-layout-state-at descriptors snapshot check extra-reader candidate pid-evidence))
                       (error "retirement layout changed during its observation scope"))
                     (physical-reseed-follow-retirement-check-receive descriptors store record base binding check)
-                    (unless (equal state (physical-reseed-follow-retirement-layout-state-at descriptors snapshot check extra-reader candidate))
+                    (unless (equal state (physical-reseed-follow-retirement-layout-state-at descriptors snapshot check extra-reader candidate pid-evidence))
                       (error "retirement layout changed around active receive validation"))
                     t))
              (verify)
@@ -156,7 +156,7 @@
       (setf active nil)
       (when store (physical-store-close store)))))
 
-(defun call-with-physical-reseed-follow-retirement-observation-at (root snapshot parent-check function extra-reader candidate)
+(defun call-with-physical-reseed-follow-retirement-observation-at (root snapshot parent-check function extra-reader candidate &optional pid-evidence)
   ;; Borrow ROOT and its parent ownership from the caller.  Hold the other nine
   ;; directory descriptors, guard streams and local store for the callback.
   (let* ((snapshot (physical-adoption-attempt-value-copy snapshot))
@@ -205,7 +205,7 @@
                          descriptors record binding (getf configuration :step)
                          (lambda (held)
                            (call-with-physical-reseed-follow-retirement-receive-at
-                            held snapshot base binding function base-check extra-reader candidate))
+                            held snapshot base binding function base-check extra-reader candidate pid-evidence))
                          base-check))))
                   auxiliary-check))
                fixed-check)))
