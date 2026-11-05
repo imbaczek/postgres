@@ -187,6 +187,8 @@
      check)))
 
 (defun call-with-physical-reseed-follow-mapped-predecessor (owner function)
+  ;; Hold nine directory roles and check the journal, attempt and terminal
+  ;; install predecessor.  The context adds the receive role for full proof.
   (call-with-physical-reseed-install-directories
    owner
    (lambda (root incoming quarantine value-plan root-check)
@@ -227,6 +229,8 @@
 ;; and receive descriptors for one mapped proof.  Keep journal and attempt checks
 ;; separate from the full layout proof so they cannot recurse into this scope.
 (defun call-with-physical-reseed-follow-mapped-image (owner function)
+  ;; Derive the installation prefix before constructing the context and its
+  ;; receive descriptor.  The callback runs under the complete mapped proof.
   (unless (physical-reseed-follow-configuration-owner-p owner)
     (error "mapped image requires dedicated configuration ownership"))
   (when *physical-reseed-follow-installation-scope* (error "mapped installation scope is already active"))

@@ -26,11 +26,17 @@
 
 (defvar *physical-reseed-follow-installation-scope* nil)
 
-(defvar *physical-reseed-follow-activation-scope* nil)
+(defvar *physical-reseed-follow-activation-scope*
+  ;; The thread-bound context, or the acquisition marker while entering it.
+  nil)
 
-(defvar *physical-reseed-follow-activation-request* nil)
+(defvar *physical-reseed-follow-activation-request*
+  ;; Select activation dispatch for the owner of the current operation.
+  nil)
 
-(defvar *physical-reseed-follow-activation-candidate* nil)
+(defvar *physical-reseed-follow-activation-candidate*
+  ;; Freeze the value authorized for the current activation publication.
+  nil)
 
 (defgeneric physical-reseed-follow-image-dispatch (owner function))
 
@@ -45,7 +51,7 @@
 (defvar *physical-reseed-follow-terminal-settlement-candidate* nil)
 
 ;; Check the candidate authorized by the current operation and adopt only its
-;; exact published snapshot into the installation context.
+;; exact published snapshot into the current mapped context.
 (defgeneric physical-reseed-follow-configuration-publication-candidate (owner context candidate))
 
 (defgeneric physical-reseed-follow-published-snapshot (owner root-fd candidate snapshot previous))
@@ -56,6 +62,8 @@
   nil)
 
 (defun physical-reseed-follow-check-idle (owner)
+  ;; Exclude nested mapped scopes and operations after an uncertain
+  ;; publication until the owner is reopened.
   (unless (physical-reseed-follow-owner-p owner) (error "target follow ownership is required"))
   (physical-directory-check-owner-common owner)
   (when (or *physical-reseed-follow-installation-scope* *physical-reseed-follow-activation-scope*)
@@ -168,6 +176,8 @@
 ;; scope and does not grant publication or network authority.
 
 (defun call-with-physical-reseed-follow-image (owner function)
+  ;; Dispatch only outside an existing mapped scope.  Each dispatch owns its
+  ;; proof and descriptor lifetime.
   (unless (physical-reseed-follow-owner-p owner) (error "target follow ownership is required"))
   (when (or *physical-reseed-follow-installation-scope* *physical-reseed-follow-activation-scope*) (error "target follow image scope is already active"))
   (physical-reseed-follow-image-dispatch owner function))

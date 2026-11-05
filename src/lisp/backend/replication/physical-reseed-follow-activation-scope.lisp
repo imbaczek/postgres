@@ -1,12 +1,19 @@
 (in-package #:pg)
 
+;;; Check a settled target through held directories and journal snapshots.
+;;; Keep activation layout and receive proofs in one thread-bound scope.
+
 (defstruct (physical-reseed-follow-activation-context
             (:constructor %make-physical-reseed-follow-activation-context)
             (:print-function physical-libpq-print-private-object))
+  ;; Thread-bound scope with borrowed descriptors and store.  Its private
+  ;; printer protects credentials, and the context is revoked on exit.
   owner thread active-p descriptors plan record install-state attempt snapshot prefix
   base binding model images store check output-entry)
 
 (defun call-with-physical-reseed-follow-activation-operation (owner function)
+  ;; The store operation callback returns a record and snapshot.  A failure
+  ;; leaves the owner uncertain and requires it to be closed and reopened.
   (unless (physical-reseed-follow-configuration-owner-p owner)
     (error "activation operation requires dedicated configuration ownership"))
   (physical-reseed-follow-check-idle owner)
@@ -19,6 +26,7 @@
       (unless completed (setf (physical-reseed-follow-owner-uncertain-p owner) t)))))
 
 (defun physical-reseed-follow-activation-context (owner)
+  ;; Only the owning thread may use the context during its busy store scope.
   (let ((context *physical-reseed-follow-activation-scope*))
     (unless (and (physical-reseed-follow-activation-context-p context)
                  (physical-reseed-follow-activation-context-active-p context)
@@ -29,6 +37,8 @@
     context))
 
 (defun physical-reseed-follow-activation-guard (context)
+  ;; Recheck the held scope and journal predecessors without recursively
+  ;; running the complete layout and receive proof.
   (unless (and (physical-reseed-follow-activation-context-active-p context)
                (eq sb-thread:*current-thread* (physical-reseed-follow-activation-context-thread context)))
     (error "activation image scope has ended or changed threads"))
@@ -50,6 +60,8 @@
   t)
 
 (defun physical-reseed-follow-activation-initial-prefix (owner descriptors record binding check)
+  ;; Identify one of the three prefixes from stable directory names, then
+  ;; check it against recorded activation progress.  Full proof follows.
   (funcall check)
   (let* ((plan (physical-reseed-install-owner-plan owner))
          (root (physical-reseed-follow-configuration-role-fd descriptors :root))
@@ -73,6 +85,8 @@
         (first matches)))))
 
 (defun physical-reseed-follow-activation-observe (owner descriptors record binding images check)
+  ;; Absent and Building intent inspect output at prefix zero.  Later phases
+  ;; identify a prefix and prove the corresponding layout.
   (let ((phase (getf (getf record :activation) :phase)))
     (if (member phase '(nil :building))
         (progn
@@ -85,6 +99,7 @@
                           owner descriptors record binding images prefix check))))))
 
 (defun physical-reseed-follow-activation-layout (context check)
+  ;; Recheck the prefix and keep any Building output entry fixed in scope.
   (let* ((record (physical-reseed-follow-activation-context-record context))
          (prefix (physical-reseed-follow-activation-context-prefix context))
          (descriptors (physical-reseed-follow-activation-context-descriptors context))
@@ -103,6 +118,8 @@
          owner descriptors record binding images prefix check))))
 
 (defun physical-reseed-follow-activation-read-saved (context)
+  ;; Read and decode fresh saved pending bytes on each call.  Check the
+  ;; captured file identity and guard the read on both sides.
   (physical-reseed-follow-activation-guard context)
   (let* ((record (physical-reseed-follow-activation-context-record context))
          (config (physical-reseed-follow-pending-config
@@ -119,6 +136,9 @@
       (physical-follow-decode-config bytes))))
 
 (defun physical-reseed-follow-activation-check-receive (context check)
+  ;; Prefix 0 checks pending control in root, prefix 1 reads saved pending
+  ;; control, and prefix 2 checks active control.  All require the settled
+  ;; receive tuple and validated retained prefix.
   (let* ((store (physical-reseed-follow-activation-context-store context))
          (binding (physical-reseed-follow-activation-context-binding context))
          (record (physical-reseed-follow-activation-context-record context))
@@ -155,6 +175,8 @@
     (funcall check)))
 
 (defun physical-reseed-follow-activation-verify (context)
+  ;; Prove the layout around the base and receive checks.  The smaller guard
+  ;; is available to each check without recursive proof.
   (physical-reseed-follow-activation-guard context)
   (let* ((descriptors (physical-reseed-follow-activation-context-descriptors context))
          (record (physical-reseed-follow-activation-context-record context))
@@ -183,6 +205,8 @@
 
 (defun call-with-physical-reseed-follow-activation-context
     (owner descriptors plan record install-state attempt snapshot check function)
+  ;; Add the held receive directory to the nine predecessor roles.  Open the
+  ;; store and prove the context around the callback, then revoke and close it.
   (let ((terminal (getf (getf record :configuration) :step)))
     (multiple-value-bind (base control binding model images row)
         (physical-reseed-follow-configuration-base-proof
@@ -223,6 +247,8 @@
        check))))
 
 (defun call-with-physical-reseed-follow-activation-image (owner function)
+  ;; The raw image callback may return its own values.  Its descriptors and
+  ;; check are valid only within the mapped proof.
   (unless (physical-reseed-follow-configuration-owner-p owner)
     (error "mapped image requires dedicated configuration ownership"))
   (when *physical-reseed-follow-activation-scope* (error "mapped activation scope is already active"))
@@ -235,6 +261,8 @@
 
 (defmethod physical-reseed-follow-image-dispatch :around
     ((owner physical-reseed-follow-configuration-owner) function)
+  ;; Route activation intent and explicit requests through the activation
+  ;; proof.  Installation and activation scopes cannot overlap.
   (when (and *physical-reseed-follow-activation-request*
              (not (eq owner *physical-reseed-follow-activation-request*)))
     (error "activation request belongs to a different owner"))

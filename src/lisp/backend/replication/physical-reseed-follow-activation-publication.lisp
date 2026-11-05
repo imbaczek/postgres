@@ -1,6 +1,11 @@
 (in-package #:pg)
 
+;;; Publish the first activation intent and recover its interrupted write.
+;;; Building binds the intended active image before output creation.
+
 (defun physical-reseed-follow-activation-require-attempt (context)
+  ;; Effects require the exact active original attempt.  Read-only scope
+  ;; checks can still inspect an attempt that has advanced to abort.
   (unless (and (physical-reseed-follow-activation-context-active-p context)
                (eq sb-thread:*current-thread* (physical-reseed-follow-activation-context-thread context)))
     (error "activation attempt check requires its active thread-bound scope"))
@@ -18,6 +23,8 @@
   t)
 
 (defun physical-reseed-follow-activation-building-candidate (context value)
+  ;; Accept only the first Building record, bound to the derived image and
+  ;; an absent output at prefix zero.
   (let* ((before (physical-reseed-follow-activation-context-record context))
          (candidate (physical-reseed-follow-copy value))
          (binding (physical-reseed-follow-activation-context-binding context))
@@ -36,6 +43,8 @@
     candidate))
 
 (defun physical-reseed-follow-activation-publication-check (owner context candidate)
+  ;; Keep the candidate and operation kind frozen throughout publication.
+  ;; Other publication kinds cannot use this activation scope.
   (unless (and (eq context (physical-reseed-follow-activation-context owner))
                (equal candidate *physical-reseed-follow-activation-candidate*)
                (not (or *physical-reseed-follow-installation-scope*
@@ -49,11 +58,14 @@
 (defmethod physical-reseed-follow-configuration-publication-candidate
     ((owner physical-reseed-follow-configuration-owner)
      (context physical-reseed-follow-activation-context) candidate)
+  ;; Revalidate the operation authority and exact Building value.
   (physical-reseed-follow-activation-publication-check owner context candidate)
   (physical-reseed-follow-activation-building-candidate context candidate))
 
 (defmethod physical-reseed-follow-published-snapshot :around
     ((owner physical-reseed-follow-configuration-owner) root-fd candidate snapshot previous)
+  ;; Check the exact prior snapshot and frozen candidate after rename.
+  ;; Adopt the published snapshot before the next guard runs.
   (unless *physical-reseed-follow-activation-scope*
     (return-from physical-reseed-follow-published-snapshot (call-next-method)))
   (let ((context (physical-reseed-follow-activation-context owner)))
@@ -70,6 +82,8 @@
   t)
 
 (defun physical-reseed-follow-activation-publish-building (context value check)
+  ;; Check the canonical candidate and future capacity before creating the
+  ;; temporary.  Keep checking the frozen kind and attempt during the write.
   (let* ((candidate (physical-reseed-follow-activation-building-candidate context value))
          (*physical-reseed-follow-activation-candidate* (physical-reseed-follow-copy candidate))
          (owner (physical-reseed-follow-activation-context-owner context))
@@ -91,6 +105,8 @@
         (values record snapshot)))))
 
 (defun physical-reseed-follow-begin-activation (owner)
+  ;; Publish the first Building intent or return the existing Building record.
+  ;; An existing temporary must be recovered explicitly.
   (call-with-physical-reseed-follow-activation-operation
    owner
    (lambda (root check)
@@ -116,6 +132,8 @@
              (physical-reseed-follow-activation-publish-building context record check)))))))
 
 (defun physical-reseed-follow-recover-activation (owner)
+  ;; Promote only the exact next Building temporary after checking its held
+  ;; identity and the active attempt.  An uncertain failure fences the owner.
   (call-with-physical-reseed-follow-activation-operation
    owner
    (lambda (root check)

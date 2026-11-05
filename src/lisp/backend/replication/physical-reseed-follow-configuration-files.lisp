@@ -25,6 +25,8 @@
 ;; Read and verify one planned file, returning its checked identity and digest.
 ;; The named file and mount must still match the held descriptor after reading.
 (defun physical-reseed-follow-configuration-file-row (parent leaf logical bytes)
+  ;; Return the checked file row and, as a second value, fresh octets read
+  ;; from the file after validating its bytes and identity.
   (call-with-physical-image-input-at
    parent leaf
    (lambda (stream)

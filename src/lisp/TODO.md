@@ -231,11 +231,26 @@
   Evidence: `layout-refactor-regression-check.json`,
   `layout-refactor-cold-check.json` and `layout-format-check.json` in the
   activation artifact directory.
-  Activation context and publication, current source and actual-attempt
-  checks, crash recovery, archive retirement and startup admission remain
-  open; these proof kernels grant no operation or startup authority. Evidence:
-  `/home/imbaczek/proj/pg-ha-artifacts/reseed-target-activation/retirement-fixed-check.json`
-  and `retirement-format-check.json` in that directory.
+  The activation context now binds the actual journal, install and attempt
+  snapshots to held directories. It checks the observed move prefix, the
+  original base and receive state, and the pending or active control at its
+  prescribed location. Publication requires the exact original PREMANIFEST
+  attempt. Beginning activation checks future journal capacity and publishes
+  Building intent before creating active output. Repeating Building preserves
+  the journal inode.
+  Recovery promotes only the exact next complete Building temporary and
+  preserves partial or conflicting state. Installation and activation share
+  predecessor acquisition while keeping their own context and admission rules.
+  Fresh verification passed 30 selected tests with 641 assertions, strict cold
+  compilation of 231 production files and eight-file formatting. This includes
+  Building publication across all five geometries, semantic checks at all three
+  actual move prefixes, attempt and snapshot changes, frozen-candidate checks,
+  journal cuts and preservation of unrelated namespace entries. See
+  `context-final-check.json` in the activation artifact directory.
+  Active-file staging, fresh selected-source authority, operational activation
+  moves, archive retirement and startup admission remain open. The next local
+  Staged record will describe a durable exact image. Source liveness must be
+  checked again before activation advances.
 
 - [x] Fence the reserved target follow intent names before startup or older
   reseed ownership. Both final and temporary names reject every entry type;
