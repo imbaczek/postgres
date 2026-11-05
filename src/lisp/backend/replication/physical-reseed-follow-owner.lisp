@@ -38,6 +38,8 @@
   ;; Freeze the value authorized for the current activation publication.
   nil)
 
+(defvar *physical-reseed-follow-activation-authority* nil)
+
 (defgeneric physical-reseed-follow-image-dispatch (owner function))
 
 (defvar *physical-reseed-follow-installation-request* nil)
