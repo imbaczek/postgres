@@ -246,6 +246,7 @@
                    (:file "../replication/physical-reseed-follow-configuration-recovery")
                    (:file "../replication/physical-reseed-follow-settlement-publication")
                    (:file "../replication/physical-reseed-follow-settlement-recovery")
+                   (:file "../replication/physical-reseed-follow-settlement-network")
                    (:file "../replication/physical-adoption-follow-plan")
                    (:file "../replication/physical-adoption-follow-codec")
                    (:file "../replication/physical-adoption-follow-state")

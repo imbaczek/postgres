@@ -101,6 +101,7 @@
                (:file "t/physical-reseed-follow-configuration-plan-tests")
                (:file "t/physical-reseed-follow-base-proof-tests")
                (:file "t/physical-reseed-follow-settlement-store-tests")
+               (:file "t/physical-reseed-follow-settlement-network-tests")
                (:file "t/wal-timeline-tests")
                (:file "t/wal-eor-tests")
                (:file "t/physical-history-tests")
