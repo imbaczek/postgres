@@ -99,6 +99,12 @@
 
 (defun physical-reseed-follow-layout-proof
     (owner descriptors plan record positions images extra expected mount check &optional active-row)
+  ;; Callers admit the owner, run the first check, and supply fixed positions
+  ;; and inventories.  Capture the namespace, run the second check, and then
+  ;; recheck the captured facts.  When supplied, the read-only active observer
+  ;; runs twice and adds :active to the result; the old wrapper omits it.
+  ;; Rows borrow parent directory descriptors.  These observations can become
+  ;; stale after return and do not by themselves authorize filesystem changes.
   (let ((root (physical-reseed-follow-configuration-role-fd descriptors :root))
         (quarantine (physical-reseed-follow-configuration-role-fd descriptors :quarantine)))
     (unless (= (length descriptors) 10) (error "mapped layout requires exactly ten directory roles"))

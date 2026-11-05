@@ -1,6 +1,9 @@
 (in-package #:pg)
 
 (defun physical-reseed-follow-activation-active-row (descriptors record binding positions mount)
+  ;; Check the canonical active bytes and captured file identity through the
+  ;; private input path.  The file descriptor is closed before return; the
+  ;; returned row borrows its parent directory descriptor.
   (let* ((position (assoc "follow.active" positions :test #'equal))
          (parent (physical-reseed-follow-configuration-role-fd descriptors (second position)))
          (leaf (third position))
@@ -14,6 +17,12 @@
     (list (copy-seq "follow.active") parent (copy-seq leaf) before)))
 
 (defun physical-reseed-follow-activation-layout-state (owner descriptors value binding images prefix check)
+  ;; Admit the owner and derive the positions and inventories for this prefix
+  ;; before proving the layout.  VALUE may be a proposed record; this does not
+  ;; establish that it is the journal on disk or pin the attempt or source.
+  ;; The returned facts can become stale and do not authorize an operation.
+  ;; A driver must bind those predecessors and the phase to the observed prefix,
+  ;; and pin and recheck the source file before moving it.
   (unless (physical-reseed-follow-configuration-owner-p owner)
     (error "mapped layout requires configuration ownership"))
   (physical-reseed-check-owner owner)
@@ -30,6 +39,11 @@
        (lambda () (physical-reseed-follow-activation-active-row descriptors record binding positions mount))))))
 
 (defun physical-reseed-follow-activation-output-state (owner descriptors value binding images check)
+  ;; Without activation intent the output must be absent.  Building permits
+  ;; either absence or a complete exact private image; partial or conflicting
+  ;; output is rejected.  For a complete image, check a Staged proposal and
+  ;; return its entry and layout without publishing, writing, or syncing it.
+  ;; A driver must sync the file and its parent before publishing Staged.
   (unless (physical-reseed-follow-configuration-owner-p owner)
     (error "activation output requires configuration ownership"))
   (physical-reseed-check-owner owner)
