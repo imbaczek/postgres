@@ -36,6 +36,9 @@
 ;; lock and root ownership proof.
 
 (defun physical-reseed-attempt-read-state-at (root-fd name &key stabilize check-fd)
+  ;; Read and decode the named file, returning its identity and a digest of
+  ;; the bytes actually read.  CHECK-FD may check the held descriptor before
+  ;; and after the read without coupling this reader to its caller.
   (unless (member name '("physical-reseed.attempt" "physical-reseed.attempt.tmp") :test #'equal)
     (error "unexpected reseed metadata name"))
   (let ((fd nil) (stream nil)
@@ -68,6 +71,7 @@
       (if stream (close stream) (when fd (sb-posix:close fd))))))
 
 (defun physical-reseed-attempt-read-at (root-fd name &key stabilize)
+  ;; Keep the original reader interface, returning only the decoded record.
   (getf (physical-reseed-attempt-read-state-at root-fd name :stabilize stabilize) :record))
 
 ;; Anchor the raw read to the checked root without calling the role method.

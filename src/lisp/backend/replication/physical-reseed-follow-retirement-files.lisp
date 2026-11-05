@@ -1,6 +1,13 @@
 (in-package #:pg)
 
 (defun physical-reseed-follow-retirement-attempt-at (root-fd container-fd value prefix)
+  ;; Observe the exact original premanifest attempt at the prefix location.
+  ;; Check the root binding, all three mounts, and the attempt file identity
+  ;; and nanosecond facts.
+  ;; The row maps UID before link count in the attempt identity.  A frozen
+  ;; reference must match, allowing ctime to change after the move to saved.
+  ;; This observation alone does not establish the saved role, the complete
+  ;; namespace, or authority for an operation or startup.
   (let* ((record (physical-reseed-follow-copy value))
          (expected (getf record :attempt))
          (retirement (getf record :retirement))

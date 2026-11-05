@@ -334,6 +334,13 @@
   Verification passed 17 selected heads with 298 assertions, 232-file cold
   compilation, and 100 property trials each at seeds 140 and 141. Input coverage
   was not collected. Actual archive observation and startup authority remain open.
+  Attempt-file observation now binds the decoded record, byte digest and
+  identity from one held descriptor. It checks the exact original PREMANIFEST record, mount,
+  nanosecond file facts and observed prefix. Frozen root references remain exact;
+  an archived reference permits only ctime to change. Verification passed 17
+  selected heads with 332 assertions, including legacy real SIGKILL recovery,
+  233-file cold compilation, and a separate cross-mount refusal experiment.
+  The actual saved-directory role and complete namespace proof remain open.
   Archive retirement and startup admission remain open. START must check
   current source state and retention floors again.
 
