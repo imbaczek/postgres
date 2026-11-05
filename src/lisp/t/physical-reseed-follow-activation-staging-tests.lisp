@@ -74,6 +74,330 @@
           root (lambda (owner)
                  (ok (eq :staged (getf (getf (pg::physical-reseed-follow-read owner) :activation) :phase)))))))))
 
+(deftest reseed-activation-source-snapshot-is-detached-and-read-only
+    (call-with-reseed-activation-fixture
+     :same-timeline
+     (lambda (owner root workspace settled)
+       (declare (ignore settled))
+       (pg::physical-reseed-follow-begin-activation owner)
+       (pg::physical-reseed-follow-stage-activation owner)
+       (let ((before (list (reseed-mapped-test-tree-facts root)
+                           (reseed-mapped-test-tree-facts workspace))))
+         (ok (signals (activation-test-call 'pg::physical-reseed-follow-activation-network-snapshot owner)))
+         (setf (pg::physical-reseed-follow-owner-busy-p owner) t)
+         (unwind-protect
+              (let* ((snapshot (activation-test-call 'pg::physical-reseed-follow-activation-network-snapshot owner))
+                     (again (activation-test-call 'pg::physical-reseed-follow-activation-network-snapshot owner snapshot)))
+                (ok (equal snapshot again))
+                (ok (equal (getf snapshot :active-entry)
+                           (getf (getf (getf (getf snapshot :follow) :record) :activation) :entry)))
+                (ok (consp (getf snapshot :active-row)))
+                (ok (not (eq (getf snapshot :active-row) (getf again :active-row))))
+                (ok (not (pg::physical-reseed-follow-owner-uncertain-p owner)))
+                (ok (equalp before (list (reseed-mapped-test-tree-facts root)
+                                         (reseed-mapped-test-tree-facts workspace))))
+                (ok (not (probe-file (merge-pathnames "physical-reseed.follow.tmp" root))))
+                (ok (probe-file (merge-pathnames "staged/follow.active" workspace))))
+           (setf (pg::physical-reseed-follow-owner-busy-p owner) nil))))))
+
+(deftest reseed-activation-source-probe-retries-exact-allocation-without-local-effects
+    (dolist (kind '(:same-timeline :retained-timeline :before-fork :at-fork :later-writer))
+      (call-with-reseed-activation-fixture
+       kind
+       (lambda (owner root workspace settled)
+         (declare (ignore settled))
+         (pg::physical-reseed-follow-begin-activation owner)
+         (let* ((staged (pg::physical-reseed-follow-stage-activation owner))
+                (generation (first (getf staged :generations)))
+                (expected (pg::physical-reseed-follow-generation-anchor generation))
+                (before (list (reseed-mapped-test-tree-facts root)
+                              (reseed-mapped-test-tree-facts workspace))))
+           (call-with-reseed-settlement-source
+            owner root staged
+            (lambda (state)
+              (let* ((symbol 'pg::pg-client-native-backup-lease-follow-prepare)
+                     (original (symbol-function symbol))
+                     (calls 0) (lose-reply t))
+                (unwind-protect
+                     (progn
+                       (setf (symbol-function symbol)
+                             (lambda (client request number name coordinates)
+                               (declare (ignore client))
+                               (assert (pg::physical-reseed-follow-owner-busy-p owner))
+                               (assert (null pg::*physical-reseed-follow-activation-scope*))
+                               (assert (null pg::*physical-reseed-follow-installation-scope*))
+                               (assert (equal request (getf (getf staged :attempt) :request)))
+                               (assert (= number (getf generation :generation)))
+                               (assert (equal name (getf generation :name)))
+                               (assert (equal coordinates (getf generation :coordinates)))
+                               (incf calls)
+                               (when lose-reply
+                                 (setf lose-reply nil)
+                                 (error "injected lost selected-allocation reply"))
+                               (pg::physical-follow-anchor-copy expected)))
+                       (ok (intake-fails-p
+                            (lambda () (activation-test-call 'pg::physical-reseed-follow-probe-activation-source
+                                                             owner :helper "/unused/helper"))))
+                       (ok (= 1 calls (getf state :closes)))
+                       (ok (not (pg::physical-reseed-follow-owner-busy-p owner)))
+                       (ok (not (pg::physical-reseed-follow-owner-uncertain-p owner)))
+                       (multiple-value-bind (anchor snapshot)
+                           (activation-test-call 'pg::physical-reseed-follow-probe-activation-source
+                                                 owner :helper "/unused/helper")
+                         (ok (equal expected anchor))
+                         (ok (equal staged (getf (getf snapshot :follow) :record))))
+                       (ok (= 2 calls (getf state :closes)))
+                       (ok (= 6 (getf state :identities)))
+                       (ok (zerop (getf state :handoffs)))
+                       (ok (zerop (getf state :statuses)))
+                       (ok (not (pg::physical-reseed-follow-owner-busy-p owner)))
+                       (ok (not (pg::physical-reseed-follow-owner-uncertain-p owner)))
+                       (ok (equalp before (list (reseed-mapped-test-tree-facts root)
+                                                (reseed-mapped-test-tree-facts workspace)))))
+                  (setf (symbol-function symbol) original))))))))))
+
+(deftest reseed-activation-source-probe-refuses-changed-writer-and-anchor
+    (call-with-reseed-activation-fixture
+     :same-timeline
+     (lambda (owner root workspace settled)
+       (declare (ignore settled))
+       (pg::physical-reseed-follow-begin-activation owner)
+       (let* ((staged (pg::physical-reseed-follow-stage-activation owner))
+              (generation (first (getf staged :generations)))
+              (expected (pg::physical-reseed-follow-generation-anchor generation))
+              (before (list (reseed-mapped-test-tree-facts root)
+                            (reseed-mapped-test-tree-facts workspace))))
+         (call-with-reseed-settlement-source
+          owner root staged
+          (lambda (state)
+            (let* ((symbol 'pg::pg-client-native-backup-lease-follow-prepare)
+                   (original (symbol-function symbol))
+                   (calls 0))
+              (unwind-protect
+                   (progn
+                     (setf (symbol-function symbol)
+                           (lambda (&rest arguments)
+                             (declare (ignore arguments))
+                             (incf calls)
+                             (let ((reply (pg::physical-follow-anchor-copy expected)))
+                               (setf (getf reply :overlap-digest)
+                                     (logxor 1 (getf reply :overlap-digest)))
+                               (pg::physical-follow-anchor-copy reply))))
+                     (setf (getf state :identity-timeline) 99)
+                     (ok (intake-fails-p
+                          (lambda () (activation-test-call 'pg::physical-reseed-follow-probe-activation-source
+                                                           owner :helper "/unused/helper"))))
+                     (ok (zerop calls))
+                     (ok (= 1 (getf state :closes)))
+                     (setf (getf state :identity-timeline) nil)
+                     (let ((message
+                             (handler-case
+                                 (progn (activation-test-call 'pg::physical-reseed-follow-probe-activation-source
+                                                              owner :helper "/unused/helper") nil)
+                               (error (condition) (princ-to-string condition)))))
+                       (ok (and message (search "exact recorded anchor" message))))
+                     (ok (= 1 calls))
+                     (ok (= 2 (getf state :closes)))
+                     (ok (not (pg::physical-reseed-follow-owner-busy-p owner)))
+                     (ok (not (pg::physical-reseed-follow-owner-uncertain-p owner)))
+                     (ok (equalp before (list (reseed-mapped-test-tree-facts root)
+                                              (reseed-mapped-test-tree-facts workspace)))))
+                (setf (symbol-function symbol) original)))))))))
+
+(deftest reseed-activation-source-probe-detaches-anchor-and-rechecks-client-close
+    (call-with-reseed-activation-fixture
+     :same-timeline
+     (lambda (owner root workspace settled)
+       (declare (ignore settled))
+       (pg::physical-reseed-follow-begin-activation owner)
+       (let* ((staged (pg::physical-reseed-follow-stage-activation owner))
+              (expected (pg::physical-reseed-follow-generation-anchor (first (getf staged :generations)))))
+         (call-with-reseed-settlement-source
+          owner root staged
+          (lambda (state)
+            (let* ((symbol 'pg::pg-client-native-backup-lease-follow-prepare)
+                   (original (symbol-function symbol))
+                   (reply nil) (after-abort nil))
+              (unwind-protect
+                   (progn
+                     (setf (symbol-function symbol)
+                           (lambda (&rest arguments)
+                             (declare (ignore arguments))
+                             (setf reply (pg::physical-follow-anchor-copy expected)))
+                           (getf state :on-close)
+                           (lambda ()
+                             (ok (pg::physical-reseed-follow-owner-busy-p owner))
+                             (ok (intake-fails-p
+                                  (lambda () (activation-test-call 'pg::physical-reseed-follow-probe-activation-source
+                                                                   owner :helper "/unused/helper"))))
+                             (incf (getf reply :overlap-digest))))
+                     (ok (equal expected
+                                (activation-test-call 'pg::physical-reseed-follow-probe-activation-source
+                                                      owner :helper "/unused/helper")))
+                     (setf (getf state :on-close)
+                           (lambda ()
+                             (ok (pg::physical-reseed-follow-owner-busy-p owner))
+                             (reseed-settlement-test-abort-attempt root staged :aborting)
+                             (setf after-abort (list (reseed-mapped-test-tree-facts root)
+                                                     (reseed-mapped-test-tree-facts workspace)))))
+                     (ok (intake-fails-p
+                          (lambda () (activation-test-call 'pg::physical-reseed-follow-probe-activation-source
+                                                           owner :helper "/unused/helper"))))
+                     (ok (= 2 (getf state :closes)))
+                     (ok (not (pg::physical-reseed-follow-owner-busy-p owner)))
+                     (ok (not (pg::physical-reseed-follow-owner-uncertain-p owner)))
+                     (ok (equalp after-abort (list (reseed-mapped-test-tree-facts root)
+                                                   (reseed-mapped-test-tree-facts workspace)))))
+                (setf (symbol-function symbol) original)))))))))
+
+(deftest reseed-activation-source-probe-rechecks-writer-and-flush-after-prepare
+    (call-with-reseed-activation-fixture
+     :same-timeline
+     (lambda (owner root workspace settled)
+       (declare (ignore settled))
+       (pg::physical-reseed-follow-begin-activation owner)
+       (let* ((staged (pg::physical-reseed-follow-stage-activation owner))
+              (expected (pg::physical-reseed-follow-generation-anchor (first (getf staged :generations))))
+              (before (list (reseed-mapped-test-tree-facts root)
+                            (reseed-mapped-test-tree-facts workspace))))
+         (dolist (mode '(:promotion :flush-regression))
+           (call-with-reseed-settlement-source
+            owner root staged
+            (lambda (state)
+              (let* ((prepare 'pg::pg-client-native-backup-lease-follow-prepare)
+                     (identity 'pg::physical-client-identity-row)
+                     (old-prepare (symbol-function prepare))
+                     (old-identity (symbol-function identity))
+                     (armed nil) (calls 0) (late-identities 0))
+                (unwind-protect
+                     (progn
+                       (setf (symbol-function prepare)
+                             (lambda (&rest arguments)
+                               (declare (ignore arguments))
+                               (incf calls)
+                               (setf armed t)
+                               (pg::physical-follow-anchor-copy expected))
+                             (symbol-function identity)
+                             (lambda (client)
+                               (let ((row (funcall old-identity client)))
+                                 (when armed
+                                   (incf late-identities)
+                                   (ecase mode
+                                     (:promotion (setf (aref row 1) "99"))
+                                     (:flush-regression (setf (aref row 2) "0/0"))))
+                                 row)))
+                       (let ((message
+                               (handler-case
+                                   (progn (activation-test-call 'pg::physical-reseed-follow-probe-activation-source
+                                                                owner :helper "/unused/helper") nil)
+                                 (error (condition) (princ-to-string condition)))))
+                         (ok (and message (search "saved writer or receive frontier" message))))
+                       (ok (= 1 calls late-identities (getf state :closes)))
+                       (ok (not (pg::physical-reseed-follow-owner-busy-p owner)))
+                       (ok (not (pg::physical-reseed-follow-owner-uncertain-p owner)))
+                       (ok (equalp before (list (reseed-mapped-test-tree-facts root)
+                                                (reseed-mapped-test-tree-facts workspace)))))
+                  (setf (symbol-function prepare) old-prepare
+                        (symbol-function identity) old-identity))))))))))
+
+(deftest reseed-activation-source-probe-rejects-incomplete-or-fenced-intent-before-connect
+    (call-with-reseed-activation-fixture
+     :same-timeline
+     (lambda (owner root workspace settled)
+       (declare (ignore settled))
+       (let* ((symbol 'pg::physical-libpq-connect-frozen)
+              (original (symbol-function symbol))
+              (connects 0))
+         (labels ((refuses ()
+                    (let ((before (list (reseed-mapped-test-tree-facts root)
+                                        (reseed-mapped-test-tree-facts workspace))))
+                      (ok (intake-fails-p
+                           (lambda () (activation-test-call 'pg::physical-reseed-follow-probe-activation-source
+                                                            owner :helper "/unused/helper"))))
+                      (ok (zerop connects))
+                      (ok (not (pg::physical-reseed-follow-owner-busy-p owner)))
+                      (ok (not (pg::physical-reseed-follow-owner-uncertain-p owner)))
+                      (ok (equalp before (list (reseed-mapped-test-tree-facts root)
+                                               (reseed-mapped-test-tree-facts workspace)))))))
+           (unwind-protect
+                (progn
+                  (setf (symbol-function symbol)
+                        (lambda (&rest arguments)
+                          (declare (ignore arguments))
+                          (incf connects)
+                          (error "unexpected connection before local activation admission")))
+                  (refuses)
+                  (pg::physical-reseed-follow-begin-activation owner)
+                  (refuses)
+                  (let* ((staged (pg::physical-reseed-follow-stage-activation owner))
+                         (temporary (merge-pathnames "physical-reseed.follow.tmp" root)))
+                    (unwind-protect
+                         (progn
+                           (reseed-follow-owner-test-write temporary #())
+                           (refuses))
+                      (when (probe-file temporary) (delete-file temporary)))
+                    (reseed-settlement-test-abort-attempt root staged :aborting)
+                    (refuses)))
+             (setf (symbol-function symbol) original)))))))
+
+(deftest reseed-activation-source-probe-detects-same-byte-output-writes-around-network
+    (call-with-reseed-activation-fixture
+     :same-timeline
+     (lambda (owner root workspace settled)
+       (declare (ignore settled))
+       (pg::physical-reseed-follow-begin-activation owner)
+       (let* ((staged (pg::physical-reseed-follow-stage-activation owner))
+              (anchor (pg::physical-reseed-follow-generation-anchor (first (getf staged :generations))))
+              (path (merge-pathnames "staged/follow.active" workspace))
+              (bytes (lineage-test-bytes path)))
+         (dolist (boundary '(pg::physical-libpq-connect-frozen pg::physical-client-identity-row
+                             pg::pg-client-native-backup-lease-follow-prepare pg::physical-client-close))
+           (call-with-reseed-settlement-source
+            owner root staged
+            (lambda (state)
+              (let* ((prepare 'pg::pg-client-native-backup-lease-follow-prepare)
+                     (old-prepare (symbol-function prepare))
+                     (original nil) (hit nil) (after-write nil))
+                (unwind-protect
+                     (progn
+                       (setf (symbol-function prepare)
+                             (lambda (&rest arguments)
+                               (declare (ignore arguments))
+                               (pg::physical-follow-anchor-copy anchor))
+                             original (symbol-function boundary)
+                             (symbol-function boundary)
+                             (lambda (&rest arguments)
+                               (multiple-value-prog1 (apply original arguments)
+                                 (unless hit
+                                   (assert (null pg::*physical-reseed-follow-activation-scope*))
+                                   (let ((before (sb-posix:lstat path)))
+                                     (sleep 1.1)
+                                     (with-open-file (stream path :direction :io :if-exists :overwrite
+                                                                  :element-type '(unsigned-byte 8))
+                                       (write-sequence bytes stream)
+                                       (finish-output stream))
+                                     (let ((after (sb-posix:lstat path)))
+                                       (assert (= (sb-posix:stat-ino before) (sb-posix:stat-ino after)))
+                                       (assert (/= (sb-posix:stat-mtime before) (sb-posix:stat-mtime after)))))
+                                   (assert (equalp bytes (lineage-test-bytes path)))
+                                   (setf hit t
+                                         after-write (list (reseed-mapped-test-tree-facts root)
+                                                           (reseed-mapped-test-tree-facts workspace)))))))
+                       (let ((message
+                               (handler-case
+                                   (progn (activation-test-call 'pg::physical-reseed-follow-probe-activation-source
+                                                                owner :helper "/unused/helper") nil)
+                                 (error (condition) (princ-to-string condition)))))
+                         (ok (and message (search "changed during source observation" message))))
+                       (ok hit)
+                       (ok (= 1 (getf state :closes)))
+                       (ok (not (pg::physical-reseed-follow-owner-busy-p owner)))
+                       (ok (not (pg::physical-reseed-follow-owner-uncertain-p owner)))
+                       (ok (equalp after-write (list (reseed-mapped-test-tree-facts root)
+                                                     (reseed-mapped-test-tree-facts workspace)))))
+                  (when original (setf (symbol-function boundary) original))
+                  (setf (symbol-function prepare) old-prepare))))))))))
+
 (deftest reseed-activation-staging-requires-building-intent
     (call-with-reseed-activation-fixture
      :same-timeline
