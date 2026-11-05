@@ -231,6 +231,9 @@
       candidate)))
 
 (defun physical-reseed-follow-activation-progress-record (value)
+  ;; Copy and check the next Activating step, then the Active state at step 2.
+  ;; Retirement must be absent.  Callers must prove the required filesystem
+  ;; state is durable and hold publication authority before writing this value.
   (let* ((record (physical-reseed-follow-copy value))
          (activation (getf record :activation)))
     (unless (and (eq :activating (getf activation :phase))
