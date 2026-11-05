@@ -274,9 +274,28 @@
   CLOSED handoff and source restart, wrong generation/name rejection and
   rejection of unready, replaced, canceled and absent pins. Those pin faults
   were controlled runtime injections. See `source-probe-final-check.json`.
-  Consuming the fresh source observation in the first Activating/0 publication,
-  operational activation moves, archive retirement and startup admission remain
-  open. START must check current source state and retention floors again.
+  Initial Activating/0 publication now consumes the fresh source observation
+  in a private owner/context/thread-bound authority. It freezes the original
+  snapshot, full anchor and exact candidate, then adopts one post-rename journal
+  snapshot while continuing to check the same local facts. Complete initial
+  intent temporaries are checked before network work and require a fresh source
+  probe before promotion. Partial or conflicting temporaries stay fenced.
+  Committed Activating/0 intent retries offline and preserves its journal inode.
+  A shared read-only observation helper keeps the owner busy through client
+  cleanup. Failed public recovery retains the earlier owner uncertainty fence.
+  Verification passed 15 selected regressions with 333 assertions. The affected
+  paths passed nine fresh-process reruns with 260 assertions after the helper
+  extraction. Strict cold compilation passed 231 production files, and four-file
+  formatting preserved reader forms. The pure transition property passed 100
+  trials each at seeds 136 and 137 with digest `fnv1a64-v1:72f99318105004ca`.
+  Its generator selects two fixture variants. Input coverage and rejection
+  counts were not measured. A ten-action native run verified an actual SIGKILL
+  after temporary fsync, source-offline recovery refusal with preserved files,
+  fresh-source recovery through the selected CLOSED pin, and offline committed
+  intent retry. See `intent-final-check.json` in the activation artifact directory.
+  The two local activation moves, Active/2 publication, archive retirement and
+  startup admission remain open. START must check current source state and
+  retention floors again.
 
 - [x] Fence the reserved target follow intent names before startup or older
   reseed ownership. Both final and temporary names reject every entry type;

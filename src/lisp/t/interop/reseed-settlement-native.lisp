@@ -40,6 +40,7 @@
        (loop repeat 8 until (eq :inert (getf (getf record :configuration) :phase))
              do (setf record (physical-reseed-follow-advance-configuration owner)))
        record))
+    ;; Check source-authorized intent, recovery and offline committed retry.
     ((equal action "start-activation")
      (let ((record (physical-reseed-follow-start-activation owner :helper (native-settlement-test-env "HELPER"))))
        (assert (eq :activating (getf (getf record :activation) :phase)))

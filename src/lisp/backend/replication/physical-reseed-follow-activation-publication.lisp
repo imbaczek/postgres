@@ -25,9 +25,13 @@
 (defstruct (physical-reseed-follow-activation-authority
             (:constructor %make-physical-reseed-follow-activation-authority)
             (:print-function physical-libpq-print-private-object))
+  ;; This thread-bound private witness retains the original snapshot, anchor
+  ;; and candidate.  PUBLISHED starts NIL and records one adopted snapshot.
+  ;; The opaque printer protects private values.
   owner context thread active-p snapshot anchor candidate published)
 
 (defun physical-reseed-follow-activation-authority (context)
+  ;; Require the live authority belonging to this context, owner and thread.
   (let ((authority *physical-reseed-follow-activation-authority*))
     (unless (and (physical-reseed-follow-activation-authority-p authority)
                  (physical-reseed-follow-activation-authority-active-p authority)
@@ -41,6 +45,8 @@
     authority))
 
 (defun physical-reseed-follow-activation-local-facts (context)
+  ;; Capture detached local facts from the live context for comparison across
+  ;; source observation and publication.
   (let* ((owner (physical-reseed-follow-activation-context-owner context))
          (record (physical-reseed-follow-activation-context-record context))
          (activation (getf record :activation))
@@ -74,6 +80,8 @@
              :active-row (fourth active))))))
 
 (defun physical-reseed-follow-activation-local-snapshot (context &optional expected)
+  ;; Run the full image proof between captures and compare both with any
+  ;; expected detached facts.
   (let ((current (physical-reseed-follow-activation-local-facts context)))
     (physical-reseed-follow-activation-verify context)
     (unless (and (equal current (physical-reseed-follow-activation-local-facts context))
@@ -106,6 +114,8 @@
            (temporary-absent)))))))
 
 (defun physical-reseed-follow-activation-initial-temporary (context)
+  ;; Check the complete temporary and its stable named identity before it can
+  ;; be used in source-authorized recovery.
   (physical-reseed-follow-activation-guard context)
   (physical-reseed-follow-activation-require-attempt context)
   (let* ((root (physical-reseed-follow-configuration-role-fd
@@ -123,6 +133,8 @@
        (list :record record :identity identity :row before)))))
 
 (defun physical-reseed-follow-activation-recovery-network-snapshot (owner &optional expected)
+  ;; Pair detached local facts with the exact decoded next intent and stable
+  ;; temporary metadata.  Recheck the temporary around the image proof.
   (unless (physical-reseed-follow-owner-busy-p owner)
     (error "activation source observation requires an active owner operation"))
   (call-with-physical-reseed-follow-image
@@ -140,6 +152,8 @@
        snapshot))))
 
 (defun call-with-physical-reseed-follow-activation-observation (owner function)
+  ;; Keep the owner busy through client close and the final snapshot check.
+  ;; This observation scope preserves the uncertainty state.
   (physical-reseed-follow-check-idle owner)
   (setf (physical-reseed-follow-owner-busy-p owner) t)
   (unwind-protect (funcall function)
@@ -203,6 +217,8 @@
       candidate)))
 
 (defun physical-reseed-follow-activation-intent-record (value)
+  ;; Construct the initial transition as a checked value.  Publication
+  ;; requires the separate source authority held by the operation.
   (let* ((record (physical-reseed-follow-copy value))
          (activation (getf record :activation)))
     (unless (and (eq :staged (getf activation :phase))
@@ -215,6 +231,8 @@
       candidate)))
 
 (defun physical-reseed-follow-activation-intent-candidate (context value)
+  ;; Check the frozen pure successor against the original snapshot and anchor.
+  ;; The context may hold the predecessor or the adopted successor.
   (let* ((authority (physical-reseed-follow-activation-authority context))
          (snapshot (physical-reseed-follow-activation-authority-snapshot authority))
          (before (getf (getf snapshot :follow) :record))
@@ -232,6 +250,8 @@
     candidate))
 
 (defun physical-reseed-follow-activation-authority-check (context)
+  ;; Recheck the copied facts and candidate.  Recovery checks its temporary
+  ;; before rename and requires its absence after publication.
   (let* ((authority (physical-reseed-follow-activation-authority context))
          (expected (physical-adoption-attempt-value-copy
                     (physical-reseed-follow-activation-authority-snapshot authority)))
@@ -255,6 +275,8 @@
   t)
 
 (defun call-with-physical-reseed-follow-activation-authority (context anchor snapshot function)
+  ;; Bind the copied snapshot, canonical anchor and candidate to this owner,
+  ;; context and thread.  Revoke the private authority when the callback exits.
   (when *physical-reseed-follow-activation-authority*
     (error "activation source authority is already active"))
   (let ((local (physical-adoption-attempt-value-copy snapshot)))
@@ -324,6 +346,8 @@
     candidate))
 
 (defun physical-reseed-follow-activation-publication-scope-check (owner context candidate)
+  ;; Check exclusive candidate binding and the exact active original attempt.
+  ;; This boundary check is smaller than the full image proof.
   (unless (and (eq context (physical-reseed-follow-activation-context owner))
                (equal candidate *physical-reseed-follow-activation-candidate*)
                (not (or *physical-reseed-follow-installation-scope*
@@ -356,7 +380,8 @@
 (defmethod physical-reseed-follow-published-snapshot :around
     ((owner physical-reseed-follow-configuration-owner) root-fd candidate snapshot previous)
   ;; Check the exact prior snapshot and frozen candidate after rename.
-  ;; Adopt the published snapshot before the next guard runs.
+  ;; Adopt the published snapshot before the next guard runs.  Initial intent
+  ;; authority permits one such adoption and then checks the new snapshot.
   (unless *physical-reseed-follow-activation-scope*
     (return-from physical-reseed-follow-published-snapshot (call-next-method)))
   (let* ((context (physical-reseed-follow-activation-context owner))
@@ -443,6 +468,8 @@
              (physical-reseed-follow-activation-publish-building context record check)))))))
 
 (defun physical-reseed-follow-activation-existing-intent (owner)
+  ;; Require the active original attempt when retrying a committed initial
+  ;; intent offline.
   (call-with-physical-reseed-follow-activation-observation owner
                                                            (lambda ()
                                                              (call-with-physical-reseed-follow-image
@@ -461,6 +488,9 @@
                                                                     (physical-reseed-follow-copy record))))))))
 
 (defun physical-reseed-follow-start-activation (owner &key helper)
+  ;; Return an already committed initial intent offline.  A new one requires
+  ;; fresh source observation and a checked publication scope.  The observation
+  ;; can become stale, and START must later recheck floors.
   (or (physical-reseed-follow-activation-existing-intent owner)
       (multiple-value-bind (anchor snapshot)
           (physical-reseed-follow-probe-activation-source owner :helper helper)
@@ -521,6 +551,9 @@
                      (physical-reseed-follow-activation-context-snapshot context))))))))
 
 (defun physical-reseed-follow-activation-source-recovery-p (owner)
+  ;; Enter the activation image directly so recovery can inspect the journal
+  ;; before the first Building final exists.  Staged with a temporary needs
+  ;; the source-authorized recovery path.
   (call-with-physical-reseed-follow-activation-observation owner
                                                            (lambda ()
                                                              (call-with-physical-reseed-follow-activation-image
@@ -534,6 +567,8 @@
                                                                        t)))))))
 
 (defun physical-reseed-follow-recover-activation-intent (owner helper)
+  ;; Reobserve the source before promoting a complete initial Activating
+  ;; temporary.  Bind its checked identity to the promotion.
   (multiple-value-bind (anchor snapshot)
       (physical-reseed-follow-probe-activation-source owner :helper helper :recovery t)
     (call-with-physical-reseed-follow-activation-operation
@@ -572,6 +607,8 @@
                 (when fd (sb-posix:close fd)))))))))))
 
 (defun physical-reseed-follow-recover-activation (owner &key helper)
+  ;; Fence the owner if recovery fails after its idle check.
+  ;; Building and Staged candidates use their local recovery paths.
   (physical-reseed-follow-check-idle owner)
   (let ((completed nil))
     (unwind-protect

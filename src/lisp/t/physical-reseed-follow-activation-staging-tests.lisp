@@ -130,6 +130,7 @@
                   (setf (pg::physical-reseed-follow-owner-busy-p owner) nil))))))))))
 
 (deftest reseed-activation-initial-intent-recovery-reprobes-before-promoting
+    ;; A complete temporary needs a fresh source observation before promotion.
     (let ((staged nil))
       (call-with-reseed-activation-fixture
        :same-timeline

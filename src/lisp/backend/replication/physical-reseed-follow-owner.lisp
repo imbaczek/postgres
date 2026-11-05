@@ -38,7 +38,9 @@
   ;; Freeze the value authorized for the current activation publication.
   nil)
 
-(defvar *physical-reseed-follow-activation-authority* nil)
+(defvar *physical-reseed-follow-activation-authority*
+  ;; Dynamic source authority is private to the bound operation scope.
+  nil)
 
 (defgeneric physical-reseed-follow-image-dispatch (owner function))
 
