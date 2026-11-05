@@ -9,7 +9,10 @@
   ;; Thread-bound scope with borrowed descriptors and store.  Its private
   ;; printer protects credentials, and the context is revoked on exit.
   owner thread active-p descriptors plan record install-state attempt snapshot prefix
-  base binding model images store check output-entry durable-output)
+  base binding model images store check output-entry
+  ;; Starts NIL on acquisition.  A sync in this scope records the entry and
+  ;; observed metadata needed to authorize Staged publication.
+  durable-output)
 
 (defun call-with-physical-reseed-follow-activation-operation (owner function)
   ;; The store operation callback returns a record and snapshot.  A failure

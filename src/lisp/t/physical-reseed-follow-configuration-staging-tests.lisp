@@ -15,6 +15,8 @@
                              (pg::physical-reseed-follow-initial-record owner) root kind))))
          (reseed-follow-owner-test-write
           (merge-pathnames "physical-reseed.follow" root) (pg::physical-reseed-follow-image core))
+         ;; Fault tests use this tag for an intentional nonlocal exit.  Normal
+         ;; callbacks still run the owner's final proof.
          (catch *reseed-follow-fixture-owner-exit*
            (pg::call-with-physical-reseed-follow-configuration-owner
             root (lambda (owner)

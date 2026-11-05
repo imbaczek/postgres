@@ -23,6 +23,7 @@
   t)
 
 (defun physical-reseed-follow-activation-staged-record (value entry)
+  ;; Construct and check the Staged successor without changing disk state.
   (let* ((record (physical-reseed-follow-copy value))
          (activation (getf record :activation)))
     (unless (and (eq :building (getf activation :phase)) (zerop (getf activation :step)))
@@ -54,6 +55,8 @@
     candidate))
 
 (defun physical-reseed-follow-activation-check-durable-output (context candidate)
+  ;; Match the candidate and current named metadata to the output witness
+  ;; captured after synchronization in this scope.
   (let* ((descriptors (physical-reseed-follow-activation-context-descriptors context))
          (parent (physical-reseed-follow-configuration-role-fd descriptors :staged))
          (proof (physical-reseed-follow-activation-context-durable-output context))
@@ -68,6 +71,8 @@
   t)
 
 (defun physical-reseed-follow-activation-staged-candidate (context value &optional (durable t))
+  ;; Check the exact Building successor.  Recovery first checks its shape,
+  ;; then establishes and checks the durability witness before publication.
   (let* ((before (physical-reseed-follow-activation-context-record context))
          (candidate (physical-reseed-follow-copy value))
          (entry (physical-reseed-follow-activation-context-output-entry context)))
@@ -122,8 +127,9 @@
   t)
 
 (defun physical-reseed-follow-activation-publish (context value check)
-  ;; Check the canonical candidate and future capacity before creating the
-  ;; temporary.  Keep checking the frozen kind and attempt during the write.
+  ;; Check the candidate before creating the temporary.  Building reserves
+  ;; future capacity, and Staged uses that reservation.  Keep checking the
+  ;; frozen kind and attempt during the write.
   (let* ((candidate (physical-reseed-follow-copy value))
          (*physical-reseed-follow-activation-candidate* (physical-reseed-follow-copy candidate))
          (owner (physical-reseed-follow-activation-context-owner context))
@@ -146,6 +152,7 @@
         (values record snapshot)))))
 
 (defun physical-reseed-follow-activation-publish-building (context value check)
+  ;; Restrict this entry point to the first Building candidate.
   (physical-reseed-follow-activation-publish
    context (physical-reseed-follow-activation-building-candidate context value) check))
 
@@ -177,8 +184,9 @@
              (physical-reseed-follow-activation-publish-building context record check)))))))
 
 (defun physical-reseed-follow-recover-activation (owner)
-  ;; Promote only the exact next Building temporary after checking its held
-  ;; identity and the active attempt.  An uncertain failure fences the owner.
+  ;; Preflight the exact next Building or Staged temporary before promotion.
+  ;; Recheck its held identity and active attempt.  An uncertain failure
+  ;; fences the owner.
   (call-with-physical-reseed-follow-activation-operation
    owner
    (lambda (root check)
@@ -219,10 +227,15 @@
                      (physical-reseed-follow-activation-context-snapshot context))))))))
 
 (defun physical-reseed-follow-activation-output-guard (context)
+  ;; Guard output work while the layout may be partial.  The complete proof
+  ;; runs again after the output has been checked and adopted.
   (physical-reseed-follow-activation-guard context)
   (physical-reseed-follow-activation-require-attempt context))
 
 (defun physical-reseed-follow-activation-sync-output (context entry check)
+  ;; Hold the same file descriptor through synchronization and identity checks.
+  ;; Sync the file and its directories, then bind the checked entry and named
+  ;; metadata as the scope's durability witness.  Recheck after adoption.
   (declare (notinline sb-posix:fsync))
   (let* ((owner (physical-reseed-follow-activation-context-owner context))
          (descriptors (physical-reseed-follow-activation-context-descriptors context))
@@ -286,6 +299,8 @@
      :element-type '(unsigned-byte 8))))
 
 (defun physical-reseed-follow-stage-activation (owner)
+  ;; Create or check the active image, make it durable, and publish Staged.
+  ;; This establishes local durability.  Current source checks are separate.
   (call-with-physical-reseed-follow-activation-operation
    owner
    (lambda (root check)
@@ -315,6 +330,8 @@
               context (physical-reseed-follow-activation-staged-record record entry) check)))))))
 
 (defun physical-reseed-follow-activation-prepare-recovery (context candidate check)
+  ;; Validate the next transition before any recovery fsync.  For Staged,
+  ;; reattach the output witness and check it before promoting the temporary.
   (case (getf (getf candidate :activation) :phase)
     (:building (physical-reseed-follow-activation-building-candidate context candidate))
     (:staged

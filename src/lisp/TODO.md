@@ -238,7 +238,7 @@
   attempt. Beginning activation checks future journal capacity and publishes
   Building intent before creating active output. Repeating Building preserves
   the journal inode.
-  Recovery promotes only the exact next complete Building temporary and
+  Recovery promotes the exact next complete Building temporary and
   preserves partial or conflicting state. Installation and activation share
   predecessor acquisition while keeping their own context and admission rules.
   Fresh verification passed 30 selected tests with 641 assertions, strict cold
@@ -247,10 +247,23 @@
   actual move prefixes, attempt and snapshot changes, frozen-candidate checks,
   journal cuts and preservation of unrelated namespace entries. See
   `context-final-check.json` in the activation artifact directory.
-  Active-file staging, fresh selected-source authority, operational activation
-  moves, archive retirement and startup admission remain open. The next local
-  Staged record will describe a durable exact image. Source liveness must be
-  checked again before activation advances.
+  Local Staged publication now holds and rechecks the active file descriptor
+  across file, staged-directory, workspace and ancestor syncs. A scoped witness
+  binds the captured entry and statx row through publication. Complete Staged
+  temporary recovery checks the proposed entry before syncing, resyncs that
+  same file and rechecks the proof before promotion. Partial and conflicting
+  files stay fenced. Staged describes durable local output.
+  Fresh verification passed 42 selected tests with 878 assertions, strict cold
+  compilation of 231 production files and five-file formatting. Coverage
+  includes all five geometries, nine output/directory sync cuts, five journal
+  cuts, partial and invalid output, replacement and same-byte mutation, abort,
+  three injected fsync failures and the earlier regressions. The transition
+  property passed 100 trials each at seeds 134 and 135 with definition digest
+  `fnv1a64-v1:0d476da5846170de`. Input coverage and rejection counts were not
+  measured. See `staging-final-check.json` in the activation artifact directory.
+  Fresh selected-source authority, operational activation moves, archive
+  retirement and startup admission remain open. Source liveness must be
+  checked before activation advances.
 
 - [x] Fence the reserved target follow intent names before startup or older
   reseed ownership. Both final and temporary names reject every entry type;
