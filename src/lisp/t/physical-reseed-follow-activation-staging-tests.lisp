@@ -590,21 +590,30 @@
                         (let* ((context (pg::physical-reseed-follow-activation-context owner))
                                (original (symbol-function 'sb-posix:fsync))
                                (syncs 0)
-                               (message nil))
+                               (messages nil))
                           (ok (pg::physical-reseed-follow-activation-authority context))
                           (unwind-protect
                                (progn
                                  (setf (symbol-function 'sb-posix:fsync)
                                        (lambda (fd) (incf syncs) (funcall original fd)))
-                                 (handler-case
-                                     (pg::call-with-physical-reseed-follow-activation-progress
-                                      context (lambda () (pg::physical-reseed-follow-activation-verify context))
-                                      (lambda (candidate)
-                                        (declare (ignore candidate))
-                                        (error "nested progress callback reached")))
-                                   (error (condition) (setf message (princ-to-string condition)))))
+                                 (dolist (operation '(:progress :move))
+                                   (handler-case
+                                       (ecase operation
+                                         (:progress
+                                          (pg::call-with-physical-reseed-follow-activation-progress
+                                           context (lambda () (pg::physical-reseed-follow-activation-verify context))
+                                           (lambda (candidate)
+                                             (declare (ignore candidate))
+                                             (error "nested progress callback reached"))))
+                                         (:move
+                                          (pg::physical-reseed-follow-activation-next-move
+                                           context (lambda () (pg::physical-reseed-follow-activation-verify context)))))
+                                     (error (condition) (push (princ-to-string condition) messages)))))
                             (setf (symbol-function 'sb-posix:fsync) original))
-                          (ok (and message (search "overlaps an active publication authority" message)))
+                          (ok (= 2 (length messages)))
+                          (ok (every (lambda (message)
+                                       (search "overlaps an active publication authority" message))
+                                     messages))
                           (ok (zerop syncs))
                           (ok (zerop (pg::physical-reseed-follow-activation-context-prefix context)))
                           (ok (probe-file (merge-pathnames "physical-follow.control" root)))
@@ -614,6 +623,174 @@
                          (pg::physical-reseed-follow-start-activation owner :helper "/unused/helper"))))
             (ok (= 1 (getf state :prepares) (getf state :closes)))))
          (ok hit)
+         (ok (not (pg::physical-reseed-follow-owner-uncertain-p owner)))
+         (ok (not (pg::physical-reseed-follow-owner-busy-p owner)))))))
+
+(defun check-reseed-activation-stable-recovery-order (step aborted)
+  (let ((expected nil))
+    (call-with-reseed-activating-fixture
+     :same-timeline
+     (lambda (owner root workspace record)
+       (declare (ignore root workspace))
+       (when (= step 1)
+         (setf record (pg::physical-reseed-follow-advance-activation owner)))
+       (setf expected record)
+       (let ((pg::*physical-reseed-follow-test-hook*
+               (lambda (event path)
+                 (declare (ignore path))
+                 (when (eq event :after-activation-move) (error "one-ahead recovery cut")))))
+         (ok (intake-fails-p (lambda () (activation-test-next-local-move owner))))))
+     (lambda (root workspace)
+       (when aborted (reseed-settlement-test-abort-attempt root expected))
+       (pg::call-with-physical-reseed-follow-configuration-owner
+        root
+        (lambda (owner)
+          (labels ((identity-at (path)
+                     (let ((stat (sb-posix:lstat path)))
+                       (list (sb-posix:stat-dev stat) (sb-posix:stat-ino stat)))))
+            (let* ((moved (if (zerop step) (merge-pathnames "saved/follow.pending" workspace)
+                              (merge-pathnames "physical-follow.control" root)))
+                   (peer (if (zerop step) (merge-pathnames "saved/" workspace)
+                             (merge-pathnames "staged/" workspace)))
+                   (roles (list (list :moved (identity-at moved))
+                                (list :root (identity-at root))
+                                (list :peer (identity-at peer))))
+                   (before (activation-test-snapshot owner))
+                   (original-fsync (symbol-function 'sb-posix:fsync))
+                   (original-read (symbol-function 'pg::physical-reseed-follow-read-at))
+                   (events nil)
+                   (renames 0)
+                   (outcome nil)
+                   (pg::*physical-reseed-follow-test-hook*
+                     (lambda (event path)
+                       (declare (ignore path))
+                       (when (eq event :after-activation-move) (incf renames)))))
+              (unwind-protect
+                   (progn
+                     (setf (symbol-function 'sb-posix:fsync)
+                           (lambda (fd)
+                             (let* ((stat (sb-posix:fstat fd))
+                                    (pair (list (sb-posix:stat-dev stat) (sb-posix:stat-ino stat))))
+                               (push (or (first (find pair roles :key #'second :test #'equal)) :other) events))
+                             (funcall original-fsync fd))
+                           (symbol-function 'pg::physical-reseed-follow-read-at)
+                           (lambda (fd name &key stabilize)
+                             (when stabilize (push :journal-stabilize events))
+                             (funcall original-read fd name :stabilize stabilize)))
+                     (setf outcome
+                           (handler-case
+                               (list :ok (pg::physical-reseed-follow-recover-activation owner))
+                             (error (condition) (list :error (princ-to-string condition))))))
+                (setf (symbol-function 'sb-posix:fsync) original-fsync
+                      (symbol-function 'pg::physical-reseed-follow-read-at) original-read))
+              (setf events (nreverse events))
+              (format t "~&STABLE-RECOVERY-ORDER ~d ~s ~s~%" step aborted events)
+              (if aborted
+                  (progn
+                    (ok (eq :error (first outcome)))
+                    (ok (and (stringp (second outcome))
+                             (search "exact active original attempt" (second outcome))))
+                    (ok (null events))
+                    (ok (pg::physical-reseed-follow-owner-uncertain-p owner)))
+                  (progn
+                    (ok (eq :ok (first outcome)))
+                    (ok (equal expected (second outcome)))
+                    (ok (equal (append '(:moved :moved)
+                                       (if (zerop step) '(:root :peer) '(:peer :root))
+                                       '(:journal-stabilize))
+                               (subseq events 0 (min 5 (length events)))))
+                    (ok (not (pg::physical-reseed-follow-owner-uncertain-p owner)))))
+              (ok (zerop renames))
+              (ok (not (pg::physical-reseed-follow-owner-busy-p owner)))
+              (ok (equal before (activation-test-snapshot owner)))))))))))
+
+(deftest reseed-activation-stable-recovery-resyncs-one-ahead-before-journal
+    (dolist (step '(0 1))
+      (check-reseed-activation-stable-recovery-order step nil)))
+
+(deftest reseed-activation-stable-one-ahead-recovery-refuses-aborted-attempt
+    (dolist (step '(0 1))
+      (check-reseed-activation-stable-recovery-order step t)))
+
+(defun check-reseed-activation-move-reentry (event expected-message)
+  (call-with-reseed-activating-fixture
+   :same-timeline
+   (lambda (owner root workspace record)
+     (declare (ignore root workspace))
+     (let* ((hit nil)
+            (pg::*physical-reseed-follow-test-hook*
+              (lambda (actual path)
+                (declare (ignore path))
+                (when (and (eq event actual) (not hit))
+                  (setf hit t)
+                  (let* ((context (pg::physical-reseed-follow-activation-context owner))
+                         (prefix (pg::physical-reseed-follow-activation-context-prefix context))
+                         (original (symbol-function 'sb-posix:fsync))
+                         (syncs 0)
+                         (message nil))
+                    (unwind-protect
+                         (progn
+                           (setf (symbol-function 'sb-posix:fsync)
+                                 (lambda (fd) (incf syncs) (funcall original fd)))
+                           (handler-case
+                               (pg::physical-reseed-follow-activation-next-move
+                                context (lambda () (pg::physical-reseed-follow-activation-verify context)))
+                             (error (condition) (setf message (princ-to-string condition)))))
+                      (setf (symbol-function 'sb-posix:fsync) original))
+                    (ok (and message (search expected-message message)))
+                    (ok (zerop syncs))
+                    (ok (= prefix (pg::physical-reseed-follow-activation-context-prefix context)))
+                    (let ((verified (pg::physical-reseed-follow-activation-verify context)))
+                      (ok verified)))))))
+       (ok (equal (pg::physical-reseed-follow-activation-progress-record record)
+                  (pg::physical-reseed-follow-advance-activation owner)))
+       (ok hit)
+       (ok (not (pg::physical-reseed-follow-owner-uncertain-p owner)))
+       (ok (not (pg::physical-reseed-follow-owner-busy-p owner)))))))
+
+(deftest reseed-activation-progress-publication-blocks-another-move
+    (check-reseed-activation-move-reentry
+     :after-follow-rename "overlaps an active publication authority"))
+
+(deftest reseed-activation-move-refuses-recursive-entry
+    (check-reseed-activation-move-reentry
+     :before-activation-move "activation move is already active"))
+
+(deftest reseed-activation-progress-publication-refuses-a-reused-witness
+    (call-with-reseed-activating-fixture
+     :same-timeline
+     (lambda (owner root workspace record)
+       (declare (ignore root workspace))
+       (let ((escaped nil))
+         (pg::call-with-physical-reseed-follow-activation-operation
+          owner
+          (lambda (fd check)
+            (declare (ignore fd))
+            (let ((context (pg::physical-reseed-follow-activation-context owner)))
+              (pg::call-with-physical-reseed-follow-activation-progress
+               context check
+               (lambda (candidate)
+                 (declare (ignore candidate))
+                 (setf escaped (pg::physical-reseed-follow-activation-progress context))
+                 (values record (pg::physical-reseed-follow-activation-context-snapshot context)))))))
+         (ok (not (pg::physical-reseed-follow-activation-progress-active-p escaped)))
+         (let ((before (activation-test-snapshot owner)))
+           (pg::call-with-physical-reseed-follow-activation-operation
+            owner
+            (lambda (fd check)
+              (declare (ignore fd))
+              (let* ((context (pg::physical-reseed-follow-activation-context owner))
+                     (candidate (pg::physical-reseed-follow-activation-progress-record record))
+                     (pg::*physical-reseed-follow-activation-progress* escaped)
+                     (pg::*physical-reseed-follow-activation-candidate* candidate)
+                     (message nil))
+                (handler-case
+                    (pg::physical-reseed-follow-configuration-publication-candidate owner context candidate)
+                  (error (condition) (setf message (princ-to-string condition))))
+                (ok (and message (search "live thread-bound durability proof" message)))
+                (funcall check)
+                (values record (pg::physical-reseed-follow-activation-context-snapshot context)))))
+           (ok (equal before (activation-test-snapshot owner))))
          (ok (not (pg::physical-reseed-follow-owner-uncertain-p owner)))
          (ok (not (pg::physical-reseed-follow-owner-busy-p owner)))))))
 

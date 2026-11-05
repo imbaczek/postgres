@@ -249,6 +249,17 @@
 
 (defvar *physical-reseed-follow-activation-progress* nil)
 
+(defvar *physical-reseed-follow-activation-moving*
+  nil)
+
+(defun physical-reseed-follow-activation-check-local-entry ()
+  (when (or *physical-reseed-follow-activation-authority*
+            *physical-reseed-follow-activation-progress*)
+    (error "activation progress overlaps an active publication authority"))
+  (when *physical-reseed-follow-activation-moving*
+    (error "activation move is already active"))
+  t)
+
 (defstruct (physical-reseed-follow-activation-progress
             (:constructor %make-physical-reseed-follow-activation-progress)
             (:print-function physical-libpq-print-private-object))
@@ -328,9 +339,7 @@
   ;; The initial source authority scope must end before local progress begins.
   ;; Sync the next move or its one-ahead layout, freeze the resulting facts,
   ;; and revoke the thread-bound witness after the callback.
-  (when (or *physical-reseed-follow-activation-progress*
-            *physical-reseed-follow-activation-authority*)
-    (error "activation progress overlaps an active publication authority"))
+  (physical-reseed-follow-activation-check-local-entry)
   (let* ((before (physical-reseed-follow-copy
                   (physical-reseed-follow-activation-context-record context)))
          (candidate (physical-reseed-follow-activation-progress-record before))
@@ -732,6 +741,12 @@
                                 (promote))))))
                  (when fd (sb-posix:close fd))))
              (progn
+               (let ((activation (getf (physical-reseed-follow-activation-context-record context)
+                                       :activation)))
+                 (when (and (eq :activating (getf activation :phase))
+                            (< (getf activation :step)
+                               (physical-reseed-follow-activation-context-prefix context)))
+                   (physical-reseed-follow-activation-next-move context check)))
                (setf (physical-reseed-follow-owner-uncertain-p owner) t)
                (physical-reseed-follow-read-at root "physical-reseed.follow" :stabilize t)
                (funcall check)
@@ -966,11 +981,13 @@
   ;; Rename may change ctime while the other recorded file facts remain fixed.
   ;; A one-ahead layout is resynced without repeating the rename.
   (declare (notinline sb-posix:fsync physical-adoption-renameat2))
+  (physical-reseed-follow-activation-check-local-entry)
   (unless (eq context
               (physical-reseed-follow-activation-context
                (physical-reseed-follow-activation-context-owner context)))
     (error "activation move requires its current context"))
-  (let* ((record (physical-reseed-follow-activation-context-record context))
+  (let* ((*physical-reseed-follow-activation-moving* context)
+         (record (physical-reseed-follow-activation-context-record context))
          (activation (getf record :activation))
          (step (getf activation :step))
          (prefix (physical-reseed-follow-activation-context-prefix context))
