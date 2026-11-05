@@ -35,7 +35,7 @@
 ;; optional file and root sync, before decoding.  The caller supplies the
 ;; lock and root ownership proof.
 
-(defun physical-reseed-attempt-read-at (root-fd name &key stabilize)
+(defun physical-reseed-attempt-read-state-at (root-fd name &key stabilize check-fd)
   (unless (member name '("physical-reseed.attempt" "physical-reseed.attempt.tmp") :test #'equal)
     (error "unexpected reseed metadata name"))
   (let ((fd nil) (stream nil)
@@ -54,14 +54,21 @@
                (error "reseed metadata changed before reading"))
              (sb-sys:without-interrupts
                (setf stream (sb-sys:make-fd-stream fd :input t :output stabilize :element-type '(unsigned-byte 8))))
+             (when check-fd (funcall check-fd fd))
+             (physical-reseed-attempt-test-point :after-attempt-open path)
              (when stabilize (fsync-stream stream) (sb-posix:fsync root-fd))
              (unless (and (= size (read-sequence bytes stream))
                           (eq :eof (read-byte stream nil :eof))
                           (equal before (physical-reseed-attempt-file-identity (sb-posix:fstat fd)))
                           (equal before (physical-reseed-attempt-file-identity (sb-posix:lstat (namestring path)))))
                (error "reseed metadata changed while reading"))
-             (physical-reseed-attempt-decode bytes)))
+             (when check-fd (funcall check-fd fd))
+             (list :record (physical-reseed-attempt-decode bytes)
+                   :identity before :digest (physical-store-update-digest #xCBF29CE484222325 bytes))))
       (if stream (close stream) (when fd (sb-posix:close fd))))))
+
+(defun physical-reseed-attempt-read-at (root-fd name &key stabilize)
+  (getf (physical-reseed-attempt-read-state-at root-fd name :stabilize stabilize) :record))
 
 ;; Anchor the raw read to the checked root without calling the role method.
 ;; Cleanup needs this path while its role check is verifying the attempt itself.

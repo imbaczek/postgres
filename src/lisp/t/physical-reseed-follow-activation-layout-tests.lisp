@@ -54,6 +54,100 @@
                (throw 'activation-layout-checked :checked))))))
      kind)))
 
+(deftest reseed-retirement-attempt-observes-root-and-one-ahead-archive
+    (call-with-reseed-activation-layout-fixture
+     :same-timeline
+     (lambda (owner root workspace record binding images descriptors check)
+       (declare (ignore owner root workspace binding images check))
+       (setf (getf (getf record :activation) :phase) :active
+             (getf (getf record :activation) :step) 2)
+       (let* ((root-fd (cdr (assoc :root descriptors)))
+              (saved-fd (cdr (assoc :saved descriptors)))
+              (state (funcall (symbol-function 'pg::physical-reseed-follow-retirement-attempt-at)
+                              root-fd root-fd record 0))
+              (reference (list :identity (copy-list (getf state :identity))
+                               :digest (getf state :digest))))
+         (ok (equal (getf record :attempt) (getf state :record)))
+         (ok (= (sb-posix:geteuid) (fourth (getf state :identity))))
+         (ok (= 1 (fifth (getf state :identity))))
+         (ok (handler-case
+                 (progn (pg::physical-reseed-follow-retirement-attempt-at saved-fd saved-fd record 0) nil)
+               (error (condition) (search "PGDATA binding" (princ-to-string condition)))))
+         (setf (getf record :retirement)
+               (list :phase :retiring :step 0 :attempt-file reference))
+         (ok (equal state (pg::physical-reseed-follow-retirement-attempt-at root-fd root-fd record 1)))
+         (decf (eighth (getf reference :identity)))
+         (ok (handler-case
+                 (progn (pg::physical-reseed-follow-retirement-attempt-at root-fd root-fd record 0) nil)
+               (error (condition) (search "frozen attempt file reference" (princ-to-string condition)))))
+         (incf (eighth (getf reference :identity)))
+         (unless (zerop (pg::physical-adoption-renameat2
+                         root-fd "physical-reseed.attempt" saved-fd "physical-reseed.attempt"
+                         pg::+physical-adoption-rename-noreplace+))
+           (error "attempt archive fixture move failed"))
+         (setf (getf (getf record :retirement) :step) 1)
+         (let ((archived (pg::physical-reseed-follow-retirement-attempt-at root-fd saved-fd record 2)))
+           (ok (equal (getf state :record) (getf archived :record)))
+           (ok (= (getf state :digest) (getf archived :digest)))
+           (ok (equal (butlast (getf state :identity)) (butlast (getf archived :identity))))
+           (decf (eighth (getf reference :identity)))
+           (ok (pg::physical-reseed-follow-retirement-attempt-at root-fd saved-fd record 2))
+           (incf (seventh (getf reference :identity)))
+           (ok (handler-case
+                   (progn (pg::physical-reseed-follow-retirement-attempt-at root-fd saved-fd record 2) nil)
+                 (error (condition) (search "frozen attempt file reference" (princ-to-string condition)))))
+           (decf (seventh (getf reference :identity))))
+         (ok (handler-case
+                 (progn (pg::physical-reseed-follow-retirement-attempt-at root-fd root-fd record 2) nil)
+               (error (condition) (search "attempt container disagrees" (princ-to-string condition)))))))))
+
+(deftest reseed-retirement-attempt-refuses-abort-replacement-and-same-byte-write
+    (dolist (kind '(:aborting :replacement :same-byte-write))
+      (call-with-reseed-activation-layout-fixture
+       :same-timeline
+       (lambda (owner root workspace record binding images descriptors check)
+         (declare (ignore owner workspace binding images check))
+         (setf (getf (getf record :activation) :phase) :active
+               (getf (getf record :activation) :step) 2)
+         (let* ((root-fd (cdr (assoc :root descriptors)))
+                (path (merge-pathnames "physical-reseed.attempt" root))
+                (saved (merge-pathnames "attempt.original" root))
+                (original (lineage-test-bytes path))
+                (bytes original)
+                (fired nil))
+           (when (eq kind :aborting)
+             (let ((aborted (pg::physical-reseed-attempt-copy (getf record :attempt))))
+               (setf (getf aborted :phase) :aborting
+                     bytes (pg::physical-reseed-attempt-image aborted))
+               (with-open-file (out path :direction :output :if-exists :overwrite
+                                         :element-type '(unsigned-byte 8))
+                 (write-sequence bytes out)
+                 (finish-output out)
+                 (sb-posix:ftruncate (sb-sys:fd-stream-fd out) (length bytes)))))
+           (let ((pg::*physical-reseed-attempt-test-hook*
+                   (lambda (point observed)
+                     (declare (ignore observed))
+                     (when (and (not fired) (eq point :after-attempt-open)
+                                (not (eq kind :aborting)))
+                       (setf fired t)
+                       (when (eq kind :replacement)
+                         (sb-posix:rename (namestring path) (namestring saved)))
+                       (with-open-file (out path :direction :output :if-exists :overwrite
+                                                 :if-does-not-exist :create :element-type '(unsigned-byte 8))
+                         (sb-posix:fchmod (sb-sys:fd-stream-fd out) #o600)
+                         (write-sequence bytes out))))))
+             (ok (handler-case
+                     (progn (pg::physical-reseed-follow-retirement-attempt-at root-fd root-fd record 0) nil)
+                   (error (condition)
+                     (search (if (eq kind :aborting) "exact active original attempt" "changed")
+                             (princ-to-string condition))))))
+           (ok (eq fired (not (eq kind :aborting))))
+           (ok (equalp bytes (lineage-test-bytes path)))
+           (when (eq kind :replacement)
+             (ok (equalp original (lineage-test-bytes saved)))
+             (ok (/= (sb-posix:stat-ino (sb-posix:lstat (namestring path)))
+                     (sb-posix:stat-ino (sb-posix:lstat (namestring saved)))))))))))
+
 (deftest reseed-activation-layout-proves-every-actual-move-prefix-read-only
     (dolist (kind '(:same-timeline :retained-timeline :before-fork :at-fork :later-writer))
       (ok
