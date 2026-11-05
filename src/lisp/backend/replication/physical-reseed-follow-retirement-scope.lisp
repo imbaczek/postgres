@@ -1,6 +1,8 @@
 (in-package #:pg)
 
 (defun physical-reseed-follow-retirement-directory-check (root expected fd)
+  ;; Check the held directory against its canonical name, recorded identity
+  ;; and root mount.
   (let* ((directory (pathname (getf expected :directory)))
          (parent (physical-image-check-directory root))
          (stat (physical-image-check-directory fd (sb-posix:stat-dev parent)))
@@ -16,6 +18,8 @@
   t)
 
 (defun physical-reseed-follow-retirement-guard-observation (fd expected lock fence)
+  ;; Capture stable facts for both held guard streams and their recorded
+  ;; inodes so the directory scope can recheck them.
   (let ((mount (physical-adoption-install-mount-id nil :directory-fd fd)))
     (loop for (name stream key) in (list (list ".pg_lisp.lock" lock :lock-inode)
                                          (list "physical-reseed.install" fence :fence-inode))
@@ -28,6 +32,8 @@
             row))))
 
 (defun call-with-physical-reseed-follow-retirement-directory (root value function parent-check)
+  ;; Borrow ROOT and hold the named directory and both guard streams around
+  ;; the callback.  VERIFY is valid only on this thread within the scope.
   (let ((expected (physical-adoption-attempt-value-copy value))
         (fd nil) (active nil) (thread sb-thread:*current-thread*))
     (unwind-protect
@@ -61,6 +67,8 @@
       (when fd (sb-posix:close fd)))))
 
 (defun physical-reseed-follow-retirement-check-workspace (record plan)
+  ;; Reject workspace overlap with either installation auxiliary before
+  ;; acquiring the remaining directories.
   (let* ((workspace (getf (getf record :configuration) :workspace))
          (directory (pathname (getf workspace :directory))))
     (dolist (other (list (getf plan :incoming) (getf plan :quarantine)))
@@ -72,6 +80,8 @@
   t)
 
 (defun call-with-physical-reseed-follow-retirement-auxiliaries (root plan function check)
+  ;; Hold incoming and quarantine together and chain their checks around the
+  ;; callback.
   (call-with-physical-reseed-follow-retirement-directory
    root (getf plan :incoming)
    (lambda (incoming incoming-check)
@@ -83,6 +93,8 @@
    check))
 
 (defun physical-reseed-follow-retirement-check-receive (descriptors store record base binding check)
+  ;; Check the exact activated receive tuple and retained prefix, then validate
+  ;; the active follow state against the held base directories.
   (funcall check)
   (physical-store-check-live store)
   (physical-store-check-complete-input store)
@@ -105,6 +117,11 @@
 
 (defun call-with-physical-reseed-follow-retirement-receive
     (descriptors snapshot base binding function check)
+  ;; Open the local store without discarding tails or creating a lock.  Normal
+  ;; process-local retained-root restoration still applies.  ON-OPEN captures
+  ;; the store for outer cleanup under the opener's failure cleanup.
+  ;; VERIFY repeats layout and active receive checks on this thread.  The
+  ;; callback gets copies and VERIFY is revoked on scope exit.
   (let* ((record (physical-reseed-follow-copy (getf snapshot :record)))
          (thread sb-thread:*current-thread*) (active nil)
          (store nil) (state nil))
@@ -140,6 +157,10 @@
       (when store (physical-store-close store)))))
 
 (defun call-with-physical-reseed-follow-retirement-observation (root snapshot parent-check function)
+  ;; Borrow ROOT and its parent ownership from the caller.  Hold the other nine
+  ;; directory descriptors, guard streams and local store for the callback.
+  ;; This read-only scope refuses temporary and PID entries.  It grants no
+  ;; mutation or startup admission authority.
   (let* ((snapshot (physical-adoption-attempt-value-copy snapshot))
          (record (physical-reseed-follow-copy (getf snapshot :record)))
          (configuration (getf record :configuration))

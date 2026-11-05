@@ -78,6 +78,8 @@
       (append state (list :row row)))))
 
 (defun physical-reseed-follow-retirement-provisional-plan-at (root saved value)
+  ;; Read one root or saved install journal to obtain a provisional plan.
+  ;; The complete layout proof later establishes the location and saved role.
   (let* ((record (physical-reseed-follow-copy value))
          (activation (getf record :activation))
          (present (loop for fd in (list root saved)
