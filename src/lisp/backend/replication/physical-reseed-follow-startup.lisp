@@ -1,6 +1,9 @@
 (in-package #:pg)
 
 (defun physical-reseed-follow-startup-projection (descriptors state)
+  ;; Copy facts for comparison across PID creation and map image descriptors
+  ;; to directory roles.  Retain root identity, permissions and ownership while
+  ;; omitting root size and timestamps, the root PID name and current PID metadata.
   (flet ((file-row (entry)
            (let ((roles (loop for (role . fd) in descriptors
                               when (= fd (second entry)) collect role)))
@@ -29,6 +32,10 @@
       (physical-adoption-attempt-value-copy projection))))
 
 (defun call-with-physical-reseed-follow-startup-root (lock function)
+  ;; Borrow the unpublished lock and own the root descriptor for this callback.
+  ;; The temporary owner and check are thread-bound and revoked on exit.  The
+  ;; check uses common ownership checks and repeats flock on the same descriptor.
+  ;; Reasserting flock proves current exclusivity and can reacquire a released lock.
   (unless (and lock (open-stream-p lock) (null *postmaster-data-lock*))
     (error "reseed startup observation requires the unpublished local lock"))
   (let* ((directory (uiop:ensure-directory-pathname (truename *pgdata*)))
@@ -77,6 +84,9 @@
       (setf (physical-adoption-owner-active-p owner) nil))))
 
 (defun physical-reseed-follow-startup-observation (lock phase &optional expected)
+  ;; Observe before PID creation and compare exact retirement evidence after
+  ;; PID ownership.  The ordinary branch runs the existing startup guards.
+  ;; This dispatcher returns read-only evidence for later reconciliation.
   (ecase phase
     (:before-pid
      (when expected (error "initial startup observation cannot reuse boundary evidence")))
