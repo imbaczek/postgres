@@ -186,6 +186,43 @@
            (when store (physical-store-close store)))))
      check)))
 
+(defun call-with-physical-reseed-follow-mapped-predecessor (owner function)
+  (call-with-physical-reseed-install-directories
+   owner
+   (lambda (root incoming quarantine value-plan root-check)
+     (let* ((snapshot (physical-reseed-follow-snapshot-at root))
+            (record (physical-reseed-follow-copy (getf snapshot :record)))
+            (attempt (physical-reseed-follow-attempt-snapshot-at root))
+            (install-state (physical-reseed-install-read-at root "physical-reseed.install")))
+       (multiple-value-bind (plan checked)
+           (physical-reseed-follow-configuration-install-plan value-plan record)
+         (setf record checked)
+         (physical-reseed-follow-check-binding owner record)
+         (unless (and (equal plan (getf install-state :plan))
+                      (equal (getf record :install) (physical-reseed-follow-terminal-reference install-state)))
+           (error "mapped image does not match the actual terminal predecessor"))
+         (flet ((journal-check ()
+                  (funcall root-check)
+                  (physical-reseed-check-owner owner)
+                  (physical-reseed-follow-check-attempt-snapshot-at root attempt)
+                  (unless (equal install-state (physical-reseed-install-read-at root "physical-reseed.install"))
+                    (error "mapped image predecessor changed"))))
+           (journal-check)
+           (physical-reseed-follow-check-snapshot root snapshot)
+           (call-with-physical-reseed-follow-installation-workspace
+            owner root record
+            (lambda (workspace staged saved workspace-check)
+              (call-with-physical-reseed-follow-base-directories
+               root plan
+               (lambda (base-fds base-check)
+                 (physical-reseed-follow-check-snapshot root snapshot)
+                 (let ((descriptors (append (list (cons :root root) (cons :incoming incoming)
+                                                  (cons :quarantine quarantine) (cons :workspace workspace)
+                                                  (cons :staged staged) (cons :saved saved)) base-fds)))
+                   (funcall function descriptors plan record install-state attempt snapshot base-check)))
+               workspace-check))
+            #'journal-check)))))))
+
 ;; Hold root, incoming, quarantine, workspace, staged, saved, base, global, WAL
 ;; and receive descriptors for one mapped proof.  Keep journal and attempt checks
 ;; separate from the full layout proof so they cannot recurse into this scope.
@@ -194,45 +231,17 @@
     (error "mapped image requires dedicated configuration ownership"))
   (when *physical-reseed-follow-installation-scope* (error "mapped installation scope is already active"))
   (let ((*physical-reseed-follow-installation-scope* :acquiring))
-    (call-with-physical-reseed-install-directories
+    (call-with-physical-reseed-follow-mapped-predecessor
      owner
-     (lambda (root incoming quarantine value-plan root-check)
-       (let* ((snapshot (physical-reseed-follow-snapshot-at root))
-              (record (physical-reseed-follow-copy (getf snapshot :record)))
-              (attempt (physical-reseed-follow-attempt-snapshot-at root))
-              (install-state (physical-reseed-install-read-at root "physical-reseed.install")))
-         (multiple-value-bind (plan checked)
-             (physical-reseed-follow-configuration-install-plan value-plan record)
-           (setf record checked)
-           (physical-reseed-follow-check-binding owner record)
-           (unless (and (equal plan (getf install-state :plan))
-                        (equal (getf record :install) (physical-reseed-follow-terminal-reference install-state)))
-             (error "mapped installation does not match the actual terminal predecessor"))
-           (flet ((journal-check ()
-                    (funcall root-check)
-                    (physical-reseed-check-owner owner)
-                    (physical-reseed-follow-check-attempt-snapshot-at root attempt)
-                    (unless (equal install-state (physical-reseed-install-read-at root "physical-reseed.install"))
-                      (error "mapped installation predecessor changed"))))
-             (journal-check)
-             (physical-reseed-follow-check-snapshot root snapshot)
-             (call-with-physical-reseed-follow-installation-workspace
-              owner root record
-              (lambda (workspace staged saved workspace-check)
-                (call-with-physical-reseed-follow-base-directories
-                 root plan
-                 (lambda (base-fds base-check)
-                   (physical-reseed-follow-check-snapshot root snapshot)
-                   (let* ((extra (physical-reseed-install-extra-entries owner root))
-                          (prefix (physical-reseed-follow-configuration-initial-prefix
-                                   root workspace staged saved plan record extra))
-                          (descriptors (append (list (cons :root root) (cons :incoming incoming)
-                                                     (cons :quarantine quarantine) (cons :workspace workspace)
-                                                     (cons :staged staged) (cons :saved saved)) base-fds)))
-                     (call-with-physical-reseed-follow-installation-context
-                      owner descriptors plan record install-state attempt snapshot prefix base-check function)))
-                 workspace-check))
-              #'journal-check))))))))
+     (lambda (descriptors plan record install-state attempt snapshot check)
+       (let* ((root (physical-reseed-follow-configuration-role-fd descriptors :root))
+              (extra (physical-reseed-install-extra-entries owner root))
+              (prefix (physical-reseed-follow-configuration-initial-prefix
+                       root (physical-reseed-follow-configuration-role-fd descriptors :workspace)
+                       (physical-reseed-follow-configuration-role-fd descriptors :staged)
+                       (physical-reseed-follow-configuration-role-fd descriptors :saved) plan record extra)))
+         (call-with-physical-reseed-follow-installation-context
+          owner descriptors plan record install-state attempt snapshot prefix check function))))))
 
 (defmethod physical-reseed-follow-image-dispatch
     ((owner physical-reseed-follow-configuration-owner) function)
