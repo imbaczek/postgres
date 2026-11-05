@@ -246,6 +246,99 @@
       (physical-reseed-follow-check-transition value candidate)
       candidate)))
 
+(defvar *physical-reseed-follow-activation-progress* nil)
+
+(defstruct (physical-reseed-follow-activation-progress
+            (:constructor %make-physical-reseed-follow-activation-progress)
+            (:print-function physical-libpq-print-private-object))
+  context thread active-p before snapshot candidate prefix facts published)
+
+(defun physical-reseed-follow-activation-progress (context)
+  (let ((proof *physical-reseed-follow-activation-progress*))
+    (unless (and (physical-reseed-follow-activation-progress-p proof)
+                 (physical-reseed-follow-activation-progress-active-p proof)
+                 (eq context (physical-reseed-follow-activation-progress-context proof))
+                 (eq sb-thread:*current-thread*
+                     (physical-reseed-follow-activation-progress-thread proof))
+                 (eq context
+                     (physical-reseed-follow-activation-context
+                      (physical-reseed-follow-activation-context-owner context))))
+      (error "activation progress requires its live thread-bound durability proof"))
+    proof))
+
+(defun physical-reseed-follow-activation-progress-observe (context)
+  (let* ((layout (physical-reseed-follow-activation-layout
+                  context (lambda () (physical-reseed-follow-activation-guard context))))
+         (names (physical-adoption-attempt-value-copy (getf layout :names))))
+    (setf (getf names :root)
+          (set-difference (getf names :root)
+                          '("physical-reseed.follow" "physical-reseed.follow.tmp") :test #'equal))
+    (physical-adoption-attempt-value-copy
+     (list :attempt (physical-reseed-follow-activation-context-attempt context)
+           :install (physical-reseed-follow-activation-context-install-state context)
+           :plan (physical-reseed-follow-activation-context-plan context)
+           :prefix (physical-reseed-follow-activation-context-prefix context)
+           :new (getf layout :new) :images (getf layout :images)
+           :active (getf layout :active) :old (getf layout :old)
+           :directories (loop for row in (getf layout :directories)
+                              collect (if (eq :root (first row)) (subseq row 0 7) row))
+           :names names))))
+
+(defun physical-reseed-follow-activation-check-progress-candidate (context value)
+  (let* ((proof (physical-reseed-follow-activation-progress context))
+         (before (physical-reseed-follow-activation-progress-before proof))
+         (candidate (physical-reseed-follow-copy value))
+         (expected (physical-reseed-follow-activation-progress-record before)))
+    (unless (and (equal candidate expected)
+                 (equal candidate (physical-reseed-follow-activation-progress-candidate proof))
+                 (equal (physical-reseed-follow-activation-context-record context)
+                        (if (physical-reseed-follow-activation-progress-published proof) candidate before)))
+      (error "activation progress differs from its frozen exact next transition"))
+    candidate))
+
+(defun physical-reseed-follow-activation-check-progress (context)
+  (let* ((proof (physical-reseed-follow-activation-progress context))
+         (published (physical-reseed-follow-activation-progress-published proof)))
+    (physical-reseed-follow-activation-require-attempt context)
+    (physical-reseed-follow-activation-check-progress-candidate
+     context (physical-reseed-follow-activation-progress-candidate proof))
+    (unless (and (= (physical-reseed-follow-activation-context-prefix context)
+                    (physical-reseed-follow-activation-progress-prefix proof))
+                 (equal (physical-reseed-follow-activation-context-snapshot context)
+                        (or published (physical-reseed-follow-activation-progress-snapshot proof)))
+                 (equal (physical-reseed-follow-activation-progress-observe context)
+                        (physical-reseed-follow-activation-progress-facts proof)))
+      (error "activation progress lost its synced local facts"))
+    t))
+
+(defun call-with-physical-reseed-follow-activation-progress (context check function &key recovery)
+  (when (or *physical-reseed-follow-activation-progress*
+            *physical-reseed-follow-activation-authority*)
+    (error "activation progress overlaps an active publication authority"))
+  (let* ((before (physical-reseed-follow-copy
+                  (physical-reseed-follow-activation-context-record context)))
+         (candidate (physical-reseed-follow-activation-progress-record before))
+         (step (getf (getf before :activation) :step))
+         (prefix (min 2 (1+ step)))
+         (snapshot (physical-adoption-attempt-value-copy
+                    (physical-reseed-follow-activation-context-snapshot context))))
+    (when (and recovery (/= prefix (physical-reseed-follow-activation-context-prefix context)))
+      (error "activation recovery requires the move already at its candidate prefix"))
+    (if (< step 2)
+        (physical-reseed-follow-activation-next-move context check)
+        (funcall check))
+    (funcall check)
+    (let* ((proof (%make-physical-reseed-follow-activation-progress
+                   :context context :thread sb-thread:*current-thread* :active-p t
+                   :before before :snapshot snapshot :candidate candidate :prefix prefix
+                   :facts (physical-reseed-follow-activation-progress-observe context)))
+           (*physical-reseed-follow-activation-progress* proof))
+      (unwind-protect
+           (progn
+             (physical-reseed-follow-activation-check-progress context)
+             (funcall function candidate))
+        (setf (physical-reseed-follow-activation-progress-active-p proof) nil)))))
+
 (defun physical-reseed-follow-activation-intent-candidate (context value)
   ;; Check the frozen pure successor against the original snapshot and anchor.
   ;; The context may hold the predecessor or the adopted successor.
@@ -375,12 +468,14 @@
   t)
 
 (defun physical-reseed-follow-activation-publication-check (owner context candidate)
-  ;; Keep the candidate and operation kind frozen throughout publication.
-  ;; Other publication kinds cannot use this activation scope.
   (physical-reseed-follow-activation-publication-scope-check owner context candidate)
   (case (getf (getf candidate :activation) :phase)
     (:staged (physical-reseed-follow-activation-check-durable-output context candidate))
-    (:activating (physical-reseed-follow-activation-authority-check context)))
+    (:activating
+     (if (zerop (getf (getf candidate :activation) :step))
+         (physical-reseed-follow-activation-authority-check context)
+         (physical-reseed-follow-activation-check-progress context)))
+    (:active (physical-reseed-follow-activation-check-progress context)))
   t)
 
 (defmethod physical-reseed-follow-configuration-publication-candidate
@@ -390,24 +485,31 @@
   (case (getf (getf candidate :activation) :phase)
     (:building (physical-reseed-follow-activation-building-candidate context candidate))
     (:staged (physical-reseed-follow-activation-staged-candidate context candidate))
-    (:activating (physical-reseed-follow-activation-intent-candidate context candidate))
+    (:activating
+     (if (zerop (getf (getf candidate :activation) :step))
+         (physical-reseed-follow-activation-intent-candidate context candidate)
+         (physical-reseed-follow-activation-check-progress-candidate context candidate)))
+    (:active (physical-reseed-follow-activation-check-progress-candidate context candidate))
     (otherwise (error "unsupported activation publication phase"))))
 
 (defmethod physical-reseed-follow-published-snapshot :around
     ((owner physical-reseed-follow-configuration-owner) root-fd candidate snapshot previous)
-  ;; Check the exact prior snapshot and frozen candidate after rename.
-  ;; Adopt the published snapshot before the next guard runs.  Initial intent
-  ;; authority permits one such adoption and then checks the new snapshot.
   (unless *physical-reseed-follow-activation-scope*
     (return-from physical-reseed-follow-published-snapshot (call-next-method)))
   (let* ((context (physical-reseed-follow-activation-context owner))
-         (intent (eq :activating (getf (getf candidate :activation) :phase))))
-    (when intent
+         (activation (getf candidate :activation))
+         (phase (getf activation :phase))
+         (intent (and (eq :activating phase) (zerop (getf activation :step))))
+         (progress (or (eq :active phase)
+                       (and (eq :activating phase) (plusp (getf activation :step))))))
+    (when (or intent progress)
       (physical-reseed-follow-activation-publication-scope-check owner context candidate))
     (unless (and (equal candidate
-                        (if intent
-                            (physical-reseed-follow-activation-intent-candidate context candidate)
-                            (physical-reseed-follow-configuration-publication-candidate owner context candidate)))
+                        (cond (intent (physical-reseed-follow-activation-intent-candidate context candidate))
+                              (progress
+                               (physical-reseed-follow-activation-check-progress-candidate context candidate))
+                              (t (physical-reseed-follow-configuration-publication-candidate
+                                  owner context candidate))))
                  (= root-fd (physical-reseed-follow-configuration-role-fd
                              (physical-reseed-follow-activation-context-descriptors context) :root))
                  (equal previous (physical-reseed-follow-activation-context-snapshot context))
@@ -417,13 +519,22 @@
     (when intent
       (let ((authority (physical-reseed-follow-activation-authority context)))
         (unless (and (null (physical-reseed-follow-activation-authority-published authority))
-                     (equal previous (getf (physical-reseed-follow-activation-authority-snapshot authority) :follow)))
+                     (equal previous
+                            (getf (physical-reseed-follow-activation-authority-snapshot authority) :follow)))
           (error "source authority already adopted a journal or changed its predecessor"))
         (setf (physical-reseed-follow-activation-authority-published authority)
               (physical-adoption-attempt-value-copy snapshot))))
+    (when progress
+      (let ((proof (physical-reseed-follow-activation-progress context)))
+        (unless (and (null (physical-reseed-follow-activation-progress-published proof))
+                     (equal previous (physical-reseed-follow-activation-progress-snapshot proof)))
+          (error "activation progress already adopted a journal or changed its predecessor"))
+        (setf (physical-reseed-follow-activation-progress-published proof)
+              (physical-adoption-attempt-value-copy snapshot))))
     (setf (physical-reseed-follow-activation-context-record context) (physical-reseed-follow-copy candidate)
           (physical-reseed-follow-activation-context-snapshot context) snapshot)
-    (when intent (physical-reseed-follow-activation-authority-check context)))
+    (when intent (physical-reseed-follow-activation-authority-check context))
+    (when progress (physical-reseed-follow-activation-check-progress context)))
   t)
 
 (defun physical-reseed-follow-activation-publish (context value check)
@@ -524,47 +635,85 @@
                  context (physical-reseed-follow-activation-authority-candidate authority) check)))))))))
 
 (defun physical-reseed-follow-recover-local-activation (owner)
-  ;; Preflight the exact next Building or Staged temporary before promotion.
-  ;; Recheck its held identity and active attempt.  An uncertain failure
-  ;; fences the owner.
   (call-with-physical-reseed-follow-activation-operation
    owner
    (lambda (root check)
      (let* ((context (physical-reseed-follow-activation-context owner))
-            (previous (physical-reseed-follow-activation-context-snapshot context))
-            (temporary (physical-reseed-follow-entry root "physical-reseed.follow.tmp" t)))
-       (if temporary
-           (let* ((candidate (physical-reseed-follow-read-at root "physical-reseed.follow.tmp"))
-                  (*physical-reseed-follow-activation-candidate* (physical-reseed-follow-copy candidate))
-                  (fd nil))
-             (physical-reseed-follow-activation-prepare-recovery context candidate check)
-             (physical-reseed-follow-configuration-publication-candidate owner context candidate)
-             (unwind-protect
-                  (progn
-                    (funcall check)
-                    (physical-reseed-follow-activation-require-attempt context)
-                    (sb-sys:without-interrupts
-                      (setf fd (physical-image-openat
-                                root "physical-reseed.follow.tmp"
-                                (logior sb-posix:o-rdwr sb-posix:o-nofollow sb-posix:o-nonblock
-                                        +postmaster-o-cloexec+) 0)))
-                    (when (minusp fd) (setf fd nil) (error "cannot open activation recovery temporary"))
-                    (unless (equal temporary (physical-reseed-follow-file-identity (sb-posix:fstat fd)))
-                      (error "activation recovery temporary changed"))
-                    (setf (physical-reseed-follow-owner-uncertain-p owner) t)
-                    (physical-reseed-follow-promote-intent
-                     owner root fd (subseq temporary 0 5) candidate previous
-                     (lambda ()
-                       (funcall check)
-                       (physical-reseed-follow-activation-publication-check owner context candidate))))
-               (when fd (sb-posix:close fd))))
-           (progn
-             (setf (physical-reseed-follow-owner-uncertain-p owner) t)
-             (physical-reseed-follow-read-at root "physical-reseed.follow" :stabilize t)
-             (funcall check)
-             (values (physical-reseed-follow-copy
-                      (physical-reseed-follow-activation-context-record context))
-                     (physical-reseed-follow-activation-context-snapshot context))))))))
+            (previous (physical-reseed-follow-activation-context-snapshot context)))
+       (multiple-value-bind (temporary row)
+           (physical-reseed-follow-entry root "physical-reseed.follow.tmp" t)
+         (if temporary
+             (let ((fd nil))
+               (unwind-protect
+                    (progn
+                      (sb-sys:without-interrupts
+                        (setf fd (physical-image-openat
+                                  root "physical-reseed.follow.tmp"
+                                  (logior sb-posix:o-rdwr sb-posix:o-nofollow sb-posix:o-nonblock
+                                          +postmaster-o-cloexec+) 0)))
+                      (when (minusp fd)
+                        (setf fd nil)
+                        (error "cannot open activation recovery temporary"))
+                      (let* ((candidate (physical-reseed-follow-read-at root "physical-reseed.follow.tmp"))
+                             (*physical-reseed-follow-activation-candidate*
+                               (physical-reseed-follow-copy candidate)))
+                        (labels ((preflight ()
+                                   (funcall check)
+                                   (physical-reseed-follow-activation-require-attempt context)
+                                   (unless (and
+                                            (equal temporary
+                                                   (physical-reseed-follow-file-identity (sb-posix:fstat fd)))
+                                            (= (physical-adoption-install-mount-id nil :directory-fd root)
+                                               (physical-adoption-install-mount-id nil :directory-fd fd))
+                                            (equal row (nth-value 1 (physical-reseed-follow-entry
+                                                                     root "physical-reseed.follow.tmp")))
+                                            (equal candidate (physical-reseed-follow-read-at
+                                                              root "physical-reseed.follow.tmp"))
+                                            (equal row (nth-value 1 (physical-reseed-follow-entry
+                                                                     root "physical-reseed.follow.tmp")))
+                                            (equal temporary
+                                                   (physical-reseed-follow-file-identity (sb-posix:fstat fd))))
+                                     (error "activation recovery temporary changed during preflight")))
+                                 (promote ()
+                                   (preflight)
+                                   (physical-reseed-follow-configuration-publication-candidate
+                                    owner context candidate)
+                                   (setf (physical-reseed-follow-owner-uncertain-p owner) t)
+                                   (physical-reseed-follow-promote-intent
+                                    owner root fd (subseq temporary 0 5) candidate previous
+                                    (lambda ()
+                                      (funcall check)
+                                      (when (equal previous
+                                                   (physical-reseed-follow-activation-context-snapshot context))
+                                        (preflight))
+                                      (physical-reseed-follow-activation-publication-check owner context candidate)))))
+                          (preflight)
+                          (if (eq :activating
+                                  (getf (getf (physical-reseed-follow-activation-context-record context)
+                                              :activation) :phase))
+                              (progn
+                                (unless (equal candidate
+                                               (physical-reseed-follow-activation-progress-record
+                                                (physical-reseed-follow-activation-context-record context)))
+                                  (error "activation recovery temporary is not the exact next progress record"))
+                                (call-with-physical-reseed-follow-activation-progress
+                                 context #'preflight
+                                 (lambda (expected)
+                                   (unless (equal candidate expected)
+                                     (error "activation recovery candidate changed during synchronization"))
+                                   (promote))
+                                 :recovery t))
+                              (progn
+                                (physical-reseed-follow-activation-prepare-recovery context candidate #'preflight)
+                                (promote))))))
+                 (when fd (sb-posix:close fd))))
+             (progn
+               (setf (physical-reseed-follow-owner-uncertain-p owner) t)
+               (physical-reseed-follow-read-at root "physical-reseed.follow" :stabilize t)
+               (funcall check)
+               (values (physical-reseed-follow-copy
+                        (physical-reseed-follow-activation-context-record context))
+                       (physical-reseed-follow-activation-context-snapshot context)))))))))
 
 (defun physical-reseed-follow-activation-source-recovery-p (owner)
   ;; Enter the activation image directly so recovery can inspect the journal
@@ -749,3 +898,133 @@
       context (getf (getf candidate :activation) :entry) check)
      (physical-reseed-follow-activation-staged-candidate context candidate))
     (otherwise (error "unsupported activation recovery transition"))))
+
+(defun physical-reseed-follow-activation-move-file-check
+    (context stream parent leaf logical bytes expected row)
+  (physical-reseed-follow-activation-guard context)
+  (physical-reseed-follow-activation-require-attempt context)
+  (let* ((fd (sb-sys:fd-stream-fd stream))
+         (mount (physical-adoption-install-mount-id nil :directory-fd parent))
+         (actual (make-array (length bytes) :element-type '(unsigned-byte 8))))
+    (unless (and (equal row (physical-reseed-install-old-observe parent leaf mount))
+                 (equal (physical-reseed-install-row-file-facts row)
+                        (physical-reseed-file-facts (sb-posix:fstat fd)))
+                 (= mount (physical-adoption-install-mount-id nil :directory-fd fd))
+                 (file-position stream 0)
+                 (= (length bytes) (read-sequence actual stream))
+                 (eq :eof (read-byte stream nil :eof))
+                 (equalp bytes actual)
+                 (equal expected
+                        (physical-reseed-follow-configuration-file-row parent leaf logical bytes))
+                 (equal row (physical-reseed-install-old-observe parent leaf mount))
+                 (equal (physical-reseed-install-row-file-facts row)
+                        (physical-reseed-file-facts (sb-posix:fstat fd))))
+      (error "activation move file changed its held identity, metadata or canonical bytes")))
+  (physical-reseed-follow-activation-guard context)
+  t)
+
+(defun physical-reseed-follow-activation-move-point (context check guard event)
+  (funcall check)
+  (funcall guard)
+  (physical-reseed-follow-test-point
+   event (physical-image-fd-path
+          (physical-reseed-follow-configuration-role-fd
+           (physical-reseed-follow-activation-context-descriptors context) :root)))
+  (funcall check)
+  (funcall guard))
+
+(defun physical-reseed-follow-activation-next-move (context check)
+  (declare (notinline sb-posix:fsync physical-adoption-renameat2))
+  (unless (eq context
+              (physical-reseed-follow-activation-context
+               (physical-reseed-follow-activation-context-owner context)))
+    (error "activation move requires its current context"))
+  (let* ((record (physical-reseed-follow-activation-context-record context))
+         (activation (getf record :activation))
+         (step (getf activation :step))
+         (prefix (physical-reseed-follow-activation-context-prefix context))
+         (descriptors (physical-reseed-follow-activation-context-descriptors context))
+         (binding (physical-reseed-follow-activation-context-binding context))
+         (owner (physical-reseed-follow-activation-context-owner context)))
+    (unless (and (eq :activating (getf activation :phase))
+                 (< step 2) (member prefix (list step (1+ step))))
+      (error "activation move requires its recorded step or one-ahead layout"))
+    (funcall check)
+    (physical-reseed-follow-activation-require-attempt context)
+    (destructuring-bind (logical from-role from-leaf to-role to-leaf)
+        (nth step (physical-reseed-follow-activation-moves record binding))
+      (let* ((from (physical-reseed-follow-configuration-role-fd descriptors from-role))
+             (to (physical-reseed-follow-configuration-role-fd descriptors to-role))
+             (parent (if (= prefix step) from to))
+             (leaf (if (= prefix step) from-leaf to-leaf))
+             (bytes (if (zerop step)
+                        (cdr (assoc logical (physical-reseed-follow-activation-context-images context)
+                                    :test #'equal))
+                        (physical-follow-config-image
+                         (physical-reseed-follow-activation-config record binding))))
+             (expected (if (zerop step)
+                           (first (second (assoc logical (getf (getf record :configuration) :entries)
+                                                 :test #'equal)))
+                           (getf activation :entry)))
+             (mount (physical-adoption-install-mount-id nil :directory-fd parent))
+             (row (physical-reseed-install-old-observe parent leaf mount)))
+        (call-with-physical-image-input-at
+         parent leaf
+         (lambda (stream)
+           (flet ((guard ()
+                    (physical-reseed-follow-activation-move-file-check
+                     context stream parent leaf logical bytes expected row)))
+             (flet ((point (event)
+                      (physical-reseed-follow-activation-move-point context check #'guard event)))
+               (guard)
+               (setf (physical-reseed-follow-owner-uncertain-p owner) t)
+               (point :before-activation-move-file-fsync)
+               (sb-posix:fsync (sb-sys:fd-stream-fd stream))
+               (point :after-activation-move-file-fsync)
+               (when (= prefix step)
+                 (point :before-activation-move)
+                 (sb-sys:without-interrupts
+                   (unless (zerop (physical-adoption-renameat2
+                                   from from-leaf to to-leaf +physical-adoption-rename-noreplace+))
+                     (error "cannot move activation file: errno ~d" (sb-alien:get-errno)))
+                   (setf parent to leaf to-leaf
+                         (physical-reseed-follow-activation-context-prefix context) (1+ step)))
+                 (let ((after (physical-reseed-install-old-observe parent leaf mount)))
+                   (unless (equal (subseq row 1 8) (subseq after 1 8))
+                     (error "activation rename changed immutable file metadata"))
+                   (setf row after))
+                 (point :after-activation-move))
+               (point :before-activation-moved-file-fsync)
+               (sb-posix:fsync (sb-sys:fd-stream-fd stream))
+               (point :after-activation-moved-file-fsync)
+               (point :before-activation-source-directory-fsync)
+               (sb-posix:fsync from)
+               (point :after-activation-source-directory-fsync)
+               (point :before-activation-destination-directory-fsync)
+               (sb-posix:fsync to)
+               (point :after-activation-destination-directory-fsync)
+               (funcall check)
+               (guard)
+               (values (1+ step)
+                       (physical-reseed-follow-activation-layout
+                        context (lambda () (physical-reseed-follow-activation-guard context)))))))
+         :element-type '(unsigned-byte 8))))))
+
+(defun physical-reseed-follow-advance-activation (owner)
+  (call-with-physical-reseed-follow-activation-operation
+   owner
+   (lambda (root check)
+     (let* ((context (physical-reseed-follow-activation-context owner))
+            (record (physical-reseed-follow-activation-context-record context)))
+       (physical-reseed-follow-activation-require-attempt context)
+       (when (physical-reseed-follow-entry root "physical-reseed.follow.tmp" t)
+         (error "activation temporary requires recovery before advancement"))
+       (if (eq :active (getf (getf record :activation) :phase))
+           (progn
+             (funcall check)
+             (values (physical-reseed-follow-copy record)
+                     (physical-reseed-follow-activation-context-snapshot context)))
+           (call-with-physical-reseed-follow-activation-progress
+            context check
+            (lambda (candidate)
+              (physical-reseed-follow-activation-publish context candidate check))))))))
