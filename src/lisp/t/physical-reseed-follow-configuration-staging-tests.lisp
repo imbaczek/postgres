@@ -1,22 +1,25 @@
 (in-package #:pg-physical-tests)
 
+(defvar *reseed-follow-fixture-owner-exit* nil)
+
 (defun call-with-reseed-follow-building-fixture (kind function &optional after)
   (call-with-reseed-follow-installed-fixture
    (lambda (root stage incoming quarantine plan)
      (declare (ignore stage incoming quarantine plan))
      (with-physical-store-directory (workspace)
        (sb-posix:chmod (namestring workspace) #o700)
-       (let ((core nil))
+       (let ((core nil) (*reseed-follow-fixture-owner-exit* (gensym "RESEED-OWNER-EXIT")))
          (pg::call-with-physical-reseed-follow-owner
           root (lambda (owner)
                  (setf core (reseed-follow-proof-test-record
                              (pg::physical-reseed-follow-initial-record owner) root kind))))
          (reseed-follow-owner-test-write
           (merge-pathnames "physical-reseed.follow" root) (pg::physical-reseed-follow-image core))
-         (pg::call-with-physical-reseed-follow-configuration-owner
-          root (lambda (owner)
-                 (let ((record (pg::physical-reseed-follow-begin-configuration owner workspace 12345)))
-                   (funcall function owner root workspace record))))
+         (catch *reseed-follow-fixture-owner-exit*
+           (pg::call-with-physical-reseed-follow-configuration-owner
+            root (lambda (owner)
+                   (let ((record (pg::physical-reseed-follow-begin-configuration owner workspace 12345)))
+                     (funcall function owner root workspace record)))))
          (when after (funcall after root workspace)))))))
 
 (deftest reseed-follow-configuration-stages-exact-inert-files-and-keeps-the-installed-base
