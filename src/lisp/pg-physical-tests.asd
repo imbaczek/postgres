@@ -111,6 +111,7 @@
                (:file "t/physical-reseed-follow-activation-plan-tests")
                (:file "t/physical-reseed-follow-activation-layout-tests")
                (:file "t/physical-reseed-follow-activation-scope-tests")
+               (:file "t/physical-reseed-follow-activation-staging-tests")
                (:file "t/wal-timeline-tests")
                (:file "t/wal-eor-tests")
                (:file "t/physical-history-tests")
