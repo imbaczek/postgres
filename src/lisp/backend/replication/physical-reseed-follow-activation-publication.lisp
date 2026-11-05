@@ -250,9 +250,11 @@
 (defvar *physical-reseed-follow-activation-progress* nil)
 
 (defvar *physical-reseed-follow-activation-moving*
+  ;; Bind the current context while a local move is in progress.
   nil)
 
 (defun physical-reseed-follow-activation-check-local-entry ()
+  ;; Exclude recursive moves and overlap with either publication proof.
   (when (or *physical-reseed-follow-activation-authority*
             *physical-reseed-follow-activation-progress*)
     (error "activation progress overlaps an active publication authority"))
@@ -741,6 +743,7 @@
                                 (promote))))))
                  (when fd (sb-posix:close fd))))
              (progn
+               ;; Resync a one-ahead move before stabilizing the final journal.
                (let ((activation (getf (physical-reseed-follow-activation-context-record context)
                                        :activation)))
                  (when (and (eq :activating (getf activation :phase))

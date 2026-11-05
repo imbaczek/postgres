@@ -627,6 +627,8 @@
          (ok (not (pg::physical-reseed-follow-owner-busy-p owner)))))))
 
 (defun check-reseed-activation-stable-recovery-order (step aborted)
+  ;; Observe actual fsync calls by held descriptor identity, then the entry
+  ;; into the journal reader with stabilization requested.
   (let ((expected nil))
     (call-with-reseed-activating-fixture
      :same-timeline

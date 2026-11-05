@@ -314,6 +314,13 @@
   source-offline local completion. They preserved the original quarantined
   bytes and unrelated file facts across the target, workspace and auxiliary trees.
   See `progress-final-check.json` and `progress-native-v3/acceptance-check.json`.
+  The follow-up recovery audit now resyncs a one-ahead move before final
+  journal stabilization, rejects an aborted attempt before syncing, and
+  excludes nested moves during publication or another move. Fresh acceptance
+  passed 27 selected heads with 1,046 assertions, a 231-file warning-free cold
+  compile and a fresh rerun of the 14-action native crash sequence. Evidence is
+  `stable-recovery-check.json`. Process crashes and injected sync failures
+  leave filesystem power-loss qualification and writeback-error policy open.
   Archive retirement and startup admission remain open. START must check
   current source state and retention floors again.
 
