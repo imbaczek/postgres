@@ -372,7 +372,12 @@ provenance. Invalid selected metadata is an error, never a fallback to an older
 history. RETAINED-DIRECTORY can place the archive outside the spool.
 The local file lock excludes another local receiver, not a distributed writer.
 With DISCARD-TAIL and CREATE-LOCK both NIL, validate without changing spool bytes
-or creating a missing lock. Do not resume input in that mode."
+or creating a missing lock. Do not resume input in that mode.
+ON-OPEN, when supplied, receives the validated store after decoder setup and
+before success is returned. It can capture the store for outer cleanup. If it
+exits by error, throw or interrupt, this function closes the store; closing it
+again after capture is safe. Opening and assigning the lock stream masks
+interrupts briefly. Validation and scanning remain interruptible."
   (unless (and (typep system-id '(unsigned-byte 64))
                (typep timeline '(integer 1 4294967295))
                (typep start-lsn '(unsigned-byte 64))
