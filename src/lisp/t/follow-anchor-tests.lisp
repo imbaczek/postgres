@@ -668,6 +668,37 @@
              (ok (equalp recovery (lineage-test-bytes (pg::physical-recovery-control-path))))
              (ok (equalp follow (lineage-test-bytes (pg::physical-follow-config-path))))))))))
 
+(deftest follow-pending-proof-can-check-a-relocated-config-without-changing-public-admission
+    (dolist (kind '(:stable :early-change :late-change))
+      (call-with-follow-pending-proof
+       (lambda (root store candidate base config)
+         (declare (ignore candidate))
+         (let ((saved (merge-pathnames "saved-follow.control" root))
+               (calls 0)
+               (before (pg::physical-store-control-tuple store)))
+           (rename-file (pg::physical-follow-config-path) saved)
+           (ok (signals (pg::physical-follow-check-pending-state store base config) 'error))
+           (let ((check (symbol-function 'pg::physical-follow-check-pending-state-core)))
+             (flet ((read-saved ()
+                      (incf calls)
+                      (let ((actual (pg::physical-follow-decode-config (lineage-test-bytes saved))))
+                        (when (or (eq kind :early-change)
+                                  (and (eq kind :late-change) (= calls 2)))
+                          (setf (fourth actual) "changed_pin"))
+                        actual)))
+               (if (eq kind :stable)
+                   (multiple-value-bind (validated position control)
+                       (funcall check store base config #'read-saved)
+                     (ok (equal (getf (fifth config) :after)
+                                (pg::physical-store-control-tuple validated)))
+                     (ok (eq :before position))
+                     (ok (equal control (pg::physical-recovery-read-control pg::*pgdata*))))
+                   (ok (signals (funcall check store base config #'read-saved) 'error)))))
+           (ok (= calls (if (eq kind :early-change) 1 2)))
+           (ok (equal before (pg::physical-store-control-tuple store)))
+           (ok (not (probe-file (pg::physical-follow-config-path))))
+           (ok (equal config (pg::physical-follow-decode-config (lineage-test-bytes saved)))))))))
+
 (deftest follow-pending-preflight-rejects-changed-progress-or-crossed-publication
     (dolist (kind '(:next :required :crossed :config :phase :identity :checkpoint :timeline :history :restartpoint))
       (call-with-follow-pending-proof

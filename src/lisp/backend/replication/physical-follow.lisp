@@ -901,7 +901,7 @@ result includes the scan disposition and does not alter replay exhaustion."
                      result))))))
     (physical-follow-call-with-receive-root store #'validate)))
 
-(defun physical-follow-check-pending-state (store verified-base config)
+(defun physical-follow-check-pending-state-core (store verified-base config read-config)
   "Validate a saved pending binding against durable recovery and receive state.
 Accept only the saved old or post receive tuple; post recovery with old receive
 is invalid. Check the actual restartpoint and scan a disposable candidate
@@ -909,7 +909,7 @@ outside the store mutex, then recheck control and config for changes.
 The caller must exclude recovery and reload and protect the selected root."
   (physical-follow-check-config config)
   (unless (and (member (length config) '(5 6)) (eq :pending (getf (fifth config) :phase))
-               (equal config (physical-follow-read-config)))
+               (equal config (funcall read-config)))
     (error "pending follow config is absent, active or changed"))
   (let* ((binding (fifth config)) (before (getf binding :before)) (after (getf binding :after))
                                   (control (physical-recovery-read-control *pgdata*))
@@ -938,9 +938,15 @@ The caller must exclude recovery and reload and protect the selected root."
                                           (t (error "pending follow receive control differs from both saved states")))))))
     (physical-follow-validate-candidate-replay candidate verified-base binding)
     (unless (and (equal control (physical-recovery-read-control *pgdata*))
-                 (equal config (physical-follow-read-config)))
+                 (equal config (funcall read-config)))
       (error "pending follow durable witnesses changed during validation"))
     (values candidate position control)))
+
+(defun physical-follow-check-pending-state (store verified-base config)
+  "Validate a pending binding against the root config and durable recovery state.
+The caller must exclude recovery and reload and protect the selected root."
+  (physical-follow-check-pending-state-core store verified-base config
+                                            #'physical-follow-read-config))
 
 (defvar *physical-follow-test-hook* nil
   "Optional test hook for reconciliation and config publication cuts.")
