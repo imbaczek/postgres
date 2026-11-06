@@ -3335,6 +3335,206 @@
          (error (condition) (search "busy or uncertain" (princ-to-string condition)))))
       (ok (not (pg::retirement-startup-active-p captured-owner)))))
 
+(deftest reseed-retirement-durable-guards-check-outer-lifetime-before-intent-access
+    (dolist (operation (list
+                        (lambda (check) (pg::physical-reseed-follow-retirement-intent-durable-scope nil nil check))
+                        (lambda (check) (pg::physical-reseed-follow-retirement-intent-durable-extra nil nil -1 check))
+                        (lambda (check) (pg::physical-reseed-follow-retirement-intent-check-durable-proof nil check))))
+      (let ((checks 0))
+        (ok (handler-case
+                (progn (funcall operation (lambda () (incf checks) (error "expired durable outer scope"))) nil)
+              (error (condition) (search "expired durable outer scope" (princ-to-string condition)))))
+        (ok (= 1 checks)))))
+
+(deftest reseed-retirement-durable-guard-refuses-incomplete-adoption-before-parent-access
+    (dolist (case '((:complete t t t t t)
+                    (:durable nil t t t t)
+                    (:durable t nil t t t)
+                    (:durable t t nil t t)
+                    (:durable t t t nil t)
+                    (:durable t t t t nil)))
+      (destructuring-bind (phase claimed effect snapshot-present correct-thread correct-snapshot) case
+        (let* ((parents 0) (outers 0)
+                           (candidate (list :candidate t))
+                           (snapshot (list :record candidate))
+                           (owner (pg::make-physical-reseed-follow-retirement-startup-owner :busy-p t :uncertain-p t))
+                           (witness (pg::make-physical-reseed-follow-retirement-intent-witness
+                                     :owner owner :thread (if correct-thread sb-thread:*current-thread* :wrong-thread)
+                                     :candidate candidate :phase phase :publication-claimed-p claimed :effect-p effect
+                                     :final-snapshot (when snapshot-present snapshot)
+                                     :parent-check (lambda () (incf parents) (error "unexpected parent access")))))
+          (ok (handler-case
+                  (progn
+                    (pg::physical-reseed-follow-retirement-intent-durable-scope
+                     witness (if correct-snapshot snapshot (list :record :wrong))
+                     (lambda () (incf outers) t))
+                    nil)
+                (error (condition) (search "lost its durable adoption" (princ-to-string condition)))))
+          (ok (zerop parents))
+          (ok (= 1 outers))))))
+
+(deftest reseed-retirement-durable-guard-rechecks-state-after-parent-callback
+    (let* ((owner (pg::make-physical-reseed-follow-retirement-startup-owner :busy-p t :uncertain-p t))
+           (candidate (list :candidate t))
+           (snapshot (list :record candidate))
+           (parents 0)
+           (witness (pg::make-physical-reseed-follow-retirement-intent-witness
+                     :owner owner :thread sb-thread:*current-thread*
+                     :candidate candidate :phase :durable :publication-claimed-p t :effect-p t
+                     :final-snapshot snapshot
+                     :parent-check (lambda ()
+                                     (incf parents)
+                                     (setf (pg::retirement-startup-uncertain-p owner) nil))))
+           (owner-check (symbol-function 'pg::physical-reseed-follow-retirement-check-startup-owner)))
+      (unwind-protect
+           (progn
+             (setf (symbol-function 'pg::physical-reseed-follow-retirement-check-startup-owner)
+                   (lambda (value) (declare (ignore value)) t))
+             (ok (handler-case
+                     (progn
+                       (pg::physical-reseed-follow-retirement-intent-durable-scope witness snapshot (lambda () t))
+                       nil)
+                   (error (condition) (search "lost its durable adoption" (princ-to-string condition)))))
+             (ok (= 1 parents)))
+        (setf (symbol-function 'pg::physical-reseed-follow-retirement-check-startup-owner) owner-check))))
+
+(deftest reseed-retirement-publication-rechecks-existing-temporary-reader-cleanup
+    (dolist (kind '(:initial :attempt))
+      (ok
+       (eq :checked
+           (catch 'retirement-temporary-cleanup-checked
+             (call-with-retirement-intent-test-owner
+              (lambda (owner root root-fd snapshot)
+                (declare (ignore snapshot))
+                (let ((holder (symbol-function 'pg::call-with-physical-reseed-follow-retirement-journal))
+                      (action (ecase kind
+                                (:initial #'pg::physical-reseed-follow-retirement-publish-initial)
+                                (:attempt #'pg::physical-reseed-follow-retirement-archive-attempt)))
+                      (temporary-stream nil) (armed nil) (changed nil))
+                  (unwind-protect
+                       (progn
+                         (setf (symbol-function 'pg::call-with-physical-reseed-follow-retirement-journal)
+                               (lambda (fd name expected function check)
+                                 (let ((temporary (equal name "physical-reseed.follow.tmp")))
+                                   (multiple-value-prog1
+                                       (funcall holder fd name expected
+                                                (lambda (stream state)
+                                                  (when temporary (setf temporary-stream stream))
+                                                  (funcall function stream state))
+                                                check)
+                                     (when (and temporary armed)
+                                       (ng (open-stream-p temporary-stream))
+                                       (setf armed nil)
+                                       (let ((record (getf (pg::physical-reseed-follow-snapshot-at fd) :record)))
+                                         (reseed-test-replace-follow-record root record)
+                                         (setf changed (pg::physical-reseed-follow-snapshot-at fd))))))))
+                         (let ((pg::*physical-reseed-follow-test-hook*
+                                 (lambda (point path)
+                                   (declare (ignore path))
+                                   (when (eq point :after-retirement-readback) (setf armed t)))))
+                           (ok (handler-case
+                                   (progn (funcall action owner) nil)
+                                 (error (condition)
+                                   (format t "~%RETIREMENT-TEMPORARY-CLEANUP-REFUSAL ~s ~a~%" kind condition)
+                                   (not (null changed))))))
+                         (ok changed)
+                         (ng (equal changed (getf (pg::retirement-startup-evidence owner) :snapshot)))
+                         (ok (equal changed (pg::physical-reseed-follow-snapshot-at root-fd)))
+                         (ok (= 1 (sb-posix:stat-nlink
+                                   (sb-posix:lstat (namestring (merge-pathnames "physical-reseed.follow" root))))))
+                         (ng (pg::retirement-startup-busy-p owner))
+                         (ok (pg::retirement-startup-uncertain-p owner))
+                         (ok (handler-case
+                                 (progn (funcall action owner) nil)
+                               (error (condition) (search "busy or uncertain" (princ-to-string condition))))))
+                    (setf (symbol-function 'pg::call-with-physical-reseed-follow-retirement-journal) holder))
+                  (throw 'retirement-temporary-cleanup-checked :checked)))
+              (lambda (root root-fd snapshot)
+                (ecase kind
+                  (:initial
+                   (reseed-follow-owner-test-write
+                    (merge-pathnames "physical-reseed.follow.tmp" root)
+                    (pg::physical-reseed-follow-image
+                     (reseed-retirement-test-initial-candidate root-fd snapshot))))
+                  (:attempt
+                   (prepare-retirement-attempt-archive-test root root-fd snapshot :temporary))))))))))
+
+(deftest reseed-retirement-publication-refuses-a-caught-partial-publication-failure
+    (ok
+     (eq :checked
+         (catch 'retirement-partial-return-checked
+           (call-with-retirement-intent-test-owner
+            (lambda (owner root root-fd snapshot)
+              (let ((publish (symbol-function 'pg::physical-reseed-follow-retirement-intent-publish-held))
+                    (injected nil) (swallowed 0))
+                (unwind-protect
+                     (progn
+                       (setf (symbol-function 'pg::physical-reseed-follow-retirement-intent-publish-held)
+                             (lambda (witness &optional authority)
+                               (handler-case (funcall publish witness authority)
+                                 (error (condition)
+                                   (if (search "injected swallowed publication failure" (princ-to-string condition))
+                                       (progn (incf swallowed) (values nil nil))
+                                       (error condition))))))
+                       (let ((pg::*physical-reseed-follow-test-hook*
+                               (lambda (point path)
+                                 (declare (ignore path))
+                                 (when (eq point :after-retirement-temporary-create)
+                                   (setf injected t)
+                                   (error "injected swallowed publication failure")))))
+                         (ok (handler-case
+                                 (progn (pg::physical-reseed-follow-retirement-publish-initial owner) nil)
+                               (error (condition)
+                                 (search "lost its durable adoption" (princ-to-string condition))))))
+                       (ok injected)
+                       (ok (= 1 swallowed))
+                       (ng (pg::retirement-startup-busy-p owner))
+                       (ok (pg::retirement-startup-uncertain-p owner))
+                       (ok (equal snapshot (pg::physical-reseed-follow-snapshot-at root-fd)))
+                       (ok (zerop (length (pg::read-bounded-regular-file
+                                           (merge-pathnames "physical-reseed.follow.tmp" root) 1 :minimum 0))))
+                       (ok (handler-case
+                               (progn (pg::physical-reseed-follow-retirement-publish-initial owner) nil)
+                             (error (condition) (search "busy or uncertain" (princ-to-string condition))))))
+                  (setf (symbol-function 'pg::physical-reseed-follow-retirement-intent-publish-held) publish))
+                (throw 'retirement-partial-return-checked :checked))))))))
+
+(deftest reseed-retirement-publication-rechecks-adopted-owner-evidence
+    (ok
+     (eq :checked
+         (catch 'retirement-owner-evidence-checked
+           (call-with-retirement-intent-test-owner
+            (lambda (owner root root-fd snapshot)
+              (declare (ignore snapshot))
+              (let ((publish (symbol-function 'pg::physical-reseed-follow-retirement-intent-publish-held))
+                    (changed nil))
+                (unwind-protect
+                     (progn
+                       (setf (symbol-function 'pg::physical-reseed-follow-retirement-intent-publish-held)
+                             (lambda (witness &optional authority)
+                               (multiple-value-prog1 (funcall publish witness authority)
+                                 (setf changed t
+                                       (pg::retirement-startup-evidence owner)
+                                       (append (pg::physical-adoption-attempt-value-copy
+                                                (pg::retirement-startup-evidence owner))
+                                               (list :unexpected-proof t))))))
+                       (ok (handler-case
+                               (progn (pg::physical-reseed-follow-retirement-publish-initial owner) nil)
+                             (error (condition)
+                               (search "changed its owner evidence" (princ-to-string condition)))))
+                       (ok changed)
+                       (ok (getf (pg::retirement-startup-evidence owner) :unexpected-proof))
+                       (ok (equal (getf (pg::retirement-startup-evidence owner) :snapshot)
+                                  (pg::physical-reseed-follow-snapshot-at root-fd)))
+                       (ng (pg::retirement-startup-busy-p owner))
+                       (ok (pg::retirement-startup-uncertain-p owner))
+                       (ng (probe-file (merge-pathnames "physical-reseed.follow.tmp" root)))
+                       (ok (handler-case
+                               (progn (pg::physical-reseed-follow-retirement-publish-initial owner) nil)
+                             (error (condition) (search "busy or uncertain" (princ-to-string condition))))))
+                  (setf (symbol-function 'pg::physical-reseed-follow-retirement-intent-publish-held) publish))
+                (throw 'retirement-owner-evidence-checked :checked))))))))
+
 (deftest reseed-retirement-publication-refuses-same-byte-final-replacement-after-readback
     (ok
      (eq :checked

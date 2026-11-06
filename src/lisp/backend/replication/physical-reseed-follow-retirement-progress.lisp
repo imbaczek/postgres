@@ -69,22 +69,11 @@
 (defmethod print-object ((witness physical-reseed-follow-retirement-archive-witness) stream)
   (physical-libpq-print-private-object witness stream 0))
 
-(defun physical-reseed-follow-retirement-archive-binding (intent)
-  ;; Bind the archive witness to the same intent owner, thread, resources,
-  ;; predecessor and candidate throughout the operation.
-  (list (retirement-intent-owner intent) (retirement-intent-thread intent)
-        (retirement-intent-descriptors intent) (retirement-intent-store intent)
-        (retirement-intent-pid intent) (retirement-intent-snapshot intent)
-        (retirement-intent-old-stream intent) (retirement-intent-old-bytes intent)
-        (retirement-intent-candidate intent)))
-
 (defun physical-reseed-follow-retirement-archive-directory (witness role)
   (physical-reseed-follow-configuration-role-fd
    (retirement-intent-descriptors (retirement-archive-intent witness)) role))
 
-(defun physical-reseed-follow-retirement-archive-check-scope (witness &optional phases)
-  ;; Check the thread, held stream, intent binding and current phase.  After
-  ;; publication, require the durable candidate snapshot and uncertain owner.
+(defun physical-reseed-follow-retirement-archive-check-outer (witness &optional phases)
   (unless (and (physical-reseed-follow-retirement-archive-witness-p witness)
                (retirement-archive-active-p witness)
                (eq (retirement-archive-thread witness) sb-thread:*current-thread*)
@@ -93,41 +82,29 @@
     (error "retirement archive witness ended or changed thread"))
   (let ((intent (retirement-archive-intent witness)))
     (unless (and (equal (retirement-archive-binding witness)
-                        (physical-reseed-follow-retirement-archive-binding intent))
+                        (physical-reseed-follow-retirement-intent-binding intent))
                  (eql (retirement-archive-step witness)
                       (getf (getf (getf (retirement-intent-snapshot intent) :record) :retirement) :step)))
-      (error "retirement archive changed its publication binding"))
-    (if (eq :done (retirement-archive-phase witness))
-        (let ((owner (retirement-intent-owner intent)))
-          (unless (and (eq :durable (retirement-intent-phase intent))
-                       (retirement-intent-publication-claimed-p intent)
-                       (retirement-intent-effect-p intent)
-                       (retirement-startup-busy-p owner) (retirement-startup-uncertain-p owner)
-                       (retirement-archive-final-snapshot witness)
-                       (equal (getf (retirement-archive-final-snapshot witness) :record)
-                              (retirement-intent-candidate intent)))
-            (error "retirement archive lost its durable publication handover"))
-          (physical-reseed-follow-retirement-check-startup-owner owner)
-          (funcall (retirement-intent-parent-check intent)))
-        (physical-reseed-follow-retirement-intent-check-scope intent)))
+      (error "retirement archive changed its publication binding")))
   (when (and phases (not (member (retirement-archive-phase witness) phases)))
     (error "retirement archive requires phase ~s" phases))
   t)
 
+(defun physical-reseed-follow-retirement-archive-check-scope (witness &optional phases)
+  (physical-reseed-follow-retirement-archive-check-outer witness phases)
+  (let ((intent (retirement-archive-intent witness)))
+    (if (eq :done (retirement-archive-phase witness))
+        (physical-reseed-follow-retirement-intent-durable-scope
+         intent (retirement-archive-final-snapshot witness)
+         (lambda () (physical-reseed-follow-retirement-archive-check-outer witness '(:done))))
+        (physical-reseed-follow-retirement-intent-check-scope intent)))
+  t)
+
 (defun physical-reseed-follow-retirement-archive-extra (witness root)
-  ;; After temporary cleanup, guard the exact final snapshot and PID while
-  ;; continuing to check the held predecessor.
   (if (eq :done (retirement-archive-phase witness))
-      (let* ((intent (retirement-archive-intent witness))
-             (check (retirement-intent-parent-check intent)))
-        (physical-reseed-follow-retirement-archive-check-scope witness '(:done))
-        (unless (= root (physical-reseed-follow-retirement-archive-directory witness :root))
-          (error "retirement archive final proof changed its root"))
-        (physical-reseed-follow-retirement-intent-check-old intent t)
-        (append
-         (physical-reseed-follow-retirement-final-extra-at
-          root (retirement-archive-final-snapshot witness) (list :verify check))
-         (list (cons "postmaster.pid" (getf (retirement-intent-pid intent) :row)))))
+      (physical-reseed-follow-retirement-intent-durable-extra
+       (retirement-archive-intent witness) (retirement-archive-final-snapshot witness) root
+       (lambda () (physical-reseed-follow-retirement-archive-check-outer witness '(:done))))
       (physical-reseed-follow-retirement-intent-extra (retirement-archive-intent witness) root)))
 
 (defun physical-reseed-follow-retirement-archive-observe (witness)
@@ -453,7 +430,7 @@
                    (make-physical-reseed-follow-retirement-archive-witness
                     :intent intent :thread sb-thread:*current-thread* :active-p t
                     :binding (physical-adoption-attempt-value-copy
-                              (physical-reseed-follow-retirement-archive-binding intent))
+                              (physical-reseed-follow-retirement-intent-binding intent))
                     :step step :prefix prefix :alias alias :phase :ready :proof proof
                     :root-row root-row
                     :stream stream :row (copy-list row) :bytes bytes))

@@ -129,10 +129,17 @@
   ;; predecessor to one candidate, proof and sequence of effects.
   owner thread active-p descriptors store parent-check pid snapshot old-stream old-bytes
   candidate bytes proof phase temporary-fd temporary-stream temporary-fixed temporary-state
-  written effect-p publication-claimed-p)
+  written effect-p publication-claimed-p final-snapshot)
 
 (defmethod print-object ((witness physical-reseed-follow-retirement-intent-witness) stream)
   (print-unreadable-object (witness stream :type t :identity t)))
+
+(defun physical-reseed-follow-retirement-intent-binding (witness)
+  (list (retirement-intent-owner witness) (retirement-intent-thread witness)
+        (retirement-intent-descriptors witness) (retirement-intent-store witness)
+        (retirement-intent-pid witness) (retirement-intent-snapshot witness)
+        (retirement-intent-old-stream witness) (retirement-intent-old-bytes witness)
+        (retirement-intent-candidate witness)))
 
 (defun physical-reseed-follow-retirement-intent-check-scope (witness)
   ;; Require the original owner, thread and active resources.  The busy and
@@ -261,6 +268,63 @@
      (list (cons "postmaster.pid"
                  (physical-adoption-attempt-value-copy (getf (retirement-intent-pid witness) :row)))))))
 
+(defun physical-reseed-follow-retirement-intent-durable-scope (witness snapshot outer-check)
+  (funcall outer-check)
+  (unless (physical-reseed-follow-retirement-intent-witness-p witness)
+    (error "retirement durable guard requires an intent witness"))
+  (let ((owner (retirement-intent-owner witness)))
+    (flet ((check-state ()
+             (unless (and (eq (retirement-intent-thread witness) sb-thread:*current-thread*)
+                          (eq :durable (retirement-intent-phase witness))
+                          (retirement-intent-publication-claimed-p witness)
+                          (retirement-intent-effect-p witness)
+                          (retirement-startup-busy-p owner) (retirement-startup-uncertain-p owner)
+                          snapshot (equal snapshot (retirement-intent-final-snapshot witness))
+                          (equal (getf snapshot :record) (retirement-intent-candidate witness)))
+               (error "retirement publisher lost its durable adoption"))))
+      (check-state)
+      (physical-reseed-follow-retirement-check-startup-owner owner)
+      (funcall (retirement-intent-parent-check witness))
+      (funcall outer-check)
+      (check-state)))
+  t)
+
+(defun physical-reseed-follow-retirement-intent-durable-extra (witness snapshot root outer-check)
+  (physical-reseed-follow-retirement-intent-durable-scope witness snapshot outer-check)
+  (unless (= root (physical-reseed-follow-retirement-intent-root witness))
+    (error "retirement durable proof changed its root"))
+  (physical-reseed-follow-retirement-intent-check-old witness t)
+  (append
+   (physical-reseed-follow-retirement-final-extra-at
+    root snapshot
+    (list :verify (lambda ()
+                    (physical-reseed-follow-retirement-intent-durable-scope witness snapshot outer-check))))
+   (list (cons "postmaster.pid" (getf (retirement-intent-pid witness) :row)))))
+
+(defun physical-reseed-follow-retirement-intent-check-durable-proof (witness outer-check)
+  (funcall outer-check)
+  (let ((snapshot (retirement-intent-final-snapshot witness)))
+    (physical-reseed-follow-retirement-intent-durable-scope witness snapshot outer-check)
+    (let* ((descriptors (retirement-intent-descriptors witness))
+           (check (lambda ()
+                    (physical-reseed-follow-retirement-intent-durable-scope witness snapshot outer-check)))
+           (extra (lambda (fd)
+                    (physical-reseed-follow-retirement-intent-durable-extra witness snapshot fd outer-check)))
+           (state (physical-reseed-follow-retirement-layout-state-at
+                   descriptors snapshot check extra nil
+                   (list :entry (cons "postmaster.pid" (getf (retirement-intent-pid witness) :row))
+                         :verify check)))
+           (proof (physical-reseed-follow-retirement-prefix-proof-at
+                   descriptors (retirement-intent-store witness) (retirement-intent-candidate witness)
+                   (getf (retirement-intent-proof witness) :prefix) check extra)))
+      (unless (equal (retirement-intent-proof witness) proof)
+        (error "retirement durable publication changed its frozen proof"))
+      (unless (equal (retirement-startup-evidence (retirement-intent-owner witness))
+                     (physical-reseed-follow-startup-projection descriptors state))
+        (error "retirement durable publication changed its owner evidence"))
+      (funcall check)))
+  t)
+
 (defun physical-reseed-follow-retirement-intent-check (witness)
   ;; Reprove frozen nonjournal state at the witness prefix, including progress
   ;; publication, and check a complete temporary against the candidate.
@@ -301,8 +365,6 @@
 
 (defun call-with-physical-reseed-follow-retirement-intent-base-context
     (owner expected make-candidate function)
-  ;; Hold the owner resources and predecessor journal while binding one
-  ;; candidate to the private intent witness.
   (call-with-physical-reseed-follow-retirement-startup-root
    owner
    (lambda (root root-check)
@@ -325,11 +387,25 @@
                         :old-bytes (nth-value 1 (physical-reseed-follow-retirement-journal-state-at
                                                  root stream "physical-reseed.follow"))
                         :candidate candidate :bytes (physical-reseed-follow-image candidate)
-                        :phase :predecessor :written 0)))
-                (unwind-protect
-                     (call-with-physical-reseed-follow-retirement-intent-existing
-                      witness (getf expected :temporary-file) function)
-                  (setf (retirement-intent-active-p witness) nil))))
+                        :phase :predecessor :written 0))
+                     (frozen (physical-adoption-attempt-value-copy
+                              (physical-reseed-follow-retirement-intent-binding witness)))
+                     (thread sb-thread:*current-thread*)
+                     (active t))
+                (flet ((check-context ()
+                         (unless (and active (eq thread sb-thread:*current-thread*)
+                                      (equal frozen (physical-reseed-follow-retirement-intent-binding witness)))
+                           (error "retirement publication context ended or changed its binding"))
+                         t))
+                  (unwind-protect
+                       (multiple-value-prog1
+                           (call-with-physical-reseed-follow-retirement-intent-existing
+                            witness (getf expected :temporary-file) function)
+                         (when (or (retirement-intent-effect-p witness)
+                                   (eq :durable (retirement-intent-phase witness)))
+                           (physical-reseed-follow-retirement-intent-check-durable-proof
+                            witness #'check-context)))
+                    (setf active nil (retirement-intent-active-p witness) nil)))))
             check))))))))
 
 (defun call-with-physical-reseed-follow-retirement-intent-context (owner expected function)
@@ -470,10 +546,12 @@
     (physical-reseed-follow-retirement-intent-point witness :after-retirement-readback)
     (physical-reseed-follow-check-snapshot root snapshot)
     (let ((evidence (physical-reseed-follow-startup-projection
-                     descriptors (append state (list :pid-file pid :temporary-file nil)))))
+                     descriptors (append state (list :pid-file pid :temporary-file nil))))
+          (final-snapshot (physical-adoption-attempt-value-copy snapshot)))
       (sb-sys:without-interrupts
         (physical-reseed-follow-retirement-intent-check-effect witness '(:renamed))
         (setf (retirement-startup-evidence (retirement-intent-owner witness)) evidence
+              (retirement-intent-final-snapshot witness) final-snapshot
               (retirement-intent-phase witness) :durable)))
     (values (physical-reseed-follow-copy (retirement-intent-candidate witness))
             (physical-adoption-attempt-value-copy snapshot))))
