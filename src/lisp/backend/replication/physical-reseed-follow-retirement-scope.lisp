@@ -221,16 +221,15 @@
           check))
        #'root-check))))
 
-(defun call-with-physical-reseed-follow-retirement-receive-at
-    (descriptors snapshot base binding function check extra-reader candidate &optional pid-evidence)
+(defun call-with-physical-reseed-follow-retirement-receive-core
+    (descriptors snapshot base binding function check layout-reader)
   ;; Carry optional PID evidence through repeated layout and active receive
   ;; checks.  The callback gets copies and its thread-bound VERIFY is revoked
   ;; before the store scope cleans up.
   (let* ((record (physical-reseed-follow-copy (getf snapshot :record)))
          (thread sb-thread:*current-thread*) (active nil) (state nil))
     (funcall check)
-    (setf state (physical-reseed-follow-retirement-layout-state-at
-                 descriptors snapshot check extra-reader candidate pid-evidence))
+    (setf state (funcall layout-reader descriptors check))
     (call-with-physical-reseed-follow-retirement-store
      descriptors base
      (lambda (store store-check)
@@ -242,12 +241,10 @@
                        (unless (and active (eq thread sb-thread:*current-thread*))
                          (error "retirement observation scope ended or changed thread"))
                        (funcall check)
-                       (unless (equal state (physical-reseed-follow-retirement-layout-state-at
-                                             descriptors snapshot check extra-reader candidate pid-evidence))
+                       (unless (equal state (funcall layout-reader descriptors check))
                          (error "retirement layout changed during its observation scope"))
                        (physical-reseed-follow-retirement-check-receive descriptors store record base binding check)
-                       (unless (equal state (physical-reseed-follow-retirement-layout-state-at
-                                             descriptors snapshot check extra-reader candidate pid-evidence))
+                       (unless (equal state (funcall layout-reader descriptors check))
                          (error "retirement layout changed around active receive validation"))
                        t))
                 (verify)
@@ -257,7 +254,15 @@
          (setf active nil)))
      check)))
 
-(defun call-with-physical-reseed-follow-retirement-observation-at (root snapshot parent-check function extra-reader candidate &optional pid-evidence)
+(defun call-with-physical-reseed-follow-retirement-receive-at
+    (descriptors snapshot base binding function check extra-reader candidate &optional pid-evidence)
+  (call-with-physical-reseed-follow-retirement-receive-core
+   descriptors snapshot base binding function check
+   (lambda (held verify)
+     (physical-reseed-follow-retirement-layout-state-at
+      held snapshot verify extra-reader candidate pid-evidence))))
+
+(defun call-with-physical-reseed-follow-retirement-observation-core (root snapshot parent-check function extra-reader layout-reader)
   ;; Pass optional PID evidence through the held-directory scope to the layout
   ;; and receive checks.
   ;; Borrow ROOT and its parent ownership from the caller.  Hold the other nine
@@ -271,9 +276,18 @@
       (call-with-physical-reseed-follow-retirement-directories
        root record
        (lambda (descriptors base binding check)
-         (call-with-physical-reseed-follow-retirement-receive-at
-          descriptors snapshot base binding function check extra-reader candidate pid-evidence))
+         (call-with-physical-reseed-follow-retirement-receive-core
+          descriptors snapshot base binding function check layout-reader))
        #'root-check))))
+
+(defun call-with-physical-reseed-follow-retirement-observation-at
+    (root snapshot parent-check function extra-reader candidate &optional pid-evidence)
+  (let ((snapshot (physical-adoption-attempt-value-copy snapshot)))
+    (call-with-physical-reseed-follow-retirement-observation-core
+     root snapshot parent-check function extra-reader
+     (lambda (descriptors check)
+       (physical-reseed-follow-retirement-layout-state-at
+        descriptors snapshot check extra-reader candidate pid-evidence)))))
 
 (defun call-with-physical-reseed-follow-retirement-receive
     (descriptors snapshot base binding function check)

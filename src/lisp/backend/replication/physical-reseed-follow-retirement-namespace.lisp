@@ -72,7 +72,8 @@
       (physical-reseed-follow-retirement-check-prefix record (caar matches))
       (values (caar matches) (second (first matches))))))
 
-(defun physical-reseed-follow-retirement-layout-state-at (descriptors snapshot check extra-reader candidate &optional pid-evidence)
+(defun physical-reseed-follow-retirement-layout-state-core
+    (descriptors snapshot check extra-reader candidate pid-evidence source-check extra-names)
   ;; When PID evidence is supplied, verify it and admit only its matching root
   ;; entry.  The strict path supplies no PID evidence.
   ;; The final snapshot remains the layout authority.  The extra reader and
@@ -86,7 +87,7 @@
          (pid-entry (getf pid-evidence :entry)))
     (funcall check)
     (when pid-evidence (funcall (getf pid-evidence :verify)))
-    (physical-reseed-follow-check-snapshot root snapshot)
+    (funcall source-check)
     (let* ((plan (physical-reseed-follow-retirement-provisional-plan-at root saved record check))
            (base-fds (loop for role in '(:base :global :wal)
                            collect (cons role (physical-reseed-follow-configuration-role-fd descriptors role)))))
@@ -110,9 +111,7 @@
                  (expected (physical-reseed-follow-retirement-inventories-at plan record binding prefix extra alias))
                  (mount (physical-adoption-install-mount-id nil :directory-fd root)))
             (unless (and (equal (mapcar #'car extra)
-                                (append '("physical-reseed.follow")
-                                        (when candidate '("physical-reseed.follow.tmp"))
-                                        (when pid-entry '("postmaster.pid"))))
+                                extra-names)
                          (equal pid-entry (assoc "postmaster.pid" extra :test #'equal)))
               (error "retirement observation has unexpected root extras"))
             (flet ((verify ()
@@ -140,6 +139,16 @@
                               :snapshot (physical-adoption-attempt-value-copy snapshot))
                         (when candidate
                           (list :temporary (physical-reseed-follow-copy candidate))))))))))))
+
+(defun physical-reseed-follow-retirement-layout-state-at
+    (descriptors snapshot check extra-reader candidate &optional pid-evidence)
+  (let ((root (physical-reseed-follow-configuration-role-fd descriptors :root)))
+    (physical-reseed-follow-retirement-layout-state-core
+     descriptors snapshot check extra-reader candidate pid-evidence
+     (lambda () (physical-reseed-follow-check-snapshot root snapshot))
+     (append '("physical-reseed.follow")
+             (when candidate '("physical-reseed.follow.tmp"))
+             (when (getf pid-evidence :entry) '("postmaster.pid"))))))
 
 (defun physical-reseed-follow-retirement-layout-state (descriptors snapshot check)
   ;; Keep the strict layout policy for callers without a held temporary.
