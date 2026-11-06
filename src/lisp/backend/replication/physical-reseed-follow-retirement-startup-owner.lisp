@@ -121,19 +121,29 @@
   (call-with-physical-reseed-follow-retirement-startup-root
    owner
    (lambda (root check)
-     (let ((evidence (retirement-startup-evidence owner)))
-       (call-with-physical-reseed-follow-retirement-owned-pid-observation
-        root (getf evidence :snapshot) check
-        (lambda (descriptors state verify)
-          (unless (equal evidence (physical-reseed-follow-startup-projection descriptors state))
-            (error "retirement startup differs from its PID handover evidence"))
-          (funcall verify)
-          (funcall function descriptors state verify)))))))
+     (let* ((evidence (retirement-startup-evidence owner))
+            (retired (getf evidence :journal)))
+       (flet ((observe (descriptors state verify)
+                (unless (equal evidence
+                               (if retired
+                                   (physical-reseed-follow-retired-startup-projection descriptors state)
+                                   (physical-reseed-follow-startup-projection descriptors state)))
+                  (error "retirement startup differs from its PID handover evidence"))
+                (funcall verify)
+                (funcall function descriptors state verify)))
+         (if retired
+             (call-with-physical-reseed-follow-retired-owned-pid-observation root check #'observe)
+             (call-with-physical-reseed-follow-retirement-owned-pid-observation
+              root (getf evidence :snapshot) check #'observe)))))))
 
 (defun call-with-physical-reseed-follow-retirement-startup-owner (expected function)
   ;; Bind trusted handover evidence to published postmaster ownership.
   ;; Reprove it before the callback and revoke the owner when the scope ends.
-  (unless (and (eq :retirement (getf expected :branch)) (getf expected :evidence)
+  (unless (and (case (getf expected :branch)
+                 (:retirement (null (getf (getf expected :evidence) :journal)))
+                 (:retired (member (getf (getf (getf expected :evidence) :journal) :geometry)
+                                   '(:alias :receipt))))
+               (getf expected :evidence)
                *postmaster-data-lock* (open-stream-p *postmaster-data-lock*)
                *postmaster-pid-stream* (open-stream-p *postmaster-pid-stream*))
     (error "retirement startup requires published postmaster ownership and handover evidence"))
