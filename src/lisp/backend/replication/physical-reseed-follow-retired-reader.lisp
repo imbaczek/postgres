@@ -1,6 +1,9 @@
 (in-package #:pg)
 
 (defun physical-reseed-follow-retired-geometry (follow receipt)
+  ;; Observe the three retirement layouts: follow only, two names for the
+  ;; same inode, or receipt only.  This does not admit the full layout,
+  ;; archive, or startup state.
   (let ((links (if (and follow receipt) 2 1)))
     (unless (and (or follow receipt)
                  (or (null follow)
@@ -16,6 +19,8 @@
   (cond ((null receipt) :follow) ((null follow) :receipt) (t :alias)))
 
 (defun physical-reseed-follow-retired-rows (root check)
+  ;; ROOT is borrowed from the caller.  CHECK guards its parent scope;
+  ;; retain exact file facts and mount identity for later comparisons.
   (funcall check)
   (let* ((stat (physical-image-check-directory root))
          (mount (physical-adoption-install-mount-id nil :directory-fd root))
@@ -70,6 +75,8 @@
          (bytes (make-array (seventh row) :element-type '(unsigned-byte 8)))
          (current (make-array (length bytes) :element-type '(unsigned-byte 8)))
          (record nil) (fd nil) (stream nil) (active nil) (thread sb-thread:*current-thread*))
+    ;; Own the opened descriptor until cleanup.  Read a bounded canonical
+    ;; Retired2 image and compare both its named and held facts.
     (multiple-value-prog1
         (unwind-protect
              (progn
@@ -97,12 +104,16 @@
                               (eql 2 (getf (getf record :retirement) :step)))
                    (error "retired journal requires the canonical Retired2 image"))
                  (verify-row)
+                 ;; The generic tree copier preserves vectors.  Copy the bytes
+                 ;; explicitly so the returned state cannot change our baseline.
                  (let ((state (append observation
                                       (list :snapshot
                                             (list :record record
                                                   :identity (physical-reseed-install-row-file-facts row)
                                                   :row row)
                                             :bytes (copy-seq bytes)))))
+                   ;; The callback may verify only on this thread and while the
+                   ;; descriptor is open.  Cleanup revokes it before close.
                    (flet ((verify ()
                             (verify-row)
                             (file-position stream 0)
@@ -118,6 +129,7 @@
                        (verify))))))
           (setf active nil)
           (if stream (close stream) (when fd (sb-posix:close fd))))
+      ;; Check the parent and named files once more after descriptor cleanup.
       (funcall check)
       (physical-reseed-follow-test-point :after-retired-journal-close path)
       (physical-reseed-follow-retired-check-root root record check)
