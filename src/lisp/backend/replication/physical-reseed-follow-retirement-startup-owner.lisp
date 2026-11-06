@@ -119,23 +119,30 @@
   ;; Select the owned-PID reader from the saved journal evidence.  Compare a
   ;; fresh matching projection before calling FUNCTION, under the borrowed
   ;; lock, PID and root checks.
-  (call-with-physical-reseed-follow-retirement-startup-root
-   owner
-   (lambda (root check)
-     (let* ((evidence (retirement-startup-evidence owner))
-            (retired (getf evidence :journal)))
-       (flet ((observe (descriptors state verify)
-                (unless (equal evidence
-                               (if retired
-                                   (physical-reseed-follow-retired-startup-projection descriptors state)
-                                   (physical-reseed-follow-startup-projection descriptors state)))
-                  (error "retirement startup differs from its PID handover evidence"))
-                (funcall verify)
-                (funcall function descriptors state verify)))
-         (if retired
-             (call-with-physical-reseed-follow-retired-owned-pid-observation root check #'observe)
-             (call-with-physical-reseed-follow-retirement-owned-pid-observation
-              root (getf evidence :snapshot) check #'observe)))))))
+  (let ((stamp nil))
+    (multiple-value-prog1
+        (call-with-physical-reseed-follow-retirement-startup-root
+         owner
+         (lambda (root check)
+           (let* ((evidence (retirement-startup-evidence owner))
+                  (retired (getf evidence :journal)))
+             (flet ((observe (descriptors state verify)
+                      (unless (equal evidence
+                                     (if retired
+                                         (physical-reseed-follow-retired-startup-projection descriptors state)
+                                         (physical-reseed-follow-startup-projection descriptors state)))
+                        (error "retirement startup differs from its PID handover evidence"))
+                      (funcall verify)
+                      (let ((private-descriptors (copy-tree descriptors))
+                            (names (physical-adoption-attempt-value-copy (getf (getf state :layout) :names))))
+                        (multiple-value-prog1 (funcall function descriptors state verify)
+                          (setf stamp (physical-reseed-follow-retirement-role-stamp private-descriptors names))))))
+               (if retired
+                   (call-with-physical-reseed-follow-retired-owned-pid-observation root check #'observe)
+                   (call-with-physical-reseed-follow-retirement-owned-pid-observation
+                    root (getf evidence :snapshot) check #'observe))))))
+      (physical-reseed-follow-retirement-audit-stamp
+       stamp (lambda () (physical-reseed-follow-retirement-check-startup-owner owner))))))
 
 (defun call-with-physical-reseed-follow-retirement-startup-owner (expected function)
   ;; Bind trusted handover evidence to published postmaster ownership.

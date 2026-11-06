@@ -581,6 +581,410 @@
               (declare (ignore descriptors state))
               (ok (funcall verify)))))))))
 
+(deftest reseed-retired-observation-refuses-archive-mutation-during-store-close
+    (call-with-retired-reader-test-fixture
+     :same-timeline
+     (lambda (root root-fd record check)
+       (reset-retired-reader-test-files root record :receipt)
+       (let* ((workspace (pathname (getf (getf (getf record :configuration) :workspace) :directory)))
+              (archive (merge-pathnames "saved/physical-reseed.attempt" workspace))
+              (bytes (lineage-test-bytes archive))
+              (original (symbol-function 'pg::physical-store-close))
+              (fired nil) (returned nil) (message nil))
+         (unwind-protect
+              (progn
+                (setf (symbol-function 'pg::physical-store-close)
+                      (lambda (store)
+                        (multiple-value-prog1 (funcall original store)
+                          (unless fired
+                            (with-open-file (output archive :direction :io :if-exists :overwrite
+                                                            :element-type '(unsigned-byte 8))
+                              (write-byte (logxor 1 (aref bytes 0)) output))
+                            (setf fired t)))))
+                (setf message
+                      (handler-case
+                          (progn
+                            (pg::call-with-physical-reseed-follow-retired-before-pid-observation
+                             root-fd check
+                             (lambda (descriptors state verify)
+                               (declare (ignore descriptors state))
+                               (funcall verify)))
+                            (setf returned t)
+                            nil)
+                        (error (condition) (princ-to-string condition)))))
+           (setf (symbol-function 'pg::physical-store-close) original))
+         (ok fired)
+         (ok (= (length bytes) (length (lineage-test-bytes archive))))
+         (ng (equalp bytes (lineage-test-bytes archive)))
+         (ok (and message (search "retirement observation changed during resource cleanup" message)))
+         (ng returned)
+         (ok (sb-posix:fstat root-fd))))))
+
+(defun restore-retirement-cleanup-test-file (path bytes stat)
+  (with-open-file (output path :direction :io :if-exists :overwrite
+                               :element-type '(unsigned-byte 8))
+    (write-sequence bytes output))
+  (sb-posix:utime (namestring path) (sb-posix:stat-atime stat) (sb-posix:stat-mtime stat)))
+
+(defun check-retirement-cleanup-test-cut (cut root-fd record check)
+  (let* ((workspace (pathname (getf (getf (getf record :configuration) :workspace) :directory)))
+         (archive (merge-pathnames (if (member cut '(:guard :pid))
+                                       "saved/physical-reseed.install" "saved/physical-reseed.attempt")
+                                   workspace))
+         (bytes (lineage-test-bytes archive))
+         (stat (sb-posix:lstat (namestring archive)))
+         (close-store (symbol-function 'pg::physical-store-close))
+         (guard (symbol-function 'pg::call-with-physical-reseed-install-guard))
+         (pid-scope (symbol-function 'pg::call-with-physical-reseed-follow-retirement-before-pid))
+         (old-hook pg::*physical-reseed-follow-test-hook*)
+         (fired nil) (closed-guard nil) (returned nil) (message nil))
+    (flet ((mutate ()
+             (unless fired
+               (with-open-file (output archive :direction :io :if-exists :overwrite
+                                               :element-type '(unsigned-byte 8))
+                 (write-byte (logxor 1 (aref bytes 0)) output))
+               (setf fired t))))
+      (unwind-protect
+           (progn
+             (setf (symbol-function 'pg::physical-store-close)
+                   (lambda (store)
+                     (multiple-value-prog1 (funcall close-store store)
+                       (when (eq cut :store) (mutate))))
+                   (symbol-function 'pg::call-with-physical-reseed-install-guard)
+                   (lambda (fd name prepare function)
+                     (let ((stream nil))
+                       (multiple-value-prog1
+                           (funcall guard fd name prepare
+                                    (lambda (held) (setf stream held) (funcall function held)))
+                         (when (and (eq cut :guard) (not fired))
+                           (setf closed-guard (not (open-stream-p stream)))
+                           (mutate)))))
+                   (symbol-function 'pg::call-with-physical-reseed-follow-retirement-before-pid)
+                   (lambda (fd parent function)
+                     (multiple-value-prog1 (funcall pid-scope fd parent function)
+                       (when (eq cut :pid) (mutate))))
+                   pg::*physical-reseed-follow-test-hook*
+                   (lambda (point path)
+                     (when old-hook (funcall old-hook point path))
+                     (when (and (eq cut :source) (eq point :after-retired-journal-close))
+                       (mutate))))
+             (setf message
+                   (handler-case
+                       (progn
+                         (pg::call-with-physical-reseed-follow-retired-before-pid-observation
+                          root-fd check
+                          (lambda (descriptors state verify)
+                            (declare (ignore descriptors state))
+                            (funcall verify)))
+                         (setf returned t)
+                         nil)
+                     (error (condition) (princ-to-string condition)))))
+        (setf (symbol-function 'pg::physical-store-close) close-store
+              (symbol-function 'pg::call-with-physical-reseed-install-guard) guard
+              (symbol-function 'pg::call-with-physical-reseed-follow-retirement-before-pid) pid-scope
+              pg::*physical-reseed-follow-test-hook* old-hook))
+      (unwind-protect
+           (progn
+             (ok fired)
+             (ok (= (length bytes) (length (lineage-test-bytes archive))))
+             (ng (equalp bytes (lineage-test-bytes archive)))
+             (ok (and message (search "retirement observation changed during resource cleanup" message)))
+             (ng returned)
+             (when (eq cut :guard) (ok closed-guard))
+             (ok (sb-posix:fstat root-fd)))
+        (restore-retirement-cleanup-test-file archive bytes stat))
+      (pg::call-with-physical-reseed-follow-retired-before-pid-observation
+       root-fd check
+       (lambda (descriptors state verify)
+         (declare (ignore descriptors state))
+         (ok (funcall verify)))))))
+
+(deftest reseed-retired-observation-audits-archives-after-every-resource-layer
+    (call-with-retired-reader-test-fixture
+     :same-timeline
+     (lambda (root root-fd record check)
+       (reset-retired-reader-test-files root record :receipt)
+       (let ((pid (merge-pathnames "postmaster.pid" root)))
+         (reseed-follow-owner-test-write
+          pid (sb-ext:string-to-octets (format nil "2147483647~%") :external-format :utf-8))
+         (let ((bytes (lineage-test-bytes pid))
+               (inode (sb-posix:stat-ino (sb-posix:lstat (namestring pid)))))
+           (dolist (cut '(:store :guard :pid :source))
+             (check-retirement-cleanup-test-cut cut root-fd record check)
+             (ok (equalp bytes (lineage-test-bytes pid)))
+             (ok (= inode (sb-posix:stat-ino (sb-posix:lstat (namestring pid))))))
+           (delete-file pid))))))
+
+(defun check-retirement-root-cleanup-cut (root root-fd record published target)
+  (let* ((workspace (pathname (getf (getf (getf record :configuration) :workspace) :directory)))
+         (archive (merge-pathnames "saved/physical-reseed.attempt" workspace))
+         (bytes (lineage-test-bytes archive))
+         (stat (sb-posix:lstat (namestring archive)))
+         (pid (merge-pathnames "postmaster.pid" root))
+         (name (if published
+                   'pg::call-with-physical-reseed-follow-retirement-startup-root
+                   'pg::call-with-physical-directory-root))
+         (original (symbol-function name))
+         (count 0) (fired nil) (closed nil) (entered nil) (inner nil) (message nil)
+         (pid-bytes nil) (pid-inode nil))
+    (unless published
+      (when (probe-file pid) (delete-file pid))
+      (reseed-follow-owner-test-write
+       pid (sb-ext:string-to-octets (format nil "2147483647~%") :external-format :utf-8))
+      (setf pid-bytes (lineage-test-bytes pid)
+            pid-inode (sb-posix:stat-ino (sb-posix:lstat (namestring pid)))))
+    (unwind-protect
+         (progn
+           (setf (symbol-function name)
+                 (lambda (owner function)
+                   (let ((fd nil))
+                     (incf count)
+                     (multiple-value-prog1
+                         (funcall original owner
+                                  (lambda (&rest arguments)
+                                    (setf fd (first arguments))
+                                    (apply function arguments)))
+                       (when (= count target)
+                         (setf closed
+                               (handler-case (progn (sb-posix:fstat fd) nil)
+                                 (sb-posix:syscall-error () t)))
+                         (with-open-file (output archive :direction :io :if-exists :overwrite
+                                                         :element-type '(unsigned-byte 8))
+                           (write-byte (logxor 1 (aref bytes 0)) output))
+                         (setf fired t))))))
+           (setf message
+                 (handler-case
+                     (progn
+                       (call-with-retired-startup-test-context
+                        root
+                        (lambda (before after)
+                          (declare (ignore before))
+                          (if published
+                              (pg::call-with-physical-reseed-follow-retirement-startup-owner
+                               after
+                               (lambda (owner)
+                                 (setf entered t)
+                                 (when (= target 2)
+                                   (pg::call-with-physical-reseed-follow-retirement-startup-observation
+                                    owner
+                                    (lambda (descriptors state verify)
+                                      (declare (ignore descriptors state))
+                                      (setf inner t)
+                                      (funcall verify))))))
+                              (setf entered t))))
+                       nil)
+                   (error (condition) (princ-to-string condition)))))
+      (setf (symbol-function name) original))
+    (unwind-protect
+         (progn
+           (ok fired)
+           (ok closed)
+           (ok (= count target))
+           (ok (eql (and published (= target 2)) entered))
+           (ok (eql (and published (= target 2)) inner))
+           (ok (and message (search "retirement observation changed during resource cleanup" message)))
+           (ok (= (length bytes) (length (lineage-test-bytes archive))))
+           (ng (equalp bytes (lineage-test-bytes archive)))
+           (if (and (not published) (= target 1))
+               (progn
+                 (ok (equalp pid-bytes (lineage-test-bytes pid)))
+                 (ok (= pid-inode (sb-posix:stat-ino (sb-posix:lstat (namestring pid)))))
+                 (delete-file pid))
+               (ng (probe-file pid)))
+           (ok (sb-posix:fstat root-fd)))
+      (restore-retirement-cleanup-test-file archive bytes stat))
+    (call-with-retired-startup-test-context
+     root
+     (lambda (before after)
+       (ok (equal before after))
+       (pg::call-with-physical-reseed-follow-retirement-startup-owner
+        after (lambda (owner) (ok (pg::physical-reseed-follow-retirement-check-startup-owner owner))))))))
+
+(deftest reseed-retired-startup-audits-archives-after-both-root-cleanup-boundaries
+    (call-with-retired-startup-test-fixture
+     :same-timeline
+     (lambda (root workspace root-fd record)
+       (declare (ignore workspace))
+       (reset-retired-reader-test-files root record :receipt)
+       (dolist (published '(nil t))
+         (dolist (target '(1 2))
+           (check-retirement-root-cleanup-cut root root-fd record published target))))))
+
+(deftest reseed-retirement-cleanup-path-facts-ignore-parent-activity-and-refuse-symlinks
+    (with-physical-store-directory (root)
+      (let* ((parent (merge-pathnames "parent/" root))
+             (child (merge-pathnames "child/" parent))
+             (moved (merge-pathnames "moved/" root)))
+        (sb-posix:mkdir (namestring parent) #o700)
+        (sb-posix:mkdir (namestring child) #o700)
+        (let* ((before (pg::physical-reseed-follow-retirement-path-facts (namestring child)))
+               (links (sb-posix:stat-nlink (sb-posix:lstat (namestring parent))))
+               (mount (pg::physical-adoption-install-mount-id child))
+               (row (pg::physical-reseed-follow-retirement-named-row (namestring child) "." mount)))
+          (sb-posix:mkdir (namestring (merge-pathnames "neighbor/" parent)) #o700)
+          (ok (/= links (sb-posix:stat-nlink (sb-posix:lstat (namestring parent)))))
+          (ok (equal before (pg::physical-reseed-follow-retirement-path-facts (namestring child))))
+          (sb-posix:rename (namestring parent) (namestring moved))
+          (unwind-protect
+               (progn
+                 (sb-posix:symlink (string-right-trim "/" (namestring moved))
+                                   (string-right-trim "/" (namestring parent)))
+                 (ok (sb-posix:s-islnk (sb-posix:stat-mode
+                                        (sb-posix:lstat (string-right-trim "/" (namestring parent))))))
+                 (ok (equal row (pg::physical-reseed-follow-retirement-named-row (namestring child) "." mount)))
+                 (ok (handler-case
+                         (progn (pg::physical-reseed-follow-retirement-path-facts (namestring child)) nil)
+                       (error (condition)
+                         (search "retirement observation changed during resource cleanup" (princ-to-string condition))))))
+            (when (pg::physical-adoption-path-present-p (string-right-trim "/" (namestring parent)))
+              (sb-posix:unlink (string-right-trim "/" (namestring parent))))
+            (sb-posix:rename (namestring moved) (namestring parent)))))))
+
+(deftest reseed-retired-cleanup-audit-keeps-private-inputs-and-opens-no-resources
+    (call-with-retired-reader-test-fixture
+     :same-timeline
+     (lambda (root root-fd record check)
+       (reset-retired-reader-test-files root record :receipt)
+       (let* ((audit (symbol-function 'pg::physical-reseed-follow-retirement-audit-stamp))
+              (open-file (symbol-function 'pg::physical-image-openat))
+              (open-store (symbol-function 'pg::physical-store-open))
+              (open-directory (symbol-function 'pg::physical-backup-open-directory))
+              (auditing nil) (audits 0) (files 0) (stores 0) (directories 0) (audit-opens 0))
+         (unwind-protect
+              (progn
+                (setf (symbol-function 'pg::physical-reseed-follow-retirement-audit-stamp)
+                      (lambda (stamp parent)
+                        (let ((previous auditing))
+                          (incf audits)
+                          (unwind-protect
+                               (progn (setf auditing t) (funcall audit stamp parent))
+                            (setf auditing previous))))
+                      (symbol-function 'pg::physical-image-openat)
+                      (lambda (&rest arguments)
+                        (incf files)
+                        (when auditing (incf audit-opens))
+                        (apply open-file arguments))
+                      (symbol-function 'pg::physical-store-open)
+                      (lambda (&rest arguments)
+                        (incf stores)
+                        (when auditing (incf audit-opens))
+                        (apply open-store arguments))
+                      (symbol-function 'pg::physical-backup-open-directory)
+                      (lambda (&rest arguments)
+                        (incf directories)
+                        (when auditing (incf audit-opens))
+                        (apply open-directory arguments)))
+                (ok
+                 (equal '(:first :second)
+                        (multiple-value-list
+                         (pg::call-with-physical-reseed-follow-retired-before-pid-observation
+                          root-fd check
+                          (lambda (descriptors state verify)
+                            (ok (funcall verify))
+                            (setf (cdr (assoc :saved descriptors)) -1
+                                  (getf (getf state :layout) :names) nil)
+                            (ok (funcall verify))
+                            (values :first :second))))))
+                (ok (>= audits 2))
+                (ok (plusp files))
+                (ok (plusp stores))
+                (ok (plusp directories))
+                (ok (zerop audit-opens))
+                (ok (sb-posix:fstat root-fd)))
+           (setf (symbol-function 'pg::physical-reseed-follow-retirement-audit-stamp) audit
+                 (symbol-function 'pg::physical-image-openat) open-file
+                 (symbol-function 'pg::physical-store-open) open-store
+                 (symbol-function 'pg::physical-backup-open-directory) open-directory))))))
+
+(deftest reseed-retired-cleanup-audit-refuses-an-unexpected-quarantine-fifo
+    (call-with-retired-reader-test-fixture
+     :same-timeline
+     (lambda (root root-fd record check)
+       (reset-retired-reader-test-files root record :receipt)
+       (let ((fifo nil) (fired nil) (returned nil) (message nil))
+         (unwind-protect
+              (progn
+                (let ((pg::*physical-reseed-follow-test-hook*
+                        (lambda (point path)
+                          (declare (ignore path))
+                          (when (and (not fired) (eq point :after-retired-journal-close))
+                            (sb-posix:mkfifo (namestring fifo) #o600)
+                            (setf fired t)))))
+                  (setf message
+                        (handler-case
+                            (progn
+                              (pg::call-with-physical-reseed-follow-retired-before-pid-observation
+                               root-fd check
+                               (lambda (descriptors state verify)
+                                 (declare (ignore state))
+                                 (setf fifo
+                                       (merge-pathnames
+                                        "unexpected-cleanup.fifo"
+                                        (truename (pg::physical-image-fd-path (cdr (assoc :quarantine descriptors))))))
+                                 (funcall verify)))
+                              (setf returned t)
+                              nil)
+                          (error (condition) (princ-to-string condition)))))
+                (ok fired)
+                (ok (and message (search "retirement observation changed during resource cleanup" message)))
+                (ng returned)
+                (ok (and fifo (sb-posix:s-isfifo (sb-posix:stat-mode (sb-posix:lstat (namestring fifo))))))
+                (ok (sb-posix:fstat root-fd)))
+           (when (and fifo (pg::physical-adoption-path-present-p fifo))
+             (sb-posix:unlink (namestring fifo))))
+         (pg::call-with-physical-reseed-follow-retired-before-pid-observation
+          root-fd check
+          (lambda (descriptors state verify)
+            (declare (ignore descriptors state))
+            (ok (funcall verify))))))))
+
+(deftest reseed-retirement-follow-only-observation-refuses-archive-write-on-close
+    (call-with-retired-reader-test-fixture
+     :same-timeline
+     (lambda (root root-fd record check)
+       (reset-retired-reader-test-files root record :follow)
+       (let* ((workspace (pathname (getf (getf (getf record :configuration) :workspace) :directory)))
+              (archive (merge-pathnames "saved/physical-reseed.attempt" workspace))
+              (bytes (lineage-test-bytes archive))
+              (original (symbol-function 'pg::physical-store-close))
+              (fired nil) (returned nil) (message nil))
+         (unwind-protect
+              (progn
+                (setf (symbol-function 'pg::physical-store-close)
+                      (lambda (store)
+                        (multiple-value-prog1 (funcall original store)
+                          (unless fired
+                            (with-open-file (output archive :direction :io :if-exists :overwrite
+                                                            :element-type '(unsigned-byte 8))
+                              (write-byte (logxor 1 (aref bytes 0)) output))
+                            (setf fired t)))))
+                (setf message
+                      (handler-case
+                          (progn
+                            (pg::call-with-physical-reseed-follow-retirement-observation
+                             root-fd (pg::physical-reseed-follow-snapshot-at root-fd) check
+                             (lambda (descriptors state verify)
+                               (declare (ignore descriptors state))
+                               (funcall verify)))
+                            (setf returned t)
+                            nil)
+                        (error (condition) (princ-to-string condition)))))
+           (setf (symbol-function 'pg::physical-store-close) original))
+         (ok fired)
+         (ok (= (length bytes) (length (lineage-test-bytes archive))))
+         (ng (equalp bytes (lineage-test-bytes archive)))
+         (ok (and message (search "retirement observation changed during resource cleanup" message)))
+         (ng returned)
+         (ok (sb-posix:fstat root-fd))))))
+
+(deftest reseed-retirement-follow-only-startup-audits-second-root-cleanup
+    (call-with-retired-startup-test-fixture
+     :same-timeline
+     (lambda (root workspace root-fd record)
+       (declare (ignore workspace))
+       (reset-retired-reader-test-files root record :follow)
+       (check-retirement-root-cleanup-cut root root-fd record t 2))))
+
 (defun check-retired-reader-geometries (kinds)
   (dolist (kind kinds)
     (call-with-retired-reader-test-fixture

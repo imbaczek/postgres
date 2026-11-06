@@ -221,6 +221,74 @@
           check))
        #'root-check))))
 
+(defun physical-reseed-follow-retirement-named-row (directory name mount)
+  (let* ((trimmed (string-right-trim "/" directory))
+         (path (if (equal name ".")
+                   (if (plusp (length trimmed)) trimmed "/.")
+                   (namestring (merge-pathnames name (pathname directory)))))
+         (row (physical-reseed-install-old-observe +physical-adoption-at-fdcwd+ path mount)))
+    (cons name (rest row))))
+
+(defun physical-reseed-follow-retirement-path-fact (path)
+  (let* ((mount (physical-adoption-install-mount-id path))
+         (row (physical-reseed-install-old-observe +physical-adoption-at-fdcwd+ path mount)))
+    (unless (= #o040000 (logand #o170000 (fourth row)))
+      (error "retirement observation changed during resource cleanup"))
+    (list path mount (list (second row) (third row) (fourth row) (sixth row)))))
+
+(defun physical-reseed-follow-retirement-path-facts (directory)
+  (let ((parts (pathname-directory (pathname directory))))
+    (loop for end from 1 to (length parts)
+          for prefix = (namestring (make-pathname :directory (subseq parts 0 end) :name nil :type nil))
+          for trimmed = (string-right-trim "/" prefix)
+          collect (physical-reseed-follow-retirement-path-fact
+                   (if (plusp (length trimmed)) trimmed "/.")))))
+
+(defun physical-reseed-follow-retirement-role-stamp (descriptors names)
+  (unless (= 10 (length descriptors))
+    (error "retirement cleanup requires exactly ten held directory roles"))
+  (let ((paths nil)
+        (roles nil))
+    (dolist (role '(:root :incoming :quarantine :base :global :wal :workspace :staged :saved :receive))
+      (let* ((fd (physical-reseed-follow-configuration-role-fd descriptors role))
+             (directory (namestring (uiop:ensure-directory-pathname (truename (physical-image-fd-path fd)))))
+             (mount (physical-adoption-install-mount-id nil :directory-fd fd))
+             (row (physical-reseed-install-old-observe fd "." mount))
+             (entries (loop for name in (getf names role)
+                            collect (physical-reseed-install-old-observe fd name mount))))
+        (unless (and (equal row (physical-reseed-install-old-observe fd "." mount))
+                     (equal row (physical-reseed-follow-retirement-named-row directory "." mount)))
+          (error "retirement observation changed during resource cleanup"))
+        (dolist (binding (physical-reseed-follow-retirement-path-facts directory))
+          (pushnew binding paths :test #'equal))
+        (push (list role directory mount row entries) roles)))
+    (list :paths (stable-sort paths #'string< :key #'first) :roles (nreverse roles))))
+
+(defun physical-reseed-follow-retirement-check-stamp (stamp)
+  (unless (and (getf stamp :paths)
+               (equal (mapcar #'first (getf stamp :roles))
+                      '(:root :incoming :quarantine :base :global :wal :workspace :staged :saved :receive)))
+    (error "retirement cleanup requires a complete private role stamp"))
+  (dolist (binding (getf stamp :paths))
+    (unless (equal binding (physical-reseed-follow-retirement-path-fact (first binding)))
+      (error "retirement observation changed during resource cleanup")))
+  (dolist (entry (getf stamp :roles))
+    (destructuring-bind (role directory mount row entries) entry
+      (declare (ignore role))
+      (unless (and (equal row (physical-reseed-follow-retirement-named-row directory "." mount))
+                   (every (lambda (file)
+                            (equal file (physical-reseed-follow-retirement-named-row directory (first file) mount)))
+                          entries)
+                   (equal row (physical-reseed-follow-retirement-named-row directory "." mount)))
+        (error "retirement observation changed during resource cleanup"))))
+  t)
+
+(defun physical-reseed-follow-retirement-audit-stamp (stamp parent-check)
+  (funcall parent-check)
+  (physical-reseed-follow-retirement-check-stamp stamp)
+  (funcall parent-check)
+  (physical-reseed-follow-retirement-check-stamp stamp))
+
 (defun call-with-physical-reseed-follow-retirement-receive-core
     (descriptors snapshot base binding function check layout-reader)
   ;; Repeat the same layout proof around active receive validation.
@@ -264,23 +332,33 @@
      (physical-reseed-follow-retirement-layout-state-at
       held snapshot verify extra-reader candidate pid-evidence))))
 
-(defun call-with-physical-reseed-follow-retirement-observation-core (root snapshot parent-check function extra-reader layout-reader)
+(defun call-with-physical-reseed-follow-retirement-observation-core
+    (root snapshot parent-check function extra-reader layout-reader)
   ;; Root checks use EXTRA-READER to keep the source facts stable.
   ;; LAYOUT-READER supplies the complete proof within the held receive scope.
   ;; Borrow ROOT and its parent ownership from the caller.  Hold the other nine
   ;; directory descriptors, guard streams and local store for the callback.
   (let* ((snapshot (physical-adoption-attempt-value-copy snapshot))
-         (record (physical-reseed-follow-copy (getf snapshot :record))))
+         (record (physical-reseed-follow-copy (getf snapshot :record)))
+         (stamp nil))
     (flet ((root-check ()
              (physical-reseed-follow-retirement-root-check root record parent-check)
              (funcall extra-reader root)))
       (root-check)
-      (call-with-physical-reseed-follow-retirement-directories
-       root record
-       (lambda (descriptors base binding check)
-         (call-with-physical-reseed-follow-retirement-receive-core
-          descriptors snapshot base binding function check layout-reader))
-       #'root-check))))
+      (multiple-value-prog1
+          (call-with-physical-reseed-follow-retirement-directories
+           root record
+           (lambda (descriptors base binding check)
+             (call-with-physical-reseed-follow-retirement-receive-core
+              descriptors snapshot base binding
+              (lambda (held state verify)
+                (let ((private-descriptors (copy-tree held))
+                      (names (physical-adoption-attempt-value-copy (getf (getf state :layout) :names))))
+                  (multiple-value-prog1 (funcall function held state verify)
+                    (setf stamp (physical-reseed-follow-retirement-role-stamp private-descriptors names)))))
+              check layout-reader))
+           #'root-check)
+        (physical-reseed-follow-retirement-audit-stamp stamp #'root-check)))))
 
 (defun call-with-physical-reseed-follow-retirement-observation-at
     (root snapshot parent-check function extra-reader candidate &optional pid-evidence)

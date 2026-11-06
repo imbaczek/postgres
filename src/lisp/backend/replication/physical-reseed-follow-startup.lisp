@@ -48,46 +48,53 @@
   ;; roles and store cleanup.  Its verifier keeps canonical bytes private.
   ;; The callback receives detached geometry rows and a read-only proof.
   ;; The caller controls startup dispatch and any later handover.
-  (call-with-physical-reseed-follow-retired-journal
-   root
-   (lambda (stream source verify-source)
-     (declare (ignore stream))
-     (let* ((snapshot (physical-adoption-attempt-value-copy (getf source :snapshot)))
-            (journal (loop for key in '(:geometry :follow :receipt :mount)
-                           append (list key (physical-adoption-attempt-value-copy (getf source key)))))
-            (names (ecase (getf journal :geometry)
-                     (:follow '("physical-reseed.follow"))
-                     (:alias '("physical-reseed.follow" "physical-reseed.retired"))
-                     (:receipt '("physical-reseed.retired")))))
-       (funcall
-        pid-scope root verify-source
-        (lambda (pid verify-pid)
-          (let* ((entry (when pid (cons (copy-seq "postmaster.pid")
-                                        (physical-adoption-attempt-value-copy (getf pid :row)))))
-                 (evidence (list :entry entry :verify verify-pid))
-                 (expected (append names (when entry '("postmaster.pid")))))
-            (flet ((extra (fd)
-                     (unless (= fd root) (error "retired observation changed its root descriptor"))
-                     (funcall verify-pid)
-                     (append
-                      (loop for key in '(:follow :receipt)
-                            for row = (getf journal key)
-                            when row collect (cons (copy-seq (first row))
-                                                   (physical-adoption-attempt-value-copy row)))
-                      (when entry (list (physical-adoption-attempt-value-copy entry))))))
-              (call-with-physical-reseed-follow-retirement-observation-core
-               root snapshot verify-pid
-               (lambda (descriptors state verify)
-                 (funcall function descriptors
-                          (append state
-                                  (list :journal (physical-adoption-attempt-value-copy journal)
-                                        :pid-file (physical-reseed-follow-retirement-pid-state-copy pid)))
-                          verify))
-               #'extra
-               (lambda (descriptors check)
-                 (physical-reseed-follow-retirement-layout-state-core
-                  descriptors snapshot check #'extra nil evidence verify-pid expected)))))))))
-   parent-check))
+  (let ((stamp nil))
+    (multiple-value-prog1
+        (call-with-physical-reseed-follow-retired-journal
+         root
+         (lambda (stream source verify-source)
+           (declare (ignore stream))
+           (let* ((snapshot (physical-adoption-attempt-value-copy (getf source :snapshot)))
+                  (journal (loop for key in '(:geometry :follow :receipt :mount)
+                                 append (list key (physical-adoption-attempt-value-copy (getf source key)))))
+                  (names (ecase (getf journal :geometry)
+                           (:follow '("physical-reseed.follow"))
+                           (:alias '("physical-reseed.follow" "physical-reseed.retired"))
+                           (:receipt '("physical-reseed.retired")))))
+             (funcall
+              pid-scope root verify-source
+              (lambda (pid verify-pid)
+                (let* ((entry (when pid (cons (copy-seq "postmaster.pid")
+                                              (physical-adoption-attempt-value-copy (getf pid :row)))))
+                       (evidence (list :entry entry :verify verify-pid))
+                       (expected (append names (when entry '("postmaster.pid")))))
+                  (flet ((extra (fd)
+                           (unless (= fd root) (error "retired observation changed its root descriptor"))
+                           (funcall verify-pid)
+                           (append
+                            (loop for key in '(:follow :receipt)
+                                  for row = (getf journal key)
+                                  when row collect (cons (copy-seq (first row))
+                                                         (physical-adoption-attempt-value-copy row)))
+                            (when entry (list (physical-adoption-attempt-value-copy entry))))))
+                    (call-with-physical-reseed-follow-retirement-observation-core
+                     root snapshot verify-pid
+                     (lambda (descriptors state verify)
+                       (let ((private-descriptors (copy-tree descriptors))
+                             (names (physical-adoption-attempt-value-copy (getf (getf state :layout) :names))))
+                         (multiple-value-prog1
+                             (funcall function descriptors
+                                      (append state
+                                              (list :journal (physical-adoption-attempt-value-copy journal)
+                                                    :pid-file (physical-reseed-follow-retirement-pid-state-copy pid)))
+                                      verify)
+                           (setf stamp (physical-reseed-follow-retirement-role-stamp private-descriptors names)))))
+                     #'extra
+                     (lambda (descriptors check)
+                       (physical-reseed-follow-retirement-layout-state-core
+                        descriptors snapshot check #'extra nil evidence verify-pid expected)))))))))
+         parent-check)
+      (physical-reseed-follow-retirement-audit-stamp stamp parent-check))))
 
 (defun call-with-physical-reseed-follow-retired-before-pid-observation (root parent-check function)
   (call-with-physical-reseed-follow-retired-pid-observation
@@ -97,7 +104,7 @@
   (call-with-physical-reseed-follow-retired-pid-observation
    root parent-check function #'call-with-physical-reseed-follow-retirement-owned-pid))
 
-(defun call-with-physical-reseed-follow-startup-root (lock function)
+(defun call-with-physical-reseed-follow-startup-root (lock function &optional after-close)
   ;; Borrow the unpublished lock and own the root descriptor for this callback.
   ;; The temporary owner and check are thread-bound and revoked on exit.  The
   ;; check uses common ownership checks and repeats flock on the same descriptor.
@@ -130,23 +137,25 @@
                                (zerop (physical-store-flock lock-fd 6)))
                     (error "reseed startup observation lost its local lock context"))))
            (check-lock)
-           (call-with-physical-directory-root
-            owner
-            (lambda (root path)
-              (declare (ignore path))
-              (let ((mount (physical-adoption-install-mount-id nil :directory-fd root)))
-                (flet ((verify ()
-                         (check-lock)
-                         (physical-image-check-target directory root)
-                         (unless (= mount
-                                    (physical-adoption-install-mount-id directory)
-                                    (physical-adoption-install-mount-id nil :directory-fd root)
-                                    (physical-adoption-install-mount-id nil :directory-fd lock-fd))
-                           (error "reseed startup root or lock crossed mounts"))
-                         t))
-                  (verify)
-                  (multiple-value-prog1 (funcall function root #'verify)
-                    (verify)))))))
+           (multiple-value-prog1
+               (call-with-physical-directory-root
+                owner
+                (lambda (root path)
+                  (declare (ignore path))
+                  (let ((mount (physical-adoption-install-mount-id nil :directory-fd root)))
+                    (flet ((verify ()
+                             (check-lock)
+                             (physical-image-check-target directory root)
+                             (unless (= mount
+                                        (physical-adoption-install-mount-id directory)
+                                        (physical-adoption-install-mount-id nil :directory-fd root)
+                                        (physical-adoption-install-mount-id nil :directory-fd lock-fd))
+                               (error "reseed startup root or lock crossed mounts"))
+                             t))
+                      (verify)
+                      (multiple-value-prog1 (funcall function root #'verify)
+                        (verify))))))
+             (when after-close (funcall after-close #'check-lock))))
       (setf (physical-adoption-owner-active-p owner) nil))))
 
 (defun physical-reseed-follow-startup-observation (lock phase &optional expected)
@@ -159,51 +168,58 @@
      (when expected (error "initial startup observation cannot reuse boundary evidence")))
     (:owned-pid
      (unless expected (error "owned PID observation requires pre-PID evidence"))))
-  (call-with-physical-reseed-follow-startup-root
-   lock
-   (lambda (root check)
-     ;; A named receipt takes precedence, including the two-name alias.
-     ;; Follow alone uses the existing retirement observer.
-     (let* ((directory (physical-image-fd-path root))
-            (receipt (physical-adoption-path-present-p (merge-pathnames "physical-reseed.retired" directory)))
-            (follow (physical-adoption-path-present-p (merge-pathnames "physical-reseed.follow" directory)))
-            (branch (cond (receipt :retired) (follow :retirement) (t :ordinary))))
-       (when (and expected (not (eq branch (getf expected :branch))))
-         (error "startup branch changed across PID creation"))
-       (ecase branch
-         (:retired
-          (funcall
-           (ecase phase
-             (:before-pid #'call-with-physical-reseed-follow-retired-before-pid-observation)
-             (:owned-pid #'call-with-physical-reseed-follow-retired-owned-pid-observation))
-           root check
-           (lambda (descriptors state verify)
-             ;; Require the receipt in the held observation too, in case the
-             ;; named entry changed after branch selection.
-             (unless (member (getf (getf state :journal) :geometry) '(:alias :receipt))
-               (error "retired startup requires a named receipt"))
-             (let ((evidence (physical-reseed-follow-retired-startup-projection descriptors state)))
-               (when (and expected (not (equal evidence (getf expected :evidence))))
-                 (error "retirement evidence changed across PID creation"))
-               (funcall verify)
-               (list :branch :retired :evidence evidence)))))
-         (:retirement
-          (let ((snapshot (physical-reseed-follow-snapshot-at root))
-                (reader (ecase phase
-                          (:before-pid #'call-with-physical-reseed-follow-retirement-before-pid-observation)
-                          (:owned-pid #'call-with-physical-reseed-follow-retirement-owned-pid-observation))))
+  (let ((stamp nil))
+    (call-with-physical-reseed-follow-startup-root
+     lock
+     (lambda (root check)
+       ;; A named receipt takes precedence, including the two-name alias.
+       ;; Follow alone uses the existing retirement observer.
+       (let* ((directory (physical-image-fd-path root))
+              (receipt (physical-adoption-path-present-p (merge-pathnames "physical-reseed.retired" directory)))
+              (follow (physical-adoption-path-present-p (merge-pathnames "physical-reseed.follow" directory)))
+              (branch (cond (receipt :retired) (follow :retirement) (t :ordinary))))
+         (when (and expected (not (eq branch (getf expected :branch))))
+           (error "startup branch changed across PID creation"))
+         (ecase branch
+           (:retired
             (funcall
-             reader root snapshot check
+             (ecase phase
+               (:before-pid #'call-with-physical-reseed-follow-retired-before-pid-observation)
+               (:owned-pid #'call-with-physical-reseed-follow-retired-owned-pid-observation))
+             root check
              (lambda (descriptors state verify)
-               (let ((evidence (physical-reseed-follow-startup-projection descriptors state)))
+               ;; Require the receipt in the held observation too, in case the
+               ;; named entry changed after branch selection.
+               (unless (member (getf (getf state :journal) :geometry) '(:alias :receipt))
+                 (error "retired startup requires a named receipt"))
+               (let ((evidence (physical-reseed-follow-retired-startup-projection descriptors state)))
                  (when (and expected (not (equal evidence (getf expected :evidence))))
                    (error "retirement evidence changed across PID creation"))
                  (funcall verify)
-                 (list :branch :retirement :evidence evidence))))))
-         (:ordinary
-          (ecase phase
-            (:before-pid (physical-reseed-check-before-pid))
-            (:owned-pid (physical-adoption-startup-preflight)))
-          (funcall check)
-          (physical-reseed-check-before-pid)
-          (list :branch :ordinary)))))))
+                 (setf stamp (physical-reseed-follow-retirement-role-stamp
+                              descriptors (physical-adoption-attempt-value-copy (getf (getf state :layout) :names))))
+                 (list :branch :retired :evidence evidence)))))
+           (:retirement
+            (let ((snapshot (physical-reseed-follow-snapshot-at root))
+                  (reader (ecase phase
+                            (:before-pid #'call-with-physical-reseed-follow-retirement-before-pid-observation)
+                            (:owned-pid #'call-with-physical-reseed-follow-retirement-owned-pid-observation))))
+              (funcall
+               reader root snapshot check
+               (lambda (descriptors state verify)
+                 (let ((evidence (physical-reseed-follow-startup-projection descriptors state)))
+                   (when (and expected (not (equal evidence (getf expected :evidence))))
+                     (error "retirement evidence changed across PID creation"))
+                   (funcall verify)
+                   (setf stamp (physical-reseed-follow-retirement-role-stamp
+                                descriptors (physical-adoption-attempt-value-copy (getf (getf state :layout) :names))))
+                   (list :branch :retirement :evidence evidence))))))
+           (:ordinary
+            (ecase phase
+              (:before-pid (physical-reseed-check-before-pid))
+              (:owned-pid (physical-adoption-startup-preflight)))
+            (funcall check)
+            (physical-reseed-check-before-pid)
+            (list :branch :ordinary)))))
+     (lambda (check)
+       (when stamp (physical-reseed-follow-retirement-audit-stamp stamp check))))))
