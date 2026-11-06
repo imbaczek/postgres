@@ -26,6 +26,7 @@
 ;; Presence alone does not authorize reconciliation.
 
 (defun physical-directory-check-reseed-follow-intent (directory)
+  ;; A retirement completion receipt also fences ordinary startup admission.
   (dolist (name '("physical-reseed.follow" "physical-reseed.follow.tmp"
                   "physical-reseed.retired"))
     (physical-adoption-require-absent
