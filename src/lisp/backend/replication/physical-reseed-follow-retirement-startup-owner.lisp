@@ -116,8 +116,9 @@
       (when fd (sb-posix:close fd)))))
 
 (defun call-with-physical-reseed-follow-retirement-startup-observation (owner function)
-  ;; Run a fresh owned-PID observation and compare it with the trusted
-  ;; handover evidence supplied when the owner was created.
+  ;; Select the owned-PID reader from the saved journal evidence.  Compare a
+  ;; fresh matching projection before calling FUNCTION, under the borrowed
+  ;; lock, PID and root checks.
   (call-with-physical-reseed-follow-retirement-startup-root
    owner
    (lambda (root check)
@@ -138,7 +139,8 @@
 
 (defun call-with-physical-reseed-follow-retirement-startup-owner (expected function)
   ;; Bind trusted handover evidence to published postmaster ownership.
-  ;; Reprove it before the callback and revoke the owner when the scope ends.
+  ;; Require the branch and journal geometry to agree before saving the
+  ;; evidence.  Reprove it before the callback and revoke the owner on exit.
   (unless (and (case (getf expected :branch)
                  (:retirement (null (getf (getf expected :evidence) :journal)))
                  (:retired (member (getf (getf (getf expected :evidence) :journal) :geometry)

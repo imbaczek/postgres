@@ -153,6 +153,7 @@
   ;; Observe before PID creation and compare exact retirement evidence after
   ;; PID ownership.  The ordinary branch runs the existing startup guards.
   ;; This dispatcher returns read-only evidence for later reconciliation.
+  ;; Keep the branch stable across PID creation and compare saved evidence.
   (ecase phase
     (:before-pid
      (when expected (error "initial startup observation cannot reuse boundary evidence")))
@@ -161,6 +162,8 @@
   (call-with-physical-reseed-follow-startup-root
    lock
    (lambda (root check)
+     ;; A named receipt takes precedence, including the two-name alias.
+     ;; Follow alone uses the existing retirement observer.
      (let* ((directory (physical-image-fd-path root))
             (receipt (physical-adoption-path-present-p (merge-pathnames "physical-reseed.retired" directory)))
             (follow (physical-adoption-path-present-p (merge-pathnames "physical-reseed.follow" directory)))
@@ -175,6 +178,8 @@
              (:owned-pid #'call-with-physical-reseed-follow-retired-owned-pid-observation))
            root check
            (lambda (descriptors state verify)
+             ;; Require the receipt in the held observation too, in case the
+             ;; named entry changed after branch selection.
              (unless (member (getf (getf state :journal) :geometry) '(:alias :receipt))
                (error "retired startup requires a named receipt"))
              (let ((evidence (physical-reseed-follow-retired-startup-projection descriptors state)))
