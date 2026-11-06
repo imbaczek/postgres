@@ -644,6 +644,16 @@
          (physical-reseed-follow-retirement-intent-write current)
          (physical-reseed-follow-retirement-intent-promote current)))))
 
+(defun physical-reseed-follow-retirement-intent-startup-expected (owner)
+  (call-with-physical-reseed-follow-retirement-startup-observation
+   owner
+   (lambda (descriptors state verify)
+     (funcall verify)
+     (let ((copy (physical-adoption-attempt-value-copy state)))
+       (setf (getf copy :layout)
+             (physical-reseed-follow-retirement-intent-layout descriptors (getf state :layout)))
+       copy))))
+
 (defun physical-reseed-follow-retirement-publish-initial (owner)
   ;; Publish the first retirement intent from a freshly proved Active state.
   ;; Keep uncertainty through resource cleanup and clear it only after the
@@ -652,14 +662,7 @@
    owner
    (lambda ()
      (let ((expected
-             (call-with-physical-reseed-follow-retirement-startup-observation
-              owner
-              (lambda (descriptors state verify)
-                (funcall verify)
-                (let ((copy (physical-adoption-attempt-value-copy state)))
-                  (setf (getf copy :layout)
-                        (physical-reseed-follow-retirement-intent-layout descriptors (getf state :layout)))
-                  copy)))))
+             (physical-reseed-follow-retirement-intent-startup-expected owner)))
        (unless (and (zerop (getf expected :prefix))
                     (null (getf (getf (getf expected :snapshot) :record) :retirement)))
          (error "initial retirement publication requires Active2 without retirement"))

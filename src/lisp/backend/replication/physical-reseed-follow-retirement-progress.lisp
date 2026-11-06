@@ -472,14 +472,7 @@
    owner
    (lambda ()
      (let* ((expected
-              (call-with-physical-reseed-follow-retirement-startup-observation
-               owner
-               (lambda (descriptors state verify)
-                 (funcall verify)
-                 (let ((copy (physical-adoption-attempt-value-copy state)))
-                   (setf (getf copy :layout)
-                         (physical-reseed-follow-retirement-intent-layout descriptors (getf state :layout)))
-                   copy))))
+              (physical-reseed-follow-retirement-intent-startup-expected owner))
             (record (getf (getf expected :snapshot) :record))
             (retirement (getf record :retirement))
             (name (if (zerop step) "install" "attempt")))
