@@ -18,6 +18,13 @@ SB-POSIX does not export this flag in the supported SBCL.")
   (from-directory sb-alien:int) (from sb-alien:c-string)
   (to-directory sb-alien:int) (to sb-alien:c-string))
 
+(sb-alien:define-alien-routine ("linkat" port-linkat) sb-alien:int
+  (from-directory sb-alien:int) (from sb-alien:c-string)
+  (to-directory sb-alien:int) (to sb-alien:c-string) (flags sb-alien:int))
+
+(sb-alien:define-alien-routine ("unlinkat" port-unlinkat) sb-alien:int
+  (directory sb-alien:int) (name sb-alien:c-string) (flags sb-alien:int))
+
 (defun open-exclusive-temporary-file (template)
   "Create a private temporary inode from TEMPLATE with close-on-exec set atomically.
 The caller must establish cleanup before calling and mask interrupts until the
