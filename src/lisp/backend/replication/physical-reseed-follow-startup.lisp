@@ -109,6 +109,8 @@
   ;; The temporary owner and check are thread-bound and revoked on exit.  The
   ;; check uses common ownership checks and repeats flock on the same descriptor.
   ;; Reasserting flock proves current exclusivity and can reacquire a released lock.
+  ;; AFTER-CLOSE runs after the root closes but before owner revocation; the
+  ;; FUNCTION's multiple values are preserved.
   (unless (and lock (open-stream-p lock) (null *postmaster-data-lock*))
     (error "reseed startup observation requires the unpublished local lock"))
   (let* ((directory (uiop:ensure-directory-pathname (truename *pgdata*)))

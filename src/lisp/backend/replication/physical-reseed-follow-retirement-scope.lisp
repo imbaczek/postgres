@@ -230,6 +230,9 @@
     (cons name (rest row))))
 
 (defun physical-reseed-follow-retirement-path-fact (path)
+  ;; The cleanup stamp supplements an already authenticated full proof.  Its
+  ;; ancestor rows retain identity, type, owner and mount, but omit volatile
+  ;; metadata that sibling changes can affect.  Role and child rows stay exact.
   (let* ((mount (physical-adoption-install-mount-id path))
          (row (physical-reseed-install-old-observe +physical-adoption-at-fdcwd+ path mount)))
     (unless (= #o040000 (logand #o170000 (fourth row)))
@@ -284,6 +287,10 @@
   t)
 
 (defun physical-reseed-follow-retirement-audit-stamp (stamp parent-check)
+  ;; Named statx observations open no new teardown scope.  They compare
+  ;; metadata under cooperating locks at the statx observation boundary.
+  ;; The parent check may itself close a PID descriptor, so finish with a pure
+  ;; stamp check after its last invocation.
   (funcall parent-check)
   (physical-reseed-follow-retirement-check-stamp stamp)
   (funcall parent-check)
@@ -338,6 +345,8 @@
   ;; LAYOUT-READER supplies the complete proof within the held receive scope.
   ;; Borrow ROOT and its parent ownership from the caller.  Hold the other nine
   ;; directory descriptors, guard streams and local store for the callback.
+  ;; Capture the stamp from private copies while all ten roles are held, before
+  ;; the mandatory final verifier.  Audit it after the owned resources close.
   (let* ((snapshot (physical-adoption-attempt-value-copy snapshot))
          (record (physical-reseed-follow-copy (getf snapshot :record)))
          (stamp nil))

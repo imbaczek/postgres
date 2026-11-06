@@ -118,7 +118,8 @@
 (defun call-with-physical-reseed-follow-retirement-startup-observation (owner function)
   ;; Select the owned-PID reader from the saved journal evidence.  Compare a
   ;; fresh matching projection before calling FUNCTION, under the borrowed
-  ;; lock, PID and root checks.
+  ;; lock, PID and root checks.  Capture from private copies while all ten
+  ;; roles are held, before the final verifier.  Audit after the root closes.
   (let ((stamp nil))
     (multiple-value-prog1
         (call-with-physical-reseed-follow-retirement-startup-root
