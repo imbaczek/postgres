@@ -215,6 +215,101 @@
          (ok (equal before after))
          (ok (pg::postmaster-pid-owned-p))))))
 
+(deftest reseed-retired-receipt-fences-real-startup-before-pid-inspection
+    (dolist (kind '(:file :symlink :directory :fifo))
+      (with-physical-store-directory (root)
+        (call-with-adoption-postmaster-fixture
+         root
+         (lambda ()
+           (let ((pid (merge-pathnames "postmaster.pid" root))
+                 (receipt (merge-pathnames "physical-reseed.retired" root))
+                 (boundaries nil))
+             (with-open-file (stream pid :direction :output :if-exists :error)
+               (write-string "opaque old PID bytes" stream))
+             (ecase kind
+               (:file
+                (with-open-file (stream receipt :direction :output :if-exists :error)
+                  (write-string "retired receipt" stream)))
+               (:symlink (sb-posix:symlink "missing" (namestring receipt)))
+               (:directory (sb-posix:mkdir (namestring receipt) #o700))
+               (:fifo (sb-posix:mkfifo (namestring receipt) #o600)))
+             (let ((bytes (lineage-test-bytes pid))
+                   (inode (sb-posix:stat-ino (sb-posix:lstat (namestring pid))))
+                   (facts (pg::physical-reseed-file-facts (sb-posix:lstat (namestring receipt)))))
+               (ok (handler-case
+                       (progn
+                         (pg::postmaster-own-data-directory
+                          "127.0.0.1" 5439
+                          :startup-observer
+                          (lambda (lock phase)
+                            (push phase boundaries)
+                            (pg::physical-reseed-follow-startup-observation lock phase)))
+                         nil)
+                     (error (condition)
+                       (search "pending offline reseed follow requires journal reconciliation"
+                               (princ-to-string condition)))))
+               (ok (equal '(:before-pid) boundaries))
+               (ok (equalp bytes (lineage-test-bytes pid)))
+               (ok (= inode (sb-posix:stat-ino (sb-posix:lstat (namestring pid)))))
+               (ok (equal facts (pg::physical-reseed-file-facts (sb-posix:lstat (namestring receipt)))))
+               (ng pg::*postmaster-pid-stream*)
+               (ng pg::*postmaster-data-lock*))))))))
+
+(deftest reseed-retired-receipt-fences-legacy-ordinary-entrypoints
+    (with-physical-store-directory (root)
+      (let* ((pg::*pgdata* root)
+             (receipt (merge-pathnames "physical-reseed.retired" root))
+             (bytes (sb-ext:string-to-octets "retired receipt" :external-format :utf-8)))
+        (reseed-follow-owner-test-write receipt bytes)
+        (let ((facts (pg::physical-reseed-file-facts (sb-posix:lstat (namestring receipt)))))
+          (dolist (function (list #'pg::physical-reseed-check-before-pid
+                                  #'pg::physical-adoption-startup-preflight
+                                  #'pg::physical-adoption-reconcile-startup
+                                  (lambda () (pg::physical-directory-check-reseed-intent root :install-only t))))
+            (ok (handler-case
+                    (progn (funcall function) nil)
+                  (error (condition)
+                    (search "pending offline reseed follow requires journal reconciliation"
+                            (princ-to-string condition))))))
+          (ok (equalp bytes (lineage-test-bytes receipt)))
+          (ok (equal facts (pg::physical-reseed-file-facts (sb-posix:lstat (namestring receipt)))))))))
+
+(deftest reseed-retired-receipt-fences-the-ordinary-owned-pid-boundary
+    (call-with-pid-owner
+     (lambda (root)
+       (pg::postmaster-remove-pid-file)
+       (close pg::*postmaster-data-lock*)
+       (setf pg::*postmaster-data-lock* nil pg::*postmaster-start-timestamp* nil)
+       (let ((before nil) (facts nil) (boundaries nil)
+                          (receipt (merge-pathnames "physical-reseed.retired" root))
+                          (bytes (sb-ext:string-to-octets "retired receipt" :external-format :utf-8)))
+         (ok (handler-case
+                 (progn
+                   (pg::postmaster-own-data-directory
+                    "127.0.0.1" 5439
+                    :startup-observer
+                    (lambda (lock phase)
+                      (push phase boundaries)
+                      (if (eq phase :before-pid)
+                          (progn
+                            (setf before (pg::physical-reseed-follow-startup-observation lock phase))
+                            (reseed-follow-owner-test-write receipt bytes)
+                            (setf facts (pg::physical-reseed-file-facts
+                                         (sb-posix:lstat (namestring receipt)))))
+                          (pg::physical-reseed-follow-startup-observation lock phase before))))
+                   nil)
+               (error (condition)
+                 (search "pending offline reseed follow requires journal reconciliation"
+                         (princ-to-string condition)))))
+         (ok (equal before '(:branch :ordinary)))
+         (ok (equal boundaries '(:owned-pid :before-pid)))
+         (ok (equalp bytes (lineage-test-bytes receipt)))
+         (ok (equal facts (pg::physical-reseed-file-facts (sb-posix:lstat (namestring receipt)))))
+         (ng pg::*postmaster-data-lock*)
+         (ng pg::*postmaster-pid-stream*)
+         (ng pg::*postmaster-start-timestamp*)
+         (ng (probe-file (merge-pathnames "postmaster.pid" root)))))))
+
 (deftest reseed-startup-observation-rejects-a-new-retirement-branch-after-pid-creation
     (call-with-pid-owner
      (lambda (root)

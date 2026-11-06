@@ -26,7 +26,8 @@
 ;; Presence alone does not authorize reconciliation.
 
 (defun physical-directory-check-reseed-follow-intent (directory)
-  (dolist (name '("physical-reseed.follow" "physical-reseed.follow.tmp"))
+  (dolist (name '("physical-reseed.follow" "physical-reseed.follow.tmp"
+                  "physical-reseed.retired"))
     (physical-adoption-require-absent
      (merge-pathnames name directory)
      "pending offline reseed follow requires journal reconciliation")))
