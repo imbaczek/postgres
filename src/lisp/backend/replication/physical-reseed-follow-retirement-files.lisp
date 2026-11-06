@@ -43,6 +43,8 @@
                 bytes)))))
 
 (defun physical-reseed-follow-retirement-pending-journal (record)
+  ;; Retiring step 0 selects the install journal and step 1 selects the
+  ;; attempt journal.  Other recorded phases select no pending journal.
   (let ((retirement (getf record :retirement)))
     (when (eq :retiring (getf retirement :phase))
       (case (getf retirement :step)
@@ -58,7 +60,8 @@
   ;; Check the root binding, all three mounts, and the attempt file identity
   ;; and nanosecond facts.
   ;; The row maps UID before link count in the attempt identity.  A frozen
-  ;; reference must match, allowing ctime to change after the move to saved.
+  ;; reference must match.  Ctime may change for the recorded pending attempt
+  ;; or after its move to saved.  Other root observations remain strict.
   ;; This observation alone does not establish the saved role, the complete
   ;; namespace, or authority for an operation or startup.
   (let* ((record (physical-reseed-follow-copy value))
@@ -104,7 +107,8 @@
 
 (defun physical-reseed-follow-retirement-install-at (descriptors value prefix)
   ;; Observe the install journal at the prefix location and compare it with
-  ;; the frozen terminal reference.  Saved permits the rename ctime change.
+  ;; the frozen terminal reference.  Ctime may change for the recorded pending
+  ;; install journal or after its move to saved.  Other root observations are strict.
   (let* ((record (physical-reseed-follow-copy value))
          (root (physical-reseed-follow-configuration-role-fd descriptors :root))
          (saved (physical-reseed-follow-configuration-role-fd descriptors :saved))
@@ -132,6 +136,8 @@
       (append state (list :row row)))))
 
 (defun physical-reseed-follow-retirement-alias-row-at (root saved name maximum check)
+  ;; Require two private names for the same inode in distinct directories on
+  ;; the root mount, with exactly two links.
   (funcall check)
   (let* ((root-stat (physical-image-check-directory root))
          (saved-stat (physical-image-check-directory saved (sb-posix:stat-dev root-stat)))
@@ -148,12 +154,17 @@
       row)))
 
 (defun physical-reseed-follow-retirement-alias-reference-p (expected actual link-index)
+  ;; Compare with the frozen single-link reference while allowing the link
+  ;; count and ctime changes caused by the alias.
   (and (= 1 (nth link-index expected)) (= 2 (nth link-index actual))
        (let ((copy (copy-list actual)))
          (setf (nth link-index copy) 1)
          (equal (butlast expected) (butlast copy)))))
 
 (defun physical-reseed-follow-retirement-alias-state (root record row bytes)
+  ;; Check the pending journal's exact bytes and frozen reference.  Install
+  ;; requires the canonical terminal image and attempt requires the original
+  ;; premanifest record.
   (let* ((kind (physical-reseed-follow-retirement-pending-journal record))
          (reference (if (eq kind :install) (getf record :install)
                         (getf (getf record :retirement) :attempt-file)))
@@ -193,6 +204,9 @@
                           :alias-row (copy-list row) :location :alias)))))
 
 (defun call-with-physical-reseed-follow-retirement-alias-file (root saved value function check)
+  ;; Hold the alias file read-only and verify both names, held facts and bytes
+  ;; before and after the callback.  VERIFY is thread-bound and revoked on exit.
+  ;; This observation gives no authority to change the files.
   (declare (notinline physical-image-openat))
   (funcall check)
   (let* ((record (physical-reseed-follow-copy value))
@@ -251,6 +265,7 @@
         (if stream (close stream) (when fd (sb-posix:close fd)))))))
 
 (defun physical-reseed-follow-retirement-alias-at (root saved value check)
+  ;; Return a detached alias observation after the held-file checks.
   (call-with-physical-reseed-follow-retirement-alias-file
    root saved value
    (lambda (stream state verify)
@@ -260,6 +275,8 @@
    check))
 
 (defun physical-reseed-follow-retirement-provisional-plan-at (root saved value &optional (check (constantly t)))
+  ;; Use the narrowly checked pending install alias when both names exist.
+  ;; Single-name cases use the ordinary readers and their one-link checks.
   (funcall check)
   (let* ((record (physical-reseed-follow-copy value))
          (activation (getf record :activation))

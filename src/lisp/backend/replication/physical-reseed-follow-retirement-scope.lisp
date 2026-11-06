@@ -131,6 +131,8 @@
   t)
 
 (defun call-with-physical-reseed-follow-retirement-directories (root value function check)
+  ;; The provisional plan read accepts the checked pending install alias while
+  ;; these directory guards are held.
   ;; Borrow ROOT and hold the other nine directory descriptors and guards for
   ;; the callback.  BASE and BINDING are fresh internal facts.  Copy them
   ;; before saving them as operation evidence.

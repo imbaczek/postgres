@@ -1,6 +1,8 @@
 (in-package #:pg)
 
 (defun physical-reseed-follow-startup-projection (descriptors state)
+  ;; Copy an explicit alias location with the comparison facts across the PID
+  ;; boundary.  This records observation and performs no effects.
   ;; Copy facts for comparison across PID creation and map image descriptors
   ;; to directory roles.  Retain root identity, permissions and ownership while
   ;; omitting root size and timestamps, the root PID name and current PID metadata.

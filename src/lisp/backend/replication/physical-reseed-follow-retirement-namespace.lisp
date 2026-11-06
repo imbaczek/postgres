@@ -19,6 +19,8 @@
     extra))
 
 (defun physical-reseed-follow-retirement-inventories-at (plan record binding prefix extra alias)
+  ;; An alias adds the saved name only for the pending journal at the final
+  ;; recorded step.  The prefix still counts completed moves.
   (let ((inventories (physical-reseed-follow-retirement-inventories plan record binding prefix extra)))
     (when alias
       (let ((kind (physical-reseed-follow-retirement-pending-journal record)))
@@ -29,6 +31,8 @@
     (physical-reseed-follow-configuration-sort-inventories inventories)))
 
 (defun physical-reseed-follow-retirement-journals-at (descriptors record prefix alias check)
+  ;; Use alias evidence only for the recorded pending move.  Read the other
+  ;; journal through its ordinary single-link observer.
   (funcall check)
   (let* ((root (physical-reseed-follow-configuration-role-fd descriptors :root))
          (saved (physical-reseed-follow-configuration-role-fd descriptors :saved))
@@ -44,6 +48,8 @@
          (physical-reseed-follow-retirement-attempt-at root (if (= prefix 2) saved root) record prefix)))))
 
 (defun physical-reseed-follow-retirement-initial-prefix (descriptors plan record binding extra)
+  ;; Match the complete inventories, including the one permitted alias shape.
+  ;; A next temporary does not select or authorize another move.
   (flet ((names ()
            (loop for role in '(:root :incoming :quarantine :base :global :wal :workspace :staged :saved :receive)
                  append (list role (physical-reseed-install-directory-names

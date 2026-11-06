@@ -44,6 +44,8 @@
     (getf (physical-reseed-follow-startup-projection descriptors (list :layout copy)) :layout)))
 
 (defun physical-reseed-follow-retirement-prefix-proof-at (descriptors store value prefix check read-extra &optional alias)
+  ;; Prove the requested prefix and optional pending alias around active
+  ;; receive validation.  The initial intent wrapper uses strict prefix zero.
   (funcall check)
   (let* ((record (physical-reseed-follow-copy value))
          (root (physical-reseed-follow-configuration-role-fd descriptors :root))
@@ -91,6 +93,8 @@
   (physical-reseed-follow-retirement-prefix-proof-at descriptors store value 0 check read-extra))
 
 (defun physical-reseed-follow-retirement-check-move-proof (before after step)
+  ;; Compare two already-proved observations.  Equal prefixes require exact
+  ;; equality.  The caller supplies full proofs and held guards around a move.
   (unless (and (typep step '(integer 0 1))
                (member (getf before :prefix) (list step (1+ step)))
                (eql (getf after :prefix) (1+ step)))
@@ -482,6 +486,7 @@
     (physical-reseed-follow-retirement-intent-adopt witness)))
 
 (defun physical-reseed-follow-retirement-intent-claim-publication (witness)
+  ;; Claim the witness once before publication callbacks can run.
   (sb-sys:without-interrupts
     (unless (and (physical-reseed-follow-retirement-intent-witness-p witness)
                  (retirement-intent-active-p witness)
