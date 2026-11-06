@@ -5,7 +5,10 @@
   ;; Borrow the published lock and PID stream on the creating thread.  Keep
   ;; root, mount and PID facts with a copy of the trusted handover evidence.
   directory root-facts mount lock lock-fd lock-facts
-  pid-stream pid-inode pid-state thread active-p evidence)
+  pid-stream pid-inode pid-state thread active-p evidence busy-p uncertain-p)
+
+(defmethod print-object ((owner physical-reseed-follow-retirement-startup-owner) stream)
+  (print-unreadable-object (owner stream :type t :identity t)))
 
 (defun physical-reseed-follow-retirement-check-startup-owner (owner)
   ;; Keep the published lock, PID and root check independent of the full
@@ -61,6 +64,30 @@
                    (equalp (getf pid :bytes) (getf current :bytes)))
         (error "retirement startup PID evidence changed"))))
   owner)
+
+(defun physical-reseed-follow-retirement-check-startup-idle (owner)
+  (physical-reseed-follow-retirement-check-startup-owner owner)
+  (when (or (retirement-startup-busy-p owner) (retirement-startup-uncertain-p owner))
+    (error "retirement startup owner is busy or uncertain"))
+  owner)
+
+(defun call-with-physical-reseed-follow-retirement-operation (owner function)
+  (physical-reseed-follow-retirement-check-startup-idle owner)
+  (unwind-protect
+       (progn
+         (setf (retirement-startup-busy-p owner) t)
+         (physical-reseed-follow-test-point
+          :after-retirement-operation-busy
+          (merge-pathnames "physical-reseed.follow" (retirement-startup-directory owner)))
+         (flet ((check ()
+                  (physical-reseed-follow-retirement-check-startup-owner owner)
+                  (unless (retirement-startup-busy-p owner)
+                    (error "retirement operation lost its busy scope"))
+                  (when (retirement-startup-uncertain-p owner)
+                    (error "retirement operation requires durable reconciliation"))))
+           (check)
+           (multiple-value-prog1 (funcall function) (check))))
+    (setf (retirement-startup-busy-p owner) nil)))
 
 (defun call-with-physical-reseed-follow-retirement-startup-root (owner function)
   ;; Open and close the root descriptor around the callback.  VERIFY is valid
@@ -122,11 +149,11 @@
             :evidence (physical-adoption-attempt-value-copy (getf expected :evidence)))))
     (unwind-protect
          (progn
-           (physical-reseed-follow-retirement-check-startup-owner owner)
+           (physical-reseed-follow-retirement-check-startup-idle owner)
            (call-with-physical-reseed-follow-retirement-startup-observation
             owner (lambda (descriptors state verify)
                     (declare (ignore descriptors state))
                     (funcall verify)))
            (multiple-value-prog1 (funcall function owner)
-             (physical-reseed-follow-retirement-check-startup-owner owner)))
+             (physical-reseed-follow-retirement-check-startup-idle owner)))
       (setf (retirement-startup-active-p owner) nil))))
