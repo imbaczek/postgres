@@ -1,5 +1,404 @@
 (in-package #:pg-physical-tests)
 
+(defun retired-receipt-test-rows (mode inode size)
+  (let* ((geometry (nth mode '(:follow :alias :receipt)))
+         (row (list (copy-seq "physical-reseed.follow") 17 inode #o100600
+                    (if (= mode 1) 2 1) 1000 size 100 200))
+         (receipt (cons (copy-seq "physical-reseed.retired") (copy-tree (rest row)))))
+    (values (unless (= mode 2) row) (unless (= mode 0) receipt) geometry)))
+
+(cl-spec:defproperty reseed-retired-geometry-binds-exact-names-and-link-counts
+    ((mode (range integer 0 2)) (inode (range integer 1 1000000)) (size (range integer 1 4096)))
+  (:about pg::physical-reseed-follow-retired-geometry)
+  (:trials (:normal 100))
+  (multiple-value-bind (follow receipt geometry) (retired-receipt-test-rows mode inode size)
+    (let ((before (copy-tree (list follow receipt))))
+      (and (eq geometry
+               (funcall (symbol-function 'pg::physical-reseed-follow-retired-geometry) follow receipt))
+           (equal before (list follow receipt))))))
+
+(deftest generated-reseed-retired-geometry-contract
+    (let ((data (cl-spec:result-data
+                 (cl-spec:run-property 'reseed-retired-geometry-binds-exact-names-and-link-counts
+                                       :seed 172 :profile :normal))))
+      (ok (eq :passed (getf data :status)))))
+
+(deftest reseed-retired-geometry-refuses-inconsistent-observations
+    (dolist (case '(:absent :follow-name :receipt-name :follow-extra-link :receipt-extra-link
+                    :follow-single-link :receipt-single-link :third-link :inode :device :mode
+                    :owner :size :mtime :ctime :row-length))
+      (multiple-value-bind (follow receipt geometry)
+          (retired-receipt-test-rows
+           (case case ((:follow-name :follow-extra-link) 0)
+                 ((:receipt-name :receipt-extra-link) 2) (otherwise 1))
+           11 128)
+        (declare (ignore geometry))
+        (ecase case
+          (:absent (setf follow nil receipt nil))
+          (:follow-name (setf (first follow) "foreign"))
+          (:receipt-name (setf (first receipt) "foreign"))
+          (:follow-extra-link (setf (fifth follow) 2))
+          (:receipt-extra-link (setf (fifth receipt) 2))
+          (:follow-single-link (setf (fifth follow) 1))
+          (:receipt-single-link (setf (fifth receipt) 1))
+          (:third-link (setf (fifth follow) 3 (fifth receipt) 3))
+          (:inode (incf (third receipt)))
+          (:device (incf (second receipt)))
+          (:mode (setf (fourth receipt) #o100644))
+          (:owner (incf (sixth receipt)))
+          (:size (incf (seventh receipt)))
+          (:mtime (incf (eighth receipt)))
+          (:ctime (incf (ninth receipt)))
+          (:row-length (setf receipt (append receipt (list :unexpected)))))
+        (ok (handler-case
+                (progn
+                  (funcall (symbol-function 'pg::physical-reseed-follow-retired-geometry) follow receipt)
+                  nil)
+              (error () t))))))
+
+(defun call-with-retired-reader-test-fixture (kind function)
+  (call-with-reseed-retirement-observation-fixture
+   kind
+   (lambda (owner root workspace root-fd snapshot check)
+     (declare (ignore owner workspace))
+     (let* ((before (prepare-retirement-terminal-test root root-fd snapshot nil))
+            (record (pg::physical-reseed-follow-retirement-next-record
+                     before (getf (getf before :retirement) :attempt-file))))
+       (reseed-retirement-layout-write root record)
+       (funcall function root root-fd record check)))))
+
+(defun check-retired-reader-geometries (kinds)
+  (dolist (kind kinds)
+    (call-with-retired-reader-test-fixture
+     kind
+     (lambda (root root-fd record check)
+       (let ((follow (merge-pathnames "physical-reseed.follow" root))
+             (receipt (merge-pathnames "physical-reseed.retired" root)))
+         (dolist (geometry '(:follow :alias :receipt))
+           (ecase geometry
+             (:follow)
+             (:alias (sb-posix:link (namestring follow) (namestring receipt)))
+             (:receipt (delete-file follow)))
+           (let ((original-sync (symbol-function 'sb-posix:fsync))
+                 (original-link (symbol-function 'pg::port-linkat))
+                 (original-unlink (symbol-function 'pg::port-unlinkat))
+                 (syncs 0) (links 0) (unlinks 0)
+                 (held nil) (held-fd nil) (escaped nil) (seen nil))
+             (unwind-protect
+                  (progn
+                    (setf (symbol-function 'sb-posix:fsync)
+                          (lambda (fd) (incf syncs) (funcall original-sync fd))
+                          (symbol-function 'pg::port-linkat)
+                          (lambda (&rest arguments) (incf links) (apply original-link arguments))
+                          (symbol-function 'pg::port-unlinkat)
+                          (lambda (&rest arguments) (incf unlinks) (apply original-unlink arguments)))
+                    (let ((result
+                            (multiple-value-list
+                             (pg::call-with-physical-reseed-follow-retired-journal
+                              root-fd
+                              (lambda (stream state verify)
+                                (setf held stream held-fd (sb-sys:fd-stream-fd stream) escaped verify
+                                      seen (pg::physical-adoption-attempt-value-copy (getf state :snapshot)))
+                                (ok (eq geometry (getf state :geometry)))
+                                (ok (equal record (getf seen :record)))
+                                (ok (= (if (eq geometry :alias) 2 1)
+                                       (sb-posix:stat-nlink (sb-posix:fstat held-fd))))
+                                (ok (logbitp 0 (sb-posix:fcntl held-fd sb-posix:f-getfd)))
+                                (ok (equalp (pg::physical-reseed-follow-image record) (getf state :bytes)))
+                                (ok (funcall verify))
+                                (let ((outcome nil))
+                                  (sb-thread:join-thread
+                                   (sb-thread:make-thread
+                                    (lambda ()
+                                      (setf outcome
+                                            (handler-case (progn (funcall verify) nil)
+                                              (error (condition)
+                                                (search "scope ended or changed thread"
+                                                        (princ-to-string condition))))))))
+                                  (ok outcome))
+                                (setf (getf state :geometry) :forged
+                                      (getf (getf state :snapshot) :record) (list :forged t)
+                                      (aref (getf state :bytes) 0) 0)
+                                (ok (funcall verify))
+                                (values :first :second))
+                              check))))
+                      (ok (equal '(:first :second) result)))
+                    (ng (open-stream-p held))
+                    (ok (handler-case (progn (sb-posix:fstat held-fd) nil)
+                          (sb-posix:syscall-error () t)))
+                    (ok (handler-case (progn (funcall escaped) nil)
+                          (error (condition) (search "scope ended or changed thread" (princ-to-string condition)))))
+                    (ok (sb-posix:fstat root-fd))
+                    (let ((fresh (pg::physical-reseed-follow-retired-journal-at root-fd check)))
+                      (ok (eq geometry (getf fresh :geometry)))
+                      (ok (equal record (getf (getf fresh :snapshot) :record))))
+                    (ok (handler-case
+                            (progn (pg::physical-reseed-follow-entry root-fd "physical-reseed.retired") nil)
+                          (error (condition) (search "unexpected target follow journal name"
+                                                     (princ-to-string condition)))))
+                    (ecase geometry
+                      (:follow (ok (equal seen (pg::physical-reseed-follow-snapshot-at root-fd))))
+                      (:alias (ok (handler-case
+                                      (progn (pg::physical-reseed-follow-snapshot-at root-fd) nil)
+                                    (error (condition) (search "single-link" (princ-to-string condition))))))
+                      (:receipt (ng (pg::physical-reseed-follow-snapshot-at root-fd))))
+                    (ok (zerop syncs))
+                    (ok (zerop links))
+                    (ok (zerop unlinks)))
+               (setf (symbol-function 'sb-posix:fsync) original-sync
+                     (symbol-function 'pg::port-linkat) original-link
+                     (symbol-function 'pg::port-unlinkat) original-unlink)))))))))
+
+(deftest reseed-retired-reader-binds-all-three-geometries-without-effects
+    (check-retired-reader-geometries
+     '(:same-timeline :retained-timeline :before-fork :at-fork :later-writer)))
+
+(defun reset-retired-reader-test-files (root record geometry)
+  (dolist (name '("physical-reseed.follow" "physical-reseed.retired" "physical-reseed.follow.tmp"
+                  "retired-third-link" "retired-other-link"))
+    (let ((path (merge-pathnames name root)))
+      (when (pg::physical-adoption-path-present-p path)
+        (if (sb-posix:s-isdir (sb-posix:stat-mode (sb-posix:lstat (namestring path))))
+            (sb-posix:rmdir (namestring path))
+            (sb-posix:unlink (namestring path))))))
+  (reseed-follow-owner-test-write
+   (merge-pathnames "physical-reseed.follow" root) (pg::physical-reseed-follow-image record))
+  (when (member geometry '(:alias :receipt))
+    (sb-posix:link (namestring (merge-pathnames "physical-reseed.follow" root))
+                   (namestring (merge-pathnames "physical-reseed.retired" root))))
+  (when (eq geometry :receipt)
+    (delete-file (merge-pathnames "physical-reseed.follow" root))))
+
+(deftest reseed-retired-reader-checks-parent-before-descriptor-access
+    (let ((checks 0) (entered nil))
+      (ok (handler-case
+              (progn
+                (pg::call-with-physical-reseed-follow-retired-journal
+                 nil (lambda (&rest arguments) (declare (ignore arguments)) (setf entered t))
+                 (lambda () (incf checks) (error "retired parent cut")))
+                nil)
+            (error (condition) (search "retired parent cut" (princ-to-string condition)))))
+      (ok (= 1 checks))
+      (ng entered)))
+
+(deftest reseed-retired-reader-refuses-invalid-files-before-callback
+    (call-with-retired-reader-test-fixture
+     :same-timeline
+     (lambda (root root-fd record check)
+       (dolist (case '(:absent :symlink :directory :fifo :empty :mode :extra-link
+                       :different-inode :temporary :wrong-phase :noncanonical))
+         (reset-retired-reader-test-files
+          root record (if (member case '(:extra-link :different-inode)) :alias :receipt))
+         (let ((follow (merge-pathnames "physical-reseed.follow" root))
+               (receipt (merge-pathnames "physical-reseed.retired" root))
+               (temporary (merge-pathnames "physical-reseed.follow.tmp" root))
+               (entered nil)
+               (original-open (symbol-function 'pg::physical-image-openat))
+               (opened nil))
+           (ecase case
+             (:absent (delete-file receipt))
+             ((:symlink :directory :fifo :empty)
+              (delete-file receipt)
+              (ecase case
+                (:symlink (sb-posix:symlink "missing" (namestring receipt)))
+                (:directory (sb-posix:mkdir (namestring receipt) #o700))
+                (:fifo (sb-posix:mkfifo (namestring receipt) #o600))
+                (:empty (reseed-follow-owner-test-write receipt (make-array 0 :element-type '(unsigned-byte 8))))))
+             (:mode (sb-posix:chmod (namestring receipt) #o644))
+             (:extra-link
+              (sb-posix:link (namestring receipt) (namestring (merge-pathnames "retired-third-link" root))))
+             (:different-inode
+              (delete-file receipt)
+              (reseed-follow-owner-test-write receipt (pg::physical-reseed-follow-image record))
+              (sb-posix:link (namestring receipt) (namestring (merge-pathnames "retired-other-link" root)))
+              (sb-posix:link (namestring follow) (namestring (merge-pathnames "retired-third-link" root))))
+             (:temporary
+              (reseed-follow-owner-test-write temporary (make-array 0 :element-type '(unsigned-byte 8))))
+             (:wrong-phase
+              (let ((previous (pg::physical-adoption-attempt-value-copy record)))
+                (setf (getf (getf previous :retirement) :phase) :retiring)
+                (delete-file receipt)
+                (reseed-follow-owner-test-write receipt (pg::physical-reseed-follow-image previous))))
+             (:noncanonical
+              (let* ((text (concatenate 'string " " (pg::physical-bootstrap-manifest-text record)))
+                     (bytes (pg::string->bytes
+                             (format nil "PGRESEEDFOLLOW1 ~8,'0X~%~a~%"
+                                     (pg::wal-crc32 (pg::string->bytes text)) text))))
+                (delete-file receipt)
+                (reseed-follow-owner-test-write receipt bytes))))
+           (let ((names (sort (pg::directory-entry-names root) #'string<))
+                 (facts (loop for path in (list follow receipt temporary)
+                              collect (when (pg::physical-adoption-path-present-p path)
+                                        (pg::physical-reseed-file-facts (sb-posix:lstat (namestring path)))))))
+             (unwind-protect
+                  (progn
+                    (setf (symbol-function 'pg::physical-image-openat)
+                          (lambda (&rest arguments)
+                            (let ((fd (apply original-open arguments)))
+                              (when (not (minusp fd)) (setf opened fd))
+                              fd)))
+                    (ok (handler-case
+                            (progn
+                              (pg::call-with-physical-reseed-follow-retired-journal
+                               root-fd
+                               (lambda (&rest arguments) (declare (ignore arguments)) (setf entered t))
+                               check)
+                              nil)
+                          (error (condition)
+                            (search (case case
+                                      ((:absent :extra-link :different-inode) "link geometry")
+                                      (:temporary "refuses a follow temporary")
+                                      (:wrong-phase "canonical Retired2 image")
+                                      (:noncanonical "noncanonical physical backup lease record")
+                                      (otherwise "bounded private regular file"))
+                                    (princ-to-string condition))))))
+               (setf (symbol-function 'pg::physical-image-openat) original-open))
+             (ok (eql (not (null opened)) (not (null (member case '(:wrong-phase :noncanonical))))))
+             (when opened
+               (ok (handler-case (progn (sb-posix:fstat opened) nil)
+                     (sb-posix:syscall-error () t))))
+             (ng entered)
+             (ok (equal names (sort (pg::directory-entry-names root) #'string<)))
+             (ok (equal facts
+                        (loop for path in (list follow receipt temporary)
+                              collect (when (pg::physical-adoption-path-present-p path)
+                                        (pg::physical-reseed-file-facts (sb-posix:lstat (namestring path)))))))
+             (ok (sb-posix:fstat root-fd))))))))
+
+(deftest reseed-retired-reader-closes-its-own-stream-on-every-exit
+    (call-with-retired-reader-test-fixture
+     :same-timeline
+     (lambda (root root-fd record check)
+       (dolist (geometry '(:follow :alias :receipt))
+         (reset-retired-reader-test-files root record geometry)
+         (dolist (mode '(:normal :error :throw :interrupt))
+           (let ((held nil) (fd nil) (escaped nil) (entered nil))
+             (let ((outcome
+                     (catch 'retired-reader-lifetime-cut
+                       (handler-case
+                           (multiple-value-list
+                            (pg::call-with-physical-reseed-follow-retired-journal
+                             root-fd
+                             (lambda (stream state verify)
+                               (declare (ignore state))
+                               (setf held stream fd (sb-sys:fd-stream-fd stream)
+                                     escaped verify entered t)
+                               (ecase mode
+                                 (:normal (values :first :second))
+                                 (:error (error "retired reader lifetime cut"))
+                                 (:throw (throw 'retired-reader-lifetime-cut :cut))
+                                 (:interrupt
+                                  (sb-thread:interrupt-thread
+                                   sb-thread:*current-thread*
+                                   (lambda () (throw 'retired-reader-lifetime-cut :cut))))))
+                             check))
+                         (error (condition)
+                           (if (search "retired reader lifetime cut" (princ-to-string condition))
+                               :error
+                               (progn (format t "~%RETIRED-READER-UNEXPECTED-EXIT ~a~%" condition)
+                                      :wrong-error)))))))
+               (ok (equal outcome (case mode (:normal '(:first :second)) (:error :error) (otherwise :cut)))))
+             (ok entered)
+             (ng (open-stream-p held))
+             (ok (handler-case (progn (sb-posix:fstat fd) nil) (sb-posix:syscall-error () t)))
+             (ok (handler-case (progn (funcall escaped) nil)
+                   (error (condition) (search "scope ended or changed thread" (princ-to-string condition)))))
+             (ok (sb-posix:fstat root-fd))
+             (ok (equal record
+                        (getf (getf (pg::physical-reseed-follow-retired-journal-at root-fd check)
+                                    :snapshot) :record)))))))))
+
+(defun replace-retired-reader-test-file (root path record)
+  (let ((replacement (merge-pathnames "retired-replacement" root)))
+    (reseed-follow-owner-test-write replacement (pg::physical-reseed-follow-image record))
+    (sb-posix:rename (namestring replacement) (namestring path))
+    (sb-posix:stat-ino (sb-posix:lstat (namestring path)))))
+
+(deftest reseed-retired-reader-fences-same-byte-replacement-through-cleanup
+    (call-with-retired-reader-test-fixture
+     :same-timeline
+     (lambda (root root-fd record check)
+       (dolist (geometry '(:follow :alias :receipt))
+         (dolist (point '(:after-retired-journal-open :callback :after-retired-journal-close))
+           (reset-retired-reader-test-files root record geometry)
+           (let* ((name (if (eq geometry :receipt) "physical-reseed.retired" "physical-reseed.follow"))
+                  (path (merge-pathnames name root))
+                  (inode (sb-posix:stat-ino (sb-posix:lstat (namestring path))))
+                  (original-open (symbol-function 'pg::physical-image-openat))
+                  (opened nil) (held nil) (escaped nil) (entered nil) (changed nil)
+                  (closed-at-hook nil) (revoked-at-hook nil)
+                  (pg::*physical-reseed-follow-test-hook*
+                    (lambda (event observed)
+                      (when (eq event point)
+                        (when (eq point :after-retired-journal-close)
+                          (setf closed-at-hook (not (open-stream-p held))
+                                revoked-at-hook
+                                (handler-case (progn (funcall escaped) nil)
+                                  (error (condition)
+                                    (not (null (search "scope ended or changed thread"
+                                                       (princ-to-string condition))))))))
+                        (setf changed (replace-retired-reader-test-file root observed record))))))
+             (unwind-protect
+                  (progn
+                    (setf (symbol-function 'pg::physical-image-openat)
+                          (lambda (&rest arguments)
+                            (let ((fd (apply original-open arguments)))
+                              (when (not (minusp fd)) (setf opened fd))
+                              fd)))
+                    (ok (handler-case
+                            (progn
+                              (pg::call-with-physical-reseed-follow-retired-journal
+                               root-fd
+                               (lambda (stream state verify)
+                                 (declare (ignore state))
+                                 (setf held stream escaped verify entered t)
+                                 (when (eq point :callback)
+                                   (setf changed (replace-retired-reader-test-file root path record))))
+                               check)
+                              nil)
+                          (error (condition)
+                            (and changed (search "retired journal" (princ-to-string condition)))))))
+               (setf (symbol-function 'pg::physical-image-openat) original-open))
+             (ok changed)
+             (ok (eql entered (not (eq point :after-retired-journal-open))))
+             (ok (/= inode (sb-posix:stat-ino (sb-posix:lstat (namestring path)))))
+             (ok (equalp (pg::physical-reseed-follow-image record) (lineage-test-bytes path)))
+             (ok (handler-case (progn (sb-posix:fstat opened) nil) (sb-posix:syscall-error () t)))
+             (ok (sb-posix:fstat root-fd))
+             (when entered
+               (ng (open-stream-p held))
+               (ok (handler-case (progn (funcall escaped) nil)
+                     (error (condition) (search "scope ended or changed thread" (princ-to-string condition))))))
+             (when (eq point :after-retired-journal-close)
+               (ok closed-at-hook)
+               (ok revoked-at-hook))))))))
+
+(deftest reseed-retired-reader-refuses-a-substituted-named-root-mount
+    (call-with-retired-reader-test-fixture
+     :same-timeline
+     (lambda (root root-fd record check)
+       (declare (ignore record))
+       (let ((original (symbol-function 'pg::physical-adoption-install-mount-id))
+             (calls 0) (entered nil))
+         (unwind-protect
+              (progn
+                (setf (symbol-function 'pg::physical-adoption-install-mount-id)
+                      (lambda (directory &key directory-fd)
+                        (let ((mount (funcall original directory :directory-fd directory-fd)))
+                          (if (and directory (equal (pathname directory) root))
+                              (progn (incf calls) (1+ mount))
+                              mount))))
+                (ok (handler-case
+                        (progn
+                          (pg::call-with-physical-reseed-follow-retired-journal
+                           root-fd (lambda (&rest arguments) (declare (ignore arguments)) (setf entered t)) check)
+                          nil)
+                      (error (condition) (search "canonical target root" (princ-to-string condition)))))
+                (ok (= 1 calls))
+                (ng entered)
+                (ok (sb-posix:fstat root-fd)))
+           (setf (symbol-function 'pg::physical-adoption-install-mount-id) original))))))
+
 (defun reseed-startup-projection-fixture (offset)
   (let* ((roles '(:root :incoming :quarantine :base :global :wal :workspace :staged :saved :receive))
          (descriptors (loop for role in roles for fd from offset collect (cons role fd)))
