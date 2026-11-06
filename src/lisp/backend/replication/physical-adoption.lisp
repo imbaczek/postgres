@@ -25,21 +25,25 @@
 ;; entry type.  The presence check uses lstat; only ENOENT means absence.
 ;; Presence alone does not authorize reconciliation.
 
-(defun physical-directory-check-reseed-follow-intent (directory)
-  ;; A retirement completion receipt also fences ordinary startup admission.
-  (dolist (name '("physical-reseed.follow" "physical-reseed.follow.tmp"
-                  "physical-reseed.retired"))
+(defun physical-directory-check-reseed-follow-journals (directory)
+  (dolist (name '("physical-reseed.follow" "physical-reseed.follow.tmp"))
     (physical-adoption-require-absent
      (merge-pathnames name directory)
      "pending offline reseed follow requires journal reconciliation")))
+
+(defun physical-directory-check-reseed-follow-intent (directory)
+  ;; A retirement completion receipt also fences ordinary startup admission.
+  (physical-directory-check-reseed-follow-journals directory)
+  (physical-adoption-require-absent
+   (merge-pathnames "physical-reseed.retired" directory)
+   "pending offline reseed follow requires journal reconciliation"))
 
 ;; Treat each reserved name as a fence, including temporary names.  This check
 ;; does not parse a journal or authorize installation.  The install-only variant
 ;; permits a stopped reseed owner to inspect its attempt, while retaining the
 ;; installation and follow fences.
 
-(defun physical-directory-check-reseed-intent (directory &key install-only)
-  (physical-directory-check-reseed-follow-intent directory)
+(defun physical-directory-check-reseed-install-attempt-intent (directory &key install-only)
   (dolist (name '("physical-reseed.attempt" "physical-reseed.attempt.tmp"
                   "physical-reseed.install" "physical-reseed.install.tmp"))
     (let ((installation (uiop:string-prefix-p "physical-reseed.install" name)))
@@ -49,6 +53,10 @@
          (if installation
              "pending offline reseed installation requires journal reconciliation"
              "pending offline reseed requires reconciliation before PID changes"))))))
+
+(defun physical-directory-check-reseed-intent (directory &key install-only)
+  (physical-directory-check-reseed-follow-intent directory)
+  (physical-directory-check-reseed-install-attempt-intent directory :install-only install-only))
 
 (defun physical-adoption-handoff-path (&optional (directory *pgdata*))
   (merge-pathnames "physical-adoption.handoff" directory))
