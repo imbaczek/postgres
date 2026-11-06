@@ -2,6 +2,7 @@
 ;;; its completed progress.  Resume from a checked intermediate layout.
 (in-package #:pg)
 
+;;; The shared archive step handles the install and attempt journals in order.
 (defun physical-reseed-follow-retirement-archive-stable-proof (proof step operation)
   ;; Project the facts allowed to change for one link or unlink.  The caller
   ;; compares the remaining facts across complete observations.
@@ -479,6 +480,10 @@
      (call-with-physical-reseed-follow-retirement-archive-file current expected function))))
 
 (defun physical-reseed-follow-retirement-archive-step (owner step)
+  ;; Archive the journal for STEP from Retiring at that step.  A Retiring
+  ;; successor is an effect-free retry only at its completed prefix with no
+  ;; alias or temporary.  The context keeps the frozen attempt reference.
+  ;; Clear uncertainty only after the archive context finishes all cleanup.
   (unless (typep step '(integer 0 1)) (error "invalid retirement archive step"))
   (call-with-physical-reseed-follow-retirement-operation
    owner
@@ -515,7 +520,9 @@
              (setf (retirement-startup-uncertain-p owner) nil)))))))
 
 (defun physical-reseed-follow-retirement-archive-attempt (owner)
+  ;; Archive the attempt journal at step 1.
   (physical-reseed-follow-retirement-archive-step owner 1))
 
 (defun physical-reseed-follow-retirement-archive-install (owner)
+  ;; Archive the install journal at step 0.
   (physical-reseed-follow-retirement-archive-step owner 0))
