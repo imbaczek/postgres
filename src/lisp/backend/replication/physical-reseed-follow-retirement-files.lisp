@@ -1,6 +1,8 @@
 (in-package #:pg)
 
 (defun physical-reseed-follow-retirement-held-file-facts (fd mount)
+  ;; Read complete identity and nanosecond facts from the held descriptor on
+  ;; the expected mount.
   (sb-alien:with-alien ((buffer (sb-alien:array sb-alien:unsigned-char 256)))
     (unless (zerop (physical-adoption-statx
                     fd "" +physical-adoption-at-empty-path+ #x17ff
@@ -18,6 +20,8 @@
             (physical-reseed-install-statx-time sap #x60)))))
 
 (defun physical-reseed-follow-retirement-journal-state-at (root stream name)
+  ;; Bind the held descriptor to the named journal while reading its exact
+  ;; bytes.  Return the decoded state, stable identity and named facts.
   (let* ((fd (sb-sys:fd-stream-fd stream))
          (mount (physical-adoption-install-mount-id nil :directory-fd root))
          (noun (if (equal name "physical-reseed.follow.tmp") "temporary" "final journal")))

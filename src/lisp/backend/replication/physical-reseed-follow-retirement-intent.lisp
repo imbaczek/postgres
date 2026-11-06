@@ -1,6 +1,10 @@
+;;; Publish the initial retirement intent from Active step 2 under published
+;;; postmaster ownership.  Recover an exact complete temporary for that intent.
 (in-package #:pg)
 
 (defun call-with-physical-reseed-follow-retirement-journal (root name expected function check)
+  ;; Hold the named journal descriptor around the callback and bind it to the
+  ;; expected snapshot.  Close the descriptor when the scope ends.
   (let ((expected (physical-adoption-attempt-value-copy expected))
         (fd nil) (stream nil))
     (unwind-protect
@@ -30,6 +34,8 @@
       (if stream (close stream) (when fd (sb-posix:close fd))))))
 
 (defun physical-reseed-follow-retirement-intent-layout (descriptors layout)
+  ;; Keep the nonjournal layout projection stable while the temporary name is
+  ;; created and removed during publication.
   (let ((copy (copy-list layout))
         (names (copy-list (getf layout :names))))
     (setf (getf names :root)
@@ -38,6 +44,8 @@
     (getf (physical-reseed-follow-startup-projection descriptors (list :layout copy)) :layout)))
 
 (defun physical-reseed-follow-retirement-intent-proof-at (descriptors store value check read-extra)
+  ;; Prove prefix zero and its files and check the active receive state between
+  ;; two layout observations.  The result binds nonjournal state for publication.
   (funcall check)
   (let* ((record (physical-reseed-follow-copy value))
          (root (physical-reseed-follow-configuration-role-fd descriptors :root))
@@ -78,6 +86,8 @@
           after)))))
 
 (defstruct (physical-reseed-follow-retirement-intent-witness (:conc-name retirement-intent-))
+  ;; Private, thread-bound publication state ties the held resources and
+  ;; predecessor to one candidate, proof and sequence of effects.
   owner thread active-p descriptors store parent-check pid snapshot old-stream old-bytes
   candidate bytes proof phase temporary-fd temporary-stream temporary-fixed temporary-state
   written effect-p)
@@ -86,6 +96,8 @@
   (print-unreadable-object (witness stream :type t :identity t)))
 
 (defun physical-reseed-follow-retirement-intent-check-scope (witness)
+  ;; Require the original owner, thread and active resources.  The busy and
+  ;; uncertainty flags must agree with whether effects have begun.
   (unless (and (physical-reseed-follow-retirement-intent-witness-p witness)
                (retirement-intent-active-p witness)
                (eq (retirement-intent-thread witness) sb-thread:*current-thread*))
@@ -103,6 +115,7 @@
   (physical-reseed-follow-configuration-role-fd (retirement-intent-descriptors witness) :root))
 
 (defun physical-reseed-follow-retirement-intent-check-effect (witness &optional phases)
+  ;; Require an effect-bearing operation and the allowed publication phase.
   (physical-reseed-follow-retirement-intent-check-scope witness)
   (unless (and (retirement-intent-effect-p witness)
                (retirement-startup-uncertain-p (retirement-intent-owner witness)))
@@ -112,6 +125,8 @@
   t)
 
 (defun physical-reseed-follow-retirement-intent-check-old (witness renamed)
+  ;; Check the original held bytes and facts before and after replacement.
+  ;; After rename the held predecessor has lost its directory link.
   (let* ((root (physical-reseed-follow-retirement-intent-root witness))
          (stream (retirement-intent-old-stream witness))
          (snapshot (retirement-intent-snapshot witness)))
@@ -141,6 +156,8 @@
   t)
 
 (defun physical-reseed-follow-retirement-intent-check-temporary (witness renamed)
+  ;; Check the held temporary against its name, identity and expected bytes.
+  ;; During writing, check the exact written prefix.
   (let* ((root (physical-reseed-follow-retirement-intent-root witness))
          (stream (retirement-intent-temporary-stream witness))
          (fd (retirement-intent-temporary-fd witness))
@@ -184,6 +201,7 @@
           state))))
 
 (defun physical-reseed-follow-retirement-intent-extra (witness root)
+  ;; Describe the journal and PID names admitted at the current phase.
   (physical-reseed-follow-retirement-intent-check-scope witness)
   (unless (= root (physical-reseed-follow-retirement-intent-root witness))
     (error "retirement intent proof changed its root descriptor"))
@@ -205,6 +223,8 @@
                  (physical-adoption-attempt-value-copy (getf (retirement-intent-pid witness) :row)))))))
 
 (defun physical-reseed-follow-retirement-intent-check (witness)
+  ;; Reprove frozen nonjournal state and check a complete temporary against
+  ;; the candidate and observed layout.
   (physical-reseed-follow-retirement-intent-check-scope witness)
   (let* ((renamed (member (retirement-intent-phase witness) '(:renamed :durable)))
          (record (if renamed (retirement-intent-candidate witness)
@@ -223,6 +243,8 @@
   t)
 
 (defun call-with-physical-reseed-follow-retirement-intent-existing (witness temporary function)
+  ;; Hold an existing complete temporary through the callback.  Its witness is
+  ;; revoked before the held descriptor closes.
   (if temporary
       (call-with-physical-reseed-follow-retirement-journal
        (physical-reseed-follow-retirement-intent-root witness) "physical-reseed.follow.tmp" temporary
@@ -238,6 +260,9 @@
       (funcall function witness)))
 
 (defun call-with-physical-reseed-follow-retirement-intent-context (owner expected function)
+  ;; Reacquire the owner resources and hold the original journal.  Bind the
+  ;; candidate to the observed attempt reference and reprove the predecessor
+  ;; before handing the private witness to the callback.
   (call-with-physical-reseed-follow-retirement-startup-root
    owner
    (lambda (root root-check)
@@ -282,6 +307,7 @@
             check))))))))
 
 (defun physical-reseed-follow-retirement-intent-point (witness point)
+  ;; Recheck the witness and effect authority around each fault point.
   (physical-reseed-follow-retirement-intent-check-effect witness)
   (physical-reseed-follow-retirement-intent-check witness)
   (physical-reseed-follow-test-point
@@ -291,6 +317,7 @@
   (physical-reseed-follow-retirement-intent-check-effect witness))
 
 (defun physical-reseed-follow-retirement-intent-sync (witness role before after)
+  ;; Sync the held descriptor for the requested phase with checks around it.
   (declare (notinline sb-posix:fsync))
   (physical-reseed-follow-retirement-intent-check-effect witness)
   (multiple-value-bind (fd phases)
@@ -310,6 +337,8 @@
     (physical-reseed-follow-retirement-intent-check-effect witness phases)))
 
 (defun call-with-physical-reseed-follow-retirement-intent-created (witness function)
+  ;; Create the private temporary exclusively and hold writer and reader
+  ;; descriptors through the callback.  Revoke the witness before cleanup.
   (physical-reseed-follow-retirement-intent-check-effect witness '(:predecessor))
   (when (or (retirement-intent-temporary-stream witness)
             (retirement-intent-temporary-fd witness))
@@ -350,6 +379,8 @@
         (when fd (sb-posix:close fd))))))
 
 (defun physical-reseed-follow-retirement-intent-write (witness)
+  ;; Write the canonical candidate in checked chunks and validate the complete
+  ;; image through the held reader.
   (physical-reseed-follow-retirement-intent-check-effect witness '(:writing))
   (let* ((bytes (retirement-intent-bytes witness))
          (limit (or *physical-reseed-follow-write-limit* (length bytes)))
@@ -374,6 +405,8 @@
     (physical-reseed-follow-retirement-intent-check witness)))
 
 (defun physical-reseed-follow-retirement-intent-adopt (witness)
+  ;; Read back the promoted candidate, reprove its layout and update the
+  ;; owner's handover evidence after the journal is durable.
   (physical-reseed-follow-retirement-intent-check-effect witness '(:renamed))
   (let* ((root (physical-reseed-follow-retirement-intent-root witness))
          (descriptors (retirement-intent-descriptors witness))
@@ -397,6 +430,8 @@
             (physical-adoption-attempt-value-copy snapshot))))
 
 (defun physical-reseed-follow-retirement-intent-promote (witness)
+  ;; Sync the complete temporary, rename it over the final journal, then sync
+  ;; the candidate and root directory before adopting the readback.
   (physical-reseed-follow-retirement-intent-check-effect witness '(:complete))
   (let ((root (physical-reseed-follow-retirement-intent-root witness)))
     (physical-reseed-follow-retirement-intent-sync
@@ -415,6 +450,8 @@
     (physical-reseed-follow-retirement-intent-adopt witness)))
 
 (defun physical-reseed-follow-retirement-intent-publish-held (witness)
+  ;; Mark the operation uncertain before effects.  Sync the old final and root,
+  ;; then write or reuse the exact complete temporary and promote it.
   (physical-reseed-follow-retirement-intent-check-scope witness)
   (unless (and (not (retirement-intent-effect-p witness))
                (case (retirement-intent-phase witness)
@@ -442,6 +479,9 @@
          (physical-reseed-follow-retirement-intent-promote current)))))
 
 (defun physical-reseed-follow-retirement-publish-initial (owner)
+  ;; Publish the first retirement intent from a freshly proved Active state.
+  ;; Keep uncertainty through resource cleanup and clear it only after the
+  ;; publication context returns normally.
   (call-with-physical-reseed-follow-retirement-operation
    owner
    (lambda ()

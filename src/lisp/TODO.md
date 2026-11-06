@@ -1501,6 +1501,12 @@
   structure accessor before its `DEFSTRUCT` caused an inlining warning only in a
   cold compile. Moving the slot module after its dependencies fixed that case;
   the wider audit remains open.
+  Include output-cache isolation and reuse across different initial images.
+  Retirement crash tests exposed flattened `packages.fasl` paths when an ASDF
+  output target was a pathname instead of a directory string. A later clean
+  process could not load a reused Rove FASL referencing `QUICKLISP-CLIENT`.
+  Exercise separate source directories with identical filenames and two fresh
+  images sharing a cache, including images with and without Quicklisp loaded.
 
 - [ ] Audit destructive sequence operations on quoted or shared lists, including
   `SORT`, `NREVERSE`, `NCONC` and the final argument to `APPEND`. Installation

@@ -66,12 +66,15 @@
   owner)
 
 (defun physical-reseed-follow-retirement-check-startup-idle (owner)
+  ;; Require a live owner with no operation in progress or uncertain outcome.
   (physical-reseed-follow-retirement-check-startup-owner owner)
   (when (or (retirement-startup-busy-p owner) (retirement-startup-uncertain-p owner))
     (error "retirement startup owner is busy or uncertain"))
   owner)
 
 (defun call-with-physical-reseed-follow-retirement-operation (owner function)
+  ;; Keep the owner busy through the operation and its final guard.  Release
+  ;; the busy flag on every exit.
   (physical-reseed-follow-retirement-check-startup-idle owner)
   (unwind-protect
        (progn

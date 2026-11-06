@@ -8,6 +8,7 @@
         (list :identity (getf attempt :identity) :digest (getf attempt :digest)))))
 
 (defun physical-reseed-follow-retirement-temporary-state-at (root stream)
+  ;; Require the held temporary bytes to be the complete canonical image.
   (multiple-value-bind (state bytes)
       (physical-reseed-follow-retirement-journal-state-at root stream "physical-reseed.follow.tmp")
     (unless (equalp bytes (physical-reseed-follow-image (getf state :record)))
