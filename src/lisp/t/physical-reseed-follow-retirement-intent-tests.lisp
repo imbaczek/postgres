@@ -916,8 +916,9 @@
              (ok (sb-posix:s-isdir (sb-posix:stat-mode (sb-posix:fstat fixture-fd))))))
          (ok (not (eq (first owners) (second owners))))))))
 
-(defun retirement-intent-test-nonjournal-facts (root)
-  (let* ((excluded '("physical-reseed.follow" "physical-reseed.follow.tmp" "postmaster.pid"))
+(defun retirement-intent-test-nonjournal-facts (root &optional extra-excluded)
+  (let* ((excluded (append '("physical-reseed.follow" "physical-reseed.follow.tmp" "postmaster.pid")
+                           extra-excluded))
          (facts (reseed-mapped-test-tree-facts root))
          (directory (first facts)))
     (setf (second directory) (subseq (second directory) 0 7)
@@ -1025,9 +1026,10 @@
              (setf process
                    (sb-ext:run-program
                     (namestring sb-ext:*runtime-pathname*)
-                    (if (eq operation :initial)
-                        (retirement-intent-test-child-arguments root point cache marker)
-                        (retirement-intent-test-child-arguments root point cache marker operation))
+                    (case operation
+                      (:initial (retirement-intent-test-child-arguments root point cache marker))
+                      (:receipt (receipt-test-crash-child-arguments root point cache marker))
+                      (otherwise (retirement-intent-test-child-arguments root point cache marker operation)))
                     :search t :wait nil :output t :error :output)
                    pid (sb-ext:process-pid process)))
            (format t "~%RETIREMENT-CRASH-OWNED-CHILD ~d ~s ~s~%" pid root point)
@@ -1044,6 +1046,9 @@
              (let ((*read-eval* nil) (*package* (find-package :cl-user)))
                (assert (equal (list pid point) (read input)))
                (assert (eq :eof (read input nil :eof)))))
+           (format t "~%RETIREMENT-CRASH-VERIFIED-CHILD ~d ~s ~d ~s ~s~%"
+                   pid (sb-ext:process-status process) (sb-ext:process-exit-code process) root point)
+           (finish-output)
            pid)
       (when process
         (when (member (sb-ext:process-status process) '(:running :stopped))
