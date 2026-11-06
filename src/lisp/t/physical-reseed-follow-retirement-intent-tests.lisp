@@ -1008,7 +1008,8 @@
                            (ceiling (length (pg::physical-reseed-follow-image candidate)) 2)))
                     ,(ecase operation
                        (:initial '(pg::physical-reseed-follow-retirement-publish-initial owner))
-                       (:archive '(pg::physical-reseed-follow-retirement-archive-install owner))))))
+                       (:archive '(pg::physical-reseed-follow-retirement-archive-install owner))
+                       (:attempt '(pg::physical-reseed-follow-retirement-archive-attempt owner))))))
                (error "retirement child did not reach its crash point")))))
     (let ((*package* (find-package :cl-user))
           (*print-length* nil) (*print-level* nil) (*print-readably* t))
@@ -1085,7 +1086,42 @@
         (ok (eq :signaled (sb-ext:process-status captured)))
         (ok (= sb-posix:sigkill (sb-ext:process-exit-code captured))))))
 
-(defun call-with-retirement-intent-published-owner (root function)
+(defparameter *retirement-archive-test-effect-points*
+  '(:after-retirement-archive-alias-fsync
+    :after-retirement-archive-baseline-root-fsync
+    :after-retirement-archive-inode-fsync
+    :after-retirement-archive-link
+    :after-retirement-archive-old-final-fsync
+    :after-retirement-archive-root-fsync
+    :after-retirement-archive-saved-fsync
+    :after-retirement-archive-source-fsync
+    :after-retirement-archive-unlink
+    :after-retirement-candidate-fsync
+    :after-retirement-directory-fsync
+    :after-retirement-old-final-fsync
+    :after-retirement-predecessor-directory-fsync
+    :after-retirement-rename
+    :after-retirement-temporary-create
+    :after-retirement-temporary-fsync
+    :after-retirement-write-chunk
+    :before-retirement-archive-alias-fsync
+    :before-retirement-archive-baseline-root-fsync
+    :before-retirement-archive-inode-fsync
+    :before-retirement-archive-link
+    :before-retirement-archive-old-final-fsync
+    :before-retirement-archive-root-fsync
+    :before-retirement-archive-saved-fsync
+    :before-retirement-archive-source-fsync
+    :before-retirement-archive-unlink
+    :before-retirement-candidate-fsync
+    :before-retirement-directory-fsync
+    :before-retirement-old-final-fsync
+    :before-retirement-predecessor-directory-fsync
+    :before-retirement-rename
+    :before-retirement-temporary-create
+    :before-retirement-temporary-fsync))
+
+(defun call-with-retirement-intent-published-owner (root function &optional observer)
   (let ((pg::*pgdata* root) (pg::*postmaster-data-lock* nil)
                             (pg::*postmaster-pid-stream* nil) (pg::*postmaster-pid-directory* nil)
                             (pg::*postmaster-pid-inode* nil) (pg::*postmaster-start-time* nil)
@@ -1097,9 +1133,12 @@
           "127.0.0.1" 5439
           :startup-observer
           (lambda (lock phase)
-            (if (eq phase :before-pid)
-                (setf before (pg::physical-reseed-follow-startup-observation lock phase))
-                (setf after (pg::physical-reseed-follow-startup-observation lock phase before))))
+            (when observer (funcall observer :enter phase))
+            (multiple-value-prog1
+                (if (eq phase :before-pid)
+                    (setf before (pg::physical-reseed-follow-startup-observation lock phase))
+                    (setf after (pg::physical-reseed-follow-startup-observation lock phase before)))
+              (when observer (funcall observer :leave phase))))
           :startup-reconcile
           (lambda ()
             (pg::call-with-physical-reseed-follow-retirement-startup-owner
@@ -1507,7 +1546,69 @@
          record (getf (getf record :retirement) :attempt-file)))))
     record))
 
-(deftest reseed-retirement-install-archive-recovers-alias-saved-and-complete-temporary
+(defun prepare-retirement-attempt-archive-test (root root-fd snapshot geometry)
+  (let* ((initial (prepare-retirement-install-archive-test root root-fd snapshot :saved))
+         (record (pg::physical-reseed-follow-retirement-next-record
+                  initial (getf (getf initial :retirement) :attempt-file)))
+         (workspace (getf (getf record :configuration) :workspace))
+         (source (merge-pathnames "physical-reseed.attempt" root))
+         (saved (merge-pathnames "saved/physical-reseed.attempt" (getf workspace :directory))))
+    (reseed-retirement-layout-write root record)
+    (ecase geometry
+      (:source)
+      ((:alias :saved :temporary)
+       (sb-posix:link (namestring source) (namestring saved))
+       (unless (eq geometry :alias) (delete-file source))))
+    (when (eq geometry :temporary)
+      (reseed-follow-owner-test-write
+       (merge-pathnames "physical-reseed.follow.tmp" root)
+       (pg::physical-reseed-follow-image
+        (pg::physical-reseed-follow-retirement-next-record
+         record (getf (getf record :retirement) :attempt-file)))))
+    record))
+
+(deftest reseed-retirement-attempt-archive-publishes-progress-under-owned-pid
+    (call-with-retirement-intent-test-owner
+     (lambda (owner root root-fd snapshot)
+       (let* ((before (getf snapshot :record))
+              (reference (pg::physical-adoption-attempt-value-copy
+                          (getf (getf before :retirement) :attempt-file)))
+              (result
+                (handler-case
+                    (funcall (symbol-function 'pg::physical-reseed-follow-retirement-archive-attempt) owner)
+                  (error (condition)
+                    (format t "~%RETIREMENT-ARCHIVE-ATTEMPT-REFUSAL ~a~%" condition)
+                    nil))))
+         (ok result)
+         (when result
+           (ok (eq :retiring (getf (getf result :retirement) :phase)))
+           (ok (= 2 (getf (getf result :retirement) :step)))
+           (ok (equal reference (getf (getf result :retirement) :attempt-file)))
+           (ng (probe-file (merge-pathnames "physical-reseed.attempt" root)))
+           (let* ((workspace (getf (getf result :configuration) :workspace))
+                  (saved (merge-pathnames "saved/physical-reseed.attempt" (getf workspace :directory))))
+             (ok (= 1 (sb-posix:stat-nlink (sb-posix:lstat (namestring saved)))))))
+         (ng (pg::retirement-startup-uncertain-p owner))
+         (ng (pg::retirement-startup-busy-p owner))
+         (ok (equal result (getf (pg::physical-reseed-follow-snapshot-at root-fd) :record)))
+         (when result
+           (pg::call-with-physical-reseed-follow-retirement-startup-observation
+            owner
+            (lambda (descriptors state verify)
+              (declare (ignore descriptors))
+              (ok (= 2 (getf state :prefix)))
+              (ok (funcall verify)))))))
+     (lambda (root root-fd snapshot)
+       (prepare-retirement-attempt-archive-test root root-fd snapshot :source))))
+
+(defun check-retirement-archive-recovery (step)
+  (let ((archive (ecase step
+                   (0 #'pg::physical-reseed-follow-retirement-archive-install)
+                   (1 #'pg::physical-reseed-follow-retirement-archive-attempt)))
+        (prepare (ecase step
+                   (0 #'prepare-retirement-install-archive-test)
+                   (1 #'prepare-retirement-attempt-archive-test)))
+        (name (ecase step (0 "physical-reseed.install") (1 "physical-reseed.attempt"))))
     (dolist (geometry '(:alias :saved :temporary))
       (call-with-retirement-intent-test-owner
        (lambda (owner root root-fd snapshot)
@@ -1516,6 +1617,8 @@
                 (fsync (symbol-function 'sb-posix:fsync))
                 (links 0) (unlinks 0) (syncs 0) (points nil)
                 (temporary (merge-pathnames "physical-reseed.follow.tmp" root))
+                (install (when (= step 1)
+                           (retirement-attempt-test-install-facts root-fd (getf snapshot :record))))
                 (temporary-inode (when (probe-file temporary)
                                    (sb-posix:stat-ino (sb-posix:lstat (namestring temporary)))))
                 (reference (pg::physical-adoption-attempt-value-copy
@@ -1532,7 +1635,7 @@
                            (lambda (event path) (declare (ignore path)) (push event points)))
                          (values
                            (handler-case
-                               (multiple-value-list (pg::physical-reseed-follow-retirement-archive-install owner))
+                               (multiple-value-list (funcall archive owner))
                              (error (condition)
                                (format t "~%RETIREMENT-ARCHIVE-RECOVERY-REFUSAL ~s ~a~%" geometry condition)
                                nil)))
@@ -1541,9 +1644,10 @@
                          (ordered (reverse points)))
                     (ok record)
                     (when record
-                      (ok (= 1 (getf (getf record :retirement) :step)))
+                      (ok (= (1+ step) (getf (getf record :retirement) :step)))
                       (ok (equal reference (getf (getf record :retirement) :attempt-file)))
                       (ok (equal actual (pg::physical-reseed-follow-snapshot-at root-fd)))
+                      (when install (ok (equalp install (retirement-attempt-test-install-facts root-fd record))))
                       (ok (zerop links))
                       (ok (= (if (eq geometry :alias) 1 0) unlinks))
                       (ok (< (position :after-retirement-archive-saved-fsync ordered)
@@ -1553,23 +1657,265 @@
                                (position :before-retirement-archive-unlink ordered))))
                       (when temporary-inode
                         (ok (= temporary-inode (second (getf actual :identity))))
-                        (ng (member :after-retirement-temporary-create ordered)))
+                        (ng (member :after-retirement-temporary-create ordered))
+                        (ng (member :after-retirement-write-chunk ordered)))
                       (ng (probe-file temporary))
-                      (ng (probe-file (merge-pathnames "physical-reseed.install" root)))
+                      (ng (probe-file (merge-pathnames name root)))
                       (ng (pg::retirement-startup-uncertain-p owner))
-                      (setf links 0 unlinks 0 syncs 0)
+                      (setf links 0 unlinks 0 syncs 0 points nil)
                       (multiple-value-bind (retry retry-snapshot)
-                          (pg::physical-reseed-follow-retirement-archive-install owner)
+                          (funcall archive owner)
                         (ok (equal record retry))
-                        (ok (equal actual retry-snapshot)))
+                        (ok (equal actual retry-snapshot))
+                        (when install (ok (equalp install (retirement-attempt-test-install-facts root-fd record)))))
                       (ok (zerop links))
                       (ok (zerop unlinks))
-                      (ok (zerop syncs)))))
+                      (ok (zerop syncs))
+                      (ng (intersection points *retirement-archive-test-effect-points*)))))
              (setf (symbol-function 'pg::port-linkat) link
                    (symbol-function 'pg::port-unlinkat) unlink
                    (symbol-function 'sb-posix:fsync) fsync))))
        (lambda (root root-fd snapshot)
-         (prepare-retirement-install-archive-test root root-fd snapshot geometry)))))
+         (funcall prepare root root-fd snapshot geometry))))))
+
+(deftest reseed-retirement-attempt-archive-recovers-alias-saved-and-complete-temporary
+    (check-retirement-archive-recovery 1))
+
+(defun retirement-attempt-test-install-facts (root-fd record)
+  (let* ((workspace (getf (getf record :configuration) :workspace))
+         (saved (pg::physical-backup-open-directory
+                 (merge-pathnames "saved/" (getf workspace :directory))))
+         (mount (pg::physical-adoption-install-mount-id nil :directory-fd root-fd)))
+    (unwind-protect
+         (list (pg::physical-reseed-install-old-observe saved "physical-reseed.install" mount)
+               (lineage-test-bytes
+                (merge-pathnames "physical-reseed.install" (pg::physical-image-fd-path saved))))
+      (sb-posix:close saved))))
+
+(deftest reseed-retirement-attempt-archive-completes-every-activation-geometry
+    (dolist (kind '(:same-timeline :retained-timeline :before-fork :at-fork :later-writer))
+      (call-with-retirement-intent-test-owner
+       (lambda (owner root root-fd snapshot)
+         (let* ((original (getf snapshot :record))
+                (reference (pg::physical-adoption-attempt-value-copy
+                            (getf (getf original :retirement) :attempt-file)))
+                (install (retirement-attempt-test-install-facts root-fd original)))
+           (multiple-value-bind (record actual)
+               (pg::physical-reseed-follow-retirement-archive-attempt owner)
+             (ok (eq :retiring (getf (getf record :retirement) :phase)))
+             (ok (= 2 (getf (getf record :retirement) :step)))
+             (ok (equal reference (getf (getf record :retirement) :attempt-file)))
+             (ok (equal actual (pg::physical-reseed-follow-snapshot-at root-fd)))
+             (ng (probe-file (merge-pathnames "physical-reseed.attempt" root)))
+             (ng (probe-file (merge-pathnames "physical-reseed.install" root)))
+             (let* ((workspace (getf (getf record :configuration) :workspace))
+                    (saved (merge-pathnames "saved/physical-reseed.attempt" (getf workspace :directory)))
+                    (stat (sb-posix:lstat (namestring saved))))
+               (ok (= (second (getf reference :identity)) (sb-posix:stat-ino stat)))
+               (ok (= 1 (sb-posix:stat-nlink stat))))
+             (ok (equalp install (retirement-attempt-test-install-facts root-fd record)))
+             (ng (pg::retirement-startup-uncertain-p owner))
+             (ng (pg::retirement-startup-busy-p owner))
+             (pg::call-with-physical-reseed-follow-retirement-startup-observation
+              owner
+              (lambda (descriptors state verify)
+                (declare (ignore descriptors))
+                (ok (= 2 (getf state :prefix)))
+                (ok (funcall verify)))))))
+       (lambda (root root-fd snapshot)
+         (prepare-retirement-attempt-archive-test root root-fd snapshot :source))
+       kind)))
+
+(deftest reseed-retirement-attempt-archive-refuses-a-terminal-temporary-on-completed-retry
+    (ok
+     (eq :checked
+         (catch 'retirement-attempt-retry-checked
+           (call-with-retirement-intent-test-owner
+            (lambda (owner root root-fd snapshot)
+              (let* ((record (getf snapshot :record))
+                     (terminal (pg::physical-reseed-follow-retirement-next-record
+                                record (getf (getf record :retirement) :attempt-file)))
+                     (temporary (merge-pathnames "physical-reseed.follow.tmp" root))
+                     (bytes (pg::physical-reseed-follow-image terminal))
+                     (points nil))
+                (let ((row (nth-value 1 (pg::physical-reseed-follow-entry
+                                         root-fd "physical-reseed.follow.tmp" t)))
+                      (pg::*physical-reseed-follow-test-hook*
+                        (lambda (point path) (declare (ignore path)) (push point points))))
+                  (ok (handler-case
+                          (progn (pg::physical-reseed-follow-retirement-archive-attempt owner) nil)
+                        (error (condition)
+                          (format t "~%RETIREMENT-ATTEMPT-TERMINAL-RETRY-REFUSAL ~a~%" condition)
+                          (search "attempt archive retry requires stable Retiring2" (princ-to-string condition)))))
+                  (ng (intersection points *retirement-archive-test-effect-points*))
+                  (ok (equal row (nth-value 1 (pg::physical-reseed-follow-entry
+                                               root-fd "physical-reseed.follow.tmp" t))))
+                  (ok (equalp bytes (lineage-test-bytes temporary)))
+                  (ok (equal snapshot (pg::physical-reseed-follow-snapshot-at root-fd)))
+                  (ng (pg::retirement-startup-uncertain-p owner))
+                  (ng (pg::retirement-startup-busy-p owner)))
+                (throw 'retirement-attempt-retry-checked :checked)))
+            (lambda (root root-fd snapshot)
+              (let* ((before (prepare-retirement-attempt-archive-test root root-fd snapshot :saved))
+                     (record (pg::physical-reseed-follow-retirement-next-record
+                              before (getf (getf before :retirement) :attempt-file))))
+                (reseed-retirement-layout-write root record)
+                (reseed-follow-owner-test-write
+                 (merge-pathnames "physical-reseed.follow.tmp" root)
+                 (pg::physical-reseed-follow-image
+                  (pg::physical-reseed-follow-retirement-next-record
+                   record (getf (getf record :retirement) :attempt-file)))))))))))
+
+(deftest reseed-retirement-attempt-archive-preserves-invalid-temporaries-before-ownership
+    (call-with-reseed-retirement-observation-fixture
+     :same-timeline
+     (lambda (offline root workspace root-fd initial check)
+       (declare (ignore workspace check))
+       (close (pg::physical-adoption-owner-lock offline))
+       (setf (pg::physical-adoption-owner-active-p offline) nil)
+       (let* ((record (prepare-retirement-attempt-archive-test root root-fd initial :saved))
+              (candidate (pg::physical-reseed-follow-retirement-next-record
+                          record (getf (getf record :retirement) :attempt-file)))
+              (terminal (pg::physical-reseed-follow-retirement-next-record
+                         candidate (getf (getf candidate :retirement) :attempt-file)))
+              (image (pg::physical-reseed-follow-image candidate))
+              (temporary (merge-pathnames "physical-reseed.follow.tmp" root))
+              (snapshot (pg::physical-reseed-follow-snapshot-at root-fd))
+              (install (retirement-attempt-test-install-facts root-fd record))
+              (entered nil))
+         (call-with-retirement-intent-published-owner
+          root (lambda (&rest arguments) (declare (ignore arguments)) (setf entered t)))
+         (ok entered)
+         (dolist (bytes (list (make-array 0 :element-type '(unsigned-byte 8))
+                              (subseq image 0 (floor (length image) 2))
+                              (pg::physical-reseed-follow-image terminal)))
+           (reseed-follow-owner-test-write temporary bytes)
+           (let ((row (nth-value 1 (pg::physical-reseed-follow-entry
+                                    root-fd "physical-reseed.follow.tmp" t)))
+                 (entered nil) (points nil) (phases nil)
+                 (pid-before (pg::physical-reseed-read-pid root)))
+             (let ((pg::*physical-reseed-follow-test-hook*
+                     (lambda (point path) (declare (ignore path)) (push point points))))
+               (ok (handler-case
+                       (progn
+                         (call-with-retirement-intent-published-owner
+                          root (lambda (&rest arguments) (declare (ignore arguments)) (setf entered t))
+                          (lambda (stage phase) (push (list stage phase) phases)))
+                         nil)
+                     (error (condition)
+                       (format t "~%RETIREMENT-ATTEMPT-INVALID-TEMPORARY-REFUSAL ~a~%" condition)
+                       t))))
+             (ng entered)
+             (ok (equal '((:enter :before-pid)) (reverse phases)))
+             (ng (intersection points *retirement-archive-test-effect-points*))
+             (ok (equal row (nth-value 1 (pg::physical-reseed-follow-entry
+                                          root-fd "physical-reseed.follow.tmp" t))))
+             (ok (equalp bytes (lineage-test-bytes temporary)))
+             (ok (equal snapshot (pg::physical-reseed-follow-snapshot-at root-fd)))
+             (ok (equalp pid-before (pg::physical-reseed-read-pid root)))
+             (ok (equalp install (retirement-attempt-test-install-facts root-fd record))))
+           (delete-file temporary))))))
+
+(deftest reseed-retirement-attempt-archive-preserves-changed-attempts-before-ownership
+    (dolist (kind '(:same-bytes :replacement :bytes))
+      (call-with-reseed-retirement-observation-fixture
+       :same-timeline
+       (lambda (offline root workspace root-fd initial check)
+         (declare (ignore workspace check))
+         (close (pg::physical-adoption-owner-lock offline))
+         (setf (pg::physical-adoption-owner-active-p offline) nil)
+         (let* ((record (prepare-retirement-attempt-archive-test root root-fd initial :source))
+                (path (merge-pathnames "physical-reseed.attempt" root))
+                (bytes (lineage-test-bytes path))
+                (snapshot (pg::physical-reseed-follow-snapshot-at root-fd))
+                (install (retirement-attempt-test-install-facts root-fd record))
+                (mount (pg::physical-adoption-install-mount-id nil :directory-fd root-fd))
+                (entered nil))
+           (call-with-retirement-intent-published-owner
+            root (lambda (&rest arguments) (declare (ignore arguments)) (setf entered t)))
+           (ok entered)
+           (ecase kind
+             (:same-bytes (check-retirement-test-same-byte-write root-fd "physical-reseed.attempt"))
+             (:replacement
+              (let ((replacement (merge-pathnames ".replacement-attempt" root)))
+                (reseed-follow-owner-test-write replacement bytes)
+                (sb-posix:rename (namestring replacement) (namestring path))))
+             (:bytes
+              (let ((changed (copy-seq bytes)))
+                (setf (aref changed 0) (logxor 1 (aref changed 0)))
+                (with-open-file (stream path :direction :output :element-type '(unsigned-byte 8)
+                                             :if-exists :overwrite :if-does-not-exist :error)
+                  (write-sequence changed stream)))))
+           (let ((row (pg::physical-reseed-install-old-observe root-fd "physical-reseed.attempt" mount))
+                 (changed (lineage-test-bytes path))
+                 (pid-before (pg::physical-reseed-read-pid root))
+                 (entered nil) (points nil) (phases nil))
+             (let ((pg::*physical-reseed-follow-test-hook*
+                     (lambda (point path) (declare (ignore path)) (push point points))))
+               (ok (handler-case
+                       (progn
+                         (call-with-retirement-intent-published-owner
+                          root (lambda (&rest arguments) (declare (ignore arguments)) (setf entered t))
+                          (lambda (stage phase) (push (list stage phase) phases)))
+                         nil)
+                     (error (condition)
+                       (format t "~%RETIREMENT-ATTEMPT-CHANGED-INPUT-REFUSAL ~s ~a~%" kind condition)
+                       t))))
+             (ng entered)
+             (ok (equal '((:enter :before-pid)) (reverse phases)))
+             (ng (intersection points *retirement-archive-test-effect-points*))
+             (ok (equal row (pg::physical-reseed-install-old-observe root-fd "physical-reseed.attempt" mount)))
+             (ok (equalp changed (lineage-test-bytes path)))
+             (ok (equal snapshot (pg::physical-reseed-follow-snapshot-at root-fd)))
+             (ok (equalp pid-before (pg::physical-reseed-read-pid root)))
+             (ok (equalp install (retirement-attempt-test-install-facts root-fd record)))
+             (ng (probe-file (merge-pathnames "physical-reseed.follow.tmp" root)))))))))
+
+(deftest reseed-retirement-attempt-archive-rejects-late-mutation-of-the-saved-install
+    (dolist (point '(:after-retirement-archive-link :after-retirement-rename))
+      (ok
+       (eq :checked
+           (catch 'retirement-attempt-install-mutation-checked
+             (call-with-retirement-intent-test-owner
+              (lambda (owner root root-fd snapshot)
+                (let* ((record (getf snapshot :record))
+                       (workspace (getf (getf record :configuration) :workspace))
+                       (saved (pg::physical-backup-open-directory
+                               (merge-pathnames "saved/" (getf workspace :directory))))
+                       (changed nil))
+                  (unwind-protect
+                       (let ((pg::*physical-reseed-follow-test-hook*
+                               (lambda (event path)
+                                 (declare (ignore path))
+                                 (when (and (eq event point) (null changed))
+                                   (check-retirement-test-ctime-change saved "physical-reseed.install")
+                                   (setf changed (retirement-attempt-test-install-facts root-fd record))))))
+                         (ok (handler-case
+                                 (progn (pg::physical-reseed-follow-retirement-archive-attempt owner) nil)
+                               (error (condition)
+                                 (format t "~%RETIREMENT-ATTEMPT-OTHER-JOURNAL-REFUSAL ~a~%" condition)
+                                 (or (search "install" (princ-to-string condition))
+                                     (search "frozen" (princ-to-string condition))))))
+                         (ok changed)
+                         (ok (equalp changed (retirement-attempt-test-install-facts root-fd record)))
+                         (ok (pg::retirement-startup-uncertain-p owner))
+                         (ng (pg::retirement-startup-busy-p owner))
+                         (let ((expected (if (eq point :after-retirement-rename)
+                                             (pg::physical-reseed-follow-retirement-next-record
+                                              record (getf (getf record :retirement) :attempt-file))
+                                             record)))
+                           (ok (equal expected (getf (pg::physical-reseed-follow-snapshot-at root-fd) :record))))
+                         (ng (probe-file (merge-pathnames "physical-reseed.follow.tmp" root)))
+                         (ok (handler-case
+                                 (progn (pg::physical-reseed-follow-retirement-archive-attempt owner) nil)
+                               (error (condition) (search "busy or uncertain" (princ-to-string condition)))))
+                         (throw 'retirement-attempt-install-mutation-checked :checked))
+                    (sb-posix:close saved))))
+              (lambda (root root-fd snapshot)
+                (prepare-retirement-attempt-archive-test root root-fd snapshot :source))))))))
+
+(deftest reseed-retirement-install-archive-recovers-alias-saved-and-complete-temporary
+    (check-retirement-archive-recovery 0))
 
 (deftest reseed-retirement-install-archive-completes-every-activation-geometry
     (dolist (kind '(:same-timeline :retained-timeline :before-fork :at-fork :later-writer))
@@ -1601,47 +1947,45 @@
          (prepare-retirement-install-archive-test root root-fd snapshot :source))
        kind)))
 
-(defun retirement-archive-test-reset (root record)
+(defun retirement-archive-test-reset (root record &optional (name "physical-reseed.install"))
   (let* ((workspace (getf (getf record :configuration) :workspace))
-         (source (merge-pathnames "physical-reseed.install" root))
-         (saved (merge-pathnames "saved/physical-reseed.install" (getf workspace :directory))))
+         (source (merge-pathnames name root))
+         (saved (merge-pathnames (concatenate 'string "saved/" name) (getf workspace :directory))))
     (unless (probe-file source)
       (sb-posix:link (namestring saved) (namestring source)))
     (when (probe-file saved) (delete-file saved))
     (retirement-intent-test-reset root record)))
 
-(defun retirement-archive-test-invariants (root workspace auxiliaries)
-  (loop for directory in (append (list root workspace) auxiliaries)
-        collect
-        (let ((facts (reseed-mapped-test-tree-facts directory)))
-          (loop for entry in facts
-                for file = (second entry)
-                for name = (first file)
-                for root-p = (equal directory root)
-                for workspace-p = (equal directory workspace)
-                for excluded = (cond (root-p '("physical-reseed.follow" "physical-reseed.follow.tmp"
-                                               "postmaster.pid" "physical-reseed.install"))
-                                     (workspace-p '("saved/physical-reseed.install")))
-                unless (and (eq :file (first entry)) (member name excluded :test #'equal))
-                  collect
-                  (progn
-                    (when (and (eq :directory (first entry))
-                               (or (and root-p (eq entry (first facts)))
-                                   (and workspace-p (equal name "saved/"))))
-                      (setf (second entry) (subseq file 0 7)
-                            (third entry)
-                            (remove-if (lambda (name)
-                                         (member name
-                                                 (if root-p '("physical-reseed.follow" "physical-reseed.follow.tmp"
-                                                              "postmaster.pid" "physical-reseed.install")
-                                                     '("physical-reseed.install"))
-                                                 :test #'equal))
-                                       (third entry))))
-                    (when (and root-p (eq :file (first entry)) (equal name ".pg_lisp.lock"))
-                      (setf (second entry) (butlast (second entry))))
-                    entry)))))
+(defun retirement-archive-test-invariants
+    (root workspace auxiliaries &optional (name "physical-reseed.install"))
+  (let ((root-names (list "physical-reseed.follow" "physical-reseed.follow.tmp" "postmaster.pid" name))
+        (saved-name (concatenate 'string "saved/" name)))
+    (loop for directory in (append (list root workspace) auxiliaries)
+          collect
+          (let ((facts (reseed-mapped-test-tree-facts directory)))
+            (loop for entry in facts
+                  for file = (second entry)
+                  for leaf = (first file)
+                  for root-p = (equal directory root)
+                  for workspace-p = (equal directory workspace)
+                  for excluded = (cond (root-p root-names)
+                                       (workspace-p (list saved-name)))
+                  unless (and (eq :file (first entry)) (member leaf excluded :test #'equal))
+                    collect
+                    (progn
+                      (when (and (eq :directory (first entry))
+                                 (or (and root-p (eq entry (first facts)))
+                                     (and workspace-p (equal leaf "saved/"))))
+                        (setf (second entry) (subseq file 0 7)
+                              (third entry)
+                              (remove-if (lambda (leaf)
+                                           (member leaf (if root-p root-names (list name)) :test #'equal))
+                                         (third entry))))
+                      (when (and root-p (eq :file (first entry)) (equal leaf ".pg_lisp.lock"))
+                        (setf (second entry) (butlast (second entry))))
+                      entry))))))
 
-(defun check-retirement-archive-test-location (root-fd record geometry original-row bytes)
+(defun check-retirement-archive-test-location (root-fd record geometry original-row bytes &optional (name "physical-reseed.install"))
   (let* ((workspace (getf (getf record :configuration) :workspace))
          (saved (pg::physical-backup-open-directory
                  (merge-pathnames "saved/" (getf workspace :directory))))
@@ -1650,44 +1994,51 @@
          (loop for role in '(:root :saved)
                for fd in (list root-fd saved)
                for expected = (or (eq geometry :alias) (eq role (if (eq geometry :source) :root :saved)))
-               for path = (merge-pathnames "physical-reseed.install" (pg::physical-image-fd-path fd))
+               for path = (merge-pathnames name (pg::physical-image-fd-path fd))
                for present = (not (null (pg::physical-adoption-path-present-p path)))
                do (ok (eql expected present))
                   (when present
-                    (let ((row (pg::physical-reseed-install-old-observe fd "physical-reseed.install" mount)))
+                    (let ((row (pg::physical-reseed-install-old-observe fd name mount)))
                       (ok (= (if (eq geometry :alias) 2 1) (fifth row)))
                       (ok (equal (subseq original-row 0 4) (subseq row 0 4)))
                       (ok (equal (subseq original-row 5 8) (subseq row 5 8)))
                       (ok (equalp bytes (lineage-test-bytes path))))))
       (sb-posix:close saved))))
 
-(defun check-retirement-archive-native-cuts (points)
+(defun check-retirement-archive-native-cuts (points &optional (step 0))
   (call-with-reseed-retirement-observation-fixture
    :same-timeline
    (lambda (offline root workspace root-fd initial check)
      (declare (ignore check))
      (close (pg::physical-adoption-owner-lock offline))
      (setf (pg::physical-adoption-owner-active-p offline) nil)
-     (let* ((record (prepare-retirement-install-archive-test root root-fd initial :source))
+     (let* ((name (ecase step (0 "physical-reseed.install") (1 "physical-reseed.attempt")))
+            (operation (if (zerop step) :archive :attempt))
+            (archive (if (zerop step)
+                         #'pg::physical-reseed-follow-retirement-archive-install
+                         #'pg::physical-reseed-follow-retirement-archive-attempt))
+            (plan (getf (pg::physical-reseed-install-read-at root-fd "physical-reseed.install") :plan))
+            (record (funcall (if (zerop step) #'prepare-retirement-install-archive-test
+                                 #'prepare-retirement-attempt-archive-test)
+                             root root-fd initial :source))
             (candidate (pg::physical-reseed-follow-retirement-next-record
                         record (getf (getf record :retirement) :attempt-file)))
-            (plan (getf (pg::physical-reseed-install-read-at root-fd "physical-reseed.install") :plan))
             (auxiliaries (mapcar (lambda (key) (pathname (getf (getf plan key) :directory)))
                                  '(:incoming :quarantine)))
             (original-row (pg::physical-reseed-install-old-observe
-                           root-fd "physical-reseed.install"
+                           root-fd name
                            (pg::physical-adoption-install-mount-id nil :directory-fd root-fd)))
-            (original-bytes (lineage-test-bytes (merge-pathnames "physical-reseed.install" root)))
-            (baseline (retirement-archive-test-invariants root workspace auxiliaries)))
+            (original-bytes (lineage-test-bytes (merge-pathnames name root)))
+            (baseline (retirement-archive-test-invariants root workspace auxiliaries name)))
        (with-physical-store-directory (driver)
          (let ((cache (merge-pathnames "cache/" driver)))
            (dolist (point points)
-             (retirement-archive-test-reset root record)
+             (retirement-archive-test-reset root record name)
              (ok (reseed-activation-layout-facts-equal-p
-                  baseline (retirement-archive-test-invariants root workspace auxiliaries)))
+                  baseline (retirement-archive-test-invariants root workspace auxiliaries name)))
              (let* ((marker (merge-pathnames (format nil "~(~a~).marker" point) driver))
                     (pid (run-retirement-intent-test-crash-child
-                          root point cache marker :operation :archive :timeout 600))
+                          root point cache marker :operation operation :timeout 600))
                     (stale (pg::physical-reseed-read-pid root))
                     (temporary (merge-pathnames "physical-reseed.follow.tmp" root))
                     (partial (member point '(:after-retirement-temporary-create :after-retirement-write-chunk)))
@@ -1703,9 +2054,9 @@
                                        :after-retirement-archive-alias-fsync
                                        :after-retirement-archive-saved-fsync)) :alias)
                       (t :saved))
-                original-row original-bytes)
+                original-row original-bytes name)
                (ok (reseed-activation-layout-facts-equal-p
-                    baseline (retirement-archive-test-invariants root workspace auxiliaries)))
+                    baseline (retirement-archive-test-invariants root workspace auxiliaries name)))
                (if partial
                    (let ((entered nil) (bytes (lineage-test-bytes temporary))
                                        (temporary-row (nth-value 1 (pg::physical-reseed-follow-entry
@@ -1739,16 +2090,29 @@
                       (declare (ignore directory))
                       (when renamed (ok (equal candidate (getf snapshot :record))))
                       (multiple-value-bind (published actual)
-                          (pg::physical-reseed-follow-retirement-archive-install owner)
+                          (funcall archive owner)
                         (ok (equal candidate published))
                         (ok (equal actual (pg::physical-reseed-follow-snapshot-at fd))))
                       (ng (probe-file temporary))
-                      (ng (probe-file (merge-pathnames "physical-reseed.install" root)))
+                      (ng (probe-file (merge-pathnames name root)))
                       (ok (pg::postmaster-pid-owned-p)))))
-               (check-retirement-archive-test-location root-fd record :saved original-row original-bytes)
+               (check-retirement-archive-test-location root-fd record :saved original-row original-bytes name)
                (ok (reseed-activation-layout-facts-equal-p
-                    baseline (retirement-archive-test-invariants root workspace auxiliaries)))))
-           (retirement-archive-test-reset root record)))))))
+                    baseline (retirement-archive-test-invariants root workspace auxiliaries name)))))
+           (retirement-archive-test-reset root record name)))))))
+
+(deftest reseed-retirement-attempt-archive-survives-native-process-crashes
+    (check-retirement-archive-native-cuts
+     '(:after-retirement-archive-link
+       :after-retirement-archive-saved-fsync
+       :after-retirement-archive-unlink
+       :after-retirement-archive-root-fsync
+       :after-retirement-temporary-create
+       :after-retirement-write-chunk
+       :after-retirement-temporary-fsync
+       :after-retirement-rename
+       :after-retirement-readback)
+     1))
 
 (deftest reseed-retirement-install-archive-survives-native-process-crashes
     (check-retirement-archive-native-cuts '(:after-retirement-archive-old-final-fsync
@@ -1774,88 +2138,103 @@
     (check-retirement-archive-native-cuts
      '(:after-retirement-temporary-create :after-retirement-write-chunk)))
 
-(defun check-retirement-archive-test-cut (root record point mode)
-  (retirement-archive-test-reset root record)
-  (catch 'retirement-archive-cut-checked
-    (call-with-retirement-intent-published-owner
-     root
-     (lambda (owner directory root-fd snapshot)
-       (declare (ignore directory))
-       (let* ((workspace (pathname (getf (getf (getf record :configuration) :workspace) :directory)))
-              (plan (getf (pg::physical-reseed-install-read-at root-fd "physical-reseed.install") :plan))
-              (auxiliaries (mapcar (lambda (key) (pathname (getf (getf plan key) :directory)))
-                                   '(:incoming :quarantine)))
-              (baseline (retirement-archive-test-invariants root workspace auxiliaries))
-              (original-row (pg::physical-reseed-install-old-observe
-                             root-fd "physical-reseed.install"
-                             (pg::physical-adoption-install-mount-id nil :directory-fd root-fd)))
-              (original-bytes (lineage-test-bytes (merge-pathnames "physical-reseed.install" root)))
-              (candidate (pg::physical-reseed-follow-retirement-next-record
-                          record (getf (getf record :retirement) :attempt-file)))
-              (bytes (pg::physical-reseed-follow-image candidate))
-              (pg::*physical-reseed-follow-write-limit* (ceiling (length bytes) 2))
-              (injected nil)
-              (pg::*physical-reseed-follow-test-hook*
-                (lambda (event path)
-                  (declare (ignore path))
-                  (when (and (eq event point) (not injected))
-                    (setf injected t)
-                    (ecase mode
-                      (:error (error "injected retirement archive cut"))
-                      (:throw (throw 'retirement-archive-injected-cut :cut))
-                      (:interrupt
-                       (sb-thread:interrupt-thread
-                        sb-thread:*current-thread*
-                        (lambda () (error "injected retirement archive cut")))))))))
-         (let ((outcome
-                 (catch 'retirement-archive-injected-cut
-                   (handler-case
-                       (progn (pg::physical-reseed-follow-retirement-archive-install owner) :returned)
-                     (error (condition)
-                       (if (search "injected retirement archive cut" (princ-to-string condition))
-                           :error
-                           (progn
-                             (format t "~%RETIREMENT-ARCHIVE-UNEXPECTED-CUT-ERROR ~s ~s ~a~%"
-                                     point mode condition)
-                             :wrong-error)))))))
-           (ok (eq (if (eq mode :throw) :cut :error) outcome)))
-         (ok injected)
-         (ng (pg::retirement-startup-busy-p owner))
-         (ok (pg::retirement-startup-uncertain-p owner))
-         (ok (handler-case
-                 (progn (pg::physical-reseed-follow-retirement-archive-install owner) nil)
-               (error (condition) (search "busy or uncertain" (princ-to-string condition)))))
-         (ok (equal snapshot (getf (pg::retirement-startup-evidence owner) :snapshot)))
-         (ok (pg::postmaster-pid-owned-p))
-         (check-retirement-archive-test-location
-          root-fd record
-          (cond ((member point '(:after-retirement-archive-old-final-fsync
-                                 :after-retirement-archive-baseline-root-fsync
-                                 :after-retirement-archive-source-fsync)) :source)
-                ((member point '(:after-retirement-archive-link
-                                 :after-retirement-archive-alias-fsync
-                                 :after-retirement-archive-saved-fsync)) :alias)
-                (t :saved))
-          original-row original-bytes)
-         (let* ((actual (pg::physical-reseed-follow-snapshot-at root-fd))
-                (temporary (merge-pathnames "physical-reseed.follow.tmp" root))
-                (renamed (member point '(:after-retirement-rename :after-retirement-candidate-fsync
-                                         :after-retirement-directory-fsync :after-retirement-readback))))
-           (if renamed
-               (progn (ok (equal candidate (getf actual :record))) (ng (probe-file temporary)))
-               (progn
-                 (ok (equal snapshot actual))
-                 (cond
-                   ((eq point :after-retirement-temporary-create)
-                    (ok (zerop (length (pg::read-bounded-regular-file temporary 1 :minimum 0)))))
-                   ((eq point :after-retirement-write-chunk)
-                    (ok (equalp (subseq bytes 0 (ceiling (length bytes) 2)) (lineage-test-bytes temporary))))
-                   ((eq point :after-retirement-temporary-fsync)
-                    (ok (equalp bytes (lineage-test-bytes temporary))))
-                   (t (ng (probe-file temporary)))))))
-         (ok (reseed-activation-layout-facts-equal-p
-              baseline (retirement-archive-test-invariants root workspace auxiliaries)))
-         (throw 'retirement-archive-cut-checked :checked))))))
+(defun retirement-archive-test-plan (root-fd record step)
+  (let ((saved (unless (zerop step)
+                 (pg::physical-backup-open-directory
+                  (merge-pathnames "saved/" (getf (getf (getf record :configuration) :workspace) :directory))))))
+    (unwind-protect
+         (getf (if saved
+                   (pg::physical-reseed-install-read-archive-at root-fd saved)
+                   (pg::physical-reseed-install-read-at root-fd "physical-reseed.install"))
+               :plan)
+      (when saved (sb-posix:close saved)))))
+
+(defun check-retirement-archive-test-cut (root record point mode &optional (step 0))
+  (let ((name (ecase step (0 "physical-reseed.install") (1 "physical-reseed.attempt")))
+        (archive (if (zerop step)
+                     #'pg::physical-reseed-follow-retirement-archive-install
+                     #'pg::physical-reseed-follow-retirement-archive-attempt)))
+    (retirement-archive-test-reset root record name)
+    (catch 'retirement-archive-cut-checked
+      (call-with-retirement-intent-published-owner
+       root
+       (lambda (owner directory root-fd snapshot)
+         (declare (ignore directory))
+         (let* ((workspace (pathname (getf (getf (getf record :configuration) :workspace) :directory)))
+                (plan (retirement-archive-test-plan root-fd record step))
+                (auxiliaries (mapcar (lambda (key) (pathname (getf (getf plan key) :directory)))
+                                     '(:incoming :quarantine)))
+                (baseline (retirement-archive-test-invariants root workspace auxiliaries name))
+                (original-row (pg::physical-reseed-install-old-observe
+                               root-fd name
+                               (pg::physical-adoption-install-mount-id nil :directory-fd root-fd)))
+                (original-bytes (lineage-test-bytes (merge-pathnames name root)))
+                (candidate (pg::physical-reseed-follow-retirement-next-record
+                            record (getf (getf record :retirement) :attempt-file)))
+                (bytes (pg::physical-reseed-follow-image candidate))
+                (pg::*physical-reseed-follow-write-limit* (ceiling (length bytes) 2))
+                (injected nil)
+                (pg::*physical-reseed-follow-test-hook*
+                  (lambda (event path)
+                    (declare (ignore path))
+                    (when (and (eq event point) (not injected))
+                      (setf injected t)
+                      (ecase mode
+                        (:error (error "injected retirement archive cut"))
+                        (:throw (throw 'retirement-archive-injected-cut :cut))
+                        (:interrupt
+                         (sb-thread:interrupt-thread
+                          sb-thread:*current-thread*
+                          (lambda () (error "injected retirement archive cut")))))))))
+           (let ((outcome
+                   (catch 'retirement-archive-injected-cut
+                     (handler-case
+                         (progn (funcall archive owner) :returned)
+                       (error (condition)
+                         (if (search "injected retirement archive cut" (princ-to-string condition))
+                             :error
+                             (progn
+                               (format t "~%RETIREMENT-ARCHIVE-UNEXPECTED-CUT-ERROR ~s ~s ~a~%"
+                                       point mode condition)
+                               :wrong-error)))))))
+             (ok (eq (if (eq mode :throw) :cut :error) outcome)))
+           (ok injected)
+           (ng (pg::retirement-startup-busy-p owner))
+           (ok (pg::retirement-startup-uncertain-p owner))
+           (ok (handler-case
+                   (progn (funcall archive owner) nil)
+                 (error (condition) (search "busy or uncertain" (princ-to-string condition)))))
+           (ok (equal snapshot (getf (pg::retirement-startup-evidence owner) :snapshot)))
+           (ok (pg::postmaster-pid-owned-p))
+           (check-retirement-archive-test-location
+            root-fd record
+            (cond ((member point '(:after-retirement-archive-old-final-fsync
+                                   :after-retirement-archive-baseline-root-fsync
+                                   :after-retirement-archive-source-fsync)) :source)
+                  ((member point '(:after-retirement-archive-link
+                                   :after-retirement-archive-alias-fsync
+                                   :after-retirement-archive-saved-fsync)) :alias)
+                  (t :saved))
+            original-row original-bytes name)
+           (let* ((actual (pg::physical-reseed-follow-snapshot-at root-fd))
+                  (temporary (merge-pathnames "physical-reseed.follow.tmp" root))
+                  (renamed (member point '(:after-retirement-rename :after-retirement-candidate-fsync
+                                           :after-retirement-directory-fsync :after-retirement-readback))))
+             (if renamed
+                 (progn (ok (equal candidate (getf actual :record))) (ng (probe-file temporary)))
+                 (progn
+                   (ok (equal snapshot actual))
+                   (cond
+                     ((eq point :after-retirement-temporary-create)
+                      (ok (zerop (length (pg::read-bounded-regular-file temporary 1 :minimum 0)))))
+                     ((eq point :after-retirement-write-chunk)
+                      (ok (equalp (subseq bytes 0 (ceiling (length bytes) 2)) (lineage-test-bytes temporary))))
+                     ((eq point :after-retirement-temporary-fsync)
+                      (ok (equalp bytes (lineage-test-bytes temporary))))
+                     (t (ng (probe-file temporary)))))))
+           (ok (reseed-activation-layout-facts-equal-p
+                baseline (retirement-archive-test-invariants root workspace auxiliaries name)))
+           (throw 'retirement-archive-cut-checked :checked)))))))
 
 (deftest reseed-retirement-install-archive-fences-error-throw-and-self-interrupt-cuts
     (call-with-reseed-retirement-observation-fixture
@@ -1894,85 +2273,107 @@
              (ok (eq :checked (check-retirement-archive-test-cut root record point mode)))))
          (retirement-archive-test-reset root record)))))
 
-(defun check-retirement-archive-syscall-failure (root record case)
-  (destructuring-bind (operation event occurrence geometry final-step temporary-state role after-real) case
-    (retirement-archive-test-reset root record)
-    (catch 'retirement-archive-syscall-checked
-      (call-with-retirement-intent-published-owner
-       root
-       (lambda (owner directory root-fd snapshot)
-         (declare (ignore directory snapshot))
-         (let* ((syscall (symbol-function operation))
-                (run (symbol-function 'pg::physical-reseed-follow-retirement-archive-run))
-                (captured nil) (armed nil) (seen 0) (failures 0)
-                (workspace (pathname (getf (getf (getf record :configuration) :workspace) :directory)))
-                (plan (getf (pg::physical-reseed-install-read-at root-fd "physical-reseed.install") :plan))
-                (auxiliaries (mapcar (lambda (key) (pathname (getf (getf plan key) :directory)))
-                                     '(:incoming :quarantine)))
-                (baseline (retirement-archive-test-invariants root workspace auxiliaries))
-                (original-row (pg::physical-reseed-install-old-observe
-                               root-fd "physical-reseed.install"
-                               (pg::physical-adoption-install-mount-id nil :directory-fd root-fd)))
-                (original-bytes (lineage-test-bytes (merge-pathnames "physical-reseed.install" root))))
-           (unwind-protect
-                (progn
-                  (setf (symbol-function 'pg::physical-reseed-follow-retirement-archive-run)
-                        (lambda (witness) (setf captured witness) (funcall run witness))
-                        (symbol-function operation)
-                        (lambda (&rest arguments)
-                          (when armed
-                            (setf armed nil)
-                            (let* ((intent (pg::retirement-archive-intent captured))
-                                   (root (pg::physical-reseed-follow-retirement-archive-directory captured :root))
-                                   (saved (pg::physical-reseed-follow-retirement-archive-directory captured :saved))
-                                   (expected
-                                     (ecase role
-                                       (:file (list (sb-sys:fd-stream-fd (pg::retirement-archive-stream captured))))
-                                       (:old-final (list (sb-sys:fd-stream-fd (pg::retirement-intent-old-stream intent))))
-                                       (:temporary (list (pg::retirement-intent-temporary-fd intent)))
-                                       (:root (list root))
-                                       (:saved (list saved))
-                                       (:link (list root "physical-reseed.install" saved "physical-reseed.install" 0))
-                                       (:unlink (list root "physical-reseed.install" 0)))))
-                              (unless (equal arguments expected) (error "wrong archive syscall injection site"))
-                              (incf failures)
-                              (when after-real
-                                (unless (zerop (apply syscall arguments))
-                                  (error "real archive namespace syscall failed before injection")))
-                              (error 'sb-posix:syscall-error :name operation :errno sb-posix:eio)))
-                          (apply syscall arguments)))
-                  (let ((pg::*physical-reseed-follow-test-hook*
-                          (lambda (point path)
-                            (declare (ignore path))
-                            (when (eq point event)
-                              (incf seen)
-                              (when (= seen occurrence) (setf armed t))))))
+(deftest reseed-retirement-attempt-archive-fences-error-throw-and-self-interrupt-cuts
+    (call-with-reseed-retirement-observation-fixture
+     :same-timeline
+     (lambda (offline root workspace root-fd initial check)
+       (declare (ignore workspace check))
+       (close (pg::physical-adoption-owner-lock offline))
+       (setf (pg::physical-adoption-owner-active-p offline) nil)
+       (let ((record (prepare-retirement-attempt-archive-test root root-fd initial :source)))
+         (dolist (mode '(:error :throw :interrupt))
+           (dolist (point '(:after-retirement-archive-link
+                            :after-retirement-archive-saved-fsync
+                            :after-retirement-archive-unlink
+                            :after-retirement-archive-root-fsync
+                            :after-retirement-temporary-fsync
+                            :after-retirement-rename))
+             (ok (eq :checked (check-retirement-archive-test-cut root record point mode 1)))))
+         (retirement-archive-test-reset root record "physical-reseed.attempt")))))
+
+(defun check-retirement-archive-syscall-failure (root record case &optional (step 0))
+  (let ((name (ecase step (0 "physical-reseed.install") (1 "physical-reseed.attempt")))
+        (archive (if (zerop step)
+                     #'pg::physical-reseed-follow-retirement-archive-install
+                     #'pg::physical-reseed-follow-retirement-archive-attempt)))
+    (destructuring-bind (operation event occurrence geometry final-step temporary-state role after-real) case
+      (retirement-archive-test-reset root record name)
+      (catch 'retirement-archive-syscall-checked
+        (call-with-retirement-intent-published-owner
+         root
+         (lambda (owner directory root-fd snapshot)
+           (declare (ignore directory snapshot))
+           (let* ((syscall (symbol-function operation))
+                  (run (symbol-function 'pg::physical-reseed-follow-retirement-archive-run))
+                  (captured nil) (armed nil) (seen 0) (failures 0)
+                  (workspace (pathname (getf (getf (getf record :configuration) :workspace) :directory)))
+                  (plan (retirement-archive-test-plan root-fd record step))
+                  (auxiliaries (mapcar (lambda (key) (pathname (getf (getf plan key) :directory)))
+                                       '(:incoming :quarantine)))
+                  (baseline (retirement-archive-test-invariants root workspace auxiliaries name))
+                  (original-row (pg::physical-reseed-install-old-observe
+                                 root-fd name
+                                 (pg::physical-adoption-install-mount-id nil :directory-fd root-fd)))
+                  (original-bytes (lineage-test-bytes (merge-pathnames name root))))
+             (unwind-protect
+                  (progn
+                    (setf (symbol-function 'pg::physical-reseed-follow-retirement-archive-run)
+                          (lambda (witness) (setf captured witness) (funcall run witness))
+                          (symbol-function operation)
+                          (lambda (&rest arguments)
+                            (when armed
+                              (setf armed nil)
+                              (let* ((intent (pg::retirement-archive-intent captured))
+                                     (root (pg::physical-reseed-follow-retirement-archive-directory captured :root))
+                                     (saved (pg::physical-reseed-follow-retirement-archive-directory captured :saved))
+                                     (expected
+                                       (ecase role
+                                         (:file (list (sb-sys:fd-stream-fd (pg::retirement-archive-stream captured))))
+                                         (:old-final (list (sb-sys:fd-stream-fd (pg::retirement-intent-old-stream intent))))
+                                         (:temporary (list (pg::retirement-intent-temporary-fd intent)))
+                                         (:root (list root))
+                                         (:saved (list saved))
+                                         (:link (list root name saved name 0))
+                                         (:unlink (list root name 0)))))
+                                (unless (equal arguments expected) (error "wrong archive syscall injection site"))
+                                (incf failures)
+                                (when after-real
+                                  (unless (zerop (apply syscall arguments))
+                                    (error "real archive namespace syscall failed before injection")))
+                                (error 'sb-posix:syscall-error :name operation :errno sb-posix:eio)))
+                            (apply syscall arguments)))
+                    (let ((pg::*physical-reseed-follow-test-hook*
+                            (lambda (point path)
+                              (declare (ignore path))
+                              (when (eq point event)
+                                (incf seen)
+                                (when (= seen occurrence) (setf armed t))))))
+                      (ok (handler-case
+                              (progn (funcall archive owner) nil)
+                            (sb-posix:syscall-error (condition) (= sb-posix:eio (sb-posix:syscall-errno condition))))))
+                    (ok (= occurrence seen))
+                    (ok (= 1 failures))
+                    (ng (pg::retirement-startup-busy-p owner))
+                    (ok (pg::retirement-startup-uncertain-p owner))
                     (ok (handler-case
-                            (progn (pg::physical-reseed-follow-retirement-archive-install owner) nil)
-                          (sb-posix:syscall-error (condition) (= sb-posix:eio (sb-posix:syscall-errno condition))))))
-                  (ok (= occurrence seen))
-                  (ok (= 1 failures))
-                  (ng (pg::retirement-startup-busy-p owner))
-                  (ok (pg::retirement-startup-uncertain-p owner))
-                  (ok (handler-case
-                          (progn (pg::physical-reseed-follow-retirement-archive-install owner) nil)
-                        (error (condition) (search "busy or uncertain" (princ-to-string condition)))))
-                  (let* ((actual (pg::physical-reseed-follow-snapshot-at root-fd))
-                         (temporary (merge-pathnames "physical-reseed.follow.tmp" root))
-                         (candidate (pg::physical-reseed-follow-retirement-next-record
-                                     record (getf (getf record :retirement) :attempt-file))))
-                    (ok (equal (if (zerop final-step) record candidate) (getf actual :record)))
-                    (ecase temporary-state
-                      (:absent (ng (probe-file temporary)))
-                      (:complete
-                       (ok (equalp (pg::physical-reseed-follow-image candidate) (lineage-test-bytes temporary))))))
-                  (check-retirement-archive-test-location
-                   root-fd record geometry original-row original-bytes)
-                  (ok (reseed-activation-layout-facts-equal-p
-                       baseline (retirement-archive-test-invariants root workspace auxiliaries))))
-             (setf (symbol-function operation) syscall
-                   (symbol-function 'pg::physical-reseed-follow-retirement-archive-run) run))
-           (throw 'retirement-archive-syscall-checked :checked)))))))
+                            (progn (funcall archive owner) nil)
+                          (error (condition) (search "busy or uncertain" (princ-to-string condition)))))
+                    (let* ((actual (pg::physical-reseed-follow-snapshot-at root-fd))
+                           (temporary (merge-pathnames "physical-reseed.follow.tmp" root))
+                           (candidate (pg::physical-reseed-follow-retirement-next-record
+                                       record (getf (getf record :retirement) :attempt-file))))
+                      (ok (equal (if (zerop final-step) record candidate) (getf actual :record)))
+                      (ecase temporary-state
+                        (:absent (ng (probe-file temporary)))
+                        (:complete
+                         (ok (equalp (pg::physical-reseed-follow-image candidate) (lineage-test-bytes temporary))))))
+                    (check-retirement-archive-test-location
+                     root-fd record geometry original-row original-bytes name)
+                    (ok (reseed-activation-layout-facts-equal-p
+                         baseline (retirement-archive-test-invariants root workspace auxiliaries name))))
+               (setf (symbol-function operation) syscall
+                     (symbol-function 'pg::physical-reseed-follow-retirement-archive-run) run))
+             (throw 'retirement-archive-syscall-checked :checked))))))))
 
 (deftest reseed-retirement-install-archive-fences-each-real-effect-syscall-failure
     (call-with-reseed-retirement-observation-fixture
@@ -2001,6 +2402,34 @@
                          (pg::port-unlinkat :before-retirement-archive-unlink 1 :saved 0 :absent :unlink t)))
            (ok (eq :checked (check-retirement-archive-syscall-failure root record case))))
          (retirement-archive-test-reset root record)))))
+
+(deftest reseed-retirement-attempt-archive-fences-real-effect-syscall-failures
+    (call-with-reseed-retirement-observation-fixture
+     :same-timeline
+     (lambda (offline root workspace root-fd initial check)
+       (declare (ignore workspace check))
+       (close (pg::physical-adoption-owner-lock offline))
+       (setf (pg::physical-adoption-owner-active-p offline) nil)
+       (let ((record (prepare-retirement-attempt-archive-test root root-fd initial :source)))
+         (dolist (case '((sb-posix:fsync :before-retirement-archive-old-final-fsync 1 :source 0 :absent :old-final nil)
+                         (sb-posix:fsync :before-retirement-archive-baseline-root-fsync 1 :source 0 :absent :root nil)
+                         (sb-posix:fsync :before-retirement-archive-source-fsync 1 :source 0 :absent :file nil)
+                         (sb-posix:fsync :before-retirement-archive-alias-fsync 1 :alias 0 :absent :file nil)
+                         (sb-posix:fsync :before-retirement-archive-saved-fsync 1 :alias 0 :absent :saved nil)
+                         (sb-posix:fsync :before-retirement-archive-inode-fsync 1 :saved 0 :absent :file nil)
+                         (sb-posix:fsync :before-retirement-archive-saved-fsync 2 :saved 0 :absent :saved nil)
+                         (sb-posix:fsync :before-retirement-archive-root-fsync 1 :saved 0 :absent :root nil)
+                         (sb-posix:fsync :before-retirement-old-final-fsync 1 :saved 0 :absent :old-final nil)
+                         (sb-posix:fsync :before-retirement-predecessor-directory-fsync 1 :saved 0 :absent :root nil)
+                         (sb-posix:fsync :before-retirement-temporary-fsync 1 :saved 0 :complete :temporary nil)
+                         (sb-posix:fsync :before-retirement-candidate-fsync 1 :saved 1 :absent :temporary nil)
+                         (sb-posix:fsync :before-retirement-directory-fsync 1 :saved 1 :absent :root nil)
+                         (pg::port-linkat :before-retirement-archive-link 1 :source 0 :absent :link nil)
+                         (pg::port-linkat :before-retirement-archive-link 1 :alias 0 :absent :link t)
+                         (pg::port-unlinkat :before-retirement-archive-unlink 1 :alias 0 :absent :unlink nil)
+                         (pg::port-unlinkat :before-retirement-archive-unlink 1 :saved 0 :absent :unlink t)))
+           (ok (eq :checked (check-retirement-archive-syscall-failure root record case 1))))
+         (retirement-archive-test-reset root record "physical-reseed.attempt")))))
 
 (deftest reseed-retirement-install-archive-fences-postcommit-store-cleanup-failure
     (check-retirement-archive-postcommit-cleanup :error))
