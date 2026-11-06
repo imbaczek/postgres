@@ -146,7 +146,7 @@
        (call-with-physical-reseed-follow-fixed-configuration-directories
         workspace-fd record
         (lambda (staged saved fixed-check)
-          (let ((plan (physical-reseed-follow-retirement-provisional-plan-at root saved record)))
+          (let ((plan (physical-reseed-follow-retirement-provisional-plan-at root saved record fixed-check)))
             (physical-reseed-follow-retirement-check-workspace record plan)
             (call-with-physical-reseed-follow-retirement-auxiliaries
              root plan

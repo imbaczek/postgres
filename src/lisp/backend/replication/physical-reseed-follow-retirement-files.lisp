@@ -42,6 +42,17 @@
         (values (list :record (physical-reseed-follow-decode bytes) :identity identity :row row)
                 bytes)))))
 
+(defun physical-reseed-follow-retirement-pending-journal (record)
+  (let ((retirement (getf record :retirement)))
+    (when (eq :retiring (getf retirement :phase))
+      (case (getf retirement :step)
+        (0 :install)
+        (1 :attempt)))))
+
+(defun physical-reseed-follow-retirement-attempt-row-identity (row)
+  (list (second row) (third row) (fourth row) (sixth row) (fifth row) (seventh row)
+        (floor (eighth row) 1000000000) (floor (ninth row) 1000000000)))
+
 (defun physical-reseed-follow-retirement-attempt-at (root-fd container-fd value prefix)
   ;; Observe the exact original premanifest attempt at the prefix location.
   ;; Check the root binding, all three mounts, and the attempt file identity
@@ -67,10 +78,7 @@
     (let* ((mount (physical-adoption-install-mount-id nil :directory-fd root-fd))
            (name (copy-seq "physical-reseed.attempt"))
            (row (physical-reseed-install-old-observe container-fd name mount))
-           (identity (list (second row) (third row) (fourth row)
-                           (sixth row) (fifth row) (seventh row)
-                           (floor (eighth row) 1000000000)
-                           (floor (ninth row) 1000000000))))
+           (identity (physical-reseed-follow-retirement-attempt-row-identity row)))
       (unless (= mount (physical-adoption-install-mount-id nil :directory-fd container-fd))
         (error "retirement attempt container crosses mounts"))
       (let ((state
@@ -86,7 +94,9 @@
           (error "retirement requires the exact active original attempt"))
         (when reference
           (unless (and (= (getf reference :digest) (getf state :digest))
-                       (if same
+                       (if (and same
+                                (not (eq :attempt
+                                         (physical-reseed-follow-retirement-pending-journal record))))
                            (equal (getf reference :identity) (getf state :identity))
                            (equal (butlast (getf reference :identity)) (butlast (getf state :identity)))))
             (error "retirement differs from its frozen attempt file reference")))
@@ -113,15 +123,144 @@
                    (equal (physical-reseed-install-row-file-facts row) (getf state :identity))
                    (every (lambda (key) (eql (getf expected key) (getf actual key)))
                           '(:digest :body-crc :step))
-                   (if (zerop prefix)
+                   (if (and (zerop prefix)
+                            (not (eq :install
+                                     (physical-reseed-follow-retirement-pending-journal record))))
                        (equal (getf expected :identity) (getf actual :identity))
                        (equal (butlast (getf expected :identity)) (butlast (getf actual :identity)))))
         (error "retirement install differs from its frozen reference or stable file facts"))
       (append state (list :row row)))))
 
-(defun physical-reseed-follow-retirement-provisional-plan-at (root saved value)
-  ;; Read one root or saved install journal to obtain a provisional plan.
-  ;; The complete layout proof later establishes the location and saved role.
+(defun physical-reseed-follow-retirement-alias-row-at (root saved name maximum check)
+  (funcall check)
+  (let* ((root-stat (physical-image-check-directory root))
+         (saved-stat (physical-image-check-directory saved (sb-posix:stat-dev root-stat)))
+         (mount (physical-adoption-install-mount-id nil :directory-fd root)))
+    (unless (and (/= (sb-posix:stat-ino root-stat) (sb-posix:stat-ino saved-stat))
+                 (= mount (physical-adoption-install-mount-id nil :directory-fd saved)))
+      (error "retirement alias requires distinct directories on the target mount"))
+    (let ((row (physical-reseed-install-old-observe root name mount)))
+      (unless (and (= #o100600 (fourth row)) (= 2 (fifth row))
+                   (= (sb-posix:geteuid) (sixth row)) (<= 1 (seventh row) maximum)
+                   (equal row (physical-reseed-install-old-observe saved name mount)))
+        (error "retirement alias requires exactly two private names of one inode"))
+      (funcall check)
+      row)))
+
+(defun physical-reseed-follow-retirement-alias-reference-p (expected actual link-index)
+  (and (= 1 (nth link-index expected)) (= 2 (nth link-index actual))
+       (let ((copy (copy-list actual)))
+         (setf (nth link-index copy) 1)
+         (equal (butlast expected) (butlast copy)))))
+
+(defun physical-reseed-follow-retirement-alias-state (root record row bytes)
+  (let* ((kind (physical-reseed-follow-retirement-pending-journal record))
+         (reference (if (eq kind :install) (getf record :install)
+                        (getf (getf record :retirement) :attempt-file)))
+         (identity (if (eq kind :install) (physical-reseed-install-row-file-facts row)
+                       (physical-reseed-follow-retirement-attempt-row-identity row)))
+         (digest (physical-store-update-digest #xCBF29CE484222325 bytes))
+         (local (getf (getf record :attempt) :local))
+         (stat (sb-posix:fstat root)))
+    (unless (and kind (= (getf local :device) (sb-posix:stat-dev stat))
+                 (= (getf local :inode) (sb-posix:stat-ino stat))
+                 (= digest (getf reference :digest))
+                 (physical-reseed-follow-retirement-alias-reference-p
+                  (getf reference :identity) identity (if (eq kind :install) 3 4)))
+      (error "retirement alias differs from its frozen file reference"))
+    (let ((state
+            (ecase kind
+              (:install
+               (let* ((state (physical-reseed-install-decode bytes))
+                      (plan (getf state :plan))
+                      (journal (getf plan :journal))
+                      (image (physical-reseed-install-image plan (physical-reseed-install-last-step plan))))
+                 (physical-reseed-follow-configuration-install-plan plan record)
+                 (unless (and (equalp bytes image)
+                              (= (getf journal :device) (first identity))
+                              (= (getf journal :inode) (second identity))
+                              (= (getf reference :body-crc) (getf state :body-crc))
+                              (= (getf reference :step) (getf state :step)))
+                   (error "retirement install alias requires the exact terminal image"))
+                 state))
+              (:attempt
+               (let ((attempt (physical-reseed-attempt-decode bytes)))
+                 (unless (and (eq :premanifest (getf attempt :phase))
+                              (equal attempt (getf record :attempt)))
+                   (error "retirement attempt alias differs from the original premanifest record"))
+                 (list :record attempt))))))
+      (append state (list :identity identity :digest digest :row (copy-list row)
+                          :alias-row (copy-list row) :location :alias)))))
+
+(defun call-with-physical-reseed-follow-retirement-alias-file (root saved value function check)
+  (declare (notinline physical-image-openat))
+  (funcall check)
+  (let* ((record (physical-reseed-follow-copy value))
+         (kind (physical-reseed-follow-retirement-pending-journal record))
+         (name (case kind (:install "physical-reseed.install") (:attempt "physical-reseed.attempt")))
+         (maximum (if (eq kind :install) +physical-reseed-install-maximum-bytes+
+                      +physical-reseed-attempt-maximum-bytes+))
+         (fd nil) (stream nil) (active nil) (thread sb-thread:*current-thread*))
+    (unless name (error "retirement alias requires a pending retirement journal"))
+    (let* ((row (physical-reseed-follow-retirement-alias-row-at root saved name maximum check))
+           (mount (physical-adoption-install-mount-id nil :directory-fd root))
+           (bytes (make-array (seventh row) :element-type '(unsigned-byte 8)))
+           (current (make-array (length bytes) :element-type '(unsigned-byte 8))))
+      (unwind-protect
+           (progn
+             (sb-sys:without-interrupts
+               (setf fd (physical-image-openat
+                         root name (logior sb-posix:o-rdonly sb-posix:o-nofollow sb-posix:o-nonblock
+                                           +postmaster-o-cloexec+) 0))
+               (when (minusp fd) (setf fd nil) (error "cannot open retirement alias")))
+             (sb-sys:without-interrupts
+               (setf stream (sb-sys:make-fd-stream fd :input t :element-type '(unsigned-byte 8))))
+             (physical-reseed-follow-test-point
+              :after-retirement-alias-open (merge-pathnames name (physical-image-fd-path root)))
+             (flet ((verify-row ()
+                      (funcall check)
+                      (unless (and (equal row (physical-reseed-follow-retirement-alias-row-at
+                                               root saved name maximum check))
+                                   (equal (rest row) (physical-reseed-follow-retirement-held-file-facts fd mount)))
+                        (error "retirement alias changed its held nanosecond facts"))))
+               (verify-row)
+               (unless (and (= (length bytes) (read-sequence bytes stream))
+                            (eq :eof (read-byte stream nil :eof)))
+                 (error "retirement alias changed while reading"))
+               (verify-row)
+               (let ((state (physical-reseed-follow-retirement-alias-state root record row bytes)))
+                 (flet ((verify ()
+                          (unless (and active (eq thread sb-thread:*current-thread*))
+                            (error "retirement alias scope ended or changed thread"))
+                          (verify-row)
+                          (file-position stream 0)
+                          (unless (and (= (length current) (read-sequence current stream))
+                                       (eq :eof (read-byte stream nil :eof))
+                                       (equalp bytes current))
+                            (error "retirement alias changed its held bytes"))
+                          (verify-row)
+                          t))
+                   (setf active t)
+                   (verify)
+                   (unwind-protect
+                        (multiple-value-prog1
+                            (funcall function stream (physical-adoption-attempt-value-copy state) #'verify)
+                          (verify))
+                     (setf active nil))))))
+        (setf active nil)
+        (if stream (close stream) (when fd (sb-posix:close fd)))))))
+
+(defun physical-reseed-follow-retirement-alias-at (root saved value check)
+  (call-with-physical-reseed-follow-retirement-alias-file
+   root saved value
+   (lambda (stream state verify)
+     (declare (ignore stream))
+     (funcall verify)
+     state)
+   check))
+
+(defun physical-reseed-follow-retirement-provisional-plan-at (root saved value &optional (check (constantly t)))
+  (funcall check)
   (let* ((record (physical-reseed-follow-copy value))
          (activation (getf record :activation))
          (present (loop for fd in (list root saved)
@@ -130,10 +269,17 @@
                           collect fd)))
     (unless (and (eq :active (getf activation :phase)) (= 2 (getf activation :step)))
       (error "retirement requires completed activation"))
-    (unless (= 1 (length present)) (error "retirement install requires one root or saved location"))
-    (let* ((state (if (= root (first present))
-                      (physical-reseed-install-read-at root "physical-reseed.install")
-                      (physical-reseed-install-read-archive-at root saved)))
+    (let* ((state
+             (cond
+               ((and (= 2 (length present))
+                     (eq :install (physical-reseed-follow-retirement-pending-journal record)))
+                (physical-reseed-follow-retirement-alias-at root saved record check))
+               ((= 1 (length present))
+                (if (= root (first present))
+                    (physical-reseed-install-read-at root "physical-reseed.install")
+                    (physical-reseed-install-read-archive-at root saved)))
+               (t (error "retirement install requires one root or saved location"))))
            (plan (getf state :plan)))
       (physical-reseed-follow-configuration-install-plan plan record)
+      (funcall check)
       plan)))

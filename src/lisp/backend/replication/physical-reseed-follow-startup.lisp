@@ -13,6 +13,8 @@
     (let* ((layout (getf state :layout))
            (projection
              (append
+              (when (getf state :location)
+                (list :location (getf state :location)))
               (loop for key in '(:prefix :snapshot :install :attempt :temporary :temporary-file)
                     append (list key (getf state key)))
               (list :layout

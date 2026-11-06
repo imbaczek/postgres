@@ -18,21 +18,53 @@
       (error "retirement read-only layout refuses temporary follow or PID entries"))
     extra))
 
+(defun physical-reseed-follow-retirement-inventories-at (plan record binding prefix extra alias)
+  (let ((inventories (physical-reseed-follow-retirement-inventories plan record binding prefix extra)))
+    (when alias
+      (let ((kind (physical-reseed-follow-retirement-pending-journal record)))
+        (unless (and kind (= prefix (getf (getf record :retirement) :step)))
+          (error "retirement alias requires the recorded pending move"))
+        (push (if (eq kind :install) "physical-reseed.install" "physical-reseed.attempt")
+              (getf inventories :saved))))
+    (physical-reseed-follow-configuration-sort-inventories inventories)))
+
+(defun physical-reseed-follow-retirement-journals-at (descriptors record prefix alias check)
+  (funcall check)
+  (let* ((root (physical-reseed-follow-configuration-role-fd descriptors :root))
+         (saved (physical-reseed-follow-configuration-role-fd descriptors :saved))
+         (kind (when alias (physical-reseed-follow-retirement-pending-journal record)))
+         (state (when alias
+                  (unless (and kind (= prefix (getf (getf record :retirement) :step)))
+                    (error "retirement alias requires the recorded pending move"))
+                  (physical-reseed-follow-retirement-alias-at root saved record check))))
+    (values
+     (if (eq kind :install) state
+         (physical-reseed-follow-retirement-install-at descriptors record prefix))
+     (if (eq kind :attempt) state
+         (physical-reseed-follow-retirement-attempt-at root (if (= prefix 2) saved root) record prefix)))))
+
 (defun physical-reseed-follow-retirement-initial-prefix (descriptors plan record binding extra)
-  ;; Compare all ten directory inventories twice and require one matching
-  ;; archive prefix consistent with the recorded retirement progress.
   (flet ((names ()
            (loop for role in '(:root :incoming :quarantine :base :global :wal :workspace :staged :saved :receive)
                  append (list role (physical-reseed-install-directory-names
                                     (physical-reseed-follow-configuration-role-fd descriptors role))))))
     (let* ((actual (names))
-           (matches (loop for prefix from 0 to 2
-                          when (equal actual (physical-reseed-follow-retirement-inventories
-                                              plan record binding prefix extra))
-                            collect prefix)))
+           (pending (physical-reseed-follow-retirement-pending-journal record))
+           (step (getf (getf record :retirement) :step))
+           (matches
+             (append
+              (loop for prefix from 0 to 2
+                    when (equal actual (physical-reseed-follow-retirement-inventories
+                                        plan record binding prefix extra))
+                      collect (list prefix nil))
+              (when (and pending
+                         (equal actual (physical-reseed-follow-retirement-inventories-at
+                                        plan record binding step extra t)))
+                (list (list step t))))))
       (unless (and (= 1 (length matches)) (equal actual (names)))
         (error "retirement layout lacks a unique complete archive prefix"))
-      (physical-reseed-follow-retirement-check-prefix record (first matches)))))
+      (physical-reseed-follow-retirement-check-prefix record (caar matches))
+      (values (caar matches) (second (first matches))))))
 
 (defun physical-reseed-follow-retirement-layout-state-at (descriptors snapshot check extra-reader candidate &optional pid-evidence)
   ;; When PID evidence is supplied, verify it and admit only its matching root
@@ -49,7 +81,7 @@
     (funcall check)
     (when pid-evidence (funcall (getf pid-evidence :verify)))
     (physical-reseed-follow-check-snapshot root snapshot)
-    (let* ((plan (physical-reseed-follow-retirement-provisional-plan-at root saved record))
+    (let* ((plan (physical-reseed-follow-retirement-provisional-plan-at root saved record check))
            (base-fds (loop for role in '(:base :global :wal)
                            collect (cons role (physical-reseed-follow-configuration-role-fd descriptors role)))))
       (flet ((initial-check ()
@@ -60,11 +92,16 @@
              root saved base-fds plan record (getf (getf record :configuration) :step) #'initial-check)
           (declare (ignore base control model row))
           (let* ((extra (funcall extra-reader root))
-                 (prefix (physical-reseed-follow-retirement-initial-prefix descriptors plan record binding extra))
-                 (install (physical-reseed-follow-retirement-install-at descriptors record prefix))
-                 (attempt (physical-reseed-follow-retirement-attempt-at root (if (= prefix 2) saved root) record prefix))
+                 (geometry (multiple-value-list
+                            (physical-reseed-follow-retirement-initial-prefix descriptors plan record binding extra)))
+                 (prefix (first geometry))
+                 (alias (second geometry))
+                 (journals (multiple-value-list
+                            (physical-reseed-follow-retirement-journals-at descriptors record prefix alias check)))
+                 (install (first journals))
+                 (attempt (second journals))
                  (positions (physical-reseed-follow-retirement-positions record binding prefix))
-                 (expected (physical-reseed-follow-retirement-inventories plan record binding prefix extra))
+                 (expected (physical-reseed-follow-retirement-inventories-at plan record binding prefix extra alias))
                  (mount (physical-adoption-install-mount-id nil :directory-fd root)))
             (unless (and (equal (mapcar #'car extra)
                                 (append '("physical-reseed.follow")
@@ -76,9 +113,10 @@
                      (funcall check)
                      (when pid-evidence (funcall (getf pid-evidence :verify)))
                      (unless (and (equal extra (funcall extra-reader root))
-                                  (equal install (physical-reseed-follow-retirement-install-at descriptors record prefix))
-                                  (equal attempt (physical-reseed-follow-retirement-attempt-at
-                                                  root (if (= prefix 2) saved root) record prefix)))
+                                  (equal (list install attempt)
+                                         (multiple-value-list
+                                          (physical-reseed-follow-retirement-journals-at
+                                           descriptors record prefix alias check))))
                        (error "retirement journals changed during layout verification"))))
               (verify)
               (let ((layout
@@ -91,7 +129,8 @@
                   (physical-reseed-follow-retirement-check-temporary-layout
                    descriptors record candidate prefix install attempt))
                 (verify)
-                (append (list :prefix prefix :layout layout :install install :attempt attempt
+                (append (when alias (list :location :alias))
+                        (list :prefix prefix :layout layout :install install :attempt attempt
                               :snapshot (physical-adoption-attempt-value-copy snapshot))
                         (when candidate
                           (list :temporary (physical-reseed-follow-copy candidate))))))))))))

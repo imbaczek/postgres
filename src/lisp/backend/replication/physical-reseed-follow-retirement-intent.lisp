@@ -43,26 +43,24 @@
           (getf copy :names) names)
     (getf (physical-reseed-follow-startup-projection descriptors (list :layout copy)) :layout)))
 
-(defun physical-reseed-follow-retirement-intent-proof-at (descriptors store value check read-extra)
-  ;; Prove prefix zero and its files and check the active receive state between
-  ;; two layout observations.  The result binds nonjournal state for publication.
+(defun physical-reseed-follow-retirement-prefix-proof-at (descriptors store value prefix check read-extra &optional alias)
   (funcall check)
   (let* ((record (physical-reseed-follow-copy value))
          (root (physical-reseed-follow-configuration-role-fd descriptors :root))
          (saved (physical-reseed-follow-configuration-role-fd descriptors :saved))
-         (plan (physical-reseed-follow-retirement-provisional-plan-at root saved record))
+         (plan (physical-reseed-follow-retirement-provisional-plan-at root saved record check))
          (base-fds (loop for role in '(:base :global :wal)
                          collect (cons role (physical-reseed-follow-configuration-role-fd descriptors role))))
          (mount (physical-adoption-install-mount-id nil :directory-fd root)))
-    (physical-reseed-follow-retirement-check-prefix record 0)
+    (physical-reseed-follow-retirement-check-prefix record prefix)
     (flet ((observe ()
              (multiple-value-bind (base control binding model images row)
                  (physical-reseed-follow-configuration-base-proof
                   root saved base-fds plan record (getf (getf record :configuration) :step) check)
                (declare (ignore control model row))
                (let* ((extra (funcall read-extra root))
-                      (positions (physical-reseed-follow-retirement-positions record binding 0))
-                      (expected (physical-reseed-follow-retirement-inventories plan record binding 0 extra))
+                      (positions (physical-reseed-follow-retirement-positions record binding prefix))
+                      (expected (physical-reseed-follow-retirement-inventories-at plan record binding prefix extra alias))
                       (layout
                         (physical-reseed-follow-layout-proof-at
                          descriptors plan record positions images extra expected mount check check read-extra
@@ -70,10 +68,12 @@
                            (physical-reseed-follow-activation-active-row
                             descriptors record binding positions mount)))))
                  (values
-                  (list :prefix 0 :layout layout
-                        :install (physical-reseed-follow-retirement-install-at descriptors record 0)
-                        :attempt (physical-reseed-follow-retirement-attempt-at root root record 0)
-                        :receive (physical-adoption-attempt-value-copy (physical-store-control-tuple store)))
+                  (multiple-value-bind (install attempt)
+                      (physical-reseed-follow-retirement-journals-at descriptors record prefix alias check)
+                    (append (when alias (list :location :alias))
+                            (list :prefix prefix :layout layout :install install :attempt attempt
+                                  :receive (physical-adoption-attempt-value-copy
+                                            (physical-store-control-tuple store)))))
                   base binding)))))
       (multiple-value-bind (before base binding) (observe)
         (physical-reseed-follow-retirement-check-receive descriptors store record base binding check)
@@ -85,12 +85,44 @@
                 (physical-reseed-follow-retirement-intent-layout descriptors (getf after :layout)))
           after)))))
 
+(defun physical-reseed-follow-retirement-intent-proof-at (descriptors store value check read-extra)
+  ;; Prove prefix zero and its files and check the active receive state between
+  ;; two layout observations.  The result binds nonjournal state for publication.
+  (physical-reseed-follow-retirement-prefix-proof-at descriptors store value 0 check read-extra))
+
+(defun physical-reseed-follow-retirement-check-move-proof (before after step)
+  (unless (and (typep step '(integer 0 1))
+               (member (getf before :prefix) (list step (1+ step)))
+               (eql (getf after :prefix) (1+ step)))
+    (error "archive move proof has an invalid prefix transition"))
+  (flet ((stable (proof)
+           (let* ((copy (physical-adoption-attempt-value-copy proof))
+                  (layout (getf copy :layout))
+                  (names (getf layout :names))
+                  (key (if (zerop step) :install :attempt))
+                  (name (if (zerop step) "physical-reseed.install" "physical-reseed.attempt"))
+                  (file (getf copy key)))
+             (setf (getf copy :prefix) nil
+                   (getf layout :directories)
+                   (loop for (role . row) in (getf layout :directories)
+                         collect (cons role (if (member role '(:root :saved)) (subseq row 0 6) row)))
+                   (getf names :root) (remove name (getf names :root) :test #'equal)
+                   (getf names :saved) (remove name (getf names :saved) :test #'equal)
+                   (getf file :identity) (butlast (getf file :identity))
+                   (getf file :row) (butlast (getf file :row)))
+             copy)))
+    (unless (if (= (getf before :prefix) (getf after :prefix))
+                (equal before after)
+                (equal (stable before) (stable after)))
+      (error "archive move changed frozen nonjournal state")))
+  t)
+
 (defstruct (physical-reseed-follow-retirement-intent-witness (:conc-name retirement-intent-))
   ;; Private, thread-bound publication state ties the held resources and
   ;; predecessor to one candidate, proof and sequence of effects.
   owner thread active-p descriptors store parent-check pid snapshot old-stream old-bytes
   candidate bytes proof phase temporary-fd temporary-stream temporary-fixed temporary-state
-  written effect-p)
+  written effect-p publication-claimed-p)
 
 (defmethod print-object ((witness physical-reseed-follow-retirement-intent-witness) stream)
   (print-unreadable-object (witness stream :type t :identity t)))
@@ -449,9 +481,21 @@
      witness :root :before-retirement-directory-fsync :after-retirement-directory-fsync)
     (physical-reseed-follow-retirement-intent-adopt witness)))
 
+(defun physical-reseed-follow-retirement-intent-claim-publication (witness)
+  (sb-sys:without-interrupts
+    (unless (and (physical-reseed-follow-retirement-intent-witness-p witness)
+                 (retirement-intent-active-p witness)
+                 (eq (retirement-intent-thread witness) sb-thread:*current-thread*))
+      (error "retirement publication requires its live thread-bound witness"))
+    (when (retirement-intent-publication-claimed-p witness)
+      (error "retirement publication already claimed"))
+    (setf (retirement-intent-publication-claimed-p witness) t))
+  t)
+
 (defun physical-reseed-follow-retirement-intent-publish-held (witness)
   ;; Mark the operation uncertain before effects.  Sync the old final and root,
   ;; then write or reuse the exact complete temporary and promote it.
+  (physical-reseed-follow-retirement-intent-claim-publication witness)
   (physical-reseed-follow-retirement-intent-check-scope witness)
   (unless (and (not (retirement-intent-effect-p witness))
                (case (retirement-intent-phase witness)
