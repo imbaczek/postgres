@@ -1,12 +1,16 @@
+;;; Publish the terminal retirement record under the held startup owner.
 (in-package #:pg)
 
 (defstruct (physical-reseed-follow-retirement-terminal-witness (:conc-name retirement-terminal-))
+  ;; Bind one private terminal publication to its intent, thread and proof.
   intent thread active-p binding proof phase final-snapshot)
 
 (defmethod print-object ((witness physical-reseed-follow-retirement-terminal-witness) stream)
   (physical-libpq-print-private-object witness stream 0))
 
 (defun physical-reseed-follow-retirement-terminal-check-outer (witness &optional phases)
+  ;; Require the live thread-bound witness and the exact Retiring step 2 to
+  ;; Retired step 2 transition at frozen prefix 2 with no alias.
   (unless (and (physical-reseed-follow-retirement-terminal-witness-p witness)
                (retirement-terminal-active-p witness)
                (eq (retirement-terminal-thread witness) sb-thread:*current-thread*))
@@ -26,6 +30,8 @@
   t)
 
 (defun physical-reseed-follow-retirement-terminal-check (witness)
+  ;; Check the frozen proof during publication and the full durable proof
+  ;; after adoption.
   (physical-reseed-follow-retirement-terminal-check-outer witness '(:ready :checking :publishing :done))
   (let ((intent (retirement-terminal-intent witness)))
     (unless (equal (retirement-terminal-proof witness) (retirement-intent-proof intent))
@@ -42,6 +48,8 @@
 
 (defmethod physical-reseed-follow-retirement-authorize-progress
     ((authority physical-reseed-follow-retirement-terminal-witness) witness)
+  ;; Consume this typed authority once before further checks and callbacks.
+  ;; Latch the effect and owner uncertainty before the first filesystem effect.
   (physical-reseed-follow-retirement-terminal-check-outer authority '(:ready))
   (unless (and (eq witness (retirement-terminal-intent authority))
                (retirement-intent-publication-claimed-p witness))
@@ -68,6 +76,8 @@
   t)
 
 (defun physical-reseed-follow-retirement-terminal-run (witness)
+  ;; Publish the exact candidate and retain the returned snapshot for the
+  ;; terminal checks after adoption.
   (physical-reseed-follow-retirement-terminal-check-outer witness '(:ready))
   (let ((intent (retirement-terminal-intent witness)))
     (multiple-value-bind (record snapshot)
@@ -83,6 +93,9 @@
       (values record snapshot))))
 
 (defun call-with-physical-reseed-follow-retirement-terminal-context (owner expected function)
+  ;; Prove prefix 2 and bind a private witness to the intent.  A normal return
+  ;; requires done and a final check.  Revoke the witness on every exit.
+  ;; The base context rechecks the adopted state after temporary cleanup.
   (call-with-physical-reseed-follow-retirement-intent-base-context
    owner expected
    (lambda (snapshot)
@@ -114,6 +127,10 @@
            (setf (retirement-terminal-active-p witness) nil)))))))
 
 (defun physical-reseed-follow-retirement-publish-terminal (owner)
+  ;; Publish from Retiring step 2 or return a stable Retired step 2 retry.
+  ;; The shared publisher can recover an exact complete temporary.  Clear
+  ;; uncertainty after the context and its cleanup return normally.
+  ;; Stable retries return copies without filesystem effects.
   (call-with-physical-reseed-follow-retirement-operation
    owner
    (lambda ()

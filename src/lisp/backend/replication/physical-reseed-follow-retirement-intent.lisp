@@ -645,6 +645,8 @@
          (physical-reseed-follow-retirement-intent-promote current)))))
 
 (defun physical-reseed-follow-retirement-intent-startup-expected (owner)
+  ;; Capture checked startup facts and detach their layout projection for the
+  ;; publication context.
   (call-with-physical-reseed-follow-retirement-startup-observation
    owner
    (lambda (descriptors state verify)
