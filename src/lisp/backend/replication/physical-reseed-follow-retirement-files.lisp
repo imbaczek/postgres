@@ -1,5 +1,43 @@
 (in-package #:pg)
 
+(defun physical-reseed-follow-retirement-held-file-facts (fd mount)
+  (sb-alien:with-alien ((buffer (sb-alien:array sb-alien:unsigned-char 256)))
+    (unless (zerop (physical-adoption-statx
+                    fd "" +physical-adoption-at-empty-path+ #x17ff
+                    (sb-alien:cast (sb-alien:addr buffer) (* sb-alien:unsigned-char))))
+      (error "cannot inspect held retirement file: errno ~d" (sb-alien:get-errno)))
+    (let ((sap (sb-alien:alien-sap (sb-alien:addr buffer))))
+      (unless (and (= #x13cf (logand #x13cf (sb-sys:sap-ref-32 sap 0)))
+                   (= mount (sb-sys:sap-ref-64 sap #x90)))
+        (error "held retirement file requires complete facts on the target mount"))
+      (list (physical-reseed-install-statx-device sap)
+            (sb-sys:sap-ref-64 sap #x20) (sb-sys:sap-ref-16 sap #x1c)
+            (sb-sys:sap-ref-32 sap #x10) (sb-sys:sap-ref-32 sap #x14)
+            (sb-sys:sap-ref-64 sap #x28)
+            (physical-reseed-install-statx-time sap #x70)
+            (physical-reseed-install-statx-time sap #x60)))))
+
+(defun physical-reseed-follow-retirement-journal-state-at (root stream name)
+  (let* ((fd (sb-sys:fd-stream-fd stream))
+         (mount (physical-adoption-install-mount-id nil :directory-fd root))
+         (noun (if (equal name "physical-reseed.follow.tmp") "temporary" "final journal")))
+    (multiple-value-bind (identity row) (physical-reseed-follow-entry root name)
+      (unless (and identity
+                   (equal identity (physical-reseed-follow-file-identity (sb-posix:fstat fd)))
+                   (= mount (physical-adoption-install-mount-id nil :directory-fd fd)))
+        (error "retirement ~A differs from its held descriptor" noun))
+      (file-position stream 0)
+      (let ((bytes (make-array (sixth identity) :element-type '(unsigned-byte 8))))
+        (unless (and (= (length bytes) (read-sequence bytes stream))
+                     (eq :eof (read-byte stream nil :eof))
+                     (equal identity (physical-reseed-follow-file-identity (sb-posix:fstat fd)))
+                     (= mount (physical-adoption-install-mount-id nil :directory-fd fd))
+                     (equal (list identity row)
+                            (multiple-value-list (physical-reseed-follow-entry root name))))
+          (error "retirement ~A changed during its held read" noun))
+        (values (list :record (physical-reseed-follow-decode bytes) :identity identity :row row)
+                bytes)))))
+
 (defun physical-reseed-follow-retirement-attempt-at (root-fd container-fd value prefix)
   ;; Observe the exact original premanifest attempt at the prefix location.
   ;; Check the root binding, all three mounts, and the attempt file identity

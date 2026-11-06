@@ -8,27 +8,11 @@
         (list :identity (getf attempt :identity) :digest (getf attempt :digest)))))
 
 (defun physical-reseed-follow-retirement-temporary-state-at (root stream)
-  ;; Read through the held descriptor and recheck its identity, mount and named
-  ;; nanosecond facts.  Accept only complete canonical bytes.
-  (let* ((name "physical-reseed.follow.tmp")
-         (fd (sb-sys:fd-stream-fd stream))
-         (mount (physical-adoption-install-mount-id nil :directory-fd root)))
-    (multiple-value-bind (identity row) (physical-reseed-follow-entry root name)
-      (unless (and identity
-                   (equal identity (physical-reseed-follow-file-identity (sb-posix:fstat fd)))
-                   (= mount (physical-adoption-install-mount-id nil :directory-fd fd)))
-        (error "retirement temporary differs from its held descriptor"))
-      (file-position stream 0)
-      (let ((bytes (make-array (sixth identity) :element-type '(unsigned-byte 8))))
-        (unless (and (= (length bytes) (read-sequence bytes stream))
-                     (eq :eof (read-byte stream nil :eof))
-                     (equal identity (physical-reseed-follow-file-identity (sb-posix:fstat fd)))
-                     (equal (list identity row) (multiple-value-list (physical-reseed-follow-entry root name))))
-          (error "retirement temporary changed during its held read"))
-        (let ((record (physical-reseed-follow-decode bytes)))
-          (unless (equalp bytes (physical-reseed-follow-image record))
-            (error "retirement temporary is not a complete canonical image"))
-          (list :record record :identity identity :row row))))))
+  (multiple-value-bind (state bytes)
+      (physical-reseed-follow-retirement-journal-state-at root stream "physical-reseed.follow.tmp")
+    (unless (equalp bytes (physical-reseed-follow-image (getf state :record)))
+      (error "retirement temporary is not a complete canonical image"))
+    state))
 
 (defun call-with-physical-reseed-follow-retirement-next-temporary (root snapshot parent-check function)
   ;; Hold a read-only temporary descriptor or pin its absence during the callback.
