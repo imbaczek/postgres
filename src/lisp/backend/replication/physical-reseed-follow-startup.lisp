@@ -35,6 +35,61 @@
                                                  names))))))))
       (physical-adoption-attempt-value-copy projection))))
 
+(defun physical-reseed-follow-retired-startup-projection (descriptors state)
+  (append (physical-reseed-follow-startup-projection descriptors state)
+          (list :journal (physical-adoption-attempt-value-copy (getf state :journal)))))
+
+(defun call-with-physical-reseed-follow-retired-pid-observation
+    (root parent-check function pid-scope)
+  (call-with-physical-reseed-follow-retired-journal
+   root
+   (lambda (stream source verify-source)
+     (declare (ignore stream))
+     (let* ((snapshot (physical-adoption-attempt-value-copy (getf source :snapshot)))
+            (journal (loop for key in '(:geometry :follow :receipt :mount)
+                           append (list key (physical-adoption-attempt-value-copy (getf source key)))))
+            (names (ecase (getf journal :geometry)
+                     (:follow '("physical-reseed.follow"))
+                     (:alias '("physical-reseed.follow" "physical-reseed.retired"))
+                     (:receipt '("physical-reseed.retired")))))
+       (funcall
+        pid-scope root verify-source
+        (lambda (pid verify-pid)
+          (let* ((entry (when pid (cons (copy-seq "postmaster.pid")
+                                        (physical-adoption-attempt-value-copy (getf pid :row)))))
+                 (evidence (list :entry entry :verify verify-pid))
+                 (expected (append names (when entry '("postmaster.pid")))))
+            (flet ((extra (fd)
+                     (unless (= fd root) (error "retired observation changed its root descriptor"))
+                     (funcall verify-pid)
+                     (append
+                      (loop for key in '(:follow :receipt)
+                            for row = (getf journal key)
+                            when row collect (cons (copy-seq (first row))
+                                                   (physical-adoption-attempt-value-copy row)))
+                      (when entry (list (physical-adoption-attempt-value-copy entry))))))
+              (call-with-physical-reseed-follow-retirement-observation-core
+               root snapshot verify-pid
+               (lambda (descriptors state verify)
+                 (funcall function descriptors
+                          (append state
+                                  (list :journal (physical-adoption-attempt-value-copy journal)
+                                        :pid-file (physical-reseed-follow-retirement-pid-state-copy pid)))
+                          verify))
+               #'extra
+               (lambda (descriptors check)
+                 (physical-reseed-follow-retirement-layout-state-core
+                  descriptors snapshot check #'extra nil evidence verify-pid expected)))))))))
+   parent-check))
+
+(defun call-with-physical-reseed-follow-retired-before-pid-observation (root parent-check function)
+  (call-with-physical-reseed-follow-retired-pid-observation
+   root parent-check function #'call-with-physical-reseed-follow-retirement-before-pid))
+
+(defun call-with-physical-reseed-follow-retired-owned-pid-observation (root parent-check function)
+  (call-with-physical-reseed-follow-retired-pid-observation
+   root parent-check function #'call-with-physical-reseed-follow-retirement-owned-pid))
+
 (defun call-with-physical-reseed-follow-startup-root (lock function)
   ;; Borrow the unpublished lock and own the root descriptor for this callback.
   ;; The temporary owner and check are thread-bound and revoked on exit.  The

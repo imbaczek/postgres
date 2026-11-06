@@ -67,6 +67,217 @@
        (reseed-retirement-layout-write root record)
        (funcall function root root-fd record check)))))
 
+(defun check-retired-layout-pid-geometries (kinds)
+  (dolist (kind kinds)
+    (call-with-retired-reader-test-fixture
+     kind
+     (lambda (root root-fd record check)
+       (let ((follow (merge-pathnames "physical-reseed.follow" root))
+             (receipt (merge-pathnames "physical-reseed.retired" root)))
+         (dolist (geometry '(:follow :alias :receipt))
+           (ecase geometry
+             (:follow)
+             (:alias (sb-posix:link (namestring follow) (namestring receipt)))
+             (:receipt (delete-file follow)))
+           (let ((before nil) (escaped nil) (held nil))
+             (pg::call-with-physical-reseed-follow-retired-before-pid-observation
+              root-fd check
+              (lambda (descriptors state verify)
+                (setf before (pg::physical-reseed-follow-retired-startup-projection descriptors state)
+                      escaped verify held (copy-tree descriptors))
+                (ok (= 10 (length descriptors)))
+                (ok (= 2 (getf state :prefix)))
+                (ok (eq geometry (getf (getf state :journal) :geometry)))
+                (ok (equal record (getf (getf state :snapshot) :record)))
+                (ok (getf state :install))
+                (ok (getf state :attempt))
+                (ok (getf (getf state :layout) :active))
+                (ok (funcall verify))
+                (setf (getf (getf state :journal) :geometry) :forged
+                      (getf (getf state :snapshot) :record) nil)
+                (ok (funcall verify))))
+             (ok (handler-case (progn (funcall escaped) nil) (error () t)))
+             (ok (sb-posix:fstat root-fd))
+             (dolist (entry held)
+               (unless (eq :root (car entry))
+                 (ok (handler-case (progn (sb-posix:fstat (cdr entry)) nil) (sb-posix:syscall-error () t)))))
+             (call-with-reseed-retirement-test-owned-pid
+              root
+              (lambda (stream)
+                (let ((position (file-position stream)))
+                  (pg::call-with-physical-reseed-follow-retired-owned-pid-observation
+                   root-fd check
+                   (lambda (descriptors state verify)
+                     (ok (equal before (pg::physical-reseed-follow-retired-startup-projection descriptors state)))
+                     (ok (= (sb-posix:getpid) (getf (getf state :pid-file) :pid)))
+                     (ok (funcall verify))))
+                  (ok (open-stream-p stream))
+                  (ok (eql position (file-position stream))))))
+             (ok (equal record
+                        (getf (getf (pg::physical-reseed-follow-retired-journal-at root-fd check)
+                                    :snapshot) :record))))))))))
+
+(deftest reseed-retired-layout-proves-all-geometries-across-pid-boundaries
+    (check-retired-layout-pid-geometries
+     '(:same-timeline :retained-timeline :before-fork :at-fork :later-writer)))
+
+(deftest reseed-retired-layout-refuses-unexpected-names-and-missing-archives
+    (dolist (geometry '(:follow :alias :receipt))
+      (call-with-retired-reader-test-fixture
+       :same-timeline
+       (lambda (root root-fd record check)
+         (let* ((follow (merge-pathnames "physical-reseed.follow" root))
+                (receipt (merge-pathnames "physical-reseed.retired" root))
+                (source (if (eq geometry :receipt) receipt follow))
+                (workspace (pathname (getf (getf (getf record :configuration) :workspace) :directory)))
+                (saved (merge-pathnames "saved/" workspace))
+                (pid-path (merge-pathnames "postmaster.pid" root)))
+           (unless (eq geometry :follow)
+             (sb-posix:link (namestring follow) (namestring receipt)))
+           (when (eq geometry :receipt) (delete-file follow))
+           (reseed-follow-owner-test-write
+            pid-path (sb-ext:string-to-octets (format nil "2147483647~%") :external-format :utf-8))
+           (let ((pid-bytes (lineage-test-bytes pid-path))
+                 (pid-inode (sb-posix:stat-ino (sb-posix:lstat (namestring pid-path)))))
+             (dolist (fault '(:unknown :temporary :third-link :missing-install :missing-attempt))
+               (let* ((name (case fault
+                              (:unknown "unexpected")
+                              (:temporary "physical-reseed.follow.tmp")
+                              (:third-link "third-link")
+                              (:missing-install "physical-reseed.install")
+                              (:missing-attempt "physical-reseed.attempt")))
+                      (archive-p (member fault '(:missing-install :missing-attempt)))
+                      (original (merge-pathnames name (if archive-p saved root)))
+                      (moved (merge-pathnames "staged/missing-archive" workspace))
+                      (entered nil) (message nil))
+                 (unwind-protect
+                      (progn
+                        (cond (archive-p (sb-posix:rename (namestring original) (namestring moved)))
+                              ((eq fault :third-link) (sb-posix:link (namestring source) (namestring original)))
+                              (t (reseed-follow-owner-test-write original #(1 2 3))))
+                        (setf message
+                              (handler-case
+                                  (progn
+                                    (pg::call-with-physical-reseed-follow-retired-before-pid-observation
+                                     root-fd check
+                                     (lambda (descriptors state verify)
+                                       (declare (ignore descriptors state verify))
+                                       (setf entered t)))
+                                    nil)
+                                (error (condition) (princ-to-string condition))))
+                        (ng entered)
+                        (ok (and message
+                                 (search (case fault
+                                           (:temporary "refuses a follow temporary")
+                                           (:third-link "exact follow and receipt link geometry")
+                                           (:missing-install "one root or saved location")
+                                           (t "unique complete archive prefix"))
+                                         message)))
+                        (ok (equalp pid-bytes (lineage-test-bytes pid-path)))
+                        (ok (= pid-inode (sb-posix:stat-ino (sb-posix:lstat (namestring pid-path)))))
+                        (ok (sb-posix:fstat root-fd)))
+                   (if archive-p
+                       (sb-posix:rename (namestring moved) (namestring original))
+                       (when (probe-file original) (delete-file original))))))
+             (delete-file pid-path)))))))
+
+(defun check-retired-layout-lifetime (root-fd check reader borrowed)
+  (dolist (mode '(:normal :error :throw :interrupt))
+    (let ((escaped nil) (held nil) (entered nil) (source-fd nil) (pid-fd nil)
+                        (position (when borrowed (file-position borrowed)))
+                        (original (symbol-function 'pg::physical-image-openat)))
+      (unwind-protect
+           (progn
+             (setf (symbol-function 'pg::physical-image-openat)
+                   (lambda (fd name flags permission)
+                     (let ((opened (funcall original fd name flags permission)))
+                       (cond ((member name '("physical-reseed.follow" "physical-reseed.retired") :test #'equal)
+                              (setf source-fd opened))
+                             ((equal name "postmaster.pid") (setf pid-fd opened)))
+                       opened)))
+             (let ((outcome
+                     (catch 'retired-layout-cut
+                       (handler-case
+                           (multiple-value-list
+                            (funcall reader root-fd check
+                                     (lambda (descriptors state verify)
+                                       (declare (ignore state))
+                                       (setf entered t escaped verify held (copy-tree descriptors))
+                                       (ecase mode
+                                         (:normal (values :first :second))
+                                         (:error (error "retired layout lifetime cut"))
+                                         (:throw (throw 'retired-layout-cut :cut))
+                                         (:interrupt
+                                          (sb-thread:interrupt-thread
+                                           sb-thread:*current-thread*
+                                           (lambda () (throw 'retired-layout-cut :cut))))))))
+                         (error (condition)
+                           (if (search "retired layout lifetime cut" (princ-to-string condition))
+                               :error :wrong-error))))))
+               (ok (equal outcome (case mode (:normal '(:first :second)) (:error :error) (otherwise :cut)))))
+             (ok entered)
+             (ok (and source-fd
+                      (handler-case (progn (sb-posix:fstat source-fd) nil) (sb-posix:syscall-error () t))))
+             (ok (or (null pid-fd)
+                     (handler-case (progn (sb-posix:fstat pid-fd) nil) (sb-posix:syscall-error () t))))
+             (ok (handler-case (progn (funcall escaped) nil)
+                   (error (condition) (search "scope ended or changed thread" (princ-to-string condition)))))
+             (ok (sb-posix:fstat root-fd))
+             (dolist (entry held)
+               (unless (eq :root (car entry))
+                 (ok (handler-case (progn (sb-posix:fstat (cdr entry)) nil)
+                       (sb-posix:syscall-error () t)))))
+             (when borrowed
+               (ok (open-stream-p borrowed))
+               (ok (eql position (file-position borrowed)))))
+        (setf (symbol-function 'pg::physical-image-openat) original)))))
+
+(deftest reseed-retired-layout-revokes-verifiers-and-closes-resources-on-every-exit
+    (call-with-retired-reader-test-fixture
+     :same-timeline
+     (lambda (root root-fd record check)
+       (dolist (geometry '(:follow :alias :receipt))
+         (reset-retired-reader-test-files root record geometry)
+         (check-retired-layout-lifetime
+          root-fd check #'pg::call-with-physical-reseed-follow-retired-before-pid-observation nil)
+         (call-with-reseed-retirement-test-owned-pid
+          root
+          (lambda (stream)
+            (check-retired-layout-lifetime
+             root-fd check #'pg::call-with-physical-reseed-follow-retired-owned-pid-observation stream)))))))
+
+(deftest reseed-retired-layout-rechecks-inventory-inside-the-full-callback
+    (call-with-retired-reader-test-fixture
+     :same-timeline
+     (lambda (root root-fd record check)
+       (dolist (geometry '(:follow :alias :receipt))
+         (reset-retired-reader-test-files root record geometry)
+         (let ((extra (merge-pathnames "unexpected-during-observation" root)))
+           (ok
+            (handler-case
+                (progn
+                  (pg::call-with-physical-reseed-follow-retired-before-pid-observation
+                   root-fd check
+                   (lambda (descriptors state verify)
+                     (declare (ignore descriptors state))
+                     (ok (funcall verify))
+                     (unwind-protect
+                          (progn
+                            (reseed-follow-owner-test-write extra #(1 2 3))
+                            (ok (probe-file extra))
+                            (ok (handler-case (progn (funcall verify) nil)
+                                  (error (condition)
+                                    (search "unique complete archive prefix" (princ-to-string condition))))))
+                       (when (probe-file extra) (delete-file extra)))))
+                  nil)
+              (error (condition)
+                (search "retirement layout changed during its observation scope" (princ-to-string condition)))))
+           (pg::call-with-physical-reseed-follow-retired-before-pid-observation
+            root-fd check
+            (lambda (descriptors state verify)
+              (declare (ignore descriptors state))
+              (ok (funcall verify)))))))))
+
 (defun check-retired-reader-geometries (kinds)
   (dolist (kind kinds)
     (call-with-retired-reader-test-fixture
@@ -417,6 +628,32 @@
                                 :directories directories
                                 :names (list :root (list (copy-seq "physical-reseed.follow"))
                                              :saved (list (copy-seq "follow.active"))))))))
+
+(cl-spec:defproperty reseed-retired-projection-keeps-journal-facts
+    ((offset (range integer 10 1000)) (mode (range integer 0 2))
+                                      (inode (range integer 1 1000000)))
+  (:about pg::physical-reseed-follow-retired-startup-projection)
+  (:trials (:normal 100))
+  (multiple-value-bind (descriptors state) (reseed-startup-projection-fixture offset)
+    (multiple-value-bind (follow receipt) (retired-receipt-test-rows mode inode 80)
+      (let ((journal (list :geometry (nth mode '(:follow :alias :receipt))
+                           :follow follow :receipt receipt :mount 7)))
+        (setf (getf state :journal) journal)
+        (let ((projection (pg::physical-reseed-follow-retired-startup-projection descriptors state)))
+          (and (equal journal (getf projection :journal))
+               (progn
+                 (incf (getf journal :mount))
+                 (not (equal projection
+                             (pg::physical-reseed-follow-retired-startup-projection descriptors state))))
+               (progn
+                 (setf (getf (getf projection :journal) :geometry) :forged)
+                 (eq (nth mode '(:follow :alias :receipt)) (getf journal :geometry)))))))))
+
+(deftest generated-reseed-retired-projection-contract
+    (let ((data (cl-spec:result-data
+                 (cl-spec:run-property 'reseed-retired-projection-keeps-journal-facts
+                                       :seed 174 :profile :normal))))
+      (ok (eq :passed (getf data :status)))))
 
 (cl-spec:defproperty reseed-startup-projection-ignores-only-pid-boundary-changes
     ((offset (range integer 10 1000)) (delta (range integer 1 1000)))
