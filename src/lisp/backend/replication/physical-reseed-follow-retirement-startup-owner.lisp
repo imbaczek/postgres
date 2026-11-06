@@ -135,6 +135,7 @@
          (lambda (root check)
            (let* ((evidence (retirement-startup-evidence owner))
                   (retired (getf evidence :journal)))
+             (unless evidence (error "retirement startup historical evidence has been consumed"))
              (flet ((observe (descriptors state verify)
                       (unless (equal evidence
                                      (if retired
