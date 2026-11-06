@@ -784,7 +784,7 @@
                        (:receipt sb-posix:fsync :before-retirement-receipt-final-root-fsync nil :receipt :root)))
          (check-receipt-effect-syscall-failure root root-fd record case)))))
 
-(defun receipt-test-crash-child-arguments (root point cache marker)
+(defun receipt-test-crash-child-arguments (root point cache marker &optional (operation :receipt))
   (let* ((arguments (retirement-intent-test-child-arguments root point cache marker))
          (form
            `(let ((pg::*physical-reseed-follow-test-hook*
@@ -804,7 +804,10 @@
                (lambda (before after)
                  (declare (ignore before))
                  (pg::call-with-physical-reseed-follow-retirement-startup-owner
-                  after #'pg::physical-reseed-follow-retirement-publish-receipt)))
+                  after
+                  ,(ecase operation
+                     (:receipt '(function pg::physical-reseed-follow-retirement-publish-receipt))
+                     (:receipt-consumption '(function pg::physical-reseed-follow-retirement-consume-receipt))))))
               (error "receipt child did not reach its crash point"))))
     (let ((*package* (find-package :cl-user))
           (*print-length* nil) (*print-level* nil) (*print-readably* t))
@@ -2196,6 +2199,699 @@
                (ok (equal facts (pg::physical-reseed-file-facts (sb-posix:lstat (namestring receipt)))))
                (ng pg::*postmaster-pid-stream*)
                (ng pg::*postmaster-data-lock*))))))))
+
+(deftest reseed-namespace-guards-preserve-public-name-and-install-only-policy
+    (with-physical-store-directory (root)
+      (flet ((message-for (function)
+               (handler-case (progn (funcall function) nil)
+                 (error (condition) (princ-to-string condition)))))
+        (ok (null (pg::physical-directory-check-reseed-intent root)))
+        (ok (null (pg::physical-directory-check-reseed-follow-intent root)))
+        (dolist (name '("physical-reseed.follow" "physical-reseed.follow.tmp" "physical-reseed.retired"
+                        "physical-reseed.attempt" "physical-reseed.attempt.tmp"
+                        "physical-reseed.install" "physical-reseed.install.tmp"))
+          (let ((path (merge-pathnames name root)))
+            (unwind-protect
+                 (progn
+                   (with-open-file (stream path :direction :output :if-exists :error)
+                     (write-string "guard fixture" stream))
+                   (let ((message (message-for
+                                   (lambda () (pg::physical-directory-check-reseed-follow-intent root)))))
+                     (ok (if (member name '("physical-reseed.follow" "physical-reseed.follow.tmp"
+                                            "physical-reseed.retired") :test #'equal)
+                             (and message (search "pending offline reseed follow requires journal reconciliation"
+                                                  message))
+                             (null message))))
+                   (dolist (install-only '(nil t))
+                     (let* ((installation (uiop:string-prefix-p "physical-reseed.install" name))
+                            (attempt (uiop:string-prefix-p "physical-reseed.attempt" name))
+                            (expected (cond
+                                        ((and attempt install-only) nil)
+                                        (installation "pending offline reseed installation requires journal reconciliation")
+                                        (attempt "pending offline reseed requires reconciliation before PID changes")
+                                        (t "pending offline reseed follow requires journal reconciliation")))
+                            (message (message-for
+                                      (lambda ()
+                                        (pg::physical-directory-check-reseed-intent root :install-only install-only)))))
+                       (ok (if expected (and message (search expected message)) (null message)))
+                       (ok (probe-file path)))))
+              (when (probe-file path) (delete-file path))))))))
+
+(deftest reseed-namespace-parts-keep-receipt-fenced-while-checking-other-intents
+    (with-physical-store-directory (root)
+      (let ((receipt (merge-pathnames "physical-reseed.retired" root)))
+        (with-open-file (stream receipt :direction :output :if-exists :error)
+          (write-string "receipt guard fixture" stream))
+        (let ((bytes (lineage-test-bytes receipt))
+              (inode (sb-posix:stat-ino (sb-posix:lstat (namestring receipt)))))
+          (ok (null (pg::physical-directory-check-reseed-follow-journals root)))
+          (ok (null (pg::physical-directory-check-reseed-install-attempt-intent root)))
+          (ok (handler-case
+                  (progn (pg::physical-directory-check-reseed-intent root) nil)
+                (error (condition)
+                  (search "pending offline reseed follow requires journal reconciliation"
+                          (princ-to-string condition)))))
+          (dolist (name '("physical-reseed.attempt" "physical-reseed.attempt.tmp"
+                          "physical-reseed.install" "physical-reseed.install.tmp"
+                          "physical-reseed.follow" "physical-reseed.follow.tmp"))
+            (let ((path (merge-pathnames name root)))
+              (unwind-protect
+                   (progn
+                     (with-open-file (stream path :direction :output :if-exists :error)
+                       (write-string "pending intent" stream))
+                     (ok (handler-case
+                             (progn
+                               (pg::physical-directory-check-reseed-follow-journals root)
+                               (pg::physical-directory-check-reseed-install-attempt-intent root)
+                               nil)
+                           (error (condition)
+                             (search "pending offline reseed" (princ-to-string condition)))))
+                     (ok (equalp bytes (lineage-test-bytes receipt)))
+                     (ok (= inode (sb-posix:stat-ino (sb-posix:lstat (namestring receipt))))))
+                (when (probe-file path) (delete-file path)))))))))
+
+(deftest reseed-receipt-local-preflight-uses-held-store-without-installing-recovery
+    (call-with-retired-startup-test-fixture
+     :same-timeline
+     (lambda (root workspace root-fd record)
+       (reset-retired-reader-test-files root record :receipt)
+       (call-with-retired-startup-test-context
+        root
+        (lambda (before after)
+          (declare (ignore before))
+          (pg::call-with-physical-reseed-follow-retirement-startup-owner
+           after
+           (lambda (owner)
+             (let ((original (symbol-function 'pg::physical-reseed-follow-retirement-check-receive))
+                   (captured-store nil) (captured-check nil)
+                   (recovery-state pg::*physical-recovery-state*)
+                   (receive-store pg::*physical-receive-store*)
+                   (wal-ready pg::*wal-ready*))
+               (unwind-protect
+                    (progn
+                      (setf (symbol-function 'pg::physical-reseed-follow-retirement-check-receive)
+                            (lambda (descriptors store current base binding check)
+                              (setf captured-store store captured-check check)
+                              (funcall original descriptors store current base binding check)))
+                      (pg::call-with-physical-reseed-follow-retirement-startup-observation
+                       owner
+                       (lambda (descriptors state verify)
+                         (declare (ignore state))
+                         (let ((baseline (list (reseed-mapped-test-tree-facts root)
+                                               (reseed-mapped-test-tree-facts workspace))))
+                           (ok captured-store)
+                           (ok captured-check)
+                           (ok (pg::physical-reseed-follow-startup-local-state-at
+                                descriptors captured-store captured-check))
+                           (ok (eq recovery-state pg::*physical-recovery-state*))
+                           (ok (eq receive-store pg::*physical-receive-store*))
+                           (ok (eq wal-ready pg::*wal-ready*))
+                           (ok (reseed-activation-layout-facts-equal-p
+                                baseline
+                                (list (reseed-mapped-test-tree-facts root)
+                                      (reseed-mapped-test-tree-facts workspace))))
+                           (ok (funcall verify)))))
+                      (ok (handler-case (progn (pg::physical-store-check-live captured-store) nil)
+                            (error () t))))
+                 (setf (symbol-function 'pg::physical-reseed-follow-retirement-check-receive) original)))))))
+       (ok (sb-posix:fstat root-fd)))))
+
+(defun check-receipt-consumption-geometry (kind)
+  (call-with-retired-startup-test-fixture
+   kind
+   (lambda (root workspace root-fd record)
+     (declare (ignore workspace))
+     (reset-retired-reader-test-files root record :receipt)
+     (let ((captured nil) (held-through-root-close nil))
+       (call-with-retired-startup-test-context
+        root
+        (lambda (before after)
+          (declare (ignore before))
+          (pg::call-with-physical-reseed-follow-retirement-startup-owner
+           after
+           (lambda (owner)
+             (let ((run (symbol-function 'pg::physical-reseed-follow-consumption-run))
+                   (source-check (symbol-function 'pg::physical-reseed-follow-consumption-check-source)))
+               (unwind-protect
+                    (progn
+                      (setf (symbol-function 'pg::physical-reseed-follow-consumption-run)
+                            (lambda (consumer) (setf captured consumer) (funcall run consumer))
+                            (symbol-function 'pg::physical-reseed-follow-consumption-check-source)
+                            (lambda (consumer)
+                              (multiple-value-prog1 (funcall source-check consumer)
+                                (when (and (pg::receipt-consumer-removed-p consumer)
+                                           (open-stream-p (pg::receipt-consumer-stream consumer))
+                                           (handler-case
+                                               (progn (sb-posix:fstat (pg::receipt-consumer-root consumer)) nil)
+                                             (sb-posix:syscall-error () t)))
+                                  (setf held-through-root-close
+                                        (and
+                                         (= 0 (sb-posix:stat-nlink
+                                               (sb-posix:fstat
+                                                (sb-sys:fd-stream-fd (pg::receipt-consumer-stream consumer)))))
+                                         (handler-case
+                                             (progn (pg::physical-store-check-live
+                                                     (pg::receipt-consumer-store consumer)) nil)
+                                           (error () t))))))))
+                      (ok (pg::physical-reseed-follow-retirement-consume-receipt owner))
+                      (ok captured)
+                      (ok held-through-root-close)
+                      (ok (not (pg::receipt-consumer-active-p captured)))
+                      (ok (not (open-stream-p (pg::receipt-consumer-stream captured))))
+                      (ok (null (pg::retirement-startup-evidence owner)))
+                      (ok (not (pg::retirement-startup-uncertain-p owner)))
+                      (ok (not (pg::retirement-startup-busy-p owner)))
+                      (ok (not (probe-file (merge-pathnames "physical-reseed.retired" root))))
+                      (ok (not (probe-file (merge-pathnames "physical-reseed.follow" root))))
+                      (ok (null (pg::physical-directory-check-reseed-intent root)))
+                      (ok (pg::physical-reseed-follow-retirement-check-startup-idle owner))
+                      (ok (handler-case
+                              (progn (pg::physical-reseed-follow-consumption-check-source captured) nil)
+                            (error () t)))
+                      (let* ((names '(sb-posix:fsync pg::port-linkat pg::port-unlinkat))
+                             (originals (mapcar (lambda (name) (cons name (symbol-function name))) names))
+                             (effects 0))
+                        (unwind-protect
+                             (progn
+                               (dolist (entry originals)
+                                 (setf (symbol-function (car entry))
+                                       (lambda (&rest arguments)
+                                         (declare (ignore arguments))
+                                         (incf effects)
+                                         (error "unexpected consumed-owner filesystem effect"))))
+                               (dolist (function
+                                        (list #'pg::physical-reseed-follow-retirement-publish-initial
+                                              #'pg::physical-reseed-follow-retirement-archive-install
+                                              #'pg::physical-reseed-follow-retirement-archive-attempt
+                                              #'pg::physical-reseed-follow-retirement-publish-terminal
+                                              #'pg::physical-reseed-follow-retirement-publish-receipt
+                                              #'pg::physical-reseed-follow-retirement-consume-receipt))
+                                 (ok (handler-case (progn (funcall function owner) nil)
+                                       (error () t))))
+                               (ok (zerop effects)))
+                          (dolist (entry originals) (setf (symbol-function (car entry)) (cdr entry))))))
+                 (setf (symbol-function 'pg::physical-reseed-follow-consumption-run) run
+                       (symbol-function 'pg::physical-reseed-follow-consumption-check-source) source-check)))))))
+       (call-with-retired-startup-test-context
+        root
+        (lambda (before after)
+          (ok (equal '(:branch :ordinary) before))
+          (ok (equal before after))
+          (ok (null (pg::physical-adoption-startup-preflight)))))
+       (ok (sb-posix:fstat root-fd))))))
+
+(deftest reseed-receipt-consumption-removes-authority-and-holds-source-through-root-close
+    (dolist (kind '(:same-timeline :retained-timeline :before-fork :at-fork :later-writer))
+      (check-receipt-consumption-geometry kind)))
+
+(deftest reseed-receipt-consumption-refuses-held-source-write-after-final-pid-close
+    (call-with-retired-startup-test-fixture
+     :same-timeline
+     (lambda (root workspace root-fd record)
+       (declare (ignore workspace))
+       (reset-retired-reader-test-files root record :receipt)
+       (let ((run (symbol-function 'pg::physical-reseed-follow-consumption-run))
+             (pid-reader (symbol-function 'pg::physical-reseed-read-pid))
+             (captured nil) (fired nil) (changed nil) (eligible-reads 0))
+         (unwind-protect
+              (ok
+               (eq :checked
+                   (catch 'consumption-source-checked
+                     (call-with-retired-startup-test-context
+                      root
+                      (lambda (before after)
+                        (declare (ignore before))
+                        (pg::call-with-physical-reseed-follow-retirement-startup-owner
+                         after
+                         (lambda (owner)
+                           (setf (symbol-function 'pg::physical-reseed-follow-consumption-run)
+                                 (lambda (consumer)
+                                   (setf captured consumer)
+                                   (funcall run consumer))
+                                 (symbol-function 'pg::physical-reseed-read-pid)
+                                 (lambda (directory)
+                                   (multiple-value-prog1 (funcall pid-reader directory)
+                                     (when (and captured (not fired)
+                                                (pg::receipt-consumer-removed-p captured)
+                                                (open-stream-p (pg::receipt-consumer-stream captured))
+                                                (handler-case
+                                                    (progn (sb-posix:fstat (pg::receipt-consumer-root captured)) nil)
+                                                  (sb-posix:syscall-error () t))
+                                                (= 2 (incf eligible-reads)))
+                                       (setf fired t)
+                                       (let* ((stream (pg::receipt-consumer-stream captured))
+                                              (fd (sb-sys:fd-stream-fd stream))
+                                              (bytes (copy-seq (pg::receipt-consumer-bytes captured))))
+                                         (ok (= 0 (sb-posix:stat-nlink (sb-posix:fstat fd))))
+                                         (setf (aref bytes 0) (logxor 1 (aref bytes 0)))
+                                         (with-open-file (output (format nil "/proc/self/fd/~D" fd)
+                                                                 :direction :io
+                                                                 :element-type '(unsigned-byte 8)
+                                                                 :if-exists :overwrite)
+                                           (write-sequence bytes output)
+                                           (finish-output output))
+                                         (file-position stream 0)
+                                         (let ((actual (make-array (length bytes) :element-type '(unsigned-byte 8))))
+                                           (setf changed
+                                                 (and (= (length actual) (read-sequence actual stream))
+                                                      (equalp actual bytes)
+                                                      (= (length actual) (sb-posix:stat-size (sb-posix:fstat fd)))))))))))
+                           (ok (handler-case
+                                   (progn (pg::physical-reseed-follow-retirement-consume-receipt owner) nil)
+                                 (error (condition)
+                                   (or (search "changed its held source facts" (princ-to-string condition))
+                                       (search "changed its canonical bytes" (princ-to-string condition))
+                                       (error condition)))))
+                           (ok fired)
+                           (ok (= 2 eligible-reads))
+                           (ok changed)
+                           (ok (pg::retirement-startup-uncertain-p owner))
+                           (ok (not (pg::retirement-startup-busy-p owner)))
+                           (ok (pg::retirement-startup-evidence owner))
+                           (ok (not (pg::receipt-consumer-active-p captured)))
+                           (ok (not (open-stream-p (pg::receipt-consumer-stream captured))))
+                           (ok (not (probe-file (merge-pathnames "physical-reseed.retired" root))))
+                           (throw 'consumption-source-checked :checked))))))))
+           (setf (symbol-function 'pg::physical-reseed-follow-consumption-run) run
+                 (symbol-function 'pg::physical-reseed-read-pid) pid-reader))
+         (call-with-retired-startup-test-context
+          root
+          (lambda (before after)
+            (ok (equal '(:branch :ordinary) before))
+            (ok (equal before after))
+            (ok (null (pg::physical-adoption-startup-preflight)))))
+         (ok (sb-posix:fstat root-fd))))))
+
+(defun check-receipt-consumption-syscall-cut (root root-fd record operation timing)
+  (reset-retired-reader-test-files root record :receipt)
+  (let ((run (symbol-function 'pg::physical-reseed-follow-consumption-run))
+        (fsync (symbol-function 'sb-posix:fsync))
+        (unlink (symbol-function 'pg::port-unlinkat))
+        (captured nil) (fired nil) (performed nil))
+    (unwind-protect
+         (ok
+          (eq :checked
+              (catch 'consumption-syscall-checked
+                (call-with-retired-startup-test-context
+                 root
+                 (lambda (before after)
+                   (declare (ignore before))
+                   (pg::call-with-physical-reseed-follow-retirement-startup-owner
+                    after
+                    (lambda (owner)
+                      (labels ((cut (function arguments)
+                                 (setf fired t)
+                                 (when (eq timing :after)
+                                   (apply function arguments)
+                                   (setf performed t))
+                                 (error "receipt consumption syscall cut"))
+                               (sync-target-p (fd)
+                                 (and captured (not fired)
+                                      (ecase operation
+                                        (:inode
+                                         (and (eq :syncing (pg::receipt-consumer-phase captured))
+                                              (= fd (sb-sys:fd-stream-fd
+                                                     (pg::receipt-consumer-stream captured)))))
+                                        (:baseline
+                                         (and (eq :syncing (pg::receipt-consumer-phase captured))
+                                              (= fd (pg::receipt-consumer-root captured))))
+                                        (:removed-root
+                                         (and (eq :syncing-removed (pg::receipt-consumer-phase captured))
+                                              (= fd (pg::receipt-consumer-root captured))))
+                                        (:unlink nil)))))
+                        (setf (symbol-function 'pg::physical-reseed-follow-consumption-run)
+                              (lambda (consumer) (setf captured consumer) (funcall run consumer))
+                              (symbol-function 'sb-posix:fsync)
+                              (lambda (fd)
+                                (if (sync-target-p fd) (cut fsync (list fd)) (funcall fsync fd)))
+                              (symbol-function 'pg::port-unlinkat)
+                              (lambda (fd name flags)
+                                (if (and captured (not fired) (eq operation :unlink)
+                                         (eq :unlinking (pg::receipt-consumer-phase captured))
+                                         (= fd (pg::receipt-consumer-root captured))
+                                         (string= name "physical-reseed.retired"))
+                                    (cut unlink (list fd name flags))
+                                    (funcall unlink fd name flags))))
+                        (ok (handler-case
+                                (progn (pg::physical-reseed-follow-retirement-consume-receipt owner) nil)
+                              (error (condition)
+                                (or (search "receipt consumption syscall cut" (princ-to-string condition))
+                                    (error condition)))))
+                        (ok fired)
+                        (ok (eq performed (eq timing :after)))
+                        (ok (pg::retirement-startup-uncertain-p owner))
+                        (ok (not (pg::retirement-startup-busy-p owner)))
+                        (ok (pg::retirement-startup-evidence owner))
+                        (ok (not (pg::receipt-consumer-active-p captured)))
+                        (ok (not (open-stream-p (pg::receipt-consumer-stream captured))))
+                        (ok (handler-case
+                                (progn (pg::physical-store-check-live (pg::receipt-consumer-store captured)) nil)
+                              (error () t)))
+                        (ok (not (probe-file (merge-pathnames "physical-reseed.follow" root))))
+                        (throw 'consumption-syscall-checked :checked)))))))))
+      (setf (symbol-function 'pg::physical-reseed-follow-consumption-run) run
+            (symbol-function 'sb-posix:fsync) fsync
+            (symbol-function 'pg::port-unlinkat) unlink))
+    (let ((removed (or (eq operation :removed-root)
+                       (and (eq operation :unlink) (eq timing :after)))))
+      (ok (eq (not removed) (not (null (probe-file (merge-pathnames "physical-reseed.retired" root)))))))
+    (call-with-retired-startup-test-context
+     root
+     (lambda (before after)
+       (ok (equal before after))
+       (ok (eq (if (or (eq operation :removed-root)
+                       (and (eq operation :unlink) (eq timing :after)))
+                   :ordinary :retired)
+               (getf before :branch)))))
+    (ok (sb-posix:fstat root-fd))))
+
+(deftest reseed-receipt-consumption-fences-each-sync-before-and-after-real-effects
+    (call-with-retired-startup-test-fixture
+     :same-timeline
+     (lambda (root workspace root-fd record)
+       (declare (ignore workspace))
+       (dolist (operation '(:inode :baseline :removed-root))
+         (dolist (timing '(:before :after))
+           (check-receipt-consumption-syscall-cut root root-fd record operation timing))))))
+
+(deftest reseed-receipt-consumption-fences-unlink-before-and-after-real-effects
+    (call-with-retired-startup-test-fixture
+     :same-timeline
+     (lambda (root workspace root-fd record)
+       (declare (ignore workspace))
+       (dolist (timing '(:before :after))
+         (check-receipt-consumption-syscall-cut root root-fd record :unlink timing)))))
+
+(deftest reseed-receipt-consumption-survives-native-process-crashes-at-every-durability-boundary
+    (call-with-retired-startup-test-fixture
+     :same-timeline
+     (lambda (root workspace root-fd record)
+       (reset-retired-reader-test-files root record :receipt)
+       (let ((baseline (list (retirement-intent-test-nonjournal-facts root '("physical-reseed.retired"))
+                             (reseed-mapped-test-tree-facts workspace))))
+         (with-physical-store-directory (driver)
+           (let ((cache (merge-pathnames "cache/" driver)))
+             (dolist (case '((:before-receipt-consumption-inode-fsync :retired)
+                             (:after-receipt-consumption-inode-fsync :retired)
+                             (:before-receipt-consumption-baseline-root-fsync :retired)
+                             (:after-receipt-consumption-baseline-root-fsync :retired)
+                             (:before-receipt-consumption-unlink :retired)
+                             (:after-receipt-consumption-unlink :ordinary)
+                             (:before-receipt-consumption-root-fsync :ordinary)
+                             (:after-receipt-consumption-root-fsync :ordinary)))
+               (destructuring-bind (point expected) case
+                 (reset-retired-reader-test-files root record :receipt)
+                 (let* ((marker (merge-pathnames (format nil "~(~a~).marker" point) driver))
+                        (pid (run-retirement-intent-test-crash-child
+                              root point cache marker :operation :receipt-consumption :timeout 1200))
+                        (stale (pg::physical-reseed-read-pid root)))
+                   (ok (= pid (getf stale :pid)))
+                   (ok (eq (eq expected :retired)
+                           (not (null (probe-file (merge-pathnames "physical-reseed.retired" root))))))
+                   (ok (not (probe-file (merge-pathnames "physical-reseed.follow" root))))
+                   (ok (reseed-activation-layout-facts-equal-p
+                        baseline
+                        (list (retirement-intent-test-nonjournal-facts root '("physical-reseed.retired"))
+                              (reseed-mapped-test-tree-facts workspace))))
+                   (call-with-retired-startup-test-context
+                    root
+                    (lambda (before after)
+                      (ok (eq expected (getf before :branch)))
+                      (ok (equal before after))
+                      (if (eq expected :retired)
+                          (pg::call-with-physical-reseed-follow-retirement-startup-owner
+                           after
+                           (lambda (owner)
+                             (ok (pg::physical-reseed-follow-retirement-consume-receipt owner))
+                             (ok (null (pg::retirement-startup-evidence owner)))
+                             (ok (not (pg::retirement-startup-uncertain-p owner)))))
+                          (ok (null (pg::physical-adoption-startup-preflight))))))
+                   (ok (not (probe-file (merge-pathnames "postmaster.pid" root))))
+                   (ok (not (probe-file (merge-pathnames "physical-reseed.retired" root))))
+                   (ok (reseed-activation-layout-facts-equal-p
+                        baseline
+                        (list (retirement-intent-test-nonjournal-facts root '("physical-reseed.retired"))
+                              (reseed-mapped-test-tree-facts workspace))))
+                   (ok (sb-posix:fstat root-fd)))))))))))
+
+(defun check-receipt-consumption-finalization-cut (root root-fd record mode)
+  (reset-retired-reader-test-files root record :receipt)
+  (let* ((workspace (pathname (getf (getf (getf record :configuration) :workspace) :directory)))
+         (archive (merge-pathnames "saved/physical-reseed.attempt" workspace))
+         (bytes (lineage-test-bytes archive))
+         (stat (sb-posix:stat (namestring archive)))
+         (run (symbol-function 'pg::physical-reseed-follow-consumption-run))
+         (pid-reader (symbol-function 'pg::physical-reseed-read-pid))
+         (stamp-check (symbol-function 'pg::physical-reseed-follow-retirement-check-stamp))
+         (captured nil) (fired nil) (closed nil) (changed nil))
+    (unwind-protect
+         (ok
+          (eq :checked
+              (catch 'consumption-finalization-checked
+                (call-with-retired-startup-test-context
+                 root
+                 (lambda (before after)
+                   (declare (ignore before))
+                   (pg::call-with-physical-reseed-follow-retirement-startup-owner
+                    after
+                    (lambda (owner)
+                      (flet ((finishing ()
+                               (and captured (not fired)
+                                    (not (pg::receipt-consumer-active-p captured))
+                                    (null (pg::retirement-startup-evidence owner))
+                                    (pg::retirement-startup-busy-p owner)
+                                    (not (pg::retirement-startup-uncertain-p owner))))
+                             (cut ()
+                               (setf fired t
+                                     closed (and
+                                             (not (open-stream-p (pg::receipt-consumer-stream captured)))
+                                             (handler-case
+                                                 (progn (sb-posix:fstat (pg::receipt-consumer-root captured)) nil)
+                                               (sb-posix:syscall-error () t))
+                                             (handler-case
+                                                 (progn (pg::physical-store-check-live
+                                                         (pg::receipt-consumer-store captured)) nil)
+                                               (error () t))))
+                               (ok (pg::retirement-startup-busy-p owner))
+                               (ok (null (pg::retirement-startup-evidence owner)))
+                               (ok (handler-case
+                                       (progn (pg::physical-reseed-follow-retirement-consume-receipt owner) nil)
+                                     (error () t)))
+                               (ecase mode
+                                 (:pid-close-mutation
+                                  (let ((replacement (copy-seq bytes)))
+                                    (setf (aref replacement 0) (logxor 1 (aref replacement 0)))
+                                    (with-open-file (stream archive :direction :io
+                                                                    :element-type '(unsigned-byte 8)
+                                                                    :if-exists :overwrite)
+                                      (write-sequence replacement stream)
+                                      (finish-output stream))
+                                    (setf changed (and (= (length bytes) (length (lineage-test-bytes archive)))
+                                                       (equalp replacement (lineage-test-bytes archive))))))
+                                 (:error (error "consumption final audit cut"))
+                                 (:throw (throw 'consumption-final-audit-cut :cut))
+                                 (:interrupt
+                                  (sb-thread:interrupt-thread
+                                   sb-thread:*current-thread*
+                                   (lambda () (throw 'consumption-final-audit-cut :cut)))))))
+                        (unwind-protect
+                             (progn
+                               (setf (symbol-function 'pg::physical-reseed-follow-consumption-run)
+                                     (lambda (consumer) (setf captured consumer) (funcall run consumer))
+                                     (symbol-function 'pg::physical-reseed-read-pid)
+                                     (lambda (directory)
+                                       (multiple-value-prog1 (funcall pid-reader directory)
+                                         (when (and (eq mode :pid-close-mutation) (finishing)) (cut))))
+                                     (symbol-function 'pg::physical-reseed-follow-retirement-check-stamp)
+                                     (lambda (stamp)
+                                       (when (and (not (eq mode :pid-close-mutation)) (finishing)) (cut))
+                                       (funcall stamp-check stamp)))
+                               (ok (eq :cut
+                                       (catch 'consumption-final-audit-cut
+                                         (handler-case
+                                             (progn (pg::physical-reseed-follow-retirement-consume-receipt owner) nil)
+                                           (error (condition)
+                                             (if (search (if (eq mode :pid-close-mutation)
+                                                             "changed during resource cleanup"
+                                                             "consumption final audit cut")
+                                                         (princ-to-string condition))
+                                                 :cut
+                                                 (error condition)))))))
+                               (ok fired)
+                               (ok closed)
+                               (when (eq mode :pid-close-mutation) (ok changed))
+                               (ok (pg::retirement-startup-uncertain-p owner))
+                               (ok (not (pg::retirement-startup-busy-p owner)))
+                               (ok (null (pg::retirement-startup-evidence owner)))
+                               (ok (not (probe-file (merge-pathnames "physical-reseed.retired" root))))
+                               (ok (pg::postmaster-pid-owned-p)))
+                          (setf (symbol-function 'pg::physical-reseed-follow-consumption-run) run
+                                (symbol-function 'pg::physical-reseed-read-pid) pid-reader
+                                (symbol-function 'pg::physical-reseed-follow-retirement-check-stamp) stamp-check)))
+                      (throw 'consumption-finalization-checked :checked))))))))
+      (when (eq mode :pid-close-mutation)
+        (restore-retirement-cleanup-test-file archive bytes stat)))
+    (ok (not (probe-file (merge-pathnames "postmaster.pid" root))))
+    (call-with-retired-startup-test-context
+     root
+     (lambda (before after)
+       (ok (equal '(:branch :ordinary) before))
+       (ok (equal before after))
+       (ok (null (pg::physical-adoption-startup-preflight)))))
+    (ok (sb-posix:fstat root-fd))))
+
+(deftest reseed-receipt-consumption-finalization-fences-last-pid-close-and-nonlocal-exits
+    (call-with-retired-startup-test-fixture
+     :same-timeline
+     (lambda (root workspace root-fd record)
+       (declare (ignore workspace))
+       (dolist (mode '(:pid-close-mutation :error :throw :interrupt))
+         (check-receipt-consumption-finalization-cut root root-fd record mode)))))
+
+(deftest reseed-receipt-consumption-effects-require-live-thread-and-one-use-phase
+    (let* ((owner (pg::make-physical-reseed-follow-retirement-startup-owner))
+           (consumer (pg::make-physical-reseed-follow-receipt-consumer :owner owner))
+           (names '(pg::physical-reseed-follow-consumption-check-scope
+                    pg::physical-reseed-follow-consumption-point
+                    pg::physical-reseed-follow-consumption-observe
+                    pg::port-unlinkat sb-posix:fsync))
+           (originals (mapcar (lambda (name) (cons name (symbol-function name))) names))
+           (calls 0))
+      (unwind-protect
+           (progn
+             (dolist (entry originals)
+               (setf (symbol-function (car entry))
+                     (lambda (&rest arguments)
+                       (declare (ignore arguments))
+                       (incf calls)
+                       (error "unexpected consumer effect or parent callback"))))
+             (dolist (case '((:sync :ready t t nil t nil)
+                             (:sync :syncing t t t t nil)
+                             (:sync :admitted nil t nil t nil)
+                             (:sync :admitted t nil nil t nil)
+                             (:sync :admitted t t nil nil nil)
+                             (:sync :admitted t t nil t t)
+                             (:unlink :syncing t t t t nil)
+                             (:unlink :unlinking t t t t nil)
+                             (:unlink :synced nil t t t nil)
+                             (:unlink :synced t nil t t nil)
+                             (:unlink :synced t t nil t nil)
+                             (:unlink :synced t t t nil nil)
+                             (:root :durable t t t t t)
+                             (:root :syncing-removed t t t t t)
+                             (:root :removed t t nil t t)))
+               (destructuring-bind (operation phase active busy uncertain same-thread removed) case
+                 (setf (pg::retirement-startup-busy-p owner) busy
+                       (pg::retirement-startup-uncertain-p owner) uncertain
+                       (pg::receipt-consumer-active-p consumer) active
+                       (pg::receipt-consumer-thread consumer) (when same-thread sb-thread:*current-thread*)
+                       (pg::receipt-consumer-phase consumer) phase
+                       (pg::receipt-consumer-removed-p consumer) removed)
+                 (ok (handler-case
+                         (progn
+                           (ecase operation
+                             (:sync (pg::physical-reseed-follow-consumption-sync-receipt consumer))
+                             (:unlink (pg::physical-reseed-follow-consumption-unlink consumer))
+                             (:root (pg::physical-reseed-follow-consumption-sync-removed-root consumer)))
+                           nil)
+                       (error (condition)
+                         (search (if (eq operation :sync)
+                                     "requires completed local admission"
+                                     "cannot claim this phase")
+                                 (princ-to-string condition)))))
+                 (ok (zerop calls))))
+             (setf (pg::retirement-startup-busy-p owner) t
+                   (pg::retirement-startup-uncertain-p owner) t
+                   (pg::receipt-consumer-active-p consumer) t
+                   (pg::receipt-consumer-thread consumer) sb-thread:*current-thread*
+                   (pg::receipt-consumer-phase consumer) :synced
+                   (pg::receipt-consumer-removed-p consumer) nil)
+             (ok (sb-thread:join-thread
+                  (sb-thread:make-thread
+                   (lambda ()
+                     (handler-case
+                         (progn (pg::physical-reseed-follow-consumption-unlink consumer) nil)
+                       (error (condition) (search "cannot claim this phase" (princ-to-string condition))))))))
+             (ok (eq :synced (pg::receipt-consumer-phase consumer)))
+             (ok (eq :unlinking (pg::physical-reseed-follow-consumption-claim consumer :synced :unlinking)))
+             (ok (handler-case
+                     (progn (pg::physical-reseed-follow-consumption-claim consumer :synced :unlinking) nil)
+                   (error (condition) (search "cannot claim this phase" (princ-to-string condition)))))
+             (ok (handler-case
+                     (progn (pg::physical-reseed-follow-consumption-run consumer) nil)
+                   (error (condition) (search "already consumed" (princ-to-string condition)))))
+             (ok (handler-case
+                     (progn (pg::physical-reseed-follow-consumption-check-owner nil) nil)
+                   (error (condition) (search "ended, changed thread" (princ-to-string condition)))))
+             (ok (zerop calls)))
+        (dolist (entry originals) (setf (symbol-function (car entry)) (cdr entry))))))
+
+(deftest reseed-receipt-consumption-preserves-authority-on-real-timeline-policy-rejection
+    (call-with-retired-startup-test-fixture
+     :same-timeline
+     (lambda (root workspace root-fd record)
+       (declare (ignore workspace))
+       (reset-retired-reader-test-files root record :receipt)
+       (call-with-retired-startup-test-context
+        root
+        (lambda (before after)
+          (declare (ignore before))
+          (pg::call-with-physical-reseed-follow-retirement-startup-owner
+           after
+           (lambda (owner)
+             (let* ((evidence (pg::physical-adoption-attempt-value-copy (pg::retirement-startup-evidence owner)))
+                    (source (pg::physical-reseed-follow-retired-journal-at root-fd (constantly t)))
+                    (names '(sb-posix:fsync pg::port-unlinkat
+                             pg::physical-recovery-resolve-timeline-policy
+                             pg::physical-reseed-follow-consumption-run))
+                    (originals (mapcar (lambda (name) (cons name (symbol-function name))) names))
+                    (resolver (symbol-function 'pg::physical-recovery-resolve-timeline-policy))
+                    (run (symbol-function 'pg::physical-reseed-follow-consumption-run))
+                    (effects 0) (goal-seen nil) (captured nil))
+               (ok (not (probe-file (pg::timeline-history-path 2 root))))
+               (unwind-protect
+                    (let ((pg::*startup-server-settings* (make-hash-table :test #'equal)))
+                      (setf (gethash "recovery_target_timeline" pg::*startup-server-settings*)
+                            '(:value "2" :source :command-line)
+                            (symbol-function 'sb-posix:fsync)
+                            (lambda (fd)
+                              (declare (ignore fd))
+                              (incf effects)
+                              (error "unexpected policy-rejected consumer fsync"))
+                            (symbol-function 'pg::port-unlinkat)
+                            (lambda (&rest arguments)
+                              (declare (ignore arguments))
+                              (incf effects)
+                              (error "unexpected policy-rejected consumer unlink"))
+                            (symbol-function 'pg::physical-recovery-resolve-timeline-policy)
+                            (lambda (state store metadata goal)
+                              (setf goal-seen goal)
+                              (funcall resolver state store metadata goal))
+                            (symbol-function 'pg::physical-reseed-follow-consumption-run)
+                            (lambda (consumer) (setf captured consumer) (funcall run consumer)))
+                      (ok (= 2 (pg::startup-recovery-timeline-goal)))
+                      (ok (handler-case
+                              (progn (pg::physical-reseed-follow-retirement-consume-receipt owner) nil)
+                            (error (condition)
+                              (or (search "could not open timeline history file" (princ-to-string condition))
+                                  (error condition)))))
+                      (ok (eql 2 goal-seen))
+                      (ok (zerop effects))
+                      (ok (equal evidence (pg::retirement-startup-evidence owner)))
+                      (ok (not (pg::retirement-startup-uncertain-p owner)))
+                      (ok (not (pg::retirement-startup-busy-p owner)))
+                      (ok (equalp source (pg::physical-reseed-follow-retired-journal-at root-fd (constantly t))))
+                      (ok (eq :checking (pg::receipt-consumer-phase captured)))
+                      (ok (not (pg::receipt-consumer-removed-p captured)))
+                      (ok (not (pg::receipt-consumer-active-p captured)))
+                      (ok (not (open-stream-p (pg::receipt-consumer-stream captured))))
+                      (ok (pg::physical-reseed-follow-retirement-check-startup-idle owner)))
+                 (dolist (entry originals) (setf (symbol-function (car entry)) (cdr entry))))
+               (let ((pg::*startup-server-settings* nil))
+                 (ok (pg::physical-reseed-follow-retirement-consume-receipt owner)))
+               (ok (null (pg::retirement-startup-evidence owner))))))))
+       (ok (not (probe-file (merge-pathnames "physical-reseed.retired" root))))
+       (ok (sb-posix:fstat root-fd)))))
 
 (deftest reseed-retired-receipt-fences-legacy-ordinary-entrypoints
     (with-physical-store-directory (root)

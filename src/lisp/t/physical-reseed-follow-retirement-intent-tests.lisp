@@ -1029,6 +1029,8 @@
                     (case operation
                       (:initial (retirement-intent-test-child-arguments root point cache marker))
                       (:receipt (receipt-test-crash-child-arguments root point cache marker))
+                      (:receipt-consumption
+                       (receipt-test-crash-child-arguments root point cache marker :receipt-consumption))
                       (otherwise (retirement-intent-test-child-arguments root point cache marker operation)))
                     :search t :wait nil :output t :error :output)
                    pid (sb-ext:process-pid process)))
