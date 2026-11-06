@@ -1,6 +1,10 @@
+;;; Archive the install journal under the held retirement owner and publish
+;;; its completed progress.  Resume from a checked intermediate layout.
 (in-package #:pg)
 
 (defun physical-reseed-follow-retirement-archive-stable-proof (proof step operation)
+  ;; Project the facts allowed to change for one link or unlink.  The caller
+  ;; compares the remaining facts across complete observations.
   (let* ((copy (physical-adoption-attempt-value-copy proof))
          (layout (getf copy :layout))
          (names (getf layout :names))
@@ -29,6 +33,8 @@
     copy))
 
 (defun physical-reseed-follow-retirement-check-archive-bridge (before after step operation)
+  ;; Check the expected source, alias and saved transitions and compare the
+  ;; frozen facts across each namespace operation.
   (unless (typep step '(integer 0 1)) (error "invalid archive bridge step"))
   (let* ((key (if (zerop step) :install :attempt))
          (link (eq operation :link))
@@ -55,12 +61,16 @@
   t)
 
 (defstruct (physical-reseed-follow-retirement-archive-witness (:conc-name retirement-archive-))
+  ;; This private, thread-bound witness holds the file stream, proof and phase
+  ;; for one archive operation and its progress publication.
   intent thread active-p binding step prefix alias phase proof root-row stream row bytes final-snapshot)
 
 (defmethod print-object ((witness physical-reseed-follow-retirement-archive-witness) stream)
   (physical-libpq-print-private-object witness stream 0))
 
 (defun physical-reseed-follow-retirement-archive-binding (intent)
+  ;; Bind the archive witness to the same intent owner, thread, resources,
+  ;; predecessor and candidate throughout the operation.
   (list (retirement-intent-owner intent) (retirement-intent-thread intent)
         (retirement-intent-descriptors intent) (retirement-intent-store intent)
         (retirement-intent-pid intent) (retirement-intent-snapshot intent)
@@ -72,6 +82,8 @@
    (retirement-intent-descriptors (retirement-archive-intent witness)) role))
 
 (defun physical-reseed-follow-retirement-archive-check-scope (witness &optional phases)
+  ;; Check the thread, held stream, intent binding and current phase.  After
+  ;; publication, require the durable candidate snapshot and uncertain owner.
   (unless (and (physical-reseed-follow-retirement-archive-witness-p witness)
                (retirement-archive-active-p witness)
                (eq (retirement-archive-thread witness) sb-thread:*current-thread*)
@@ -102,6 +114,8 @@
   t)
 
 (defun physical-reseed-follow-retirement-archive-extra (witness root)
+  ;; After temporary cleanup, guard the exact final snapshot and PID while
+  ;; continuing to check the held predecessor.
   (if (eq :done (retirement-archive-phase witness))
       (let* ((intent (retirement-archive-intent witness))
              (check (retirement-intent-parent-check intent)))
@@ -144,6 +158,8 @@
   t)
 
 (defun physical-reseed-follow-retirement-archive-check (witness)
+  ;; Recheck held bytes and the full frozen proof under the cooperating locks.
+  ;; Root size and times may change while the journal is published.
   (physical-reseed-follow-retirement-archive-check-scope witness)
   (let* ((intent (retirement-archive-intent witness))
          (root (physical-reseed-follow-retirement-archive-directory witness :root))
@@ -213,6 +229,8 @@
     (physical-reseed-follow-retirement-archive-check-effect witness phases)))
 
 (defun physical-reseed-follow-retirement-archive-bridge-rows (witness)
+  ;; Capture the immediate named and held facts after a link or unlink.  The
+  ;; seal allows the subsequent full proof to check the same transition.
   (let* ((phase (retirement-archive-phase witness))
          (alias (ecase phase (:bridging-link t) (:bridging-unlink nil)))
          (root (physical-reseed-follow-retirement-archive-directory witness :root))
@@ -245,6 +263,8 @@
     (list :file file-row :held held-row :root root-row :saved saved-row)))
 
 (defun physical-reseed-follow-retirement-archive-bridge (witness operation seal)
+  ;; Check the post-system-call seal around the full observation before
+  ;; adopting the new phase and frozen proof.
   (physical-reseed-follow-retirement-archive-check-effect
    witness (ecase operation (:link '(:bridging-link)) (:unlink '(:bridging-unlink))))
   (unless (equal seal (physical-reseed-follow-retirement-archive-bridge-rows witness))
@@ -271,6 +291,8 @@
     (physical-reseed-follow-retirement-archive-check witness)))
 
 (defun physical-reseed-follow-retirement-archive-link (witness)
+  ;; Create the saved name and capture raw post-link facts before callbacks or
+  ;; the full proof can run.
   (declare (notinline port-linkat))
   (physical-reseed-follow-retirement-archive-check-effect witness '(:source))
   (physical-reseed-follow-retirement-archive-point witness :before-retirement-archive-link)
@@ -289,6 +311,8 @@
   (physical-reseed-follow-retirement-archive-point witness :after-retirement-archive-link))
 
 (defun physical-reseed-follow-retirement-archive-unlink (witness)
+  ;; Remove the root name and capture raw post-unlink facts before callbacks or
+  ;; the full proof can run.
   (declare (notinline port-unlinkat))
   (physical-reseed-follow-retirement-archive-check-effect witness '(:alias-durable))
   (physical-reseed-follow-retirement-archive-point witness :before-retirement-archive-unlink)
@@ -308,6 +332,8 @@
 
 (defmethod physical-reseed-follow-retirement-authorize-progress
     ((authority physical-reseed-follow-retirement-archive-witness) witness)
+  ;; Only the archive witness bound to this intent can authorize publication
+  ;; after the saved-only move has been synced and proved.
   (unless (eq witness (retirement-archive-intent authority))
     (error "retirement archive authority belongs to another publisher"))
   (physical-reseed-follow-retirement-archive-check-effect authority '(:moved-durable))
@@ -323,6 +349,10 @@
   t)
 
 (defun physical-reseed-follow-retirement-archive-run (witness)
+  ;; Resume from the proved source, two-name alias or saved-only state.  Link
+  ;; the destination first, sync the inode and saved directory, then unlink
+  ;; the source.  Sync the saved inode and both parents before publishing
+  ;; progress with this witness.
   (unless (and (physical-reseed-follow-retirement-archive-witness-p witness)
                (retirement-archive-active-p witness)
                (eq (retirement-archive-thread witness) sb-thread:*current-thread*)
@@ -373,6 +403,8 @@
       (values record snapshot))))
 
 (defun call-with-physical-reseed-follow-retirement-archive-file (intent expected function)
+  ;; Hold the archive file and its private bytes through the thread-bound
+  ;; witness scope.  Reprove the observed state before and after the callback.
   (declare (notinline physical-image-openat))
   (physical-reseed-follow-retirement-intent-check-scope intent)
   (let* ((record (getf (retirement-intent-snapshot intent) :record))
@@ -431,6 +463,7 @@
       (if stream (close stream) (when fd (sb-posix:close fd))))))
 
 (defun call-with-physical-reseed-follow-retirement-archive-context (owner expected function)
+  ;; Bind the archive witness and next candidate to one intent context.
   (call-with-physical-reseed-follow-retirement-intent-base-context
    owner expected
    (lambda (snapshot)
@@ -446,6 +479,9 @@
      (call-with-physical-reseed-follow-retirement-archive-file current expected function))))
 
 (defun physical-reseed-follow-retirement-archive-install (owner)
+  ;; Advance the install archive or return a checked completed retry.  Keep the
+  ;; owner uncertain through all resource cleanup and clear it after the
+  ;; archive context returns normally.
   (call-with-physical-reseed-follow-retirement-operation
    owner
    (lambda ()

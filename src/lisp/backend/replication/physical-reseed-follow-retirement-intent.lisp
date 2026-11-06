@@ -2,6 +2,9 @@
 ;;; postmaster ownership.  Recover an exact complete temporary for that intent.
 (in-package #:pg)
 
+;;; The held publisher also handles later progress when an archive witness
+;;; authorizes the same candidate and its synced filesystem state.
+
 (defun call-with-physical-reseed-follow-retirement-journal (root name expected function check)
   ;; Hold the named journal descriptor around the callback and bind it to the
   ;; expected snapshot.  Close the descriptor when the scope ends.
@@ -259,8 +262,8 @@
                  (physical-adoption-attempt-value-copy (getf (retirement-intent-pid witness) :row)))))))
 
 (defun physical-reseed-follow-retirement-intent-check (witness)
-  ;; Reprove frozen nonjournal state and check a complete temporary against
-  ;; the candidate and observed layout.
+  ;; Reprove frozen nonjournal state at the witness prefix, including progress
+  ;; publication, and check a complete temporary against the candidate.
   (physical-reseed-follow-retirement-intent-check-scope witness)
   (let* ((renamed (member (retirement-intent-phase witness) '(:renamed :durable)))
          (record (if renamed (retirement-intent-candidate witness)
@@ -298,6 +301,8 @@
 
 (defun call-with-physical-reseed-follow-retirement-intent-base-context
     (owner expected make-candidate function)
+  ;; Hold the owner resources and predecessor journal while binding one
+  ;; candidate to the private intent witness.
   (call-with-physical-reseed-follow-retirement-startup-root
    owner
    (lambda (root root-check)
@@ -328,6 +333,8 @@
             check))))))))
 
 (defun call-with-physical-reseed-follow-retirement-intent-context (owner expected function)
+  ;; Derive the initial candidate from the observed attempt and require the
+  ;; strict prefix-zero proof before invoking the callback.
   (call-with-physical-reseed-follow-retirement-intent-base-context
    owner expected
    (lambda (snapshot)
@@ -510,6 +517,8 @@
   (error "retirement progress requires a live archive authority"))
 
 (defun physical-reseed-follow-retirement-intent-publish-held (witness &optional authority)
+  ;; Progress publication requires the typed authority for this same intent.
+  ;; The publication claim is consumed before callbacks and effects.
   ;; Mark the operation uncertain before effects.  Sync the old final and root,
   ;; then write or reuse the exact complete temporary and promote it.
   (physical-reseed-follow-retirement-intent-claim-publication witness)
