@@ -478,10 +478,8 @@
    (lambda (current)
      (call-with-physical-reseed-follow-retirement-archive-file current expected function))))
 
-(defun physical-reseed-follow-retirement-archive-install (owner)
-  ;; Advance the install archive or return a checked completed retry.  Keep the
-  ;; owner uncertain through all resource cleanup and clear it after the
-  ;; archive context returns normally.
+(defun physical-reseed-follow-retirement-archive-step (owner step)
+  (unless (typep step '(integer 0 1)) (error "invalid retirement archive step"))
   (call-with-physical-reseed-follow-retirement-operation
    owner
    (lambda ()
@@ -495,22 +493,29 @@
                          (physical-reseed-follow-retirement-intent-layout descriptors (getf state :layout)))
                    copy))))
             (record (getf (getf expected :snapshot) :record))
-            (retirement (getf record :retirement)))
+            (retirement (getf record :retirement))
+            (name (if (zerop step) "install" "attempt")))
        (unless (and (eq :retiring (getf retirement :phase))
-                    (member (getf retirement :step) '(0 1)))
-         (error "install archive requires Retiring0 or completed Retiring1"))
+                    (member (getf retirement :step) (list step (1+ step))))
+         (error "~a archive requires Retiring~d or completed Retiring~d" name step (1+ step)))
        (when (and *physical-reseed-follow-write-limit*
                   (not (and (integerp *physical-reseed-follow-write-limit*)
                             (plusp *physical-reseed-follow-write-limit*))))
          (error "invalid retirement intent write limit"))
-       (if (= 1 (getf retirement :step))
+       (if (= (1+ step) (getf retirement :step))
            (progn
-             (unless (and (= 1 (getf expected :prefix)) (null (getf expected :location))
+             (unless (and (= (1+ step) (getf expected :prefix)) (null (getf expected :location))
                           (null (getf expected :temporary-file)))
-               (error "install archive retry requires stable Retiring1"))
+               (error "~a archive retry requires stable Retiring~d" name (1+ step)))
              (values (physical-reseed-follow-copy record)
                      (physical-adoption-attempt-value-copy (getf expected :snapshot))))
            (multiple-value-prog1
                (call-with-physical-reseed-follow-retirement-archive-context
                 owner expected #'physical-reseed-follow-retirement-archive-run)
              (setf (retirement-startup-uncertain-p owner) nil)))))))
+
+(defun physical-reseed-follow-retirement-archive-attempt (owner)
+  (physical-reseed-follow-retirement-archive-step owner 1))
+
+(defun physical-reseed-follow-retirement-archive-install (owner)
+  (physical-reseed-follow-retirement-archive-step owner 0))
