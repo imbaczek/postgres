@@ -1,13 +1,21 @@
+;; Publish the terminal follow journal as a durable retirement receipt.
+;; Its result records evidence at actor return.  Later consumption and main
+;; startup remain separate operations.
+
 (in-package #:pg)
 
 (defstruct (physical-reseed-follow-receipt-witness (:conc-name receipt-witness-))
+  ;; The witness borrows the owner, root, roles, store, PID and source stream.
+  ;; Its lifetime and phase limit every use to the active operation and thread.
   owner root descriptors store base binding check pid stream bytes journal snapshot
   proof root-row active-p thread phase)
 
 (defmethod print-object ((witness physical-reseed-follow-receipt-witness) stream)
+  ;; Keep private witness contents out of printed representations.
   (print-unreadable-object (witness stream :type t :identity t)))
 
 (defun physical-reseed-follow-receipt-check-scope (witness)
+  ;; Check the thread, busy operation and borrowed ownership before observation.
   (unless (and (receipt-witness-active-p witness)
                (eq (receipt-witness-thread witness) sb-thread:*current-thread*)
                (retirement-startup-busy-p (receipt-witness-owner witness)))
@@ -17,6 +25,7 @@
   t)
 
 (defun physical-reseed-follow-receipt-check-source (witness)
+  ;; Check the held inode around a complete read of the private source bytes.
   (physical-reseed-follow-receipt-check-scope witness)
   (let* ((root (receipt-witness-root witness))
          (journal (receipt-witness-journal witness))
@@ -37,6 +46,7 @@
   t)
 
 (defun physical-reseed-follow-receipt-extra (witness root)
+  ;; Include copied journal and PID rows in the root layout proof.
   (unless (= root (receipt-witness-root witness))
     (error "receipt witness changed its root descriptor"))
   (physical-reseed-follow-receipt-check-source witness)
@@ -47,6 +57,7 @@
    (list (cons "postmaster.pid" (copy-list (getf (receipt-witness-pid witness) :row))))))
 
 (defun physical-reseed-follow-receipt-observe (witness)
+  ;; Prove the layout on both sides of receive validation while resources live.
   (flet ((check () (physical-reseed-follow-receipt-check-scope witness))
          (source-check () (physical-reseed-follow-receipt-check-source witness))
          (extra (root) (physical-reseed-follow-receipt-extra witness root)))
@@ -68,12 +79,16 @@
                   (list :journal (physical-adoption-attempt-value-copy (receipt-witness-journal witness)))))))))
 
 (defun physical-reseed-follow-receipt-check (witness)
+  ;; Require the complete observation to match the frozen proof.
   (unless (equal (receipt-witness-proof witness)
                  (physical-reseed-follow-receipt-observe witness))
     (error "receipt witness changed its frozen full proof"))
   t)
 
 (defun physical-reseed-follow-receipt-stable-proof (proof)
+  ;; Remove transition-owned fields from comparison while preserving independent
+  ;; source identity and mtime and the other roles.  The raw seal checks the
+  ;; authorized deltas before this comparison.
   (let* ((copy (physical-adoption-attempt-value-copy proof))
          (snapshot (getf copy :snapshot))
          (row (copy-list (getf snapshot :row)))
@@ -97,6 +112,7 @@
     copy))
 
 (defun physical-reseed-follow-receipt-point (witness point)
+  ;; Test callbacks run between checks of the complete frozen proof.
   (physical-reseed-follow-receipt-check witness)
   (physical-reseed-follow-test-point
    point (merge-pathnames "physical-reseed.retired"
@@ -104,6 +120,7 @@
   (physical-reseed-follow-receipt-check witness))
 
 (defun physical-reseed-follow-receipt-claim (witness expected claim)
+  ;; Claim the phase before any callback or effect can reenter the operation.
   (sb-sys:without-interrupts
     (unless (and (receipt-witness-active-p witness)
                  (eq (receipt-witness-thread witness) sb-thread:*current-thread*)
@@ -119,6 +136,7 @@
     (setf (receipt-witness-phase witness) claim)))
 
 (defun physical-reseed-follow-receipt-check-effect (witness phase)
+  ;; Effects require both their claimed phase and the uncertainty latch.
   (physical-reseed-follow-receipt-check-scope witness)
   (unless (and (retirement-startup-uncertain-p (receipt-witness-owner witness))
                (eq phase (receipt-witness-phase witness)))
@@ -126,6 +144,8 @@
   t)
 
 (defun physical-reseed-follow-receipt-sync (witness inode-point root-point after-inode after-root)
+  ;; A fresh alias or receipt-only retry repeats both inode and root syncs.
+  ;; Advance to a durable phase only after both barriers and the full proof.
   (declare (notinline sb-posix:fsync))
   (let ((geometry (getf (receipt-witness-journal witness) :geometry)))
     (unless (member geometry '(:follow :alias :receipt))
@@ -145,6 +165,8 @@
           (ecase geometry (:follow :follow-durable) (:alias :alias-durable) (:receipt :receipt-durable)))))
 
 (defun physical-reseed-follow-receipt-seal (witness operation)
+  ;; Capture raw journal, held inode and root facts immediately after the effect
+  ;; and before proof checks or test callbacks.
   (let* ((root (receipt-witness-root witness))
          (before (receipt-witness-journal witness))
          (old-row (or (getf before :follow) (getf before :receipt)))
@@ -164,6 +186,8 @@
     (list :journal journal :root root-row :held held)))
 
 (defun physical-reseed-follow-receipt-transition (witness operation)
+  ;; Seal the namespace effect without interruption, then compare a fresh full
+  ;; proof with the seal and the stable parts of the preceding proof.
   (declare (notinline port-linkat port-unlinkat))
   (let ((root (receipt-witness-root witness))
         (before (receipt-witness-proof witness))
@@ -211,6 +235,8 @@
                     (:unlink :after-retirement-receipt-unlink)))))
 
 (defun physical-reseed-follow-receipt-run (witness)
+  ;; Bind the initial proof to handover evidence and drive each durable phase.
+  ;; Capture the cleanup stamp while the roles are still held.
   (unless (eq :ready (receipt-witness-phase witness))
     (error "receipt witness was already consumed"))
   (setf (receipt-witness-phase witness) :checking
@@ -254,6 +280,8 @@
 
 (defun call-with-physical-reseed-follow-receipt-source
     (owner root descriptors store base binding check pid source function)
+  ;; Own the source stream for the witness and keep private copies of source
+  ;; bytes, descriptors and journal facts until the witness is revoked.
   (declare (notinline physical-image-openat))
   (let ((fd nil) (stream nil) (witness nil))
     (unwind-protect
@@ -280,6 +308,10 @@
       (if stream (close stream) (when fd (sb-posix:close fd))))))
 
 (defun physical-reseed-follow-retirement-publish-receipt (owner)
+  ;; Hold source, store, roles, PID-reader and root scopes through the transition.
+  ;; After closure, audit before adopting evidence and clearing uncertainty.
+  ;; The final pure audit follows the owner guard.  Failure after effects begin
+  ;; restores uncertainty before the operation releases its busy flag.
   (let ((stamp nil) (evidence nil) (success nil) (started nil))
     (unwind-protect
          (multiple-value-prog1

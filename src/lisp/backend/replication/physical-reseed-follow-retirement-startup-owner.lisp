@@ -73,8 +73,9 @@
   owner)
 
 (defun call-with-physical-reseed-follow-retirement-operation (owner function &optional final-check failure-cleanup)
-  ;; Keep the owner busy through the operation and its final guard.  Release
-  ;; the busy flag on every exit.
+  ;; Keep the owner busy through the operation and its final guard.  Run the
+  ;; optional final check only after successful return and guard validation.
+  ;; On failure, defer interrupts while cleanup runs before clearing busy.
   (physical-reseed-follow-retirement-check-startup-idle owner)
   (let ((completed nil))
     (unwind-protect
