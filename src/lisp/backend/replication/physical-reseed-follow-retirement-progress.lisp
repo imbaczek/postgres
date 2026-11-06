@@ -74,6 +74,8 @@
    (retirement-intent-descriptors (retirement-archive-intent witness)) role))
 
 (defun physical-reseed-follow-retirement-archive-check-outer (witness &optional phases)
+  ;; Check the archive witness, thread, held stream and frozen intent binding
+  ;; for the lifetime of the outer archive scope.
   (unless (and (physical-reseed-follow-retirement-archive-witness-p witness)
                (retirement-archive-active-p witness)
                (eq (retirement-archive-thread witness) sb-thread:*current-thread*)
@@ -91,6 +93,8 @@
   t)
 
 (defun physical-reseed-follow-retirement-archive-check-scope (witness &optional phases)
+  ;; Use the intent scope during publication and the durable scope after the
+  ;; archive reaches done.  The outer check keeps the archive binding fixed.
   (physical-reseed-follow-retirement-archive-check-outer witness phases)
   (let ((intent (retirement-archive-intent witness)))
     (if (eq :done (retirement-archive-phase witness))
@@ -101,6 +105,8 @@
   t)
 
 (defun physical-reseed-follow-retirement-archive-extra (witness root)
+  ;; Use the adopted final snapshot after completion and the current intent
+  ;; extras during publication.
   (if (eq :done (retirement-archive-phase witness))
       (physical-reseed-follow-retirement-intent-durable-extra
        (retirement-archive-intent witness) (retirement-archive-final-snapshot witness) root

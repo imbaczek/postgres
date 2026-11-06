@@ -129,12 +129,16 @@
   ;; predecessor to one candidate, proof and sequence of effects.
   owner thread active-p descriptors store parent-check pid snapshot old-stream old-bytes
   candidate bytes proof phase temporary-fd temporary-stream temporary-fixed temporary-state
+  ;; FINAL-SNAPSHOT records the adopted journal for checks after temporary
+  ;; cleanup while the outer resource scope remains held.
   written effect-p publication-claimed-p final-snapshot)
 
 (defmethod print-object ((witness physical-reseed-follow-retirement-intent-witness) stream)
   (print-unreadable-object (witness stream :type t :identity t)))
 
 (defun physical-reseed-follow-retirement-intent-binding (witness)
+  ;; Collect the owner, thread, held resources, predecessor and candidate that
+  ;; must stay fixed through the outer publication scope.
   (list (retirement-intent-owner witness) (retirement-intent-thread witness)
         (retirement-intent-descriptors witness) (retirement-intent-store witness)
         (retirement-intent-pid witness) (retirement-intent-snapshot witness)
@@ -269,6 +273,8 @@
                  (physical-adoption-attempt-value-copy (getf (retirement-intent-pid witness) :row)))))))
 
 (defun physical-reseed-follow-retirement-intent-durable-scope (witness snapshot outer-check)
+  ;; Check the adopted snapshot and owner after publication while the outer
+  ;; resources remain held.  OUTER-CHECK guards the caller's own scope.
   (funcall outer-check)
   (unless (physical-reseed-follow-retirement-intent-witness-p witness)
     (error "retirement durable guard requires an intent witness"))
@@ -290,6 +296,8 @@
   t)
 
 (defun physical-reseed-follow-retirement-intent-durable-extra (witness snapshot root outer-check)
+  ;; Check the held predecessor and final snapshot while collecting the
+  ;; admitted final journal and PID entries.
   (physical-reseed-follow-retirement-intent-durable-scope witness snapshot outer-check)
   (unless (= root (physical-reseed-follow-retirement-intent-root witness))
     (error "retirement durable proof changed its root"))
@@ -302,6 +310,8 @@
    (list (cons "postmaster.pid" (getf (retirement-intent-pid witness) :row)))))
 
 (defun physical-reseed-follow-retirement-intent-check-durable-proof (witness outer-check)
+  ;; Reprove the adopted layout and active state after temporary cleanup, then
+  ;; compare the frozen proof and the owner's updated evidence.
   (funcall outer-check)
   (let ((snapshot (retirement-intent-final-snapshot witness)))
     (physical-reseed-follow-retirement-intent-durable-scope witness snapshot outer-check)
@@ -365,6 +375,8 @@
 
 (defun call-with-physical-reseed-follow-retirement-intent-base-context
     (owner expected make-candidate function)
+  ;; Keep the outer binding and held resources valid after the temporary scope
+  ;; returns.  Recheck durable effects before revoking this context.
   (call-with-physical-reseed-follow-retirement-startup-root
    owner
    (lambda (root root-check)
