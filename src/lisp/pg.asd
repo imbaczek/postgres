@@ -257,6 +257,7 @@
                    (:file "../replication/physical-reseed-follow-startup")
                    (:file "../replication/physical-reseed-follow-retirement-startup-owner")
                    (:file "../replication/physical-reseed-follow-retirement-intent")
+                   (:file "../replication/physical-reseed-follow-retirement-progress")
                    (:file "../replication/physical-reseed-follow-configuration-staging")
                    (:file "../replication/physical-reseed-follow-configuration-install")
                    (:file "../replication/physical-reseed-follow-configuration-recovery")
