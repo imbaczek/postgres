@@ -265,8 +265,9 @@
   (let* ((renamed (member (retirement-intent-phase witness) '(:renamed :durable)))
          (record (if renamed (retirement-intent-candidate witness)
                      (getf (retirement-intent-snapshot witness) :record)))
-         (proof (physical-reseed-follow-retirement-intent-proof-at
-                 (retirement-intent-descriptors witness) (retirement-intent-store witness) record
+         (prefix (getf (retirement-intent-proof witness) :prefix))
+         (proof (physical-reseed-follow-retirement-prefix-proof-at
+                 (retirement-intent-descriptors witness) (retirement-intent-store witness) record prefix
                  (lambda () (physical-reseed-follow-retirement-intent-check-scope witness))
                  (lambda (root) (physical-reseed-follow-retirement-intent-extra witness root)))))
     (unless (equal (retirement-intent-proof witness) proof)
@@ -274,7 +275,7 @@
     (when (eq :complete (retirement-intent-phase witness))
       (physical-reseed-follow-retirement-check-temporary-layout
        (retirement-intent-descriptors witness) record (retirement-intent-candidate witness)
-       0 (getf proof :install) (getf proof :attempt))))
+       prefix (getf proof :install) (getf proof :attempt))))
   (physical-reseed-follow-retirement-intent-check-scope witness)
   t)
 
@@ -295,10 +296,8 @@
        (retirement-intent-parent-check witness))
       (funcall function witness)))
 
-(defun call-with-physical-reseed-follow-retirement-intent-context (owner expected function)
-  ;; Reacquire the owner resources and hold the original journal.  Bind the
-  ;; candidate to the observed attempt reference and reprove the predecessor
-  ;; before handing the private witness to the callback.
+(defun call-with-physical-reseed-follow-retirement-intent-base-context
+    (owner expected make-candidate function)
   (call-with-physical-reseed-follow-retirement-startup-root
    owner
    (lambda (root root-check)
@@ -312,10 +311,7 @@
            (call-with-physical-reseed-follow-retirement-journal
             root "physical-reseed.follow" (getf expected :snapshot)
             (lambda (stream snapshot)
-              (let* ((attempt (getf expected :attempt))
-                     (candidate (physical-reseed-follow-retirement-next-record
-                                 (getf snapshot :record)
-                                 (list :identity (getf attempt :identity) :digest (getf attempt :digest))))
+              (let* ((candidate (funcall make-candidate snapshot))
                      (witness
                        (make-physical-reseed-follow-retirement-intent-witness
                         :owner owner :thread sb-thread:*current-thread* :active-p t
@@ -327,20 +323,30 @@
                         :phase :predecessor :written 0)))
                 (unwind-protect
                      (call-with-physical-reseed-follow-retirement-intent-existing
-                      witness (getf expected :temporary-file)
-                      (lambda (current)
-                        (let ((proof (physical-reseed-follow-retirement-intent-proof-at
-                                      descriptors store (getf snapshot :record)
-                                      (lambda () (physical-reseed-follow-retirement-intent-check-scope current))
-                                      (lambda (fd) (physical-reseed-follow-retirement-intent-extra current fd)))))
-                          (dolist (key '(:prefix :layout :install :attempt))
-                            (unless (equal (getf expected key) (getf proof key))
-                              (error "retirement predecessor changed after startup reproof")))
-                          (setf (retirement-intent-proof current) proof)
-                          (physical-reseed-follow-retirement-intent-check current)
-                          (funcall function current))))
+                      witness (getf expected :temporary-file) function)
                   (setf (retirement-intent-active-p witness) nil))))
             check))))))))
+
+(defun call-with-physical-reseed-follow-retirement-intent-context (owner expected function)
+  (call-with-physical-reseed-follow-retirement-intent-base-context
+   owner expected
+   (lambda (snapshot)
+     (let ((attempt (getf expected :attempt)))
+       (physical-reseed-follow-retirement-next-record
+        (getf snapshot :record)
+        (list :identity (getf attempt :identity) :digest (getf attempt :digest)))))
+   (lambda (current)
+     (let ((proof (physical-reseed-follow-retirement-intent-proof-at
+                   (retirement-intent-descriptors current) (retirement-intent-store current)
+                   (getf (retirement-intent-snapshot current) :record)
+                   (lambda () (physical-reseed-follow-retirement-intent-check-scope current))
+                   (lambda (fd) (physical-reseed-follow-retirement-intent-extra current fd)))))
+       (dolist (key '(:prefix :layout :install :attempt))
+         (unless (equal (getf expected key) (getf proof key))
+           (error "retirement predecessor changed after startup reproof")))
+       (setf (retirement-intent-proof current) proof)
+       (physical-reseed-follow-retirement-intent-check current)
+       (funcall function current)))))
 
 (defun physical-reseed-follow-retirement-intent-point (witness point)
   ;; Recheck the witness and effect authority around each fault point.
@@ -497,22 +503,34 @@
     (setf (retirement-intent-publication-claimed-p witness) t))
   t)
 
-(defun physical-reseed-follow-retirement-intent-publish-held (witness)
+(defgeneric physical-reseed-follow-retirement-authorize-progress (authority witness))
+
+(defmethod physical-reseed-follow-retirement-authorize-progress (authority witness)
+  (declare (ignore authority witness))
+  (error "retirement progress requires a live archive authority"))
+
+(defun physical-reseed-follow-retirement-intent-publish-held (witness &optional authority)
   ;; Mark the operation uncertain before effects.  Sync the old final and root,
   ;; then write or reuse the exact complete temporary and promote it.
   (physical-reseed-follow-retirement-intent-claim-publication witness)
-  (physical-reseed-follow-retirement-intent-check-scope witness)
-  (unless (and (not (retirement-intent-effect-p witness))
+  (unless (and (or authority (not (retirement-intent-effect-p witness)))
                (case (retirement-intent-phase witness)
                  (:predecessor (and (null (retirement-intent-temporary-stream witness))
                                     (null (retirement-intent-temporary-fd witness))))
                  (:complete (and (retirement-intent-temporary-stream witness)
                                  (retirement-intent-temporary-fd witness)))))
     (error "retirement publisher already started or changed phase"))
-  (physical-reseed-follow-retirement-intent-check witness)
-  (sb-sys:without-interrupts
-    (setf (retirement-intent-effect-p witness) t
-          (retirement-startup-uncertain-p (retirement-intent-owner witness)) t))
+  (if authority
+      (physical-reseed-follow-retirement-authorize-progress authority witness)
+      (progn
+        (physical-reseed-follow-retirement-intent-check-scope witness)
+        (physical-reseed-follow-retirement-intent-check witness)
+        (unless (and (eql 0 (getf (retirement-intent-proof witness) :prefix))
+                     (null (getf (getf (retirement-intent-snapshot witness) :record) :retirement)))
+          (error "initial retirement publisher requires its strict Active2 predecessor"))
+        (sb-sys:without-interrupts
+          (setf (retirement-intent-effect-p witness) t
+                (retirement-startup-uncertain-p (retirement-intent-owner witness)) t))))
   (physical-reseed-follow-retirement-intent-sync
    witness :old-final
    :before-retirement-old-final-fsync :after-retirement-old-final-fsync)
