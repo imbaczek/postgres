@@ -1,6 +1,11 @@
+;; Consume a published retirement receipt after local standby admission.
+;; This scoped operation leaves startup integration to its caller.
+
 (in-package #:pg)
 
 (defun physical-reseed-follow-startup-local-state-at (descriptors store check)
+  ;; Check ordinary standby control, follow configuration and recovery state
+  ;; under the held directory and store checks.
   (funcall check)
   (physical-store-check-live store)
   (call-with-physical-reseed-follow-held-base-directory
@@ -38,6 +43,8 @@
   t)
 
 (defstruct (physical-reseed-follow-receipt-consumer (:conc-name receipt-consumer-))
+  ;; Borrow the owner, root, roles, store and PID context for one operation.
+  ;; Keep private receipt bytes and facts with a thread-bound phase and stream.
   owner root descriptors store base binding check pid stream bytes snapshot journal
   row root-row proof phase removed-p active-p thread)
 
@@ -45,6 +52,7 @@
   (print-unreadable-object (consumer stream :type t :identity t)))
 
 (defun physical-reseed-follow-consumption-check-owner (consumer)
+  ;; The consumer is usable only on its creating thread while the owner is busy.
   (unless (and (physical-reseed-follow-receipt-consumer-p consumer)
                (receipt-consumer-active-p consumer)
                (eq (receipt-consumer-thread consumer) sb-thread:*current-thread*)
@@ -54,6 +62,9 @@
   t)
 
 (defun physical-reseed-follow-consumption-check-source (consumer)
+  ;; Check the held inode and private bytes around ownership checks.  After
+  ;; the last owner check, repeat both checks without further callbacks.  After
+  ;; unlink, require zero links and continued absence of the receipt name.
   (physical-reseed-follow-consumption-check-owner consumer)
   (let* ((owner (receipt-consumer-owner consumer))
          (directory (retirement-startup-directory owner))
@@ -93,11 +104,13 @@
   t)
 
 (defun physical-reseed-follow-consumption-check-scope (consumer)
+  ;; Combine receipt and borrowed resource checks for the current scope.
   (physical-reseed-follow-consumption-check-source consumer)
   (funcall (receipt-consumer-check consumer))
   t)
 
 (defun physical-reseed-follow-consumption-extra (consumer root)
+  ;; Supply copied receipt and PID rows to the layout observation.
   (unless (= root (receipt-consumer-root consumer))
     (error "receipt consumption changed its root descriptor"))
   (physical-reseed-follow-consumption-check-scope consumer)
@@ -107,6 +120,7 @@
    (list (cons "postmaster.pid" (copy-list (getf (receipt-consumer-pid consumer) :row))))))
 
 (defun physical-reseed-follow-consumption-observe (consumer)
+  ;; Match the full layout on both sides of receive validation.
   (flet ((check () (physical-reseed-follow-consumption-check-scope consumer))
          (extra (root) (physical-reseed-follow-consumption-extra consumer root)))
     (let* ((entry (cons "postmaster.pid" (copy-list (getf (receipt-consumer-pid consumer) :row))))
@@ -128,12 +142,14 @@
                         (physical-adoption-attempt-value-copy (receipt-consumer-journal consumer)))))))))
 
 (defun physical-reseed-follow-consumption-check (consumer)
+  ;; Require a fresh observation to match the frozen proof.
   (unless (equal (receipt-consumer-proof consumer)
                  (physical-reseed-follow-consumption-observe consumer))
     (error "receipt consumption changed its frozen full proof"))
   t)
 
 (defun physical-reseed-follow-consumption-point (consumer point)
+  ;; Check the frozen proof around each test callback.
   (physical-reseed-follow-consumption-check consumer)
   (physical-reseed-follow-test-point
    point (merge-pathnames "physical-reseed.retired"
@@ -141,6 +157,7 @@
   (physical-reseed-follow-consumption-check consumer))
 
 (defun physical-reseed-follow-consumption-claim (consumer expected next)
+  ;; Claim the next phase before callbacks or effects can reenter it.
   (sb-sys:without-interrupts
     (unless (and (receipt-consumer-active-p consumer)
                  (eq (receipt-consumer-thread consumer) sb-thread:*current-thread*)
@@ -151,6 +168,7 @@
     (setf (receipt-consumer-phase consumer) next)))
 
 (defun physical-reseed-follow-consumption-check-effect (consumer phase)
+  ;; Effects require the claimed phase and the owner's uncertainty latch.
   (physical-reseed-follow-consumption-check-scope consumer)
   (unless (and (eq phase (receipt-consumer-phase consumer))
                (retirement-startup-uncertain-p (receipt-consumer-owner consumer)))
@@ -158,6 +176,8 @@
   t)
 
 (defun physical-reseed-follow-consumption-sync-receipt (consumer)
+  ;; After admission, latch uncertainty and sync the receipt inode and root
+  ;; before allowing the unlink.
   (declare (notinline sb-posix:fsync))
   (sb-sys:without-interrupts
     (unless (and (receipt-consumer-active-p consumer)
@@ -180,6 +200,8 @@
   (setf (receipt-consumer-phase consumer) :synced))
 
 (defun physical-reseed-follow-consumption-unlink (consumer)
+  ;; Seal the held inode and root immediately after unlink, before callbacks.
+  ;; Compare the new full proof with the seal and stable historical facts.
   (declare (notinline port-unlinkat))
   (physical-reseed-follow-consumption-claim consumer :synced :unlinking)
   (physical-reseed-follow-consumption-point consumer :before-receipt-consumption-unlink)
@@ -228,6 +250,7 @@
   (physical-reseed-follow-consumption-point consumer :after-receipt-consumption-unlink))
 
 (defun physical-reseed-follow-consumption-sync-removed-root (consumer)
+  ;; Sync the parent directory to make the removal durable.
   (declare (notinline sb-posix:fsync))
   (physical-reseed-follow-consumption-claim consumer :removed :syncing-removed)
   (physical-reseed-follow-consumption-point consumer :before-receipt-consumption-root-fsync)
@@ -238,6 +261,8 @@
   (setf (receipt-consumer-phase consumer) :durable))
 
 (defun physical-reseed-follow-consumption-run (consumer)
+  ;; Match handover evidence and admit local standby state before removal.
+  ;; Recheck intent, local state and the full proof after the removal sync.
   (unless (eq :ready (receipt-consumer-phase consumer))
     (error "receipt consumption witness was already consumed"))
   (setf (receipt-consumer-phase consumer) :checking
@@ -266,6 +291,9 @@
   t)
 
 (defun call-with-physical-reseed-follow-consumption-context (owner function)
+  ;; Keep the receipt stream open while the store, roles, PID reader and root
+  ;; close.  Capture the stamp while roles are held, then close the stream before
+  ;; auditing the stamp.
   (declare (notinline physical-image-openat))
   (let ((fd nil) (stream nil) (consumer nil) (stamp nil) (result nil))
     (multiple-value-prog1
@@ -319,6 +347,9 @@
        stamp (lambda () (physical-reseed-follow-retirement-check-startup-owner owner))))))
 
 (defun physical-reseed-follow-retirement-consume-receipt (owner)
+  ;; Clear evidence and uncertainty after the closed-resource audit succeeds.
+  ;; The final pure audit follows the owner guard.  A failure after effects
+  ;; begin restores uncertainty before the operation releases its busy flag.
   (let ((stamp nil) (started nil) (success nil))
     (unwind-protect
          (multiple-value-prog1
