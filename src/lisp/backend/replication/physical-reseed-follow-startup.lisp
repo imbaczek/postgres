@@ -36,11 +36,18 @@
       (physical-adoption-attempt-value-copy projection))))
 
 (defun physical-reseed-follow-retired-startup-projection (descriptors state)
+  ;; Include detached journal geometry in the cross-PID projection.  The
+  ;; common projection omits the PID entry and volatile root facts, while
+  ;; retaining the remaining layout evidence.
   (append (physical-reseed-follow-startup-projection descriptors state)
           (list :journal (physical-adoption-attempt-value-copy (getf state :journal)))))
 
 (defun call-with-physical-reseed-follow-retired-pid-observation
     (root parent-check function pid-scope)
+  ;; Hold the raw journal outermost, across PID evidence, all ten directory
+  ;; roles and store cleanup.  Its verifier keeps canonical bytes private.
+  ;; The callback receives detached geometry rows and a read-only proof.
+  ;; The caller controls startup dispatch and any later handover.
   (call-with-physical-reseed-follow-retired-journal
    root
    (lambda (stream source verify-source)

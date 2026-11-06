@@ -223,9 +223,11 @@
 
 (defun call-with-physical-reseed-follow-retirement-receive-core
     (descriptors snapshot base binding function check layout-reader)
-  ;; Carry optional PID evidence through repeated layout and active receive
-  ;; checks.  The callback gets copies and its thread-bound VERIFY is revoked
-  ;; before the store scope cleans up.
+  ;; Repeat the same layout proof around active receive validation.
+  ;; Full root metadata must remain exact.  Creating and removing an entry
+  ;; invalidates this observation, so recovery requires a fresh scope.
+  ;; The callback gets copies.  Revoke its thread-bound VERIFY before the
+  ;; store scope cleans up.
   (let* ((record (physical-reseed-follow-copy (getf snapshot :record)))
          (thread sb-thread:*current-thread*) (active nil) (state nil))
     (funcall check)
@@ -263,8 +265,8 @@
       held snapshot verify extra-reader candidate pid-evidence))))
 
 (defun call-with-physical-reseed-follow-retirement-observation-core (root snapshot parent-check function extra-reader layout-reader)
-  ;; Pass optional PID evidence through the held-directory scope to the layout
-  ;; and receive checks.
+  ;; Root checks use EXTRA-READER to keep the source facts stable.
+  ;; LAYOUT-READER supplies the complete proof within the held receive scope.
   ;; Borrow ROOT and its parent ownership from the caller.  Hold the other nine
   ;; directory descriptors, guard streams and local store for the callback.
   (let* ((snapshot (physical-adoption-attempt-value-copy snapshot))

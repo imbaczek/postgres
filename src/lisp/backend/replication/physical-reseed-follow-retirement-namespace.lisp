@@ -74,13 +74,13 @@
 
 (defun physical-reseed-follow-retirement-layout-state-core
     (descriptors snapshot check extra-reader candidate pid-evidence source-check extra-names)
-  ;; When PID evidence is supplied, verify it and admit only its matching root
-  ;; entry.  The strict path supplies no PID evidence.
-  ;; The final snapshot remains the layout authority.  The extra reader and
-  ;; checks keep admitted evidence stable.
+  ;; SOURCE-CHECK verifies the journal behind SNAPSHOT.  EXTRA-NAMES fixes
+  ;; the exact root entries allowed by that source and any PID evidence.
+  ;; The follow wrapper supplies its original snapshot and name policy.
+  ;; Verify supplied PID evidence and admit only its matching root entry.
   ;; Use the provisional install read only to obtain a plan.  Prove the saved
   ;; role, complete images and exact prefix, then recheck both journals around
-  ;; the layout proof against the actual follow snapshot.
+  ;; the layout proof against the supplied journal snapshot.
   (let* ((root (physical-reseed-follow-configuration-role-fd descriptors :root))
          (saved (physical-reseed-follow-configuration-role-fd descriptors :saved))
          (record (physical-reseed-follow-copy (getf snapshot :record)))
