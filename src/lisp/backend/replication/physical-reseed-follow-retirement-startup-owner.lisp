@@ -72,25 +72,32 @@
     (error "retirement startup owner is busy or uncertain"))
   owner)
 
-(defun call-with-physical-reseed-follow-retirement-operation (owner function)
+(defun call-with-physical-reseed-follow-retirement-operation (owner function &optional final-check failure-cleanup)
   ;; Keep the owner busy through the operation and its final guard.  Release
   ;; the busy flag on every exit.
   (physical-reseed-follow-retirement-check-startup-idle owner)
-  (unwind-protect
-       (progn
-         (setf (retirement-startup-busy-p owner) t)
-         (physical-reseed-follow-test-point
-          :after-retirement-operation-busy
-          (merge-pathnames "physical-reseed.follow" (retirement-startup-directory owner)))
-         (flet ((check ()
-                  (physical-reseed-follow-retirement-check-startup-owner owner)
-                  (unless (retirement-startup-busy-p owner)
-                    (error "retirement operation lost its busy scope"))
-                  (when (retirement-startup-uncertain-p owner)
-                    (error "retirement operation requires durable reconciliation"))))
-           (check)
-           (multiple-value-prog1 (funcall function) (check))))
-    (setf (retirement-startup-busy-p owner) nil)))
+  (let ((completed nil))
+    (unwind-protect
+         (progn
+           (setf (retirement-startup-busy-p owner) t)
+           (physical-reseed-follow-test-point
+            :after-retirement-operation-busy
+            (merge-pathnames "physical-reseed.follow" (retirement-startup-directory owner)))
+           (flet ((check ()
+                    (physical-reseed-follow-retirement-check-startup-owner owner)
+                    (unless (retirement-startup-busy-p owner)
+                      (error "retirement operation lost its busy scope"))
+                    (when (retirement-startup-uncertain-p owner)
+                      (error "retirement operation requires durable reconciliation"))))
+             (check)
+             (multiple-value-prog1 (funcall function)
+               (check)
+               (when final-check (funcall final-check))
+               (setf completed t))))
+      (sb-sys:without-interrupts
+        (unwind-protect
+             (when (and (not completed) failure-cleanup) (funcall failure-cleanup))
+          (setf (retirement-startup-busy-p owner) nil))))))
 
 (defun call-with-physical-reseed-follow-retirement-startup-root (owner function)
   ;; Open and close the root descriptor around the callback.  VERIFY is valid
