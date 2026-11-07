@@ -83,6 +83,8 @@
               (physical-reseed-follow-cancellation-authority-phase authority) :written)))))
 
 (defun physical-reseed-follow-cancellation-check-publication-state (authority root-fd temporary-identity)
+  ;; Recheck the published snapshot and temporary absence, or the identity of
+  ;; the held recovery temporary before promotion.
   (let ((published (physical-reseed-follow-cancellation-authority-published authority)))
     (cond
       (published

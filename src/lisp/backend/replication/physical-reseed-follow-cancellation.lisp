@@ -1,9 +1,9 @@
-;; Begin or recover pending cancellation under the follow owner.
+;; Begin or recover cancellation under the follow owner.
 
 (in-package #:pg)
 
 (defun physical-reseed-follow-cancellation-stable (owner root-fd snapshot check)
-  ;; A stable pending marker can be synchronized after an actual abort.
+  ;; A stable cancellation marker can be synchronized after an actual abort.
   (let ((record (getf snapshot :record)))
     (unless (getf record :cancellation) (error "no pending cancellation to recover"))
     (physical-reseed-follow-cancellation-local-proof owner root-fd record)
@@ -20,8 +20,9 @@
 (declaim (ftype function physical-reseed-follow-cancellation-recover-source-closed))
 
 (defun physical-reseed-follow-cancellation-recover-temporary (owner root-fd previous temporary check)
-  ;; Promoting a temporary still requires the active attempt and its exact
-  ;; pending successor.  Its descriptor stays held through promotion.
+  ;; Dispatch source-closed recovery when cancellation is already pending.
+  ;; Initial pending recovery requires the active attempt and exact successor.
+  ;; Hold the temporary descriptor through promotion.
   (declare (notinline sb-posix:close))
   (when (getf (getf previous :record) :cancellation)
     (return-from physical-reseed-follow-cancellation-recover-temporary

@@ -1,6 +1,13 @@
+;;; Record a structural source-closed observation and recover its publication.
+;;; Completion of source cleanup requires separate operation evidence.
+
 (in-package #:pg)
 
 (defun physical-reseed-follow-record-cancellation-source-closed (owner observation)
+  ;; Record the structurally checked source observation for a pending owner.
+  ;; Cleanup completion requires separate evidence of the source operation.
+  ;; A matching source-closed retry synchronizes the saved record.  Busy remains
+  ;; held through finalization, and uncertain publication requires recovery.
   (let ((observation (physical-backup-lease-copy observation)))
     (physical-reseed-follow-check-idle-state owner)
     (setf (physical-reseed-follow-owner-busy-p owner) t)
@@ -46,6 +53,9 @@
 
 (defun physical-reseed-follow-cancellation-recover-source-closed
     (owner root-fd previous temporary check)
+  ;; Recheck the exact successor and temporary identity before promotion.
+  ;; Hold the descriptor through promotion.  Keep uncertainty latched through
+  ;; finalization.
   (declare (notinline sb-posix:close))
   (multiple-value-bind (candidate identity)
       (physical-reseed-follow-read-at root-fd "physical-reseed.follow.tmp")
