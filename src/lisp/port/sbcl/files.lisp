@@ -87,6 +87,96 @@ callers needing a coherent view across publications must compare control images.
              bytes))
       (close stream))))
 
+(defun physical-file-exclusive-flock-p (text inode)
+  (flet ((fields (line)
+           (remove "" (uiop:split-string line :separator '(#\Space #\Tab)) :test #'equal))
+         (unsigned (value radix positive)
+           (and (<= 1 (length value) 20)
+                (every (lambda (character) (digit-char-p character radix)) value)
+                (or (not positive) (some (lambda (character) (char/= character #\0)) value)))))
+    (and (stringp text) (<= (length text) 4096)
+         (let* ((lines (uiop:split-string text :separator '(#\Newline)))
+                (locks (remove-if-not
+                        (lambda (line) (and (<= 5 (length line)) (string= "lock:" line :end2 5))) lines))
+                (identities (remove-if-not
+                             (lambda (line) (and (<= 4 (length line)) (string= "ino:" line :end2 4))) lines)))
+           (and (= 1 (length locks)) (= 1 (length identities))
+                (let ((row (fields (first locks)))
+                      (identity (fields (first identities))))
+                  (and (= 9 (length row)) (= 2 (length identity))
+                       (equal "lock:" (first row)) (equal "ino:" (first identity))
+                       (unsigned (second identity) 10 t)
+                       (= inode (parse-integer (second identity)))
+                       (< 1 (length (second row)))
+                       (char= #\: (char (second row) (1- (length (second row)))))
+                       (unsigned (subseq (second row) 0 (1- (length (second row)))) 10 t)
+                       (equal '("FLOCK" "ADVISORY" "WRITE") (subseq row 2 5))
+                       (unsigned (sixth row) 10 t)
+                       (equal '("0" "EOF") (subseq row 7))
+                       (let ((file (uiop:split-string (seventh row) :separator '(#\:))))
+                         (and (= 3 (length file))
+                              (unsigned (first file) 16 nil)
+                              (unsigned (second file) 16 nil)
+                              (unsigned (third file) 10 t)
+                              (= inode (parse-integer (third file))))))))))))
+
+(defun physical-file-holds-exclusive-flock-p (borrowed-fd)
+  (let ((before (sb-posix:fstat borrowed-fd))
+        (fd nil) (stream nil)
+        (buffer (make-array 4097 :element-type '(unsigned-byte 8))))
+    (unwind-protect
+         (progn
+           (sb-sys:without-interrupts
+             (setf fd (sb-posix:open (format nil "/proc/self/fdinfo/~d" borrowed-fd)
+                                     (logior sb-posix:o-rdonly sb-posix:o-nofollow
+                                             sb-posix:o-nonblock +postmaster-o-cloexec+))
+                   stream (sb-sys:make-fd-stream fd :input t :element-type '(unsigned-byte 8))))
+           (let ((length (read-sequence buffer stream))
+                 (after (sb-posix:fstat borrowed-fd)))
+             (and (<= length 4096)
+                  (= (sb-posix:stat-dev before) (sb-posix:stat-dev after))
+                  (= (sb-posix:stat-ino before) (sb-posix:stat-ino after))
+                  (physical-file-exclusive-flock-p
+                   (sb-ext:octets-to-string buffer :end length :external-format :ascii)
+                   (sb-posix:stat-ino after)))))
+      (if stream (close stream) (when fd (sb-posix:close fd))))))
+
+(let ((revoked (make-hash-table :test #'eq :weakness :key))
+      (lock (sb-thread:make-mutex :name "file lock revocation")))
+  (defun physical-file-revoke-flock (stream &optional owner)
+    (sb-sys:without-interrupts
+      (sb-thread:with-mutex (lock)
+        (unless (and owner (gethash owner revoked))
+          (when (streamp stream) (setf (gethash stream revoked) t)))
+        (when owner (setf (gethash owner revoked) t))))
+    (values))
+
+  (defun physical-file-check-exclusive-flock (stream &optional owner)
+    (unless (streamp stream)
+      (physical-file-revoke-flock stream owner)
+      (error "physical file lost its exclusive lock"))
+    (flet ((check-revocation ()
+             (when (sb-sys:without-interrupts
+                     (sb-thread:with-mutex (lock)
+                       (when (or (gethash stream revoked)
+                                 (and owner (gethash owner revoked)))
+                         (when owner (setf (gethash owner revoked) t))
+                         t)))
+               (error "physical file lost its exclusive lock"))))
+      (check-revocation)
+      (sb-sys:without-interrupts
+        (unless (sb-sys:with-local-interrupts
+                  (handler-case
+                      (and (open-stream-p stream)
+                           (physical-file-holds-exclusive-flock-p (sb-sys:fd-stream-fd stream)))
+                    (error () nil)))
+          (sb-thread:with-mutex (lock)
+            (setf (gethash stream revoked) t)
+            (when owner (setf (gethash owner revoked) t)))
+          (error "physical file lost its exclusive lock")))
+      (check-revocation))
+    t))
+
 (defun open-relation-file (pathname)
   (ensure-directories-exist pathname)
   (open pathname
