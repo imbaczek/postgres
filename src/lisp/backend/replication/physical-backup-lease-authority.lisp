@@ -48,6 +48,9 @@
     (wal-invalid-input "backup lease handoff still owns successor ~a" name)))
 
 (defun physical-backup-lease-check-successor-create (name)
+  ;; Under WAL exclusion, durable lease history permanently reserves each
+  ;; selected successor name, even after CLOSED and restart.  This protects
+  ;; attempt proof ownership from a newly created pin using the same name.
   (when (gethash name (physical-backup-lease-successor-records))
     (wal-invalid-input "backup lease historical successor permanently reserves this name")))
 
@@ -65,6 +68,7 @@
 ;; Ordinary creation may not take any name in the lease inventory.
 (defun physical-backup-lease-check-pin-create (name request)
   (physical-backup-lease-allocation-check-unowned-name name)
+  ;; This path creates a pin, so historical successor names are not reusable.
   (physical-backup-lease-check-successor-create name)
   (let ((record (physical-backup-lease-record-under-lock name)))
     (cond
