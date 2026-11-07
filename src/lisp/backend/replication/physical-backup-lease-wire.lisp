@@ -24,7 +24,8 @@
 (defun physical-backup-lease-wire-option-keys (kind)
   (append '("native_format" "lease_name" "lease_token" "cluster_identity" "system_id" "source_timeline")
           (case kind
-            (:physical-lease-handoff '("successor_name" "successor_anchor_digest"))
+            ((:physical-lease-handoff :physical-lease-cleanup-selected)
+             '("successor_name" "successor_anchor_digest"))
             ((:physical-lease-prepare-follow :physical-lease-cancel-follow)
              (append '("allocation_generation" "allocation_name")
                      (loop for (name) in *physical-follow-wire-fields*
@@ -68,7 +69,7 @@
                                  :cluster-identity (value "cluster_identity")
                                  :system-id (physical-stream-u64 (value "system_id"))
                                  :timeline (physical-stream-u64 (value "source_timeline")))))
-                 (successor (when (eq kind :physical-lease-handoff)
+                 (successor (when (member kind '(:physical-lease-handoff :physical-lease-cleanup-selected))
                               (physical-backup-lease-successor-copy
                                (list :name (value "successor_name") :anchor-digest
                                      (physical-stream-u64 (value "successor_anchor_digest")))
@@ -120,7 +121,8 @@
       ((:physical-lease-handoff :physical-lease-prepare-follow)
        (prevent-recovery-primary-operation "backup lease handoff")
        (with-wal-critical (wal-check-healthy)))
-      ((:physical-lease-status :physical-lease-abort :physical-lease-cancel-follow) nil)
+      ((:physical-lease-status :physical-lease-abort :physical-lease-cancel-follow
+                               :physical-lease-cleanup-selected) nil)
       (otherwise (ereport "42601" "unsupported native backup lease command")))))
 
 (defun send-native-backup-lease-row (stream row schema tag)
@@ -216,6 +218,10 @@
                  (ecase kind
                    (:physical-lease-status (physical-backup-lease-status request))
                    (:physical-lease-abort (physical-backup-lease-abort request))
+                   (:physical-lease-cleanup-selected
+                    (physical-backup-lease-cleanup-selected
+                     request (cdr (assoc "successor" (logical-replication-command-options command)
+                                         :test #'equal))))
                    (:physical-lease-handoff
                     (physical-backup-lease-handoff
                      request (cdr (assoc "successor" (logical-replication-command-options command)

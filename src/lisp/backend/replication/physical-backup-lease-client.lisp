@@ -59,10 +59,10 @@
 
 (defun pg-client-native-backup-lease-query (verb request &optional successor)
   (unless (member verb '("CAPTURE_BACKUP_NATIVE" "BACKUP_LEASE_STATUS" "BACKUP_LEASE_ABORT"
-                         "BACKUP_LEASE_HANDOFF") :test #'equal)
+                         "BACKUP_LEASE_HANDOFF" "BACKUP_LEASE_CLEANUP_SELECTED") :test #'equal)
     (error "invalid native backup lease query command"))
   (let* ((request (physical-backup-lease-request-copy request))
-         (successor (if (equal verb "BACKUP_LEASE_HANDOFF")
+         (successor (if (member verb '("BACKUP_LEASE_HANDOFF" "BACKUP_LEASE_CLEANUP_SELECTED") :test #'equal)
                         (physical-backup-lease-successor-copy successor request)
                         (when successor (error "unexpected backup lease successor")))))
     (pg-client-native-backup-lease-option-query
@@ -154,7 +154,8 @@
 ;; exact successor. The caller must settle an uncertain result after reconnecting
 ;; to the original frozen route.
 (defun pg-client-native-backup-lease-command (client verb request &optional successor)
-  (unless (member verb '("BACKUP_LEASE_STATUS" "BACKUP_LEASE_ABORT" "BACKUP_LEASE_HANDOFF") :test #'equal)
+  (unless (member verb '("BACKUP_LEASE_STATUS" "BACKUP_LEASE_ABORT" "BACKUP_LEASE_HANDOFF"
+                         "BACKUP_LEASE_CLEANUP_SELECTED") :test #'equal)
     (error "native backup lease command requires a status result"))
   (let* ((request (physical-backup-lease-request-copy request))
          (successor (when successor (physical-backup-lease-successor-copy successor request)))
@@ -165,7 +166,7 @@
                (not (and (member (getf record :phase) '(:closing :closed))
                          (eq :aborted (getf record :outcome)))))
       (pg-client-native-reject "native backup lease abort did not confirm cancellation"))
-    (when (and (equal verb "BACKUP_LEASE_HANDOFF")
+    (when (and (member verb '("BACKUP_LEASE_HANDOFF" "BACKUP_LEASE_CLEANUP_SELECTED") :test #'equal)
                (not (and (eq :closed (getf record :phase))
                          (eq :handed-off (getf record :outcome))
                          (equal successor (getf record :successor)))))
@@ -180,6 +181,9 @@
 
 (defun pg-client-native-backup-lease-handoff (client request successor)
   (pg-client-native-backup-lease-command client "BACKUP_LEASE_HANDOFF" request successor))
+
+(defun pg-client-native-backup-lease-cleanup-selected (client request successor)
+  (pg-client-native-backup-lease-command client "BACKUP_LEASE_CLEANUP_SELECTED" request successor))
 
 (defun physical-backup-lease-check-received-status (manifest digest request record)
   (setf request (physical-backup-lease-request-copy request))

@@ -41,6 +41,7 @@
                (:file "t/physical-backup-lease-status-tests")
                (:file "t/physical-backup-lease-capture-tests")
                (:file "t/physical-backup-lease-wire-tests")
+               (:file "t/physical-backup-lease-cleanup-wire-tests")
                (:file "t/export-origin-tests")
                (:file "t/physical-recovery-tests")
                (:file "t/auth-backup-tests")

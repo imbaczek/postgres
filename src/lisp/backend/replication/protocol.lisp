@@ -206,6 +206,7 @@
     ("BACKUP_LEASE_STATUS" . :physical-lease-status)
     ("BACKUP_LEASE_ABORT" . :physical-lease-abort)
     ("BACKUP_LEASE_HANDOFF" . :physical-lease-handoff)
+    ("BACKUP_LEASE_CLEANUP_SELECTED" . :physical-lease-cleanup-selected)
     ("BACKUP_LEASE_PREPARE_FOLLOW" . :physical-lease-prepare-follow)
     ("BACKUP_LEASE_CANCEL_FOLLOW" . :physical-lease-cancel-follow)))
 
@@ -1031,7 +1032,8 @@ keepalive's WAL-end field, which may include changes not yet applied."
     (ereport "55000" "logical decoding requires a database connection"))
   ;; All non-read-only commands retain their recovery write guard.
   (unless (member (logical-replication-command-type command) '(:identify :timeline-history :show :physical-release :physical-bootstrap-release
-                                                               :physical-lease-status :physical-lease-abort :physical-lease-cancel-follow))
+                                                               :physical-lease-status :physical-lease-abort :physical-lease-cancel-follow
+                                                               :physical-lease-cleanup-selected))
     (prevent-recovery-write "logical replication state change"))
   (when (and (eq (logical-replication-command-type command) :create)
              (eq (logical-replication-command-snapshot-action command) :export)
@@ -1039,6 +1041,7 @@ keepalive's WAL-end field, which may include changes not yet applied."
     (ereport "25001" "EXPORT_SNAPSHOT cannot run inside a transaction block"))
   (when (and (member (logical-replication-command-type command) '(:start :physical-start :physical-backup :physical-prepare :physical-prove :physical-release :physical-bootstrap-release :timeline-history
                                                                   :physical-lease-capture :physical-lease-status :physical-lease-abort :physical-lease-handoff
+                                                                  :physical-lease-cleanup-selected
                                                                   :physical-lease-prepare-follow :physical-lease-cancel-follow))
              (backend-explicit *backend*))
     (ereport "25001" "~a cannot run inside a transaction block"
@@ -1049,6 +1052,7 @@ keepalive's WAL-end field, which may include changes not yet applied."
                (:physical-lease-status "BACKUP_LEASE_STATUS")
                (:physical-lease-abort "BACKUP_LEASE_ABORT")
                (:physical-lease-handoff "BACKUP_LEASE_HANDOFF")
+               (:physical-lease-cleanup-selected "BACKUP_LEASE_CLEANUP_SELECTED")
                (:physical-lease-prepare-follow "BACKUP_LEASE_PREPARE_FOLLOW")
                (:physical-lease-cancel-follow "BACKUP_LEASE_CANCEL_FOLLOW")
                (:physical-prepare "PREPARE_FOLLOW")
@@ -1092,7 +1096,8 @@ keepalive's WAL-end field, which may include changes not yet applied."
             (:physical-backup (start-native-physical-backup stream command))
             (:physical-lease-capture (start-native-backup-lease-capture stream command))
             ((:physical-lease-status :physical-lease-abort :physical-lease-handoff
-                                     :physical-lease-prepare-follow :physical-lease-cancel-follow)
+                                     :physical-lease-cleanup-selected
+              :physical-lease-prepare-follow :physical-lease-cancel-follow)
              (execute-native-backup-lease-command stream command))
             (:physical-prepare (prepare-native-physical-follow stream command))
             (:physical-prove (prove-native-physical-retained stream command))
