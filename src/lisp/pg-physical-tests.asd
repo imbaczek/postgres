@@ -116,6 +116,7 @@
                (:file "t/physical-reseed-follow-retirement-temporary-tests")
                (:file "t/physical-reseed-follow-retirement-pid-tests")
                (:file "t/physical-reseed-follow-startup-tests")
+               (:file "t/physical-reseed-follow-main-native-tests")
                (:file "t/physical-reseed-follow-retirement-intent-tests")
                (:file "t/wal-timeline-tests")
                (:file "t/wal-eor-tests")
