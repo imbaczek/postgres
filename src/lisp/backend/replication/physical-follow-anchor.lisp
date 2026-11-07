@@ -85,6 +85,7 @@ pin; an ambiguous save fences the source and keeps retention until restart."
                 (wal-invalid-input "physical follow pin name is already bound to another request"))
               (physical-follow-pin-check-live existing)
               (return-from physical-source-follow-reserve existing)))
+          (physical-backup-lease-check-successor-create name)
           (when (probe-file (physical-source-pin-path name))
             (wal-invalid-input "physical follow pin file is unregistered; restart is required"))
           (handler-case
@@ -288,6 +289,7 @@ The existing pin keeps any confirmation already advanced."
       (physical-backup-lease-allocation-check-prepare name request nil t)
       (physical-follow-check-attempt-name name)
       (let ((pin (gethash name *physical-source-pins*)))
+        (unless pin (physical-backup-lease-check-successor-create name))
         (when pin
           (unless (and (physical-follow-pin-p pin)
                        (physical-follow-request-matches-anchor-p request (physical-follow-pin-anchor pin)))

@@ -47,6 +47,10 @@
   (when (physical-backup-lease-closing-successor name)
     (wal-invalid-input "backup lease handoff still owns successor ~a" name)))
 
+(defun physical-backup-lease-check-successor-create (name)
+  (when (gethash name (physical-backup-lease-successor-records))
+    (wal-invalid-input "backup lease historical successor permanently reserves this name")))
+
 (defun physical-backup-lease-check-ordinary-pin (name)
   (physical-backup-lease-check-successor-mutation name)
   (when (physical-backup-lease-record-under-lock name)
@@ -61,7 +65,7 @@
 ;; Ordinary creation may not take any name in the lease inventory.
 (defun physical-backup-lease-check-pin-create (name request)
   (physical-backup-lease-allocation-check-unowned-name name)
-  (physical-backup-lease-check-successor-mutation name)
+  (physical-backup-lease-check-successor-create name)
   (let ((record (physical-backup-lease-record-under-lock name)))
     (cond
       (request
