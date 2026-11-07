@@ -118,6 +118,7 @@
                (:file "t/physical-reseed-follow-startup-tests")
                (:file "t/physical-reseed-follow-main-native-tests")
                (:file "t/physical-reseed-follow-cancellation-tests")
+               (:file "t/physical-reseed-follow-cancellation-source-tests")
                (:file "t/physical-reseed-follow-cancellation-operation-tests")
                (:file "t/physical-reseed-follow-cancellation-publication-tests")
                (:file "t/physical-reseed-follow-cancellation-fault-tests")
