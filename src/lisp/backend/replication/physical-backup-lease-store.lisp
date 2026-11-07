@@ -180,6 +180,8 @@
                (<= count *physical-backup-lease-limit*))
     (wal-invalid-input "backup lease inventory is at capacity")))
 
+(declaim (ftype function physical-backup-lease-check-successor-create))
+
 (declaim (ftype function physical-backup-lease-check-handoff-publication))
 
 (declaim (ftype function physical-backup-lease-allocation-check-unowned-name))
@@ -195,7 +197,9 @@
   (let* ((request (getf after :request)) (name (getf request :name)))
     (physical-backup-lease-check-source
      request :current-timeline (member (getf after :phase) '(:requested :capturing :ready)))
-    (when (null before) (physical-backup-lease-allocation-check-unowned-name name))
+    (when (null before)
+      (physical-backup-lease-allocation-check-unowned-name name)
+      (physical-backup-lease-check-successor-create name))
     (unless (equal before (gethash name *physical-backup-lease-records*))
       (wal-invalid-input "backup lease caller has stale state"))
     (when (and (null before)

@@ -28,7 +28,7 @@
                                          :seed 190 :profile :normal))))
       (ok (eq :passed (getf result :status)))))
 
-(defun call-with-backup-lease-closed-successor-fixture (function)
+(defun call-with-backup-lease-closed-successor-fixture (function &optional selected-name)
   (call-with-backup-lease-authority-fixture
    (lambda (root)
      (let ((pg::*physical-follow-aborted-attempts* (make-hash-table :test #'equal))
@@ -36,7 +36,10 @@
        (multiple-value-bind (record bootstrap) (backup-lease-authority-prepare t)
          (declare (ignore bootstrap))
          (backup-lease-startup-save-origin record)
-         (let* ((pin (backup-lease-startup-prepare-successor record))
+         (let* ((prime (backup-lease-startup-prepare-successor record))
+                (pin (if selected-name
+                         (pg::physical-source-follow-ready selected-name (pg::physical-follow-pin-anchor prime))
+                         prime))
                 (anchor (pg::physical-follow-anchor-copy (pg::physical-follow-pin-anchor pin)))
                 (successor (list :name (pg::physical-source-pin-name pin)
                                  :anchor-digest (pg::physical-follow-anchor-digest anchor)))
@@ -205,3 +208,83 @@
                                        pid (namestring root) mode) raw))
                    (ok (search (format nil "SOURCE-NAME-FENCE-CHILD-VERIFIED ~d ~s ~s"
                                        pid (namestring root) mode) raw)))))))))))
+
+(defun backup-lease-successor-admission-request ()
+  (let ((request (pg::physical-backup-lease-request-copy (backup-lease-test-request))))
+    (setf (char (getf request :name) 7) #\f
+          (char (getf request :token) 0) #\b)
+    (pg::physical-backup-lease-request-copy request)))
+
+(deftest backup-lease-historical-successor-rejects-new-lease-admission
+    (dolist (reload '(nil t))
+      (dolist (lane '(:publish :capture :abort))
+        (let ((request (backup-lease-successor-admission-request)))
+          (call-with-backup-lease-closed-successor-fixture
+           (lambda (root closed pin anchor)
+             (declare (ignore root))
+             (pg::physical-source-follow-release
+              (pg::physical-source-pin-name pin) (pg::physical-follow-anchor-digest anchor))
+             (setf pg::*physical-follow-aborted-attempts* (make-hash-table :test #'equal))
+             (when reload (backup-lease-startup-reopen))
+             (let* ((name (getf request :name))
+                    (parent-path (pg::physical-backup-lease-path (getf closed :request)))
+                    (before (lineage-test-bytes parent-path))
+                    (writes 0)
+                    (pg::*physical-backup-lease-test-hook*
+                      (lambda (point value)
+                        (declare (ignore value))
+                        (when (eq point :before-write) (incf writes)))))
+               (ok (equal "backup lease historical successor permanently reserves this name"
+                          (handler-case
+                              (progn
+                                (ecase lane
+                                  (:publish
+                                   (pg::physical-backup-lease-publish
+                                    nil (list :version 1 :request request :phase :requested
+                                              :base nil :outcome nil :successor nil)))
+                                  (:capture (pg::physical-backup-lease-claim-capture request))
+                                  (:abort (pg::physical-backup-lease-abort request)))
+                                :accepted)
+                            (pg::wal-input-validation-error (condition)
+                              (princ-to-string condition)))))
+               (ok (not (probe-file (pg::physical-backup-lease-path request))))
+               (ok (null (gethash name pg::*physical-backup-lease-records*)))
+               (ok (null (gethash name pg::*physical-backup-lease-capture-owners*)))
+               (ok (equalp before (lineage-test-bytes parent-path)))
+               (ok (zerop writes))
+               (ok (not pg::*wal-poisoned*))))
+           (getf request :name))))))
+
+(deftest backup-lease-historical-successor-keeps-preexisting-lease-records-readable
+    (let ((request (backup-lease-successor-admission-request)))
+      (call-with-backup-lease-closed-successor-fixture
+       (lambda (root closed pin anchor)
+         (declare (ignore root))
+         (pg::physical-source-follow-release
+          (pg::physical-source-pin-name pin) (pg::physical-follow-anchor-digest anchor))
+         (let* ((legacy (pg::physical-backup-lease-copy
+                         (list :version 1 :request request :phase :requested
+                               :base nil :outcome nil :successor nil)))
+                (parent-path (pg::physical-backup-lease-path (getf closed :request)))
+                (before (lineage-test-bytes parent-path))
+                (recovered (copy-tree legacy)))
+           (setf (getf recovered :phase) :interrupted)
+           (pg::with-write-lock
+             (pg::with-wal-publication-fence (begin-publication)
+               (begin-publication)
+               (pg::physical-backup-lease-write legacy)))
+           (backup-lease-startup-reopen)
+           (multiple-value-bind (observed owner) (pg::physical-backup-lease-claim-capture request)
+             (ok (equal recovered observed))
+             (ok (null owner)))
+           (let ((aborted (pg::physical-backup-lease-abort request)))
+             (ok (eq :closed (getf aborted :phase)))
+             (ok (eq :aborted (getf aborted :outcome)))
+             (backup-lease-startup-reopen)
+             (ok (equal aborted (pg::physical-backup-lease-status request))))
+           (ok (equalp before (lineage-test-bytes parent-path)))
+           (ok (equal closed (pg::physical-backup-lease-handoff
+                              (getf closed :request) (getf closed :successor))))
+           (ok (null (gethash (getf request :name) pg::*physical-source-pins*)))
+           (ok (not pg::*wal-poisoned*))))
+       (getf request :name))))
