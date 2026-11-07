@@ -23,6 +23,8 @@
 (defun physical-backup-lease-load-standby-pins ()
   (physical-backup-lease-load-startup-pins t))
 
+(declaim (ftype function physical-backup-lease-selected-observation-under-lock))
+
 ;; Validate the closing intent and its successor before finding the bootstrap
 ;; pin to remove. The successor may be present only on disk during startup.
 (defun physical-backup-lease-closing-pin (record)
@@ -31,11 +33,10 @@
     (unless (and (eq :closing (getf current :phase)) (equal current record))
       (wal-invalid-input "backup lease has no matching closing intent"))
     (when (eq :handed-off (getf record :outcome))
-      (let ((name (getf (getf record :successor) :name)))
-        (multiple-value-bind (successor disk) (physical-source-retirement-pins name)
-          (declare (ignore disk))
-          (physical-backup-lease-check-successor-pin record successor)
-          (physical-follow-pin-check-wal successor))))
+      (let ((successor
+              (nth-value 1 (physical-backup-lease-selected-observation-under-lock record))))
+        (physical-backup-lease-check-successor-pin record successor)
+        (physical-follow-pin-check-wal successor)))
     (physical-backup-lease-check-successor-assignment record)
     (physical-backup-lease-pin-directory-stat)
     (multiple-value-bind (pin disk) (physical-source-retirement-pins (getf request :name))
