@@ -11,6 +11,7 @@
 ;; publication checks.  Adopt the canonical post-rename snapshot before hooks
 ;; can observe the new journal generation.
 (defun physical-reseed-follow-promote-intent (owner root-fd fd fixed candidate previous check)
+  ;; A cancellation promotion claims the held temporary before mutation.
   (declare (notinline sb-posix:fsync))
   (unless (and (physical-reseed-follow-owner-busy-p owner)
                (physical-reseed-follow-owner-uncertain-p owner))
@@ -71,6 +72,7 @@
 ;; an incomplete exit preserves the temporary or final entry for a new owner.
 
 (defun physical-reseed-follow-write-intent (owner root-fd candidate bytes previous check)
+  ;; A cancellation write claims its typed authority before creating the file.
   (declare (notinline sb-posix:close))
   (physical-reseed-follow-cancellation-claim owner root-fd candidate previous :write :bytes bytes)
   (let ((fd nil) (fixed nil)

@@ -105,6 +105,8 @@
 ;; uncertainty.  An incomplete mutation requires closing and reopening the owner.
 
 (defun call-with-physical-reseed-follow-held-store (owner function)
+  ;; The caller owns busy and uncertainty.  Hold the image and attempt checks
+  ;; around the callback, then verify final metadata before returning.
   (unless (physical-reseed-follow-owner-busy-p owner)
     (error "target follow held store requires an active operation"))
   (let ((result

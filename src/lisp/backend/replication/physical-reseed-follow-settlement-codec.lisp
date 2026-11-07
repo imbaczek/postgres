@@ -104,6 +104,7 @@
                           +physical-reseed-follow-maximum-bytes+))))
 
 (defun physical-reseed-follow-capacity-reserve (record)
+  ;; Pending cancellation releases the reserve for ordinary follow completion.
   (if (getf record :cancellation)
       0
       (+ (case (getf (car (last (getf record :generations))) :phase)

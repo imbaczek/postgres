@@ -66,6 +66,8 @@
   nil)
 
 (defun physical-reseed-follow-check-idle-state (owner)
+  ;; Check ownership and exclude nested or uncertain operations.  Cancellation
+  ;; recovery uses this state check even when a pending marker fences forward work.
   (unless (physical-reseed-follow-owner-p owner) (error "target follow ownership is required"))
   (physical-directory-check-owner-common owner)
   (when (or *physical-reseed-follow-installation-scope* *physical-reseed-follow-activation-scope*)
@@ -77,6 +79,7 @@
   owner)
 
 (defun physical-reseed-follow-check-idle (owner)
+  ;; Ordinary operations also require a journal without pending cancellation.
   (physical-reseed-follow-check-idle-state owner)
   (call-with-physical-directory-root
    owner

@@ -1,6 +1,11 @@
+;; Verify the published cancellation through resource cleanup.
+
 (in-package #:pg)
 
 (defun physical-reseed-follow-cancellation-cleanup-stamp (owner root-fd check)
+  ;; Derive installed descendants and old opaque top-level entries from the
+  ;; authenticated root, incoming and quarantine inventories.  The audit uses
+  ;; those rows without a recursive scan.
   (funcall check)
   (let* ((plan (physical-reseed-install-owner-plan owner))
          (prefix (1- (physical-reseed-install-last-step plan)))
@@ -33,6 +38,7 @@
     (list :paths paths :roles (nreverse roles))))
 
 (defun physical-reseed-follow-cancellation-check-cleanup-stamp (stamp)
+  ;; Recheck named metadata without opening a new owned descriptor scope.
   (dolist (binding (getf stamp :paths))
     (unless (equal binding (physical-reseed-follow-retirement-path-fact (first binding)))
       (error "cancellation ancestor changed during resource cleanup")))
@@ -48,6 +54,8 @@
   t)
 
 (defun call-with-physical-reseed-follow-cancellation-finalization (owner function)
+  ;; Keep the journal open and check its bytes through image and root cleanup.
+  ;; After it closes, audit named image metadata before clearing uncertainty.
   (let ((fd nil) (stream nil) (snapshot nil) (stamp nil) (bytes nil) (mount nil)
                  (complete nil))
     (labels ((source-check ()

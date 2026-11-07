@@ -1,6 +1,9 @@
+;; Bind cancellation publication to a checked, one-use local authority.
+
 (in-package #:pg)
 
 (defun physical-reseed-follow-cancellation-preconfiguration-record (value)
+  ;; Publication is allowed only before configuration and later follow phases.
   (let* ((record (physical-reseed-follow-copy value))
          (generations (getf record :generations)))
     (unless (and (notany (lambda (key) (getf record key))
@@ -15,6 +18,8 @@
             (:constructor %make-physical-reseed-follow-cancellation-authority)
             (:copier nil)
             (:print-function physical-libpq-print-private-object))
+  ;; Bind publication to the owner, root, thread, predecessor and canonical
+  ;; bytes for one active scope.  The phase limits each effect to one claim.
   (owner nil :read-only t) (root-fd nil :read-only t) (thread nil :read-only t)
   (candidate nil :read-only t) (previous nil :read-only t) (bytes nil :read-only t)
   (mode nil :read-only t) (scope nil :read-only t) (check nil :read-only t)
@@ -24,6 +29,7 @@
 
 (defun physical-reseed-follow-cancellation-claim (owner root-fd candidate previous operation
                                                   &key bytes fd)
+  ;; Claim the write or promotion before callbacks can reenter the operation.
   (let ((authority *physical-reseed-follow-cancellation-authority*))
     (when (or authority (getf candidate :cancellation)
               (getf (getf previous :record) :cancellation))
@@ -55,6 +61,7 @@
     authority))
 
 (defun physical-reseed-follow-cancellation-write-complete (owner root-fd fd fixed candidate previous)
+  ;; Bind the completed temporary descriptor to the claimed write.
   (let ((authority *physical-reseed-follow-cancellation-authority*))
     (when authority
       (unless (and (physical-reseed-follow-cancellation-authority-active-p authority)
@@ -77,6 +84,8 @@
 
 (defun call-with-physical-reseed-follow-cancellation-authority
     (owner root-fd candidate previous bytes mode check function &optional fd temporary-identity)
+  ;; Keep the authority in acquiring phase during its initial proof so a
+  ;; reentrant call cannot use it before verification finishes.
   (when *physical-reseed-follow-cancellation-authority*
     (error "cancellation authority cannot reenter acquisition or publication"))
   (let* ((frozen (physical-reseed-follow-cancellation-preconfiguration-record candidate))
@@ -133,6 +142,7 @@
           (setf (physical-reseed-follow-cancellation-authority-active-p authority) nil))))))
 
 (defun physical-reseed-follow-cancellation-local-proof (owner root-fd value)
+  ;; Check local intent and any proof already present in the predecessor.
   (let ((record (physical-reseed-follow-cancellation-preconfiguration-record value)))
     (physical-reseed-follow-check-local-intent owner root-fd record)
     (when (eq :proved (getf (first (getf record :generations)) :phase))
@@ -141,6 +151,7 @@
 
 (defmethod physical-reseed-follow-published-snapshot :around
     ((owner physical-reseed-follow-owner) root-fd candidate snapshot previous)
+  ;; Adopt exactly one verified published snapshot into this authority.
   (let ((authority *physical-reseed-follow-cancellation-authority*))
     (when authority
       (unless (and (physical-reseed-follow-cancellation-authority-active-p authority)

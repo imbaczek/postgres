@@ -1,6 +1,9 @@
+;; Begin or recover pending cancellation under the follow owner.
+
 (in-package #:pg)
 
 (defun physical-reseed-follow-cancellation-stable (owner root-fd snapshot check)
+  ;; A stable pending marker can be synchronized after an actual abort.
   (let ((record (getf snapshot :record)))
     (unless (getf record :cancellation) (error "no pending cancellation to recover"))
     (physical-reseed-follow-cancellation-local-proof owner root-fd record)
@@ -15,6 +18,8 @@
     (values (physical-reseed-follow-copy record) snapshot)))
 
 (defun physical-reseed-follow-cancellation-recover-temporary (owner root-fd previous temporary check)
+  ;; Promoting a temporary still requires the active attempt and its exact
+  ;; pending successor.  Its descriptor stays held through promotion.
   (declare (notinline sb-posix:close))
   (physical-reseed-follow-check-active-attempt owner)
   (when (getf (getf previous :record) :cancellation)
@@ -59,6 +64,9 @@
        (physical-reseed-follow-write-intent owner root-fd candidate bytes previous verify)))))
 
 (defun call-with-physical-reseed-follow-cancellation-store (owner operation)
+  ;; This scope owns busy through finalization.  Read-only admission leaves
+  ;; certainty intact.  Publication latches uncertainty before possible disk
+  ;; mutation and retains it until finalization succeeds.
   (physical-reseed-follow-check-idle-state owner)
   (setf (physical-reseed-follow-owner-busy-p owner) t)
   (unwind-protect
@@ -90,7 +98,9 @@
       (setf (physical-reseed-follow-owner-busy-p owner) nil))))
 
 (defun physical-reseed-follow-begin-cancellation (owner)
+  ;; Publish pending cancellation for an eligible predecessor.
   (call-with-physical-reseed-follow-cancellation-store owner :begin))
 
 (defun physical-reseed-follow-recover-cancellation (owner)
+  ;; Reconcile a stable pending marker or an eligible temporary.
   (call-with-physical-reseed-follow-cancellation-store owner :recover))

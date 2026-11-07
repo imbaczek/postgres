@@ -4,7 +4,8 @@
 
 (defun physical-reseed-follow-check-terminal-startup (observation)
   ;; Main startup admits only terminal retirement evidence.  Generic
-  ;; observation also supports inspecting earlier recovery states.
+  ;; observation also supports inspecting earlier recovery states.  A pending
+  ;; cancellation fences retirement startup.
   (case (getf observation :branch)
     (:ordinary observation)
     ((:retirement :retired)
