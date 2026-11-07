@@ -221,6 +221,7 @@
                    (:file "../replication/physical-reseed-follow-settlement-codec")
                    (:file "../replication/physical-reseed-follow-activation-codec")
                    (:file "../replication/physical-reseed-follow-retirement-codec")
+                   (:file "../replication/physical-reseed-follow-cancellation-source")
                    (:file "../replication/physical-reseed-follow-cancellation-codec")
                    (:file "../replication/physical-reseed-follow-capacity")
                    (:file "../replication/physical-reseed-follow-settlement-source")

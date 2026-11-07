@@ -146,7 +146,7 @@
       (when cancellation-p
         (setf core (append core (list :cancellation
                                       (physical-reseed-follow-cancellation-copy
-                                       (getf record :cancellation))))))
+                                       (getf record :cancellation) core)))))
       core)))
 
 ;; The original attempt, install reference and base remain immutable.  Append
