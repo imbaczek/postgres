@@ -51,6 +51,7 @@
          (record (physical-reseed-follow-activation-context-record context))
          (activation (getf record :activation))
          (generations (getf record :generations)))
+    (physical-reseed-follow-check-forward-record record)
     (unless (and (eq context (physical-reseed-follow-activation-context owner))
                  (member (getf activation :phase) '(:staged :activating))
                  (zerop (getf activation :step))
@@ -124,6 +125,7 @@
          (before (nth-value 1 (physical-reseed-follow-entry root name t))))
     (unless before (error "initial activation recovery requires its complete temporary"))
     (multiple-value-bind (record identity) (physical-reseed-follow-read-at root name)
+      (physical-reseed-follow-check-forward-record record)
       (unless (and (equal record (physical-reseed-follow-activation-intent-record
                                   (physical-reseed-follow-activation-context-record context)))
                    (equal before (nth-value 1 (physical-reseed-follow-entry root name t))))
@@ -637,6 +639,7 @@
                                                                 (let* ((context (physical-reseed-follow-activation-context owner))
                                                                        (record (physical-reseed-follow-activation-context-record context))
                                                                        (activation (getf record :activation)))
+                                                                  (physical-reseed-follow-check-forward-record record)
                                                                   (funcall check)
                                                                   (physical-reseed-follow-activation-require-attempt context)
                                                                   (physical-adoption-require-absent

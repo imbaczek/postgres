@@ -104,17 +104,20 @@
                           +physical-reseed-follow-maximum-bytes+))))
 
 (defun physical-reseed-follow-capacity-reserve (record)
-  (+ (case (getf (car (last (getf record :generations))) :phase)
-       (:preparing +physical-reseed-follow-proof-reserve+)
-       ((:proved :canceling) 32)
-       (otherwise 0))
-     (if (eq :building (getf (getf record :configuration) :phase))
-         +physical-reseed-follow-configuration-reserve+ 0)))
+  (if (getf record :cancellation)
+      0
+      (+ (case (getf (car (last (getf record :generations))) :phase)
+           (:preparing +physical-reseed-follow-proof-reserve+)
+           ((:proved :canceling) 32)
+           (otherwise 0))
+         (if (eq :building (getf (getf record :configuration) :phase))
+             +physical-reseed-follow-configuration-reserve+ 0))))
 
 ;; Reserve space for the larger terminal receipt as well as existing margins.
 (defun physical-reseed-follow-check-image-capacity (record encoded-length maximum)
   (let* ((reserve (physical-reseed-follow-capacity-reserve record))
-         (required (if (eq :handoff-pending (getf (getf record :settlement) :phase))
+         (required (if (and (null (getf record :cancellation))
+                            (eq :handoff-pending (getf (getf record :settlement) :phase)))
                        (max encoded-length (physical-reseed-follow-settlement-terminal-size record))
                        encoded-length)))
     (unless (<= (+ required reserve) maximum)

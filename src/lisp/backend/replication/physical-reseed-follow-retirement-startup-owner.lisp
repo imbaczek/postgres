@@ -18,6 +18,8 @@
                (retirement-startup-active-p owner)
                (eq (retirement-startup-thread owner) sb-thread:*current-thread*))
     (error "retirement startup owner ended or changed thread"))
+  (when (getf (getf (getf (retirement-startup-evidence owner) :snapshot) :record) :cancellation)
+    (error "target cancellation fences retirement startup"))
   (physical-adoption-check-startup-quiescence)
   (let* ((directory (retirement-startup-directory owner))
          (lock (retirement-startup-lock owner))
@@ -158,6 +160,8 @@
   ;; Bind trusted handover evidence to published postmaster ownership.
   ;; Require the branch and journal geometry to agree before saving the
   ;; evidence.  Reprove it before the callback and revoke the owner on exit.
+  (when (getf (getf (getf (getf expected :evidence) :snapshot) :record) :cancellation)
+    (error "target cancellation fences retirement startup"))
   (unless (and (case (getf expected :branch)
                  (:retirement (null (getf (getf expected :evidence) :journal)))
                  (:retired (member (getf (getf (getf expected :evidence) :journal) :geometry)

@@ -48,12 +48,14 @@
                 (physical-adoption-require-absent
                  (merge-pathnames "physical-reseed.follow.tmp" (physical-image-fd-path fd))
                  "target follow temporary requires reconciliation")
-                (physical-reseed-follow-read-at fd "physical-reseed.follow" :stabilize t)
                 (let* ((follow (physical-reseed-follow-snapshot-at fd))
                        (record (getf follow :record))
                        (generations (getf record :generations))
                        (current (list :follow follow
                                       :attempt (physical-reseed-follow-attempt-snapshot-at fd))))
+                  (physical-reseed-follow-check-forward-record record)
+                  (physical-reseed-follow-read-at fd "physical-reseed.follow" :stabilize t)
+                  (physical-reseed-follow-check-network-snapshot-at fd current)
                   (unless (and (= 1 (length generations))
                                (member (getf (first generations) :phase) '(:preparing :proved)))
                     (error "target follow source preparation requires one preparing or proved generation"))

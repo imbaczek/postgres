@@ -15,6 +15,7 @@
   (unless (and (physical-reseed-follow-owner-busy-p owner)
                (physical-reseed-follow-owner-uncertain-p owner))
     (error "target follow promotion requires an active uncertain store scope"))
+  (physical-reseed-follow-cancellation-claim owner root-fd candidate previous :promote :fd fd)
   (let ((name "physical-reseed.follow.tmp")
         (path (merge-pathnames "physical-reseed.follow" (physical-image-fd-path root-fd)))
         (renamed nil))
@@ -70,6 +71,8 @@
 ;; an incomplete exit preserves the temporary or final entry for a new owner.
 
 (defun physical-reseed-follow-write-intent (owner root-fd candidate bytes previous check)
+  (declare (notinline sb-posix:close))
+  (physical-reseed-follow-cancellation-claim owner root-fd candidate previous :write :bytes bytes)
   (let ((fd nil) (fixed nil)
                  (path (merge-pathnames "physical-reseed.follow.tmp" (physical-image-fd-path root-fd))))
     (unwind-protect
@@ -106,6 +109,7 @@
                 fd bytes 0 path :limit *physical-reseed-follow-write-limit* :point :after-follow-write-chunk))
              (unless (= (length bytes) (sixth (held)))
                (error "target follow temporary length differs from its frozen image"))
+             (physical-reseed-follow-cancellation-write-complete owner root-fd fd fixed candidate previous)
              (physical-reseed-follow-promote-intent owner root-fd fd fixed candidate previous check)))
       (when fd (sb-posix:close fd)))))
 

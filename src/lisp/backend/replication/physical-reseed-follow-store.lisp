@@ -9,7 +9,7 @@
 (defun physical-reseed-follow-intent-copy (record &optional previous)
   (let* ((copy (physical-reseed-follow-copy record))
          (generations (getf copy :generations)))
-    (unless (and (<= (length generations) 1)
+    (unless (and (null (getf copy :cancellation)) (<= (length generations) 1)
                  (every (lambda (row) (eq :preparing (getf row :phase))) generations))
       (error "target follow intent publication cannot certify a remote outcome"))
     (when previous
@@ -104,35 +104,48 @@
 ;; attempt after the image post-check and final metadata check, before clearing
 ;; uncertainty.  An incomplete mutation requires closing and reopening the owner.
 
+(defun call-with-physical-reseed-follow-held-store (owner function)
+  (unless (physical-reseed-follow-owner-busy-p owner)
+    (error "target follow held store requires an active operation"))
+  (let ((result
+          (call-with-physical-directory-root
+           owner
+           (lambda (root-fd directory)
+             (declare (ignore directory))
+             (let ((attempt (physical-reseed-follow-attempt-snapshot-at root-fd)))
+               (flet ((attempt-check ()
+                        (physical-reseed-follow-check-attempt-snapshot-at root-fd attempt)))
+                 (multiple-value-bind (record snapshot)
+                     (call-with-physical-reseed-follow-image
+                      owner
+                      (lambda (image-fd image-check)
+                        (flet ((check () (funcall image-check) (attempt-check)))
+                          (check)
+                          (funcall function image-fd #'check))))
+                   (attempt-check)
+                   (physical-reseed-follow-check-final-metadata root-fd snapshot)
+                   (attempt-check)
+                   record)))))))
+    result))
+
 ;; The busy flag also covers mapped installation operations.  An incomplete
 ;; mutation remains uncertain even though the busy flag is cleared on exit.
 (defun call-with-physical-reseed-follow-store (owner function)
   (physical-reseed-follow-check-idle owner)
   (setf (physical-reseed-follow-owner-busy-p owner) t)
   (unwind-protect
-       (let ((result
-               (call-with-physical-directory-root
-                owner
-                (lambda (root-fd directory)
-                  (declare (ignore directory))
-                  (let ((attempt (physical-reseed-follow-attempt-snapshot-at root-fd)))
-                    (flet ((attempt-check ()
-                             (physical-reseed-follow-check-attempt-snapshot-at root-fd attempt)))
-                      (multiple-value-bind (record snapshot)
-                          (call-with-physical-reseed-follow-image
-                           owner
-                           (lambda (image-fd image-check)
-                             (flet ((check ()
-                                      (funcall image-check)
-                                      (attempt-check)))
-                               (check)
-                               (funcall function image-fd #'check))))
-                        (attempt-check)
-                        (physical-reseed-follow-check-final-metadata root-fd snapshot)
-                        (attempt-check)
-                        record)))))))
-         (setf (physical-reseed-follow-owner-uncertain-p owner) nil)
-         result)
+       (multiple-value-prog1
+           (call-with-physical-reseed-follow-held-store
+            owner
+            (lambda (root-fd check)
+              (flet ((forward-check ()
+                       (physical-reseed-follow-check-forward-record
+                        (getf (physical-reseed-follow-snapshot-at root-fd) :record))
+                       (funcall check)))
+                (forward-check)
+                (multiple-value-prog1 (funcall function root-fd #'forward-check)
+                  (forward-check)))))
+         (setf (physical-reseed-follow-owner-uncertain-p owner) nil))
     (setf (physical-reseed-follow-owner-busy-p owner) nil)))
 
 ;; Pin the exact current attempt and its file facts around the full image and

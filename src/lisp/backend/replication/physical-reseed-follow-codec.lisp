@@ -120,11 +120,12 @@
          (settlement-p (loop for key in record by #'cddr thereis (eq key :settlement)))
          (activation-p (loop for key in record by #'cddr thereis (eq key :activation)))
          (retirement-p (loop for key in record by #'cddr thereis (eq key :retirement)))
+         (cancellation-p (loop for key in record by #'cddr thereis (eq key :cancellation)))
          (keys '(:version :attempt :install :base :generations)))
     (physical-follow-check-plist
      record (append keys (when configuration-p '(:configuration))
                     (when settlement-p '(:settlement)) (when activation-p '(:activation))
-                    (when retirement-p '(:retirement))))
+                    (when retirement-p '(:retirement)) (when cancellation-p '(:cancellation))))
     (let ((core (physical-reseed-follow-core-copy (physical-reseed-follow-core-projection record))))
       (when configuration-p
         (setf core (append core (list :configuration
@@ -142,6 +143,10 @@
         (setf core (append core (list :retirement
                                       (physical-reseed-follow-retirement-copy
                                        (getf record :retirement) core)))))
+      (when cancellation-p
+        (setf core (append core (list :cancellation
+                                      (physical-reseed-follow-cancellation-copy
+                                       (getf record :cancellation))))))
       core)))
 
 ;; The original attempt, install reference and base remain immutable.  Append
@@ -156,6 +161,8 @@
     (unless (every (lambda (key) (equal (getf before key) (getf after key)))
                    '(:version :attempt :install :base))
       (error "target follow journal cannot rebind its predecessors"))
+    (when (or (getf before :cancellation) (getf after :cancellation))
+      (physical-reseed-follow-cancellation-check-transition before after))
     (when (or (getf before :retirement) (getf after :retirement))
       (physical-reseed-follow-retirement-check-transition before after))
     (when (or (getf before :activation) (getf after :activation))

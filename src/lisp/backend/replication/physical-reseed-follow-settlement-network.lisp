@@ -15,6 +15,7 @@
             (current (list :follow (physical-reseed-follow-installation-context-snapshot context)
                            :attempt (physical-reseed-follow-installation-context-attempt context)
                            :install (physical-reseed-follow-installation-context-install-state context))))
+       (physical-reseed-follow-check-forward-record record)
        (unless (and (eq :inert (getf (getf record :configuration) :phase))
                     (eq :handoff-pending (getf (getf record :settlement) :phase)))
          (error "network settlement requires durable pending intent on an inert installation"))

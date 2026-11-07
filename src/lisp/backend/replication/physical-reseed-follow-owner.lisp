@@ -65,9 +65,7 @@
   (declare (ignore root-fd candidate snapshot previous))
   nil)
 
-(defun physical-reseed-follow-check-idle (owner)
-  ;; Exclude nested mapped scopes and operations after an uncertain
-  ;; publication until the owner is reopened.
+(defun physical-reseed-follow-check-idle-state (owner)
   (unless (physical-reseed-follow-owner-p owner) (error "target follow ownership is required"))
   (physical-directory-check-owner-common owner)
   (when (or *physical-reseed-follow-installation-scope* *physical-reseed-follow-activation-scope*)
@@ -76,6 +74,17 @@
     (error "target follow journal operation is already in progress"))
   (when (physical-reseed-follow-owner-uncertain-p owner)
     (error "target follow publication is uncertain; close and reopen the owner"))
+  owner)
+
+(defun physical-reseed-follow-check-idle (owner)
+  (physical-reseed-follow-check-idle-state owner)
+  (call-with-physical-directory-root
+   owner
+   (lambda (root-fd directory)
+     (declare (ignore directory))
+     (when (physical-reseed-follow-entry root-fd "physical-reseed.follow")
+       (physical-reseed-follow-check-forward-record
+        (physical-reseed-follow-read-at root-fd "physical-reseed.follow")))))
   owner)
 
 (defun physical-reseed-follow-base-projection (manifest digest control-bytes directory request)
@@ -237,8 +246,12 @@
       (merge-pathnames "physical-reseed.follow.tmp" (physical-image-fd-path root-fd))
       "target follow temporary requires reconciliation")
      (when (physical-reseed-follow-entry root-fd "physical-reseed.follow")
-       (physical-reseed-follow-copy
-        (physical-reseed-follow-check-binding owner (physical-reseed-follow-read-at root-fd "physical-reseed.follow" :stabilize t)))))))
+       (let* ((snapshot (physical-reseed-follow-snapshot-at root-fd))
+              (record (getf snapshot :record)))
+         (physical-reseed-follow-check-forward-record record)
+         (physical-reseed-follow-read-at root-fd "physical-reseed.follow" :stabilize t)
+         (physical-reseed-follow-check-snapshot root-fd snapshot)
+         (physical-reseed-follow-copy (physical-reseed-follow-check-binding owner record)))))))
 
 ;; Acquire the stopped root lock for FUNCTION and revoke the owner on exit.
 ;; Finish the initial image scope before FUNCTION so its operations can take
