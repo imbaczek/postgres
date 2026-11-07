@@ -18,9 +18,7 @@
         (if (eq :closing (getf record :phase))
             (physical-backup-lease-check-successor-pin record selected)
             (when selected
-              (unless (physical-backup-lease-successor-pin-identity-p record selected)
-                (error "closed backup lease successor differs from its immutable selection"))
-              (physical-follow-pin-check-fields selected)))))))
+              (physical-backup-lease-check-selected-pin-fields record selected)))))))
 
 (defun physical-backup-lease-allocation-check-pin-inventory-row (row parent pins)
   (let ((pin (gethash (getf row :name) pins)))

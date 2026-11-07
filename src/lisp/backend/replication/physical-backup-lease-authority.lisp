@@ -170,19 +170,31 @@
          (= (getf base :base) (getf anchor :base))
          (= (getf base :manifest-digest) (getf anchor :manifest-digest)))))
 
+(defun physical-backup-lease-check-selected-pin-fields (record pin)
+  (unless (and (member (getf record :phase) '(:closing :closed))
+               (eq :handed-off (getf record :outcome))
+               (physical-backup-lease-successor-pin-identity-p record pin))
+    (wal-invalid-input "backup lease successor differs from its immutable selection"))
+  (physical-follow-pin-check-fields pin)
+  (when (eq :closing (getf record :phase))
+    (let ((cursor (getf (physical-follow-pin-anchor pin) :receive-lsn)))
+      (unless (and (eql (physical-source-pin-confirmed-lsn pin) cursor)
+                   (eql (physical-source-pin-restart-lsn pin) cursor))
+        (wal-invalid-input "backup lease closing successor has advanced progress"))))
+  pin)
+
 ;; Require the exact unused READY follow pin for this backup's original system,
 ;; timeline, base and manifest. Its saved anchor digest and receive position
 ;; bind the successor to the handoff before the old retention can be released.
 (defun physical-backup-lease-check-successor-pin (record pin)
+  (physical-backup-lease-check-selected-pin-fields record pin)
   (let* ((successor (getf record :successor))
-         (anchor (and (physical-follow-pin-p pin) (physical-follow-pin-anchor pin))))
-    (unless (and (physical-backup-lease-successor-pin-identity-p record pin)
-                 (not (physical-source-pin-lost-p pin))
+         (anchor (physical-follow-pin-anchor pin)))
+    (unless (and (not (physical-source-pin-lost-p pin))
                  (eql (physical-source-pin-confirmed-lsn pin) (getf anchor :receive-lsn))
                  (eql (physical-source-pin-restart-lsn pin) (getf anchor :receive-lsn))
                  (null (gethash (getf successor :name) *physical-source-senders*)))
       (wal-invalid-input "backup lease handoff lacks its unused ready successor"))
-    (physical-follow-pin-check-fields pin)
     pin))
 
 (declaim (ftype function physical-backup-lease-check-successor-assignment))
