@@ -34,6 +34,7 @@
                (:file "t/physical-backup-lease-successor-fence-tests")
                (:file "t/physical-backup-lease-allocation-authority-tests")
                (:file "t/physical-backup-lease-allocation-startup-tests")
+               (:file "t/physical-backup-lease-selected-startup-tests")
                (:file "t/physical-backup-lease-status-tests")
                (:file "t/physical-backup-lease-capture-tests")
                (:file "t/physical-backup-lease-wire-tests")

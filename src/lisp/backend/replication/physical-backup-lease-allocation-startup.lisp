@@ -21,7 +21,11 @@
                  (equal name (getf (getf owner :successor) :name)))
             (values :selected row owner))
            (t (values :preparation row owner)))))
-      (t (values :ordinary nil nil)))))
+      (t
+       (let ((successor-owner (gethash name (physical-backup-lease-successor-records))))
+         (if successor-owner
+             (values :selected nil successor-owner)
+             (values :ordinary nil nil)))))))
 
 ;; Apply role and WAL policy after structural graph validation.  Among allocated
 ;; pins, only unselected live preparations are marked lost for role or timeline
@@ -62,7 +66,8 @@
 
 (defun physical-backup-lease-startup-managed-pin-p (name)
   (or (gethash name *physical-backup-lease-records*)
-      (gethash name *physical-backup-lease-allocations*)))
+      (gethash name *physical-backup-lease-allocations*)
+      (gethash name (physical-backup-lease-successor-records))))
 
 (defun physical-backup-lease-check-standby-registered-pins ()
   (maphash
