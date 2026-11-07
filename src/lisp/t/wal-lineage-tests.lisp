@@ -230,3 +230,92 @@
         ;; A switchpoint in skipped capacity is not a selected-branch record end.
         (ok (intake-fails-p
              (lambda () (lineage-test-read (lineage-test-history (1+ last-end)) 0 (+ size 96))))))))
+
+(cl-spec:defproperty lineage-missing-carriers-have-a-distinct-condition
+    ((segment (range integer 0 16)))
+  (:about pg::wal-lineage-open-segment)
+  (:trials (:normal 100))
+  (with-physical-store-directory (root)
+    (let* ((pg::*pgdata* root)
+           (start (* segment pg::+wal-segment-size+))
+           (condition (handler-case
+                          (progn (lineage-test-read (pg::timeline-parse-history 1 "")
+                                                    start (+ start 33)) nil)
+                        (error (condition) condition))))
+      (and (find-class 'pg::wal-lineage-segment-unavailable nil)
+           (typep condition 'pg::wal-lineage-segment-unavailable)
+           (= segment (pg::wal-lineage-unavailable-segment condition))
+           (eq :timeline (pg::wal-lineage-unavailable-namespace condition))
+           (eq :missing (pg::wal-lineage-unavailable-reason condition))
+           (string= (format nil "missing lineage WAL segment ~d" segment)
+                    (princ-to-string condition))
+           (not (probe-file (pg::wal-directory)))))))
+
+(deftest generated-lineage-missing-carrier-condition
+    (let ((result (cl-spec:result-data
+                   (cl-spec:run-property 'lineage-missing-carriers-have-a-distinct-condition
+                                         :seed 194 :profile :normal))))
+      (ok (eq :passed (getf result :status)))))
+
+(deftest lineage-missing-newer-carrier-still-uses-a-valid-older-file
+    (with-physical-store-directory (root)
+      (let ((pg::*pgdata* root))
+        (lineage-test-file 1 0 (lineage-test-record 0))
+        (multiple-value-bind (records cursor files complete)
+            (lineage-test-read (lineage-test-history 33) 0 33)
+          (ok (equal records '((0 1 1 1))))
+          (ok (= 33 cursor))
+          (ok (equal files '((1 0))))
+          (ok complete)))))
+
+(deftest lineage-present-invalid-carriers-keep-their-hard-errors
+    (dolist (fault '(:symlink :fifo :oversize :truncated :corrupt))
+      (with-physical-store-directory (root)
+        (let* ((pg::*pgdata* root)
+               (parent (lineage-test-file 1 0 (lineage-test-record 0)))
+               (before (lineage-test-bytes parent))
+               (child (pg::wal-segment-path 0 2 :timeline)))
+          (ecase fault
+            (:symlink (sb-posix:symlink (namestring parent) (namestring child)))
+            (:fifo (sb-posix:mkfifo (namestring child) #o600))
+            (:oversize
+             (with-open-file (stream child :direction :output :if-exists :error
+                                           :element-type '(unsigned-byte 8))
+               (file-position stream pg::+wal-segment-size+)
+               (write-byte 0 stream)))
+            (:truncated
+             (lineage-test-file 2 0 (make-array 16 :element-type '(unsigned-byte 8)
+                                                   :initial-element 0)))
+            (:corrupt
+             (let ((bytes (lineage-test-record 0)))
+               (setf (aref bytes 28) (logxor 1 (aref bytes 28)))
+               (lineage-test-file 2 0 bytes))))
+          (let ((condition
+                  (handler-case (progn (lineage-test-read (lineage-test-history 33) 0 33) nil)
+                    (error (condition) condition))))
+            (ok (typep condition 'error))
+            (ok (not (typep condition 'pg::wal-lineage-segment-unavailable))))
+          (ok (equalp before (lineage-test-bytes parent)))))))
+
+(deftest lineage-current-carrier-loss-keeps-ancestor-reads-available
+    (with-physical-store-directory (root)
+      (let* ((pg::*pgdata* root)
+             (pg::*wal-durable-lsn* 33)
+             (history (lineage-test-history 33))
+             (path (lineage-test-file 1 0 (lineage-test-record 0)))
+             (before (lineage-test-bytes path))
+             (condition
+               (handler-case
+                   (progn (pg::physical-source-lineage-live-segment 2 0 history :timeline nil 33) nil)
+                 (error (condition) condition))))
+        (ok (typep condition 'pg::wal-lineage-segment-unavailable))
+        (ok (eq :current-carrier (pg::wal-lineage-unavailable-reason condition)))
+        (ok (eq :timeline (pg::wal-lineage-unavailable-namespace condition)))
+        (ok (= 0 (pg::wal-lineage-unavailable-segment condition)))
+        (ok (string= "physical follow requires a complete source WAL extent; reseed is required"
+                     (princ-to-string condition)))
+        (multiple-value-bind (bytes carrier)
+            (pg::physical-source-lineage-live-segment 2 0 history :timeline t 33)
+          (ok (equalp before bytes))
+          (ok (= 1 carrier)))
+        (ok (equalp before (lineage-test-bytes path))))))

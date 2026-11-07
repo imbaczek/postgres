@@ -223,7 +223,8 @@ A present but invalid newer carrier is an error, not a reason to fall back."
     (unwind-protect
          (progn
            (unless (or allow-ancestor (= timeline source-timeline))
-             (error "physical follow requires a complete source WAL extent; reseed is required"))
+             (error 'wal-lineage-segment-unavailable
+                    :segment segment :namespace namespace :reason :current-carrier))
            (let ((bytes (make-array
                          (min (wal-lineage-effective-size size segment timeline history)
                               (max 0 (- (min end *wal-durable-lsn*) (* segment +wal-segment-size+))))

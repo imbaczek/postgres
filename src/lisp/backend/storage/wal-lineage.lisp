@@ -7,6 +7,20 @@
          (end (timeline-history-entry-end entry)))
     (if end (max 0 (min size (- end (* segment +wal-segment-size+)))) size)))
 
+(define-condition wal-lineage-segment-unavailable (error)
+  ((segment :initarg :segment :reader wal-lineage-unavailable-segment)
+   (namespace :initarg :namespace :reader wal-lineage-unavailable-namespace)
+   (reason :initarg :reason :initform :missing :reader wal-lineage-unavailable-reason))
+  (:report
+   (lambda (condition stream)
+     (ecase (wal-lineage-unavailable-reason condition)
+       (:missing
+        (format stream "missing lineage WAL segment ~d"
+                (wal-lineage-unavailable-segment condition)))
+       (:current-carrier
+        (write-string "physical follow requires a complete source WAL extent; reseed is required"
+                      stream))))))
+
 (defun wal-lineage-open-segment (segment history previous-file-timeline namespace)
   "Open the first C-ordered candidate; only ENOENT permits an older candidate."
   (dolist (timeline (timeline-segment-candidates segment history previous-file-timeline))
@@ -28,7 +42,7 @@
                (setf stream (sb-sys:make-fd-stream fd :input t :element-type '(unsigned-byte 8)))
                (return-from wal-lineage-open-segment (values stream timeline size)))
           (unless stream (sb-posix:close fd))))))
-  (error "missing lineage WAL segment ~d" segment))
+  (error 'wal-lineage-segment-unavailable :segment segment :namespace namespace))
 
 (defun wal-lineage-read-record (source segment offset size)
   "Decode one record from a bounded file or copied segment prefix without repair.
