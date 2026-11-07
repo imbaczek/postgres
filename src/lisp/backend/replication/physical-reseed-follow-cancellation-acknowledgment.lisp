@@ -1,3 +1,6 @@
+;;; Publish acknowledged cleanup using operation evidence and one-use authority.
+;;; A complete recovery temporary uses the same checks before promotion.
+
 (in-package #:pg)
 
 (defstruct (physical-reseed-follow-cancellation-ack-authority
@@ -5,6 +8,9 @@
             (:constructor %make-physical-reseed-follow-cancellation-ack-authority)
             (:copier nil)
             (:print-function physical-libpq-print-private-object)))
+
+;; Claim the operation evidence before publishing CLEANED.  Freeze the candidate,
+;; predecessor and attempt through checked write or temporary promotion.
 
 (defun physical-reseed-follow-publish-cancellation-cleaned-held
     (owner operation expected evidence begin-publication evidence-check)

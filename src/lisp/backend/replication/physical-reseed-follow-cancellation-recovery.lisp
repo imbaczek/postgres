@@ -1,3 +1,6 @@
+;;; Capture a complete cleanup temporary with its predecessor and directory facts.
+;;; Recheck that capture before network work and promotion.
+
 (in-package #:pg)
 
 (declaim (ftype function physical-reseed-follow-cancellation-owner-root))
@@ -8,6 +11,9 @@
             (:print-function physical-libpq-print-private-object))
   (owner nil :read-only t) (thread nil :read-only t) (root nil :read-only t)
   (snapshot nil :read-only t) (bytes nil :read-only t))
+
+;; Accept a complete temporary only when it is the exact eligible CLEANED
+;; successor of the saved predecessor.  Fresh source evidence is still required.
 
 (defun physical-reseed-follow-cleaned-recovery-snapshot-at (root-fd)
   (let* ((snapshot (physical-reseed-follow-cancellation-snapshot-at root-fd))

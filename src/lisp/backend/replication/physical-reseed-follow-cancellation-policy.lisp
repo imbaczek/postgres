@@ -1,4 +1,10 @@
+;;; Choose source actions and cleanup acknowledgments from the saved cancellation
+;;; and a bound source observation.  Unresolved generation debt remains deferred.
+
 (in-package #:pg)
+
+;; Plan only the cases for which this operation can confirm cleanup.  A parent
+;; abort with generation history keeps that debt for later reconciliation.
 
 (defun physical-reseed-follow-cancellation-ack-plan (value observation)
   (let* ((record (physical-reseed-follow-cancellation-preconfiguration-record value))

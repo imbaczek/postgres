@@ -1,3 +1,6 @@
+;;; Drive source cancellation and selected cleanup from the saved local intent.
+;;; Publish completion only after the required source operations are confirmed.
+
 (in-package #:pg)
 
 (defun physical-reseed-follow-observe-cancellation-source-held (operation expected &key helper)
@@ -35,6 +38,9 @@
                         (eq :closed (getf receipt :phase)))
                receipt)))))
      :helper helper)))
+
+;; Observe or close the source, save a closed receipt, then obtain operation
+;; evidence before recording CLEANED.  Unresolved and deferred work is returned.
 
 (defun physical-reseed-follow-cleanup-cancellation (owner &key helper)
   (call-with-physical-reseed-follow-cancellation-operation

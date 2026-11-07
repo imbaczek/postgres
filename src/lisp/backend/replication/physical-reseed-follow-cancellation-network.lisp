@@ -1,3 +1,6 @@
+;;; Capture and recheck local follow, attempt and install evidence around network
+;;; work while the cancellation owner is busy.
+
 (in-package #:pg)
 
 (defun physical-reseed-follow-cancellation-snapshot-at (root-fd)
@@ -7,6 +10,9 @@
            :attempt (physical-reseed-follow-attempt-snapshot-at root-fd)
            :install (list :record (physical-reseed-install-read-at root-fd "physical-reseed.install")
                           :row (physical-reseed-install-old-observe root-fd "physical-reseed.install" mount))))))
+
+;; Require a stable cancellation and no temporary before network work.  Check
+;; the same local evidence again after releasing the image resources.
 
 (defun physical-reseed-follow-cancellation-network-snapshot (owner &optional expected)
   (unless (physical-reseed-follow-owner-busy-p owner)

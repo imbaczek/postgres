@@ -1,3 +1,6 @@
+;;; Bind cancellation work, network checks and publication to one owned operation.
+;;; The scope holds the owner busy and checks its thread, root and saved evidence.
+
 (in-package #:pg)
 
 (defstruct (physical-reseed-follow-cancellation-operation
@@ -97,6 +100,9 @@
 
 (defun call-with-physical-reseed-follow-cancellation-operation (owner function)
   (%call-with-physical-reseed-follow-cancellation-operation owner function nil))
+
+;; Keep ownership across network and publication phases.  An escaped operation
+;; loses authority on exit.  An uncertain publication must be recovered.
 
 (defun %call-with-physical-reseed-follow-cancellation-operation (owner function recovery-request)
   (when *physical-reseed-follow-cancellation-operation*
@@ -217,6 +223,9 @@
           (setf (physical-reseed-follow-owner-uncertain-p owner) t))
         (setf live nil (physical-reseed-follow-owner-busy-p owner) nil)))))
 
+;; Connect using the saved source profile.  Check local evidence and source
+;; identity around each RPC, and close the client when the network scope ends.
+
 (defun call-with-physical-reseed-follow-cancellation-source
     (operation expected function &key helper)
   (let* ((snapshot (physical-adoption-attempt-value-copy expected))
@@ -252,6 +261,9 @@
         (when client (physical-client-close client)))
       (physical-reseed-follow-cancellation-operation-call operation :network-end snapshot)
       result)))
+
+;; Evidence is issued after the source operations succeed.  Its claim is bound
+;; to the current operation and predecessor and can be consumed once in scope.
 
 (defstruct (physical-reseed-follow-cleanup-operation-evidence
             (:constructor %make-physical-reseed-follow-cleanup-operation-evidence)

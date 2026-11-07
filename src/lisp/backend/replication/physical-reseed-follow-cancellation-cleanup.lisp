@@ -3,6 +3,9 @@
 
 (in-package #:pg)
 
+;; Publish the exact source-closed candidate under the held operation.  A retry
+;; checks and synchronizes the matching saved receipt before returning it.
+
 (defun physical-reseed-follow-publish-cancellation-source-closed-held (owner expected candidate evidence-check)
   (let* ((previous (getf expected :follow))
          (phase (getf (getf (getf previous :record) :cancellation) :phase))
