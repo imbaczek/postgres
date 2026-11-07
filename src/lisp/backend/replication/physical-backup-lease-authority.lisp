@@ -171,6 +171,10 @@
          (= (getf base :manifest-digest) (getf anchor :manifest-digest)))))
 
 (defun physical-backup-lease-check-selected-pin-fields (record pin)
+  ;; Check the saved READY selection and embedded fields. Closing requires
+  ;; unused progress. A lost pin is allowed, and a closed pin may have advanced.
+  ;; Callers establish the operation's ownership and WAL usability separately.
+  ;; The successor wrapper retains the stricter forward handoff checks.
   (unless (and (member (getf record :phase) '(:closing :closed))
                (eq :handed-off (getf record :outcome))
                (physical-backup-lease-successor-pin-identity-p record pin))
