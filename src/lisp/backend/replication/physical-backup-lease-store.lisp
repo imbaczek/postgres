@@ -197,6 +197,8 @@
   (let* ((request (getf after :request)) (name (getf request :name)))
     (physical-backup-lease-check-source
      request :current-timeline (member (getf after :phase) '(:requested :capturing :ready)))
+    ;; New leases cannot reuse a historical selected successor name.  Existing
+    ;; parents may still advance or recover, including legacy aliases.
     (when (null before)
       (physical-backup-lease-allocation-check-unowned-name name)
       (physical-backup-lease-check-successor-create name))

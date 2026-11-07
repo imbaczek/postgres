@@ -50,7 +50,7 @@
 (defun physical-backup-lease-check-successor-create (name)
   ;; Under WAL exclusion, durable lease history permanently reserves each
   ;; selected successor name, even after CLOSED and restart.  This protects
-  ;; attempt proof ownership from a newly created pin using the same name.
+  ;; attempt proof ownership from a new pin or lease using the same name.
   (when (gethash name (physical-backup-lease-successor-records))
     (wal-invalid-input "backup lease historical successor permanently reserves this name")))
 
