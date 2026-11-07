@@ -4,8 +4,10 @@
 ;;; policy before publishing loss or replacing the source pin registry.
 
 ;; A parent pin is bootstrap retention.  An allocated pin is cleanup debt,
-;; the selected successor, or an unselected preparation; other pins are ordinary.
-;; The caller holds WAL exclusion while using the returned owners.
+;; a selected successor, or an unselected preparation.  A historical successor
+;; without an allocation row is also selected; remaining pins are ordinary.
+;; Classification alone does not establish usability.  The caller holds WAL
+;; exclusion while using the returned owners.
 
 (defun physical-backup-lease-startup-pin-class (name)
   (let ((parent (physical-backup-lease-record-under-lock name))
@@ -22,6 +24,9 @@
             (values :selected row owner))
            (t (values :preparation row owner)))))
       (t
+       ;; Legacy handoffs have a selected successor but no allocation row.
+       ;; Classify from the durable parent without inventing a row; WAL and
+       ;; role policy still decide whether the pin is usable.
        (let ((successor-owner (gethash name (physical-backup-lease-successor-records))))
          (if successor-owner
              (values :selected nil successor-owner)
@@ -65,6 +70,8 @@
   (values))
 
 (defun physical-backup-lease-startup-managed-pin-p (name)
+  ;; Historical successors are managed even without an allocation row, so
+  ;; standby startup removes any old registered retention for them.
   (or (gethash name *physical-backup-lease-records*)
       (gethash name *physical-backup-lease-allocations*)
       (gethash name (physical-backup-lease-successor-records))))
