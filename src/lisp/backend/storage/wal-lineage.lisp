@@ -8,6 +8,8 @@
     (if end (max 0 (min size (- end (* segment +wal-segment-size+)))) size)))
 
 (define-condition wal-lineage-segment-unavailable (error)
+  ;; The namespace and segment locate the unavailable carrier.  The reason
+  ;; distinguishes exhaustion of all candidates from a missing current carrier.
   ((segment :initarg :segment :reader wal-lineage-unavailable-segment)
    (namespace :initarg :namespace :reader wal-lineage-unavailable-namespace)
    (reason :initarg :reason :initform :missing :reader wal-lineage-unavailable-reason))

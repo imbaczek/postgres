@@ -218,6 +218,8 @@ base. In the base segment, compare the extent prefix with the immutable overlap.
 ALLOW-ANCESTOR permits an eligible older timeline for public slot coverage and
 bounded retained-timeline follow.  Ordinary follow requires the current source.
 A present but invalid newer carrier is an error, not a reason to fall back."
+  ;; Reject an ineligible ancestor by its filename before reading its payload.
+  ;; Startup can classify this typed condition as unavailable current WAL.
   (multiple-value-bind (stream timeline size)
       (wal-lineage-open-segment segment history 0 namespace)
     (unwind-protect

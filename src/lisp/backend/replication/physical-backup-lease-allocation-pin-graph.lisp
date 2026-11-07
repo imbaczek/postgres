@@ -37,8 +37,8 @@
           (error "unselected live backup lease allocation has advanced progress"))))))
 
 ;; Check ownership across the complete parent, allocation and raw pin inventory.
-;; A closing handoff requires its unused successor; a closed handoff may have
-;; advanced or retired it.  Unselected live preparations cannot have advanced.
+;; Selected successors may be absent or lost.  A present CLOSING successor
+;; keeps its unused coordinates.  Unselected live preparations cannot advance.
 
 (defun physical-backup-lease-allocation-check-pin-inventory (parents allocations pins)
   (multiple-value-bind (histories successors checked-parents checked-allocations)
@@ -62,6 +62,8 @@
     (values histories successors checked-parents checked-allocations)))
 
 (defun physical-backup-lease-pin-inventory ()
+  ;; Read the complete raw disk inventory under write and WAL exclusion.
+  ;; Later policy checks decide which pins provide usable retention.
   (physical-backup-lease-require-locks)
   (physical-backup-lease-pin-directory-stat)
   (let ((pins (make-hash-table :test #'equal)))

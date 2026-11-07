@@ -41,6 +41,7 @@
 ;; record relationships. Legacy handoffs may have no allocation rows. Pin and
 ;; WAL authority require separate checks by the caller.
 (defun physical-backup-lease-allocation-check-graph (parents allocations)
+  ;; Return histories, successor owners and checked copies of both inventories.
   (unless (and (typep *physical-backup-lease-allocation-limit* '(integer 0 65536))
                (<= (hash-table-count allocations) *physical-backup-lease-allocation-limit*))
     (error "backup lease allocation graph exceeds capacity"))

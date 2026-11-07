@@ -189,6 +189,9 @@
 
 (defun physical-backup-lease-selected-pin-observation
     (record pin parents allocations history successor-owner)
+  ;; Prove ownership from the supplied graph, allowing an absent or lost pin.
+  ;; Return presence, the pin, detached coordinates and a detached allocation.
+  ;; WAL availability and the live registry are checked by the caller.
   (let* ((checked (physical-backup-lease-copy record))
          (request (getf checked :request))
          (current (gethash (getf request :name) parents))

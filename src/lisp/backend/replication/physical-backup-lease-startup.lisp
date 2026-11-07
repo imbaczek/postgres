@@ -197,6 +197,9 @@
             (physical-backup-lease-finish-closing-under-lock request #'begin-publication)))))))
 
 (defun physical-backup-lease-startup-action (record)
+  ;; A closing handoff keeps any bootstrap pin until its successor is usable.
+  ;; Unavailable successors leave cleanup pending.  Normal closing still uses
+  ;; the strict successor and WAL checks before removing bootstrap retention.
   (let* ((request (getf record :request))
          (name (getf request :name)))
     (physical-backup-lease-current-record request)

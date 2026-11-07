@@ -43,6 +43,8 @@
               (sb-sys:sap-ref-64 sap #x90))))))
 
 (defun physical-backup-lease-startup-source-context ()
+  ;; Capture the source facts observed during this startup plan.  Recheck them
+  ;; before publishing loss and installing the replacement pin registry.
   (physical-backup-lease-require-locks)
   (list (physical-backup-lease-startup-wal-directory-state)
         (multiple-value-list (wal-read-control-fields))
@@ -56,6 +58,9 @@
   (values))
 
 (defun physical-backup-lease-startup-selected-state (record pin standby context)
+  ;; Classify availability after ownership has been checked.  A lost pin needs
+  ;; no on-disk history for its old writer.  CLOSED standby pins need only saved fields.
+  ;; A missing carrier or changed writer can later cause durable loss.
   (unless context (error "selected startup availability lacks its source context"))
   (cond
     ((null pin) :absent)
@@ -106,6 +111,7 @@
   (values))
 
 (defun physical-backup-lease-check-startup-loss (pin parent history)
+  ;; Recheck the durable owner, allocation history and pin before saving loss.
   (unless (equal parent (physical-backup-lease-current-record (getf parent :request)))
     (error "backup lease pin loss parent changed"))
   (dolist (row history)
@@ -157,9 +163,8 @@
              (values :selected nil successor-owner)
              (values :ordinary nil nil)))))))
 
-;; Apply role and WAL policy after structural graph validation.  Among allocated
-;; pins, only unselected live preparations are marked lost for role or timeline
-;; changes.  Selected pins are never automatically invalidated here.
+;; Apply role and WAL policy after structural graph validation.  A selected pin
+;; is marked lost when its writer changes or a required carrier is unavailable.
 
 (defun physical-backup-lease-startup-pin-candidate
     (pin standby states parents allocations successors)
@@ -283,6 +288,8 @@
 ;; retention.  The publication fence covers the disk and memory changes.
 
 (defun physical-backup-lease-load-startup-pins (&optional standby)
+  ;; Preflight every candidate and recheck the source context and disk images
+  ;; before loss writes.  Install the replacement registry only after those writes.
   (when (and standby (not (recovery-in-progress-p)))
     (error "backup lease standby pin load requires recovery"))
   (with-write-lock
