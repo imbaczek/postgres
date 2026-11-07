@@ -1018,7 +1018,8 @@
       (append '("--noinform" "--no-sysinit" "--no-userinit" "--non-interactive")
               (loop for form in forms append (list "--eval" (write-to-string form)))))))
 
-(defun run-retirement-intent-test-crash-child (root point cache marker &key (timeout 300) (operation :initial))
+(defun run-retirement-intent-test-crash-child
+    (root point cache marker &key (timeout 300) (operation :initial) argument-builder)
   (let ((process nil) (pid nil))
     (unwind-protect
          (progn
@@ -1026,12 +1027,14 @@
              (setf process
                    (sb-ext:run-program
                     (namestring sb-ext:*runtime-pathname*)
-                    (case operation
-                      (:initial (retirement-intent-test-child-arguments root point cache marker))
-                      (:receipt (receipt-test-crash-child-arguments root point cache marker))
-                      (:receipt-consumption
-                       (receipt-test-crash-child-arguments root point cache marker :receipt-consumption))
-                      (otherwise (retirement-intent-test-child-arguments root point cache marker operation)))
+                    (if argument-builder
+                        (funcall argument-builder root point cache marker)
+                        (case operation
+                          (:initial (retirement-intent-test-child-arguments root point cache marker))
+                          (:receipt (receipt-test-crash-child-arguments root point cache marker))
+                          (:receipt-consumption
+                           (receipt-test-crash-child-arguments root point cache marker :receipt-consumption))
+                          (otherwise (retirement-intent-test-child-arguments root point cache marker operation))))
                     :search t :wait nil :output t :error :output)
                    pid (sb-ext:process-pid process)))
            (format t "~%RETIREMENT-CRASH-OWNED-CHILD ~d ~s ~s~%" pid root point)

@@ -69,12 +69,12 @@
                  (format nil "Reject changed source observation ~A" kind))
              (ok (member :identify (funcall events)))))))))
 
-(defun call-with-reseed-follow-prepare-source (owner root record function)
+(defun call-with-reseed-follow-prepare-source (owner root record function &optional (kind :same-timeline))
   (let* ((generation (first (getf record :generations)))
          (request (getf (getf record :attempt) :request))
          (coordinates (getf generation :coordinates))
          (source (getf (getf record :attempt) :source))
-         (proved (reseed-follow-proof-test-record record root :same-timeline))
+         (proved (reseed-follow-proof-test-record record root kind))
          (anchor (pg::physical-reseed-follow-generation-anchor (first (getf proved :generations))))
          (token (gensym "FOLLOW-PREPARE-CLIENT"))
          (state (list :connections 0 :closes 0 :prepares 0 :requests nil

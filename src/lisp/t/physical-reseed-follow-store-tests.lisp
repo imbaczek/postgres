@@ -364,23 +364,27 @@
 (defun reseed-follow-store-run-child (root log body cache)
   (let* ((source (asdf:system-source-directory "pg"))
          (code (format nil "(let ((pg::*pgdata* #P~s)) ~a)" (namestring root) body))
-         (process
-           (sb-ext:run-program
-            "/usr/bin/env"
-            (list (format nil "XDG_CACHE_HOME=~a" (namestring cache))
-                  (format nil "CL_SOURCE_REGISTRY=~a//:" (namestring source))
-                  (or (uiop:getenv "SBCL") (namestring sb-ext:*runtime-pathname*))
-                  "--noinform" "--no-sysinit" "--no-userinit" "--non-interactive"
-                  "--eval" "(require :asdf)" "--eval" "(asdf:load-system \"pg\")" "--eval" code)
-            :wait nil :output log :error :output :if-output-exists :supersede)))
+         (process nil))
     (unwind-protect
          (progn
+           (sb-sys:without-interrupts
+             (setf process
+                   (sb-ext:run-program
+                    "/usr/bin/env"
+                    (list (format nil "XDG_CACHE_HOME=~a" (namestring cache))
+                          (format nil "CL_SOURCE_REGISTRY=~a//:" (namestring source))
+                          (or (uiop:getenv "SBCL") (namestring sb-ext:*runtime-pathname*))
+                          "--noinform" "--no-sysinit" "--no-userinit" "--non-interactive"
+                          "--eval" "(require :asdf)" "--eval" "(asdf:load-system \"pg\")" "--eval" code)
+                    :wait nil :output log :error :output :if-output-exists :supersede)))
            (sb-ext:process-wait process)
-           (list (sb-ext:process-status process) (sb-ext:process-exit-code process)))
-      (when (sb-ext:process-alive-p process)
-        (sb-ext:process-kill process 9)
-        (sb-ext:process-wait process))
-      (sb-ext:process-close process))))
+           (values (list (sb-ext:process-status process) (sb-ext:process-exit-code process))
+                   (sb-ext:process-pid process)))
+      (when process
+        (when (sb-ext:process-alive-p process)
+          (sb-ext:process-kill process 9)
+          (sb-ext:process-wait process))
+        (sb-ext:process-close process)))))
 
 (deftest reseed-follow-intent-recovers-actual-sigkill-cuts-in-fresh-images
     (with-physical-store-directory (cache-root)
