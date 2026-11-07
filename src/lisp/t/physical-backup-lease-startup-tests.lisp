@@ -195,7 +195,7 @@
                        pg::*physical-backup-lease-records*) saved)
         saved))))
 
-(deftest backup-lease-handed-off-closing-requires-a-live-successor
+(deftest backup-lease-live-closing-rejects-absent-selection-while-startup-defers
     (dolist (startup '(nil t))
       (call-with-backup-lease-authority-fixture
        (lambda (root)
@@ -210,11 +210,12 @@
                    (getf closing :outcome) :handed-off
                    (getf closing :successor) (list :name "reseed_follow_missing" :anchor-digest 42))
              (backup-lease-startup-inject-closing record closing)
-             (ok (intake-fails-p
-                  (lambda ()
-                    (if startup
-                        (backup-lease-startup-reopen)
-                        (pg::physical-backup-lease-finish-closing request)))))
+             (ok (eq (intake-fails-p
+                      (lambda ()
+                        (if startup
+                            (backup-lease-startup-reopen)
+                            (pg::physical-backup-lease-finish-closing request))))
+                     (not startup)))
              (ok (probe-file (pg::physical-source-pin-path name)))
              (ok (eq :closing (getf (gethash name pg::*physical-backup-lease-records*) :phase)))))))))
 
