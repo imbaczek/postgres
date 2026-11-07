@@ -1,6 +1,10 @@
+;; Reconcile terminal reseed retirement during postmaster ownership startup.
+
 (in-package #:pg)
 
 (defun physical-reseed-follow-check-terminal-startup (observation)
+  ;; Main startup admits only terminal retirement evidence.  Generic
+  ;; observation also supports inspecting earlier recovery states.
   (case (getf observation :branch)
     (:ordinary observation)
     ((:retirement :retired)
@@ -21,10 +25,13 @@
     (otherwise (error "postmaster startup requires a recognized reseed observation"))))
 
 (defun physical-reseed-follow-check-ordinary-startup ()
+  ;; Require the ordinary local namespace and adoption checks after handover.
   (physical-reseed-check-before-pid)
   (physical-adoption-check-startup))
 
 (defun physical-reseed-follow-own-startup (host port)
+  ;; Save the before-PID observation and compare it with owned-PID evidence.
+  ;; Ordinary startup keeps the existing adoption reconciliation path.
   (let ((before nil) (after nil))
     (postmaster-own-data-directory
      host port
@@ -47,4 +54,6 @@
            (lambda (owner)
              (physical-reseed-follow-retirement-publish-receipt owner)
              (physical-reseed-follow-retirement-consume-receipt owner)))))
+       ;; Any retirement owner and its resources have closed.  Check the strict
+       ;; namespace while still inside postmaster reconciliation.
        (physical-reseed-follow-check-ordinary-startup)))))

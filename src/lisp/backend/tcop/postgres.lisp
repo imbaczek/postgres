@@ -954,7 +954,8 @@ Then check the cached handles and workers under startup exclusion."
     (startup-install-initial-settings startup-settings startup-native startup-overrides)
     (startup-install-resource-capacity startup-settings)
     (sb-sys:enable-interrupt sb-unix:sigusr1 #'request-physical-promotion)
-    ;; Fence pending reseed before stale PID repair or startup timestamp changes.
+    ;; Observe before PID repair and consume terminal retirement under ownership
+    ;; before mutable bootstrap or storage initialization begins.
     (physical-reseed-follow-own-startup host port)
     (physical-backup-cleanup-stages)
     ;; Complete authentication using the captured inputs after PGDATA ownership.
@@ -964,6 +965,8 @@ Then check the cached handles and workers under startup exclusion."
     (physical-promotion-test-point :after-promotion-request-initialization)
     ;; Reject an unsupported SBCL before pending reconstruction can open storage.
     (call-with-query-sort-arena (lambda (arena) (declare (ignore arena))))
+    ;; Historical retirement authority is gone.  Continue with ordinary local
+    ;; startup checks before bootstrap and storage initialization.
     (physical-reseed-follow-check-ordinary-startup)
     (let ((primary-ready (eq :primary-ready (physical-bootstrap-check-startup))))
       (initialize-query-temp-storage)
