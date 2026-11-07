@@ -69,12 +69,13 @@
                 physical-backup-lease-allocation-canceled-cleanup-plan
                 physical-backup-lease-finish-canceled-allocations-under-lock))
 
-;; Finish allocation cleanup for an aborted parent, including on a CLOSED retry.
-;; Retire and sync the bootstrap pin before publishing CLOSED; this does not
-;; require its old WAL.  A handed-off CLOSING parent still requires proof of
-;; the selected successor and its WAL.  The caller holds write and WAL exclusion
-;; and supplies the publication fence callback.
+;; Finish allocation cleanup for an aborted parent, including a CLOSED retry.
+;; Retire and sync the bootstrap pin before publishing CLOSED. Normal handoff
+;; closing checks the selected successor and its WAL. Explicit selected cleanup
+;; uses scoped authority to finish a committed handoff. The caller holds write
+;; and WAL exclusion and supplies the publication fence callback.
 (defun physical-backup-lease-finish-closing-under-lock (request begin-publication &optional cleanup-authority)
+  ;; A supplied cleanup authority claims retirement before any terminal branch.
   (physical-backup-lease-selected-cleanup-check-entry cleanup-authority)
   (let* ((record (physical-backup-lease-current-record request))
          (name (getf request :name))
@@ -99,6 +100,8 @@
           (if (physical-backup-lease-pin-directory-stat)
               (fsync-directory (physical-source-pin-directory))
               (fsync-directory *pgdata*)))
+      ;; Unlink and sync finish before the publication claim.  Completion follows
+      ;; the checked record readback and installation in the memory registry.
       (when cleanup-authority
         (physical-backup-lease-selected-cleanup-claim cleanup-authority record :retired))
       (let ((next (copy-list record)))
@@ -154,9 +157,9 @@
       (wal-invalid-input "backup lease successor already belongs to another lease")))
   record)
 
-;; Check the successor and retained WAL before publishing a handoff. A completed
+;; Normal handoff publication checks the successor and retained WAL. A completed
 ;; base on an INTERRUPTED lease can be handed to a descendant source through a
-;; matching successor, while an incomplete capture cannot be handed off.
+;; matching successor. Explicit selected cleanup claims its own authority.
 (defun physical-backup-lease-check-handoff-publication (before after &optional cleanup-authority)
   (when cleanup-authority
     (physical-backup-lease-check-successor-assignment after)

@@ -1,3 +1,7 @@
+;;; Finish a committed handoff through explicit selected cleanup.  The selected
+;;; successor and its allocation history remain unchanged while bootstrap
+;;; retention is retired and the parent is published CLOSED.
+
 (in-package #:pg)
 
 (defstruct (physical-backup-lease-selected-cleanup-authority
@@ -6,11 +10,15 @@
             (:print-object
              (lambda (value stream)
                (print-unreadable-object (value stream :type t :identity t)))))
+  ;; The fixed verifier closure owns frozen facts and its scope lifetime.
+  ;; Phase and active state expose the progress of that scoped authority.
   (check nil :read-only t) (phase :acquiring) active-p)
 
 (defvar *physical-backup-lease-selected-cleanup-authority* nil)
 
 (defun physical-backup-lease-selected-cleanup-observation (record retired)
+  ;; Under write and WAL exclusion, observe the selected owner and pin images
+  ;; and the bootstrap pin.  The returned snapshots support later rechecks.
   (physical-backup-lease-require-locks)
   (let* ((request (getf record :request))
          (name (getf request :name))
@@ -40,6 +48,8 @@
                (when bootstrap (coerce (physical-source-pin-encode bootstrap) 'list))))))))
 
 (defun physical-backup-lease-selected-cleanup-check-entry (authority)
+  ;; Ordinary callers may pass NIL outside cleanup.  An active cleanup scope
+  ;; requires its explicit authority at each entry.
   (when (or authority *physical-backup-lease-selected-cleanup-authority*)
     (unless (and (physical-backup-lease-selected-cleanup-authority-p authority)
                  (eq authority *physical-backup-lease-selected-cleanup-authority*)
@@ -50,6 +60,8 @@
   (values))
 
 (defun physical-backup-lease-selected-cleanup-claim (authority record operation &optional candidate)
+  ;; Every claim requires its token.  Its verifier checks ownership and advances
+  ;; the one-use phase for the requested operation.
   (unless authority
     (wal-invalid-input "selected cleanup lacks its active typed authority"))
   (physical-backup-lease-selected-cleanup-check-entry authority)
@@ -57,6 +69,11 @@
            authority record operation candidate))
 
 (defun call-with-physical-backup-lease-selected-cleanup (record function)
+  ;; Freeze the owner, selected and bootstrap observations, thread, backend,
+  ;; storage incarnation and root for this one cleanup.  The private scope
+  ;; verifier reads them at each claim.  Active and claiming guards prevent
+  ;; reuse or reentry while claims advance through retirement and publication.
+  ;; Revoke the authority on every exit.
   (when *physical-backup-lease-selected-cleanup-authority*
     (wal-invalid-input "selected cleanup authority cannot reenter"))
   (let* ((before (physical-backup-lease-copy record))
@@ -132,6 +149,9 @@
                   (physical-backup-lease-selected-cleanup-authority-active-p authority) nil)))))))
 
 (defun physical-backup-lease-cleanup-selected (request successor)
+  ;; Finish the exact CLOSING handed-off owner with scoped cleanup authority.
+  ;; A matching CLOSED retry checks the saved ownership and returns its record.
+  ;; Selected pin bytes and allocation history stay untouched.
   (when *physical-backup-lease-selected-cleanup-authority*
     (wal-invalid-input "selected cleanup cannot recursively acquire authority"))
   (let* ((request (physical-backup-lease-request-copy request))

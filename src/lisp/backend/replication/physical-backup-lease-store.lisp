@@ -220,6 +220,7 @@
     (physical-backup-lease-check-capacity
      (+ (hash-table-count *physical-backup-lease-records*) (if before 0 1)))
     (physical-backup-lease-allocation-check-handoff after)
+    ;; The cleanup publication claim checks the frozen handoff before the write.
     (physical-backup-lease-check-handoff-publication before after cleanup-authority)
     (unless (equal before after)
       (funcall begin-publication)
