@@ -88,6 +88,9 @@ callers needing a coherent view across publications must compare control images.
       (close stream))))
 
 (defun physical-file-exclusive-flock-p (text inode)
+  ;; Accept the current Linux fdinfo format only when one whole-file advisory
+  ;; write flock and the fdinfo inode both identify INODE.  Keep the input and
+  ;; numeric fields bounded and reject ambiguous or incomplete lock records.
   (flet ((fields (line)
            (remove "" (uiop:split-string line :separator '(#\Space #\Tab)) :test #'equal))
          (unsigned (value radix positive)
@@ -121,6 +124,11 @@ callers needing a coherent view across publications must compare control images.
                               (= inode (parse-integer (third file))))))))))))
 
 (defun physical-file-holds-exclusive-flock-p (borrowed-fd)
+  ;; BORROWED-FD stays with its caller.  This function owns and closes only
+  ;; the fdinfo descriptor or its stream.  Proc files can report a zero stat
+  ;; size, so read a bounded buffer and use the extra byte to detect overflow.
+  ;; The surrounding fstats and fdinfo describe evidence at this check, while
+  ;; the caller remains responsible for the lock descriptor's lifetime.
   (let ((before (sb-posix:fstat borrowed-fd))
         (fd nil) (stream nil)
         (buffer (make-array 4097 :element-type '(unsigned-byte 8))))
@@ -141,6 +149,11 @@ callers needing a coherent view across publications must compare control images.
                    (sb-posix:stat-ino after)))))
       (if stream (close stream) (when fd (sb-posix:close fd))))))
 
+;; The weak registry retains observed lock loss while its stream or owner lives.
+;; Rechecking an already revoked owner does not mark a replacement stream.
+;; Registry updates use the mutex with interrupts deferred.  The descriptor
+;; probe permits local interrupts, then latches a failed observation before an
+;; interrupt can escape.  Checks on both sides of the probe see concurrent loss.
 (let ((revoked (make-hash-table :test #'eq :weakness :key))
       (lock (sb-thread:make-mutex :name "file lock revocation")))
   (defun physical-file-revoke-flock (stream &optional owner)

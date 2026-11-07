@@ -103,6 +103,13 @@ This context is invalid after its enclosing call exits."
 (defmethod physical-adoption-owner-extra-root-names ((owner null))
   nil)
 
+;; The revocation rule below applies to failed held-descriptor or flock checks.
+;; The named directory and lock inode must still match the identities saved by
+;; the thread-bound owner.  The held descriptor is checked separately for a
+;; matching inode and current flock evidence.  An observed loss revokes the
+;; owner and stream in a private weak registry, with interrupts deferred while
+;; its mutex protects the update.  A previously revoked owner cannot revive by
+;; substituting a stream, and that substitution is not itself marked revoked.
 ;; Check the common thread, root and lock identities.
 ;; Callers that need role authority must also perform the role check.
 

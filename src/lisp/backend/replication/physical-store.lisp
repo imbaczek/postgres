@@ -42,6 +42,10 @@ the archive outside the receive spool; otherwise it is stored beneath the spool.
     (error "physical receive store is closed or failed; reopen at durable progress")))
 
 (defun physical-store-check-held-lock (store)
+  ;; Compare the named receive.lock with the held descriptor on both sides of
+  ;; the flock check.  The caller must serialize access to the store.  These
+  ;; checks give evidence at this boundary.  A signaled error latches the store
+  ;; and revokes its ownership before the error escapes.
   (let ((stream (physical-store-lock-stream store)))
     (handler-case
         (progn
