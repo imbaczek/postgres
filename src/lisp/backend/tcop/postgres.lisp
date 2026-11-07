@@ -955,10 +955,7 @@ Then check the cached handles and workers under startup exclusion."
     (startup-install-resource-capacity startup-settings)
     (sb-sys:enable-interrupt sb-unix:sigusr1 #'request-physical-promotion)
     ;; Fence pending reseed before stale PID repair or startup timestamp changes.
-    (postmaster-own-data-directory host port
-                                   :startup-before-pid #'physical-reseed-check-before-pid
-                                   :startup-check #'physical-adoption-startup-preflight
-                                   :startup-reconcile #'physical-adoption-reconcile-startup)
+    (physical-reseed-follow-own-startup host port)
     (physical-backup-cleanup-stages)
     ;; Complete authentication using the captured inputs after PGDATA ownership.
     ;; Do not reread configuration files or reinstall startup resource capacity.
@@ -967,10 +964,12 @@ Then check the cached handles and workers under startup exclusion."
     (physical-promotion-test-point :after-promotion-request-initialization)
     ;; Reject an unsupported SBCL before pending reconstruction can open storage.
     (call-with-query-sort-arena (lambda (arena) (declare (ignore arena))))
+    (physical-reseed-follow-check-ordinary-startup)
     (let ((primary-ready (eq :primary-ready (physical-bootstrap-check-startup))))
       (initialize-query-temp-storage)
       (capture-server-streams)
       (unless primary-ready
+        (physical-reseed-follow-check-ordinary-startup)
         (if (recovery-in-progress-p)
             (physical-recovery-open-storage)
             (initialize-primary-storage)))

@@ -278,6 +278,7 @@
                    (:file "../replication/physical-adoption-retire-state")
                    (:file "../replication/physical-adoption-retire")
                    (:file "../replication/physical-adoption-startup")
+                   (:file "../replication/physical-reseed-follow-startup-integration")
                    (:file "../replication/physical-promotion-online")
                    (:file "../replication/standard")
                    (:file "../replication/worker")
