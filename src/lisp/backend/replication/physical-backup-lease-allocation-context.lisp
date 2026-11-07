@@ -79,6 +79,13 @@
                  (getf row :coordinates) (physical-follow-pin-anchor pin))))))
 
 (defun physical-backup-lease-selected-observation-under-lock (record)
+  ;; With write and WAL exclusion, check the exact durable parent, successor
+  ;; index, local allocation history, and registered and durable pin pair.
+  ;; Ownership remains checkable after old WAL is unavailable. Cleanup requires
+  ;; separate operation authority.
+  ;; Return :PRESENT or :ABSENT, the pin for use under these locks, detached
+  ;; coordinates, and a detached allocation row. Allocated absence retains saved
+  ;; coordinates. Legacy absence returns NIL coordinates and a NIL row.
   (physical-backup-lease-require-locks)
   (let* ((checked (physical-backup-lease-copy record))
          (request (getf checked :request))

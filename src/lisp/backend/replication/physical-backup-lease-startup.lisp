@@ -33,6 +33,8 @@
     (unless (and (eq :closing (getf current :phase)) (equal current record))
       (wal-invalid-input "backup lease has no matching closing intent"))
     (when (eq :handed-off (getf record :outcome))
+      ;; The observation establishes the selected pin under the locks.  Closing
+      ;; still requires the strict unused-pin and source WAL checks below.
       (let ((successor
               (nth-value 1 (physical-backup-lease-selected-observation-under-lock record))))
         (physical-backup-lease-check-successor-pin record successor)
