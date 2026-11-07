@@ -128,6 +128,7 @@
                (:file "t/physical-reseed-follow-cancellation-operation-tests")
                (:file "t/physical-reseed-follow-cancellation-publication-tests")
                (:file "t/physical-reseed-follow-cancellation-fault-tests")
+               (:file "t/physical-reseed-follow-cancellation-cleanup-tests")
                (:file "t/physical-reseed-follow-retirement-intent-tests")
                (:file "t/wal-timeline-tests")
                (:file "t/wal-eor-tests")

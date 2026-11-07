@@ -17,13 +17,16 @@
     (funcall check)
     (values (physical-reseed-follow-copy record) snapshot)))
 
+(declaim (ftype function physical-reseed-follow-cancellation-recover-source-closed))
+
 (defun physical-reseed-follow-cancellation-recover-temporary (owner root-fd previous temporary check)
   ;; Promoting a temporary still requires the active attempt and its exact
   ;; pending successor.  Its descriptor stays held through promotion.
   (declare (notinline sb-posix:close))
-  (physical-reseed-follow-check-active-attempt owner)
   (when (getf (getf previous :record) :cancellation)
-    (error "pending cancellation already has a conflicting temporary"))
+    (return-from physical-reseed-follow-cancellation-recover-temporary
+      (physical-reseed-follow-cancellation-recover-source-closed owner root-fd previous temporary check)))
+  (physical-reseed-follow-check-active-attempt owner)
   (multiple-value-bind (candidate identity)
       (physical-reseed-follow-read-at root-fd "physical-reseed.follow.tmp")
     (unless (and (equal temporary identity)

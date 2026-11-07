@@ -82,6 +82,19 @@
         (setf (physical-reseed-follow-cancellation-authority-fd authority) fd
               (physical-reseed-follow-cancellation-authority-phase authority) :written)))))
 
+(defun physical-reseed-follow-cancellation-check-publication-state (authority root-fd temporary-identity)
+  (let ((published (physical-reseed-follow-cancellation-authority-published authority)))
+    (cond
+      (published
+       (physical-reseed-follow-check-snapshot root-fd published)
+       (physical-adoption-require-absent
+        (merge-pathnames "physical-reseed.follow.tmp" (physical-image-fd-path root-fd))
+        "published cancellation has an unexpected temporary"))
+      (temporary-identity
+       (unless (equal temporary-identity
+                      (physical-reseed-follow-entry root-fd "physical-reseed.follow.tmp"))
+         (error "cancellation recovery temporary changed"))))))
+
 (defun call-with-physical-reseed-follow-cancellation-authority
     (owner root-fd candidate previous bytes mode check function &optional fd temporary-identity)
   ;; Keep the authority in acquiring phase during its initial proof so a
@@ -115,17 +128,8 @@
                (scope authority owner root-fd frozen before image)
                (physical-reseed-follow-check-active-attempt owner)
                (funcall check)
-               (let ((published (physical-reseed-follow-cancellation-authority-published authority)))
-                 (cond
-                   (published
-                    (physical-reseed-follow-check-snapshot root-fd published)
-                    (physical-adoption-require-absent
-                     (merge-pathnames "physical-reseed.follow.tmp" (physical-image-fd-path root-fd))
-                     "published cancellation has an unexpected temporary"))
-                   (temporary-identity
-                    (unless (equal temporary-identity
-                                   (physical-reseed-follow-entry root-fd "physical-reseed.follow.tmp"))
-                      (error "cancellation recovery temporary changed")))))))
+               (physical-reseed-follow-cancellation-check-publication-state
+                authority root-fd temporary-identity)))
       (setf authority
             (%make-physical-reseed-follow-cancellation-authority
              :owner owner :root-fd root-fd :thread thread :mode mode :fd fd
