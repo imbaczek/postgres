@@ -37,6 +37,7 @@
                (:file "t/physical-backup-lease-selected-startup-tests")
                (:file "t/physical-backup-lease-selected-observation-tests")
                (:file "t/physical-backup-lease-selected-availability-tests")
+               (:file "t/physical-backup-lease-selected-cleanup-tests")
                (:file "t/physical-backup-lease-status-tests")
                (:file "t/physical-backup-lease-capture-tests")
                (:file "t/physical-backup-lease-wire-tests")

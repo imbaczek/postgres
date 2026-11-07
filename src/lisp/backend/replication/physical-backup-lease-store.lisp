@@ -182,7 +182,8 @@
 
 (declaim (ftype function physical-backup-lease-check-successor-create))
 
-(declaim (ftype function physical-backup-lease-check-handoff-publication))
+(declaim (ftype function physical-backup-lease-check-handoff-publication
+                physical-backup-lease-selected-cleanup-check-entry))
 
 (declaim (ftype function physical-backup-lease-allocation-check-unowned-name))
 
@@ -192,7 +193,9 @@
 ;; The caller holds write and WAL exclusion and supplies the callback for an
 ;; active publication fence.  Recheck memory and disk under those locks, then
 ;; begin publication before writing disk and installing the new memory record.
-(defun physical-backup-lease-publish-checked-under-lock (before after begin-publication)
+(defun physical-backup-lease-publish-checked-under-lock
+    (before after begin-publication &optional cleanup-authority)
+  (physical-backup-lease-selected-cleanup-check-entry cleanup-authority)
   (physical-backup-lease-require-locks)
   (let* ((request (getf after :request)) (name (getf request :name)))
     (physical-backup-lease-check-source
@@ -217,7 +220,7 @@
     (physical-backup-lease-check-capacity
      (+ (hash-table-count *physical-backup-lease-records*) (if before 0 1)))
     (physical-backup-lease-allocation-check-handoff after)
-    (physical-backup-lease-check-handoff-publication before after)
+    (physical-backup-lease-check-handoff-publication before after cleanup-authority)
     (unless (equal before after)
       (funcall begin-publication)
       (physical-backup-lease-write after)

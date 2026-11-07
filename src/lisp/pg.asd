@@ -155,6 +155,7 @@
                    (:file "../replication/physical-backup-lease-capture")
                    (:file "../replication/physical-backup-lease-allocation-authority")
                    (:file "../replication/physical-backup-lease-allocation-context")
+                   (:file "../replication/physical-backup-lease-selected-cleanup")
                    (:file "../replication/physical-follow-anchor")
                    (:file "../replication/physical-backup-lease-allocation-operations")
                    (:file "../replication/physical-backup-lease-allocation-pin-graph")

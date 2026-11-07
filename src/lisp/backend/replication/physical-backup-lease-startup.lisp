@@ -63,7 +63,8 @@
     (physical-backup-lease-check-successor-assignment record)
     (physical-backup-lease-closing-bootstrap-pin record)))
 
-(declaim (ftype function physical-backup-lease-finish-aborted-allocations-under-lock
+(declaim (ftype function physical-backup-lease-selected-cleanup-claim
+                physical-backup-lease-finish-aborted-allocations-under-lock
                 physical-backup-lease-allocation-abort-cleanup-plan
                 physical-backup-lease-allocation-canceled-cleanup-plan
                 physical-backup-lease-finish-canceled-allocations-under-lock))
@@ -73,9 +74,13 @@
 ;; require its old WAL.  A handed-off CLOSING parent still requires proof of
 ;; the selected successor and its WAL.  The caller holds write and WAL exclusion
 ;; and supplies the publication fence callback.
-(defun physical-backup-lease-finish-closing-under-lock (request begin-publication)
+(defun physical-backup-lease-finish-closing-under-lock (request begin-publication &optional cleanup-authority)
+  (physical-backup-lease-selected-cleanup-check-entry cleanup-authority)
   (let* ((record (physical-backup-lease-current-record request))
-         (name (getf request :name)))
+         (name (getf request :name))
+         (cleanup-pin (when cleanup-authority
+                        (physical-backup-lease-selected-cleanup-claim
+                         cleanup-authority record :retire))))
     (when (gethash name *physical-backup-lease-capture-owners*)
       (wal-invalid-input "backup lease still has an active capture owner"))
     (when (eq :aborted (getf record :outcome))
@@ -86,17 +91,24 @@
         (error "closed backup lease still has a source pin"))
       (return-from physical-backup-lease-finish-closing-under-lock
         (physical-backup-lease-copy record)))
-    (let ((pin (physical-backup-lease-closing-pin record)))
+    (let ((pin (if cleanup-authority cleanup-pin
+                   (physical-backup-lease-closing-pin record))))
       (funcall begin-publication)
       (if pin
           (physical-source-pin-unlink pin request)
           (if (physical-backup-lease-pin-directory-stat)
               (fsync-directory (physical-source-pin-directory))
               (fsync-directory *pgdata*)))
+      (when cleanup-authority
+        (physical-backup-lease-selected-cleanup-claim cleanup-authority record :retired))
       (let ((next (copy-list record)))
         (setf (getf next :phase) :closed)
-        (physical-backup-lease-publish-checked-under-lock
-         record (physical-backup-lease-transition record next) begin-publication)))))
+        (let ((result (physical-backup-lease-publish-checked-under-lock
+                       record (physical-backup-lease-transition record next)
+                       begin-publication cleanup-authority)))
+          (when cleanup-authority
+            (physical-backup-lease-selected-cleanup-claim cleanup-authority result :done))
+          result)))))
 
 (defun physical-backup-lease-finish-closing (request)
   (let ((request (physical-backup-lease-request-copy request)))
@@ -145,7 +157,11 @@
 ;; Check the successor and retained WAL before publishing a handoff. A completed
 ;; base on an INTERRUPTED lease can be handed to a descendant source through a
 ;; matching successor, while an incomplete capture cannot be handed off.
-(defun physical-backup-lease-check-handoff-publication (before after)
+(defun physical-backup-lease-check-handoff-publication (before after &optional cleanup-authority)
+  (when cleanup-authority
+    (physical-backup-lease-check-successor-assignment after)
+    (physical-backup-lease-selected-cleanup-claim cleanup-authority before :publish after)
+    (return-from physical-backup-lease-check-handoff-publication after))
   (when (eq :handed-off (getf after :outcome))
     (physical-backup-lease-check-successor-assignment after)
     (unless (equal before after)
