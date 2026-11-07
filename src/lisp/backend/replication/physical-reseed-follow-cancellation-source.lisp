@@ -1,5 +1,17 @@
 (in-package #:pg)
 
+;; Copy and classify a source lease observation against the frozen request and
+;; installed base.  Return the detached parent and its classification.  NIL is
+;; unknown; a lease without a base is unbound.  Neither settles cleanup debt.
+;; A bound observation must equal any frozen closed settlement receipt exactly.
+;; A closing or closed handoff must name the selected generation and match its
+;; anchor digest when that proof is known.  Without the anchor, the matching
+;; handoff remains unproved.
+;;
+;; A closed receipt is structural evidence, not proof that an operation ran.
+;; Source-closed records that observation; a cleaned acknowledgment requires a
+;; future caller to establish the corresponding typed operation.
+
 (defun physical-reseed-follow-cancellation-source-observation-copy (predecessor observation)
   (let* ((record (physical-reseed-follow-core-copy
                   (physical-reseed-follow-core-projection predecessor)))
@@ -32,6 +44,13 @@
                 (error "source cleanup successor differs from its saved proof"))
               (values parent (if anchor :handed-off :unproved))))
         (values parent :open))))
+
+;; Before a future connection or STATUS request, check the image size needed
+;; for the possible terminal receipts and both later phases.  A known receipt
+;; is reused; otherwise consider abort and, when a generation exists, handoff.
+;; An unknown anchor uses the maximum 64-bit digest for the size bound.  A
+;; cleaned record needs only its existing image.  This preflight checks journal
+;; capacity; it does not perform cleanup or source I/O.
 
 (defun physical-reseed-follow-cancellation-check-cleanup-capacity
     (value &optional (maximum +physical-reseed-follow-maximum-bytes+))

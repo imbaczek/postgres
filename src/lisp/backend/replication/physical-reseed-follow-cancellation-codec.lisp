@@ -1,6 +1,23 @@
-;; Encode pending cancellation and preserve its predecessor across transitions.
+;; Encode cancellation phases and preserve their frozen predecessors.
 
 (in-package #:pg)
+
+;; Cancellation also records a closed source receipt and a cleanup
+;; acknowledgment.  The request, installed base, generation history, and any
+;; existing terminal receipt remain frozen.  A handoff receipt must select the
+;; recorded generation and match its known digest; without an anchor proof it
+;; remains structurally valid but unproved.
+;;
+;; Pending may advance to source-closed, or directly to cleaned for parent
+;; abort.  Source-closed may advance to cleaned with the same receipt.  The
+;; cleaned acknowledgment is parent-abort for an abort and selected-release
+;; for a handoff.  Repeating an unchanged record is allowed.
+;;
+;; These are pure schemas and transitions.  A source-closed receipt observes
+;; the source; a cleaned acknowledgment needs the caller's proof of the typed
+;; operation.  Neither form grants authority to issue RPCs or write a journal.
+;; The common record constructor copies and checks each candidate and its
+;; transition; the wrappers select the desired cancellation phase.
 
 (defun physical-reseed-follow-cancellation-copy (value &optional predecessor)
   (physical-reseed-install-check-literal value)
@@ -32,8 +49,8 @@
         group))))
 
 (defun physical-reseed-follow-check-forward-record (record)
-  ;; A pending marker fences preparation, settlement, activation and other
-  ;; forward follow operations.  Recovery has its own admission path.
+  ;; Every cancellation phase fences preparation, settlement, activation and
+  ;; other forward follow operations.  Recovery has its own admission path.
   (when (getf record :cancellation)
     (error "target cancellation fences ordinary follow operations"))
   record)

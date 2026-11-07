@@ -113,8 +113,10 @@
 ;; groups are checked against their predecessors.  Missing keys differ from NIL
 ;; groups; records without settlement keep their original canonical encoding.
 (defun physical-reseed-follow-copy (record)
-  ;; Check optional groups in predecessor order: configuration, settlement,
-  ;; activation, then retirement.  Presence of a key is distinct from NIL.
+  ;; Check optional groups in predecessor order, ending with cancellation.
+  ;; Each receives the canonical core and any already checked groups, so a
+  ;; cancellation receipt is checked against its frozen predecessors.
+  ;; Presence of a key is distinct from NIL.
   (physical-reseed-install-check-literal record)
   (let* ((configuration-p (loop for key in record by #'cddr thereis (eq key :configuration)))
          (settlement-p (loop for key in record by #'cddr thereis (eq key :settlement)))
@@ -188,8 +190,9 @@
       (t (error "target follow generation history cannot be shortened or skipped")))
     t))
 
-;; Reserve space for the remaining proof, cancellation or larger terminal
-;; receipt before accepting an image.  Size checks do not prove a source outcome.
+;; Check the bounded image and the reserve for remaining forward work.
+;; Pending settlement without cancellation also needs room for the larger
+;; terminal receipt.  Cancellation cleanup uses its separate capacity preflight.
 (defun physical-reseed-follow-image (record)
   (let* ((record (physical-reseed-follow-copy record))
          (bytes (physical-backup-lease-encode-literal
