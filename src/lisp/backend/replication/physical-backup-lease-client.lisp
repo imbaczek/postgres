@@ -150,9 +150,9 @@
     parent))
 
 ;; Copy the request and successor before I/O so the reply is checked against
-;; the same identity sent in the query. HANDOFF accepts only CLOSED with the
-;; exact successor. The caller must settle an uncertain result after reconnecting
-;; to the original frozen route.
+;; the same identity sent in the query. HANDOFF and CLEANUP_SELECTED accept only
+;; CLOSED with the exact handed-off successor. The caller must settle an uncertain
+;; result after reconnecting to the original frozen route.
 (defun pg-client-native-backup-lease-command (client verb request &optional successor)
   (unless (member verb '("BACKUP_LEASE_STATUS" "BACKUP_LEASE_ABORT" "BACKUP_LEASE_HANDOFF"
                          "BACKUP_LEASE_CLEANUP_SELECTED") :test #'equal)
@@ -183,6 +183,8 @@
   (pg-client-native-backup-lease-command client "BACKUP_LEASE_HANDOFF" request successor))
 
 (defun pg-client-native-backup-lease-cleanup-selected (client request successor)
+  ;; Confirm the saved owner and successor in a CLOSED handed-off result.
+  ;; The caller settles an uncertain result using the original route and intent.
   (pg-client-native-backup-lease-command client "BACKUP_LEASE_CLEANUP_SELECTED" request successor))
 
 (defun physical-backup-lease-check-received-status (manifest digest request record)

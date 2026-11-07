@@ -1,11 +1,11 @@
 (in-package #:pg)
 
 ;;; Native backup lease commands for admitted physical replication senders.
-;;; All use the six lease options; HANDOFF adds successor identity and allocated
-;;; follow commands add generation, name and prefixed receiver coordinates.
+;;; All use the six lease options. HANDOFF and CLEANUP_SELECTED add successor
+;;; identity. Allocated follow commands add generation, name and receiver coordinates.
 ;;; Values are quoted. The token is never echoed in a result or error.
 
-;; STATUS, ABORT and HANDOFF return one row of eight text columns. UNKNOWN
+;; STATUS, ABORT, HANDOFF and CLEANUP_SELECTED return eight text columns. UNKNOWN
 ;; has no state fields. Outcome, base identity and successor identity may be null.
 (defparameter *physical-backup-lease-result-schema*
   '(("lease_name" 25) ("phase" 25) ("outcome" 25 :nullable)
@@ -103,6 +103,8 @@
             (when successor (format nil "~d" (getf successor :anchor-digest)))))))
 
 (defun physical-backup-lease-wire-preflight (command)
+  ;; Every lease command needs an admitted physical sender and a clear transaction.
+  ;; Selected cleanup is also allowed during recovery after the source checks.
   (with-live-operation
     (unless (and *backend* (eq :physical (backend-replication-mode *backend*))
                  (wal-sender-for-backend))
@@ -218,6 +220,8 @@
                  (ecase kind
                    (:physical-lease-status (physical-backup-lease-status request))
                    (:physical-lease-abort (physical-backup-lease-abort request))
+                   ;; Cleanup verifies the committed selection structurally and
+                   ;; retires bootstrap ownership.  Handoff checks usable WAL.
                    (:physical-lease-cleanup-selected
                     (physical-backup-lease-cleanup-selected
                      request (cdr (assoc "successor" (logical-replication-command-options command)

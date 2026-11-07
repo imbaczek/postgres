@@ -1030,7 +1030,8 @@ keepalive's WAL-end field, which may include changes not yet applied."
   (when (and (eq (backend-replication-mode *backend*) :physical)
              (member (logical-replication-command-type command) '(:create :start)))
     (ereport "55000" "logical decoding requires a database connection"))
-  ;; All non-read-only commands retain their recovery write guard.
+  ;; Cleanup is admitted during recovery and still checks its exact owner.
+  ;; Other guarded commands retain their recovery write guard.
   (unless (member (logical-replication-command-type command) '(:identify :timeline-history :show :physical-release :physical-bootstrap-release
                                                                :physical-lease-status :physical-lease-abort :physical-lease-cancel-follow
                                                                :physical-lease-cleanup-selected))
