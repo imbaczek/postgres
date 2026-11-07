@@ -4,7 +4,8 @@
 ;;; loading interrupts captures or removes temporary files.  Source WAL and
 ;;; role policy are applied later when startup loads the pins.
 
-(defun physical-backup-lease-check-parent-pin-inventory (record pins)
+(defun physical-backup-lease-check-parent-pin-inventory
+    (record parents allocations pins histories successors)
   (let* ((name (getf (getf record :request) :name))
          (pin (gethash name pins)))
     (when pin
@@ -14,11 +15,10 @@
     (when (and (eq :ready (getf record :phase)) (null pin))
       (error "ready backup lease has no source pin"))
     (when (eq :handed-off (getf record :outcome))
-      (let ((selected (gethash (getf (getf record :successor) :name) pins)))
-        (if (eq :closing (getf record :phase))
-            (physical-backup-lease-check-successor-pin record selected)
-            (when selected
-              (physical-backup-lease-check-selected-pin-fields record selected)))))))
+      (let ((selected-name (getf (getf record :successor) :name)))
+        (physical-backup-lease-selected-pin-observation
+         record (gethash selected-name pins) parents allocations
+         (gethash name histories) (gethash selected-name successors))))))
 
 (defun physical-backup-lease-allocation-check-pin-inventory-row (row parent pins)
   (let ((pin (gethash (getf row :name) pins)))
@@ -41,7 +41,8 @@
 ;; advanced or retired it.  Unselected live preparations cannot have advanced.
 
 (defun physical-backup-lease-allocation-check-pin-inventory (parents allocations pins)
-  (let ((histories (physical-backup-lease-allocation-check-graph parents allocations)))
+  (multiple-value-bind (histories successors checked-parents checked-allocations)
+      (physical-backup-lease-allocation-check-graph parents allocations)
     (maphash
      (lambda (name pin)
        (unless (and (physical-source-pin-p pin) (equal name (physical-source-pin-name pin)))
@@ -49,15 +50,16 @@
      pins)
     (maphash (lambda (name record)
                (declare (ignore name))
-               (physical-backup-lease-check-parent-pin-inventory record pins))
+               (physical-backup-lease-check-parent-pin-inventory
+                record checked-parents checked-allocations pins histories successors))
              parents)
     (maphash
      (lambda (name row)
        (declare (ignore name))
        (physical-backup-lease-allocation-check-pin-inventory-row
-        row (gethash (getf (getf row :request) :name) parents) pins))
-     allocations)
-    histories))
+        row (gethash (getf (getf row :request) :name) checked-parents) pins))
+     checked-allocations)
+    (values histories successors checked-parents checked-allocations)))
 
 (defun physical-backup-lease-pin-inventory ()
   (physical-backup-lease-require-locks)

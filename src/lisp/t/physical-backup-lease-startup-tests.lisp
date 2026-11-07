@@ -559,7 +559,7 @@
                (backup-lease-startup-reopen)
                (ok (not (probe-file (pg::physical-source-pin-path name)))))))))))
 
-(deftest backup-lease-handed-off-closing-rejects-unusable-successors-before-loss
+(deftest backup-lease-handed-off-closing-validates-corruption-and-defers-known-loss
     (dolist (mode '(:live :primary :standby))
       (dolist (fault '(:lost :retaining :advanced :digest :manifest :sender :disk))
         (call-with-backup-lease-authority-fixture
@@ -597,13 +597,23 @@
                  (:disk (delete-file (pg::physical-source-pin-path name))))
                (unless (member fault '(:digest :sender :disk))
                  (pg::physical-source-pin-save pin))
-               (ok (intake-fails-p
-                    (lambda ()
-                      (if (eq mode :live)
-                          (pg::physical-backup-lease-finish-closing request)
-                          (backup-lease-startup-reopen (eq mode :standby))))))
-               (ok (not (pg::physical-source-pin-lost-p bootstrap)))
-               (ok (= 32 (gethash bootstrap pg::*wal-snapshot-retention-pins*)))
+               (let ((pending (and (not (eq mode :live))
+                                   (member fault '(:lost :disk)))))
+                 (ok (eq (intake-fails-p
+                          (lambda ()
+                            (if (eq mode :live)
+                                (pg::physical-backup-lease-finish-closing request)
+                                (backup-lease-startup-reopen (eq mode :standby)))))
+                         (null pending)))
+                 (let ((registered (gethash (getf request :name)
+                                            pg::*physical-source-pins*)))
+                   (ok registered)
+                   (ok (not (pg::physical-source-pin-lost-p registered)))
+                   (if (and pending (eq mode :standby))
+                       (ok (null (gethash registered pg::*wal-snapshot-retention-pins*)))
+                       (ok (= 32 (gethash registered pg::*wal-snapshot-retention-pins*)))))
+                 (when pending
+                   (ok (null (gethash pin pg::*wal-snapshot-retention-pins*)))))
                (ok (equalp bootstrap-image
                            (pg::physical-source-pin-encode
                             (pg::physical-source-pin-read-retirement (getf request :name)))))

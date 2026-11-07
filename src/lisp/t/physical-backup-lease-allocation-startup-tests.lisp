@@ -78,7 +78,7 @@
     (when (eq phase :closed) (remhash name pins))
     parent))
 
-(deftest backup-lease-allocation-pin-graph-closing-requires-unused-ready-selection
+(deftest backup-lease-allocation-pin-graph-closing-keeps-unused-selection-or-absence
     (dolist (fault '(:none :absent :lost :advanced :wrong-digest))
       (call-with-backup-lease-allocation-pin-graph-fixture
        (lambda (root parents allocations pins row)
@@ -97,7 +97,7 @@
              (ok (eq (not (null (handler-case
                                     (backup-lease-allocation-pin-graph-check parents allocations pins)
                                   (error () nil))))
-                     (eq fault :none)))
+                     (not (null (member fault '(:none :absent :lost))))))
              (ok (equal before (backup-lease-allocation-pin-graph-snapshot parents allocations pins)))))))))
 
 (deftest backup-lease-allocation-pin-graph-closed-allows-selected-progress-or-retirement
@@ -372,7 +372,7 @@
                  (ok (null (gethash "ordinary_startup_pin" pg::*physical-source-pins*)))
                  (ok (zerop (hash-table-count pg::*wal-snapshot-retention-pins*)))))))))))
 
-(deftest backup-lease-allocation-unavailable-closing-source-prevents-all-role-loss
+(deftest backup-lease-allocation-unavailable-closing-source-preserves-bootstrap-and-other-role-policy
     (call-with-backup-lease-allocation-authority-fixture
      (lambda (root parent row)
        (declare (ignore root))
@@ -409,12 +409,26 @@
                        collect (list path (pg::read-bounded-regular-file
                                            path (pg::physical-follow-pin-image-limit)))))
                (pg::*wal-insert-timeline* 3))
-           (ok (intake-fails-p (lambda () (backup-lease-startup-reopen nil))))
-           (dolist (entry before)
-             (ok (equalp (second entry)
-                         (pg::read-bounded-regular-file (first entry) (pg::physical-follow-pin-image-limit))))
-             (ok (not (pg::physical-source-pin-lost-p
-                       (pg::physical-source-pin-read-raw (first entry) :stabilize t)))))
+           (ok (not (intake-fails-p (lambda () (backup-lease-startup-reopen nil)))))
+           (loop for entry in before
+                 for bootstrap-p = (equal (first entry)
+                                          (pg::physical-source-pin-path
+                                           (getf (getf parent :request) :name)))
+                 for restored = (pg::physical-source-pin-read-raw (first entry) :stabilize t)
+                 do (ok (eq (not (null (pg::physical-source-pin-lost-p restored)))
+                            (not bootstrap-p)))
+                    (setf (pg::physical-source-pin-lost-p restored) nil)
+                    (ok (equalp (second entry) (pg::physical-source-pin-encode restored))))
+           (let ((bootstrap (gethash (getf (getf parent :request) :name)
+                                     pg::*physical-source-pins*)))
+             (ok bootstrap)
+             (ok (= 32 (gethash bootstrap pg::*wal-snapshot-retention-pins*))))
+           (ok (eq :closing
+                   (getf (gethash (getf (getf parent :request) :name)
+                                  pg::*physical-backup-lease-records*) :phase)))
+           (ok (eq :interrupted
+                   (getf (gethash (getf (getf other :request) :name)
+                                  pg::*physical-backup-lease-records*) :phase)))
            (ok (eq :live
                    (getf (gethash (getf other-row :name) pg::*physical-backup-lease-allocations*) :state))))))))
 

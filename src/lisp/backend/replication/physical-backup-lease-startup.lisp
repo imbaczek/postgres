@@ -25,6 +25,27 @@
 
 (declaim (ftype function physical-backup-lease-selected-observation-under-lock))
 
+(declaim (ftype function physical-backup-lease-startup-source-context
+                physical-backup-lease-check-startup-source-context
+                physical-backup-lease-startup-selected-state))
+
+(defun physical-backup-lease-closing-bootstrap-pin (record)
+  (let* ((request (getf record :request))
+         (name (getf request :name))
+         (current (physical-backup-lease-current-record request))
+         (selected-name (getf (getf current :successor) :name)))
+    (unless (and (eq :closing (getf current :phase)) (equal current record))
+      (wal-invalid-input "backup lease has no matching closing intent"))
+    (when (or (gethash name *physical-backup-lease-capture-owners*)
+              (gethash name *physical-source-senders*)
+              (gethash selected-name *physical-source-senders*))
+      (wal-invalid-input "backup lease closing still has an active source owner"))
+    (physical-backup-lease-pin-directory-stat)
+    (multiple-value-bind (pin disk) (physical-source-retirement-pins name)
+      (declare (ignore disk))
+      (when pin (physical-backup-lease-check-pin-unlink pin request))
+      pin)))
+
 ;; Validate the closing intent and its successor before finding the bootstrap
 ;; pin to remove. The successor may be present only on disk during startup.
 (defun physical-backup-lease-closing-pin (record)
@@ -40,11 +61,7 @@
         (physical-backup-lease-check-successor-pin record successor)
         (physical-follow-pin-check-wal successor)))
     (physical-backup-lease-check-successor-assignment record)
-    (physical-backup-lease-pin-directory-stat)
-    (multiple-value-bind (pin disk) (physical-source-retirement-pins (getf request :name))
-      (declare (ignore disk))
-      (when pin (physical-backup-lease-check-pin-unlink pin request))
-      pin)))
+    (physical-backup-lease-closing-bootstrap-pin record)))
 
 (declaim (ftype function physical-backup-lease-finish-aborted-allocations-under-lock
                 physical-backup-lease-allocation-abort-cleanup-plan
@@ -187,9 +204,18 @@
       (:ready (physical-backup-lease-ready-action record))
       (:closing
        (if (eq :aborted (getf record :outcome))
-           (physical-backup-lease-allocation-abort-cleanup-plan record)
-           (physical-backup-lease-closing-pin record))
-       :close)
+           (progn (physical-backup-lease-allocation-abort-cleanup-plan record) :close)
+           (multiple-value-bind (presence pin coordinates row)
+               (physical-backup-lease-selected-observation-under-lock record)
+             (declare (ignore presence coordinates row))
+             (let* ((context (physical-backup-lease-startup-source-context))
+                    (state (physical-backup-lease-startup-selected-state
+                            record pin (recovery-in-progress-p) context)))
+               (physical-backup-lease-check-startup-source-context context)
+               (physical-backup-lease-closing-bootstrap-pin record)
+               (when (eq state :usable)
+                 (physical-backup-lease-check-successor-pin record pin)
+                 :close)))))
       (:closed
        (when (or (gethash name *physical-source-pins*)
                  (physical-backup-lease-lstat (physical-source-pin-path name)))

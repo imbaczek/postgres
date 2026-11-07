@@ -187,6 +187,37 @@
         (wal-invalid-input "backup lease closing successor has advanced progress"))))
   pin)
 
+(defun physical-backup-lease-selected-pin-observation
+    (record pin parents allocations history successor-owner)
+  (let* ((checked (physical-backup-lease-copy record))
+         (request (getf checked :request))
+         (current (gethash (getf request :name) parents))
+         (name (getf (getf checked :successor) :name))
+         (row (gethash name allocations)))
+    (unless (and (equal checked current)
+                 (member (getf checked :phase) '(:closing :closed))
+                 (eq :handed-off (getf checked :outcome))
+                 (equal checked successor-owner))
+      (wal-invalid-input "backup lease selection has no matching candidate owner"))
+    (when history (physical-backup-lease-allocation-check-history checked history))
+    (unless (equal row (find name history :test #'equal :key (lambda (entry) (getf entry :name))))
+      (wal-invalid-input "backup lease selection differs from its allocation history"))
+    (when row
+      (unless (and (eq :live (getf row :state)) (equal request (getf row :request)))
+        (wal-invalid-input "backup lease selection has a different allocated owner"))
+      (physical-backup-lease-allocation-check-parent row parents))
+    (when pin
+      (physical-backup-lease-check-selected-pin-fields checked pin)
+      (when (and row
+                 (not (physical-follow-request-matches-anchor-p
+                       (getf row :coordinates) (physical-follow-pin-anchor pin))))
+        (wal-invalid-input "backup lease selection differs from its allocated coordinates")))
+    (values (if pin :present :absent)
+            pin
+            (cond (row (physical-follow-request-copy (getf row :coordinates)))
+                  (pin (physical-follow-anchor-request (physical-follow-pin-anchor pin))))
+            (when row (physical-backup-lease-allocation-copy row)))))
+
 ;; Require the exact unused READY follow pin for this backup's original system,
 ;; timeline, base and manifest. Its saved anchor digest and receive position
 ;; bind the successor to the handoff before the old retention can be released.

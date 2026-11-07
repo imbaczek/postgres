@@ -45,6 +45,7 @@
                (<= (hash-table-count allocations) *physical-backup-lease-allocation-limit*))
     (error "backup lease allocation graph exceeds capacity"))
   (let ((checked-parents (make-hash-table :test #'equal))
+        (checked-allocations (make-hash-table :test #'equal))
         (successors (make-hash-table :test #'equal))
         (histories (make-hash-table :test #'equal)))
     (maphash
@@ -57,7 +58,7 @@
            (when successor
              (when (gethash successor successors)
                (error "backup lease graph shares a historical successor"))
-             (setf (gethash successor successors) name)))))
+             (setf (gethash successor successors) parent)))))
      parents)
     (maphash
      (lambda (name record)
@@ -65,12 +66,14 @@
               (parent-name (getf (getf row :request) :name))
               (historical-owner (gethash name successors)))
          (unless (and (equal name (getf row :name))
-                      (or (null historical-owner) (equal historical-owner parent-name)))
+                      (or (null historical-owner)
+                          (equal (getf (getf historical-owner :request) :name) parent-name)))
            (error "backup lease allocation name belongs to another owner"))
+         (setf (gethash name checked-allocations) row)
          (push row (gethash parent-name histories))))
      allocations)
     (maphash
      (lambda (name rows)
        (physical-backup-lease-allocation-check-history (gethash name checked-parents) rows))
      histories)
-    histories))
+    (values histories successors checked-parents checked-allocations)))
