@@ -47,8 +47,8 @@
    owner
    (lambda (operation)
      (let ((snapshot (physical-reseed-follow-cancellation-operation-call operation :snapshot)))
-       (physical-reseed-follow-cancellation-preconfiguration-record
-        (getf (getf snapshot :follow) :record))
+       (physical-reseed-follow-cancellation-publication-record
+        owner (getf (getf snapshot :follow) :record))
        (when (eq :pending (getf (getf (getf (getf snapshot :follow) :record) :cancellation) :phase))
          (let ((receipt (physical-reseed-follow-observe-cancellation-source-held
                          operation snapshot :helper helper)))

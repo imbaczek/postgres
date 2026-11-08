@@ -35,13 +35,17 @@
             (call-with-physical-reseed-follow-cancellation-finalization
              owner
              (lambda (root-fd store-check)
-               (let ((authority nil) (live t) (fd nil))
+               (physical-reseed-follow-cancellation-publication-record owner (getf previous :record))
+               (physical-reseed-follow-cancellation-publication-record owner candidate)
+               (let ((authority nil) (live t) (fd nil)
+                                     (context (physical-reseed-follow-cancellation-publication-context owner)))
                  (labels
                      ((scope (value actual-owner actual-root actual-candidate actual-previous actual-bytes)
                         (unless (and live (eq value authority)
                                      (physical-reseed-follow-cancellation-ack-authority-p value)
                                      (eq owner actual-owner) (eql root-fd actual-root)
                                      (eq thread sb-thread:*current-thread*)
+                                     (eq context (physical-reseed-follow-cancellation-publication-context owner))
                                      (eq thread (physical-reseed-follow-cancellation-authority-thread value))
                                      (eq mode (physical-reseed-follow-cancellation-authority-mode value))
                                      (eq owner (physical-reseed-follow-cancellation-authority-owner value))

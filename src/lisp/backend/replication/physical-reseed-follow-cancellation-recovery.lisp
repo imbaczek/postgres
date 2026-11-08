@@ -17,7 +17,7 @@
 
 (defun physical-reseed-follow-cleaned-recovery-snapshot-at (root-fd)
   (let* ((snapshot (physical-reseed-follow-cancellation-snapshot-at root-fd))
-         (before (physical-reseed-follow-cancellation-preconfiguration-record
+         (before (physical-reseed-follow-copy
                   (getf (getf snapshot :follow) :record))))
     (unless (member (getf (getf before :cancellation) :phase) '(:pending :source-closed))
       (error "cleanup recovery requires its pending or source-closed predecessor"))

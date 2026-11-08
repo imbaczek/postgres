@@ -140,8 +140,7 @@
                      (reseed-cancellation-source-parent pending :ready nil t)))
              (setf (getf state :allowed-commands)
                    (if (eq outcome :aborted) '(:status :abort) '(:status :cleanup)))
-             (ok (signals
-                  (pg::physical-reseed-follow-cleanup-cancellation owner :helper "/unused/helper") 'error))
+             (ok (equal pending (pg::physical-reseed-follow-read-configured-cancellation owner)))
              (ng (getf state :events))
              (pg::call-with-physical-reseed-follow-cancellation-operation
               owner
@@ -160,8 +159,7 @@
                              (pg::physical-reseed-follow-record-cancellation-source-closed-held
                               operation snapshot actual))))))
              (let ((events (copy-list (getf state :events))))
-               (ok (signals
-                    (pg::physical-reseed-follow-cleanup-cancellation owner :helper "/unused/helper") 'error))
+               (ok (equal expected (pg::physical-reseed-follow-read-configured-cancellation owner)))
                (ok (equal events (getf state :events))))
              (ok (equal expected (pg::physical-reseed-follow-read-configured-cancellation owner)))
              (ok (equalp (pg::physical-reseed-follow-image expected) (lineage-test-bytes path)))

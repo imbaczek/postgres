@@ -7,7 +7,7 @@
 ;; abort with generation history keeps that debt for later reconciliation.
 
 (defun physical-reseed-follow-cancellation-ack-plan (value observation)
-  (let* ((record (physical-reseed-follow-cancellation-preconfiguration-record value))
+  (let* ((record (physical-reseed-follow-copy value))
          (group (getf record :cancellation))
          (phase (getf group :phase))
          (generations (getf record :generations)))
@@ -46,7 +46,7 @@
        receipt))))
 
 (defun physical-reseed-follow-cancellation-source-action (value observation)
-  (let* ((record (physical-reseed-follow-cancellation-preconfiguration-record value))
+  (let* ((record (physical-reseed-follow-copy value))
          (group (getf record :cancellation))
          (phase (getf group :phase)))
     (ecase phase
@@ -80,7 +80,7 @@
     confirmed))
 
 (defun physical-reseed-follow-cancellation-cleaned-candidate (value &optional plan)
-  (let* ((before (physical-reseed-follow-cancellation-preconfiguration-record value))
+  (let* ((before (physical-reseed-follow-copy value))
          (confirmed (or plan
                         (physical-reseed-follow-cancellation-ack-plan
                          before (getf (getf before :cancellation) :receipt)))))
