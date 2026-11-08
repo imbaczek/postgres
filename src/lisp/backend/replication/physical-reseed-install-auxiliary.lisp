@@ -103,6 +103,15 @@
                    :fence-inode (physical-reseed-install-guard-facts fd fence "physical-reseed.install" device mount)))
      local identities)))
 
+(defmacro physical-reseed-check-directory-flock (fd active message)
+  `(sb-sys:without-interrupts
+     (unless (and (sb-sys:with-local-interrupts
+                    (handler-case (physical-file-holds-exclusive-flock-p ,fd)
+                      (error () nil)))
+                  ,active)
+       (setf ,active nil)
+       (error ,message))))
+
 ;; Prepare guards under ordinary stopped ownership or reopen saved guard facts.
 ;; Preparation checks the full owner role after each test point and before the
 ;; callback.  It syncs the guard files, auxiliary directory and naming ancestors
@@ -167,8 +176,11 @@
                         (setf active t)
                         (flet ((check ()
                                  (unless active (error "reseed auxiliary scope has ended"))
+                                 (physical-reseed-check-directory-flock
+                                  fd active "reseed auxiliary directory lost its exclusive lock")
                                  (let ((actual (physical-reseed-install-auxiliary-facts owner root-fd directory fd lock fence)))
                                    (unless (equal facts actual) (error "reseed auxiliary identity changed"))
+                                   (physical-file-check-exclusive-flock lock)
                                    actual)))
                           (physical-reseed-install-test-point :after-auxiliary-sync directory)
                           (when prepare (physical-reseed-check-owner owner))

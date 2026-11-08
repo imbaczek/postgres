@@ -148,7 +148,7 @@
          (base (physical-reseed-follow-activation-context-base context))
          (descriptors (physical-reseed-follow-activation-context-descriptors context))
          (prefix (physical-reseed-follow-activation-context-prefix context)))
-    (physical-store-check-live store)
+    (physical-store-check-held-lock store)
     (physical-store-check-complete-input store)
     (unless (equal (physical-store-control-tuple store) (getf binding :after))
       (error "activation receive store differs from its exact settled tuple"))
@@ -228,12 +228,13 @@
            (let ((store nil) (context nil))
              (unwind-protect
                   (progn
-                    (setf store (physical-store-open
-                                 (physical-image-fd-path (physical-reseed-follow-configuration-role-fd held :receive))
-                                 (getf base :system-id) (getf base :timeline) :start-lsn (getf base :end)
-                                 :discard-tail nil :create-lock nil
-                                 :retained-identity (physical-recovery-retained-identity base))
-                          context (%make-physical-reseed-follow-activation-context
+                    (physical-store-open
+                     (physical-image-fd-path (physical-reseed-follow-configuration-role-fd held :receive))
+                     (getf base :system-id) (getf base :timeline) :start-lsn (getf base :end)
+                     :discard-tail nil :create-lock nil
+                     :retained-identity (physical-recovery-retained-identity base)
+                     :on-open (lambda (opened) (setf store opened)))
+                    (setf context (%make-physical-reseed-follow-activation-context
                                    :owner owner :thread sb-thread:*current-thread* :active-p t
                                    :descriptors held :plan plan :record record :install-state install-state
                                    :attempt attempt :snapshot snapshot :prefix prefix :base base :binding binding

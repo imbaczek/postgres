@@ -97,7 +97,7 @@
          (base (physical-reseed-follow-installation-context-base context))
          (descriptors (physical-reseed-follow-installation-context-descriptors context))
          (maximum (length (physical-reseed-follow-configuration-moves record binding))))
-    (physical-store-check-live store)
+    (physical-store-check-held-lock store)
     (physical-store-check-complete-input store)
     (unless (equal (physical-store-control-tuple store) (getf binding :after))
       (error "installation receive store differs from the exact derived tuple"))
@@ -133,7 +133,7 @@
          (base-fds (loop for role in '(:base :global :wal)
                          collect (cons role (physical-reseed-follow-configuration-role-fd descriptors role)))))
     (flet ((guard () (physical-reseed-follow-installation-guard context)))
-      (let ((layout (physical-reseed-follow-configuration-layout-state
+      (let ((layout (physical-reseed-follow-installation-layout-state
                      owner descriptors record binding images prefix #'guard)))
         (multiple-value-bind (base control actual-binding model actual-images row)
             (physical-reseed-follow-configuration-base-proof root saved base-fds plan record prefix #'guard)
@@ -144,7 +144,7 @@
                               (physical-store-control-tuple (physical-reseed-follow-installation-context-model context))))
             (error "mapped installation base facts changed")))
         (physical-reseed-follow-installation-check-receive context #'guard)
-        (unless (equal layout (physical-reseed-follow-configuration-layout-state
+        (unless (equal layout (physical-reseed-follow-installation-layout-state
                                owner descriptors record binding images prefix #'guard))
           (error "mapped installation layout changed around the complete base proof"))
         (guard))))
@@ -166,12 +166,13 @@
        (let ((store nil) (context nil))
          (unwind-protect
               (progn
-                (setf store (physical-store-open
-                             (physical-image-fd-path (physical-reseed-follow-configuration-role-fd held :receive))
-                             (getf base :system-id) (getf base :timeline) :start-lsn (getf base :end)
-                             :discard-tail nil :create-lock nil
-                             :retained-identity (physical-recovery-retained-identity base))
-                      context (%make-physical-reseed-follow-installation-context
+                (physical-store-open
+                 (physical-image-fd-path (physical-reseed-follow-configuration-role-fd held :receive))
+                 (getf base :system-id) (getf base :timeline) :start-lsn (getf base :end)
+                 :discard-tail nil :create-lock nil
+                 :retained-identity (physical-recovery-retained-identity base)
+                 :on-open (lambda (opened) (setf store opened)))
+                (setf context (%make-physical-reseed-follow-installation-context
                                :owner owner :thread sb-thread:*current-thread* :active-p t
                                :descriptors held :plan plan :record record :install-state install-state
                                :attempt attempt :snapshot snapshot :prefix prefix :base base :binding binding
@@ -228,11 +229,9 @@
 ;; Hold root, incoming, quarantine, workspace, staged, saved, base, global, WAL
 ;; and receive descriptors for one mapped proof.  Keep journal and attempt checks
 ;; separate from the full layout proof so they cannot recurse into this scope.
-(defun call-with-physical-reseed-follow-mapped-image (owner function)
+(defun %call-with-physical-reseed-follow-mapped-image (owner function)
   ;; Derive the installation prefix before constructing the context and its
   ;; receive descriptor.  The callback runs under the complete mapped proof.
-  (unless (physical-reseed-follow-configuration-owner-p owner)
-    (error "mapped image requires dedicated configuration ownership"))
   (when *physical-reseed-follow-installation-scope* (error "mapped installation scope is already active"))
   (let ((*physical-reseed-follow-installation-scope* :acquiring))
     (call-with-physical-reseed-follow-mapped-predecessor
@@ -246,6 +245,11 @@
                        (physical-reseed-follow-configuration-role-fd descriptors :saved) plan record extra)))
          (call-with-physical-reseed-follow-installation-context
           owner descriptors plan record install-state attempt snapshot prefix check function))))))
+
+(defun call-with-physical-reseed-follow-mapped-image (owner function)
+  (unless (physical-reseed-follow-configuration-owner-p owner)
+    (error "mapped image requires dedicated configuration ownership"))
+  (%call-with-physical-reseed-follow-mapped-image owner function))
 
 (defmethod physical-reseed-follow-image-dispatch
     ((owner physical-reseed-follow-configuration-owner) function)

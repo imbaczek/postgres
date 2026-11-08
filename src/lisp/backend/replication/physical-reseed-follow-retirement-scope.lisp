@@ -29,6 +29,8 @@
             (unless (and (= inode (getf expected key))
                          (equal row (physical-reseed-install-old-observe fd name mount)))
               (error "retirement guard differs from its recorded inode or stable facts"))
+            (when (equal name ".pg_lisp.lock")
+              (physical-file-check-exclusive-flock stream))
             row))))
 
 (defun call-with-physical-reseed-follow-retirement-directory (root value function parent-check)
@@ -55,6 +57,8 @@
                               (error "retirement directory scope ended or changed thread"))
                             (funcall parent-check)
                             (physical-reseed-follow-retirement-directory-check root expected fd)
+                            (physical-reseed-check-directory-flock
+                             fd active "retirement directory lost its exclusive lock")
                             (unless (equal guards (physical-reseed-follow-retirement-guard-observation fd expected lock fence))
                               (error "retirement guards changed during their held scope"))))
                      (unwind-protect
@@ -96,7 +100,7 @@
   ;; Check the exact activated receive tuple and retained prefix, then validate
   ;; the active follow state against the held base directories.
   (funcall check)
-  (physical-store-check-live store)
+  (physical-store-check-held-lock store)
   (physical-store-check-complete-input store)
   (unless (equal (getf binding :after) (physical-store-control-tuple store))
     (error "retirement receive tuple differs from the exact activated selection"))
@@ -197,7 +201,7 @@
                     (unless (and active (eq thread sb-thread:*current-thread*))
                       (error "retirement store scope ended or changed thread"))
                     (funcall check)
-                    (physical-store-check-live store)
+                    (physical-store-check-held-lock store)
                     t))
              (verify)
              (multiple-value-prog1 (funcall function store #'verify) (verify))))

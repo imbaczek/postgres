@@ -94,7 +94,9 @@
                       (funcall check)
                       (unless (equal facts
                                      (physical-reseed-follow-configuration-workspace-facts owner root-fd directory fd))
-                        (error "configuration workspace identity changed"))))
+                        (error "configuration workspace identity changed"))
+                      (physical-reseed-check-directory-flock
+                       fd active "configuration workspace lost its exclusive lock")))
                (verify)
                (multiple-value-prog1 (funcall function facts fd #'verify)
                  (verify)))))

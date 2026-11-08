@@ -78,9 +78,15 @@
     (error "target follow publication is uncertain; close and reopen the owner"))
   owner)
 
+(defgeneric physical-reseed-follow-check-forward-owner (owner))
+
+(defmethod physical-reseed-follow-check-forward-owner ((owner physical-reseed-follow-owner))
+  owner)
+
 (defun physical-reseed-follow-check-idle (owner)
   ;; Ordinary operations also require a journal without pending cancellation.
   (physical-reseed-follow-check-idle-state owner)
+  (physical-reseed-follow-check-forward-owner owner)
   (call-with-physical-directory-root
    owner
    (lambda (root-fd directory)

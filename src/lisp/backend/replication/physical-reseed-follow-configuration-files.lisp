@@ -251,7 +251,9 @@
          (flet ((verify ()
                   (funcall check)
                   (unless (= inode (physical-reseed-follow-configuration-guard-facts parent stream name))
-                    (error "configuration guard identity changed"))))
+                    (error "configuration guard identity changed"))
+                  (when (equal name ".pg_lisp.lock")
+                    (physical-file-check-exclusive-flock stream))))
            (verify)
            (when synchronize
              (sb-posix:fsync (sb-sys:fd-stream-fd stream))

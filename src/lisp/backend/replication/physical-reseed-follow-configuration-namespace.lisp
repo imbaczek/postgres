@@ -156,9 +156,7 @@
 
 ;; Prove the complete mapped namespace at one prefix, including unused images.
 ;; Check identities, contents and exact child names again around the proof.
-(defun physical-reseed-follow-configuration-layout-state (owner descriptors value binding images prefix check)
-  (unless (physical-reseed-follow-configuration-owner-p owner)
-    (error "mapped layout requires configuration ownership"))
+(defun %physical-reseed-follow-configuration-layout-state (owner descriptors value binding images prefix check)
   (physical-reseed-check-owner owner)
   (funcall check)
   (multiple-value-bind (plan record)
@@ -170,3 +168,15 @@
            (expected (physical-reseed-follow-configuration-inventories plan record binding prefix extra)))
       (physical-reseed-follow-layout-proof
        owner descriptors plan record positions images extra expected mount check))))
+
+(defun physical-reseed-follow-configuration-layout-state (owner descriptors value binding images prefix check)
+  (unless (physical-reseed-follow-configuration-owner-p owner)
+    (error "mapped layout requires configuration ownership"))
+  (%physical-reseed-follow-configuration-layout-state owner descriptors value binding images prefix check))
+
+(defgeneric physical-reseed-follow-installation-layout-state
+    (owner descriptors value binding images prefix check))
+
+(defmethod physical-reseed-follow-installation-layout-state
+    ((owner physical-reseed-follow-owner) descriptors value binding images prefix check)
+  (physical-reseed-follow-configuration-layout-state owner descriptors value binding images prefix check))
