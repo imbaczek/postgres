@@ -99,6 +99,256 @@
          (pg::physical-store-close store))))
    :system-id system-id))
 
+(defun call-with-cold-promotion-image (function)
+  (call-with-physical-store-directory
+   (lambda (driver)
+     (call-with-promotion-fixture
+      (lambda (root store)
+        (pg::wal-atomic-write-bytes (pg::clog-path) (empty-octets))
+        (pg::wal-atomic-write-bytes (pg::pgdata-path "PG_VERSION")
+                                    (pg::string->bytes (format nil "16~%")))
+        (call-with-promotion-exclusion (lambda () (pg::physical-promotion-publish-intent 2)))
+        (pg::physical-store-close store)
+        (sb-posix:rename (namestring (pg::physical-store-directory store))
+                         (namestring (pg::physical-recovery-spool-directory)))
+        (let ((target (merge-pathnames "data/" driver)))
+          (uiop:run-program (list "cp" "-a" (namestring root) (namestring target)))
+          (sb-posix:chmod (namestring target) #o700)
+          (funcall function target driver)))
+      :system-id (pg::physical-store-update-digest
+                  #xCBF29CE484222325 (pg::string->bytes "history-source"))))))
+
+(defun promotion-handoff-child-form (root marker boundary kind)
+  `(let ((pg::*pgdata* ,root)
+         (opened nil) (calls 0) (result nil)
+         (original (symbol-function ',boundary))
+         (tag (gensym "PROMOTION-HANDOFF")))
+     (pg::postmaster-own-data-directory "127.0.0.1" 5439)
+     (unwind-protect
+          (progn
+            (setf (symbol-function ',boundary)
+                  (lambda (&rest arguments)
+                    (setf opened (apply original arguments))
+                    (incf calls)
+                    (ecase ,kind
+                      (:error (error "injected promotion handoff"))
+                      (:throw (throw tag :cut))
+                      (:interrupt
+                       (sb-thread:interrupt-thread
+                        sb-thread:*current-thread*
+                        (lambda () (error "injected promotion handoff")))))
+                    (error "promotion handoff injection did not exit")))
+            (let ((exit
+                    (catch tag
+                      (handler-case
+                          (sb-thread:with-mutex (pg::*physical-follow-command-lock*)
+                            (sb-thread:with-mutex (pg::*reload-run-lock*)
+                              (pg::with-live-operation-quiescence
+                                (pg::physical-promotion-resume-pending))))
+                        (error (condition)
+                          (when (search "injected promotion handoff" (princ-to-string condition))
+                            :cut))))))
+              (setf (symbol-function ',boundary) original)
+              (setf result
+                    (list (eq exit :cut)
+                          (= calls 1)
+                          (and opened (pg::physical-store-closed-p opened))
+                          (and opened (not (open-stream-p (pg::physical-store-lock-stream opened))))
+                          pg::*physical-recovery-failed-p*
+                          (null pg::*physical-receive-store*)
+                          (null pg::*clog-stream*)
+                          (handler-case
+                              (let* ((state (nth-value 0 (pg::physical-promotion-read-pending-state)))
+                                     (fresh (pg::physical-promotion-open-pending-store state)))
+                                (unwind-protect (pg::physical-store-check-held-lock fresh)
+                                  (pg::physical-store-close fresh)))
+                            (error () nil)))))
+            (with-open-file (out ,marker :direction :output :if-exists :error)
+              (write (list (sb-posix:getpid) ,kind result) :stream out :readably t))
+            (format t "~%PROMOTION-HANDOFF-CHILD-PASS ~s ~s~%" ',boundary ,kind))
+       (setf (symbol-function ',boundary) original)
+       (when opened (pg::physical-store-close opened))
+       (when pg::*physical-receive-store* (pg::physical-store-close pg::*physical-receive-store*))
+       (when pg::*clog-stream* (close pg::*clog-stream*))
+       (pg::smgr-close-all)
+       (pg::postmaster-remove-pid-file))))
+
+(defun run-promotion-handoff-child (root driver boundary kind &key (form-builder #'promotion-handoff-child-form))
+  (let* ((cache (merge-pathnames "cache/" driver))
+         (marker (merge-pathnames "result" driver))
+         (log (merge-pathnames "child.log" driver))
+         (directories
+           (remove-duplicates
+            (remove nil (mapcar #'asdf:system-source-directory (asdf:already-loaded-systems)))
+            :test #'equal))
+         (registry `(:source-registry
+                     ,@(mapcar (lambda (directory) `(:directory ,directory)) directories)
+                     :ignore-inherited-configuration))
+         (forms (list '(require :asdf)
+                      `(asdf:initialize-source-registry ',registry)
+                      `(asdf:initialize-output-translations
+                        '(:output-translations (t ,(namestring cache)) :ignore-inherited-configuration))
+                      '(asdf:load-system "pg")
+                      '(make-package "PG-PHYSICAL-TESTS" :use '("CL"))
+                      (funcall form-builder root marker boundary kind)))
+         (arguments
+           (let ((*package* (find-package :cl-user))
+                 (*print-length* nil) (*print-level* nil) (*print-readably* t))
+             (append '("--noinform" "--no-sysinit" "--no-userinit" "--non-interactive")
+                     (loop for form in forms append (list "--eval" (write-to-string form))))))
+         (process nil))
+    (unwind-protect
+         (progn
+           (sb-sys:without-interrupts
+             (setf process
+                   (sb-ext:run-program (namestring sb-ext:*runtime-pathname*) arguments
+                                       :wait nil :output log :error :output :if-output-exists :error)))
+           (loop with deadline = (+ (get-internal-real-time) (* 180 internal-time-units-per-second))
+                 while (member (sb-ext:process-status process) '(:running :stopped))
+                 do (when (>= (get-internal-real-time) deadline)
+                      (error "promotion handoff child exceeded deadline"))
+                    (sleep 0.05))
+           (sb-ext:process-wait process)
+           (unless (and (eq :exited (sb-ext:process-status process))
+                        (zerop (sb-ext:process-exit-code process)))
+             (error "promotion handoff child failed: ~a" (uiop:read-file-string log)))
+           (with-open-file (input marker)
+             (let* ((*read-eval* nil) (*package* (find-package :cl-user))
+                                      (record (read input)))
+               (assert (eql (first record) (sb-ext:process-pid process)))
+               (assert (eq (second record) kind))
+               (assert (= 8 (length (third record))))
+               (assert (eq :eof (read input nil :eof)))
+               (third record))))
+      (when process
+        (when (member (sb-ext:process-status process) '(:running :stopped))
+          (sb-ext:process-kill process sb-posix:sigkill))
+        (sb-ext:process-wait process)
+        (sb-ext:process-close process)))))
+
+(deftest promotion-cold-resume-closes-interrupted-store-handoffs
+    (dolist (boundary '(pg::physical-store-open pg::physical-promotion-open-pending-store))
+      (dolist (kind '(:error :throw :interrupt))
+        (testing (format nil "~s ~s" boundary kind)
+                 (call-with-cold-promotion-image
+                  (lambda (root driver)
+                    (let ((before (lineage-test-bytes (pg::physical-recovery-control-path root))))
+                      (loop for value in (run-promotion-handoff-child root driver boundary kind)
+                            for label in '("injected exit" "one acquisition" "closed store" "closed lock"
+                                           "recovery fenced" "receive pointer cleared" "CLOG pointer cleared"
+                                           "independent lock reacquisition")
+                            do (ok value label))
+                      (ok (equalp before (lineage-test-bytes (pg::physical-recovery-control-path root)))
+                          "pending intent unchanged"))))))))
+
+(defun promotion-restored-child-form (root marker boundary kind)
+  `(let ((pg::*pgdata* ,root)
+         (pg::*installed-resource-parameters* (pg::make-resource-parameters 100 8 10 0 64))
+         (opened nil) (clog nil) (calls 0) (result nil)
+         (original-close (symbol-function 'pg::physical-store-close))
+         (tag (gensym "PROMOTION-RESTORED")))
+     (labels ((inject ()
+                (ecase ,kind
+                  (:error (error "injected promotion restore"))
+                  (:throw (throw tag :cut))
+                  (:interrupt
+                   (sb-thread:interrupt-thread
+                    sb-thread:*current-thread*
+                    (lambda () (error "injected promotion restore")))))))
+       (unwind-protect
+            (progn
+              (pg::postmaster-own-data-directory "127.0.0.1" 5439)
+              (when (eq ,boundary :store-close)
+                (setf (symbol-function 'pg::physical-store-close)
+                      (lambda (store)
+                        (funcall original-close store)
+                        (when (eq store opened) (inject)))))
+              (let* ((pg::*physical-promotion-test-hook*
+                       (lambda (point)
+                         (when (eq point :after-pending-restore)
+                           (setf opened pg::*physical-receive-store* clog pg::*clog-stream*)
+                           (incf calls)
+                           (case ,boundary
+                             (:restore (inject))
+                             (:store-close (error "injected promotion restore"))))))
+                     (exit
+                       (catch tag
+                         (handler-case
+                             (progn
+                               (sb-thread:with-mutex (pg::*physical-follow-command-lock*)
+                                 (sb-thread:with-mutex (pg::*reload-run-lock*)
+                                   (pg::with-live-operation-quiescence
+                                     ,(if (eq boundary :startup)
+                                          '(pg::physical-promotion-resume-pending
+                                            :artifact-checker #'pg::physical-promotion-checkpoint-artifacts
+                                            :publisher #'pg::physical-promotion-complete-child)
+                                          '(pg::physical-promotion-resume-pending)))))
+                               :success)
+                           (error (condition)
+                             (when (search "injected promotion restore" (princ-to-string condition))
+                               :cut))))))
+                (setf (symbol-function 'pg::physical-store-close) original-close)
+                (setf result
+                      (list
+                       (eq exit ,(if (member boundary '(:success :startup)) :success :cut))
+                       (= calls 1)
+                       (and opened ,(if (eq boundary :success)
+                                        '(pg::physical-store-check-held-lock opened)
+                                        '(pg::physical-store-closed-p opened)))
+                       (and clog ,(if (eq boundary :success)
+                                      '(open-stream-p clog)
+                                      '(not (open-stream-p clog))))
+                       ,(if (member boundary '(:success :startup))
+                            '(not pg::*physical-recovery-failed-p*)
+                            'pg::*physical-recovery-failed-p*)
+                       ,(if (eq boundary :success)
+                            '(eq opened pg::*physical-receive-store*)
+                            '(null pg::*physical-receive-store*))
+                       ,(case boundary
+                          (:success '(eq clog pg::*clog-stream*))
+                          (:startup '(and pg::*clog-stream* (open-stream-p pg::*clog-stream*)
+                                      (not (eq clog pg::*clog-stream*))))
+                          (otherwise '(null pg::*clog-stream*)))
+                       ,(if (member boundary '(:success :startup))
+                            `(and pg::*wal-ready*
+                                  (eq ,(eq boundary :success) (not (null pg::*physical-recovery-state*))))
+                            '(and opened
+                              (not (open-stream-p (pg::physical-store-lock-stream opened))))))))
+              (with-open-file (out ,marker :direction :output :if-exists :error)
+                (write (list (sb-posix:getpid) ,kind result) :stream out :readably t))
+              (format t "~%PROMOTION-RESTORED-CHILD-PASS ~s ~s~%" ,boundary ,kind))
+         (setf (symbol-function 'pg::physical-store-close) original-close)
+         (when opened (funcall original-close opened))
+         (when pg::*physical-receive-store* (funcall original-close pg::*physical-receive-store*))
+         (when pg::*clog-stream* (close pg::*clog-stream*))
+         (pg::smgr-close-all)
+         (pg::postmaster-remove-pid-file)))))
+
+(deftest promotion-cold-resume-cleans-restored-resources-across-exits
+    (dolist (boundary '(:restore :store-close))
+      (dolist (kind '(:error :throw :interrupt))
+        (testing (format nil "~s ~s" boundary kind)
+                 (call-with-cold-promotion-image
+                  (lambda (root driver)
+                    (loop for value in (run-promotion-handoff-child
+                                        root driver boundary kind :form-builder #'promotion-restored-child-form)
+                          for label in '("injected exit" "one restoration" "closed store" "closed CLOG"
+                                         "recovery fenced" "receive pointer cleared" "CLOG pointer cleared"
+                                         "closed kernel lock")
+                          do (ok value label))))))))
+
+(deftest promotion-cold-resume-keeps-the-successful-publisher-resources
+    (dolist (boundary '(:success :startup))
+      (testing (symbol-name boundary)
+               (call-with-cold-promotion-image
+                (lambda (root driver)
+                  (loop for value in (run-promotion-handoff-child
+                                      root driver boundary :error :form-builder #'promotion-restored-child-form)
+                        for label in '("publisher completed" "one restoration" "expected store ownership"
+                                       "expected restored CLOG lifetime" "recovery healthy"
+                                       "expected receive pointer" "expected active CLOG" "expected runtime role")
+                        do (ok value label)))))))
+
 (defmacro with-promotion-fixture ((root store &key (system-id 123)) &body body)
   `(call-with-promotion-fixture (lambda (,root ,store) ,@body) :system-id ,system-id))
 

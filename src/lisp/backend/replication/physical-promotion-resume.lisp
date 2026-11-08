@@ -77,7 +77,7 @@ Restore the frozen fact after checking it against the selected generation."
             (physical-promotion-timeline-floor state)
             (values state metadata prefix generation)))))))
 
-(defun physical-promotion-open-pending-store (state)
+(defun physical-promotion-open-pending-store (state &key on-open)
   "Verify acknowledged files, then own the spool without creating or trimming.
 
 Use the verified pending base identity and the recovery retained archive."
@@ -104,7 +104,8 @@ Use the verified pending base identity and the recovery retained archive."
     (physical-store-open directory (getf state :system-id) (getf state :timeline)
                          :discard-tail nil :create-lock nil
                          :retained-identity (physical-recovery-retained-identity state)
-                         :retained-directory (physical-recovery-retained-directory))))
+                         :retained-directory (physical-recovery-retained-directory)
+                         :on-open on-open)))
 
 (defun physical-promotion-validate-cold-state (state metadata prefix generation store &optional (artifact-checker #'physical-promotion-wal-plan))
   "Use the live publisher's proof checker without installing candidate globals."
@@ -138,8 +139,9 @@ which rejects pending CLOG debt, before installing the selected state."
     (setf (getf *physical-recovery-state* :timeline-policy)
           (physical-promotion-pending-timeline-policy state metadata store)))
   (physical-restartpoint-prepare-storage store)
-  (setf *clog-stream* (open (clog-path) :direction :input :element-type '(unsigned-byte 8)
-                                        :if-does-not-exist :error))
+  (sb-sys:without-interrupts
+    (setf *clog-stream* (open (clog-path) :direction :input :element-type '(unsigned-byte 8)
+                                          :if-does-not-exist :error)))
   (physical-recovery-check-live-files)
   (catalog-refresh-oldest-relfrozenxid))
 
@@ -164,7 +166,7 @@ reuse partially restored state."
            (sb-thread:with-mutex (*physical-restartpoint-start-lock*)
              (sb-thread:with-mutex (*timeline-history-lock*)
                (multiple-value-bind (state metadata prefix generation) (physical-promotion-read-pending-state)
-                 (setf store (physical-promotion-open-pending-store state))
+                 (physical-promotion-open-pending-store state :on-open (lambda (opened) (setf store opened)))
                  (physical-promotion-validate-cold-state state metadata prefix generation store artifact-checker)
                  (physical-promotion-ensure-pending-retained state metadata store)
                  (physical-promotion-test-point :before-pending-restore)
@@ -176,6 +178,8 @@ reuse partially restored state."
            (prog1 (funcall publisher) (setf finished t)))
       (unless finished
         (setf *physical-recovery-failed-p* t)
-        (when *clog-stream* (ignore-errors (close *clog-stream*)))
-        (when store (physical-store-close store))
-        (setf *clog-stream* nil *physical-receive-store* nil)))))
+        (unwind-protect
+             (when *clog-stream* (ignore-errors (close *clog-stream*)))
+          (unwind-protect
+               (when store (physical-store-close store))
+            (setf *clog-stream* nil *physical-receive-store* nil)))))))
