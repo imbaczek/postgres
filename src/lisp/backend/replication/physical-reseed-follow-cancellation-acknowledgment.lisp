@@ -37,6 +37,8 @@
              (lambda (root-fd store-check)
                (physical-reseed-follow-cancellation-publication-record owner (getf previous :record))
                (physical-reseed-follow-cancellation-publication-record owner candidate)
+               ;; Keep the mapped context identity while adopting the renamed journal
+               ;; into its record and snapshot.
                (let ((authority nil) (live t) (fd nil)
                                      (context (physical-reseed-follow-cancellation-publication-context owner)))
                  (labels

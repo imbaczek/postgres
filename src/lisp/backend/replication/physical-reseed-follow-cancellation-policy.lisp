@@ -46,6 +46,8 @@
        receipt))))
 
 (defun physical-reseed-follow-cancellation-source-action (value observation)
+  ;; Classify the complete record here.  The operation using the result
+  ;; checks its owner before performing source or publication effects.
   (let* ((record (physical-reseed-follow-copy value))
          (group (getf record :cancellation))
          (phase (getf group :phase)))

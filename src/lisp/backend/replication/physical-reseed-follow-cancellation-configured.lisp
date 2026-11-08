@@ -22,6 +22,7 @@
 ;; This owner admits read-only observations of inert configured history.
 ;; Its forward-owner method rejects forward follow operations.
 (defstruct (physical-reseed-follow-cancellation-owner
+            ;; Allow observations and typed cancellation cleanup for inert history.
             (:include physical-reseed-follow-owner)
             (:print-function print-physical-reseed-install-owner)))
 
@@ -96,7 +97,10 @@
             (lambda (owner)
               (flet ((verify ()
                        (physical-reseed-follow-observe-configured-cancellation owner)))
-                ;; Explicit recovery finishes before observation and the callback.
+                ;; Recovery finishes before observation and the callback.
+                ;; T reconciles local pending or source-closed publication.
+                ;; CLEANED obtains fresh operation evidence for a complete
+                ;; acknowledgment temporary.  A stable CLEANED journal returns locally.
                 (ecase recover
                   ((nil) nil)
                   ((t) (physical-reseed-follow-recover-cancellation owner))
