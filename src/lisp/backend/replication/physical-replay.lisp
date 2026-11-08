@@ -158,7 +158,7 @@ does not excuse a missing file or a different fork."
   (list :system-id (getf state :system-id) :base-timeline (getf state :timeline)
         :base (getf state :end) :manifest-digest (getf state :manifest-digest)))
 
-(defun physical-recovery-open-receive-store (&key create)
+(defun physical-recovery-open-receive-store (&key create on-open)
   (let ((directory (physical-recovery-spool-directory)))
     (when create
       (wal-ensure-directory-durable directory))
@@ -166,7 +166,8 @@ does not excuse a missing file or a different fork."
                          (getf *physical-recovery-state* :timeline)
                          :create create :start-lsn (getf *physical-recovery-state* :end)
                          :retained-identity (physical-recovery-retained-identity)
-                         :retained-directory (physical-recovery-retained-directory))))
+                         :retained-directory (physical-recovery-retained-directory)
+                         :on-open on-open)))
 
 (defun physical-recovery-open-clog-redo ()
   ;; Open once when streaming starts. Keep the old stream if opening fails.
@@ -196,21 +197,31 @@ Direct control operation; does not promote, follow a network source or coordinat
       (unless *physical-receive-store*
         ;; A process may have stopped after spool creation but before phase 2.
         ;; Reuse only an empty, valid spool with this exact base and identity.
-        (let* ((existing (probe-file (merge-pathnames "receive.control"
-                                                      (physical-recovery-spool-directory))))
-               (store (physical-recovery-open-receive-store :create (not existing)))
-               (success nil))
+        (let ((existing (probe-file (merge-pathnames "receive.control"
+                                                     (physical-recovery-spool-directory))))
+              (store nil) (previous *clog-stream*) (success nil))
           (unwind-protect
                (progn
+                 (physical-recovery-open-receive-store
+                  :create (not existing) :on-open (lambda (opened) (setf store opened)))
                  (unless (= (physical-store-base-lsn store) (physical-store-flushed-lsn store)
                             (getf *physical-recovery-state* :end))
                    (error "unattached receive spool is not an empty base continuation"))
                  (physical-recovery-open-clog-redo)
                  (physical-recovery-save-progress *last-replay-lsn* *next-xid*)
                  (physical-recovery-reset-replay-history)
-                 (setf *physical-receive-store* store success t
-                       (getf *physical-recovery-state* :phase) 2))
-            (unless success (physical-store-close store)))))
+                 (sb-sys:without-interrupts
+                   (setf (getf *physical-recovery-state* :phase) 2
+                         *physical-receive-store* store
+                         success t)))
+            (unless success
+              (unwind-protect
+                   (unless (eq previous *clog-stream*)
+                     (setf *physical-recovery-failed-p* t)
+                     (unwind-protect
+                          (when *clog-stream* (close *clog-stream*))
+                       (setf *clog-stream* nil)))
+                (when store (physical-store-close store)))))))
       (physical-restartpoint-start-worker)
       (getf *physical-recovery-state* :phase))))
 

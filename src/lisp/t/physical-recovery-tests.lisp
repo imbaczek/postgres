@@ -5,6 +5,204 @@
   (handler-case (progn (funcall function) nil)
     (pg::pg-error (condition) (pg::pg-error-sqlstate condition))))
 
+(defun call-with-streaming-setup-fixture (function)
+  (call-with-physical-store-directory
+   (lambda (root)
+     (let* ((pg::*pgdata* root)
+            (pg::*physical-recovery-state*
+              (list :phase 1 :system-id 123 :timeline 1 :manifest-digest 77
+                    :checkpoint 32 :end 32 :next-xid 50 :required-applied 32 :observed-next-xid 50))
+            (pg::*physical-receive-store* nil)
+            (pg::*physical-recovery-failed-p* nil)
+            (pg::*physical-restartpoint-worker* nil)
+            (pg::*physical-follow-runtime* nil)
+            (pg::*physical-shutdown-state* nil)
+            (pg::*physical-promotion-stopping-p* nil)
+            (pg::*shutdown* pg::+no-shutdown+)
+            (pg::*swank-listener-enabled-p* nil)
+            (pg::*active-snapshots* 0)
+            (pg::*backend-registry* (make-hash-table))
+            (pg::*last-replay-lsn* 32) (pg::*next-xid* 50)
+            (pg::*physical-replay-seen-relfilenodes* (make-hash-table :test #'eql))
+            (pg::*physical-recovery-control-test-hook* nil)
+            (pg::*clog-stream* nil))
+       (pg::wal-atomic-write-bytes (pg::clog-path) (empty-octets))
+       (pg::wal-atomic-write-bytes
+        (pg::physical-recovery-control-path)
+        (pg::physical-recovery-control-image 1 123 1 77 32 32 50))
+       (let ((previous (open (pg::clog-path) :element-type '(unsigned-byte 8))))
+         (setf pg::*clog-stream* previous)
+         (unwind-protect (funcall function root previous)
+           (when pg::*physical-receive-store* (pg::physical-store-close pg::*physical-receive-store*))
+           (when pg::*clog-stream* (close pg::*clog-stream*))
+           (when (open-stream-p previous) (close previous))))))))
+
+(deftest streaming-setup-closes-interrupted-receive-store-handoffs
+    (dolist (boundary '(pg::physical-store-open pg::physical-recovery-open-receive-store))
+      (dolist (kind '(:error :throw :interrupt))
+        (testing (format nil "~s ~s" boundary kind)
+                 (call-with-streaming-setup-fixture
+                  (lambda (root previous)
+                    (let ((original (symbol-function boundary))
+                          (start (symbol-function 'pg::physical-restartpoint-start-worker))
+                          (opened nil) (calls 0) (workers 0)
+                          (before (lineage-test-bytes (pg::physical-recovery-control-path root)))
+                          (tag (gensym "STREAMING-HANDOFF")))
+                      (unwind-protect
+                           (progn
+                             (setf (symbol-function boundary)
+                                   (lambda (&rest arguments)
+                                     (setf opened (apply original arguments))
+                                     (incf calls)
+                                     (ecase kind
+                                       (:error (error "injected streaming handoff"))
+                                       (:throw (throw tag :cut))
+                                       (:interrupt
+                                        (sb-thread:interrupt-thread
+                                         sb-thread:*current-thread*
+                                         (lambda () (error "injected streaming handoff"))))))
+                                   (symbol-function 'pg::physical-restartpoint-start-worker)
+                                   (lambda ()
+                                     (incf workers)
+                                     (assert (sb-thread:holding-mutex-p pg::*reload-run-lock*))
+                                     (assert (eq pg::*live-operation-quiescence-owner-thread* sb-thread:*current-thread*))
+                                     (assert (= 2 (getf pg::*physical-recovery-state* :phase)))
+                                     (assert (pg::physical-store-check-held-lock pg::*physical-receive-store*))))
+                             (ok (eq :cut
+                                     (catch tag
+                                       (handler-case (pg::physical-recovery-enable-streaming)
+                                         (error (condition)
+                                           (when (search "injected streaming handoff" (princ-to-string condition))
+                                             :cut))))))
+                             (setf (symbol-function boundary) original)
+                             (ok (= calls 1))
+                             (ok (zerop workers))
+                             (ok (and opened (pg::physical-store-closed-p opened)))
+                             (ok (and opened (not (open-stream-p (pg::physical-store-lock-stream opened)))))
+                             (ok (null pg::*physical-receive-store*))
+                             (ok (not pg::*physical-recovery-failed-p*))
+                             (ok (and (eq previous pg::*clog-stream*) (open-stream-p previous)))
+                             (ok (= 1 (getf pg::*physical-recovery-state* :phase)))
+                             (ok (equalp before (lineage-test-bytes (pg::physical-recovery-control-path root))))
+                             (ok (handler-case
+                                     (let ((fresh (pg::physical-recovery-open-receive-store)))
+                                       (unwind-protect (pg::physical-store-check-held-lock fresh)
+                                         (pg::physical-store-close fresh)))
+                                   (error () nil)))
+                             (when opened (pg::physical-store-close opened))
+                             (ok (= 2 (pg::physical-recovery-enable-streaming)))
+                             (ok (= workers 1))
+                             (ok (and pg::*physical-receive-store*
+                                      (pg::physical-store-check-held-lock pg::*physical-receive-store*)))
+                             (ok (and (not (eq previous pg::*clog-stream*))
+                                      (open-stream-p pg::*clog-stream*) (not (open-stream-p previous)))))
+                        (setf (symbol-function boundary) original
+                              (symbol-function 'pg::physical-restartpoint-start-worker) start)
+                        (when opened (pg::physical-store-close opened))))))))))
+
+(defun check-streaming-setup-transition-cut (boundary kind)
+  (call-with-streaming-setup-fixture
+   (lambda (root previous)
+     (let ((original-open (symbol-function 'pg::physical-store-open))
+           (original-clog (symbol-function 'pg::physical-recovery-open-clog-redo))
+           (original-reset (symbol-function 'pg::physical-recovery-reset-replay-history))
+           (original-close (symbol-function 'pg::physical-store-close))
+           (original-start (symbol-function 'pg::physical-restartpoint-start-worker))
+           (opened nil) (replacement nil) (cuts 0) (workers 0)
+           (tag (gensym "STREAMING-TRANSITION")))
+       (labels ((inject ()
+                  (incf cuts)
+                  (ecase kind
+                    (:error (error "injected streaming transition"))
+                    (:throw (throw tag :cut))
+                    (:interrupt
+                     (sb-thread:interrupt-thread
+                      sb-thread:*current-thread*
+                      (lambda () (error "injected streaming transition")))))))
+         (unwind-protect
+              (let ((pg::*physical-recovery-control-test-hook*
+                      (lambda (point state)
+                        (declare (ignore state))
+                        (when (or (and (eq boundary :save-before) (eq point :before-write))
+                                  (and (eq boundary :save-after) (eq point :after-write)))
+                          (inject)))))
+                (setf (symbol-function 'pg::physical-store-open)
+                      (lambda (&rest arguments) (setf opened (apply original-open arguments)))
+                      (symbol-function 'pg::physical-recovery-open-clog-redo)
+                      (lambda ()
+                        (funcall original-clog)
+                        (setf replacement pg::*clog-stream*)
+                        (case boundary
+                          (:clog-return (inject))
+                          (:cleanup (error "injected streaming transition"))))
+                      (symbol-function 'pg::physical-recovery-reset-replay-history)
+                      (lambda ()
+                        (funcall original-reset)
+                        (when (eq boundary :reset) (inject)))
+                      (symbol-function 'pg::physical-store-close)
+                      (lambda (store)
+                        (funcall original-close store)
+                        (when (and (eq boundary :cleanup) (eq store opened)) (inject)))
+                      (symbol-function 'pg::physical-restartpoint-start-worker)
+                      (lambda ()
+                        (incf workers)
+                        (assert (sb-thread:holding-mutex-p pg::*reload-run-lock*))
+                        (assert (eq pg::*live-operation-quiescence-owner-thread* sb-thread:*current-thread*))
+                        (assert (= 2 (getf pg::*physical-recovery-state* :phase)))
+                        (assert (eq opened pg::*physical-receive-store*))
+                        (assert (pg::physical-store-check-held-lock opened))
+                        (when (eq boundary :worker) (inject))))
+                (ok (eq (if (eq boundary :success) 2 :cut)
+                        (catch tag
+                          (handler-case (pg::physical-recovery-enable-streaming)
+                            (error (condition)
+                              (when (search "injected streaming transition" (princ-to-string condition))
+                                :cut))))))
+                (ok (= cuts (if (eq boundary :success) 0 1)))
+                (ok (and opened replacement))
+                (ok (not (open-stream-p previous)))
+                (if (member boundary '(:worker :success))
+                    (progn
+                      (ok (= workers 1))
+                      (ok (not pg::*physical-recovery-failed-p*))
+                      (ok (eq opened pg::*physical-receive-store*))
+                      (ok (pg::physical-store-check-held-lock opened))
+                      (ok (eq replacement pg::*clog-stream*))
+                      (ok (open-stream-p replacement))
+                      (ok (= 2 (getf pg::*physical-recovery-state* :phase)))
+                      (ok (= 2 (getf (pg::physical-recovery-read-control root) :phase))))
+                    (progn
+                      (ok (zerop workers))
+                      (ok pg::*physical-recovery-failed-p*)
+                      (ok (pg::physical-store-closed-p opened))
+                      (ok (not (open-stream-p (pg::physical-store-lock-stream opened))))
+                      (ok (not (open-stream-p replacement)))
+                      (ok (null pg::*physical-receive-store*))
+                      (ok (null pg::*clog-stream*))
+                      (ok (pg::recovery-in-progress-p))
+                      (ok (equal "57P03" (recovery-state-of #'pg::check-recovery-available)))
+                      (ok (= (if (member boundary '(:save-after :reset)) 2 1)
+                             (getf (pg::physical-recovery-read-control root) :phase))))))
+           (setf (symbol-function 'pg::physical-store-open) original-open
+                 (symbol-function 'pg::physical-recovery-open-clog-redo) original-clog
+                 (symbol-function 'pg::physical-recovery-reset-replay-history) original-reset
+                 (symbol-function 'pg::physical-store-close) original-close
+                 (symbol-function 'pg::physical-restartpoint-start-worker) original-start)
+           (when opened (funcall original-close opened))
+           (when (and replacement (open-stream-p replacement)) (close replacement))))))))
+
+(deftest streaming-setup-fences-partial-clog-transitions-and-cleans-resources
+    (dolist (boundary '(:clog-return :save-before :save-after :reset :cleanup))
+      (dolist (kind '(:error :throw :interrupt))
+        (testing (format nil "~s ~s" boundary kind)
+                 (check-streaming-setup-transition-cut boundary kind)))))
+
+(deftest streaming-setup-retains-published-resources-after-worker-start-failure
+    (dolist (kind '(:error :throw :interrupt))
+      (testing (symbol-name kind)
+               (check-streaming-setup-transition-cut :worker kind)))
+  (check-streaming-setup-transition-cut :success :error))
+
 (defun sample-recovery-manifest ()
   (list :version 1 :system-id 123 :cluster-identity "fixture#identity" :timeline 1
         :checkpoint 32 :end 32 :next-xid 3 :source-pin "copy"
