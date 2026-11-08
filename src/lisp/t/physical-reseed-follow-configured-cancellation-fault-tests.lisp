@@ -308,6 +308,7 @@
                             (lineage-test-bytes (merge-pathnames "physical-reseed.follow" root))))
                 (ng (pg::physical-adoption-path-present-p
                      (merge-pathnames "physical-reseed.follow.tmp" root)))
+                ;; The rejecting connector stays installed through the local reopen.
                 (pg::call-with-physical-reseed-follow-cancellation-owner
                  root
                  (lambda (owner)
@@ -410,6 +411,7 @@
                             (lineage-test-bytes (merge-pathnames "physical-reseed.follow" root))))
                 (ng (pg::physical-adoption-path-present-p
                      (merge-pathnames "physical-reseed.follow.tmp" root)))
+                ;; Preserve the unexpected child until its contents and identity are checked.
                 (ok (equalp bytes (lineage-test-bytes foreign)))
                 (ok (equal foreign-facts
                            (pg::physical-reseed-file-facts (sb-posix:lstat (namestring foreign)))))
