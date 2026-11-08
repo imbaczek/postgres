@@ -88,6 +88,8 @@
     (list (sb-posix:stat-dev stat) (sb-posix:stat-ino stat))))
 
 (defun configured-mount-require-child-context ()
+  ;; Check the harness child identity, UID mapping and distinct mount namespace
+  ;; before its mount and unmount syscalls can run.
   (let ((rows
           (with-open-file (input "/proc/self/uid_map")
             (loop for line = (read-line input nil)
@@ -300,6 +302,8 @@
              (error "configured mount child failed (~s ~s)~%~a"
                     (sb-ext:process-status process) (sb-ext:process-exit-code process)
                     (uiop:read-file-string log)))
+           ;; Read the child's completion marker in CL-USER so T and NIL have
+           ;; their standard meanings, with reader evaluation disabled.
            (with-open-file (input marker)
              (let ((*read-eval* nil) (*package* (find-package :cl-user)))
                (ok (equal (read input)
