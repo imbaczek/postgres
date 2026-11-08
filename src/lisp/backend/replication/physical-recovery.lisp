@@ -726,6 +726,8 @@ installing the recovery store."
   (wal-require-no-pending-storage)
   (unless (recovery-in-progress-p) (error "physical recovery image was not verified"))
   (physical-follow-check-startup-admission *physical-recovery-state*)
+  ;; Cold resources make every relation stream cached during this initialization
+  ;; part of its cleanup scope under the caller's startup exclusion.
   (unless (and (not *catalog*) (not *clog-stream*) (not *physical-receive-store*)
                (not *wal-output-stream*) (not *wal-ready*)
                (zerop (hash-table-count *relation-streams*)))
@@ -752,6 +754,8 @@ installing the recovery store."
                    *active-xids* nil
                    *catalog* (load-catalog))
              (when streaming
+               ;; Capture the validated store before its opener returns so this
+               ;; scope can close it if later initialization exits.
                (physical-recovery-open-receive-store :on-open (lambda (opened) (setf store opened)))
                (setf *physical-receive-store* store)
                (unless (= (physical-store-base-lsn *physical-receive-store*)
@@ -785,6 +789,9 @@ installing the recovery store."
              (catalog-refresh-oldest-relfrozenxid))
            (setf finished t))
       (unless finished
+        ;; Leave partial recovery state fenced until restart.  Defer
+        ;; queued interrupts while nested cleanup keeps each later close reachable
+        ;; even when an earlier close exits.
         (sb-sys:without-interrupts
           (setf *physical-recovery-failed-p* t)
           (unwind-protect
