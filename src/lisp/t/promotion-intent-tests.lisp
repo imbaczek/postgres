@@ -99,7 +99,7 @@
          (pg::physical-store-close store))))
    :system-id system-id))
 
-(defun call-with-cold-promotion-image (function)
+(defun call-with-cold-promotion-image (function &key (pending t) (applied 216))
   (call-with-physical-store-directory
    (lambda (driver)
      (call-with-promotion-fixture
@@ -107,7 +107,8 @@
         (pg::wal-atomic-write-bytes (pg::clog-path) (empty-octets))
         (pg::wal-atomic-write-bytes (pg::pgdata-path "PG_VERSION")
                                     (pg::string->bytes (format nil "16~%")))
-        (call-with-promotion-exclusion (lambda () (pg::physical-promotion-publish-intent 2)))
+        (when pending
+          (call-with-promotion-exclusion (lambda () (pg::physical-promotion-publish-intent 2))))
         (pg::physical-store-close store)
         (sb-posix:rename (namestring (pg::physical-store-directory store))
                          (namestring (pg::physical-recovery-spool-directory)))
@@ -115,8 +116,8 @@
           (uiop:run-program (list "cp" "-a" (namestring root) (namestring target)))
           (sb-posix:chmod (namestring target) #o700)
           (funcall function target driver)))
-      :system-id (pg::physical-store-update-digest
-                  #xCBF29CE484222325 (pg::string->bytes "history-source"))))))
+      :applied applied :system-id (pg::physical-store-update-digest
+                                   #xCBF29CE484222325 (pg::string->bytes "history-source"))))))
 
 (defun promotion-handoff-child-form (root marker boundary kind)
   `(let ((pg::*pgdata* ,root)
@@ -173,8 +174,8 @@
        (pg::smgr-close-all)
        (pg::postmaster-remove-pid-file))))
 
-(defun run-promotion-handoff-child (root driver boundary kind &key (form-builder #'promotion-handoff-child-form))
-  (let* ((cache (merge-pathnames "cache/" driver))
+(defun run-promotion-handoff-child (root driver boundary kind &key (form-builder #'promotion-handoff-child-form) cache)
+  (let* ((cache (or cache (merge-pathnames "cache/" driver)))
          (marker (merge-pathnames "result" driver))
          (log (merge-pathnames "child.log" driver))
          (directories

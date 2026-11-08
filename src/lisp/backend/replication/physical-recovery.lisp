@@ -726,51 +726,73 @@ installing the recovery store."
   (wal-require-no-pending-storage)
   (unless (recovery-in-progress-p) (error "physical recovery image was not verified"))
   (physical-follow-check-startup-admission *physical-recovery-state*)
-  (wal-replace-storage-incarnation)
-  (wal-ensure-directory-durable (merge-pathnames "base/" *pgdata*))
-  (let ((streaming (= 2 (getf *physical-recovery-state* :phase))))
-    (setf (getf *physical-recovery-state* :replay-timeline) (getf *physical-recovery-state* :timeline)
-          *wal-segment-namespace* (getf *physical-recovery-state* :wal-namespace :legacy)
-          *wal-insert-timeline* (getf *physical-recovery-state* :timeline)
-          *wal-checkpoint-timeline* (getf *physical-recovery-state* :timeline)
-          *wal-checkpoint-snapshot* (copy-tree (getf *physical-recovery-state* :source-checkpoint))
-          *wal-checkpoint-lsn* (getf *physical-recovery-state* :checkpoint)
-          *wal-durable-lsn* (getf *physical-recovery-state* :end)
-          *wal-end-lsn* *wal-durable-lsn*
-          *last-replay-lsn* *wal-durable-lsn*
-          *wal-ready* t
-          *wal-poisoned* nil
-          *next-xid* (getf *physical-recovery-state* :next-xid)
-          *xid-batch-end* *next-xid*
-          *active-xids* nil
-          *catalog* (load-catalog))
-    (when streaming
-      (setf *physical-receive-store* (physical-recovery-open-receive-store))
-      (unless (= (physical-store-base-lsn *physical-receive-store*)
-                 (getf *physical-recovery-state* :end))
-        (error "streaming receive base differs from verified backup"))
-      (setf *physical-recovery-state*
-            (physical-recovery-attach-selected-store *physical-recovery-state* *physical-receive-store*)
-            (getf *physical-recovery-state* :receive-lsn)
-            (physical-store-flushed-lsn *physical-receive-store*))
-      (unless (<= (getf *physical-recovery-state* :required-applied)
-                  (physical-store-flushed-lsn *physical-receive-store*))
-        (error "streaming receive spool lost previously applied WAL"))
-      (physical-recovery-publish-selected-history *physical-receive-store*)
-      (physical-restartpoint-prepare-storage *physical-receive-store*)
-      (setf *clog-stream* (open (clog-path) :element-type '(unsigned-byte 8)
-                                            :direction :io :if-exists :overwrite
-                                            :if-does-not-exist :error))
-      (let ((*physical-replay-restarting-p* t))
-        (physical-replay-from *last-replay-lsn*))
-      (physical-recovery-check-required-pair *physical-receive-store*)
-      (unless (<= (getf *physical-recovery-state* :observed-next-xid) *next-xid*)
-        (error "streaming redo did not restore its observed XID visibility floor"))
-      (physical-recovery-check-live-files)
-      (physical-recovery-save-progress *last-replay-lsn* *next-xid*))
-    (unless streaming
-      (setf *clog-stream* (open (clog-path) :element-type '(unsigned-byte 8)
-                                            :direction :input :if-does-not-exist :error)))
-    (wal-load-replication-slots)
-    (catalog-refresh-oldest-relfrozenxid))
+  (unless (and (not *catalog*) (not *clog-stream*) (not *physical-receive-store*)
+               (not *wal-output-stream*) (not *wal-ready*)
+               (zerop (hash-table-count *relation-streams*)))
+    (error "recovery storage requires cold resources"))
+  (let ((store nil) (finished nil))
+    (unwind-protect
+         (progn
+           (wal-replace-storage-incarnation)
+           (wal-ensure-directory-durable (merge-pathnames "base/" *pgdata*))
+           (let ((streaming (= 2 (getf *physical-recovery-state* :phase))))
+             (setf (getf *physical-recovery-state* :replay-timeline) (getf *physical-recovery-state* :timeline)
+                   *wal-segment-namespace* (getf *physical-recovery-state* :wal-namespace :legacy)
+                   *wal-insert-timeline* (getf *physical-recovery-state* :timeline)
+                   *wal-checkpoint-timeline* (getf *physical-recovery-state* :timeline)
+                   *wal-checkpoint-snapshot* (copy-tree (getf *physical-recovery-state* :source-checkpoint))
+                   *wal-checkpoint-lsn* (getf *physical-recovery-state* :checkpoint)
+                   *wal-durable-lsn* (getf *physical-recovery-state* :end)
+                   *wal-end-lsn* *wal-durable-lsn*
+                   *last-replay-lsn* *wal-durable-lsn*
+                   *wal-ready* t
+                   *wal-poisoned* nil
+                   *next-xid* (getf *physical-recovery-state* :next-xid)
+                   *xid-batch-end* *next-xid*
+                   *active-xids* nil
+                   *catalog* (load-catalog))
+             (when streaming
+               (physical-recovery-open-receive-store :on-open (lambda (opened) (setf store opened)))
+               (setf *physical-receive-store* store)
+               (unless (= (physical-store-base-lsn *physical-receive-store*)
+                          (getf *physical-recovery-state* :end))
+                 (error "streaming receive base differs from verified backup"))
+               (setf *physical-recovery-state*
+                     (physical-recovery-attach-selected-store *physical-recovery-state* *physical-receive-store*)
+                     (getf *physical-recovery-state* :receive-lsn)
+                     (physical-store-flushed-lsn *physical-receive-store*))
+               (unless (<= (getf *physical-recovery-state* :required-applied)
+                           (physical-store-flushed-lsn *physical-receive-store*))
+                 (error "streaming receive spool lost previously applied WAL"))
+               (physical-recovery-publish-selected-history *physical-receive-store*)
+               (physical-restartpoint-prepare-storage *physical-receive-store*)
+               (sb-sys:without-interrupts
+                 (setf *clog-stream* (open (clog-path) :element-type '(unsigned-byte 8)
+                                                       :direction :io :if-exists :overwrite
+                                                       :if-does-not-exist :error)))
+               (let ((*physical-replay-restarting-p* t))
+                 (physical-replay-from *last-replay-lsn*))
+               (physical-recovery-check-required-pair *physical-receive-store*)
+               (unless (<= (getf *physical-recovery-state* :observed-next-xid) *next-xid*)
+                 (error "streaming redo did not restore its observed XID visibility floor"))
+               (physical-recovery-check-live-files)
+               (physical-recovery-save-progress *last-replay-lsn* *next-xid*))
+             (unless streaming
+               (sb-sys:without-interrupts
+                 (setf *clog-stream* (open (clog-path) :element-type '(unsigned-byte 8)
+                                                       :direction :input :if-does-not-exist :error))))
+             (wal-load-replication-slots)
+             (catalog-refresh-oldest-relfrozenxid))
+           (setf finished t))
+      (unless finished
+        (sb-sys:without-interrupts
+          (setf *physical-recovery-failed-p* t)
+          (unwind-protect
+               (smgr-close-all)
+            (unwind-protect
+                 (when *clog-stream* (close *clog-stream*))
+              (setf *clog-stream* nil)
+              (unwind-protect
+                   (when store (physical-store-close store))
+                (setf *physical-receive-store* nil))))))))
   (values))
