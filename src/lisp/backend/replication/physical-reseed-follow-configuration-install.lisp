@@ -39,6 +39,8 @@
                  (equal (physical-reseed-follow-installation-context-record context) (getf previous :record))
                  (equal candidate (getf snapshot :record)))
       (error "published configuration differs from this operation's frozen candidate or predecessor"))
+    ;; Adopt the canonical readback before later publication checks run.
+    ;; Prepare both copies before updating the record and snapshot together.
     (physical-reseed-follow-check-snapshot root-fd snapshot)
     (let ((record (physical-reseed-follow-copy candidate))
           (published (physical-adoption-attempt-value-copy snapshot)))

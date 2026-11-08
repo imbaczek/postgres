@@ -1,5 +1,7 @@
 (in-package #:pg)
 
+;; Connect configured cancellation publication to its cleanup owner and
+;; the installation context held by that owner.
 (defmethod physical-reseed-follow-cancellation-publication-record
     ((owner physical-reseed-follow-cancellation-owner) value)
   (physical-reseed-follow-cancellation-check-owner-history owner value))
@@ -23,6 +25,8 @@
 
 (defmethod physical-reseed-follow-configuration-publication-candidate
     ((owner physical-reseed-follow-cancellation-owner) context candidate)
+  ;; Adoption belongs to the active promotion for this owner and mapped
+  ;; context.  The authority also checks the candidate and predecessor.
   (let ((authority *physical-reseed-follow-cancellation-authority*))
     (unless (and (physical-reseed-follow-cancellation-authority-p authority)
                  (physical-reseed-follow-cancellation-authority-active-p authority)

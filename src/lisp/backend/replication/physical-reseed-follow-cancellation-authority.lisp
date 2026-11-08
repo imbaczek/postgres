@@ -119,6 +119,8 @@
   ;; reentrant call cannot use it before verification finishes.
   (when *physical-reseed-follow-cancellation-authority*
     (error "cancellation authority cannot reenter acquisition or publication"))
+  ;; Keep the exact mapped context in scope so a later operation cannot
+  ;; use this authority even if its owner and journal values match.
   (let* ((frozen (physical-reseed-follow-cancellation-publication-record owner candidate))
          (context (physical-reseed-follow-cancellation-publication-context owner))
          (before (physical-adoption-attempt-value-copy previous))

@@ -95,6 +95,7 @@
             (lambda (owner)
               (flet ((verify ()
                        (physical-reseed-follow-observe-configured-cancellation owner)))
+                ;; Explicit recovery finishes before observation and the callback.
                 (when recover (physical-reseed-follow-recover-cancellation owner))
                 (verify)
                 (multiple-value-prog1 (funcall function owner) (verify))))
