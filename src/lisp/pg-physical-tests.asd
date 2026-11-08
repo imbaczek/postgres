@@ -135,6 +135,7 @@
                (:file "t/physical-reseed-follow-mapped-lock-tests")
                (:file "t/physical-reseed-follow-configured-cancellation-tests")
                (:file "t/physical-reseed-follow-retirement-intent-tests")
+               (:file "t/physical-reseed-follow-configured-mount-tests")
                (:file "t/wal-timeline-tests")
                (:file "t/wal-eor-tests")
                (:file "t/physical-history-tests")
