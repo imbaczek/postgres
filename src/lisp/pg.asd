@@ -280,6 +280,7 @@
                    (:file "../replication/physical-reseed-follow-receipt-consumption")
                    (:file "../replication/physical-reseed-follow-configuration-staging")
                    (:file "../replication/physical-reseed-follow-configuration-install")
+                   (:file "../replication/physical-reseed-follow-cancellation-configured-publication")
                    (:file "../replication/physical-reseed-follow-configuration-recovery")
                    (:file "../replication/physical-reseed-follow-settlement-publication")
                    (:file "../replication/physical-reseed-follow-settlement-recovery")

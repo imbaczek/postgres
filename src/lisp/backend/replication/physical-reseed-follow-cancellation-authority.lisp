@@ -97,13 +97,30 @@
                       (physical-reseed-follow-entry root-fd "physical-reseed.follow.tmp"))
          (error "cancellation recovery temporary changed"))))))
 
+(defgeneric physical-reseed-follow-cancellation-publication-record (owner value))
+
+(defmethod physical-reseed-follow-cancellation-publication-record
+    ((owner physical-reseed-follow-owner) value)
+  (declare (ignore owner))
+  (physical-reseed-follow-cancellation-preconfiguration-record value))
+
+(defgeneric physical-reseed-follow-cancellation-publication-context (owner))
+
+(defmethod physical-reseed-follow-cancellation-publication-context
+    ((owner physical-reseed-follow-owner))
+  (declare (ignore owner))
+  nil)
+
+(defgeneric physical-reseed-follow-cancellation-local-proof (owner root-fd value))
+
 (defun call-with-physical-reseed-follow-cancellation-authority
     (owner root-fd candidate previous bytes mode check function &optional fd temporary-identity)
   ;; Keep the authority in acquiring phase during its initial proof so a
   ;; reentrant call cannot use it before verification finishes.
   (when *physical-reseed-follow-cancellation-authority*
     (error "cancellation authority cannot reenter acquisition or publication"))
-  (let* ((frozen (physical-reseed-follow-cancellation-preconfiguration-record candidate))
+  (let* ((frozen (physical-reseed-follow-cancellation-publication-record owner candidate))
+         (context (physical-reseed-follow-cancellation-publication-context owner))
          (before (physical-adoption-attempt-value-copy previous))
          (image (copy-seq bytes))
          (thread sb-thread:*current-thread*)
@@ -119,6 +136,7 @@
                             (eql root-fd (physical-reseed-follow-cancellation-authority-root-fd value))
                             (eq actual-owner owner) (eql actual-root root-fd)
                             (eq thread sb-thread:*current-thread*)
+                            (eq context (physical-reseed-follow-cancellation-publication-context owner))
                             (physical-reseed-follow-cancellation-authority-active-p value)
                             (equal frozen actual-candidate) (equal before actual-previous)
                             (or (null actual-bytes) (equalp image actual-bytes))
@@ -147,7 +165,8 @@
                (funcall function #'verify))
           (setf (physical-reseed-follow-cancellation-authority-active-p authority) nil))))))
 
-(defun physical-reseed-follow-cancellation-local-proof (owner root-fd value)
+(defmethod physical-reseed-follow-cancellation-local-proof
+    ((owner physical-reseed-follow-owner) root-fd value)
   ;; Check local intent and any proof already present in the predecessor.
   (let ((record (physical-reseed-follow-cancellation-preconfiguration-record value)))
     (physical-reseed-follow-check-local-intent owner root-fd record)

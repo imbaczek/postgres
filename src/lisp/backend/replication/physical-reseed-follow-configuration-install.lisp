@@ -29,10 +29,7 @@
     (error "configuration publication lacks its frozen installation candidate"))
   (physical-reseed-follow-installation-candidate context candidate))
 
-(defmethod physical-reseed-follow-published-snapshot
-    ((owner physical-reseed-follow-configuration-owner) root-fd candidate snapshot previous)
-  (unless *physical-reseed-follow-installation-scope*
-    (return-from physical-reseed-follow-published-snapshot (call-next-method)))
+(defun physical-reseed-follow-installation-adopt-snapshot (owner root-fd candidate snapshot previous)
   (let ((context (physical-reseed-follow-installation-context owner)))
     (unless (and (equal candidate (physical-reseed-follow-configuration-publication-candidate
                                    owner context candidate))
@@ -42,10 +39,19 @@
                  (equal (physical-reseed-follow-installation-context-record context) (getf previous :record))
                  (equal candidate (getf snapshot :record)))
       (error "published configuration differs from this operation's frozen candidate or predecessor"))
-    (setf (physical-reseed-follow-installation-context-record context)
-          (physical-reseed-follow-copy candidate)
-          (physical-reseed-follow-installation-context-snapshot context) snapshot))
+    (physical-reseed-follow-check-snapshot root-fd snapshot)
+    (let ((record (physical-reseed-follow-copy candidate))
+          (published (physical-adoption-attempt-value-copy snapshot)))
+      (sb-sys:without-interrupts
+        (setf (physical-reseed-follow-installation-context-record context) record
+              (physical-reseed-follow-installation-context-snapshot context) published))))
   t)
+
+(defmethod physical-reseed-follow-published-snapshot
+    ((owner physical-reseed-follow-configuration-owner) root-fd candidate snapshot previous)
+  (unless *physical-reseed-follow-installation-scope*
+    (return-from physical-reseed-follow-published-snapshot (call-next-method)))
+  (physical-reseed-follow-installation-adopt-snapshot owner root-fd candidate snapshot previous))
 
 (defun physical-reseed-follow-installation-point (context check event)
   (funcall check)

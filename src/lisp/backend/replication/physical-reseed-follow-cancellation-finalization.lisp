@@ -2,7 +2,10 @@
 
 (in-package #:pg)
 
-(defun physical-reseed-follow-cancellation-cleanup-stamp (owner root-fd check)
+(defgeneric physical-reseed-follow-cancellation-cleanup-stamp (owner root-fd check))
+
+(defmethod physical-reseed-follow-cancellation-cleanup-stamp
+    ((owner physical-reseed-follow-owner) root-fd check)
   ;; Derive installed descendants and old opaque top-level entries from the
   ;; authenticated root, incoming and quarantine inventories.  The audit uses
   ;; those rows without a recursive scan.
@@ -53,6 +56,13 @@
         (error "cancellation image changed during resource cleanup"))))
   t)
 
+(defgeneric physical-reseed-follow-cancellation-audit-cleanup-stamp (owner stamp))
+
+(defmethod physical-reseed-follow-cancellation-audit-cleanup-stamp
+    ((owner physical-reseed-follow-owner) stamp)
+  (declare (ignore owner))
+  (physical-reseed-follow-cancellation-check-cleanup-stamp stamp))
+
 (defun call-with-physical-reseed-follow-cancellation-finalization (owner function)
   ;; Keep the journal open and check its bytes through image and root cleanup.
   ;; After it closes, audit named image metadata before clearing uncertainty.
@@ -96,12 +106,12 @@
                                  (source-check)
                                  (values record final))))))
                       (physical-directory-check-owner-common owner)
-                      (physical-reseed-follow-cancellation-check-cleanup-stamp stamp)
+                      (physical-reseed-follow-cancellation-audit-cleanup-stamp owner stamp)
                       (source-check)
                       result)
                  (if stream (close stream) (when fd (sb-posix:close fd))))
              (physical-directory-check-owner-common owner)
-             (physical-reseed-follow-cancellation-check-cleanup-stamp stamp)
+             (physical-reseed-follow-cancellation-audit-cleanup-stamp owner stamp)
              (sb-sys:without-interrupts
                (setf (physical-reseed-follow-owner-uncertain-p owner) nil complete t)))
         (sb-sys:without-interrupts

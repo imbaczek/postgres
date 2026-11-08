@@ -81,7 +81,7 @@
                   (declare (ignore directory))
                   (let ((snapshot (physical-reseed-follow-snapshot-at root-fd)))
                     (unless snapshot (error "cancellation requires a durable follow predecessor"))
-                    (physical-reseed-follow-cancellation-preconfiguration-record (getf snapshot :record))
+                    (physical-reseed-follow-cancellation-publication-record owner (getf snapshot :record))
                     snapshot)))))
          (call-with-physical-reseed-follow-cancellation-finalization
           owner

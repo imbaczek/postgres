@@ -1,0 +1,269 @@
+(in-package #:pg-physical-tests)
+
+(defun check-configured-cancellation-publication-cut (cut escape)
+  (call-with-reseed-inert-settlement-fixture
+   :same-timeline
+   (lambda (owner root workspace) (declare (ignore owner root workspace)))
+   (lambda (root workspace)
+     (declare (ignore workspace))
+     (let* ((final (merge-pathnames "physical-reseed.follow" root))
+            (temporary (merge-pathnames "physical-reseed.follow.tmp" root))
+            (record (pg::physical-reseed-follow-decode (lineage-test-bytes final)))
+            (pending (pg::physical-reseed-follow-cancellation-begin-record record))
+            (paths (mapcar (lambda (name) (merge-pathnames name root))
+                           '("physical-reseed.attempt" "physical-reseed.install"
+                             "physical-recovery.control" "global/pg_catalog.dat")))
+            (before (mapcar (lambda (path)
+                              (list (lineage-test-bytes path)
+                                    (pg::physical-reseed-file-facts (sb-posix:lstat path))))
+                            paths))
+            (tag (gensym "CONFIGURED-CANCELLATION-CUT"))
+            (escaped nil) (fired 0) (connections 0)
+            (connect (symbol-function 'pg::physical-libpq-connect-frozen)))
+       (unwind-protect
+            (progn
+              (setf (symbol-function 'pg::physical-libpq-connect-frozen)
+                    (lambda (&rest arguments)
+                      (declare (ignore arguments))
+                      (incf connections)
+                      (error "configured cancellation cut contacted its source")))
+              (ok (eq :interrupted
+                      (catch tag
+                        (handler-case
+                            (pg::call-with-physical-reseed-follow-cancellation-owner
+                             root
+                             (lambda (owner)
+                               (setf escaped owner)
+                               (let ((pg::*physical-reseed-follow-write-limit* 257)
+                                     (pg::*physical-reseed-follow-test-hook*
+                                       (lambda (event path)
+                                         (declare (ignore path))
+                                         (when (and (eq event cut) (zerop fired))
+                                           (incf fired)
+                                           (ecase escape
+                                             (:error (error "configured cancellation publication cut"))
+                                             (:throw (throw tag :interrupted))
+                                             (:interrupt
+                                              (sb-thread:interrupt-thread
+                                               sb-thread:*current-thread*
+                                               (lambda () (throw tag :interrupted)))))))))
+                                 (pg::physical-reseed-follow-begin-cancellation owner))))
+                          (error (condition)
+                            (if (equal "configured cancellation publication cut"
+                                       (princ-to-string condition))
+                                :interrupted
+                                (error condition)))))))
+              (ok (= 1 fired))
+              (ng (pg::physical-reseed-follow-owner-busy-p escaped))
+              (ng (pg::physical-adoption-owner-active-p escaped))
+              (ok (eq (not (eq cut :before-follow-temporary-create))
+                      (not (null (pg::physical-reseed-follow-owner-uncertain-p escaped)))))
+              (let* ((partial (member cut '(:after-follow-temporary-create :after-follow-write-chunk)))
+                     (renamed (member cut '(:after-follow-rename :after-follow-directory-fsync
+                                            :before-follow-readback :after-follow-readback)))
+                     (temporary-bytes (when (pg::physical-adoption-path-present-p temporary)
+                                        (lineage-test-bytes temporary)))
+                     (temporary-identity (when temporary-bytes
+                                           (pg::physical-reseed-follow-file-identity
+                                            (sb-posix:lstat (namestring temporary)) t))))
+                (ok (equal (if renamed pending record)
+                           (pg::physical-reseed-follow-decode (lineage-test-bytes final))))
+                (ok (equalp (pg::physical-reseed-follow-image (if renamed pending record))
+                            (lineage-test-bytes final)))
+                (cond
+                  (partial
+                   (if (eq cut :after-follow-temporary-create)
+                       (ok (zerop (length temporary-bytes)))
+                       (progn
+                         (ok (< 0 (length temporary-bytes)
+                                (length (pg::physical-reseed-follow-image pending))))
+                         (ok (<= (length temporary-bytes) 257))
+                         (ok (equalp temporary-bytes
+                                     (subseq (pg::physical-reseed-follow-image pending)
+                                             0 (length temporary-bytes))))))
+                   (let ((admitted nil))
+                     (ok (signals
+                          (pg::call-with-physical-reseed-follow-cancellation-owner
+                           root (lambda (owner) (declare (ignore owner)) (setf admitted t))
+                           :recover t)
+                          'error))
+                     (ng admitted))
+                   (ok (equalp temporary-bytes (lineage-test-bytes temporary)))
+                   (ok (equal temporary-identity
+                              (pg::physical-reseed-follow-file-identity
+                               (sb-posix:lstat (namestring temporary)) t)))
+                   (ok (equalp (pg::physical-reseed-follow-image record) (lineage-test-bytes final))))
+                  (t
+                   (pg::call-with-physical-reseed-follow-cancellation-owner
+                    root
+                    (lambda (owner)
+                      (when (eq cut :before-follow-temporary-create)
+                        (ok (signals (pg::physical-reseed-follow-recover-cancellation owner) 'error))
+                        (ok (equal pending (pg::physical-reseed-follow-begin-cancellation owner))))
+                      (ok (equal pending (pg::physical-reseed-follow-read-configured-cancellation owner)))
+                      (ng (pg::physical-reseed-follow-owner-uncertain-p owner))
+                      (ng (pg::physical-reseed-follow-owner-busy-p owner)))
+                    :recover (not (eq cut :before-follow-temporary-create)))
+                   (ok (equalp (pg::physical-reseed-follow-image pending)
+                               (lineage-test-bytes final)))
+                   (ng (pg::physical-adoption-path-present-p temporary))
+                   (when temporary-identity
+                     (ok (equal (subseq temporary-identity 0 7)
+                                (subseq (pg::physical-reseed-follow-file-identity
+                                         (sb-posix:lstat (namestring final))) 0 7)))))))
+              (ok (zerop connections))
+              (ok (equalp before
+                          (mapcar (lambda (path)
+                                    (list (lineage-test-bytes path)
+                                          (pg::physical-reseed-file-facts (sb-posix:lstat path))))
+                                  paths))))
+         (setf (symbol-function 'pg::physical-libpq-connect-frozen) connect))))))
+
+(deftest reseed-configured-cancellation-cuts-before-follow-temporary-create
+    (dolist (escape '(:error :throw :interrupt))
+      (testing (symbol-name escape)
+               (check-configured-cancellation-publication-cut :before-follow-temporary-create escape))))
+
+(deftest reseed-configured-cancellation-cuts-after-follow-temporary-create
+    (dolist (escape '(:error :throw :interrupt))
+      (testing (symbol-name escape)
+               (check-configured-cancellation-publication-cut :after-follow-temporary-create escape))))
+
+(deftest reseed-configured-cancellation-cuts-after-follow-write-chunk
+    (dolist (escape '(:error :throw :interrupt))
+      (testing (symbol-name escape)
+               (check-configured-cancellation-publication-cut :after-follow-write-chunk escape))))
+
+(deftest reseed-configured-cancellation-cuts-before-follow-temporary-fsync
+    (dolist (escape '(:error :throw :interrupt))
+      (testing (symbol-name escape)
+               (check-configured-cancellation-publication-cut :before-follow-temporary-fsync escape))))
+
+(deftest reseed-configured-cancellation-cuts-after-follow-temporary-fsync
+    (dolist (escape '(:error :throw :interrupt))
+      (testing (symbol-name escape)
+               (check-configured-cancellation-publication-cut :after-follow-temporary-fsync escape))))
+
+(deftest reseed-configured-cancellation-cuts-before-follow-temporary-readback
+    (dolist (escape '(:error :throw :interrupt))
+      (testing (symbol-name escape)
+               (check-configured-cancellation-publication-cut :before-follow-temporary-readback escape))))
+
+(deftest reseed-configured-cancellation-cuts-after-follow-temporary-readback
+    (dolist (escape '(:error :throw :interrupt))
+      (testing (symbol-name escape)
+               (check-configured-cancellation-publication-cut :after-follow-temporary-readback escape))))
+
+(deftest reseed-configured-cancellation-cuts-before-follow-rename
+    (dolist (escape '(:error :throw :interrupt))
+      (testing (symbol-name escape)
+               (check-configured-cancellation-publication-cut :before-follow-rename escape))))
+
+(deftest reseed-configured-cancellation-cuts-after-follow-rename
+    (dolist (escape '(:error :throw :interrupt))
+      (testing (symbol-name escape)
+               (check-configured-cancellation-publication-cut :after-follow-rename escape))))
+
+(deftest reseed-configured-cancellation-cuts-after-follow-directory-fsync
+    (dolist (escape '(:error :throw :interrupt))
+      (testing (symbol-name escape)
+               (check-configured-cancellation-publication-cut :after-follow-directory-fsync escape))))
+
+(deftest reseed-configured-cancellation-cuts-before-follow-readback
+    (dolist (escape '(:error :throw :interrupt))
+      (testing (symbol-name escape)
+               (check-configured-cancellation-publication-cut :before-follow-readback escape))))
+
+(deftest reseed-configured-cancellation-cuts-after-follow-readback
+    (dolist (escape '(:error :throw :interrupt))
+      (testing (symbol-name escape)
+               (check-configured-cancellation-publication-cut :after-follow-readback escape))))
+
+(defun check-configured-cancellation-store-close-exit (escape)
+  (call-with-reseed-inert-settlement-fixture
+   :same-timeline
+   (lambda (owner root workspace) (declare (ignore owner root workspace)))
+   (lambda (root workspace)
+     (declare (ignore workspace))
+     (let ((stamp (symbol-function 'pg::physical-reseed-follow-cancellation-cleanup-stamp))
+           (close-store (symbol-function 'pg::physical-store-close))
+           (connect (symbol-function 'pg::physical-libpq-connect-frozen))
+           (opened nil) (descriptors nil) (escaped nil) (expected nil)
+           (fired 0) (connections 0) (tag (gensym "CONFIGURED-CANCELLATION-CLOSE")))
+       (unwind-protect
+            (progn
+              (setf (symbol-function 'pg::physical-reseed-follow-cancellation-cleanup-stamp)
+                    (lambda (owner fd check)
+                      (let ((context (pg::physical-reseed-follow-installation-context owner)))
+                        (setf opened (pg::physical-reseed-follow-installation-context-store context)
+                              descriptors (copy-tree
+                                           (pg::physical-reseed-follow-installation-context-descriptors context))))
+                      (funcall stamp owner fd check))
+                    (symbol-function 'pg::physical-store-close)
+                    (lambda (store)
+                      (multiple-value-prog1 (funcall close-store store)
+                        (when (and (eq store opened) (zerop fired))
+                          (incf fired)
+                          (ecase escape
+                            (:error (error "configured cancellation store close cut"))
+                            (:throw (throw tag :interrupted))
+                            (:interrupt
+                             (sb-thread:interrupt-thread
+                              sb-thread:*current-thread*
+                              (lambda () (throw tag :interrupted))))))))
+                    (symbol-function 'pg::physical-libpq-connect-frozen)
+                    (lambda (&rest arguments)
+                      (declare (ignore arguments))
+                      (incf connections)
+                      (error "configured cancellation close contacted its source")))
+              (ok (eq :interrupted
+                      (catch tag
+                        (handler-case
+                            (pg::call-with-physical-reseed-follow-cancellation-owner
+                             root
+                             (lambda (owner)
+                               (setf escaped owner
+                                     expected (pg::physical-reseed-follow-cancellation-begin-record
+                                               (pg::physical-reseed-follow-read-configured-cancellation owner)))
+                               (pg::physical-reseed-follow-begin-cancellation owner)))
+                          (error (condition)
+                            (if (equal "configured cancellation store close cut" (princ-to-string condition))
+                                :interrupted
+                                (error condition)))))))
+              (setf (symbol-function 'pg::physical-reseed-follow-cancellation-cleanup-stamp) stamp
+                    (symbol-function 'pg::physical-store-close) close-store)
+              (ok (= 1 fired))
+              (ok (= 10 (length descriptors)))
+              (dolist (entry descriptors)
+                (ok (handler-case
+                        (progn (sb-posix:fstat (cdr entry)) nil)
+                      (sb-posix:syscall-error (condition)
+                        (= sb-posix:ebadf (sb-posix:syscall-errno condition))))))
+              (ok (and opened (pg::physical-store-closed-p opened)))
+              (ng (open-stream-p (pg::physical-store-lock-stream opened)))
+              (ok (pg::physical-reseed-follow-owner-uncertain-p escaped))
+              (ng (pg::physical-reseed-follow-owner-busy-p escaped))
+              (ng (pg::physical-adoption-owner-active-p escaped))
+              (ok (equalp (pg::physical-reseed-follow-image expected)
+                          (lineage-test-bytes (merge-pathnames "physical-reseed.follow" root))))
+              (ng (pg::physical-adoption-path-present-p
+                   (merge-pathnames "physical-reseed.follow.tmp" root)))
+              (pg::call-with-physical-reseed-follow-cancellation-owner
+               root
+               (lambda (owner)
+                 (ok (equal expected (pg::physical-reseed-follow-read-configured-cancellation owner)))
+                 (ng (pg::physical-reseed-follow-owner-uncertain-p owner)))
+               :recover t)
+              (ok (zerop connections)))
+         (setf (symbol-function 'pg::physical-reseed-follow-cancellation-cleanup-stamp) stamp
+               (symbol-function 'pg::physical-store-close) close-store
+               (symbol-function 'pg::physical-libpq-connect-frozen) connect))))))
+
+(deftest reseed-configured-cancellation-store-close-error-revokes-and-recovers
+    (check-configured-cancellation-store-close-exit :error))
+
+(deftest reseed-configured-cancellation-store-close-throw-revokes-and-recovers
+    (check-configured-cancellation-store-close-exit :throw))
+
+(deftest reseed-configured-cancellation-store-close-interrupt-revokes-and-recovers
+    (check-configured-cancellation-store-close-exit :interrupt))

@@ -96,8 +96,6 @@
                        (ok (signals (pg::physical-reseed-follow-begin-activation owner) 'error))
                        (ok (signals (pg::physical-reseed-follow-publish-intent owner expected :previous expected) 'error))
                        (ok (signals (pg::physical-reseed-follow-recover-intent owner) 'error))
-                       (ok (signals (pg::physical-reseed-follow-begin-cancellation owner) 'error))
-                       (ok (signals (pg::physical-reseed-follow-recover-cancellation owner) 'error))
                        (ok (signals (pg::physical-reseed-follow-cleanup-cancellation owner :helper "/unused/helper") 'error))
                        (ok (not (pg::physical-backup-lease-lstat (merge-pathnames "physical-reseed.follow.tmp" root))))
                        (ok (signals

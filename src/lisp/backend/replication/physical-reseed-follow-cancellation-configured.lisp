@@ -1,5 +1,7 @@
 (in-package #:pg)
 
+(declaim (ftype function physical-reseed-follow-recover-cancellation))
+
 (defun physical-reseed-follow-cancellation-configured-record (value)
   (let* ((record (physical-reseed-follow-copy value))
          (configuration (getf record :configuration)))
@@ -85,7 +87,7 @@
             (error "configured cancellation owner changed its frozen history"))))
       copy))
 
-  (defun call-with-physical-reseed-follow-cancellation-owner (directory function)
+  (defun call-with-physical-reseed-follow-cancellation-owner (directory function &key recover)
     (let ((owned nil))
       (unwind-protect
            (call-with-physical-adoption-directory-owner
@@ -93,6 +95,7 @@
             (lambda (owner)
               (flet ((verify ()
                        (physical-reseed-follow-observe-configured-cancellation owner)))
+                (when recover (physical-reseed-follow-recover-cancellation owner))
                 (verify)
                 (multiple-value-prog1 (funcall function owner) (verify))))
             :constructor
