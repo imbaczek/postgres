@@ -173,6 +173,9 @@
 
 (defun physical-adoption-follow-check-active (owner value)
   "Verify active follow configuration and its retained recovery state."
+  ;; Scan the existing store, preserving its unflushed tail.  ON-OPEN captures
+  ;; the validated store for this scope to close, including on unwinding.
+  ;; The opener handles cleanup if opening fails before that capture.
   (let* ((*pgdata* (physical-adoption-owner-directory owner))
          (record (physical-adoption-follow-record value))
          (binding (physical-adoption-follow-planned-binding record))

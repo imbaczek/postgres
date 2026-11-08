@@ -57,6 +57,10 @@
     mount))
 
 (defun physical-adoption-handoff-check-spool (owner value location)
+  ;; Check the actual spool is empty at the proved end, then recheck its
+  ;; directory facts after closing the store and return LOCATION.  The opener
+  ;; cleans up failures before ON-OPEN captures the validated store.  This
+  ;; scope closes it after capture, including on unwinding.
   (let* ((directory (physical-adoption-handoff-spool owner value location))
          (fact (physical-adoption-install-directory-fact directory))
          (identity (getf value :spool))

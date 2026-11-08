@@ -15,6 +15,10 @@
 
 ;; Verify the installed base and empty receive spool before preparing images.
 (defun physical-adoption-follow-preflight (owner handoff)
+  ;; Build the binding and lockless live candidate from the checked spool.
+  ;; ON-OPEN captures the validated store before open returns.  The opener
+  ;; cleans up failures before capture, and this scope closes the store before
+  ;; returning the results or unwinding.
   (unless (eq :ready (physical-adoption-handoff-validate owner handoff))
     (error "adoption follow requires a published empty receive spool"))
   (let* ((*pgdata* (physical-adoption-owner-directory owner))

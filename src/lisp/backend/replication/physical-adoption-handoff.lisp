@@ -16,6 +16,10 @@
 (defvar *physical-adoption-handoff-write-limit* nil)
 
 (defun physical-adoption-handoff-create-workspace (owner installation directory)
+  ;; Create the empty spool and return the workspace fact, spool identity,
+  ;; and spool entry facts for the later handoff.  ON-OPEN captures the
+  ;; validated store for this scope to close, including on unwinding.  The
+  ;; opener cleans up failures before capture.
   (let* ((root (physical-adoption-owner-directory owner))
          (plan (getf installation :plan))
          (fact (physical-adoption-install-directory-fact directory))
