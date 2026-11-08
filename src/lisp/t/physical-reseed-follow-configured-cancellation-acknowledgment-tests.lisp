@@ -127,20 +127,6 @@
 (deftest reseed-configured-cleaned-completes-later-writer
     (check-configured-cancellation-cleaned :later-writer))
 
-(defun call-with-configured-cleaned-recovery-source (record receipt observe function)
-  (let ((recover (symbol-function 'pg::physical-reseed-follow-recover-cleaned-cancellation)))
-    (unwind-protect
-         (progn
-           (setf (symbol-function 'pg::physical-reseed-follow-recover-cleaned-cancellation)
-                 (lambda (owner &key helper)
-                   (call-with-reseed-cancellation-source
-                    owner record receipt
-                    (lambda (state)
-                      (funcall observe owner state)
-                      (funcall recover owner :helper helper)))))
-           (funcall function))
-      (setf (symbol-function 'pg::physical-reseed-follow-recover-cleaned-cancellation) recover))))
-
 (defun check-configured-cleaned-recovery-cut (cut escape)
   (call-with-reseed-inert-settlement-fixture
    :same-timeline
