@@ -15,6 +15,8 @@
    *pgdata*))
 
 (defun smgr-open-locked (relfilenode &optional (fork :main))
+  ;; Defer interrupts across opening and cache registration so the cached
+  ;; stream has an owner before a queued interrupt can be delivered.
   (let ((key (list relfilenode fork)))
     (or (gethash key *relation-streams*)
         (sb-sys:without-interrupts
@@ -122,6 +124,8 @@ under the smgr lock so buffered state cannot survive the truncation."
   (values))
 
 (defun smgr-close-all ()
+  ;; Finish the close traversal and clear the cache before delivering queued
+  ;; interrupts.  Individual close errors remain ignored during the traversal.
   (sb-thread:with-mutex (*smgr-lock*)
     (sb-sys:without-interrupts
       (maphash (lambda (k v)
