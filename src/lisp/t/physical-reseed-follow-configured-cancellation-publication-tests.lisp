@@ -26,72 +26,87 @@
       (ok (eq :passed (getf result :status)))
       (ok (= 100 (getf result :trials)))))
 
+(defun check-configured-cancellation-publication-geometry (kind)
+  (call-with-reseed-inert-settlement-fixture
+   kind
+   (lambda (owner root workspace) (declare (ignore owner root workspace)))
+   (lambda (root workspace)
+     (declare (ignore workspace))
+     (pg::call-with-physical-reseed-follow-cancellation-owner
+      root
+      (lambda (owner)
+        (let* ((before (pg::physical-reseed-follow-read-configured-cancellation owner))
+               (expected (pg::physical-reseed-follow-cancellation-begin-record before))
+               (connect (symbol-function 'pg::physical-libpq-connect-frozen))
+               (point (symbol-function 'pg::physical-reseed-follow-test-point))
+               (published-checks 0)
+               (connections 0) (record nil) (snapshot nil) (failure nil))
+          (unwind-protect
+               (progn
+                 (setf (symbol-function 'pg::physical-libpq-connect-frozen)
+                       (lambda (&rest arguments)
+                         (declare (ignore arguments))
+                         (incf connections)
+                         (error "local configured cancellation contacted its source")))
+                 (setf (symbol-function 'pg::physical-reseed-follow-test-point)
+                       (lambda (event path)
+                         (funcall point event path)
+                         (when (eq event :after-follow-rename)
+                           (incf published-checks)
+                           (let ((context (pg::physical-reseed-follow-installation-context owner)))
+                             (ok (equal expected
+                                        (pg::physical-reseed-follow-installation-context-record context)))
+                             (ok (equal expected
+                                        (getf (pg::physical-reseed-follow-installation-context-snapshot context)
+                                              :record)))
+                             (ok (signals (pg::physical-reseed-follow-begin-cancellation owner) 'error))
+                             (ok (sb-thread:join-thread
+                                  (sb-thread:make-thread
+                                   (lambda ()
+                                     (handler-case
+                                         (progn
+                                           (pg::physical-reseed-follow-cancellation-publication-record owner expected)
+                                           nil)
+                                       (error () t))))))))))
+                 (handler-case
+                     (setf record (pg::physical-reseed-follow-begin-cancellation owner))
+                   (error (condition) (setf failure (princ-to-string condition))))
+                 (ng failure (or failure "configured cancellation publishes without error"))
+                 (ok (equal expected record))
+                 (setf snapshot
+                       (pg::call-with-physical-directory-root
+                        owner
+                        (lambda (fd directory)
+                          (declare (ignore directory))
+                          (pg::physical-reseed-follow-snapshot-at fd))))
+                 (ok (equal expected (getf snapshot :record)))
+                 (ok (equalp (pg::physical-reseed-follow-image expected)
+                             (lineage-test-bytes (merge-pathnames "physical-reseed.follow" root))))
+                 (ng (pg::physical-adoption-path-present-p
+                      (merge-pathnames "physical-reseed.follow.tmp" root)))
+                 (ng (pg::physical-reseed-follow-owner-busy-p owner))
+                 (ng (pg::physical-reseed-follow-owner-uncertain-p owner))
+                 (ok (zerop connections))
+                 (ok (= 1 published-checks))
+                 (ok (equal expected
+                            (pg::physical-reseed-follow-read-configured-cancellation owner))))
+            (setf (symbol-function 'pg::physical-libpq-connect-frozen) connect
+                  (symbol-function 'pg::physical-reseed-follow-test-point) point))))))))
+
 (deftest reseed-configured-cancellation-begin-publishes-pending-and-adopts-the-journal
-    (call-with-reseed-inert-settlement-fixture
-     :same-timeline
-     (lambda (owner root workspace) (declare (ignore owner root workspace)))
-     (lambda (root workspace)
-       (declare (ignore workspace))
-       (pg::call-with-physical-reseed-follow-cancellation-owner
-        root
-        (lambda (owner)
-          (let* ((before (pg::physical-reseed-follow-read-configured-cancellation owner))
-                 (expected (pg::physical-reseed-follow-cancellation-begin-record before))
-                 (connect (symbol-function 'pg::physical-libpq-connect-frozen))
-                 (point (symbol-function 'pg::physical-reseed-follow-test-point))
-                 (published-checks 0)
-                 (connections 0) (record nil) (snapshot nil) (failure nil))
-            (unwind-protect
-                 (progn
-                   (setf (symbol-function 'pg::physical-libpq-connect-frozen)
-                         (lambda (&rest arguments)
-                           (declare (ignore arguments))
-                           (incf connections)
-                           (error "local configured cancellation contacted its source")))
-                   (setf (symbol-function 'pg::physical-reseed-follow-test-point)
-                         (lambda (event path)
-                           (funcall point event path)
-                           (when (eq event :after-follow-rename)
-                             (incf published-checks)
-                             (let ((context (pg::physical-reseed-follow-installation-context owner)))
-                               (ok (equal expected
-                                          (pg::physical-reseed-follow-installation-context-record context)))
-                               (ok (equal expected
-                                          (getf (pg::physical-reseed-follow-installation-context-snapshot context)
-                                                :record)))
-                               (ok (signals (pg::physical-reseed-follow-begin-cancellation owner) 'error))
-                               (ok (sb-thread:join-thread
-                                    (sb-thread:make-thread
-                                     (lambda ()
-                                       (handler-case
-                                           (progn
-                                             (pg::physical-reseed-follow-cancellation-publication-record owner expected)
-                                             nil)
-                                         (error () t))))))))))
-                   (handler-case
-                       (setf record (pg::physical-reseed-follow-begin-cancellation owner))
-                     (error (condition) (setf failure (princ-to-string condition))))
-                   (ng failure (or failure "configured cancellation publishes without error"))
-                   (ok (equal expected record))
-                   (setf snapshot
-                         (pg::call-with-physical-directory-root
-                          owner
-                          (lambda (fd directory)
-                            (declare (ignore directory))
-                            (pg::physical-reseed-follow-snapshot-at fd))))
-                   (ok (equal expected (getf snapshot :record)))
-                   (ok (equalp (pg::physical-reseed-follow-image expected)
-                               (lineage-test-bytes (merge-pathnames "physical-reseed.follow" root))))
-                   (ng (pg::physical-adoption-path-present-p
-                        (merge-pathnames "physical-reseed.follow.tmp" root)))
-                   (ng (pg::physical-reseed-follow-owner-busy-p owner))
-                   (ng (pg::physical-reseed-follow-owner-uncertain-p owner))
-                   (ok (zerop connections))
-                   (ok (= 1 published-checks))
-                   (ok (equal expected
-                              (pg::physical-reseed-follow-read-configured-cancellation owner))))
-              (setf (symbol-function 'pg::physical-libpq-connect-frozen) connect
-                    (symbol-function 'pg::physical-reseed-follow-test-point) point))))))))
+    (check-configured-cancellation-publication-geometry :same-timeline))
+
+(deftest reseed-configured-cancellation-publishes-retained-timeline-history
+    (check-configured-cancellation-publication-geometry :retained-timeline))
+
+(deftest reseed-configured-cancellation-publishes-before-fork-history
+    (check-configured-cancellation-publication-geometry :before-fork))
+
+(deftest reseed-configured-cancellation-publishes-at-fork-history
+    (check-configured-cancellation-publication-geometry :at-fork))
+
+(deftest reseed-configured-cancellation-publishes-later-writer-history
+    (check-configured-cancellation-publication-geometry :later-writer))
 
 (deftest reseed-configured-cancellation-recovers-a-published-marker-after-rename-error
     (call-with-reseed-inert-settlement-fixture

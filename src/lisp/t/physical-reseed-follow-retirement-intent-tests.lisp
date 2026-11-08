@@ -1019,7 +1019,7 @@
               (loop for form in forms append (list "--eval" (write-to-string form)))))))
 
 (defun run-retirement-intent-test-crash-child
-    (root point cache marker &key (timeout 300) (operation :initial) argument-builder)
+    (root point cache marker &key (timeout 300) (operation :initial) argument-builder (output t))
   (let ((process nil) (pid nil))
     (unwind-protect
          (progn
@@ -1035,7 +1035,7 @@
                           (:receipt-consumption
                            (receipt-test-crash-child-arguments root point cache marker :receipt-consumption))
                           (otherwise (retirement-intent-test-child-arguments root point cache marker operation))))
-                    :search t :wait nil :output t :error :output)
+                    :search t :wait nil :output output :error :output :if-output-exists :error)
                    pid (sb-ext:process-pid process)))
            (format t "~%RETIREMENT-CRASH-OWNED-CHILD ~d ~s ~s~%" pid root point)
            (finish-output)
