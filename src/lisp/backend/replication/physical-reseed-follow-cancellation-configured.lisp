@@ -10,10 +10,14 @@
     record))
 
 (defun physical-reseed-follow-cancellation-configured-history (value)
+  ;; Freeze the inert configured predecessor in a private copy, leaving the
+  ;; cancellation field out of the history bound to the cleanup owner.
   (let ((record (physical-reseed-follow-cancellation-configured-record value)))
     (remf record :cancellation)
     record))
 
+;; This owner admits read-only observations of inert configured history.
+;; Its forward-owner method rejects forward follow operations.
 (defstruct (physical-reseed-follow-cancellation-owner
             (:include physical-reseed-follow-owner)
             (:print-function print-physical-reseed-install-owner)))
@@ -62,6 +66,9 @@
   (physical-reseed-follow-cancellation-configured-record value)
   (%physical-reseed-follow-configuration-layout-state owner descriptors value binding images prefix check))
 
+;; The private registry binds each cleanup owner to its thread and copied
+;; history for the owner's lifetime.  Observe before the callback and again
+;; after it returns normally, then remove the registry entry on exit.
 (let ((owners (make-hash-table :test #'eq))
       (lock (sb-thread:make-mutex :name "configured cancellation history")))
   (defun physical-reseed-follow-cancellation-check-owner-history (owner record)
@@ -147,6 +154,9 @@
         observation))))
 
 (defun physical-reseed-follow-observe-configured-cancellation (owner)
+  ;; Collect detached observation data while the mapped resources are held.
+  ;; After they close, audit the ten directory roles' metadata and return the
+  ;; data in an opaque observation.
   (unless (physical-reseed-follow-cancellation-owner-p owner)
     (error "configured cancellation observation requires dedicated cleanup ownership"))
   (physical-reseed-follow-check-idle-state owner)
