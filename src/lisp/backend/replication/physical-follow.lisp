@@ -1063,6 +1063,11 @@ state. The active config still needs durable-state validation before admission."
 Require owned PGDATA and exclude reload and live operations. Open and close a
 temporary store without contacting the source, running redo or installing runtime
 state. An active result still requires startup validation before workers launch."
+  ;; The temporary receive store is opened and closed while command, reload and
+  ;; live-operation exclusion are held.  ON-OPEN captures the validated store
+  ;; before open returns.  The opener cleans up failures before capture, and
+  ;; this scope closes the captured store on return or unwinding.  Reconciliation
+  ;; can publish active configuration and leaves worker startup to a later step.
   (unless (and *postmaster-data-lock* (postmaster-pid-owned-p)
                (zerop *live-operation-depth*) (not *wal-ready*)
                (not *physical-receive-store*) (not *physical-follow-runtime*)
