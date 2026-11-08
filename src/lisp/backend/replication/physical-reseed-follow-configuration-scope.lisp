@@ -163,6 +163,9 @@
     (call-with-physical-reseed-follow-installation-receive
      descriptors record binding prefix
      (lambda (held)
+       ;; ON-OPEN captures the validated store before open returns.  The opener
+       ;; cleans up failures before capture, and this scope closes the captured
+       ;; store after revoking the context.
        (let ((store nil) (context nil))
          (unwind-protect
               (progn
