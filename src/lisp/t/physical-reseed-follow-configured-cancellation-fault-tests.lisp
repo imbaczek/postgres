@@ -235,85 +235,90 @@
       (testing (symbol-name escape)
                (check-configured-cancellation-publication-cut :after-follow-readback escape))))
 
-(defun check-configured-cancellation-store-close-exit (escape)
+(defun check-configured-cancellation-store-close-exit (escape &optional (phase :pending))
   (call-with-reseed-inert-settlement-fixture
    :same-timeline
    (lambda (owner root workspace) (declare (ignore owner root workspace)))
    (lambda (root workspace)
      (declare (ignore workspace))
-     (let ((stamp (symbol-function 'pg::physical-reseed-follow-cancellation-cleanup-stamp))
-           (close-store (symbol-function 'pg::physical-store-close))
-           (connect (symbol-function 'pg::physical-libpq-connect-frozen))
-           (opened nil) (descriptors nil) (escaped nil) (expected nil)
-           (fired 0) (connections 0) (tag (gensym "CONFIGURED-CANCELLATION-CLOSE")))
-       (unwind-protect
-            (progn
-              (setf (symbol-function 'pg::physical-reseed-follow-cancellation-cleanup-stamp)
-                    (lambda (owner fd check)
-                      (let ((context (pg::physical-reseed-follow-installation-context owner)))
-                        (setf opened (pg::physical-reseed-follow-installation-context-store context)
-                              descriptors (copy-tree
-                                           (pg::physical-reseed-follow-installation-context-descriptors context))))
-                      (funcall stamp owner fd check))
-                    (symbol-function 'pg::physical-store-close)
-                    (lambda (store)
-                      (multiple-value-prog1 (funcall close-store store)
-                        (when (and (eq store opened) (zerop fired))
-                          (incf fired)
-                          (ecase escape
-                            (:error (error "configured cancellation store close cut"))
-                            (:throw (throw tag :interrupted))
-                            (:interrupt
-                             (sb-thread:interrupt-thread
-                              sb-thread:*current-thread*
-                              (lambda () (throw tag :interrupted))))))))
-                    (symbol-function 'pg::physical-libpq-connect-frozen)
-                    (lambda (&rest arguments)
-                      (declare (ignore arguments))
-                      (incf connections)
-                      (error "configured cancellation close contacted its source")))
-              (ok (eq :interrupted
-                      (catch tag
-                        (handler-case
-                            (pg::call-with-physical-reseed-follow-cancellation-owner
-                             root
-                             (lambda (owner)
-                               (setf escaped owner
-                                     expected (pg::physical-reseed-follow-cancellation-begin-record
-                                               (pg::physical-reseed-follow-read-configured-cancellation owner)))
-                               (pg::physical-reseed-follow-begin-cancellation owner)))
-                          (error (condition)
-                            (if (equal "configured cancellation store close cut" (princ-to-string condition))
-                                :interrupted
-                                (error condition)))))))
-              (setf (symbol-function 'pg::physical-reseed-follow-cancellation-cleanup-stamp) stamp
-                    (symbol-function 'pg::physical-store-close) close-store)
-              (ok (= 1 fired))
-              (ok (= 10 (length descriptors)))
-              (dolist (entry descriptors)
-                (ok (handler-case
-                        (progn (sb-posix:fstat (cdr entry)) nil)
-                      (sb-posix:syscall-error (condition)
-                        (= sb-posix:ebadf (sb-posix:syscall-errno condition))))))
-              (ok (and opened (pg::physical-store-closed-p opened)))
-              (ng (open-stream-p (pg::physical-store-lock-stream opened)))
-              (ok (pg::physical-reseed-follow-owner-uncertain-p escaped))
-              (ng (pg::physical-reseed-follow-owner-busy-p escaped))
-              (ng (pg::physical-adoption-owner-active-p escaped))
-              (ok (equalp (pg::physical-reseed-follow-image expected)
-                          (lineage-test-bytes (merge-pathnames "physical-reseed.follow" root))))
-              (ng (pg::physical-adoption-path-present-p
-                   (merge-pathnames "physical-reseed.follow.tmp" root)))
-              (pg::call-with-physical-reseed-follow-cancellation-owner
-               root
-               (lambda (owner)
-                 (ok (equal expected (pg::physical-reseed-follow-read-configured-cancellation owner)))
-                 (ng (pg::physical-reseed-follow-owner-uncertain-p owner)))
-               :recover t)
-              (ok (zerop connections)))
-         (setf (symbol-function 'pg::physical-reseed-follow-cancellation-cleanup-stamp) stamp
-               (symbol-function 'pg::physical-store-close) close-store
-               (symbol-function 'pg::physical-libpq-connect-frozen) connect))))))
+     (multiple-value-bind (record expected receipt)
+         (configured-cancellation-test-phase-state root phase)
+       (declare (ignore receipt))
+       (let ((stamp (symbol-function 'pg::physical-reseed-follow-cancellation-cleanup-stamp))
+             (close-store (symbol-function 'pg::physical-store-close))
+             (connect (symbol-function 'pg::physical-libpq-connect-frozen))
+             (opened nil) (descriptors nil) (escaped nil) (source-state nil)
+             (facts (configured-cancellation-test-preserved-file-facts root))
+             (fired 0) (connections 0) (tag (gensym "CONFIGURED-CANCELLATION-CLOSE")))
+         (unwind-protect
+              (progn
+                (setf (symbol-function 'pg::physical-reseed-follow-cancellation-cleanup-stamp)
+                      (lambda (owner fd check)
+                        (let ((context (pg::physical-reseed-follow-installation-context owner)))
+                          (setf opened (pg::physical-reseed-follow-installation-context-store context)
+                                descriptors (copy-tree
+                                             (pg::physical-reseed-follow-installation-context-descriptors context))))
+                        (funcall stamp owner fd check))
+                      (symbol-function 'pg::physical-store-close)
+                      (lambda (store)
+                        (multiple-value-prog1 (funcall close-store store)
+                          (when (and (eq store opened) (zerop fired))
+                            (incf fired)
+                            (ecase escape
+                              (:error (error "configured cancellation store close cut"))
+                              (:throw (throw tag :interrupted))
+                              (:interrupt
+                               (sb-thread:interrupt-thread
+                                sb-thread:*current-thread*
+                                (lambda () (throw tag :interrupted))))))))
+                      (symbol-function 'pg::physical-libpq-connect-frozen)
+                      (lambda (&rest arguments)
+                        (declare (ignore arguments))
+                        (incf connections)
+                        (error "configured cancellation close contacted its source")))
+                (ok (eq :interrupted
+                        (catch tag
+                          (handler-case
+                              (pg::call-with-physical-reseed-follow-cancellation-owner
+                               root
+                               (lambda (owner)
+                                 (setf escaped owner)
+                                 (configured-cancellation-test-phase-action
+                                  owner phase record (lambda (state) (setf source-state state)))))
+                            (error (condition)
+                              (if (equal "configured cancellation store close cut" (princ-to-string condition))
+                                  :interrupted
+                                  (error condition)))))))
+                (setf (symbol-function 'pg::physical-reseed-follow-cancellation-cleanup-stamp) stamp
+                      (symbol-function 'pg::physical-store-close) close-store)
+                (check-configured-cancellation-test-source-events source-state (eq phase :cleaned))
+                (ok (= 1 fired))
+                (ok (= 10 (length descriptors)))
+                (dolist (entry descriptors)
+                  (ok (handler-case
+                          (progn (sb-posix:fstat (cdr entry)) nil)
+                        (sb-posix:syscall-error (condition)
+                          (= sb-posix:ebadf (sb-posix:syscall-errno condition))))))
+                (ok (and opened (pg::physical-store-closed-p opened)))
+                (ng (open-stream-p (pg::physical-store-lock-stream opened)))
+                (ok (pg::physical-reseed-follow-owner-uncertain-p escaped))
+                (ng (pg::physical-reseed-follow-owner-busy-p escaped))
+                (ng (pg::physical-adoption-owner-active-p escaped))
+                (ok (equalp (pg::physical-reseed-follow-image expected)
+                            (lineage-test-bytes (merge-pathnames "physical-reseed.follow" root))))
+                (ng (pg::physical-adoption-path-present-p
+                     (merge-pathnames "physical-reseed.follow.tmp" root)))
+                (pg::call-with-physical-reseed-follow-cancellation-owner
+                 root
+                 (lambda (owner)
+                   (ok (equal expected (pg::physical-reseed-follow-read-configured-cancellation owner)))
+                   (ng (pg::physical-reseed-follow-owner-uncertain-p owner)))
+                 :recover (if (eq phase :cleaned) :cleaned t) :helper "/unused/helper")
+                (ok (equalp facts (configured-cancellation-test-preserved-file-facts root)))
+                (ok (zerop connections)))
+           (setf (symbol-function 'pg::physical-reseed-follow-cancellation-cleanup-stamp) stamp
+                 (symbol-function 'pg::physical-store-close) close-store
+                 (symbol-function 'pg::physical-libpq-connect-frozen) connect)))))))
 
 (deftest reseed-configured-cancellation-store-close-error-revokes-and-recovers
     (check-configured-cancellation-store-close-exit :error))
@@ -324,94 +329,97 @@
 (deftest reseed-configured-cancellation-store-close-interrupt-revokes-and-recovers
     (check-configured-cancellation-store-close-exit :interrupt))
 
-(defun check-configured-cancellation-postclose-mutation (role audit-index)
+(defun check-configured-cancellation-postclose-mutation (role audit-index &optional (phase :pending))
   (call-with-reseed-inert-settlement-fixture
    :same-timeline
    (lambda (owner root workspace) (declare (ignore owner root workspace)))
    (lambda (root workspace)
      (declare (ignore workspace))
-     (let ((make-stamp (symbol-function 'pg::physical-reseed-follow-cancellation-cleanup-stamp))
-           (audit (symbol-function 'pg::physical-reseed-follow-cancellation-audit-cleanup-stamp))
-           (connect (symbol-function 'pg::physical-libpq-connect-frozen))
-           (facts (configured-cancellation-test-preserved-file-facts root))
-           (escaped nil) (expected nil) (descriptors nil) (store nil)
-           (foreign nil) (created-p nil) (foreign-facts nil) (message nil) (returned nil)
-           (audits 0) (fired 0) (connections 0)
-           (bytes (make-array 3 :element-type '(unsigned-byte 8) :initial-contents '(17 23 41))))
-       (unwind-protect
-            (progn
-              (setf (symbol-function 'pg::physical-reseed-follow-cancellation-cleanup-stamp)
-                    (lambda (owner fd check)
-                      (let ((context (pg::physical-reseed-follow-installation-context owner)))
-                        (setf descriptors
-                              (copy-tree (pg::physical-reseed-follow-installation-context-descriptors context))
-                              store (pg::physical-reseed-follow-installation-context-store context)))
-                      (funcall make-stamp owner fd check))
-                    (symbol-function 'pg::physical-reseed-follow-cancellation-audit-cleanup-stamp)
-                    (lambda (owner stamp)
-                      (when (eq owner escaped)
-                        (incf audits)
-                        (when (= audits audit-index)
-                          (ok (= 10 (length descriptors)))
-                          (dolist (entry descriptors)
-                            (ok (handler-case
-                                    (progn (sb-posix:fstat (cdr entry)) nil)
-                                  (sb-posix:syscall-error (condition)
-                                    (= sb-posix:ebadf (sb-posix:syscall-errno condition))))))
-                          (ok (pg::physical-store-closed-p store))
-                          (ng (open-stream-p (pg::physical-store-lock-stream store)))
-                          (let ((entry (assoc role (getf stamp :roles))))
-                            (unless entry (error "publication stamp lacks its requested role"))
-                            (setf foreign (merge-pathnames ".unexpected-published-child"
-                                                           (pathname (second entry)))))
-                          (with-open-file (output foreign :direction :output :if-exists :error
-                                                          :element-type '(unsigned-byte 8))
-                            (setf created-p t)
-                            (write-sequence bytes output))
-                          (sb-posix:chmod (namestring foreign) #o600)
-                          (setf foreign-facts
-                                (pg::physical-reseed-file-facts (sb-posix:lstat (namestring foreign))))
-                          (incf fired)))
-                      (funcall audit owner stamp))
-                    (symbol-function 'pg::physical-libpq-connect-frozen)
-                    (lambda (&rest arguments)
-                      (declare (ignore arguments))
-                      (incf connections)
-                      (error "configured cancellation mutation check contacted its source")))
-              (setf message
-                    (handler-case
-                        (progn
-                          (pg::call-with-physical-reseed-follow-cancellation-owner
-                           root
-                           (lambda (owner)
-                             (setf escaped owner
-                                   expected (pg::physical-reseed-follow-cancellation-begin-record
-                                             (pg::physical-reseed-follow-read-configured-cancellation owner)))
-                             (pg::physical-reseed-follow-begin-cancellation owner)))
-                          (setf returned t)
-                          nil)
-                      (error (condition) (princ-to-string condition))))
-              (ok (equal "retirement observation changed during resource cleanup" message))
-              (ok (= 1 fired))
-              (ok (= audit-index audits))
-              (ng returned)
-              (ok (pg::physical-reseed-follow-owner-uncertain-p escaped))
-              (ng (pg::physical-reseed-follow-owner-busy-p escaped))
-              (ng (pg::physical-adoption-owner-active-p escaped))
-              (ok (equalp (pg::physical-reseed-follow-image expected)
-                          (lineage-test-bytes (merge-pathnames "physical-reseed.follow" root))))
-              (ng (pg::physical-adoption-path-present-p
-                   (merge-pathnames "physical-reseed.follow.tmp" root)))
-              (ok (equalp bytes (lineage-test-bytes foreign)))
-              (ok (equal foreign-facts
-                         (pg::physical-reseed-file-facts (sb-posix:lstat (namestring foreign)))))
-              (ok (equalp facts (configured-cancellation-test-preserved-file-facts root)))
-              (ok (zerop connections)))
-         (setf (symbol-function 'pg::physical-reseed-follow-cancellation-cleanup-stamp) make-stamp
-               (symbol-function 'pg::physical-reseed-follow-cancellation-audit-cleanup-stamp) audit
-               (symbol-function 'pg::physical-libpq-connect-frozen) connect)
-         (when (and created-p (pg::physical-adoption-path-present-p foreign))
-           (delete-file foreign)))))))
+     (multiple-value-bind (record expected receipt)
+         (configured-cancellation-test-phase-state root phase)
+       (declare (ignore receipt))
+       (let ((make-stamp (symbol-function 'pg::physical-reseed-follow-cancellation-cleanup-stamp))
+             (audit (symbol-function 'pg::physical-reseed-follow-cancellation-audit-cleanup-stamp))
+             (connect (symbol-function 'pg::physical-libpq-connect-frozen))
+             (facts (configured-cancellation-test-preserved-file-facts root))
+             (escaped nil) (source-state nil) (descriptors nil) (store nil)
+             (foreign nil) (created-p nil) (foreign-facts nil) (message nil) (returned nil)
+             (audits 0) (fired 0) (connections 0)
+             (bytes (make-array 3 :element-type '(unsigned-byte 8) :initial-contents '(17 23 41))))
+         (unwind-protect
+              (progn
+                (setf (symbol-function 'pg::physical-reseed-follow-cancellation-cleanup-stamp)
+                      (lambda (owner fd check)
+                        (let ((context (pg::physical-reseed-follow-installation-context owner)))
+                          (setf descriptors
+                                (copy-tree (pg::physical-reseed-follow-installation-context-descriptors context))
+                                store (pg::physical-reseed-follow-installation-context-store context)))
+                        (funcall make-stamp owner fd check))
+                      (symbol-function 'pg::physical-reseed-follow-cancellation-audit-cleanup-stamp)
+                      (lambda (owner stamp)
+                        (when (eq owner escaped)
+                          (incf audits)
+                          (when (= audits audit-index)
+                            (ok (= 10 (length descriptors)))
+                            (dolist (entry descriptors)
+                              (ok (handler-case
+                                      (progn (sb-posix:fstat (cdr entry)) nil)
+                                    (sb-posix:syscall-error (condition)
+                                      (= sb-posix:ebadf (sb-posix:syscall-errno condition))))))
+                            (ok (pg::physical-store-closed-p store))
+                            (ng (open-stream-p (pg::physical-store-lock-stream store)))
+                            (let ((entry (assoc role (getf stamp :roles))))
+                              (unless entry (error "publication stamp lacks its requested role"))
+                              (setf foreign (merge-pathnames ".unexpected-published-child"
+                                                             (pathname (second entry)))))
+                            (with-open-file (output foreign :direction :output :if-exists :error
+                                                            :element-type '(unsigned-byte 8))
+                              (setf created-p t)
+                              (write-sequence bytes output))
+                            (sb-posix:chmod (namestring foreign) #o600)
+                            (setf foreign-facts
+                                  (pg::physical-reseed-file-facts (sb-posix:lstat (namestring foreign))))
+                            (incf fired)))
+                        (funcall audit owner stamp))
+                      (symbol-function 'pg::physical-libpq-connect-frozen)
+                      (lambda (&rest arguments)
+                        (declare (ignore arguments))
+                        (incf connections)
+                        (error "configured cancellation mutation check contacted its source")))
+                (setf message
+                      (handler-case
+                          (progn
+                            (pg::call-with-physical-reseed-follow-cancellation-owner
+                             root
+                             (lambda (owner)
+                               (setf escaped owner)
+                               (configured-cancellation-test-phase-action
+                                owner phase record (lambda (state) (setf source-state state)))))
+                            (setf returned t)
+                            nil)
+                        (error (condition) (princ-to-string condition))))
+                (check-configured-cancellation-test-source-events source-state (eq phase :cleaned))
+                (ok (equal "retirement observation changed during resource cleanup" message))
+                (ok (= 1 fired))
+                (ok (= audit-index audits))
+                (ng returned)
+                (ok (pg::physical-reseed-follow-owner-uncertain-p escaped))
+                (ng (pg::physical-reseed-follow-owner-busy-p escaped))
+                (ng (pg::physical-adoption-owner-active-p escaped))
+                (ok (equalp (pg::physical-reseed-follow-image expected)
+                            (lineage-test-bytes (merge-pathnames "physical-reseed.follow" root))))
+                (ng (pg::physical-adoption-path-present-p
+                     (merge-pathnames "physical-reseed.follow.tmp" root)))
+                (ok (equalp bytes (lineage-test-bytes foreign)))
+                (ok (equal foreign-facts
+                           (pg::physical-reseed-file-facts (sb-posix:lstat (namestring foreign)))))
+                (ok (equalp facts (configured-cancellation-test-preserved-file-facts root)))
+                (ok (zerop connections)))
+           (setf (symbol-function 'pg::physical-reseed-follow-cancellation-cleanup-stamp) make-stamp
+                 (symbol-function 'pg::physical-reseed-follow-cancellation-audit-cleanup-stamp) audit
+                 (symbol-function 'pg::physical-libpq-connect-frozen) connect)
+           (when (and created-p (pg::physical-adoption-path-present-p foreign))
+             (delete-file foreign))))))))
 
 (deftest reseed-configured-cancellation-postclose-mutation-root
     (dolist (audit-index '(1 2))
@@ -672,3 +680,121 @@
 
 (deftest reseed-configured-cleaned-syscall-recovery-close
     (check-configured-cancellation-syscall-failure :recovery-close :cleaned))
+
+(deftest reseed-configured-source-closed-store-close-error-revokes-and-recovers
+    (check-configured-cancellation-store-close-exit :error :source-closed))
+
+(deftest reseed-configured-source-closed-store-close-throw-revokes-and-recovers
+    (check-configured-cancellation-store-close-exit :throw :source-closed))
+
+(deftest reseed-configured-source-closed-store-close-interrupt-revokes-and-recovers
+    (check-configured-cancellation-store-close-exit :interrupt :source-closed))
+
+(deftest reseed-configured-source-closed-postclose-mutation-root
+    (dolist (audit '(1 2))
+      (testing (write-to-string audit)
+               (check-configured-cancellation-postclose-mutation :root audit :source-closed))))
+
+(deftest reseed-configured-source-closed-postclose-mutation-incoming
+    (dolist (audit '(1 2))
+      (testing (write-to-string audit)
+               (check-configured-cancellation-postclose-mutation :incoming audit :source-closed))))
+
+(deftest reseed-configured-source-closed-postclose-mutation-quarantine
+    (dolist (audit '(1 2))
+      (testing (write-to-string audit)
+               (check-configured-cancellation-postclose-mutation :quarantine audit :source-closed))))
+
+(deftest reseed-configured-source-closed-postclose-mutation-base
+    (dolist (audit '(1 2))
+      (testing (write-to-string audit)
+               (check-configured-cancellation-postclose-mutation :base audit :source-closed))))
+
+(deftest reseed-configured-source-closed-postclose-mutation-global
+    (dolist (audit '(1 2))
+      (testing (write-to-string audit)
+               (check-configured-cancellation-postclose-mutation :global audit :source-closed))))
+
+(deftest reseed-configured-source-closed-postclose-mutation-wal
+    (dolist (audit '(1 2))
+      (testing (write-to-string audit)
+               (check-configured-cancellation-postclose-mutation :wal audit :source-closed))))
+
+(deftest reseed-configured-source-closed-postclose-mutation-workspace
+    (dolist (audit '(1 2))
+      (testing (write-to-string audit)
+               (check-configured-cancellation-postclose-mutation :workspace audit :source-closed))))
+
+(deftest reseed-configured-source-closed-postclose-mutation-staged
+    (dolist (audit '(1 2))
+      (testing (write-to-string audit)
+               (check-configured-cancellation-postclose-mutation :staged audit :source-closed))))
+
+(deftest reseed-configured-source-closed-postclose-mutation-saved
+    (dolist (audit '(1 2))
+      (testing (write-to-string audit)
+               (check-configured-cancellation-postclose-mutation :saved audit :source-closed))))
+
+(deftest reseed-configured-source-closed-postclose-mutation-receive
+    (dolist (audit '(1 2))
+      (testing (write-to-string audit)
+               (check-configured-cancellation-postclose-mutation :receive audit :source-closed))))
+
+(deftest reseed-configured-cleaned-store-close-error-revokes-and-recovers
+    (check-configured-cancellation-store-close-exit :error :cleaned))
+
+(deftest reseed-configured-cleaned-store-close-throw-revokes-and-recovers
+    (check-configured-cancellation-store-close-exit :throw :cleaned))
+
+(deftest reseed-configured-cleaned-store-close-interrupt-revokes-and-recovers
+    (check-configured-cancellation-store-close-exit :interrupt :cleaned))
+
+(deftest reseed-configured-cleaned-postclose-mutation-root
+    (dolist (audit '(1 2))
+      (testing (write-to-string audit)
+               (check-configured-cancellation-postclose-mutation :root audit :cleaned))))
+
+(deftest reseed-configured-cleaned-postclose-mutation-incoming
+    (dolist (audit '(1 2))
+      (testing (write-to-string audit)
+               (check-configured-cancellation-postclose-mutation :incoming audit :cleaned))))
+
+(deftest reseed-configured-cleaned-postclose-mutation-quarantine
+    (dolist (audit '(1 2))
+      (testing (write-to-string audit)
+               (check-configured-cancellation-postclose-mutation :quarantine audit :cleaned))))
+
+(deftest reseed-configured-cleaned-postclose-mutation-base
+    (dolist (audit '(1 2))
+      (testing (write-to-string audit)
+               (check-configured-cancellation-postclose-mutation :base audit :cleaned))))
+
+(deftest reseed-configured-cleaned-postclose-mutation-global
+    (dolist (audit '(1 2))
+      (testing (write-to-string audit)
+               (check-configured-cancellation-postclose-mutation :global audit :cleaned))))
+
+(deftest reseed-configured-cleaned-postclose-mutation-wal
+    (dolist (audit '(1 2))
+      (testing (write-to-string audit)
+               (check-configured-cancellation-postclose-mutation :wal audit :cleaned))))
+
+(deftest reseed-configured-cleaned-postclose-mutation-workspace
+    (dolist (audit '(1 2))
+      (testing (write-to-string audit)
+               (check-configured-cancellation-postclose-mutation :workspace audit :cleaned))))
+
+(deftest reseed-configured-cleaned-postclose-mutation-staged
+    (dolist (audit '(1 2))
+      (testing (write-to-string audit)
+               (check-configured-cancellation-postclose-mutation :staged audit :cleaned))))
+
+(deftest reseed-configured-cleaned-postclose-mutation-saved
+    (dolist (audit '(1 2))
+      (testing (write-to-string audit)
+               (check-configured-cancellation-postclose-mutation :saved audit :cleaned))))
+
+(deftest reseed-configured-cleaned-postclose-mutation-receive
+    (dolist (audit '(1 2))
+      (testing (write-to-string audit)
+               (check-configured-cancellation-postclose-mutation :receive audit :cleaned))))
