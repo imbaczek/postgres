@@ -29,6 +29,8 @@
                            (getf receipt :successor) (getf receipt :request))))))))
 
 (defun physical-reseed-follow-cancellation-pending-source-action (value observation)
+  ;; Classify pending source observations for both cleanup owner types.
+  ;; A closed abort with generation history leaves that debt for later.
   (let ((record (physical-reseed-follow-copy value)))
     (unless (eq :pending (getf (getf record :cancellation) :phase))
       (error "source cleanup observation requires pending cancellation"))

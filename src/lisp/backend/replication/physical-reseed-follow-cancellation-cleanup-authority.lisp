@@ -11,6 +11,7 @@
             (:print-function physical-libpq-print-private-object)))
 
 (defun physical-reseed-follow-cancellation-cleanup-candidate (owner candidate previous)
+  ;; The owner checks the history appropriate to its cleanup scope.
   ;; Accept only the exact pending to source-closed transition and its receipt.
   (let* ((before (physical-reseed-follow-cancellation-publication-record owner (getf previous :record)))
          (after (physical-reseed-follow-cancellation-publication-record owner candidate))
@@ -25,7 +26,8 @@
 
 (defun call-with-physical-reseed-follow-cancellation-cleanup-authority
     (owner root-fd candidate previous bytes mode check function &optional fd temporary-identity)
-  ;; Freeze the owner, root, thread, candidate and attempt for this scope.
+  ;; Bind publication to the owner, root, thread, candidate, attempt and
+  ;; the identity of the mapped context.
   ;; The attempt may already be aborted and must stay unchanged during the
   ;; operation.  Initial pending publication requires an active attempt.
   ;; Keep claims unavailable during initial proof and revoke them on exit.
