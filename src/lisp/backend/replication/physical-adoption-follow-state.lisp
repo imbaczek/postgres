@@ -182,13 +182,16 @@
     (unless (equal expected config) (error "adoption follow active config differs from its proved plan"))
     (multiple-value-bind (base control) (physical-recovery-verify-base-state)
       (declare (ignore control))
-      (let ((store (physical-store-open
-                    (physical-adoption-follow-directory value :spool) (getf base :system-id)
-                    (getf base :timeline) :start-lsn (getf base :end) :discard-tail nil :create-lock nil
-                    :retained-identity (physical-recovery-retained-identity base))))
+      (let ((store nil))
         (unwind-protect
-             (physical-follow-check-active-state store base config :policy nil)
-          (physical-store-close store))))))
+             (progn
+               (physical-store-open
+                (physical-adoption-follow-directory value :spool) (getf base :system-id)
+                (getf base :timeline) :start-lsn (getf base :end) :discard-tail nil :create-lock nil
+                :retained-identity (physical-recovery-retained-identity base)
+                :on-open (lambda (opened) (setf store opened)))
+               (physical-follow-check-active-state store base config :policy nil))
+          (when store (physical-store-close store)))))))
 
 ;; Accept the recorded prefix or one completed but unrecorded move.
 ;; Recheck the context and journal after inspecting names and contents.

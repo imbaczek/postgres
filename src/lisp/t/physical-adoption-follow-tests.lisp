@@ -202,3 +202,22 @@
                   (ok (= 11 (getf state :step)))
                   (ok (= 11 (pg::physical-adoption-follow-validate recovered state)))))))))
        :fork-distance 0)))
+
+(deftest adoption-active-store-check-closes-interrupted-open-handoffs
+    (call-with-adoption-follow-transaction-fixture
+     (lambda (root owner handoff directory)
+       (declare (ignore handoff))
+       (pg::physical-adoption-follow-prepare owner directory)
+       (multiple-value-bind (state status) (pg::physical-adoption-follow-resume owner)
+         (ok (eq status :active-fenced))
+         (let* ((value (getf state :plan))
+                (stage (getf (pg::physical-adoption-follow-record value) :stage))
+                (end (getf stage :end))
+                (spool (pg::physical-adoption-follow-directory value :spool)))
+           (check-adoption-store-open-handoff
+            (lambda ()
+              (let ((result (pg::physical-adoption-follow-check-active owner value)))
+                (values (getf result :start) (getf result :terminal)
+                        (getf result :timeline) (getf result :next-xid))))
+            (list end end (getf stage :timeline) (getf stage :next-xid))
+            1 root spool))))))

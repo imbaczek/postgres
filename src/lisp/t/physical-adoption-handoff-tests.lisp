@@ -243,3 +243,70 @@
            (ok (intake-fails-p (lambda () (pg::physical-adoption-handoff-resume owner)))))
          (ok (equalp #(111 99 99) (lineage-test-bytes target)))
          (ok (probe-file (merge-pathnames "spool/receive.control" handoff)))))))
+
+(deftest adoption-handoff-workspace-closes-interrupted-store-creation
+    (dolist (kind '(:normal :error :throw :interrupt))
+      (testing (symbol-name kind)
+               (call-with-adoption-handoff-fixture
+                (lambda (root owner stage workspace installed handoff)
+                  (declare (ignore stage workspace))
+                  (let ((original (symbol-function 'pg::physical-store-open))
+                        (spool (merge-pathnames "spool/" handoff))
+                        (opened nil) (calls 0) (control nil) (outcome nil)
+                        (tag (gensym "HANDOFF-STORE-CREATE"))
+                        (inventory (pg::physical-adoption-install-snapshot root)))
+                    (unwind-protect
+                         (progn
+                           (setf (symbol-function 'pg::physical-store-open)
+                                 (lambda (&rest arguments)
+                                   (setf opened (apply original arguments))
+                                   (incf calls)
+                                   (setf control (lineage-test-bytes (merge-pathnames "receive.control" spool)))
+                                   (case kind
+                                     (:error (error "injected handoff store creation"))
+                                     (:throw (throw tag :cut))
+                                     (:interrupt
+                                      (sb-thread:interrupt-thread
+                                       sb-thread:*current-thread*
+                                       (lambda () (error "injected handoff store creation")))))
+                                   opened))
+                           (setf outcome
+                                 (catch tag
+                                   (handler-case
+                                       (multiple-value-list
+                                        (pg::physical-adoption-handoff-create-workspace owner installed handoff))
+                                     (error (condition)
+                                       (when (search "injected handoff store creation"
+                                                     (princ-to-string condition))
+                                         :cut)))))
+                           (setf (symbol-function 'pg::physical-store-open) original)
+                           (if (eq kind :normal)
+                               (progn
+                                 (ok (= 3 (length outcome)))
+                                 (ok (equal (first outcome)
+                                            (pg::physical-adoption-install-persistent-fact
+                                             (pg::physical-adoption-install-auxiliary-fact handoff) :directory t)))
+                                 (let ((stat (sb-posix:stat (namestring spool))))
+                                   (ok (equal (second outcome)
+                                              (list :device (sb-posix:stat-dev stat) :inode (sb-posix:stat-ino stat)))))
+                                 (ok (equal (third outcome) (pg::physical-adoption-install-snapshot spool))))
+                               (ok (eq outcome :cut)))
+                           (ok (= calls 1))
+                           (ok (and opened (pg::physical-store-closed-p opened)))
+                           (ok (and opened (not (open-stream-p (pg::physical-store-lock-stream opened)))))
+                           (ok (equal inventory (pg::physical-adoption-install-snapshot root)))
+                           (ok (equalp control (lineage-test-bytes (merge-pathnames "receive.control" spool))))
+                           (ok (and opened
+                                    (handler-case
+                                        (let ((fresh
+                                                (funcall original spool
+                                                         (pg::physical-store-system-id opened)
+                                                         (pg::physical-store-timeline opened)
+                                                         :start-lsn (pg::physical-store-base-lsn opened)
+                                                         :discard-tail nil :create-lock nil)))
+                                          (unwind-protect (pg::physical-store-check-held-lock fresh)
+                                            (pg::physical-store-close fresh)))
+                                      (error () nil))))
+                           (ok (equalp control (lineage-test-bytes (merge-pathnames "receive.control" spool)))))
+                      (setf (symbol-function 'pg::physical-store-open) original)
+                      (when opened (pg::physical-store-close opened)))))))))

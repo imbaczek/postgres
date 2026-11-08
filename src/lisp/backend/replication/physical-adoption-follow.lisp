@@ -20,14 +20,17 @@
   (let* ((*pgdata* (physical-adoption-owner-directory owner))
          (record (getf (getf handoff :installation) :attempt)))
     (multiple-value-bind (base control) (physical-recovery-verify-base-state)
-      (let ((store (physical-store-open
-                    (merge-pathnames "pg_physical_receive/" *pgdata*)
-                    (getf base :system-id) (getf base :timeline) :start-lsn (getf base :end)
-                    :discard-tail nil :create-lock nil
-                    :retained-identity (physical-recovery-retained-identity base))))
+      (let ((store nil))
         (unwind-protect
-             (physical-adoption-follow-make-binding record base control store)
-          (physical-store-close store))))))
+             (progn
+               (physical-store-open
+                (merge-pathnames "pg_physical_receive/" *pgdata*)
+                (getf base :system-id) (getf base :timeline) :start-lsn (getf base :end)
+                :discard-tail nil :create-lock nil
+                :retained-identity (physical-recovery-retained-identity base)
+                :on-open (lambda (opened) (setf store opened)))
+               (physical-adoption-follow-make-binding record base control store))
+          (when store (physical-store-close store)))))))
 
 (defun physical-adoption-follow-create-workspace (owner handoff directory)
   (let* ((fact (physical-adoption-install-directory-fact directory))

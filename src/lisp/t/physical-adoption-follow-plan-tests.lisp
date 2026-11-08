@@ -154,3 +154,81 @@
                              (pg::timeline-parse-history 2 (getf binding :child-history)))))
                  (ok (= 2 (pg::timeline-history-entry-timeline (first child))))))))
          :fork-distance distance :generations generations))))
+
+(defun check-adoption-store-open-handoff (function expected calls-target root spool)
+  (dolist (kind '(:normal :error :throw :interrupt))
+    (testing (symbol-name kind)
+             (let ((original (symbol-function 'pg::physical-store-open))
+                   (opened nil) (calls 0)
+                   (tag (gensym "ADOPTION-STORE-HANDOFF"))
+                   (inventory (pg::physical-adoption-install-snapshot root))
+                   (control (lineage-test-bytes (merge-pathnames "receive.control" spool))))
+               (unwind-protect
+                    (progn
+                      (setf (symbol-function 'pg::physical-store-open)
+                            (lambda (&rest arguments)
+                              (let ((store (apply original arguments)))
+                                (incf calls)
+                                (when (= calls calls-target)
+                                  (setf opened store)
+                                  (case kind
+                                    (:error (error "injected adoption store handoff"))
+                                    (:throw (throw tag :cut))
+                                    (:interrupt
+                                     (sb-thread:interrupt-thread
+                                      sb-thread:*current-thread*
+                                      (lambda () (error "injected adoption store handoff"))))))
+                                store)))
+                      (ok (equal (if (eq kind :normal) expected :cut)
+                                 (catch tag
+                                   (handler-case
+                                       (multiple-value-list (funcall function))
+                                     (error (condition)
+                                       (when (search "injected adoption store handoff"
+                                                     (princ-to-string condition))
+                                         :cut))))))
+                      (setf (symbol-function 'pg::physical-store-open) original)
+                      (ok (= calls calls-target))
+                      (ok (and opened (pg::physical-store-closed-p opened)))
+                      (ok (and opened (not (open-stream-p (pg::physical-store-lock-stream opened)))))
+                      (ok (equal inventory (pg::physical-adoption-install-snapshot root)))
+                      (ok (equalp control (lineage-test-bytes (merge-pathnames "receive.control" spool))))
+                      (ok (and opened
+                               (handler-case
+                                   (let ((fresh
+                                           (funcall original spool
+                                                    (pg::physical-store-system-id opened)
+                                                    (pg::physical-store-timeline opened)
+                                                    :start-lsn (pg::physical-store-base-lsn opened)
+                                                    :discard-tail nil :create-lock nil
+                                                    :retained-identity (pg::physical-store-retained-identity opened))))
+                                     (unwind-protect (pg::physical-store-check-held-lock fresh)
+                                       (pg::physical-store-close fresh)))
+                                 (error () nil)))))
+                 (setf (symbol-function 'pg::physical-store-open) original)
+                 (when opened (pg::physical-store-close opened)))))))
+
+(deftest adoption-empty-store-scopes-close-interrupted-open-handoffs
+    (call-with-adoption-handoff-fixture
+     (lambda (root owner stage workspace installed handoff)
+       (declare (ignore stage workspace installed))
+       (multiple-value-bind (value location) (pg::physical-adoption-handoff-start owner handoff)
+         (ok (eq location :ready))
+         (let* ((spool (merge-pathnames "pg_physical_receive/" root))
+                (record (getf (getf value :installation) :attempt)))
+           (testing "handoff spool validation"
+                    (check-adoption-store-open-handoff
+                     (lambda () (pg::physical-adoption-handoff-check-spool owner value location))
+                     '(:ready) 1 root spool))
+           (testing "follow preflight"
+                    (check-adoption-store-open-handoff
+                     (lambda ()
+                       (multiple-value-bind (binding candidate)
+                           (pg::physical-adoption-follow-preflight owner value)
+                         (values binding
+                                 (and (pg::physical-store-p candidate)
+                                      (null (pg::physical-store-lock-stream candidate))
+                                      (progn (pg::physical-store-check-live candidate) t)
+                                      (equal (pg::physical-store-control-tuple candidate)
+                                             (getf binding :after))))))
+                     (list (pg::physical-adoption-follow-planned-binding record) t) 2 root spool)))))))
