@@ -1039,6 +1039,98 @@
            (setf sb-ext:*exit-hooks* saved-exit-hooks)
            (when pg::*postmaster-data-lock* (close pg::*postmaster-data-lock*))))) :system-id 42))
 
+(deftest follow-pending-offline-closes-interrupted-store-handoffs
+    (dolist (kind '(:error :throw :interrupt))
+      (testing (symbol-name kind)
+               (call-with-promotion-fixture
+                (lambda (root store)
+                  (pg::wal-atomic-write-bytes (pg::clog-path) (empty-octets))
+                  (let* ((base (pg::physical-recovery-verify-base-state))
+                         (config (follow-pending-proof-config-for-store store base))
+                         (pg::*postmaster-data-lock* nil) (pg::*postmaster-pid-stream* nil)
+                         (pg::*postmaster-pid-directory* nil) (pg::*postmaster-start-time* nil)
+                         (pg::*postmaster-start-timestamp* nil) (pg::*postmaster-pid-host* nil)
+                         (pg::*postmaster-pid-port* nil) (pg::*postmaster-pid-inode* nil)
+                         (saved-exit-hooks sb-ext:*exit-hooks*)
+                         (original-open (symbol-function 'pg::physical-store-open))
+                         (original-reconcile (symbol-function 'pg::physical-follow-reconcile-pending-store))
+                         (opened nil) (resumed-store nil) (calls 0) (reconciles 0)
+                         (tag (gensym "PENDING-STORE-HANDOFF")))
+                    (pg::physical-follow-save-config config)
+                    (pg::physical-store-close store)
+                    (sb-posix:rename (namestring (pg::physical-store-directory store))
+                                     (namestring (pg::physical-recovery-spool-directory)))
+                    (sb-posix:chmod (namestring root) #o700)
+                    (unwind-protect
+                         (let ((pg::*wal-ready* nil) (pg::*physical-receive-store* nil))
+                           (pg::postmaster-own-data-directory "127.0.0.1" 5439)
+                           (let* ((spool (pg::physical-recovery-spool-directory))
+                                  (path (merge-pathnames "receive.control" spool))
+                                  (control (lineage-test-bytes path))
+                                  (config-bytes (lineage-test-bytes (pg::physical-follow-config-path)))
+                                  (inventory (pg::physical-adoption-install-snapshot root)))
+                             (setf (symbol-function 'pg::physical-store-open)
+                                   (lambda (&rest arguments)
+                                     (setf opened (apply original-open arguments))
+                                     (incf calls)
+                                     (ecase kind
+                                       (:error (error "injected pending store handoff"))
+                                       (:throw (throw tag :cut))
+                                       (:interrupt
+                                        (sb-thread:interrupt-thread
+                                         sb-thread:*current-thread*
+                                         (lambda () (error "injected pending store handoff")))))
+                                     (error "pending store handoff injection did not exit"))
+                                   (symbol-function 'pg::physical-follow-reconcile-pending-store)
+                                   (lambda (&rest arguments)
+                                     (incf reconciles)
+                                     (setf resumed-store (first arguments))
+                                     (apply original-reconcile arguments)))
+                             (ok (eq :cut
+                                     (catch tag
+                                       (handler-case
+                                           (pg::physical-follow-reconcile-pending-offline)
+                                         (error (condition)
+                                           (when (search "injected pending store handoff"
+                                                         (princ-to-string condition))
+                                             :cut))))))
+                             (setf (symbol-function 'pg::physical-store-open) original-open)
+                             (ok (= calls 1))
+                             (ok (zerop reconciles))
+                             (ok (and opened (pg::physical-store-closed-p opened)))
+                             (ok (and opened (not (open-stream-p (pg::physical-store-lock-stream opened)))))
+                             (ok (equal inventory (pg::physical-adoption-install-snapshot root)))
+                             (ok (equalp config-bytes (lineage-test-bytes (pg::physical-follow-config-path))))
+                             (ok (equalp control (lineage-test-bytes path)))
+                             (ok (not (or pg::*wal-ready* pg::*physical-receive-store*
+                                          pg::*physical-follow-runtime* pg::*physical-restartpoint-worker*)))
+                             (ok (handler-case
+                                     (let ((fresh
+                                             (funcall original-open spool (getf base :system-id) (getf base :timeline)
+                                                      :start-lsn (getf base :end) :discard-tail nil :create-lock nil
+                                                      :retained-identity (pg::physical-recovery-retained-identity base)
+                                                      :retained-directory (pg::physical-recovery-retained-directory))))
+                                       (unwind-protect (pg::physical-store-check-held-lock fresh)
+                                         (pg::physical-store-close fresh)))
+                                   (error () nil)))
+                             (when opened (pg::physical-store-close opened))
+                             (let ((active (pg::physical-follow-reconcile-pending-offline)))
+                               (ok (eq :active (getf (fifth active) :phase)))
+                               (ok (equal active (pg::physical-follow-read-config)))
+                               (ok (= 1 reconciles))
+                               (ok (and resumed-store (pg::physical-store-closed-p resumed-store)))
+                               (ok (and resumed-store
+                                        (not (open-stream-p (pg::physical-store-lock-stream resumed-store)))))
+                               (ok (not (or pg::*wal-ready* pg::*physical-receive-store*
+                                            pg::*physical-follow-runtime* pg::*physical-restartpoint-worker*))))))
+                      (setf (symbol-function 'pg::physical-store-open) original-open
+                            (symbol-function 'pg::physical-follow-reconcile-pending-store) original-reconcile)
+                      (when opened (pg::physical-store-close opened))
+                      (pg::postmaster-remove-pid-file)
+                      (setf sb-ext:*exit-hooks* saved-exit-hooks)
+                      (when pg::*postmaster-data-lock* (close pg::*postmaster-data-lock*)))))
+                :system-id 42))))
+
 (defun follow-pending-proof-run-crash (root store base point &optional rooted)
   (pg::wal-atomic-write-bytes
    (merge-pathnames "pending-base.fixture" root)

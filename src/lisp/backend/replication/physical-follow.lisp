@@ -1074,15 +1074,17 @@ state. An active result still requires startup validation before workers launch.
         (let ((config (physical-follow-read-config)))
           (unless (and (member (length config) '(5 6)) (eq :pending (getf (fifth config) :phase)))
             (error "offline follow reconciliation requires a saved pending binding"))
-          (let* ((base (physical-recovery-verify-base-state))
-                 (store (physical-store-open
-                         (physical-recovery-spool-directory) (getf base :system-id) (getf base :timeline)
-                         :start-lsn (getf base :end) :discard-tail nil :create-lock nil
-                         :retained-identity (physical-recovery-retained-identity base)
-                         :retained-directory (physical-recovery-retained-directory))))
+          (let ((base (physical-recovery-verify-base-state)) (store nil))
             (unwind-protect
-                 (physical-follow-reconcile-pending-store store base config)
-              (physical-store-close store))))))))
+                 (progn
+                   (physical-store-open
+                    (physical-recovery-spool-directory) (getf base :system-id) (getf base :timeline)
+                    :start-lsn (getf base :end) :discard-tail nil :create-lock nil
+                    :retained-identity (physical-recovery-retained-identity base)
+                    :retained-directory (physical-recovery-retained-directory)
+                    :on-open (lambda (opened) (setf store opened)))
+                   (physical-follow-reconcile-pending-store store base config))
+              (when store (physical-store-close store)))))))))
 
 (defun physical-follow-check-config (config)
   "Validate follow state, including private source and cleanup ownership."
