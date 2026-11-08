@@ -1058,6 +1058,24 @@ state. The active config still needs durable-state validation before admission."
                      (setf (physical-store-failed-p store) t)))))))
     (physical-follow-call-with-receive-root store #'reconcile)))
 
+(defun physical-follow-call-with-offline-store (base function)
+  ;; Open the existing receive store for offline work, preserving its unflushed
+  ;; tail.  FUNCTION borrows the store for the duration of the call.
+  ;; ON-OPEN captures the validated store before open returns.  The opener
+  ;; cleans up failures before capture.  This scope closes a captured store on
+  ;; return or an error, throw, or interrupt.
+  (let ((store nil))
+    (unwind-protect
+         (progn
+           (physical-store-open
+            (physical-recovery-spool-directory) (getf base :system-id) (getf base :timeline)
+            :start-lsn (getf base :end) :discard-tail nil :create-lock nil
+            :retained-identity (physical-recovery-retained-identity base)
+            :retained-directory (physical-recovery-retained-directory)
+            :on-open (lambda (opened) (setf store opened)))
+           (funcall function store))
+      (when store (physical-store-close store)))))
+
 (defun physical-follow-reconcile-pending-offline ()
   "Reconcile a saved pending binding privately before storage or workers start.
 Require owned PGDATA and exclude reload and live operations. Open and close a
@@ -1079,17 +1097,9 @@ state. An active result still requires startup validation before workers launch.
         (let ((config (physical-follow-read-config)))
           (unless (and (member (length config) '(5 6)) (eq :pending (getf (fifth config) :phase)))
             (error "offline follow reconciliation requires a saved pending binding"))
-          (let ((base (physical-recovery-verify-base-state)) (store nil))
-            (unwind-protect
-                 (progn
-                   (physical-store-open
-                    (physical-recovery-spool-directory) (getf base :system-id) (getf base :timeline)
-                    :start-lsn (getf base :end) :discard-tail nil :create-lock nil
-                    :retained-identity (physical-recovery-retained-identity base)
-                    :retained-directory (physical-recovery-retained-directory)
-                    :on-open (lambda (opened) (setf store opened)))
-                   (physical-follow-reconcile-pending-store store base config))
-              (when store (physical-store-close store)))))))))
+          (let ((base (physical-recovery-verify-base-state)))
+            (physical-follow-call-with-offline-store
+             base (lambda (store) (physical-follow-reconcile-pending-store store base config)))))))))
 
 (defun physical-follow-check-config (config)
   "Validate follow state, including private source and cleanup ownership."
