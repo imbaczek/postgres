@@ -261,6 +261,7 @@
                    (:file "../replication/physical-reseed-follow-configuration-scope")
                    (:file "../replication/physical-reseed-follow-activation-scope")
                    (:file "../replication/physical-reseed-follow-retirement-scope")
+                   (:file "../replication/physical-reseed-follow-cancellation-configured")
                    (:file "../replication/physical-reseed-follow-cancellation-finalization")
                    (:file "../replication/physical-reseed-follow-cancellation")
                    (:file "../replication/physical-reseed-follow-cancellation-network")
