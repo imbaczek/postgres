@@ -5,6 +5,98 @@
   (handler-case (progn (funcall function) nil)
     (pg::pg-error (condition) (pg::pg-error-sqlstate condition))))
 
+(defclass smgr-close-interrupt-test-stream (sb-gray:fundamental-binary-input-stream)
+  ((file :initarg :file :reader smgr-close-interrupt-test-file)
+   (hook :initarg :hook :reader smgr-close-interrupt-test-hook)))
+
+(defmethod close ((stream smgr-close-interrupt-test-stream) &key abort)
+  (unwind-protect
+       (funcall (smgr-close-interrupt-test-hook stream))
+    (close (smgr-close-interrupt-test-file stream) :abort abort)
+    (call-next-method)))
+
+(deftest relation-cache-registers-an-open-before-delivering-a-queued-interrupt
+    (dolist (fork '(:main :visibility))
+      (with-physical-store-directory (root)
+        (let* ((pg::*pgdata* root)
+               (pg::*relation-streams* (make-hash-table :test #'equal))
+               (original (symbol-function 'pg::open-relation-file))
+               (opened nil) (calls 0)
+               (path (pg::relation-file-path 900 fork))
+               (bytes (make-array 3 :element-type '(unsigned-byte 8) :initial-contents '(1 2 3))))
+          (pg::wal-atomic-write-bytes path bytes)
+          (unwind-protect
+               (progn
+                 (setf (symbol-function 'pg::open-relation-file)
+                       (lambda (pathname)
+                         (setf opened (funcall original pathname))
+                         (incf calls)
+                         (sb-thread:interrupt-thread
+                          sb-thread:*current-thread*
+                          (lambda () (error "injected relation-cache handoff")))
+                         opened))
+                 (ok (eq :cut
+                         (handler-case
+                             (sb-thread:with-mutex (pg::*smgr-lock*)
+                               (pg::smgr-open-locked 900 fork)
+                               :unexpected)
+                           (error (condition)
+                             (when (search "injected relation-cache handoff" (princ-to-string condition))
+                               :cut)))))
+                 (setf (symbol-function 'pg::open-relation-file) original)
+                 (ok (= calls 1))
+                 (ok (eq opened (gethash (list 900 fork) pg::*relation-streams*)))
+                 (ok (= 1 (hash-table-count pg::*relation-streams*)))
+                 (ok (and opened (open-stream-p opened)))
+                 (ok (eq opened
+                         (sb-thread:with-mutex (pg::*smgr-lock*) (pg::smgr-open-locked 900 fork))))
+                 (ok (equalp bytes (lineage-test-bytes path)))
+                 (pg::smgr-close-all)
+                 (ok (not (open-stream-p opened)))
+                 (ok (zerop (hash-table-count pg::*relation-streams*)))
+                 (let ((fresh (sb-thread:with-mutex (pg::*smgr-lock*) (pg::smgr-open-locked 900 fork))))
+                   (ok (not (eq opened fresh)))
+                   (pg::smgr-close-all)
+                   (ok (not (open-stream-p fresh))))
+                 (ok (equalp bytes (lineage-test-bytes path))))
+            (setf (symbol-function 'pg::open-relation-file) original)
+            (pg::smgr-close-all)
+            (when opened (close opened)))))))
+
+(deftest relation-cache-cleanup-finishes-before-delivering-a-queued-interrupt
+    (dolist (kind '(:interrupt :error :normal))
+      (testing (symbol-name kind)
+               (with-physical-store-directory (root)
+                 (let ((pg::*relation-streams* (make-hash-table :test #'equal))
+                       (streams nil) (files nil) (calls 0) (tag (gensym "RELATION-CACHE-CLOSE")))
+                   (unwind-protect
+                        (progn
+                          (dotimes (index 3)
+                            (let* ((file (open (merge-pathnames (format nil "relation-~d" index) root)
+                                               :direction :io :element-type '(unsigned-byte 8)
+                                               :if-exists :error :if-does-not-exist :create))
+                                   (stream
+                                     (make-instance
+                                      'smgr-close-interrupt-test-stream :file file
+                                      :hook (lambda ()
+                                              (when (= 1 (incf calls))
+                                                (case kind
+                                                  (:interrupt
+                                                   (sb-thread:interrupt-thread
+                                                    sb-thread:*current-thread* (lambda () (throw tag :cut))))
+                                                  (:error (error "injected ordinary close error"))))))))
+                              (push file files)
+                              (push stream streams)
+                              (setf (gethash (list index :main) pg::*relation-streams*) stream)))
+                          (ok (eq (if (eq kind :interrupt) :cut :complete)
+                                  (catch tag (pg::smgr-close-all) :complete)))
+                          (ok (= calls 3))
+                          (ok (every (lambda (stream) (not (open-stream-p stream))) streams))
+                          (ok (every (lambda (file) (not (open-stream-p file))) files))
+                          (ok (zerop (hash-table-count pg::*relation-streams*)))
+                          (ok (not (sb-thread:holding-mutex-p pg::*smgr-lock*))))
+                     (dolist (file files) (when (open-stream-p file) (close file)))))))))
+
 (defun call-with-streaming-setup-fixture (function)
   (call-with-physical-store-directory
    (lambda (root)

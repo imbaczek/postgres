@@ -17,8 +17,9 @@
 (defun smgr-open-locked (relfilenode &optional (fork :main))
   (let ((key (list relfilenode fork)))
     (or (gethash key *relation-streams*)
-        (setf (gethash key *relation-streams*)
-              (open-relation-file (relation-file-path relfilenode fork))))))
+        (sb-sys:without-interrupts
+          (setf (gethash key *relation-streams*)
+                (open-relation-file (relation-file-path relfilenode fork)))))))
 
 (defun smgr-create (relfilenode &key redo)
   "Durably create an empty main fork before publishing its catalog identity.
@@ -122,8 +123,9 @@ under the smgr lock so buffered state cannot survive the truncation."
 
 (defun smgr-close-all ()
   (sb-thread:with-mutex (*smgr-lock*)
-    (maphash (lambda (k v)
-               (declare (ignore k))
-               (ignore-errors (close v)))
-             *relation-streams*)
-    (clrhash *relation-streams*)))
+    (sb-sys:without-interrupts
+      (maphash (lambda (k v)
+                 (declare (ignore k))
+                 (ignore-errors (close v)))
+               *relation-streams*)
+      (clrhash *relation-streams*))))
