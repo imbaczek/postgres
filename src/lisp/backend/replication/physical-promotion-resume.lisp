@@ -101,6 +101,8 @@ Use the verified pending base identity and the recovery retained archive."
                   for segment from first to (floor (1- flush) +wal-segment-size+)
                   for stat = (wal-namespace-file-stat (physical-store-segment-path probe segment) t)
                   unless (or stat (= segment first)) do (error "missing acknowledged pending segment")))))
+    ;; Forward ON-OPEN so the caller can capture the validated store before
+    ;; the opener returns and take responsibility for its later cleanup.
     (physical-store-open directory (getf state :system-id) (getf state :timeline)
                          :discard-tail nil :create-lock nil
                          :retained-identity (physical-recovery-retained-identity state)
@@ -139,6 +141,8 @@ which rejects pending CLOG debt, before installing the selected state."
     (setf (getf *physical-recovery-state* :timeline-policy)
           (physical-promotion-pending-timeline-policy state metadata store)))
   (physical-restartpoint-prepare-storage store)
+  ;; Defer interrupts across open and registration so cleanup can find CLOG
+  ;; as soon as its stream exists.
   (sb-sys:without-interrupts
     (setf *clog-stream* (open (clog-path) :direction :input :element-type '(unsigned-byte 8)
                                           :if-does-not-exist :error)))
@@ -178,6 +182,8 @@ reuse partially restored state."
            (prog1 (funcall publisher) (setf finished t)))
       (unless finished
         (setf *physical-recovery-failed-p* t)
+        ;; Keep the store close and global cleanup reachable even if an earlier
+        ;; close exits.  ON-OPEN captures STORE before a successful open returns.
         (unwind-protect
              (when *clog-stream* (ignore-errors (close *clog-stream*)))
           (unwind-protect
