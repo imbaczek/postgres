@@ -10,10 +10,10 @@
             ;; This subtype uses shared publication claims for source-closed cleanup.
             (:print-function physical-libpq-print-private-object)))
 
-(defun physical-reseed-follow-cancellation-cleanup-candidate (candidate previous)
+(defun physical-reseed-follow-cancellation-cleanup-candidate (owner candidate previous)
   ;; Accept only the exact pending to source-closed transition and its receipt.
-  (let* ((before (physical-reseed-follow-cancellation-preconfiguration-record (getf previous :record)))
-         (after (physical-reseed-follow-cancellation-preconfiguration-record candidate))
+  (let* ((before (physical-reseed-follow-cancellation-publication-record owner (getf previous :record)))
+         (after (physical-reseed-follow-cancellation-publication-record owner candidate))
          (group (getf after :cancellation)))
     (unless (and (eq :pending (getf (getf before :cancellation) :phase))
                  (eq :source-closed (getf group :phase))
@@ -31,7 +31,8 @@
   ;; Keep claims unavailable during initial proof and revoke them on exit.
   (when *physical-reseed-follow-cancellation-authority*
     (error "cancellation authority cannot reenter acquisition or publication"))
-  (let* ((frozen (physical-reseed-follow-cancellation-cleanup-candidate candidate previous))
+  (let* ((frozen (physical-reseed-follow-cancellation-cleanup-candidate owner candidate previous))
+         (context (physical-reseed-follow-cancellation-publication-context owner))
          (before (physical-adoption-attempt-value-copy previous))
          (image (copy-seq bytes))
          (thread sb-thread:*current-thread*)
@@ -50,6 +51,7 @@
                             (eql root-fd (physical-reseed-follow-cancellation-authority-root-fd value))
                             (eq actual-owner owner) (eql actual-root root-fd)
                             (eq thread sb-thread:*current-thread*)
+                            (eq context (physical-reseed-follow-cancellation-publication-context owner))
                             (physical-reseed-follow-cancellation-authority-active-p value)
                             (equal frozen actual-candidate) (equal before actual-previous)
                             (or (null actual-bytes) (equalp image actual-bytes))

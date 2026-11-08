@@ -28,6 +28,21 @@
                :successor (physical-backup-lease-successor-copy
                            (getf receipt :successor) (getf receipt :request))))))))
 
+(defun physical-reseed-follow-cancellation-pending-source-action (value observation)
+  (let ((record (physical-reseed-follow-copy value)))
+    (unless (eq :pending (getf (getf record :cancellation) :phase))
+      (error "source cleanup observation requires pending cancellation"))
+    (multiple-value-bind (receipt classification)
+        (physical-reseed-follow-cancellation-source-observation-copy record observation)
+      (values
+       (case classification
+         ((:unknown :unbound) :unresolved)
+         (:open :abort)
+         (:aborting
+          (if (and (eq :closed (getf receipt :phase)) (getf record :generations)) :defer :abort))
+         ((:handed-off :unproved) :cleanup-selected))
+       receipt))))
+
 (defun physical-reseed-follow-cancellation-source-action (value observation)
   (let* ((record (physical-reseed-follow-cancellation-preconfiguration-record value))
          (group (getf record :cancellation))
@@ -41,20 +56,10 @@
          (let ((plan (physical-reseed-follow-cancellation-ack-plan record receipt)))
            (values (case (getf plan :operation) (:abort :abort) (:release :release) (otherwise :defer))
                    (physical-backup-lease-copy receipt)))))
-      (:pending
-       (multiple-value-bind (receipt classification)
-           (physical-reseed-follow-cancellation-source-observation-copy record observation)
-         (values
-          (case classification
-            ((:unknown :unbound) :unresolved)
-            (:open :abort)
-            (:aborting
-             (if (and (eq :closed (getf receipt :phase)) (getf record :generations)) :defer :abort))
-            ((:handed-off :unproved) :cleanup-selected))
-          receipt))))))
+      (:pending (physical-reseed-follow-cancellation-pending-source-action record observation)))))
 
 (defun physical-reseed-follow-cancellation-source-closed-candidate (value observation)
-  (let* ((before (physical-reseed-follow-cancellation-preconfiguration-record value))
+  (let* ((before (physical-reseed-follow-copy value))
          (observation (physical-backup-lease-copy observation)))
     (case (getf (getf before :cancellation) :phase)
       (:pending (physical-reseed-follow-cancellation-source-closed-record before observation))

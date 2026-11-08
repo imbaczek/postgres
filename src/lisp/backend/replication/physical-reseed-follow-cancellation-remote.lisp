@@ -12,7 +12,7 @@
      operation expected
      (lambda (client rpc)
        (multiple-value-bind (action observation)
-           (physical-reseed-follow-cancellation-source-action
+           (physical-reseed-follow-cancellation-pending-source-action
             record (funcall rpc
                             (lambda ()
                               (pg-client-native-backup-lease-status
@@ -47,6 +47,8 @@
    owner
    (lambda (operation)
      (let ((snapshot (physical-reseed-follow-cancellation-operation-call operation :snapshot)))
+       (physical-reseed-follow-cancellation-preconfiguration-record
+        (getf (getf snapshot :follow) :record))
        (when (eq :pending (getf (getf (getf (getf snapshot :follow) :record) :cancellation) :phase))
          (let ((receipt (physical-reseed-follow-observe-cancellation-source-held
                          operation snapshot :helper helper)))

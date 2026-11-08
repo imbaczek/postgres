@@ -65,7 +65,7 @@
       (physical-reseed-follow-read-at root-fd "physical-reseed.follow.tmp")
     (unless (equal temporary identity)
       (error "source-closed recovery temporary changed"))
-    (physical-reseed-follow-cancellation-cleanup-candidate candidate previous)
+    (physical-reseed-follow-cancellation-cleanup-candidate owner candidate previous)
     (physical-reseed-follow-cancellation-local-proof owner root-fd candidate)
     (physical-reseed-follow-cancellation-check-cleanup-capacity candidate)
     (funcall check)

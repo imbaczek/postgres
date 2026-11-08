@@ -136,6 +136,7 @@
                (:file "t/physical-reseed-follow-configured-cancellation-tests")
                (:file "t/physical-reseed-follow-configured-cancellation-publication-tests")
                (:file "t/physical-reseed-follow-configured-cancellation-fault-tests")
+               (:file "t/physical-reseed-follow-configured-cancellation-cleanup-tests")
                (:file "t/physical-reseed-follow-retirement-intent-tests")
                (:file "t/physical-reseed-follow-configured-cancellation-native-tests")
                (:file "t/physical-reseed-follow-configured-mount-tests")
