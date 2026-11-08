@@ -322,6 +322,11 @@ base provenance is removed; it does not identify a cleanup endpoint."
       config)))
 
 (defun physical-follow-call-with-offline-store (base function)
+  ;; Open the existing receive store for offline work, preserving its unflushed
+  ;; tail.  FUNCTION borrows the store for the duration of the call.
+  ;; ON-OPEN captures the validated store before open returns.  The opener
+  ;; cleans up failures before capture.  This scope closes a captured store on
+  ;; return or an error, throw, or interrupt.
   (let ((store nil))
     (unwind-protect
          (progn
