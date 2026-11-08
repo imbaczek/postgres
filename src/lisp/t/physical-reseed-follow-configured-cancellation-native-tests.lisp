@@ -3,9 +3,11 @@
 (defun configured-cancellation-test-child-arguments (root cut cache marker form)
   (let* ((*package* (find-package :cl-user))
          (*print-length* nil) (*print-level* nil) (*print-readably* t)
+         ;; SBCL pretty printing can corrupt a shared SETF form on readback.
          (*print-pretty* nil) (*print-circle* t)
          (arguments (retirement-intent-test-child-arguments root cut cache marker))
          (old-load (write-to-string '(asdf:load-system "pg-physical-tests")))
+         ;; Child mocks need PG, while the driver keeps the test suite loaded.
          (new-load (write-to-string '(asdf:load-system "pg"))))
     (unless (= 1 (count old-load arguments :test #'string=))
       (error "configured cancellation child lacks its expected system load"))
@@ -222,6 +224,7 @@
                                         (pg::physical-reseed-follow-cancellation-authority-candidate authority)))
                          (let ((source-evidence (list connections identities (reverse events) (not source-live))))
                            (assert (equal ',(configured-cancellation-test-source-evidence phase t) source-evidence))
+                           ;; Keep the inherited crash marker format and record source evidence separately.
                            (with-open-file (output ,marker :direction :output :if-exists :error)
                              (with-standard-io-syntax
                                (write (list (sb-posix:getpid) ,cut) :stream output)))
@@ -243,6 +246,7 @@
     (root cut candidate marker &optional (phase :pending))
   (let* ((stage (configured-cancellation-test-cut-stage cut))
          (partial (eq stage :partial)) (absent (eq stage :absent))
+         ;; Recovery repeats source work only when this cut needs fresh evidence.
          (source-evidence
            (configured-cancellation-test-source-evidence phase (member stage '(:absent :complete-temporary)))))
     `(let ((pg::*pgdata* ,root) (evidence nil))
