@@ -159,6 +159,8 @@ does not excuse a missing file or a different fork."
         :base (getf state :end) :manifest-digest (getf state :manifest-digest)))
 
 (defun physical-recovery-open-receive-store (&key create on-open)
+  ;; Forward ON-OPEN so the caller can capture the validated store before
+  ;; the opener returns and take responsibility for its cleanup.
   (let ((directory (physical-recovery-spool-directory)))
     (when create
       (wal-ensure-directory-durable directory))
@@ -210,10 +212,14 @@ Direct control operation; does not promote, follow a network source or coordinat
                  (physical-recovery-open-clog-redo)
                  (physical-recovery-save-progress *last-replay-lsn* *next-xid*)
                  (physical-recovery-reset-replay-history)
+                 ;; Set the phase and store with interrupts deferred, then mark success.
+                 ;; Worker startup follows this ownership transition.
                  (sb-sys:without-interrupts
                    (setf (getf *physical-recovery-state* :phase) 2
                          *physical-receive-store* store
                          success t)))
+            ;; A changed CLOG stream fences recovery on failure.  Nested cleanup
+            ;; still closes the captured store if closing that stream exits.
             (unless success
               (unwind-protect
                    (unless (eq previous *clog-stream*)
