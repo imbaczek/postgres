@@ -9,6 +9,7 @@
 
 (defun configured-cancellation-test-phase-state (root phase)
   (assert (member phase '(:pending :source-closed :cleaned)))
+  ;; Prepare the durable predecessor and local abort before injecting a fault.
   (unless (eq phase :pending)
     (pg::call-with-physical-reseed-follow-cancellation-owner
      root
@@ -36,6 +37,7 @@
      (pg::physical-reseed-follow-record-cancellation-source-closed
       owner (reseed-cancellation-source-parent record :closed :handed-off t)))
     (:cleaned
+     ;; Run the cleanup actor with only cleanup and release allowed at the source.
      (call-with-reseed-cancellation-source
       owner record (getf (getf record :cancellation) :receipt)
       (lambda (state)
