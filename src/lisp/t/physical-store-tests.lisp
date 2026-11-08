@@ -103,6 +103,75 @@
                    (ok (not (pg::physical-store-closed-p reopened))))
               (pg::physical-store-close reopened)))))))
 
+(deftest physical-follow-offline-store-preserves-cleanup-through-open-handoff
+    (with-physical-store-directory (root)
+      (let* ((pg::*pgdata* root)
+             (directory (pg::physical-recovery-spool-directory))
+             (base '(:system-id 123 :timeline 1 :end 0 :manifest-digest 17))
+             (segment nil))
+        (ensure-directories-exist (merge-pathnames "dummy" directory))
+        (let ((store (pg::physical-store-open directory 123 1 :create t)))
+          (unwind-protect
+               (progn
+                 (pg::physical-store-input store 0 (sample-physical-record))
+                 (pg::physical-store-flush store)
+                 (pg::physical-store-input store 32 (sample-physical-record 32))
+                 (setf segment (pg::physical-store-segment-path store 0)))
+            (pg::physical-store-close store)))
+        (ok (equalp (lineage-test-bytes segment)
+                    (concatenate '(vector (unsigned-byte 8))
+                                 (sample-physical-record) (sample-physical-record 32))))
+        (dolist (kind '(:normal :error :throw :interrupt))
+          (testing (symbol-name kind)
+                   (let ((original (symbol-function 'pg::physical-store-open))
+                         (opened nil) (calls 0) (entered 0)
+                         (tag (gensym "OFFLINE-STORE-HANDOFF"))
+                         (before (lineage-test-bytes (merge-pathnames "receive.control" directory)))
+                         (segment-before (lineage-test-bytes segment)))
+                     (unwind-protect
+                          (progn
+                            (setf (symbol-function 'pg::physical-store-open)
+                                  (lambda (&rest arguments)
+                                    (setf opened (apply original arguments))
+                                    (incf calls)
+                                    (case kind
+                                      (:error (error "injected offline store handoff"))
+                                      (:throw (throw tag :cut))
+                                      (:interrupt
+                                       (sb-thread:interrupt-thread
+                                        sb-thread:*current-thread*
+                                        (lambda () (error "injected offline store handoff")))))
+                                    opened))
+                            (ok (equal (if (eq kind :normal) '(:first :second) :cut)
+                                       (catch tag
+                                         (handler-case
+                                             (multiple-value-list
+                                              (pg::physical-follow-call-with-offline-store
+                                               base
+                                               (lambda (store)
+                                                 (pg::physical-store-check-held-lock store)
+                                                 (incf entered)
+                                                 (values :first :second))))
+                                           (error (condition)
+                                             (when (search "injected offline store handoff"
+                                                           (princ-to-string condition))
+                                               :cut))))))
+                            (setf (symbol-function 'pg::physical-store-open) original)
+                            (ok (= calls 1))
+                            (ok (= entered (if (eq kind :normal) 1 0)))
+                            (ok (and opened (pg::physical-store-closed-p opened)))
+                            (ok (and opened (not (open-stream-p (pg::physical-store-lock-stream opened)))))
+                            (ok (equalp before (lineage-test-bytes (merge-pathnames "receive.control" directory))))
+                            (ok (equalp segment-before (lineage-test-bytes segment)))
+                            (ok (handler-case
+                                    (let ((fresh (funcall original directory 123 1
+                                                          :discard-tail nil :create-lock nil)))
+                                      (unwind-protect (pg::physical-store-check-held-lock fresh)
+                                        (pg::physical-store-close fresh)))
+                                  (error () nil))))
+                       (setf (symbol-function 'pg::physical-store-open) original)
+                       (when opened (pg::physical-store-close opened)))))))))
+
 (deftest physical-store-compaction-preserves-unflushed-input
     (with-physical-store-directory (root)
       (let* ((segment pg::+wal-segment-size+)

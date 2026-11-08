@@ -322,12 +322,17 @@ base provenance is removed; it does not identify a cleanup endpoint."
       config)))
 
 (defun physical-follow-call-with-offline-store (base function)
-  (let ((store (physical-store-open
-                (physical-recovery-spool-directory) (getf base :system-id) (getf base :timeline)
-                :start-lsn (getf base :end) :discard-tail nil :create-lock nil
-                :retained-identity (physical-recovery-retained-identity base)
-                :retained-directory (physical-recovery-retained-directory))))
-    (unwind-protect (funcall function store) (physical-store-close store))))
+  (let ((store nil))
+    (unwind-protect
+         (progn
+           (physical-store-open
+            (physical-recovery-spool-directory) (getf base :system-id) (getf base :timeline)
+            :start-lsn (getf base :end) :discard-tail nil :create-lock nil
+            :retained-identity (physical-recovery-retained-identity base)
+            :retained-directory (physical-recovery-retained-directory)
+            :on-open (lambda (opened) (setf store opened)))
+           (funcall function store))
+      (when store (physical-store-close store)))))
 
 (defun physical-follow-call-with-startup-candidate (base function)
   "Call FUNCTION with the strictly checked prospective pending store, if any.
