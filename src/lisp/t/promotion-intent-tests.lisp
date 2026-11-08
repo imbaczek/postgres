@@ -228,19 +228,22 @@
         (sb-ext:process-close process)))))
 
 (deftest promotion-cold-resume-closes-interrupted-store-handoffs
-    (dolist (boundary '(pg::physical-store-open pg::physical-promotion-open-pending-store))
-      (dolist (kind '(:error :throw :interrupt))
-        (testing (format nil "~s ~s" boundary kind)
-                 (call-with-cold-promotion-image
-                  (lambda (root driver)
-                    (let ((before (lineage-test-bytes (pg::physical-recovery-control-path root))))
-                      (loop for value in (run-promotion-handoff-child root driver boundary kind)
-                            for label in '("injected exit" "one acquisition" "closed store" "closed lock"
-                                           "recovery fenced" "receive pointer cleared" "CLOG pointer cleared"
-                                           "independent lock reacquisition")
-                            do (ok value label))
-                      (ok (equalp before (lineage-test-bytes (pg::physical-recovery-control-path root)))
-                          "pending intent unchanged"))))))))
+    (call-with-physical-store-directory
+     (lambda (cache-root)
+       (dolist (boundary '(pg::physical-store-open pg::physical-promotion-open-pending-store))
+         (dolist (kind '(:error :throw :interrupt))
+           (testing (format nil "~s ~s" boundary kind)
+                    (call-with-cold-promotion-image
+                     (lambda (root driver)
+                       (let ((before (lineage-test-bytes (pg::physical-recovery-control-path root))))
+                         (loop for value in (run-promotion-handoff-child root driver boundary kind
+                                                                         :cache (merge-pathnames "cache/" cache-root))
+                               for label in '("injected exit" "one acquisition" "closed store" "closed lock"
+                                              "recovery fenced" "receive pointer cleared" "CLOG pointer cleared"
+                                              "independent lock reacquisition")
+                               do (ok value label))
+                         (ok (equalp before (lineage-test-bytes (pg::physical-recovery-control-path root)))
+                             "pending intent unchanged"))))))))))
 
 (defun promotion-restored-child-form (root marker boundary kind)
   `(let ((pg::*pgdata* ,root)
@@ -326,29 +329,35 @@
          (pg::postmaster-remove-pid-file)))))
 
 (deftest promotion-cold-resume-cleans-restored-resources-across-exits
-    (dolist (boundary '(:restore :store-close))
-      (dolist (kind '(:error :throw :interrupt))
-        (testing (format nil "~s ~s" boundary kind)
-                 (call-with-cold-promotion-image
-                  (lambda (root driver)
-                    (loop for value in (run-promotion-handoff-child
-                                        root driver boundary kind :form-builder #'promotion-restored-child-form)
-                          for label in '("injected exit" "one restoration" "closed store" "closed CLOG"
-                                         "recovery fenced" "receive pointer cleared" "CLOG pointer cleared"
-                                         "closed kernel lock")
-                          do (ok value label))))))))
+    (call-with-physical-store-directory
+     (lambda (cache-root)
+       (dolist (boundary '(:restore :store-close))
+         (dolist (kind '(:error :throw :interrupt))
+           (testing (format nil "~s ~s" boundary kind)
+                    (call-with-cold-promotion-image
+                     (lambda (root driver)
+                       (loop for value in (run-promotion-handoff-child
+                                           root driver boundary kind :form-builder #'promotion-restored-child-form
+                                           :cache (merge-pathnames "cache/" cache-root))
+                             for label in '("injected exit" "one restoration" "closed store" "closed CLOG"
+                                            "recovery fenced" "receive pointer cleared" "CLOG pointer cleared"
+                                            "closed kernel lock")
+                             do (ok value label))))))))))
 
 (deftest promotion-cold-resume-keeps-the-successful-publisher-resources
-    (dolist (boundary '(:success :startup))
-      (testing (symbol-name boundary)
-               (call-with-cold-promotion-image
-                (lambda (root driver)
-                  (loop for value in (run-promotion-handoff-child
-                                      root driver boundary :error :form-builder #'promotion-restored-child-form)
-                        for label in '("publisher completed" "one restoration" "expected store ownership"
-                                       "expected restored CLOG lifetime" "recovery healthy"
-                                       "expected receive pointer" "expected active CLOG" "expected runtime role")
-                        do (ok value label)))))))
+    (call-with-physical-store-directory
+     (lambda (cache-root)
+       (dolist (boundary '(:success :startup))
+         (testing (symbol-name boundary)
+                  (call-with-cold-promotion-image
+                   (lambda (root driver)
+                     (loop for value in (run-promotion-handoff-child
+                                         root driver boundary :error :form-builder #'promotion-restored-child-form
+                                         :cache (merge-pathnames "cache/" cache-root))
+                           for label in '("publisher completed" "one restoration" "expected store ownership"
+                                          "expected restored CLOG lifetime" "recovery healthy"
+                                          "expected receive pointer" "expected active CLOG" "expected runtime role")
+                           do (ok value label)))))))))
 
 (defmacro with-promotion-fixture ((root store &key (system-id 123)) &body body)
   `(call-with-promotion-fixture (lambda (,root ,store) ,@body) :system-id ,system-id))

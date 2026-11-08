@@ -466,6 +466,25 @@ Remove the trace and its temporary helper after the demo:
 (makunbound 'pg::*debug-trace-events*)
 ```
 
+## Milestone verification timing
+
+- Record monotonic elapsed time for production compilation/loading, test-system
+  loading, test execution, and each selected test or batch. Keep total elapsed
+  time and setup costs alongside the phase timings.
+- Save timings beside the raw verification log with the source revision/tree,
+  exact test selection, test and assertion counts, cache policy, and outcome.
+  Label reconstructed estimates separately from measured durations. Retain
+  timings for failed and interrupted runs with their actual completion status.
+- Include a timing summary at each milestone. Identify the slowest tests and
+  dominant setup costs, then assess cache reuse, narrower development selections,
+  and independent parallel batches while preserving the milestone's coverage.
+  Compare the same selection when evaluating a performance change.
+- Run longer qualification batches in tracked background Lisp processes pinned
+  to an immutable source tree with owned logs and private caches. Overlap them
+  with reviews and independent work. Share a cache among sequential children
+  using the same tree. Serialize batches that share a live image or write one
+  cache. Existing process ownership, polling, and cleanup rules still apply.
+
 ## Tests
 
 ```sh
