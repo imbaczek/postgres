@@ -34,6 +34,9 @@ test "$("$C_PG_BINDIR/pg_config" --bindir)" = "$C_PG_BINDIR" || {
     echo 'pg_config belongs to a different installation' >&2; exit 1;
 }
 PORT_BASE=${PORT_BASE:-5790}
+STARTUP_TIMEOUT_SECONDS=${PG_LISP_INTEROP_STARTUP_TIMEOUT_SECONDS:-120}
+case "$STARTUP_TIMEOUT_SECONDS" in ''|*[!0-9]*|0*)
+    echo 'PG_LISP_INTEROP_STARTUP_TIMEOUT_SECONDS must be a positive decimal integer without leading zeros' >&2; exit 2;; esac
 LISP_PORT=$PORT_BASE
 C_PORT=$((PORT_BASE + 1))
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/pg-logical-interop.XXXXXX")
@@ -79,16 +82,31 @@ sql() {
             -qAt -v ON_ERROR_STOP=1 -c "$2"
     fi
 }
+report_startup_wait() {
+    python3 - "$startup_started" "$startup_phase" "$port" "$1" <<'PY'
+import sys
+import time
+started, phase, port, outcome = sys.argv[1:]
+print(f'logical-interop: startup phase={phase} port={port} outcome={outcome} '
+      f'elapsed_seconds={time.monotonic() - float(started):.3f}', flush=True)
+PY
+}
 wait_sql() {
     port=$1
+    startup_phase=$2
+    startup_started=$(python3 -c 'import time; print(time.monotonic())')
     attempt=0
-    while [ "$attempt" -lt 200 ]; do
-        if sql "$port" '' >/dev/null 2>&1; then return; fi
-        kill -0 "$LISP_PID" 2>/dev/null || return 1
+    # Crash recovery replays the large-transaction acceptance workload.
+    while [ "$attempt" -lt "$((STARTUP_TIMEOUT_SECONDS * 10))" ]; do
+        if sql "$port" '' >/dev/null 2>&1; then report_startup_wait ready; return; fi
+        if ! kill -0 "$LISP_PID" 2>/dev/null; then
+            report_startup_wait process-exited >&2
+            return 1
+        fi
         attempt=$((attempt + 1))
         sleep 0.1
     done
-    echo "logical-interop: server startup timed out on $port" >&2
+    report_startup_wait timeout >&2
     return 1
 }
 wait_rows() {
@@ -144,7 +162,7 @@ native_publication_capture_race() {
     rm -f "$TMP/control.sock"
     "$BASE/pg-lisp.sh" -p "$LISP_PORT" -D "$TMP/lisp-data" --control-socket "$TMP/control.sock" >>"$TMP/lisp.log" 2>&1 &
     LISP_PID=$!
-    wait_sql "$LISP_PORT"
+    wait_sql "$LISP_PORT" historic-membership-recovery
     sql "$C_PORT" 'ALTER SUBSCRIPTION interop_sub ENABLE' >/dev/null
     wait_rows "$C_PORT" 24 'SELECT id FROM interop_rows WHERE id=24'
     sql "$LISP_PORT" 'ALTER PUBLICATION interop_pub ADD TABLE interop_rows' >/dev/null
@@ -346,7 +364,7 @@ standard_endpoint_recovery() {
     rm -f "$TMP/control.sock"
     "$BASE/pg-lisp.sh" -p "$LISP_PORT" -D "$TMP/lisp-data" --control-socket "$TMP/control.sock" >>"$TMP/lisp.log" 2>&1 &
     LISP_PID=$!
-    wait_sql "$LISP_PORT"
+    wait_sql "$LISP_PORT" standard-endpoint-recovery
     test "$(sql "$LISP_PORT" "SELECT source_lsn FROM pg_lisp_standard_subscriptions WHERE subscription_key='interop_sub' AND state='ready'")" = "$endpoint_marker"
     test "$(sql "$LISP_PORT" "SELECT actual_slot FROM pg_lisp_standard_subscriptions WHERE subscription_key='interop_sub'")" = "$endpoint_slot"
     wait_rows "$LISP_PORT" "$(sql "$C_PORT" 'SELECT id, amount, label FROM interop_rows ORDER BY id')"
@@ -469,7 +487,7 @@ restart_native_publisher() {
     rm -f "$TMP/control.sock"
     "$BASE/pg-lisp.sh" -p "$LISP_PORT" -D "$TMP/lisp-data" --control-socket "$TMP/control.sock" >>"$TMP/lisp.log" 2>&1 &
     LISP_PID=$!
-    wait_sql "$LISP_PORT"
+    wait_sql "$LISP_PORT" native-publisher-recovery
     test "$(sql "$LISP_PORT" "SELECT confirmed_flush_lsn,restart_lsn FROM pg_replication_slots WHERE slot_name='interop_sub'")" = "$slot_floor"
     test "$(sql "$C_PORT" "SELECT oid FROM pg_subscription WHERE subname='interop_sub'")" = "$subscription"
     sql "$LISP_PORT" "INSERT INTO interop_rows VALUES (11,110,'after publisher crash')" >/dev/null
@@ -593,7 +611,7 @@ native_feedback_recovery() {
     rm -f "$TMP/control.sock"
     "$BASE/pg-lisp.sh" -p "$LISP_PORT" -D "$TMP/lisp-data" --control-socket "$TMP/control.sock" >>"$TMP/lisp.log" 2>&1 &
     LISP_PID=$!
-    wait_sql "$LISP_PORT"
+    wait_sql "$LISP_PORT" native-feedback-recovery
     test "$(sql "$LISP_PORT" "SELECT confirmed_flush_lsn,restart_lsn FROM pg_replication_slots WHERE slot_name='interop_sub'")" = "$lost_floor"
     test "$(sql "$C_PORT" "SELECT pg_replication_origin_progress('pg_$native_sub',true)")" = "$durable_feedback_origin"
     sql "$C_PORT" 'ALTER SUBSCRIPTION interop_sub ENABLE' >/dev/null
@@ -716,7 +734,7 @@ C_STARTED=yes
 "$C_PG_BINDIR/pg_ctl" -D "$TMP/c-data" -l "$TMP/c.log" -o "-p $C_PORT -h 127.0.0.1 -k $TMP" -w start >"$TMP/pg_ctl.log" 2>&1
 "$BASE/pg-lisp.sh" -p "$LISP_PORT" -D "$TMP/lisp-data" --control-socket "$TMP/control.sock" >"$TMP/lisp.log" 2>&1 &
 LISP_PID=$!
-wait_sql "$LISP_PORT"
+wait_sql "$LISP_PORT" initial
 echo "logical-interop: pg-lisp version=$(sql "$LISP_PORT" 'SHOW server_version')"
 setup_tables
 if [ "$DIRECTION" = lisp-to-c ]; then
