@@ -472,7 +472,8 @@ Remove the trace and its temporary helper after the demo:
   loading, test execution, and each selected test or batch. Keep total elapsed
   time and setup costs alongside the phase timings.
 - Save timings beside the raw verification log with the source revision/tree,
-  exact test selection, test and assertion counts, cache policy, and outcome.
+  exact command and test selection, test and assertion counts, cache policy,
+  and outcome.
   Label reconstructed estimates separately from measured durations. Retain
   timings for failed and interrupted runs with their actual completion status.
 - Include a timing summary at each milestone. Identify the slowest tests and
@@ -486,6 +487,11 @@ Remove the trace and its temporary helper after the demo:
 - Keep an append-only machine-readable timing ledger with the verification
   artifacts. Link each milestone summary to its raw logs and timing records,
   and state which timing reduction or background scheduling change to try next.
+  The current ledger is `/home/imbaczek/proj/pg-ha-artifacts/test-timings.jsonl`.
+- Inspect reporter failure markers during background runs as well as exceptions
+  caught by the outer runner. Rove uses `×` for failed assertions, including
+  errors caught inside a test. Check the terminal exit and failure counter before
+  accepting the run. Only label a completed head passed after inspecting its result.
 - Run longer qualification batches in tracked background Lisp processes pinned
   to an immutable source tree with owned logs and private caches. Overlap them
   with reviews and independent work. Share a cache among sequential children
@@ -688,22 +694,3 @@ this mode.
   worker, restore its ASDF registrations and private cache, and reload saved source
   before testing again. A fresh external process also needs dependency discovery:
   the worker's `cl-spec` registration does not configure a shell test runner.
-
-### Test execution timing and milestone reports
-
-- Record each verification attempt in the append-only timing ledger at
-  `/home/imbaczek/proj/pg-ha-artifacts/test-timings.jsonl`, including failures
-  and retries. Preserve the command, source revision, suite scope, result, raw
-  log path and cache policy so measurements remain comparable.
-- Measure monotonic command wall time. Separate compilation/system loading from
-  actual test execution where instrumentation supports it. Mark unmeasured
-  phases explicitly. For overlapping jobs, report elapsed wall time separately
-  from summed job durations and record observed process concurrency.
-- At each milestone, summarize suite counts, pass/fail results, phase timings,
-  slow suites or cases, retries and overlap. Compare equivalent workloads and
-  cache conditions before claiming a speedup.
-- Assess opportunities to reduce repeated compilation and setup, reuse an owned
-  cache sequentially, and run independent suites in the background. Background
-  jobs need tracked handles, isolated mutable state and logs, bounded process
-  concurrency, and terminal results checked before the milestone is complete.
-  Preserve required coverage and timing-sensitive assertions.
