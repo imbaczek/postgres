@@ -1,14 +1,25 @@
+;;;; Logical WAL sender shutdown.
+;;
+;; Capture the last flushed WAL position before the shutdown checkpoint.
+;; Each ready stream keeps its exact slot claim and source epoch until cleanup.
+;; The live-operation lock protects sender state. Validate storage under the WAL
+;; lock between state checks, releasing each lock before acquiring the other.
+
 (in-package #:pg)
 
 (defstruct (logical-shutdown-owner
             (:constructor make-logical-shutdown-owner
                 (slot name claim backend system-id timeline namespace incarnation database plugin)))
+  ;; Capture the exact slot claim and source epoch while holding the WAL lock.
+  ;; Later checks reject a replacement slot, claimant, timeline or storage instance.
   (slot nil :read-only t) (name nil :read-only t) (claim nil :read-only t)
   (backend nil :read-only t) (system-id nil :read-only t) (timeline nil :read-only t)
   (namespace nil :read-only t) (incarnation nil :read-only t)
   (database nil :read-only t) (plugin nil :read-only t))
 
 (defun logical-shutdown-validate-owner-under-lock (owner &key allow-departed)
+  "Validate OWNER under the WAL lock and return its slot and active status.
+ALLOW-DEPARTED accepts a fully released claim for cleanup checks."
   (wal-check-healthy)
   (let ((slot (logical-shutdown-owner-slot owner)))
     (unless (and *wal-ready* (not (recovery-in-progress-p))
@@ -33,6 +44,7 @@
       (values slot active))))
 
 (defun wal-sender-stream-logical-ready (slot)
+  "Capture the slot claim under WAL, then publish it under the sender state lock."
   (when *wal-sender-stream-token*
     (with-live-operation
       (let ((owner
@@ -66,6 +78,8 @@
   slot)
 
 (defun wal-sender-stream-logical-leaving (slot claim)
+  "Mark the frozen stream as cleaning up before its exact slot claim is released.
+A departure without an earlier acknowledgement is an abandoned drain."
   (when *wal-sender-stream-token*
     (call-with-wal-sender-state-lock
      (lambda ()
@@ -88,12 +102,16 @@
   (values))
 
 (defun wal-sender-shutdown-owned-quiescence-p (plan)
+  "Test shutdown ownership while holding the live-operation state lock."
   (and plan (eq :stopping (wal-sender-shutdown-plan-stage plan))
        (not *live-operation-admission-open*)
        (not *live-operation-terminal-shutdown*)
        (eq *live-operation-quiescence-owner-thread* sb-thread:*current-thread*)))
 
 (defun wal-sender-capture-logical-shutdown-target ()
+  "Flush and capture the logical drain target before the shutdown checkpoint.
+The caller owns nonterminal quiescence. Snapshot stream state under the state
+lock, validate each source and claim under WAL, then recheck before publishing."
   (let (plan tokens rows target)
     (call-with-wal-sender-state-lock
      (lambda ()
@@ -141,6 +159,10 @@
   (values))
 
 (defun wal-sender-publish-shutdown-target (system-id timeline namespace endpoint)
+  "Publish the checkpoint endpoint and open the frozen streams for draining.
+Logical streams use their earlier flushed target. Physical streams use the
+checkpoint endpoint, bounded by any historic fork limit. Revalidate identities
+across the state and WAL lock acquisitions before opening the drain lane."
   (let (plan tokens rows)
     (call-with-wal-sender-state-lock
      (lambda ()
@@ -214,6 +236,9 @@
   (values))
 
 (defun wal-sender-acknowledge-logical-shutdown (slot scanned &key partial)
+  "Acknowledge a complete logical drain for the exact active claim.
+The scan, sent position and confirmed flush must all reach the target, and no
+output frame may be partial. Slot release is checked separately during cleanup."
   (when (and *wal-sender-stream-token* (not partial))
     (with-live-operation
       (multiple-value-bind (target owner sent)
@@ -245,6 +270,8 @@
           t)))))
 
 (defun wal-sender-check-logical-shutdown-completion (slot)
+  "Recheck an acknowledged stream after its slot claim has been released.
+The source epoch must still match and confirmed flush must cover the target."
   (with-live-operation
     (let* ((token *wal-sender-stream-token*)
            (plan nil)
@@ -290,11 +317,13 @@
       t)))
 
 (defun logical-stream-poll (state)
+  "Observe stopping and check slot ownership while logical output is in flight."
   (wal-sender-shutdown-observe)
   (with-live-operation
     (standard-stream-check state :check-timeout nil)))
 
 (defun logical-stream-read-status (stream state)
+  "Read feedback with shutdown polling, retaining an incomplete input frame."
   (unless state
     (return-from logical-stream-read-status (replication-standby-status stream)))
   (let ((status nil))
@@ -321,6 +350,7 @@
        :input 0.05 nil))))
 
 (defun call-with-logical-stream-io (stream slot function)
+  "Use interruptible framed socket output for the lifetime of a logical stream."
   (unless (and *backend* (backend-socket *backend*))
     (return-from call-with-logical-stream-io (funcall function nil)))
   (let* ((state (make-standard-stream
@@ -342,6 +372,7 @@
     (funcall function state)))
 
 (defun logical-stream-acknowledge-shutdown (state scanned)
+  "Record shutdown as the stop reason once the logical drain is acknowledged."
   (when (and state
              (wal-sender-acknowledge-logical-shutdown
               (standard-stream-slot-object state) scanned

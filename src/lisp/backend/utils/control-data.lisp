@@ -72,7 +72,8 @@ The caller must finish those steps before calling this function."
   (values))
 
 (defun prepare-primary-shutdown-with-senders ()
-  ;; Keep normal admission closed while the final checkpoint is streamed.
+  ;; Capture the logical target before the checkpoint, then stream the checkpoint
+  ;; endpoint to physical senders. Keep normal admission closed during the drain.
   ;; Defer recycling until the senders have exited and released their claims;
   ;; only then fence the drain and publish clean primary state.
   (unless (eq *live-operation-quiescence-owner-thread* sb-thread:*current-thread*)
@@ -111,8 +112,9 @@ The caller must finish those steps before calling this function."
 
 (defun prepare-primary-shutdown ()
   "Finish smart or fast shutdown in the owning postmaster, outside admission.
-Ordinary clients must already be gone. Selected physical senders may drain
-through the checkpoint; an empty plan uses the terminal fence immediately.
+Ordinary clients must already be gone. Selected logical senders drain to the
+pre-checkpoint target and physical senders through the checkpoint. An empty
+plan uses the terminal fence immediately.
 Serialize with reload, close normal admission,
 retire abandoned transactions, then sync a checkpoint before recording clean
 shutdown. Retry WAL temporary cleanup and require the domain to be empty before

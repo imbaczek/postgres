@@ -890,9 +890,24 @@
   SIGQUIT's zero exit timeout avoids thread-join waiting, not every possible exit
   delay. Six native scenarios, 1,447 physical, 903 unit and 201 wire tests, strict
   cold compilation and the existing shutdown test passed. Logs are in
-  `/home/imbaczek/proj/pg-ha-artifacts/shutdown-streaming/`. Graceful logical and
-  pgoutput pre-checkpoint drain remains open relative to C; former-primary
-  adoption, rewind, provenance and coordination remain outside this milestone.
+  `/home/imbaczek/proj/pg-ha-artifacts/shutdown-streaming/`. Logical sender drain
+  is covered by the following milestone. Former-primary adoption, rewind,
+  provenance and coordination remain outside this milestone.
+
+- [x] Drain ready private logical and pgoutput senders during primary shutdown.
+  Freeze the exact slot claim and source epoch, settle the WAL writer and
+  abandoned transactions, then capture the flushed target before the checkpoint.
+  Require scanned, sent and confirmed positions through that target before
+  recording acknowledgement. Release the slot before sending one `COPY 0`
+  completion and closing. Client CopyDone retains its existing command sequence.
+  Fast and smart shutdown, partial feedback, output backpressure, filtered and
+  asynchronous WAL tails, disconnects, stalled feedback, SIGQUIT and incomplete
+  WAL publication are covered by ten native cases. All 246 selected unit tests,
+  six physical shutdown cases and both C interoperability directions passed.
+  Code and harness commits are `b1327c80ba6`, `d73385a61ac` and `fde17d44d16`.
+  The interop startup wait now allows 120 seconds after large-WAL crash recovery
+  exceeded its previous 20-second allowance. Evidence and measured phase timings
+  are in `/home/imbaczek/proj/pg-ha-artifacts/logical-shutdown/`.
 
 - [x] Resolve the admission and receiver join race during concurrent reload.
   Receiver quiescence holds reload exclusion with admission open through stop,

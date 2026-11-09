@@ -1,8 +1,9 @@
-;; Physical WAL sender shutdown coordination.
+;; WAL sender shutdown coordination.
 ;;
 ;; Like WalSndInitStopping and ShutdownXLOG in the C server, freeze senders
-;; before the shutdown checkpoint, then let them deliver the durable endpoint.
-;; This native path does not yet implement C's logical sender drain.
+;; before the shutdown checkpoint, then let them deliver their durable targets.
+;; Logical streams capture their target before that checkpoint. The later
+;; logical-shutdown module validates slot claims and publishes both stream kinds.
 ;;
 ;; The live-operation mutex protects the plan and stream state.  The state-lock
 ;; helper masks interrupts across updates; the admission predicate runs under
@@ -15,7 +16,7 @@
 
 (defstruct wal-sender-stream-token
   ;; Bound to one backend, thread and registration.  The owner and fork limit
-  ;; become fixed when a physical stream is ready.
+  ;; become fixed when a physical or logical stream is ready.
   backend thread registration kind owner limit
   (state :starting) stopped-p target outcome)
 

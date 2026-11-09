@@ -864,6 +864,8 @@ keepalive's WAL-end field, which may include changes not yet applied."
   (send-ready-for-query stream #\I))
 
 (defun stream-logical-replication-loop (stream slot-name initial-lsn &optional state)
+  "Read through the shutdown target and wait for confirmed standby feedback.
+The caller releases the slot before sending shutdown completion."
   (let ((sent-lsn initial-lsn))
     (loop
       (wal-sender-shutdown-observe)

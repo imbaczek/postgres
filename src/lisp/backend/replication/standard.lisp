@@ -350,6 +350,7 @@ that position cannot certify the whole transaction; retention alone is not enoug
                      (standard-read-feedback-frame state)))))
 
 (defun standard-poll-shutdown-completion (state)
+  "Keep validating the released slot while the shutdown completion is written."
   (check-for-interrupts)
   (unless (eq :shutdown (standard-stream-stop-reason state))
     (error "logical shutdown completion has no shutdown reason"))
@@ -407,6 +408,8 @@ that position cannot certify the whole transaction; retention alone is not enoug
         (ignore-errors (close (standard-stream-stream state) :abort t))))))
 
 (defun standard-finish-shutdown (state)
+  "Send one COPY 0 completion after acknowledged shutdown and slot release.
+Continue checking completion while writing, then close the connection."
   (let ((payload (make-payload)))
     (payload-push-cstring payload "COPY 0")
     (unwind-protect
@@ -533,7 +536,9 @@ records need not decode their publication history. Keep eligibility there."
 
 (defun standard-stream-loop (state)
   "Stream logical transactions and process real standby feedback.
-Catchup changes to streaming when the captured scan horizon is exhausted."
+Catchup changes to streaming when the captured scan horizon is exhausted.
+A client CopyDone receives CopyDone here. Server shutdown completes separately
+after the slot is released, with a single COPY 0 command completion."
   (block streaming
     (loop
       (standard-poll-feedback state)
