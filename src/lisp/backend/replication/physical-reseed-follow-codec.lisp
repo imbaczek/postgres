@@ -113,6 +113,9 @@
 ;; groups are checked against their predecessors.  Missing keys differ from NIL
 ;; groups; records without settlement keep their original canonical encoding.
 (defun physical-reseed-follow-copy (record)
+  ;; Private copies reuse this call's validated predecessors.  Missing groups
+  ;; use public copies to validate the full required prefix.  Validation here
+  ;; grants no filesystem authority and creates no persistent trust or cache.
   ;; Check optional groups in predecessor order, ending with cancellation.
   ;; Each receives the canonical core and any already checked groups, so a
   ;; cancellation receipt is checked against its frozen predecessors.

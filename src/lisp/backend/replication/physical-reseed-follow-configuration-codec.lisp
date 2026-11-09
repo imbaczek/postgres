@@ -66,6 +66,8 @@
     identities))
 
 (defun %physical-reseed-follow-configuration-copy (value core)
+  ;; CORE is a locally validated canonical predecessor.
+  ;; This validates VALUE without copying CORE again.
   (physical-follow-check-plist value
                                '(:phase :generation :anchor-digest :time :workspace :directories :images :entries :step))
   (let* ((generation (car (last (getf core :generations))))

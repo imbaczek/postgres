@@ -36,6 +36,8 @@
     (list :identity (copy-list identity) :digest (getf value :digest))))
 
 (defun %physical-reseed-follow-retirement-copy (value record)
+  ;; RECORD is a locally validated canonical predecessor through activation.
+  ;; This validates VALUE without copying that predecessor again.
   (physical-follow-check-plist value '(:phase :step :attempt-file))
   (let* ((activation (getf record :activation))
          (phase (getf value :phase)) (step (getf value :step)))

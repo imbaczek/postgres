@@ -31,6 +31,8 @@
     entry))
 
 (defun %physical-reseed-follow-activation-copy (value record)
+  ;; RECORD is a locally validated canonical predecessor through settlement.
+  ;; This validates VALUE without copying that predecessor again.
   (physical-follow-check-plist value '(:phase :step :image :entry))
   (let* ((phase (getf value :phase)) (step (getf value :step))
                                      (image (getf value :image)) (entry (getf value :entry)))

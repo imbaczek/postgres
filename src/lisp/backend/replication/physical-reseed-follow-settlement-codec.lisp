@@ -27,6 +27,9 @@
           :manifest-digest (getf base :manifest-digest))))
 
 (defun %physical-reseed-follow-settlement-copy (value record)
+  ;; RECORD is a locally validated canonical predecessor through configuration.
+  ;; This avoids repeating the public wrapper's full-prefix validation.
+  ;; Successor derivation still rechecks the canonical core.
   (physical-follow-check-plist value '(:phase :successor :receipt))
   (let* ((core (physical-reseed-follow-core-projection record))
          (configuration (getf record :configuration))
