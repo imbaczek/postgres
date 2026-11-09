@@ -231,6 +231,7 @@
                      (physical-reseed-follow-cancellation-authority-p authority)
                      (eq (cdr entry) (getf (getf (physical-reseed-follow-cancellation-authority-candidate authority)
                                                  :cancellation) :phase)))
+            ;; Validate the transition and save any requested images before SIGKILL.
             (native-cancellation-save-cut authority (cdr entry))
             (format t "~%NATIVE-CANCELLATION-CUT ~d ~s ~a~%"
                     (sb-posix:getpid) event (namestring target))

@@ -441,6 +441,7 @@ class Acceptance:
             elif phase == "cleaned":
                 modes.append(("local", "cleanup publication requires the exact source-closed successor"))
         recovery_pids = []
+        # Repeat partial-temporary refusals through fresh recovery processes.
         for _ in range(2 if partial else 1):
             for mode, cause in modes:
                 recovery_pids.append(self.run(
