@@ -248,6 +248,7 @@ class Acceptance:
         assert facts(target / "physical-reseed.follow") == journal
         after = self.configured_inventory(roots, target)
         lock = str(target / ".pg_lisp.lock")
+        # Opening the data lock applies mode 0600 and can update its ctime.
         previous, current = before[lock], after[lock]
         assert previous[:8] == current[:8] and previous[9:] == current[9:]
         expected = dict(before)

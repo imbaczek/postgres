@@ -12,6 +12,7 @@
       default (error "missing native cancellation test setting ~a" name)))
 
 (defun call-with-native-cancellation-owner (target action function)
+  ;; Prove, configure and optional settlement use the configuration owner.
   (if (and (equal "yes" (native-cancellation-env "CONFIGURED" "no"))
            (not (member action '("prove" "configure" "settle") :test #'equal)))
       (call-with-physical-reseed-follow-cancellation-owner target function)
@@ -32,6 +33,7 @@
                 collect (let ((original (symbol-function symbol)) (event event))
                           (setf (symbol-function symbol)
                                 (lambda (&rest arguments)
+                                  ;; Record an event after the source command returns normally.
                                   (multiple-value-prog1 (apply original arguments)
                                     (sb-thread:with-mutex (*native-cancellation-source-events-lock*)
                                       (push event *native-cancellation-source-events*)))))
