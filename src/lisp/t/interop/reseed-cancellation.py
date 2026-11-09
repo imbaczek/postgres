@@ -259,25 +259,31 @@ class Acceptance:
              "lock_ctime_before_ns": previous[8], "lock_ctime_after_ns": current[8]})
         return after
 
+    def audit_configured_selection(self, index):
+        self.control("(progn (pg::native-settlement-test-source-audit " +
+                     lisp_string("reseed_" + format(index, "032x")) + " " +
+                     lisp_string("native_target_follow_" + str(index)) +
+                     ' "handed-off") (values))')
+
+    def prepare_configured(self, index, label, settled):
+        target, _, _ = self.install(index, label, selected=True)
+        self.run("prove", target)
+        workspace = self.server.root / (label + "-workspace")
+        workspace.mkdir(mode=0o700)
+        self.run("configure", target, configured=True, workspace=workspace, connections=0)
+        if settled:
+            self.run("settle", target, configured=True)
+            self.audit_configured_selection(index)
+        roots = [self.server.root / (label + "-" + suffix)
+                 for suffix in ("target", "stage", "incoming", "quarantine", "workspace")]
+        assert any(path.is_file() for path in (target / "base").rglob("*"))
+        return target, roots, self.configured_inventory(roots, target)
+
     def configured(self):
         for index, settled in enumerate((True, False), 6801):
             started = time.monotonic()
             label = "configured-" + ("selected" if settled else "generation-debt")
-            target, _, _ = self.install(index, label, selected=True)
-            self.run("prove", target)
-            workspace = self.server.root / (label + "-workspace")
-            workspace.mkdir(mode=0o700)
-            self.run("configure", target, configured=True, workspace=workspace, connections=0)
-            if settled:
-                self.run("settle", target, configured=True)
-                self.control("(progn (pg::native-settlement-test-source-audit " +
-                             lisp_string("reseed_" + format(index, "032x")) + " " +
-                             lisp_string("native_target_follow_" + str(index)) +
-                             ' "handed-off") (values))')
-            roots = [self.server.root / (label + "-" + suffix)
-                     for suffix in ("target", "stage", "incoming", "quarantine", "workspace")]
-            assert any(path.is_file() for path in (target / "base").rglob("*"))
-            before = self.configured_inventory(roots, target)
+            target, roots, before = self.prepare_configured(index, label, settled)
             before = self.configured_startup_fence(target, roots, before, "inert")
             self.control("(progn (pg::native-cancellation-reset-source-events) (values))")
             self.run("begin", target, "pending", configured=True, connections=0)
@@ -298,6 +304,60 @@ class Acceptance:
             assert facts(target / "physical-reseed.follow") == saved
             assert self.configured_inventory(roots, target) == before
             self.audit(index, aborted=not settled)
+            self.result["checks"].append(label)
+            self.result.setdefault("timings", []).append(
+                {"case": label, "elapsed_seconds": time.monotonic() - started, "outcome": "pass"})
+
+    def configured_effects(self):
+        for index, kind in enumerate(("observer", "issuer", "release"), 6901):
+            started = time.monotonic()
+            label = "configured-lost-" + kind
+            target, roots, before = self.prepare_configured(index, label, settled=True)
+            before = self.configured_startup_fence(target, roots, before, "inert")
+            self.control("(progn (pg::native-cancellation-reset-source-events) (values))")
+            self.run("begin", target, "pending", configured=True, connections=0)
+            pending = facts(target / "physical-reseed.follow")
+            phase = "pending" if kind == "observer" else "source-closed"
+            self.run("lose-reply", target, phase, configured=True,
+                     connections=1 if phase == "pending" else 2, lose_reply=kind)
+            if phase == "pending":
+                assert facts(target / "physical-reseed.follow") == pending
+            assert not os.path.lexists(target / "physical-reseed.follow.tmp")
+            events = {"observer": "(:status :cleanup)",
+                      "issuer": "(:status :cleanup :cleanup)",
+                      "release": "(:status :cleanup :cleanup :release)"}[kind]
+            self.control("(progn (pg::native-cancellation-check-source-events '" + events + ") (values))")
+            if kind == "release":
+                self.audit(index)
+            else:
+                self.audit_configured_selection(index)
+            before = self.configured_startup_fence(target, roots, before, phase)
+            interrupted = facts(target / "physical-reseed.follow")
+            self.stop()
+            self.start()
+            assert facts(target / "physical-reseed.follow") == interrupted
+            if kind == "release":
+                self.audit(index)
+            else:
+                self.audit_configured_selection(index)
+            self.control("(progn (pg::native-cancellation-reset-source-events) (values))")
+            self.run("cleanup", target, "cleaned", configured=True,
+                     connections=2 if phase == "pending" else 1)
+            events = "(:status :cleanup :cleanup :release)" if phase == "pending" else "(:cleanup :release)"
+            self.control("(progn (pg::native-cancellation-check-source-events '" + events + ") (values))")
+            self.audit(index)
+            before = self.configured_startup_fence(target, roots, before, "cleaned")
+            saved = facts(target / "physical-reseed.follow")
+            self.stop()
+            self.run("cleanup", target, "cleaned", configured=True, connections=0)
+            assert facts(target / "physical-reseed.follow") == saved
+            self.start()
+            self.control("(progn (pg::native-cancellation-reset-source-events) (values))")
+            self.run("cleanup", target, "cleaned", configured=True, connections=0)
+            self.control("(progn (pg::native-cancellation-check-source-events nil) (values))")
+            assert facts(target / "physical-reseed.follow") == saved
+            assert self.configured_inventory(roots, target) == before
+            self.audit(index)
             self.result["checks"].append(label)
             self.result.setdefault("timings", []).append(
                 {"case": label, "elapsed_seconds": time.monotonic() - started, "outcome": "pass"})
@@ -489,7 +549,8 @@ class Acceptance:
             groups = {"selected": self.selected, "abort": self.abort, "crash": self.crash,
                       "lost": self.effects, "early": lambda: self.effects(kill=True),
                       "reuse": self.reuse, "offline": self.access,
-                        "auth": lambda: self.access(authentication=True), "configured": self.configured}
+                        "auth": lambda: self.access(authentication=True), "configured": self.configured,
+                        "configured-lost": self.configured_effects}
             for name, function in groups.items():
                 if "all" in suites or name in suites:
                     suite_started = time.monotonic()
@@ -524,7 +585,7 @@ class Acceptance:
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--suite", nargs="+", default=["all"],
-                          choices=("all", "selected", "abort", "crash", "lost", "early", "reuse", "offline", "auth", "configured"))
+                          choices=("all", "selected", "abort", "crash", "lost", "early", "reuse", "offline", "auth", "configured", "configured-lost"))
     parser.add_argument("--output", type=Path, help="new directory for retained logs and process evidence")
     arguments = parser.parse_args()
     Acceptance(arguments.output).execute(arguments.suite)
