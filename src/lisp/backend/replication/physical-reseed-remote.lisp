@@ -101,7 +101,7 @@
            (funcall function client))
       (when client (physical-client-close client)))))
 
-(defun physical-reseed-start-remote (owner directory request profile &key helper)
+(defun %physical-reseed-start-remote (owner directory request profile &key helper stage-check)
   (physical-reseed-check-owner owner)
   (let* ((request (physical-backup-lease-request-copy request))
          (*pgdata* (physical-adoption-owner-directory owner)))
@@ -110,26 +110,34 @@
     (call-with-physical-reseed-stage
      owner directory
      (lambda (stage facts fd)
-       (multiple-value-bind (source resolved) (physical-reseed-discover-source request profile helper)
-         (physical-reseed-remote-test-point :after-discovery)
-         (physical-reseed-stage-facts owner stage fd :empty t :expected facts)
-         (let ((record (physical-reseed-attempt-publish
-                        owner (list :version 1 :phase :premanifest
-                                    :local (physical-reseed-attempt-local-facts owner)
-                                    :request request :source source :stage facts))))
-           (physical-reseed-remote-test-point :after-journal)
-           (call-with-physical-reseed-client
-            owner record
-            (lambda (client)
-              (physical-reseed-remote-test-point :before-capture)
-              (physical-reseed-require-journal owner record)
-              (physical-reseed-stage-facts owner stage fd :empty t :expected facts)
-              (multiple-value-prog1 (physical-backup-lease-capture-remote stage client (getf record :request)
-                                                                          :directory-fd fd)
-                (physical-reseed-remote-test-point :after-capture)
+       (flet ((check-stage (empty)
+                (physical-reseed-stage-facts owner stage fd :empty empty :expected facts)
+                (when stage-check (funcall stage-check stage fd))))
+         (check-stage t)
+         (multiple-value-bind (source resolved) (physical-reseed-discover-source request profile helper)
+           (physical-reseed-remote-test-point :after-discovery)
+           (check-stage t)
+           (let ((record (physical-reseed-attempt-publish
+                          owner (list :version 1 :phase :premanifest
+                                      :local (physical-reseed-attempt-local-facts owner)
+                                      :request request :source source :stage facts))))
+             (physical-reseed-remote-test-point :after-journal)
+             (call-with-physical-reseed-client
+              owner record
+              (lambda (client)
+                (physical-reseed-remote-test-point :before-capture)
                 (physical-reseed-require-journal owner record)
-                (physical-reseed-stage-facts owner stage fd :expected facts)))
-            :helper resolved :capture t)))))))
+                (check-stage t)
+                (multiple-value-prog1
+                    (physical-backup-lease-capture-remote stage client (getf record :request)
+                                                          :directory-fd fd)
+                  (physical-reseed-remote-test-point :after-capture)
+                  (physical-reseed-require-journal owner record)
+                  (check-stage nil)))
+              :helper resolved :capture t))))))))
+
+(defun physical-reseed-start-remote (owner directory request profile &key helper)
+  (%physical-reseed-start-remote owner directory request profile :helper helper))
 
 (defun physical-reseed-source-result (record source)
   (let ((source (when source (physical-backup-lease-copy source))))

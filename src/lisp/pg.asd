@@ -270,6 +270,7 @@
                    (:file "../replication/physical-reseed-follow-cancellation-acknowledgment")
                    (:file "../replication/physical-reseed-follow-cancellation-cleanup")
                    (:file "../replication/physical-reseed-follow-cancellation-remote")
+                   (:file "../replication/physical-reseed-replacement")
                    (:file "../replication/physical-reseed-follow-retirement-pid")
                    (:file "../replication/physical-reseed-follow-startup")
                    (:file "../replication/physical-reseed-follow-retirement-startup-owner")

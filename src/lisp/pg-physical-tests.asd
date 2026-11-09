@@ -141,6 +141,7 @@
                (:file "t/physical-reseed-follow-retirement-intent-tests")
                (:file "t/physical-reseed-follow-configured-cancellation-native-tests")
                (:file "t/physical-reseed-follow-configured-mount-tests")
+               (:file "t/physical-reseed-replacement-tests")
                (:file "t/wal-timeline-tests")
                (:file "t/wal-eor-tests")
                (:file "t/physical-history-tests")
