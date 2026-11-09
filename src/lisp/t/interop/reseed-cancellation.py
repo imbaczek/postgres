@@ -299,11 +299,35 @@ class Acceptance:
         assert any(path.is_file() for path in (target / "base").rglob("*"))
         return target, roots, self.configured_inventory(roots, target)
 
+    def audit_configured_allocation(self, index, state):
+        assert state in ("ready", "aborted", "released")
+        self.control("(progn (pg::native-cancellation-check-source-allocation " +
+                     lisp_string("reseed_" + format(index, "032x")) + " " +
+                     lisp_string("native_target_follow_" + str(index)) + " :" + state +
+                     ") (values))")
+        self.result.setdefault("allocation_checks", []).append({"index": index, "state": state})
+
+    def configured_reuse_refused(self, index, target, roots, before):
+        saved = facts(target / "physical-reseed.follow")
+        self.control("(progn (pg::native-cancellation-reset-source-events) " +
+                     "(pg::native-cancellation-observe-reuse) (values))")
+        self.run("reuse-refused", target, "cleaned", configured=True, connections=1)
+        self.control("(progn (pg::native-cancellation-check-reuse-witness " +
+                     lisp_string("native_target_follow_" + str(index)) + " t) " +
+                     "(pg::native-cancellation-check-source-events nil) (values))")
+        self.audit(index)
+        self.audit_configured_allocation(index, "released")
+        assert facts(target / "physical-reseed.follow") == saved
+        assert self.configured_inventory(roots, target) == before
+        self.result.setdefault("configured_reuse_checks", []).append({"index": index})
+
     def configured(self):
         for index, settled in enumerate((True, False), 6801):
             started = time.monotonic()
             label = "configured-" + ("selected" if settled else "generation-debt")
             target, roots, before = self.prepare_configured(index, label, settled)
+            if not settled:
+                self.audit_configured_allocation(index, "ready")
             before = self.configured_startup_fence(target, roots, before, "inert")
             self.control("(progn (pg::native-cancellation-reset-source-events) (values))")
             self.run("begin", target, "pending", configured=True, connections=0)
@@ -314,8 +338,11 @@ class Acceptance:
             events = "(:status :cleanup :cleanup :release)" if settled else "(:status :abort)"
             self.control("(progn (pg::native-cancellation-check-source-events '" + events + ") (values))")
             self.audit(index, aborted=not settled)
+            self.audit_configured_allocation(index, "released" if settled else "aborted")
             before = self.configured_startup_fence(target, roots, before, phase)
             saved = facts(target / "physical-reseed.follow")
+            if settled:
+                self.configured_reuse_refused(index, target, roots, before)
             self.stop()
             self.run("cleanup", target, phase, configured=True, connections=0, outcome=outcome)
             assert facts(target / "physical-reseed.follow") == saved
@@ -324,6 +351,9 @@ class Acceptance:
             assert facts(target / "physical-reseed.follow") == saved
             assert self.configured_inventory(roots, target) == before
             self.audit(index, aborted=not settled)
+            self.audit_configured_allocation(index, "released" if settled else "aborted")
+            if settled:
+                self.configured_reuse_refused(index, target, roots, before)
             self.result["checks"].append(label)
             self.result.setdefault("timings", []).append(
                 {"case": label, "elapsed_seconds": time.monotonic() - started, "outcome": "pass"})

@@ -547,3 +547,74 @@
                      (not *wal-poisoned*)))))))
     (assert valid))
   (values))
+
+(defun native-cancellation-check-source-allocation (lease-name follow-name expected)
+  (assert (member expected '(:ready :aborted :released)))
+  (assert (not (equal lease-name follow-name)))
+  (with-write-lock
+    (sb-thread:with-mutex (*wal-lock*)
+      (assert (not (recovery-in-progress-p)))
+      (assert (not *wal-poisoned*))
+      (let* ((parent (gethash lease-name *physical-backup-lease-records*))
+             (allocation (gethash follow-name *physical-backup-lease-allocations*))
+             (history
+               (gethash lease-name (physical-backup-lease-allocation-histories)))
+             (ready (eq expected :ready)))
+        (assert parent)
+        (assert allocation)
+        (assert (equal lease-name (getf (getf parent :request) :name)))
+        (assert (equal follow-name (getf allocation :name)))
+        (assert (= 1 (getf allocation :generation)))
+        (assert (equal (getf parent :request) (getf allocation :request)))
+        (assert (equal history (list allocation)))
+        (assert (eq (if (eq expected :aborted) :canceled :live)
+                    (getf allocation :state)))
+        (physical-backup-lease-current-record (getf parent :request))
+        (physical-backup-lease-allocation-check-disk allocation)
+        (physical-backup-lease-allocation-check-parent
+         allocation *physical-backup-lease-records*)
+        (physical-backup-lease-allocation-check-history parent history)
+        (ecase expected
+          (:ready
+           (assert (eq :ready (getf parent :phase)))
+           (assert (null (getf parent :outcome)))
+           (assert (null (getf parent :successor))))
+          (:aborted
+           (assert (eq :closed (getf parent :phase)))
+           (assert (eq :aborted (getf parent :outcome)))
+           (assert (null (getf parent :successor))))
+          (:released
+           (assert (eq :closed (getf parent :phase)))
+           (assert (eq :handed-off (getf parent :outcome)))
+           (assert (equal follow-name (getf (getf parent :successor) :name)))))
+        (dolist (name (list lease-name follow-name))
+          (assert (null (gethash name *physical-source-senders*)))
+          (assert (null (gethash name *physical-backup-lease-capture-owners*)))
+          (multiple-value-bind (pin disk) (physical-source-retirement-pins name)
+            (if ready
+                (progn
+                  (assert (and pin disk))
+                  (assert (eq pin (gethash name *physical-source-pins*)))
+                  (assert (not (physical-source-pin-lost-p pin)))
+                  (if (equal name follow-name)
+                      (progn
+                        (assert (physical-follow-pin-p pin))
+                        (assert (physical-follow-pin-ready-p pin))
+                        (assert
+                         (physical-follow-request-matches-anchor-p
+                          (getf allocation :coordinates)
+                          (physical-follow-pin-anchor pin))))
+                      (physical-backup-lease-check-pin-record pin parent))
+                  (physical-source-pin-check-wal pin)
+                  (multiple-value-bind (floor present)
+                      (gethash pin *wal-snapshot-retention-pins*)
+                    (assert present)
+                    (assert (= floor (physical-source-pin-restart-lsn pin)))))
+                (assert (and (null pin) (null disk)))))
+          (assert
+           (= (if ready 1 0)
+              (loop for retained being the hash-keys of *wal-snapshot-retention-pins*
+                    count (and (physical-source-pin-p retained)
+                               (equal name (physical-source-pin-name retained)))))))
+        (assert (not *wal-poisoned*)))))
+  (values))
