@@ -254,10 +254,11 @@
                  (ok injected)
                  (ok (eq called (eq boundary :callback)))
                  (ok (and message
-                          (search (case kind
-                                    (:replace "single-link")
-                                    (:final-replace "final generation")
-                                    (otherwise "temporary"))
+                          (search (cond ((and (eq boundary :callback) (eq kind :remove))
+                                         "cannot inspect reseed old inventory entry")
+                                        ((eq kind :replace) "single-link")
+                                        ((eq kind :final-replace) "final generation")
+                                        (t "temporary"))
                                   message))
                      (format nil "~a/~a rejects the injected journal change" boundary kind))
                  (ok (reseed-activation-layout-facts-equal-p

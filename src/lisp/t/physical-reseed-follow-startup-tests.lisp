@@ -2401,41 +2401,76 @@
     (call-with-pid-owner
      (lambda (root)
        (declare (ignore root))
-       (pg::postmaster-remove-pid-file)
-       (close pg::*postmaster-data-lock*)
-       (setf pg::*postmaster-data-lock* nil pg::*postmaster-start-timestamp* nil)
-       (pg::postmaster-own-data-directory
-        "127.0.0.1" 5439
-        :startup-observer
-        (lambda (lock phase)
-          (declare (ignore phase))
-          (pg::call-with-physical-reseed-follow-startup-root
-           lock
-           (lambda (fd verify)
-             (declare (ignore fd))
-             (let ((pg::*postmaster-data-lock* lock))
-               (ok (handler-case (progn (funcall verify) nil)
-                     (error () t))))
-             (let ((pg::*postmaster-pid-directory* nil))
-               (ok (handler-case (progn (funcall verify) nil)
-                     (error () t))))
-             (ok (sb-thread:join-thread
-                  (sb-thread:make-thread
-                   (lambda ()
-                     (handler-case (progn (funcall verify) nil)
-                       (error () t))))))
-             (let* ((lock-fd (sb-sys:fd-stream-fd lock))
-                    (flags (sb-posix:fcntl lock-fd sb-posix:f-getfd))
-                    (backup (sb-posix:dup lock-fd)))
-               (unwind-protect
-                    (progn
-                      (sb-posix:close lock-fd)
-                      (ok (handler-case (progn (funcall verify) nil)
-                            (sb-posix:syscall-error () t))))
-                 (sb-posix:dup2 backup lock-fd)
-                 (sb-posix:fcntl lock-fd sb-posix:f-setfd flags)
-                 (sb-posix:close backup)))
-             (ok (funcall verify)))))))))
+       (flet ((restart-startup (observer)
+                (pg::postmaster-remove-pid-file)
+                (when pg::*postmaster-data-lock*
+                  (close pg::*postmaster-data-lock*))
+                (setf pg::*postmaster-data-lock* nil pg::*postmaster-start-timestamp* nil)
+                (pg::postmaster-own-data-directory
+                 "127.0.0.1" 5439 :startup-observer observer)))
+         (restart-startup
+          (lambda (lock phase)
+            (declare (ignore phase))
+            (pg::call-with-physical-reseed-follow-startup-root
+             lock
+             (lambda (fd verify)
+               (declare (ignore fd))
+               (let ((pg::*postmaster-data-lock* lock))
+                 (ok (handler-case (progn (funcall verify) nil)
+                       (error () t))))
+               (let ((pg::*postmaster-pid-directory* nil))
+                 (ok (handler-case (progn (funcall verify) nil)
+                       (error () t))))
+               (ok (sb-thread:join-thread
+                    (sb-thread:make-thread
+                     (lambda ()
+                       (handler-case (progn (funcall verify) nil)
+                         (error () t))))))
+               (ok (funcall verify))))))
+         (let ((first-message nil) (restored-message nil)
+                                   (failure-message nil) (revoked-lock nil))
+           (handler-case
+               (restart-startup
+                (lambda (lock phase)
+                  (declare (ignore phase))
+                  (setf revoked-lock lock)
+                  (pg::call-with-physical-reseed-follow-startup-root
+                   lock
+                   (lambda (fd verify)
+                     (declare (ignore fd))
+                     (let* ((lock-fd (sb-sys:fd-stream-fd lock))
+                            (flags (sb-posix:fcntl lock-fd sb-posix:f-getfd))
+                            (backup (sb-posix:dup lock-fd)))
+                       (unwind-protect
+                            (progn
+                              (sb-posix:close lock-fd)
+                              (setf first-message
+                                    (handler-case (progn (funcall verify) nil)
+                                      (error (condition) (princ-to-string condition)))))
+                         (sb-posix:dup2 backup lock-fd)
+                         (sb-posix:fcntl lock-fd sb-posix:f-setfd flags)
+                         (sb-posix:close backup)))
+                     (setf restored-message
+                           (handler-case (progn (funcall verify) nil)
+                             (error (condition) (princ-to-string condition))))))))
+             (error (condition) (setf failure-message (princ-to-string condition))))
+           (ok (and first-message
+                    (search "lost its exclusive directory lock" first-message)))
+           (dolist (message (list restored-message failure-message))
+             (ok (and message (search "no longer owns its data directory" message))))
+           (ok (and revoked-lock (not (open-stream-p revoked-lock))))
+           (ok (null pg::*postmaster-data-lock*))
+           (let ((phases nil))
+             (restart-startup
+              (lambda (lock phase)
+                (push phase phases)
+                (ok (not (eq lock revoked-lock)))
+                (pg::call-with-physical-reseed-follow-startup-root
+                 lock
+                 (lambda (fd verify)
+                   (declare (ignore fd))
+                   (ok (funcall verify))))))
+             (ok (equal (reverse phases) '(:before-pid :owned-pid)))))))))
 
 (deftest reseed-startup-root-closes-only-its-own-fd-on-every-exit
     (call-with-pid-owner
