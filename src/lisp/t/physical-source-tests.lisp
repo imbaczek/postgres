@@ -66,13 +66,14 @@
          (ok (= received (gethash pin pg::*wal-snapshot-retention-pins*)))
          (pg::wal-remove-checkpointed-segments pg::*wal-durable-lsn*)
          (ok (equal '(3) (pg::wal-discover-segments)))
+         (ok (intake-fails-p
+              (lambda () (pg::physical-source-confirm-receipt "advance" owner (1- received) 456))))
+         (pg::physical-source-release-sender "advance" owner)
          (pg::physical-source-pin-load)
          (let ((loaded (gethash "advance" pg::*physical-source-pins*)))
            (ok (= received (pg::physical-source-pin-confirmed-lsn loaded)))
            (ok (= 456 (pg::physical-source-pin-prefix-digest loaded)))
            (ok (not (pg::physical-source-pin-lost-p loaded))))
-         (ok (intake-fails-p
-              (lambda () (pg::physical-source-confirm-receipt "advance" owner (1- received) 456))))
          (ok (not pg::*wal-poisoned*))))))
 
 (deftest physical-source-failed-save-keeps-conservative-runtime-floor
@@ -164,7 +165,10 @@
                   (progn
                     (pg::physical-source-pin-load)
                     (ok (not (eq old-table pg::*physical-source-pins*)))
-                    (ok (equal '(:directory :file :directory) (mapcar #'first (reverse (car events)))))
+                    (ok (equal '(:directory :file :directory
+                                 :directory :file :directory
+                                 :directory :file :directory)
+                               (mapcar #'first (reverse (car events)))))
                     (let ((loaded (gethash "startup_sync" pg::*physical-source-pins*)))
                       (ok (not (eq pin loaded)))
                       (ok (= floor (gethash loaded pg::*wal-snapshot-retention-pins*))))
@@ -196,7 +200,8 @@
                     (pg::physical-source-pin-load)
                     (ok (zerop (hash-table-count pg::*physical-source-pins*)))
                     (ok (null (gethash pin pg::*wal-snapshot-retention-pins*)))))
-              (ok (equal '(:directory) (mapcar #'first (reverse (car events)))))
+              (ok (equal (if failure '(:directory) '(:directory :directory :directory))
+                         (mapcar #'first (reverse (car events)))))
               (ok (null (car streams))))
             :fail-at failure
             :before-sync (lambda (stage)
