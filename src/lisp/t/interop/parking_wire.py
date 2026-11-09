@@ -16,7 +16,7 @@ class RawConnection:
         values = ("user", "postgres", "database", "postgres",
                   "application_name", application_name, "client_encoding", "UTF8")
         if replication:
-            values += ("replication", "true")
+            values += ("replication", replication if isinstance(replication, str) else "true")
         body = struct.pack("!I", 196608) + "\0".join(values).encode() + b"\0\0"
         self.socket.sendall(struct.pack("!I", len(body) + 4) + body)
         while True:

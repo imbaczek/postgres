@@ -479,6 +479,13 @@ Remove the trace and its temporary helper after the demo:
   dominant setup costs, then assess cache reuse, narrower development selections,
   and independent parallel batches while preserving the milestone's coverage.
   Compare the same selection when evaluating a performance change.
+- Report milestone verification wall time separately from the sum of batch
+  durations. Record overlapping batches and peak concurrent Lisp processes,
+  including nested children. If wall time was not measured, say so. Treat a
+  duration below clock resolution as such. Include failed-run costs separately.
+- Keep an append-only machine-readable timing ledger with the verification
+  artifacts. Link each milestone summary to its raw logs and timing records,
+  and state which timing reduction or background scheduling change to try next.
 - Run longer qualification batches in tracked background Lisp processes pinned
   to an immutable source tree with owned logs and private caches. Overlap them
   with reviews and independent work. Share a cache among sequential children
