@@ -151,8 +151,24 @@ consumes the retirement receipt and prepares ordinary configuration under PGDATA
 ownership before Patroni's constructor and `Postgresql.follow` run. It checks
 streaming, standby write rejection, cold restart, source-offline restart and
 reconnect. The harness creates the source physical slot through SQL and runs
-Patroni's PostgreSQL control layer directly. A measured full run took about 12
-minutes. The output directory retains logs, process results and inventories.
+Patroni's PostgreSQL control layer directly. The output directory retains logs,
+process results, elapsed timings and inventories.
+
+The default case uses a synthetic target. Run the former-primary case with
+another new output directory.
+
+```sh
+PG_CONFIG=/path/to/c/bin/pg_config "$PATRONI_PYTHON" t/interop/patroni-reseed.py --case former-primary --output /tmp/new-patroni-former-primary-oracle
+```
+
+This case builds shared timeline 1 history from an old writer. A local native
+base backup constructs a replacement that follows and promotes through real
+Patroni methods onto timeline 2. The isolated old writer then commits row 999
+past the fork. The test stops it and explicitly performs a journaled remote
+reseed of its actual PGDATA from the promoted source. It checks that the old
+files and nested directory identities survive in quarantine along with the exact
+auxiliary guard, and that the standby can cold restart, restart with the source
+offline and reconnect. It also checks a table created only on the child timeline.
 
 From `src/lisp`, compare `cluster_name` configuration and byte normalization
 against a C executable using Python 3, SBCL and an existing C installation:
