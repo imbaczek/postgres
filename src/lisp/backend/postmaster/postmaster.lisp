@@ -188,7 +188,9 @@ Registry removal is conditional on exact ownership; repeated cleanup is safe."
     (unwind-protect
          (progn
            (setf (backend-executing backend) nil
-                 (backend-cancel-pending backend) nil)
+                 (backend-cancel-pending backend) nil
+                 (backend-termination-pending backend) nil
+                 (backend-thread backend) nil)
            (remhash backend *live-operation-backend-query-tokens*)
            (sb-thread:condition-broadcast *live-operation-cv*))
       (sb-thread:release-mutex *live-operation-lock*)))
@@ -233,18 +235,22 @@ interrupt. The target consumes the flag at FATAL delivery; a queued helper does
 nothing if a cooperative check has already delivered it."
   (when backend
     (let ((self-p (eq backend *backend*))
-          (thread (backend-thread backend)))
+          (thread (backend-thread backend))
+          (current nil))
       (when (or self-p (and thread (sb-thread:thread-alive-p thread)))
         (sb-sys:without-interrupts
           (sb-thread:with-mutex (*live-operation-lock*)
-            (setf (backend-termination-pending backend) t)
-            (sb-thread:condition-broadcast *live-operation-cv*))
-          (if self-p
-              (deliver-backend-termination backend)
-              (handler-case
-                  (sb-thread:interrupt-thread
-                   thread (lambda () (deliver-backend-termination backend)))
-                (error () nil)))))))
+            (when (eq thread (backend-thread backend))
+              (setf current t
+                    (backend-termination-pending backend) t)
+              (sb-thread:condition-broadcast *live-operation-cv*)))
+          (when current
+            (if self-p
+                (deliver-backend-termination backend)
+                (handler-case
+                    (sb-thread:interrupt-thread
+                     thread (lambda () (deliver-backend-termination backend)))
+                  (error () nil))))))))
   (values))
 
 (defun cancel-backend (backend)

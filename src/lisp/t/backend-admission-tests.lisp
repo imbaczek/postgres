@@ -219,6 +219,83 @@
                   (ok (eq :accepted (admission-test-result (admission-test-register 2)))))
              (setf (symbol-function 'pg::wal-cleanup-backend-physical-slots) old)))))))
 
+(deftest backend-unregister-retires-a-queued-termination-before-accounting-exits
+    (call-with-backend-admission-fixture
+     (lambda ()
+       (let* ((backend (admission-test-register 991))
+              (pg::*n-connections* 1)
+              (pg::*shutdown* pg::+no-shutdown+)
+              (original (symbol-function 'pg::unregister-backend))
+              (queued 0)
+              (result nil))
+         (setf (pg::backend-thread backend) sb-thread:*current-thread*
+               (pg::backend-termination-pending backend) t)
+         (unwind-protect
+              (progn
+                (setf (symbol-function 'pg::unregister-backend)
+                      (lambda (target)
+                        (funcall original target)
+                        (when (eq target backend)
+                          (incf queued)
+                          (sb-thread:interrupt-thread
+                           sb-thread:*current-thread*
+                           (lambda () (pg::deliver-backend-termination target))))))
+                (setf result
+                      (handler-case
+                          (progn
+                            (pg::finish-backend-connection backend nil nil)
+                            (sleep 0)
+                            :completed)
+                        (pg::pg-error (condition) (pg::pg-error-sqlstate condition))))
+                (ok (eq :completed result))
+                (ok (= 1 queued))
+                (ok (zerop pg::*n-connections*))
+                (ok (zerop pg::*n-backends*))
+                (ok (zerop (hash-table-count pg::*backend-registry*)))
+                (ok (not (pg::backend-termination-pending backend)))
+                (ok (null (pg::backend-thread backend))))
+           (setf (pg::backend-termination-pending backend) nil
+                 (symbol-function 'pg::unregister-backend) original))))))
+
+(deftest backend-termination-rechecks-a-thread-retired-during-its-lock-wait
+    (call-with-backend-admission-fixture
+     (lambda ()
+       (let* ((backend (admission-test-register 992))
+              (mutex (sb-thread:make-mutex :name "termination retirement race"))
+              (pg::*live-operation-lock* mutex)
+              (thread nil)
+              (waiting nil)
+              (pending nil)
+              (joined nil))
+         (setf (pg::backend-thread backend) sb-thread:*current-thread*)
+         (sb-sys:without-interrupts
+           (unwind-protect
+                (progn
+                  (sb-thread:with-mutex (mutex)
+                    (setf thread
+                          (sb-thread:make-thread
+                           (lambda ()
+                             (let ((pg::*backend* nil) (pg::*live-operation-lock* mutex))
+                               (pg::terminate-backend backend)
+                               :completed))
+                           :name "stale backend terminator"))
+                    (loop repeat 1000
+                          when (eq mutex (sb-thread::thread-waiting-for thread))
+                            do (setf waiting t) (return)
+                          do (sleep 0.001))
+                    ;; Model the interrupt-target retirement performed under this
+                    ;; same mutex by UNREGISTER-BACKEND, after the requester captured
+                    ;; the live thread and before it may publish a pending request.
+                    (setf (pg::backend-thread backend) nil
+                          (pg::backend-termination-pending backend) nil))
+                  (setf joined (sb-thread:join-thread thread :timeout 2 :default :pending)
+                        pending (pg::backend-termination-pending backend))
+                  (ok waiting)
+                  (ok (eq :completed joined))
+                  (ok (not pending)))
+             (when thread (sb-thread:join-thread thread :timeout 2 :default :cleanup-timeout))
+             (setf (pg::backend-termination-pending backend) nil)))))))
+
 (deftest connection-guc-validation-and-installation-are-atomic
     (call-with-backend-admission-fixture
      (lambda ()
