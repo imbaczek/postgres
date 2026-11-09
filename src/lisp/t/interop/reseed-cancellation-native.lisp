@@ -11,12 +11,21 @@
   (or (sb-posix:getenv (concatenate 'string "NATIVE_CANCELLATION_" name))
       default (error "missing native cancellation test setting ~a" name)))
 
+(defun native-cancellation-recovery-mode ()
+  (let* ((name (native-cancellation-env "RECOVERY" "none"))
+         (entry (assoc name '(("none") ("local" . t) ("cleaned" . :cleaned)) :test #'equal)))
+    (unless entry (error "unknown native cancellation recovery mode"))
+    (cdr entry)))
+
 (defun call-with-native-cancellation-owner (target action function)
   ;; Prove, configure and optional settlement use the configuration owner.
   (if (and (equal "yes" (native-cancellation-env "CONFIGURED" "no"))
            (not (member action '("prove" "configure" "settle") :test #'equal)))
-      (call-with-physical-reseed-follow-cancellation-owner target function)
+      (call-with-physical-reseed-follow-cancellation-owner
+       target function :recover (native-cancellation-recovery-mode) :helper (native-cancellation-env "HELPER"))
       (call-with-physical-reseed-follow-configuration-owner target function)))
+
+(defvar *native-cancellation-connections* 0)
 
 (defvar *native-cancellation-source-events* nil)
 
@@ -167,6 +176,67 @@
     (assert (zerop (hash-table-count *physical-libpq-channels*))))
   (native-cancellation-read-journal owner))
 
+(defun native-cancellation-factory-refused (target)
+  (assert (equal "yes" (native-cancellation-env "CONFIGURED" "no")))
+  (let ((entered nil) (caught nil))
+    (handler-case
+        (call-with-native-cancellation-owner
+         target "factory-refused" (lambda (owner) (declare (ignore owner)) (setf entered t)))
+      (error (condition) (setf caught condition)))
+    (assert (not entered))
+    (assert caught)
+    (assert (search (native-cancellation-env "REFUSAL_CAUSE") (princ-to-string caught)))
+    (sb-thread:with-mutex (*physical-libpq-channels-lock*)
+      (assert (zerop (hash-table-count *physical-libpq-channels*))))
+    (format t "~%NATIVE-CANCELLATION-FACTORY-REFUSED ~d ~a ~a~%"
+            (sb-posix:getpid) (native-cancellation-env "RECOVERY" "none") caught)))
+
+(defun native-cancellation-save-cut (authority phase)
+  (let* ((before (getf (physical-reseed-follow-cancellation-authority-previous authority) :record))
+         (candidate (physical-reseed-follow-cancellation-authority-candidate authority))
+         (group (getf candidate :cancellation))
+         (expected
+           (ecase phase
+             (:pending (physical-reseed-follow-cancellation-begin-record before))
+             (:source-closed
+              (physical-reseed-follow-cancellation-source-closed-record before (getf group :receipt)))
+             (:cleaned
+              (physical-reseed-follow-cancellation-cleaned-record before (getf group :receipt) (getf group :ack)))))
+         (image (physical-reseed-follow-image expected))
+         (previous (physical-reseed-follow-image before))
+         (prefix (native-cancellation-env "EVIDENCE" "")))
+    (assert (equal expected candidate))
+    (assert (equalp image (physical-reseed-follow-cancellation-authority-bytes authority)))
+    (unless (equal prefix "")
+      (loop for suffix in '(".before" ".after")
+            for bytes in (list previous image)
+            for path = (concatenate 'string prefix suffix)
+            do (with-open-file (output path :direction :output :if-exists :error
+                                            :element-type '(unsigned-byte 8))
+                 (write-sequence bytes output))
+               (sb-posix:chmod path #o600))
+      (format t "~%NATIVE-CANCELLATION-CANDIDATE ~d ~s ~d ~d ~d~%"
+              (sb-posix:getpid) phase (length previous) (length image) *native-cancellation-connections*))))
+
+(defun native-cancellation-cut-hook (cut target)
+  (when cut
+    (let* ((name (native-cancellation-env "CUT_PHASE" "cleaned"))
+           (entry (assoc name '(("pending" . :pending) ("source-closed" . :source-closed)
+                                ("cleaned" . :cleaned)) :test #'equal)))
+      (unless entry (error "unknown native cancellation cut phase"))
+      (lambda (event path)
+        (declare (ignore path))
+        (let ((authority *physical-reseed-follow-cancellation-authority*))
+          (when (and (eq event cut)
+                     (physical-reseed-follow-cancellation-authority-p authority)
+                     (eq (cdr entry) (getf (getf (physical-reseed-follow-cancellation-authority-candidate authority)
+                                                 :cancellation) :phase)))
+            (native-cancellation-save-cut authority (cdr entry))
+            (format t "~%NATIVE-CANCELLATION-CUT ~d ~s ~a~%"
+                    (sb-posix:getpid) event (namestring target))
+            (finish-output)
+            (sb-posix:kill (sb-posix:getpid) 9)))))))
+
 (defun native-cancellation-run-actions ()
   (let* ((*print-circle* t) (*print-level* 5) (*print-length* 10)
                             (target (uiop:ensure-directory-pathname (native-cancellation-env "TARGET")))
@@ -183,18 +253,14 @@
                                              :test #'equal)))
                             (*physical-reseed-follow-write-limit*
                               (when (equal "yes" (native-cancellation-env "PARTIAL" "no")) 257))
-                            (*physical-reseed-follow-test-hook*
-                              (when cut
-                                (lambda (event path)
-                                  (declare (ignore path))
-                                  (when (and (eq event cut)
-                                             (physical-reseed-follow-cancellation-ack-authority-p
-                                              *physical-reseed-follow-cancellation-authority*))
-                                    (format t "~%NATIVE-CANCELLATION-CUT ~d ~s ~a~%"
-                                            (sb-posix:getpid) event (namestring target))
-                                    (finish-output)
-                                    (sb-posix:kill (sb-posix:getpid) 9))))))
+                            (*physical-reseed-follow-test-hook* (native-cancellation-cut-hook cut target)))
     (unless (or cut (equal cut-name "none")) (error "unknown native cancellation cut"))
+    (when (equal action "factory-refused")
+      (assert (null cut))
+      (native-cancellation-factory-refused target)
+      (format t "~%NATIVE-CANCELLATION-CHECKED ~d ~a~%" (sb-posix:getpid) action)
+      (finish-output)
+      (return-from native-cancellation-run-actions (values)))
     (call-with-native-cancellation-owner
      target action
      (lambda (owner)
@@ -245,6 +311,9 @@
                                (sb-posix:getpid) condition)
                        t)))
                   (native-cancellation-read-journal owner))
+                 ((equal action "factory-recover")
+                  (assert (physical-reseed-follow-cancellation-owner-p owner))
+                  (physical-reseed-follow-read-configured-cancellation owner))
                  ((equal action "recover")
                   (multiple-value-bind (result outcome)
                       (physical-reseed-follow-recover-cleaned-cancellation owner :helper (native-cancellation-env "HELPER"))
@@ -272,19 +341,20 @@
 (defun native-cancellation-run ()
   (let ((setting (native-cancellation-env "EXPECT_CONNECTIONS" "any"))
         (original (symbol-function 'physical-libpq-connect-frozen))
-        (connections 0))
-    (if (equal setting "any")
+        (*native-cancellation-connections* 0))
+    (if (and (equal setting "any") (equal "none" (native-cancellation-env "CUT" "none")))
         (native-cancellation-run-actions)
         (unwind-protect
              (progn
                (setf (symbol-function 'physical-libpq-connect-frozen)
                      (lambda (&rest arguments)
-                       (incf connections)
+                       (incf *native-cancellation-connections*)
                        (apply original arguments)))
                (native-cancellation-run-actions)
-               (assert (= (parse-integer setting) connections))
+               (unless (equal setting "any")
+                 (assert (= (parse-integer setting) *native-cancellation-connections*)))
                (format t "~%NATIVE-CANCELLATION-CONNECTIONS ~d ~d~%"
-                       (sb-posix:getpid) connections)
+                       (sb-posix:getpid) *native-cancellation-connections*)
                (finish-output))
           (setf (symbol-function 'physical-libpq-connect-frozen) original)))))
 

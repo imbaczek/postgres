@@ -98,7 +98,7 @@ class Acceptance:
 
     def run(self, action, target, phase="none", connections=None, outcome="complete", *,
             cut=None, lose_reply=None, kill_effect=False, refusal_cause=None,
-            configured=False, workspace=None):
+            configured=False, workspace=None, cut_phase="cleaned", recovery="none", evidence=None):
         killed = cut is not None or kill_effect
         assert not (killed and connections is not None)
         env = {key: value for key, value in os.environ.items()
@@ -112,10 +112,14 @@ class Acceptance:
             env["NATIVE_CANCELLATION_CONFIGURED"] = "yes"
         if workspace is not None:
             env["NATIVE_CANCELLATION_WORKSPACE"] = str(workspace)
+        env["NATIVE_CANCELLATION_RECOVERY"] = recovery
+        if evidence is not None:
+            env["NATIVE_CANCELLATION_EVIDENCE"] = str(evidence)
         if connections is not None:
             env["NATIVE_CANCELLATION_EXPECT_CONNECTIONS"] = str(connections)
         if cut is not None:
             env["NATIVE_CANCELLATION_CUT"] = cut
+            env["NATIVE_CANCELLATION_CUT_PHASE"] = cut_phase
             if cut == "write":
                 env["NATIVE_CANCELLATION_PARTIAL"] = "yes"
         if lose_reply is not None:
@@ -134,11 +138,20 @@ class Acceptance:
                      "--eval", "(pg::native-cancellation-run)"], env=env, expected=-9 if killed else 0)
         self.result["processes"][-1].update(
             {"phase": phase, "connections": connections, "cut": cut,
-             "lose_reply": lose_reply, "kill_effect": kill_effect, "refusal_cause": refusal_cause})
+               "lose_reply": lose_reply, "kill_effect": kill_effect, "refusal_cause": refusal_cause,
+               "cut_phase": cut_phase if cut is not None else None, "recovery": recovery,
+               "target": str(target), "evidence": str(evidence) if evidence is not None else None})
         if cut is not None:
             point = {"create": "AFTER-FOLLOW-TEMPORARY-CREATE", "write": "AFTER-FOLLOW-WRITE-CHUNK",
                      "fsync": "AFTER-FOLLOW-TEMPORARY-FSYNC", "rename": "AFTER-FOLLOW-RENAME"}[cut]
             assert f"NATIVE-CANCELLATION-CUT {pid} :{point} {target}/".encode() in output
+            if evidence is not None:
+                before = Path(str(evidence) + ".before").read_bytes()
+                after = Path(str(evidence) + ".after").read_bytes()
+                assert before != after
+                count = {"pending": 0, "source-closed": 1, "cleaned": 2}[cut_phase]
+                marker = f"NATIVE-CANCELLATION-CANDIDATE {pid} :{cut_phase.upper()} {len(before)} {len(after)} {count}"
+                assert marker.encode() in output.splitlines()
         elif not killed:
             assert f"NATIVE-CANCELLATION-CHECKED {pid} {action}".encode() in output
         if lose_reply is not None:
@@ -147,12 +160,16 @@ class Acceptance:
         if action == "recover-refused":
             assert refusal_cause and refusal_cause.encode() in output
             assert f"NATIVE-CANCELLATION-REFUSED {pid} ".encode() in output
+        if action == "factory-refused":
+            assert refusal_cause and refusal_cause.encode() in output
+            assert f"NATIVE-CANCELLATION-FACTORY-REFUSED {pid} {recovery} ".encode() in output
         if action == "reuse-refused":
             assert f"NATIVE-CANCELLATION-REUSE-REFUSED {pid}".encode() in output
         if connections is not None:
             assert f"NATIVE-CANCELLATION-CONNECTIONS {pid} {connections}".encode() in output
         if not killed and (phase == "cleaned" or action == "cleanup"):
             assert not os.path.lexists(target / "physical-reseed.follow.tmp")
+        return pid
 
     def install(self, index, label, selected):
         paths = [self.server.root / (label + "-" + suffix)
@@ -234,17 +251,18 @@ class Acceptance:
                     inventory[str(path)] = facts(path)
         return inventory
 
-    def configured_startup_fence(self, target, roots, before, phase):
+    def configured_startup_fence(self, target, roots, before, phase, *, temporary=None,
+                                 diagnostic="pg-lisp: fatal: retirement requires completed activation"):
         assert self.configured_inventory(roots, target) == before
         journal = facts(target / "physical-reseed.follow")
-        temporary = target / "physical-reseed.follow.tmp"
-        assert not os.path.lexists(temporary)
+        temporary_path = target / "physical-reseed.follow.tmp"
+        assert (facts(temporary_path) if os.path.lexists(temporary_path) else None) == temporary
         pid, output = self.process(
             "configured-startup", [str(LISP / "pg-lisp.sh"), "-D", str(target),
                                    "-p", str(self.server.port)], expected=1)
-        assert b"pg-lisp: fatal: retirement requires completed activation" in output
+        assert diagnostic.encode() in output
         assert not os.path.lexists(target / "postmaster.pid")
-        assert not os.path.lexists(temporary)
+        assert (facts(temporary_path) if os.path.lexists(temporary_path) else None) == temporary
         assert facts(target / "physical-reseed.follow") == journal
         after = self.configured_inventory(roots, target)
         lock = str(target / ".pg_lisp.lock")
@@ -256,7 +274,8 @@ class Acceptance:
         assert after == expected
         self.result.setdefault("startup_fences", []).append(
             {"pid": pid, "target": str(target), "phase": phase,
-             "lock_ctime_before_ns": previous[8], "lock_ctime_after_ns": current[8]})
+             "lock_ctime_before_ns": previous[8], "lock_ctime_after_ns": current[8],
+             "diagnostic": diagnostic, "temporary_size": len(temporary[-1]) if temporary is not None else None})
         return after
 
     def audit_configured_selection(self, index):
@@ -363,6 +382,115 @@ class Acceptance:
             self.result["checks"].append(label)
             self.result.setdefault("timings", []).append(
                 {"case": label, "elapsed_seconds": time.monotonic() - started, "outcome": "pass"})
+
+    def configured_crash_case(self, index, phase, cut):
+        started = time.monotonic()
+        label = "configured-crash-" + phase + "-" + cut
+        target, roots, before = self.prepare_configured(index, label, settled=True)
+        before = self.configured_startup_fence(target, roots, before, "inert")
+        if phase != "pending":
+            self.run("begin", target, "pending", configured=True, connections=0)
+        self.control("(progn (pg::native-cancellation-reset-source-events) (values))")
+        evidence = self.output / (label + "-evidence")
+        crashed = self.run("begin" if phase == "pending" else "cleanup", target, phase,
+                           configured=True, cut=cut, cut_phase=phase, evidence=evidence)
+        predecessor = Path(str(evidence) + ".before").read_bytes()
+        candidate = Path(str(evidence) + ".after").read_bytes()
+        final = target / "physical-reseed.follow"
+        temporary = target / "physical-reseed.follow.tmp"
+        renamed = cut == "rename"
+        partial = cut in ("create", "write")
+        saved_final = facts(final)
+        saved_temporary = facts(temporary) if os.path.lexists(temporary) else None
+        assert saved_final[-1] == (candidate if renamed else predecessor)
+        if renamed:
+            assert saved_temporary is None
+        elif partial:
+            length = len(saved_temporary[-1])
+            assert length == (0 if cut == "create" else 257)
+            assert length < len(candidate) and saved_temporary[-1] == candidate[:length]
+        else:
+            assert saved_temporary[-1] == candidate
+        events = {"pending": "nil", "source-closed": "(:status :cleanup)",
+                  "cleaned": "(:status :cleanup :cleanup :release)"}[phase]
+        self.control("(progn (pg::native-cancellation-check-source-events '" + events + ") (values))")
+        if phase == "cleaned":
+            self.audit(index)
+        else:
+            self.audit_configured_selection(index)
+        self.stop()
+        self.start()
+        assert facts(final) == saved_final
+        assert (facts(temporary) if os.path.lexists(temporary) else None) == saved_temporary
+        self.control("(progn (pg::native-cancellation-reset-source-events) (values))")
+        diagnostic = {"create": "target follow journal is not a bounded private single-link regular file",
+                      "write": "physical backup lease checksum mismatch",
+                      "rename": "retirement requires completed activation",
+                      "fsync": "observed retirement prefix disagrees with recorded progress"}[cut]
+        stable_phase = "cleaned" if renamed else {"pending": "inert", "source-closed": "pending",
+                                                   "cleaned": "source-closed"}[phase]
+        before = self.configured_startup_fence(
+            target, roots, before, stable_phase, temporary=saved_temporary, diagnostic=diagnostic)
+        modes = []
+        if not renamed:
+            modes.append(("none", "configured cancellation temporary requires explicit reconciliation"))
+            if partial:
+                cause = ("target follow journal is not a bounded private single-link regular file" if cut == "create"
+                         else "physical backup lease checksum mismatch")
+                modes.extend((("local", cause), ("cleaned", cause)))
+            elif phase == "cleaned":
+                modes.append(("local", "cleanup publication requires the exact source-closed successor"))
+        recovery_pids = []
+        for _ in range(2 if partial else 1):
+            for mode, cause in modes:
+                recovery_pids.append(self.run(
+                    "factory-refused", target, stable_phase, configured=True,
+                    recovery=mode, connections=0, refusal_cause=cause))
+                assert facts(final) == saved_final and facts(temporary) == saved_temporary
+                assert self.configured_inventory(roots, target) == before
+        self.control("(progn (pg::native-cancellation-check-source-events nil) (values))")
+        if not partial:
+            mode = "cleaned" if phase == "cleaned" else "local"
+            recovery_pids.append(self.run("factory-recover", target, phase, configured=True,
+                                          recovery=mode, connections=1 if phase == "cleaned" and not renamed else 0))
+            assert facts(final)[-1] == candidate and not os.path.lexists(temporary)
+            if saved_temporary is not None:
+                promoted = facts(final)
+                assert promoted[:8] == saved_temporary[:8] and promoted[9:] == saved_temporary[9:]
+            else:
+                assert facts(final) == saved_final
+            events = "(:cleanup :release)" if phase == "cleaned" and not renamed else "nil"
+            self.control("(progn (pg::native-cancellation-check-source-events '" + events + ") (values))")
+            if phase != "cleaned":
+                self.control("(progn (pg::native-cancellation-reset-source-events) (values))")
+                self.run("cleanup", target, "cleaned", configured=True,
+                         connections=2 if phase == "pending" else 1)
+                events = "(:status :cleanup :cleanup :release)" if phase == "pending" else "(:cleanup :release)"
+                self.control("(progn (pg::native-cancellation-check-source-events '" + events + ") (values))")
+            self.audit(index)
+            before = self.configured_startup_fence(target, roots, before, "cleaned")
+            saved = facts(final)
+            self.stop()
+            self.run("cleanup", target, "cleaned", configured=True, connections=0)
+            assert facts(final) == saved
+            self.start()
+            self.control("(progn (pg::native-cancellation-reset-source-events) (values))")
+            self.run("cleanup", target, "cleaned", configured=True, connections=0)
+            self.control("(progn (pg::native-cancellation-check-source-events nil) (values))")
+            assert facts(final) == saved
+        assert len(set([crashed, *recovery_pids])) == 1 + len(recovery_pids)
+        assert self.configured_inventory(roots, target) == before
+        self.audit(index)
+        self.result["checks"].append(label)
+        self.result.setdefault("timings", []).append(
+            {"case": label, "elapsed_seconds": time.monotonic() - started, "outcome": "pass"})
+
+    def configured_crash(self):
+        cases = (("pending", "fsync"), ("source-closed", "fsync"),
+                 ("cleaned", "create"), ("cleaned", "write"),
+                 ("cleaned", "fsync"), ("cleaned", "rename"))
+        for index, (phase, cut) in enumerate(cases, 7001):
+            self.configured_crash_case(index, phase, cut)
 
     def abort(self):
         for index, zero in enumerate((True, False), 6101):
@@ -552,7 +680,8 @@ class Acceptance:
                       "lost": self.effects, "early": lambda: self.effects(kill=True),
                       "reuse": self.reuse, "offline": self.access,
                         "auth": lambda: self.access(authentication=True), "configured": self.configured,
-                        "configured-lost": self.configured_effects}
+                        "configured-lost": self.configured_effects,
+                        "configured-crash": self.configured_crash}
             for name, function in groups.items():
                 if "all" in suites or name in suites:
                     suite_started = time.monotonic()
@@ -587,7 +716,7 @@ class Acceptance:
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--suite", nargs="+", default=["all"],
-                          choices=("all", "selected", "abort", "crash", "lost", "early", "reuse", "offline", "auth", "configured", "configured-lost"))
+                          choices=("all", "selected", "abort", "crash", "lost", "early", "reuse", "offline", "auth", "configured", "configured-lost", "configured-crash"))
     parser.add_argument("--output", type=Path, help="new directory for retained logs and process evidence")
     arguments = parser.parse_args()
     Acceptance(arguments.output).execute(arguments.suite)
