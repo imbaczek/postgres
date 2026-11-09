@@ -274,6 +274,7 @@ class Acceptance:
         if settled:
             self.run("settle", target, configured=True)
             self.audit_configured_selection(index)
+        # Take the inventory after configuration has moved its files.
         roots = [self.server.root / (label + "-" + suffix)
                  for suffix in ("target", "stage", "incoming", "quarantine", "workspace")]
         assert any(path.is_file() for path in (target / "base").rglob("*"))
@@ -318,6 +319,7 @@ class Acceptance:
             self.run("begin", target, "pending", configured=True, connections=0)
             pending = facts(target / "physical-reseed.follow")
             phase = "pending" if kind == "observer" else "source-closed"
+            # Discard the reply in the target after the real source command returns.
             self.run("lose-reply", target, phase, configured=True,
                      connections=1 if phase == "pending" else 2, lose_reply=kind)
             if phase == "pending":
