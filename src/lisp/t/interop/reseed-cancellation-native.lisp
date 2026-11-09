@@ -472,7 +472,9 @@
                                    :receive-digest #xCBF29CE484222325
                                    :overlap-start (- (getf base :end) (length bytes))
                                    :overlap-digest (third entry))
-                             :source-history "" :phase :preparing :anchor nil))))
+                             :source-history (if (= 1 (getf base :timeline)) ""
+                                                 (bytes->string (timeline-history-bytes (getf base :timeline) target)))
+                             :phase :preparing :anchor nil))))
          (physical-reseed-follow-publish-intent owner record :previous initial))))))
 
 (defun native-cancellation-install-initial (target stage incoming quarantine request profile helper)

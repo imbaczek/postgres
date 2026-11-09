@@ -171,14 +171,18 @@ class Acceptance:
             assert not os.path.lexists(target / "physical-reseed.follow.tmp")
         return pid
 
+    def initialize_target(self, target):
+        target.mkdir(mode=0o700)
+        (target / ".pg_lisp.lock").touch(mode=0o600)
+        (target / "opaque-old-data").write_bytes(b"original data\x00\xff")
+
     def install(self, index, label, selected):
         paths = [self.server.root / (label + "-" + suffix)
                  for suffix in ("target", "stage", "incoming", "quarantine")]
-        for path in paths:
+        for path in paths[1:]:
             path.mkdir(mode=0o700)
         target = paths[0]
-        (target / ".pg_lisp.lock").touch(mode=0o600)
-        (target / "opaque-old-data").write_bytes(b"original data\x00\xff")
+        self.initialize_target(target)
         go = self.server.root / (label + "-go")
         done = self.server.root / (label + "-done")
         arguments = " ".join("#P" + lisp_string(str(path) + "/") for path in paths)
