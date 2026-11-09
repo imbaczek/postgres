@@ -475,8 +475,8 @@ Remove the trace and its temporary helper after the demo:
   executable files for compiled test helpers. Setup uses noninteractive sudo.
   It fails if the kernel or privileges cannot provide the requested mount.
 - Launch jobs with `src/lisp/t/test-ramdisk.sh run COMMAND ARG...`. Each job gets
-  private `TMPDIR`, `XDG_CACHE_HOME`, `PG_LISP_TEST_RUN_DIR`, and
-  `PG_LISP_TEST_LOG_DIR` directories. Direct raw logs and timing artifacts to the
+  private `TMPDIR`, `XDG_CACHE_HOME`, `PYTHONPYCACHEPREFIX`,
+  `PG_LISP_TEST_RUN_DIR`, and `PG_LISP_TEST_LOG_DIR` directories. Direct raw logs and timing artifacts to the
   log directory. The inherited usage lease prevents teardown during active jobs.
   Launch live Lisp images through this wrapper too. When moving an existing
   image, refresh `uiop:*temporary-directory*` and ASDF output translations after

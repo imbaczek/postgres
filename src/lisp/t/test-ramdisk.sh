@@ -69,6 +69,7 @@ run() {
     flock -u 8
     exec 8>&-
     export TMPDIR="$job/tmp" XDG_CACHE_HOME="$job/cache"
+    export PYTHONPYCACHEPREFIX="$job/cache/python"
     export PG_LISP_TEST_RUN_DIR="$job" PG_LISP_TEST_LOG_DIR="$job/logs"
     printf 'RAM test workspace %s\n' "$job" >&2
     exec "$@"
