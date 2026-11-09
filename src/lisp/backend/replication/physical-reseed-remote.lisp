@@ -102,6 +102,9 @@
       (when client (physical-client-close client)))))
 
 (defun %physical-reseed-start-remote (owner directory request profile &key helper stage-check)
+  ;; The optional check adds caller-specific observations at each stage check.
+  ;; Publish the ordinary attempt journal before CAPTURE so a reopened attempt
+  ;; can use status or cancellation without issuing CAPTURE again.
   (physical-reseed-check-owner owner)
   (let* ((request (physical-backup-lease-request-copy request))
          (*pgdata* (physical-adoption-owner-directory owner)))
@@ -137,6 +140,7 @@
               :helper resolved :capture t))))))))
 
 (defun physical-reseed-start-remote (owner directory request profile &key helper)
+  ;; Start capture with the ordinary stage validation and durable journal.
   (%physical-reseed-start-remote owner directory request profile :helper helper))
 
 (defun physical-reseed-source-result (record source)

@@ -76,6 +76,20 @@
   settlement. Reconcile the source outcome and activate follow only after the
   required durable checks; retire installation fences during startup reconciliation.
 
+- [x] Capture a configured cancellation replacement in a separate private root.
+  Hold and recheck the old cancellation history through capture, require a fresh
+  lease for the same cluster and system, and retain the old history and debt.
+  The ordinary durable capture journal fences retries. Existing operations handle
+  status, cancellation, recovery and later installation and handoff. The caller
+  chooses explicit directories and coordinates competing replacements.
+  Production strict cold compilation and 24 Rove tests passed, with 799 passing
+  assertion reports.
+  Native Patroni replacement runs passed for pending, source-closed and cleaned,
+  including the pending journal crash and fresh-process recovery. The original
+  default reseed regression also passed. Logs, results and timings are under
+  `/home/imbaczek/proj/pg-ha-artifacts/reseed-target-follow/`, with remaining broad
+  work in `full-goal-completion-ledger.md` there.
+
 - [x] Add the target follow codec and read-only owner foundation. Validate
   bounded generation records and the installed predecessor and image under a
   scoped owner. The next item adds durable intent publication and recovery.
@@ -1545,6 +1559,14 @@
 - [ ] Fix cl-mcp character-name alias acceptance and custom-reader handling of
   unknown packages across server and worker images; add regressions for parinfer
   repairs that alter balanced but misindented forms. Keep reader evaluation disabled.
+
+- [ ] Investigate cl-spec declaration digests changing between source loading and
+  compiled loading. The replacement contract and property metadata compare equal
+  except for their digests. Compiling and loading the same saved test file restores
+  the earlier digests. Preserve both observations and use compiled loading for
+  replay until the difference is understood. The reproduction is retained in
+  `replacement-spec-compile-probe.fasl` and `replacement-specs-final.json` under
+  the reseed-target-follow verification artifacts.
 
 - [ ] Fix cold test declarations in `t/promotion-intent-tests.lisp`.
   `call-with-promotion-fixture` binds `pg::*shutdown-mode*` and

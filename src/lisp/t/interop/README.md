@@ -154,8 +154,23 @@ reconnect. The harness creates the source physical slot through SQL and runs
 Patroni's PostgreSQL control layer directly. The output directory retains logs,
 process results, elapsed timings and inventories.
 
-The default case uses a synthetic target. Run the former-primary case with
-another new output directory.
+Run the configured cancellation replacement oracle with the same dependencies
+and a new output directory. Select `pending`, `source-closed` or `cleaned`.
+
+```sh
+PG_CONFIG=/path/to/c/bin/pg_config "$PATRONI_PYTHON" t/interop/patroni-replacement.py --output /tmp/new-patroni-replacement-oracle --phase pending
+```
+
+The test uses native peers and Patroni 4.1.5 `Postgresql.follow`. It checks
+cold restart, source-offline restart and reconnect, along with the retained old
+history and its fence. The source-closed case retains deferred generation debt.
+The pending case also exits a child abruptly after journal publication, then uses
+two fresh children to check absent source status, durable cancellation and an
+idempotent cancellation retry.
+The output retains logs, process results and timings.
+
+The `patroni-reseed.py` default case uses a synthetic target. Run its
+former-primary case with another new output directory.
 
 ```sh
 PG_CONFIG=/path/to/c/bin/pg_config "$PATRONI_PYTHON" t/interop/patroni-reseed.py --case former-primary --output /tmp/new-patroni-former-primary-oracle

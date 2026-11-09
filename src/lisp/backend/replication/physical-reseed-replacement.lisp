@@ -1,6 +1,12 @@
+;; Start an independent capture while retaining a configured cancellation tree.
+;; The old owner protects saved cleanup history.  The new root's attempt journal
+;; records capture progress for status and cancellation after an interruption.
+
 (in-package #:pg)
 
 (defun physical-reseed-replacement-request-copy (old new)
+  ;; Both cluster identifiers must match.  A fresh name and token keep the
+  ;; new lease separate from the cancelled lease, even if the timeline changed.
   (let ((old (physical-backup-lease-request-copy old))
         (new (physical-backup-lease-request-copy new)))
     (unless (and (= (getf old :system-id) (getf new :system-id))
@@ -11,6 +17,9 @@
     new))
 
 (defun physical-reseed-replacement-directories-disjoint-p (left right)
+  ;; Rows contain (canonical-path device inode mount-id).  Refuse path
+  ;; containment and inode aliases.  Different mounts on one device can alias
+  ;; protected history, so refuse that layout too.
   (let ((left-path (pathname (first left))) (right-path (pathname (first right))))
     (and (not (uiop:subpathp left-path right-path))
          (not (uiop:subpathp right-path left-path))
@@ -18,6 +27,8 @@
          (or (/= (second left) (second right)) (= (fourth left) (fourth right))))))
 
 (defun physical-reseed-replacement-directory (observation directory fd)
+  ;; Compare the held directory with all ten protected directories in the
+  ;; old cancellation snapshot.
   (physical-image-check-target directory fd)
   (let* ((path (namestring (uiop:ensure-directory-pathname (truename (physical-image-fd-path fd)))))
          (stat (sb-posix:fstat fd))
@@ -31,6 +42,8 @@
     row))
 
 (defun physical-reseed-replacement-observation (owner &optional expected)
+  ;; Read the complete cancellation snapshot again while holding its owner.
+  ;; Reject a changed snapshot before continuing capture.
   (let ((actual (physical-reseed-follow-cancellation-observation-data
                  (physical-reseed-follow-observe-configured-cancellation owner))))
     (when (and expected (not (equal expected actual)))
@@ -38,6 +51,8 @@
     actual))
 
 (defun physical-reseed-replacement-target (observation owner fd &key empty)
+  ;; The new root starts with only its private, empty lock.  After journal
+  ;; publication that journal is the only other permitted entry.
   (let* ((row (physical-reseed-replacement-directory
                observation (physical-adoption-owner-directory owner) fd))
          (lock (sb-posix:fstat (sb-sys:fd-stream-fd (physical-adoption-owner-lock owner))))
@@ -51,6 +66,26 @@
 
 (defun physical-reseed-start-configured-replacement-remote
     (old-directory directory stage request profile &key helper)
+  "Capture a replacement for a durable configured cancellation.
+
+OLD-DIRECTORY names a dedicated configured cancellation in PENDING,
+SOURCE-CLOSED or CLEANED phase.  Reconcile temporary cancellation files before
+calling.  DIRECTORY must exist with mode 0700 and contain only an empty
+.pg_lisp.lock file with mode 0600.  STAGE must be a separate empty private
+directory on the same mount.  Both must be disjoint from every protected old
+role.  The request must identify the same cluster and system and use a fresh
+lease name and token.  Its timeline may differ from the cancelled request.
+
+The old owner stays held through capture.  The old snapshot, new root and
+stage are checked before and after source discovery and capture, and the old
+snapshot is checked on unwind.  The new root's durable capture journal fences
+retries.  Use the existing status, cancellation and recovery operations for an
+interrupted attempt.  Keep the old root, saved debt and frozen route for later
+cleanup.
+
+Return the received manifest and source lease record.  Installation, activation,
+retirement and finalization use the existing operations.  The caller chooses
+the directories and coordinates any competing replacements."
   (call-with-physical-reseed-follow-cancellation-owner
    old-directory
    (lambda (old-owner)
