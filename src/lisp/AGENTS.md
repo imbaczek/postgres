@@ -512,6 +512,11 @@ Remove the trace and its temporary helper after the demo:
   caught by the outer runner. Rove uses `×` for failed assertions, including
   errors caught inside a test. Check the terminal exit and failure counter before
   accepting the run. Only label a completed head passed after inspecting its result.
+- The verification ceiling is eight concurrent Lisp images, including nested
+  test servers and compiler images. Use private RAM-backed caches and data roots.
+  Count active children before adding jobs and check RAM capacity. Keep batches
+  with shared live state serialized. A frozen run retains its recorded schedule
+  and process limit.
 - Run longer qualification batches in tracked background Lisp processes pinned
   to an immutable source tree with owned logs and private caches. Overlap them
   with reviews and independent work. Share a cache among sequential children
