@@ -207,7 +207,8 @@
                                                    :direction :output)
                              (write-string "not a directory" output)))
                     (:fifo (sb-posix:mkfifo (string-right-trim "/" (namestring path)) #o600))
-                    (:public (sb-posix:mkdir (namestring path) #o755))
+                    (:public (sb-posix:mkdir (namestring path) #o755)
+                     (sb-posix:chmod (namestring path) #o755))
                     (:special-mode (sb-posix:mkdir (namestring path) #o700)
                      (sb-posix:chmod (namestring path) #o2700)))
                   (ok (intake-fails-p
