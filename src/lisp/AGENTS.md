@@ -688,3 +688,22 @@ this mode.
   worker, restore its ASDF registrations and private cache, and reload saved source
   before testing again. A fresh external process also needs dependency discovery:
   the worker's `cl-spec` registration does not configure a shell test runner.
+
+### Test execution timing and milestone reports
+
+- Record each verification attempt in the append-only timing ledger at
+  `/home/imbaczek/proj/pg-ha-artifacts/test-timings.jsonl`, including failures
+  and retries. Preserve the command, source revision, suite scope, result, raw
+  log path and cache policy so measurements remain comparable.
+- Measure monotonic command wall time. Separate compilation/system loading from
+  actual test execution where instrumentation supports it. Mark unmeasured
+  phases explicitly. For overlapping jobs, report elapsed wall time separately
+  from summed job durations and record observed process concurrency.
+- At each milestone, summarize suite counts, pass/fail results, phase timings,
+  slow suites or cases, retries and overlap. Compare equivalent workloads and
+  cache conditions before claiming a speedup.
+- Assess opportunities to reduce repeated compilation and setup, reuse an owned
+  cache sequentially, and run independent suites in the background. Background
+  jobs need tracked handles, isolated mutable state and logs, bounded process
+  concurrency, and terminal results checked before the milestone is complete.
+  Preserve required coverage and timing-sensitive assertions.
