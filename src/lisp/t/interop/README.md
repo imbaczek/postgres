@@ -170,6 +170,25 @@ files and nested directory identities survive in quarantine along with the exact
 auxiliary guard, and that the standby can cold restart, restart with the source
 offline and reconnect. It also checks a table created only on the child timeline.
 
+Run the Patroni bootstrap cancellation oracle from `src/lisp` with the same
+pinned Patroni 4.1.5 environment and build dependencies. Choose a new output
+directory. The test uses an initially empty disposable destination.
+
+```sh
+PATRONI_PYTHON=/path/to/pinned-venv/bin/python3
+PG_CONFIG=/path/to/c/bin/pg_config "$PATRONI_PYTHON" t/interop/patroni-bootstrap-cancel.py --output /tmp/new-patroni-bootstrap-cancel-oracle
+```
+
+The test pauses the actual `Bootstrap.clone` before streaming through a source
+control hook, then calls Patroni's `cancellable.cancel` and checks wrapper exit
+130. It checks that the destination remains unpublished and empty, the client
+and source staging are cleaned up, and observed descendants are gone. Fresh
+Patroni objects then check clone failure with the source offline and successful
+clone and follow with it online. The test verifies replay of SQL commits, standby
+write rejection with SQLSTATE `25006`, and a cold restart. It runs Patroni's
+PostgreSQL control layer directly. The output directory retains logs, process
+results and phase elapsed timings in `result.json`.
+
 From `src/lisp`, compare `cluster_name` configuration and byte normalization
 against a C executable using Python 3, SBCL and an existing C installation:
 
