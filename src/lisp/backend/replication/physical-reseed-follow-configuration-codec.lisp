@@ -65,12 +65,7 @@
       (physical-reseed-install-register device inode device identities))
     identities))
 
-;; Validate and copy a configuration group bound to the proved generation.
-;; Building has image specifications but no staged identities; later phases carry
-;; directory and entry facts.  This representation is not a disk proof.
-(defun physical-reseed-follow-configuration-copy (value core)
-  (physical-reseed-install-check-literal (list value core))
-  (setf core (physical-reseed-follow-core-copy core))
+(defun %physical-reseed-follow-configuration-copy (value core)
   (physical-follow-check-plist value
                                '(:phase :generation :anchor-digest :time :workspace :directories :images :entries :step))
   (let* ((generation (car (last (getf core :generations))))
@@ -106,6 +101,13 @@
       (list :phase phase :generation (getf value :generation) :anchor-digest (getf value :anchor-digest)
             :time (getf value :time) :workspace workspace :directories directories
             :images images :entries entries :step step))))
+
+;; Validate and copy a configuration group bound to the proved generation.
+;; Building has image specifications but no staged identities; later phases carry
+;; directory and entry facts.  This representation is not a disk proof.
+(defun physical-reseed-follow-configuration-copy (value core)
+  (physical-reseed-install-check-literal (list value core))
+  (%physical-reseed-follow-configuration-copy value (physical-reseed-follow-core-copy core)))
 
 ;; Check configuration progress against the immutable core and saved image facts.
 ;; The driver publishes installation progress through inert.  Activation is

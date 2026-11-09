@@ -269,3 +269,75 @@
       (ok (handler-case
               (progn (pg::physical-reseed-follow-retirement-copy (first groups) active) nil)
             (error () t)))))
+
+(cl-spec:defproperty reseed-follow-copy-preserves-mutable-predecessor-snapshots
+    ((selected boolean) (position (range integer 0 3))
+                        (time (range integer -9223372036854775808 9223372036854775807)))
+  (:about pg::physical-reseed-follow-copy)
+  (:trials (:normal 80))
+  (multiple-value-bind (record groups) (reseed-follow-retirement-codec-fixture selected)
+    (let ((journal (reseed-follow-with-retirement record (nth position groups))))
+      (setf (getf (getf journal :configuration) :time) time)
+      (let* ((before (pg::physical-adoption-attempt-value-copy journal))
+             (first-copy (pg::physical-reseed-follow-copy journal))
+             (second-copy (pg::physical-reseed-follow-copy journal)))
+        (and (equal before first-copy)
+             (equal before second-copy)
+             (progn
+               (setf (char (getf (getf (getf first-copy :configuration) :workspace) :directory) 0) #\X)
+               (and (equal before journal) (equal before second-copy))))))))
+
+(deftest generated-reseed-follow-copy-predecessor-snapshots
+    (let ((data (cl-spec:result-data
+                 (cl-spec:run-property 'reseed-follow-copy-preserves-mutable-predecessor-snapshots
+                                       :seed 232 :profile :normal))))
+      (ok (eq :passed (getf data :status)))))
+
+(deftest reseed-follow-copy-bounds-retirement-prefix-validation
+    (dolist (selected '(nil t))
+      (multiple-value-bind (record groups) (reseed-follow-retirement-codec-fixture selected)
+        (dolist (group groups)
+          (let* ((journal (reseed-follow-with-retirement record group))
+                 (original (symbol-function 'pg::physical-reseed-follow-core-copy))
+                 (calls 0)
+                 (copy nil))
+            (unwind-protect
+                 (progn
+                   (setf (symbol-function 'pg::physical-reseed-follow-core-copy)
+                         (lambda (value) (incf calls) (funcall original value)))
+                   (setf copy (pg::physical-reseed-follow-copy journal)))
+              (setf (symbol-function 'pg::physical-reseed-follow-core-copy) original))
+            (ok (equal journal copy))
+            (ok (and (plusp calls) (<= calls 2))
+                (format nil "canonical predecessor core copied ~d times" calls)))))))
+
+(deftest reseed-follow-public-group-copiers-keep-predecessor-validation
+    (multiple-value-bind (record groups) (reseed-follow-retirement-codec-fixture nil)
+      (let ((journal (reseed-follow-with-retirement record (car (last groups)))))
+        (flet ((rejected (function group predecessor)
+                 (handler-case (progn (funcall function group predecessor) nil)
+                   (error () t))))
+          (dolist (entry '((:configuration . pg::physical-reseed-follow-configuration-copy)
+                           (:settlement . pg::physical-reseed-follow-settlement-copy)
+                           (:activation . pg::physical-reseed-follow-activation-copy)
+                           (:retirement . pg::physical-reseed-follow-retirement-copy)))
+            (let* ((key (car entry))
+                   (function (symbol-function (cdr entry)))
+                   (group (getf journal key))
+                   (predecessor (if (eq key :configuration)
+                                    (pg::physical-reseed-follow-core-projection journal)
+                                    journal))
+                   (changed (copy-list predecessor))
+                   (missing (copy-list predecessor))
+                   (cycle (copy-list predecessor)))
+              (setf (getf changed :version) 2
+                    (cdr (last cycle)) cycle)
+              (remf missing (ecase key
+                              (:configuration :attempt) (:settlement :configuration)
+                              (:activation :settlement) (:retirement :activation)))
+              (ok (rejected function group changed))
+              (ok (rejected function group missing))
+              (ok (rejected function group cycle))
+              (ok (rejected function (append group (list :unknown t)) predecessor))
+              (ok (handler-case (progn (pg::physical-reseed-follow-copy missing) nil)
+                    (error () t)))))))))

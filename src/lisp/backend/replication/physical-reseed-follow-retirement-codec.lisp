@@ -35,15 +35,9 @@
     (physical-reseed-install-register device (second identity) device identities)
     (list :identity (copy-list identity) :digest (getf value :digest))))
 
-(defun physical-reseed-follow-retirement-copy (value record)
-  ;; Retirement records the attempt-file identity and digest, with an archive
-  ;; prefix in steps 0 to 2.  It requires active step 2; retired is step 2.
-  ;; Retired permits final follow-fence removal; it does not say the fence
-  ;; is already absent.
-  (physical-reseed-install-check-literal (list value record))
+(defun %physical-reseed-follow-retirement-copy (value record)
   (physical-follow-check-plist value '(:phase :step :attempt-file))
-  (let* ((record (physical-reseed-follow-retirement-predecessor record))
-         (activation (getf record :activation))
+  (let* ((activation (getf record :activation))
          (phase (getf value :phase)) (step (getf value :step)))
     (unless (and (eq :active (getf activation :phase)) (= 2 (getf activation :step))
                  (typep step '(integer 0 2))
@@ -52,6 +46,15 @@
     (list :phase phase :step step
           :attempt-file (physical-reseed-follow-retirement-attempt-file-copy
                          (getf value :attempt-file) record))))
+
+(defun physical-reseed-follow-retirement-copy (value record)
+  ;; Retirement records the attempt-file identity and digest, with an archive
+  ;; prefix in steps 0 to 2.  It requires active step 2; retired is step 2.
+  ;; Retired permits final follow-fence removal; it does not say the fence
+  ;; is already absent.
+  (physical-reseed-install-check-literal (list value record))
+  (physical-follow-check-plist value '(:phase :step :attempt-file))
+  (%physical-reseed-follow-retirement-copy value (physical-reseed-follow-retirement-predecessor record)))
 
 (defun physical-reseed-follow-retirement-check-transition (before after)
   ;; Freeze activation and the attempt-file reference while advancing one

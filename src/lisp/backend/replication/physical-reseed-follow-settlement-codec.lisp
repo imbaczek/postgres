@@ -26,16 +26,10 @@
           :base (getf control :applied)
           :manifest-digest (getf base :manifest-digest))))
 
-;; Validate settlement against the inert configuration, proved successor, and
-;; exact closed outcome.  The receipt request is the client's binding to the
-;; submitted request; it is not a full-request echo from the wire.
-(defun physical-reseed-follow-settlement-copy (value record)
-  (physical-reseed-install-check-literal (list value record))
+(defun %physical-reseed-follow-settlement-copy (value record)
   (physical-follow-check-plist value '(:phase :successor :receipt))
-  (let* ((core (physical-reseed-follow-core-copy
-                (physical-reseed-follow-core-projection record)))
-         (configuration (physical-reseed-follow-configuration-copy
-                         (getf record :configuration) core))
+  (let* ((core (physical-reseed-follow-core-projection record))
+         (configuration (getf record :configuration))
          (phase (getf value :phase))
          (successor (physical-reseed-follow-settlement-successor core))
          (submitted (physical-backup-lease-successor-copy
@@ -58,6 +52,18 @@
                               (null (getf receipt :successor)))))
           (error "settlement lacks the exact closed source outcome")))
     (list :phase phase :successor successor :receipt receipt)))
+
+;; Validate settlement against the inert configuration, proved successor, and
+;; exact closed outcome.  The receipt request is the client's binding to the
+;; submitted request; it is not a full-request echo from the wire.
+(defun physical-reseed-follow-settlement-copy (value record)
+  (physical-reseed-install-check-literal (list value record))
+  (physical-follow-check-plist value '(:phase :successor :receipt))
+  (let* ((core (physical-reseed-follow-core-copy
+                (physical-reseed-follow-core-projection record)))
+         (configuration (physical-reseed-follow-configuration-copy
+                         (getf record :configuration) core)))
+    (%physical-reseed-follow-settlement-copy value (append core (list :configuration configuration)))))
 
 ;; Freeze the installed predecessors while settlement advances through pending
 ;; to one terminal outcome.  A terminal outcome cannot be changed.

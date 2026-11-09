@@ -30,16 +30,10 @@
       (error "activation entry differs from its private active image"))
     entry))
 
-(defun physical-reseed-follow-activation-copy (value record)
-  ;; The image is (byte-count digest); entry describes the private active
-  ;; file.  Building has no entry, staged has one, and activating advances
-  ;; through steps 0 to 2 before active at step 2.
-  ;; These are structural checks, not evidence that a file was published.
-  (physical-reseed-install-check-literal (list value record))
+(defun %physical-reseed-follow-activation-copy (value record)
   (physical-follow-check-plist value '(:phase :step :image :entry))
-  (let* ((record (physical-reseed-follow-activation-predecessor record))
-         (phase (getf value :phase)) (step (getf value :step))
-         (image (getf value :image)) (entry (getf value :entry)))
+  (let* ((phase (getf value :phase)) (step (getf value :step))
+                                     (image (getf value :image)) (entry (getf value :entry)))
     (unless (and (eq :inert (getf (getf record :configuration) :phase))
                  (eq :handed-off (getf (getf record :settlement) :phase))
                  (listp image) (= 2 (length image))
@@ -55,6 +49,15 @@
       (error "activation differs from its settled inert predecessor or image phase"))
     (list :phase phase :step step :image (copy-list image)
           :entry (when entry (physical-reseed-follow-activation-entry-copy entry record image)))))
+
+(defun physical-reseed-follow-activation-copy (value record)
+  ;; The image is (byte-count digest); entry describes the private active
+  ;; file.  Building has no entry, staged has one, and activating advances
+  ;; through steps 0 to 2 before active at step 2.
+  ;; These are structural checks, not evidence that a file was published.
+  (physical-reseed-install-check-literal (list value record))
+  (physical-follow-check-plist value '(:phase :step :image :entry))
+  (%physical-reseed-follow-activation-copy value (physical-reseed-follow-activation-predecessor record)))
 
 (defun physical-reseed-follow-activation-check-transition (before after)
   ;; Freeze the predecessor and image, then freeze the entry once staged.

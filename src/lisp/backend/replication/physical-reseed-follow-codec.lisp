@@ -131,20 +131,26 @@
     (let ((core (physical-reseed-follow-core-copy (physical-reseed-follow-core-projection record))))
       (when configuration-p
         (setf core (append core (list :configuration
-                                      (physical-reseed-follow-configuration-copy
+                                      (%physical-reseed-follow-configuration-copy
                                        (getf record :configuration) core)))))
       (when settlement-p
         (setf core (append core (list :settlement
-                                      (physical-reseed-follow-settlement-copy
-                                       (getf record :settlement) core)))))
+                                      (funcall (if configuration-p
+                                                   #'%physical-reseed-follow-settlement-copy
+                                                   #'physical-reseed-follow-settlement-copy)
+                                               (getf record :settlement) core)))))
       (when activation-p
         (setf core (append core (list :activation
-                                      (physical-reseed-follow-activation-copy
-                                       (getf record :activation) core)))))
+                                      (funcall (if (and configuration-p settlement-p)
+                                                   #'%physical-reseed-follow-activation-copy
+                                                   #'physical-reseed-follow-activation-copy)
+                                               (getf record :activation) core)))))
       (when retirement-p
         (setf core (append core (list :retirement
-                                      (physical-reseed-follow-retirement-copy
-                                       (getf record :retirement) core)))))
+                                      (funcall (if (and configuration-p settlement-p activation-p)
+                                                   #'%physical-reseed-follow-retirement-copy
+                                                   #'physical-reseed-follow-retirement-copy)
+                                               (getf record :retirement) core)))))
       (when cancellation-p
         (setf core (append core (list :cancellation
                                       (physical-reseed-follow-cancellation-copy
