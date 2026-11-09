@@ -477,13 +477,21 @@
                              :phase :preparing :anchor nil))))
          (physical-reseed-follow-publish-intent owner record :previous initial))))))
 
-(defun native-cancellation-install-initial (target stage incoming quarantine request profile helper)
-  (call-with-physical-reseed-owner
-   target
-   (lambda (owner)
-     (physical-reseed-start-remote owner stage request profile :helper helper)
-     (physical-reseed-prepare-image owner incoming :helper helper)
-     (physical-reseed-publish-install owner incoming quarantine :helper helper)))
+(defun native-cancellation-install-initial
+    (target stage incoming quarantine request profile helper &optional old-directory)
+  (flet ((prepare (owner)
+           (physical-reseed-prepare-image owner incoming :helper helper)
+           (physical-reseed-publish-install owner incoming quarantine :helper helper)))
+    (if old-directory
+        (progn
+          (physical-reseed-start-configured-replacement-remote
+           old-directory target stage request profile :helper helper)
+          (call-with-physical-reseed-owner target #'prepare))
+        (call-with-physical-reseed-owner
+         target
+         (lambda (owner)
+           (physical-reseed-start-remote owner stage request profile :helper helper)
+           (prepare owner)))))
   (let ((plan (getf (physical-reseed-install-initial-arguments target) :plan)))
     (call-with-physical-reseed-install-owner
      target
@@ -499,7 +507,7 @@
 
 (defvar *native-cancellation-install-worker* nil)
 
-(defun native-cancellation-start-initial-install (target stage incoming quarantine index port helper go done &optional follow-name)
+(defun native-cancellation-start-initial-install (target stage incoming quarantine index port helper go done &optional follow-name old-directory)
   (assert (null *native-cancellation-install-worker*))
   (sb-sys:without-interrupts
     (setf *native-cancellation-install-worker*
@@ -518,7 +526,7 @@
                             (make-physical-libpq-profile
                              (format nil "host=127.0.0.1 port=~d user=postgres dbname=postgres" port)
                              :mode :physical :fallback "native-target-follow")
-                            helper)
+                            helper old-directory)
                            (when follow-name (native-cancellation-publish-selection target follow-name))
                            "PASS")
                        (error (condition) (format nil "ERROR ~a" condition)))))

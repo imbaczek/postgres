@@ -176,20 +176,25 @@ class Acceptance:
         (target / ".pg_lisp.lock").touch(mode=0o600)
         (target / "opaque-old-data").write_bytes(b"original data\x00\xff")
 
-    def install(self, index, label, selected):
+    def install(self, index, label, selected, *, replacement=None):
         paths = [self.server.root / (label + "-" + suffix)
                  for suffix in ("target", "stage", "incoming", "quarantine")]
         for path in paths[1:]:
             path.mkdir(mode=0o700)
         target = paths[0]
-        self.initialize_target(target)
+        if replacement is None:
+            self.initialize_target(target)
+        else:
+            target.mkdir(mode=0o700)
+            (target / ".pg_lisp.lock").touch(mode=0o600)
         go = self.server.root / (label + "-go")
         done = self.server.root / (label + "-done")
         arguments = " ".join("#P" + lisp_string(str(path) + "/") for path in paths)
         follow = lisp_string("native_target_follow_" + str(index)) if selected else "nil"
+        old_directory = " #P" + lisp_string(str(replacement) + "/") if replacement is not None else ""
         self.control("(progn (pg::native-cancellation-start-initial-install " + arguments +
                      f" {index} {self.server.port} " + lisp_string(self.helper) +
-                     " #P" + lisp_string(go) + " #P" + lisp_string(done) + " " + follow + ") (values))")
+                       " #P" + lisp_string(go) + " #P" + lisp_string(done) + " " + follow + old_directory + ") (values))")
         go.touch()
         deadline = time.monotonic() + 180
         while time.monotonic() < deadline:
@@ -203,7 +208,8 @@ class Acceptance:
         fixed = [target / name for name in
                  ("physical-reseed.attempt", "physical-reseed.install", "physical-recovery.control",
                   "global/pg_wal_control", "global/pg_control", ".pg_lisp.lock")]
-        fixed.append(paths[3] / "opaque-old-data")
+        if replacement is None:
+            fixed.append(paths[3] / "opaque-old-data")
         return target, fixed, [facts(path) for path in fixed]
 
     def audit(self, index, aborted=False, selected_present=False):
