@@ -11,6 +11,40 @@
   (or (sb-posix:getenv (concatenate 'string "NATIVE_CANCELLATION_" name))
       default (error "missing native cancellation test setting ~a" name)))
 
+(defun call-with-native-cancellation-owner (target action function)
+  (if (and (equal "yes" (native-cancellation-env "CONFIGURED" "no"))
+           (not (member action '("prove" "configure" "settle") :test #'equal)))
+      (call-with-physical-reseed-follow-cancellation-owner target function)
+      (call-with-physical-reseed-follow-configuration-owner target function)))
+
+(defvar *native-cancellation-source-events* nil)
+
+(defvar *native-cancellation-source-originals* nil)
+
+(defvar *native-cancellation-source-events-lock* (sb-thread:make-mutex :name "native cancellation source events"))
+
+(defun native-cancellation-reset-source-events ()
+  (unless *native-cancellation-source-originals*
+    (setf *native-cancellation-source-originals*
+          (loop for symbol in '(physical-backup-lease-status physical-backup-lease-abort
+                                physical-backup-lease-cleanup-selected physical-source-follow-release)
+                for event in '(:status :abort :cleanup :release)
+                collect (let ((original (symbol-function symbol)) (event event))
+                          (setf (symbol-function symbol)
+                                (lambda (&rest arguments)
+                                  (multiple-value-prog1 (apply original arguments)
+                                    (sb-thread:with-mutex (*native-cancellation-source-events-lock*)
+                                      (push event *native-cancellation-source-events*)))))
+                          (cons symbol original)))))
+  (sb-thread:with-mutex (*native-cancellation-source-events-lock*)
+    (setf *native-cancellation-source-events* nil))
+  (values))
+
+(defun native-cancellation-check-source-events (expected)
+  (sb-thread:with-mutex (*native-cancellation-source-events-lock*)
+    (assert (equal expected (reverse *native-cancellation-source-events*))))
+  (values))
+
 (defun call-with-native-cancellation-client (record function)
   (let* ((source (physical-follow-source-copy (getf (getf record :attempt) :source)))
          (request (physical-backup-lease-request-copy (getf (getf record :attempt) :request)))
@@ -159,8 +193,8 @@
                                     (finish-output)
                                     (sb-posix:kill (sb-posix:getpid) 9))))))
     (unless (or cut (equal cut-name "none")) (error "unknown native cancellation cut"))
-    (call-with-physical-reseed-follow-configuration-owner
-     target
+    (call-with-native-cancellation-owner
+     target action
      (lambda (owner)
        (let ((record
                (cond
@@ -173,6 +207,16 @@
                     (assert (physical-reseed-follow-generation-anchor (first generations)))
                     (assert (equal record (physical-reseed-follow-read owner)))
                     record))
+                 ((equal action "configure")
+                  (physical-reseed-follow-begin-configuration
+                   owner (uiop:ensure-directory-pathname (native-cancellation-env "WORKSPACE")) 12345)
+                  (let ((record (physical-reseed-follow-stage-configuration owner)))
+                    (loop repeat 8 until (eq :inert (getf (getf record :configuration) :phase))
+                          do (setf record (physical-reseed-follow-advance-configuration owner)))
+                    (assert (eq :inert (getf (getf record :configuration) :phase)))
+                    record))
+                 ((equal action "settle")
+                  (physical-reseed-follow-settle owner :helper (native-cancellation-env "HELPER")))
                  ((equal action "handoff-allocated") (native-cancellation-handoff owner nil))
                  ((equal action "handoff-legacy") (native-cancellation-handoff owner t))
                  ((equal action "reuse-refused") (native-cancellation-reuse-refused owner))
@@ -205,11 +249,19 @@
                     (assert (eq :complete outcome))
                     result))
                  (t (error "unknown native cancellation action")))))
+         (when (equal "yes" (native-cancellation-env "CONFIGURED" "no"))
+           (assert (eq :inert (getf (getf record :configuration) :phase)))
+           (assert (= 1 (length (getf record :generations))))
+           (let ((generation (first (getf record :generations))))
+             (assert (eq :proved (getf generation :phase)))
+             (assert (physical-reseed-follow-generation-anchor generation))))
          (let ((phase (getf (getf record :cancellation) :phase)))
            (assert (equal (native-cancellation-env "PHASE" "none")
                           (if phase (string-downcase (symbol-name phase)) "none"))))
          (assert (not (physical-reseed-follow-owner-busy-p owner)))
          (assert (not (physical-reseed-follow-owner-uncertain-p owner))))))
+    (sb-thread:with-mutex (*physical-libpq-channels-lock*)
+      (assert (zerop (hash-table-count *physical-libpq-channels*))))
     (when cut (error "native cancellation cut was not reached"))
     (format t "~%NATIVE-CANCELLATION-CHECKED ~d ~a~%" (sb-posix:getpid) action)
     (finish-output)

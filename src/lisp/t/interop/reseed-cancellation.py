@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -53,6 +54,7 @@ class Acceptance:
 
     def process(self, kind, arguments, *, env=None, text_input=None, timeout=240, expected=0):
         log = self.output / f"{len(self.result['processes'])}-{kind}.log"
+        started = time.monotonic()
         with log.open("xb") as stream:
             process = subprocess.Popen(arguments, cwd=LISP, env=env, stdout=stream,
                                        stderr=subprocess.STDOUT,
@@ -65,7 +67,8 @@ class Acceptance:
                     process.wait(timeout=10)
                 self.result["processes"].append(
                     {"kind": kind, "pid": process.pid, "exit": process.returncode,
-                     "expected_exit": expected, "log": str(log)})
+                       "expected_exit": expected, "log": str(log),
+                       "elapsed_seconds": time.monotonic() - started})
         assert process.returncode == expected, (kind, process.returncode, str(log))
         output = log.read_bytes()
         assert b"\0" not in output, str(log)
@@ -83,6 +86,8 @@ class Acceptance:
     def start(self):
         self.server.start()
         self.control("(progn (load #P" + lisp_string(DRIVER) + ") (values))")
+        self.control("(progn (load #P" + lisp_string(DRIVER.with_name("reseed-settlement-native.lisp")) +
+                     ") (values))")
 
     def stop(self):
         process = self.server.process
@@ -92,7 +97,8 @@ class Acceptance:
                 {"kind": "source", "pid": process.pid, "exit": process.returncode, "expected_exit": 0})
 
     def run(self, action, target, phase="none", connections=None, outcome="complete", *,
-            cut=None, lose_reply=None, kill_effect=False, refusal_cause=None):
+            cut=None, lose_reply=None, kill_effect=False, refusal_cause=None,
+            configured=False, workspace=None):
         killed = cut is not None or kill_effect
         assert not (killed and connections is not None)
         env = {key: value for key, value in os.environ.items()
@@ -102,6 +108,10 @@ class Acceptance:
                     "NATIVE_CANCELLATION_PHASE": phase,
                     "NATIVE_CANCELLATION_OUTCOME": outcome,
                     "NATIVE_CANCELLATION_HELPER": self.helper})
+        if configured:
+            env["NATIVE_CANCELLATION_CONFIGURED"] = "yes"
+        if workspace is not None:
+            env["NATIVE_CANCELLATION_WORKSPACE"] = str(workspace)
         if connections is not None:
             env["NATIVE_CANCELLATION_EXPECT_CONNECTIONS"] = str(connections)
         if cut is not None:
@@ -141,7 +151,7 @@ class Acceptance:
             assert f"NATIVE-CANCELLATION-REUSE-REFUSED {pid}".encode() in output
         if connections is not None:
             assert f"NATIVE-CANCELLATION-CONNECTIONS {pid} {connections}".encode() in output
-        if phase == "cleaned" and not killed:
+        if not killed and (phase == "cleaned" or action == "cleanup"):
             assert not os.path.lexists(target / "physical-reseed.follow.tmp")
 
     def install(self, index, label, selected):
@@ -207,6 +217,89 @@ class Acceptance:
             assert [facts(path) for path in fixed] == before
             self.audit(index)
             self.result["checks"].append(label)
+
+    def configured_inventory(self, roots, target):
+        inventory = {}
+        for root in roots:
+            for path in [root, *sorted(root.rglob("*"))]:
+                if path.parent == target and path.name in (
+                        "physical-reseed.follow", "physical-reseed.follow.tmp"):
+                    continue
+                metadata = path.lstat()
+                if stat.S_ISDIR(metadata.st_mode):
+                    inventory[str(path)] = (metadata.st_dev, metadata.st_ino,
+                                            metadata.st_mode, metadata.st_uid, metadata.st_gid)
+                else:
+                    assert stat.S_ISREG(metadata.st_mode), str(path)
+                    inventory[str(path)] = facts(path)
+        return inventory
+
+    def configured_startup_fence(self, target, roots, before, phase):
+        assert self.configured_inventory(roots, target) == before
+        journal = facts(target / "physical-reseed.follow")
+        temporary = target / "physical-reseed.follow.tmp"
+        assert not os.path.lexists(temporary)
+        pid, output = self.process(
+            "configured-startup", [str(LISP / "pg-lisp.sh"), "-D", str(target),
+                                   "-p", str(self.server.port)], expected=1)
+        assert b"pg-lisp: fatal: retirement requires completed activation" in output
+        assert not os.path.lexists(target / "postmaster.pid")
+        assert not os.path.lexists(temporary)
+        assert facts(target / "physical-reseed.follow") == journal
+        after = self.configured_inventory(roots, target)
+        lock = str(target / ".pg_lisp.lock")
+        previous, current = before[lock], after[lock]
+        assert previous[:8] == current[:8] and previous[9:] == current[9:]
+        expected = dict(before)
+        expected[lock] = current
+        assert after == expected
+        self.result.setdefault("startup_fences", []).append(
+            {"pid": pid, "target": str(target), "phase": phase,
+             "lock_ctime_before_ns": previous[8], "lock_ctime_after_ns": current[8]})
+        return after
+
+    def configured(self):
+        for index, settled in enumerate((True, False), 6801):
+            started = time.monotonic()
+            label = "configured-" + ("selected" if settled else "generation-debt")
+            target, _, _ = self.install(index, label, selected=True)
+            self.run("prove", target)
+            workspace = self.server.root / (label + "-workspace")
+            workspace.mkdir(mode=0o700)
+            self.run("configure", target, configured=True, workspace=workspace, connections=0)
+            if settled:
+                self.run("settle", target, configured=True)
+                self.control("(progn (pg::native-settlement-test-source-audit " +
+                             lisp_string("reseed_" + format(index, "032x")) + " " +
+                             lisp_string("native_target_follow_" + str(index)) +
+                             ' "handed-off") (values))')
+            roots = [self.server.root / (label + "-" + suffix)
+                     for suffix in ("target", "stage", "incoming", "quarantine", "workspace")]
+            assert any(path.is_file() for path in (target / "base").rglob("*"))
+            before = self.configured_inventory(roots, target)
+            before = self.configured_startup_fence(target, roots, before, "inert")
+            self.control("(progn (pg::native-cancellation-reset-source-events) (values))")
+            self.run("begin", target, "pending", configured=True, connections=0)
+            before = self.configured_startup_fence(target, roots, before, "pending")
+            phase, outcome = ("cleaned", "complete") if settled else ("source-closed", "deferred")
+            self.run("cleanup", target, phase, configured=True,
+                     connections=2 if settled else 1, outcome=outcome)
+            events = "(:status :cleanup :cleanup :release)" if settled else "(:status :abort)"
+            self.control("(progn (pg::native-cancellation-check-source-events '" + events + ") (values))")
+            self.audit(index, aborted=not settled)
+            before = self.configured_startup_fence(target, roots, before, phase)
+            saved = facts(target / "physical-reseed.follow")
+            self.stop()
+            self.run("cleanup", target, phase, configured=True, connections=0, outcome=outcome)
+            assert facts(target / "physical-reseed.follow") == saved
+            self.start()
+            self.run("cleanup", target, phase, configured=True, connections=0, outcome=outcome)
+            assert facts(target / "physical-reseed.follow") == saved
+            assert self.configured_inventory(roots, target) == before
+            self.audit(index, aborted=not settled)
+            self.result["checks"].append(label)
+            self.result.setdefault("timings", []).append(
+                {"case": label, "elapsed_seconds": time.monotonic() - started, "outcome": "pass"})
 
     def abort(self):
         for index, zero in enumerate((True, False), 6101):
@@ -380,6 +473,7 @@ class Acceptance:
             self.result["checks"].append(label)
 
     def execute(self, suites):
+        started = time.monotonic()
         try:
             _, output = self.process("resolve-helper", [str(LISP / "bin/pg-libpq-helper-path")], timeout=70)
             self.helper = output.decode().splitlines()[-1]
@@ -394,10 +488,18 @@ class Acceptance:
             groups = {"selected": self.selected, "abort": self.abort, "crash": self.crash,
                       "lost": self.effects, "early": lambda: self.effects(kill=True),
                       "reuse": self.reuse, "offline": self.access,
-                      "auth": lambda: self.access(authentication=True)}
+                        "auth": lambda: self.access(authentication=True), "configured": self.configured}
             for name, function in groups.items():
                 if "all" in suites or name in suites:
-                    function()
+                    suite_started = time.monotonic()
+                    complete = False
+                    try:
+                        function()
+                        complete = True
+                    finally:
+                        self.result.setdefault("timings", []).append(
+                            {"suite": name, "elapsed_seconds": time.monotonic() - suite_started,
+                             "outcome": "pass" if complete else "fail"})
             connection = wire.Connection(self.server.port)
             try:
                 assert connection.query("SELECT id FROM native_cancellation_items ORDER BY id") == [["17"], ["29"]]
@@ -407,6 +509,7 @@ class Acceptance:
             self.result["complete"] = True
         finally:
             self.stop()
+            self.result["elapsed_seconds"] = time.monotonic() - started
             processes = self.result["processes"]
             self.result["all_recorded_pids_absent"] = all(
                 not Path("/proc", str(item["pid"])).exists() for item in processes)
@@ -420,7 +523,7 @@ class Acceptance:
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--suite", nargs="+", default=["all"],
-                        choices=("all", "selected", "abort", "crash", "lost", "early", "reuse", "offline", "auth"))
+                          choices=("all", "selected", "abort", "crash", "lost", "early", "reuse", "offline", "auth", "configured"))
     parser.add_argument("--output", type=Path, help="new directory for retained logs and process evidence")
     arguments = parser.parse_args()
     Acceptance(arguments.output).execute(arguments.suite)
