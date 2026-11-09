@@ -468,6 +468,26 @@ Remove the trace and its temporary helper after the demo:
 
 ## Milestone verification timing
 
+- Run test data, temporary files, compiler caches, and live logs on the private
+  RAM workspace to avoid SSD wear. From the repository root, provision it with
+  `src/lisp/t/test-ramdisk.sh setup 4G`. This mounts a bounded Linux tmpfs at
+  `/dev/shm/pg-lisp-tests-$(id -u)` with `noswap`, private permissions, and
+  executable files for compiled test helpers. Setup uses noninteractive sudo.
+  It fails if the kernel or privileges cannot provide the requested mount.
+- Launch jobs with `src/lisp/t/test-ramdisk.sh run COMMAND ARG...`. Each job gets
+  private `TMPDIR`, `XDG_CACHE_HOME`, `PG_LISP_TEST_RUN_DIR`, and
+  `PG_LISP_TEST_LOG_DIR` directories. Direct raw logs and timing artifacts to the
+  log directory. The inherited usage lease prevents teardown during active jobs.
+  Launch live Lisp images through this wrapper too. When moving an existing
+  image, refresh `uiop:*temporary-directory*` and ASDF output translations after
+  changing its environment, and hold a usage lease for its lifetime.
+- Archive required logs once after verification. Run
+  `src/lisp/t/test-ramdisk.sh teardown /absolute/artifact/directory` to copy job
+  logs and unmount. Caches and data are discarded. Teardown without an archive
+  directory discards logs too. Stop all owned jobs first. Keep source checkouts
+  and reference libraries outside the mount. RAM-backed crash tests retain their
+  fsync and fault assertions and provide process-crash and I/O-order evidence.
+
 - Record monotonic elapsed time for production compilation/loading, test-system
   loading, test execution, and each selected test or batch. Keep total elapsed
   time and setup costs alongside the phase timings.
