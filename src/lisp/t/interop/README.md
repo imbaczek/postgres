@@ -137,6 +137,23 @@ which flushes contiguous WAL payload before acknowledging its flush position,
 with apply set to zero. The suite Python must provide Linux `os.pidfd_open` and
 `psutil.Process.net_connections`; psutil 7.1.3 is suitable.
 
+Run the journaled reseed oracle from `src/lisp` with the pinned Patroni 4.1.5
+Python environment, SBCL and native libpq helper build dependencies. Choose a new
+output directory.
+
+```sh
+PATRONI_PYTHON=/path/to/pinned-venv/bin/python3
+PG_CONFIG=/path/to/c/bin/pg_config "$PATRONI_PYTHON" t/interop/patroni-reseed.py --output /tmp/new-patroni-reseed-oracle
+```
+
+The test performs native reseed, activation and retirement. A fresh native child
+consumes the retirement receipt and prepares ordinary configuration under PGDATA
+ownership before Patroni's constructor and `Postgresql.follow` run. It checks
+streaming, standby write rejection, cold restart, source-offline restart and
+reconnect. The harness creates the source physical slot through SQL and runs
+Patroni's PostgreSQL control layer directly. A measured full run took about 12
+minutes. The output directory retains logs, process results and inventories.
+
 From `src/lisp`, compare `cluster_name` configuration and byte normalization
 against a C executable using Python 3, SBCL and an existing C installation:
 

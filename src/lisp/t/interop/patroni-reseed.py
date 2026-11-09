@@ -103,6 +103,7 @@ class Acceptance(cancellation.Acceptance):
         label = "patroni-reseed"
         follow.query(self.server.port, "CREATE TABLE patroni_reseed_probe(id integer)")
         follow.query(self.server.port, "INSERT INTO patroni_reseed_probe VALUES(1)")
+        # Provide the slot normally managed by the Patroni HA loop.
         follow.query(self.server.port, "SELECT pg_create_physical_replication_slot('follow_one',true)")
         target, _, _ = self.install(7201, label, selected=True)
         self.run("prove", target)

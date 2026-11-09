@@ -48,6 +48,7 @@
   (let ((*pgdata* target))
     (unwind-protect
          (progn
+           ;; Consume the receipt before creating ordinary configuration under the data lock.
            (physical-reseed-follow-own-startup "127.0.0.1" port)
            (physical-reseed-follow-check-ordinary-startup)
            (let ((path (merge-pathnames "postgresql.conf" target)))
