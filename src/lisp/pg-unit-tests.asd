@@ -25,6 +25,7 @@
                (:file "t/rove/transaction-tests")
                (:file "t/rove/wal-tests")
                (:file "t/rove/wal-writer-tests")
+               (:file "t/rove/wal-writer-output-tests")
                (:file "t/rove/wal-pressure-tests")
                (:file "t/rove/wal-writer-lifecycle-tests")
                (:file "t/rove/backend-lifecycle-tests")
