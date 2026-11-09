@@ -88,6 +88,9 @@
              (remhash *backend* *wal-sender-streams*))
            (sb-thread:condition-broadcast *live-operation-cv*)))))))
 
+(defun wal-sender-logical-shutdown-complete-p (target scanned sent confirmed)
+  (and target (>= scanned target) (>= sent target) (>= confirmed target)))
+
 (defun wal-sender-stream-physical-ready (owner limit)
   ;; Publish the claimed physical owner and optional historic fork limit before
   ;; the shutdown plan can select this stream.
@@ -114,7 +117,7 @@
      (or *wal-sender-shutdown-plan*
          (let ((tokens
                  (loop for token being the hash-values of *wal-sender-streams*
-                       when (and (eq :physical (wal-sender-stream-token-kind token))
+                       when (and (member (wal-sender-stream-token-kind token) '(:physical :logical))
                                  (eq :ready (wal-sender-stream-token-state token))
                                  (wal-sender-stream-token-owner token))
                          collect token)))
@@ -140,41 +143,7 @@
            (sb-thread:condition-broadcast *live-operation-cv*))))))
   (values))
 
-(defun wal-sender-publish-shutdown-target (system-id timeline namespace endpoint)
-  ;; Under owned quiescence, check the stopped streams against the durable
-  ;; checkpoint identity and give each its endpoint, capped at its fork.
-  (call-with-wal-sender-state-lock
-   (lambda ()
-     (let ((plan *wal-sender-shutdown-plan*))
-       (unless (and plan (eq :stopping (wal-sender-shutdown-plan-stage plan))
-                    (not *live-operation-admission-open*)
-                    (not *live-operation-terminal-shutdown*))
-         (error "shutdown checkpoint target requires owned nonterminal quiescence"))
-       (unless (eq *live-operation-quiescence-owner-thread* sb-thread:*current-thread*)
-         (error "shutdown target publisher does not own quiescence"))
-       (unless (and (typep system-id '(unsigned-byte 64))
-                    (typep timeline '(integer 1 4294967295))
-                    (typep endpoint '(unsigned-byte 64))
-                    (every (lambda (token)
-                             (let ((owner (wal-sender-stream-token-owner token)))
-                               (and (or (wal-sender-stream-token-stopped-p token)
-                                        (eq :released (wal-sender-stream-token-state token)))
-                                    (= system-id (physical-sender-system-id owner))
-                                    (= timeline (physical-sender-timeline owner))
-                                    (eq namespace (physical-sender-namespace owner)))))
-                           (wal-sender-shutdown-plan-tokens plan)))
-         (error "shutdown endpoint differs from its stopped physical streams"))
-       (setf (wal-sender-shutdown-plan-endpoint plan) endpoint
-             (wal-sender-shutdown-plan-system-id plan) system-id
-             (wal-sender-shutdown-plan-timeline plan) timeline
-             (wal-sender-shutdown-plan-namespace plan) namespace)
-       (dolist (token (wal-sender-shutdown-plan-tokens plan))
-         (setf (wal-sender-stream-token-target token)
-               (min endpoint (or (wal-sender-stream-token-limit token) endpoint))))
-       (setf (wal-sender-shutdown-plan-stage plan) :draining
-             *live-operation-shutdown-drain-open* t)
-       (sb-thread:condition-broadcast *live-operation-cv*))))
-  (values))
+(declaim (ftype (function (t t t t) (values)) wal-sender-publish-shutdown-target))
 
 (defun wal-sender-shutdown-target ()
   ;; Only the current stream can obtain its frozen post-checkpoint target.

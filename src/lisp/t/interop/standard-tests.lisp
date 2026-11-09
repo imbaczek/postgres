@@ -540,3 +540,115 @@
                   (ok (= 44 (file-position input)))
                   (ok (= (char-code #\Q) (read-byte input))))
              (setf (symbol-function 'pg::standard-input-ready-p) original)))))))
+
+(deftest standard-shutdown-completion-uses-the-terminal-guard-and-one-frame
+    (call-with-standard-socket-pair
+     (lambda (state input)
+       (let ((guard (symbol-function 'pg::wal-sender-check-logical-shutdown-completion))
+             (poll (symbol-function 'pg::standard-poll-feedback))
+             (checks 0))
+         (unwind-protect
+              (progn
+                (setf (pg::standard-stream-stop-reason state) :shutdown
+                      (symbol-function 'pg::wal-sender-check-logical-shutdown-completion)
+                      (lambda (slot)
+                        (ok (eq slot (pg::standard-stream-slot-object state)))
+                        (incf checks)
+                        t)
+                      (symbol-function 'pg::standard-poll-feedback)
+                      (lambda (reader)
+                        (declare (ignore reader))
+                        (error "terminal output must not consume feedback")))
+                (ok (pg::standard-finish-shutdown state))
+                (ok (>= checks 2))
+                (ok (not (pg::standard-stream-raw-partial-p state)))
+                (ok (not (open-stream-p (pg::standard-stream-stream state))))
+                (sb-ext:with-timeout 2
+                  (multiple-value-bind (kind payload) (pg::pg-client-frame input)
+                    (ok (char= kind #\C))
+                    (ok (equalp payload #(67 79 80 89 32 48 0))))
+                  (ok (null (read-byte input nil nil)))))
+           (setf (symbol-function 'pg::wal-sender-check-logical-shutdown-completion) guard
+                 (symbol-function 'pg::standard-poll-feedback) poll))))))
+
+(deftest standard-shutdown-completion-refuses-an-unowned-frame
+    (call-with-standard-socket-pair
+     (lambda (state input)
+       (setf (pg::standard-stream-stop-reason state) :shutdown)
+       (let ((pg::*wal-sender-stream-token* nil))
+         (ok (signals (pg::standard-finish-shutdown state) 'error)))
+       (ok (not (open-stream-p (pg::standard-stream-stream state))))
+       (sb-ext:with-timeout 2
+         (ok (null (read-byte input nil nil)))))))
+
+(deftest private-feedback-retains-fragments-without-a-new-timeout-or-copydone
+    (call-with-owned-standard-stream
+     (lambda (state slot)
+       (let* ((path (merge-pathnames "private-fragmented-feedback" pg::*pgdata*))
+              (feedback (standard-test-feedback 64 64 64))
+              (available 0)
+              (partial-callbacks 0)
+              (confirmed (pg::wal-replication-slot-confirmed-flush-lsn slot))
+              (original (symbol-function 'pg::standard-input-ready-p)))
+         (with-open-file (output path :direction :output :element-type '(unsigned-byte 8))
+           (write-byte (char-code #\d) output)
+           (write-sequence (pg::u32-to-bytes 38) output)
+           (write-sequence feedback output)
+           (write-byte (char-code #\c) output)
+           (write-sequence (pg::u32-to-bytes 4) output))
+         (with-open-file (input path :element-type '(unsigned-byte 8))
+           (setf (pg::standard-stream-stream state) input
+                 (pg::standard-stream-last-reply-time state)
+                 (- (get-internal-real-time) (* 120 internal-time-units-per-second)))
+           (unwind-protect
+                (progn
+                  (setf (symbol-function 'pg::standard-input-ready-p)
+                        (lambda (reader)
+                          (declare (ignore reader))
+                          (< (file-position input) available)))
+                  (loop for exposed from 1 below 39
+                        do (setf available exposed)
+                           (ok (null (pg::standard-read-feedback-frame
+                                      state :allow-copy-done nil
+                                      :accept-feedback
+                                      (lambda (reader payload)
+                                        (declare (ignore reader payload))
+                                        (incf partial-callbacks)))))
+                           (ok (= exposed (pg::standard-stream-input-count state))))
+                  (ok (zerop partial-callbacks))
+                  (setf available 39)
+                  (let ((status (pg::logical-stream-read-status input state)))
+                    (ok (= 64 (getf status :write) (getf status :flush) (getf status :apply))))
+                  (ok (zerop (pg::standard-stream-input-count state)))
+                  (ok (= confirmed (pg::wal-replication-slot-confirmed-flush-lsn slot)))
+                  (setf available 44)
+                  (ok (equal "08P01" (sqlstate-of (pg::logical-stream-read-status input state)))))
+             (setf (symbol-function 'pg::standard-input-ready-p) original)))))))
+
+(deftest private-raw-output-disconnect-cannot-advance-sent-progress
+    (call-with-standard-socket-pair
+     (lambda (state input)
+       (declare (ignore input))
+       (let ((original (symbol-function 'pg::standard-write-frame))
+             (pg::*backend* (pg::make-backend :socket (pg::standard-stream-socket state)))
+             (slot (pg::make-wal-replication-slot :name "private_output"))
+             (writes 0)
+             (sent 0))
+         (unwind-protect
+              (progn
+                (setf (symbol-function 'pg::standard-write-frame)
+                      (lambda (&rest arguments)
+                        (declare (ignore arguments))
+                        (incf writes)
+                        nil))
+                (ok (signals
+                     (pg::call-with-logical-stream-io
+                      (pg::standard-stream-stream state) slot
+                      (lambda (reader)
+                        (declare (ignore reader))
+                        (pg::send-logical-progress (pg::standard-stream-stream state) 64)
+                        (incf sent)))
+                     'pg::logical-stream-disconnect))
+                (ok (= 1 writes))
+                (ok (zerop sent)))
+           (setf (symbol-function 'pg::standard-write-frame) original))))))

@@ -2,6 +2,8 @@
 
 (in-package #:pg)
 
+(declaim (ftype (function (t t) (values)) wal-sender-stream-logical-leaving))
+
 ;;; Standard slot recycling stops active owners before saving loss and removing WAL.
 ;;; Consumer cleanup also retires logical snapshot exports and importers.
 
@@ -373,7 +375,9 @@ A temporary physical slot returns to its creator and records inactivity time."
              (funcall function slot)))
       ;; Safe even if claim validation failed or the slot was replaced: release
       ;; only clears the exact owner token published above.
-      (wal-release-replication-slot-owner name owner))))
+      (unwind-protect
+           (wal-sender-stream-logical-leaving slot owner)
+        (wal-release-replication-slot-owner name owner slot)))))
 
 (defun register-exported-logical-snapshot (state)
   "Publish STATE only while its exact slot is still durably reserved."

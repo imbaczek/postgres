@@ -303,4 +303,5 @@
                    (:file "../replication/standard-subscriber")
                    (:file "extended-query")
                    (:file "postgres")))
-     (:file "replication/logical-retention")))))
+     (:file "replication/logical-retention")
+     (:file "replication/logical-shutdown")))))

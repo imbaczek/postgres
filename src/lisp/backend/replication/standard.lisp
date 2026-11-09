@@ -1,6 +1,10 @@
 ;;;; standard.lisp -- native nonstreamed pgoutput sender.
 (in-package #:pg)
 
+(declaim (ftype function wal-sender-stream-logical-ready
+                wal-sender-acknowledge-logical-shutdown
+                wal-sender-check-logical-shutdown-completion))
+
 (defconstant +standard-stream-boundary-limit+ 1024)
 
 (define-condition standard-replication-timeout (error) ())
@@ -272,7 +276,7 @@ that position cannot certify the whole transaction; retention alone is not enoug
     (replication-push-i64 payload (logical-transaction-commit-timestamp transaction))
     payload))
 
-(defun standard-stream-check (state)
+(defun standard-stream-check (state &key (check-timeout t))
   (check-for-interrupts)
   (sb-thread:with-mutex (*wal-lock*)
     (wal-check-healthy)
@@ -282,8 +286,9 @@ that position cannot certify the whole transaction; retention alone is not enoug
         (ereport "55006" "standard replication slot is no longer owned"))
       (when (eq (wal-replication-slot-wal-status slot) :lost)
         (ereport "55000" "standard replication slot has lost its WAL"))))
-  (when (> (- (get-internal-real-time) (standard-stream-last-reply-time state))
-           (* 60 internal-time-units-per-second))
+  (when (and check-timeout
+             (> (- (get-internal-real-time) (standard-stream-last-reply-time state))
+                (* 60 internal-time-units-per-second)))
     (error 'standard-replication-timeout)))
 
 (defun standard-input-ready-p (state)
@@ -303,7 +308,7 @@ that position cannot certify the whole transaction; retention alone is not enoug
       (ereport-fatal "08P01" "invalid frontend frame in standard CopyBoth mode"))
     (1+ length)))
 
-(defun standard-read-feedback-frame (state)
+(defun standard-read-feedback-frame (state &key (accept-feedback #'standard-accept-feedback) (allow-copy-done t))
   "Consume at most one frame, retaining partial input and following command bytes."
   (when (standard-stream-stop-reason state)
     (return-from standard-read-feedback-frame nil))
@@ -323,23 +328,41 @@ that position cannot certify the whole transaction; retention alone is not enoug
              (when (eql (standard-stream-input-count state)
                         (standard-stream-input-length state))
                (case (code-char (aref bytes 0))
-                 (#\d (standard-accept-feedback state (subseq bytes 5 39)))
-                 (#\c (setf (standard-stream-stop-reason state) :done))
-                 (#\X (setf (standard-stream-stop-reason state) :disconnect)))
+                 (#\d (funcall accept-feedback state (subseq bytes 5 39)))
+                 (#\c
+                  (unless allow-copy-done
+                    (ereport-fatal "08P01" "expected a standby status update in CopyBoth mode"))
+                  (setf (standard-stream-stop-reason state) :done))
+                 (#\X
+                  (unless allow-copy-done
+                    (ereport-fatal "08P01" "expected a standby status update in CopyBoth mode"))
+                  (setf (standard-stream-stop-reason state) :disconnect)))
                (setf (standard-stream-input-count state) 0
                      (standard-stream-input-length state) nil)
                (return t)))))
 
 (defun standard-poll-feedback (state)
+  (wal-sender-shutdown-observe)
   (with-live-operation
     (standard-stream-check state)
     (loop repeat 16
           while (and (not (standard-stream-stop-reason state))
                      (standard-read-feedback-frame state)))))
 
-(defun standard-write-frame (state type payload &key finish-copy)
+(defun standard-poll-shutdown-completion (state)
+  (check-for-interrupts)
+  (unless (eq :shutdown (standard-stream-stop-reason state))
+    (error "logical shutdown completion has no shutdown reason"))
+  (wal-sender-check-logical-shutdown-completion (standard-stream-slot-object state)))
+
+(defun standard-write-frame (state type payload &key finish-copy shutdown-completion (poll #'standard-poll-feedback))
   "Write one bounded frame while consuming replies; never interleave frame bytes."
-  (let* ((header (make-array 5 :element-type '(unsigned-byte 8)))
+  (when shutdown-completion
+    (unless (and (char= type #\C) (equalp payload #(67 79 80 89 32 48 0))
+                 (eq :shutdown (standard-stream-stop-reason state)))
+      (error "invalid logical shutdown completion frame")))
+  (let* ((poll-function (if shutdown-completion #'standard-poll-shutdown-completion poll))
+         (header (make-array 5 :element-type '(unsigned-byte 8)))
          (parts (list header payload))
          (written 0))
     (setf (aref header 0) (char-code type))
@@ -349,26 +372,27 @@ that position cannot certify the whole transaction; retention alone is not enoug
            (dolist (part parts)
              (loop with offset = 0
                    while (< offset (length part))
-                   do (standard-poll-feedback state)
+                   do (funcall poll-function state)
                       (when (and (standard-stream-stop-reason state)
-                                 (zerop written) (not finish-copy))
+                                 (zerop written) (not (or finish-copy shutdown-completion)))
                         (return-from sending nil))
                       (let ((chunk (subseq part offset
                                            (min (length part) (+ offset 65536)))))
                         ;; Retain this chunk across EAGAIN/EINTR retries.
                         (loop
-                          (let ((count
-                                  (sb-bsd-sockets:socket-send
-                                   (standard-stream-socket state) chunk (length chunk)
-                                   :dontwait t :nosignal t)))
-                            (when (and count (plusp count))
-                              (incf offset count)
-                              (incf written count)
-                              (setf (standard-stream-raw-partial-p state) t)
-                              (return)))
-                          (standard-poll-feedback state)
+                          (sb-sys:without-interrupts
+                            (let ((count
+                                    (sb-bsd-sockets:socket-send
+                                     (standard-stream-socket state) chunk (length chunk)
+                                     :dontwait t :nosignal t)))
+                              (when (and count (plusp count))
+                                (incf offset count)
+                                (incf written count)
+                                (setf (standard-stream-raw-partial-p state) t)
+                                (return))))
+                          (funcall poll-function state)
                           (when (and (standard-stream-stop-reason state)
-                                     (zerop written) (not finish-copy))
+                                     (zerop written) (not (or finish-copy shutdown-completion)))
                             (return-from sending nil))
                           (sb-sys:wait-until-fd-usable
                            (sb-bsd-sockets:socket-file-descriptor
@@ -381,6 +405,13 @@ that position cannot certify the whole transaction; retention alone is not enoug
       ;; no buffered ErrorResponse or CopyDone may be appended to its partial bytes.
       (when (standard-stream-raw-partial-p state)
         (ignore-errors (close (standard-stream-stream state) :abort t))))))
+
+(defun standard-finish-shutdown (state)
+  (let ((payload (make-payload)))
+    (payload-push-cstring payload "COPY 0")
+    (unwind-protect
+         (standard-write-frame state #\C payload :shutdown-completion t)
+      (ignore-errors (close (standard-stream-stream state) :abort t)))))
 
 (defun standard-xlog-data (state payload &optional (end 0))
   (let ((data (make-payload)))
@@ -396,7 +427,7 @@ that position cannot certify the whole transaction; retention alone is not enoug
 (defun standard-send-socket-chunk (socket chunk)
   (sb-bsd-sockets:socket-send socket chunk (length chunk) :dontwait t :nosignal t))
 
-(defun standard-write-streamed-frame (state type payload-size producer)
+(defun standard-write-streamed-frame (state type payload-size producer &key (poll #'standard-poll-feedback))
   "Write one frame in bounded chunks, retaining partial socket writes safely."
   (unless (and (integerp payload-size) (<= 0 payload-size (- #x7fffffff 4)))
     (error "invalid streamed frame length"))
@@ -408,7 +439,7 @@ that position cannot certify the whole transaction; retention alone is not enoug
          (block sending
            (labels ((send-part (part length)
                       (loop with offset = 0 while (< offset length)
-                            do (standard-poll-feedback state)
+                            do (funcall poll state)
                                (when (and (standard-stream-stop-reason state) (zerop written))
                                  (return-from sending nil))
                                (let ((chunk (subseq part offset length)))
@@ -422,7 +453,7 @@ that position cannot certify the whole transaction; retention alone is not enoug
                                          (incf written count)
                                          (setf (standard-stream-raw-partial-p state) t)
                                          (return))))
-                                   (standard-poll-feedback state)
+                                   (funcall poll state)
                                    (when (and (standard-stream-stop-reason state) (zerop written))
                                      (return-from sending nil))
                                    (sb-sys:wait-until-fd-usable
@@ -515,6 +546,7 @@ Catchup changes to streaming when the captured scan horizon is exhausted."
                  (with-live-operation
                    (wal-logical-slot-read-transactions
                     (standard-stream-slot-name state)
+                    :upto-lsn (wal-sender-shutdown-target)
                     :from-lsn (standard-stream-scan-cursor state) :max-transactions 1))
                (setf exhausted exhausted-p)
                (dolist (transaction transactions)
@@ -527,6 +559,12 @@ Catchup changes to streaming when the captured scan horizon is exhausted."
                  (standard-note-frontier state progress)
                  (with-live-operation (standard-acknowledge-flush state)))))))
         (standard-maybe-keepalive state)
+        (when (and (not (standard-stream-stop-reason state))
+                   (wal-sender-acknowledge-logical-shutdown
+                    (standard-stream-slot-object state) (standard-stream-scan-cursor state)
+                    :partial (standard-stream-raw-partial-p state)))
+          (setf (standard-stream-stop-reason state) :shutdown)
+          (return))
         (unless advanced
           (when exhausted (wal-sender-set-state *wal-sender* "streaming"))
           (sb-sys:wait-until-fd-usable
@@ -541,42 +579,45 @@ the slot restart position, then advance it only from processed or sent frontiers
 the envelope's WAL end alone is not a sent frontier."
   (call-with-wal-sender-stream
    (lambda ()
-     (let ((reason
-             (handler-case
-                 (call-with-logical-replication-slot
-                  (logical-replication-command-slot-name command)
-                  (lambda (slot)
-                    (unless (equal (wal-replication-slot-plugin slot) "pgoutput")
-                      (ereport "0A000" "standard replication requires a pgoutput slot"))
-                    (let* ((names (standard-publication-names command))
-                           (confirmed (wal-replication-slot-confirmed-flush-lsn slot))
-                           (state (make-standard-stream
-                                   :stream stream :socket (backend-socket *backend*)
-                                   :slot-name (wal-replication-slot-name slot) :slot-object slot
-                                   :publication-names names
-                                   :emit-floor
-                                   (max confirmed (logical-replication-command-requested-lsn command))
-                                   :scan-cursor (wal-replication-slot-restart-lsn slot)
-                                   :safe-frontier confirmed :reported-flush confirmed
-                                   :restart-floor (wal-replication-slot-restart-lsn slot))))
-                      (logical-test-failpoint
-                       :standard-stream-start (wal-replication-slot-name slot)
-                       (logical-replication-command-protocol-version command) names)
-                      (wal-sender-note-sent *wal-sender* (wal-replication-slot-restart-lsn slot))
-                      (send-copy-both-response stream)
-                      ;; Preserve input read-ahead while switching the fully drained
-                      ;; output side of SBCL's dual-channel stream to raw sends.
-                      (finish-output stream)
-                      (let* ((option (assoc "binary" (logical-replication-command-options command) :test #'equal))
-                             (*pgoutput-binary-bytea* (and option (replication-option-boolean "binary" (cdr option)))))
-                        (standard-stream-loop state)))))
-               (standard-replication-timeout ()
-                 (ignore-errors (close stream :abort t))
-                 :disconnect))))
+     (let* ((state nil)
+            (reason
+              (handler-case
+                  (call-with-logical-replication-slot
+                   (logical-replication-command-slot-name command)
+                   (lambda (slot)
+                     (unless (equal (wal-replication-slot-plugin slot) "pgoutput")
+                       (ereport "0A000" "standard replication requires a pgoutput slot"))
+                     (let* ((names (standard-publication-names command))
+                            (confirmed (wal-replication-slot-confirmed-flush-lsn slot)))
+                       (setf state (make-standard-stream
+                                    :stream stream :socket (backend-socket *backend*)
+                                    :slot-name (wal-replication-slot-name slot) :slot-object slot
+                                    :publication-names names
+                                    :emit-floor
+                                    (max confirmed (logical-replication-command-requested-lsn command))
+                                    :scan-cursor (wal-replication-slot-restart-lsn slot)
+                                    :safe-frontier confirmed :reported-flush confirmed
+                                    :restart-floor (wal-replication-slot-restart-lsn slot)))
+                       (logical-test-failpoint
+                        :standard-stream-start (wal-replication-slot-name slot)
+                        (logical-replication-command-protocol-version command) names)
+                       (wal-sender-note-sent *wal-sender* (wal-replication-slot-restart-lsn slot))
+                       (send-copy-both-response stream)
+                       ;; Preserve input read-ahead while switching the fully drained
+                       ;; output side of SBCL's dual-channel stream to raw sends.
+                       (finish-output stream)
+                       (wal-sender-stream-logical-ready slot)
+                       (let* ((option (assoc "binary" (logical-replication-command-options command) :test #'equal))
+                              (*pgoutput-binary-bytea* (and option (replication-option-boolean "binary" (cdr option)))))
+                         (standard-stream-loop state)))))
+                (standard-replication-timeout ()
+                  (ignore-errors (close stream :abort t))
+                  :disconnect))))
        ;; C releases its slot before both completion results and the following query.
        (case reason
          (:done
           (send-command-complete stream "COPY 0")
           (send-command-complete stream "START_REPLICATION")
           (send-ready-for-query stream #\I))
+         (:shutdown (standard-finish-shutdown state))
          (:disconnect (ignore-errors (close stream :abort t))))))))

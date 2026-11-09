@@ -173,6 +173,7 @@
                (:file "t/promotion-sql-tests")
                (:file "t/physical-stream-tests")
                (:file "t/walsender-shutdown-tests")
+               (:file "t/logical-walsender-shutdown-tests")
                (:file "t/physical-follow-exit-tests")
                (:file "t/physical-shutdown-tests"))
   :perform (asdf:test-op (operation component)

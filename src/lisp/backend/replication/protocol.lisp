@@ -2,6 +2,14 @@
 
 (in-package #:pg)
 
+(declaim (ftype function wal-sender-stream-logical-ready call-with-logical-stream-io
+                logical-stream-read-status logical-stream-acknowledge-shutdown
+                standard-finish-shutdown))
+
+(defvar *logical-copy-frame-writer* nil)
+
+(define-condition logical-stream-disconnect (error) ())
+
 (defstruct logical-replication-command
   type slot-name plugin snapshot-action requested-lsn protocol-version options)
 
@@ -341,7 +349,9 @@ and an empty Terminate as EOF. Other malformed messages remain protocol errors."
   (write-message stream #\W #(0 0 0)))
 
 (defun send-replication-copy-data (stream payload)
-  (write-message stream #\d payload))
+  (if *logical-copy-frame-writer*
+      (funcall *logical-copy-frame-writer* stream payload)
+      (write-message stream #\d payload)))
 
 (defun send-logical-xlog-data (stream wal-start wal-end plugin-data)
   (let ((payload (make-payload)))
@@ -620,6 +630,13 @@ and an empty Terminate as EOF. Other malformed messages remain protocol errors."
   (let* ((size (pgoutput-row-change-size change))
          (envelope (pgoutput-xlog-envelope wal-start wal-end (postgres-current-timestamp)))
          (started nil) (complete nil))
+    (when *logical-copy-frame-writer*
+      (funcall *logical-copy-frame-writer* stream nil
+               :payload-size (+ (length envelope) size)
+               :producer (lambda (sink)
+                           (funcall sink envelope)
+                           (pgoutput-emit-row-change change sink)))
+      (return-from send-logical-row-xlog-data (values)))
     (unwind-protect
          (progn
            (setf started t)
@@ -846,6 +863,45 @@ keepalive's WAL-end field, which may include changes not yet applied."
   (send-command-complete stream "START_REPLICATION")
   (send-ready-for-query stream #\I))
 
+(defun stream-logical-replication-loop (stream slot-name initial-lsn &optional state)
+  (let ((sent-lsn initial-lsn))
+    (loop
+      (wal-sender-shutdown-observe)
+      (unless
+          (call-with-logical-reader-spools
+           (lambda ()
+             (multiple-value-bind (transactions progress-lsn exhausted)
+                 (with-live-operation
+                   (wal-logical-slot-read-transactions
+                    slot-name :upto-lsn (wal-sender-shutdown-target)
+                    :max-transactions 1
+                    :max-scan-bytes (logical-stream-scan-budget-bytes)))
+               (let ((advanced (or transactions (> progress-lsn sent-lsn))))
+                 (cond
+                   (transactions
+                    (let* ((transaction (first transactions))
+                           (commit-lsn (logical-transaction-commit-lsn transaction)))
+                      (send-logical-transaction stream transaction progress-lsn)
+                      (setf sent-lsn commit-lsn)
+                      (wal-sender-note-sent *wal-sender* commit-lsn)))
+                   ((> progress-lsn sent-lsn)
+                    (send-logical-progress stream progress-lsn)
+                    (setf sent-lsn progress-lsn)
+                    (wal-sender-note-sent *wal-sender* progress-lsn))
+                   (t
+                    (when exhausted (wal-sender-set-state *wal-sender* "streaming"))
+                    (send-logical-keepalive stream sent-lsn)))
+                 (let ((status (logical-stream-read-status stream state)))
+                   (when status
+                     (let ((position (with-live-operation
+                                       (validate-stream-status slot-name sent-lsn status))))
+                       (when advanced (setf sent-lsn position)))
+                     (when (logical-stream-acknowledge-shutdown state progress-lsn)
+                       (return-from stream-logical-replication-loop :shutdown))
+                     (unless advanced (sleep 0.05))
+                     t))))))
+        (return :disconnect)))))
+
 (defun start-logical-replication (stream slot-name requested-lsn &optional command)
   (when (and command
              (sb-thread:with-mutex (*wal-lock*)
@@ -859,7 +915,7 @@ keepalive's WAL-end field, which may include changes not yet applied."
     (ereport "0A000" "publication options require a pgoutput slot"))
   (call-with-wal-sender-stream
    (lambda ()
-     (let ((copy-mode-p nil))
+     (let ((copy-mode-p nil) (reason nil) (io-state nil))
        (handler-case-nonfatal
         (progn
           (wal-logical-slot-validate-start-position slot-name requested-lsn)
@@ -899,17 +955,28 @@ keepalive's WAL-end field, which may include changes not yet applied."
                                         (getf first-status :reply-time 0)))
                (let* ((option (and command (assoc "binary_bytea" (logical-replication-command-options command) :test #'equal)))
                       (*pgoutput-binary-bytea* (and option (replication-option-boolean "binary_bytea" (cdr option)))))
-                 (stream-logical-replication-loop stream slot-name requested-lsn))))
+                 (call-with-logical-stream-io
+                  stream slot
+                  (lambda (state)
+                    (setf io-state state)
+                    (wal-sender-stream-logical-ready slot)
+                    (setf reason (stream-logical-replication-loop
+                                  stream slot-name requested-lsn state)))))))
            :allow-initial-copy t)
-          (when copy-mode-p (end-logical-copy-mode stream)))
+          (case reason
+            (:shutdown (standard-finish-shutdown io-state))
+            (:disconnect (ignore-errors (close stream :abort t)))
+            (otherwise (when copy-mode-p (end-logical-copy-mode stream)))))
         (condition
-         (if copy-mode-p
-             (progn
-               (send-error-response stream condition)
-               (end-logical-copy-mode stream))
-             (progn
-               (send-error-response stream condition)
-               (send-ready-for-query stream #\I)))))))))
+         (if (typep condition 'logical-stream-disconnect)
+             (ignore-errors (close stream :abort t))
+             (if copy-mode-p
+                 (progn
+                   (send-error-response stream condition)
+                   (end-logical-copy-mode stream))
+                 (progn
+                   (send-error-response stream condition)
+                   (send-ready-for-query stream #\I))))))))))
 
 (defun logical-scan-budget-limit (override failpoint action)
   "Return the scan budget, permitting a narrow value only for crash tests."
@@ -932,45 +999,6 @@ keepalive's WAL-end field, which may include changes not yet applied."
    (sb-ext:posix-getenv "PG_LISP_TEST_LOGICAL_SCAN_BYTES")
    (sb-ext:posix-getenv "PG_LISP_TEST_FAILPOINT")
    (sb-ext:posix-getenv "PG_LISP_TEST_FAILPOINT_ACTION")))
-
-(defun stream-logical-replication-loop (stream slot-name initial-lsn)
-  (let ((sent-lsn initial-lsn))
-    (loop
-      (unless
-          (call-with-logical-reader-spools
-           (lambda ()
-             (multiple-value-bind (transactions progress-lsn exhausted)
-                 (wal-logical-slot-read-transactions
-                  slot-name :max-transactions 1
-                  :max-scan-bytes (logical-stream-scan-budget-bytes))
-               (if transactions
-                   (let* ((transaction (first transactions))
-                          (commit-lsn (logical-transaction-commit-lsn transaction)))
-                     (send-logical-transaction stream transaction progress-lsn)
-                     (setf sent-lsn commit-lsn)
-                     (wal-sender-note-sent *wal-sender* commit-lsn)
-                     (let ((status (replication-standby-status stream)))
-                       (when status
-                         (setf sent-lsn (validate-stream-status slot-name sent-lsn status))
-                         t)))
-                   (if (> progress-lsn sent-lsn)
-                       (progn
-                         (send-logical-progress stream progress-lsn)
-                         (setf sent-lsn progress-lsn)
-                         (wal-sender-note-sent *wal-sender* progress-lsn)
-                         (let ((status (replication-standby-status stream)))
-                           (when status
-                             (setf sent-lsn (validate-stream-status slot-name sent-lsn status))
-                             t)))
-                       (progn
-                         (when exhausted (wal-sender-set-state *wal-sender* "streaming"))
-                         (send-logical-keepalive stream sent-lsn)
-                         (let ((status (replication-standby-status stream)))
-                           (when status
-                             (validate-stream-status slot-name sent-lsn status)
-                             (sleep 0.05)
-                             t))))))))
-        (return)))))
 
 (defun create-replication-slot-command (stream command)
   (let ((name (logical-replication-command-slot-name command))

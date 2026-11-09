@@ -10,6 +10,8 @@
 
 (in-package #:pg)
 
+(declaim (ftype (function () (values)) wal-sender-capture-logical-shutdown-target))
+
 (defvar *native-control-test-hook* nil)
 
 (defun native-control-test-point (point)
@@ -78,6 +80,7 @@ The caller must finish those steps before calling this function."
   (wal-set-primary-state +db-shutdowning+)
   (native-control-test-point :after-primary-shutdown-dirty)
   (postmaster-retire-abandoned-backends)
+  (wal-sender-capture-logical-shutdown-target)
   (let ((*wal-shutdown-defer-recycling* t))
     (wal-checkpoint-core))
   (native-control-test-point :after-primary-shutdown-checkpoint)
