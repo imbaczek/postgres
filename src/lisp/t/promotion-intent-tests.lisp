@@ -31,7 +31,7 @@
             (pg::*physical-follow-desired-worker* nil) (pg::*physical-follow-desired-stopping-p* nil)
             (pg::*physical-follow-desired-last-error* nil)
             (pg::*physical-restartpoint-worker* nil) (pg::*physical-shutdown-state* nil)
-            (pg::*shutdown-mode* nil) (pg::*shutdown-requested* nil)
+            (pg::*shutdown* pg::+no-shutdown+)
             (pg::*swank-listener-enabled-p* nil)
             (pg::*wal-replication-slots* (make-hash-table :test #'equal))
             (pg::*physical-source-pins* (make-hash-table :test #'equal))
@@ -98,6 +98,15 @@
          (setf (symbol-function 'pg::start-primary-wal-writer-under-lock) start-writer)
          (pg::physical-store-close store))))
    :system-id system-id))
+
+(deftest promotion-fixture-isolates-the-current-shutdown-level
+    (let ((pg::*shutdown* pg::+fast-shutdown+))
+      (call-with-promotion-fixture
+       (lambda (root store)
+         (declare (ignore root store))
+         (ok (= pg::+no-shutdown+ (pg::shutdown-mode)))
+         (ok (not (pg::shutdown-in-progress-p)))))
+      (ok (= pg::+fast-shutdown+ (pg::shutdown-mode)))))
 
 (defun call-with-cold-promotion-image (function &key (pending t) (applied 216))
   (call-with-physical-store-directory
