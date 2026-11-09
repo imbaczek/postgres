@@ -567,6 +567,7 @@
         (assert (= 1 (getf allocation :generation)))
         (assert (equal (getf parent :request) (getf allocation :request)))
         (assert (equal history (list allocation)))
+        ;; Released allocations retain live history after their pins are removed.
         (assert (eq (if (eq expected :aborted) :canceled :live)
                     (getf allocation :state)))
         (physical-backup-lease-current-record (getf parent :request))

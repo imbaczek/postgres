@@ -309,6 +309,7 @@ class Acceptance:
 
     def configured_reuse_refused(self, index, target, roots, before):
         saved = facts(target / "physical-reseed.follow")
+        # Arm the source observer for each probe, including after restart.
         self.control("(progn (pg::native-cancellation-reset-source-events) " +
                      "(pg::native-cancellation-observe-reuse) (values))")
         self.run("reuse-refused", target, "cleaned", configured=True, connections=1)
