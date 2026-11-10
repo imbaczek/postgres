@@ -267,7 +267,9 @@ alter native page images."
               end))))))
 
 (defun wal-require-fpw-physical-replay-supported (record)
-  "Reject physical replay of changes until source-policy persistence is wired."
+  "Validate a type-17 FPW change record before replay credits its state.
+Batch framing and durable source-fact publication are checked by callers.
+This validates source policy; it does not change local writer policy or incarnation."
   (when (= (wal-record-type record) +wal-record-full-page-writes-change+)
     (wal-full-page-writes-change-record-info record))
   (values))

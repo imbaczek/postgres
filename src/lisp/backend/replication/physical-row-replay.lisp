@@ -27,7 +27,7 @@ Zero is valid when every registered snapshot is covered."
       (values horizon (nreverse covered)))))
 
 (defun physical-row-replay-allowed-p (record horizon)
-  ;; Parameter changes carry no row images and are checked at their terminal.
+  ;; Parameter and FPW changes carry no row images and are checked at their terminal.
   ;; Stop at the first record outside the certified row replay prefix.
   ;; Empty allocation-reservation batches are allowed; the decoder validates
   ;; that they have the required empty shape.

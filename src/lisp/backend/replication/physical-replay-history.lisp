@@ -139,11 +139,10 @@ caller state."
 (defun physical-replay-check-child-initialization (record next-xid &optional (fpw-fact (getf *physical-recovery-state* :source-fpw-fact)))
   "Check native checkpoint timeline and selected child initialization during replay.
 Only a validated selected EOR can switch the replay timeline. After EOR,
-require the child initialization checkpoint before later child work. An optional
+require the child initialization checkpoint before later child work. One validated
 FPW change may precede it in a clean batch, and the checkpoint must preserve
 that policy. FPW-FACT describes the prefix before RECORD and defaults to the
-published source fact. Validation leaves caller state unchanged. The public
-physical replay guard still rejects type 17 records."
+published source fact. Validation leaves caller state unchanged."
   (wal-require-fpw-physical-replay-supported record)
   (let* ((state *physical-recovery-state*) (timeline (physical-recovery-replay-timeline state))
                                            (snapshot (getf state :source-checkpoint)) (type (wal-record-type record)))
