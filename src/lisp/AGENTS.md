@@ -483,6 +483,26 @@ Remove the trace and its temporary helper after the demo:
 (makunbound 'pg::*debug-trace-events*)
 ```
 
+## Recurring performance work
+
+- Reserve two hours in every ten hours of active project work for performance:
+  eight hours of regular development, then a two-hour performance window.
+  Count overlapping work once. Unattended tests, background execution and waiting
+  do not consume the active-work budget.
+- Record measured active intervals in
+  `/home/imbaczek/proj/pg-ha-artifacts/performance-budget.json` and its append-only
+  ledger. Close intervals before yielding or unattended waiting. An interval left
+  open across a restart is incomplete; do not charge its unobserved elapsed time.
+  Keep estimates separate from measurements and report usage at each milestone.
+- When a window is due, reach a safe checkpoint without interrupting owned tests.
+  Spend at most two active hours, record results and remaining work, then resume
+  the development milestone. Carry unfinished investigations into the next window.
+- Next window: first investigate native Lisp IEEE CRC-32 with `sb-simd`, comparing
+  the scalar Lisp kernel and libdeflate. Check correctness, allocation, CPU feature
+  support, small-buffer costs and representative workload results. Then profile
+  metadata validation, parsing and copying to reduce allocations. Keep allocating
+  validation outside allocation-free `*.hot.lisp` kernels.
+
 ## Milestone verification timing
 
 - Run test data, temporary files, compiler caches, and live logs on the private
