@@ -6,9 +6,13 @@
 (defconstant +wal-checkpoint-resource-snapshot-size+ 136
   "PGCKPT02 payload size with a complete resource tuple and coordinates.")
 
-(defconstant +wal-checkpoint-commit-ts-size+ 8)
+(defconstant +wal-checkpoint-commit-ts-size+ 8
+  "Bytes for the oldest and newest commit timestamp XIDs as two u32 values.")
 
 (defun wal-checkpoint-commit-ts-fields-valid-p (facts)
+  "Accept absent fields or one oldest and newest pair with both values zero.
+Absent fields preserve unknown history.  Duplicate, partial, NIL and nonzero
+fields are invalid.  Callers establish policy before supplying facts."
   (loop for key in facts by #'cddr
         count (eq key :oldest-commit-ts-xid) into oldest-count
         count (eq key :newest-commit-ts-xid) into newest-count
@@ -19,12 +23,14 @@
                            (eql 0 (getf facts :newest-commit-ts-xid)))))))
 
 (defun wal-copy-checkpoint-commit-ts-fields (facts)
+  "Validate and copy the optional commit timestamp pair from FACTS."
   (unless (wal-checkpoint-commit-ts-fields-valid-p facts)
     (error "invalid checkpoint commit timestamp facts"))
   (when (getf facts :oldest-commit-ts-xid)
     (list :oldest-commit-ts-xid 0 :newest-commit-ts-xid 0)))
 
 (defun wal-checkpoint-snapshot-length-p (length)
+  "Recognize the 88, 96, 136 and 144 byte checkpoint payload lengths."
   (member length
           (list +wal-checkpoint-snapshot-size+
                 (+ +wal-checkpoint-snapshot-size+ +wal-checkpoint-commit-ts-size+)
@@ -51,8 +57,10 @@
       (wal-checkpoint-snapshot-length-p (- length +wal-header-size+))))
 
 (defun wal-checkpoint-snapshot-valid-p (snapshot)
-  "Check checkpoint coordinates and the complete optional resource group.
-Numeric timeline bounds alone do not prove the resource record's ancestry."
+  "Check checkpoint coordinates and optional resource and commit timestamp facts.
+Version 1 has no extensions.  The commit timestamp pair represents disabled
+tracking with zero values, while absence preserves unknown history.
+Ancestry requires separate history validation."
   (let ((version (getf snapshot :version))
         (start (getf snapshot :start)) (end (getf snapshot :end))
         (redo (getf snapshot :redo)) (next (getf snapshot :next-xid))
@@ -83,9 +91,11 @@ Numeric timeline bounds alone do not prove the resource record's ancestry."
          (<= (getf snapshot :prev-timeline) (getf snapshot :timeline)))))
 
 (defun wal-encode-checkpoint-snapshot (snapshot)
-  "V2 uses explicit flags for one-past FullXIDs, without truncating the sentinel.
-The base payload uses 88 bytes and resource facts add 48 bytes.
-A known commit timestamp range adds eight bytes after either representation."
+  "Encode a validated checkpoint snapshot.
+PGCKPT02 uses flags for one-past FullXIDs.
+Payload lengths are 88, 96, 136 or 144 bytes.  Resource facts add 48 bytes.
+Flag bit 2 adds the eight-byte oldest and newest u32 commit timestamp pair
+after the base payload and any resource extension.  Currently, both values must be zero.  Absence preserves unknown history."
   (unless (wal-checkpoint-snapshot-valid-p snapshot) (error "invalid native checkpoint snapshot"))
   (let* ((bytes (make-array (- (wal-checkpoint-record-size snapshot) +wal-header-size+)
                             :element-type '(unsigned-byte 8) :initial-element 0))
@@ -112,7 +122,10 @@ A known commit timestamp range adds eight bytes after either representation."
     bytes))
 
 (defun wal-decode-checkpoint-snapshot (bytes)
-  "Decode the bounded checkpoint payload covered by WAL or control CRC."
+  "Decode a checkpoint payload covered by WAL or control CRC.
+PGCKPT02 flag bit 2 marks the final eight-byte commit timestamp pair.
+The pair follows the base and any 48-byte resource extension.  Version 1
+has no extensions.  Saved source facts preserve the distinction between known and unknown history."
   (unless (wal-checkpoint-snapshot-length-p (length bytes))
     (error "invalid checkpoint snapshot length"))
   (let* ((version (cond ((equalp (subseq bytes 0 8) #(80 71 67 75 80 84 48 49)) 1)
@@ -154,7 +167,8 @@ A known commit timestamp range adds eight bytes after either representation."
       snapshot)))
 
 (defun wal-checkpoint-record-snapshot (record)
-  "Validate a checkpoint terminal; legacy empty payloads have unknown metadata."
+  "Validate a checkpoint terminal.  Legacy empty payloads have unknown metadata.
+A commit timestamp pair requires WAL version 8."
   (unless (and (= (wal-record-type record) +wal-record-checkpoint+)
                (zerop (wal-record-xid record)))
     (error "invalid native checkpoint record"))
@@ -197,13 +211,13 @@ A known commit timestamp range adds eight bytes after either representation."
         (t (- end +wal-header-size+))))
 
 (defun wal-checkpoint-snapshot-hex (snapshot)
-  "Encode either supported snapshot length for control metadata."
+  "Encode a supported 88, 96, 136 or 144 byte snapshot for control metadata."
   (with-output-to-string (stream)
     (loop for byte across (wal-encode-checkpoint-snapshot snapshot)
           do (format stream "~2,'0X" byte))))
 
 (defun wal-checkpoint-snapshot-from-hex (text)
-  "Decode and validate either supported snapshot length from control metadata."
+  "Decode and validate a supported checkpoint snapshot from control metadata."
   (unless (and (evenp (length text))
                (wal-checkpoint-snapshot-length-p (/ (length text) 2))
                (every (lambda (char) (digit-char-p char 16)) text))
@@ -422,9 +436,10 @@ its archive before mutation."
 (declaim (notinline catalog-next-oid))
 
 (defun wal-capture-checkpoint-snapshot (start &optional resource-facts)
-  "Called with writer and WAL locks; sample counters under XID lock, as C does.
-Copy explicit resource facts into the snapshot; omission leaves them unknown.
-The caller must freeze facts and plan the record size before choosing START."
+  "Called with writer and WAL locks, sample counters under XID lock, as C does.
+Copy supplied resource and commit timestamp facts into the snapshot.  Omitted
+facts remain unknown.  The caller establishes policy, freezes facts and plans
+the record size before choosing START."
   (sb-thread:with-mutex (*xid-lock*)
     (let* ((next *next-xid*)
            (active (reduce #'min *active-xids* :initial-value next))
