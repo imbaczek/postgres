@@ -1,4 +1,4 @@
-"""Restore owned C and native primary backups taken with full_page_writes off."""
+"""Check C concurrent and native quiescent primary backups with FPW off."""
 import argparse
 from contextlib import ExitStack
 import ctypes

@@ -134,6 +134,27 @@ OFF still uses conservative full page images; these tests make no WAL volume
 claim. All peers use native PGWL. This does not test C binary WAL interoperability
 or run a coordinator, DCS or HA loop.
 
+Run the primary OFF backup oracle on Linux from `src/lisp`, using the pinned
+Patroni 4.1.5 environment with psutil and psycopg2, SBCL, C PostgreSQL 20 binaries
+and matching libpq development files:
+
+```sh
+PATRONI_PYTHON=/path/to/pinned-venv/bin/python3
+./t/test-ramdisk.sh setup 4G
+PG_CONFIG=/path/to/c/bin/pg_config ./t/test-ramdisk.sh run "$PATRONI_PYTHON" t/interop/primary-off-backup.py --reference-bin /path/to/c/bin
+```
+
+The C case updates a heap while `pg_basebackup` copies an OFF primary. WAL
+inspection shows no full page image for that heap before or after the backup,
+but an image during it: C forces images during primary backup even with FPW OFF.
+The restored backup contains value 19 while the source advances to 20, and its
+checkpoint policy remains OFF. The native case copies a quiescent OFF primary
+and checks checkpoint and source-fact metadata, source-offline cold recovery,
+local ON promotion and a same-timeline primary restart after SIGKILL. It does
+not test a concurrent native copy. Standby backup interval checks are a separate
+case from these primary backup checks. The native peers use PGWL; the test runs
+no DCS and does not test C binary WAL interoperability.
+
 The independent C idle-writer check can be run from `src/lisp` with:
 
 ```sh
