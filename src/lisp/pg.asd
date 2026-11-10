@@ -173,6 +173,7 @@
                    (:file "../replication/physical-retained-seal")
                    (:file "../replication/physical-retained-project")
                    (:file "../replication/physical-restartpoint")
+                   (:file "../replication/physical-standby-backup")
                    (:file "../replication/protocol")
                    (:file "../replication/physical-stream")
                    (:file "../replication/physical-client")
