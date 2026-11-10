@@ -1,6 +1,10 @@
 (in-package #:pg)
 
 (defun physical-standby-backup-checkpoint ()
+  "Prove that the frozen standby is at an exact source checkpoint.
+The applied next XID and catalog next OID must match the checkpoint, and its
+oldest active XID must equal next XID.  The completed source reservation must
+also reach this replay position and match the checkpoint's reservation bound."
   (check-physical-recovery-work)
   (unless (and (eq *live-operation-quiescence-owner-thread* sb-thread:*current-thread*)
                (not *live-operation-drain-open*) (zerop *live-operation-depth*)
@@ -49,6 +53,12 @@
       (values (copy-seq prefix) decoded))))
 
 (defun physical-standby-backup-prefix (store snapshot)
+  "Return the complete checkpoint segment prefix through SNAPSHOT's end.
+For a checkpoint later than the immutable base, validate the full retained
+inventory and its digest chain from the base LSN through the current receive
+floor before reading the extent. The caller holds the store mutex; a reader
+lease protects retained images. Compare the decoded checkpoint with the applied
+snapshot in both cases."
   (when (= (getf snapshot :end) (getf *physical-recovery-state* :end))
     (return-from physical-standby-backup-prefix
       (physical-standby-backup-check-prefix
@@ -93,6 +103,11 @@
     (list relative (length bytes) (physical-store-update-digest #xCBF29CE484222325 bytes))))
 
 (defun physical-standby-backup-copy (target label snapshot prefix policy)
+  "Copy frozen checkpoint data and derive the target controls from SNAPSHOT.
+Mark TARGET first and publish its manifest last, after checking the copied
+catalog; a failed copy remains guarded.  LABEL is the manifest export label
+and creates no upstream WAL retention.  Resumed follow requires an independently
+retained upstream slot or equivalent retention."
   (let* ((end (getf snapshot :end)) (timeline (getf snapshot :timeline))
                                     (system-id (catalog-system-identifier))
                                     (expected-catalog (catalog-image-bytes))
@@ -146,6 +161,11 @@
       manifest)))
 
 (defun physical-standby-base-backup (directory label)
+  "Export a local, quiescent standby at its exact applied source checkpoint.
+The reload lock and owned quiescence gate exclude reload, replay and mutations
+while the checkpoint is proved and the data copied.  This is not an online
+backup or a cascading wire clone.  Unlike PostgreSQL's online standby backup,
+full_page_writes may be off because source data files stay unchanged during copy."
   (when (plusp *live-operation-depth*)
     (error "standby export must start outside a live operation"))
   (unless (wal-valid-replication-slot-name-p label) (error "invalid standby export label"))
