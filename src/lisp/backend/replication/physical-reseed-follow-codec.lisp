@@ -39,7 +39,7 @@
 (defun physical-reseed-follow-base-copy (value request)
   (physical-follow-check-plist
    value '(:manifest-digest :checkpoint-start :recovery-control :wal-control :auth-files))
-  (let* ((recovery (physical-libpq-datum-octets (getf value :recovery-control) 196))
+  (let* ((recovery (physical-libpq-datum-octets (getf value :recovery-control) +physical-recovery-control-maximum-bytes+))
          (wal (physical-libpq-datum-octets (getf value :wal-control) (1+ +wal-control-maximum-bytes+)))
          (control (physical-recovery-decode-control recovery))
          (auth (physical-adoption-attempt-auth-copy (getf value :auth-files))))

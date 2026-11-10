@@ -7,7 +7,7 @@
 
 (defstruct (wal-fpw-state
             (:constructor %make-wal-fpw-state
-                (incarnation enabled witness-kind start end timeline coverage-start last-disable-start last-disable-timeline)))
+                (incarnation enabled witness-kind start end timeline coverage-start coverage-timeline last-disable-start last-disable-timeline)))
   "Immutable policy evidence owned by one local WAL storage incarnation.
 START, END and TIMELINE identify the latest checkpoint or change witness;
 COVERAGE-START is the earliest position covered by this evidence. The optional
@@ -20,6 +20,7 @@ number alone does not prove ancestry."
   (end 0 :read-only t)
   (timeline 1 :read-only t)
   (coverage-start 0 :read-only t)
+  (coverage-timeline 1 :read-only t)
   (last-disable-start nil :read-only t)
   (last-disable-timeline nil :read-only t))
 
@@ -67,6 +68,8 @@ number alone does not prove ancestry."
        (<= (wal-fpw-state-coverage-start state) (wal-fpw-state-start state))
        (< (wal-fpw-state-start state) (wal-fpw-state-end state))
        (typep (wal-fpw-state-timeline state) '(integer 1 4294967295))
+       (typep (wal-fpw-state-coverage-timeline state) '(integer 1 4294967295))
+       (<= (wal-fpw-state-coverage-timeline state) (wal-fpw-state-timeline state))
        (= (floor (wal-fpw-state-start state) +wal-segment-size+)
           (floor (1- (wal-fpw-state-end state)) +wal-segment-size+))
        (if (eq :change (wal-fpw-state-witness-kind state))
@@ -81,7 +84,8 @@ number alone does not prove ancestry."
                        (<= (wal-fpw-state-coverage-start state) disabled)
                        (<= disabled (wal-fpw-state-start state))
                        (typep disabled-timeline '(integer 1 4294967295))
-                       (<= disabled-timeline (wal-fpw-state-timeline state))))
+                       (<= (wal-fpw-state-coverage-timeline state) disabled-timeline
+                           (wal-fpw-state-timeline state))))
               (or (not (eq :change (wal-fpw-state-witness-kind state)))
                   (wal-fpw-state-enabled state)
                   (and (eql disabled (wal-fpw-state-start state))
@@ -89,7 +93,15 @@ number alone does not prove ancestry."
               (or (null disabled)
                   (and (eq :change (wal-fpw-state-witness-kind state))
                        (null (wal-fpw-state-enabled state)))
-                  (< disabled (wal-fpw-state-start state)))))))
+                  (< disabled (wal-fpw-state-start state)))
+              (or (null disabled)
+                  (and (<= (+ disabled +wal-header-size+ +wal-full-page-writes-change-size+)
+                           (if (and (eq :change (wal-fpw-state-witness-kind state))
+                                    (null (wal-fpw-state-enabled state)))
+                               (wal-fpw-state-end state) (wal-fpw-state-start state)))
+                       (= (floor disabled +wal-segment-size+)
+                          (floor (+ disabled +wal-header-size+ +wal-full-page-writes-change-size+ -1)
+                                 +wal-segment-size+))))))))
 
 (defun wal-fpw-state-from-checkpoint (snapshot incarnation)
   "Seed evidence from a checkpoint with a policy field, or return NIL if absent.
@@ -100,7 +112,7 @@ A present NIL field is known OFF. The checkpoint starts the coverage floor."
   (when (get-properties snapshot '(:full-page-writes))
     (%make-wal-fpw-state incarnation (getf snapshot :full-page-writes) :checkpoint
                          (getf snapshot :start) (getf snapshot :end)
-                         (getf snapshot :timeline) (getf snapshot :start) nil nil)))
+                         (getf snapshot :timeline) (getf snapshot :start) (getf snapshot :timeline) nil nil)))
 
 (defun wal-fpw-state-next (state record timeline incarnation)
   "Derive evidence without changing shared state.
@@ -146,6 +158,7 @@ ordering alone does not prove ancestry."
     (%make-wal-fpw-state
      incarnation enabled kind start end timeline
      (if state (wal-fpw-state-coverage-start state) start)
+     (if state (wal-fpw-state-coverage-timeline state) timeline)
      (if (and (eq kind :change) (null enabled)) start
          (when state (wal-fpw-state-last-disable-start state)))
      (if (and (eq kind :change) (null enabled)) timeline

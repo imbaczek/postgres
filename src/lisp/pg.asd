@@ -133,6 +133,7 @@
                    (:file "../libpq/auth-policy")
                    (:file "../utils/session-config")
                    (:file "../access/transam/timeline")
+                   (:file "../replication/physical-fpw")
                    (:file "../replication/physical-bootstrap")
                    (:file "../replication/physical-recovery")
                    (:file "../replication/physical-store-history")

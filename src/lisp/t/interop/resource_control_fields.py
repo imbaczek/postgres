@@ -46,23 +46,72 @@ def checkpoint_resource_fact(data):
     return dict(parameters=list(values), lsn=lsn, timeline=timeline)
 
 
-def recovery_control_layout(data):
+def source_fpw_fact(data, applied, applied_timeline):
+    assert len(data) == 72 and data[:8] == b"PGFPWFC1"
+    number = lambda offset, size: int.from_bytes(data[offset:offset + size], "little")
+    flags = number(8, 4)
+    assert flags <= 7 and number(12, 4) == 0
+    checkpoint, disabled = bool(flags & 2), bool(flags & 4)
+    fact = dict(enabled=bool(flags & 1), witness_kind="checkpoint" if checkpoint else "change",
+                witness_start=number(16, 8), witness_end=number(24, 8),
+                witness_timeline=number(32, 4), coverage_start=number(40, 8),
+                coverage_timeline=number(36, 4), through=number(48, 8),
+                through_timeline=number(56, 4),
+                last_disable_start=number(64, 8) if disabled else None,
+                last_disable_timeline=number(60, 4) if disabled else None)
+    start, end = fact["witness_start"], fact["witness_end"]
+    assert fact["coverage_start"] <= start < end <= fact["through"]
+    assert 1 <= fact["coverage_timeline"] <= fact["witness_timeline"] <= fact["through_timeline"]
+    assert (fact["through"], fact["through_timeline"]) == (applied, applied_timeline)
+    assert start // (16 * 1024 * 1024) == (end - 1) // (16 * 1024 * 1024)
+    assert (end - start - 32 in (88, 96, 136, 144)) if checkpoint else (end - start == 48)
+    if disabled:
+        position, timeline = fact["last_disable_start"], fact["last_disable_timeline"]
+        assert fact["coverage_start"] <= position <= start
+        assert fact["coverage_timeline"] <= timeline <= fact["witness_timeline"]
+        assert position // (16 * 1024 * 1024) == (position + 47) // (16 * 1024 * 1024)
+        if not checkpoint and not fact["enabled"]:
+            assert (position, timeline) == (start, fact["witness_timeline"])
+        else:
+            assert position + 48 <= start
+    else:
+        assert number(60, 4) == number(64, 8) == 0
+    assert checkpoint or fact["enabled"] or disabled
+    return fact
+
+
+def recovery_control_fields(data):
     ordinary, pending = data[:8] == b"PGRSTAT3", data[:8] == b"PGRSTAT4"
-    known = ((ordinary and len(data) in (120, 136))
-             or (pending and len(data) in (136, 152, 180, 196)))
-    size = len(data) - (48 if known else 0)
+    fpw = ((ordinary and len(data) in (144, 160, 192, 208))
+           or (pending and len(data) in (160, 176, 204, 208, 220, 224, 252, 268)))
+    resource_end = len(data) - 4 - (72 if fpw else 0)
+    known = ((ordinary and resource_end + 4 in (120, 136))
+             or (pending and resource_end + 4 in (136, 152, 180, 196)))
+    size = resource_end + 4 - (48 if known else 0)
     assert (ordinary and size in (72, 88)) or (pending and size in (88, 104, 132, 148))
     assert zlib.crc32(data[:-4] + bytes(4)) == int.from_bytes(data[-4:], "little")
-    if not known:
-        return size, None
-    fact = data[-52:-4]
-    values = resource_values(fact[:32])
-    lsn, timeline = int.from_bytes(fact[32:40], "little"), int.from_bytes(fact[40:44], "little")
     selected = size in ((104, 148) if pending else (88,))
     offset = (84 if pending else 68) if selected else 12
-    assert not any(fact[44:]) and 1 <= lsn <= int.from_bytes(data[40:48], "little")
-    assert 1 <= timeline <= int.from_bytes(data[offset:offset + 4], "little")
-    return size, dict(parameters=list(values), lsn=lsn, timeline=timeline)
+    applied, applied_timeline = int.from_bytes(data[40:48], "little"), int.from_bytes(data[offset:offset + 4], "little")
+    resources = None
+    if known:
+        fact = data[resource_end - 48:resource_end]
+        values = resource_values(fact[:32])
+        lsn, timeline = int.from_bytes(fact[32:40], "little"), int.from_bytes(fact[40:44], "little")
+        assert not any(fact[44:]) and 1 <= lsn <= applied
+        assert 1 <= timeline <= applied_timeline
+        resources = dict(parameters=list(values), lsn=lsn, timeline=timeline)
+    policy = source_fpw_fact(data[-76:-4], applied, applied_timeline) if fpw else None
+    return size, resources, policy
+
+
+def recovery_control_layout(data):
+    size, resources, _ = recovery_control_fields(data)
+    return size, resources
+
+
+def recovery_full_page_writes_fact(data):
+    return recovery_control_fields(data)[2]
 
 
 def check_optional_fields(fields):

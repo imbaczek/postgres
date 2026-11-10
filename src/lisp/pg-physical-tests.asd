@@ -55,6 +55,7 @@
                (:file "t/xid-reservation-tests")
                (:file "t/wal-xid-reservation-tests")
                (:file "t/full-page-writes-wal-tests")
+               (:file "t/source-fpw-persistence-tests")
                (:file "t/running-xacts-tests")
                (:file "t/wal-namespace-tests")
                (:file "t/wal-lineage-tests")

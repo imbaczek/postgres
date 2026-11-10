@@ -36,28 +36,60 @@ def read_regular(path, limit):
 
 def recovery_phase(root):
     """Read and check native recovery control; do not infer a role from file names."""
-    data = read_regular(root / "physical-recovery.control", 196)
+    data = read_regular(root / "physical-recovery.control", 268)
     ordinary = data[:8] == b"PGRSTAT3"
     pending = data[:8] == b"PGRSTAT4"
-    known = ((ordinary and len(data) in (120, 136))
-             or (pending and len(data) in (136, 152, 180, 196)))
-    size = len(data) - (48 if known else 0)
+    fpw = ((ordinary and len(data) in (144, 160, 192, 208))
+           or (pending and len(data) in (160, 176, 204, 208, 220, 224, 252, 268)))
+    resource_end = len(data) - 4 - (72 if fpw else 0)
+    known = ((ordinary and resource_end + 4 in (120, 136))
+             or (pending and resource_end + 4 in (136, 152, 180, 196)))
+    size = resource_end + 4 - (48 if known else 0)
     if not ((ordinary and size in (72, 88)) or (pending and size in (88, 104, 132, 148))):
         raise ValueError("invalid native recovery control")
     saved = struct.unpack_from("<I", data, len(data) - 4)[0]
     if zlib.crc32(data[:-4] + b"\0" * 4) != saved:
         raise ValueError("native recovery control checksum mismatch")
+    selected = size in ((104, 148) if pending else (88,))
+    timeline_offset = (84 if pending else 68) if selected else 12
+    applied_timeline = struct.unpack_from("<I", data, timeline_offset)[0]
+    applied = struct.unpack_from("<Q", data, 40)[0]
     if known:
-        fact = data[-52:-4]
+        fact = data[resource_end - 48:resource_end]
         validate_resource_tuple(fact[:32])
         origin, timeline, reserved = struct.unpack_from("<QII", fact, 32)
-        applied = struct.unpack_from("<Q", data, 40)[0]
-        selected = size in ((104, 148) if pending else (88,))
-        timeline_offset = (84 if pending else 68) if selected else 12
-        applied_timeline = struct.unpack_from("<I", data, timeline_offset)[0]
         if not (reserved == 0 and 1 <= origin <= applied and 1 <= timeline <= applied_timeline):
             raise ValueError("invalid native recovery resource fact")
+    if fpw:
+        validate_fpw_fact(data[-76:-4], applied, applied_timeline)
     return struct.unpack_from("<I", data, 8)[0] & 0x7FFFFFFF
+
+
+def validate_fpw_fact(data, applied, applied_timeline):
+    """Check the source policy shape and exact frontier, without proving ancestry."""
+    if len(data) != 72 or data[:8] != b"PGFPWFC1":
+        raise ValueError("invalid native recovery FPW encoding")
+    flags, reserved, start, end, timeline, coverage_timeline, coverage, through, through_timeline, disable_timeline, disabled = struct.unpack_from("<IIQQIIQQIIQ", data, 8)
+    checkpoint, has_disable = bool(flags & 2), bool(flags & 4)
+    segment = 16 * 1024 * 1024
+    valid = (flags <= 7 and reserved == 0 and coverage <= start < end <= through
+             and 1 <= coverage_timeline <= timeline <= through_timeline
+             and through == applied and through_timeline == applied_timeline
+             and start // segment == (end - 1) // segment
+             and ((end - start - 32 in (88, 96, 136, 144)) if checkpoint else end - start == 48))
+    if has_disable:
+        own_disable = not checkpoint and not flags & 1
+        valid = (valid and coverage <= disabled <= start
+                 and coverage_timeline <= disable_timeline <= timeline
+                 and disabled // segment == (disabled + 47) // segment
+                 and ((disabled == start and disable_timeline == timeline) if own_disable
+                      else disabled + 48 <= start))
+    else:
+        valid = valid and disabled == disable_timeline == 0
+    if not checkpoint and not flags & 1:
+        valid = valid and has_disable
+    if not valid:
+        raise ValueError("invalid native recovery FPW fact")
 
 
 def open_postmaster(root):

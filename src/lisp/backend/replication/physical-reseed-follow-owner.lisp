@@ -119,7 +119,7 @@
          (error "target follow base differs from its install plan"))
        (physical-reseed-follow-base-projection
         manifest digest
-        (recovery-read-bytes (physical-recovery-control-path directory) :maximum 196)
+        (recovery-read-bytes (physical-recovery-control-path directory) :maximum +physical-recovery-control-maximum-bytes+)
         directory (getf (getf plan :attempt) :request))))))
 
 ;; The original base evidence and terminal installation reference remain fixed

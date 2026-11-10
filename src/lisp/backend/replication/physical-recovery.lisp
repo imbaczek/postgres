@@ -36,7 +36,7 @@ the referenced archive."
   (destructuring-bind (&key phase system-id timeline manifest-digest checkpoint
                          applied next-xid db-state state-time (control-version 3)
                          (applied-timeline timeline) history-target history-digest
-                         promotion-child promotion-generation promotion-source-namespace retained-reference resource-fact
+                         promotion-child promotion-generation promotion-source-namespace retained-reference resource-fact fpw-fact
                        &allow-other-keys)
       control
     (and (member phase '(0 1 2 3))
@@ -51,6 +51,9 @@ the referenced archive."
                   (wal-resource-fact-valid-p resource-fact)
                   (<= (getf resource-fact :resource-lsn) applied)
                   (<= (getf resource-fact :resource-timeline) applied-timeline)))
+         (or (null fpw-fact)
+             (and (member control-version '(3 4))
+                  (physical-fpw-fact-at-p fpw-fact applied applied-timeline)))
          (or (null retained-reference)
              (and (= phase 3) (= control-version 4)
                   (wal-retained-reference-valid-p retained-reference)
@@ -102,7 +105,7 @@ the referenced archive."
                                         &key (db-state (if (zerop phase) +db-startup+ +db-in-archive-recovery+))
                                           (state-time (- (get-universal-time) 2208988800))
                                           (applied-timeline timeline) history-target history-digest
-                                          promotion-child promotion-generation promotion-source-namespace retained-reference resource-fact)
+                                          promotion-child promotion-generation promotion-source-namespace retained-reference resource-fact fpw-fact)
   "Encode recovery progress and its optional extensions under one CRC.
 Ordinary and pending images may append a 48-byte positioned resource fact."
   (let* ((pending (= phase 3)) (version (if pending 4 3))
@@ -110,7 +113,8 @@ Ordinary and pending images may append a 48-byte positioned resource fact."
                                (selected (not (null history-target)))
                                (reference-offset (+ extension-start (if selected 16 0)))
                                (resource-offset (+ reference-offset (if retained-reference 44 0)))
-                               (crc-offset (+ resource-offset (if resource-fact +wal-resource-fact-size+ 0))))
+                               (fpw-offset (+ resource-offset (if resource-fact +wal-resource-fact-size+ 0)))
+                               (crc-offset (+ fpw-offset (if fpw-fact +physical-fpw-fact-size+ 0))))
     (unless (physical-recovery-control-valid-p
              (list :control-version version :phase phase :system-id system-id :timeline timeline
                    :manifest-digest manifest-digest :checkpoint checkpoint :applied applied
@@ -118,7 +122,7 @@ Ordinary and pending images may append a 48-byte positioned resource fact."
                    :applied-timeline applied-timeline :history-target history-target :history-digest history-digest
                    :promotion-child promotion-child :promotion-generation promotion-generation
                    :promotion-source-namespace promotion-source-namespace :retained-reference retained-reference
-                   :resource-fact resource-fact))
+                   :resource-fact resource-fact :fpw-fact fpw-fact))
       (error "unrepresentable physical recovery control state"))
     (let ((bytes (make-array (+ crc-offset 4) :element-type '(unsigned-byte 8) :initial-element 0)))
       (replace bytes (if pending #(80 71 82 83 84 65 84 52) #(80 71 82 83 84 65 84 51)))
@@ -143,29 +147,30 @@ Ordinary and pending images may append a 48-byte positioned resource fact."
         (physical-recovery-write-retained-reference bytes reference-offset retained-reference))
       (when resource-fact
         (replace bytes (wal-encode-resource-fact resource-fact) :start1 resource-offset))
+      (when fpw-fact
+        (replace bytes (physical-fpw-encode-fact fpw-fact) :start1 fpw-offset))
       (wal-set-u32 bytes crc-offset (wal-crc32 bytes))
       bytes)))
 
 (defun physical-recovery-decode-control (bytes)
-  "Decode recovery control by magic and exact length, then verify its CRC.
-Legacy versions use 60 or 72 bytes. Ordinary v3 uses 72 or 88 bytes;
-pending v4 uses 88 or 104 bytes, or 132 or 148 with a retained reference.
-The v3 and v4 layouts can add a 48-byte resource fact before the CRC.
-Magic distinguishes the overlapping 88-byte and 136-byte layouts."
-
-  (unless (member (length bytes) '(60 72 88 104 120 132 136 148 152 180 196))
+  "Decode an exact native control layout and verify its CRC before accepting facts."
+  (unless (member (length bytes) '(60 72 88 104 120 132 136 144 148 152 160 176 180
+                                   192 196 204 208 220 224 252 268))
     (error "invalid physical recovery control length"))
   (let* ((size (length bytes)) (magic (subseq bytes 0 8))
-                               (resources (or (and (equalp magic #(80 71 82 83 84 65 84 51))
-                                                   (member size '(120 136)))
-                                              (and (equalp magic #(80 71 82 83 84 65 84 52))
-                                                   (member size '(136 152 180 196)))))
-                               (layout-size (- size (if resources +wal-resource-fact-size+ 0)))
+                               (ordinary (equalp magic #(80 71 82 83 84 65 84 51)))
+                               (child (equalp magic #(80 71 82 83 84 65 84 52)))
+                               (fpw (or (and ordinary (member size '(144 160 192 208)))
+                                        (and child (member size '(160 176 204 208 220 224 252 268)))))
+                               (resource-size (- size (if fpw +physical-fpw-fact-size+ 0)))
+                               (resources (or (and ordinary (member resource-size '(120 136)))
+                                              (and child (member resource-size '(136 152 180 196)))))
+                               (layout-size (- resource-size (if resources +wal-resource-fact-size+ 0)))
                                (version (cond
                                           ((and (= size 60) (equalp magic #(80 71 82 83 84 65 84 69))) 1)
                                           ((and (= size 72) (equalp magic #(80 71 82 83 84 65 84 50))) 2)
-                                          ((and (member layout-size '(72 88)) (equalp magic #(80 71 82 83 84 65 84 51))) 3)
-                                          ((and (member layout-size '(88 104 132 148)) (equalp magic #(80 71 82 83 84 65 84 52))) 4)))
+                                          ((and ordinary (member layout-size '(72 88))) 3)
+                                          ((and child (member layout-size '(88 104 132 148))) 4)))
                                (legacy (eql version 1)) (pending (eql version 4))
                                (extension-start (if pending 84 68))
                                (retained (and pending (member layout-size '(132 148))))
@@ -202,14 +207,18 @@ Magic distinguishes the overlapping 88-byte and 136-byte layouts."
               (physical-recovery-read-retained-reference bytes (- layout-size 48))))
       (when resources
         (setf (getf control :resource-fact)
-              (wal-decode-resource-fact (subseq bytes (- size 52) crc-offset))))
+              (wal-decode-resource-fact
+               (subseq bytes (- resource-size 52) (- resource-size 4)))))
+      (when fpw
+        (setf (getf control :fpw-fact)
+              (physical-fpw-decode-fact (subseq bytes (- size 76) crc-offset))))
       (unless (physical-recovery-control-valid-p control :legacy legacy)
         (error "corrupt or unsupported physical recovery control"))
       control)))
 
 (defun physical-recovery-read-control (directory)
   (physical-recovery-decode-control
-   (recovery-read-bytes (physical-recovery-control-path directory) :maximum 196)))
+   (recovery-read-bytes (physical-recovery-control-path directory) :maximum +physical-recovery-control-maximum-bytes+)))
 
 (defvar *physical-recovery-control-test-hook* nil
   "Optional deterministic hook for recovery control publication failures.")
@@ -252,7 +261,10 @@ resource values, but their reporting position cannot move backward."
          (required (getf state :required-applied))
          (required-timeline (getf state :required-timeline base))
          (source (getf state :source-resource-fact))
-         (minimum (getf state :required-resource-fact)))
+         (minimum (getf state :required-resource-fact))
+         (fpw-fact (physical-fpw-required-fact
+                    (getf state :source-fpw-fact) (getf state :required-fpw-fact)
+                    applied runtime required required-timeline)))
     (unless (or (null source)
                 (and (wal-resource-fact-valid-p source)
                      (<= (getf source :resource-lsn) applied)
@@ -273,8 +285,8 @@ resource values, but their reporting position cannot move backward."
                    (or (> applied required) (equal source minimum)))
         (error "reconstructed resources differ at the required recovery frontier")))
     (if (and required (< applied required))
-        (values required required-timeline (wal-copy-control-resource-fields minimum))
-        (values applied runtime (wal-copy-control-resource-fields source)))))
+        (values required required-timeline (wal-copy-control-resource-fields minimum) fpw-fact)
+        (values applied runtime (wal-copy-control-resource-fields source) fpw-fact))))
 
 (defun physical-recovery-write-control (state phase applied next-xid
                                         &key (db-state +db-in-archive-recovery+))
@@ -287,14 +299,14 @@ resource values, but their reporting position cannot move backward."
   (when (and (= db-state +db-shutdowned-in-recovery+)
              (< applied (or (getf state :required-applied) applied)))
     (error "clean recovery has not reached its previously applied boundary"))
-  (multiple-value-bind (required required-timeline resource-fact) (physical-recovery-control-frontier state applied)
+  (multiple-value-bind (required required-timeline resource-fact fpw-fact) (physical-recovery-control-frontier state applied)
     (let* ((state (copy-list state))
            (next-xid (max next-xid (or (getf state :observed-next-xid) next-xid)))
            (time (- (get-universal-time) 2208988800))
            (bytes (physical-recovery-control-image
                    phase (getf state :system-id) (getf state :timeline)
                    (getf state :manifest-digest) (getf state :checkpoint) required next-xid
-                   :applied-timeline required-timeline :resource-fact resource-fact
+                   :applied-timeline required-timeline :resource-fact resource-fact :fpw-fact fpw-fact
                    :history-target (getf state :history-target) :history-digest (getf state :history-digest)
                    :db-state db-state :state-time time)))
       (when (getf state :source-resource-fact)
@@ -303,6 +315,11 @@ resource values, but their reporting position cannot move backward."
       (if resource-fact
           (setf (getf state :required-resource-fact) (wal-copy-control-resource-fields resource-fact))
           (remf state :required-resource-fact))
+      (when (getf state :source-fpw-fact)
+        (setf (getf state :source-fpw-fact) (physical-fpw-copy-fact (getf state :source-fpw-fact))))
+      (if fpw-fact
+          (setf (getf state :required-fpw-fact) (physical-fpw-copy-fact fpw-fact))
+          (remf state :required-fpw-fact))
       (physical-recovery-persist-control-bytes bytes db-state)
       (setf (getf state :phase) phase
             (getf state :db-state) db-state
@@ -624,6 +641,15 @@ the manifest does not add another authority for those facts."
     (when (getf control :resource-fact)
       (setf (getf manifest :required-resource-fact)
             (wal-copy-control-resource-fields (getf control :resource-fact))))
+    (let* ((snapshot (getf manifest :source-checkpoint))
+           (fact (physical-fpw-fact-from-state
+                  (wal-fpw-state-from-checkpoint snapshot (make-symbol "FPW-BASE"))
+                  (getf manifest :end) (getf manifest :timeline))))
+      (when fact
+        (setf (getf manifest :source-fpw-fact) (physical-fpw-copy-fact fact)
+              (getf manifest :base-source-fpw-fact) (physical-fpw-copy-fact fact))))
+    (when (getf control :fpw-fact)
+      (setf (getf manifest :required-fpw-fact) (physical-fpw-copy-fact (getf control :fpw-fact))))
     (setf (getf manifest :source-reservation) (physical-recovery-initial-reservation manifest))
     (setf (getf manifest :manifest-digest) digest
           (getf manifest :phase) (if (= 2 (getf control :phase)) 2 1)

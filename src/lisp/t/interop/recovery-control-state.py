@@ -6,6 +6,7 @@ import zlib
 from pathlib import Path
 
 RECOVERY_LAYOUT = runpy.run_path(str(Path(__file__).with_name("resource_control_fields.py")))["recovery_control_layout"]
+RECOVERY_FPW = runpy.run_path(str(Path(__file__).with_name("resource_control_fields.py")))["recovery_full_page_writes_fact"]
 
 def decode(raw):
     legacy = len(raw) == 60
@@ -45,6 +46,10 @@ def decode(raw):
                   applied=applied, next_xid=xid, state=state, time=when)
     if resources is not None:
         result['resource_fact'] = resources
+    if version == 3:
+        fpw = RECOVERY_FPW(raw)
+        if fpw is not None:
+            result['fpw_fact'] = fpw
     return result
 
 

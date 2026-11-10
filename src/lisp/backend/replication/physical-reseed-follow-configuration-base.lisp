@@ -9,7 +9,7 @@
            (maximum (if (physical-reseed-follow-configuration-selected-p
                          (physical-reseed-follow-core-projection record)) 5 4))
            (expected (assoc "physical-recovery.control" (getf plan :new) :test #'equal))
-           (bytes (physical-libpq-datum-octets (getf (getf record :base) :recovery-control) 196))
+           (bytes (physical-libpq-datum-octets (getf (getf record :base) :recovery-control) +physical-recovery-control-maximum-bytes+))
            (local (getf (getf plan :attempt) :local))
            (root (physical-image-check-directory root-fd))
            (mount (physical-adoption-install-mount-id nil :directory-fd root-fd)))

@@ -14,6 +14,7 @@ CHECKPOINT = runpy.run_path(str(HERE / "checkpoint-snapshot.py"))["read_copy"]
 DECODE_CHECKPOINT = runpy.run_path(str(HERE / "checkpoint-snapshot.py"))["checkpoint"]
 NAMESPACE = runpy.run_path(str(HERE / "wal-namespace-inspect.py"))["inspect"]
 RECOVERY_LAYOUT = runpy.run_path(str(HERE / "resource_control_fields.py"))["recovery_control_layout"]
+RECOVERY_FPW = runpy.run_path(str(HERE / "resource_control_fields.py"))["recovery_full_page_writes_fact"]
 DECODE_RECOVERY = runpy.run_path(str(HERE / "recovery-control-state.py"))["decode"]
 PENDING = runpy.run_path(str(HERE / "restartpoint-prefix-inspect.py"))
 PROMOTION_FIXTURE = runpy.run_path(str(HERE / "promotion-primary-inspect.py"))["checkpoint_bytes"]
@@ -267,6 +268,77 @@ class ResourceControlTests(unittest.TestCase):
                                     CTL["recovery_phase"](self.root)
                                 with self.assertRaises(AssertionError):
                                     RECOVERY_LAYOUT(bad)
+
+    def fpw_recovery_image(self, pending, layout, resources, enabled):
+        data = bytearray(layout + (48 if resources else 0) + (72 if enabled is not None else 0))
+        data[:8] = b"PGRSTAT4" if pending else b"PGRSTAT3"
+        struct.pack_into("<IIQQQQQ", data, 8, 3 if pending else 2, 1, 123, 456, 32, 256, 1003)
+        struct.pack_into("<Iq", data, 56, 5, 0)
+        selected = layout in ((104, 148) if pending else (88,))
+        offset, applied_timeline = (84 if pending else 68), (2 if selected else 1)
+        if pending:
+            struct.pack_into("<IIQ", data, 68, 3, 0, 7)
+        if selected:
+            struct.pack_into("<IIQ", data, offset, 2, 2, 99)
+            offset += 16
+        if pending and layout in (132, 148):
+            struct.pack_into("<QIQQQQ", data, offset, 9, 1, 32, 456, 256, 8)
+        offset = layout - 4
+        if resources:
+            data[offset:offset + 48] = (b"PGRES001" + struct.pack("<5I", 100, 8, 10, 0, 128)
+                                      + bytes(4) + struct.pack("<QII", 64, 1, 0))
+            offset += 48
+        if enabled is not None:
+            data[offset:offset + 8] = b"PGFPWFC1"
+            struct.pack_into("<IIQQIIQQIIQ", data, offset + 8,
+                             1 if enabled else 4, 0, 64, 112, 1, 1, 64, 256,
+                             applied_timeline, 0 if enabled else 1, 0 if enabled else 64)
+        struct.pack_into("<I", data, len(data) - 4, zlib.crc32(data))
+        return data
+
+    def test_recovery_fpw_false_unknown_and_all_extension_combinations(self):
+        for pending, layouts in ((False, (72, 88)), (True, (88, 104, 132, 148))):
+            for layout in layouts:
+                for resources in (False, True):
+                    for enabled in (None, False, True):
+                        with self.subTest(pending=pending, layout=layout, resources=resources, enabled=enabled):
+                            data = self.fpw_recovery_image(pending, layout, resources, enabled)
+                            (self.root / "physical-recovery.control").write_bytes(data)
+                            self.assertEqual(3 if pending else 2, CTL["recovery_phase"](self.root))
+                            size, fact = RECOVERY_LAYOUT(data)
+                            self.assertEqual(layout, size)
+                            self.assertEqual(resources, fact is not None)
+                            policy = RECOVERY_FPW(data)
+                            if enabled is None:
+                                self.assertIsNone(policy)
+                            else:
+                                self.assertIs(enabled, policy["enabled"])
+                                self.assertEqual(256, policy["through"])
+                                self.assertEqual(None if enabled else 64, policy["last_disable_start"])
+                            if pending:
+                                self.assertEqual(data, PENDING["checked_pending_control"](self.root))
+                                if layout in (132, 148):
+                                    self.assertEqual((9, 1, 32, 456, 256, 8), PENDING["retained_reference"](data))
+                            else:
+                                self.assertEqual(policy, DECODE_RECOVERY(data).get("fpw_fact"))
+
+    def test_recovery_fpw_malformed_facts_fail_with_recomputed_crc(self):
+        source = self.fpw_recovery_image(False, 88, True, False)
+        fpw_offset = len(source) - 76
+        for offset, size, value in ((0, 1, 0), (8, 4, 8), (12, 4, 1), (24, 8, 64),
+                                    (36, 4, 0), (48, 8, 257), (56, 4, 0), (60, 4, 0), (64, 8, 65)):
+            with self.subTest(offset=offset):
+                data = source.copy()
+                data[fpw_offset + offset:fpw_offset + offset + size] = value.to_bytes(size, "little")
+                struct.pack_into("<I", data, len(data) - 4, 0)
+                struct.pack_into("<I", data, len(data) - 4, zlib.crc32(data))
+                (self.root / "physical-recovery.control").write_bytes(data)
+                with self.assertRaises(ValueError):
+                    CTL["recovery_phase"](self.root)
+                with self.assertRaises(AssertionError):
+                    RECOVERY_LAYOUT(data)
+                with self.assertRaises(AssertionError):
+                    DECODE_RECOVERY(data)
 
     def test_promotion_fixture_preserves_frozen_resources_in_checkpoint_bytes(self):
         expected = dict(fork=256, floor=1003, oid=16384, time=0, child=3, parent=2)

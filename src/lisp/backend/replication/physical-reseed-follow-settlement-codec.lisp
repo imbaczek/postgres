@@ -21,7 +21,7 @@
 (defun physical-reseed-follow-settlement-base (record)
   (let* ((base (getf record :base))
          (control (physical-recovery-decode-control
-                   (physical-libpq-datum-octets (getf base :recovery-control) 196))))
+                   (physical-libpq-datum-octets (getf base :recovery-control) +physical-recovery-control-maximum-bytes+))))
     (list :checkpoint-start (getf base :checkpoint-start)
           :base (getf control :applied)
           :manifest-digest (getf base :manifest-digest))))

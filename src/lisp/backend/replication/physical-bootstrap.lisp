@@ -562,9 +562,9 @@ The slot is dropped on every exit; a verified origin remains after cancellation.
           (close input))))))
 
 (defun physical-backup-metadata-bounds ()
-  '(("physical-backup.manifest" 16777216)
+  `(("physical-backup.manifest" 16777216)
     ("recovery.required" 1024)
-    ("physical-recovery.control" 196)
+    ("physical-recovery.control" ,+physical-recovery-control-maximum-bytes+)
     ("pg_hba.conf" 1048576)
     ("pg_ident.conf" 1048576)
     ("authentication.initialized" 1024)))
