@@ -88,7 +88,7 @@
     (let ((snapshot (unit-fpw-snapshot policy nil nil)))
       (setf (getf snapshot :version) 1)
       (rove:ok (not (wal-checkpoint-snapshot-valid-p snapshot)))))
-  (dolist (flags '(16 20 32 255))
+  (dolist (flags '(16 20 128 255))
     (let ((bytes (wal-encode-checkpoint-snapshot (unit-commit-ts-snapshot))))
       (wal-set-u32 bytes 84 flags)
       (rove:ok (unit-commit-ts-error-p (lambda () (wal-decode-checkpoint-snapshot bytes))))))

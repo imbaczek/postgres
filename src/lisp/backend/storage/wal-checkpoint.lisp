@@ -29,16 +29,19 @@ fields are invalid.  Callers establish policy before supplying facts."
   (when (getf facts :oldest-commit-ts-xid)
     (list :oldest-commit-ts-xid 0 :newest-commit-ts-xid 0)))
 
+(defun wal-checkpoint-boolean-fact-valid-p (facts key)
+  (let ((length (and (listp facts) (list-length facts))))
+    (and length (evenp length)
+         (loop for candidate in facts by #'cddr
+               count (eq candidate key) into count
+               finally (return (or (zerop count)
+                                   (and (= count 1)
+                                        (member (getf facts key) '(nil t)))))))))
+
 (defun wal-checkpoint-full-page-writes-fields-valid-p (facts)
   "Accept an absent fact or one Boolean full-page-writes fact.
 Absence means unknown; present NIL means off and present T means on."
-  (let ((length (and (listp facts) (list-length facts))))
-    (and length (evenp length)
-         (loop for key in facts by #'cddr
-               count (eq key :full-page-writes) into count
-               finally (return (or (zerop count)
-                                   (and (= count 1)
-                                        (member (getf facts :full-page-writes) '(nil t)))))))))
+  (wal-checkpoint-boolean-fact-valid-p facts :full-page-writes))
 
 (defun wal-copy-checkpoint-full-page-writes-fields (facts)
   "Validate and copy the optional fact, retaining a known NIL value."
@@ -46,6 +49,15 @@ Absence means unknown; present NIL means off and present T means on."
     (error "invalid checkpoint full page writes fact"))
   (when (get-properties facts '(:full-page-writes))
     (list :full-page-writes (getf facts :full-page-writes))))
+
+(defun wal-checkpoint-logical-decoding-fields-valid-p (facts)
+  (wal-checkpoint-boolean-fact-valid-p facts :logical-decoding-enabled))
+
+(defun wal-copy-checkpoint-logical-decoding-fields (facts)
+  (unless (wal-checkpoint-logical-decoding-fields-valid-p facts)
+    (error "invalid checkpoint logical decoding fact"))
+  (when (get-properties facts '(:logical-decoding-enabled))
+    (list :logical-decoding-enabled (getf facts :logical-decoding-enabled))))
 
 (defun wal-checkpoint-snapshot-length-p (length)
   "Recognize the 88, 96, 136 and 144 byte checkpoint payload lengths."
@@ -63,7 +75,8 @@ Absence means unknown; present NIL means off and present T means on."
   "Plan placement from the same frozen optional facts used by the encoder."
   (unless (and (wal-control-resource-fields-valid-p facts)
                (wal-checkpoint-commit-ts-fields-valid-p facts)
-               (wal-checkpoint-full-page-writes-fields-valid-p facts))
+               (wal-checkpoint-full-page-writes-fields-valid-p facts)
+               (wal-checkpoint-logical-decoding-fields-valid-p facts))
     (error "invalid checkpoint facts"))
   (+ +wal-header-size+
      (if (wal-control-resource-parameters facts)
@@ -91,9 +104,10 @@ Ancestry requires separate history validation."
          (wal-control-resource-fields-valid-p snapshot)
          (wal-checkpoint-commit-ts-fields-valid-p snapshot)
          (wal-checkpoint-full-page-writes-fields-valid-p snapshot)
+         (wal-checkpoint-logical-decoding-fields-valid-p snapshot)
          (or (= version 2)
              (and (null (getf snapshot :oldest-commit-ts-xid))
-                  (null (get-properties snapshot '(:full-page-writes)))))
+                  (null (get-properties snapshot '(:full-page-writes :logical-decoding-enabled)))))
          (every (lambda (value) (typep value '(unsigned-byte 64)))
                 (list start end redo reserved))
          (typep next (if (= version 1) '(integer 3 18446744073709551615)
@@ -140,7 +154,9 @@ must be zero. Absence preserves unknown history."
     (wal-set-u32 bytes 84 (logior (if next-exhausted 1 0) (if active-exhausted 2 0)
                                   (if (getf snapshot :oldest-commit-ts-xid) 4 0)
                                   (if (get-properties snapshot '(:full-page-writes)) 8 0)
-                                  (if (getf snapshot :full-page-writes) 16 0)))
+                                  (if (getf snapshot :full-page-writes) 16 0)
+                                  (if (get-properties snapshot '(:logical-decoding-enabled)) 32 0)
+                                  (if (getf snapshot :logical-decoding-enabled) 64 0)))
     (when (getf snapshot :resource-parameters)
       (replace bytes (wal-encode-resource-fact (wal-copy-control-resource-fields snapshot)) :start1 88))
     (when (getf snapshot :oldest-commit-ts-xid)
@@ -163,8 +179,9 @@ has no extensions.  Saved source facts preserve the distinction between known an
          (flags (wal-u32 bytes 84))
          (commit-ts-p (logbitp 2 flags))
          (resource-end (- (length bytes) (if commit-ts-p +wal-checkpoint-commit-ts-size+ 0))))
-    (unless (and version (if (= version 1) (zerop flags) (<= 0 flags 31))
+    (unless (and version (if (= version 1) (zerop flags) (<= 0 flags 127))
                  (or (not (logbitp 4 flags)) (logbitp 3 flags))
+                 (or (not (logbitp 6 flags)) (logbitp 5 flags))
                  (member resource-end
                          (list +wal-checkpoint-snapshot-size+ +wal-checkpoint-resource-snapshot-size+))
                  (or (= (length bytes) +wal-checkpoint-snapshot-size+) (= version 2))
@@ -195,6 +212,8 @@ has no extensions.  Saved source facts preserve the distinction between known an
                             :newest-commit-ts-xid (wal-u32 bytes (+ resource-end 4))))))
       (when (logbitp 3 flags)
         (setf snapshot (append snapshot (list :full-page-writes (logbitp 4 flags)))))
+      (when (logbitp 5 flags)
+        (setf snapshot (append snapshot (list :logical-decoding-enabled (logbitp 6 flags)))))
       (unless (wal-checkpoint-snapshot-valid-p snapshot)
         (error "invalid native checkpoint snapshot"))
       snapshot)))
@@ -216,7 +235,7 @@ version 8 or newer, including when that fact is false."
         (unless (and (>= (wal-record-version record)
                          (cond ((or (getf snapshot :resource-parameters)
                                     (getf snapshot :oldest-commit-ts-xid)
-                                    (get-properties snapshot '(:full-page-writes))) 8)
+                                    (get-properties snapshot '(:full-page-writes :logical-decoding-enabled))) 8)
                                ((= 2 (getf snapshot :version)) 7) (t 6)))
                      (= (wal-record-start record) (getf snapshot :start))
                      (= (wal-record-end record) (getf snapshot :end)))
@@ -486,7 +505,8 @@ and plans the record size before choosing START."
                                    :timeline *wal-insert-timeline* :prev-timeline *wal-prev-timeline* :oldest-active-xid active)
                              (wal-copy-control-resource-fields resource-facts)
                              (wal-copy-checkpoint-commit-ts-fields resource-facts)
-                             (wal-copy-checkpoint-full-page-writes-fields resource-facts))))
+                             (wal-copy-checkpoint-full-page-writes-fields resource-facts)
+                             (wal-copy-checkpoint-logical-decoding-fields resource-facts))))
       (unless (wal-checkpoint-snapshot-valid-p snapshot)
         (error "source allocation state cannot be represented in checkpoint"))
       snapshot)))
