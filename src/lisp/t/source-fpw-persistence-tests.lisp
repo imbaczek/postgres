@@ -176,6 +176,8 @@
                      (ok (= start (getf next :witness-start)))
                      (ok (equal next (getf (pg::physical-recovery-read-control root) :fpw-fact)))))))
              (let* ((fork pg::*last-replay-lsn*)
+                    (checkpoint (copy-tree (getf pg::*physical-recovery-state* :source-checkpoint)))
+                    (next-xid pg::*next-xid*)
                     (raw (pg::wal-encode-end-of-recovery-record fork pg::*next-xid* 2 1 1))
                     (end (+ fork (length raw)))
                     (prior (copy-list (getf pg::*physical-recovery-state* :source-fpw-fact))))
@@ -189,7 +191,8 @@
                  (ok (pg::physical-fpw-fact-at-p next end 2))
                  (ok (equal next (nth-value 1 (pg::physical-recovery-scan-resource-fact
                                                store fork end nil pg::*physical-recovery-state*
-                                               :fpw-seed prior))))
+                                               :fpw-seed prior :checkpoint-seed checkpoint
+                                               :next-xid-seed next-xid))))
                  (ok (eql enabled (getf next :enabled)))
                  (ok (= (getf prior :witness-start) (getf next :witness-start)))
                  (ok (= 1 (getf next :witness-timeline) (getf next :coverage-timeline)))

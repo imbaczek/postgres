@@ -663,7 +663,8 @@ from the source checkpoint and retain any later required fact from control."
                       (if snapshot (getf snapshot :start) (- checkpoint +wal-header-size+))))
         (error "base checkpoint control differs from manifest"))
       (physical-recovery-check-checkpoint-resources snapshot metadata)
-      (setf (getf manifest :source-checkpoint) snapshot))
+      (setf (getf manifest :source-checkpoint) snapshot
+            (getf manifest :base-source-checkpoint) (copy-tree snapshot)))
     (when (getf (getf manifest :source-checkpoint) :resource-parameters)
       (setf (getf manifest :source-resource-fact)
             (wal-copy-control-resource-fields (getf manifest :source-checkpoint))

@@ -101,6 +101,20 @@
         (error "invalid restartpoint source resource fact"))))
   (values))
 
+(defun physical-restartpoint-scan-seeds (metadata state)
+  (if metadata
+      (let ((checkpoint (getf metadata :source-checkpoint)))
+        (values checkpoint
+                (or (getf metadata :next-xid)
+                    (when (and checkpoint (eql (getf metadata :lsn) (getf checkpoint :end)))
+                      (getf checkpoint :next-xid)))))
+      (values (if (get-properties state '(:base-source-checkpoint))
+                  (getf state :base-source-checkpoint)
+                  (let ((checkpoint (getf state :source-checkpoint)))
+                    (when (and checkpoint (<= (getf checkpoint :end) (getf state :end)))
+                      checkpoint)))
+              (getf state :next-xid))))
+
 (defun physical-restartpoint-resource-seed (metadata state store start)
   "Recover the fact at START from the restartpoint, checkpoint or retained WAL.
 Prove the separately saved required fact at its own recovery boundary before use."
@@ -120,17 +134,27 @@ Prove the separately saved required fact at its own recovery boundary before use
         ((and checkpoint (getf checkpoint :resource-parameters)
               (<= (physical-store-floor-lsn store) (getf checkpoint :end) start))
          (setf fact (physical-recovery-scan-resource-fact
-                     store (getf checkpoint :end) start (wal-copy-control-resource-fields checkpoint) state)))
+                     store (getf checkpoint :end) start (wal-copy-control-resource-fields checkpoint) state
+                     :checkpoint-seed checkpoint :next-xid-seed (getf checkpoint :next-xid))))
         ((<= (physical-store-floor-lsn store) base)
-         (setf fact (physical-recovery-scan-resource-fact store base start base-fact state)))))
+         (multiple-value-bind (base-checkpoint base-next) (physical-restartpoint-scan-seeds nil state)
+           (setf fact (physical-recovery-scan-resource-fact
+                       store base start base-fact state
+                       :checkpoint-seed base-checkpoint :next-xid-seed base-next
+                       :fpw-seed (getf state :base-source-fpw-fact)))))))
     (when fact
       (unless (<= (getf fact :resource-lsn) start)
         (error "restartpoint resources are newer than its replay seed"))
       (timeline-check-resource-origin fact (physical-recovery-resource-history store state)))
     (when minimum
       (if (< start required)
-          (unless (equal minimum (physical-recovery-scan-resource-fact store start required fact state))
-            (error "required resource fact cannot be reconstructed; take a fresh base backup"))
+          (multiple-value-bind (checkpoint next) (physical-restartpoint-scan-seeds metadata state)
+            (unless (equal minimum (physical-recovery-scan-resource-fact
+                                    store start required fact state
+                                    :checkpoint-seed checkpoint :next-xid-seed next
+                                    :fpw-seed (if metadata (getf metadata :source-fpw-fact)
+                                                  (getf state :base-source-fpw-fact))))
+              (error "required resource fact cannot be reconstructed; take a fresh base backup")))
           (let ((candidate (copy-list state)))
             ;; This synthetic candidate checks resources only. FPW has its own
             ;; restartpoint seed check; runtime FPW may still belong to the base.
@@ -169,9 +193,10 @@ A historical source checkpoint can record OFF regardless of local writer policy.
                (physical-fpw-fact-from-state
                 (wal-fpw-state-from-checkpoint checkpoint (make-symbol "RESTARTPOINT-FPW"))
                 (getf checkpoint :end) (getf checkpoint :timeline)))
-             (scan (from to initial)
+             (scan (from to initial checkpoint next)
                (nth-value 1 (physical-recovery-scan-resource-fact
-                             store from to nil state :fpw-seed initial))))
+                             store from to nil state :fpw-seed initial
+                             :checkpoint-seed checkpoint :next-xid-seed next))))
       (when (and (null fact) checkpoint
                  (= (getf checkpoint :end) start) (= (getf checkpoint :timeline) timeline))
         (setf fact (checkpoint-fact)))
@@ -179,15 +204,18 @@ A historical source checkpoint can record OFF regardless of local writer policy.
         (cond
           ((and checkpoint (get-properties checkpoint '(:full-page-writes))
                 (<= (physical-store-floor-lsn store) (getf checkpoint :end) start))
-           (setf fact (scan (getf checkpoint :end) start (checkpoint-fact))))
+           (setf fact (scan (getf checkpoint :end) start (checkpoint-fact)
+                            checkpoint (getf checkpoint :next-xid))))
           ((<= (physical-store-floor-lsn store) base)
-           (setf fact (scan base start base-fact)))))
+           (multiple-value-bind (base-checkpoint base-next) (physical-restartpoint-scan-seeds nil state)
+             (setf fact (scan base start base-fact base-checkpoint base-next))))))
       (when fact
         (physical-fpw-check-fact fact (physical-recovery-resource-history store state) start timeline))
       (when minimum
         (if (< start required)
-            (physical-fpw-required-fact (scan start required fact) minimum
-                                        required required-timeline required required-timeline)
+            (multiple-value-bind (checkpoint next) (physical-restartpoint-scan-seeds metadata state)
+              (physical-fpw-required-fact (scan start required fact checkpoint next) minimum
+                                          required required-timeline required required-timeline))
             (physical-fpw-required-fact fact minimum start timeline required required-timeline)))
       (physical-fpw-copy-fact fact))))
 
