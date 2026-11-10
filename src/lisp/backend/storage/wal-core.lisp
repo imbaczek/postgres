@@ -625,6 +625,20 @@ Legacy 16-hex segment names always belong to timeline 1."
 #+x86-64
 (defparameter *wal-crc32-ieee-reference-table* (make-wal-crc32-table))
 
+(defun wal-crc32-typed-range (bytes start end table &optional (seed #xffffffff))
+  (declare (type (simple-array (unsigned-byte 8) (*)) bytes)
+           (type (simple-array (unsigned-byte 32) (256)) table)
+           (type fixnum start end)
+           (type (unsigned-byte 32) seed))
+  #+x86-64
+  (when (and *native-ieee-crc32-available-p*
+             (>= (- end start) 128)
+             (equalp table *wal-crc32-ieee-reference-table*))
+    (return-from wal-crc32-typed-range
+      (%wal-crc32-ieee-octets bytes start end table
+                              *native-ieee-crc32-constants* seed)))
+  (%wal-crc32-octets bytes start end table seed))
+
 (defun wal-crc32 (bytes &optional (start 0) (end (length bytes)))
   "Return the final IEEE CRC-32 of BYTES from START inclusive to END exclusive.
 The initial running state is #xffffffff.  On x86-64, valid simple octet
@@ -637,15 +651,7 @@ This native WAL checksum remains IEEE CRC-32; PostgreSQL C uses CRC-32C."
              (typep table '(simple-array (unsigned-byte 32) (256)))
              (typep start 'fixnum) (typep end 'fixnum)
              (<= 0 start end (length bytes)))
-        (progn
-          #+x86-64
-          (when (and *native-ieee-crc32-available-p*
-                     (>= (- end start) 128)
-                     (equalp table *wal-crc32-ieee-reference-table*))
-            (return-from wal-crc32
-              (%wal-crc32-ieee-octets bytes start end table
-                                      *native-ieee-crc32-constants* #xffffffff)))
-          (%wal-crc32-octets bytes start end table))
+        (wal-crc32-typed-range bytes start end table)
         (let ((crc #xFFFFFFFF))
           (loop for i from start below end
                 for slot = (logand (logxor crc (aref bytes i)) #xFF)
@@ -2418,6 +2424,21 @@ Follow a symlink at the WAL directory itself. Enumeration errors are reported."
            ;; version-aware xlogreader must decode WAL written by older servers.
            (>= version +wal-version-v3+))))
 
+(defun wal-record-crc32 (bytes)
+  (let ((table (and (boundp '*wal-crc32-table*) *wal-crc32-table*)))
+    (when (and (typep bytes '(simple-array (unsigned-byte 8) (*)))
+               (>= (length bytes) +wal-header-size+)
+               (typep table '(simple-array (unsigned-byte 32) (256))))
+      (let ((crc (logxor #xffffffff (%wal-crc32-octets bytes 0 28 table))))
+        (declare (type (unsigned-byte 32) crc))
+        (loop repeat 4
+              do (setf crc (logxor (ash crc -8) (aref table (logand crc #xff)))))
+        (return-from wal-record-crc32
+          (wal-crc32-typed-range bytes +wal-header-size+ (length bytes) table crc)))))
+  (let ((copy (copy-seq bytes)))
+    (wal-set-u32 copy 28 0)
+    (wal-crc32 copy)))
+
 (defun wal-decode-record (bytes expected-lsn)
   (let ((version (and (>= (length bytes) +wal-header-size+)
                       (wal-u16 bytes 4))))
@@ -2436,10 +2457,8 @@ Follow a symlink at the WAL directory itself. Enumeration errors are reported."
                  (= (wal-u64 bytes 12) expected-lsn)
                  (wal-valid-type-p (wal-u16 bytes 6) version))
       (error "invalid WAL record at LSN ~a" expected-lsn))
-    (let ((saved-crc (wal-u32 bytes 28))
-          (copy (copy-seq bytes)))
-      (wal-set-u32 copy 28 0)
-      (unless (= saved-crc (wal-crc32 copy))
+    (let ((saved-crc (wal-u32 bytes 28)))
+      (unless (= saved-crc (wal-record-crc32 bytes))
         (error "WAL checksum mismatch at LSN ~a" expected-lsn)))
     (let* ((type (wal-u16 bytes 6))
            (xid (wal-u64 bytes 20))
