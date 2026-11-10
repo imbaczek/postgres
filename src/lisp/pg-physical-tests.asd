@@ -160,6 +160,7 @@
                (:file "t/scan-stage-tests")
                (:file "t/readiness-fpw-tests")
                (:file "t/drop-fpw-tests")
+               (:file "t/eor-stage-tests")
                (:file "t/source-xids-replay-tests")
                (:file "t/source-xids-snapshot-tests")
                (:file "t/statement-snapshot-scope-tests")

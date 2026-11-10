@@ -33,6 +33,7 @@
                (:file "t/rove/promotion-fpw-plan-tests")
                (:file "t/rove/child-fpw-grammar-tests")
                (:file "t/rove/scan-stage-tests")
+               (:file "t/rove/eor-stage-tests")
                (:file "t/rove/snapshot-tests")
                (:file "t/rove/transaction-tests")
                (:file "t/rove/wal-tests")

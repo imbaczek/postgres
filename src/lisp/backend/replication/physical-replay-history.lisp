@@ -54,11 +54,24 @@ Adopt the latest selection without moving the applied replay timeline."
             (getf candidate :history-digest) (getf selection :digest)))
     candidate))
 
+(defun physical-replay-check-eor-stage (store previous timeline)
+  (let ((checkpoint (getf *physical-recovery-state* :source-checkpoint)))
+    (unless (and (typep previous '(unsigned-byte 64))
+                 (typep timeline '(integer 1 4294967295))
+                 (if checkpoint
+                     (and (wal-checkpoint-snapshot-valid-p checkpoint)
+                          (= timeline (getf checkpoint :timeline))
+                          (<= (getf checkpoint :end) previous))
+                     (= timeline (physical-store-timeline store))))
+      (error "end-of-recovery requires a completed checkpoint on its parent timeline")))
+  t)
+
 (defun physical-replay-check-selected-eor (store record raw previous timeline)
   "Check EOR against the selected receive history and current replay timeline.
 EOR cannot finish an active batch. This check does not change the server role."
   (when *wal-recovery-group-active*
     (error "end-of-recovery cannot finish an active WAL batch"))
+  (physical-replay-check-eor-stage store previous timeline)
   (let ((selection (physical-store-selection store)))
     (unless selection (error "end-of-recovery has no selected receive history"))
     (physical-store-history-check-record store record raw previous)
