@@ -1,3 +1,6 @@
+;; Primary effective full page writes policy is derived from checkpoint and WAL.
+;; Configuration and physical replay are not yet wired to this module.
+
 (in-package #:pg)
 
 (defconstant +wal-full-page-writes-change-size+ 16)
@@ -5,6 +8,11 @@
 (defstruct (wal-fpw-state
             (:constructor %make-wal-fpw-state
                 (incarnation enabled witness-kind start end timeline coverage-start last-disable-start last-disable-timeline)))
+  "Immutable policy evidence owned by one local WAL storage incarnation.
+START, END and TIMELINE identify the latest checkpoint or change witness;
+COVERAGE-START is the earliest position covered by this evidence. The optional
+last disabling change records its START and timeline, not its end. A timeline
+number alone does not prove ancestry."
   (incarnation nil :read-only t)
   (enabled nil :read-only t)
   (witness-kind nil :read-only t)
@@ -16,6 +24,7 @@
   (last-disable-timeline nil :read-only t))
 
 (defun wal-encode-full-page-writes-change (enabled)
+  "Encode the 16-byte type-17 WAL payload for the boolean ENABLED."
   (unless (member enabled '(nil t)) (error "invalid full page writes policy"))
   (let ((bytes (make-array +wal-full-page-writes-change-size+
                            :element-type '(unsigned-byte 8) :initial-element 0)))
@@ -24,6 +33,7 @@
     bytes))
 
 (defun wal-decode-full-page-writes-change (bytes)
+  "Validate a type-17 WAL payload and return its boolean policy."
   (unless (and (= (length bytes) +wal-full-page-writes-change-size+)
                (equalp (subseq bytes 0 8) #(80 71 70 80 87 48 48 49))
                (member (aref bytes 8) '(0 1))
@@ -32,6 +42,7 @@
   (= 1 (aref bytes 8)))
 
 (defun wal-full-page-writes-change-record-info (record)
+  "Validate a type-17 WAL terminal and return its boolean policy."
   (unless (and (= (wal-record-type record) +wal-record-full-page-writes-change+)
                (>= (wal-record-version record) 8) (zerop (wal-record-xid record))
                (typep (wal-record-start record) '(unsigned-byte 64))
@@ -45,6 +56,7 @@
   (wal-decode-full-page-writes-change (wal-record-payload record)))
 
 (defun wal-fpw-state-valid-p (state)
+  "Check the shape and ordering of evidence; this does not prove ancestry."
   (and (wal-fpw-state-p state)
        (symbolp (wal-fpw-state-incarnation state)) (wal-fpw-state-incarnation state)
        (member (wal-fpw-state-enabled state) '(nil t))
@@ -80,6 +92,8 @@
                   (< disabled (wal-fpw-state-start state)))))))
 
 (defun wal-fpw-state-from-checkpoint (snapshot incarnation)
+  "Seed evidence from a checkpoint with a policy field, or return NIL if absent.
+A present NIL field is known OFF. The checkpoint starts the coverage floor."
   (unless (and incarnation (symbolp incarnation)
                (or (null snapshot) (wal-checkpoint-snapshot-valid-p snapshot)))
     (error "invalid full page writes checkpoint seed"))
@@ -89,6 +103,11 @@
                          (getf snapshot :timeline) (getf snapshot :start) nil nil)))
 
 (defun wal-fpw-state-next (state record timeline incarnation)
+  "Derive evidence without changing shared state.
+A checkpoint supplies policy and must agree with any preceding known policy;
+a change establishes a new one. Records without a known policy field preserve
+STATE. Replay callers verify complete batches and selected history. Timeline
+ordering alone does not prove ancestry."
   (unless (and incarnation (symbolp incarnation)
                (typep timeline '(integer 1 4294967295))
                (wal-record-p record)
@@ -138,6 +157,8 @@
   (when *wal-fpw-test-hook* (funcall *wal-fpw-test-hook* point state)))
 
 (defun wal-checked-fpw-state-under-lock ()
+  "Return durable evidence or NIL when unknown, requiring the WAL lock.
+Do not call while an enabling candidate is installed before its flush."
   (unless (sb-thread:holding-mutex-p *wal-lock*) (error "full page writes requires WAL lock"))
   (wal-check-healthy)
   (unless *wal-ready* (wal-invalid-input "full page writes requires initialized WAL"))
@@ -152,15 +173,19 @@
   *wal-fpw-state*)
 
 (defun wal-current-full-page-writes-fields ()
+  "Return checkpoint fields under the WAL lock, preserving known OFF versus absent."
   (let ((state (wal-checked-fpw-state-under-lock)))
     (when state (list :full-page-writes (wal-fpw-state-enabled state)))))
 
 (defun wal-fpw-prepare-recovery (snapshot marker-p)
+  "Mark known policy evidence unavailable until recovery completes, under WAL lock."
   (unless (sb-thread:holding-mutex-p *wal-lock*) (error "FPW recovery requires WAL lock"))
   (setf *wal-fpw-state*
         (when (or marker-p (get-properties snapshot '(:full-page-writes))) :unrecovered)))
 
 (defun wal-fpw-install-recovered-state (state incarnation)
+  "Install recovered evidence under WAL lock after the full scan and sync succeed.
+The caller must exclude storage replacement throughout recovery."
   (unless (sb-thread:holding-mutex-p *wal-lock*) (error "FPW recovery requires WAL lock"))
   (unless (eq incarnation *wal-storage-incarnation*)
     (wal-invalid-input "full page writes recovery belongs to replaced storage"))
@@ -173,6 +198,7 @@
   (setf *wal-fpw-state* state))
 
 (defun wal-fpw-note-published-checkpoint (snapshot)
+  "Advance evidence after checkpoint control publication, under the WAL lock."
   (let ((state (wal-checked-fpw-state-under-lock)))
     (when (or state (get-properties snapshot '(:full-page-writes)))
       (unless (get-properties snapshot '(:full-page-writes))
@@ -185,6 +211,13 @@
              *wal-insert-timeline* *wal-storage-incarnation*)))))
 
 (defun wal-report-full-page-writes (enabled &optional (incarnation *wal-storage-incarnation*))
+  "Publish a primary policy change and return its durable witness end.
+An unchanged known policy returns its current witness end without I/O. A change
+settles preceding page and CLOG work before append. Errors and nonlocal exits
+after publication starts fail-stop. ON is installed before the change terminal;
+OFF only after the terminal is durable. The transient ON candidate exists while
+the WAL lock is held. This helper does not install a configuration producer or
+alter native page images."
   (unless (member enabled '(nil t)) (error "invalid full page writes policy"))
   (prevent-recovery-primary-operation "full page writes policy publication")
   (with-wal-publication-fence (begin-publication)
@@ -220,6 +253,7 @@
               end))))))
 
 (defun wal-require-fpw-physical-replay-supported (record)
+  "Reject physical replay of changes until source-policy persistence exists."
   ;; Source-policy persistence must be wired before physical replay credits a change.
   (when (= (wal-record-type record) +wal-record-full-page-writes-change+)
     (error "native FPW change replay requires source-policy persistence"))

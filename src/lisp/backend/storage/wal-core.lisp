@@ -257,7 +257,10 @@ Owners are process-local; the appropriate codec stores durable slot fields."
   "WAL-owned token for the local insertion domain, retained across reload.
 It is separate from the source identity used for remote acknowledgments.")
 
-(defvar *wal-fpw-state* nil)
+(defvar *wal-fpw-state* nil
+  "Primary policy evidence under WAL lock: NIL is unknown, :UNRECOVERED awaits redo.
+A state with ENABLED NIL is known OFF. It belongs to the current storage
+incarnation and is reconstructed from checkpoint and WAL, not a control extension.")
 
 (defstruct (wal-writer-position
             (:constructor make-wal-writer-position (incarnation timeline end)))
@@ -2905,7 +2908,9 @@ published separately after primary redo completes."
          (wal-recovery-reset-logical-change-batch)))))
 
 (defun wal-recover ()
-  "Redo durable complete batches before loading the catalog."
+  "Redo durable complete batches before loading the catalog.
+Build policy evidence privately and install it only after the full scan and CLOG
+sync succeed. The caller must exclude storage lifecycle changes throughout."
   (let* ((incarnation *wal-storage-incarnation*)
          (fpw-state (wal-fpw-state-from-checkpoint *wal-checkpoint-snapshot* incarnation))
          (*wal-recovery-page-spool-enabled* t)
@@ -3514,7 +3519,8 @@ Refresh its modification time. Update memory only after atomic publication."
   "Initialize WAL under startup or equivalent quiescence.
 Reject surviving page and CLOG debt and a nonempty cleanup domain before
 replacement. Establish a fresh local identity; cleanup owners are released only
-after cleanup is confirmed."
+after cleanup is confirmed. Policy evidence is unavailable pending recovery when
+the checkpoint or scanned WAL contains a policy witness."
   (require-primary-wal-writer-retired)
   (wal-require-no-pending-storage)
   (sb-thread:with-mutex (*wal-lock*)
@@ -3664,7 +3670,10 @@ after cleanup is confirmed."
   "Write all cached pages, sync durable state, and advance the redo pointer.
 Capture installed commit timestamp facts before taking storage locks. Under the
 WAL lock, freeze resource facts before planning placement and rotation. Check the
-encoded size against that plan before appending the checkpoint.
+encoded size against that plan before appending the checkpoint. Include known
+full page writes policy, including OFF, and advance its checkpoint witness only
+after checkpoint control publication. Extra full page images remain native format
+when the policy is OFF.
 Settle pending pages, then require page and CLOG debt to be empty before appending
 any checkpoint batch records. Shutdown can defer recycling until its senders
 release their claims to the retained WAL."
