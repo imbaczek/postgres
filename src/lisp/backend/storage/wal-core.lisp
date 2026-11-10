@@ -609,11 +609,17 @@ Legacy 16-hex segment names always belong to timeline 1."
 (defvar *wal-crc32-table* (make-wal-crc32-table))
 
 (defun wal-crc32 (bytes &optional (start 0) (end (length bytes)))
-  (let ((crc #xFFFFFFFF))
-    (loop for i from start below end
-          for slot = (logand (logxor crc (aref bytes i)) #xFF)
-          do (setf crc (logxor (ash crc -8) (aref *wal-crc32-table* slot))))
-    (logxor crc #xFFFFFFFF)))
+  (let ((table (and (boundp '*wal-crc32-table*) *wal-crc32-table*)))
+    (if (and (typep bytes '(simple-array (unsigned-byte 8) (*)))
+             (typep table '(simple-array (unsigned-byte 32) (256)))
+             (typep start 'fixnum) (typep end 'fixnum)
+             (<= 0 start end (length bytes)))
+        (%wal-crc32-octets bytes start end table)
+        (let ((crc #xFFFFFFFF))
+          (loop for i from start below end
+                for slot = (logand (logxor crc (aref bytes i)) #xFF)
+                do (setf crc (logxor (ash crc -8) (aref *wal-crc32-table* slot))))
+          (logxor crc #xFFFFFFFF)))))
 
 (defun wal-page-fork-id (fork)
   (case fork

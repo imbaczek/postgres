@@ -96,10 +96,16 @@ the archive outside the receive spool; otherwise it is stored beneath the spool.
   "Checksum the exact ordered prefix, including each record's embedded coordinates.
 Per-record CRCs alone cannot detect a missing whole record before a rotation.
 This FNV-1a-64 checksum detects accidental prefix damage, not malicious tampering."
-  (loop for octet across bytes
-        do (setf digest (logand #xffffffffffffffff
-                                (* (logxor digest octet) #x100000001B3))))
-  digest)
+  (if (and (typep digest '(unsigned-byte 64))
+           (typep bytes '(simple-array (unsigned-byte 8) (*)))
+           (plusp (length bytes)))
+      (multiple-value-bind (low high) (%physical-store-fnv1a64-parts digest bytes)
+        (logior low (ash high 32)))
+      (progn
+        (loop for octet across bytes
+              do (setf digest (logand #xffffffffffffffff
+                                      (* (logxor digest octet) #x100000001B3))))
+        digest)))
 
 (defun physical-store-encode-control (store flush-lsn &key
                                                         (digest (physical-store-written-digest store))

@@ -31,6 +31,7 @@
       :serial t
       :components ((:file "bufpage")
                    (:file "smgr")
+                   (:file "wal-core.hot")
                    (:file "wal" :pathname "wal-core")
                    (:file "wal-pressure")
                    (:file "wal-resource-parameters")
@@ -83,6 +84,7 @@
                    (:file "schema-contracts")
                    (:file "client-core")
                    (:file "physical")
+                   (:file "physical-store.hot")
                    (:file "physical-store")
                    (:file "physical-source")
                    (:file "../postmaster/pidfile")))

@@ -4,6 +4,7 @@
   :depends-on ("pg" "rove" "cl-spec/check-it")
   :serial t
   :components ((:file "t/rove/support")
+               (:file "t/rove/hot-path-tests")
                (:file "t/rove/primitives-tests")
                (:file "t/rove/storage-tests")
                (:file "t/rove/pglz-tests")
@@ -24,6 +25,8 @@
                (:file "t/rove/snapshot-tests")
                (:file "t/rove/transaction-tests")
                (:file "t/rove/wal-tests")
+               (:file "t/rove/crc32-tests")
+               (:file "t/rove/fnv64-tests")
                (:file "t/rove/wal-writer-tests")
                (:file "t/rove/wal-writer-output-tests")
                (:file "t/rove/wal-writer-policy-tests")

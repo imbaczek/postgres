@@ -21,6 +21,23 @@ the user's instructions take precedence. Use the tools available in the session
 and this project's existing reload and test workflows; the prompts do not
 require installing cl-mcp, cl-spec, or Rove.
 
+## Allocation-free modules
+
+This rule applies to every `*.hot.lisp` file in the Lisp source tree. Functions
+in these files must allocate zero heap bytes during valid calls. Callers prepare
+buffers and workspaces, validate inputs, and construct errors before entering
+the hot functions. Keep allocating fallbacks in the calling module.
+
+Every function defined in a hot file needs representative, preallocated argument
+cases in `t/rove/hot-path-tests.lisp`. The unit suite discovers hot files by their
+generic filename pattern, screens for explicit allocators and LOOP collectors,
+and measures allocation through each function's current definition. The source
+screen is conservative. Runtime probes also cover boxing and indirect calls.
+Add cases for each branch and boundary when changing a hot function.
+Hot files contain only `IN-PACKAGE`, `DECLAIM` and `DEFUN` top-level forms, so the
+cheap source check can account for every function. Probes include an allocating
+control and enough repeated calls to detect small per-call allocation.
+
 ## Lisp host
 
 The scripts default to `sbcl` from `PATH`. Set `SBCL` to a local executable or
