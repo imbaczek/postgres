@@ -187,8 +187,11 @@ Invalid or ambiguous catalog metadata fails closed instead of proving a drop."
                                          (next-xid-seed nil next-xid-seed-p) fpw-seed)
   "Certify drops and fork resets from complete terminals in validated durable WAL.
 An unfinished batch grants no exemption. REQUIRED-LSN must be a complete terminal.
-Return three values: the deletion set, last terminal, and the set of exact
-relation/fork pairs with committed resets. No database files are written."
+Checkpoint and observed XID seeds must be supplied together and prove the stage
+at START-LSN. FPW-SEED is folded privately while validating the suffix. A stateless
+parent scan can start with unknown seeds, but cannot cross EOR without a proven
+stage and XID. Return the deletion set, last terminal, and committed relation/fork
+resets. No database files are written."
   (let ((state (or *physical-recovery-state*
                    (list :timeline (physical-store-timeline store) :end (physical-store-base-lsn store)))))
     (physical-recovery-check-store-point store start-lsn (physical-store-prefix-timeline store start-lsn))

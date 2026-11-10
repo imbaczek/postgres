@@ -412,7 +412,8 @@ Older metadata without these fields uses the base timeline."
 ;;; is copied so recovery owns it independently of the decoded generation.
 
 (defun physical-restartpoint-prepare-storage (store)
-  "Validate provenance, suffix and surviving forks before restoring an R catalog."
+  "Validate provenance, suffix and surviving forks before restoring an R catalog.
+Validate the suffix using explicit seeds from the verified restartpoint or base."
   (let* ((state *physical-recovery-state*)
          (identity (getf state :cluster-identity))
          (required (getf state :required-applied)))

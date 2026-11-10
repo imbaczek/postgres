@@ -292,6 +292,9 @@ appropriate instead of replacing the native C peer or adding a message relay.
   documentation check exposed that false difference in `with-physical-image-input`.
 - Stop after a failed balance or reader check before writing a new Lisp file.
   `fs-write-file` can save invalid text; its diagnosis does not undo the write.
+  A balance check can return an unbalanced diagnosis without throwing an error.
+  Inspect its result before a dependent write, or run the check and write in
+  separate calls.
   Use the structural editor for existing forms and inspect the parsed scope too:
   balanced parentheses alone do not prove that cleanup is inside `unwind-protect`.
 - A changed macro needs its callers recompiled. Clear the `pg` FASLs and reload

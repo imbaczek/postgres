@@ -34,7 +34,9 @@ ALLOW-RESOURCE-PAUSE is used only to restore recovery workers after a failed att
   "Flush receipt and replay the safe durable backlog with verified readers.
 
 Return true when no complete terminal remains beyond the applied position.
-An unsafe complete batch defers promotion; an unfinished tail does not."
+An unsafe complete batch defers promotion; an unfinished tail does not.
+Check the suffix from the applied fork using the exact runtime checkpoint,
+observed XID and FPW facts."
   (unless *physical-promotion-preserve-readers-p*
     (error "promotion replay requires verified reader ownership"))
   (physical-recovery-flush)
@@ -95,9 +97,10 @@ after release."
        publication))))
 
 (defun physical-promotion-awaiting-child-initialization-p ()
-  "Scan the durable suffix without applying it to check child initialization.
-Validate allocation transitions too. Promotion waits for a complete child
-checkpoint before stopping workers and rechecks after their final flush."
+  "Scan the durable suffix privately for pending child initialization.
+Validate allocation transitions and advance a local FPW fact at complete terminals.
+Promotion waits for a complete child checkpoint before stopping workers and
+rechecks after their final flush."
   (let* ((*physical-recovery-state* (copy-tree *physical-recovery-state*))
          (store *physical-receive-store*)
          (timeline (physical-recovery-replay-timeline))

@@ -298,6 +298,9 @@ parent.  The phase check here alone does not establish that ownership."
     (physical-fpw-copy-fact (or frozen source))))
 
 (defun physical-promotion-check-progress (state metadata prefix generation &optional (phase 2))
+  "Verify durable promotion progress and return the applied fork and next XID.
+Check the suffix from that fork using the verified restartpoint checkpoint,
+observed XID and FPW facts; a later complete terminal must be replayed first."
   (let* ((fork *last-replay-lsn*) (next *next-xid*)
                                   (control (physical-recovery-read-control *pgdata*))
                                   (snapshot (getf metadata :source-checkpoint))
