@@ -337,8 +337,10 @@ the base files are still checked against the manifest read from disk."
 
 (defun native-control-checkpoint-record (facts)
   "Build the checkpoint SQL record from validated, captured control facts.
-Fields without persisted native facts are SQL NULL; legacy snapshots can leave
-additional fields unknown. REDO and the checkpoint timeline select the filename."
+Fields without persisted native facts are SQL NULL. Legacy snapshots can leave
+additional fields unknown. An absent commit timestamp XID pair is unknown for
+that checkpoint; a present 0/0 pair is known. REDO and the checkpoint timeline
+select the filename."
   (let* ((snapshot (getf facts :snapshot))
          (timeline (or (getf snapshot :timeline) (getf facts :checkpoint-timeline)))
          (redo (getf snapshot :redo))
@@ -387,7 +389,9 @@ additional fields unknown. REDO and the checkpoint timeline select the filename.
   "Return supported native facts under C pg_controldata's field names.
 Omit fields the native format does not establish, including rewind settings
 and checksum versions. A legacy primary's unknown lifecycle stays unknown.
-Print all five persisted resource values together when known; omit them when unknown."
+Print all five persisted resource values together when known; omit them when unknown.
+Omit an absent commit timestamp XID pair, which was not recorded for that
+checkpoint; a present 0/0 pair is known and is printed."
   (let* ((snapshot (getf facts :snapshot))
          (timeline (or (getf snapshot :timeline) (getf facts :checkpoint-timeline)))
          (redo (or (getf snapshot :redo) (getf facts :checkpoint)))

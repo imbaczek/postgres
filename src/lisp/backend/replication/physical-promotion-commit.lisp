@@ -26,8 +26,10 @@ separate from the capacity that the new primary must reserve.
 Return a plist with :FORK, :CHILD, :SNAPSHOT, :END and :FRAMES. Each frame is
 a list of its start LSN and encoded bytes. Each record fits entirely within
 one segment; rotation leaves an EOF gap rather than inventing padding records.
-The frozen source fact selects the exact checkpoint size and is carried into
-its snapshot, so frame placement and retry bytes use the same proof."
+Copy the source checkpoint's historical commit timestamp XID pair before size
+planning. Local configuration does not establish facts about that checkpoint;
+an absent pair remains unknown. The frozen source facts select the exact size
+and enter the snapshot, so placement and retries use the same captured facts."
   (unless (and (eql 3 (getf state :phase)) (typep next-oid '(unsigned-byte 64))
                (physical-source-reservation-valid-p (getf state :source-reservation))
                (getf (getf state :source-reservation) :complete)

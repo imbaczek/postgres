@@ -70,6 +70,9 @@ A missing root is an error; there is no fallback to globals."
             (startup-setting-value settings "wal_writer_flush_after"))))
 
 (defun startup-checkpoint-commit-ts-facts ()
+  "Capture commit timestamp facts from the installed configuration.
+No installed configuration leaves the facts unknown. Enabled tracking is not
+supported, so a canonical off setting establishes invalid XIDs (0/0)."
   (let ((configuration (startup-capture-configuration)))
     (when configuration
       (let ((settings (startup-configuration-settings configuration)))

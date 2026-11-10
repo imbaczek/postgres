@@ -3638,9 +3638,9 @@ after cleanup is confirmed."
 
 (defun wal-checkpoint-core ()
   "Write all cached pages, sync durable state, and advance the redo pointer.
-Capture configuration facts before storage locks. Under the WAL lock, freeze
-resource facts before planning placement and rotation. Check the encoded size
-against that plan before appending the checkpoint.
+Capture installed commit timestamp facts before taking storage locks. Under the
+WAL lock, freeze resource facts before planning placement and rotation. Check the
+encoded size against that plan before appending the checkpoint.
 Settle pending pages, then require page and CLOG debt to be empty before appending
 any checkpoint batch records. Shutdown can defer recycling until its senders
 release their claims to the retained WAL."
