@@ -339,8 +339,9 @@ the base files are still checked against the manifest read from disk."
   "Build the checkpoint SQL record from validated, captured control facts.
 Fields without persisted native facts are SQL NULL. Legacy snapshots can leave
 additional fields unknown. An absent commit timestamp XID pair is unknown for
-that checkpoint; a present 0/0 pair is known. REDO and the checkpoint timeline
-select the filename."
+that checkpoint; a present 0/0 pair is known. A recorded false full-page-writes
+value is SQL false; an absent value is SQL NULL. REDO and the checkpoint
+timeline select the filename."
   (let* ((snapshot (getf facts :snapshot))
          (timeline (or (getf snapshot :timeline) (getf facts :checkpoint-timeline)))
          (redo (getf snapshot :redo))
@@ -393,7 +394,8 @@ Omit fields the native format does not establish, including rewind settings
 and checksum versions. A legacy primary's unknown lifecycle stays unknown.
 Print all five persisted resource values together when known; omit them when unknown.
 Omit an absent commit timestamp XID pair, which was not recorded for that
-checkpoint; a present 0/0 pair is known and is printed."
+checkpoint; a present 0/0 pair is known and is printed. Print a recorded
+full-page-writes value as on or off; omit it when unknown."
   (let* ((snapshot (getf facts :snapshot))
          (timeline (or (getf snapshot :timeline) (getf facts :checkpoint-timeline)))
          (redo (or (getf snapshot :redo) (getf facts :checkpoint)))
