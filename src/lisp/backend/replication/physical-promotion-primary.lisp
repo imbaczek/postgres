@@ -403,7 +403,10 @@ installing the child's state."
                            *wal-checkpoint-snapshot* (copy-list snapshot)
                            *wal-checkpoint-lsn* checkpoint *wal-durable-lsn* durable
                            *wal-end-lsn* durable *wal-xid-reserved-through* (1- next)
-                           *wal-control-metadata* (copy-list metadata)))))
+                           *wal-control-metadata* (copy-list metadata))))
+                 (wal-fpw-install-recovered-state
+                  (wal-fpw-state-from-checkpoint snapshot *wal-storage-incarnation*)
+                  *wal-storage-incarnation*))
                (physical-promotion-test-point :after-live-child-runtime)
                (setf finished t)
                checkpoint)))

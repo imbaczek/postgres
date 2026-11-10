@@ -408,8 +408,15 @@ Sync WAL before draining page and CLOG publications through the durable frontier
 (defun primary-wal-writer-background-step (writer policy)
   (when (primary-wal-writer-stopping-p writer)
     (return-from primary-wal-writer-background-step :stop))
-  (sb-thread:with-mutex (*wal-lock*)
-    (primary-wal-writer-background-under-lock writer (primary-wal-writer-epoch writer) policy)))
+  (multiple-value-bind (enabled known) (startup-full-page-writes-policy)
+    (with-wal-publication-fence (begin-publication)
+      (let ((epoch (primary-wal-writer-epoch writer)))
+        (unless (validate-primary-wal-writer-under-lock writer epoch)
+          (return-from primary-wal-writer-background-step :stop))
+        (when known
+          (wal-report-full-page-writes-under-lock
+           enabled (wal-writer-epoch-incarnation epoch) #'begin-publication))
+        (primary-wal-writer-background-under-lock writer epoch policy)))))
 
 (defun request-primary-wal-writer-stop-under-state-lock (writer)
   (assert (sb-thread:holding-mutex-p *primary-wal-writer-lock*))

@@ -86,18 +86,23 @@ supported, so a canonical off setting establishes invalid XIDs (0/0)."
             (error "invalid installed commit timestamp policy"))))
       (list :oldest-commit-ts-xid 0 :newest-commit-ts-xid 0))))
 
-(defun startup-promotion-fpw-policy-arguments ()
-  "Capture the fixed native ON policy for a valid installed root.
-No root leaves intent absent. A configurable startup or SIGHUP producer is not wired."
+(defun startup-full-page-writes-policy ()
   (let ((configuration (startup-capture-configuration)))
     (when configuration
-      (unless (and (startup-configuration-p configuration)
-                   (hash-table-p (startup-configuration-settings configuration)))
-        (error "invalid installed full page writes policy"))
-      ;; Native writers currently always emit full page images. Capture this
-      ;; fixed policy only for an installed root; no root leaves legacy intent
-      ;; absent. Replace this with the validated setting when its producer lands.
-      (list :promotion-full-page-writes t))))
+      (let ((settings (startup-configuration-settings configuration)))
+        (unless (hash-table-p settings)
+          (error "invalid installed full page writes policy"))
+        (let* ((entry (gethash "full_page_writes" settings))
+               (length (and (listp entry) (list-length entry))))
+          (unless (and length (evenp length)
+                       (= 1 (loop for key in entry by #'cddr count (eq key :value)))
+                       (member (getf entry :value) '(nil t)))
+            (error "invalid installed full page writes policy"))
+          (values (getf entry :value) t))))))
+
+(defun startup-promotion-fpw-policy-arguments ()
+  (multiple-value-bind (enabled known) (startup-full-page-writes-policy)
+    (when known (list :promotion-full-page-writes enabled))))
 
 (defun startup-copy-input (value)
   "Copy mutable storage in configuration input trees.
@@ -195,6 +200,7 @@ synchronous configuration plan against the same source and generation."
     ("hot_standby" :postmaster :boolean "on")
     ("wal_level" :postmaster :wal-level "replica")
     ("wal_log_hints" :postmaster :boolean "off")
+    ("full_page_writes" :sighup :boolean "on")
     ("max_connections" :postmaster :integer "100" 1 262143 nil)
     ("max_wal_senders" :postmaster :integer "10" 0 262143 nil)
     ("max_worker_processes" :postmaster :integer "8" 0 262143 nil)

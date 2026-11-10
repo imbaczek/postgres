@@ -224,47 +224,58 @@ The caller must exclude storage replacement throughout recovery."
                                     :payload (wal-encode-checkpoint-snapshot snapshot))
              *wal-insert-timeline* *wal-storage-incarnation*)))))
 
+(defun wal-report-full-page-writes-under-lock (enabled incarnation begin-publication)
+  (assert (sb-thread:holding-mutex-p *wal-lock*))
+  (unless (member enabled '(nil t)) (error "invalid full page writes policy"))
+  (prevent-recovery-primary-operation "full page writes policy publication")
+  (unless (eq incarnation *wal-storage-incarnation*)
+    (wal-invalid-input "full page writes request belongs to replaced storage"))
+  (let ((prior (wal-checked-fpw-state-under-lock)))
+    (if (and prior (eql enabled (wal-fpw-state-enabled prior)))
+        (wal-fpw-state-end prior)
+        (progn
+          (wal-settle-page-publications-under-lock)
+          (wal-require-no-pending-storage)
+          (let* ((payload (wal-encode-full-page-writes-change enabled))
+                 (batch-start (wal-next-record-start +wal-header-size+))
+                 (start (wal-record-start-after (+ batch-start +wal-header-size+)
+                                                (+ +wal-header-size+ (length payload))))
+                 (end (+ start +wal-header-size+ (length payload)))
+                 (record (make-wal-record :version +wal-version+ :type +wal-record-full-page-writes-change+
+                                          :xid 0 :start start :end end :payload payload))
+                 (candidate (wal-fpw-state-next prior record *wal-insert-timeline* incarnation)))
+            (funcall begin-publication)
+            (unless (= batch-start (wal-append-batch-start))
+              (error "FPW batch placement differs from its plan"))
+            (when enabled (setf *wal-fpw-state* candidate))
+            (wal-fpw-test-point :before-record candidate)
+            (unless (= end (wal-append-record +wal-record-full-page-writes-change+ 0 payload))
+              (error "FPW record placement differs from its plan"))
+            (wal-fpw-test-point :after-record candidate)
+            (wal-flush)
+            (unless (<= end *wal-durable-lsn*) (error "FPW terminal is not durable"))
+            (wal-fpw-test-point :after-flush candidate)
+            (setf *wal-fpw-state* candidate)
+            (wal-fpw-test-point :after-state candidate)
+            end)))))
+
 (defun wal-report-full-page-writes (enabled &optional (incarnation *wal-storage-incarnation*))
   "Publish a primary policy change and return its durable witness end.
 An unchanged known policy returns its current witness end without I/O. A change
 settles preceding page and CLOG work before append. Errors and nonlocal exits
 after publication starts fail-stop. ON is installed before the change terminal;
 OFF only after the terminal is durable. The transient ON candidate exists while
-the WAL lock is held. This helper does not install a configuration producer or
-alter native page images."
+the WAL lock is held. Native page images remain conservative."
   (unless (member enabled '(nil t)) (error "invalid full page writes policy"))
   (prevent-recovery-primary-operation "full page writes policy publication")
   (with-wal-publication-fence (begin-publication)
-    (unless (eq incarnation *wal-storage-incarnation*)
-      (wal-invalid-input "full page writes request belongs to replaced storage"))
-    (let ((prior (wal-checked-fpw-state-under-lock)))
-      (if (and prior (eql enabled (wal-fpw-state-enabled prior)))
-          (wal-fpw-state-end prior)
-          (progn
-            (wal-settle-page-publications-under-lock)
-            (wal-require-no-pending-storage)
-            (let* ((payload (wal-encode-full-page-writes-change enabled))
-                   (batch-start (wal-next-record-start +wal-header-size+))
-                   (start (wal-record-start-after (+ batch-start +wal-header-size+)
-                                                  (+ +wal-header-size+ (length payload))))
-                   (end (+ start +wal-header-size+ (length payload)))
-                   (record (make-wal-record :version +wal-version+ :type +wal-record-full-page-writes-change+
-                                            :xid 0 :start start :end end :payload payload))
-                   (candidate (wal-fpw-state-next prior record *wal-insert-timeline* incarnation)))
-              (begin-publication)
-              (unless (= batch-start (wal-append-batch-start))
-                (error "FPW batch placement differs from its plan"))
-              (when enabled (setf *wal-fpw-state* candidate))
-              (wal-fpw-test-point :before-record candidate)
-              (unless (= end (wal-append-record +wal-record-full-page-writes-change+ 0 payload))
-                (error "FPW record placement differs from its plan"))
-              (wal-fpw-test-point :after-record candidate)
-              (wal-flush)
-              (unless (<= end *wal-durable-lsn*) (error "FPW terminal is not durable"))
-              (wal-fpw-test-point :after-flush candidate)
-              (setf *wal-fpw-state* candidate)
-              (wal-fpw-test-point :after-state candidate)
-              end))))))
+    (wal-report-full-page-writes-under-lock enabled incarnation #'begin-publication)))
+
+(declaim (ftype function startup-full-page-writes-policy))
+
+(defun wal-report-configured-full-page-writes ()
+  (multiple-value-bind (enabled known) (startup-full-page-writes-policy)
+    (when known (wal-report-full-page-writes enabled))))
 
 (defun wal-require-fpw-physical-replay-supported (record)
   "Validate a type-17 FPW change record before replay credits its state.

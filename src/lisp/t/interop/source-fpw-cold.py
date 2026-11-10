@@ -90,7 +90,7 @@ def arm_replay_cut(node, point, marker):
             (sb-ext:exit :code 93 :abort t)))))''')
 
 
-def interrupted_promotion(node, connection, root):
+def interrupted_promotion(node, connection, root, configured=False):
     marker = root / 'promotion.cut'
     control(node, f'''(setf *physical-promotion-test-hook*
       (lambda (point)
@@ -109,23 +109,30 @@ def interrupted_promotion(node, connection, root):
         raise AssertionError('promotion fault did not interrupt the SQL waiter')
     exited = await_exit(node, marker, process, previous, 94)
     assert exited['pid'] == previous['pid']
+    if configured:
+        # The pending child must keep frozen OFF intent despite new startup ON.
+        (Path(node.data_dir) / 'postgresql.auto.conf').write_text('full_page_writes=on\n')
     connection = restart(node, PostgresqlRole.PRIMARY, exited)
     assert api['scalar'](connection, 'SELECT pg_is_in_recovery()') is False
     checkpoint, _ = read_copy(Path(node.data_dir))
-    assert checkpoint['timeline'] > 1 and checkpoint['full_page_writes'] is True, checkpoint
+    assert checkpoint['timeline'] > 1, checkpoint
+    assert checkpoint['full_page_writes'] is (not configured), checkpoint
+    control(node, '(assert (wal-fpw-state-enabled *wal-fpw-state*))')
     return connection, checkpoint, exited
 
 
-def check(point):
+def check(point, configured=False, live_promotion=False):
     started = time.monotonic()
     source = api['peers']['OwnedLisp']()
-    result = dict(point=point, root=str(source.root), checks=[], processes=[])
+    result = dict(point=point, configured=configured, live_promotion=live_promotion,
+                  root=str(source.root), checks=[], processes=[])
     with ExitStack() as cleanup:
         cleanup.callback(source.stop, immediate=True)
         source.start()
         connection = api['peers']['connect'](source.port, source.process)
         cleanup.callback(connection.close)
-        source.control('(wal-report-full-page-writes t)')
+        if not configured:
+            source.control('(wal-report-full-page-writes t)')
         with connection.cursor() as cursor:
             cursor.execute('CREATE TABLE fpw_cold_probe (n integer)')
             cursor.execute('INSERT INTO fpw_cold_probe VALUES (17)')
@@ -134,6 +141,12 @@ def check(point):
         target = node.connection_pool.get('heartbeat').get()
         assert api['scalar'](target, 'SELECT count(*) FROM public.fpw_cold_probe') == 1
         assert recovery(node)['fpw_fact']['enabled'] is True
+        if configured:
+            (Path(node.data_dir) / 'postgresql.auto.conf').write_text('full_page_writes=off\n')
+            node.is_running().send_signal(signal.SIGHUP)
+            api['follow']['wait_for'](
+                lambda: api['scalar'](target, 'SHOW full_page_writes') == 'off')
+            assert recovery(node)['fpw_fact']['enabled'] is True
         with target.cursor() as cursor:
             cursor.execute('CHECKPOINT')
         marker = source.root / 'replay.cut'
@@ -141,7 +154,11 @@ def check(point):
         process = node.is_running()
         assert process is not None
         previous = dict(pid=process.pid, birth=process.create_time())
-        source.control('(wal-report-full-page-writes nil)')
+        if configured:
+            (source.data / 'postgresql.auto.conf').write_text('full_page_writes=off\n')
+            source.process.send_signal(signal.SIGHUP)
+        else:
+            source.control('(wal-report-full-page-writes nil)')
         exited = await_exit(node, marker, process, previous, 93)
         result['processes'].append(exited)
         start, end = map(int, marker.read_text().split())
@@ -165,10 +182,23 @@ def check(point):
         target = restart(node, PostgresqlRole.REPLICA, previous)
         check_source_off(node, start, end)
         result['checks'].append('fast-shutdown-and-second-cold-replica-preserve-off')
-        target, checkpoint, promoted_exit = interrupted_promotion(node, target, source.root)
-        result['processes'].append(promoted_exit)
+        if live_promotion:
+            control(node, '''(setf *physical-promotion-test-hook*
+              (lambda (point)
+                (when (member point '(:after-child-primary-initialization :after-child-primary-ready))
+                  (assert (sb-thread:holding-mutex-p *physical-follow-generation-lock*)))))''')
+            assert api['scalar'](target, 'SELECT pg_promote(true, 30)') is True
+            checkpoint, _ = read_copy(Path(node.data_dir))
+            assert checkpoint['full_page_writes'] is (not configured)
+            control(node, f'''(let ((state *wal-fpw-state*))
+              (assert (eq :checkpoint (wal-fpw-state-witness-kind state)))
+              (assert (= {checkpoint['end']} (wal-fpw-state-end state))))''')
+            result['checks'].append('live-promotion-keeps-exact-child-checkpoint-policy-witness')
+        else:
+            target, checkpoint, promoted_exit = interrupted_promotion(node, target, source.root, configured)
+            result['processes'].append(promoted_exit)
+            result['checks'].append('cold-pending-promotion-finishes-local-on-policy')
         assert api['scalar'](target, 'SELECT count(*) FROM public.fpw_cold_probe') == 1
-        result['checks'].append('cold-pending-promotion-finishes-local-on-policy')
         process = node.is_running()
         previous = dict(pid=process.pid, birth=process.create_time())
         node.connection_pool.close()
@@ -177,7 +207,9 @@ def check(point):
         target = restart(node, PostgresqlRole.PRIMARY, previous)
         current, _ = read_copy(Path(node.data_dir))
         assert current['timeline'] == checkpoint['timeline']
-        assert current['full_page_writes'] is True
+        assert current['full_page_writes'] is (not configured)
+        enabled = 'nil' if configured and live_promotion else 't'
+        control(node, f'(assert (eql {enabled} (wal-fpw-state-enabled *wal-fpw-state*)))')
         assert api['scalar'](target, 'SELECT count(*) FROM public.fpw_cold_probe') == 1
         result['checks'].append('independent-child-cold-restart-preserves-policy-and-data')
     result['elapsed_seconds'] = time.monotonic() - started
@@ -189,6 +221,10 @@ def check(point):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--point', choices=['after-redo', 'after-progress', 'both'], default='both')
+    parser.add_argument('--configured', action='store_true',
+                        help='publish through SIGHUP and change local policy during pending promotion')
+    parser.add_argument('--live-promotion', action='store_true',
+                        help='keep the promoted process alive and verify its exact checkpoint witness')
     args = parser.parse_args()
     assert importlib.metadata.version('patroni') == '4.1.5'
     # Adopt daemonized native servers so waitpid proves each injected exit code.
@@ -200,4 +236,4 @@ if __name__ == '__main__':
     os.environ['PG_LIBPQ_HELPER'] = str(helper)
     points = ['after-redo', 'after-progress'] if args.point == 'both' else [args.point]
     for point in points:
-        check(point)
+        check(point, configured=args.configured, live_promotion=args.live_promotion)

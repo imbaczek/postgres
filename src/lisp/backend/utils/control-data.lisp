@@ -65,6 +65,7 @@ an existing identity must match the catalog."
 (defun wal-note-primary-ready ()
   "Publish production after primary initialization and promotion cleanup.
 The caller must finish those steps before calling this function."
+  (wal-report-configured-full-page-writes)
   (unless (and *wal-control-metadata*
                (= +db-in-production+ (getf *wal-control-metadata* :db-state))
                (= (catalog-system-identifier) (getf *wal-control-metadata* :system-id)))
