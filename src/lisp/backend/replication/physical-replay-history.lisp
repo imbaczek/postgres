@@ -55,6 +55,13 @@ Adopt the latest selection without moving the applied replay timeline."
     candidate))
 
 (defun physical-replay-check-eor-stage (store previous timeline)
+  "Check native lineage and allocation proof before a selected EOR.
+A present checkpoint must be valid, match TIMELINE and end by PREVIOUS.
+Without one, TIMELINE must be the immutable store base timeline, including
+when runtime recovery state is absent.
+C PostgreSQL can accept queries after lightweight EOR before its asynchronous
+checkpoint. The native producer durably writes EOR, optional FPW change and
+checkpoint before starting the writer."
   (let ((checkpoint (getf *physical-recovery-state* :source-checkpoint)))
     (unless (and (typep previous '(unsigned-byte 64))
                  (typep timeline '(integer 1 4294967295))
@@ -68,7 +75,9 @@ Adopt the latest selection without moving the applied replay timeline."
 
 (defun physical-replay-check-selected-eor (store record raw previous timeline)
   "Check EOR against the selected receive history and current replay timeline.
-EOR cannot finish an active batch. This check does not change the server role."
+Reject an active batch first, then check the parent checkpoint stage before
+history and minimum recovery position. Return the selected child timeline
+without changing recovery state or server role."
   (when *wal-recovery-group-active*
     (error "end-of-recovery cannot finish an active WAL batch"))
   (physical-replay-check-eor-stage store previous timeline)
