@@ -557,7 +557,7 @@ Stop before the next record when a published terminal causes a resource pause."
                     (physical-replay-selected-eor record raw next-xid reservation source-xids :fpw-fact fpw-fact)
                     (physical-replay-selected-eor record raw next-xid reservation source-xids)))
               (progn
-                (physical-replay-check-child-initialization record next-xid)
+                (physical-replay-check-child-initialization record next-xid fpw-fact)
                 (setf next-xid (physical-replay-observed-next-xid record next-xid)
                       reservation (physical-source-reservation-next reservation record next-xid)
                       source-xids (physical-source-xids-next source-xids record next-xid))

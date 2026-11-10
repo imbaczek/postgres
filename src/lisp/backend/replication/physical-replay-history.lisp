@@ -92,7 +92,24 @@ Receipt may advance the position only when its durable owner is the replay timel
                     timeline)))
         (values (max replay (or (getf *physical-recovery-state* :receive-lsn) 0)) timeline))))
 
-(defun physical-replay-check-child-initialization (record next-xid)
+(defun physical-replay-check-child-policy (record fpw-fact timeline)
+  (let ((marker-seen (and fpw-fact
+                          (eq :change (getf fpw-fact :witness-kind))
+                          (eql timeline (getf fpw-fact :witness-timeline)))))
+    (cond
+      ((= (wal-record-type record) +wal-record-full-page-writes-change+)
+       (unless (and *wal-recovery-group-active* *wal-recovery-reservation-batch-clean-p*
+                    (not marker-seen))
+         (error "child initialization requires one clean FPW change batch"))
+       (wal-full-page-writes-change-record-info record))
+      ((and marker-seen (= (wal-record-type record) +wal-record-checkpoint+))
+       (let ((checkpoint (wal-checkpoint-record-snapshot record)))
+         (unless (and checkpoint (get-properties checkpoint '(:full-page-writes))
+                      (eql (getf fpw-fact :enabled) (getf checkpoint :full-page-writes)))
+           (error "child initialization checkpoint loses its FPW change"))))))
+  t)
+
+(defun physical-replay-check-child-initialization (record next-xid &optional (fpw-fact (getf *physical-recovery-state* :source-fpw-fact)))
   "Check native checkpoint timeline and selected child initialization during replay.
 A checkpoint cannot switch the replay timeline; only a validated selected EOR
 does that. After EOR, require the child's initialization checkpoint before later
@@ -106,9 +123,11 @@ candidate validation; this is a native allocation-safety rule."
         (when (and checkpoint (/= timeline (getf checkpoint :timeline)))
           (error "native checkpoint differs from its replay timeline"))))
     (when (/= timeline (getf snapshot :timeline (getf state :timeline)))
+      (physical-replay-check-child-policy record fpw-fact timeline)
       (cond
         ((= type +wal-record-batch-start+)
          (when *wal-recovery-group-active* (error "child initialization has repeated batch framing")))
+        ((= type +wal-record-full-page-writes-change+) nil)
         ((= type +wal-record-checkpoint+)
          (let* ((child (wal-checkpoint-record-snapshot record))
                 (selection (loop for item = (physical-store-selection *physical-receive-store*)
