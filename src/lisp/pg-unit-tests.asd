@@ -39,6 +39,7 @@
                (:file "t/rove/transaction-tests")
                (:file "t/rove/wal-tests")
                (:file "t/rove/crc32-tests")
+               (:file "t/rove/native-crc32-tests" :if-feature :x86-64)
                (:file "t/rove/fnv64-tests")
                (:file "t/rove/wal-writer-tests")
                (:file "t/rove/wal-writer-output-tests")

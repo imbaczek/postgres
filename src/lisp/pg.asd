@@ -15,7 +15,8 @@
                   :serial t
                   :components ((:file "sockets")
                                (:file "files")
-                               (:file "physical-image")))))
+                               (:file "physical-image")
+                               (:file "ieee-crc32" :if-feature :x86-64)))))
    (:module "backend"
     :serial t
     :components
@@ -32,6 +33,7 @@
       :components ((:file "bufpage")
                    (:file "smgr")
                    (:file "wal-core.hot")
+                   (:file "wal-crc32.hot" :if-feature :x86-64)
                    (:file "wal" :pathname "wal-core")
                    (:file "wal-pressure")
                    (:file "wal-resource-parameters")

@@ -622,6 +622,9 @@ Legacy 16-hex segment names always belong to timeline 1."
 
 (defvar *wal-crc32-table* (make-wal-crc32-table))
 
+#+x86-64
+(defparameter *wal-crc32-ieee-reference-table* (make-wal-crc32-table))
+
 (defun wal-crc32 (bytes &optional (start 0) (end (length bytes)))
   "Return IEEE CRC-32 of BYTES from START inclusive to END exclusive.
 Use the typed kernel when its inputs and bounds are valid, otherwise retain
@@ -631,7 +634,15 @@ the historical generic calculation.  BYTES is read without mutation."
              (typep table '(simple-array (unsigned-byte 32) (256)))
              (typep start 'fixnum) (typep end 'fixnum)
              (<= 0 start end (length bytes)))
-        (%wal-crc32-octets bytes start end table)
+        (progn
+          #+x86-64
+          (when (and *native-ieee-crc32-available-p*
+                     (>= (- end start) 128)
+                     (equalp table *wal-crc32-ieee-reference-table*))
+            (return-from wal-crc32
+              (%wal-crc32-ieee-octets bytes start end table
+                                      *native-ieee-crc32-constants* #xffffffff)))
+          (%wal-crc32-octets bytes start end table))
         (let ((crc #xFFFFFFFF))
           (loop for i from start below end
                 for slot = (logand (logxor crc (aref bytes i)) #xFF)
