@@ -170,6 +170,7 @@
                (:file "t/promotion-wal-tests")
                (:file "t/promotion-resume-tests")
                (:file "t/promotion-commit-tests")
+               (:file "t/promotion-fpw-persistence-tests")
                (:file "t/promotion-retained-tests")
                (:file "t/physical-origin-proof-tests")
                (:file "t/promotion-online-tests")

@@ -86,6 +86,17 @@ supported, so a canonical off setting establishes invalid XIDs (0/0)."
             (error "invalid installed commit timestamp policy"))))
       (list :oldest-commit-ts-xid 0 :newest-commit-ts-xid 0))))
 
+(defun startup-promotion-fpw-policy-arguments ()
+  (let ((configuration (startup-capture-configuration)))
+    (when configuration
+      (unless (and (startup-configuration-p configuration)
+                   (hash-table-p (startup-configuration-settings configuration)))
+        (error "invalid installed full page writes policy"))
+      ;; Native writers currently always emit full page images. Capture this
+      ;; fixed policy only for an installed root; no root leaves legacy intent
+      ;; absent. Replace this with the validated setting when its producer lands.
+      (list :promotion-full-page-writes t))))
+
 (defun startup-copy-input (value)
   "Copy mutable storage in configuration input trees.
 Reject unsupported objects without printing their contents."

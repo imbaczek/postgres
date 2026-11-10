@@ -283,6 +283,19 @@ parent.  The phase check here alone does not establish that ownership."
   (physical-recovery-resolve-timeline-policy
    state store metadata (physical-recovery-replay-timeline state)))
 
+(defun physical-promotion-frozen-fpw-fact (control metadata)
+  (let ((frozen (getf control :fpw-fact))
+        (source (getf metadata :source-fpw-fact)))
+    (unless (and (or (null frozen) (physical-fpw-fact-valid-p frozen))
+                 (or (null source)
+                     (and (physical-fpw-fact-valid-p source)
+                          (physical-fpw-fact-at-p
+                           source (getf metadata :lsn)
+                           (getf metadata :replay-timeline (getf metadata :timeline)))))
+                 (or (null frozen) (equal frozen source)))
+      (error "pending promotion FPW fact differs from its selected generation"))
+    (physical-fpw-copy-fact (or frozen source))))
+
 (defun physical-promotion-check-progress (state metadata prefix generation &optional (phase 2))
   (let* ((fork *last-replay-lsn*) (next *next-xid*)
                                   (control (physical-recovery-read-control *pgdata*))
@@ -302,6 +315,11 @@ parent.  The phase check here alone does not establish that ownership."
                     (getf metadata :replay-timeline (getf metadata :timeline)))
                  (equal (getf control :history-target) (getf state :history-target))
                  (equal (getf control :history-digest) (getf state :history-digest))
+                 (equal (getf state :source-fpw-fact) (getf metadata :source-fpw-fact))
+                 (equal (getf state :source-fpw-fact)
+                        (if (= phase 3)
+                            (physical-promotion-frozen-fpw-fact control metadata)
+                            (getf control :fpw-fact)))
                  (equal (getf state :source-resource-fact) (getf metadata :source-resource-fact))
                  (equal (getf state :source-resource-fact) (getf control :resource-fact))
                  snapshot (wal-checkpoint-snapshot-valid-p snapshot)
@@ -347,27 +365,35 @@ Older pending control may lack the fact; then the selected generation supplies i
       (error "pending promotion resource fact differs from its selected generation"))
     (copy-tree (or frozen source))))
 
-(defun physical-promotion-make-pending (state metadata prefix generation namespace child time reference)
+(defun physical-promotion-make-pending
+    (state metadata prefix generation namespace child time reference
+     &key (promotion-full-page-writes nil promotion-fpw-intent-p))
   "Build pending control bytes and runtime state for the selected archive.
 The caller publishes the bytes and installs the state after owner handoff.
 Freeze the selected generation's source fact in pending control when present."
   (let* ((fork (getf metadata :lsn))
          (next (getf metadata :next-xid))
-         (bytes (physical-recovery-control-image
-                 3 (getf state :system-id) (getf state :timeline)
-                 (getf state :manifest-digest) (getf state :checkpoint) fork next
-                 :state-time time :promotion-child child :promotion-generation generation
-                 :applied-timeline (physical-recovery-replay-timeline state)
-                 :history-target (getf state :history-target) :history-digest (getf state :history-digest)
-                 :promotion-source-namespace namespace :retained-reference reference
-                 :resource-fact (getf metadata :source-resource-fact)))
+         (source-fpw (physical-promotion-frozen-fpw-fact nil metadata))
+         (bytes (apply #'physical-recovery-control-image
+                       3 (getf state :system-id) (getf state :timeline)
+                       (getf state :manifest-digest) (getf state :checkpoint) fork next
+                       :state-time time :promotion-child child :promotion-generation generation
+                       :applied-timeline (physical-recovery-replay-timeline state)
+                       :history-target (getf state :history-target) :history-digest (getf state :history-digest)
+                       :promotion-source-namespace namespace :retained-reference reference
+                       :resource-fact (getf metadata :source-resource-fact)
+                       :fpw-fact source-fpw
+                       (when promotion-fpw-intent-p
+                         (list :promotion-full-page-writes promotion-full-page-writes))))
          (pending (copy-list state)))
     (loop for (key value) on (physical-recovery-decode-control bytes) by #'cddr
           do (setf (getf pending key) value))
     (setf (getf pending :required-applied) fork (getf pending :observed-next-xid) next
           (getf pending :wal-prefix-lsn) fork (getf pending :wal-prefix-bytes) prefix
           (getf pending :source-checkpoint) (copy-tree (getf metadata :source-checkpoint))
-          (getf pending :source-reservation) (copy-list (getf metadata :source-reservation)))
+          (getf pending :source-reservation) (copy-list (getf metadata :source-reservation))
+          (getf pending :source-fpw-fact) (physical-fpw-copy-fact source-fpw)
+          (getf pending :required-fpw-fact) source-fpw)
     (let ((fact (physical-promotion-frozen-resource-fact
                  (physical-recovery-decode-control bytes) metadata)))
       (when fact
@@ -389,35 +415,37 @@ mutex.  Install pending runtime state only after control readback and owner
 handoff.  Failure during publication fences recovery.
 A resource pause prevents publishing intent."
   (with-physical-promotion-exclusion (2)
-    (check-physical-resource-promotion)
-    (physical-follow-promotion-cleanup-config)
-    (physical-recovery-publish-selected-history *physical-receive-store*)
-    (let* ((state *physical-recovery-state*)
-           (namespace (physical-promotion-check-base-control state))
-           (floor (physical-promotion-timeline-floor state))
-           (child (physical-promotion-select-child floor)))
-      (when (and requested-child (not (eql requested-child child)))
-        (error "requested promotion child is not the next local timeline"))
-      (multiple-value-bind (metadata catalog prefix generation) (physical-restartpoint-read state)
-        (when (and *catalog* (not (equalp catalog (catalog-image-bytes))))
-          (error "promotion retained catalog differs from its restartpoint"))
-        (multiple-value-bind (fork next) (physical-promotion-check-progress state metadata prefix generation)
-          (physical-promotion-preflight-runtime
-           next (getf (getf metadata :source-reservation) :bound) fork)
-          (physical-promotion-freeze-timeline-floor floor)
-          (let ((time (- (get-universal-time) 2208988800)) (finished nil))
-            (unwind-protect
-                 (let ((pending
-                         (physical-promotion-publish-retained-intent
-                          state metadata fork
-                          (lambda (reference)
-                            (physical-promotion-make-pending
-                             state metadata prefix generation namespace child time reference)))))
-                   (setf *physical-recovery-state* pending)
-                   (physical-recovery-control-test-point :after-write +db-in-archive-recovery+)
-                   (setf finished t)
-                   pending)
-              (unless finished (setf *physical-recovery-failed-p* t)))))))))
+    (let ((fpw-policy-arguments (startup-promotion-fpw-policy-arguments)))
+      (check-physical-resource-promotion)
+      (physical-follow-promotion-cleanup-config)
+      (physical-recovery-publish-selected-history *physical-receive-store*)
+      (let* ((state *physical-recovery-state*)
+             (namespace (physical-promotion-check-base-control state))
+             (floor (physical-promotion-timeline-floor state))
+             (child (physical-promotion-select-child floor)))
+        (when (and requested-child (not (eql requested-child child)))
+          (error "requested promotion child is not the next local timeline"))
+        (multiple-value-bind (metadata catalog prefix generation) (physical-restartpoint-read state)
+          (when (and *catalog* (not (equalp catalog (catalog-image-bytes))))
+            (error "promotion retained catalog differs from its restartpoint"))
+          (multiple-value-bind (fork next) (physical-promotion-check-progress state metadata prefix generation)
+            (physical-promotion-preflight-runtime
+             next (getf (getf metadata :source-reservation) :bound) fork)
+            (physical-promotion-freeze-timeline-floor floor)
+            (let ((time (- (get-universal-time) 2208988800)) (finished nil))
+              (unwind-protect
+                   (let ((pending
+                           (physical-promotion-publish-retained-intent
+                            state metadata fork
+                            (lambda (reference)
+                              (apply #'physical-promotion-make-pending
+                                     state metadata prefix generation namespace child time reference
+                                     fpw-policy-arguments)))))
+                     (setf *physical-recovery-state* pending)
+                     (physical-recovery-control-test-point :after-write +db-in-archive-recovery+)
+                     (setf finished t)
+                     pending)
+                (unless finished (setf *physical-recovery-failed-p* t))))))))))
 
 (defun physical-promotion-open-file (path &optional writable)
   "Open an existing bounded regular inode without following symlinks."
@@ -463,7 +491,12 @@ child state is published. History publication ends prefix-install eligibility."
              (every (lambda (key) (eql (getf state key) (getf control key)))
                     '(:control-version :phase :system-id :timeline :manifest-digest
                       :checkpoint :applied :next-xid :db-state :state-time
-                      :promotion-child :promotion-generation :promotion-source-namespace))
+                      :promotion-child :promotion-generation :promotion-source-namespace
+                      :promotion-full-page-writes))
+             (eql (not (null (get-properties state '(:promotion-full-page-writes))))
+                  (not (null (get-properties control '(:promotion-full-page-writes)))))
+             (equal (getf state :required-fpw-fact)
+                    (physical-promotion-frozen-fpw-fact control metadata))
              (= generation (getf control :promotion-generation))
              (eq (physical-promotion-check-base-control state)
                  (getf control :promotion-source-namespace))

@@ -73,6 +73,9 @@ Restore the frozen fact after checking it against the selected generation."
               (when fact
                 (setf (getf state :source-resource-fact) (copy-tree fact)
                       (getf state :required-resource-fact) fact)))
+            (let ((fact (physical-promotion-frozen-fpw-fact control metadata)))
+              (setf (getf state :source-fpw-fact) (physical-fpw-copy-fact fact)
+                    (getf state :required-fpw-fact) fact))
             (physical-promotion-check-pending-retained control metadata)
             (physical-promotion-timeline-floor state)
             (values state metadata prefix generation)))))))
