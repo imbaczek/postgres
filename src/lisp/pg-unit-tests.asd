@@ -22,6 +22,7 @@
                (:file "t/rove/concurrency-tests")
                (:file "t/rove/relation-resource-tests")
                (:file "t/rove/resource-parameters-tests")
+               (:file "t/rove/checkpoint-commit-ts-tests")
                (:file "t/rove/snapshot-tests")
                (:file "t/rove/transaction-tests")
                (:file "t/rove/wal-tests")

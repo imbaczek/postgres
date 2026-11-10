@@ -6,24 +6,49 @@
 (defconstant +wal-checkpoint-resource-snapshot-size+ 136
   "PGCKPT02 payload size with a complete resource tuple and coordinates.")
 
+(defconstant +wal-checkpoint-commit-ts-size+ 8)
+
+(defun wal-checkpoint-commit-ts-fields-valid-p (facts)
+  (loop for key in facts by #'cddr
+        count (eq key :oldest-commit-ts-xid) into oldest-count
+        count (eq key :newest-commit-ts-xid) into newest-count
+        finally (return
+                  (or (zerop (+ oldest-count newest-count))
+                      (and (= oldest-count newest-count 1)
+                           (eql 0 (getf facts :oldest-commit-ts-xid))
+                           (eql 0 (getf facts :newest-commit-ts-xid)))))))
+
+(defun wal-copy-checkpoint-commit-ts-fields (facts)
+  (unless (wal-checkpoint-commit-ts-fields-valid-p facts)
+    (error "invalid checkpoint commit timestamp facts"))
+  (when (getf facts :oldest-commit-ts-xid)
+    (list :oldest-commit-ts-xid 0 :newest-commit-ts-xid 0)))
+
+(defun wal-checkpoint-snapshot-length-p (length)
+  (member length
+          (list +wal-checkpoint-snapshot-size+
+                (+ +wal-checkpoint-snapshot-size+ +wal-checkpoint-commit-ts-size+)
+                +wal-checkpoint-resource-snapshot-size+
+                (+ +wal-checkpoint-resource-snapshot-size+ +wal-checkpoint-commit-ts-size+))
+          :test #'=))
+
 (declaim (ftype function wal-control-resource-fields-valid-p wal-control-resource-parameters
                 wal-copy-control-resource-fields))
 
-(defun wal-checkpoint-record-size (&optional resource-facts)
-  "Plan header and payload size from a complete resource group, or unknown facts.
-The known version 8 record occupies 168 bytes."
-  (unless (wal-control-resource-fields-valid-p resource-facts)
-    (error "invalid checkpoint resource facts"))
+(defun wal-checkpoint-record-size (&optional facts)
+  "Plan placement from the same frozen optional facts used by the encoder."
+  (unless (and (wal-control-resource-fields-valid-p facts)
+               (wal-checkpoint-commit-ts-fields-valid-p facts))
+    (error "invalid checkpoint facts"))
   (+ +wal-header-size+
-     (if (wal-control-resource-parameters resource-facts)
+     (if (wal-control-resource-parameters facts)
          +wal-checkpoint-resource-snapshot-size+
-         +wal-checkpoint-snapshot-size+)))
+         +wal-checkpoint-snapshot-size+)
+     (if (getf facts :oldest-commit-ts-xid) +wal-checkpoint-commit-ts-size+ 0)))
 
 (defun wal-checkpoint-record-length-p (length)
-  "Recognize legacy empty and both snapshot record lengths before reading."
-  (member length (list +wal-header-size+
-                       (+ +wal-header-size+ +wal-checkpoint-snapshot-size+)
-                       (+ +wal-header-size+ +wal-checkpoint-resource-snapshot-size+)) :test #'=))
+  (or (= length +wal-header-size+)
+      (wal-checkpoint-snapshot-length-p (- length +wal-header-size+))))
 
 (defun wal-checkpoint-snapshot-valid-p (snapshot)
   "Check checkpoint coordinates and the complete optional resource group.
@@ -35,6 +60,8 @@ Numeric timeline bounds alone do not prove the resource record's ancestry."
         (oid (getf snapshot :next-oid)) (active (getf snapshot :oldest-active-xid)))
     (and (member version '(1 2))
          (wal-control-resource-fields-valid-p snapshot)
+         (wal-checkpoint-commit-ts-fields-valid-p snapshot)
+         (or (= version 2) (null (getf snapshot :oldest-commit-ts-xid)))
          (every (lambda (value) (typep value '(unsigned-byte 64)))
                 (list start end redo reserved))
          (typep next (if (= version 1) '(integer 3 18446744073709551615)
@@ -57,8 +84,8 @@ Numeric timeline bounds alone do not prove the resource record's ancestry."
 
 (defun wal-encode-checkpoint-snapshot (snapshot)
   "V2 uses explicit flags for one-past FullXIDs, without truncating the sentinel.
-Unknown resources use 88 bytes; known resources extend PGCKPT02 to 136 bytes.
-The extension is the shared 48-byte positioned resource fact."
+The base payload uses 88 bytes and resource facts add 48 bytes.
+A known commit timestamp range adds eight bytes after either representation."
   (unless (wal-checkpoint-snapshot-valid-p snapshot) (error "invalid native checkpoint snapshot"))
   (let* ((bytes (make-array (- (wal-checkpoint-record-size snapshot) +wal-header-size+)
                             :element-type '(unsigned-byte 8) :initial-element 0))
@@ -74,24 +101,29 @@ The extension is the shared 48-byte positioned resource fact."
     (wal-set-u32 bytes 68 (getf snapshot :prev-timeline))
     (wal-set-u64 bytes 72 (if active-exhausted 0 (getf snapshot :oldest-active-xid)))
     (when (getf snapshot :next-oid) (wal-set-u32 bytes 80 1))
-    (wal-set-u32 bytes 84 (logior (if next-exhausted 1 0) (if active-exhausted 2 0)))
+    (wal-set-u32 bytes 84 (logior (if next-exhausted 1 0) (if active-exhausted 2 0)
+                                  (if (getf snapshot :oldest-commit-ts-xid) 4 0)))
     (when (getf snapshot :resource-parameters)
       (replace bytes (wal-encode-resource-fact (wal-copy-control-resource-fields snapshot)) :start1 88))
+    (when (getf snapshot :oldest-commit-ts-xid)
+      (let ((offset (- (length bytes) +wal-checkpoint-commit-ts-size+)))
+        (wal-set-u32 bytes offset (getf snapshot :oldest-commit-ts-xid))
+        (wal-set-u32 bytes (+ offset 4) (getf snapshot :newest-commit-ts-xid))))
     bytes))
 
 (defun wal-decode-checkpoint-snapshot (bytes)
-  "Containing WAL/control supplies CRC; reject ambiguous flags and hidden values.
-The 88-byte form has unknown resources. The 136-byte PGCKPT02 form requires a
-complete tuple and coordinates and a zero reserved word.
-The extension uses the shared fact decoder used by recovery control."
-  (unless (member (length bytes) (list +wal-checkpoint-snapshot-size+ +wal-checkpoint-resource-snapshot-size+))
+  "Decode the bounded checkpoint payload covered by WAL or control CRC."
+  (unless (wal-checkpoint-snapshot-length-p (length bytes))
     (error "invalid checkpoint snapshot length"))
   (let* ((version (cond ((equalp (subseq bytes 0 8) #(80 71 67 75 80 84 48 49)) 1)
                         ((equalp (subseq bytes 0 8) #(80 71 67 75 80 84 48 50)) 2)))
-         (flags (wal-u32 bytes 84)))
-    (unless (and version (if (= version 1) (zerop flags) (<= 0 flags 3))
-                 (or (= (length bytes) +wal-checkpoint-snapshot-size+)
-                     (= version 2))
+         (flags (wal-u32 bytes 84))
+         (commit-ts-p (logbitp 2 flags))
+         (resource-end (- (length bytes) (if commit-ts-p +wal-checkpoint-commit-ts-size+ 0))))
+    (unless (and version (if (= version 1) (zerop flags) (<= 0 flags 7))
+                 (member resource-end
+                         (list +wal-checkpoint-snapshot-size+ +wal-checkpoint-resource-snapshot-size+))
+                 (or (= (length bytes) +wal-checkpoint-snapshot-size+) (= version 2))
                  (member (wal-u32 bytes 80) '(0 1))
                  (or (= 1 (wal-u32 bytes 80)) (zerop (wal-u64 bytes 48)))
                  (or (not (logbitp 0 flags)) (zerop (wal-u64 bytes 32)))
@@ -106,11 +138,19 @@ The extension uses the shared fact decoder used by recovery control."
                   :time (wal-i64 bytes 56) :timeline (wal-u32 bytes 64)
                   :prev-timeline (wal-u32 bytes 68)
                   :oldest-active-xid (if (logbitp 1 flags) 18446744073709551616 (wal-u64 bytes 72)))))
-      (when (= (length bytes) +wal-checkpoint-resource-snapshot-size+)
+      (when (= resource-end +wal-checkpoint-resource-snapshot-size+)
         (setf snapshot
               (append snapshot
-                      (wal-decode-resource-fact (subseq bytes 88)))))
-      (unless (wal-checkpoint-snapshot-valid-p snapshot) (error "invalid native checkpoint snapshot"))
+                      (wal-decode-resource-fact
+                       (subseq bytes +wal-checkpoint-snapshot-size+
+                               +wal-checkpoint-resource-snapshot-size+)))))
+      (when commit-ts-p
+        (setf snapshot
+              (append snapshot
+                      (list :oldest-commit-ts-xid (wal-u32 bytes resource-end)
+                            :newest-commit-ts-xid (wal-u32 bytes (+ resource-end 4))))))
+      (unless (wal-checkpoint-snapshot-valid-p snapshot)
+        (error "invalid native checkpoint snapshot"))
       snapshot)))
 
 (defun wal-checkpoint-record-snapshot (record)
@@ -126,7 +166,8 @@ The extension uses the shared fact decoder used by recovery control."
         nil)
       (let ((snapshot (wal-decode-checkpoint-snapshot (wal-record-payload record))))
         (unless (and (>= (wal-record-version record)
-                         (cond ((getf snapshot :resource-parameters) 8)
+                         (cond ((or (getf snapshot :resource-parameters)
+                                    (getf snapshot :oldest-commit-ts-xid)) 8)
                                ((= 2 (getf snapshot :version)) 7) (t 6)))
                      (= (wal-record-start record) (getf snapshot :start))
                      (= (wal-record-end record) (getf snapshot :end)))
@@ -163,8 +204,8 @@ The extension uses the shared fact decoder used by recovery control."
 
 (defun wal-checkpoint-snapshot-from-hex (text)
   "Decode and validate either supported snapshot length from control metadata."
-  (unless (and (member (length text) (list (* 2 +wal-checkpoint-snapshot-size+)
-                                           (* 2 +wal-checkpoint-resource-snapshot-size+)))
+  (unless (and (evenp (length text))
+               (wal-checkpoint-snapshot-length-p (/ (length text) 2))
                (every (lambda (char) (digit-char-p char 16)) text))
     (error "invalid checkpoint control snapshot encoding"))
   (let ((bytes (make-array (/ (length text) 2) :element-type '(unsigned-byte 8))))
@@ -393,7 +434,8 @@ The caller must freeze facts and plan the record size before choosing START."
                                    :next-oid (when *catalog* (catalog-next-oid *catalog*))
                                    :time (- (get-universal-time) 2208988800)
                                    :timeline *wal-insert-timeline* :prev-timeline *wal-prev-timeline* :oldest-active-xid active)
-                             (wal-copy-control-resource-fields resource-facts))))
+                             (wal-copy-control-resource-fields resource-facts)
+                             (wal-copy-checkpoint-commit-ts-fields resource-facts))))
       (unless (wal-checkpoint-snapshot-valid-p snapshot)
         (error "source allocation state cannot be represented in checkpoint"))
       snapshot)))
