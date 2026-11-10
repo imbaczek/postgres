@@ -251,6 +251,7 @@ It is separate from the source identity used for remote acknowledgments.")
 
 (defstruct (wal-writer-position
             (:constructor make-wal-writer-position (incarnation timeline end)))
+  "An LSN bound to the storage incarnation and insertion timeline that own it."
   (incarnation nil :read-only t) (timeline nil :read-only t) (end 0 :read-only t))
 
 (defvar *wal-explicit-write-frontier* nil)
@@ -1370,6 +1371,7 @@ during cleanup, and keep backend termination from replacing a latched WAL failur
 (declaim (ftype function notify-primary-wal-writer-async-under-lock))
 
 (defun wal-writer-position-end-under-lock (position)
+  "Return the current-epoch end LSN, or zero for an absent or stale position."
   (assert (sb-thread:holding-mutex-p *wal-lock*))
   (if (and position
            (eq *wal-storage-incarnation* (wal-writer-position-incarnation position))
@@ -1381,6 +1383,7 @@ during cleanup, and keep backend termination from replacing a latched WAL failur
       0))
 
 (defun wal-explicit-written-lsn ()
+  "Return the explicit write frontier, at least as far as durable WAL."
   (max *wal-durable-lsn*
        (wal-writer-position-end-under-lock *wal-explicit-write-frontier*)))
 
@@ -1388,6 +1391,7 @@ during cleanup, and keep backend termination from replacing a latched WAL failur
   (wal-writer-position-end-under-lock *wal-async-flush-frontier*))
 
 (defun wal-request-async-flush-under-lock (end)
+  "Advance the current epoch's async flush request and check whether to wake the writer."
   (assert (sb-thread:holding-mutex-p *wal-lock*))
   (unless (and (typep end '(unsigned-byte 64)) (<= end *wal-end-lsn*))
     (wal-invalid-input "async flush request is past inserted WAL"))
@@ -1404,6 +1408,8 @@ during cleanup, and keep backend termination from replacing a latched WAL failur
   (values))
 
 (defun wal-write-core ()
+  "Finish output through the current inserted end without claiming durability.
+The whole stream is completed, which can exceed the selected background request."
   (assert (sb-thread:holding-mutex-p *wal-lock*))
   (unless *wal-output-stream*
     (wal-invalid-input "background WAL write has no output stream"))
@@ -1411,7 +1417,8 @@ during cleanup, and keep backend termination from replacing a latched WAL failur
   (wal-note-explicit-write))
 
 (defun wal-flush-core ()
-  "Sync WAL bytes and names, then durable control; caller supplies failure fences."
+  "Sync WAL bytes and names, then durable control; caller supplies failure fences.
+The sync covers the whole current inserted stream, possibly beyond the request."
   (wal-sync-output-bytes *wal-output-stream* *wal-new-segments*)
   (wal-note-explicit-write)
   (setf *wal-new-segments* '())

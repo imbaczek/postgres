@@ -64,6 +64,7 @@ A missing root is an error; there is no fallback to globals."
             (startup-configuration-keep-mb configuration))))
 
 (defun startup-wal-writer-settings ()
+  "Read writer delay and flush threshold from one installed configuration root."
   (let ((settings (startup-configuration-settings (startup-require-configuration))))
     (values (startup-setting-value settings "wal_writer_delay")
             (startup-setting-value settings "wal_writer_flush_after"))))

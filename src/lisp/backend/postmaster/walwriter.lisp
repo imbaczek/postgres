@@ -14,6 +14,7 @@ A new epoch may be installed during a writer's lifetime."
   (ownership nil :read-only t))
 
 (defstruct (wal-writer-policy (:constructor make-wal-writer-policy (delay flush-after)))
+  "Immutable cycle policy: delay in milliseconds and flush threshold in 8 KiB blocks."
   (delay 200 :type (integer 1 10000) :read-only t)
   (flush-after 128 :type (integer 0 2147483647) :read-only t))
 
@@ -227,6 +228,7 @@ The wait path consumes signals and clears the pending flag under this lock."
 (declaim (ftype function startup-wal-writer-settings))
 
 (defun primary-wal-writer-capture-policy ()
+  "Capture a policy from the installed root or test delay override for one cycle and wait."
   (if *primary-wal-writer-delay*
       (make-wal-writer-policy (max 1 (round (* 1000 *primary-wal-writer-delay*))) 128)
       (multiple-value-bind (delay blocks) (startup-wal-writer-settings)
@@ -245,6 +247,8 @@ The wait path consumes signals and clears the pending flag under this lock."
       (>= (- (floor request 8192) (floor flushed 8192)) blocks)))
 
 (defun notify-primary-wal-writer-async-under-lock (end)
+  "Wake a sleeping writer or one whose async request reaches its flush threshold.
+Wakeups are coalesced under the writer state lock; caller holds the WAL lock."
   (assert (sb-thread:holding-mutex-p *wal-lock*))
   (sb-thread:with-mutex (*primary-wal-writer-lock*)
     (let* ((writer *primary-wal-writer*)
@@ -312,12 +316,15 @@ a cycle accepted before a stop request may finish."
   (validate-primary-wal-writer-storage-under-lock epoch))
 
 (defun wal-writer-write-request (end flushed async)
+  "Select the completed 8 KiB boundary beyond FLUSHED, otherwise the async end.
+Return zero when neither advances beyond FLUSHED."
   (let ((completed (* 8192 (floor end 8192))))
     (cond ((> completed flushed) completed)
           ((> async flushed) async)
           (t 0))))
 
 (defun wal-writer-flush-due-p (request flushed last now delay blocks)
+  "Return true for pending work when no prior flush is timed, or the delay or block threshold is reached."
   (and (> request flushed)
        (or (null last) (>= (- now last) delay)
            (wal-writer-flush-threshold-p request flushed blocks))))
@@ -325,6 +332,7 @@ a cycle accepted before a stop request may finish."
 (defun primary-wal-writer-drain-under-lock (writer epoch)
   "Settle the FIFO and record the captured tail's exact terminal end.
 With no FIFO owner, flush outstanding WAL without changing that metric.
+This forced drain includes a partial tail at shutdown.
 The caller must request fail-stop after releasing WAL."
   (unless (validate-primary-wal-writer-under-lock writer epoch)
     (return-from primary-wal-writer-drain-under-lock :stop))
@@ -350,6 +358,9 @@ The caller must request fail-stop after releasing WAL."
   (/ (* (get-internal-real-time) 1000) internal-time-units-per-second))
 
 (defun primary-wal-writer-background-under-lock (writer epoch policy)
+  "Run one cycle under the WAL lock after checking the writer's storage epoch.
+Advertise possible hibernation early so async commits can wake the writer.
+Sync WAL before draining page and CLOG publications through the durable frontier."
   (unless (validate-primary-wal-writer-under-lock writer epoch)
     (return-from primary-wal-writer-background-under-lock :stop))
   (wal-check-healthy)
@@ -450,6 +461,7 @@ Only the installed writer poisons WAL. Request fail-stop after releasing locks."
   (values))
 
 (defun primary-wal-writer-wait (writer policy)
+  "Wait using this cycle's policy; after 50 idle cycles use 25 times the delay."
   (let ((hibernate-p
           (sb-thread:with-mutex (*primary-wal-writer-lock*)
             (>= (primary-wal-writer-idle-cycles writer) 50))))
@@ -462,7 +474,8 @@ Only the installed writer poisons WAL. Request fail-stop after releasing locks."
   (values))
 
 (defun primary-wal-writer-main (writer)
-  "Run the auxiliary writer outside backend and live-operation admission."
+  "Run the auxiliary writer outside backend and live-operation admission.
+Capture one policy per cycle and use the same policy for its wait."
   (let ((*backend* nil) (*live-operation-depth* 0)
                         (*standard-output* (primary-wal-writer-output writer))
                         (*error-output* (primary-wal-writer-error-output writer))
