@@ -329,6 +329,7 @@
          (log (merge-pathnames "stale.log" driver))
          (receipt-path (merge-pathnames "physical-reseed.retired" root))
          (pid-path (merge-pathnames "postmaster.pid" root))
+         (catalog-path (merge-pathnames "global/pg_catalog.dat" root))
          (pid-bytes (pg::string->bytes (format nil "-~d~%stale receipt must preserve this PID file~%"
                                                (sb-posix:getpid))))
          (control-path (merge-pathnames "physical-recovery.control" root))
@@ -336,6 +337,16 @@
          (process nil))
     (assert (not (probe-file receipt-path)))
     (assert (not (probe-file pid-path)))
+    (let ((stat (sb-posix:lstat (namestring catalog-path)))
+          (entry (assoc "global/pg_catalog.dat"
+                        (getf (pg::recovery-read-manifest root) :files) :test #'equal)))
+      (assert (sb-posix:s-isreg (sb-posix:stat-mode stat)))
+      (assert (= (sb-posix:geteuid) (sb-posix:stat-uid stat)))
+      (assert (= 1 (sb-posix:stat-nlink stat)))
+      (assert entry)
+      (assert (/= (second entry) (sb-posix:stat-size stat)))
+      (sb-posix:chmod (namestring catalog-path) #o600)
+      (assert (= #o100600 (sb-posix:stat-mode (sb-posix:lstat (namestring catalog-path))))))
     (pg::wal-atomic-write-bytes receipt-path receipt)
     (sb-posix:chmod (namestring receipt-path) #o600)
     (assert (= #o100600 (sb-posix:stat-mode (sb-posix:stat (namestring receipt-path)))))
@@ -355,7 +366,7 @@
              (finish-output)
              (assert (equal '(:exited 1) (reseed-main-native-wait process 180)))
              (let ((text (uiop:read-file-string log)))
-               (dolist (expected '("physical image input is not a private regular file"
+               (dolist (expected '("physical recovery file length mismatch: global/pg_catalog.dat"
                                    "\"pg_catalog.dat\""
                                    "PG::RECOVERY-CHECK-MANIFEST-FILES"
                                    "PG::PHYSICAL-RECOVERY-VERIFY-BASE-CONTROL-WITH-NAMESPACE"))
