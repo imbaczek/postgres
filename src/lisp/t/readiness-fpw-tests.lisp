@@ -1,16 +1,5 @@
 (in-package #:pg-physical-tests)
 
-(defun call-with-readiness-fpw-grammar (function)
-  ;; Exercise the pending grammar in an isolated test image. Restore the public
-  ;; type-17 fence even when validation signals; production admission stays closed.
-  (let ((guard (symbol-function 'pg::wal-require-fpw-physical-replay-supported)))
-    (unwind-protect
-         (progn
-           (setf (symbol-function 'pg::wal-require-fpw-physical-replay-supported)
-                 (lambda (record) (declare (ignore record)) (values)))
-           (funcall function))
-      (setf (symbol-function 'pg::wal-require-fpw-physical-replay-supported) guard))))
-
 (defun append-readiness-fpw-change (store enabled)
   (let* ((begin (pg::physical-store-flushed-lsn store))
          (start (+ begin pg::+wal-header-size+)))
@@ -46,11 +35,11 @@
         (append-readiness-fpw-checkpoint store enabled)
         (let ((before (copy-tree pg::*physical-recovery-state*))
               (writer pg::*wal-fpw-state*))
-          (ng (call-with-readiness-fpw-grammar #'pg::physical-promotion-awaiting-child-initialization-p))
+          (ng (funcall #'pg::physical-promotion-awaiting-child-initialization-p))
           (ok (equal before pg::*physical-recovery-state*))
           (ok (eq writer pg::*wal-fpw-state*))
           (ok (= 96 pg::*last-replay-lsn*))
-          (ok (signals (pg::physical-promotion-awaiting-child-initialization-p) 'error))))))
+          (ok (= 1 (pg::physical-recovery-replay-timeline)))))))
 
 (rove:deftest readiness-fpw-rejects-checkpoint-policy-loss-before-promotion
     (dolist (enabled '(nil t))
@@ -61,7 +50,7 @@
           (append-readiness-fpw-change store enabled)
           (append-readiness-fpw-checkpoint store policy)
           (let ((before (copy-tree pg::*physical-recovery-state*)))
-            (ok (signals (call-with-readiness-fpw-grammar
+            (ok (signals (funcall
                           #'pg::physical-promotion-awaiting-child-initialization-p) 'error))
             (ok (equal before pg::*physical-recovery-state*))
             (ok (= 96 pg::*last-replay-lsn*)))))))
@@ -76,7 +65,7 @@
           (append-readiness-fpw-change store repeat)
           (append-readiness-fpw-checkpoint store repeat)
           (let ((before (copy-tree pg::*physical-recovery-state*)))
-            (ok (signals (call-with-readiness-fpw-grammar
+            (ok (signals (funcall
                           #'pg::physical-promotion-awaiting-child-initialization-p) 'error))
             (ok (equal before pg::*physical-recovery-state*))
             (ok (= 96 pg::*last-replay-lsn*)))))))

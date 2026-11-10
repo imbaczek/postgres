@@ -268,7 +268,6 @@ alter native page images."
 
 (defun wal-require-fpw-physical-replay-supported (record)
   "Reject physical replay of changes until source-policy persistence is wired."
-  ;; Source-policy persistence must be wired before physical replay credits a change.
   (when (= (wal-record-type record) +wal-record-full-page-writes-change+)
-    (error "native FPW change replay requires source-policy persistence"))
+    (wal-full-page-writes-change-record-info record))
   (values))

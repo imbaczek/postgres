@@ -10,7 +10,7 @@
         (let ((before (copy-tree pg::*physical-recovery-state*))
               (writer pg::*wal-fpw-state*))
           (multiple-value-bind (removed terminal)
-              (call-with-readiness-fpw-grammar
+              (funcall
                (lambda () (pg::physical-recovery-proven-drops store "history-source")))
             (ok (zerop (hash-table-count removed)))
             (ok (= terminal (pg::physical-store-flushed-lsn store))))
@@ -28,7 +28,7 @@
           (append-readiness-fpw-checkpoint store policy)
           (let ((before (copy-tree pg::*physical-recovery-state*)))
             (ok (signals
-                 (call-with-readiness-fpw-grammar
+                 (funcall
                   (lambda () (pg::physical-recovery-proven-drops store "history-source")))
                  'error))
             (ok (equal before pg::*physical-recovery-state*)))))))
@@ -43,7 +43,7 @@
         (append-readiness-fpw-checkpoint store enabled)
         (let ((before (copy-tree pg::*physical-recovery-state*)))
           (ok (signals
-               (call-with-readiness-fpw-grammar
+               (funcall
                 (lambda () (pg::physical-recovery-proven-drops store "history-source")))
                'error))
           (ok (equal before pg::*physical-recovery-state*))))))

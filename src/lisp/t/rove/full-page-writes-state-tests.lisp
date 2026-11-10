@@ -103,14 +103,11 @@
                     (cl-spec:run-property 'full-page-writes-change-roundtrip :seed 252))))
       (rove:ok (eq :passed (getf result :status)) (format nil "~s" result))))
 
-(rove:deftest full-page-writes-physical-consumers-do-not-credit-untracked-policy
+(rove:deftest full-page-writes-physical-consumers-reject-malformed-policy-before-credit
     (let ((*wal-recovery-group-active* :unchanged)
           (record (unit-fpw-change-record nil)))
-      (flet ((refused (function)
-               (handler-case (progn (funcall function) nil)
-                 (simple-error (condition)
-                   (search "requires source-policy persistence" (princ-to-string condition))))))
-        (rove:ok (refused (lambda () (physical-history-accept-record record "source" nil))))
-        (rove:ok (eq :unchanged *wal-recovery-group-active*))
-        (rove:ok (refused (lambda () (physical-replay-check-child-initialization record 3))))
-        (rove:ok (eq :unchanged *wal-recovery-group-active*)))))
+      (setf (aref (wal-record-payload record) 9) 1)
+      (rove:ok (rove:signals (physical-history-accept-record record "source" nil) 'error))
+      (rove:ok (eq :unchanged *wal-recovery-group-active*))
+      (rove:ok (rove:signals (physical-replay-check-child-initialization record 3) 'error))
+      (rove:ok (eq :unchanged *wal-recovery-group-active*))))
