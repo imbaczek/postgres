@@ -626,6 +626,11 @@ Legacy 16-hex segment names always belong to timeline 1."
 (defparameter *wal-crc32-ieee-reference-table* (make-wal-crc32-table))
 
 (defun wal-crc32-typed-range (bytes start end table &optional (seed #xffffffff))
+  "Return the final inverted CRC for a validated octet range and raw SEED.
+The caller supplies a simple octet vector, valid fixnum bounds, a 256-entry
+unsigned 32-bit table and a 32-bit SEED.  On x86-64, PCLMUL is used when
+available for slices of at least 128 bytes and an exact IEEE table; otherwise
+use the seeded scalar recurrence.  Inputs are read only."
   (declare (type (simple-array (unsigned-byte 8) (*)) bytes)
            (type (simple-array (unsigned-byte 32) (256)) table)
            (type fixnum start end)
@@ -2425,6 +2430,12 @@ Follow a symlink at the WAL directory itself. Enumeration errors are reported."
            (>= version +wal-version-v3+))))
 
 (defun wal-record-crc32 (bytes)
+  "Return the final CRC of a WAL record with its checksum field treated as zero.
+For a simple octet record of at least 32 bytes and a typed table, process bytes
+0 through 27, invert that result back to raw state, apply four zero bytes, then
+process bytes 32 onward.  This read-only path allocates no heap storage.
+Other vectors or tables use the copy, zero and public CRC fallback, preserving
+its behavior and allocation.  The record format uses IEEE CRC-32."
   (let ((table (and (boundp '*wal-crc32-table*) *wal-crc32-table*)))
     (when (and (typep bytes '(simple-array (unsigned-byte 8) (*)))
                (>= (length bytes) +wal-header-size+)
@@ -2440,6 +2451,8 @@ Follow a symlink at the WAL directory itself. Enumeration errors are reported."
     (wal-crc32 copy)))
 
 (defun wal-decode-record (bytes expected-lsn)
+  "Validate the record header and checksum at EXPECTED-LSN and decode it.
+The returned record owns a separate payload subsequence of BYTES."
   (let ((version (and (>= (length bytes) +wal-header-size+)
                       (wal-u16 bytes 4))))
     (unless (and (>= (length bytes) +wal-header-size+)
