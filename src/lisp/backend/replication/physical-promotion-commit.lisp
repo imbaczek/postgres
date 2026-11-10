@@ -206,7 +206,8 @@ Close the stream on every exit; the enclosing publisher fences failures."
                  (write-sequence record stream))
                (physical-promotion-test-point
                 (ecase (wal-u16 record 6)
-                  (13 :after-child-eor-write) (6 :after-child-batch-write) (4 :after-child-checkpoint-write)))
+                  (13 :after-child-eor-write) (6 :after-child-batch-write)
+                  (17 :after-child-fpw-write) (4 :after-child-checkpoint-write)))
                (wal-sync-output-bytes stream t))
           (close stream))))))
 
