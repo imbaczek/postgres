@@ -15,6 +15,7 @@ DECODE_CHECKPOINT = runpy.run_path(str(HERE / "checkpoint-snapshot.py"))["checkp
 NAMESPACE = runpy.run_path(str(HERE / "wal-namespace-inspect.py"))["inspect"]
 RECOVERY_LAYOUT = runpy.run_path(str(HERE / "resource_control_fields.py"))["recovery_control_layout"]
 RECOVERY_FPW = runpy.run_path(str(HERE / "resource_control_fields.py"))["recovery_full_page_writes_fact"]
+RECOVERY_INTENT = runpy.run_path(str(HERE / "resource_control_fields.py"))["recovery_promotion_full_page_writes"]
 DECODE_RECOVERY = runpy.run_path(str(HERE / "recovery-control-state.py"))["decode"]
 PENDING = runpy.run_path(str(HERE / "restartpoint-prefix-inspect.py"))
 PROMOTION_FIXTURE = runpy.run_path(str(HERE / "promotion-primary-inspect.py"))["checkpoint_bytes"]
@@ -339,6 +340,72 @@ class ResourceControlTests(unittest.TestCase):
                     RECOVERY_LAYOUT(data)
                 with self.assertRaises(AssertionError):
                     DECODE_RECOVERY(data)
+
+    def promotion_intent_image(self, old, desired):
+        data = old[:-4] + b"PGFPWPI1" + bytes([desired]) + bytes(8) + bytes(4)
+        data = bytearray(data)
+        struct.pack_into("<I", data, len(data) - 4, zlib.crc32(data))
+        return data
+
+    def test_pending_fpw_intent_keeps_source_and_local_policy_separate(self):
+        maximum = 0
+        for layout in (88, 104, 132, 148):
+            for resources in (False, True):
+                for source in (None, False, True):
+                    old = self.fpw_recovery_image(True, layout, resources, source)
+                    self.assertIsNone(RECOVERY_INTENT(old))
+                    for desired in (False, True):
+                        with self.subTest(layout=layout, resources=resources, source=source, desired=desired):
+                            data = self.promotion_intent_image(old, desired)
+                            maximum = max(maximum, len(data))
+                            self.assertEqual(1, len(data) % 4)
+                            self.assertEqual(old[:-4], data[:len(old) - 4])
+                            self.assertIs(desired, RECOVERY_INTENT(data))
+                            self.assertEqual(RECOVERY_LAYOUT(old), RECOVERY_LAYOUT(data))
+                            self.assertEqual(RECOVERY_FPW(old), RECOVERY_FPW(data))
+                            (self.root / "physical-recovery.control").write_bytes(data)
+                            self.assertEqual(3, CTL["recovery_phase"](self.root))
+                            self.assertEqual(data, PENDING["checked_pending_control"](self.root))
+                            if layout in (132, 148):
+                                self.assertEqual(PENDING["retained_reference"](old),
+                                                 PENDING["retained_reference"](data))
+        self.assertEqual(285, maximum)
+
+    def test_pending_fpw_intent_rejects_crc_valid_malformed_trailers(self):
+        source = self.promotion_intent_image(self.fpw_recovery_image(True, 148, True, False), False)
+        start = len(source) - 21
+        mutations = [(offset, source[start + offset] ^ 1)
+                     for offset in (*range(8), *range(9, 17))] + [(8, 2), (8, 255)]
+        for offset, value in mutations:
+            with self.subTest(offset=offset, value=value):
+                data = source.copy()
+                data[start + offset] = value
+                struct.pack_into("<I", data, len(data) - 4, 0)
+                struct.pack_into("<I", data, len(data) - 4, zlib.crc32(data))
+                (self.root / "physical-recovery.control").write_bytes(data)
+                with self.assertRaises(ValueError):
+                    CTL["recovery_phase"](self.root)
+                with self.assertRaises(AssertionError):
+                    RECOVERY_LAYOUT(data)
+                with self.assertRaises(AssertionError):
+                    RECOVERY_INTENT(data)
+
+    def test_promotion_fpw_intent_is_pending_only_and_crc_covered(self):
+        ordinary = self.promotion_intent_image(self.fpw_recovery_image(False, 72, False, None), True)
+        wrong_phase = self.promotion_intent_image(self.fpw_recovery_image(True, 88, False, None), False)
+        struct.pack_into("<I", wrong_phase, 8, 2)
+        struct.pack_into("<I", wrong_phase, len(wrong_phase) - 4, 0)
+        struct.pack_into("<I", wrong_phase, len(wrong_phase) - 4, zlib.crc32(wrong_phase))
+        bad_crc = self.promotion_intent_image(self.fpw_recovery_image(True, 88, False, None), False)
+        bad_crc[-13] = 1
+        for data in (ordinary, wrong_phase, bad_crc):
+            (self.root / "physical-recovery.control").write_bytes(data)
+            with self.assertRaises(ValueError):
+                CTL["recovery_phase"](self.root)
+            with self.assertRaises(AssertionError):
+                RECOVERY_LAYOUT(data)
+            with self.assertRaises(AssertionError):
+                RECOVERY_INTENT(data)
 
     def test_promotion_fixture_preserves_frozen_resources_in_checkpoint_bytes(self):
         expected = dict(fork=256, floor=1003, oid=16384, time=0, child=3, parent=2)

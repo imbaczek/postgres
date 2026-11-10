@@ -10,7 +10,32 @@
 (defconstant +physical-fpw-fact-size+ 72
   "Size in bytes of the optional PGFPWFC1 control suffix.")
 
-(defconstant +physical-recovery-control-maximum-bytes+ (+ 196 +physical-fpw-fact-size+)
+(defconstant +physical-promotion-fpw-intent-size+ 17)
+
+(defun physical-fpw-encode-promotion-intent (enabled)
+  (unless (member enabled '(nil t)) (error "invalid promotion full page writes policy"))
+  (let ((bytes (make-array +physical-promotion-fpw-intent-size+
+                           :element-type '(unsigned-byte 8) :initial-element 0)))
+    (replace bytes #(80 71 70 80 87 80 73 49))
+    (setf (aref bytes 8) (if enabled 1 0))
+    bytes))
+
+(defun physical-fpw-decode-promotion-intent (bytes)
+  (unless (and (= (length bytes) +physical-promotion-fpw-intent-size+)
+               (equalp (subseq bytes 0 8) #(80 71 70 80 87 80 73 49))
+               (member (aref bytes 8) '(0 1))
+               (every #'zerop (subseq bytes 9)))
+    (error "invalid promotion full page writes intent"))
+  (= 1 (aref bytes 8)))
+
+(defun physical-fpw-control-core-size (bytes)
+  (let ((size (length bytes)))
+    (case (mod size 4)
+      (0 (values size nil))
+      (1 (values (- size +physical-promotion-fpw-intent-size+) t))
+      (otherwise (error "invalid physical recovery control length")))))
+
+(defconstant +physical-recovery-control-maximum-bytes+ (+ 196 +physical-fpw-fact-size+ +physical-promotion-fpw-intent-size+)
   "Maximum recovery control image size, shared by all bounded readers.")
 
 (defun physical-fpw-state-fields (fact incarnation)

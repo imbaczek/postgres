@@ -80,11 +80,29 @@ def source_fpw_fact(data, applied, applied_timeline):
     return fact
 
 
+def recovery_promotion_full_page_writes(data):
+    if len(data) % 4 == 0:
+        return None
+    assert len(data) % 4 == 1 and data[:8] == b"PGRSTAT4"
+    assert len(data) - 17 in (88, 104, 132, 136, 148, 152, 160, 176,
+                             180, 196, 204, 208, 220, 224, 252, 268)
+    assert int.from_bytes(data[8:12], "little") & 0x7FFFFFFF == 3
+    intent = data[-21:-4]
+    assert intent[:8] == b"PGFPWPI1" and intent[8] in (0, 1) and not any(intent[9:])
+    assert zlib.crc32(data[:-4] + bytes(4)) == int.from_bytes(data[-4:], "little")
+    return bool(intent[8])
+
+
 def recovery_control_fields(data):
+    assert len(data) % 4 in (0, 1)
+    intent = len(data) % 4 == 1
+    if intent:
+        recovery_promotion_full_page_writes(data)
+    core_size = len(data) - (17 if intent else 0)
     ordinary, pending = data[:8] == b"PGRSTAT3", data[:8] == b"PGRSTAT4"
-    fpw = ((ordinary and len(data) in (144, 160, 192, 208))
-           or (pending and len(data) in (160, 176, 204, 208, 220, 224, 252, 268)))
-    resource_end = len(data) - 4 - (72 if fpw else 0)
+    fpw = ((ordinary and core_size in (144, 160, 192, 208))
+           or (pending and core_size in (160, 176, 204, 208, 220, 224, 252, 268)))
+    resource_end = core_size - 4 - (72 if fpw else 0)
     known = ((ordinary and resource_end + 4 in (120, 136))
              or (pending and resource_end + 4 in (136, 152, 180, 196)))
     size = resource_end + 4 - (48 if known else 0)
@@ -101,7 +119,7 @@ def recovery_control_fields(data):
         assert not any(fact[44:]) and 1 <= lsn <= applied
         assert 1 <= timeline <= applied_timeline
         resources = dict(parameters=list(values), lsn=lsn, timeline=timeline)
-    policy = source_fpw_fact(data[-76:-4], applied, applied_timeline) if fpw else None
+    policy = source_fpw_fact(data[core_size - 76:core_size - 4], applied, applied_timeline) if fpw else None
     return size, resources, policy
 
 

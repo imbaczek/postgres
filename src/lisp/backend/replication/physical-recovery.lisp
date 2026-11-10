@@ -38,6 +38,7 @@ here; selected-history geometry, source identity and the verified WAL prefix are
                          applied next-xid db-state state-time (control-version 3)
                          (applied-timeline timeline) history-target history-digest
                          promotion-child promotion-generation promotion-source-namespace retained-reference resource-fact fpw-fact
+                         (promotion-full-page-writes nil promotion-fpw-intent-p)
                        &allow-other-keys)
       control
     (and (member phase '(0 1 2 3))
@@ -46,6 +47,8 @@ here; selected-history geometry, source identity and the verified WAL prefix are
          (every (lambda (value) (typep value '(unsigned-byte 64)))
                 (list system-id manifest-digest checkpoint applied))
          (member control-version '(1 2 3 4))
+         (or (not promotion-fpw-intent-p)
+             (and (= phase 3) (= control-version 4) (member promotion-full-page-writes '(nil t))))
          (or (null resource-fact)
              (and (member control-version '(3 4))
                   (typep applied-timeline '(integer 1 4294967295))
@@ -106,7 +109,8 @@ here; selected-history geometry, source identity and the verified WAL prefix are
                                         &key (db-state (if (zerop phase) +db-startup+ +db-in-archive-recovery+))
                                           (state-time (- (get-universal-time) 2208988800))
                                           (applied-timeline timeline) history-target history-digest
-                                          promotion-child promotion-generation promotion-source-namespace retained-reference resource-fact fpw-fact)
+                                          promotion-child promotion-generation promotion-source-namespace retained-reference resource-fact fpw-fact
+                                          (promotion-full-page-writes nil promotion-fpw-intent-p))
   "Encode recovery progress and optional extensions under one CRC.
 Ordinary and pending images may append a 48-byte resource fact and a 72-byte FPW
 fact. Absent facts leave the earlier layouts unchanged; FPW has no separate CRC."
@@ -116,15 +120,18 @@ fact. Absent facts leave the earlier layouts unchanged; FPW has no separate CRC.
                                (reference-offset (+ extension-start (if selected 16 0)))
                                (resource-offset (+ reference-offset (if retained-reference 44 0)))
                                (fpw-offset (+ resource-offset (if resource-fact +wal-resource-fact-size+ 0)))
-                               (crc-offset (+ fpw-offset (if fpw-fact +physical-fpw-fact-size+ 0))))
+                               (intent-offset (+ fpw-offset (if fpw-fact +physical-fpw-fact-size+ 0)))
+                               (crc-offset (+ intent-offset (if promotion-fpw-intent-p +physical-promotion-fpw-intent-size+ 0))))
     (unless (physical-recovery-control-valid-p
-             (list :control-version version :phase phase :system-id system-id :timeline timeline
-                   :manifest-digest manifest-digest :checkpoint checkpoint :applied applied
-                   :next-xid next-xid :db-state db-state :state-time state-time
-                   :applied-timeline applied-timeline :history-target history-target :history-digest history-digest
-                   :promotion-child promotion-child :promotion-generation promotion-generation
-                   :promotion-source-namespace promotion-source-namespace :retained-reference retained-reference
-                   :resource-fact resource-fact :fpw-fact fpw-fact))
+             (append (list :control-version version :phase phase :system-id system-id :timeline timeline
+                           :manifest-digest manifest-digest :checkpoint checkpoint :applied applied
+                           :next-xid next-xid :db-state db-state :state-time state-time
+                           :applied-timeline applied-timeline :history-target history-target :history-digest history-digest
+                           :promotion-child promotion-child :promotion-generation promotion-generation
+                           :promotion-source-namespace promotion-source-namespace :retained-reference retained-reference
+                           :resource-fact resource-fact :fpw-fact fpw-fact)
+                     (when promotion-fpw-intent-p
+                       (list :promotion-full-page-writes promotion-full-page-writes))))
       (error "unrepresentable physical recovery control state"))
     (let ((bytes (make-array (+ crc-offset 4) :element-type '(unsigned-byte 8) :initial-element 0)))
       (replace bytes (if pending #(80 71 82 83 84 65 84 52) #(80 71 82 83 84 65 84 51)))
@@ -151,73 +158,81 @@ fact. Absent facts leave the earlier layouts unchanged; FPW has no separate CRC.
         (replace bytes (wal-encode-resource-fact resource-fact) :start1 resource-offset))
       (when fpw-fact
         (replace bytes (physical-fpw-encode-fact fpw-fact) :start1 fpw-offset))
+      (when promotion-fpw-intent-p
+        (replace bytes (physical-fpw-encode-promotion-intent promotion-full-page-writes) :start1 intent-offset))
       (wal-set-u32 bytes crc-offset (wal-crc32 bytes))
       bytes)))
 
 (defun physical-recovery-decode-control (bytes)
   "Decode an exact native control layout and verify its CRC before accepting facts.
 The optional 72-byte FPW suffix is covered by that CRC; legacy layouts remain valid."
-  (unless (member (length bytes) '(60 72 88 104 120 132 136 144 148 152 160 176 180
-                                   192 196 204 208 220 224 252 268))
-    (error "invalid physical recovery control length"))
-  (let* ((size (length bytes)) (magic (subseq bytes 0 8))
-                               (ordinary (equalp magic #(80 71 82 83 84 65 84 51)))
-                               (child (equalp magic #(80 71 82 83 84 65 84 52)))
-                               (fpw (or (and ordinary (member size '(144 160 192 208)))
-                                        (and child (member size '(160 176 204 208 220 224 252 268)))))
-                               (resource-size (- size (if fpw +physical-fpw-fact-size+ 0)))
-                               (resources (or (and ordinary (member resource-size '(120 136)))
-                                              (and child (member resource-size '(136 152 180 196)))))
-                               (layout-size (- resource-size (if resources +wal-resource-fact-size+ 0)))
-                               (version (cond
-                                          ((and (= size 60) (equalp magic #(80 71 82 83 84 65 84 69))) 1)
-                                          ((and (= size 72) (equalp magic #(80 71 82 83 84 65 84 50))) 2)
-                                          ((and ordinary (member layout-size '(72 88))) 3)
-                                          ((and child (member layout-size '(88 104 132 148))) 4)))
-                               (legacy (eql version 1)) (pending (eql version 4))
-                               (extension-start (if pending 84 68))
-                               (retained (and pending (member layout-size '(132 148))))
-                               (selected (and (member version '(3 4))
-                                              (= layout-size (+ extension-start 20 (if retained 44 0)))))
-                               (crc-offset (- size 4))
-                               (copy (copy-seq bytes)) (crc (wal-u32 copy crc-offset))
-                               (raw-phase (wal-u32 bytes 8))
-                               (exhausted (and (member version '(3 4)) (logbitp 31 raw-phase))))
-    (wal-set-u32 copy crc-offset 0)
-    (unless (and version (= crc (wal-crc32 copy))
-                 (or (not exhausted) (zerop (wal-u64 bytes 48))))
-      (error "corrupt or unsupported physical recovery control"))
-    (let ((control
-            (list :control-version version
-                  :phase (if (member version '(3 4)) (logand raw-phase #x7fffffff) raw-phase)
-                  :timeline (wal-u32 bytes 12)
-                  :system-id (wal-u64 bytes 16) :manifest-digest (wal-u64 bytes 24)
-                  :checkpoint (wal-u64 bytes 32) :applied (wal-u64 bytes 40)
-                  :next-xid (if exhausted 18446744073709551616 (wal-u64 bytes 48))
-                  :db-state (unless legacy (wal-u32 bytes 56))
-                  :state-time (unless legacy (wal-i64 bytes 60)))))
-      (when pending
-        (setf (getf control :promotion-child) (wal-u32 bytes 68)
-              (getf control :promotion-source-namespace)
-              (case (wal-u32 bytes 72) (0 :legacy) (1 :timeline))
-              (getf control :promotion-generation) (wal-u64 bytes 76)))
-      (when selected
-        (setf (getf control :applied-timeline) (wal-u32 bytes extension-start)
-              (getf control :history-target) (wal-u32 bytes (+ extension-start 4))
-              (getf control :history-digest) (wal-u64 bytes (+ extension-start 8))))
-      (when retained
-        (setf (getf control :retained-reference)
-              (physical-recovery-read-retained-reference bytes (- layout-size 48))))
-      (when resources
-        (setf (getf control :resource-fact)
-              (wal-decode-resource-fact
-               (subseq bytes (- resource-size 52) (- resource-size 4)))))
-      (when fpw
-        (setf (getf control :fpw-fact)
-              (physical-fpw-decode-fact (subseq bytes (- size 76) crc-offset))))
-      (unless (physical-recovery-control-valid-p control :legacy legacy)
+  (multiple-value-bind (size promotion-fpw-intent-p) (physical-fpw-control-core-size bytes)
+    (unless (member size '(60 72 88 104 120 132 136 144 148 152 160 176 180
+                           192 196 204 208 220 224 252 268))
+      (error "invalid physical recovery control length"))
+    (let* ((magic (subseq bytes 0 8))
+           (ordinary (equalp magic #(80 71 82 83 84 65 84 51)))
+           (child (equalp magic #(80 71 82 83 84 65 84 52)))
+           (fpw (or (and ordinary (member size '(144 160 192 208)))
+                    (and child (member size '(160 176 204 208 220 224 252 268)))))
+           (resource-size (- size (if fpw +physical-fpw-fact-size+ 0)))
+           (resources (or (and ordinary (member resource-size '(120 136)))
+                          (and child (member resource-size '(136 152 180 196)))))
+           (layout-size (- resource-size (if resources +wal-resource-fact-size+ 0)))
+           (version (cond
+                      ((and (= size 60) (equalp magic #(80 71 82 83 84 65 84 69))) 1)
+                      ((and (= size 72) (equalp magic #(80 71 82 83 84 65 84 50))) 2)
+                      ((and ordinary (member layout-size '(72 88))) 3)
+                      ((and child (member layout-size '(88 104 132 148))) 4)))
+           (legacy (eql version 1)) (pending (eql version 4))
+           (extension-start (if pending 84 68))
+           (retained (and pending (member layout-size '(132 148))))
+           (selected (and (member version '(3 4))
+                          (= layout-size (+ extension-start 20 (if retained 44 0)))))
+           (crc-offset (- (length bytes) 4))
+           (copy (copy-seq bytes)) (crc (wal-u32 copy crc-offset))
+           (raw-phase (wal-u32 bytes 8))
+           (exhausted (and (member version '(3 4)) (logbitp 31 raw-phase))))
+      (wal-set-u32 copy crc-offset 0)
+      (unless (and version (= crc (wal-crc32 copy))
+                   (or (not exhausted) (zerop (wal-u64 bytes 48))))
         (error "corrupt or unsupported physical recovery control"))
-      control)))
+      (when (and promotion-fpw-intent-p (not pending))
+        (error "promotion FPW intent requires pending recovery control"))
+      (let ((control
+              (list :control-version version
+                    :phase (if (member version '(3 4)) (logand raw-phase #x7fffffff) raw-phase)
+                    :timeline (wal-u32 bytes 12)
+                    :system-id (wal-u64 bytes 16) :manifest-digest (wal-u64 bytes 24)
+                    :checkpoint (wal-u64 bytes 32) :applied (wal-u64 bytes 40)
+                    :next-xid (if exhausted 18446744073709551616 (wal-u64 bytes 48))
+                    :db-state (unless legacy (wal-u32 bytes 56))
+                    :state-time (unless legacy (wal-i64 bytes 60)))))
+        (when pending
+          (setf (getf control :promotion-child) (wal-u32 bytes 68)
+                (getf control :promotion-source-namespace)
+                (case (wal-u32 bytes 72) (0 :legacy) (1 :timeline))
+                (getf control :promotion-generation) (wal-u64 bytes 76)))
+        (when selected
+          (setf (getf control :applied-timeline) (wal-u32 bytes extension-start)
+                (getf control :history-target) (wal-u32 bytes (+ extension-start 4))
+                (getf control :history-digest) (wal-u64 bytes (+ extension-start 8))))
+        (when retained
+          (setf (getf control :retained-reference)
+                (physical-recovery-read-retained-reference bytes (- layout-size 48))))
+        (when resources
+          (setf (getf control :resource-fact)
+                (wal-decode-resource-fact
+                 (subseq bytes (- resource-size 52) (- resource-size 4)))))
+        (when fpw
+          (setf (getf control :fpw-fact)
+                (physical-fpw-decode-fact (subseq bytes (- size 76) (- size 4)))))
+        (when promotion-fpw-intent-p
+          (setf (getf control :promotion-full-page-writes)
+                (physical-fpw-decode-promotion-intent (subseq bytes (- size 4) crc-offset))))
+        (unless (physical-recovery-control-valid-p control :legacy legacy)
+          (error "corrupt or unsupported physical recovery control"))
+        control))))
 
 (defun physical-recovery-read-control (directory)
   (physical-recovery-decode-control

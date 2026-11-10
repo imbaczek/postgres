@@ -36,12 +36,16 @@ def read_regular(path, limit):
 
 def recovery_phase(root):
     """Read and check native recovery control; do not infer a role from file names."""
-    data = read_regular(root / "physical-recovery.control", 268)
+    data = read_regular(root / "physical-recovery.control", 285)
     ordinary = data[:8] == b"PGRSTAT3"
     pending = data[:8] == b"PGRSTAT4"
-    fpw = ((ordinary and len(data) in (144, 160, 192, 208))
-           or (pending and len(data) in (160, 176, 204, 208, 220, 224, 252, 268)))
-    resource_end = len(data) - 4 - (72 if fpw else 0)
+    intent = len(data) % 4 == 1
+    if len(data) % 4 not in (0, 1) or (intent and not pending):
+        raise ValueError("invalid native recovery control length")
+    core_size = len(data) - (17 if intent else 0)
+    fpw = ((ordinary and core_size in (144, 160, 192, 208))
+           or (pending and core_size in (160, 176, 204, 208, 220, 224, 252, 268)))
+    resource_end = core_size - 4 - (72 if fpw else 0)
     known = ((ordinary and resource_end + 4 in (120, 136))
              or (pending and resource_end + 4 in (136, 152, 180, 196)))
     size = resource_end + 4 - (48 if known else 0)
@@ -61,8 +65,14 @@ def recovery_phase(root):
         if not (reserved == 0 and 1 <= origin <= applied and 1 <= timeline <= applied_timeline):
             raise ValueError("invalid native recovery resource fact")
     if fpw:
-        validate_fpw_fact(data[-76:-4], applied, applied_timeline)
-    return struct.unpack_from("<I", data, 8)[0] & 0x7FFFFFFF
+        validate_fpw_fact(data[core_size - 76:core_size - 4], applied, applied_timeline)
+    phase = struct.unpack_from("<I", data, 8)[0] & 0x7FFFFFFF
+    if intent:
+        policy = data[-21:-4]
+        if not (phase == 3 and policy[:8] == b"PGFPWPI1" and policy[8] in (0, 1)
+                and not any(policy[9:])):
+            raise ValueError("invalid native promotion FPW intent")
+    return phase
 
 
 def validate_fpw_fact(data, applied, applied_timeline):
