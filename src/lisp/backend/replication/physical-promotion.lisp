@@ -284,6 +284,7 @@ parent.  The phase check here alone does not establish that ownership."
    state store metadata (physical-recovery-replay-timeline state)))
 
 (defun physical-promotion-frozen-fpw-fact (control metadata)
+  "Check the frozen source fact against the selected generation and return a copy."
   (let ((frozen (getf control :fpw-fact))
         (source (getf metadata :source-fpw-fact)))
     (unless (and (or (null frozen) (physical-fpw-fact-valid-p frozen))
@@ -370,7 +371,9 @@ Older pending control may lack the fact; then the selected generation supplies i
      &key (promotion-full-page-writes nil promotion-fpw-intent-p))
   "Build pending control bytes and runtime state for the selected archive.
 The caller publishes the bytes and installs the state after owner handoff.
-Freeze the selected generation's source fact in pending control when present."
+Freeze the selected generation's source fact and the supplied local policy.
+A supplied NIL policy means OFF; an absent policy preserves legacy intent.
+Retries use the saved intent rather than capturing the policy again."
   (let* ((fork (getf metadata :lsn))
          (next (getf metadata :next-xid))
          (source-fpw (physical-promotion-frozen-fpw-fact nil metadata))

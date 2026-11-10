@@ -87,6 +87,8 @@ supported, so a canonical off setting establishes invalid XIDs (0/0)."
       (list :oldest-commit-ts-xid 0 :newest-commit-ts-xid 0))))
 
 (defun startup-promotion-fpw-policy-arguments ()
+  "Capture the fixed native ON policy for a valid installed root.
+No root leaves intent absent. A configurable startup or SIGHUP producer is not wired."
   (let ((configuration (startup-capture-configuration)))
     (when configuration
       (unless (and (startup-configuration-p configuration)

@@ -15,9 +15,16 @@
 ;;;; This native checkpoint bridge is slower than C's lightweight promotion path;
 ;;;; compare StartupXLOG and PerformRecoveryXLogAction in access/transam/xlog.c.
 
+;;;; The sequence above applies to legacy pending control. Frozen FPW intent
+;;;; may add a batch start and type 17 change between EOR and the checkpoint
+;;;; batch when the source policy is unknown or differs. Native EOR first proves
+;;;; child lineage; C calls UpdateFullPageWrites before PerformRecoveryXLogAction.
+;;;; Writer admission stays closed until child control is durable.
 (in-package #:pg)
 
 (defun physical-promotion-fpw-prefix (state cursor)
+  "Plan an FPW change when frozen local policy differs from the source fact.
+Unknown source state requires a change; absent legacy intent emits none."
   (let ((source (physical-fpw-copy-fact (getf state :source-fpw-fact))))
     (when (and source
                (not (physical-fpw-fact-at-p source (getf state :applied)

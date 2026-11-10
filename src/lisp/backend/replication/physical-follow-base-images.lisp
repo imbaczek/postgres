@@ -6,6 +6,7 @@
 ;; Encode the binding's phase-2 recovery witness at TIME (Unix seconds).
 ;; SELECTED uses the history in the after tuple. Return bytes without writing.
 (defun physical-follow-binding-recovery-image (binding time &key selected)
+  "Encode the required boundary and its witnessed source facts in recovery control."
   (physical-follow-binding-check binding)
   (unless (typep time '(signed-byte 64)) (error "invalid follow recovery image time"))
   (let ((before (getf binding :before)) (after (getf binding :after))

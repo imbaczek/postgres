@@ -27,7 +27,8 @@
   "Read provenance and exact selected generation before opening or restoring storage.
 Check the frozen namespace floor and reject collisions with observed IDs, even
 for legacy pending state that has no saved floor.
-Restore the frozen fact after checking it against the selected generation."
+Restore the frozen source fact after checking it against the selected generation.
+Cold retry also retains the saved policy, including OFF or legacy absence."
   (physical-recovery-check-required-marker)
   (let ((control (physical-recovery-read-control *pgdata*)))
     (unless (and (eql 4 (getf control :control-version)) (eql 3 (getf control :phase)))

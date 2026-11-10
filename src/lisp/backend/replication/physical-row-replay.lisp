@@ -128,6 +128,7 @@ A violation is an error; the outer replay path fences recovery."
 (defun physical-row-replay-publish-terminal (record next-xid reservation source-xids
                                              &key (resource-fact (getf *physical-recovery-state* :source-resource-fact))
                                                (fpw-fact (getf *physical-recovery-state* :source-fpw-fact)))
+  "Publish source facts with the applied terminal after redo is durable."
   ;; Check the published resource fact before replaying the next record.
   ;; Publish progress only after redo; restart can repeat an unpublished batch.
   (when *physical-replay-test-hook*

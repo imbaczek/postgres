@@ -153,6 +153,9 @@ Prove the separately saved required fact at its own recovery boundary before use
   (values))
 
 (defun physical-restartpoint-fpw-seed (metadata state store start)
+  "Recover a copied source FPW fact at START from a generation, checkpoint or WAL.
+Check its origin and coverage against history and the required recovery boundary.
+A historical source checkpoint can record OFF regardless of local writer policy."
   (let* ((checkpoint (if metadata (getf metadata :source-checkpoint) (getf state :source-checkpoint)))
          (timeline (if metadata (getf metadata :replay-timeline (getf metadata :timeline))
                        (getf state :timeline)))

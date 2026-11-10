@@ -61,6 +61,7 @@
     binding))
 
 (defun physical-adoption-follow-make-binding (record base control store)
+  "Check the saved required frontier and its facts before validating the candidate."
   (let* ((record (physical-adoption-attempt-copy record))
          (stage (getf record :stage))
          (binding (physical-adoption-follow-planned-binding record))

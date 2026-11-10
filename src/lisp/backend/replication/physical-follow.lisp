@@ -521,11 +521,13 @@ Return seven values, including the optional fact at the chosen seed."
 (defun physical-follow-scan-replay-from-seed-core
     (candidate verified-base applied required observed seed map-records allow-open-tail &optional witness)
   "Scan a stable candidate without redo or publication. SEED supplies the replay
-position, timeline, XID, checkpoint, reservation, source XIDs and optional fact.
-APPLIED and REQUIRED are clean recovery boundaries. If REQUIRED precedes SEED,
-the seed's validated visibility and resource proof supply that earlier requirement.
-A historical WITNESS has LSN, timeline and next XID, and may carry a fourth
-resource-fact field. Return the disposition and any facts observed at those boundaries.
+position, timeline, XID, checkpoint, reservation, source XIDs and optional
+resource and FPW facts. APPLIED and REQUIRED are clean recovery boundaries.
+If REQUIRED precedes SEED, the seed's validated visibility and resource proof
+supply that earlier requirement. After checking FPW coverage, retain the saved
+required FPW minimum at its own boundary rather than backdating the seed fact.
+A historical WITNESS has LSN, timeline and next XID, optionally followed by
+resource and FPW facts. Return the disposition and facts at the boundaries.
 A policy fence must leave a clean batch boundary; an allowed open tail may remain."
   (destructuring-bind (start timeline next snapshot reservation source-xids &optional resource-fact fpw-fact) seed
     (let* ((*physical-recovery-state* (copy-tree verified-base))
@@ -650,6 +652,7 @@ A policy fence must leave a clean batch boundary; an allowed open tail may remai
   t)
 
 (defun physical-follow-check-fpw-publication (result binding)
+  "Require a saved witness when the required boundary has reconstructed FPW evidence."
   (when (and (getf result :required-fpw-fact)
              (null (getf (getf binding :recovery) :fpw-fact)))
     (error "pending follow binding lacks reconstructed FPW evidence; prepare a new binding"))

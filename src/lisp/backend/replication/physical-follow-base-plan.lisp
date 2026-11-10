@@ -51,6 +51,7 @@
 ;; while applied and required remain (B, parent timeline).  The phase-2
 ;; recovery witness is a plan; the installed recovery control remains phase 0.
 (defun physical-follow-empty-base-binding (base anchor)
+  "Build a pending binding with copied facts at the immutable base frontier."
   (let* ((base (copy-tree base))
          (anchor (physical-follow-anchor-copy anchor))
          (end (getf base :end)) (timeline (getf base :timeline))

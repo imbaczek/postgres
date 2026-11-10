@@ -30,6 +30,8 @@ Check the fact's origin against the selected history."
       (timeline-check-resource-origin candidate (if (functionp history) (funcall history) history)))))
 
 (defun physical-replay-fpw-fact-next (prior record timeline history)
+  "Advance the source FPW fact at a complete terminal. NIL means unknown;
+known OFF is a non-NIL fact. The fact describes source history, not local policy."
   (when (or prior
             (= (wal-record-type record) +wal-record-full-page-writes-change+)
             (and (= (wal-record-type record) +wal-record-checkpoint+)
@@ -43,8 +45,11 @@ Check the fact's origin against the selected history."
         (timeline-read-history (getf state :timeline)))))
 
 (defun physical-recovery-scan-resource-fact (store start end seed state &key (fpw-seed nil fpw-seed-p))
-  "Reconstruct a fact through complete terminals in a durable prefix without redo.
-The seed belongs to START; selected end-of-recovery records advance the timeline."
+  "Reconstruct the resource fact through complete terminals without redo or publication.
+The resource seed belongs to START; selected EOR records advance the timeline.
+When FPW-SEED is supplied, also return the source FPW fact as a second value.
+NIL means unknown; a non-NIL seed must prove the exact START boundary.
+Without FPW-SEED, retain the resource-only scan."
   (unless (<= (physical-store-floor-lsn store) start end (physical-store-flushed-lsn store))
     (error "resource proof prefix is unavailable; take a fresh base backup"))
   (let ((fact (wal-copy-control-resource-fields seed))
@@ -159,7 +164,7 @@ does not excuse a missing file or a different fork."
                                                                     (getf *physical-recovery-state* :timeline)))
                                           (resource-fact (getf *physical-recovery-state* :source-resource-fact))
                                           (fpw-fact (getf *physical-recovery-state* :source-fpw-fact)))
-  "Publish the replay position and its source resource fact together."
+  "Publish the replay position and copied source facts together after redo is durable."
   (let ((candidate (copy-list *physical-recovery-state*)))
     (setf (getf candidate :replay-timeline) replay-timeline)
     (when (or resource-fact (getf candidate :source-resource-fact))
@@ -413,6 +418,9 @@ referenced fork."
 ;;; Copy membership so the prospective replay state remains independently owned.
 
 (defun physical-replay-fact-arguments (resource-fact fpw-fact)
+  "Build fact keywords for progress publication, borrowing the supplied values.
+Omit an unknown fact when no prior fact exists; pass NIL to clear a prior fact.
+The progress save copies facts at the publication boundary."
   (append (when (or resource-fact (getf *physical-recovery-state* :source-resource-fact))
             (list :resource-fact resource-fact))
           (when (or fpw-fact (getf *physical-recovery-state* :source-fpw-fact))
