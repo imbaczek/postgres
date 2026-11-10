@@ -150,6 +150,7 @@ Invalid or ambiguous catalog metadata fails closed instead of proving a drop."
 
 (defun physical-history-accept-record (record identity removed)
   "Validate native batch ordering and payloads without applying any storage."
+  (wal-require-fpw-physical-replay-supported record)
   (wal-note-recovery-batch-record record)
   (let ((type (wal-record-type record)))
     (cond

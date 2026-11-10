@@ -37,6 +37,7 @@
                    (:file "wal-resource-parameters")
                    (:file "wal-eor")
                    (:file "wal-checkpoint")
+                   (:file "wal-full-page-writes")
                    (:file "bufmgr")))
      (:file "utils/adt/pglz")
      (:file "utils/adt/json")

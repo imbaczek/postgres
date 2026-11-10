@@ -28,6 +28,14 @@
 (defconstant +wal-record-parameter-change+ 16
   "Native version 8 empty-batch terminal carrying a resource tuple.")
 
+(defconstant +wal-record-full-page-writes-change+ 17)
+
+(declaim (ftype function wal-current-full-page-writes-fields
+                wal-fpw-note-published-checkpoint wal-fpw-state-from-checkpoint
+                wal-fpw-state-next wal-fpw-install-recovered-state wal-fpw-prepare-recovery))
+
+(declaim (ftype function wal-full-page-writes-change-record-info))
+
 (declaim (ftype function wal-parameter-change-record-info wal-recover-resource-parameters))
 
 (declaim (ftype function wal-running-xacts-record-info
@@ -249,6 +257,8 @@ Owners are process-local; the appropriate codec stores durable slot fields."
   "WAL-owned token for the local insertion domain, retained across reload.
 It is separate from the source identity used for remote acknowledgments.")
 
+(defvar *wal-fpw-state* nil)
+
 (defstruct (wal-writer-position
             (:constructor make-wal-writer-position (incarnation timeline end)))
   "An LSN bound to the storage incarnation and insertion timeline that own it."
@@ -420,7 +430,8 @@ This identity is separate from the source used for remote acknowledgments."
   (require-primary-wal-writer-retired-under-lock)
   (wal-require-no-pending-storage)
   (wal-require-no-temp-cleanup-under-lock)
-  (setf *wal-storage-incarnation* (gensym "WAL-STORE-")))
+  (prog1 (setf *wal-storage-incarnation* (gensym "WAL-STORE-"))
+    (setf *wal-fpw-state* nil)))
 
 (defun wal-replace-storage-incarnation ()
   "Check debt and rotate identity under WAL lock.
@@ -2376,6 +2387,7 @@ Follow a symlink at the WAL directory itself. Enumeration errors are reported."
                               +wal-record-maintenance+))
            (and (= type +wal-record-relation-reset+) (>= version 8))
            (and (= type +wal-record-parameter-change+) (>= version 8))
+           (and (= type +wal-record-full-page-writes-change+) (>= version 8))
            (and (= type +wal-record-xid-reservation+) (>= version +wal-version-v7+))
            (and (= type +wal-record-running-xacts+) (>= version 7))
            (and (= type +wal-record-end-of-recovery+) (>= version 7))
@@ -2719,7 +2731,7 @@ src/backend/access/transam/xlogreader.c."
 (defun wal-empty-metadata-terminal-type-p (type)
   "Recognize terminals that must be the only record after a batch marker."
   (member type (list +wal-record-running-xacts+ +wal-record-xid-reservation+
-                     +wal-record-parameter-change+) :test #'=))
+                     +wal-record-parameter-change+ +wal-record-full-page-writes-change+) :test #'=))
 
 (defun wal-note-recovery-batch-record (record)
   "Track whether a metadata terminal can follow the batch marker alone."
@@ -2742,6 +2754,7 @@ CLEAN-P must certify that only a valid batch marker precedes the terminal."
     (cond
       ((= type +wal-record-running-xacts+) (wal-running-xacts-record-info record))
       ((= type +wal-record-parameter-change+) (wal-parameter-change-record-info record))
+      ((= type +wal-record-full-page-writes-change+) (wal-full-page-writes-change-record-info record))
       ((= type +wal-record-xid-reservation+) (wal-xid-reservation-record-bound record))
       (t (error "unsupported empty metadata terminal")))))
 
@@ -2892,20 +2905,26 @@ published separately after primary redo completes."
          (wal-recovery-reset-logical-change-batch)))))
 
 (defun wal-recover ()
-  "Redo durable complete batches before loading the catalog.
-After the scan, publish the latest parameter terminal beyond the checkpoint;
-the scan itself validates records without publishing their resource state."
-  (let ((*wal-recovery-page-spool-enabled* t)
-        (resource-record nil))
+  "Redo durable complete batches before loading the catalog."
+  (let* ((incarnation *wal-storage-incarnation*)
+         (fpw-state (wal-fpw-state-from-checkpoint *wal-checkpoint-snapshot* incarnation))
+         (*wal-recovery-page-spool-enabled* t)
+         (resource-record nil))
     (with-wal-replay-staging ()
-      (wal-scan (lambda (record)
-                  (wal-replay-record record)
-                  (when (and (> (wal-record-end record) *wal-checkpoint-lsn*)
-                             (= (wal-record-type record) +wal-record-parameter-change+))
-                    (setf resource-record record)))))
+      (wal-scan
+       (lambda (record)
+         (wal-replay-record record)
+         (when (> (wal-record-end record) *wal-checkpoint-lsn*)
+           (when (= (wal-record-type record) +wal-record-parameter-change+)
+             (setf resource-record record))
+           (when (and (wal-terminal-record-type-p (wal-record-type record))
+                      (not *wal-recovery-group-active*))
+             (setf fpw-state (wal-fpw-state-next
+                              fpw-state record *wal-insert-timeline* incarnation)))))))
     (when resource-record
-      (with-wal-critical (wal-recover-resource-parameters resource-record))))
-  (clog-fsync)
+      (with-wal-critical (wal-recover-resource-parameters resource-record)))
+    (clog-fsync)
+    (with-wal-critical (wal-fpw-install-recovered-state fpw-state incarnation)))
   (values))
 
 (defun wal-atomic-write-bytes (path bytes)
@@ -3181,7 +3200,8 @@ and supplies POLICY and KEEP-MB from the same captured configuration."
   (member type (list +wal-record-commit+ +wal-record-catalog+
                      +wal-record-catalog-commit+ +wal-record-checkpoint+
                      +wal-record-maintenance+ +wal-record-clog-reset+ +wal-record-xid-reservation+
-                     +wal-record-running-xacts+ +wal-record-parameter-change+)
+                     +wal-record-running-xacts+ +wal-record-parameter-change+
+                     +wal-record-full-page-writes-change+)
           :test #'=))
 
 (defun wal-slot-terminal-ack-p (slot target-lsn)
@@ -3554,13 +3574,17 @@ after cleanup is confirmed."
             *wal-test-pause-relfilenode* nil
             *wal-test-pause-fired* nil)
       (unless checkpoint-lsn (wal-save-control-fields 0 0))
-      (multiple-value-bind (end-lsn found-segments)
-          (wal-scan (lambda (record) (declare (ignore record))))
-        (setf *wal-end-lsn* end-lsn)
-        (when (> end-lsn *wal-durable-lsn*)
-          ;; Adopt only a complete, synced tail belonging to this insertion identity.
-          (wal-sync-segments found-segments)
-          (wal-save-durable-lsn end-lsn)))
+      (let ((fpw-marker-p nil))
+        (multiple-value-bind (end-lsn found-segments)
+            (wal-scan (lambda (record)
+                        (when (= (wal-record-type record) +wal-record-full-page-writes-change+)
+                          (setf fpw-marker-p t))))
+          (setf *wal-end-lsn* end-lsn)
+          (when (> end-lsn *wal-durable-lsn*)
+            ;; Adopt only a complete, synced tail belonging to this insertion identity.
+            (wal-sync-segments found-segments)
+            (wal-save-durable-lsn end-lsn)))
+        (with-wal-critical (wal-fpw-prepare-recovery snapshot fpw-marker-p)))
       (setf *wal-test-pause-at*
             (let ((value (sb-ext:posix-getenv "PG_WAL_TEST_PAUSE_AT")))
               (and value (string-downcase value)))
@@ -3650,7 +3674,8 @@ release their claims to the retained WAL."
       (with-wal-critical
         (wal-settle-page-publications-under-lock)
         (wal-require-no-pending-storage)
-        (let ((keys (wal-primary-page-keys)))
+        (let ((keys (wal-primary-page-keys))
+              (fpw-facts (wal-current-full-page-writes-fields)))
           (wal-primary-preflight-page-keys keys)
           (with-wal-primary-page-spool (spool)
             (wal-primary-record-page-xids keys (wal-append-batch-start))
@@ -3658,7 +3683,7 @@ release their claims to the retained WAL."
             (wal-primary-seal-page-spool spool)
             (let* ((checkpoint-facts
                      (append (wal-copy-control-resource-fields *wal-control-metadata*)
-                             commit-ts-facts))
+                             commit-ts-facts fpw-facts))
                    (size (wal-checkpoint-record-size checkpoint-facts))
                    (start (wal-next-record-start size))
                    (snapshot (wal-capture-checkpoint-snapshot start checkpoint-facts))
@@ -3678,6 +3703,7 @@ release their claims to the retained WAL."
               (fsync-directory (merge-pathnames "base/" *pgdata*))
               (fsync-directory (merge-pathnames "global/" *pgdata*))
               (wal-save-checkpoint-control checkpoint-end snapshot)
+              (wal-fpw-note-published-checkpoint snapshot)
               (wal-test-pause :after-checkpoint-control)
               (wal-remove-checkpointed-segments-under-wal-lock checkpoint-end)))))))
   (values))

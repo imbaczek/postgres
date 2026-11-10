@@ -1,0 +1,108 @@
+(in-package #:pg-physical-tests)
+
+(defun call-with-fpw-wal-fixture (function)
+  (let ((pg::*wal-fpw-state* nil) (pg::*wal-fpw-test-hook* nil)
+                                  (pg::*wal-lock* (sb-thread:make-mutex :name "FPW real WAL"))
+                                  (pg::*wal-temp-cleanup-domain* nil)
+                                  (pg::*relation-streams* (make-hash-table :test #'equal))
+                                  (pg::*physical-source-pins* (make-hash-table :test #'equal))
+                                  (pg::*wal-prev-timeline* 1))
+    (call-with-resource-wal-fixture
+     (lambda ()
+       (ensure-directories-exist (merge-pathnames "base/placeholder" pg::*pgdata*))
+       (funcall function)))))
+
+(defun fpw-reopen-wal ()
+  (when pg::*wal-output-stream*
+    (close pg::*wal-output-stream*) (setf pg::*wal-output-stream* nil))
+  (when pg::*clog-stream*
+    (close pg::*clog-stream*) (setf pg::*clog-stream* nil))
+  (pg::wal-init)
+  (pg::xact-init))
+
+(deftest primary-fpw-recovery-folds-every-change-and-replaces-incarnation
+    (call-with-fpw-wal-fixture
+     (lambda ()
+       (ok (null pg::*wal-fpw-state*))
+       (let* ((incarnation pg::*wal-storage-incarnation*)
+              (first (pg::wal-report-full-page-writes t))
+              (disabled (pg::wal-report-full-page-writes nil))
+              (end (pg::wal-report-full-page-writes t))
+              (state pg::*wal-fpw-state*)
+              (records nil))
+         (ok (= 80 first)) (ok (= 160 disabled)) (ok (= 240 end))
+         (pg::wal-scan (lambda (record) (push record records)))
+         (ok (equal '(6 17 6 17 6 17) (mapcar #'pg::wal-record-type (reverse records))))
+         (ok (= 112 (pg::wal-fpw-state-last-disable-start state)))
+         (fpw-reopen-wal)
+         (ok (not (eq incarnation pg::*wal-storage-incarnation*)))
+         (ok (eq :unrecovered pg::*wal-fpw-state*))
+         (ok (intake-fails-p (lambda () (pg::wal-report-full-page-writes nil))))
+         (ok (not pg::*wal-poisoned*))
+         (pg::wal-recover)
+         (ok (eq t (pg::wal-fpw-state-enabled pg::*wal-fpw-state*)))
+         (ok (= 112 (pg::wal-fpw-state-last-disable-start pg::*wal-fpw-state*)))
+         (ok (= 32 (pg::wal-fpw-state-coverage-start pg::*wal-fpw-state*)))
+         (ok (eq pg::*wal-storage-incarnation* (pg::wal-fpw-state-incarnation pg::*wal-fpw-state*)))
+         (ok (= 240 (pg::wal-report-full-page-writes t)))
+         (ok (= 240 pg::*wal-end-lsn*))))))
+
+(deftest primary-fpw-checkpoint-keeps-unknown-and-restores-known-booleans
+    (call-with-fpw-wal-fixture
+     (lambda ()
+       (pg::wal-checkpoint-core)
+       (ok (null (get-properties pg::*wal-checkpoint-snapshot* '(:full-page-writes))))
+       (dolist (enabled '(nil t nil))
+         (pg::wal-report-full-page-writes enabled)
+         (pg::wal-checkpoint-core)
+         (let ((snapshot (copy-tree pg::*wal-checkpoint-snapshot*)))
+           (ok (eq :full-page-writes (get-properties snapshot '(:full-page-writes))))
+           (ok (eql enabled (getf snapshot :full-page-writes)))
+           (ok (equal snapshot (third (multiple-value-list (pg::wal-read-control-fields)))))
+           (ok (eq :checkpoint (pg::wal-fpw-state-witness-kind pg::*wal-fpw-state*)))
+           (fpw-reopen-wal)
+           (ok (eq :unrecovered pg::*wal-fpw-state*))
+           (pg::wal-recover)
+           (ok (eql enabled (pg::wal-fpw-state-enabled pg::*wal-fpw-state*)))
+           (ok (= (getf snapshot :start) (pg::wal-fpw-state-coverage-start pg::*wal-fpw-state*)))
+           (ok (null (pg::wal-fpw-state-last-disable-start pg::*wal-fpw-state*)))
+           (ok (= (getf snapshot :end) (pg::wal-report-full-page-writes enabled))))))))
+
+(deftest primary-fpw-durable-publication-failure-recovers-from-wal
+    (dolist (enabled '(nil t))
+      (dolist (point '(:after-flush :after-state))
+        (call-with-fpw-wal-fixture
+         (lambda ()
+           (pg::wal-report-full-page-writes (not enabled))
+           (let ((pg::*wal-fpw-test-hook*
+                   (lambda (stage state)
+                     (declare (ignore state))
+                     (when (eq stage point) (error "injected durable FPW failure")))))
+             (ok (intake-fails-p (lambda () (pg::wal-report-full-page-writes enabled)))))
+           (ok pg::*wal-poisoned*)
+           (ok (= 160 pg::*wal-durable-lsn*))
+           (fpw-reopen-wal)
+           (ok (eq :unrecovered pg::*wal-fpw-state*))
+           (pg::wal-recover)
+           (ok (not pg::*wal-poisoned*))
+           (ok (eql enabled (pg::wal-fpw-state-enabled pg::*wal-fpw-state*)))
+           (ok (= 160 (pg::wal-report-full-page-writes enabled))))))))
+
+(deftest primary-fpw-recovery-does-not-publish-before-final-sync
+    (call-with-fpw-wal-fixture
+     (lambda ()
+       (pg::wal-report-full-page-writes nil)
+       (fpw-reopen-wal)
+       (let ((original (symbol-function 'pg::clog-fsync)) (attempts 0))
+         (unwind-protect
+              (progn
+                (setf (symbol-function 'pg::clog-fsync)
+                      (lambda () (incf attempts) (error "injected recovery sync failure")))
+                (ok (intake-fails-p #'pg::wal-recover))
+                (ok (= 1 attempts))
+                (ok (eq :unrecovered pg::*wal-fpw-state*)))
+           (setf (symbol-function 'pg::clog-fsync) original)))
+       (pg::wal-recover)
+       (ok (pg::wal-fpw-state-p pg::*wal-fpw-state*))
+       (ok (null (pg::wal-fpw-state-enabled pg::*wal-fpw-state*)))
+       (ok (= 32 (pg::wal-fpw-state-last-disable-start pg::*wal-fpw-state*))))))

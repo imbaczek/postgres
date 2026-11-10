@@ -25,6 +25,8 @@
                (:file "t/rove/checkpoint-commit-ts-tests")
                (:file "t/rove/checkpoint-commit-ts-policy-tests")
                (:file "t/rove/checkpoint-full-page-writes-tests")
+               (:file "t/rove/full-page-writes-state-tests")
+               (:file "t/rove/full-page-writes-writer-tests")
                (:file "t/rove/snapshot-tests")
                (:file "t/rove/transaction-tests")
                (:file "t/rove/wal-tests")
