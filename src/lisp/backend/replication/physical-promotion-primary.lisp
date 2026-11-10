@@ -320,7 +320,8 @@ XID lock before installing child scalars.  Keep catalog, CLOG, storage handles,
 readers, retention state and the parent replay position.  Any failure fences
 recovery; restart must classify durable control. Under the existing quiescence
 requirements, reject pending page and CLOG debt and rotate the local WAL identity before
-installing the child's state."
+installing the child's state. Install FPW evidence from the committed child
+checkpoint in the new WAL incarnation."
   (require-primary-wal-writer-retired)
   (let ((finished nil))
     (unwind-protect

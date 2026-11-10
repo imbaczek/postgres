@@ -110,10 +110,29 @@ Both replay cuts check source-offline cold recovery of the exact OFF witness
 and last-disable position, a clean standby shutdown and second cold restart,
 interrupted promotion after the child EOR is synced, and another child restart
 with local ON policy and the row intact. The last-disable check corresponds to
-the boundary tracked in C `xlog.c:xlog_redo`. Policy changes are published
-manually through the control REPL; this does not test a GUC producer. The peers
-use native PGWL. This does not test C binary WAL interoperability or run a
-coordinator, DCS or HA loop.
+the boundary tracked in C `xlog.c:xlog_redo`. The default case publishes policy
+changes manually through the control REPL. To exercise configuration and live
+promotion, use the same pinned environment and private RAM mount:
+
+```sh
+PATRONI_PYTHON=/path/to/pinned-venv/bin/python3
+export PG_CONFIG=/path/to/c/bin/pg_config
+export PATH="/path/to/c/bin:$PATH"
+./t/test-ramdisk.sh setup 4G
+./t/test-ramdisk.sh run "$PATRONI_PYTHON" t/interop/fpw-config.py
+./t/test-ramdisk.sh run "$PATRONI_PYTHON" t/interop/source-fpw-cold.py --point both --configured
+./t/test-ramdisk.sh run "$PATRONI_PYTHON" t/interop/source-fpw-cold.py --point after-progress --configured --live-promotion
+```
+
+The configuration oracle checks startup, reload, unchanged policy, session
+context rejection and cold reconciliation. After SIGHUP the displayed setting
+is desired policy; the WAL writer applies it asynchronously. The configured
+promotion cases preserve the frozen child checkpoint policy and then publish a
+marker if current configuration differs. Live promotion checks that the new
+incarnation retains the exact checkpoint witness when policy is unchanged.
+OFF still uses conservative full page images; these tests make no WAL volume
+claim. All peers use native PGWL. This does not test C binary WAL interoperability
+or run a coordinator, DCS or HA loop.
 
 The independent C idle-writer check can be run from `src/lisp` with:
 

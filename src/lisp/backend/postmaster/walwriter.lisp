@@ -406,6 +406,8 @@ Sync WAL before draining page and CLOG publications through the durable frontier
   :continue)
 
 (defun primary-wal-writer-background-step (writer policy)
+  "Capture desired FPW policy before WAL locking, then validate the writer epoch.
+Publish policy only for the validated epoch, and run the background cycle."
   (when (primary-wal-writer-stopping-p writer)
     (return-from primary-wal-writer-background-step :stop))
   (multiple-value-bind (enabled known) (startup-full-page-writes-policy)

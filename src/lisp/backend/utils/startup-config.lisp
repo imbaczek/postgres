@@ -87,6 +87,8 @@ supported, so a canonical off setting establishes invalid XIDs (0/0)."
       (list :oldest-commit-ts-xid 0 :newest-commit-ts-xid 0))))
 
 (defun startup-full-page-writes-policy ()
+  "Return the installed desired FPW policy and a presence flag.
+No installed root returns NIL/NIL. A present NIL value means known OFF."
   (let ((configuration (startup-capture-configuration)))
     (when configuration
       (let ((settings (startup-configuration-settings configuration)))
@@ -101,6 +103,7 @@ supported, so a canonical off setting establishes invalid XIDs (0/0)."
           (values (getf entry :value) t))))))
 
 (defun startup-promotion-fpw-policy-arguments ()
+  "Return promotion arguments for the installed policy, preserving known OFF."
   (multiple-value-bind (enabled known) (startup-full-page-writes-policy)
     (when known (list :promotion-full-page-writes enabled))))
 

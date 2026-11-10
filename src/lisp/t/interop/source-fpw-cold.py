@@ -1,7 +1,8 @@
 """Crash native source-FPW replay and promotion using complete owned PGDATA.
 
-Use pinned Patroni's PostgreSQL control layer only; no DCS or HA loop runs.
-Policy publication uses the server control REPL until the GUC producer is wired.
+Use pinned Patroni's PostgreSQL control layer without a DCS or HA loop.
+The default case publishes policy through the control REPL; --configured
+uses server configuration and --live-promotion tests the live child path.
 """
 import argparse
 from contextlib import ExitStack

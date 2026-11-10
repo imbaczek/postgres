@@ -1,5 +1,5 @@
-;; Primary effective full page writes policy is derived from checkpoint and WAL.
-;; Configuration and physical replay are not yet wired to this module.
+;; Track primary FPW policy from durable checkpoints and WAL records.
+;; Configuration publishes local policy; physical replay tracks source policy.
 
 (in-package #:pg)
 
@@ -225,6 +225,10 @@ The caller must exclude storage replacement throughout recovery."
              *wal-insert-timeline* *wal-storage-incarnation*)))))
 
 (defun wal-report-full-page-writes-under-lock (enabled incarnation begin-publication)
+  "Publish a primary FPW policy under the WAL lock and return its durable end.
+Reuse an unchanged witness; otherwise settle pending work and flush a change.
+Install ON before the terminal; install OFF only after its flush.
+BEGIN-PUBLICATION arms the caller's fence before appending this batch."
   (assert (sb-thread:holding-mutex-p *wal-lock*))
   (unless (member enabled '(nil t)) (error "invalid full page writes policy"))
   (prevent-recovery-primary-operation "full page writes policy publication")
@@ -274,6 +278,8 @@ the WAL lock is held. Native page images remain conservative."
 (declaim (ftype function startup-full-page-writes-policy))
 
 (defun wal-report-configured-full-page-writes ()
+  "Publish the installed desired FPW policy when configuration is available.
+Capture the desired policy before taking the WAL lock."
   (multiple-value-bind (enabled known) (startup-full-page-writes-policy)
     (when known (wal-report-full-page-writes enabled))))
 

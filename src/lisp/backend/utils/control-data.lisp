@@ -63,8 +63,8 @@ an existing identity must match the catalog."
   (values))
 
 (defun wal-note-primary-ready ()
-  "Publish production after primary initialization and promotion cleanup.
-The caller must finish those steps before calling this function."
+  "Publish configured FPW policy and production state after primary initialization
+and promotion cleanup. The caller must finish those steps first."
   (wal-report-configured-full-page-writes)
   (unless (and *wal-control-metadata*
                (= +db-in-production+ (getf *wal-control-metadata* :db-state))
