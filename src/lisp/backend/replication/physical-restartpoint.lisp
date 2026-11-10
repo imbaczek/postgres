@@ -102,6 +102,9 @@
   (values))
 
 (defun physical-restartpoint-scan-seeds (metadata state)
+  "Return checkpoint and XID seeds from verified restartpoint metadata or base state.
+Without metadata, prefer the saved base checkpoint; older state may use its
+source checkpoint only when it does not extend beyond the base."
   (if metadata
       (let ((checkpoint (getf metadata :source-checkpoint)))
         (values checkpoint

@@ -45,6 +45,10 @@ known OFF is a non-NIL fact. The fact describes source history, not local policy
         (timeline-read-history (getf state :timeline)))))
 
 (defun physical-recovery-scan-stage (store start state checkpoint next)
+  "Build private replay state for the proven stage at START.
+CHECKPOINT and NEXT must describe that prefix, never a later checkpoint or
+observed XID. A NIL checkpoint with a known NEXT can describe a child awaiting
+its initialization checkpoint."
   (let ((timeline (physical-store-prefix-timeline store start))
         (private (copy-tree state)))
     (unless (or (null next) (typep next '(integer 3 18446744073709551616)))
@@ -66,6 +70,10 @@ known OFF is a non-NIL fact. The fact describes source history, not local policy
     private))
 
 (defun physical-recovery-scan-seeds (state start checkpoint checkpoint-p next next-p)
+  "Select checkpoint and observed XID seeds for exactly START.
+Explicit seeds must be supplied together and are the caller's proof of that
+prefix. Otherwise use state only where its position establishes the seeds.
+Return the seeds and whether the starting stage is proven."
   (unless (eql checkpoint-p next-p)
     (error "suffix scan requires checkpoint and observed XID seeds together"))
   (cond
@@ -81,6 +89,9 @@ known OFF is a non-NIL fact. The fact describes source history, not local policy
     (t (values nil nil nil))))
 
 (defun physical-recovery-scan-checkpoint-fpw (checkpoint fact start timeline)
+  "Use known FPW policy from a checkpoint ending at START.
+If FACT is present, require matching witness and policy; otherwise derive it.
+Return FACT unchanged when the checkpoint does not prove policy at START."
   (if (and checkpoint (= start (getf checkpoint :end))
            (get-properties checkpoint '(:full-page-writes)))
       (let ((expected (physical-fpw-fact-from-state
@@ -97,6 +108,13 @@ known OFF is a non-NIL fact. The fact describes source history, not local policy
                                              &key (fpw-seed nil fpw-seed-p)
                                                (checkpoint-seed nil checkpoint-seed-p)
                                                (next-xid-seed nil next-xid-seed-p))
+  "Scan the retained prefix from START through END for resource and FPW facts.
+A checkpoint may precede START; the caller must prove it describes the stage at
+START and supply the observed XID for that position, not a later value. Even when
+START equals END, the bounds and seeds are checked. FPW is folded internally for validation even
+when only resources are requested; return the FPW fact as the second value only
+when FPW-SEED was supplied. A checkpoint ending at START can supply FPW policy.
+Validation uses private state and performs no redo or publication."
   (unless (<= (physical-store-floor-lsn store) start end (physical-store-flushed-lsn store))
     (error "resource proof prefix is unavailable; take a fresh base backup"))
   (physical-recovery-check-store-point store start (physical-store-prefix-timeline store start))

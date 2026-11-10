@@ -628,7 +628,8 @@ A nonpending standby cannot fall back to primary startup when validation fails."
 Return the reconstructed state and durable control; do not install runtime state.
 The nested source checkpoint records base facts, not later applied resources;
 the manifest does not add another authority for those facts. Reconstruct base FPW
-from the source checkpoint and retain any later required fact from control."
+from the source checkpoint and retain any later required fact from control.
+Keep a separate copy of the immutable base checkpoint for later prefix scans."
   ;; Pending control must never fall through the ordinary phase rewrite/redo path.
   ;; A later milestone will verify and reconcile this exact generation before SQL.
   (when (= 3 (getf control :phase))
