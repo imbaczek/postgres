@@ -40,6 +40,9 @@
          (witness (getf binding :recovery))
          (resource (wal-copy-control-resource-fields
                     (getf (physical-adoption-install-image-state record) :snapshot)))
+         (fpw (physical-fpw-fact-from-state
+               (wal-fpw-state-from-checkpoint (getf (physical-adoption-install-image-state record) :snapshot)
+                                              (make-symbol "ADOPTION-FPW")) end (getf stage :timeline)))
          (fork (nth-value 1 (physical-follow-anchor-check anchor))))
     (unless (and (equal anchor (getf binding :anchor))
                  (equal before (getf binding :before))
@@ -51,6 +54,7 @@
                  (null (getf witness :history-target)) (null (getf witness :history-digest))
                  (null (getf witness :restartpoint))
                  (equal resource (getf witness :resource-fact))
+                 (equal fpw (getf witness :fpw-fact))
                  fork (<= end fork)
                  (eq (< end fork) (equal before (getf binding :after))))
       (error "adoption follow binding rebinds its proved stage or source"))
@@ -70,9 +74,10 @@
                  (= (getf control :next-xid) (getf stage :next-xid))
                  (null (getf control :history-target)) (null (getf control :retained-reference)))
       (error "adoption follow planning requires the verified empty stage frontier"))
-    (multiple-value-bind (required timeline resource) (physical-recovery-control-frontier base end)
+    (multiple-value-bind (required timeline resource fpw) (physical-recovery-control-frontier base end)
       (unless (and (equal pair (list required timeline))
-                   (equal resource (getf (getf binding :recovery) :resource-fact)))
+                   (equal resource (getf (getf binding :recovery) :resource-fact))
+                   (equal fpw (getf (getf binding :recovery) :fpw-fact)))
         (error "adoption recovery frontier differs from the saved stage witness")))
     (let ((candidate
             (if (equal (getf binding :before) (getf binding :after))
@@ -117,7 +122,10 @@
       (error "adoption follow cannot retain a divergent stage frontier"))
     (setf (getf base :observed-next-xid) (getf stage :next-xid)
           (getf base :source-checkpoint) snapshot
-          (getf base :source-resource-fact) (wal-copy-control-resource-fields snapshot))
+          (getf base :source-resource-fact) (wal-copy-control-resource-fields snapshot)
+          (getf base :source-fpw-fact)
+          (physical-fpw-fact-from-state (wal-fpw-state-from-checkpoint snapshot (make-symbol "ADOPTION-FPW"))
+                                        (getf stage :end) (getf stage :timeline)))
     (let ((binding (physical-follow-empty-base-binding base anchor)))
       (physical-adoption-follow-check-binding record binding)
       binding)))

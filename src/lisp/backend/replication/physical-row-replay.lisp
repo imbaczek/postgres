@@ -126,21 +126,20 @@ A violation is an error; the outer replay path fences recovery."
 ;;; full replay; prospective per-record membership is not visible before it.
 
 (defun physical-row-replay-publish-terminal (record next-xid reservation source-xids
-                                             &key (resource-fact (getf *physical-recovery-state* :source-resource-fact)))
+                                             &key (resource-fact (getf *physical-recovery-state* :source-resource-fact))
+                                               (fpw-fact (getf *physical-recovery-state* :source-fpw-fact)))
   ;; Check the published resource fact before replaying the next record.
   ;; Publish progress only after redo; restart can repeat an unpublished batch.
   (when *physical-replay-test-hook*
     (funcall *physical-replay-test-hook* :after-redo record))
-  (if (or resource-fact (getf *physical-recovery-state* :source-resource-fact))
-      (physical-replay-publish-progress record next-xid reservation source-xids :resource-fact resource-fact)
-      (physical-replay-publish-progress record next-xid reservation source-xids))
+  (apply #'physical-replay-publish-progress record next-xid reservation source-xids
+         (physical-replay-fact-arguments resource-fact fpw-fact))
   (wal-clear-page-cache)
   (when *physical-replay-test-hook*
     (funcall *physical-replay-test-hook* :after-progress record))
   (physical-recovery-note-resource-limits))
 
 (defun physical-row-replay-prefix (horizon &optional covered)
-  ;; Publish resource facts at safe terminals, then stop on an insufficient fact.
   ;; Publish each safe terminal in order, and defer at the first unsafe batch.
   ;; Coverage checks do not replace provenance, storage or quiescence barriers.
   ;; Ordinary DML preserves heap and index versions, including during splits.
@@ -149,8 +148,14 @@ A violation is an error; the outer replay path fences recovery."
   (with-physical-replay-staging ()
     (let ((next-xid *next-xid*)
           (resource-fact (copy-tree (getf *physical-recovery-state* :source-resource-fact)))
+          (fpw-fact (physical-fpw-copy-fact (getf *physical-recovery-state* :source-fpw-fact)))
+          (history (lambda () (physical-recovery-resource-history
+                               *physical-receive-store* *physical-recovery-state*)))
           (source-xids (copy-tree (getf *physical-recovery-state* :source-xids)))
           (reservation (copy-list (getf *physical-recovery-state* :source-reservation))))
+      (when fpw-fact
+        (physical-fpw-check-fact fpw-fact (funcall history) *last-replay-lsn*
+                                 (physical-recovery-replay-timeline)))
       (physical-recovery-note-policy-exhaustion
        (physical-recovery-map-permitted-records
         *physical-receive-store*
@@ -174,15 +179,13 @@ A violation is an error; the outer replay path fences recovery."
                   (return-from physical-row-replay-prefix :deferred))
                 (physical-row-replay-preflight-with-map #'wal-recovery-map-page-spool)
                 (let ((candidate (physical-resource-fact-next
-                                  resource-fact record (physical-recovery-replay-timeline *physical-recovery-state*)
-                                  (lambda () (physical-recovery-resource-history
-                                              *physical-receive-store* *physical-recovery-state*)))))
+                                  resource-fact record (physical-recovery-replay-timeline) history))
+                      (fpw-candidate (physical-replay-fpw-fact-next
+                                      fpw-fact record (physical-recovery-replay-timeline) history)))
                   (wal-replay-record record)
-                  (setf resource-fact candidate))
-                (if (or resource-fact (getf *physical-recovery-state* :source-resource-fact))
-                    (physical-row-replay-publish-terminal record next-xid reservation source-xids
-                                                          :resource-fact resource-fact)
-                    (physical-row-replay-publish-terminal record next-xid reservation source-xids)))
+                  (setf resource-fact candidate fpw-fact fpw-candidate))
+                (apply #'physical-row-replay-publish-terminal record next-xid reservation source-xids
+                       (physical-replay-fact-arguments resource-fact fpw-fact)))
               (wal-replay-record record)))
         :start-lsn *last-replay-lsn*) *physical-receive-store*)))
   (if *physical-resource-pause* :resource-paused *last-replay-lsn*))

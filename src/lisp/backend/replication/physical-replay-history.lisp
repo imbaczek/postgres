@@ -144,17 +144,23 @@ A replayed child uses timeline-qualified WAL even when the base used legacy name
   (if (> (physical-recovery-replay-timeline state) 1) :timeline
       (getf state :promotion-source-namespace)))
 
-(defun physical-replay-selected-eor (record raw next-xid reservation source-xids)
+(defun physical-replay-selected-eor (record raw next-xid reservation source-xids
+                                     &key (fpw-fact (getf *physical-recovery-state* :source-fpw-fact)))
   "Apply a verified selected EOR and durably publish replay progress.
 The applied timeline advances only after redo and recovery control are durable.
 This does not end recovery or grant writer authority."
-  (let ((child (physical-replay-check-selected-eor
-                *physical-receive-store* record raw *last-replay-lsn*
-                (physical-recovery-replay-timeline))))
+  (let* ((child (physical-replay-check-selected-eor
+                 *physical-receive-store* record raw *last-replay-lsn*
+                 (physical-recovery-replay-timeline)))
+         (candidate (physical-replay-fpw-fact-next
+                     fpw-fact record child
+                     (lambda () (physical-recovery-resource-history
+                                 *physical-receive-store* *physical-recovery-state*)))))
     (physical-recovery-publish-selected-history *physical-receive-store*)
     (setf reservation (physical-source-reservation-next reservation record next-xid)
           source-xids (physical-source-xids-next source-xids record next-xid))
     (when *physical-replay-test-hook* (funcall *physical-replay-test-hook* :before-eor-progress record))
-    (physical-replay-publish-progress record next-xid reservation source-xids :replay-timeline child)
+    (apply #'physical-replay-publish-progress record next-xid reservation source-xids
+           :replay-timeline child (when candidate (list :fpw-fact candidate)))
     (when *physical-replay-test-hook* (funcall *physical-replay-test-hook* :after-eor-progress record))
-    (values reservation source-xids)))
+    (values reservation source-xids candidate)))

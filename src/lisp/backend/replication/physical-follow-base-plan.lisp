@@ -58,7 +58,7 @@
          (before (physical-store-control-tuple model))
          (pair (list end timeline))
          (text (physical-follow-anchor-child-history anchor)))
-    (multiple-value-bind (required required-timeline resource) (physical-recovery-control-frontier base end)
+    (multiple-value-bind (required required-timeline resource fpw) (physical-recovery-control-frontier base end)
       (unless (equal pair (list required required-timeline))
         (error "empty base has a different required recovery frontier"))
       (multiple-value-bind (history fork eor) (physical-follow-anchor-check anchor)
@@ -79,7 +79,8 @@
                                   :checkpoint (getf base :checkpoint)
                                   :observed-next-xid (getf base :observed-next-xid)
                                   :history-target nil :history-digest nil :restartpoint nil)
-                            (when resource (list :resource-fact (copy-tree resource)))))))
+                            (when resource (list :resource-fact (copy-tree resource)))
+                            (when fpw (list :fpw-fact (physical-fpw-copy-fact fpw)))))))
         (physical-follow-binding-check binding)
         (values binding model)))))
 
@@ -92,6 +93,7 @@
                                  (pair (list end timeline)) (observed (getf base :observed-next-xid))
                                  (checkpoint (getf base :source-checkpoint)) (reservation (getf base :source-reservation))
                                  (resource (physical-restartpoint-resource-seed nil base model end))
+                                 (fpw (physical-restartpoint-fpw-seed nil base model end))
                                  (seed #xCBF29CE484222325)
                                  (before (list (getf base :system-id) timeline end end seed end seed nil nil
                                                (getf base :manifest-digest) nil)))
@@ -117,10 +119,11 @@
                               (<= observed (1+ (getf reservation :bound)))))))
       (error "empty-base replay model differs from its verified base or seed"))
     (setf (getf base :required-applied) end (getf base :required-timeline) timeline
-          (getf base :required-resource-fact) (copy-tree (getf (getf binding :recovery) :resource-fact)))
+          (getf base :required-resource-fact) (copy-tree (getf (getf binding :recovery) :resource-fact))
+          (getf base :required-fpw-fact) (physical-fpw-copy-fact (getf (getf binding :recovery) :fpw-fact)))
     (physical-follow-scan-replay-from-seed-core
      model base pair pair observed
-     (list end timeline observed (copy-tree checkpoint) (copy-tree reservation) nil resource)
+     (list end timeline observed (copy-tree checkpoint) (copy-tree reservation) nil resource fpw)
      (lambda (function start)
        (declare (ignore function))
        (unless (= start end) (error "empty-base replay cannot skip WAL"))

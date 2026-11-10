@@ -29,17 +29,26 @@ Check the fact's origin against the selected history."
         (error "resource origin is newer than the replay timeline"))
       (timeline-check-resource-origin candidate (if (functionp history) (funcall history) history)))))
 
+(defun physical-replay-fpw-fact-next (prior record timeline history)
+  (when (or prior
+            (= (wal-record-type record) +wal-record-full-page-writes-change+)
+            (and (= (wal-record-type record) +wal-record-checkpoint+)
+                 (get-properties (wal-checkpoint-record-snapshot record) '(:full-page-writes))))
+    (physical-fpw-fact-next prior record timeline
+                            (if (functionp history) (funcall history) history))))
+
 (defun physical-recovery-resource-history (store state)
   (let ((selection (and store (physical-store-selection store))))
     (if selection (getf selection :history)
         (timeline-read-history (getf state :timeline)))))
 
-(defun physical-recovery-scan-resource-fact (store start end seed state)
+(defun physical-recovery-scan-resource-fact (store start end seed state &key (fpw-seed nil fpw-seed-p))
   "Reconstruct a fact through complete terminals in a durable prefix without redo.
 The seed belongs to START; selected end-of-recovery records advance the timeline."
   (unless (<= (physical-store-floor-lsn store) start end (physical-store-flushed-lsn store))
     (error "resource proof prefix is unavailable; take a fresh base backup"))
   (let ((fact (wal-copy-control-resource-fields seed))
+        (fpw-fact (physical-fpw-copy-fact fpw-seed))
         (timeline (physical-store-prefix-timeline store start))
         (terminal start)
         (*physical-recovery-state* state)
@@ -49,8 +58,10 @@ The seed belongs to START; selected end-of-recovery records advance the timeline
       (unless (<= (getf fact :resource-lsn) start)
         (error "resource seed is newer than its replay position"))
       (timeline-check-resource-origin fact (physical-recovery-resource-history store state)))
+    (when fpw-fact
+      (physical-fpw-check-fact fpw-fact (physical-recovery-resource-history store state) start timeline))
     (if (= start end)
-        fact
+        (values fact fpw-fact)
         (with-physical-replay-staging ()
           (block scan
             (physical-recovery-map-permitted-records
@@ -66,9 +77,14 @@ The seed belongs to START; selected end-of-recovery records advance the timeline
                    (setf fact (physical-resource-fact-next
                                fact record timeline
                                (lambda () (physical-recovery-resource-history store state)))))
+                 (when fpw-seed-p
+                   (setf fpw-fact (physical-replay-fpw-fact-next
+                                   fpw-fact record timeline
+                                   (lambda () (physical-recovery-resource-history store state)))))
                  (setf terminal (wal-record-end record))
                  (when (= terminal end)
-                   (return-from scan (wal-copy-control-resource-fields fact)))))
+                   (return-from scan (values (wal-copy-control-resource-fields fact)
+                                             (physical-fpw-copy-fact fpw-fact))))))
              :start-lsn start :policy (getf state :timeline-policy))
             (error "resource proof did not reach its required boundary; take a fresh base backup"))))))
 
@@ -141,12 +157,15 @@ does not excuse a missing file or a different fork."
 (defun physical-recovery-save-progress (applied next-xid
                                         &key (replay-timeline (getf *physical-recovery-state* :replay-timeline
                                                                     (getf *physical-recovery-state* :timeline)))
-                                          (resource-fact (getf *physical-recovery-state* :source-resource-fact)))
+                                          (resource-fact (getf *physical-recovery-state* :source-resource-fact))
+                                          (fpw-fact (getf *physical-recovery-state* :source-fpw-fact)))
   "Publish the replay position and its source resource fact together."
   (let ((candidate (copy-list *physical-recovery-state*)))
     (setf (getf candidate :replay-timeline) replay-timeline)
     (when (or resource-fact (getf candidate :source-resource-fact))
       (setf (getf candidate :source-resource-fact) (wal-copy-control-resource-fields resource-fact)))
+    (when (or fpw-fact (getf candidate :source-fpw-fact))
+      (setf (getf candidate :source-fpw-fact) (physical-fpw-copy-fact fpw-fact)))
     (setf *physical-recovery-state* (physical-recovery-write-control candidate 2 applied next-xid))))
 
 (defun physical-recovery-retained-directory ()
@@ -393,20 +412,25 @@ referenced fork."
 ;;; replay LSN under the XID lock, after data and control progress are durable.
 ;;; Copy membership so the prospective replay state remains independently owned.
 
+(defun physical-replay-fact-arguments (resource-fact fpw-fact)
+  (append (when (or resource-fact (getf *physical-recovery-state* :source-resource-fact))
+            (list :resource-fact resource-fact))
+          (when (or fpw-fact (getf *physical-recovery-state* :source-fpw-fact))
+            (list :fpw-fact fpw-fact))))
+
 (defun physical-replay-publish-progress (record next-xid reservation source-xids &key replay-timeline
-                                                                                   (resource-fact (getf *physical-recovery-state* :source-resource-fact)))
+                                                                                   (resource-fact (getf *physical-recovery-state* :source-resource-fact))
+                                                                                   (fpw-fact (getf *physical-recovery-state* :source-fpw-fact)))
   "Make redo durable before publishing the applied terminal and visibility state.
 Source allocation capacity stays separate from the observed next XID.
 Updating source membership does not change existing snapshots."
-  ;; Make redo durable before recording the applied terminal and visibility.
   (smgr-fsync-all)
   (clog-fsync)
   (fsync-directory (merge-pathnames "base/" *pgdata*))
   (fsync-directory (merge-pathnames "global/" *pgdata*))
   (apply #'physical-recovery-save-progress (wal-record-end record) next-xid
          (append (when replay-timeline (list :replay-timeline replay-timeline))
-                 (when (or resource-fact (getf *physical-recovery-state* :source-resource-fact))
-                   (list :resource-fact resource-fact))))
+                 (physical-replay-fact-arguments resource-fact fpw-fact)))
   (sb-thread:with-mutex (*xid-lock*)
     (setf (getf *physical-recovery-state* :source-xids) (copy-tree source-xids)
           (getf *physical-recovery-state* :source-reservation) (copy-list reservation)
@@ -417,7 +441,8 @@ Updating source membership does not change existing snapshots."
             (wal-checkpoint-record-snapshot record)))))
 
 (defun physical-replay-publish-terminal (record next-xid reservation source-xids
-                                         &key (resource-fact (getf *physical-recovery-state* :source-resource-fact)))
+                                         &key (resource-fact (getf *physical-recovery-state* :source-resource-fact))
+                                           (fpw-fact (getf *physical-recovery-state* :source-fpw-fact)))
   "Durably finish pages/CLOG/catalog before publishing an applied terminal.
 Check resource limits after the durable terminal and its fact are published."
   (when *physical-replay-test-hook*
@@ -436,9 +461,8 @@ Check resource limits after the durable terminal and its fact are published."
           (setf (gethash node *physical-replay-seen-relfilenodes*) t))))
     (unless *physical-replay-restarting-p*
       (let ((*catalog* catalog)) (physical-recovery-check-live-files)))
-    (if (or resource-fact (getf *physical-recovery-state* :source-resource-fact))
-        (physical-replay-publish-progress record next-xid reservation source-xids :resource-fact resource-fact)
-        (physical-replay-publish-progress record next-xid reservation source-xids))
+    (apply #'physical-replay-publish-progress record next-xid reservation source-xids
+           (physical-replay-fact-arguments resource-fact fpw-fact))
     (setf *catalog* catalog)
     (catalog-refresh-oldest-relfrozenxid)
     (wal-clear-page-cache))
@@ -502,11 +526,15 @@ Stop before the next record when a published terminal causes a resource pause."
   (with-physical-replay-staging ()
     (let ((next-xid *next-xid*)
           (resource-fact (wal-copy-control-resource-fields (getf *physical-recovery-state* :source-resource-fact)))
+          (fpw-fact (physical-fpw-copy-fact (getf *physical-recovery-state* :source-fpw-fact)))
           (resource-history (lambda ()
                               (physical-recovery-resource-history
                                *physical-receive-store* *physical-recovery-state*)))
           (source-xids (copy-tree (getf *physical-recovery-state* :source-xids)))
           (reservation (copy-list (getf *physical-recovery-state* :source-reservation))))
+      (when fpw-fact
+        (physical-fpw-check-fact fpw-fact (funcall resource-history) start-lsn
+                                 (physical-recovery-replay-timeline)))
       (physical-recovery-note-policy-exhaustion
        (physical-recovery-map-permitted-records
         *physical-receive-store*
@@ -516,23 +544,27 @@ Stop before the next record when a published terminal causes a resource pause."
           (when *physical-replay-test-hook*
             (funcall *physical-replay-test-hook* :before-record record))
           (if (= (wal-record-type record) +wal-record-end-of-recovery+)
-              (multiple-value-setq (reservation source-xids)
-                (physical-replay-selected-eor record raw next-xid reservation source-xids))
+              (multiple-value-setq (reservation source-xids fpw-fact)
+                (if fpw-fact
+                    (physical-replay-selected-eor record raw next-xid reservation source-xids :fpw-fact fpw-fact)
+                    (physical-replay-selected-eor record raw next-xid reservation source-xids)))
               (progn
                 (physical-replay-check-child-initialization record next-xid)
                 (setf next-xid (physical-replay-observed-next-xid record next-xid)
                       reservation (physical-source-reservation-next reservation record next-xid)
                       source-xids (physical-source-xids-next source-xids record next-xid))
-                (let ((candidate (when (wal-terminal-record-type-p (wal-record-type record))
-                                   (physical-resource-fact-next
-                                    resource-fact record (physical-recovery-replay-timeline) resource-history))))
+                (let* ((terminal (wal-terminal-record-type-p (wal-record-type record)))
+                       (candidate (when terminal
+                                    (physical-resource-fact-next
+                                     resource-fact record (physical-recovery-replay-timeline) resource-history)))
+                       (fpw-candidate (when terminal
+                                        (physical-replay-fpw-fact-next
+                                         fpw-fact record (physical-recovery-replay-timeline) resource-history))))
                   (wal-replay-record record)
                   (unless *wal-recovery-group-active*
-                    (setf resource-fact candidate)
-                    (if (or resource-fact (getf *physical-recovery-state* :source-resource-fact))
-                        (physical-replay-publish-terminal
-                         record next-xid reservation source-xids :resource-fact resource-fact)
-                        (physical-replay-publish-terminal record next-xid reservation source-xids)))))))
+                    (setf resource-fact candidate fpw-fact fpw-candidate)
+                    (apply #'physical-replay-publish-terminal record next-xid reservation source-xids
+                           (physical-replay-fact-arguments resource-fact fpw-fact)))))))
         :start-lsn start-lsn) *physical-receive-store*)))
   (if *physical-resource-pause* :resource-paused *last-replay-lsn*))
 
