@@ -3,6 +3,10 @@
 (declaim (inline %wal-crc32-octets))
 
 (defun %wal-crc32-octets (bytes start end table)
+  "Compute IEEE CRC-32 over BYTES from START inclusive to END exclusive.
+The caller supplies a simple octet vector, valid fixnum bounds and the
+256-entry unsigned 32-bit CRC table.  The inputs are read without mutation.
+The polynomial is #xedb88320.  Valid calls allocate no heap storage."
   (declare (optimize (speed 3) (safety 3))
            (type (simple-array (unsigned-byte 8) (*)) bytes)
            (type (simple-array (unsigned-byte 32) (256)) table)

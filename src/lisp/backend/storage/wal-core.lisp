@@ -609,6 +609,9 @@ Legacy 16-hex segment names always belong to timeline 1."
 (defvar *wal-crc32-table* (make-wal-crc32-table))
 
 (defun wal-crc32 (bytes &optional (start 0) (end (length bytes)))
+  "Return IEEE CRC-32 of BYTES from START inclusive to END exclusive.
+Use the typed kernel when its inputs and bounds are valid, otherwise retain
+the historical generic calculation.  BYTES is read without mutation."
   (let ((table (and (boundp '*wal-crc32-table*) *wal-crc32-table*)))
     (if (and (typep bytes '(simple-array (unsigned-byte 8) (*)))
              (typep table '(simple-array (unsigned-byte 32) (256)))

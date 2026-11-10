@@ -3,6 +3,11 @@
 (declaim (inline %physical-store-fnv1a64-parts))
 
 (defun %physical-store-fnv1a64-parts (digest bytes)
+  "Extend DIGEST with BYTES using FNV-1a arithmetic modulo 2^64.
+The caller supplies an unsigned 64-bit digest and a simple octet vector.
+BYTES is read without mutation.  Return the low and high 32-bit halves
+as separate values so the full-width result need not be boxed here.
+Valid calls allocate no heap storage."
   (declare (optimize (speed 3) (safety 3))
            (type (unsigned-byte 64) digest)
            (type (simple-array (unsigned-byte 8) (*)) bytes))

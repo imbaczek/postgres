@@ -95,7 +95,10 @@ the archive outside the receive spool; otherwise it is stored beneath the spool.
 (defun physical-store-update-digest (digest bytes)
   "Checksum the exact ordered prefix, including each record's embedded coordinates.
 Per-record CRCs alone cannot detect a missing whole record before a rotation.
-This FNV-1a-64 checksum detects accidental prefix damage, not malicious tampering."
+This FNV-1a-64 checksum detects accidental prefix damage, not malicious tampering.
+For a nonempty simple octet vector and unsigned 64-bit DIGEST, join the
+kernel's two halves here, which may allocate a full-width integer.  Other
+inputs use the historical generic calculation.  BYTES is read without mutation."
   (if (and (typep digest '(unsigned-byte 64))
            (typep bytes '(simple-array (unsigned-byte 8) (*)))
            (plusp (length bytes)))
