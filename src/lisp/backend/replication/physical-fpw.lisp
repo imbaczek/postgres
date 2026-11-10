@@ -1,10 +1,20 @@
+;; Source FPW facts describe policy evidence and an exact covered frontier.
+;; Shape checks, selected-history geometry and authenticated prefix identity are
+;; separate requirements; these helpers do not implement physical replay.
+
+;; Callers verify source identity and the WAL prefix before using a fact for a
+;; policy decision.
+
 (in-package #:pg)
 
-(defconstant +physical-fpw-fact-size+ 72)
+(defconstant +physical-fpw-fact-size+ 72
+  "Size in bytes of the optional PGFPWFC1 control suffix.")
 
-(defconstant +physical-recovery-control-maximum-bytes+ (+ 196 +physical-fpw-fact-size+))
+(defconstant +physical-recovery-control-maximum-bytes+ (+ 196 +physical-fpw-fact-size+)
+  "Maximum recovery control image size, shared by all bounded readers.")
 
 (defun physical-fpw-state-fields (fact incarnation)
+  "Construct fold evidence with the supplied private owner token."
   (%make-wal-fpw-state
    incarnation (getf fact :enabled) (getf fact :witness-kind)
    (getf fact :witness-start) (getf fact :witness-end) (getf fact :witness-timeline)
@@ -12,6 +22,7 @@
    (getf fact :last-disable-start) (getf fact :last-disable-timeline)))
 
 (defun physical-fpw-fact-valid-p (fact)
+  "Check fact shape and ordering, not selected-history geometry or prefix identity."
   (and (eql 22 (ignore-errors (list-length fact)))
        (equal (loop for (key value) on fact by #'cddr collect key)
               '(:enabled :witness-kind :witness-start :witness-end :witness-timeline
@@ -24,17 +35,23 @@
        (<= (getf fact :witness-timeline) (getf fact :through-timeline))))
 
 (defun physical-fpw-copy-fact (fact)
+  "Validate and copy FACT, preserving NIL as unknown."
   (when fact
     (unless (physical-fpw-fact-valid-p fact) (error "invalid source FPW fact"))
     (copy-list fact)))
 
 (defun physical-fpw-state-from-fact (fact incarnation)
+  "Recreate fold evidence using INCARNATION as a private owner token.
+The token is not stored in the fact."
   (unless (and incarnation (symbolp incarnation)) (error "invalid FPW fold owner"))
   (when fact
     (unless (physical-fpw-fact-valid-p fact) (error "invalid source FPW fact"))
     (physical-fpw-state-fields fact incarnation)))
 
 (defun physical-fpw-fact-from-state (state through through-timeline)
+  "Export evidence at the exact THROUGH and THROUGH-TIMELINE boundary.
+NIL state is unknown; a present fact with ENABLED NIL is known OFF. The caller
+must prove coverage through the supplied pair; export checks shape only."
   (unless (and (typep through '(unsigned-byte 64))
                (typep through-timeline '(integer 1 4294967295))
                (or (null state) (wal-fpw-state-valid-p state)))
@@ -54,6 +71,7 @@
       fact)))
 
 (defun physical-fpw-check-record-owner (start end timeline history)
+  "Check that START and END-1 belong to TIMELINE in selected HISTORY."
   (unless (and (typep start '(unsigned-byte 64)) (typep end '(unsigned-byte 64))
                (< start end) (= timeline (timeline-at-point start history))
                (= timeline (timeline-at-point (1- end) history)))
@@ -61,6 +79,8 @@
   (values))
 
 (defun physical-fpw-check-fact (fact history through through-timeline)
+  "Check FACT at its exact boundary against selected-history geometry.
+Source identity and the verified WAL prefix must be established separately."
   (when fact
     (unless (and (physical-fpw-fact-valid-p fact)
                  (eql through (getf fact :through))
@@ -80,6 +100,9 @@
     (copy-list fact)))
 
 (defun physical-fpw-fact-next (prior record timeline history)
+  "Derive a source fact from PRIOR and a complete terminal.
+The caller verifies complete batch framing, source identity and the WAL prefix.
+The fold uses a fresh private owner token which is not stored in the fact."
   (unless (and (wal-record-p record)
                (or (wal-terminal-record-type-p (wal-record-type record))
                    (= (wal-record-type record) +wal-record-end-of-recovery+)))
@@ -102,6 +125,8 @@
     (physical-fpw-check-fact fact history (wal-record-end record) timeline)))
 
 (defun physical-fpw-encode-fact (fact)
+  "Encode a known fact as the 72-byte PGFPWFC1 suffix.
+The suffix has no CRC of its own; the enclosing control image supplies one."
   (unless (physical-fpw-fact-valid-p fact) (error "invalid source FPW fact"))
   (let ((bytes (make-array +physical-fpw-fact-size+ :element-type '(unsigned-byte 8) :initial-element 0)))
     (replace bytes #(80 71 70 80 87 70 67 49))
@@ -120,6 +145,7 @@
     bytes))
 
 (defun physical-fpw-decode-fact (bytes)
+  "Decode and shape-check a 72-byte PGFPWFC1 suffix."
   (unless (and (typep bytes '(vector (unsigned-byte 8)))
                (= (length bytes) +physical-fpw-fact-size+)
                (equalp (subseq bytes 0 8) #(80 71 70 80 87 70 67 49)))
@@ -141,20 +167,25 @@
       fact)))
 
 (defun physical-fpw-fact-at-p (fact through timeline)
+  "Check fact shape and its exact THROUGH and timeline pair."
   (and (physical-fpw-fact-valid-p fact)
        (eql through (getf fact :through))
        (eql timeline (getf fact :through-timeline))))
 
 (defun physical-fpw-covers-required-p (fact minimum)
+  "Check that FACT covers at least MINIMUM's starting floor.
+Both facts must already belong to the same selected history."
   (or (< (getf fact :coverage-start) (getf minimum :coverage-start))
       (and (= (getf fact :coverage-start) (getf minimum :coverage-start))
            (= (getf fact :coverage-timeline) (getf minimum :coverage-timeline)))))
 
 (defun physical-fpw-witness-equal-p (left right)
+  "Compare policy and checkpoint or change witness, excluding the frontier."
   (every (lambda (key) (eql (getf left key) (getf right key)))
          '(:enabled :witness-kind :witness-start :witness-end :witness-timeline)))
 
 (defun physical-fpw-restrict-fact (fact minimum)
+  "Copy with MINIMUM coverage floor; forget a saved disable only if it precedes that floor."
   (let ((restricted (copy-list fact)) (floor (getf minimum :coverage-start)))
     (setf (getf restricted :coverage-start) floor
           (getf restricted :coverage-timeline) (getf minimum :coverage-timeline))
@@ -165,6 +196,7 @@
     restricted))
 
 (defun physical-fpw-check-extension (fact minimum required)
+  "Reject invented witnesses or disables inside the required prefix."
   (unless (or (physical-fpw-witness-equal-p fact minimum)
               (>= (getf fact :witness-start) required))
     (error "FPW witness was inserted inside a required prefix"))
@@ -182,6 +214,11 @@
   (values))
 
 (defun physical-fpw-required-fact (source minimum applied timeline required required-timeline)
+  "Preserve MINIMUM below REQUIRED and reconcile SOURCE at or beyond it.
+At the boundary compare exactly after restricting stronger earlier coverage.
+Beyond it, reject invented witnesses or disables inside the promised prefix.
+Source identity, history and WAL prefix verification are separate from these
+consistency comparisons."
   (unless (and (typep applied '(unsigned-byte 64))
                (typep timeline '(integer 1 4294967295))
                (or (null source) (physical-fpw-fact-at-p source applied timeline))

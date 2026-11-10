@@ -32,7 +32,8 @@ An absent selection requires the applied timeline to remain the base timeline."
 
 A retained reference is allowed only in pending control and must match its base
 timeline, checkpoint, manifest digest and applied end. This checks fields, not
-the referenced archive."
+the referenced archive. FPW fact shape and its exact applied boundary are checked
+here; selected-history geometry, source identity and the verified WAL prefix are separate."
   (destructuring-bind (&key phase system-id timeline manifest-digest checkpoint
                          applied next-xid db-state state-time (control-version 3)
                          (applied-timeline timeline) history-target history-digest
@@ -106,8 +107,9 @@ the referenced archive."
                                           (state-time (- (get-universal-time) 2208988800))
                                           (applied-timeline timeline) history-target history-digest
                                           promotion-child promotion-generation promotion-source-namespace retained-reference resource-fact fpw-fact)
-  "Encode recovery progress and its optional extensions under one CRC.
-Ordinary and pending images may append a 48-byte positioned resource fact."
+  "Encode recovery progress and optional extensions under one CRC.
+Ordinary and pending images may append a 48-byte resource fact and a 72-byte FPW
+fact. Absent facts leave the earlier layouts unchanged; FPW has no separate CRC."
   (let* ((pending (= phase 3)) (version (if pending 4 3))
                                (extension-start (if pending 84 68))
                                (selected (not (null history-target)))
@@ -153,7 +155,8 @@ Ordinary and pending images may append a 48-byte positioned resource fact."
       bytes)))
 
 (defun physical-recovery-decode-control (bytes)
-  "Decode an exact native control layout and verify its CRC before accepting facts."
+  "Decode an exact native control layout and verify its CRC before accepting facts.
+The optional 72-byte FPW suffix is covered by that CRC; legacy layouts remain valid."
   (unless (member (length bytes) '(60 72 88 104 120 132 136 144 148 152 160 176 180
                                    192 196 204 208 220 224 252 268))
     (error "invalid physical recovery control length"))
@@ -252,10 +255,12 @@ Ordinary and pending images may append a 48-byte positioned resource fact."
       (write-sequence bytes stream))))
 
 (defun physical-recovery-control-frontier (state applied)
-  "Check current and required facts at their respective replay positions.
+  "Return required position, timeline, resource fact and FPW fact.
+Check current and required facts at their respective replay positions.
 Before required replay is reached, preserve its durable fact and position.
 A known required fact must match at the boundary; later facts may have lower
-resource values, but their reporting position cannot move backward."
+resource values, but their reporting position cannot move backward. FPW evidence
+is restricted for boundary comparison and checked for extension beyond it."
   (let* ((base (getf state :timeline))
          (runtime (getf state :replay-timeline base))
          (required (getf state :required-applied))
@@ -290,7 +295,9 @@ resource values, but their reporting position cannot move backward."
 
 (defun physical-recovery-write-control (state phase applied next-xid
                                         &key (db-state +db-in-archive-recovery+))
-  "Publish ordinary progress; pending child state needs its dedicated publisher."
+  "Publish ordinary progress and return a plist copy for the caller to install.
+Pending child state needs its dedicated publisher. An ambiguous failure can leave
+disk advanced while the input remains unchanged; the outer caller must fence it."
   (when *physical-recovery-failed-p*
     (error "failed recovery cannot publish ordinary progress"))
   (when (or (eql phase 3) (eql (getf state :phase) 3) (getf state :promotion-child)
@@ -597,7 +604,8 @@ A nonpending standby cannot fall back to primary startup when validation fails."
   "Verify base provenance in the selected namespace without publishing control.
 Return the reconstructed state and durable control; do not install runtime state.
 The nested source checkpoint records base facts, not later applied resources;
-the manifest does not add another authority for those facts."
+the manifest does not add another authority for those facts. Reconstruct base FPW
+from the source checkpoint and retain any later required fact from control."
   ;; Pending control must never fall through the ordinary phase rewrite/redo path.
   ;; A later milestone will verify and reconcile this exact generation before SQL.
   (when (= 3 (getf control :phase))

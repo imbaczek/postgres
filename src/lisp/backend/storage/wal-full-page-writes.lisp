@@ -8,11 +8,12 @@
 (defstruct (wal-fpw-state
             (:constructor %make-wal-fpw-state
                 (incarnation enabled witness-kind start end timeline coverage-start coverage-timeline last-disable-start last-disable-timeline)))
-  "Immutable policy evidence owned by one local WAL storage incarnation.
-START, END and TIMELINE identify the latest checkpoint or change witness;
-COVERAGE-START is the earliest position covered by this evidence. The optional
-last disabling change records its START and timeline, not its end. A timeline
-number alone does not prove ancestry."
+  "Immutable policy evidence owned by an incarnation token.
+Primary state uses the local WAL storage incarnation; a private fold uses a fresh
+owner token, never serialized. START, END and TIMELINE identify the latest
+checkpoint or change witness. COVERAGE-START and COVERAGE-TIMELINE give the
+coverage floor. The optional last disabling change records its START and timeline,
+not its end. A timeline number alone does not prove ancestry."
   (incarnation nil :read-only t)
   (enabled nil :read-only t)
   (witness-kind nil :read-only t)
@@ -266,7 +267,7 @@ alter native page images."
               end))))))
 
 (defun wal-require-fpw-physical-replay-supported (record)
-  "Reject physical replay of changes until source-policy persistence exists."
+  "Reject physical replay of changes until source-policy persistence is wired."
   ;; Source-policy persistence must be wired before physical replay credits a change.
   (when (= (wal-record-type record) +wal-record-full-page-writes-change+)
     (error "native FPW change replay requires source-policy persistence"))
