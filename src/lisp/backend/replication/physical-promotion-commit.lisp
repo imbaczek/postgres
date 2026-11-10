@@ -34,8 +34,10 @@ its snapshot, so frame placement and retry bytes use the same proof."
                (typep local-floor '(integer 3 18446744073709551616)))
     (error "child checkpoint lacks allocation proof"))
   (multiple-value-bind (eor eor-start) (physical-promotion-eor-image state)
-    (let* ((resource-fact (copy-tree (getf state :source-resource-fact)))
-           (record-size (wal-checkpoint-record-size resource-fact))
+    (let* ((checkpoint-facts
+             (append (copy-tree (getf state :source-resource-fact))
+                     (wal-copy-checkpoint-commit-ts-fields (getf state :source-checkpoint))))
+           (record-size (wal-checkpoint-record-size checkpoint-facts))
            (batch-start (wal-record-start-after (+ eor-start (length eor)) +wal-header-size+))
            (start (wal-record-start-after (+ batch-start +wal-header-size+) record-size))
            (end (+ start record-size))
@@ -46,7 +48,7 @@ its snapshot, so frame placement and retry bytes use the same proof."
                            :next-xid next :xid-reserved-through (1- next) :next-oid next-oid
                            :time (getf state :state-time) :timeline (getf state :promotion-child)
                            :prev-timeline (physical-recovery-replay-timeline state) :oldest-active-xid next)))
-      (setf snapshot (append snapshot resource-fact))
+      (setf snapshot (append snapshot checkpoint-facts))
       (unless (and (<= end #xffffffffffffffff) (wal-checkpoint-snapshot-valid-p snapshot))
         (error "invalid child checkpoint plan"))
       (list :fork (getf state :applied) :child (getf state :promotion-child)

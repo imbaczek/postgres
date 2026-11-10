@@ -20,7 +20,7 @@ from patroni.postgresql.misc import PostgresqlRole
 
 api = runpy.run_path(str(Path(__file__).with_name('patroni-sync-monitor.py')))
 BASE = Path(__file__).resolve().parents[2]
-UNAVAILABLE = {5, 6, 9, 10, 11, 12, 14, 15, 16, 17, 18}
+UNAVAILABLE = {5, 6, 9, 10, 11, 12, 14, 15, 18}
 read_copy = runpy.run_path(str(Path(__file__).with_name('checkpoint-snapshot.py')))['read_copy']
 
 
@@ -35,6 +35,8 @@ def check_native_copy(directory, record):
     assert int(record[8]) == facts['next_oid']
     assert int(record[13]) == facts['active'] & 0xffffffff
     assert record[19].timestamp() == facts['time']
+    assert int(record[16]) == facts['oldest_commit_ts_xid'] == 0
+    assert int(record[17]) == facts['newest_commit_ts_xid'] == 0
 
 
 def check_oid8(native, reference):
@@ -95,6 +97,7 @@ def check(native, reference, server):
         with connection.cursor() as cursor:
             cursor.execute('CHECKPOINT')
         _, before = checkpoint(connection)
+        assert tuple(map(int, before[16:18])) == (0, 0), (label, before)
         with connection.cursor() as cursor:
             cursor.execute('SELECT to_json(next_oid),to_json(oldest_active_xid) '
                            'FROM pg_control_checkpoint()')
@@ -168,6 +171,24 @@ def check(native, reference, server):
             pointer.write_bytes(original)
         assert checkpoint(connection)[1] == source_checkpoint
         print('native: corrupt selected restartpoint errors without falling back PASS', flush=True)
+        assert api['scalar'](connection, 'SELECT pg_promote(true, 30)') is True
+        _, promoted = checkpoint(connection)
+        assert promoted[3] > source_checkpoint[3], (source_checkpoint, promoted)
+        assert tuple(map(int, promoted[16:18])) == (0, 0), promoted
+        check_native_copy(Path(follower.data_dir), promoted)
+        follower.connection_pool.close()
+        process = follower.is_running()
+        assert process is not None
+        process.send_signal(signal.SIGKILL)
+        process.wait(timeout=20)
+        assert not process.is_running() or process.status() == psutil.STATUS_ZOMBIE
+        (Path(follower.data_dir).parent / 'target.sock').unlink(missing_ok=True)
+        assert follower.start(timeout=90, role=PostgresqlRole.PRIMARY) is True
+        connection = follower.connection_pool.get('heartbeat').get()
+        assert checkpoint(connection)[1] == promoted
+        check_native_copy(Path(follower.data_dir), promoted)
+        print('native: source commit timestamp facts survive promotion and child cold restart PASS',
+              flush=True)
 
 
 if __name__ == '__main__':

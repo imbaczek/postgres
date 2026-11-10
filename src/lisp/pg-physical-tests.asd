@@ -151,6 +151,7 @@
                (:file "t/fork-follow-tests")
                (:file "t/physical-store-history-tests")
                (:file "t/physical-restartpoint-tests")
+               (:file "t/rove/checkpoint-commit-ts-replay-tests")
                (:file "t/physical-slot-standby-tests")
                (:file "t/physical-slot-api-tests")
                (:file "t/selected-eor-replay-tests")

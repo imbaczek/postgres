@@ -152,6 +152,37 @@ class ResourceControlTests(unittest.TestCase):
             with self.assertRaises(AssertionError):
                 DECODE_CHECKPOINT(data)
 
+    def test_checkpoint_commit_ts_presence_and_layout_boundaries(self):
+        for resources in (False, True):
+            for known in (False, True):
+                with self.subTest(resources=resources, known=known):
+                    size = 88 + 48 * resources + 8 * known
+                    data = bytearray(size)
+                    data[:8] = b"PGCKPT02"
+                    struct.pack_into("<6QqIIQII", data, 8, 64, 96 + size, 64,
+                                     50, 1002, 10000, 1793030000, 1, 1, 3, 1, 4 * known)
+                    if resources:
+                        data[88:96] = b"PGRES001"
+                        struct.pack_into("<5I", data, 96, 100, 8, 8, 0, 64)
+                        struct.pack_into("<QI", data, 120, 32, 1)
+                    facts = DECODE_CHECKPOINT(data)
+                    for name in ("oldest_commit_ts_xid", "newest_commit_ts_xid"):
+                        self.assertEqual(known, name in facts)
+                        if known:
+                            self.assertEqual(0, facts[name])
+                    self.assertEqual(resources, "resource_fact" in facts)
+                    mutations = [(84, data[84] ^ 4), (0, ord("X"))]
+                    if known:
+                        mutations += [(size - 8, 1), (size - 4, 1)]
+                    for offset, value in mutations:
+                        bad = data.copy()
+                        bad[offset] = value
+                        with self.assertRaises(AssertionError):
+                            DECODE_CHECKPOINT(bad)
+                    for bad in (data[:-1], data + b"\0"):
+                        with self.assertRaises(AssertionError):
+                            DECODE_CHECKPOINT(bad)
+
     def test_promotion_utility_reads_all_recovery_resource_layouts(self):
         for pending, layouts in ((False, (72, 88)), (True, (88, 104, 132, 148))):
             for layout in layouts:

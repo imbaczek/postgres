@@ -11,9 +11,24 @@ def resource_values(data):
     return values
 
 
+def checkpoint_commit_ts_fact(data):
+    assert len(data) in (88, 96, 136, 144)
+    assert data[:8] in (b"PGCKPT01", b"PGCKPT02")
+    flags = int.from_bytes(data[84:88], "little")
+    known = bool(flags & 4)
+    assert flags <= 7 and known == (len(data) in (96, 144))
+    assert data[:8] == b"PGCKPT02" or (len(data) == 88 and flags == 0)
+    if not known:
+        return None
+    pair = tuple(int.from_bytes(data[index:index + 4], "little")
+                 for index in range(len(data) - 8, len(data), 4))
+    assert pair == (0, 0)
+    return pair
+
+
 def checkpoint_resource_fact(data):
-    assert len(data) in (88, 136) and data[:8] in (b"PGCKPT01", b"PGCKPT02")
-    if len(data) == 88:
+    checkpoint_commit_ts_fact(data)
+    if len(data) in (88, 96):
         return None
     assert data[:8] == b"PGCKPT02" and not any(data[132:136])
     values = resource_values(data[88:120])

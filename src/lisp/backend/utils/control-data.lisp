@@ -363,7 +363,9 @@ additional fields unknown. REDO and the checkpoint timeline select the filename.
                      (t (format nil "~d:~d" (ldb (byte 32 32) next) (ldb (byte 32 0) next))))
                (value snapshot :next-oid) +null+ +null+ +null+ +null+
                (if active (ldb (byte 32 0) active) +null+)
-               +null+ +null+ +null+ +null+ +null+
+               +null+ +null+
+               (value snapshot :oldest-commit-ts-xid) (value snapshot :newest-commit-ts-xid)
+               +null+
                (if time (* (- time 946684800) 1000000) +null+))))))
 
 (defun native-control-checkpoint-result ()
@@ -415,6 +417,9 @@ Print all five persisted resource values together when known; omit them when unk
           (add "Latest checkpoint's NextOID" (getf snapshot :next-oid)))
         (add "Latest checkpoint's oldestActiveXID"
              (ldb (byte 32 0) (getf snapshot :oldest-active-xid)))
+        (when (getf snapshot :oldest-commit-ts-xid)
+          (add "Latest checkpoint's oldestCommitTsXid" (getf snapshot :oldest-commit-ts-xid))
+          (add "Latest checkpoint's newestCommitTsXid" (getf snapshot :newest-commit-ts-xid)))
         (add "Time of latest checkpoint" (native-control-time-text (getf snapshot :time))))
       (add "Minimum recovery ending location" (wal-format-lsn (getf facts :recovery-lsn)))
       (add "Min recovery ending loc's timeline" (getf facts :recovery-timeline))

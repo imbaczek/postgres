@@ -10,14 +10,16 @@ import zlib
 
 CHECK_OPTIONAL_CONTROL = runpy.run_path(str(Path(__file__).with_name("resource_control_fields.py")))["check_optional_fields"]
 CHECK_RESOURCES = runpy.run_path(str(Path(__file__).with_name("resource_control_fields.py")))["checkpoint_resource_fact"]
+CHECK_COMMIT_TS = runpy.run_path(str(Path(__file__).with_name("resource_control_fields.py")))["checkpoint_commit_ts_fact"]
 
 
 def checkpoint(data):
     resources = CHECK_RESOURCES(data)
+    commit_ts = CHECK_COMMIT_TS(data)
     start, end, redo, xid, reserved, oid = struct.unpack_from("<6Q", data, 8)
     timestamp = struct.unpack_from("<q", data, 56)[0]
     timeline, previous, active, known_oid, tail = struct.unpack_from("<IIQII", data, 64)
-    assert tail == 0 if data[:8] == b"PGCKPT01" else 0 <= tail <= 3
+    assert tail == 0 if data[:8] == b"PGCKPT01" else 0 <= tail <= 7
     if tail & 1:
         assert xid == 0
         xid = 1 << 64
@@ -34,6 +36,8 @@ def checkpoint(data):
                  time=timestamp, timeline=timeline, previous=previous, active=active)
     if resources is not None:
         facts["resource_fact"] = resources
+    if commit_ts is not None:
+        facts["oldest_commit_ts_xid"], facts["newest_commit_ts_xid"] = commit_ts
     return facts
 
 

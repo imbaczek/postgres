@@ -3634,46 +3634,52 @@ after cleanup is confirmed."
     (when removed (fsync-directory base)))
   (values))
 
+(declaim (ftype function startup-checkpoint-commit-ts-facts))
+
 (defun wal-checkpoint-core ()
   "Write all cached pages, sync durable state, and advance the redo pointer.
-Under the WAL lock, freeze resource facts before planning placement and rotation.
-Check the encoded size against that plan before appending the checkpoint.
+Capture configuration facts before storage locks. Under the WAL lock, freeze
+resource facts before planning placement and rotation. Check the encoded size
+against that plan before appending the checkpoint.
 Settle pending pages, then require page and CLOG debt to be empty before appending
 any checkpoint batch records. Shutdown can defer recycling until its senders
 release their claims to the retained WAL."
-  ;; CHECKPOINT follows the global write-lock -> WAL-lock order.
-  (with-write-lock
-    (with-wal-critical
-      (wal-settle-page-publications-under-lock)
-      (wal-require-no-pending-storage)
-      (let ((keys (wal-primary-page-keys)))
-        (wal-primary-preflight-page-keys keys)
-        (with-wal-primary-page-spool (spool)
-          (wal-primary-record-page-xids keys (wal-append-batch-start))
-          (wal-primary-append-pages keys spool)
-          (wal-primary-seal-page-spool spool)
-          (let* ((resource-facts (wal-copy-control-resource-fields *wal-control-metadata*))
-                 (size (wal-checkpoint-record-size resource-facts))
-                 (start (wal-next-record-start size))
-                 (snapshot (wal-capture-checkpoint-snapshot start resource-facts))
-                 (payload (wal-encode-checkpoint-snapshot snapshot))
-                 (checkpoint-end
-                   (progn
-                     (unless (= size (+ +wal-header-size+ (length payload)))
-                       (error "checkpoint encoding differs from planned size"))
-                     (wal-append-record +wal-record-checkpoint+ 0 payload))))
-            (wal-flush)
-            (wal-test-pause :after-checkpoint-wal-flush)
-            (wal-primary-apply-page-spool spool)
-            (wal-clear-page-cache)
-            (smgr-fsync-all)
-            (clog-fsync)
-            (fsync-directory *pgdata*)
-            (fsync-directory (merge-pathnames "base/" *pgdata*))
-            (fsync-directory (merge-pathnames "global/" *pgdata*))
-            (wal-save-checkpoint-control checkpoint-end snapshot)
-            (wal-test-pause :after-checkpoint-control)
-            (wal-remove-checkpointed-segments-under-wal-lock checkpoint-end))))))
+  (let ((commit-ts-facts (startup-checkpoint-commit-ts-facts)))
+    ;; CHECKPOINT follows the global write-lock -> WAL-lock order.
+    (with-write-lock
+      (with-wal-critical
+        (wal-settle-page-publications-under-lock)
+        (wal-require-no-pending-storage)
+        (let ((keys (wal-primary-page-keys)))
+          (wal-primary-preflight-page-keys keys)
+          (with-wal-primary-page-spool (spool)
+            (wal-primary-record-page-xids keys (wal-append-batch-start))
+            (wal-primary-append-pages keys spool)
+            (wal-primary-seal-page-spool spool)
+            (let* ((checkpoint-facts
+                     (append (wal-copy-control-resource-fields *wal-control-metadata*)
+                             commit-ts-facts))
+                   (size (wal-checkpoint-record-size checkpoint-facts))
+                   (start (wal-next-record-start size))
+                   (snapshot (wal-capture-checkpoint-snapshot start checkpoint-facts))
+                   (payload (wal-encode-checkpoint-snapshot snapshot))
+                   (checkpoint-end
+                     (progn
+                       (unless (= size (+ +wal-header-size+ (length payload)))
+                         (error "checkpoint encoding differs from planned size"))
+                       (wal-append-record +wal-record-checkpoint+ 0 payload))))
+              (wal-flush)
+              (wal-test-pause :after-checkpoint-wal-flush)
+              (wal-primary-apply-page-spool spool)
+              (wal-clear-page-cache)
+              (smgr-fsync-all)
+              (clog-fsync)
+              (fsync-directory *pgdata*)
+              (fsync-directory (merge-pathnames "base/" *pgdata*))
+              (fsync-directory (merge-pathnames "global/" *pgdata*))
+              (wal-save-checkpoint-control checkpoint-end snapshot)
+              (wal-test-pause :after-checkpoint-control)
+              (wal-remove-checkpointed-segments-under-wal-lock checkpoint-end)))))))
   (values))
 
 (declaim (ftype function wal-prepare-slot-recycling-under-lock))

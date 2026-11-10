@@ -69,6 +69,20 @@ A missing root is an error; there is no fallback to globals."
     (values (startup-setting-value settings "wal_writer_delay")
             (startup-setting-value settings "wal_writer_flush_after"))))
 
+(defun startup-checkpoint-commit-ts-facts ()
+  (let ((configuration (startup-capture-configuration)))
+    (when configuration
+      (let ((settings (startup-configuration-settings configuration)))
+        (unless (hash-table-p settings)
+          (error "invalid installed commit timestamp policy"))
+        (let* ((entry (gethash "track_commit_timestamp" settings))
+               (length (and (listp entry) (list-length entry))))
+          (unless (and length (evenp length)
+                       (= 1 (loop for key in entry by #'cddr count (eq key :value)))
+                       (null (startup-setting-value settings "track_commit_timestamp")))
+            (error "invalid installed commit timestamp policy"))))
+      (list :oldest-commit-ts-xid 0 :newest-commit-ts-xid 0))))
+
 (defun startup-copy-input (value)
   "Copy mutable storage in configuration input trees.
 Reject unsupported objects without printing their contents."
