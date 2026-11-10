@@ -359,7 +359,9 @@ select the filename."
                    (subseq (wal-segment-filename (floor redo +wal-segment-size+) timeline :timeline) 0 24)
                    +null+)
                (timeline-value timeline) (timeline-value (getf snapshot :prev-timeline))
-               +null+ +null+
+               (if (get-properties snapshot '(:full-page-writes))
+                   (getf snapshot :full-page-writes) +null+)
+               +null+
                (cond ((null next) +null+)
                      ((= next +max-xid-one-past+) "exhausted")
                      (t (format nil "~d:~d" (ldb (byte 32 32) next) (ldb (byte 32 0) next))))
@@ -413,6 +415,9 @@ checkpoint; a present 0/0 pair is known and is printed."
       (add "Latest checkpoint's TimeLineID" timeline)
       (add "Latest checkpoint's PrevTimeLineID" (or (getf snapshot :prev-timeline) timeline))
       (when snapshot
+        (when (get-properties snapshot '(:full-page-writes))
+          (add "Latest checkpoint's full_page_writes"
+               (if (getf snapshot :full-page-writes) "on" "off")))
         (let ((next (getf snapshot :next-xid)))
           (add "Latest checkpoint's NextXID"
                (if (= next #x10000000000000000) "exhausted"

@@ -11,15 +11,17 @@ import zlib
 CHECK_OPTIONAL_CONTROL = runpy.run_path(str(Path(__file__).with_name("resource_control_fields.py")))["check_optional_fields"]
 CHECK_RESOURCES = runpy.run_path(str(Path(__file__).with_name("resource_control_fields.py")))["checkpoint_resource_fact"]
 CHECK_COMMIT_TS = runpy.run_path(str(Path(__file__).with_name("resource_control_fields.py")))["checkpoint_commit_ts_fact"]
+CHECK_FPW = runpy.run_path(str(Path(__file__).with_name("resource_control_fields.py")))["checkpoint_full_page_writes_fact"]
 
 
 def checkpoint(data):
     resources = CHECK_RESOURCES(data)
     commit_ts = CHECK_COMMIT_TS(data)
+    full_page_writes = CHECK_FPW(data)
     start, end, redo, xid, reserved, oid = struct.unpack_from("<6Q", data, 8)
     timestamp = struct.unpack_from("<q", data, 56)[0]
     timeline, previous, active, known_oid, tail = struct.unpack_from("<IIQII", data, 64)
-    assert tail == 0 if data[:8] == b"PGCKPT01" else 0 <= tail <= 7
+    assert tail == 0 if data[:8] == b"PGCKPT01" else 0 <= tail <= 31
     if tail & 1:
         assert xid == 0
         xid = 1 << 64
@@ -38,6 +40,8 @@ def checkpoint(data):
         facts["resource_fact"] = resources
     if commit_ts is not None:
         facts["oldest_commit_ts_xid"], facts["newest_commit_ts_xid"] = commit_ts
+    if full_page_writes is not None:
+        facts["full_page_writes"] = full_page_writes
     return facts
 
 
@@ -76,6 +80,7 @@ def read_copy(pgdata):
     assert wal_version in (6, 7, 8)
     assert wal_version >= 7 or data[:8] == b"PGCKPT01"
     assert wal_version >= 8 or len(data) == 88
+    assert wal_version >= 8 or not int.from_bytes(data[84:88], "little") & 24
     assert (magic, kind, size, start, xid) == (b"PGWL", 4, 32 + len(data), facts["start"], 0)
     struct.pack_into("<I", record, 28, 0)
     assert zlib.crc32(record) == crc and record[32:] == data

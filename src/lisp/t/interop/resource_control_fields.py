@@ -16,7 +16,8 @@ def checkpoint_commit_ts_fact(data):
     assert data[:8] in (b"PGCKPT01", b"PGCKPT02")
     flags = int.from_bytes(data[84:88], "little")
     known = bool(flags & 4)
-    assert flags <= 7 and known == (len(data) in (96, 144))
+    assert flags <= 31 and known == (len(data) in (96, 144))
+    assert not flags & 16 or flags & 8
     assert data[:8] == b"PGCKPT02" or (len(data) == 88 and flags == 0)
     if not known:
         return None
@@ -24,6 +25,12 @@ def checkpoint_commit_ts_fact(data):
                  for index in range(len(data) - 8, len(data), 4))
     assert pair == (0, 0)
     return pair
+
+
+def checkpoint_full_page_writes_fact(data):
+    checkpoint_commit_ts_fact(data)
+    flags = int.from_bytes(data[84:88], "little")
+    return bool(flags & 16) if flags & 8 else None
 
 
 def checkpoint_resource_fact(data):

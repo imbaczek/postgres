@@ -89,7 +89,7 @@
             (wal-set-u32 bad 84 (logxor 4 (wal-u32 bad 84)))
             (rove:ok (unit-commit-ts-error-p (lambda () (wal-decode-checkpoint-snapshot bad)))))
           (let ((bad (copy-seq bytes)))
-            (wal-set-u32 bad 84 (logior 8 (wal-u32 bad 84)))
+            (wal-set-u32 bad 84 (logior 32 (wal-u32 bad 84)))
             (rove:ok (unit-commit-ts-error-p (lambda () (wal-decode-checkpoint-snapshot bad)))))
           (dolist (bad (list (subseq bytes 0 (1- (length bytes)))
                              (concatenate '(vector (unsigned-byte 8)) bytes #(0))))

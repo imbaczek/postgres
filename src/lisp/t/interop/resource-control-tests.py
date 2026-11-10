@@ -183,6 +183,42 @@ class ResourceControlTests(unittest.TestCase):
                         with self.assertRaises(AssertionError):
                             DECODE_CHECKPOINT(bad)
 
+    def test_checkpoint_full_page_writes_preserves_false_in_control_copy(self):
+        for policy, flags in ((None, 0), (False, 8), (True, 24)):
+            with self.subTest(policy=policy):
+                fields, snapshot = self.known_checkpoint()
+                struct.pack_into("<I", snapshot, 84, flags)
+                fields[6] = snapshot.hex()
+                self.write(fields)
+                record = bytearray(struct.pack("<4sHHIQQI", b"PGWL", 8, 4, 168, 128, 0, 0) + snapshot)
+                struct.pack_into("<I", record, 28, zlib.crc32(record))
+                (self.root / "pg_wal/0000000000000000.wal").write_bytes(bytes(128) + record)
+                facts, _ = CHECKPOINT(self.root)
+                self.assertEqual(policy is not None, "full_page_writes" in facts)
+                if policy is not None:
+                    self.assertIs(policy, facts["full_page_writes"])
+                for illegal in (16, 20, 32):
+                    bad = snapshot.copy()
+                    struct.pack_into("<I", bad, 84, illegal)
+                    with self.assertRaises(AssertionError):
+                        DECODE_CHECKPOINT(bad)
+
+        for policy, flags in ((False, 8), (True, 24)):
+            fields = self.fields(timeline=1)
+            snapshot = bytearray.fromhex(fields[6])
+            struct.pack_into("<I", snapshot, 84, flags)
+            fields[6] = snapshot.hex()
+            self.write(fields)
+            for version in (7, 8):
+                record = bytearray(struct.pack("<4sHHIQQI", b"PGWL", version, 4, 120, 0, 0, 0) + snapshot)
+                struct.pack_into("<I", record, 28, zlib.crc32(record))
+                (self.root / "pg_wal/0000000000000000.wal").write_bytes(record)
+                if version == 7:
+                    with self.assertRaises(AssertionError):
+                        CHECKPOINT(self.root)
+                else:
+                    self.assertIs(policy, CHECKPOINT(self.root)[0]["full_page_writes"])
+
     def test_promotion_utility_reads_all_recovery_resource_layouts(self):
         for pending, layouts in ((False, (72, 88)), (True, (88, 104, 132, 148))):
             for layout in layouts:
