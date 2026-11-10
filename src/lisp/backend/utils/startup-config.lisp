@@ -63,6 +63,11 @@ A missing root is an error; there is no fallback to globals."
     (values (startup-configuration-slot-policy configuration)
             (startup-configuration-keep-mb configuration))))
 
+(defun startup-wal-writer-settings ()
+  (let ((settings (startup-configuration-settings (startup-require-configuration))))
+    (values (startup-setting-value settings "wal_writer_delay")
+            (startup-setting-value settings "wal_writer_flush_after"))))
+
 (defun startup-copy-input (value)
   "Copy mutable storage in configuration input trees.
 Reject unsupported objects without printing their contents."
@@ -173,6 +178,8 @@ synchronous configuration plan against the same source and generation."
     ("reserved_connections" :postmaster :integer "0" 0 262143 nil)
     ("superuser_reserved_connections" :postmaster :integer "3" 0 262143 nil)
     ("max_replication_slots" :postmaster :integer "10" 0 262143 nil)
+    ("wal_writer_delay" :sighup :integer "200" 1 10000 :milliseconds)
+    ("wal_writer_flush_after" :sighup :integer "128" 0 2147483647 :xblocks)
     ("checkpoint_timeout" :sighup :integer "300" 30 86400 :seconds)
     ("max_wal_size" :sighup :integer "1024" 2 2147483647 :megabytes)
     ("wal_keep_size" :sighup :integer "0" 0 2147483647 :megabytes)
@@ -278,6 +285,8 @@ uses strtod. Return the remaining unit for the caller's conversion and rounding.
                                        ("s" 1000d0) ("ms" 1d0) ("us" 0.001d0)))
                       (:seconds '(("d" 86400d0) ("h" 3600d0) ("min" 60d0)
                                   ("s" 1d0) ("ms" 0.001d0) ("us" 0.000001d0)))
+                      (:xblocks '(("TB" 134217728d0) ("GB" 131072d0) ("MB" 128d0)
+                                  ("kB" 0.125d0) ("B" 0.0001220703125d0)))
                       (:megabytes '(("TB" 1048576d0) ("GB" 1024d0) ("MB" 1d0)
                                     ("kB" 0.0009765625d0) ("B" 0.00000095367431640625d0)))
                       ((nil) nil)))
@@ -930,6 +939,7 @@ claim. Translate a final sender-lock stale check so reload can prepare again."
     (sync-replication-configuration-changed ()
       (error 'startup-configuration-changed
              :format-control "synchronous replication changed during configuration publication")))
+  (notify-primary-wal-writer-configuration)
   candidate)
 
 (defun startup-commit-installation-at-boundary (candidate boundary)
@@ -1037,6 +1047,8 @@ This configuration path does not take live admission or the code reload lock."
 (defun startup-format-unit (value kind)
   (if (<= value 0) (princ-to-string value)
       (let ((units (ecase kind
+                     (:milliseconds '(("d" 86400000) ("h" 3600000) ("min" 60000)
+                                      ("s" 1000) ("ms" 1)))
                      (:seconds '(("d" 86400) ("h" 3600) ("min" 60) ("s" 1)))
                      (:bytes '(("TB" 1099511627776) ("GB" 1073741824) ("MB" 1048576)
                                ("kB" 1024) ("B" 1))))))
@@ -1061,7 +1073,8 @@ slot policy and provenance from the same root as ENTRY, without rereading the
 environment."
   (let* ((spec (assoc name *startup-setting-specs* :test #'string=))
          (source (getf entry :source))
-         (unit (case (seventh spec) (:seconds "s") (:megabytes "MB") (t +null+)))
+         (unit (case (seventh spec) (:seconds "s") (:milliseconds "ms")
+                     (:megabytes "MB") (:xblocks "8kB") (t +null+)))
          (value (getf entry :value)))
     ;; The native byte option predates GUC support and can specify partial MB.
     ;; Preserve its true value, unit and provenance instead of rounding it away.
@@ -1114,6 +1127,8 @@ Without an installed root, return session rows."
           (let ((value (getf entry :value)))
             (values (case (intern (string-upcase name) :keyword)
                       (:checkpoint_timeout (startup-format-unit value :seconds))
+                      (:wal_writer_delay (startup-format-unit value :milliseconds))
+                      (:wal_writer_flush_after (startup-format-unit (* value 8192) :bytes))
                       ((:max_wal_size :wal_keep_size)
                        (startup-format-unit (* value 1024 1024) :bytes))
                       (:max_slot_wal_keep_size

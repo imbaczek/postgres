@@ -13,6 +13,10 @@ A new epoch may be installed during a writer's lifetime."
   (timeline nil :read-only t)
   (ownership nil :read-only t))
 
+(defstruct (wal-writer-policy (:constructor make-wal-writer-policy (delay flush-after)))
+  (delay 200 :type (integer 1 10000) :read-only t)
+  (flush-after 128 :type (integer 0 2147483647) :read-only t))
+
 (defstruct (primary-wal-writer
             (:constructor %make-primary-wal-writer (generation epoch output error-output)))
   "Writer lifetime and mutable state, separate from its current storage epoch.
@@ -27,7 +31,7 @@ When both locks are needed, take WAL before the writer state lock."
   (state :starting)
   failure
   (cycles 0)
-  last-drained-end)
+  last-drained-end policy last-flush-time (idle-cycles 0) sleeping-p)
 
 (defstruct (clog-reset-epoch-plan
             (:constructor %make-clog-reset-epoch-plan
@@ -52,7 +56,10 @@ The descriptors are immutable; CONSUMED-P prevents reuse."
 (defvar *primary-wal-writer-shutdown-p* nil)
 
 (defvar *primary-wal-writer-lock* (sb-thread:make-mutex :name "primary WAL writer state"))
-(defvar *primary-wal-writer-delay* 0.2)
+
+(defvar *primary-wal-writer-delay* nil
+  "Test override in seconds. NIL uses the installed writer settings.")
+
 (defvar *primary-wal-writer-join-timeout* 5)
 (defvar *primary-wal-writer-test-hook* nil)
 
@@ -217,6 +224,39 @@ The wait path consumes signals and clears the pending flag under this lock."
       (wake-primary-wal-writer-under-state-lock *primary-wal-writer*)))
   (values))
 
+(declaim (ftype function startup-wal-writer-settings))
+
+(defun primary-wal-writer-capture-policy ()
+  (if *primary-wal-writer-delay*
+      (make-wal-writer-policy (max 1 (round (* 1000 *primary-wal-writer-delay*))) 128)
+      (multiple-value-bind (delay blocks) (startup-wal-writer-settings)
+        (make-wal-writer-policy delay blocks))))
+
+(defun notify-primary-wal-writer-configuration ()
+  (sb-thread:with-mutex (*primary-wal-writer-lock*)
+    (let ((writer *primary-wal-writer*))
+      (when (and writer (not (primary-wal-writer-stop-p writer))
+                 (not (primary-wal-writer-failure writer)))
+        (wake-primary-wal-writer-under-state-lock writer))))
+  (values))
+
+(defun wal-writer-flush-threshold-p (request flushed blocks)
+  (or (zerop blocks)
+      (>= (- (floor request 8192) (floor flushed 8192)) blocks)))
+
+(defun notify-primary-wal-writer-async-under-lock (end)
+  (assert (sb-thread:holding-mutex-p *wal-lock*))
+  (sb-thread:with-mutex (*primary-wal-writer-lock*)
+    (let* ((writer *primary-wal-writer*)
+           (policy (when writer (primary-wal-writer-policy writer))))
+      (when (and writer (not (primary-wal-writer-stop-p writer))
+                 (not (primary-wal-writer-failure writer))
+                 (or (null policy) (primary-wal-writer-sleeping-p writer)
+                     (wal-writer-flush-threshold-p
+                      end *wal-durable-lsn* (wal-writer-policy-flush-after policy))))
+        (wake-primary-wal-writer-under-state-lock writer))))
+  (values))
+
 (defun primary-wal-writer-available-under-lock-p ()
   "Check the running writer and its current storage authority under WAL then state lock."
   (assert (sb-thread:holding-mutex-p *wal-lock*))
@@ -241,9 +281,13 @@ Leave poisoned work intact; fail-stop on settlement failure after releasing both
           (call-with-reload-definitions
            (lambda ()
              (sb-thread:with-mutex (*wal-lock*)
-               (when (and (not *wal-poisoned*)
-                          (or *wal-pending-page-publication* *wal-pending-page-publication-tail*))
-                 (wal-settle-page-publications-under-lock)))))
+               (unless *wal-poisoned*
+                 (when (or *wal-pending-page-publication* *wal-pending-page-publication-tail*)
+                   (wal-settle-page-publications-under-lock))
+                 (when (and *wal-ready* (not (recovery-in-progress-p))
+                            (> *wal-end-lsn* *wal-durable-lsn*))
+                   (with-wal-poison-on-incomplete ("stopped WAL writer flush exited before completion")
+                     (wal-flush-core)))))))
         (error (condition) (setf failure condition)))
       (when failure
         (wal-fail-stop failure)
@@ -266,6 +310,17 @@ a cycle accepted before a stop request may finish."
     (when (primary-wal-writer-stop-p writer)
       (return-from validate-primary-wal-writer-under-lock nil)))
   (validate-primary-wal-writer-storage-under-lock epoch))
+
+(defun wal-writer-write-request (end flushed async)
+  (let ((completed (* 8192 (floor end 8192))))
+    (cond ((> completed flushed) completed)
+          ((> async flushed) async)
+          (t 0))))
+
+(defun wal-writer-flush-due-p (request flushed last now delay blocks)
+  (and (> request flushed)
+       (or (null last) (>= (- now last) delay)
+           (wal-writer-flush-threshold-p request flushed blocks))))
 
 (defun primary-wal-writer-drain-under-lock (writer epoch)
   "Settle the FIFO and record the captured tail's exact terminal end.
@@ -290,6 +345,60 @@ The caller must request fail-stop after releasing WAL."
   (sb-thread:with-mutex (*wal-lock*)
     (when (primary-wal-writer-stopping-p writer) (return-from primary-wal-writer-step :stop))
     (primary-wal-writer-drain-under-lock writer (primary-wal-writer-epoch writer))))
+
+(defun wal-writer-now-ms ()
+  (/ (* (get-internal-real-time) 1000) internal-time-units-per-second))
+
+(defun primary-wal-writer-background-under-lock (writer epoch policy)
+  (unless (validate-primary-wal-writer-under-lock writer epoch)
+    (return-from primary-wal-writer-background-under-lock :stop))
+  (wal-check-healthy)
+  (wal-check-page-publication-queue-under-lock)
+  (clog-check-queued-commits-under-wal-lock)
+  (let* ((tail *wal-pending-page-publication-tail*)
+         (request (wal-writer-write-request
+                   *wal-end-lsn* *wal-durable-lsn*
+                   (wal-async-flush-lsn)))
+         (now (wal-writer-now-ms))
+         (work-p (> request *wal-durable-lsn*))
+         (flushed-p nil)
+         (drained nil))
+    (sb-thread:with-mutex (*primary-wal-writer-lock*)
+      (setf (primary-wal-writer-policy writer) policy
+            (primary-wal-writer-sleeping-p writer)
+            (>= (primary-wal-writer-idle-cycles writer) 49)))
+    (with-wal-poison-on-incomplete ("background WAL writer exited before completion")
+      (when work-p
+        (if (wal-writer-flush-due-p
+             request *wal-durable-lsn* (primary-wal-writer-last-flush-time writer)
+             now (wal-writer-policy-delay policy) (wal-writer-policy-flush-after policy))
+            (progn (wal-flush-core) (setf flushed-p t))
+            (when (> request (wal-explicit-written-lsn))
+              (wal-write-core))))
+      (when tail
+        (loop for owner = *wal-pending-page-publication* then (wal-page-publication-next owner)
+              while owner
+              while (<= (wal-page-publication-terminal-end owner) *wal-durable-lsn*)
+              do (setf drained owner)
+              when (eq owner tail) return nil)
+        (when drained
+          (wal-drain-page-publications-through-under-lock drained :fault-on-first-write t)))
+      (sb-thread:with-mutex (*primary-wal-writer-lock*)
+        (incf (primary-wal-writer-cycles writer))
+        (when flushed-p (setf (primary-wal-writer-last-flush-time writer) now))
+        (when drained
+          (setf (primary-wal-writer-last-drained-end writer)
+                (wal-page-publication-terminal-end drained)))
+        (setf (primary-wal-writer-idle-cycles writer)
+              (if (or work-p drained) 0
+                  (min 50 (1+ (primary-wal-writer-idle-cycles writer))))))))
+  :continue)
+
+(defun primary-wal-writer-background-step (writer policy)
+  (when (primary-wal-writer-stopping-p writer)
+    (return-from primary-wal-writer-background-step :stop))
+  (sb-thread:with-mutex (*wal-lock*)
+    (primary-wal-writer-background-under-lock writer (primary-wal-writer-epoch writer) policy)))
 
 (defun request-primary-wal-writer-stop-under-state-lock (writer)
   (assert (sb-thread:holding-mutex-p *primary-wal-writer-lock*))
@@ -340,18 +449,20 @@ Only the installed writer poisons WAL. Request fail-stop after releasing locks."
         (handler-case (wal-fail-stop fence) (error () nil)))))
   (values))
 
-(defun primary-wal-writer-wait (writer)
-  (sb-thread:wait-on-semaphore (primary-wal-writer-wake writer)
-                               :timeout *primary-wal-writer-delay*)
+(defun primary-wal-writer-wait (writer policy)
+  (let ((hibernate-p
+          (sb-thread:with-mutex (*primary-wal-writer-lock*)
+            (>= (primary-wal-writer-idle-cycles writer) 50))))
+    (sb-thread:wait-on-semaphore
+     (primary-wal-writer-wake writer)
+     :timeout (* (/ (wal-writer-policy-delay policy) 1000.0) (if hibernate-p 25 1))))
   (sb-thread:with-mutex (*primary-wal-writer-lock*)
     (loop while (sb-thread:try-semaphore (primary-wal-writer-wake writer)))
     (setf (primary-wal-writer-wake-pending-p writer) nil))
   (values))
 
 (defun primary-wal-writer-main (writer)
-  "Run the auxiliary writer outside backend and live-operation admission.
-Wait for registration, then take definition exclusion before WAL each cycle.
-Each cycle drains the publication FIFO or flushes outstanding WAL if it is empty."
+  "Run the auxiliary writer outside backend and live-operation admission."
   (let ((*backend* nil) (*live-operation-depth* 0)
                         (*standard-output* (primary-wal-writer-output writer))
                         (*error-output* (primary-wal-writer-error-output writer))
@@ -363,12 +474,15 @@ Each cycle drains the publication FIFO or flushes outstanding WAL if it is empty
                (loop
                  (when (primary-wal-writer-stopping-p writer) (return))
                  (primary-wal-writer-test-point :before-cycle writer)
-                 (when (eq :stop
-                           (call-with-reload-definitions
-                            (lambda () (primary-wal-writer-step writer))))
-                   (return))
-                 (primary-wal-writer-test-point :after-cycle writer)
-                 (primary-wal-writer-wait writer))
+                 (let ((policy nil))
+                   (when (eq :stop
+                             (call-with-reload-definitions
+                              (lambda ()
+                                (setf policy (primary-wal-writer-capture-policy))
+                                (primary-wal-writer-background-step writer policy))))
+                     (return))
+                   (primary-wal-writer-test-point :after-cycle writer)
+                   (primary-wal-writer-wait writer policy)))
                (setf normal-p t))
            (error (condition) (setf failure condition)))
       (finish-primary-wal-writer writer failure normal-p))))

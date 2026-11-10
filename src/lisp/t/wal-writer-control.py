@@ -37,11 +37,18 @@ def resume_writer(server, paths):
         wait_file(server, paths[2])
 
 
-def wait_control(server, expression, marker):
-    deadline = time.monotonic() + 15
-    while marker not in server.control(expression):
+def wait_control(server, expression, marker, timeout=15, call_timeout=None):
+    deadline = time.monotonic() + timeout
+    while True:
         assert server.process is not None and server.process.poll() is None
         assert time.monotonic() < deadline, f'writer state did not reach {marker}'
+        if call_timeout is None:
+            output = server.control(expression)
+        else:
+            output = server.control(expression, timeout=min(call_timeout, deadline - time.monotonic()))
+        assert time.monotonic() < deadline, f'writer state did not reach {marker}'
+        if marker in output:
+            return
         time.sleep(0.02)
 
 

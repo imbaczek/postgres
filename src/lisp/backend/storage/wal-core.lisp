@@ -249,6 +249,14 @@ Owners are process-local; the appropriate codec stores durable slot fields."
   "WAL-owned token for the local insertion domain, retained across reload.
 It is separate from the source identity used for remote acknowledgments.")
 
+(defstruct (wal-writer-position
+            (:constructor make-wal-writer-position (incarnation timeline end)))
+  (incarnation nil :read-only t) (timeline nil :read-only t) (end 0 :read-only t))
+
+(defvar *wal-explicit-write-frontier* nil)
+
+(defvar *wal-async-flush-frontier* nil)
+
 (defstruct (wal-page-publication (:constructor %make-wal-page-publication))
   ;; Before FIFO handoff the stack normally closes SPOOL on exit. A transaction's
   ;; CLOG reservation retains the owner after its terminal attempt starts, so
@@ -1359,9 +1367,53 @@ during cleanup, and keep backend termination from replacing a latched WAL failur
   (when stream (finish-output stream) (fsync-stream stream))
   (when sync-names (fsync-directory (wal-directory))))
 
+(declaim (ftype function notify-primary-wal-writer-async-under-lock))
+
+(defun wal-writer-position-end-under-lock (position)
+  (assert (sb-thread:holding-mutex-p *wal-lock*))
+  (if (and position
+           (eq *wal-storage-incarnation* (wal-writer-position-incarnation position))
+           (eql *wal-insert-timeline* (wal-writer-position-timeline position)))
+      (progn
+        (unless (<= (wal-writer-position-end position) *wal-end-lsn*)
+          (wal-invalid-input "writer position is past inserted WAL"))
+        (wal-writer-position-end position))
+      0))
+
+(defun wal-explicit-written-lsn ()
+  (max *wal-durable-lsn*
+       (wal-writer-position-end-under-lock *wal-explicit-write-frontier*)))
+
+(defun wal-async-flush-lsn ()
+  (wal-writer-position-end-under-lock *wal-async-flush-frontier*))
+
+(defun wal-request-async-flush-under-lock (end)
+  (assert (sb-thread:holding-mutex-p *wal-lock*))
+  (unless (and (typep end '(unsigned-byte 64)) (<= end *wal-end-lsn*))
+    (wal-invalid-input "async flush request is past inserted WAL"))
+  (when (> end (wal-async-flush-lsn))
+    (setf *wal-async-flush-frontier*
+          (make-wal-writer-position *wal-storage-incarnation* *wal-insert-timeline* end))
+    (notify-primary-wal-writer-async-under-lock end))
+  (values))
+
+(defun wal-note-explicit-write ()
+  (setf *wal-explicit-write-frontier*
+        (make-wal-writer-position
+         *wal-storage-incarnation* *wal-insert-timeline* *wal-end-lsn*))
+  (values))
+
+(defun wal-write-core ()
+  (assert (sb-thread:holding-mutex-p *wal-lock*))
+  (unless *wal-output-stream*
+    (wal-invalid-input "background WAL write has no output stream"))
+  (finish-output *wal-output-stream*)
+  (wal-note-explicit-write))
+
 (defun wal-flush-core ()
   "Sync WAL bytes and names, then durable control; caller supplies failure fences."
   (wal-sync-output-bytes *wal-output-stream* *wal-new-segments*)
+  (wal-note-explicit-write)
   (setf *wal-new-segments* '())
   (wal-test-pause :after-wal-bytes-flush)
   (wal-save-durable-lsn *wal-end-lsn*)
@@ -1653,8 +1705,7 @@ Install the preallocated empty maps by pointer, without changing references."
     (if *wal-pending-page-publication-tail*
         (setf (wal-page-publication-next *wal-pending-page-publication-tail*) owner)
         (setf *wal-pending-page-publication* owner))
-    (setf *wal-pending-page-publication-tail* owner)
-    (notify-primary-wal-writer-under-lock))
+    (setf *wal-pending-page-publication-tail* owner))
   owner)
 
 (defun wal-drain-page-publication-under-lock (owner &key fault-on-first-write)
@@ -1990,7 +2041,8 @@ I/O or locks. With WAL it runs under the publication fence and WAL mutex."
               (progn
                 (setf receipt (%make-wal-commit-receipt xid source-id commit-lsn nil))
                 (wal-slot-record-xid-commit-under-wal-lock xid commit-lsn)
-                (clog-accept-publication-under-wal-lock publication))
+                (clog-accept-publication-under-wal-lock publication)
+                (wal-request-async-flush-under-lock commit-lsn))
               (progn
                 (wal-flush)
                 (when terminal-durable-function (funcall terminal-durable-function commit-lsn))
@@ -3479,6 +3531,8 @@ after cleanup is confirmed."
             *wal-pending-btree-split* nil
             *wal-output-stream* nil
             *wal-output-segment* nil
+            *wal-explicit-write-frontier* nil
+            *wal-async-flush-frontier* nil
             *wal-new-segments* '()
             *wal-test-pause-at* nil
             *wal-test-pause-relfilenode* nil

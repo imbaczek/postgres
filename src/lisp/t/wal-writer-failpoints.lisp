@@ -50,7 +50,8 @@
                              (wal-encode-resource-parameters
                               (resource-parameters-from-values
                                (getf *wal-control-metadata* :resource-parameters)))))
-    (assert (> *writer-test-end* *wal-durable-lsn*)))
+    (assert (> *writer-test-end* *wal-durable-lsn*))
+    (wal-request-async-flush-under-lock *writer-test-end*))
   (values))
 
 (defun wal-writer-test-idle-durable-p ()
@@ -111,7 +112,8 @@
     (with-wal-publication-fence (begin)
       (begin)
       (multiple-value-setq (*writer-test-owner* *writer-test-end*)
-        (wal-admit-transaction-under-lock (backend-xid *backend*) nil))))
+        (wal-admit-transaction-under-lock (backend-xid *backend*) nil))
+      (wal-request-async-flush-under-lock *writer-test-end*)))
   (values))
 
 (defun wal-writer-test-prefix-drained-p ()

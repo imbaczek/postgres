@@ -2,6 +2,7 @@
 from pathlib import Path
 import runpy
 import signal
+import time
 
 
 api = runpy.run_path(str(Path(__file__).with_name('synchronous-ddl.py')))
@@ -42,7 +43,10 @@ def run_idle_drain_and_reload():
             '(assert (logical-spool-closed-p (wal-page-publication-spool *writer-test-owner*)))) '
             '(wal-writer-test-finish-backend)')
         assert actor.query('SELECT id FROM writer_rows') == [['1']]
-        server.control('(reload)')
+        reload_started = time.monotonic()
+        server.control('(reload)', timeout=120)
+        print(f'wal-writer: code reload elapsed_seconds={time.monotonic() - reload_started:.6f}',
+              flush=True)
         server.control(
             '(assert (eq *writer-witness* *primary-wal-writer*)) '
             '(assert (eq *writer-thread-witness* (primary-wal-writer-thread *primary-wal-writer*))) '
