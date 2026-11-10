@@ -33,7 +33,9 @@ An absent selection requires the applied timeline to remain the base timeline."
 A retained reference is allowed only in pending control and must match its base
 timeline, checkpoint, manifest digest and applied end. This checks fields, not
 the referenced archive. FPW fact shape and its exact applied boundary are checked
-here; selected-history geometry, source identity and the verified WAL prefix are separate."
+here; selected-history geometry, source identity and the verified WAL prefix are separate.
+A present promotion policy is allowed only in pending control. NIL means OFF;
+an absent key leaves the legacy byte plan in use."
   (destructuring-bind (&key phase system-id timeline manifest-digest checkpoint
                          applied next-xid db-state state-time (control-version 3)
                          (applied-timeline timeline) history-target history-digest
@@ -112,8 +114,11 @@ here; selected-history geometry, source identity and the verified WAL prefix are
                                           promotion-child promotion-generation promotion-source-namespace retained-reference resource-fact fpw-fact
                                           (promotion-full-page-writes nil promotion-fpw-intent-p))
   "Encode recovery progress and optional extensions under one CRC.
-Ordinary and pending images may append a 48-byte resource fact and a 72-byte FPW
-fact. Absent facts leave the earlier layouts unchanged; FPW has no separate CRC."
+Ordinary and pending images may append a 48-byte resource fact and a 72-byte source
+FPW fact. Pending images may then append a 17-byte PGFPWPI1 promotion intent.
+The intent records the desired policy independently of the source fact. A supplied
+NIL means OFF; an absent argument leaves the legacy byte plan unchanged. All
+extensions precede and are covered by the outer CRC."
   (let* ((pending (= phase 3)) (version (if pending 4 3))
                                (extension-start (if pending 84 68))
                                (selected (not (null history-target)))
@@ -165,7 +170,10 @@ fact. Absent facts leave the earlier layouts unchanged; FPW has no separate CRC.
 
 (defun physical-recovery-decode-control (bytes)
   "Decode an exact native control layout and verify its CRC before accepting facts.
-The optional 72-byte FPW suffix is covered by that CRC; legacy layouts remain valid."
+The optional source FPW fact and pending-only promotion intent precede the CRC.
+Length modulo four distinguishes an intent from earlier layouts; the decoder also
+checks its magic, value and reserved bytes. An absent intent preserves the legacy
+byte plan, while a present NIL policy means OFF."
   (multiple-value-bind (size promotion-fpw-intent-p) (physical-fpw-control-core-size bytes)
     (unless (member size '(60 72 88 104 120 132 136 144 148 152 160 176 180
                            192 196 204 208 220 224 252 268))

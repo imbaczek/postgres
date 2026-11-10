@@ -81,6 +81,12 @@ def source_fpw_fact(data, applied, applied_timeline):
 
 
 def recovery_promotion_full_page_writes(data):
+    """Read the pending promotion intent, or return None for the legacy layout.
+
+    False means a present intent to turn FPW off. The desired policy is
+    independent of the source FPW fact. This helper checks the intent and CRC
+    when present; callers still need to validate the rest of the control image.
+    """
     if len(data) % 4 == 0:
         return None
     assert len(data) % 4 == 1 and data[:8] == b"PGRSTAT4"
@@ -94,6 +100,11 @@ def recovery_promotion_full_page_writes(data):
 
 
 def recovery_control_fields(data):
+    """Check the control layout and return its resource and source FPW facts.
+
+    A length of one modulo four marks the 17-byte intent after the optional
+    source FPW fact and before the outer CRC. The intent is checked separately.
+    """
     assert len(data) % 4 in (0, 1)
     intent = len(data) % 4 == 1
     if intent:

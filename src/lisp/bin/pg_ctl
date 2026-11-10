@@ -35,7 +35,13 @@ def read_regular(path, limit):
 
 
 def recovery_phase(root):
-    """Read and check native recovery control; do not infer a role from file names."""
+    """Read bounded native recovery control and return its checked phase.
+
+    The 285-byte bound includes the optional pending-only 17-byte promotion
+    intent after any optional source FPW fact and before the CRC. Length modulo
+    four distinguishes it from earlier layouts. Check its magic, value byte and
+    reserved bytes; this does not establish source ancestry or carry out promotion.
+    """
     data = read_regular(root / "physical-recovery.control", 285)
     ordinary = data[:8] == b"PGRSTAT3"
     pending = data[:8] == b"PGRSTAT4"

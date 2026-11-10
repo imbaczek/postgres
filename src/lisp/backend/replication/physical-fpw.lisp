@@ -13,6 +13,7 @@
 (defconstant +physical-promotion-fpw-intent-size+ 17)
 
 (defun physical-fpw-encode-promotion-intent (enabled)
+  "Encode the desired promotion policy independently of the source FPW fact."
   (unless (member enabled '(nil t)) (error "invalid promotion full page writes policy"))
   (let ((bytes (make-array +physical-promotion-fpw-intent-size+
                            :element-type '(unsigned-byte 8) :initial-element 0)))
@@ -21,6 +22,7 @@
     bytes))
 
 (defun physical-fpw-decode-promotion-intent (bytes)
+  "Decode the 17-byte PGFPWPI1 intent, checking its value and reserved bytes."
   (unless (and (= (length bytes) +physical-promotion-fpw-intent-size+)
                (equalp (subseq bytes 0 8) #(80 71 70 80 87 80 73 49))
                (member (aref bytes 8) '(0 1))
@@ -29,6 +31,9 @@
   (= 1 (aref bytes 8)))
 
 (defun physical-fpw-control-core-size (bytes)
+  "Return the old layout size and whether a 17-byte intent follows it.
+Old layouts have lengths divisible by four; the intent adds one modulo four.
+The caller must still check the layout, intent and CRC."
   (let ((size (length bytes)))
     (case (mod size 4)
       (0 (values size nil))
