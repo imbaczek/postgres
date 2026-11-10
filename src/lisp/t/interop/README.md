@@ -93,6 +93,28 @@ persisted facts. It also exercises the unchanged Patroni standby-leader query on
 a real native follower through restartpoint publication, source-offline cold
 restart and corrupt-pointer rejection. Unpersisted native fields remain NULL.
 
+Run the native source FPW cold-recovery oracle from `src/lisp` on Linux with
+Patroni 4.1.5, psutil and psycopg2 in the pinned Python environment, SBCL and
+matching libpq build dependencies. It uses a Linux child subreaper to verify
+injected process exits. The RAM wrapper keeps data, caches and temporary files
+on the project's private RAM mount:
+
+```sh
+PATRONI_PYTHON=/path/to/pinned-venv/bin/python3
+./t/test-ramdisk.sh setup 4G
+PATH="/path/to/c/bin:$PATH" PG_CONFIG=/path/to/c/bin/pg_config \
+  ./t/test-ramdisk.sh run "$PATRONI_PYTHON" t/interop/source-fpw-cold.py --point both
+```
+
+Both replay cuts check source-offline cold recovery of the exact OFF witness
+and last-disable position, a clean standby shutdown and second cold restart,
+interrupted promotion after the child EOR is synced, and another child restart
+with local ON policy and the row intact. The last-disable check corresponds to
+the boundary tracked in C `xlog.c:xlog_redo`. Policy changes are published
+manually through the control REPL; this does not test a GUC producer. The peers
+use native PGWL. This does not test C binary WAL interoperability or run a
+coordinator, DCS or HA loop.
+
 The independent C idle-writer check can be run from `src/lisp` with:
 
 ```sh
