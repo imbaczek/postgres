@@ -24,6 +24,12 @@
 
 #+x86-64
 (defun %wal-crc32-ieee-octets (bytes start end table constants seed)
+  "Return the final inverted IEEE CRC-32 for BYTES[START, END).
+SEED is the uncomplemented 32-bit running state.  BYTES must be a simple
+octet vector and START and END valid fixnum bounds. TABLE must be the IEEE
+256-entry table and CONSTANTS the preallocated eight unsigned 64-bit folding
+coefficients.  PCLMUL support is required for lengths of at least 16 bytes.
+Inputs are read only; valid calls allocate no heap storage."
   (declare (optimize (speed 3) (safety 3))
            (type (simple-array (unsigned-byte 8) (*)) bytes)
            (type (simple-array (unsigned-byte 32) (256)) table)

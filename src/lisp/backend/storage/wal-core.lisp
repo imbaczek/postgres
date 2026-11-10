@@ -626,9 +626,12 @@ Legacy 16-hex segment names always belong to timeline 1."
 (defparameter *wal-crc32-ieee-reference-table* (make-wal-crc32-table))
 
 (defun wal-crc32 (bytes &optional (start 0) (end (length bytes)))
-  "Return IEEE CRC-32 of BYTES from START inclusive to END exclusive.
-Use the typed kernel when its inputs and bounds are valid, otherwise retain
-the historical generic calculation.  BYTES is read without mutation."
+  "Return the final IEEE CRC-32 of BYTES from START inclusive to END exclusive.
+The initial running state is #xffffffff.  On x86-64, valid simple octet
+slices of at least 128 bytes use PCLMUL when available and when all 256 table
+entries match the IEEE table.  Other inputs retain the scalar calculation,
+including the behavior of a modified table.  BYTES is read without mutation.
+This native WAL checksum remains IEEE CRC-32; PostgreSQL C uses CRC-32C."
   (let ((table (and (boundp '*wal-crc32-table*) *wal-crc32-table*)))
     (if (and (typep bytes '(simple-array (unsigned-byte 8) (*)))
              (typep table '(simple-array (unsigned-byte 32) (256)))
