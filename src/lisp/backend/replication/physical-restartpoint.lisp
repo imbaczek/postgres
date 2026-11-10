@@ -439,13 +439,15 @@ Older metadata without these fields uses the base timeline."
             (error "restartpoint differs from its durable receive prefix")))
         (setf resource-seed (physical-restartpoint-resource-seed metadata state store start)
               fpw-seed (physical-restartpoint-fpw-seed metadata state store start))
-        (multiple-value-bind (removed terminal reset-forks)
-            (physical-recovery-proven-drops
-             store identity :start-lsn start :required-lsn (max required start)
-             :policy (getf state :timeline-policy))
-          (declare (ignore terminal))
-          (physical-recovery-check-base-forks
-           (if metadata (list :files (getf metadata :forks)) state) removed reset-forks))
+        (multiple-value-bind (checkpoint next) (physical-restartpoint-scan-seeds metadata state)
+          (multiple-value-bind (removed terminal reset-forks)
+              (physical-recovery-proven-drops
+               store identity :start-lsn start :required-lsn (max required start)
+               :checkpoint-seed checkpoint :next-xid-seed next :fpw-seed fpw-seed
+               :policy (getf state :timeline-policy))
+            (declare (ignore terminal))
+            (physical-recovery-check-base-forks
+             (if metadata (list :files (getf metadata :forks)) state) removed reset-forks)))
         (setf (getf *physical-recovery-state* :wal-prefix-lsn) (and metadata start)
               (getf *physical-recovery-state* :wal-prefix-bytes) (and metadata prefix))
         ;; Every check above precedes mutation. Later failure still leaves the

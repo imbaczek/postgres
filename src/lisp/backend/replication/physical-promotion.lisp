@@ -342,7 +342,8 @@ parent.  The phase check here alone does not establish that ownership."
     ;; be applied first; an unfinished native batch does not move the data fork.
     (multiple-value-bind (removed terminal)
         (physical-recovery-proven-drops
-         *physical-receive-store* (getf state :cluster-identity) :required-lsn fork
+         *physical-receive-store* (getf state :cluster-identity) :start-lsn fork :required-lsn fork
+         :checkpoint-seed snapshot :next-xid-seed next :fpw-seed (getf metadata :source-fpw-fact)
          :policy (if (= phase 3)
                      (physical-promotion-pending-timeline-policy state metadata *physical-receive-store*)
                      (getf state :timeline-policy)))

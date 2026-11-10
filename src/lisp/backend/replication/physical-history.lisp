@@ -174,27 +174,72 @@ Invalid or ambiguous catalog metadata fails closed instead of proving a drop."
 
 (declaim (ftype function physical-replay-check-selected-eor))
 
-(defun physical-recovery-proven-drops (store identity &key
-                                                        (start-lsn (physical-store-floor-lsn store)) required-lsn (policy (getf *physical-recovery-state* :timeline-policy)))
+(declaim (ftype function physical-replay-check-selected-eor physical-recovery-scan-seeds
+                physical-recovery-scan-stage physical-recovery-scan-checkpoint-fpw
+                physical-replay-check-child-initialization physical-replay-observed-next-xid
+                physical-replay-fpw-fact-next physical-recovery-resource-history
+                physical-recovery-check-store-point physical-fpw-check-fact physical-fpw-copy-fact))
+
+(defun physical-recovery-proven-drops (store identity
+                                       &key (start-lsn (physical-store-floor-lsn store))
+                                         required-lsn (policy (getf *physical-recovery-state* :timeline-policy))
+                                         (checkpoint-seed nil checkpoint-seed-p)
+                                         (next-xid-seed nil next-xid-seed-p) fpw-seed)
   "Certify drops and fork resets from complete terminals in validated durable WAL.
 An unfinished batch grants no exemption. REQUIRED-LSN must be a complete terminal.
 Return three values: the deletion set, last terminal, and the set of exact
 relation/fork pairs with committed resets. No database files are written."
-  (with-physical-replay-staging ()
-    (let ((*physical-history-reset-forks* (make-hash-table :test #'equal))
-          (removed (make-hash-table :test #'eql))
-          (terminal start-lsn)
-          (timeline (physical-store-prefix-timeline store start-lsn))
-          (required-found (eql required-lsn start-lsn)))
-      (physical-recovery-map-permitted-records
-       store (lambda (record raw)
+  (let ((state (or *physical-recovery-state*
+                   (list :timeline (physical-store-timeline store) :end (physical-store-base-lsn store)))))
+    (physical-recovery-check-store-point store start-lsn (physical-store-prefix-timeline store start-lsn))
+    (multiple-value-bind (checkpoint next stage-proven-p)
+        (physical-recovery-scan-seeds state start-lsn checkpoint-seed checkpoint-seed-p
+                                      next-xid-seed next-xid-seed-p)
+      (let* ((timeline (physical-store-prefix-timeline store start-lsn))
+             (*physical-receive-store* store)
+             (*physical-recovery-state*
+               (if stage-proven-p
+                   (physical-recovery-scan-stage store start-lsn state checkpoint next)
+                   (let ((private (copy-tree state)))
+                     (setf (getf private :source-checkpoint) nil
+                           (getf private :replay-timeline) timeline)
+                     private)))
+             (observed (or next 3))
+             (fpw-fact (physical-fpw-copy-fact fpw-seed)))
+        (when fpw-fact
+          (physical-fpw-check-fact fpw-fact (physical-recovery-resource-history store state) start-lsn timeline))
+        (setf fpw-fact (physical-recovery-scan-checkpoint-fpw checkpoint fpw-fact start-lsn timeline))
+        (when (and (< start-lsn (physical-store-flushed-lsn store))
+                   (not stage-proven-p) (/= timeline (getf state :timeline)))
+          (error "drop proof lacks its child checkpoint and observed XID seeds"))
+        (with-physical-replay-staging ()
+          (let ((*physical-history-reset-forks* (make-hash-table :test #'equal))
+                (removed (make-hash-table :test #'eql))
+                (terminal start-lsn)
+                (required-found (eql required-lsn start-lsn)))
+            (physical-recovery-map-permitted-records
+             store
+             (lambda (record raw)
                (if (= (wal-record-type record) +wal-record-end-of-recovery+)
-                   (setf timeline (physical-replay-check-selected-eor store record raw terminal timeline))
-                   (physical-history-accept-record record identity removed))
+                   (progn
+                     (unless (and stage-proven-p next)
+                       (error "drop proof cannot cross EOR without proven starting stage and XID"))
+                     (setf timeline (physical-replay-check-selected-eor store record raw terminal timeline)
+                           (getf *physical-recovery-state* :replay-timeline) timeline))
+                   (progn
+                     (physical-replay-check-child-initialization record observed fpw-fact)
+                     (setf observed (physical-replay-observed-next-xid record observed))
+                     (physical-history-accept-record record identity removed)))
                (unless *wal-recovery-group-active*
+                 (setf fpw-fact (physical-replay-fpw-fact-next
+                                 fpw-fact record timeline
+                                 (lambda () (physical-recovery-resource-history store state))))
+                 (when (= (wal-record-type record) +wal-record-checkpoint+)
+                   (setf (getf *physical-recovery-state* :source-checkpoint)
+                         (wal-checkpoint-record-snapshot record)))
                  (setf terminal (wal-record-end record))
                  (when (eql required-lsn terminal) (setf required-found t))))
-       :start-lsn start-lsn :policy policy)
-      (when (and required-lsn (not required-found))
-        (error "durable WAL lost a previously applied terminal"))
-      (values removed terminal *physical-history-reset-forks*))))
+             :start-lsn start-lsn :policy policy)
+            (when (and required-lsn (not required-found))
+              (error "durable WAL lost a previously applied terminal"))
+            (values removed terminal *physical-history-reset-forks*)))))))

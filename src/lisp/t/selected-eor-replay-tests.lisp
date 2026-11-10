@@ -122,7 +122,11 @@
                          pg::*physical-recovery-state* store metadata :current)))
             (setf (getf pg::*physical-recovery-state* :timeline-policy) policy)
             (multiple-value-bind (removed terminal)
-                (pg::physical-recovery-proven-drops store "history-source" :start-lsn 96 :required-lsn 96 :policy nil)
+                (pg::physical-recovery-proven-drops
+                 store "history-source" :start-lsn 96 :required-lsn 96 :policy nil
+                 :checkpoint-seed (getf metadata :source-checkpoint)
+                 :next-xid-seed (getf metadata :next-xid)
+                 :fpw-seed (getf metadata :source-fpw-fact))
               (ok (gethash 900 removed))
               (ok (= (+ next 32 (length drop)) terminal)))
             (multiple-value-bind (removed terminal)

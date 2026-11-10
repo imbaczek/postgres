@@ -44,7 +44,9 @@ An unsafe complete batch defers promotion; an unfinished tail does not."
   (multiple-value-bind (removed terminal)
       (physical-recovery-proven-drops
        *physical-receive-store* (getf *physical-recovery-state* :cluster-identity)
-       :required-lsn *last-replay-lsn*
+       :start-lsn *last-replay-lsn* :required-lsn *last-replay-lsn*
+       :checkpoint-seed (getf *physical-recovery-state* :source-checkpoint)
+       :next-xid-seed *next-xid* :fpw-seed (getf *physical-recovery-state* :source-fpw-fact)
        :policy (getf *physical-recovery-state* :timeline-policy))
     (declare (ignore removed))
     (= terminal *last-replay-lsn*)))
@@ -96,12 +98,13 @@ after release."
   "Scan the durable suffix without applying it to check child initialization.
 Validate allocation transitions too. Promotion waits for a complete child
 checkpoint before stopping workers and rechecks after their final flush."
-  (let* ((*physical-recovery-state* (copy-list *physical-recovery-state*))
+  (let* ((*physical-recovery-state* (copy-tree *physical-recovery-state*))
          (store *physical-receive-store*)
          (timeline (physical-recovery-replay-timeline))
          (terminal *last-replay-lsn*)
          (next *next-xid*)
          (reservation (copy-list (getf *physical-recovery-state* :source-reservation)))
+         (fpw-fact (physical-fpw-copy-fact (getf *physical-recovery-state* :source-fpw-fact)))
          (removed (make-hash-table :test #'eql)))
     (with-physical-replay-staging ()
       (physical-recovery-map-permitted-records
@@ -111,7 +114,7 @@ checkpoint before stopping workers and rechecks after their final flush."
              (setf timeline (physical-replay-check-selected-eor store record raw terminal timeline)
                    (getf *physical-recovery-state* :replay-timeline) timeline)
              (progn
-               (physical-replay-check-child-initialization record next)
+               (physical-replay-check-child-initialization record next fpw-fact)
                (setf next (physical-replay-observed-next-xid record next))
                (physical-history-accept-record
                 record (getf *physical-recovery-state* :cluster-identity) removed)
@@ -120,7 +123,10 @@ checkpoint before stopping workers and rechecks after their final flush."
                        (wal-checkpoint-record-snapshot record)))))
          (setf reservation (physical-source-reservation-next reservation record next))
          (unless *wal-recovery-group-active*
-           (setf terminal (wal-record-end record))))
+           (setf fpw-fact (physical-replay-fpw-fact-next
+                           fpw-fact record timeline
+                           (lambda () (physical-recovery-resource-history store *physical-recovery-state*)))
+                 terminal (wal-record-end record))))
        :start-lsn *last-replay-lsn*))
     (/= timeline (getf (getf *physical-recovery-state* :source-checkpoint)
                        :timeline (getf *physical-recovery-state* :timeline)))))

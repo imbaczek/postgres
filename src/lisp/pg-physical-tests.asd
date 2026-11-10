@@ -158,6 +158,8 @@
                (:file "t/physical-slot-api-tests")
                (:file "t/selected-eor-replay-tests")
                (:file "t/scan-stage-tests")
+               (:file "t/readiness-fpw-tests")
+               (:file "t/drop-fpw-tests")
                (:file "t/source-xids-replay-tests")
                (:file "t/source-xids-snapshot-tests")
                (:file "t/statement-snapshot-scope-tests")
