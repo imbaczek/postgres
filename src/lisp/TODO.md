@@ -1536,6 +1536,12 @@
   process could not load a reused Rove FASL referencing `QUICKLISP-CLIENT`.
   Exercise separate source directories with identical filenames and two fresh
   images sharing a cache, including images with and without Quicklisp loaded.
+  A new two-image audit reproduced that failure with the current Rove dependency.
+  Its `core/suite.lisp` and `reporter.lisp` select direct `ql:quickload` calls with
+  `#+quicklisp`, leaving package references in the resulting FASLs. Production
+  loading passed in both images, while the plain consumer failed during test
+  loading. Keep cache reuse within one read-time feature context while the wider
+  audit remains open.
 
 - [ ] Audit destructive sequence operations on quoted or shared lists, including
   `SORT`, `NREVERSE`, `NCONC` and the final argument to `APPEND`. Installation
