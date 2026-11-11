@@ -293,6 +293,7 @@ failure_setup=$(control <<EOF
 (defvar *index-publication-failure-phase* :before)
 (defvar *index-publication-failure-relfilenode* nil)
 (defvar *index-publication-failure-fired* nil)
+(defvar *index-publication-failure-backend* nil)
 (setf *index-publication-failure-original-save* (symbol-function 'save-catalog)
       *index-publication-failure-fired* nil)
 (setf (symbol-function 'save-catalog)
@@ -315,6 +316,7 @@ failure_setup=$(control <<EOF
                   (error "injected pre-durable catalog save failure"))
                 (prog1 (apply *index-publication-failure-original-save* args)
                   (when (eq *index-publication-failure-phase* :after)
+                      (setf *index-publication-failure-backend* *backend*)
                     (error "injected post-durable catalog save failure"))))
               (apply *index-publication-failure-original-save* args)))))
 (quit)
@@ -361,11 +363,18 @@ if run -c "create index durable_failure_idx on build_failure_b (category)" \
         > "$TMP/durable-failure.out" 2>&1; then
     fail "injected post-durable failure did not abort CREATE INDEX"
 fi
-grep -q 'injected post-durable catalog save failure' "$TMP/durable-failure.out" \
-    || fail "CREATE INDEX did not report the post-durable failure"
+# Failed completion after the final durable catalog boundary suppresses output.
+# The hook and retained backend below distinguish this from an unrelated EOF.
+grep -q 'server closed the connection unexpectedly' "$TMP/durable-failure.out" \
+    || fail "post-durable CREATE INDEX failure did not close its connection"
 failure_output=$(control <<'EOF'
 (let ((db (gethash "postgres" (catalog-databases *catalog*))))
   (if (and *index-publication-failure-fired*
+           *index-publication-failure-backend*
+           (eq :abnormal-ddl-completion
+               (backend-frontend-output-suppressed-reason
+                *index-publication-failure-backend*))
+           (eq :idle (backend-state *index-publication-failure-backend*))
            (gethash "durable_failure_idx" (database-indexes db)))
       :DURABLE-PUBLICATION-REMAINS
       :DURABLE-PUBLICATION-MISSING))
