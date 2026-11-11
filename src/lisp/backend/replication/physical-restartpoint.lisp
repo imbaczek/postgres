@@ -182,11 +182,11 @@ Prove the separately saved required fact at its own recovery boundary before use
   (values))
 
 (defun physical-restartpoint-fpw-seed (metadata state store start)
-  "Recover a copied source FPW fact at START from a generation, checkpoint or WAL.
-A verified checkpoint with unknown policy can start a scan that learns a later
-marker; required evidence must still be proved.
-Check its origin and coverage against history and the required recovery boundary.
-A historical source checkpoint can record OFF regardless of local writer policy."
+  "Recover a copied source FPW fact at START and check required coverage.
+When metadata lacks a fact, scan from the retained base if available; otherwise
+scan from a retained checkpoint. A scan returning NIL leaves the fact unknown;
+it does not trigger another fallback. A checkpoint at START may supply a fact.
+Source checkpoint policy is distinct from local writer policy."
   (let* ((checkpoint (if metadata (getf metadata :source-checkpoint) (getf state :source-checkpoint)))
          (timeline (if metadata (getf metadata :replay-timeline (getf metadata :timeline))
                        (getf state :timeline)))
@@ -238,10 +238,11 @@ An absent field is unknown; a present NIL is invalid, while a fact may be OFF."
   (values))
 
 (defun physical-restartpoint-logical-seed (metadata state store start)
-  "Reconstruct a copied logical fact at START from generation, checkpoint or WAL.
-An unknown checkpoint can seed a retained scan that learns a later status.
-Reconcile required evidence; if known base coverage was lost to compaction and
-cannot be reconstructed, require a fresh base backup."
+  "Recover a copied source logical fact at START and check required coverage.
+When metadata lacks a fact, scan from the retained base if available; otherwise
+scan from a retained checkpoint. A scan returning NIL leaves the fact unknown;
+it does not trigger another fallback. A checkpoint at START may supply a fact.
+If known base coverage cannot be reconstructed, require a fresh base backup."
   (let* ((checkpoint (if metadata (getf metadata :source-checkpoint) (getf state :source-checkpoint)))
          (timeline (if metadata (getf metadata :replay-timeline (getf metadata :timeline))
                        (getf state :timeline)))

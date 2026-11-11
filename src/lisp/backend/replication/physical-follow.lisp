@@ -335,7 +335,7 @@ Use PHYSICAL-STORE-CONTROL-TUPLE's field order; no durable file is read here."
   tuple)
 
 (defun physical-follow-recovery-witness (witness control)
-  "Copy the recovery witness and its optional durable resource fact."
+  "Copy the recovery witness and its durable resource, FPW and logical facts."
   (let ((copy (copy-tree witness)) (fact (getf control :resource-fact))
                                    (fpw (physical-fpw-copy-fact (getf control :fpw-fact))))
     (when fact
@@ -352,7 +352,7 @@ Use PHYSICAL-STORE-CONTROL-TUPLE's field order; no durable file is read here."
   "Check the named phase-2 recovery witness against the saved tuple and applied pair.
 Identity, checkpoint, observed XID, old history reference and restartpoint token
 still require comparison with durable recovery state.
-The optional resource fact is part of the durable recovery witness."
+Optional resource, FPW and logical facts are part of the durable recovery witness."
   (physical-follow-check-plist
    witness (append '(:phase :cluster-identity :checkpoint :observed-next-xid
                      :history-target :history-digest :restartpoint)
@@ -484,7 +484,7 @@ A version 3 or later generation supplies the seed; an older generation falls
 back to BASE and requires the full prefix. Check its timeline, history and
 prefix digest against STORE, and require the seed not to pass APPLIED. The
 caller supplies a verified BASE and protects PGDATA and the retained root.
-Return seven values, including the optional fact at the chosen seed."
+Return nine values, including optional resource, FPW and logical facts."
   (multiple-value-bind (metadata catalog prefix digest) (physical-restartpoint-read base)
     (declare (ignore catalog prefix))
     (unless (equal restartpoint
@@ -532,12 +532,11 @@ Return seven values, including the optional fact at the chosen seed."
     (candidate verified-base applied required observed seed map-records allow-open-tail &optional witness)
   "Scan a stable candidate without redo or publication. SEED supplies the replay
 position, timeline, XID, checkpoint, reservation, source XIDs and optional
-resource and FPW facts. APPLIED and REQUIRED are clean recovery boundaries.
-If REQUIRED precedes SEED, the seed's validated visibility and resource proof
-supply that earlier requirement. After checking FPW coverage, retain the saved
-required FPW minimum at its own boundary rather than backdating the seed fact.
-A historical WITNESS has LSN, timeline and next XID, optionally followed by
-resource and FPW facts. Return the disposition and facts at the boundaries.
+resource, FPW and logical facts. APPLIED and REQUIRED are clean boundaries.
+If REQUIRED precedes SEED, check visibility and required FPW and logical
+coverage, retaining saved minimum facts at their own boundary. A historical
+WITNESS has LSN, timeline and next XID, optionally followed by resource, FPW
+and logical facts. Return the disposition and copied facts at both boundaries.
 A policy fence must leave a clean batch boundary; an allowed open tail may remain."
   (destructuring-bind (start timeline next snapshot reservation source-xids &optional resource-fact fpw-fact logical-fact) seed
     (let* ((*physical-recovery-state* (copy-tree verified-base))
@@ -680,7 +679,7 @@ A policy fence must leave a clean batch boundary; an allowed open tail may remai
   t)
 
 (defun physical-follow-check-policy-publication (result binding)
-  "Require a saved witness when the required boundary has reconstructed FPW evidence."
+  "Require saved witnesses for reconstructed required FPW and logical evidence."
   (when (and (getf result :required-fpw-fact)
              (null (getf (getf binding :recovery) :fpw-fact)))
     (error "pending follow binding lacks reconstructed FPW evidence; prepare a new binding"))
@@ -729,7 +728,7 @@ The saved required fact is checked at the witnessed recovery boundary."
   "Match durable recovery provenance, required pair and XID to the witness.
 Return whether the history reference is the saved old or proposed post state;
 reject any other state.
-Pending control must also match the witnessed resource fact exactly."
+Pending control must also match the witnessed resource, FPW and logical facts exactly."
   (let* ((witness (getf binding :recovery))
          (required (getf binding :required))
          (before (getf binding :before))
