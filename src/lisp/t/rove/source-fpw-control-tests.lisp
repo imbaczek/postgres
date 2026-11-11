@@ -18,7 +18,7 @@
                                                      42 0 0 0 0 0 0 0 4 0 0 0 0 0 0 0
                                                      32 0 0 0 0 0 0 0 80 0 0 0 0 0 0 0
                                                      3 0 0 0 0 0 0 0 5 0 0 0 0 0 0 0
-                                                     0 0 0 0 59 253 186 22))))
+                                                     0 0 0 0 228 188 220 43))))
       (rove:ok (equalp legacy (unit-source-fpw-control nil)))
       (rove:ok (null (get-properties (physical-recovery-decode-control legacy) '(:fpw-fact)))))
   (dolist (pending '(nil t))
