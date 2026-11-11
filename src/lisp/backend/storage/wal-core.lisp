@@ -136,10 +136,10 @@ This policy is a choice, distinct from a WAL receipt's historical facts."
 Owners are process-local; the appropriate codec stores durable slot fields."
   name database-oid restart-lsn consistent-lsn confirmed-flush-lsn active-owner
   active-owner-backend
-  ;; Process-local only: DROP-CLAIM retains the directory identity across retries.
-  ;; CREATION-FAILED-P fences a possibly published slot until startup validates it.
-  ;; Neither field is encoded in durable slot state.
-  (drop-claim nil) (creation-failed-p nil)
+  ;; These process-local fields retain uncertain publication and retirement state.
+  (drop-claim nil) (creation-failed-p nil) (state-uncertain-p nil)
+  (logical-provenance nil :read-only t)
+  confirmed-timeline invalidation-cause
   ;; PGSLOT1-3 were the private protocol even though the old wire name was pgoutput.
   (plugin "pg_lisp")
   (kind :logical) system-id restart-timeline (temporary-p nil) temporary-owner
@@ -3203,12 +3203,19 @@ and supplies POLICY and KEEP-MB from the same captured configuration."
 
 (declaim (ftype function physical-slot-encode physical-slot-decode physical-slot-image-p))
 
+(declaim (ftype function logical-slot-state-valid-p logical-slot-state-required-p
+                logical-slot-state-encode logical-slot-state-image-p logical-slot-state-decode))
+
 (defun wal-encode-replication-slot (slot)
   "Encode using the slot's explicit kind; reject unknown kinds."
   (when (eq :physical (wal-replication-slot-kind slot))
     (return-from wal-encode-replication-slot (physical-slot-encode slot)))
   (unless (wal-logical-slot-p slot)
     (error "unknown WAL replication slot kind ~s" (wal-replication-slot-kind slot)))
+  (unless (logical-slot-state-valid-p slot)
+    (error "invalid logical slot state"))
+  (when (logical-slot-state-required-p slot)
+    (return-from wal-encode-replication-slot (logical-slot-state-encode slot)))
   (let* ((name (wal-replication-slot-name slot))
          (database-oid (wal-replication-slot-database-oid slot))
          (restart-lsn (wal-replication-slot-restart-lsn slot))
@@ -3217,21 +3224,6 @@ and supplies POLICY and KEEP-MB from the same captured configuration."
          (wal-status (wal-replication-slot-wal-status slot))
          (plugin (wal-replication-slot-plugin slot))
          (profile (wal-slot-profile slot)))
-    (unless (and (wal-valid-replication-slot-name-p name)
-                 (wal-valid-slot-plugin-state-p plugin database-oid confirmed-flush-lsn)
-                 (or (null database-oid)
-                     (and (integerp database-oid) (<= 1 database-oid #xffffffff)))
-                 (integerp restart-lsn) (<= 0 restart-lsn #xffffffffffffffff)
-                 (integerp consistent-lsn) (<= 0 consistent-lsn #xffffffffffffffff)
-                 (or (null confirmed-flush-lsn)
-                     (and (integerp confirmed-flush-lsn)
-                          (<= consistent-lsn confirmed-flush-lsn #xffffffffffffffff)
-                          (<= restart-lsn confirmed-flush-lsn)))
-                 (or confirmed-flush-lsn (<= restart-lsn consistent-lsn))
-                 (member wal-status '(:reserved :lost))
-                 (member profile '(:text :binary-bytea))
-                 (or (eq profile :text) (and database-oid (string= plugin "pg_lisp"))))
-      (error "invalid WAL replication slot state ~s" slot))
     (let* ((prefix (format nil "~a ~a ~a ~a ~a ~a ~a ~a~a"
                            (if (eq profile :text) "PGSLOT4" "PGSLOT5")
                            name (or database-oid "-") restart-lsn consistent-lsn
@@ -3302,6 +3294,8 @@ must separately validate system, history, lifetime, replay and storage context."
   (when (physical-slot-image-p bytes)
     (return-from wal-decode-replication-slot-image
       (physical-slot-decode bytes expected-name)))
+  (when (logical-slot-state-image-p bytes)
+    (return-from wal-decode-replication-slot-image (logical-slot-state-decode bytes expected-name)))
   (with-input-from-string (stream (bytes->string bytes))
     (let* ((line (read-line stream nil nil))
            (fields (and line (wal-split-fields line)))

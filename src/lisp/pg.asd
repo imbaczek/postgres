@@ -143,6 +143,7 @@
                    (:file "../libpq/auth-policy")
                    (:file "../utils/session-config")
                    (:file "../access/transam/timeline")
+                   (:file "../replication/logical-slot-state")
                    (:file "../replication/physical-fpw")
                    (:file "../replication/physical-logical-status")
                    (:file "../replication/physical-bootstrap")
