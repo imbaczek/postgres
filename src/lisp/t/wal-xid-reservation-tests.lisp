@@ -646,10 +646,13 @@
          (pg::wal-checkpoint-core)
          (let* ((snapshot (copy-tree pg::*wal-checkpoint-snapshot*))
                 (fields (multiple-value-list (pg::wal-read-control-fields)))
-                (record (pg::wal-read-checkpoint-record 128 296)))
+                (record (pg::wal-read-checkpoint-record 128 304)))
            (ok (= 128 (getf snapshot :start)))
-           (ok (= 296 (getf snapshot :end) pg::*wal-durable-lsn*))
-           (ok (= 136 (length (pg::wal-record-payload record))))
+           (ok (= 304 (getf snapshot :end) pg::*wal-durable-lsn*))
+           ;; Resource payload includes the disabled commit-timestamp XID pair.
+           (ok (= 0 (getf snapshot :oldest-commit-ts-xid)
+                  (getf snapshot :newest-commit-ts-xid)))
+           (ok (= 144 (length (pg::wal-record-payload record))))
            (ok (equal snapshot (pg::wal-checkpoint-record-snapshot record)))
            (ok (equal snapshot (third fields)))
            (ok (= 96 (getf snapshot :resource-lsn)))
@@ -663,7 +666,7 @@
                   (pg::physical-recovery-check-checkpoint-resources snapshot pg::*wal-control-metadata*))))
            (pg::wal-checkpoint-core)
            (ok (equal '(50 4 5 0 64) (getf pg::*wal-checkpoint-snapshot* :resource-parameters)))
-           (ok (= 392 (getf pg::*wal-checkpoint-snapshot* :resource-lsn))))))))
+           (ok (= 400 (getf pg::*wal-checkpoint-snapshot* :resource-lsn))))))))
 
 (deftest resource-checkpoint-placement-plans-the-extension-before-rotation
     (let* ((cursor (- pg::+wal-segment-size+ 160))

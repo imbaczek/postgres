@@ -81,7 +81,8 @@
                                               (pg::*live-operation-drain-open* nil))
     (call-with-wal-allocation-fixture
      (lambda ()
-       (pg::assign-xid)
+       ;; Reserve real WAL bytes without retaining a transaction across restart.
+       (pg::release-xid (pg::assign-xid))
        (funcall function)))))
 
 (defun migrate-test-wal-namespace ()
