@@ -975,6 +975,11 @@ Without an owner, the caller remains responsible for releasing the active XID."
     (xid-assign-with-wal-reservation oldest owner)))
 
 (defun relation-lock-owner-xid (xid &optional (backend *backend*))
+  "Use BACKEND's virtual reader identity for its relation locks when present.
+NIL denotes the current owner for DDL when BACKEND has a virtual ID; otherwise
+it passes through.  Only the backend's own IDs are matched, and foreign IDs pass
+through.  The virtual owner stays stable after real XID assignment and is not
+used for MVCC or capture maps."
   (if (and backend (backend-virtual-reader-xid backend)
            (or (null xid) (eql xid (backend-xid backend))
                (eql xid (backend-virtual-reader-xid backend))))
@@ -1013,7 +1018,8 @@ Without an owner, the caller remains responsible for releasing the active XID."
 
 (defun register-relation-accesses (write-relfilenodes read-relfilenodes xid)
   "Admit a mutation and all subquery reads atomically, with writes taking precedence.
-Reserve the complete set before waiting; transaction cleanup owns granted access."
+Reserve the complete set before waiting; transaction cleanup owns granted access.
+Mutation capture uses the real XID; gates and quotas use the canonical owner."
   (when (and write-relfilenodes *backend* (eql xid (backend-xid *backend*)))
     (logical-note-xid-mutation-needs-capture-p xid))
   (let* ((relation-xid (relation-lock-owner-xid xid))
@@ -1427,6 +1433,12 @@ Pass BACKEND when releasing its virtual reader ID."
   (values))
 
 (defun logical-activation-relation-wait-p (old-xids &optional (backend *backend*))
+  "Detect a possible activation wait cycle before publishing logical-info ON.
+Return true if an old uncaptured XID is still active and BACKEND owns a reader
+or writer registration, build gate, or maintenance gate.  The caller rejects
+this case with 55000, even if the old transaction is unrelated; an empty
+virtual reader may proceed.  This is not a deadlock detector: C SnapBuildWaitSnapshot
+uses XactLockTableWait and the deadlock-aware lock manager."
   (let ((real (and backend (backend-xid backend)))
         (virtual (and backend (backend-virtual-reader-xid backend))))
     (labels ((owned-p (actor)
@@ -1460,7 +1472,7 @@ reconsider deferred disable after release, without holding the XID lock."
       (unwind-protect
            (progn
              (sb-thread:with-mutex (*xid-lock*)
-               ;; Reads allocate XIDs here. A clean XID has no prefix to lose.
+               ;; Ordinary reads use virtual IDs. A clean real XID has no prefix to lose.
                (when (and *backend* (backend-xid *backend*))
                  (let* ((xid (backend-xid *backend*))
                         (mode (gethash xid *logical-capture-xid-modes*)))
@@ -1908,6 +1920,11 @@ between snapshot capture and this durable publication."
    :activation (make-wal-logical-info-activation :slot-name slot-name)))
 
 (defun create-sql-logical-replication-slot (name plugin temporary twophase failover)
+  "Create a confirmed SQL logical slot at a real capture boundary on a primary.
+Only pgoutput and false TEMPORARY, TWOPHASE, and FAILOVER are supported.
+The SQL caller handles strict NULLs.  A real transaction XID is rejected with
+25001; a read transaction without one may proceed.  Arm capture outside the
+slot lifecycle mutex, then use the private confirmed-slot core under that mutex."
   (unless (and *backend* (not (eq (backend-replication-mode *backend*) :physical)))
     (ereport "55000" "logical decoding requires a database connection"))
   (prevent-recovery-primary-operation "SQL logical slot creation")
@@ -2277,6 +2294,9 @@ transaction until cleanup and is not a durable XID."
         xid))))
 
 (defun get-current-reader-xid ()
+  "Return an assigned real XID or a negative virtual reader ID on primary or recovery.
+This does not force durable XID allocation.  Relation registration retains an
+existing virtual owner after a write assigns a real XID."
   (or (backend-xid *backend*)
       (ensure-recovery-reader-identity *backend*)))
 
@@ -2428,8 +2448,9 @@ Portal initialization can retain the current command ID by disabling advance."
   "Release transaction resources and return B to idle.
 Detach the WAL obligation without modifying it, so a lexical owner can retain it.
 
-Mask interrupts until cleanup and the idle transition finish, so no interrupt
-can discard the owner of a virtual ID or its remaining relation locks."
+The transaction completion path releases any real XID before this final virtual
+reader release.  Mask interrupts until cleanup and the idle transition finish,
+so no interrupt can discard the owner of a virtual ID or its relation locks."
   (sb-sys:without-interrupts
     (clear-backend-command-id-used b)
     (when (backend-logical-spool b)

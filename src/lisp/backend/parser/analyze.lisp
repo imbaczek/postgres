@@ -895,6 +895,7 @@ then argument types. Only ambiguity and type failures carry the cast hint."
      :signature (random-call-signature analyzed (nreverse argument-names)))))
 
 (defun replication-slot-function-signature (name)
+  "Return the supported SQL replication slot parameters, types, and defaults."
   (cond
     ((string= name "pg_create_physical_replication_slot")
      '(("slot_name" :name :required) ("immediately_reserve" :bool nil) ("temporary" :bool nil)))
@@ -921,7 +922,7 @@ then argument types. Only ambiguity and type failures carry the cast hint."
     (values analyzed names)))
 
 (defun analyze-replication-slot-arguments (name arguments table variadic)
-  "Bind supported physical slot arguments and defaults to the catalog signature."
+  "Bind supported replication slot arguments and defaults to the catalog signature."
   (multiple-value-bind (analyzed names) (analyze-catalog-call-inputs arguments table)
     (let* ((signature (replication-slot-function-signature name))
            (assigned (make-array (length signature) :initial-element nil))
@@ -951,6 +952,7 @@ then argument types. Only ambiguity and type failures carry the cast hint."
       (coerce slots 'list))))
 
 (defun analyze-replication-slot-function (name arguments)
+  "Build the typed expression and result descriptor for a replication slot call."
   (if (string= name "pg_drop_replication_slot")
       (list :func name arguments :type :void :typmod -1)
       (list :func name arguments :type :record :typmod -1
@@ -959,6 +961,7 @@ then argument types. Only ambiguity and type failures carry the cast hint."
                                              +physical-slot-create-result-fields+ +physical-slot-advance-result-fields+))))
 
 (defun eval-replication-slot-function (name arguments)
+  "Evaluate a replication slot call, applying strict NULL semantics first."
   (if (some (lambda (argument) (eq argument +null+)) arguments)
       +null+
       (cond
