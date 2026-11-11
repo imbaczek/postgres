@@ -208,7 +208,7 @@
   (let ((dir (merge-pathnames
               (format nil "pg-unit-~a-~a-~a/"
                       (sb-posix:getpid) (get-universal-time) (random 1000000))
-              #p"/tmp/opencode/")))
+              (uiop:temporary-directory))))
     (ensure-directories-exist dir)
     (let ((*pgdata* dir)
           (*backend* (make-backend))
