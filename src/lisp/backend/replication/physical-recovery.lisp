@@ -35,8 +35,9 @@ timeline, checkpoint, manifest digest and applied end. This checks fields, not
 the referenced archive. FPW and logical fact shapes and their exact applied
 boundaries are checked here; selected-history geometry, source identity and the
 verified WAL prefix require separate proof.
-A present promotion policy is allowed only in pending control. NIL means OFF;
-an absent key leaves the legacy byte plan in use."
+Promotion FPW and logical intents are allowed only in pending control. A present
+NIL means OFF; an absent key preserves the old image. Logical intent is distinct
+from the source logical fact."
   (destructuring-bind (&key phase system-id timeline manifest-digest checkpoint
                          applied next-xid db-state state-time (control-version 3)
                          (applied-timeline timeline) history-target history-digest
@@ -123,13 +124,13 @@ an absent key leaves the legacy byte plan in use."
                                           (promotion-full-page-writes nil promotion-fpw-intent-p)
                                           (promotion-logical-decoding-enabled nil promotion-logical-intent-p))
   "Encode recovery progress and optional extensions under one CRC.
-Ordinary and pending images may append a 48-byte resource fact and a 72-byte source
-FPW fact. Pending images may then append a 17-byte PGFPWPI1 promotion intent.
-The intent records the desired policy independently of the source fact. A supplied
-NIL means OFF; an absent argument leaves the legacy byte plan unchanged. An
-optional 88-byte logical fact follows the intent. Phase bit 30 signals its presence;
-bit 31 retains its next-XID exhaustion meaning. All extensions precede and are
-covered by the outer CRC."
+Ordinary and pending images may append resource and source FPW facts. Pending
+images may then append a 17-byte FPW intent and an 18-byte logical intent, in
+that order. An optional 88-byte source logical fact follows; phase bit 30 marks
+its presence and bit 31 marks next-XID exhaustion. The intents record policies
+independently of source facts: a supplied NIL means OFF, while an absent argument
+preserves the old image. All extensions precede the single outer CRC; these
+extensions do not change the format version."
   (let* ((pending (= phase 3)) (version (if pending 4 3))
                                (extension-start (if pending 84 68))
                                (selected (not (null history-target)))
@@ -192,12 +193,12 @@ covered by the outer CRC."
 
 (defun physical-recovery-decode-control (bytes)
   "Decode an exact native control layout and verify its CRC before accepting facts.
-The optional source FPW fact, pending-only promotion intent and 88-byte logical
-fact precede the CRC. Bit 30 marks logical fact presence; bit 31 still marks
-next-XID exhaustion. The maximum image is 373 bytes.
-Length modulo four distinguishes an intent from earlier layouts; the decoder also
-checks its magic, value and reserved bytes. An absent intent preserves the legacy
-byte plan, while a present NIL policy means OFF."
+The optional source FPW fact, pending-only FPW and logical intents, and source
+logical fact precede the single CRC in that order. Bit 30 marks the logical fact;
+bit 31 marks next-XID exhaustion. The maximum image is 391 bytes. After stripping
+the logical fact, length modulo four identifies no intent, FPW, logical or both.
+The decoder checks intent magic, value and reserved bytes. An absent intent
+preserves the old image; a present NIL means OFF independently of source facts."
   (multiple-value-bind (logical-size logical-p) (physical-logical-control-core-size bytes)
     (multiple-value-bind (size promotion-fpw-intent-p promotion-logical-intent-p)
         (physical-promotion-intents-core-size logical-size)

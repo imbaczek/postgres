@@ -10,6 +10,7 @@
 (defconstant +physical-promotion-logical-intent-size+ 18)
 
 (defun physical-logical-encode-promotion-intent (enabled)
+  "Encode logical decoding ON or OFF in the 18-byte PGLOGPI1 promotion intent."
   (unless (member enabled '(nil t)) (error "invalid promotion logical decoding policy"))
   (let ((bytes (make-array +physical-promotion-logical-intent-size+
                            :element-type '(unsigned-byte 8) :initial-element 0)))
@@ -18,6 +19,7 @@
     bytes))
 
 (defun physical-logical-decode-promotion-intent (bytes)
+  "Decode PGLOGPI1 after checking its length, magic, value and reserved bytes."
   (unless (and (typep bytes '(vector (unsigned-byte 8)))
                (= (length bytes) +physical-promotion-logical-intent-size+)
                (equalp (subseq bytes 0 8) #(80 71 76 79 71 80 73 49))
@@ -27,6 +29,11 @@
   (= 1 (aref bytes 8)))
 
 (defun physical-promotion-intents-core-size (size)
+  "Separate intent lengths from SIZE, keeping the final four CRC bytes.
+SIZE excludes any source logical fact. Its length modulo four identifies no
+intent, FPW, logical or both. Return the core size including CRC, followed by
+FPW and logical presence flags. The caller checks the layout, intent bytes and
+CRC."
   (let* ((residue (mod size 4))
          (fpw (logbitp 0 residue))
          (logical (logbitp 1 residue))
@@ -40,7 +47,7 @@
 
 (defun physical-logical-control-core-size (bytes)
   "Separate an optional 88-byte logical suffix, retaining the outer CRC size.
-Bit 30 signals presence; the bounded image is at most 373 bytes."
+Bit 30 signals presence; the bounded image is at most 391 bytes."
   (unless (and (typep bytes '(vector (unsigned-byte 8)))
                (<= 60 (length bytes) +physical-recovery-control-maximum-bytes+))
     (error "invalid physical recovery control length"))
