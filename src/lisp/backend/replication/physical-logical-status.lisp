@@ -1,3 +1,8 @@
+;;; Source logical status evidence and its recovery control encoding.
+;;; NIL means unknown; a fact with ENABLED NIL is known OFF. The wrapper retains
+;;; coverage and transition provenance outside the private WAL status state.
+;;; This is codec and fold groundwork; it does not publish runtime authority.
+
 (in-package #:pg)
 
 (defconstant +physical-logical-fact-size+ 88)
@@ -6,6 +11,8 @@
   (+ 196 +physical-fpw-fact-size+ +physical-promotion-fpw-intent-size+ +physical-logical-fact-size+))
 
 (defun physical-logical-control-core-size (bytes)
+  "Separate an optional 88-byte logical suffix, retaining the outer CRC size.
+Bit 30 signals presence; the bounded image is at most 373 bytes."
   (unless (and (typep bytes '(vector (unsigned-byte 8)))
                (<= 60 (length bytes) +physical-recovery-control-maximum-bytes+))
     (error "invalid physical recovery control length"))
@@ -27,6 +34,7 @@
            (<= lsn end) (<= timeline owner))))
 
 (defun physical-logical-fact-valid-p (fact)
+  "Check fact shape and ordering, not history geometry or prefix identity."
   (and (eql 26 (ignore-errors (list-length fact)))
        (equal (loop for (key value) on fact by #'cddr collect key)
               '(:enabled :witness-kind :witness-start :witness-end :witness-timeline
@@ -59,17 +67,20 @@
                             (getf fact (if enabled :last-enable-timeline :last-disable-timeline)))))))))
 
 (defun physical-logical-copy-fact (fact)
+  "Return a validated independent copy, preserving NIL as unknown."
   (when fact
     (unless (physical-logical-fact-valid-p fact) (error "invalid source logical fact"))
     (copy-list fact)))
 
 (defun physical-logical-state-from-fact (fact)
+  "Reconstruct private fold state; coverage and OFF provenance stay in FACT."
   (when fact
     (unless (physical-logical-fact-valid-p fact) (error "invalid source logical fact"))
     (physical-logical-state-fields fact)))
 
 (defun physical-logical-fact-from-state
     (state kind coverage-start coverage-timeline through through-timeline disable disable-timeline)
+  "Wrap private STATE with coverage and transition provenance in a new fact."
   (when state
     (let ((fact (list :enabled (wal-logical-status-enabled state)
                       :witness-kind kind :witness-start (wal-logical-status-start state)
@@ -84,6 +95,8 @@
       fact)))
 
 (defun physical-logical-fact-from-checkpoint (snapshot)
+  "Start coverage at a checkpoint witness, if it reports logical status.
+An ON checkpoint does not establish the last enabling record or earlier continuity."
   (let ((state (wal-logical-status-from-checkpoint snapshot)))
     (when state
       (physical-logical-fact-from-state
@@ -91,6 +104,8 @@
        (wal-logical-status-end state) (wal-logical-status-timeline state) nil nil))))
 
 (defun physical-logical-check-fact (fact history through through-timeline)
+  "Check the fact's boundary and witnesses against selected history; return a copy.
+The caller must separately prove source identity and the verified WAL prefix."
   (when fact
     (unless (and (physical-logical-fact-valid-p fact)
                  (eql through (getf fact :through))
@@ -111,6 +126,11 @@
     (copy-list fact)))
 
 (defun physical-logical-fact-next (prior record timeline history)
+  "Fold one complete terminal into a new source fact on selected history.
+The caller must supply every complete terminal in verified order. LSN gaps are
+allowed but do not prove that no status record was omitted. Coverage starts at
+the first observation, not at a proven earlier ON. Each ON refreshes the last
+enable end; retain the last OFF boundary across later records."
   (when prior
     (physical-logical-check-fact prior history (getf prior :through) (getf prior :through-timeline)))
   (physical-policy-check-terminal record timeline history (getf prior :through))
@@ -132,6 +152,7 @@
     (physical-logical-check-fact fact history (wal-record-end record) timeline)))
 
 (defun physical-logical-encode-fact (fact)
+  "Encode known source evidence as the 88-byte PGLOGFC1 suffix."
   (unless (physical-logical-fact-valid-p fact) (error "invalid source logical fact"))
   (let ((bytes (make-array +physical-logical-fact-size+ :element-type '(unsigned-byte 8)
                                                         :initial-element 0)))
@@ -152,6 +173,7 @@
     bytes))
 
 (defun physical-logical-decode-fact (bytes)
+  "Decode and shape-check the 88-byte suffix, including reserved fields."
   (unless (and (typep bytes '(vector (unsigned-byte 8)))
                (= (length bytes) +physical-logical-fact-size+)
                (equalp (subseq bytes 0 8) #(80 71 76 79 71 70 67 49)))
@@ -175,10 +197,12 @@
       fact)))
 
 (defun physical-logical-fact-at-p (fact through timeline)
+  "Check fact shape and the exact frontier and timeline."
   (and (physical-logical-fact-valid-p fact)
        (eql through (getf fact :through)) (eql timeline (getf fact :through-timeline))))
 
 (defun physical-logical-restrict-fact (fact minimum)
+  "Copy FACT at MINIMUM's coverage floor, dropping older transition boundaries."
   (let ((copy (copy-list fact)) (floor (getf minimum :coverage-start)))
     (setf (getf copy :coverage-start) floor
           (getf copy :coverage-timeline) (getf minimum :coverage-timeline))
@@ -189,6 +213,7 @@
     copy))
 
 (defun physical-logical-check-extension (fact minimum required)
+  "Reject new witnesses or transitions invented inside the required prefix."
   (unless (or (every (lambda (key) (eql (getf fact key) (getf minimum key)))
                      '(:enabled :witness-kind :witness-start :witness-end :witness-timeline))
               (>= (getf fact :witness-start) required))
@@ -207,6 +232,9 @@
   (values))
 
 (defun physical-logical-required-fact (source minimum applied timeline required required-timeline)
+  "Reconcile source evidence with a required frontier and return a copy.
+These numeric checks require separate selected-history, source identity and
+verified-prefix proofs from the caller."
   (unless (and (typep applied '(unsigned-byte 64)) (typep timeline '(integer 1 4294967295))
                (or (null source) (physical-logical-fact-at-p source applied timeline))
                (or (null required)

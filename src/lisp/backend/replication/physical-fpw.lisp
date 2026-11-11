@@ -97,6 +97,7 @@ must prove coverage through the supplied pair; export checks shape only."
       fact)))
 
 (defun physical-policy-check-record-owner (start end timeline history)
+  "Check that a record belongs to one selected timeline and WAL segment."
   (unless (and (typep start '(unsigned-byte 64)) (typep end '(unsigned-byte 64))
                (< start end) (= timeline (timeline-at-point start history))
                (= timeline (timeline-at-point (1- end) history))
@@ -105,6 +106,9 @@ must prove coverage through the supplied pair; export checks shape only."
   (values))
 
 (defun physical-policy-check-terminal (record timeline history prior-through)
+  "Preflight a complete terminal's geometry, ancestry and ordering.
+The caller must supply every terminal in verified order; an allowed LSN gap
+does not prove the absence of an omitted policy transition."
   (unless (and (wal-record-p record)
                (or (wal-terminal-record-type-p (wal-record-type record))
                    (= (wal-record-type record) +wal-record-end-of-recovery+)))

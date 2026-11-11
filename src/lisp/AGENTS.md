@@ -86,8 +86,8 @@ A **restart** is still required when:
   `enable-shutdown-handlers` / `enable-cleanup`;
 - you add or remove files in `pg.asd`.
 
-Caveats: a reload recompiles the whole system (about a second, not incremental),
-and a reload whose compilation fails partway can leave a mixed image — restart if
+Caveats: a reload recompiles the whole system; its duration varies with the build.
+A reload whose compilation fails partway can leave a mixed image — restart if
 the reload output reports an error. Reader evaluation (`#.`) is disabled at the
 control REPL prompt, but `eval` still runs parsed forms, so the REPL is arbitrary
 code execution; it stays off unless `--control-port` / `--control-socket` is
@@ -146,6 +146,11 @@ appropriate instead of replacing the native C peer or adding a message relay.
 
 ### Redefine deliberately, then verify from saved source
 
+- `(pg::reload)` can return `:queued` when its caller retains admission or
+  executable state. A control prompt returning does not prove completion. Wait
+  for the owned server's `reload complete` message, then check SQL and inspect
+  the relevant identities again. Reload compilation output uses the server's
+  streams, so rebinding output in the control request may leave its log empty.
 - A source edit is not a live redefinition. After a cl-mcp structural edit,
   `load-system` updates the worker; `(pg::reload)` or SIGHUP separately updates
   the dev server. Individual REPL definitions are useful experiments, but save
