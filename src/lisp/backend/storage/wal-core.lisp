@@ -134,7 +134,8 @@ This policy is a choice, distinct from a WAL receipt's historical facts."
 (defstruct wal-replication-slot
   "KIND distinguishes logical and physical slots, including unbound logical slots.
 Owners are process-local; the appropriate codec stores durable slot fields.
-Logical provenance and cause are codec foundations, not admission authority."
+Startup checks known logical provenance system IDs against the local cluster;
+other logical provenance and cause integration remains a codec foundation."
   name database-oid restart-lsn consistent-lsn confirmed-flush-lsn active-owner
   active-owner-backend
   ;; Process-local publication and retirement state. STATE-UNCERTAIN-P is

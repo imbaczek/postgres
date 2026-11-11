@@ -7,9 +7,11 @@
             (:constructor %make-logical-slot-provenance
                 (system-id generation birth-timeline on-start-lsn on-start-timeline)))
   "Immutable slot identity and optional logical ON interval evidence.
-The codec checks shape only. Creation stamping, startup identity admission,
-acknowledgment guards, cause publication, SQL projection and import are not
-wired by this foundation. Callers must prove identity, history and lifetime."
+Provenance validation checks shape. The image codec also checks framing, CRC
+and canonical bytes. Startup checks known system IDs against the durable
+catalog and available control metadata. Creation stamping, acknowledgment
+guards, cause publication, SQL projection and import remain unwired; callers
+must separately prove history and lifetime."
   (system-id nil :read-only t)
   (generation nil :read-only t)
   (birth-timeline nil :read-only t)
@@ -47,6 +49,11 @@ History and source identity require separate verification."
     provenance))
 
 (defun logical-slot-check-startup-identities (slots)
+  "Check known logical slot system IDs before publishing the startup registry.
+When any logical slot has known provenance, read the durable catalog identity
+once and compare it with each known ID and available control metadata. Zero is
+valid; slots with unknown provenance are unchanged. This does not initialize or
+repair the catalog, or prove history and lifetime."
   (let ((known (remove-if-not
                 (lambda (slot)
                   (and (wal-logical-slot-p slot)
