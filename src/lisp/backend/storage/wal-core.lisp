@@ -2964,6 +2964,10 @@ published separately after primary redo completes."
          (wal-recovery-reset-logical-change-batch)))))
 
 (defun wal-recovery-policy-incarnation (state incarnation record completed-p)
+  "Carry private FPW evidence across a completed CLOG reset's identity change.
+The caller supplies COMPLETED-P only after a validated terminal closes its batch.
+A completed type-5 reset must rotate storage; any other rotation is refused.
+Return the rebound evidence and current token, or the unchanged pair."
   (let ((current *wal-storage-incarnation*))
     (cond
       ((and completed-p (= (wal-record-type record) +wal-record-clog-reset+))
@@ -2977,9 +2981,10 @@ published separately after primary redo completes."
 (defun wal-recover ()
   "Redo durable complete batches before loading the catalog.
 Validate logical status privately before each new terminal's redo; it is not
-published as authoritative state. Build FPW evidence privately and install it
-after the full scan and CLOG sync succeed. The caller must exclude storage
-lifecycle changes throughout."
+published as authoritative state. Carry private FPW evidence to a new token
+only after a validated CLOG reset terminal closes its batch; reject other storage
+rotations. Install FPW after the full scan and CLOG sync succeed. The caller
+must exclude storage lifecycle changes throughout."
   (let* ((incarnation *wal-storage-incarnation*)
          (fpw-state (wal-fpw-state-from-checkpoint *wal-checkpoint-snapshot* incarnation))
          (logical-status (wal-logical-status-from-checkpoint *wal-checkpoint-snapshot*))

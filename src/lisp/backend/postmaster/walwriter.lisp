@@ -38,8 +38,10 @@ When both locks are needed, take WAL before the writer state lock."
             (:constructor %make-clog-reset-epoch-plan
                 (service generation thread epoch old-incarnation new-incarnation
                  timeline ownership replacement &optional fpw-predecessor fpw-replacement)))
-  "Preallocated reset identities and writer registration for one publication.
-The descriptors are immutable; CONSUMED-P prevents reuse."
+  "Preallocated reset identities, FPW evidence and writer registration.
+FPW-PREDECESSOR captures the exact prior state; FPW-REPLACEMENT transfers its
+evidence to the new incarnation. Descriptors are immutable; CONSUMED-P
+prevents reuse."
   (service nil :read-only t)
   (generation 0 :read-only t)
   (thread nil :read-only t)
@@ -95,9 +97,10 @@ The descriptors are immutable; CONSUMED-P prevents reuse."
   t)
 
 (defun prepare-primary-wal-writer-clog-reset-under-lock ()
-  "Prepare the reset identity and replacement epoch under WAL then state lock.
-A writer already stopping cannot be prepared; a later stop remains in effect.
-Do not require an empty temp domain here: reset WAL can retire dirty scratch."
+  "Preallocate the reset identity, FPW replacement and writer epoch before file effects.
+Hold WAL then state lock. A writer already stopping cannot be prepared; a later
+stop remains in effect. Reset WAL can retire dirty scratch, so the temp domain
+need not yet be empty."
   (assert (sb-thread:holding-mutex-p *wal-lock*))
   (wal-require-no-pending-storage)
   (when (wal-fpw-state-p *wal-fpw-state*) (wal-checked-fpw-state-under-lock))
@@ -128,8 +131,9 @@ Do not require an empty temp domain here: reset WAL can retire dirty scratch."
        fpw-predecessor fpw-replacement))))
 
 (defun validate-primary-wal-writer-clog-reset-plan-under-state-lock (plan)
-  "Check one unused plan and its captured writer and storage descriptors.
-An accepted plan permits a subsequent stop without clearing that request."
+  "Check an unused plan against its captured writer and storage descriptors.
+Require the exact FPW predecessor and a valid replacement preserving its
+evidence under the new token. A later stop request remains in effect."
   (assert (sb-thread:holding-mutex-p *wal-lock*))
   (assert (sb-thread:holding-mutex-p *primary-wal-writer-lock*))
   (unless (and (clog-reset-epoch-plan-p plan)
@@ -183,13 +187,16 @@ An accepted plan permits a subsequent stop without clearing that request."
   plan)
 
 (defun validate-primary-wal-writer-clog-reset-plan-under-lock (plan)
+  "Validate PLAN under WAL then writer state lock before reset file effects."
   (assert (sb-thread:holding-mutex-p *wal-lock*))
   (sb-thread:with-mutex (*primary-wal-writer-lock*)
     (validate-primary-wal-writer-clog-reset-plan-under-state-lock plan)))
 
 (defun publish-primary-wal-writer-clog-reset-under-lock (plan)
-  "Revalidate and publish the paired identities under WAL then state lock.
-Consume PLAN in the same critical section so it cannot be reused."
+  "Revalidate and publish storage identity, FPW and any prepared writer epoch.
+After durability, hold WAL then state lock, consume PLAN and publish with
+interrupts masked. Revalidation can fail after file effects; the enclosing reset
+fail-stops rather than rolling those effects back."
   (assert (sb-thread:holding-mutex-p *wal-lock*))
   (sb-thread:with-mutex (*primary-wal-writer-lock*)
     (validate-primary-wal-writer-clog-reset-plan-under-state-lock plan)

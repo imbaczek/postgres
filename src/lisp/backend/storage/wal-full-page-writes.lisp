@@ -9,8 +9,8 @@
             (:constructor %make-wal-fpw-state
                 (incarnation enabled witness-kind start end timeline coverage-start coverage-timeline last-disable-start last-disable-timeline)))
   "Immutable policy evidence owned by an incarnation token.
-Primary state uses the local WAL storage incarnation; a private fold uses a fresh
-owner token, never serialized. START, END and TIMELINE identify the latest
+Primary state and its recovery fold use the local WAL storage incarnation.
+A physical source fold uses a private owner token, never serialized. START, END and TIMELINE identify the latest
 checkpoint or change witness. COVERAGE-START and COVERAGE-TIMELINE give the
 coverage floor. The optional last disabling change records its START and timeline,
 not its end. A timeline number alone does not prove ancestry."
@@ -111,6 +111,9 @@ The caller's payload decoder validates the payload itself."
                                  +wal-segment-size+))))))))
 
 (defun wal-fpw-rebinding-valid-p (prior replacement old new)
+  "Check an FPW transfer between non-NIL OLD and NEW incarnation symbols.
+NIL and :UNRECOVERED must remain unchanged. Otherwise both states must be
+valid, owned by their respective tokens and equal in all nine evidence fields."
   (and (symbolp old) old (symbolp new) new
        (if (member prior '(nil :unrecovered))
            (eq prior replacement)
@@ -125,6 +128,9 @@ The caller's payload decoder validates the payload itself."
                          wal-fpw-state-last-disable-start wal-fpw-state-last-disable-timeline))))))
 
 (defun wal-fpw-rebind-incarnation (state old new)
+  "Transfer FPW evidence from OLD to NEW without changing the evidence.
+NIL and :UNRECOVERED remain unchanged. A known state must belong to OLD;
+the returned immutable copy belongs to NEW and retains all nine evidence fields."
   (unless (and (symbolp old) old (symbolp new) new
                (or (member state '(nil :unrecovered))
                    (and (wal-fpw-state-valid-p state)
