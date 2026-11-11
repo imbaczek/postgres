@@ -108,7 +108,7 @@ install_output=$(control <<EOF
   (setf *index-build-test-heap* (pg-class-relfilenode table)
         *index-build-test-writer-heap* (pg-class-relfilenode table)))
 (setf *index-build-test-original-entries* (symbol-function 'build-index-entries)
-      *index-build-test-original-writer* (symbol-function 'register-relation-writer)
+      *index-build-test-original-writer* (symbol-function 'register-relation-accesses)
       *index-build-test-original-wait* (symbol-function 'condition-wait-with-timeout))
 (setf (symbol-function 'build-index-entries)
       (lambda (&rest args)
@@ -130,15 +130,15 @@ install_output=$(control <<EOF
                          (format nil "$TMP/~a.release" *index-build-test-label*))
                   do (sleep 0.01)))
         (apply *index-build-test-original-entries* args))))
-(setf (symbol-function 'register-relation-writer)
-      (lambda (relfilenode xid)
+  (setf (symbol-function 'register-relation-accesses)
+        (lambda (writes reads xid)
         (when (and *index-build-test-writer-heap*
-                   (= relfilenode *index-build-test-writer-heap*))
+                     (member *index-build-test-writer-heap* writes :test #'=))
           (setf *index-build-test-writer-xid* xid)
           (with-open-file (out "$TMP/same-writer-attempting"
                                :direction :output :if-exists :supersede)
             (write-string "attempting" out)))
-        (funcall *index-build-test-original-writer* relfilenode xid)))
+          (funcall *index-build-test-original-writer* writes reads xid)))
 (setf (symbol-function 'condition-wait-with-timeout)
       (lambda (waitqueue mutex)
         (when (and *backend* *index-build-test-writer-xid*
@@ -264,7 +264,7 @@ plan_contains_indented_node "$plan" "Seq Scan on build_race_left" \
     || fail "the losing builder left an index attached to its table: $plan"
 
 restore_output=$(control <<'EOF'
-(setf (symbol-function 'register-relation-writer) *index-build-test-original-writer*
+(setf (symbol-function 'register-relation-accesses) *index-build-test-original-writer*
       (symbol-function 'condition-wait-with-timeout) *index-build-test-original-wait*)
 (quit)
 EOF
