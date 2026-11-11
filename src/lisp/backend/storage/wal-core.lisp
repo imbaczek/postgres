@@ -133,10 +133,12 @@ This policy is a choice, distinct from a WAL receipt's historical facts."
 
 (defstruct wal-replication-slot
   "KIND distinguishes logical and physical slots, including unbound logical slots.
-Owners are process-local; the appropriate codec stores durable slot fields."
+Owners are process-local; the appropriate codec stores durable slot fields.
+Logical provenance and cause are codec foundations, not admission authority."
   name database-oid restart-lsn consistent-lsn confirmed-flush-lsn active-owner
   active-owner-backend
-  ;; These process-local fields retain uncertain publication and retirement state.
+  ;; Process-local publication and retirement state. STATE-UNCERTAIN-P is
+  ;; reserved for future guarded integration.
   (drop-claim nil) (creation-failed-p nil) (state-uncertain-p nil)
   (logical-provenance nil :read-only t)
   confirmed-timeline invalidation-cause
@@ -3207,7 +3209,9 @@ and supplies POLICY and KEEP-MB from the same captured configuration."
                 logical-slot-state-encode logical-slot-state-image-p logical-slot-state-decode))
 
 (defun wal-encode-replication-slot (slot)
-  "Encode using the slot's explicit kind; reject unknown kinds."
+  "Encode using the slot's explicit kind; reject unknown kinds.
+Logical slots retain PGSLOT4 or PGSLOT5 when representable; provenance or a
+wal_level_insufficient cause requires PGSLOT6."
   (when (eq :physical (wal-replication-slot-kind slot))
     (return-from wal-encode-replication-slot (physical-slot-encode slot)))
   (unless (wal-logical-slot-p slot)
