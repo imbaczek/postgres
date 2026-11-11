@@ -99,15 +99,17 @@
 (defun physical-reseed-follow-base-projection (manifest digest control-bytes directory request)
   (let ((*pgdata* directory))
     (physical-reseed-follow-base-copy
-     (list :manifest-digest digest
-           :checkpoint-start (physical-manifest-checkpoint-start manifest)
-           :recovery-control (physical-libpq-octets-datum control-bytes)
-           :wal-control
-           (physical-libpq-octets-datum
-            (recovery-read-bytes (wal-control-path) :maximum (1+ +wal-control-maximum-bytes+)))
-           :auth-files
-           (loop for name in '("authentication.initialized" "pg_hba.conf" "pg_ident.conf")
-                 collect (subseq (physical-adoption-stage-file-state name :maximum 1048576) 0 3)))
+     (append (list :manifest-digest digest
+                   :checkpoint-start (physical-manifest-checkpoint-start manifest)
+                   :recovery-control (physical-libpq-octets-datum control-bytes)
+                   :wal-control
+                   (physical-libpq-octets-datum
+                    (recovery-read-bytes (wal-control-path) :maximum (1+ +wal-control-maximum-bytes+)))
+                   :auth-files
+                   (loop for name in '("authentication.initialized" "pg_hba.conf" "pg_ident.conf")
+                         collect (subseq (physical-adoption-stage-file-state name :maximum 1048576) 0 3)))
+             (when (get-properties manifest '(:logical-base-anchor))
+               (list :logical-base-anchor (getf manifest :logical-base-anchor))))
      request)))
 
 (defun physical-reseed-follow-base-at (root-fd plan)

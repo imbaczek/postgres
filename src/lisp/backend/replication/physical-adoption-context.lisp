@@ -81,7 +81,9 @@
            (loop for key in '(:system-id :cluster-identity :timeline :checkpoint :checkpoint-start
                               :end :next-xid :manifest-digest :source-pin)
                  append (list key (getf verified key)))
-           (list :auth-files auth-files))
+           (list :auth-files auth-files)
+           (when (get-properties verified '(:logical-base-anchor))
+             (list :logical-base-anchor (getf verified :logical-base-anchor))))
    (physical-adoption-attempt-local-facts state)))
 
 (defun physical-adoption-attempt-check-stage-root (target source)

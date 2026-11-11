@@ -26,6 +26,15 @@
    (physical-adoption-attempt-with-history
     (getf record :anchor) *physical-follow-anchor-keys* (getf record :source-history))))
 
+(defun physical-adoption-follow-logical-fact (record)
+  (physical-logical-base-fact
+   (getf record :stage)
+   (getf (physical-adoption-install-image-state record) :snapshot)
+   (timeline-check-lineage
+    (timeline-parse-history
+     (getf (getf record :request) :source-timeline)
+     (getf record :source-history)))))
+
 ;; Refuse a binding that changes the saved stage, source or recovery witness.
 (defun physical-adoption-follow-check-binding (record binding)
   (physical-follow-binding-check binding)
@@ -55,6 +64,7 @@
                  (null (getf witness :restartpoint))
                  (equal resource (getf witness :resource-fact))
                  (equal fpw (getf witness :fpw-fact))
+                 (equal (physical-adoption-follow-logical-fact record) (getf witness :logical-fact))
                  fork (<= end fork)
                  (eq (< end fork) (equal before (getf binding :after))))
       (error "adoption follow binding rebinds its proved stage or source"))
@@ -70,15 +80,16 @@
          (pair (getf binding :required)))
     (unless (and (equal (physical-store-control-tuple store) (getf binding :before))
                  (every (lambda (key) (equal (getf base key) (getf stage key)))
-                        '(:system-id :cluster-identity :timeline :checkpoint :end :manifest-digest))
+                        '(:system-id :cluster-identity :timeline :checkpoint :end :manifest-digest :logical-base-anchor))
                  (zerop (getf control :phase))
                  (= (getf control :next-xid) (getf stage :next-xid))
                  (null (getf control :history-target)) (null (getf control :retained-reference)))
       (error "adoption follow planning requires the verified empty stage frontier"))
-    (multiple-value-bind (required timeline resource fpw) (physical-recovery-control-frontier base end)
+    (multiple-value-bind (required timeline resource fpw logical) (physical-recovery-control-frontier base end)
       (unless (and (equal pair (list required timeline))
                    (equal resource (getf (getf binding :recovery) :resource-fact))
-                   (equal fpw (getf (getf binding :recovery) :fpw-fact)))
+                   (equal fpw (getf (getf binding :recovery) :fpw-fact))
+                   (equal logical (getf (getf binding :recovery) :logical-fact)))
         (error "adoption recovery frontier differs from the saved stage witness")))
     (let ((candidate
             (if (equal (getf binding :before) (getf binding :after))
@@ -127,6 +138,9 @@
           (getf base :source-fpw-fact)
           (physical-fpw-fact-from-state (wal-fpw-state-from-checkpoint snapshot (make-symbol "ADOPTION-FPW"))
                                         (getf stage :end) (getf stage :timeline)))
+    (setf (getf base :source-logical-fact) (physical-adoption-follow-logical-fact record)
+          (getf base :base-source-logical-fact)
+          (physical-logical-copy-fact (getf base :source-logical-fact)))
     (let ((binding (physical-follow-empty-base-binding base anchor)))
       (physical-adoption-follow-check-binding record binding)
       binding)))

@@ -514,9 +514,7 @@ facts. All checks precede restoration writes."
             (error "restartpoint differs from its durable receive prefix")))
         (setf resource-seed (physical-restartpoint-resource-seed metadata state store start)
               fpw-seed (physical-restartpoint-fpw-seed metadata state store start))
-        (when (or (getf metadata :source-logical-fact) (getf state :source-logical-fact)
-                  (getf state :base-source-logical-fact) (getf state :required-logical-fact))
-          (setf logical-seed (physical-restartpoint-logical-seed metadata state store start)))
+        (setf logical-seed (physical-restartpoint-logical-seed metadata state store start))
         (multiple-value-bind (checkpoint next) (physical-restartpoint-scan-seeds metadata state)
           (multiple-value-bind (removed terminal reset-forks)
               (apply #'physical-recovery-proven-drops

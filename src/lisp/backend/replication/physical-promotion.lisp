@@ -283,19 +283,27 @@ parent.  The phase check here alone does not establish that ownership."
   (physical-recovery-resolve-timeline-policy
    state store metadata (physical-recovery-replay-timeline state)))
 
+(defun physical-promotion-frozen-policy-fact (frozen source metadata valid-p at-p copier label)
+  (unless (and (or (null frozen) (funcall valid-p frozen))
+               (or (null source)
+                   (and (funcall valid-p source)
+                        (funcall at-p source (getf metadata :lsn)
+                                 (getf metadata :replay-timeline (getf metadata :timeline)))))
+               (or (null frozen) (equal frozen source)))
+    (error "pending promotion ~a fact differs from its selected generation" label))
+  (funcall copier (or frozen source)))
+
 (defun physical-promotion-frozen-fpw-fact (control metadata)
   "Check the frozen source fact against the selected generation and return a copy."
-  (let ((frozen (getf control :fpw-fact))
-        (source (getf metadata :source-fpw-fact)))
-    (unless (and (or (null frozen) (physical-fpw-fact-valid-p frozen))
-                 (or (null source)
-                     (and (physical-fpw-fact-valid-p source)
-                          (physical-fpw-fact-at-p
-                           source (getf metadata :lsn)
-                           (getf metadata :replay-timeline (getf metadata :timeline)))))
-                 (or (null frozen) (equal frozen source)))
-      (error "pending promotion FPW fact differs from its selected generation"))
-    (physical-fpw-copy-fact (or frozen source))))
+  (physical-promotion-frozen-policy-fact
+   (getf control :fpw-fact) (getf metadata :source-fpw-fact) metadata
+   #'physical-fpw-fact-valid-p #'physical-fpw-fact-at-p #'physical-fpw-copy-fact "FPW"))
+
+(defun physical-promotion-frozen-logical-fact (control metadata)
+  "Check the frozen source fact against the selected generation and return a copy."
+  (physical-promotion-frozen-policy-fact
+   (getf control :logical-fact) (getf metadata :source-logical-fact) metadata
+   #'physical-logical-fact-valid-p #'physical-logical-fact-at-p #'physical-logical-copy-fact "logical"))
 
 (defun physical-promotion-check-progress (state metadata prefix generation &optional (phase 2))
   "Verify durable promotion progress and return the applied fork and next XID.
@@ -324,6 +332,11 @@ observed XID and FPW facts; a later complete terminal must be replayed first."
                         (if (= phase 3)
                             (physical-promotion-frozen-fpw-fact control metadata)
                             (getf control :fpw-fact)))
+                 (equal (getf state :source-logical-fact) (getf metadata :source-logical-fact))
+                 (equal (getf state :source-logical-fact)
+                        (if (= phase 3)
+                            (physical-promotion-frozen-logical-fact control metadata)
+                            (getf control :logical-fact)))
                  (equal (getf state :source-resource-fact) (getf metadata :source-resource-fact))
                  (equal (getf state :source-resource-fact) (getf control :resource-fact))
                  snapshot (wal-checkpoint-snapshot-valid-p snapshot)
@@ -344,12 +357,14 @@ observed XID and FPW facts; a later complete terminal must be replayed first."
     ;; Include all acknowledged receive records. A complete later terminal must
     ;; be applied first; an unfinished native batch does not move the data fork.
     (multiple-value-bind (removed terminal)
-        (physical-recovery-proven-drops
-         *physical-receive-store* (getf state :cluster-identity) :start-lsn fork :required-lsn fork
-         :checkpoint-seed snapshot :next-xid-seed next :fpw-seed (getf metadata :source-fpw-fact)
-         :policy (if (= phase 3)
-                     (physical-promotion-pending-timeline-policy state metadata *physical-receive-store*)
-                     (getf state :timeline-policy)))
+        (apply #'physical-recovery-proven-drops
+               *physical-receive-store* (getf state :cluster-identity) :start-lsn fork :required-lsn fork
+               :checkpoint-seed snapshot :next-xid-seed next :fpw-seed (getf metadata :source-fpw-fact)
+               :policy (if (= phase 3)
+                           (physical-promotion-pending-timeline-policy state metadata *physical-receive-store*)
+                           (getf state :timeline-policy))
+               (when (getf metadata :source-logical-fact)
+                 (list :logical-seed (getf metadata :source-logical-fact))))
       (declare (ignore removed))
       (unless (= fork terminal)
         (error "promotion must replay complete durable receive backlog")))
@@ -381,6 +396,7 @@ Retries use the saved intent rather than capturing the policy again."
   (let* ((fork (getf metadata :lsn))
          (next (getf metadata :next-xid))
          (source-fpw (physical-promotion-frozen-fpw-fact nil metadata))
+         (source-logical (physical-promotion-frozen-logical-fact nil metadata))
          (bytes (apply #'physical-recovery-control-image
                        3 (getf state :system-id) (getf state :timeline)
                        (getf state :manifest-digest) (getf state :checkpoint) fork next
@@ -390,8 +406,9 @@ Retries use the saved intent rather than capturing the policy again."
                        :promotion-source-namespace namespace :retained-reference reference
                        :resource-fact (getf metadata :source-resource-fact)
                        :fpw-fact source-fpw
-                       (when promotion-fpw-intent-p
-                         (list :promotion-full-page-writes promotion-full-page-writes))))
+                       (append (when source-logical (list :logical-fact source-logical))
+                               (when promotion-fpw-intent-p
+                                 (list :promotion-full-page-writes promotion-full-page-writes)))))
          (pending (copy-list state)))
     (loop for (key value) on (physical-recovery-decode-control bytes) by #'cddr
           do (setf (getf pending key) value))
@@ -401,6 +418,9 @@ Retries use the saved intent rather than capturing the policy again."
           (getf pending :source-reservation) (copy-list (getf metadata :source-reservation))
           (getf pending :source-fpw-fact) (physical-fpw-copy-fact source-fpw)
           (getf pending :required-fpw-fact) source-fpw)
+    (when (or source-logical (get-properties pending '(:source-logical-fact :required-logical-fact)))
+      (setf (getf pending :source-logical-fact) (physical-logical-copy-fact source-logical)
+            (getf pending :required-logical-fact) source-logical))
     (let ((fact (physical-promotion-frozen-resource-fact
                  (physical-recovery-decode-control bytes) metadata)))
       (when fact
@@ -504,6 +524,8 @@ child state is published. History publication ends prefix-install eligibility."
                   (not (null (get-properties control '(:promotion-full-page-writes)))))
              (equal (getf state :required-fpw-fact)
                     (physical-promotion-frozen-fpw-fact control metadata))
+             (equal (getf state :required-logical-fact)
+                    (physical-promotion-frozen-logical-fact control metadata))
              (= generation (getf control :promotion-generation))
              (eq (physical-promotion-check-base-control state)
                  (getf control :promotion-source-namespace))

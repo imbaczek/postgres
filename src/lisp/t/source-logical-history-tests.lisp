@@ -402,6 +402,35 @@
            (ok (eq primary pg::*wal-logical-policy*))
            (ok (eq force pg::*logical-capture-force*)))))))
 
+(deftest source-logical-restartpoint-recovers-known-checkpoint-without-saved-fact
+    (dolist (enabled '(nil t))
+      (call-with-resource-restartpoint-fixture
+       (lambda (root store)
+         (let* ((begin pg::*last-replay-lsn*)
+                (snapshot (append-source-logical-test-checkpoint store enabled))
+                (end (getf snapshot :end))
+                (expected (pg::physical-logical-fact-from-checkpoint snapshot)))
+           (ok (= end (pg::physical-replay-from begin)))
+           (pg::physical-store-compact store end #'pg::physical-restartpoint-publish)
+           (multiple-value-bind (metadata catalog prefix)
+               (pg::physical-restartpoint-read pg::*physical-recovery-state*)
+             (remf metadata :source-logical-fact)
+             (source-fpw-publish-test-restartpoint metadata catalog prefix))
+           (dolist (key '(:source-logical-fact :base-source-logical-fact :required-logical-fact))
+             (remf pg::*physical-recovery-state* key))
+           (setf pg::*physical-recovery-state*
+                 (pg::physical-recovery-write-control pg::*physical-recovery-state* 2 end pg::*next-xid*))
+           (ok (not (getf (pg::physical-recovery-read-control root) :logical-fact)))
+           (dotimes (retry 2)
+             (declare (ignorable retry))
+             (remf pg::*physical-recovery-state* :source-logical-fact)
+             (ok (= end (pg::physical-restartpoint-prepare-storage store)))
+             (let ((actual (getf pg::*physical-recovery-state* :source-logical-fact)))
+               (ok (equal expected actual))
+               (ok (not (eq expected actual)))
+               (ok (= (getf snapshot :start) (getf actual :coverage-start)))
+               (ok (not (getf actual :last-disable-lsn))))))))))
+
 (deftest source-logical-restartpoint-reconstructs-omitted-fact-from-retained-wal
     (dolist (enabled '(nil t))
       (call-with-source-logical-restartpoint-fixture

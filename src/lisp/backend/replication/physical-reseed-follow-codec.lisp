@@ -38,11 +38,14 @@
 
 (defun physical-reseed-follow-base-copy (value request)
   (physical-follow-check-plist
-   value '(:manifest-digest :checkpoint-start :recovery-control :wal-control :auth-files))
+   value (append '(:manifest-digest :checkpoint-start :recovery-control :wal-control :auth-files)
+                 (when (get-properties value '(:logical-base-anchor)) '(:logical-base-anchor))))
   (let* ((recovery (physical-libpq-datum-octets (getf value :recovery-control) +physical-recovery-control-maximum-bytes+))
          (wal (physical-libpq-datum-octets (getf value :wal-control) (1+ +wal-control-maximum-bytes+)))
          (control (physical-recovery-decode-control recovery))
-         (auth (physical-adoption-attempt-auth-copy (getf value :auth-files))))
+         (auth (physical-adoption-attempt-auth-copy (getf value :auth-files)))
+         (anchor (when (get-properties value '(:logical-base-anchor))
+                   (physical-logical-decode-base-anchor (getf value :logical-base-anchor)))))
     (unless (and (typep (getf value :manifest-digest) '(unsigned-byte 64))
                  (typep (getf value :checkpoint-start) '(unsigned-byte 64))
                  (zerop (getf control :phase))
@@ -58,13 +61,19 @@
                       (if snapshot (getf snapshot :start) (- checkpoint +wal-header-size+)))
                    (or (null metadata) (= (getf metadata :system-id) (getf request :system-id))))
         (error "target follow control images disagree")))
+    (when (and anchor
+               (not (physical-logical-fact-at-p anchor (getf control :checkpoint)
+                                                (getf control :timeline))))
+      (error "target follow logical base anchor disagrees with its frontier"))
     (dolist (entry auth)
       (unless (<= (second entry) (second (assoc (first entry) (physical-backup-metadata-bounds) :test #'equal)))
         (error "target follow authentication commitment exceeds its file bound")))
     (values
-     (list :manifest-digest (getf value :manifest-digest) :checkpoint-start (getf value :checkpoint-start)
-           :recovery-control (physical-libpq-octets-datum recovery)
-           :wal-control (physical-libpq-octets-datum wal) :auth-files auth)
+     (append
+      (list :manifest-digest (getf value :manifest-digest) :checkpoint-start (getf value :checkpoint-start)
+            :recovery-control (physical-libpq-octets-datum recovery)
+            :wal-control (physical-libpq-octets-datum wal) :auth-files auth)
+      (when anchor (list :logical-base-anchor (copy-seq (getf value :logical-base-anchor)))))
      control)))
 
 ;; Generations are contiguous from 1, names are unique, and every older entry

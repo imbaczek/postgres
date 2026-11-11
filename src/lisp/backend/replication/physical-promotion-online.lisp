@@ -44,12 +44,14 @@ observed XID and FPW facts."
       (physical-replay-with-readers)
       (physical-recovery-replay-core))
   (multiple-value-bind (removed terminal)
-      (physical-recovery-proven-drops
-       *physical-receive-store* (getf *physical-recovery-state* :cluster-identity)
-       :start-lsn *last-replay-lsn* :required-lsn *last-replay-lsn*
-       :checkpoint-seed (getf *physical-recovery-state* :source-checkpoint)
-       :next-xid-seed *next-xid* :fpw-seed (getf *physical-recovery-state* :source-fpw-fact)
-       :policy (getf *physical-recovery-state* :timeline-policy))
+      (apply #'physical-recovery-proven-drops
+             *physical-receive-store* (getf *physical-recovery-state* :cluster-identity)
+             :start-lsn *last-replay-lsn* :required-lsn *last-replay-lsn*
+             :checkpoint-seed (getf *physical-recovery-state* :source-checkpoint)
+             :next-xid-seed *next-xid* :fpw-seed (getf *physical-recovery-state* :source-fpw-fact)
+             :policy (getf *physical-recovery-state* :timeline-policy)
+             (when (getf *physical-recovery-state* :source-logical-fact)
+               (list :logical-seed (getf *physical-recovery-state* :source-logical-fact))))
     (declare (ignore removed))
     (= terminal *last-replay-lsn*)))
 
@@ -108,7 +110,15 @@ rechecks after their final flush."
          (next *next-xid*)
          (reservation (copy-list (getf *physical-recovery-state* :source-reservation)))
          (fpw-fact (physical-fpw-copy-fact (getf *physical-recovery-state* :source-fpw-fact)))
+         (logical-fact (physical-recovery-scan-checkpoint-logical
+                        (getf *physical-recovery-state* :source-checkpoint)
+                        (physical-logical-copy-fact (getf *physical-recovery-state* :source-logical-fact))
+                        terminal timeline))
          (removed (make-hash-table :test #'eql)))
+    (when logical-fact
+      (physical-logical-check-fact
+       logical-fact (physical-recovery-resource-history store *physical-recovery-state*)
+       terminal timeline))
     (with-physical-replay-staging ()
       (physical-recovery-map-permitted-records
        store
@@ -129,6 +139,9 @@ rechecks after their final flush."
            (setf fpw-fact (physical-replay-fpw-fact-next
                            fpw-fact record timeline
                            (lambda () (physical-recovery-resource-history store *physical-recovery-state*)))
+                 logical-fact (physical-replay-logical-fact-next
+                               logical-fact record timeline
+                               (lambda () (physical-recovery-resource-history store *physical-recovery-state*)))
                  terminal (wal-record-end record))))
        :start-lsn *last-replay-lsn*))
     (/= timeline (getf (getf *physical-recovery-state* :source-checkpoint)

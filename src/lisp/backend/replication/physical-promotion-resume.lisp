@@ -77,6 +77,13 @@ Cold retry also retains the saved policy, including OFF or legacy absence."
             (let ((fact (physical-promotion-frozen-fpw-fact control metadata)))
               (setf (getf state :source-fpw-fact) (physical-fpw-copy-fact fact)
                     (getf state :required-fpw-fact) fact))
+            (let ((fact (physical-promotion-frozen-logical-fact control metadata)))
+              (when fact
+                (setf (getf state :source-logical-fact) (physical-logical-copy-fact fact)
+                      (getf state :required-logical-fact) fact)))
+            (let ((fact (physical-logical-base-fact
+                         manifest snapshot (physical-recovery-resource-history nil manifest))))
+              (when fact (setf (getf state :base-source-logical-fact) fact)))
             (physical-promotion-check-pending-retained control metadata)
             (physical-promotion-timeline-floor state)
             (values state metadata prefix generation)))))))

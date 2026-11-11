@@ -129,14 +129,15 @@ A violation is an error; the outer replay path fences recovery."
 
 (defun physical-row-replay-publish-terminal (record next-xid reservation source-xids
                                              &key (resource-fact (getf *physical-recovery-state* :source-resource-fact))
-                                               (fpw-fact (getf *physical-recovery-state* :source-fpw-fact)))
+                                               (fpw-fact (getf *physical-recovery-state* :source-fpw-fact))
+                                               (logical-fact (getf *physical-recovery-state* :source-logical-fact)))
   "Publish source facts with the applied terminal after redo is durable."
   ;; Check the published resource fact before replaying the next record.
   ;; Publish progress only after redo; restart can repeat an unpublished batch.
   (when *physical-replay-test-hook*
     (funcall *physical-replay-test-hook* :after-redo record))
   (apply #'physical-replay-publish-progress record next-xid reservation source-xids
-         (physical-replay-fact-arguments resource-fact fpw-fact))
+         (physical-replay-fact-arguments resource-fact fpw-fact logical-fact))
   (wal-clear-page-cache)
   (when *physical-replay-test-hook*
     (funcall *physical-replay-test-hook* :after-progress record))
@@ -152,6 +153,7 @@ A violation is an error; the outer replay path fences recovery."
     (let ((next-xid *next-xid*)
           (resource-fact (copy-tree (getf *physical-recovery-state* :source-resource-fact)))
           (fpw-fact (physical-fpw-copy-fact (getf *physical-recovery-state* :source-fpw-fact)))
+          (logical-fact (physical-logical-copy-fact (getf *physical-recovery-state* :source-logical-fact)))
           (history (lambda () (physical-recovery-resource-history
                                *physical-receive-store* *physical-recovery-state*)))
           (source-xids (copy-tree (getf *physical-recovery-state* :source-xids)))
@@ -159,6 +161,9 @@ A violation is an error; the outer replay path fences recovery."
       (when fpw-fact
         (physical-fpw-check-fact fpw-fact (funcall history) *last-replay-lsn*
                                  (physical-recovery-replay-timeline)))
+      (when logical-fact
+        (physical-logical-check-fact logical-fact (funcall history) *last-replay-lsn*
+                                     (physical-recovery-replay-timeline)))
       (physical-recovery-note-policy-exhaustion
        (physical-recovery-map-permitted-records
         *physical-receive-store*
@@ -185,11 +190,13 @@ A violation is an error; the outer replay path fences recovery."
                 (let ((candidate (physical-resource-fact-next
                                   resource-fact record (physical-recovery-replay-timeline) history))
                       (fpw-candidate (physical-replay-fpw-fact-next
-                                      fpw-fact record (physical-recovery-replay-timeline) history)))
+                                      fpw-fact record (physical-recovery-replay-timeline) history))
+                      (logical-candidate (physical-replay-logical-fact-next
+                                          logical-fact record (physical-recovery-replay-timeline) history)))
                   (wal-replay-record record)
-                  (setf resource-fact candidate fpw-fact fpw-candidate))
+                  (setf resource-fact candidate fpw-fact fpw-candidate logical-fact logical-candidate))
                 (apply #'physical-row-replay-publish-terminal record next-xid reservation source-xids
-                       (physical-replay-fact-arguments resource-fact fpw-fact)))
+                       (physical-replay-fact-arguments resource-fact fpw-fact logical-fact)))
               (wal-replay-record record)))
         :start-lsn *last-replay-lsn*) *physical-receive-store*)))
   (if *physical-resource-pause* :resource-paused *last-replay-lsn*))

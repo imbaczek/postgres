@@ -196,6 +196,46 @@ enable end; retain the last OFF boundary across later records."
       (unless (physical-logical-fact-valid-p fact) (error "invalid decoded source logical fact"))
       fact)))
 
+(defun physical-logical-encode-base-anchor (fact)
+  (let* ((bytes (physical-logical-encode-fact fact))
+         (digits "0123456789ABCDEF")
+         (text (make-string (* 2 (length bytes)) :element-type 'base-char)))
+    (loop for octet across bytes for position from 0 by 2
+          do (setf (char text position) (char digits (ldb (byte 4 4) octet))
+                   (char text (1+ position)) (char digits (ldb (byte 4 0) octet))))
+    text))
+
+(defun physical-logical-decode-base-anchor (text)
+  (unless (and (stringp text) (= (length text) (* 2 +physical-logical-fact-size+))
+               (every (lambda (digit) (find digit "0123456789ABCDEF" :test #'char=)) text))
+    (error "invalid immutable logical base anchor"))
+  (let ((bytes (make-array +physical-logical-fact-size+ :element-type '(unsigned-byte 8))))
+    (loop for index below (length bytes) for position from 0 by 2
+          do (setf (aref bytes index)
+                   (logior (ash (digit-char-p (char text position) 16) 4)
+                           (digit-char-p (char text (1+ position)) 16))))
+    (physical-logical-decode-fact bytes)))
+
+(defun physical-logical-base-fact (manifest checkpoint history)
+  (let* ((end (getf manifest :end)) (timeline (getf manifest :timeline))
+                                    (checkpoint-fact (physical-logical-fact-from-checkpoint checkpoint))
+                                    (anchor (when (get-properties manifest '(:logical-base-anchor))
+                                              (physical-logical-decode-base-anchor (getf manifest :logical-base-anchor)))))
+    (when anchor (physical-logical-check-fact anchor history end timeline))
+    (cond
+      (checkpoint-fact
+       (physical-logical-check-fact checkpoint-fact history end timeline)
+       (when (and anchor (not (physical-policy-witness-equal-p anchor checkpoint-fact)))
+         (error "logical base anchor contradicts its known checkpoint"))
+       checkpoint-fact)
+      (anchor
+       (unless (and checkpoint (wal-checkpoint-snapshot-valid-p checkpoint)
+                    (= end (getf checkpoint :end)) (= timeline (getf checkpoint :timeline))
+                    (<= (getf anchor :witness-end) (getf checkpoint :start)))
+         (error "unknown base checkpoint cannot supply a logical status witness"))
+       anchor)
+      (t nil))))
+
 (defun physical-logical-fact-at-p (fact through timeline)
   "Check fact shape and the exact frontier and timeline."
   (and (physical-logical-fact-valid-p fact)

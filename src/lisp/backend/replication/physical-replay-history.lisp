@@ -193,22 +193,26 @@ A replayed child uses timeline-qualified WAL even when the base used legacy name
       (getf state :promotion-source-namespace)))
 
 (defun physical-replay-selected-eor (record raw next-xid reservation source-xids
-                                     &key (fpw-fact (getf *physical-recovery-state* :source-fpw-fact)))
+                                     &key (fpw-fact (getf *physical-recovery-state* :source-fpw-fact))
+                                       (logical-fact (getf *physical-recovery-state* :source-logical-fact)))
   "Apply a verified selected EOR and durably publish replay progress.
 The applied timeline and source FPW fact advance with durable recovery control.
 This does not end recovery or grant writer authority."
   (let* ((child (physical-replay-check-selected-eor
                  *physical-receive-store* record raw *last-replay-lsn*
                  (physical-recovery-replay-timeline)))
+         (history (lambda () (physical-recovery-resource-history
+                              *physical-receive-store* *physical-recovery-state*)))
          (candidate (physical-replay-fpw-fact-next
                      fpw-fact record child
-                     (lambda () (physical-recovery-resource-history
-                                 *physical-receive-store* *physical-recovery-state*)))))
+                     history))
+         (logical-candidate (physical-replay-logical-fact-next logical-fact record child history)))
     (physical-recovery-publish-selected-history *physical-receive-store*)
     (setf reservation (physical-source-reservation-next reservation record next-xid)
           source-xids (physical-source-xids-next source-xids record next-xid))
     (when *physical-replay-test-hook* (funcall *physical-replay-test-hook* :before-eor-progress record))
     (apply #'physical-replay-publish-progress record next-xid reservation source-xids
-           :replay-timeline child (when candidate (list :fpw-fact candidate)))
+           :replay-timeline child (append (when candidate (list :fpw-fact candidate))
+                                          (when logical-candidate (list :logical-fact logical-candidate))))
     (when *physical-replay-test-hook* (funcall *physical-replay-test-hook* :after-eor-progress record))
-    (values reservation source-xids candidate)))
+    (values reservation source-xids candidate logical-candidate)))

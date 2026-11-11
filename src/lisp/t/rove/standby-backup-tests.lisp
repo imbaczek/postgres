@@ -18,6 +18,7 @@
           *physical-recovery-state*
           (list :phase 2 :timeline 3 :replay-timeline 3
                 :system-id (catalog-system-identifier)
+                :cluster-identity (catalog-cluster-identity *catalog*)
                 :source-checkpoint checkpoint
                 :source-reservation (list :version 1 :through *last-replay-lsn* :bound 2 :complete t)))
     (setf (physical-store-system-id *physical-receive-store*) (catalog-system-identifier)
@@ -48,7 +49,7 @@
 
 (rove:deftest standby-backup-checkpoint-rejects-unproved-or-mismatched-context
     (dolist (change '(:later :timeline :oid :missing-oid :unknown-reservation
-                      :bound :reservation-position :counter :identity :phase :failed :store))
+                      :bound :reservation-position :counter :identity :cluster-identity :phase :failed :store))
       (call-with-standby-backup-checkpoint-test
        (lambda (checkpoint)
          (ecase change
@@ -63,6 +64,7 @@
             (decf (getf (getf *physical-recovery-state* :source-reservation) :through)))
            (:counter (incf *next-xid*))
            (:identity (incf (getf *physical-recovery-state* :system-id)))
+           (:cluster-identity (setf (getf *physical-recovery-state* :cluster-identity) "foreign"))
            (:phase (setf (getf *physical-recovery-state* :phase) 1))
            (:failed (setf *physical-recovery-failed-p* t))
            (:store (setf *physical-receive-store* nil)))

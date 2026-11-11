@@ -483,18 +483,21 @@ Child images may include history files no newer than their selected timeline."
       (- (getf manifest :checkpoint) +wal-header-size+)))
 
 (defun recovery-manifest-keys-valid-p (manifest)
-  "Accept canonical legacy keys or the exact version 3 authentication requirement.
-The optional flag is exactly 1 and follows the legacy keys."
   (let* ((version (getf manifest :version))
          (keys (loop for (key value) on manifest by #'cddr collect key))
          (legacy (if (member version '(2 3))
                      '(:version :system-id :cluster-identity :timeline :checkpoint
                        :checkpoint-start :end :next-xid :source-pin :files)
                      '(:version :system-id :cluster-identity :timeline :checkpoint
-                       :end :next-xid :source-pin :files))))
+                       :end :next-xid :source-pin :files)))
+         (auth (get-properties manifest '(:auth-policy-required)))
+         (anchor (get-properties manifest '(:logical-base-anchor)))
+         (suffix (append (when auth '(:auth-policy-required))
+                         (when anchor '(:logical-base-anchor)))))
     (or (equal keys legacy)
-        (and (eql version 3) (eql 1 (getf manifest :auth-policy-required))
-             (equal keys (append legacy '(:auth-policy-required)))))))
+        (and (eql version 3) suffix
+             (or (not auth) (eql 1 (getf manifest :auth-policy-required)))
+             (equal keys (append legacy suffix))))))
 
 (defun recovery-check-manifest-schema (manifest)
   (unless (and (listp manifest) (member (getf manifest :version) '(1 2 3))
@@ -516,6 +519,10 @@ The optional flag is exactly 1 and follows the legacy keys."
                (wal-valid-replication-slot-name-p (getf manifest :source-pin))
                (listp (getf manifest :files)) (getf manifest :files))
     (error "unsupported or malformed physical recovery manifest"))
+  (when (get-properties manifest '(:logical-base-anchor))
+    (let ((fact (physical-logical-decode-base-anchor (getf manifest :logical-base-anchor))))
+      (unless (physical-logical-fact-at-p fact (getf manifest :end) (getf manifest :timeline))
+        (error "logical base anchor differs from its manifest frontier"))))
   (let ((names (make-hash-table :test #'equal)))
     (dolist (entry (getf manifest :files))
       (unless (and (listp entry) (= (length entry) 3)
@@ -647,6 +654,8 @@ A nonpending standby cannot fall back to primary startup when validation fails."
       (physical-recovery-prepare-with-namespace :signal-mode signal-mode :timeline-goal timeline-goal)
       (setf (getf *physical-recovery-state* :wal-namespace) namespace))))
 
+(declaim (ftype function physical-recovery-resource-history))
+
 (declaim (ftype function physical-follow-check-startup-config))
 
 ;; CONTROL must be decoded from the actual root or saved original recovery
@@ -713,6 +722,14 @@ Keep a separate copy of the immutable base checkpoint for later prefix scans."
               (getf manifest :base-source-fpw-fact) (physical-fpw-copy-fact fact))))
     (when (getf control :fpw-fact)
       (setf (getf manifest :required-fpw-fact) (physical-fpw-copy-fact (getf control :fpw-fact))))
+    (let ((fact (physical-logical-base-fact
+                 manifest (getf manifest :source-checkpoint)
+                 (physical-recovery-resource-history nil manifest))))
+      (when fact
+        (setf (getf manifest :source-logical-fact) (physical-logical-copy-fact fact)
+              (getf manifest :base-source-logical-fact) (physical-logical-copy-fact fact))))
+    (when (getf control :logical-fact)
+      (setf (getf manifest :required-logical-fact) (physical-logical-copy-fact (getf control :logical-fact))))
     (setf (getf manifest :source-reservation) (physical-recovery-initial-reservation manifest))
     (setf (getf manifest :manifest-digest) digest
           (getf manifest :phase) (if (= 2 (getf control :phase)) 2 1)

@@ -83,7 +83,7 @@
        (physical-adoption-install-image-state record) base control (getf stage :manifest-digest))
       (unless (every (lambda (key) (equal (getf base key) (getf stage key)))
                      '(:system-id :cluster-identity :timeline :checkpoint :checkpoint-start
-                       :end :next-xid :manifest-digest :source-pin))
+                       :end :next-xid :manifest-digest :source-pin :logical-base-anchor))
         (error "adoption installed manifest differs from its proved stage"))
       (physical-recovery-read-base-overlap base directory)
       base)))
