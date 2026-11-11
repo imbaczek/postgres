@@ -396,9 +396,9 @@ Older pending control may lack the fact; then the selected generation supplies i
   "Build pending control bytes and runtime state for the selected archive.
 The caller publishes the bytes and installs the state after owner handoff.
 Freeze source evidence from the selected restartpoint and save the supplied
-local full-page-writes intent. A supplied NIL intent means OFF; omitting it
-preserves legacy behavior. Retries reuse that saved intent rather than
-capturing it again."
+local FPW and logical intents, including the configured WAL level. A supplied
+NIL status means OFF; absent intents preserve legacy behavior. Retries reuse
+the saved intents rather than capturing them again."
   (let* ((fork (getf metadata :lsn))
          (next (getf metadata :next-xid))
          (source-fpw (physical-promotion-frozen-fpw-fact nil metadata))
@@ -516,7 +516,8 @@ A published child must match the saved history and the intervening probe."
 
 (defun physical-promotion-check-pending (state metadata prefix generation &key allow-history)
   "Revalidate durable promotion ownership and persistent slot floors before the
-child state is published. History publication ends prefix-install eligibility."
+child state is published. Check intent values and presence against durable control.
+History publication ends prefix-install eligibility."
   (let ((control (physical-recovery-read-control *pgdata*)))
     (unless (equal (getf state :retained-reference) (getf control :retained-reference))
       (error "retained promotion archive pending reference changed"))

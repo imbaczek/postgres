@@ -7,7 +7,8 @@
   (when *physical-promotion-test-hook* (funcall *physical-promotion-test-hook* point)))
 
 (defun physical-promotion-eor-image (state)
-  "Stable pending bytes: intent time in PG microseconds, fixed native logical level."
+  "Build stable EOR bytes using the frozen time and configured WAL level.
+An absent legacy intent retains the historical level 2 bytes."
   (let* ((fork (getf state :applied))
          (remaining (- +wal-segment-size+ (mod fork +wal-segment-size+)))
          (start (if (<= +wal-end-of-recovery-record-size+ remaining) fork (+ fork remaining)))

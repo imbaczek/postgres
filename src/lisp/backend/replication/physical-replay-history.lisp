@@ -60,8 +60,8 @@ A present checkpoint must be valid, match TIMELINE and end by PREVIOUS.
 Without one, TIMELINE must be the immutable store base timeline, including
 when runtime recovery state is absent.
 C PostgreSQL can accept queries after lightweight EOR before its asynchronous
-checkpoint. The native producer durably writes EOR, optional FPW change and
-checkpoint before starting the writer."
+checkpoint. The native producer durably writes EOR, optional FPW and logical
+status changes, and the child checkpoint before starting the writer."
   (let ((checkpoint (getf *physical-recovery-state* :source-checkpoint)))
     (unless (and (typep previous '(unsigned-byte 64))
                  (typep timeline '(integer 1 4294967295))
@@ -137,6 +137,8 @@ caller state."
   t)
 
 (defun physical-replay-check-child-logical-policy (record logical-fact timeline)
+  "Check the child logical change batch, ordering and checkpoint agreement.
+LOGICAL-FACT describes the prefix before RECORD; this check changes no state."
   (let* ((type (wal-record-type record))
          (marker-seen (and logical-fact (eq :change (getf logical-fact :witness-kind))
                            (eql timeline (getf logical-fact :witness-timeline)))))
@@ -160,9 +162,9 @@ caller state."
   "Check native checkpoint timeline and selected child initialization during replay.
 Only a validated selected EOR can switch the replay timeline. After EOR,
 require the child initialization checkpoint before later child work. One validated
-FPW change may precede it in a clean batch, and the checkpoint must preserve
-that policy. FPW-FACT describes the prefix before RECORD and defaults to the
-published source fact. Validation leaves caller state unchanged."
+FPW change and one logical status change may precede it in clean batches, in
+that order. The checkpoint must preserve each change. The fact arguments describe
+the prefix before RECORD and default to published facts; validation changes no state."
   (wal-require-fpw-physical-replay-supported record)
   (wal-require-logical-status-physical-replay-supported record)
   (let* ((state *physical-recovery-state*) (timeline (physical-recovery-replay-timeline state))

@@ -24,6 +24,9 @@
 
 (defun physical-promotion-policy-prefix
     (state cursor source-key intent-key checkpoint-key copy-fact fact-at-p record-type encode)
+  "Plan a policy change and checkpoint field from frozen intent and source evidence.
+Unknown source status requires a change; absent intent emits no change or field.
+Return frames, the next cursor and checkpoint fields without publishing them."
   (let ((source (funcall copy-fact (getf state source-key))))
     (when (and source
                (not (funcall fact-at-p source (getf state :applied)
@@ -54,6 +57,8 @@ Unknown source state requires a change; absent legacy intent emits none."
    +wal-record-full-page-writes-change+ #'wal-encode-full-page-writes-change))
 
 (defun physical-promotion-logical-prefix (state cursor)
+  "Plan a logical status marker when needed and its checkpoint field.
+A matching known source status omits the marker but retains the frozen field."
   (physical-promotion-policy-prefix
    state cursor :source-logical-fact :promotion-logical-decoding-enabled :logical-decoding-enabled
    #'physical-logical-copy-fact #'physical-logical-fact-at-p
@@ -71,7 +76,9 @@ one segment; rotation leaves an EOF gap rather than inventing padding records.
 Copy the source checkpoint's historical commit timestamp XID pair before size
 planning. Local configuration does not establish facts about that checkpoint;
 an absent pair remains unknown. The frozen source facts select the exact size
-and enter the snapshot, so placement and retries use the same captured facts."
+and enter the snapshot, so placement and retries use the same captured facts.
+Semantic records are ordered EOR, optional FPW change, optional logical status
+change, checkpoint. Each batched record has a preceding batch-start frame."
   (unless (and (eql 3 (getf state :phase)) (typep next-oid '(unsigned-byte 64))
                (physical-source-reservation-valid-p (getf state :source-reservation))
                (getf (getf state :source-reservation) :complete)

@@ -10,12 +10,16 @@
 (defconstant +physical-promotion-logical-intent-size+ 18)
 
 (defun physical-logical-promotion-intent-valid-p (enabled level)
+  "Check the logical status and configured WAL level pair.
+Logical level requires ON; replica level permits either status."
   (and (member enabled '(nil t)) (member level '(:replica :logical))
        (or (eq level :replica) enabled)))
 
 (defun physical-logical-encode-promotion-intent
     (enabled &optional (level (if enabled :logical :replica)))
-  "Encode logical decoding ON or OFF in the 18-byte PGLOGPI1 promotion intent."
+  "Encode status and configured WAL level in the 18-byte PGLOGPI1 intent.
+Byte 8 is the boolean status, byte 9 is 1 for replica or 2 for logical,
+and bytes 10 through 17 are zero."
   (unless (physical-logical-promotion-intent-valid-p enabled level)
     (error "invalid promotion logical decoding policy"))
   (let ((bytes (make-array +physical-promotion-logical-intent-size+
@@ -26,7 +30,8 @@
     bytes))
 
 (defun physical-logical-decode-promotion-intent (bytes)
-  "Decode PGLOGPI1 after checking its length, magic, value and reserved bytes."
+  "Decode PGLOGPI1 and return status and configured WAL level.
+Check the length, magic, both values, their pairing and reserved bytes."
   (unless (and (typep bytes '(vector (unsigned-byte 8)))
                (= (length bytes) +physical-promotion-logical-intent-size+)
                (equalp (subseq bytes 0 8) #(80 71 76 79 71 80 73 49))

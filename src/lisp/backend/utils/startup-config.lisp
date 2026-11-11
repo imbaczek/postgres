@@ -88,7 +88,8 @@ supported, so a canonical off setting establishes invalid XIDs (0/0)."
 
 (defun startup-full-page-writes-policy (&optional (configuration (startup-capture-configuration)))
   "Return the installed desired FPW policy and a presence flag.
-No installed root returns NIL/NIL. A present NIL value means known OFF."
+CONFIGURATION may be an already captured root. No root returns NIL/NIL;
+a present NIL value means known OFF."
   (when configuration
     (let ((settings (startup-configuration-settings configuration)))
       (unless (hash-table-p settings)
@@ -107,6 +108,9 @@ No installed root returns NIL/NIL. A present NIL value means known OFF."
     (when known (list :promotion-full-page-writes enabled))))
 
 (defun startup-promotion-policy-arguments ()
+  "Capture one installed root and return FPW, logical status and configured WAL level.
+Return NIL if no root is installed. Logical status follows the configured level;
+promotion separately rejects logical slots until their restoration is supported."
   (let ((configuration (startup-capture-configuration)))
     (when configuration
       (let ((level (startup-configuration-wal-level configuration)))
