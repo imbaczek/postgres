@@ -106,6 +106,9 @@ snapshot in both cases."
     (list relative (length bytes) (physical-store-update-digest #xCBF29CE484222325 bytes))))
 
 (defun physical-standby-backup-logical-facts (snapshot)
+  "Derive checkpoint logical evidence and any needed immutable base anchor.
+Preserve a known interval when the checkpoint omits it. This evidence does not
+restore logical slots; standby logical-slot restore is not implemented."
   (let* ((end (getf snapshot :end)) (timeline (getf snapshot :timeline))
                                     (current (physical-logical-copy-fact
                                               (getf *physical-recovery-state* :source-logical-fact)))

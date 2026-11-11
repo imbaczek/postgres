@@ -364,6 +364,7 @@ Reject an unrecovered witness rather than treating it as an OFF state."
   *wal-logical-policy*)
 
 (defun wal-current-logical-decoding-fields ()
+  "Copy durable logical status and any known ON interval under the WAL lock."
   (let* ((policy (wal-checked-logical-policy-under-lock))
          (state (and policy (wal-logical-policy-state policy))))
     (when state

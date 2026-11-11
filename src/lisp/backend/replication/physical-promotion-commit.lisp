@@ -57,6 +57,9 @@ Unknown source state requires a change; absent legacy intent emits none."
    +wal-record-full-page-writes-change+ #'wal-encode-full-page-writes-change))
 
 (defun physical-promotion-logical-prefix (state cursor)
+  "Plan the child logical status and checkpoint fields from frozen evidence.
+An unchanged ON status retains the inherited pair, including unknown. A change
+to ON writes a child terminal and uses its end and child timeline as the pair."
   (multiple-value-bind (frames next fields)
       (physical-promotion-policy-prefix
        state cursor :source-logical-fact :promotion-logical-decoding-enabled :logical-decoding-enabled

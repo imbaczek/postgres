@@ -130,10 +130,10 @@ level must be supplied together as a valid pair, distinct from the source fact."
   "Encode recovery progress and optional extensions under one CRC.
 Ordinary and pending images may append resource and source FPW facts. Pending
 images may then append a 17-byte FPW intent and an 18-byte logical intent, in
-that order. An optional 88-byte source logical fact follows; phase bit 30 marks
+that order. An optional 88- or 104-byte source logical fact follows; phase bit 30 marks
 its presence and bit 31 marks next-XID exhaustion. The intents record policies
 independently of source facts: a supplied NIL means OFF, while an absent argument
-preserves the old image. Logical status and configured WAL level must be supplied
+omits that extension. Logical status and configured WAL level must be supplied
 together as a valid pair. All extensions precede the single outer CRC; these
 extensions do not change the format version."
   (let* ((pending (= phase 3)) (version (if pending 4 3))
@@ -201,10 +201,10 @@ extensions do not change the format version."
   "Decode an exact native control layout and verify its CRC before accepting facts.
 The optional source FPW fact, pending-only FPW and logical intents, and source
 logical fact precede the single CRC in that order. Bit 30 marks the logical fact;
-bit 31 marks next-XID exhaustion. The maximum image is 391 bytes. After stripping
+bit 31 marks next-XID exhaustion. The maximum image is 407 bytes. After stripping
 the logical fact, length modulo four identifies no intent, FPW, logical or both.
 The decoder checks intent magic, value and reserved bytes. An absent intent
-preserves the old image; a present NIL means OFF independently of source facts.
+leaves that policy unspecified; a present NIL means OFF independently of source facts.
 A logical intent yields both its status and configured WAL level."
   (multiple-value-bind (logical-size logical-p) (physical-logical-control-core-size bytes)
     (multiple-value-bind (size promotion-fpw-intent-p promotion-logical-intent-p)

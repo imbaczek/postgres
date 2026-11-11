@@ -54,6 +54,7 @@ Absence means unknown; present NIL means off and present T means on."
 (defconstant +wal-checkpoint-logical-interval-size+ 16)
 
 (defun wal-logical-on-interval-valid-p (enabled lsn timeline end owner)
+  "Check the optional ON pair's shape and bounds, not its history or identity."
   (or (and (null lsn) (null timeline))
       (and (eq enabled t)
            (typep lsn '(integer 33 18446744073709551615))
@@ -198,12 +199,13 @@ must be zero. Absence preserves unknown history."
 
 (defun wal-decode-checkpoint-snapshot (bytes)
   "Decode a checkpoint payload covered by WAL or control CRC.
-PGCKPT02 flag bit 2 marks the final eight-byte commit timestamp pair.
-The pair follows the base and any 48-byte resource extension. Bit 3 marks
-full-page-writes presence and bit 4 its value; bits 5 and 6 represent logical
-decoding presence and value. A value without presence is invalid. These bits
-do not change payload length. Version 1 has no extensions. Absent status is
-unknown; present NIL is off and present T is on."
+PGCKPT02 flag bit 2 marks an eight-byte commit timestamp pair after the base
+and any 48-byte resource extension. Bits 3 and 4 mark full-page-writes
+presence and value; bits 5 and 6 mark logical decoding presence and value.
+These four bits do not change payload length, and a value without presence is
+invalid. Bit 7 adds a final 16-byte ON interval after the commit timestamp
+pair, if present. Version 1 has no extensions. Absent status is unknown;
+present NIL is off and present T is on."
   (unless (wal-checkpoint-snapshot-length-p (length bytes))
     (error "invalid checkpoint snapshot length"))
   (let* ((version (cond ((equalp (subseq bytes 0 8) #(80 71 67 75 80 84 48 49)) 1)
@@ -308,7 +310,7 @@ Boolean fact is false."
         (t (- end +wal-header-size+))))
 
 (defun wal-checkpoint-snapshot-hex (snapshot)
-  "Encode a supported 88, 96, 136 or 144 byte snapshot for control metadata."
+  "Encode a supported 88, 96, 104, 112, 136, 144, 152 or 160 byte snapshot."
   (with-output-to-string (stream)
     (loop for byte across (wal-encode-checkpoint-snapshot snapshot)
           do (format stream "~2,'0X" byte))))

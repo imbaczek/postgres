@@ -114,6 +114,9 @@ Return FACT unchanged when the checkpoint does not prove policy at START."
       fact))
 
 (defun physical-recovery-scan-checkpoint-logical (checkpoint fact start timeline)
+  "Use a checkpoint at START to supply or refine logical status evidence.
+When FACT is present, require the same witness before merging interval knowledge.
+The caller must establish the checkpoint and its place in the selected history."
   (if (and checkpoint (= start (getf checkpoint :end))
            (get-properties checkpoint '(:logical-decoding-enabled)))
       (let ((expected (physical-logical-fact-from-state

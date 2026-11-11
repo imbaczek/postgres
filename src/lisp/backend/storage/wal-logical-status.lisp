@@ -4,7 +4,12 @@
             (:constructor %make-wal-logical-status
                 (enabled start end timeline last-enable-lsn last-enable-timeline
                  &optional on-start-lsn on-start-timeline)))
-  "Immutable evidence from a checkpoint or status change, not published authority."
+  "Immutable evidence from a checkpoint or status change, not published authority.
+START, END and TIMELINE locate the witness. LAST-ENABLE records the latest
+observed ON terminal, including redundant ON records. ON-START is the end LSN
+and timeline of the ON terminal that began the current uninterrupted interval.
+A legacy ON checkpoint can leave ON-START unknown; it must not be inferred from
+LAST-ENABLE. This evidence does not establish slot provenance or admission."
   (enabled nil :read-only t)
   (start 0 :read-only t)
   (end 0 :read-only t)
@@ -71,6 +76,10 @@ This gate does not persist or publish the status fact."
        (getf snapshot :logical-on-start-lsn) (getf snapshot :logical-on-start-timeline)))))
 
 (defun wal-logical-status-next-on-interval (prior record timeline checkpoint enabled change-p)
+  "Carry the ON interval across records in a caller-verified ordered history.
+OFF clears it; a later ON starts a new interval. Redundant ON preserves even
+an unknown interval. A verified checkpoint can supply a previously unknown pair;
+the original ON WAL need not still be retained."
   (unless enabled (return-from wal-logical-status-next-on-interval (values nil nil)))
   (if change-p
       (if (and prior (wal-logical-status-enabled prior))

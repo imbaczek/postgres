@@ -92,9 +92,10 @@ either directory."
     (timeline-history-entry-timeline entry)))
 
 (defun timeline-check-resource-origin (facts history)
-  "Check the claimed resource origin against selected history and copy facts.
-The record end is exclusive, so subtract one to find its owning timeline.
-The caller verifies history provenance and bounds the fact at its replay point."
+  "Check resource and optional logical ON origins against selected history.
+Record ends are exclusive; check both ends of the ON record against its owner.
+The caller verifies history provenance and bounds each fact at its replay point.
+This geometry check does not establish the identity of the source evidence."
   (unless (wal-control-resource-fields-valid-p facts)
     (error "invalid resource origin facts"))
   (timeline-check-lineage history)

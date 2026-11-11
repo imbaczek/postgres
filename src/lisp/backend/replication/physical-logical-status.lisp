@@ -10,6 +10,7 @@
 (defconstant +physical-logical-interval-fact-size+ 104)
 
 (defun physical-logical-fact-image-size (fact)
+  "Return the fact image size, including the optional ON interval suffix."
   (if (getf fact :logical-on-start-lsn)
       +physical-logical-interval-fact-size+ +physical-logical-fact-size+))
 
@@ -69,6 +70,8 @@ CRC."
      +physical-logical-interval-fact-size+ +physical-promotion-logical-intent-size+))
 
 (defun physical-logical-control-core-size (bytes)
+  "Separate the optional logical fact from the control image.
+The word before the CRC identifies the fact's optional 16-byte suffix."
   (unless (and (typep bytes '(vector (unsigned-byte 8)))
                (<= 60 (length bytes) +physical-recovery-control-maximum-bytes+))
     (error "invalid physical recovery control length"))
@@ -283,7 +286,7 @@ enable end; retain the last OFF boundary across later records."
       fact)))
 
 (defun physical-logical-encode-base-anchor (fact)
-  "Encode the 88-byte source fact as 176 uppercase hexadecimal characters."
+  "Encode an 88- or 104-byte source fact as 176 or 208 uppercase hex characters."
   (let* ((bytes (physical-logical-encode-fact fact))
          (digits "0123456789ABCDEF")
          (text (make-string (* 2 (length bytes)) :element-type 'base-char)))
@@ -307,6 +310,9 @@ enable end; retain the last OFF boundary across later records."
     (physical-logical-decode-fact bytes)))
 
 (defun physical-logical-merge-checkpoint-interval (target witness)
+  "Merge interval knowledge from the same retained checkpoint witness.
+The caller must establish the witness as source evidence on the selected history;
+shape and numeric checks alone do not prove identity or ancestry."
   (unless (and (physical-logical-fact-valid-p target)
                (physical-logical-fact-valid-p witness)
                (physical-policy-witness-equal-p target witness))
@@ -385,6 +391,10 @@ The interval must be part of the caller's verified source evidence."
                                 :witness-start :witness-end))))))
 
 (defun physical-logical-check-on-interval-extension (fact minimum required)
+  "Check that a verified source fact extends MINIMUM through REQUIRED.
+An established interval remains the same until a later OFF and ON. A verified
+checkpoint can refine an unknown interval through the earlier frontier. The
+caller must establish source identity and selected history before this check."
   (let* ((current (getf fact :logical-on-start-lsn))
          (owner (getf fact :logical-on-start-timeline))
          (saved (getf minimum :logical-on-start-lsn))
