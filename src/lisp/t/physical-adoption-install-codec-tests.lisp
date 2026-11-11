@@ -60,6 +60,45 @@
                                        :seed 316 :profile :normal))))
       (ok (eq :passed (getf data :status)) (format nil "~s" data))))
 
+(deftest adoption-install-rejects-checksummed-noncanonical-bodies
+    (let* ((plan (adoption-install-codec-fixture))
+           (canonical (pg::physical-bootstrap-manifest-text plan))
+           (last-step (pg::physical-adoption-install-last-step plan)))
+      (dolist (text (list (concatenate 'string canonical " ")
+                          (concatenate 'string " " canonical)
+                          (format nil "~a~%" canonical)))
+        (let* ((body (pg::string->bytes text))
+               (crc (pg::wal-crc32 body))
+               (header (pg::string->bytes
+                        (format nil "PGADOPTIONINSTALL1 ~d ~8,'0X~%" (length body) crc)))
+               (base (concatenate '(vector (unsigned-byte 8)) header body
+                                  (make-array 1 :element-type '(unsigned-byte 8)
+                                                :initial-element 10)))
+               (complete (apply #'concatenate '(vector (unsigned-byte 8)) base
+                                (loop for step from 1 to last-step
+                                      collect (pg::physical-adoption-install-step-image crc step))))
+               (partial (concatenate '(vector (unsigned-byte 8)) base
+                                     (pg::physical-adoption-install-step-image crc 1)
+                                     (subseq (pg::physical-adoption-install-step-image crc 2) 0 3))))
+          (dolist (image (list base complete partial))
+            (dolist (shape '(:simple :adjustable :fill-pointer :displaced))
+              (let ((bytes (metadata-codec-test-storage image shape)))
+                (ok (intake-fails-p
+                     (lambda () (pg::physical-adoption-install-decode bytes)))))))))))
+
+(deftest adoption-install-rejects-long-headers-before-decoding
+    (let ((bytes (make-array 1024 :element-type '(unsigned-byte 8) :initial-element 65))
+          (original (symbol-function 'pg::bytes->string))
+          (calls 0))
+      (setf (aref bytes 1000) 10)
+      (unwind-protect
+           (progn
+             (setf (symbol-function 'pg::bytes->string)
+                   (lambda (&rest arguments) (incf calls) (apply original arguments)))
+             (ok (intake-fails-p (lambda () (pg::physical-adoption-install-decode bytes))))
+             (ok (zerop calls)))
+        (setf (symbol-function 'pg::bytes->string) original))))
+
 (deftest adoption-install-decoder-bounds-progress-limit-traversals
     (let* ((plan (adoption-install-codec-fixture 32))
            (last (pg::physical-adoption-install-last-step plan))
