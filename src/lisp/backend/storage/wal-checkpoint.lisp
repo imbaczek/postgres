@@ -30,6 +30,7 @@ fields are invalid.  Callers establish policy before supplying facts."
     (list :oldest-commit-ts-xid 0 :newest-commit-ts-xid 0)))
 
 (defun wal-checkpoint-boolean-fact-valid-p (facts key)
+  "Accept a well-formed property list with KEY absent or present once as NIL or T."
   (let ((length (and (listp facts) (list-length facts))))
     (and length (evenp length)
          (loop for candidate in facts by #'cddr
@@ -51,9 +52,12 @@ Absence means unknown; present NIL means off and present T means on."
     (list :full-page-writes (getf facts :full-page-writes))))
 
 (defun wal-checkpoint-logical-decoding-fields-valid-p (facts)
+  "Accept an optional Boolean logical-decoding fact.
+Absent means unknown; present NIL means off and present T means on."
   (wal-checkpoint-boolean-fact-valid-p facts :logical-decoding-enabled))
 
 (defun wal-copy-checkpoint-logical-decoding-fields (facts)
+  "Validate and copy the caller's optional logical-decoding fact, including NIL."
   (unless (wal-checkpoint-logical-decoding-fields-valid-p facts)
     (error "invalid checkpoint logical decoding fact"))
   (when (get-properties facts '(:logical-decoding-enabled))
@@ -89,12 +93,11 @@ Absence means unknown; present NIL means off and present T means on."
       (wal-checkpoint-snapshot-length-p (- length +wal-header-size+))))
 
 (defun wal-checkpoint-snapshot-valid-p (snapshot)
-  "Check checkpoint coordinates and optional resource, commit timestamp and
-full-page-writes facts. Version 1 has no extensions. Full-page-writes may be
-absent, NIL or T; absence means unknown, while NIL and T are known off and on.
-The commit timestamp pair represents disabled tracking with zero values, while
-absence preserves unknown history.
-Ancestry requires separate history validation."
+  "Check checkpoint coordinates and optional resource and status facts.
+Version 1 has no extensions. Full-page-writes and logical-decoding facts may
+be absent, NIL or T: absence is unknown, NIL is off and T is on.
+The zero commit timestamp pair represents disabled tracking; absence preserves
+unknown history. Ancestry requires separate history validation."
   (let ((version (getf snapshot :version))
         (start (getf snapshot :start)) (end (getf snapshot :end))
         (redo (getf snapshot :redo)) (next (getf snapshot :next-xid))
@@ -130,8 +133,9 @@ Ancestry requires separate history validation."
 
 (defun wal-encode-checkpoint-snapshot (snapshot)
   "Encode a validated checkpoint snapshot.
-PGCKPT02 uses flags for one-past FullXIDs. Bit 3 marks a known
-full-page-writes fact and bit 4 holds its value; these bits add no payload bytes.
+PGCKPT02 uses flags for one-past FullXIDs. Bit 3 marks full-page-writes
+presence and bit 4 its value; bits 5 and 6 do the same for logical decoding.
+These status bits add no payload bytes. Version 1 has no extensions.
 Payload lengths are 88, 96, 136 or 144 bytes.  Resource facts add 48 bytes.
 Flag bit 2 adds the eight-byte oldest and newest u32 commit timestamp pair
 after the base payload and any resource extension. Currently, both values
@@ -169,9 +173,10 @@ must be zero. Absence preserves unknown history."
   "Decode a checkpoint payload covered by WAL or control CRC.
 PGCKPT02 flag bit 2 marks the final eight-byte commit timestamp pair.
 The pair follows the base and any 48-byte resource extension. Bit 3 marks
-full-page-writes presence and bit 4 its value; a value without presence is
-invalid. These bits do not change payload length. Version 1
-has no extensions.  Saved source facts preserve the distinction between known and unknown history."
+full-page-writes presence and bit 4 its value; bits 5 and 6 represent logical
+decoding presence and value. A value without presence is invalid. These bits
+do not change payload length. Version 1 has no extensions. Absent status is
+unknown; present NIL is off and present T is on."
   (unless (wal-checkpoint-snapshot-length-p (length bytes))
     (error "invalid checkpoint snapshot length"))
   (let* ((version (cond ((equalp (subseq bytes 0 8) #(80 71 67 75 80 84 48 49)) 1)
@@ -220,8 +225,9 @@ has no extensions.  Saved source facts preserve the distinction between known an
 
 (defun wal-checkpoint-record-snapshot (record)
   "Validate a checkpoint terminal.  Legacy empty payloads have unknown metadata.
-A commit timestamp pair or a present full-page-writes fact requires WAL
-version 8 or newer, including when that fact is false."
+Resource parameters, a commit timestamp pair, or a present full-page-writes
+or logical-decoding fact require WAL version 8 or newer, including when a
+Boolean fact is false."
   (unless (and (= (wal-record-type record) +wal-record-checkpoint+)
                (zerop (wal-record-xid record)))
     (error "invalid native checkpoint record"))
@@ -491,9 +497,10 @@ its archive before mutation."
 
 (defun wal-capture-checkpoint-snapshot (start &optional resource-facts)
   "Called with writer and WAL locks, sample counters under XID lock, as C does.
-Copy the caller's frozen resource, commit timestamp and full-page-writes facts
-into the snapshot. Omitted facts remain unknown. The caller establishes policy
-and plans the record size before choosing START."
+Copy the caller's frozen resource, commit timestamp, full-page-writes and
+logical-decoding facts into the snapshot. Omitted facts remain unknown; a
+present NIL Boolean is off and T is on. The caller establishes policy and
+plans the record size before choosing START."
   (sb-thread:with-mutex (*xid-lock*)
     (let* ((next *next-xid*)
            (active (reduce #'min *active-xids* :initial-value next))
