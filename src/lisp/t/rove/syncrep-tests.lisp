@@ -481,6 +481,8 @@
                                       (let* ((settings (make-hash-table :test #'equal))
                                              (*startup-installed-configuration* (make-startup-configuration :settings settings :wal-level :replica))
                                              (*backend* (make-backend :state :in-progress :explicit t)))
+                                        (sb-thread:with-mutex (*xid-lock*)
+                                          (wal-logical-info-initialize-backend-under-xid-lock *backend*))
                                         (setf (gethash "synchronous_commit" settings) (list :value "on" :source :file
                                                                                             :sourcefile "/owned/test.conf" :sourceline 7))
                                         (rove:ok (equal "on" (sql-setting-value "synchronous_commit")))

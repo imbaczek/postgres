@@ -142,6 +142,8 @@ cannot change. Exhaustion raises FATAL before authentication success is sent."
     (sb-thread:with-mutex (*backend-registry-lock*)
       (when (gethash (backend-pid backend) *backend-registry*)
         (error "backend PID is already registered"))
+      (sb-thread:with-mutex (*xid-lock*)
+        (wal-logical-info-initialize-backend-under-xid-lock backend))
       (sb-sys:without-interrupts
         (setf (gethash (backend-pid backend) *backend-registry*) backend)
         (incf *n-backends*)

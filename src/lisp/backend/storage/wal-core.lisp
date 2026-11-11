@@ -272,6 +272,14 @@ incarnation and is reconstructed from checkpoint and WAL, not a control extensio
 (defvar *wal-logical-policy* nil
   "WAL-owned logical status evidence; NIL is unknown, :UNRECOVERED awaits redo.")
 
+(defvar *wal-logical-info* nil)
+
+(defvar *wal-logical-info-generation* 0)
+
+(defvar *wal-logical-info-activations* (make-hash-table :test #'eq))
+
+(defvar *wal-logical-info-disable-pending* nil)
+
 (defvar *logical-capture-force* nil
   "Capture mode for new XIDs, protected by the XID lock and changed under WAL.")
 
@@ -445,6 +453,8 @@ This is separate from the checks for pending page and CLOG debt."
       (wal-invalid-input "temporary cleanup prevents WAL storage replacement")))
   (values))
 
+(declaim (ftype function wal-logical-info-publish-under-lock))
+
 (defun wal-replace-storage-incarnation-under-lock ()
   "Rotate local WAL store identity only after pending page and CLOG debt is gone.
 This identity is separate from the source used for remote acknowledgments."
@@ -452,9 +462,11 @@ This identity is separate from the source used for remote acknowledgments."
   (require-primary-wal-writer-retired-under-lock)
   (wal-require-no-pending-storage)
   (wal-require-no-temp-cleanup-under-lock)
-  (prog1 (setf *wal-storage-incarnation* (gensym "WAL-STORE-"))
+  (let ((incarnation (gensym "WAL-STORE-")))
+    (wal-logical-info-publish-under-lock nil :rebase t :incarnation incarnation)
     (setf *wal-fpw-state* nil)
-    (wal-reset-logical-policy-under-lock)))
+    (wal-reset-logical-policy-under-lock)
+    incarnation))
 
 (defun wal-replace-storage-incarnation ()
   "Check debt and rotate identity under WAL lock.
@@ -642,7 +654,7 @@ Legacy 16-hex segment names always belong to timeline 1."
 
 (defvar *wal-crc32-table* (make-wal-crc32-table))
 
-#+x86-64
+#+(or x86-64 arm64)
 (defparameter *wal-crc32-ieee-reference-table* (make-wal-crc32-table))
 
 (defun wal-crc32-typed-range (bytes start end table &optional (seed #xffffffff))
@@ -662,6 +674,12 @@ use the seeded scalar recurrence.  Inputs are read only."
     (return-from wal-crc32-typed-range
       (%wal-crc32-ieee-octets bytes start end table
                               *native-ieee-crc32-constants* seed)))
+  #+arm64
+  (when (and *native-arm-crc32-available-p*
+             (>= (- end start) 128)
+             (equalp table *wal-crc32-ieee-reference-table*))
+    (return-from wal-crc32-typed-range
+      (%wal-crc32-ieee-arm-octets bytes start end nil nil seed)))
   (%wal-crc32-octets bytes start end table seed))
 
 (defun wal-crc32 (bytes &optional (start 0) (end (length bytes)))

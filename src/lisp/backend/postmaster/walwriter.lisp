@@ -38,7 +38,8 @@ When both locks are needed, take WAL before the writer state lock."
             (:constructor %make-clog-reset-epoch-plan
                 (service generation thread epoch old-incarnation new-incarnation
                  timeline ownership replacement &optional fpw-predecessor fpw-replacement
-                                                  logical-predecessor logical-replacement)))
+                                                  logical-predecessor logical-replacement
+                                                  logical-info-predecessor logical-info-replacement)))
   "Preallocated reset identities, policy evidence and writer registration.
 LOGICAL-PREDECESSOR and LOGICAL-REPLACEMENT carry logical status across the
 same validated incarnation change.
@@ -58,6 +59,8 @@ prevents reuse."
   (fpw-replacement nil :read-only t)
   (logical-predecessor nil :read-only t)
   (logical-replacement nil :read-only t)
+  (logical-info-predecessor nil :read-only t)
+  (logical-info-replacement nil :read-only t)
   consumed-p)
 
 (defvar *primary-wal-writer* nil)
@@ -121,7 +124,13 @@ need not yet be empty."
                              fpw-predecessor *wal-storage-incarnation* incarnation))
            (logical-predecessor *wal-logical-policy*)
            (logical-replacement (wal-logical-policy-rebind-incarnation
-                                 logical-predecessor *wal-storage-incarnation* incarnation)))
+                                 logical-predecessor *wal-storage-incarnation* incarnation))
+           (logical-info-predecessor
+             (sb-thread:with-mutex (*xid-lock*)
+               (wal-logical-info-current-under-xid-lock t)))
+           (logical-info-replacement
+             (wal-logical-info-rebind-incarnation
+              logical-info-predecessor *wal-storage-incarnation* incarnation)))
       (when active-p
         (unless (and (= (primary-wal-writer-generation service) *primary-wal-writer-generation*)
                      (primary-wal-writer-thread service)
@@ -138,7 +147,8 @@ need not yet be empty."
        epoch *wal-storage-incarnation* incarnation *wal-insert-timeline* *postmaster-data-lock*
        (when active-p
          (make-wal-writer-epoch incarnation *wal-insert-timeline* *postmaster-data-lock*))
-       fpw-predecessor fpw-replacement logical-predecessor logical-replacement))))
+       fpw-predecessor fpw-replacement logical-predecessor logical-replacement
+       logical-info-predecessor logical-info-replacement))))
 
 (defun validate-primary-wal-writer-clog-reset-plan-under-state-lock (plan)
   "Check an unused plan against its captured writer and storage descriptors.
@@ -148,6 +158,13 @@ preserving their evidence under the new token. A later stop request remains in e
   (assert (sb-thread:holding-mutex-p *primary-wal-writer-lock*))
   (unless (and (clog-reset-epoch-plan-p plan)
                (not (clog-reset-epoch-plan-consumed-p plan))
+               (sb-thread:with-mutex (*xid-lock*)
+                 (and (eq (wal-logical-info-current-under-xid-lock t)
+                          (clog-reset-epoch-plan-logical-info-predecessor plan))
+                      (wal-logical-info-rebinding-valid-p
+                       *wal-logical-info* (clog-reset-epoch-plan-logical-info-replacement plan)
+                       (clog-reset-epoch-plan-old-incarnation plan)
+                       (clog-reset-epoch-plan-new-incarnation plan))))
                (eq *wal-logical-policy* (clog-reset-epoch-plan-logical-predecessor plan))
                (wal-logical-policy-rebinding-valid-p
                 *wal-logical-policy* (clog-reset-epoch-plan-logical-replacement plan)
@@ -216,14 +233,16 @@ fail-stops rather than rolling those effects back."
   (assert (sb-thread:holding-mutex-p *wal-lock*))
   (sb-thread:with-mutex (*primary-wal-writer-lock*)
     (validate-primary-wal-writer-clog-reset-plan-under-state-lock plan)
-    (sb-sys:without-interrupts
-      (setf (clog-reset-epoch-plan-consumed-p plan) t
-            *wal-storage-incarnation* (clog-reset-epoch-plan-new-incarnation plan)
-            *wal-fpw-state* (clog-reset-epoch-plan-fpw-replacement plan)
-            *wal-logical-policy* (clog-reset-epoch-plan-logical-replacement plan))
-      (when (clog-reset-epoch-plan-replacement plan)
-        (setf (primary-wal-writer-epoch (clog-reset-epoch-plan-service plan))
-              (clog-reset-epoch-plan-replacement plan)))))
+    (sb-thread:with-mutex (*xid-lock*)
+      (sb-sys:without-interrupts
+        (setf (clog-reset-epoch-plan-consumed-p plan) t
+              *wal-storage-incarnation* (clog-reset-epoch-plan-new-incarnation plan)
+              *wal-fpw-state* (clog-reset-epoch-plan-fpw-replacement plan)
+              *wal-logical-policy* (clog-reset-epoch-plan-logical-replacement plan)
+              *wal-logical-info* (clog-reset-epoch-plan-logical-info-replacement plan))
+        (when (clog-reset-epoch-plan-replacement plan)
+          (setf (primary-wal-writer-epoch (clog-reset-epoch-plan-service plan))
+                (clog-reset-epoch-plan-replacement plan))))))
   (values))
 
 (defun require-primary-wal-writer-retired-under-lock ()

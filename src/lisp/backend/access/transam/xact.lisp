@@ -14,6 +14,7 @@
   (application-name nil)
   (reported-settings (make-hash-table :test #'equal))
   (xid nil)
+  (logical-info-cache nil)
   (state :idle)                 ; :idle | :in-progress | :aborted
   (explicit nil)
   (implicit-query-block nil)
@@ -58,6 +59,8 @@
   (virtual-reader-xid nil))
 
 (defvar *backend* nil)
+
+(defvar *preserve-failed-logical-info-backend* nil)
 
 (defun suppress-backend-frontend-output (backend reason)
   "Remember the first reason to suppress this backend's frontend output."
@@ -935,10 +938,12 @@ its mutations arrive.
 When OWNER is supplied, publish its XID with the active registration and next
 counter under the XID lock and interrupt mask, so cleanup can find it."
   (xid-check-allocation-owner owner)
+  (when owner (wal-logical-info-initialize-backend-under-xid-lock owner))
   (let* ((xid *next-xid*)
          (next (advance-full-xid xid))
          (link (list xid))
          (capture (or (eq *wal-level* :logical)
+                      (wal-logical-info-capture-under-xid-lock-p)
                       *logical-capture-force*
                       (not (eql *logical-capture-live-slots* 0))
                       (plusp (hash-table-count *logical-capture-arming*)))))
@@ -1411,17 +1416,19 @@ Pass BACKEND when releasing its virtual reader ID."
     (wal-note-logical-slot-count-under-lock count))
   (values))
 
-(defun call-with-logical-capture-armed (function)
+(defun call-with-logical-capture-armed (function &key activation)
   "Arm capture for new XIDs, then drain older uncaptured XIDs before FUNCTION.
 Keep the arm until FUNCTION exits, including on error; after release, reconsider
 any deferred disable without holding the XID lock."
-  (let ((token (gensym "LOGICAL-CAPTURE-ARM-")) (old-xids nil) (registered nil))
+  (when (and activation (not (wal-logical-info-activation-p activation)))
+    (error "invalid logical activation scope"))
+  (let ((token (gensym "LOGICAL-CAPTURE-ARM-")) (old-xids nil)
+                                                (registered nil) (finished nil))
     (sb-sys:without-interrupts
       (unwind-protect
            (progn
              (sb-thread:with-mutex (*xid-lock*)
-               ;; Reads allocate XIDs in this server. A known clean XID has no
-               ;; prefix to lose and can begin capturing before the boundary.
+               ;; Reads allocate XIDs here. A clean XID has no prefix to lose.
                (when (and *backend* (backend-xid *backend*))
                  (let* ((xid (backend-xid *backend*))
                         (mode (gethash xid *logical-capture-xid-modes*)))
@@ -1434,7 +1441,8 @@ any deferred disable without holding the XID lock."
                (setf (gethash token *logical-capture-arming*) t
                      registered t
                      old-xids (loop for xid in *active-xids*
-                                    when (member (gethash xid *logical-capture-xid-modes* :capture) '(:skip :skip-written))
+                                    when (member (gethash xid *logical-capture-xid-modes* :capture)
+                                                 '(:skip :skip-written))
                                       collect xid)))
              (sb-sys:with-local-interrupts
                ;; A retained schema lease can prevent an old writer from ending.
@@ -1442,12 +1450,15 @@ any deferred disable without holding the XID lock."
                           (or (backend-holds-schema-read-lock-p)
                               *schema-read-lock-held* *schema-write-lock-held*))
                  (ereport "55000" "cannot wait for uncaptured transactions while holding a schema lock"))
+               (when activation (wal-logical-info-begin-activation token activation))
                (dolist (xid old-xids) (wait-for-xid xid))
-               (funcall function)))
+               (multiple-value-prog1 (funcall function) (setf finished t))))
         (when registered
-          (sb-thread:with-mutex (*xid-lock*)
-            (remhash token *logical-capture-arming*))
-          (wal-request-logical-disable-after-arm))))))
+          (unwind-protect
+               (when activation (wal-logical-info-end-activation token (not finished)))
+            (sb-thread:with-mutex (*xid-lock*)
+              (remhash token *logical-capture-arming*))
+            (wal-request-logical-disable-after-arm)))))))
 
 (declaim (ftype function running-xacts-check-state))
 
@@ -1858,7 +1869,8 @@ between snapshot capture and this durable publication."
     (ereport "0A000" "standard snapshot export is not implemented"))
   (when (eq snapshot-action :use) (validate-standard-snapshot-use *backend*))
   (call-with-logical-capture-armed
-   (lambda () (%create-standard-logical-slot slot-name snapshot-action))))
+   (lambda () (%create-standard-logical-slot slot-name snapshot-action))
+   :activation (make-wal-logical-info-activation :slot-name slot-name)))
 
 (defun %create-exported-logical-snapshot-slot (slot-name)
   "Create an unconfirmed logical slot and return its copy boundary and token.
@@ -1959,7 +1971,8 @@ snapshot lifecycle."
   (unless (eq (backend-state *backend*) :idle)
     (ereport "25001" "cannot export a replication snapshot inside a transaction"))
   (call-with-logical-capture-armed
-   (lambda () (%create-exported-logical-snapshot-slot slot-name))))
+   (lambda () (%create-exported-logical-snapshot-slot slot-name))
+   :activation (make-wal-logical-info-activation :slot-name slot-name)))
 
 (defun import-exported-logical-snapshot (token)
   "Import TOKEN into the current read-only RR transaction as an independent pin.
@@ -2156,7 +2169,8 @@ VACUUM FULL wait for this scope."
   (unless (eq (backend-state *backend*) :idle)
     (ereport "25001" "cannot export a snapshot from inside a transaction"))
   (call-with-logical-capture-armed
-   (lambda () (%call-with-exported-snapshot slot-name function))))
+   (lambda () (%call-with-exported-snapshot slot-name function))
+   :activation (make-wal-logical-info-activation :slot-name slot-name)))
 
 (defmacro with-exported-snapshot
     ((snapshot-var start-lsn-var &key slot-name) &body body)
@@ -2379,8 +2393,10 @@ can discard the owner of a virtual ID or its remaining relation locks."
     (release-backend-transaction-snapshot b)
     (when (backend-virtual-reader-xid b)
       (release-xid (backend-virtual-reader-xid b) b))
-    (setf (backend-xid b) nil
-          (backend-explicit b) nil
+    (sb-thread:with-mutex (*xid-lock*)
+      (wal-logical-info-finish-backend-under-xid-lock
+       b (eq b *preserve-failed-logical-info-backend*)))
+    (setf (backend-explicit b) nil
           (backend-implicit-query-block b) nil
           (backend-isolation-level b) :read-committed
           (backend-read-only b) (recovery-in-progress-p)
@@ -2667,7 +2683,8 @@ Run outside publication locks, clean up the transaction, then handle the outcome
 (defun abort-transaction-block ()
   "Abort resources immediately while retaining the explicit failed-block status."
   (let ((explicit (backend-explicit *backend*)))
-    (let ((*preserve-failed-extended-portals* explicit))
+    (let ((*preserve-failed-extended-portals* explicit)
+          (*preserve-failed-logical-info-backend* (and explicit *backend*)))
       (abort-transaction))
     (when explicit
       (setf (backend-explicit *backend*) t)

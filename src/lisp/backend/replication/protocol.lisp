@@ -1009,8 +1009,7 @@ The caller releases the slot before sending shutdown completion."
         (*wal-new-slot-profile*
           (if (assoc "binary_bytea" (logical-replication-command-options command) :test #'equal)
               :binary-bytea :text)))
-    ;; Drain uncaptured XIDs before taking the lifecycle mutex: an older writer
-    ;; may itself need that mutex before it can finish.
+    ;; Drain before the lifecycle mutex: an older writer may need it to finish.
     (call-with-logical-capture-armed
      (lambda ()
        ;; Serialize DROP until the success row is sent.
@@ -1019,7 +1018,8 @@ The caller releases the slot before sending shutdown completion."
              (if (equal plugin "pg_lisp")
                  (create-exported-logical-snapshot-slot name)
                  (create-standard-logical-slot name snapshot))
-           (send-create-replication-slot-result stream name boundary token plugin)))))))
+           (send-create-replication-slot-result stream name boundary token plugin))))
+     :activation (make-wal-logical-info-activation :slot-name name))))
 
 (defun drop-replication-slot-command (stream command)
   (let ((name (logical-replication-command-slot-name command))

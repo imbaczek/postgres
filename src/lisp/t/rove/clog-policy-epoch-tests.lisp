@@ -119,6 +119,8 @@
              (*wal-insert-timeline* 3) (*wal-end-lsn* 512) (*wal-durable-lsn* 512)
              (*wal-ready* t) (*wal-poisoned* nil) (*wal-fpw-state* :unrecovered)
              (*wal-logical-policy* nil) (*logical-capture-force* nil)
+             (*wal-logical-info* nil) (*wal-logical-info-disable-pending* nil)
+             (*wal-logical-info-activations* (make-hash-table :test #'eq))
              (record (make-wal-record :version 8 :type +wal-record-clog-reset+
                                       :xid 3 :start 216 :end 256
                                       :payload (make-array 8 :element-type '(unsigned-byte 8)

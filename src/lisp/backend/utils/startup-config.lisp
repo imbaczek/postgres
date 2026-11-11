@@ -1139,13 +1139,9 @@ This reports published policy, not C's per-backend transaction cache timing."
           (unless (and configuration
                        (member (startup-configuration-wal-level configuration) '(:replica :logical)))
             (error "effective WAL level requires installed configuration"))
-          (sb-thread:with-mutex (*wal-lock*)
-            (let* ((policy (wal-checked-logical-policy-under-lock))
-                   (state (and policy (wal-logical-policy-state policy))))
-              (unless state (error "effective WAL level requires recovered logical status"))
-              (if (or (eq :logical (startup-configuration-wal-level configuration))
-                      (wal-logical-status-enabled state))
-                  "logical" "replica")))))))
+          (let ((enabled (wal-logical-info-backend-enabled *backend*)))
+            (if (or (eq :logical (startup-configuration-wal-level configuration)) enabled)
+                "logical" "replica"))))))
 
 (defun startup-effective-wal-level-settings-row (configuration)
   "Build the internal computed settings row from the captured configuration."

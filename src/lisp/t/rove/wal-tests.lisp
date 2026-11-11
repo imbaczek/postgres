@@ -407,6 +407,8 @@ Each entry in SEGMENTS contains a segment number followed by its byte vectors."
          (*wal-pending-page-publication-tail* nil)
          (*wal-storage-incarnation* (gensym "TEST-PAGE-STORE-"))
          (*wal-logical-policy* nil) (*logical-capture-force* nil)
+         (*wal-logical-info* nil) (*wal-logical-info-disable-pending* nil)
+         (*wal-logical-info-activations* (make-hash-table :test #'eq))
          (*wal-temp-cleanup-domain* nil)
          (*wal-insert-timeline* 1) (*wal-ready* t) (*wal-poisoned* nil)
          (*physical-recovery-failed-p* nil)
