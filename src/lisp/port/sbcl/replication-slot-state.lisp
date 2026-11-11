@@ -95,6 +95,8 @@
        (when ,fd (sb-posix:close ,fd)))))
 
 (defun call-with-slot-state-root (root function &optional missing-ok)
+  "Call FUNCTION with a held root descriptor, checking its path binding.
+The descriptor is valid only during the callback and must not escape it."
   (let* ((root (uiop:ensure-directory-pathname root))
          (parent (uiop:pathname-parent-directory-pathname root))
          (leaf (car (last (pathname-directory root)))))
@@ -183,6 +185,10 @@
   (slot-state-point :slot-file-after-directory-fsync-before-memory-publication root name))
 
 (defun slot-state-create (root name bytes)
+  "Create a new slot directory and publish BYTES; existing directories fail.
+Success follows child and root directory fsync. An error after rename can leave
+visible state, so the caller must retain slot and retention protection until
+the outcome is resolved."
   (slot-state-directory root name)
   (slot-state-check-bytes bytes)
   (call-with-slot-state-root
@@ -211,6 +217,10 @@
   (values))
 
 (defun slot-state-update (root name bytes)
+  "Replace state in an existing slot directory; never create a missing slot.
+Success follows child and root directory fsync. An error after rename can leave
+visible state, so the caller must retain slot and retention protection until
+the outcome is resolved."
   (slot-state-directory root name)
   (slot-state-check-bytes bytes)
   (call-with-slot-state-root
@@ -228,6 +238,7 @@
   (values))
 
 (defun slot-state-read (root name function &key stabilize)
+  "Call FUNCTION with the bounded state bytes and NAME for an existing slot."
   (slot-state-directory root name)
   (call-with-slot-state-root
    root
@@ -250,6 +261,8 @@
         #'string<))
 
 (defun slot-state-check-contents (fd &optional temporary)
+  "Check the allowed state files and return their names.
+A temporary directory need not contain the final state file."
   (let ((entries (slot-state-directory-entries fd)))
     (dolist (entry entries)
       (unless (member entry '("state" "state.tmp") :test #'string=)
@@ -304,6 +317,10 @@
     (fsync-directory (physical-image-fd-path root-fd))))
 
 (defun slot-state-map (root function &key cleanup)
+  "Call FUNCTION with state bytes and name for each canonical slot.
+With CLEANUP, remove staging directories and state.tmp files in canonical
+directories; use it only at startup with writers quiescent. Without CLEANUP,
+unfinished state is an error."
   (call-with-slot-state-root
    root
    (lambda (root-fd)
@@ -334,6 +351,10 @@
    t))
 
 (defun slot-state-claim-drop (root name)
+  "Capture NAME and numeric root and child device/inode identities for drop.
+Hold one lifecycle lock through capture, storage on the live slot, and the
+first drop. Retain the claim and retention pin on any error, and reject normal
+use while drop is pending. Reacquire the same lock for each retry."
   (slot-state-directory root name)
   (call-with-slot-state-root
    root
@@ -363,6 +384,8 @@
       (error "replication slot drop root changed"))))
 
 (defun slot-state-retire-claimed (root-fd root name claim final-p)
+  "Stabilize claimed retirement, renaming the final directory if needed.
+A retry can instead sync the existing tombstone."
   (let* ((temporary (concatenate 'string name ".tmp"))
          (entry (if final-p name temporary))
          (path (slot-state-fd-path root-fd entry))
@@ -387,6 +410,11 @@
               (slot-state-check-contents child-fd t))))))
 
 (defun slot-state-drop (root name claim)
+  "Remove the slot named by CLAIM, or finish a previous removal attempt.
+Retry only with the same stored claim. A final directory or tombstone must
+match the claimed child identity; absence is accepted under the same root.
+Retain the claim and retention pin on any error, and reacquire the same
+lifecycle lock for each retry. Startup cleanup handles crash garbage."
   (slot-state-directory root name)
   (call-with-slot-state-root
    root
