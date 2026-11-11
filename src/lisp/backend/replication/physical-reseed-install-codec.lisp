@@ -239,6 +239,10 @@
 ;; the end of the last complete line.  The caller must validate the namespace
 ;; before using that boundary for recovery.
 (defun physical-reseed-install-decode (bytes)
+  "Decode a bounded reseed installation journal from stable BYTES.
+Validate the body checksum and canonical encoding before trusting progress.
+The returned plan is detached from BYTES; compute its last step once and match
+each bounded progress span against the scratch prefix, including partial tails."
   (unless (and (typep bytes '(vector (unsigned-byte 8)))
                (<= (length bytes) +physical-reseed-install-maximum-bytes+))
     (error "invalid or oversized reseed install journal"))

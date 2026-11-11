@@ -153,6 +153,10 @@
     image))
 
 (defun physical-adoption-install-decode (bytes)
+  "Decode a bounded adoption installation journal from stable BYTES.
+Validate the body checksum and canonical encoding before trusting progress.
+The returned plan is detached from BYTES; compute its last step once and match
+each bounded progress span against the scratch prefix, including partial tails."
   (unless (and (typep bytes '(vector (unsigned-byte 8)))
                (<= (length bytes) +physical-adoption-install-maximum-bytes+))
     (error "invalid or oversized adoption installation journal"))

@@ -36,6 +36,8 @@
   (sb-ext:string-to-octets string :external-format :utf-8))
 
 (defun bytes->string (bytes &key (start 0) (end (length bytes)))
+  "Decode UTF-8 from the byte span [START, END) into a new string.
+BYTES must remain stable during decoding; the returned string owns its contents."
   (sb-ext:octets-to-string bytes :start start :end end :external-format :utf-8))
 
 ;;; ---- reading ----

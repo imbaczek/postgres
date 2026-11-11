@@ -1,8 +1,12 @@
+;; Format expected installation progress lines in reusable scratch space.
+;; The decoders compare bounded input spans with the resulting prefix.
 (in-package #:pg)
 
 (declaim (inline %physical-install-write-u32-hex %physical-install-write-step))
 
 (defun %physical-install-write-u32-hex (value buffer start)
+  "Write eight uppercase hexadecimal digits to BUFFER at START.
+Return the first offset after the digits; BUFFER is caller-owned scratch."
   (declare (optimize (speed 3) (safety 3))
            (type (unsigned-byte 32) value)
            (type (simple-array (unsigned-byte 8) (32)) buffer)
@@ -13,6 +17,8 @@
   (+ start 8))
 
 (defun %physical-install-write-step (step buffer start)
+  "Write STEP in decimal to caller-owned BUFFER at START and return its length.
+STEP must be between 1 and 200001 inclusive."
   (declare (optimize (speed 3) (safety 3))
            (type (integer 1 200001) step)
            (type (simple-array (unsigned-byte 8) (32)) buffer)
@@ -32,6 +38,11 @@
     digits))
 
 (defun %physical-install-write-progress (body-crc step buffer)
+  "Write the canonical progress line into caller-owned 32-byte BUFFER.
+Return its length; only that prefix is meaningful and the next call overwrites it.
+STEP must be between 1 and 200001 inclusive.  Valid calls allocate no heap
+storage.  The journal decoders validate the body checksum before generating progress lines.
+The original journal writers remain independent format oracles."
   (declare (optimize (speed 3) (safety 3))
            (type (unsigned-byte 32) body-crc)
            (type (integer 1 200001) step)

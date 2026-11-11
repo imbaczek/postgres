@@ -96,6 +96,9 @@
 ;; They do not establish that the source is live or the control file is clean.
 
 (defun physical-reseed-attempt-decode (bytes)
+  "Decode a bounded reseed attempt from BYTES, which must remain stable.
+Check the checksum over the original UTF-8 body bytes excluding the terminal LF,
+then validate the canonical image.  Return a record detached from BYTES."
   (unless (and (typep bytes '(vector (unsigned-byte 8)))
                (<= (length bytes) +physical-reseed-attempt-maximum-bytes+))
     (error "invalid reseed attempt byte vector"))
