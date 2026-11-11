@@ -269,6 +269,16 @@ It is separate from the source identity used for remote acknowledgments.")
 A state with ENABLED NIL is known OFF. It belongs to the current storage
 incarnation and is reconstructed from checkpoint and WAL, not a control extension.")
 
+(defvar *wal-logical-policy* nil)
+
+(defvar *logical-capture-force* nil)
+
+(declaim (ftype function wal-reset-logical-policy-under-lock
+                wal-current-logical-decoding-fields wal-prepare-logical-policy-recovery
+                wal-install-recovered-logical-policy wal-logical-note-published-checkpoint
+                wal-logical-capture-required-under-lock-p
+                wal-process-pending-logical-disable-under-lock))
+
 (defstruct (wal-writer-position
             (:constructor make-wal-writer-position (incarnation timeline end)))
   "An LSN bound to the storage incarnation and insertion timeline that own it."
@@ -441,7 +451,8 @@ This identity is separate from the source used for remote acknowledgments."
   (wal-require-no-pending-storage)
   (wal-require-no-temp-cleanup-under-lock)
   (prog1 (setf *wal-storage-incarnation* (gensym "WAL-STORE-"))
-    (setf *wal-fpw-state* nil)))
+    (setf *wal-fpw-state* nil)
+    (wal-reset-logical-policy-under-lock)))
 
 (defun wal-replace-storage-incarnation ()
   "Check debt and rotate identity under WAL lock.
@@ -2269,7 +2280,8 @@ I/O or locks. With WAL it runs under the publication fence and WAL mutex."
 
 Call while holding *WAL-LOCK*. Provisional interests close the gap between
 snapshot capture under *WRITE-LOCK* and durable slot publication."
-  (or (loop for interested-database being the hash-values of
+  (or (wal-logical-capture-required-under-lock-p)
+      (loop for interested-database being the hash-values of
             *wal-logical-catalog-event-interests*
               thereis (= database-oid interested-database))
       (loop for slot being the hash-values of *wal-replication-slots*
@@ -3016,7 +3028,9 @@ must exclude storage lifecycle changes throughout."
     (when resource-record
       (with-wal-critical (wal-recover-resource-parameters resource-record)))
     (clog-fsync)
-    (with-wal-critical (wal-fpw-install-recovered-state fpw-state incarnation)))
+    (with-wal-critical
+      (wal-fpw-install-recovered-state fpw-state incarnation)
+      (wal-install-recovered-logical-policy logical-status incarnation)))
   (values))
 
 (defun wal-atomic-write-bytes (path bytes)
@@ -3667,17 +3681,21 @@ the checkpoint or scanned WAL contains a policy witness."
             *wal-test-pause-relfilenode* nil
             *wal-test-pause-fired* nil)
       (unless checkpoint-lsn (wal-save-control-fields 0 0))
-      (let ((fpw-marker-p nil))
+      (let ((fpw-marker-p nil) (logical-marker-p nil))
         (multiple-value-bind (end-lsn found-segments)
             (wal-scan (lambda (record)
                         (when (= (wal-record-type record) +wal-record-full-page-writes-change+)
-                          (setf fpw-marker-p t))))
+                          (setf fpw-marker-p t))
+                        (when (= (wal-record-type record) +wal-record-logical-decoding-status-change+)
+                          (setf logical-marker-p t))))
           (setf *wal-end-lsn* end-lsn)
           (when (> end-lsn *wal-durable-lsn*)
             ;; Adopt only a complete, synced tail belonging to this insertion identity.
             (wal-sync-segments found-segments)
             (wal-save-durable-lsn end-lsn)))
-        (with-wal-critical (wal-fpw-prepare-recovery snapshot fpw-marker-p)))
+        (with-wal-critical
+          (wal-fpw-prepare-recovery snapshot fpw-marker-p)
+          (wal-prepare-logical-policy-recovery snapshot logical-marker-p)))
       (setf *wal-test-pause-at*
             (let ((value (sb-ext:posix-getenv "PG_WAL_TEST_PAUSE_AT")))
               (and value (string-downcase value)))
@@ -3770,8 +3788,10 @@ release their claims to the retained WAL."
       (with-wal-critical
         (wal-settle-page-publications-under-lock)
         (wal-require-no-pending-storage)
+        (wal-process-pending-logical-disable-under-lock #'values)
         (let ((keys (wal-primary-page-keys))
-              (fpw-facts (wal-current-full-page-writes-fields)))
+              (fpw-facts (wal-current-full-page-writes-fields))
+              (logical-facts (wal-current-logical-decoding-fields)))
           (wal-primary-preflight-page-keys keys)
           (with-wal-primary-page-spool (spool)
             (wal-primary-record-page-xids keys (wal-append-batch-start))
@@ -3779,7 +3799,7 @@ release their claims to the retained WAL."
             (wal-primary-seal-page-spool spool)
             (let* ((checkpoint-facts
                      (append (wal-copy-control-resource-fields *wal-control-metadata*)
-                             commit-ts-facts fpw-facts))
+                             commit-ts-facts fpw-facts logical-facts))
                    (size (wal-checkpoint-record-size checkpoint-facts))
                    (start (wal-next-record-start size))
                    (snapshot (wal-capture-checkpoint-snapshot start checkpoint-facts))
@@ -3800,6 +3820,7 @@ release their claims to the retained WAL."
               (fsync-directory (merge-pathnames "global/" *pgdata*))
               (wal-save-checkpoint-control checkpoint-end snapshot)
               (wal-fpw-note-published-checkpoint snapshot)
+              (wal-logical-note-published-checkpoint snapshot)
               (wal-test-pause :after-checkpoint-control)
               (wal-remove-checkpointed-segments-under-wal-lock checkpoint-end)))))))
   (values))

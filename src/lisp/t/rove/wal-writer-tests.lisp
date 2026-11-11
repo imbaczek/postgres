@@ -13,6 +13,8 @@
          (*wal-storage-incarnation* (if isolate (gensym "WRITER-TEST-STORE-")
                                         *wal-storage-incarnation*))
          (*wal-insert-timeline* (if isolate 3 *wal-insert-timeline*))
+         (*wal-logical-policy* (unless isolate *wal-logical-policy*))
+         (*logical-capture-force* (unless isolate *logical-capture-force*))
          (*postmaster-data-lock* (list :owned-directory))
          (*physical-recovery-state* nil)
          (*wal-ready* t)

@@ -2,6 +2,7 @@
 
 (defun call-with-fpw-wal-fixture (function)
   (let ((pg::*wal-fpw-state* nil) (pg::*wal-fpw-test-hook* nil)
+                                  (pg::*wal-logical-policy* nil) (pg::*logical-capture-force* nil)
                                   (pg::*wal-lock* (sb-thread:make-mutex :name "FPW real WAL"))
                                   (pg::*wal-temp-cleanup-domain* nil)
                                   (pg::*relation-streams* (make-hash-table :test #'equal))

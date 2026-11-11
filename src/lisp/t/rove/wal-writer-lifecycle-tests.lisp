@@ -4,7 +4,7 @@
 (defun make-wal-writer-service-test-thread (function)
   (let* ((names '(*wal-lock* *primary-wal-writer-lock* *reload-definition-lock*
                   *wal-ready* *wal-poisoned* *wal-storage-incarnation*
-                  *wal-end-lsn* *wal-durable-lsn*
+                  *wal-end-lsn* *wal-durable-lsn* *wal-logical-policy* *logical-capture-force*
                   *wal-insert-timeline* *wal-control-metadata* *postmaster-data-lock*
                   *physical-recovery-state* *wal-pending-page-publication*
                   *wal-pending-page-publication-tail* *clog-pending-commits*
@@ -23,6 +23,7 @@
          (*wal-ready* t) (*wal-poisoned* nil)
          (*wal-end-lsn* 0) (*wal-durable-lsn* 0)
          (*wal-storage-incarnation* (gensym "WRITER-SERVICE-TEST-"))
+         (*wal-logical-policy* nil) (*logical-capture-force* nil)
          (*wal-insert-timeline* 1)
          (*wal-control-metadata* (make-wal-control-metadata 1 +db-in-production+))
          (*postmaster-data-lock* (list :owned-directory))

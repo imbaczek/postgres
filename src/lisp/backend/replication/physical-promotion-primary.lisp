@@ -407,7 +407,9 @@ checkpoint in the new WAL incarnation."
                            *wal-control-metadata* (copy-list metadata))))
                  (wal-fpw-install-recovered-state
                   (wal-fpw-state-from-checkpoint snapshot *wal-storage-incarnation*)
-                  *wal-storage-incarnation*))
+                  *wal-storage-incarnation*)
+                 (wal-install-recovered-logical-policy
+                  (wal-logical-status-from-checkpoint snapshot) *wal-storage-incarnation*))
                (physical-promotion-test-point :after-live-child-runtime)
                (setf finished t)
                checkpoint)))

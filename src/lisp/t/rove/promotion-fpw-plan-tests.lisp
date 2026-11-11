@@ -156,6 +156,7 @@
            (*wal-control-metadata* nil)
            (settings (startup-configuration-settings *startup-installed-configuration*))
            (report (symbol-function 'wal-report-full-page-writes))
+           (logical (symbol-function 'wal-reconcile-configured-logical-policy))
            (ready (symbol-function 'wal-set-primary-state))
            (events nil))
       (setf (gethash "full_page_writes" settings) '(:value nil :source :file))
@@ -167,11 +168,13 @@
                      (assert (not (sb-thread:holding-mutex-p *wal-lock*)))
                      (assert (not (sb-thread:holding-mutex-p *write-lock*)))
                      (push (list :policy enabled) events))
+                   (symbol-function 'wal-reconcile-configured-logical-policy)
+                   (lambda () (push (list :logical) events))
                    (symbol-function 'wal-set-primary-state)
                    (lambda (state) (push (list :ready state) events)))
              (wal-note-primary-ready)
              (rove:ok (equal (reverse events)
-                             (list (list :policy nil) (list :ready +db-in-production+))))
+                             (list (list :policy nil) (list :logical) (list :ready +db-in-production+))))
              (setf events nil
                    (symbol-function 'wal-report-full-page-writes)
                    (lambda (&rest arguments)
@@ -180,7 +183,8 @@
              (rove:ok (unit-commit-ts-error-p #'wal-note-primary-ready))
              (rove:ok (null events)))
         (setf (symbol-function 'wal-report-full-page-writes) report
-              (symbol-function 'wal-set-primary-state) ready))))
+              (symbol-function 'wal-set-primary-state) ready
+              (symbol-function 'wal-reconcile-configured-logical-policy) logical))))
 
 (rove:deftest primary-writer-reconciles-fpw-after-epoch-validation
     (let* ((*wal-lock* (sb-thread:make-mutex :name "FPW cycle test WAL"))
@@ -194,6 +198,7 @@
            (validate (symbol-function 'validate-primary-wal-writer-under-lock))
            (publish (symbol-function 'wal-report-full-page-writes-under-lock))
            (drain (symbol-function 'primary-wal-writer-background-under-lock))
+           (logical (symbol-function 'wal-process-pending-logical-disable-under-lock))
            (capture (symbol-function 'startup-capture-configuration))
            (accepted nil) (events nil))
       (setf (gethash "full_page_writes" settings) '(:value nil :source :file))
@@ -219,6 +224,11 @@
                      (assert (null enabled))
                      (assert (eq owner incarnation))
                      (push :publish events))
+                   (symbol-function 'wal-process-pending-logical-disable-under-lock)
+                   (lambda (begin)
+                     (declare (ignore begin))
+                     (assert (sb-thread:holding-mutex-p *wal-lock*))
+                     (push :logical events))
                    (symbol-function 'primary-wal-writer-background-under-lock)
                    (lambda (&rest arguments)
                      (declare (ignore arguments))
@@ -228,11 +238,12 @@
              (rove:ok (equal (reverse events) '(:capture :validate)))
              (setf accepted t events nil)
              (rove:ok (eq :continue (primary-wal-writer-background-step writer nil)))
-             (rove:ok (equal (reverse events) '(:capture :validate :publish :drain))))
+             (rove:ok (equal (reverse events) '(:capture :validate :publish :logical :drain))))
         (setf (symbol-function 'primary-wal-writer-stopping-p) stopping
               (symbol-function 'validate-primary-wal-writer-under-lock) validate
               (symbol-function 'wal-report-full-page-writes-under-lock) publish
               (symbol-function 'primary-wal-writer-background-under-lock) drain
+              (symbol-function 'wal-process-pending-logical-disable-under-lock) logical
               (symbol-function 'startup-capture-configuration) capture))))
 
 (rove:deftest promotion-fpw-source-fact-is-bound-to-selected-generation

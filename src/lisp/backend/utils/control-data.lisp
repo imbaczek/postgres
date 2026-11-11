@@ -66,6 +66,7 @@ an existing identity must match the catalog."
   "Publish configured FPW policy and production state after primary initialization
 and promotion cleanup. The caller must finish those steps first."
   (wal-report-configured-full-page-writes)
+  (wal-reconcile-configured-logical-policy)
   (unless (and *wal-control-metadata*
                (= +db-in-production+ (getf *wal-control-metadata* :db-state))
                (= (catalog-system-identifier) (getf *wal-control-metadata* :system-id)))

@@ -939,6 +939,7 @@ counter under the XID lock and interrupt mask, so cleanup can find it."
          (next (advance-full-xid xid))
          (link (list xid))
          (capture (or (eq *wal-level* :logical)
+                      *logical-capture-force*
                       (not (eql *logical-capture-live-slots* 0))
                       (plusp (hash-table-count *logical-capture-arming*)))))
     (sb-sys:without-interrupts
@@ -1404,11 +1405,10 @@ Pass BACKEND when releasing its virtual reader ID."
 
 (defun wal-refresh-logical-capture-slot-mirror-under-wal-lock ()
   "Publish the live slot count under the established WAL-to-XID lock order."
-  (let ((count (loop for slot being the hash-values of *wal-replication-slots*
-                     count (and (wal-logical-slot-p slot)
-                                (not (eq (wal-replication-slot-wal-status slot) :lost))))))
+  (let ((count (wal-logical-valid-slot-count-under-lock)))
     (sb-thread:with-mutex (*xid-lock*)
-      (setf *logical-capture-live-slots* count)))
+      (setf *logical-capture-live-slots* count))
+    (wal-note-logical-slot-count-under-lock count))
   (values))
 
 (defun call-with-logical-capture-armed (function)
@@ -1444,7 +1444,8 @@ Pass BACKEND when releasing its virtual reader ID."
                (funcall function)))
         (when registered
           (sb-thread:with-mutex (*xid-lock*)
-            (remhash token *logical-capture-arming*)))))))
+            (remhash token *logical-capture-arming*))
+          (wal-request-logical-disable-after-arm))))))
 
 (declaim (ftype function running-xacts-check-state))
 
@@ -1601,6 +1602,8 @@ excluded, so a sequence advance before slot publication remains streamable."
     (when (loop for xid in *active-xids*
                   thereis (member (gethash xid *logical-capture-xid-modes* :capture) '(:skip :skip-written)))
       (error "logical slot publication requires uncaptured XIDs to drain")))
+  (unless (getf (wal-current-logical-decoding-fields) :logical-decoding-enabled)
+    (wal-invalid-input "logical slot publication requires durable enabled status"))
   (unless (wal-valid-replication-slot-name-p name)
     (ereport "42602" "invalid replication slot name \"~a\"" name))
   (unless (and (snapshot-registration-p register)
@@ -1643,6 +1646,10 @@ excluded, so a sequence advance before slot publication remains streamable."
   "Persist a named restart point before exposing its captured snapshot."
   (unless (wal-valid-replication-slot-name-p name)
     (ereport "42602" "invalid replication slot name \"~a\"" name))
+  (sb-thread:with-mutex (*xid-lock*)
+    (unless (plusp (hash-table-count *logical-capture-arming*))
+      (wal-invalid-input "logical slot creation requires an armed capture gate")))
+  (wal-report-logical-decoding-status t)
   (let ((slot nil))
     (multiple-value-bind (snapshot boundary-lsn restart-lsn)
         (wal-capture-snapshot-boundary-under-writer-lock
@@ -1801,6 +1808,7 @@ between snapshot capture and this durable publication."
                 backend
                 (lambda ()
                   (with-write-lock
+                    (wal-report-logical-decoding-status t)
                     (multiple-value-bind (snapshot boundary restart)
                         (wal-capture-snapshot-boundary-under-writer-lock
                          (backend-command-id backend) registration)
@@ -1883,6 +1891,7 @@ snapshot lifecycle."
                 backend
                 (lambda ()
                   (with-write-lock
+                    (wal-report-logical-decoding-status t)
                     (wal-capture-logical-snapshot-boundary-under-writer-lock
                      backend registration database-id))))
              (setf snapshot captured

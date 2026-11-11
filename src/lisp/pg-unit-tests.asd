@@ -46,6 +46,7 @@
                (:file "t/rove/fnv64-tests")
                (:file "t/rove/wal-writer-tests")
                (:file "t/rove/clog-policy-epoch-tests")
+               (:file "t/rove/logical-policy-tests")
                (:file "t/rove/wal-writer-output-tests")
                (:file "t/rove/wal-writer-policy-tests")
                (:file "t/rove/wal-pressure-tests")
