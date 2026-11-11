@@ -2963,8 +2963,10 @@ published separately after primary redo completes."
 
 (defun wal-recover ()
   "Redo durable complete batches before loading the catalog.
-Build policy evidence privately and install it only after the full scan and CLOG
-sync succeed. The caller must exclude storage lifecycle changes throughout."
+Validate logical status privately before each new terminal's redo; it is not
+published as authoritative state. Build FPW evidence privately and install it
+after the full scan and CLOG sync succeed. The caller must exclude storage
+lifecycle changes throughout."
   (let* ((incarnation *wal-storage-incarnation*)
          (fpw-state (wal-fpw-state-from-checkpoint *wal-checkpoint-snapshot* incarnation))
          (logical-status (wal-logical-status-from-checkpoint *wal-checkpoint-snapshot*))

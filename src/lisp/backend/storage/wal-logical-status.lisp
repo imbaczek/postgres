@@ -3,6 +3,10 @@
 (defstruct (wal-logical-status
             (:constructor %make-wal-logical-status
                 (enabled start end timeline last-enable-lsn last-enable-timeline)))
+  "Immutable evidence from a checkpoint or status change, not published authority.
+START, END and TIMELINE identify its latest witness. LAST-ENABLE-LSN and
+LAST-ENABLE-TIMELINE identify the end of the latest observed enable record.
+NIL for both means none was observed; it does not prove earlier continuity."
   (enabled nil :read-only t)
   (start 0 :read-only t)
   (end 0 :read-only t)
@@ -11,24 +15,30 @@
   (last-enable-timeline nil :read-only t))
 
 (defun wal-encode-logical-decoding-status-change (enabled)
+  "Encode Boolean ENABLED as a newly allocated one-byte status payload."
   (unless (member enabled '(nil t)) (error "invalid logical decoding status"))
   (make-array 1 :element-type '(unsigned-byte 8) :initial-element (if enabled 1 0)))
 
 (defun wal-decode-logical-decoding-status-change (bytes)
+  "Validate a one-byte status payload and return NIL for off or T for on."
   (unless (and (= (length bytes) 1) (member (aref bytes 0) '(0 1)))
     (error "invalid native logical decoding status change"))
   (= 1 (aref bytes 0)))
 
 (defun wal-logical-decoding-status-record-info (record)
+  "Validate a logical-status terminal and return its decoded Boolean value."
   (wal-require-boolean-change-envelope record +wal-record-logical-decoding-status-change+ 1)
   (wal-decode-logical-decoding-status-change (wal-record-payload record)))
 
 (defun wal-require-logical-status-physical-replay-supported (record)
+  "Validate a logical-status terminal for physical replay; accept other types.
+This gate does not persist or publish the status fact."
   (when (= (wal-record-type record) +wal-record-logical-decoding-status-change+)
     (wal-logical-decoding-status-record-info record))
   t)
 
 (defun wal-logical-status-valid-p (state)
+  "Check evidence shape and numeric ordering; this does not prove ancestry."
   (and (wal-logical-status-p state)
        (member (wal-logical-status-enabled state) '(nil t))
        (typep (wal-logical-status-start state) '(unsigned-byte 64))
@@ -44,6 +54,9 @@
                   (<= timeline (wal-logical-status-timeline state)))))))
 
 (defun wal-logical-status-from-checkpoint (snapshot)
+  "Seed private evidence from a checkpoint, or return NIL when status is absent.
+A present NIL is known off. A checkpoint marked on has no observed enable
+position, and does not establish earlier continuity."
   (when snapshot
     (unless (wal-checkpoint-snapshot-valid-p snapshot)
       (error "invalid logical status checkpoint seed"))
@@ -53,6 +66,12 @@
        (getf snapshot :start) (getf snapshot :end) (getf snapshot :timeline) nil nil))))
 
 (defun wal-logical-status-next (prior record timeline)
+  "Fold a later record into private logical-status evidence without publication.
+When PRIOR is present, records must start at or after its witness end. The
+caller proves ancestry and complete batch order. An absent seed is unknown;
+records without facts preserve prior evidence. A present NIL is known off.
+A checkpoint fact must agree with prior known status. Every enable record
+updates the last-enable end and timeline, even if status was already on."
   (unless (and (typep timeline '(integer 1 4294967295))
                (or (null prior)
                    (and (wal-logical-status-valid-p prior)
