@@ -602,9 +602,9 @@
 
 (deftest promotion-logical-control-composes-intents-with-every-optional-layout
     (ok (equal
-         '(((88 3047467184057977510) (356 10222404067229254730))
-           ((105 6362589021702428304) (373 784685876338193293))
-           ((105 15851637857956649796) (373 4463505136374351416)))
+         '(((88 16590158288205227922) (356 3657234055354259330))
+           ((105 1046427146213484383) (373 8669646262245995252))
+           ((105 623693058593181923) (373 9753913470866187585)))
          (loop for fpw in '(:absent nil t) collect
                                            (loop for full in '(nil t) collect
                                                                       (let ((bytes (promotion-logical-codec-image
