@@ -136,7 +136,9 @@ This policy is a choice, distinct from a WAL receipt's historical facts."
 Owners are process-local; the appropriate codec stores durable slot fields."
   name database-oid restart-lsn consistent-lsn confirmed-flush-lsn active-owner
   active-owner-backend
-  ;; Process-local retirement identity; never encoded in durable slot state.
+  ;; Process-local only: DROP-CLAIM retains the directory identity across retries.
+  ;; CREATION-FAILED-P fences a possibly published slot until startup validates it.
+  ;; Neither field is encoded in durable slot state.
   (drop-claim nil) (creation-failed-p nil)
   ;; PGSLOT1-3 were the private protocol even though the old wire name was pgoutput.
   (plugin "pg_lisp")
@@ -179,12 +181,14 @@ Owners are process-local; the appropriate codec stores durable slot fields."
   (eq :logical (wal-replication-slot-kind slot)))
 
 (defun wal-require-known-replication-slot (slot)
+  ;; A failed publication may still be visible on disk and must retain its pin.
   (when (wal-replication-slot-creation-failed-p slot)
     (ereport "55000" "replication slot ~s creation failed; restart required"
              (wal-replication-slot-name slot)))
   slot)
 
 (defun wal-require-usable-replication-slot (slot)
+  ;; Pending retirement permits only a retry with the stored claim.
   (wal-require-known-replication-slot slot)
   (when (wal-replication-slot-drop-claim slot)
     (ereport "55000" "replication slot ~s has a pending drop"
@@ -194,6 +198,7 @@ Owners are process-local; the appropriate codec stores durable slot fields."
 (declaim (special *wal-lock*))
 
 (defun wal-find-usable-replication-slot-under-lock (name)
+  ;; Look up and check the generation while the registry is locked.
   (assert (sb-thread:holding-mutex-p *wal-lock*))
   (let ((slot (gethash name *wal-replication-slots*)))
     (when slot (wal-require-usable-replication-slot slot))))
@@ -3232,6 +3237,8 @@ and supplies POLICY and KEEP-MB from the same captured configuration."
       (string->bytes (format nil "~a ~8,'0X~%" prefix crc)))))
 
 (defun wal-finish-replication-slot-creation-under-lock (slot receipt completed)
+  ;; Remove only our unpublished candidate. An uncertain or published failure
+  ;; keeps its WAL pin and is fenced until startup reads fresh durable state.
   (assert (sb-thread:holding-mutex-p *wal-lock*))
   (when (and (not completed)
              (eq slot (gethash (wal-replication-slot-name slot) *wal-replication-slots*)))
@@ -3243,6 +3250,7 @@ and supplies POLICY and KEEP-MB from the same captured configuration."
   (values))
 
 (defun wal-create-replication-slot-file (slot &optional publication-receipt)
+  ;; CREATE publishes a staged directory without replacing an existing name.
   (wal-require-usable-replication-slot slot)
   (slot-state-create (wal-replication-slot-directory)
                      (wal-replication-slot-name slot)
@@ -3251,6 +3259,7 @@ and supplies POLICY and KEEP-MB from the same captured configuration."
   (values))
 
 (defun wal-save-replication-slot (slot)
+  ;; UPDATE requires an existing directory and cannot recreate a dropped slot.
   (wal-require-usable-replication-slot slot)
   (slot-state-update (wal-replication-slot-directory)
                      (wal-replication-slot-name slot)
@@ -3263,6 +3272,8 @@ and supplies POLICY and KEEP-MB from the same captured configuration."
     (unless (and slot (or (null expected-slot) (eq slot expected-slot)))
       (error "replication slot deletion requires its exact registered object"))
     (wal-require-known-replication-slot slot)
+    ;; Save the numeric directory identities before removal. On failure the
+    ;; claim and WAL pin remain, and only this generation may retry the drop.
     (unless (wal-replication-slot-drop-claim slot)
       (setf (wal-replication-slot-drop-claim slot)
             (slot-state-claim-drop (wal-replication-slot-directory) name)))
@@ -3278,6 +3289,7 @@ and supplies POLICY and KEEP-MB from the same captured configuration."
         do (setf start (1+ end))))
 
 (defun wal-decode-replication-slot (bytes expected-name)
+  ;; Decode a fresh object; process-local creation and drop fences are not stored.
   (unless (and (typep bytes '(vector (unsigned-byte 8))) (<= 1 (length bytes) 2048))
     (error "invalid replication slot state bytes"))
   (when (physical-slot-image-p bytes)
@@ -3344,6 +3356,7 @@ and supplies POLICY and KEEP-MB from the same captured configuration."
           slot)))))
 
 (defun wal-read-replication-slot (path &key stabilize)
+  ;; Canonical state is read through the held slot directory descriptor.
   (if (equal (file-namestring path) "state")
       (let* ((directory (uiop:pathname-directory-pathname path))
              (name (car (last (pathname-directory directory))))
@@ -3613,6 +3626,7 @@ Logical restoration during native recovery remains unsupported."
                  (declare (ignore name))
                  (wal-slot-rebuild-progress slot))
                restored))
+    ;; Replace the registry only after every candidate has been checked.
     (setf *wal-replication-slots* restored))
   (values))
 

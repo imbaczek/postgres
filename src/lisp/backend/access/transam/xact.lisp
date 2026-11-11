@@ -1685,9 +1685,9 @@ ON status must be durable before the slot is published."
                :active-owner active-owner
                :active-owner-backend (and active-owner *backend*))))
     (wal-slot-set-initial-profile slot *wal-new-slot-profile*)
-    ;; Reserve the in-memory pin before slot-file I/O. If atomic replace has
-    ;; renamed the file but directory fsync fails, retain the pin: startup may
-    ;; still observe that file and will require its WAL.
+    ;; Reserve the in-memory pin before slot-file I/O. The receipt distinguishes
+    ;; an unpublished candidate from a possibly visible one; COMPLETED also
+    ;; covers the remaining work after the directory is published.
     (unwind-protect
          (progn
            (setf (gethash name *wal-replication-slots*) slot)

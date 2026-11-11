@@ -237,6 +237,7 @@ precedes catalog initialization, so startup must not invent an identity."
   "Remove temporary slots at startup and set the persistent inactive timestamp.
 Validate primary WAL here; standby slots are checked together after loading."
   (cond
+    ;; Never remove a temporary directory belonging to a live generation.
     ((wal-replication-slot-temporary-p slot)
      (let* ((name (wal-replication-slot-name slot))
             (root (wal-replication-slot-directory)))
@@ -326,10 +327,12 @@ The returned slot has fresh process-local ownership and transaction state."
        (eq backend (wal-replication-slot-temporary-owner slot))))
 
 (defun physical-slot-publish-create-under-lock (name restart timeline temporary)
-  "Publish and save a slot under the WAL lock. An ambiguous save keeps its name
-and retention floor until the durable state can be resolved."
+  "Create and publish a slot while holding the WAL lock.
+If creation may have published state but fails, retain its name and WAL floor
+and reject normal use until startup validates the state."
   (wal-check-healthy)
   (wal-check-physical-slot-create name)
+  ;; The receipt and completion flag let cleanup retain a possibly visible pin.
   (let ((publication-receipt (list :unpublished))
         (completed nil)
         (slot (make-wal-replication-slot
@@ -509,6 +512,7 @@ interior position on a standby."
                               (physical-slot-owned-by-backend-p slot backend))
                       collect slot)))
           (*backend* backend))
+      ;; Failed creations remain fenced for startup, even when temporary.
       (dolist (slot slots)
         (wal-drop-replication-slot (wal-replication-slot-name slot) slot))))
   (values))

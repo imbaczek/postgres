@@ -176,6 +176,8 @@ allocation. All four values must be canonical counters or the exhaustion sentine
 (defun physical-promotion-read-physical-slots (&key reconcile-live)
   "Read canonical physical state under promotion exclusion, rejecting unfinished I/O.
 Live promotion preserves exact registry objects and their runtime ownership."
+  ;; Inventory is read through held directory descriptors. Reconciliation
+  ;; returns the matching live objects so their owners remain intact.
   (let ((slots
           (slot-state-map
            (wal-replication-slot-directory)

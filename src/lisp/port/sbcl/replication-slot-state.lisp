@@ -190,6 +190,9 @@ Success follows child and root directory fsync. An error after rename can leave
 visible state, so the caller must retain slot and retention protection until
 the outcome is resolved."
   (when publication-receipt
+    ;; The fresh receipt is :UNPUBLISHED. Under interrupt exclusion it becomes
+    ;; :UNCERTAIN before the no-replace rename and :PUBLISHED on success,
+    ;; before the directory fsyncs complete.
     (unless (and (consp publication-receipt)
                  (eq (car publication-receipt) :unpublished) (null (cdr publication-receipt)))
       (error "invalid replication slot publication receipt")))
