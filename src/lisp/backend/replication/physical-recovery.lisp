@@ -310,7 +310,10 @@ is restricted for boundary comparison and checked for extension beyond it."
          (minimum (getf state :required-resource-fact))
          (fpw-fact (physical-fpw-required-fact
                     (getf state :source-fpw-fact) (getf state :required-fpw-fact)
-                    applied runtime required required-timeline)))
+                    applied runtime required required-timeline))
+         (logical-fact (physical-logical-required-fact
+                        (getf state :source-logical-fact) (getf state :required-logical-fact)
+                        applied runtime required required-timeline)))
     (unless (or (null source)
                 (and (wal-resource-fact-valid-p source)
                      (<= (getf source :resource-lsn) applied)
@@ -331,8 +334,8 @@ is restricted for boundary comparison and checked for extension beyond it."
                    (or (> applied required) (equal source minimum)))
         (error "reconstructed resources differ at the required recovery frontier")))
     (if (and required (< applied required))
-        (values required required-timeline (wal-copy-control-resource-fields minimum) fpw-fact)
-        (values applied runtime (wal-copy-control-resource-fields source) fpw-fact))))
+        (values required required-timeline (wal-copy-control-resource-fields minimum) fpw-fact logical-fact)
+        (values applied runtime (wal-copy-control-resource-fields source) fpw-fact logical-fact))))
 
 (defun physical-recovery-write-control (state phase applied next-xid
                                         &key (db-state +db-in-archive-recovery+))
@@ -347,7 +350,7 @@ disk advanced while the input remains unchanged; the outer caller must fence it.
   (when (and (= db-state +db-shutdowned-in-recovery+)
              (< applied (or (getf state :required-applied) applied)))
     (error "clean recovery has not reached its previously applied boundary"))
-  (multiple-value-bind (required required-timeline resource-fact fpw-fact) (physical-recovery-control-frontier state applied)
+  (multiple-value-bind (required required-timeline resource-fact fpw-fact logical-fact) (physical-recovery-control-frontier state applied)
     (let* ((state (copy-list state))
            (next-xid (max next-xid (or (getf state :observed-next-xid) next-xid)))
            (time (- (get-universal-time) 2208988800))
@@ -355,6 +358,7 @@ disk advanced while the input remains unchanged; the outer caller must fence it.
                    phase (getf state :system-id) (getf state :timeline)
                    (getf state :manifest-digest) (getf state :checkpoint) required next-xid
                    :applied-timeline required-timeline :resource-fact resource-fact :fpw-fact fpw-fact
+                   :logical-fact logical-fact
                    :history-target (getf state :history-target) :history-digest (getf state :history-digest)
                    :db-state db-state :state-time time)))
       (when (getf state :source-resource-fact)
@@ -368,6 +372,12 @@ disk advanced while the input remains unchanged; the outer caller must fence it.
       (if fpw-fact
           (setf (getf state :required-fpw-fact) (physical-fpw-copy-fact fpw-fact))
           (remf state :required-fpw-fact))
+      (when (getf state :source-logical-fact)
+        (setf (getf state :source-logical-fact)
+              (physical-logical-copy-fact (getf state :source-logical-fact))))
+      (if logical-fact
+          (setf (getf state :required-logical-fact) (physical-logical-copy-fact logical-fact))
+          (remf state :required-logical-fact))
       (physical-recovery-persist-control-bytes bytes db-state)
       (setf (getf state :phase) phase
             (getf state :db-state) db-state

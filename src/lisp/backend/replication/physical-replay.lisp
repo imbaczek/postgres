@@ -254,7 +254,8 @@ does not excuse a missing file or a different fork."
                                         &key (replay-timeline (getf *physical-recovery-state* :replay-timeline
                                                                     (getf *physical-recovery-state* :timeline)))
                                           (resource-fact (getf *physical-recovery-state* :source-resource-fact))
-                                          (fpw-fact (getf *physical-recovery-state* :source-fpw-fact)))
+                                          (fpw-fact (getf *physical-recovery-state* :source-fpw-fact))
+                                          (logical-fact (getf *physical-recovery-state* :source-logical-fact)))
   "Publish the replay position and copied source facts together after redo is durable."
   (let ((candidate (copy-list *physical-recovery-state*)))
     (setf (getf candidate :replay-timeline) replay-timeline)
@@ -262,6 +263,8 @@ does not excuse a missing file or a different fork."
       (setf (getf candidate :source-resource-fact) (wal-copy-control-resource-fields resource-fact)))
     (when (or fpw-fact (getf candidate :source-fpw-fact))
       (setf (getf candidate :source-fpw-fact) (physical-fpw-copy-fact fpw-fact)))
+    (when (or logical-fact (getf candidate :source-logical-fact))
+      (setf (getf candidate :source-logical-fact) (physical-logical-copy-fact logical-fact)))
     (setf *physical-recovery-state* (physical-recovery-write-control candidate 2 applied next-xid))))
 
 (defun physical-recovery-retained-directory ()

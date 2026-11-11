@@ -57,6 +57,7 @@
                (:file "t/full-page-writes-wal-tests")
                (:file "t/logical-policy-wal-tests")
                (:file "t/source-fpw-persistence-tests")
+               (:file "t/source-logical-persistence-tests")
                (:file "t/running-xacts-tests")
                (:file "t/wal-namespace-tests")
                (:file "t/wal-lineage-tests")
