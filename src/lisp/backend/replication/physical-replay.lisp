@@ -40,6 +40,8 @@ known OFF is a non-NIL fact. The fact describes source history, not local policy
                             (if (functionp history) (funcall history) history))))
 
 (defun physical-replay-logical-fact-next (prior record timeline history)
+  "Advance private logical evidence at a complete terminal, leaving unknown NIL
+until a status record or checkpoint establishes it."
   (when (or prior
             (= (wal-record-type record) +wal-record-logical-decoding-status-change+)
             (and (= (wal-record-type record) +wal-record-checkpoint+)
@@ -112,6 +114,8 @@ Return FACT unchanged when the checkpoint does not prove policy at START."
       fact))
 
 (defun physical-recovery-scan-checkpoint-logical (checkpoint fact start timeline)
+  "Use logical status from a checkpoint ending at START, checking any seed's
+witness agrees. An absent checkpoint status leaves the seed unchanged."
   (if (and checkpoint (= start (getf checkpoint :end))
            (get-properties checkpoint '(:logical-decoding-enabled)))
       (let ((expected (physical-logical-fact-from-state
@@ -129,13 +133,14 @@ Return FACT unchanged when the checkpoint does not prove policy at START."
                                                (logical-seed nil logical-seed-p)
                                                (checkpoint-seed nil checkpoint-seed-p)
                                                (next-xid-seed nil next-xid-seed-p))
-  "Scan the retained prefix from START through END for resource and FPW facts.
-A checkpoint may precede START; the caller must prove it describes the stage at
-START and supply the observed XID for that position, not a later value. Even when
-START equals END, the bounds and seeds are checked. FPW is folded internally for validation even
-when only resources are requested; return the FPW fact as the second value only
-when FPW-SEED was supplied. A checkpoint ending at START can supply FPW policy.
-Validation uses private state and performs no redo or publication."
+  "Scan the retained prefix from START through END using private state, without redo.
+A checkpoint may precede START; the caller must prove its stage and supply the
+observed XID at START. Check bounds and seeds even for an empty range, and copy
+known seeds before folding. A checkpoint ending at START can supply policy and
+must agree with a known seed. Fold FPW and logical status even for resource-only
+requests. Return FPW as the second value only when FPW-SEED was supplied; return
+logical status as a third value only when LOGICAL-SEED was supplied, including
+explicit NIL. Otherwise preserve the two-value interface."
   (unless (<= (physical-store-floor-lsn store) start end (physical-store-flushed-lsn store))
     (error "resource proof prefix is unavailable; take a fresh base backup"))
   (physical-recovery-check-store-point store start (physical-store-prefix-timeline store start))

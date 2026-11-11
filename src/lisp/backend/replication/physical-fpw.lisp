@@ -214,7 +214,7 @@ Both facts must already belong to the same selected history."
            (= (getf fact :coverage-timeline) (getf minimum :coverage-timeline)))))
 
 (defun physical-policy-witness-equal-p (left right)
-  "Compare policy and checkpoint or change witness, excluding the frontier."
+  "Compare FPW or logical policy and checkpoint or change witness, excluding the frontier."
   (every (lambda (key) (eql (getf left key) (getf right key)))
          '(:enabled :witness-kind :witness-start :witness-end :witness-timeline)))
 

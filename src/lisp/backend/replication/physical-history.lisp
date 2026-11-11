@@ -191,7 +191,8 @@ Invalid or ambiguous catalog metadata fails closed instead of proving a drop."
   "Certify drops and fork resets from complete terminals in validated durable WAL.
 An unfinished batch grants no exemption. REQUIRED-LSN must be a complete terminal.
 Checkpoint and observed XID seeds must be supplied together and prove the stage
-at START-LSN. FPW-SEED is folded privately while validating the suffix. A stateless
+at START-LSN. FPW and logical seeds are copied and folded privately while
+validating the suffix. A stateless
 parent scan can start with unknown seeds, but cannot cross EOR without a proven
 stage and XID. Return the deletion set, last terminal, and committed relation/fork
 resets. No database files are written."
