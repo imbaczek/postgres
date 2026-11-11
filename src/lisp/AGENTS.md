@@ -514,10 +514,10 @@ Remove the trace and its temporary helper after the demo:
 - When a window is due, reach a safe checkpoint without interrupting owned tests.
   Spend at most two active hours, record results and remaining work, then resume
   the development milestone. Carry unfinished investigations into the next window.
-- Next window: first investigate native Lisp IEEE CRC-32 with `sb-simd`, comparing
-  the scalar Lisp kernel and libdeflate. Check correctness, allocation, CPU feature
-  support, small-buffer costs and representative workload results. Then profile
-  metadata validation, parsing and copying to reduce allocations. Keep allocating
+- CRC optimizations are handled in a separate session and are considered done
+  for now. Use upcoming performance windows to reduce allocations and optimize
+  other measured hot paths. Start with metadata validation, parsing and copying;
+  preserve canonical and ownership checks when removing copies. Keep allocating
   validation outside allocation-free `*.hot.lisp` kernels.
 
 ## Milestone verification timing
