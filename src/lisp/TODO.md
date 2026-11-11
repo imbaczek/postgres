@@ -1,5 +1,15 @@
 # Development TODO
 
+- [ ] Allow detached index builds to overlap logical DDL on other tables.
+  The global logical DDL order mutex currently spans the entire build. The
+  index-build contention test reaches its name race but the second builder
+  waits until the first publishes. Preserve schema-before evidence, catalog/WAL
+  publication order and final DDL durability when narrowing that scope. Do not
+  reacquire the order mutex while holding a table gate: competing DROP/ALTER
+  paths currently take those locks in the opposite order. Runtime proof and
+  the repair plan are in
+  `/home/imbaczek/proj/pg-ha-artifacts/wal-writer-policy/logical-slot-sql/`.
+
 - [ ] Qualify native CRC32C on physical ARM hardware.
   Native WAL and storage checksums now use Castagnoli CRC32C, without an IEEE
   legacy reader. Existing development data with IEEE checksums is incompatible;
