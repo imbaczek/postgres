@@ -46,6 +46,26 @@ History and source identity require separate verification."
       (error "invalid logical slot provenance"))
     provenance))
 
+(defun logical-slot-check-startup-identities (slots)
+  (let ((known (remove-if-not
+                (lambda (slot)
+                  (and (wal-logical-slot-p slot)
+                       (wal-replication-slot-logical-provenance slot)))
+                slots)))
+    (when known
+      (let ((system-id (physical-slot-startup-system-id)))
+        (unless (and (typep system-id '(unsigned-byte 64))
+                     (or (null *wal-control-metadata*)
+                         (eql system-id (getf *wal-control-metadata* :system-id))))
+          (error "logical slot startup catalog and control identities differ"))
+        (dolist (slot known)
+          (unless (= system-id
+                     (logical-slot-provenance-system-id
+                      (wal-replication-slot-logical-provenance slot)))
+            (error "logical slot ~a belongs to another cluster"
+                   (wal-replication-slot-name slot)))))))
+  (values))
+
 (defun logical-slot-generation-token (generation)
   "Encode an unsigned 128-bit generation as 32 lowercase hex digits."
   (unless (typep generation '(unsigned-byte 128))

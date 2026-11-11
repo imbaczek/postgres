@@ -3616,6 +3616,8 @@ must separately validate system, history, lifetime, replay and storage context."
 
 (declaim (ftype function physical-slot-restore physical-slot-check-standby-slots physical-slot-startup-system-id))
 
+(declaim (ftype function logical-slot-check-startup-identities))
+
 (defun wal-load-replication-slots ()
   "Validate a complete startup inventory before publishing its registry.
 Logical restoration during native recovery remains unsupported."
@@ -3624,6 +3626,7 @@ Logical restoration during native recovery remains unsupported."
         (restored (make-hash-table :test #'equal))
         (candidates (slot-state-map (wal-replication-slot-directory)
                                     #'wal-decode-replication-slot :cleanup t)))
+    (logical-slot-check-startup-identities candidates)
     (let ((*wal-replication-slots* restored))
       (dolist (slot candidates)
         (let ((name (wal-replication-slot-name slot)))
