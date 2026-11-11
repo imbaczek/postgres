@@ -7,6 +7,7 @@
                (:file "t/rove/hot-path-tests")
                (:file "t/rove/primitives-tests")
                (:file "t/rove/storage-tests")
+               (:file "t/rove/replication-slot-state-tests")
                (:file "t/rove/pglz-tests")
                (:file "t/rove/numeric-storage-tests")
                (:file "t/rove/jsonb-storage-tests")

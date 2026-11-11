@@ -16,6 +16,7 @@
                   :components ((:file "sockets")
                                (:file "files")
                                (:file "physical-image")
+                               (:file "replication-slot-state")
                                (:file "arm-crc32-support")
                                (:file "ieee-crc32" :if-feature :x86-64)
                                (:file "crc32c" :if-feature :x86-64)
