@@ -181,11 +181,13 @@ Invalid or ambiguous catalog metadata fails closed instead of proving a drop."
                 physical-replay-fpw-fact-next physical-recovery-resource-history
                 physical-recovery-check-store-point physical-fpw-check-fact physical-fpw-copy-fact))
 
+(declaim (ftype function physical-replay-logical-fact-next physical-recovery-scan-checkpoint-logical))
+
 (defun physical-recovery-proven-drops (store identity
                                        &key (start-lsn (physical-store-floor-lsn store))
                                          required-lsn (policy (getf *physical-recovery-state* :timeline-policy))
                                          (checkpoint-seed nil checkpoint-seed-p)
-                                         (next-xid-seed nil next-xid-seed-p) fpw-seed)
+                                         (next-xid-seed nil next-xid-seed-p) fpw-seed logical-seed)
   "Certify drops and fork resets from complete terminals in validated durable WAL.
 An unfinished batch grants no exemption. REQUIRED-LSN must be a complete terminal.
 Checkpoint and observed XID seeds must be supplied together and prove the stage
@@ -209,10 +211,14 @@ resets. No database files are written."
                            (getf private :replay-timeline) timeline)
                      private)))
              (observed (or next 3))
-             (fpw-fact (physical-fpw-copy-fact fpw-seed)))
+             (fpw-fact (physical-fpw-copy-fact fpw-seed))
+             (logical-fact (physical-logical-copy-fact logical-seed)))
         (when fpw-fact
           (physical-fpw-check-fact fpw-fact (physical-recovery-resource-history store state) start-lsn timeline))
-        (setf fpw-fact (physical-recovery-scan-checkpoint-fpw checkpoint fpw-fact start-lsn timeline))
+        (when logical-fact
+          (physical-logical-check-fact logical-fact (physical-recovery-resource-history store state) start-lsn timeline))
+        (setf fpw-fact (physical-recovery-scan-checkpoint-fpw checkpoint fpw-fact start-lsn timeline)
+              logical-fact (physical-recovery-scan-checkpoint-logical checkpoint logical-fact start-lsn timeline))
         (when (and (< start-lsn (physical-store-flushed-lsn store))
                    (not stage-proven-p) (/= timeline (getf state :timeline)))
           (error "drop proof lacks its child checkpoint and observed XID seeds"))
@@ -237,7 +243,10 @@ resets. No database files are written."
                (unless *wal-recovery-group-active*
                  (setf fpw-fact (physical-replay-fpw-fact-next
                                  fpw-fact record timeline
-                                 (lambda () (physical-recovery-resource-history store state))))
+                                 (lambda () (physical-recovery-resource-history store state)))
+                       logical-fact (physical-replay-logical-fact-next
+                                     logical-fact record timeline
+                                     (lambda () (physical-recovery-resource-history store state))))
                  (when (= (wal-record-type record) +wal-record-checkpoint+)
                    (setf (getf *physical-recovery-state* :source-checkpoint)
                          (wal-checkpoint-record-snapshot record)))

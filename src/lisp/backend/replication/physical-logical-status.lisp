@@ -214,8 +214,7 @@ enable end; retain the last OFF boundary across later records."
 
 (defun physical-logical-check-extension (fact minimum required)
   "Reject new witnesses or transitions invented inside the required prefix."
-  (unless (or (every (lambda (key) (eql (getf fact key) (getf minimum key)))
-                     '(:enabled :witness-kind :witness-start :witness-end :witness-timeline))
+  (unless (or (physical-policy-witness-equal-p fact minimum)
               (>= (getf fact :witness-start) required))
     (error "logical witness was inserted inside a required prefix"))
   (dolist (keys '((:last-enable-lsn :last-enable-timeline)

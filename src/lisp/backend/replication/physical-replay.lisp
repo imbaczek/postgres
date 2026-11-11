@@ -39,6 +39,14 @@ known OFF is a non-NIL fact. The fact describes source history, not local policy
     (physical-fpw-fact-next prior record timeline
                             (if (functionp history) (funcall history) history))))
 
+(defun physical-replay-logical-fact-next (prior record timeline history)
+  (when (or prior
+            (= (wal-record-type record) +wal-record-logical-decoding-status-change+)
+            (and (= (wal-record-type record) +wal-record-checkpoint+)
+                 (get-properties (wal-checkpoint-record-snapshot record) '(:logical-decoding-enabled))))
+    (physical-logical-fact-next prior record timeline
+                                (if (functionp history) (funcall history) history))))
+
 (defun physical-recovery-resource-history (store state)
   (let ((selection (and store (physical-store-selection store))))
     (if selection (getf selection :history)
@@ -98,14 +106,27 @@ Return FACT unchanged when the checkpoint does not prove policy at START."
                        (wal-fpw-state-from-checkpoint checkpoint (make-symbol "SCAN-FPW"))
                        start timeline)))
         (when fact
-          (unless (every (lambda (key) (eql (getf fact key) (getf expected key)))
-                         '(:enabled :witness-kind :witness-start :witness-end :witness-timeline))
+          (unless (physical-policy-witness-equal-p fact expected)
             (error "suffix scan FPW seed differs from its starting checkpoint")))
+        (or fact expected))
+      fact))
+
+(defun physical-recovery-scan-checkpoint-logical (checkpoint fact start timeline)
+  (if (and checkpoint (= start (getf checkpoint :end))
+           (get-properties checkpoint '(:logical-decoding-enabled)))
+      (let ((expected (physical-logical-fact-from-state
+                       (wal-logical-status-from-checkpoint checkpoint) :checkpoint
+                       (getf checkpoint :start) (getf checkpoint :timeline)
+                       start timeline nil nil)))
+        (when fact
+          (unless (physical-policy-witness-equal-p fact expected)
+            (error "suffix scan logical seed differs from its starting checkpoint")))
         (or fact expected))
       fact))
 
 (defun physical-recovery-scan-resource-fact (store start end seed state
                                              &key (fpw-seed nil fpw-seed-p)
+                                               (logical-seed nil logical-seed-p)
                                                (checkpoint-seed nil checkpoint-seed-p)
                                                (next-xid-seed nil next-xid-seed-p))
   "Scan the retained prefix from START through END for resource and FPW facts.
@@ -123,6 +144,7 @@ Validation uses private state and performs no redo or publication."
        state start checkpoint-seed checkpoint-seed-p next-xid-seed next-xid-seed-p)
     (let* ((fact (wal-copy-control-resource-fields seed))
            (fpw-fact (physical-fpw-copy-fact fpw-seed))
+           (logical-fact (physical-logical-copy-fact logical-seed))
            (timeline (physical-store-prefix-timeline store start))
            (terminal start)
            (observed (or next 3))
@@ -142,10 +164,15 @@ Validation uses private state and performs no redo or publication."
         (timeline-check-resource-origin fact (physical-recovery-resource-history store state)))
       (when fpw-fact
         (physical-fpw-check-fact fpw-fact (physical-recovery-resource-history store state) start timeline))
-      (setf fpw-fact (physical-recovery-scan-checkpoint-fpw checkpoint fpw-fact start timeline))
+      (when logical-fact
+        (physical-logical-check-fact logical-fact (physical-recovery-resource-history store state) start timeline))
+      (setf fpw-fact (physical-recovery-scan-checkpoint-fpw checkpoint fpw-fact start timeline)
+            logical-fact (physical-recovery-scan-checkpoint-logical checkpoint logical-fact start timeline))
       (when (= start end)
         (return-from physical-recovery-scan-resource-fact
-          (values fact (when fpw-seed-p fpw-fact))))
+          (if logical-seed-p
+              (values fact (when fpw-seed-p fpw-fact) logical-fact)
+              (values fact (when fpw-seed-p fpw-fact)))))
       (unless (or stage-proven-p (= timeline (getf state :timeline)))
         (error "suffix scan lacks its child checkpoint and observed XID seeds"))
       (with-physical-replay-staging ()
@@ -172,15 +199,22 @@ Validation uses private state and performs no redo or publication."
                              (lambda () (physical-recovery-resource-history store state)))))
                (setf fpw-fact (physical-replay-fpw-fact-next
                                fpw-fact record timeline
-                               (lambda () (physical-recovery-resource-history store state))))
+                               (lambda () (physical-recovery-resource-history store state)))
+                     logical-fact (physical-replay-logical-fact-next
+                                   logical-fact record timeline
+                                   (lambda () (physical-recovery-resource-history store state))))
                (when (= (wal-record-type record) +wal-record-checkpoint+)
                  (setf (getf *physical-recovery-state* :source-checkpoint)
                        (wal-checkpoint-record-snapshot record)))
                (setf terminal (wal-record-end record))
                (when (= terminal end)
                  (return-from scan
-                   (values (wal-copy-control-resource-fields fact)
-                           (when fpw-seed-p (physical-fpw-copy-fact fpw-fact)))))))
+                   (if logical-seed-p
+                       (values (wal-copy-control-resource-fields fact)
+                               (when fpw-seed-p (physical-fpw-copy-fact fpw-fact))
+                               (physical-logical-copy-fact logical-fact))
+                       (values (wal-copy-control-resource-fields fact)
+                               (when fpw-seed-p (physical-fpw-copy-fact fpw-fact))))))))
            :start-lsn start :policy (getf state :timeline-policy))
           (error "resource proof did not reach its required boundary; take a fresh base backup"))))))
 

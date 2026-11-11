@@ -213,7 +213,7 @@ Both facts must already belong to the same selected history."
       (and (= (getf fact :coverage-start) (getf minimum :coverage-start))
            (= (getf fact :coverage-timeline) (getf minimum :coverage-timeline)))))
 
-(defun physical-fpw-witness-equal-p (left right)
+(defun physical-policy-witness-equal-p (left right)
   "Compare policy and checkpoint or change witness, excluding the frontier."
   (every (lambda (key) (eql (getf left key) (getf right key)))
          '(:enabled :witness-kind :witness-start :witness-end :witness-timeline)))
@@ -231,7 +231,7 @@ Both facts must already belong to the same selected history."
 
 (defun physical-fpw-check-extension (fact minimum required)
   "Reject invented witnesses or disables inside the required prefix."
-  (unless (or (physical-fpw-witness-equal-p fact minimum)
+  (unless (or (physical-policy-witness-equal-p fact minimum)
               (>= (getf fact :witness-start) required))
     (error "FPW witness was inserted inside a required prefix"))
   (let ((disabled (getf fact :last-disable-start))

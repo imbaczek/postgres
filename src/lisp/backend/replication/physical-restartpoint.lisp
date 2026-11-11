@@ -163,6 +163,8 @@ Prove the separately saved required fact at its own recovery boundary before use
             ;; restartpoint seed check; runtime FPW may still belong to the base.
             (remf candidate :source-fpw-fact)
             (remf candidate :required-fpw-fact)
+            (remf candidate :source-logical-fact)
+            (remf candidate :required-logical-fact)
             (unless fact
               (error "restartpoint lacks required resource proof; take a fresh base backup"))
             (setf (getf candidate :source-resource-fact) fact
@@ -205,7 +207,7 @@ A historical source checkpoint can record OFF regardless of local writer policy.
         (setf fact (checkpoint-fact)))
       (when (and metadata (null fact))
         (cond
-          ((and checkpoint (get-properties checkpoint '(:full-page-writes))
+          ((and checkpoint
                 (<= (physical-store-floor-lsn store) (getf checkpoint :end) start))
            (setf fact (scan (getf checkpoint :end) start (checkpoint-fact)
                             checkpoint (getf checkpoint :next-xid))))
@@ -222,6 +224,56 @@ A historical source checkpoint can record OFF regardless of local writer policy.
             (physical-fpw-required-fact fact minimum start timeline required required-timeline)))
       (physical-fpw-copy-fact fact))))
 
+(defun physical-restartpoint-check-source-logical (metadata)
+  (when (get-properties metadata '(:source-logical-fact))
+    (unless (and (eql 4 (getf metadata :version))
+                 (physical-logical-fact-at-p
+                  (getf metadata :source-logical-fact) (getf metadata :lsn)
+                  (getf metadata :replay-timeline (getf metadata :timeline))))
+      (error "invalid restartpoint source logical fact")))
+  (values))
+
+(defun physical-restartpoint-logical-seed (metadata state store start)
+  (let* ((checkpoint (if metadata (getf metadata :source-checkpoint) (getf state :source-checkpoint)))
+         (timeline (if metadata (getf metadata :replay-timeline (getf metadata :timeline))
+                       (getf state :timeline)))
+         (base (getf state :end))
+         (base-fact (getf state :base-source-logical-fact))
+         (fact (physical-logical-copy-fact (if metadata (getf metadata :source-logical-fact) base-fact)))
+         (required (getf state :required-applied))
+         (required-timeline (getf state :required-timeline (getf state :timeline)))
+         (minimum (getf state :required-logical-fact)))
+    (labels ((checkpoint-fact ()
+               (physical-recovery-scan-checkpoint-logical
+                checkpoint nil (getf checkpoint :end) (getf checkpoint :timeline)))
+             (scan (from to initial checkpoint next)
+               (nth-value 2 (physical-recovery-scan-resource-fact
+                             store from to nil state :logical-seed initial
+                             :checkpoint-seed checkpoint :next-xid-seed next))))
+      (when (and (null fact) checkpoint
+                 (= (getf checkpoint :end) start) (= (getf checkpoint :timeline) timeline))
+        (setf fact (checkpoint-fact)))
+      (when (and metadata (null fact))
+        (cond
+          ((and checkpoint
+                (<= (physical-store-floor-lsn store) (getf checkpoint :end) start))
+           (setf fact (scan (getf checkpoint :end) start (checkpoint-fact)
+                            checkpoint (getf checkpoint :next-xid))))
+          ((<= (physical-store-floor-lsn store) base)
+           (multiple-value-bind (base-checkpoint base-next) (physical-restartpoint-scan-seeds nil state)
+             (setf fact (scan base start base-fact base-checkpoint base-next))))))
+      (when (and metadata (null fact) base-fact)
+        (error "restartpoint lost known logical coverage; take a fresh base backup"))
+      (when fact
+        (physical-logical-check-fact fact (physical-recovery-resource-history store state) start timeline))
+      (when minimum
+        (if (< start required)
+            (multiple-value-bind (checkpoint next) (physical-restartpoint-scan-seeds metadata state)
+              (physical-logical-required-fact (scan start required fact checkpoint next) minimum
+                                              required required-timeline required required-timeline))
+            (physical-logical-required-fact fact minimum start timeline required required-timeline)))
+      (physical-logical-copy-fact fact))))
+
 (defun physical-restartpoint-history-fields-valid-p (metadata)
   "Check the optional selected-history reference and replay timeline in metadata.
 Older metadata without these fields uses the base timeline."
@@ -230,8 +282,9 @@ Older metadata without these fields uses the base timeline."
                                           (replay (getf metadata :replay-timeline base))
                                           (source-xids (loop for key in metadata by #'cddr thereis (eq key :source-xids)))
                                           (resources (loop for key in metadata by #'cddr thereis (eq key :source-resource-fact)))
-                                          (fpw (get-properties metadata '(:source-fpw-fact))))
-    (and (= (length metadata) (+ 28 (if source-xids 2 0) (if resources 2 0) (if fpw 2 0) (if target 6 0)))
+                                          (fpw (get-properties metadata '(:source-fpw-fact)))
+                                          (logical (get-properties metadata '(:source-logical-fact))))
+    (and (= (length metadata) (+ 28 (if source-xids 2 0) (if resources 2 0) (if fpw 2 0) (if logical 2 0) (if target 6 0)))
          (physical-recovery-selection-fields-valid-p 2 3 base replay target digest)
          (or (not target)
              (every (lambda (key) (loop for name in metadata by #'cddr thereis (eq key name)))
@@ -265,6 +318,7 @@ Older metadata without these fields uses the base timeline."
   (physical-restartpoint-check-source-xids metadata)
   (physical-restartpoint-check-source-resources metadata)
   (physical-restartpoint-check-source-fpw metadata)
+  (physical-restartpoint-check-source-logical metadata)
   (let ((reservation (getf metadata :source-reservation)))
     (when reservation
       (unless (and (physical-source-reservation-valid-p reservation)
@@ -342,6 +396,10 @@ Older metadata without these fields uses the base timeline."
       (when (getf state :source-fpw-fact)
         (setf metadata (append metadata
                                (list :source-fpw-fact (physical-fpw-copy-fact (getf state :source-fpw-fact))))))
+      (when (getf state :source-logical-fact)
+        (setf metadata (append metadata
+                               (list :source-logical-fact
+                                     (physical-logical-copy-fact (getf state :source-logical-fact))))))
       (when (getf state :source-xids)
         (setf metadata (append metadata (list :source-xids (copy-tree (getf state :source-xids))))))
       (when (getf state :history-target)
@@ -427,7 +485,8 @@ Validate the suffix using explicit seeds from the verified restartpoint or base.
       (physical-recovery-policy-check-seed state store metadata)
       (let ((start (if metadata (getf metadata :lsn) (getf state :end)))
             (resource-seed nil)
-            (fpw-seed nil))
+            (fpw-seed nil)
+            (logical-seed nil))
         (unless (and (<= (physical-store-floor-lsn store) start (physical-store-flushed-lsn store))
                      (or metadata (= start (physical-store-base-lsn store))))
           (error "receive floor lacks its required published restartpoint"))
@@ -440,12 +499,16 @@ Validate the suffix using explicit seeds from the verified restartpoint or base.
             (error "restartpoint differs from its durable receive prefix")))
         (setf resource-seed (physical-restartpoint-resource-seed metadata state store start)
               fpw-seed (physical-restartpoint-fpw-seed metadata state store start))
+        (when (or (getf metadata :source-logical-fact) (getf state :source-logical-fact)
+                  (getf state :base-source-logical-fact) (getf state :required-logical-fact))
+          (setf logical-seed (physical-restartpoint-logical-seed metadata state store start)))
         (multiple-value-bind (checkpoint next) (physical-restartpoint-scan-seeds metadata state)
           (multiple-value-bind (removed terminal reset-forks)
-              (physical-recovery-proven-drops
-               store identity :start-lsn start :required-lsn (max required start)
-               :checkpoint-seed checkpoint :next-xid-seed next :fpw-seed fpw-seed
-               :policy (getf state :timeline-policy))
+              (apply #'physical-recovery-proven-drops
+                     store identity :start-lsn start :required-lsn (max required start)
+                     :checkpoint-seed checkpoint :next-xid-seed next :fpw-seed fpw-seed
+                     :policy (getf state :timeline-policy)
+                     (when logical-seed (list :logical-seed logical-seed)))
             (declare (ignore terminal))
             (physical-recovery-check-base-forks
              (if metadata (list :files (getf metadata :forks)) state) removed reset-forks)))
@@ -480,12 +543,18 @@ Validate the suffix using explicit seeds from the verified restartpoint or base.
                 (wal-copy-control-resource-fields resource-seed)))
         (when (or fpw-seed (get-properties *physical-recovery-state* '(:source-fpw-fact)))
           (setf (getf *physical-recovery-state* :source-fpw-fact) (physical-fpw-copy-fact fpw-seed)))
+        (when (or logical-seed (get-properties *physical-recovery-state* '(:source-logical-fact)))
+          (setf (getf *physical-recovery-state* :source-logical-fact)
+                (physical-logical-copy-fact logical-seed)))
         (setf (getf *physical-recovery-state* :replay-timeline)
               (if metadata (getf metadata :replay-timeline (getf metadata :timeline))
                   (getf state :timeline)))
         (when (> start required)
           (when (or fpw-seed (get-properties *physical-recovery-state* '(:required-fpw-fact)))
             (setf (getf *physical-recovery-state* :required-fpw-fact) (physical-fpw-copy-fact fpw-seed)))
+          (when (or logical-seed (get-properties *physical-recovery-state* '(:required-logical-fact)))
+            (setf (getf *physical-recovery-state* :required-logical-fact)
+                  (physical-logical-copy-fact logical-seed)))
           (when resource-seed
             (setf (getf *physical-recovery-state* :required-resource-fact)
                   (wal-copy-control-resource-fields resource-seed)))
