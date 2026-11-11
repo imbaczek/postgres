@@ -2,7 +2,7 @@
 from pathlib import Path
 import struct
 import sys
-import zlib
+from crc32c_reference import crc32c
 
 
 def reports(directory):
@@ -22,7 +22,7 @@ def reports(directory):
             assert offset + size <= len(data)
             record = bytearray(data[offset:offset + size])
             record[28:32] = bytes(4)
-            assert zlib.crc32(record) == crc, (path, offset)
+            assert crc32c(record) == crc, (path, offset)
             if kind == 16:
                 assert version == 8 and xid == 0 and size == 64
                 assert record[32:40] == b"PGRES001" and record[60:64] == bytes(4)

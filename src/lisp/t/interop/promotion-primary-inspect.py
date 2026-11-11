@@ -8,7 +8,7 @@ import runpy
 import shutil
 import struct
 import sys
-import zlib
+from crc32c_reference import crc32c
 
 SIZE = 16 * 1024 * 1024
 ARCHIVE = runpy.run_path(str(pathlib.Path(__file__).with_name("restartpoint-prefix-inspect.py")))
@@ -20,13 +20,13 @@ def crc(data, offset):
     scratch = bytearray(data)
     saved = struct.unpack_from("<I", scratch, offset)[0]
     struct.pack_into("<I", scratch, offset, 0)
-    assert zlib.crc32(scratch) == saved
+    assert crc32c(scratch) == saved
 
 
 def control(root):
     fields = (root / "global/pg_wal_control").read_bytes().split()
     assert fields[0] == b"PGWAL6" and len(fields) in (8, 11, 15, 17, 21)
-    assert zlib.crc32(b" ".join(fields[:-1])) == int(fields[-1], 16)
+    assert crc32c(b" ".join(fields[:-1])) == int(fields[-1], 16)
     CHECK_OPTIONAL_CONTROL(fields[:-1])
     return int(fields[1]), int(fields[2]), int(fields[3]), int(fields[4]), fields[5], bytes.fromhex(fields[6].decode())
 
@@ -172,7 +172,7 @@ def checkpoint_bytes(expected):
         snapshot[88:120] = b"PGRES001" + struct.pack("<5I", *resources["parameters"]) + bytes(4)
         struct.pack_into("<QII", snapshot, 120, resources["lsn"], resources["timeline"], 0)
     record = bytearray(struct.pack("<4sHHIQQI", b"PGWL", 8, 4, size, start, 0, 0) + snapshot)
-    struct.pack_into("<I", record, 28, zlib.crc32(record))
+    struct.pack_into("<I", record, 28, crc32c(record))
     return start, record
 
 
@@ -195,7 +195,7 @@ def damage(target, expected_path, kind):
     elif kind == "foreign-staging":
         struct.pack_into("<I", record, 96, expected["child"] + 1)
         struct.pack_into("<I", record, 28, 0)
-        struct.pack_into("<I", record, 28, zlib.crc32(record))
+        struct.pack_into("<I", record, 28, crc32c(record))
         path.write_bytes(path.read_bytes()[:offset] + record)
     elif kind == "oversized-staging":
         path.write_bytes(path.read_bytes()[:offset] + record + b"x")
@@ -208,7 +208,7 @@ def damage(target, expected_path, kind):
         state = bytearray(state_path.read_bytes()[:68] + b"\0" * 4)
         state[:8] = b"PGRSTAT3"
         struct.pack_into("<I", state, 8, (struct.unpack_from("<I", state, 8)[0] & (1 << 31)) | 2)
-        struct.pack_into("<I", state, 68, zlib.crc32(state))
+        struct.pack_into("<I", state, 68, crc32c(state))
         state_path.write_bytes(state)
     elif kind == "wrong-history":
         fork = expected["fork"] + 1

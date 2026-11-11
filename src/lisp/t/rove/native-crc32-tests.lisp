@@ -1,5 +1,14 @@
 (in-package #:pg)
 
+(defparameter *unit-ieee-crc32-table*
+  (let ((table (make-array 256 :element-type '(unsigned-byte 32))))
+    (dotimes (index 256 table)
+      (let ((crc index))
+        (dotimes (bit 8)
+          (setf crc (logxor (ash crc -1) (if (oddp crc) #xedb88320 0))))
+        (setf (aref table index) crc))))
+  "Independent IEEE table for comparison with CRC32C.")
+
 #+x86-64
 (defun unit-crc32-bit-reference-seeded (bytes start end seed)
   (let ((crc seed))
@@ -18,14 +27,14 @@
               append (loop for size in (if *native-ieee-crc32-available-p*
                                            '(0 1 15 16 17 63 64 65 127 128 129 255 256 257 1024)
                                            '(0 1 15))
-                           collect (list bytes 3 (+ 3 size) *wal-crc32-table*
+                           collect (list bytes 3 (+ 3 size) *unit-ieee-crc32-table*
                                          *native-ieee-crc32-constants* seed)))))
 
 #+x86-64
 (rove:deftest native-crc32-seeded-folds-match-bit-reference-and-preserve-inputs
     (if *native-ieee-crc32-available-p*
         (let* ((bytes (make-array 8300 :element-type '(unsigned-byte 8)))
-               (table (copy-seq *wal-crc32-table*))
+               (table (copy-seq *unit-ieee-crc32-table*))
                (constants (copy-seq *native-ieee-crc32-constants*)))
           (dotimes (index (length bytes))
             (setf (aref bytes index) (mod (+ (* 73 index) (floor index 17)) 256)))
@@ -36,7 +45,7 @@
                   (rove:ok (= (unit-crc32-bit-reference-seeded bytes start (+ start size) seed)
                               (%wal-crc32-ieee-octets bytes start (+ start size) table constants seed))))))
             (rove:ok (equalp bytes before)))
-          (rove:ok (equalp table *wal-crc32-table*))
+          (rove:ok (equalp table *unit-ieee-crc32-table*))
           (rove:ok (equalp constants *native-ieee-crc32-constants*)))
         (rove:skip "CPU has no PCLMULQDQ; scalar fallback remains covered.")))
 
@@ -58,7 +67,7 @@
                          (dolist (seed '(0 #xffffffff #x12345678 #x80000001))
                            (unless (= (unit-crc32-bit-reference-seeded bytes start end seed)
                                       (%wal-crc32-ieee-octets
-                                       bytes start end *wal-crc32-table*
+                                       bytes start end *unit-ieee-crc32-table*
                                        *native-ieee-crc32-constants* seed))
                              (setf mismatch (list size start seed))
                              (return-from check))
@@ -91,7 +100,8 @@
           (expected (unit-crc32-bit-reference bytes start (length bytes)))
           (native (wal-crc32 bytes start)))
       (and (= expected native
-              (let ((*native-ieee-crc32-available-p* nil)) (wal-crc32 bytes start)))
+              (let ((*native-crc32c-sse42-available-p* nil)
+                    (*native-crc32c-pclmul-available-p* nil)) (wal-crc32 bytes start)))
            (equalp bytes before)))))
 
 #+x86-64

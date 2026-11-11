@@ -4,7 +4,7 @@ import runpy
 import tempfile
 from types import SimpleNamespace
 import unittest
-import zlib
+from crc32c_reference import crc32c
 
 module = SimpleNamespace(**runpy.run_path(str(Path(__file__).resolve().parents[2] / 'bin/pg_ctl')))
 
@@ -19,7 +19,7 @@ class PromotionControl(unittest.TestCase):
     def write_control(self, fields):
         prefix = ' '.join(fields).encode()
         (self.root / 'global/pg_wal_control').write_bytes(
-            prefix + f' {zlib.crc32(prefix):08X}\n'.encode())
+            prefix + f' {crc32c(prefix):08X}\n'.encode())
 
     def test_production_state_with_and_without_retained_reference(self):
         # Checkpoint payload is opaque to pg_ctl; only lifecycle state is read.

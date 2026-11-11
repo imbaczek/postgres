@@ -6,7 +6,7 @@
           do (setf crc (logxor crc (aref bytes index)))
              (dotimes (bit 8)
                (setf crc (if (oddp crc)
-                             (logxor (ash crc -1) #xedb88320)
+                             (logxor (ash crc -1) #x82f63b78)
                              (ash crc -1)))))
     (logxor crc #xffffffff)))
 
@@ -49,10 +49,10 @@
          (wal-crc32 bytes start end)
          (wal-crc32 (coerce (coerce bytes 'list) 'vector) start end)))))
 
-(rove:deftest crc32-matches-ieee-and-empty-vectors
-    (rove:ok (= #xcbf43926 (wal-crc32 (string->bytes "123456789"))))
+(rove:deftest crc32-matches-castagnoli-and-empty-vectors
+    (rove:ok (= #xe3069283 (wal-crc32 (string->bytes "123456789"))))
   (rove:ok (zerop (wal-crc32 (make-array 0 :element-type '(unsigned-byte 8)))))
-  (rove:ok (= #xcbf43926 (wal-crc32 (string->bytes "_123456789_") 1 10)))
+  (rove:ok (= #xe3069283 (wal-crc32 (string->bytes "_123456789_") 1 10)))
   (progv '(*wal-crc32-table*) nil
     (rove:ok (zerop (wal-crc32 (make-array 0 :element-type '(unsigned-byte 8)))))))
 

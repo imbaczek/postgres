@@ -652,47 +652,44 @@ Legacy 16-hex segment names always belong to timeline 1."
       (let ((crc i))
         (loop repeat 8
               do (setf crc (if (oddp crc)
-                               (logxor (ash crc -1) #xEDB88320)
+                               (logxor (ash crc -1) #x82F63B78)
                                (ash crc -1))))
         (setf (aref table i) (logand crc #xFFFFFFFF))))))
 
-(defvar *wal-crc32-table* (make-wal-crc32-table))
+(defparameter *wal-crc32-table* (make-wal-crc32-table)
+  "Native storage CRC32C table; reinitialized on reload when the format changes.")
 
 #+(or x86-64 arm64)
-(defparameter *wal-crc32-ieee-reference-table* (make-wal-crc32-table))
+(defparameter *wal-crc32c-reference-table* (make-wal-crc32-table))
 
 (defun wal-crc32-typed-range (bytes start end table &optional (seed #xffffffff))
-  "Return the final inverted CRC for a validated octet range and raw SEED.
-The caller supplies a simple octet vector, valid fixnum bounds, a 256-entry
-unsigned 32-bit table and a 32-bit SEED. For slices of at least 128 bytes and
-an exact IEEE table, use x86-64 PCLMUL or ARM64 CRC32 when available; otherwise
-use the seeded scalar recurrence. Inputs are read only."
+  "Return final CRC32C for a validated slice and raw SEED.
+Canonical tables permit CPU-qualified native kernels; custom tables retain
+their scalar recurrence. Inputs are read only."
   (declare (type (simple-array (unsigned-byte 8) (*)) bytes)
            (type (simple-array (unsigned-byte 32) (256)) table)
            (type fixnum start end)
            (type (unsigned-byte 32) seed))
   #+x86-64
-  (when (and *native-ieee-crc32-available-p*
-             (>= (- end start) 128)
-             (equalp table *wal-crc32-ieee-reference-table*))
+  (when (and *native-crc32c-sse42-available-p*
+             (equalp table *wal-crc32c-reference-table*))
     (return-from wal-crc32-typed-range
-      (%wal-crc32-ieee-octets bytes start end table
-                              *native-ieee-crc32-constants* seed)))
+      (if (and *native-crc32c-pclmul-available-p* (>= (- end start) 64))
+          (%wal-crc32c-pclmul-octets bytes start end table
+                                     *native-crc32c-constants* seed)
+          (%wal-crc32c-sse42-octets bytes start end nil nil seed))))
   #+arm64
   (when (and *native-arm-crc32-available-p*
-             (>= (- end start) 128)
-             (equalp table *wal-crc32-ieee-reference-table*))
+             (equalp table *wal-crc32c-reference-table*))
     (return-from wal-crc32-typed-range
-      (%wal-crc32-ieee-arm-octets bytes start end nil nil seed)))
+      (%wal-crc32c-arm-octets bytes start end nil nil seed)))
   (%wal-crc32-octets bytes start end table seed))
 
 (defun wal-crc32 (bytes &optional (start 0) (end (length bytes)))
-  "Return the final IEEE CRC-32 of BYTES from START inclusive to END exclusive.
-The initial running state is #xffffffff. Valid simple octet slices of at
-least 128 bytes use x86-64 PCLMUL or ARM64 CRC32 when available and when all
-256 table entries match the IEEE table. Other inputs retain the scalar calculation,
-including the behavior of a modified table.  BYTES is read without mutation.
-This native WAL checksum remains IEEE CRC-32; PostgreSQL C uses CRC-32C."
+  "Return final CRC32C (Castagnoli) of BYTES from START inclusive to END exclusive.
+The initial raw state and final XOR are #xffffffff, as in PostgreSQL C.
+Validated octet slices use available native instructions with a canonical table;
+other inputs and modified tables use the scalar recurrence. BYTES is read only."
   (let ((table (and (boundp '*wal-crc32-table*) *wal-crc32-table*)))
     (if (and (typep bytes '(simple-array (unsigned-byte 8) (*)))
              (typep table '(simple-array (unsigned-byte 32) (256)))
@@ -2479,7 +2476,7 @@ For a simple octet record of at least 32 bytes and a typed table, process bytes
 0 through 27, invert that result back to raw state, apply four zero bytes, then
 process bytes 32 onward.  This read-only path allocates no heap storage.
 Other vectors or tables use the copy, zero and public CRC fallback, preserving
-its behavior and allocation.  The record format uses IEEE CRC-32."
+its behavior and allocation.  The record format uses CRC32C (Castagnoli)."
   (let ((table (and (boundp '*wal-crc32-table*) *wal-crc32-table*)))
     (when (and (typep bytes '(simple-array (unsigned-byte 8) (*)))
                (>= (length bytes) +wal-header-size+)

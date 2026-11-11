@@ -1,5 +1,16 @@
 # Development TODO
 
+- [ ] Qualify native CRC32C on physical ARM hardware.
+  Native WAL and storage checksums now use Castagnoli CRC32C, without an IEEE
+  legacy reader. Existing development data with IEEE checksums is incompatible;
+  the native WAL layout version remains 8. Physical Graviton/Mac performance
+  and the macOS runtime feature probe still need hardware qualification. Swap
+  validation evidence is recorded in
+  `/home/imbaczek/proj/pg-ha-artifacts/crc32c-swap-20261111/summary.json`.
+  Earlier benchmark and emulated portability evidence:
+  `/home/imbaczek/proj/pg-ha-artifacts/crc32c-comparison-20261111-111649/summary.json`
+  and `/home/imbaczek/proj/pg-ha-artifacts/crc32-arm64-portability-20261111/summary.json`.
+
 - [x] Recover interrupted preserved-data reseed installation moves.
   Verify the recorded move prefix or one completed rename ahead across the
   target, incoming image and quarantine. Sync visible journal progress before

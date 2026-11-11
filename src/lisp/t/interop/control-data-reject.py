@@ -4,7 +4,7 @@ import shutil
 import struct
 import subprocess
 import sys
-import zlib
+from crc32c_reference import crc32c
 
 helpers = runpy.run_path(str(pathlib.Path(__file__).with_name("control-data-inspect.py")))
 storage = helpers["storage"]
@@ -42,7 +42,7 @@ for kind in ("generation-symlink", "generation-fifo", "generation-corrupt", "poi
     elif kind == "control-state":
         fields = path.read_bytes().split()
         prefix = b" ".join(fields[:7] + [b"42", b"7", b"0"])
-        path.write_bytes(prefix + f" {zlib.crc32(prefix):08X}\n".encode())
+        path.write_bytes(prefix + f" {crc32c(prefix):08X}\n".encode())
     else:
         data = bytearray(path.read_bytes())
         data[len(data) // 2] ^= 1

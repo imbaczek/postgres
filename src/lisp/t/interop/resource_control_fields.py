@@ -1,5 +1,5 @@
 """Independent optional-field checks for native control inspection oracles."""
-import zlib
+from crc32c_reference import crc32c
 
 
 def resource_values(data):
@@ -95,7 +95,7 @@ def recovery_promotion_full_page_writes(data):
     assert int.from_bytes(data[8:12], "little") & 0x7FFFFFFF == 3
     intent = data[-21:-4]
     assert intent[:8] == b"PGFPWPI1" and intent[8] in (0, 1) and not any(intent[9:])
-    assert zlib.crc32(data[:-4] + bytes(4)) == int.from_bytes(data[-4:], "little")
+    assert crc32c(data[:-4] + bytes(4)) == int.from_bytes(data[-4:], "little")
     return bool(intent[8])
 
 
@@ -118,7 +118,7 @@ def recovery_control_fields(data):
              or (pending and resource_end + 4 in (136, 152, 180, 196)))
     size = resource_end + 4 - (48 if known else 0)
     assert (ordinary and size in (72, 88)) or (pending and size in (88, 104, 132, 148))
-    assert zlib.crc32(data[:-4] + bytes(4)) == int.from_bytes(data[-4:], "little")
+    assert crc32c(data[:-4] + bytes(4)) == int.from_bytes(data[-4:], "little")
     selected = size in ((104, 148) if pending else (88,))
     offset = (84 if pending else 68) if selected else 12
     applied, applied_timeline = int.from_bytes(data[40:48], "little"), int.from_bytes(data[offset:offset + 4], "little")

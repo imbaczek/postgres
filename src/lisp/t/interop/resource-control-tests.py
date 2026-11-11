@@ -4,7 +4,7 @@ import runpy
 import struct
 import tempfile
 import unittest
-import zlib
+from crc32c_reference import crc32c
 
 HERE = Path(__file__).resolve().parent
 CTL = runpy.run_path(str(HERE.parents[1] / "bin/pg_ctl"))
@@ -33,7 +33,7 @@ class ResourceControlTests(unittest.TestCase):
         snapshot = (b"PGCKPT02" + struct.pack("<6QqIIQII", 0, 120, 0, 3, 2, 0, 0,
                                            timeline, 1, 0, 0, 0))
         record = bytearray(struct.pack("<4sHHIQQI", b"PGWL", 8, 4, 120, 0, 0, 0) + snapshot)
-        struct.pack_into("<I", record, 28, zlib.crc32(record))
+        struct.pack_into("<I", record, 28, crc32c(record))
         namespace = "legacy" if timeline == 1 else "timeline"
         filename = "0000000000000000.wal" if timeline == 1 else f"{timeline:08X}0000000000000000.wal"
         (self.root / "pg_wal" / filename).write_bytes(record)
@@ -49,7 +49,7 @@ class ResourceControlTests(unittest.TestCase):
 
     def write(self, fields, corrupt_crc=False):
         prefix = " ".join(fields).encode("ascii")
-        crc = zlib.crc32(prefix) ^ bool(corrupt_crc)
+        crc = crc32c(prefix) ^ bool(corrupt_crc)
         (self.root / "global/pg_wal_control").write_bytes(prefix + f" {crc:08X}\n".encode("ascii"))
 
     def known_checkpoint(self, timeline=1):
@@ -61,7 +61,7 @@ class ResourceControlTests(unittest.TestCase):
         fields[6] = snapshot.hex()
         fields[12:14] = ["96", "1"]
         record = bytearray(struct.pack("<4sHHIQQI", b"PGWL", 8, 4, 168, 128, 0, 0) + snapshot)
-        struct.pack_into("<I", record, 28, zlib.crc32(record))
+        struct.pack_into("<I", record, 28, crc32c(record))
         filename = "0000000000000000.wal" if timeline == 1 else f"{timeline:08X}0000000000000000.wal"
         (self.root / "pg_wal" / filename).write_bytes(bytes(128) + record)
         self.write(fields)
@@ -193,7 +193,7 @@ class ResourceControlTests(unittest.TestCase):
                 fields[6] = snapshot.hex()
                 self.write(fields)
                 record = bytearray(struct.pack("<4sHHIQQI", b"PGWL", 8, 4, 168, 128, 0, 0) + snapshot)
-                struct.pack_into("<I", record, 28, zlib.crc32(record))
+                struct.pack_into("<I", record, 28, crc32c(record))
                 (self.root / "pg_wal/0000000000000000.wal").write_bytes(bytes(128) + record)
                 facts, _ = CHECKPOINT(self.root)
                 self.assertEqual(policy is not None, "full_page_writes" in facts)
@@ -213,7 +213,7 @@ class ResourceControlTests(unittest.TestCase):
             self.write(fields)
             for version in (7, 8):
                 record = bytearray(struct.pack("<4sHHIQQI", b"PGWL", version, 4, 120, 0, 0, 0) + snapshot)
-                struct.pack_into("<I", record, 28, zlib.crc32(record))
+                struct.pack_into("<I", record, 28, crc32c(record))
                 (self.root / "pg_wal/0000000000000000.wal").write_bytes(record)
                 if version == 7:
                     with self.assertRaises(AssertionError):
@@ -244,7 +244,7 @@ class ResourceControlTests(unittest.TestCase):
                             fact = (b"PGRES001" + struct.pack("<5I", 100, 8, 10, 0, 128)
                                     + bytes(4) + struct.pack("<QII", 64, 1, 0))
                             data[-52:-4] = fact
-                        struct.pack_into("<I", data, len(data) - 4, zlib.crc32(data))
+                        struct.pack_into("<I", data, len(data) - 4, crc32c(data))
                         path = self.root / "physical-recovery.control"
                         path.write_bytes(data)
                         self.assertEqual(3 if pending else 2, CTL["recovery_phase"](self.root))
@@ -263,7 +263,7 @@ class ResourceControlTests(unittest.TestCase):
                                 bad = data.copy()
                                 struct.pack_into("<I", bad, len(bad) - 52 + relative, value)
                                 struct.pack_into("<I", bad, len(bad) - 4, 0)
-                                struct.pack_into("<I", bad, len(bad) - 4, zlib.crc32(bad))
+                                struct.pack_into("<I", bad, len(bad) - 4, crc32c(bad))
                                 path.write_bytes(bad)
                                 with self.assertRaises(ValueError):
                                     CTL["recovery_phase"](self.root)
@@ -294,7 +294,7 @@ class ResourceControlTests(unittest.TestCase):
             struct.pack_into("<IIQQIIQQIIQ", data, offset + 8,
                              1 if enabled else 4, 0, 64, 112, 1, 1, 64, 256,
                              applied_timeline, 0 if enabled else 1, 0 if enabled else 64)
-        struct.pack_into("<I", data, len(data) - 4, zlib.crc32(data))
+        struct.pack_into("<I", data, len(data) - 4, crc32c(data))
         return data
 
     def test_recovery_fpw_false_unknown_and_all_extension_combinations(self):
@@ -332,7 +332,7 @@ class ResourceControlTests(unittest.TestCase):
                 data = source.copy()
                 data[fpw_offset + offset:fpw_offset + offset + size] = value.to_bytes(size, "little")
                 struct.pack_into("<I", data, len(data) - 4, 0)
-                struct.pack_into("<I", data, len(data) - 4, zlib.crc32(data))
+                struct.pack_into("<I", data, len(data) - 4, crc32c(data))
                 (self.root / "physical-recovery.control").write_bytes(data)
                 with self.assertRaises(ValueError):
                     CTL["recovery_phase"](self.root)
@@ -344,7 +344,7 @@ class ResourceControlTests(unittest.TestCase):
     def promotion_intent_image(self, old, desired):
         data = old[:-4] + b"PGFPWPI1" + bytes([desired]) + bytes(8) + bytes(4)
         data = bytearray(data)
-        struct.pack_into("<I", data, len(data) - 4, zlib.crc32(data))
+        struct.pack_into("<I", data, len(data) - 4, crc32c(data))
         return data
 
     def test_pending_fpw_intent_keeps_source_and_local_policy_separate(self):
@@ -381,7 +381,7 @@ class ResourceControlTests(unittest.TestCase):
                 data = source.copy()
                 data[start + offset] = value
                 struct.pack_into("<I", data, len(data) - 4, 0)
-                struct.pack_into("<I", data, len(data) - 4, zlib.crc32(data))
+                struct.pack_into("<I", data, len(data) - 4, crc32c(data))
                 (self.root / "physical-recovery.control").write_bytes(data)
                 with self.assertRaises(ValueError):
                     CTL["recovery_phase"](self.root)
@@ -395,7 +395,7 @@ class ResourceControlTests(unittest.TestCase):
         wrong_phase = self.promotion_intent_image(self.fpw_recovery_image(True, 88, False, None), False)
         struct.pack_into("<I", wrong_phase, 8, 2)
         struct.pack_into("<I", wrong_phase, len(wrong_phase) - 4, 0)
-        struct.pack_into("<I", wrong_phase, len(wrong_phase) - 4, zlib.crc32(wrong_phase))
+        struct.pack_into("<I", wrong_phase, len(wrong_phase) - 4, crc32c(wrong_phase))
         bad_crc = self.promotion_intent_image(self.fpw_recovery_image(True, 88, False, None), False)
         bad_crc[-13] = 1
         for data in (ordinary, wrong_phase, bad_crc):

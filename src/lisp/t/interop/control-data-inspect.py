@@ -6,7 +6,7 @@ import stat
 import struct
 import subprocess
 import sys
-import zlib
+from crc32c_reference import crc32c
 
 from patroni_native_node import native_node
 
@@ -40,7 +40,7 @@ def run(root, expected_state=None):
     rows = {key: value.strip() for key, value in rows.items()}
     fields = (root / "global/pg_wal_control").read_bytes().split()
     assert fields[0] == b"PGWAL6" and len(fields) in (8, 11, 15, 17, 21)
-    assert zlib.crc32(b" ".join(fields[:-1])) == int(fields[-1], 16)
+    assert crc32c(b" ".join(fields[:-1])) == int(fields[-1], 16)
     CHECK_OPTIONAL_CONTROL(fields[:-1])
     if len(fields) in (11, 15, 17, 21) and not (root / "physical-recovery.control").exists():
         assert rows["Database system identifier"] == fields[7].decode()

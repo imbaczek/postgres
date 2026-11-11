@@ -2,7 +2,7 @@
 import argparse
 import runpy
 import struct
-import zlib
+from crc32c_reference import crc32c
 from pathlib import Path
 
 RECOVERY_LAYOUT = runpy.run_path(str(Path(__file__).with_name("resource_control_fields.py")))["recovery_control_layout"]
@@ -23,7 +23,7 @@ def decode(raw):
     expected, = struct.unpack_from('<I', raw, crc_offset)
     checked = bytearray(raw)
     struct.pack_into('<I', checked, crc_offset, 0)
-    assert zlib.crc32(checked) == expected, 'CRC'
+    assert crc32c(checked) == expected, 'CRC'
     phase, timeline, system_id, digest, checkpoint, applied, xid = struct.unpack_from('<IIQQQQQ', raw, 8)
     if version == 3 and phase & (1 << 31):
         assert xid == 0, 'hidden exhausted XID value'
@@ -68,7 +68,7 @@ def main():
         assert not (struct.unpack_from('<I', raw, 8)[0] & (1 << 31)), 'legacy cannot represent exhaustion'
         old = bytearray(raw[:56] + bytes(4))
         old[:8] = b'PGRSTATE'
-        struct.pack_into('<I', old, 56, zlib.crc32(old))
+        struct.pack_into('<I', old, 56, crc32c(old))
         args.path.write_bytes(old)
         raw = args.path.read_bytes()
     value = decode(raw)

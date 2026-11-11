@@ -8,7 +8,7 @@ import re
 import runpy
 import struct
 import sys
-import zlib
+from crc32c_reference import crc32c
 
 CHECK_RESOURCES = runpy.run_path(str(pathlib.Path(__file__).with_name("resource_control_fields.py")))["checkpoint_resource_fact"]
 RECOVERY_LAYOUT = runpy.run_path(str(pathlib.Path(__file__).with_name("resource_control_fields.py")))["recovery_control_layout"]
@@ -23,7 +23,7 @@ def checked_crc(data, offset):
     saved = struct.unpack_from("<I", data, offset)[0]
     scratch = bytearray(data)
     struct.pack_into("<I", scratch, offset, 0)
-    assert zlib.crc32(scratch) == saved, "CRC mismatch"
+    assert crc32c(scratch) == saved, "CRC mismatch"
 
 
 def field(text, name):
@@ -206,7 +206,7 @@ def check_oracle_fixtures():
 
     def frame(kind, payload=b"", start=boundary):
         record = bytearray(struct.pack("<4sHHIQQI", b"PGWL", 7, kind, 32 + len(payload), start, 0, 0) + payload)
-        struct.pack_into("<I", record, 28, zlib.crc32(record))
+        struct.pack_into("<I", record, 28, crc32c(record))
         return record
 
     ordinary = frame(6)
@@ -347,7 +347,7 @@ def prepare_pending(target, source, snapshot):
     assert struct.unpack_from("<I", ordinary, 12)[0] == 1
     fields = (root / "global" / "pg_wal_control").read_bytes().split()
     assert fields[0] == b"PGWAL6"
-    assert zlib.crc32(b" ".join(fields[:-1])) == int(fields[-1], 16)
+    assert crc32c(b" ".join(fields[:-1])) == int(fields[-1], 16)
     source_namespace = {b"legacy": 0, b"timeline": 1}[fields[5]]
     pending = bytearray(88)
     pending[:68] = ordinary[:68]
@@ -356,7 +356,7 @@ def prepare_pending(target, source, snapshot):
     struct.pack_into("<I", pending, 56, 5)  # DB_IN_ARCHIVE_RECOVERY
     # Schema alone is insufficient: this fixture deliberately lacks generation ownership.
     struct.pack_into("<IIQ", pending, 68, 2, source_namespace, digest ^ 1)
-    struct.pack_into("<I", pending, 84, zlib.crc32(pending))
+    struct.pack_into("<I", pending, 84, crc32c(pending))
     path.write_bytes(pending)
     pathlib.Path(snapshot).write_text(json.dumps(storage_snapshot(root), sort_keys=True))
     print(f"pending-control-fixture: prepared unproven fork={lsn} child=2 generation={digest ^ 1:016X}")
@@ -379,7 +379,7 @@ def snapshot_pending(target, source, snapshot):
     assert struct.unpack_from("<I", control, 68)[0] == 2
     fields = (root / "global" / "pg_wal_control").read_bytes().split()
     assert fields[0] == b"PGWAL6"
-    assert zlib.crc32(b" ".join(fields[:-1])) == int(fields[-1], 16)
+    assert crc32c(b" ".join(fields[:-1])) == int(fields[-1], 16)
     assert struct.unpack_from("<I", control, 72)[0] == {b"legacy": 0, b"timeline": 1}[fields[5]]
     image = (root / "pg_physical_restartpoints" / f"{lsn:016X}-{digest:016X}.rp").read_bytes()
     text_length = struct.unpack_from("<I", image, 8)[0]
@@ -507,16 +507,16 @@ def damage_resume(target, change):
         image = bytearray(data[:32] + text + data[32 + length:])
         struct.pack_into("<I", image, 8, len(text))
         struct.pack_into("<I", image, 24, 0)
-        struct.pack_into("<I", image, 24, zlib.crc32(image))
+        struct.pack_into("<I", image, 24, crc32c(image))
         new_digest = fnv(image)
         (generation_path.parent / f"{fork:016X}-{new_digest:016X}.rp").write_bytes(image)
         struct.pack_into("<Q", pointer, 16, new_digest)
         struct.pack_into("<I", pointer, 24, 0)
-        struct.pack_into("<I", pointer, 24, zlib.crc32(pointer))
+        struct.pack_into("<I", pointer, 24, crc32c(pointer))
         pointer_path.write_bytes(pointer)
         struct.pack_into("<Q", control, 76, new_digest)
         struct.pack_into("<I", control, len(control) - 4, 0)
-        struct.pack_into("<I", control, len(control) - 4, zlib.crc32(control))
+        struct.pack_into("<I", control, len(control) - 4, crc32c(control))
         control_path.write_bytes(control)
     elif change == "receive":
         path = root / "pg_physical_receive" / "receive.control"
@@ -534,7 +534,7 @@ def damage_resume(target, change):
         records = []
         for kind, start in ((6, flush), (9, flush + 32)):
             record = bytearray(struct.pack("<4sHHIQQI", b"PGWL", 7, kind, 32, start, 0, 0))
-            struct.pack_into("<I", record, 28, zlib.crc32(record))
+            struct.pack_into("<I", record, 28, crc32c(record))
             records.append(record)
         batch = b"".join(records)
         value = struct.unpack_from("<Q", receive, 40)[0]
@@ -549,7 +549,7 @@ def damage_resume(target, change):
         struct.pack_into("<Q", receive, 40, value)
         crc_offset = len(receive) - 4
         struct.pack_into("<I", receive, crc_offset, 0)
-        struct.pack_into("<I", receive, crc_offset, zlib.crc32(receive))
+        struct.pack_into("<I", receive, crc_offset, crc32c(receive))
         path.write_bytes(receive)
     elif change == "lock":
         (root / "pg_physical_receive" / "receive.lock").unlink()
@@ -579,7 +579,7 @@ def damage_resume(target, change):
     elif change == "system":
         struct.pack_into("<Q", control, 16, struct.unpack_from("<Q", control, 16)[0] ^ 1)
         struct.pack_into("<I", control, len(control) - 4, 0)
-        struct.pack_into("<I", control, len(control) - 4, zlib.crc32(control))
+        struct.pack_into("<I", control, len(control) - 4, crc32c(control))
         control_path.write_bytes(control)
     elif change == "valid-tail":
         data = child_path.read_bytes()
@@ -588,7 +588,7 @@ def damage_resume(target, change):
         assert len(record) == 56
         struct.pack_into("<I", record, 40, child + 1)
         struct.pack_into("<I", record, 28, 0)
-        struct.pack_into("<I", record, 28, zlib.crc32(record))
+        struct.pack_into("<I", record, 28, crc32c(record))
         child_path.write_bytes(data[:offset] + record)
     elif change == "oversized-tail":
         with child_path.open("ab") as stream:

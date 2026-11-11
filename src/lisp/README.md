@@ -185,10 +185,23 @@ advances the durable LSN. Run `CHECKPOINT` to flush staged pages and catalog/CLO
 state before advancing the recovery pointer. This is a small physical WAL
 implementation for the server's supported operations.
 
+Native WAL and storage metadata use CRC32C (Castagnoli), with no foreign
+checksum calls. For validated slices with the canonical table, SBCL uses
+x86-64 SSE4.2 when available, with PCLMUL folding for slices of at least 64
+bytes when both features are available. Little-endian ARM64 uses CRC32
+instructions when supported. Other cases use a scalar kernel compiled with
+safety 1. ARM feature discovery uses Linux HWCAP or macOS sysctl and fails
+closed; cached features are refreshed on load and saved-image startup. PMULL
+is detected and reserved for future use, but no PMULL kernel is implemented.
+ARM tests have run under QEMU; native Graviton and Mac performance and the
+Darwin runtime probe are not yet hardware-qualified. Existing development data
+with IEEE CRC-32 checksums is incompatible; there is no legacy checksum reader.
+
 Native WAL checkpoints (payload introduced in version 6) preserve source counters, checkpoint time
 and explicit start/end/redo positions in the record and the CRC-checked WAL
-control copy. The copy advances only after data/CLOG sync. Stored legacy WAL and
-controls remain readable with unknown checkpoint facts until a new checkpoint.
+control copy. The copy advances only after data/CLOG sync. Older WAL and control
+layouts with current CRC32C checksums remain readable with unknown checkpoint
+facts until a new checkpoint.
 Native streaming uses the experimental `pg_lisp_wal_8` format. End-of-recovery
 syntax and read-only timeline checks use that same format; operational promotion
 remains unfinished.
@@ -247,8 +260,8 @@ until commit; recovery applies the reset and replacement images only after the
 batch terminal is durable. Work includes discarding staged cache entries and
 private pages, as well as handling replaced relations and new pages. It does not
 walk old physical pages or log an image for each one. Stored WAL
-versions 2–7 remain readable. Both native streaming peers must support format 8;
-older peers are rejected during negotiation.
+versions 2–7 with current CRC32C checksums remain readable. Both native streaming
+peers must support format 8; older peers are rejected during negotiation.
 `./t/checkpoint-snapshot.sh` covers legacy upgrade, both publication crash
 boundaries, control-copy mismatch rejection and standby restartpoint preservation.
 Version 7 additionally logs native XID reservations before allocation. Standby

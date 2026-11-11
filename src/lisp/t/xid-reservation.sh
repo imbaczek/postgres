@@ -84,6 +84,7 @@ legacy_migration() {
         python3 - "$BASE" "$TMP/copy" "$TMP/migration-$kind" "$TMP/base-checkpoint.json" <<'PY'
 import json, runpy, sys
 from pathlib import Path
+sys.path.insert(0, str(Path(sys.argv[1]) / 't/interop'))
 decode = runpy.run_path(str(Path(sys.argv[1]) / 't/interop/recovery-control-state.py'))['decode']
 root = Path(sys.argv[2])
 control = decode((root / 'physical-recovery.control').read_bytes())

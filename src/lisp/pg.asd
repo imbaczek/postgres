@@ -16,7 +16,10 @@
                   :components ((:file "sockets")
                                (:file "files")
                                (:file "physical-image")
-                               (:file "ieee-crc32" :if-feature :x86-64)))))
+                               (:file "arm-crc32-support")
+                               (:file "ieee-crc32" :if-feature :x86-64)
+                               (:file "crc32c" :if-feature :x86-64)
+                               (:file "arm-crc32" :if-feature :arm64)))))
    (:module "backend"
     :serial t
     :components
@@ -34,6 +37,8 @@
                    (:file "smgr")
                    (:file "wal-core.hot")
                    (:file "wal-crc32.hot" :if-feature :x86-64)
+                   (:file "wal-crc32c.hot" :if-feature :x86-64)
+                   (:file "wal-crc32-arm.hot" :if-feature :arm64)
                    (:file "wal" :pathname "wal-core")
                    (:file "wal-pressure")
                    (:file "wal-resource-parameters")

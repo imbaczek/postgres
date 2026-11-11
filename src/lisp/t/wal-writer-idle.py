@@ -3,7 +3,7 @@ from pathlib import Path
 import re
 import runpy
 import signal
-import zlib
+from interop.crc32c_reference import crc32c
 
 
 api = runpy.run_path(str(Path(__file__).with_name('wal-writer.py')))
@@ -19,7 +19,7 @@ def control_facts(server):
     raw = (server.data / 'global/pg_wal_control').read_text(encoding='ascii')
     assert raw.endswith('\n') and raw.count('\n') == 1
     prefix, crc = raw.rstrip('\n').rsplit(' ', 1)
-    assert zlib.crc32(prefix.encode('ascii')) == int(crc, 16)
+    assert crc32c(prefix.encode('ascii')) == int(crc, 16)
     fields = prefix.split(' ')
     assert fields[0] == 'PGWAL6'
     return dict(durable=int(fields[2]), resource=optional_fields(fields)['lsn'],

@@ -12,7 +12,7 @@ import shlex
 import socket
 import struct
 import subprocess
-import zlib
+from crc32c_reference import crc32c
 
 from patroni.dcs import Member
 from patroni.postgresql import Postgresql
@@ -44,7 +44,7 @@ def origin(data, identity):
     image = (data / 'pg_physical_origins' / name).read_bytes()
     fields = image.split()
     assert len(fields) == 8 and fields[0] == b'PGPHYSORIGIN1'
-    assert zlib.crc32(b' '.join(fields[:-1])) == int(fields[-1], 16)
+    assert crc32c(b' '.join(fields[:-1])) == int(fields[-1], 16)
     numbers = tuple(map(int, fields[1:7]))
     assert numbers[:4] == identity
     return numbers[4:]
@@ -53,7 +53,7 @@ def origin(data, identity):
 def control(data):
     image = (data / 'global/pg_wal_control').read_bytes()
     fields = image.split()
-    assert fields[0] == b'PGWAL6' and zlib.crc32(b' '.join(fields[:-1])) == int(fields[-1], 16)
+    assert fields[0] == b'PGWAL6' and crc32c(b' '.join(fields[:-1])) == int(fields[-1], 16)
     assert fields[3:6] == [b'1', b'1', b'legacy']
     return int(fields[1]), int(fields[2]), int(fields[8])
 
@@ -83,7 +83,7 @@ def hash_history(data, cursor, endpoint, digest=SEED):
             raw = header + stream.read(size - 32)
         assert len(raw) == size
         checked = raw[:28] + b'\0\0\0\0' + raw[32:]
-        assert zlib.crc32(checked) == crc
+        assert crc32c(checked) == crc
         digest = fnv(raw, digest)
         cursor = start + size
     assert cursor == endpoint

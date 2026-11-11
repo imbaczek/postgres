@@ -8,7 +8,7 @@ import struct
 import subprocess
 import sys
 import time
-import zlib
+from crc32c_reference import crc32c
 from pathlib import Path
 
 import psutil
@@ -59,7 +59,7 @@ def reject_missing_child_recovery_control():
 
 def check_committed_archive(pending):
     fields = (data / "global/pg_wal_control").read_bytes().split()
-    assert len(fields) == 17 and zlib.crc32(b" ".join(fields[:-1])) == int(fields[-1], 16)
+    assert len(fields) == 17 and crc32c(b" ".join(fields[:-1])) == int(fields[-1], 16)
     assert [int(value) for value in fields[10:16]] == list(archive["retained_reference"](pending))
     history = (data / "pg_wal/00000003.history").read_text()
     parsed = archive["parsed_history"](3, history)
@@ -290,7 +290,7 @@ try:
     target_control = (data / "global/pg_wal_control").read_bytes().split()
     assert len(source_control) == 17 and len(target_control) == 11
     for fields in (source_control, target_control):
-        assert zlib.crc32(b" ".join(fields[:-1])) == int(fields[-1], 16)
+        assert crc32c(b" ".join(fields[:-1])) == int(fields[-1], 16)
     assert source_control[:10] == target_control[:10]
     assert not (data / "pg_physical_retained").exists()
     inspect_child_control("starting up", stopped=True)

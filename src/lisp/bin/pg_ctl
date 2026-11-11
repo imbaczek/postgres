@@ -16,7 +16,16 @@ import stat
 import struct
 import sys
 import time
-import zlib
+
+
+def crc32c(data):
+    """Compute the native metadata CRC32C without an external dependency."""
+    crc = 0xffffffff
+    for byte in data:
+        crc ^= byte
+        for _ in range(8):
+            crc = (crc >> 1) ^ (0x82f63b78 if crc & 1 else 0)
+    return crc ^ 0xffffffff
 
 
 def read_regular(path, limit):
@@ -58,7 +67,7 @@ def recovery_phase(root):
     if not ((ordinary and size in (72, 88)) or (pending and size in (88, 104, 132, 148))):
         raise ValueError("invalid native recovery control")
     saved = struct.unpack_from("<I", data, len(data) - 4)[0]
-    if zlib.crc32(data[:-4] + b"\0" * 4) != saved:
+    if crc32c(data[:-4] + b"\0" * 4) != saved:
         raise ValueError("native recovery control checksum mismatch")
     selected = size in ((104, 148) if pending else (88,))
     timeline_offset = (84 if pending else 68) if selected else 12
@@ -180,7 +189,7 @@ def primary_committed(root):
     fields = read_regular(root / "global/pg_wal_control", 1025).split()
     if len(fields) not in (8, 11, 15, 17, 21) or fields[0] != b"PGWAL6":
         raise ValueError("invalid native WAL control")
-    if zlib.crc32(b" ".join(fields[:-1])) != int(fields[-1], 16):
+    if crc32c(b" ".join(fields[:-1])) != int(fields[-1], 16):
         raise ValueError("native WAL control checksum mismatch")
     validate_resource_fields(fields)
     return (int(fields[3]) > 1 and fields[3] == fields[4] and fields[5] == b"timeline"

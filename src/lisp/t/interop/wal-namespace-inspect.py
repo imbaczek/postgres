@@ -4,7 +4,7 @@ import hashlib
 import json
 from pathlib import Path
 import runpy
-import zlib
+from crc32c_reference import crc32c
 
 CHECK_OPTIONAL_CONTROL = runpy.run_path(str(Path(__file__).with_name("resource_control_fields.py")))["check_optional_fields"]
 
@@ -13,7 +13,7 @@ def inspect(root):
     raw = (root / 'global/pg_wal_control').read_text(encoding='ascii')
     assert raw.endswith('\n') and raw.count('\n') == 1
     prefix, crc = raw.rstrip('\n').rsplit(' ', 1)
-    assert zlib.crc32(prefix.encode()) == int(crc, 16)
+    assert crc32c(prefix.encode()) == int(crc, 16)
     fields = prefix.split(' ')
     CHECK_OPTIONAL_CONTROL(fields)
     magic, checkpoint, durable, insertion, record_tli, namespace, payload = fields[:7]

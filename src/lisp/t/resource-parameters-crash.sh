@@ -53,15 +53,16 @@ check_control() {
 import runpy
 import struct
 import sys
-import zlib
 from pathlib import Path
 
 if not __debug__:
     raise RuntimeError("resource crash assertions require Python assertions")
 base, path, expected = sys.argv[1:]
+sys.path.insert(0, str(Path(base) / "t/interop"))
+from crc32c_reference import crc32c
 line = Path(path).read_text().strip()
 prefix, crc = line.rsplit(" ", 1)
-assert zlib.crc32(prefix.encode()) == int(crc, 16), line
+assert crc32c(prefix.encode()) == int(crc, 16), line
 fields = prefix.split()
 runpy.run_path(str(Path(base) / "t/interop/resource_control_fields.py"))["check_optional_fields"](fields)
 index = fields.index("R")

@@ -4,6 +4,15 @@
 ;;;; BASELINE-PATH is optional. No production definitions are replaced.
 (in-package #:pg)
 
+(defparameter *crc32-codegen-ieee-table*
+  (let ((table (make-array 256 :element-type '(unsigned-byte 32))))
+    (dotimes (index 256 table)
+      (let ((crc index))
+        (dotimes (bit 8)
+          (setf crc (logxor (ash crc -1) (if (oddp crc) #xedb88320 0))))
+        (setf (aref table index) crc))))
+  "Independent IEEE table for comparison with CRC32C.")
+
 #+x86-64
 (defmacro crc32-codegen-c-loop (bytes index limit state state1 state2 state3 factors)
   "Translate the C four-stream PCLMUL loop into SBCL assembler for comparison.
@@ -101,7 +110,7 @@ remains a GC root; no raw pointer escapes this VOP."
   "Check seeds, vector boundaries, offsets, larger buffers and input preservation."
   (let ((bytes (make-array (+ 65536 64) :element-type '(unsigned-byte 8)))
         (checks 0)
-        (table (copy-seq *wal-crc32-table*))
+        (table (copy-seq *crc32-codegen-ieee-table*))
         (constants (copy-seq *native-ieee-crc32-constants*)))
     (dotimes (index (length bytes))
       (setf (aref bytes index) (mod (+ 17 (* 73 index) (floor index 17)) 256)))
@@ -136,13 +145,13 @@ remains a GC root; no raw pointer escapes this VOP."
         (witness 0))
     (declare (type (unsigned-byte 32) witness))
     (dotimes (iteration 100)
-      (funcall function bytes 3 end *wal-crc32-table* *native-ieee-crc32-constants* #xffffffff))
+      (funcall function bytes 3 end *crc32-codegen-ieee-table* *native-ieee-crc32-constants* #xffffffff))
     (multiple-value-bind (seconds microseconds) (sb-ext:get-time-of-day)
       (let ((allocated (sb-ext:get-bytes-consed)))
         (dotimes (iteration iterations)
           (setf witness
                 (logxor witness
-                        (funcall function bytes 3 end *wal-crc32-table*
+                        (funcall function bytes 3 end *crc32-codegen-ieee-table*
                                  *native-ieee-crc32-constants* #xffffffff))))
         (setf allocated (- (sb-ext:get-bytes-consed) allocated))
         (multiple-value-bind (after-seconds after-microseconds) (sb-ext:get-time-of-day)

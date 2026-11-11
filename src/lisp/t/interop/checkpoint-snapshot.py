@@ -6,7 +6,7 @@ import os
 from pathlib import Path
 import runpy
 import struct
-import zlib
+from crc32c_reference import crc32c
 
 CHECK_OPTIONAL_CONTROL = runpy.run_path(str(Path(__file__).with_name("resource_control_fields.py")))["check_optional_fields"]
 CHECK_RESOURCES = runpy.run_path(str(Path(__file__).with_name("resource_control_fields.py")))["checkpoint_resource_fact"]
@@ -49,7 +49,7 @@ def read_copy(pgdata):
     raw = (pgdata / "global/pg_wal_control").read_text(encoding="ascii")
     assert raw.endswith("\n") and raw.count("\n") == 1
     prefix, crc = raw.rstrip("\n").rsplit(" ", 1)
-    assert zlib.crc32(prefix.encode("ascii")) == int(crc, 16)
+    assert crc32c(prefix.encode("ascii")) == int(crc, 16)
     fields = prefix.split(" ")
     namespace = "legacy"
     if fields[0] == "PGWAL6":
@@ -83,7 +83,7 @@ def read_copy(pgdata):
     assert wal_version >= 8 or not int.from_bytes(data[84:88], "little") & 24
     assert (magic, kind, size, start, xid) == (b"PGWL", 4, 32 + len(data), facts["start"], 0)
     struct.pack_into("<I", record, 28, 0)
-    assert zlib.crc32(record) == crc and record[32:] == data
+    assert crc32c(record) == crc and record[32:] == data
     return facts, payload
 
 
@@ -109,7 +109,7 @@ def convert_fixture(pgdata, facts, payload, legacy, unsupported_insertion=False)
         segment = pgdata / f"pg_wal/{facts['start'] // 16777216:016X}.wal"
         assert sorted((pgdata / "pg_wal").glob("*.wal"))[-1] == segment
         header = bytearray(struct.pack("<4sHHIQQI", b"PGWL", 5, 4, 32, facts["start"], 0, 0))
-        struct.pack_into("<I", header, 28, zlib.crc32(header))
+        struct.pack_into("<I", header, 28, crc32c(header))
         with segment.open("r+b") as stream:
             assert stream.seek(0, 2) == facts["end"] - facts["start"] // 16777216 * 16777216
             stream.seek(facts["start"] % 16777216)
@@ -124,7 +124,7 @@ def convert_fixture(pgdata, facts, payload, legacy, unsupported_insertion=False)
         struct.pack_into("<q", data, 56, facts["time"] + 1)
         prefix = f"PGWAL4 {facts['end']} {facts['end']} {data.hex().upper()}"
     with control.open("wb") as stream:
-        stream.write(f"{prefix} {zlib.crc32(prefix.encode()):08X}\n".encode())
+        stream.write(f"{prefix} {crc32c(prefix.encode()):08X}\n".encode())
         stream.flush()
         os.fsync(stream.fileno())
 

@@ -40,7 +40,8 @@
           (let ((before (copy-seq bytes)))
             (rove:ok (= (unit-record-crc32-copy-reference bytes) (wal-record-crc32 bytes)))
             #+x86-64
-            (let ((*native-ieee-crc32-available-p* nil))
+            (let ((*native-crc32c-sse42-available-p* nil)
+                  (*native-crc32c-pclmul-available-p* nil))
               (rove:ok (= (unit-record-crc32-copy-reference bytes) (wal-record-crc32 bytes))))
             (rove:ok (equalp bytes before)))))))
 
@@ -93,6 +94,21 @@
                        (error (condition) (search "WAL checksum mismatch" (princ-to-string condition)))))
             (rove:ok (equalp corrupt before)))))))
 
+(rove:deftest record-crc32-rejects-ieee-checksum
+    (let* ((payload (make-array 128 :element-type '(unsigned-byte 8) :initial-element 173))
+           (record (wal-encode-record +wal-record-pages+ 3 0 payload))
+           (crc #xffffffff))
+      (wal-set-u32 record 28 0)
+      (loop for byte across record
+            do (setf crc (logxor crc byte))
+               (dotimes (bit 8)
+                 (setf crc (logxor (ash crc -1)
+                                   (if (oddp crc) #xedb88320 0)))))
+      (wal-set-u32 record 28 (logxor crc #xffffffff))
+      (rove:ok (handler-case (progn (wal-decode-record record 0) nil)
+                 (error (condition)
+                   (search "WAL checksum mismatch" (princ-to-string condition)))))))
+
 (rove:deftest record-crc32-generated-copy-equivalence-contract
     (let ((data (cl-spec:result-data
                  (cl-spec:check-function 'wal-record-crc32 :trials 100 :seed 3402))))
@@ -108,5 +124,6 @@
                    (arguments (list bytes)))
               (rove:ok (zerop (unit-hot-call-allocated-bytes #'wal-record-crc32 arguments)))
               #+x86-64
-              (let ((*native-ieee-crc32-available-p* nil))
+              (let ((*native-crc32c-sse42-available-p* nil)
+                    (*native-crc32c-pclmul-available-p* nil))
                 (rove:ok (zerop (unit-hot-call-allocated-bytes #'wal-record-crc32 arguments))))))))))
