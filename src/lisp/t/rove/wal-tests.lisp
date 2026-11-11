@@ -34,6 +34,7 @@ Each entry in SEGMENTS contains a segment number followed by its byte vectors."
          (*clog-stream* nil)
          (*clog-pending-commits* (make-hash-table :test #'eql))
          (*wal-storage-incarnation* (gensym "TEST-WAL-STORE-"))
+         (*wal-fpw-state* nil) (*wal-logical-policy* nil) (*wal-logical-info* nil)
          (*wal-ready* t) (*wal-poisoned* nil) (*physical-recovery-failed-p* nil)
          (*wal-insert-timeline* 1) (*wal-end-lsn* 200) (*wal-durable-lsn* 100))
     (declare (special *clog-pending-commits* *wal-storage-incarnation*))
@@ -42,6 +43,20 @@ Each entry in SEGMENTS contains a segment number followed by its byte vectors."
          (progn (clog-init) (funcall function))
       (when *clog-stream* (ignore-errors (close *clog-stream*)))
       (uiop:delete-directory-tree *pgdata* :validate t :if-does-not-exist :ignore))))
+
+(rove:deftest pending-clog-fixture-isolates-logical-info-incarnation
+    (let* ((*wal-storage-incarnation* (gensym "OUTER-CLOG-STORE-"))
+           (*wal-logical-info-generation* 1)
+           (*wal-logical-info*
+             (%make-wal-logical-info *wal-storage-incarnation* 1 nil))
+           (outer-info *wal-logical-info*)
+           (outer-incarnation *wal-storage-incarnation*))
+      (call-with-pending-clog-test
+       (lambda ()
+         (rove:ok (not (eq outer-incarnation *wal-storage-incarnation*)))
+         (rove:ok (null *wal-logical-info*))))
+      (rove:ok (eq outer-info *wal-logical-info*))
+      (rove:ok (eq outer-incarnation *wal-storage-incarnation*))))
 
 (defun pending-clog-raw-status (xid)
   (with-open-file (in (clog-path) :element-type '(unsigned-byte 8))
