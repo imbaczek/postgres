@@ -45,6 +45,11 @@ compatibility document for their commands, semantics and review evidence.
 
 ## Running
 
+Run `python3 t/interop/ddl-publication.py SQL_PORT CONTROL_SOCKET` from
+`src/lisp` against an explicitly owned SQL server and its private control
+socket. It checks relation gate ordering, the interleaved schema event chain,
+late subscriber drift and no-op guards.
+
 See the main README's test dependency setup. The primary `pg-interop-tests`
 ASDF/Rove suite executes the Function Specs and Properties through four ordinary
 Rove tests, using seed 42 and 200 trials per declaration. Merely registering

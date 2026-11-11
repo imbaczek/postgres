@@ -587,6 +587,16 @@ Remove the trace and its temporary helper after the demo:
 
 ## Tests
 
+- CLOG fixtures that scope `*wal-storage-incarnation*` must also scope
+  `*wal-fpw-state*`, `*wal-logical-policy*` and `*wal-logical-info*`.
+  Isolated wraparound fixtures must scope `*recovery-reader-xids*` as well as
+  active XIDs and
+  snapshot domains.
+- Synthetic WAL fixtures must match the current file length to the WAL end.
+  Logical slot activation and publication fixtures must exercise a real ON
+  tail rather than a fabricated policy. Use `uiop:temporary-directory` to
+  honor the RAM wrapper's `TMPDIR`, rather than hardcoding `/tmp`.
+
 ```sh
 ./t/run-unit-tests.sh   # page/tuple/index/visibility checks
 ./t/psql-smoke.sh       # psql acceptance, diffed against t/psql-smoke.out

@@ -101,7 +101,8 @@
   (values))
 
 (defun call-with-logical-ddl-response-collection (function)
-  "Collect DDL replies until transaction completion."
+  "Collect DDL notices and command tags for the caller to flush after commit.
+The dynamic queue is private to this call. If FUNCTION fails, it is discarded."
   (let ((*logical-ddl-responses-deferred-p* t)
         (*logical-ddl-deferred-responses* nil))
     (let ((result (funcall function)))

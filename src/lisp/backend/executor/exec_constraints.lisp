@@ -271,7 +271,9 @@ NOT VALID checks still apply to new row versions, after their NOT NULL checks."
   "Alter stored expressions under schema DDL serialization.
 ADD, default, drop and rename actions wait for relation users. VALIDATE permits
 DML: the installed NOT VALID check protects new versions while a fresh retained
-snapshot is scanned. Expression evaluation holds no global write/catalog mutex."
+snapshot is scanned. Expression evaluation holds no global write/catalog mutex.
+After scans, the final publication revalidates the table and captures a fresh
+schema precondition under the write and catalog locks."
   (with-schema-write-lock
     (with-stored-expression-barrier (table (getf ast :action))
       (let* ((*current-snapshot* (refresh-statement-snapshot))

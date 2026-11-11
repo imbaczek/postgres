@@ -115,7 +115,7 @@ bootstrap payloads without index owners are rejected before schema changes."
          table-name)))
 
 (defun logical-private-metadata-ddl-target-name-under-write-lock (database ast)
-  "Return the subscriber-owned table name targeted by replicated DDL AST."
+  "Return the subscriber-owned table targeted by AST, with the write lock held."
   (case (getf ast :type)
     (:create-table
      (let ((name (getf ast :name)))
@@ -155,7 +155,7 @@ bootstrap payloads without index owners are rejected before schema changes."
     (otherwise nil)))
 
 (defun logical-private-metadata-ddl-target-name (database ast)
-  "Return the subscriber-owned table name targeted by replicated DDL AST."
+  "Look up the subscriber-owned table targeted by AST under the write lock."
   (with-write-lock
     (logical-private-metadata-ddl-target-name-under-write-lock database ast)))
 
@@ -225,6 +225,9 @@ bootstrap payloads without index owners are rejected before schema changes."
     (logical-validate-schema-contract-under-write-lock expected phase)))
 
 (defun call-with-logical-ddl-publication-under-lock (ast function)
+  "Run FUNCTION with a fresh schema precondition under write and catalog locks.
+When applying a replicated event, reject subscriber drift and private metadata
+targets before calling FUNCTION."
   (unless (and (sb-thread:holding-mutex-p *write-lock*)
                (sb-thread:holding-mutex-p *catalog-lock*))
     (error "logical DDL publication requires write and catalog locks"))
@@ -246,11 +249,14 @@ bootstrap payloads without index owners are rejected before schema changes."
     (funcall function)))
 
 (defmacro with-logical-ddl-publication ((ast) &body body)
+  "Hold the publication locks while checking AST and running BODY."
   `(with-write-catalog-locks
      (call-with-logical-ddl-publication-under-lock
       ,ast (lambda () ,@body))))
 
 (defun call-with-logical-ddl-durability-rollback (ast rollback function)
+  "Publish FUNCTION under the schema check. Invoke ROLLBACK on an earlier error;
+preserve catalog state after a durable save."
   (with-logical-ddl-publication (ast)
     (call-with-catalog-durability-rollback-under-lock rollback function)))
 

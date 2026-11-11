@@ -4,7 +4,9 @@
 
 (defmacro with-table-ddl ((table &key refresh-snapshot indexes wait-readers ast)
                           &body body)
-  "Lock and revalidate TABLE and INDEXES before running catalog change BODY."
+  "Gate TABLE and INDEXES and revalidate TABLE before publishing BODY.
+BODY must revalidate indexes as needed. AST identifies the DDL for a fresh schema
+precondition under the write and catalog locks, after acquiring the gates."
   (let* ((table-value (gensym "TABLE-"))
          (index-values (gensym "INDEXES-"))
          (relfilenodes (gensym "RELFILENODES-"))
@@ -1075,6 +1077,12 @@ before this removal horizon is captured."
                        (when table (list (pg-class-relfilenode table))))))
 
 (defun exec-create-index (stream ast)
+  "Build privately while holding the table gate, then publish the index.
+OID reservation, build, file sync and detached relfile cleanup stay outside the
+final publication scope. Under the write and catalog locks, revalidate and capture
+a fresh schema precondition before mutation, event creation and durable save or
+catalog rollback.
+Release these locks before waiting for commit or sending replies."
   (let* ((*catalog-save-error-after-durable-p* nil)
          (name (getf ast :name))
          (unique (getf ast :unique))
@@ -1612,6 +1620,9 @@ completion after success; anonymous source cannot inherit Bind parameters."
     (send-command-complete stream "DO")))
 
 (defun execute-in-transaction-body (stream ast)
+  "Execute AST and collect DDL replies through transaction completion.
+Replicated DDL gets a short subscriber preflight even if execution returns
+without a change; each actual publication captures its own schema precondition."
   (let ((implicit (not (or (backend-explicit *backend*)
                            (backend-implicit-query-block *backend*))))
         (logical-ddl-responses nil)

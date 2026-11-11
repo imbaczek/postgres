@@ -1,14 +1,19 @@
 # Development TODO
 
-- [ ] Allow detached index builds to overlap logical DDL on other tables.
-  The global logical DDL order mutex currently spans the entire build. The
-  index-build contention test reaches its name race but the second builder
-  waits until the first publishes. Preserve schema-before evidence, catalog/WAL
-  publication order and final DDL durability when narrowing that scope. Do not
-  reacquire the order mutex while holding a table gate: competing DROP/ALTER
-  paths currently take those locks in the opposite order. Runtime proof and
-  the repair plan are in
-  `/home/imbaczek/proj/pg-ha-artifacts/wal-writer-policy/logical-slot-sql/`.
+- [x] Allow detached index builds to overlap logical DDL on other tables.
+  Capture schema-before and validate subscriber state at final catalog publication,
+  after relation gates. Keep response collection separate from publication locks.
+  The unchanged name race, durable failure/restart checks and an interleaved
+  B-to-A-to-DROP schema chain pass. Code is in `c992a20a742`; evidence is in
+  `/home/imbaczek/proj/pg-ha-artifacts/wal-writer-policy/ddl-publication-scope/`.
+
+- [ ] Audit legacy fixtures that leave virtual reader owners behind.
+  A full Rove-plus-legacy run reached wraparound with no real XIDs or retained
+  snapshots in its fixture, but still waited for readers from earlier fixtures.
+  The isolated wraparound fixtures now bind their own virtual reader registry.
+  Identify the producers at test boundaries and end their owned backend scopes;
+  do not clear live owners globally to make the suite pass. The interrupted run
+  and its wait-for-no-active-xids backtrace are archived with the DDL evidence.
 
 - [ ] Qualify native CRC32C on physical ARM hardware.
   Native WAL and storage checksums now use Castagnoli CRC32C, without an IEEE

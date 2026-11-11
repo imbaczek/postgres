@@ -2125,7 +2125,11 @@ snapshot owns copies of XIP and sequence states."
 Like PostgreSQL's logical snapbuild path, this owns a read-only REPEATABLE READ
 snapshot for the initial copy. The named slot survives the dynamic scope and
 must be dropped after logical consumption. Schema-changing commands and
-VACUUM FULL wait for this scope."
+VACUUM FULL wait for this scope. The caller keeps logical capture armed. This
+function rechecks wraparound admission after arming and flushes the logical
+decoding ON record before acquiring the schema read lock or capturing the
+snapshot and slot.
+A failed copy can leave the named slot for the caller to remove."
   (unless *backend*
     (ereport "55000" "exported snapshots require an active backend"))
   (unless (eq (backend-state *backend*) :idle)
@@ -2236,6 +2240,9 @@ VACUUM FULL wait for this scope."
                          slot-name slot-owner))))))))))))
 
 (defun call-with-exported-snapshot (slot-name function)
+  "Admit wraparound before activation and keep capture armed through publication.
+The arm prevents logical decoding from being disabled while the snapshot and
+its slot are created."
   (unless *backend* (ereport "55000" "exported snapshots require an active backend"))
   (unless (eq (backend-state *backend*) :idle)
     (ereport "25001" "cannot export a snapshot from inside a transaction"))
@@ -2564,7 +2571,8 @@ The caller keeps interrupts masked and retains any XID until cleanup."
 (defun finish-synchronous-commit-response (backend outcome)
   "Handle the wait outcome after committed transaction cleanup.
 Cancellation or timeout warns that remote replication is uncertain; termination
-and source change close the connection. An incomplete response suppresses output."
+and source change close the connection. The warning bypasses the DDL response
+queue after local cleanup. An incomplete response suppresses output."
   (let ((complete nil))
     (unwind-protect
          (progn
