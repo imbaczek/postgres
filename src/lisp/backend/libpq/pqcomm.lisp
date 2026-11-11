@@ -36,7 +36,7 @@
   (sb-ext:string-to-octets string :external-format :utf-8))
 
 (defun bytes->string (bytes &key (start 0) (end (length bytes)))
-  (sb-ext:octets-to-string (subseq bytes start end) :external-format :utf-8))
+  (sb-ext:octets-to-string bytes :start start :end end :external-format :utf-8))
 
 ;;; ---- reading ----
 

@@ -1,6 +1,76 @@
 ;;;; logical-tests.lisp -- migrated unit regressions; run with pg-unit-tests.
 (in-package #:pg)
 
+(defun unit-byte-span-vector (shape)
+  (let* ((bytes (concatenate '(vector (unsigned-byte 8))
+                             (make-array 1 :element-type '(unsigned-byte 8) :initial-element 255)
+                             (string->bytes "prefix-λ-🦉-中-suffix")
+                             (make-array 1 :element-type '(unsigned-byte 8) :initial-element 255)))
+         (size (length bytes)))
+    (ecase shape
+      (:simple bytes)
+      (:adjustable
+       (make-array size :element-type '(unsigned-byte 8) :initial-contents bytes :adjustable t))
+      (:fill-pointer
+       (let ((result (make-array (+ size 7) :element-type '(unsigned-byte 8)
+                                            :initial-element 255 :adjustable t :fill-pointer size)))
+         (replace result bytes)
+         result))
+      (:displaced
+       (let ((backing (make-array (+ size 6) :element-type '(unsigned-byte 8) :initial-element 255)))
+         (replace backing bytes :start1 3)
+         (make-array size :element-type '(unsigned-byte 8)
+                          :displaced-to backing :displaced-index-offset 3))))))
+
+(defun unit-byte-span-outcome (function bytes start end)
+  (handler-case (list :value (funcall function bytes :start start :end end))
+    (error (condition) (list :error (type-of condition)))))
+
+(defun unit-byte-span-reference (bytes &key (start 0) (end (length bytes)))
+  (sb-ext:octets-to-string (subseq bytes start end) :external-format :utf-8))
+
+(cl-spec:defproperty utf8-span-decoding-matches-owned-copy
+    ((shape (member :simple :adjustable :fill-pointer :displaced))
+     (first (range integer 0 64)) (count (range integer 0 64)))
+  (:about bytes->string)
+  (:trials (:normal 200))
+  (let* ((bytes (unit-byte-span-vector shape))
+         (start (mod first (1+ (length bytes))))
+         (end (+ start (mod count (1+ (- (length bytes) start))))))
+    (equal (unit-byte-span-outcome #'unit-byte-span-reference bytes start end)
+           (unit-byte-span-outcome #'bytes->string bytes start end))))
+
+(rove:deftest utf8-span-decoding-generated-boundary-contract
+    (let ((data (cl-spec:result-data
+                 (cl-spec:run-property 'utf8-span-decoding-matches-owned-copy
+                                       :seed 313 :profile :normal))))
+      (rove:ok (eq :passed (getf data :status)) (format nil "~s" data))))
+
+(rove:deftest utf8-span-decoding-owns-result-and-obeys-active-vector-length
+    (dolist (shape '(:simple :adjustable :fill-pointer :displaced))
+      (let* ((bytes (unit-byte-span-vector shape))
+             (end (1- (length bytes)))
+             (decoded (bytes->string bytes :start 1 :end end)))
+        (rove:ok (string= "prefix-λ-🦉-中-suffix" decoded))
+        (fill bytes 0)
+        (rove:ok (string= "prefix-λ-🦉-中-suffix" decoded))))
+  (let ((bytes (make-array 8 :element-type '(unsigned-byte 8) :initial-element 65
+                             :adjustable t :fill-pointer 2)))
+    (rove:ok (string= "AA" (bytes->string bytes)))
+    (rove:ok (string= "AA" (bytes->string bytes :end nil)))
+    (rove:ok (rove:signals (bytes->string bytes :end 3) 'error))))
+
+(rove:deftest utf8-span-decoding-preserves-invalid-input-precedence
+    (dolist (shape '(:simple :adjustable :fill-pointer :displaced))
+      (let ((bytes (unit-byte-span-vector shape)))
+        (dolist (bounds (list (list -1 1) (list 0 -1) (list 2 1)
+                              (list 0 (1+ (length bytes))) (list :bad 1)
+                              (list 0 :bad) (list 0 1) (list 1 1) (list 1 nil)))
+          (destructuring-bind (start end) bounds
+            (rove:ok
+             (equal (unit-byte-span-outcome #'unit-byte-span-reference bytes start end)
+                    (unit-byte-span-outcome #'bytes->string bytes start end))))))))
+
 (rove:deftest test-row-decoders-reject-malformed-before-apply
     (let ((insert (symbol-function 'logical-apply-insert-tuple))
           (update (symbol-function 'logical-apply-update-tuples))
