@@ -2,12 +2,17 @@
 
 (in-package #:pg)
 
-(defmacro with-table-ddl ((table &key refresh-snapshot indexes wait-readers)
+(defmacro with-table-ddl ((table &key refresh-snapshot indexes wait-readers ast)
                           &body body)
   "Lock and revalidate TABLE and INDEXES before running catalog change BODY."
-  (let ((table-value (gensym "TABLE-"))
-        (index-values (gensym "INDEXES-"))
-        (relfilenodes (gensym "RELFILENODES-")))
+  (let* ((table-value (gensym "TABLE-"))
+         (index-values (gensym "INDEXES-"))
+         (relfilenodes (gensym "RELFILENODES-"))
+         (publication
+           `(with-write-catalog-locks
+              (ensure-current-table ,table-value)
+              (call-with-logical-ddl-publication-under-lock
+               ,ast (lambda () ,@body)))))
     `(with-schema-write-lock
        (let* ((,table-value ,table)
               (,index-values ,indexes)
@@ -17,12 +22,8 @@
          (with-relation-build-locks (,relfilenodes ,wait-readers)
            ,(if refresh-snapshot
                 `(let ((*current-snapshot* (refresh-statement-snapshot)))
-                   (with-write-catalog-locks
-                     (ensure-current-table ,table-value)
-                     ,@body))
-                `(with-write-catalog-locks
-                   (ensure-current-table ,table-value)
-                   ,@body)))))))
+                   ,publication)
+                publication))))))
 
 (defun ddl-p (ast)
   (member (getf ast :type)
@@ -150,7 +151,8 @@ Recheck identities after waiting and under catalog locks before changing storage
                  (sequence-value-range-p last)
                  (member called '(t nil)))
       (ereport "08P01" "invalid replicated sequence state"))
-    (call-with-catalog-durability-rollback
+    (call-with-logical-ddl-durability-rollback
+     ast
      (lambda ()
        (when previous
          (setf (gethash name (database-sequences db)) previous)))
@@ -231,7 +233,8 @@ Recheck identities after waiting and under catalog locks before changing storage
          (minimum (getf ast :min))
          (maximum (getf ast :max))
          (created nil))
-    (call-with-catalog-durability-rollback
+    (call-with-logical-ddl-durability-rollback
+     ast
      (lambda ()
        (when created
          (remhash name (database-sequences db))))
@@ -268,7 +271,8 @@ Recheck identities after waiting and under catalog locks before changing storage
   (let* ((db (current-database))
          (name (getf ast :name))
          (previous nil))
-    (call-with-catalog-durability-rollback
+    (call-with-logical-ddl-durability-rollback
+     ast
      (lambda ()
        (when previous (setf (gethash name (database-sequences db)) previous)))
      (lambda ()
@@ -311,7 +315,8 @@ Recheck identities after waiting and under catalog locks before changing storage
         (if-exists (getf ast :if-exists))
         (removed '())
         (publication-state '()))
-    (call-with-catalog-durability-rollback
+    (call-with-logical-ddl-durability-rollback
+     ast
      (lambda ()
        (dolist (entry removed)
          (setf (gethash (car entry) (database-sequences db)) (cdr entry)))
@@ -401,7 +406,8 @@ Recheck identities after waiting and under catalog locks before changing storage
                                 (copy-list (getf ast :publish-actions
                                                  '(:insert :update :delete :truncate)))))
          (created nil))
-    (call-with-catalog-durability-rollback
+    (call-with-logical-ddl-durability-rollback
+     ast
      (lambda ()
        (when created
          (remhash name (database-publications db))))
@@ -472,7 +478,8 @@ Recheck identities after waiting and under catalog locks before changing storage
   (let* ((db (current-database))
          (name (getf ast :name))
          (previous nil))
-    (call-with-catalog-durability-rollback
+    (call-with-logical-ddl-durability-rollback
+     ast
      (lambda ()
        (when previous
          (setf (gethash name (database-publications db)) previous)))
@@ -503,7 +510,8 @@ Recheck identities after waiting and under catalog locks before changing storage
   (let ((db (current-database))
         (if-exists (getf ast :if-exists))
         (removed '()))
-    (call-with-catalog-durability-rollback
+    (call-with-logical-ddl-durability-rollback
+     ast
      (lambda ()
        (dolist (entry removed)
          (setf (gethash (car entry) (database-publications db)) (cdr entry))))
@@ -952,7 +960,7 @@ before this removal horizon is captured."
           (ereport "42P16"
                    "multiple primary keys for table \"~a\" are not allowed"
                    name)))
-      (with-write-catalog-locks
+      (with-logical-ddl-publication (ast)
         (let* ((*catalog-save-error-after-durable-p* nil)
                (class (create-table* db name cols))
                (durable-generation *catalog-durable-generation*)
@@ -1028,7 +1036,7 @@ before this removal horizon is captured."
                   for class = (cdr entry)
                   when class collect (pg-class-relfilenode class))))
     (with-relation-build-locks (relfilenodes t)
-      (with-write-catalog-locks
+      (with-logical-ddl-publication (ast)
         ;; A concurrent DROP/CREATE may have replaced a name while we waited.
         ;; Never delete a relation whose gate was not part of this operation.
         (dolist (entry relations)
@@ -1116,7 +1124,7 @@ before this removal horizon is captured."
                 (btree-init (pg-index-relfilenode idx))
                 (build-index-entries idx table :unique unique :name name)
                 (fsync-index idx)
-                (with-write-catalog-locks
+                (with-logical-ddl-publication (ast)
                   (ensure-current-table table)
                   (setf existing (gethash name (database-indexes db)))
                   (when existing
@@ -1183,7 +1191,7 @@ before this removal horizon is captured."
       (unless (or (cdr entry) if-exists)
         (ereport "42704" "index \"~a\" does not exist" (car entry))))
     (with-relation-build-locks (relfilenodes t)
-      (with-write-catalog-locks
+      (with-logical-ddl-publication (ast)
         ;; Revalidate every captured index before making any change.  This
         ;; keeps a concurrent drop/recreate from redirecting this statement.
         (dolist (entry entries)
@@ -1236,7 +1244,7 @@ before this removal horizon is captured."
       (ereport "42704" "index \"~a\" does not exist" name))
     (unless table
       (ereport "42P01" "table for index \"~a\" does not exist" name))
-    (with-table-ddl (table :indexes (list idx) :wait-readers t)
+    (with-table-ddl (table :ast ast :indexes (list idx) :wait-readers t)
       (let ((current (lookup-index name)))
         (unless (eq idx current)
           (if current
@@ -1254,7 +1262,7 @@ before this removal horizon is captured."
          (idx (with-write-lock (lookup-index index-name))))
     (unless idx
       (ereport "42704" "index \"~a\" does not exist" index-name))
-    (with-table-ddl (table :refresh-snapshot t
+    (with-table-ddl (table :ast ast :refresh-snapshot t
                            :indexes (list idx)
                            :wait-readers t)
       ;; Recheck after waiting for both the heap and index readers.
@@ -1308,7 +1316,7 @@ before this removal horizon is captured."
          (if-exists (getf ast :constraint-if-exists))
          (original (with-write-lock
                      (gethash name (database-indexes db)))))
-    (with-table-ddl (table :indexes (when original (list original))
+    (with-table-ddl (table :ast ast :indexes (when original (list original))
                            :wait-readers t)
       (let* ((idx (gethash name (database-indexes db)))
              (belongs-to-table
@@ -1355,7 +1363,7 @@ before this removal horizon is captured."
     (with-write-lock
       (setf original-old-idx (gethash old-name (database-indexes db))
             original-new-idx (gethash index-name (database-indexes db))))
-    (with-table-ddl (table :refresh-snapshot t
+    (with-table-ddl (table :ast ast :refresh-snapshot t
                            :indexes (remove nil
                                             (list original-old-idx
                                                   original-new-idx))
@@ -1425,7 +1433,7 @@ before this removal horizon is captured."
 
 (defun exec-alter-column-storage (db table ast)
   "Change a column's policy for future tuples and publish the catalog change."
-  (with-table-ddl (table :refresh-snapshot t)
+  (with-table-ddl (table :ast ast :refresh-snapshot t)
     (let* ((name (getf ast :column))
            (column (find-column table name))
            (requested (getf ast :storage)))
@@ -1485,7 +1493,7 @@ before this removal horizon is captured."
        (exec-alter-table-constraint stream db table ast))
       (t
        (let ((attnums (resolve-attnums table (getf ast :columns))))
-         (with-table-ddl (table :refresh-snapshot t)
+         (with-table-ddl (table :ast ast :refresh-snapshot t)
            (when (and primary
                       (find-if #'pg-index-primary-p (table-indexes table)))
              (ereport "42P16"
@@ -1535,6 +1543,8 @@ before this removal horizon is captured."
                (save-catalog :final-ddl-p t :logical-event
                              (logical-catalog-event-for-ast ast))))))))
     (send-command-complete stream "ALTER TABLE")))
+
+;;; ---- simple-query execution ----
 
 ;;; ---- simple-query execution ----
 
@@ -1650,33 +1660,12 @@ completion after success; anonymous source cannot inherit Bind parameters."
                      (t (ereport "0A000" "unsupported statement")))))
             (if (ddl-p ast)
                 (with-schema-write-lock
-                  ;; The schema contract is database-wide, while tablecmds.c
-                  ;; relation locks permit disjoint DDL to overlap. Serialize
-                  ;; before-image capture through WAL publication so event
-                  ;; schema-before follows the preceding schema-after.
                   (multiple-value-bind (result responses)
-                      (call-with-logical-ddl-event-order
+                      (call-with-logical-ddl-response-collection
                        (lambda ()
-                         (let* ((*logical-source-schema-precondition*
-                                  (logical-current-schema-contract))
-                                (expected-before
-                                  (and *logical-event-schema-contract*
-                                       (getf *logical-event-schema-contract*
-                                             :schema-before))))
-                           (when (and expected-before
-                                      (not (equal expected-before
-                                                  *logical-source-schema-precondition*)))
-                             (error
-                              "subscriber schema differs from publisher schema before DDL"))
-                           (when *logical-event-schema-contract*
-                             (let ((target-name
-                                     (logical-private-metadata-ddl-target-name
-                                      (current-database) ast)))
-                               (when target-name
-                                 (error
-                                  "replicated DDL cannot target subscriber metadata relation ~s"
-                                  target-name))))
-                           (execute-body))))
+                         (when *logical-event-schema-contract*
+                           (with-logical-ddl-publication (ast) (values)))
+                         (execute-body)))
                     (setf logical-ddl-responses responses)
                     result))
                 (execute-body)))

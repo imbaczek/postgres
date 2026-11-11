@@ -63,41 +63,36 @@
            (setf (symbol-function 'write-message)
                  (lambda (stream type payload)
                    (declare (ignore stream payload))
-                   (let ((acquired
-                           (sb-thread:grab-mutex
-                            *logical-ddl-event-order-lock* :waitp nil)))
-                     (setf all-writes-after-commit-and-unlock-p
-                           (and all-writes-after-commit-and-unlock-p
-                                (not *logical-ddl-event-order-active-p*)
-                                commit-complete-p
-                                acquired))
-                     (when acquired
-                       (sb-thread:release-mutex
-                        *logical-ddl-event-order-lock*))
-                     (incf write-count)
-                     (push type write-types)
-                     (values)))
+                   (setf all-writes-after-commit-and-unlock-p
+                         (and all-writes-after-commit-and-unlock-p
+                              (not *logical-ddl-responses-deferred-p*)
+                              commit-complete-p
+                              (not (sb-thread:holding-mutex-p *write-lock*))
+                              (not (sb-thread:holding-mutex-p *catalog-lock*))))
+                   (incf write-count)
+                   (push type write-types)
+                   (values))
                  (symbol-function 'commit-transaction)
                  (lambda ()
                    (when commit-failed-p
                      (error "injected DDL commit failure"))
                    (setf commit-complete-p t)))
            (multiple-value-bind (result queued)
-               (call-with-logical-ddl-event-order
+               (call-with-logical-ddl-response-collection
                 (lambda ()
                   (send-notice nil "queued DDL notice")
                   (send-command-complete nil "CREATE TABLE")
                   (check (zerop write-count)
-                         "DDL responses remain queued while schema events are ordered")
+                         "DDL responses remain queued during DDL execution")
                   :ddl-result))
              (check (eq result :ddl-result)
-                    "DDL ordering returns the body result")
+                    "DDL collection returns the body result")
              (setf responses queued))
            (check (equal (mapcar #'first responses)
                          '(:notice :command-complete))
                   "DDL response queue preserves notice and completion order")
            (check (zerop write-count)
-                  "responses stay deferred after unlocking until COMMIT succeeds")
+                  "responses stay deferred after collection until COMMIT succeeds")
            (handler-case
                (commit-ddl-and-flush-responses responses)
              (error () nil))
@@ -109,7 +104,7 @@
                        (equal (mapcar #'char-code (nreverse write-types))
                               '(78 67))
                        all-writes-after-commit-and-unlock-p)
-                  "successful DDL COMMIT flushes replies outside the event-order lock"))
+                  "successful DDL COMMIT flushes replies outside publication locks"))
       (setf (symbol-function 'write-message) original-write-message
             (symbol-function 'commit-transaction)
             original-commit-transaction))))

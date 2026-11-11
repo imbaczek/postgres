@@ -6072,6 +6072,110 @@
                       (< account-position primary-position))
                  "table constraints serialize in stable name order"))))
 
+(rove:deftest test-logical-ddl-publication-boundary
+    (let* ((*catalog* (make-catalog))
+           (*backend* (make-backend :database "postgres"))
+           (*logical-event-schema-contract* nil)
+           (database (make-database :name "postgres" :oid 7))
+           (table (make-pg-class
+                   :oid 701 :name "publication_rows" :relfilenode 1701
+                   :columns (vector (make-pg-column
+                                     :name "id" :type :int4 :typmod -1
+                                     :attnum 1 :notnull t))))
+           (ast '(:type :alter-table :table "publication_rows" :actions ()))
+           (called nil))
+      (setf (gethash "postgres" (catalog-databases *catalog*)) database
+            (gethash "publication_rows" (database-tables database)) table)
+      (rove:ok
+       (handler-case
+           (progn
+             (call-with-logical-ddl-publication-under-lock
+              ast (lambda () (setf called t)))
+             nil)
+         (error (condition)
+           (and (not called)
+                (search "requires write and catalog locks" (princ-to-string condition)))))
+       "publication rejects missing locks before running a mutation")
+      (with-write-lock
+        (rove:ok
+         (handler-case
+             (progn
+               (call-with-logical-ddl-publication-under-lock
+                ast (lambda () (setf called t)))
+               nil)
+           (error (condition)
+             (and (not called)
+                  (search "requires write and catalog locks" (princ-to-string condition)))))
+         "holding only the write lock is insufficient"))
+      (with-catalog-lock
+        (rove:ok
+         (handler-case
+             (progn
+               (call-with-logical-ddl-publication-under-lock
+                ast (lambda () (setf called t)))
+               nil)
+           (error (condition)
+             (and (not called)
+                  (search "requires write and catalog locks" (princ-to-string condition)))))
+         "holding only the catalog lock is insufficient"))
+      (let ((stale (logical-current-schema-contract)))
+        ;; Model an unrelated publication during detached preparation.
+        (setf (pg-column-notnull (aref (pg-class-columns table) 0)) nil)
+        (let ((*logical-source-schema-precondition* stale)
+              (fresh (logical-current-schema-contract)))
+          (with-write-catalog-locks
+            (multiple-value-bind (result second)
+                (call-with-logical-ddl-publication-under-lock
+                 ast
+                 (lambda ()
+                   (rove:ok (equal *logical-source-schema-precondition* fresh)
+                            "publication captures current shape instead of an outer stale image")
+                   (setf (pg-column-notnull (aref (pg-class-columns table) 0)) t)
+                   (let* ((bytes (logical-catalog-event-for-ast ast))
+                          (change (logical-decode-catalog-event bytes))
+                          (envelope (logical-read-data-string
+                                     (logical-change-event-payload change))))
+                     (rove:ok (equal (getf envelope :schema-before) fresh)
+                              "the event starts at the preceding publication")
+                     (rove:ok (equal (getf envelope :schema-after) stale)
+                              "the event ends at the mutation's new catalog shape"))
+                   (values :published :second)))
+              (rove:ok (and (eq result :published) (eq second :second))
+                       "publication preserves the callback's multiple values")))
+          (rove:ok (eq *logical-source-schema-precondition* stale)
+                   "publication restores the outer dynamic binding")
+          (setf (pg-column-notnull (aref (pg-class-columns table) 0)) nil)
+          (let ((*logical-event-schema-contract* (list :schema-before stale)))
+            (with-write-catalog-locks
+              (rove:ok
+               (handler-case
+                   (progn
+                     (call-with-logical-ddl-publication-under-lock
+                      ast (lambda () (setf called t)))
+                     nil)
+                 (error (condition)
+                   (and (not called)
+                        (search "subscriber schema differs" (princ-to-string condition)))))
+               "subscriber drift discovered after preparation rejects before mutation")))
+          (let ((*logical-event-schema-contract* (list :schema-before fresh)))
+            (with-write-catalog-locks
+              (rove:ok
+               (handler-case
+                   (progn
+                     (call-with-logical-ddl-publication-under-lock
+                      '(:type :drop-table :names ("pg_lisp_subscription_progress"))
+                      (lambda () (setf called t)))
+                     nil)
+                 (error (condition)
+                   (and (not called)
+                        (search "cannot target subscriber metadata" (princ-to-string condition)))))
+               "protected subscriber metadata is checked without reacquiring the write lock")
+              (rove:ok
+               (eq :accepted
+                   (call-with-logical-ddl-publication-under-lock
+                    ast (lambda () :accepted)))
+               "matching subscriber shape admits a supported mutation")))))))
+
 (rove:deftest test-logical-schema-contract-strictness
     (let* ((*catalog* (make-catalog))
            (*backend* (make-backend :database "postgres"))

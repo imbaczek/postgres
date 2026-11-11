@@ -2570,7 +2570,7 @@ and source change close the connection. An incomplete response suppresses output
          (progn
            (case outcome
              ((:cancelled :timeout)
-              (let ((*logical-ddl-event-order-active-p* nil))
+              (let ((*logical-ddl-responses-deferred-p* nil))
                 (when (backend-stream backend)
                   (send-notice
                    (backend-stream backend)

@@ -310,7 +310,7 @@ snapshot is scanned. Expression evaluation holds no global write/catalog mutex."
             (materialize-select-tuple table tuple (statement-protection-snapshot))
             (check-for-interrupts)
             (check-table-constraints table (htup-values tuple) (list check))))
-        (with-write-catalog-locks
+        (with-logical-ddl-publication (ast)
           (ensure-current-table table)
           (with-catalog-mutation-rollback (db)
             (case action

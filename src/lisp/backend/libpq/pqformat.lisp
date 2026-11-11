@@ -2,10 +2,7 @@
 
 (in-package #:pg)
 
-(defvar *logical-ddl-event-order-lock*
-  (sb-thread:make-mutex :name "logical DDL event order"))
-
-(defvar *logical-ddl-event-order-active-p* nil)
+(defvar *logical-ddl-responses-deferred-p* nil)
 
 (defvar *logical-ddl-deferred-responses* nil)
 
@@ -47,7 +44,7 @@
   (when *defer-command-complete-p*
     (push (list stream tag) *deferred-command-completes*)
     (return-from send-command-complete nil))
-  (if *logical-ddl-event-order-active-p*
+  (if *logical-ddl-responses-deferred-p*
       (push (list :command-complete stream tag)
             *logical-ddl-deferred-responses*)
       (with-backend-message (stream #\C p)
@@ -81,7 +78,7 @@
 
 (defun send-notice (stream message &optional (severity "NOTICE")
                                      (sqlstate (if (string= severity "NOTICE") "00000" "01000")))
-  (if *logical-ddl-event-order-active-p*
+  (if *logical-ddl-responses-deferred-p*
       (push (list :notice stream message severity sqlstate)
             *logical-ddl-deferred-responses*)
       (with-backend-message (stream #\N p)
@@ -103,18 +100,12 @@
        (apply #'send-notice (rest response)))))
   (values))
 
-(defun call-with-logical-ddl-event-order (function)
-  "Serialize schema events and return replies to flush after transaction commit."
-  (let ((*logical-ddl-event-order-active-p* t)
-        (*logical-ddl-deferred-responses* nil)
-        (result nil))
-    (unwind-protect
-         (setf result
-               (sb-thread:with-mutex (*logical-ddl-event-order-lock*)
-                 (funcall function)))
-      ;; DDL responses force output, so return them only after unlocking.
-      (setf *logical-ddl-event-order-active-p* nil))
-    (values result (nreverse *logical-ddl-deferred-responses*))))
+(defun call-with-logical-ddl-response-collection (function)
+  "Collect DDL replies until transaction completion."
+  (let ((*logical-ddl-responses-deferred-p* t)
+        (*logical-ddl-deferred-responses* nil))
+    (let ((result (funcall function)))
+      (values result (nreverse *logical-ddl-deferred-responses*)))))
 
 (defun warning-notice (control-string &rest args)
   "Send a WARNING to the current frontend connection, if there is one.

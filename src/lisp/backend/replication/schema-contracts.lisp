@@ -114,46 +114,50 @@ bootstrap payloads without index owners are rejected before schema changes."
     (and (logical-private-metadata-table-name-p table-name)
          table-name)))
 
+(defun logical-private-metadata-ddl-target-name-under-write-lock (database ast)
+  "Return the subscriber-owned table name targeted by replicated DDL AST."
+  (case (getf ast :type)
+    (:create-table
+     (let ((name (getf ast :name)))
+       (or (and (logical-private-metadata-table-name-p name) name)
+           (logical-private-metadata-resolved-table-name database name))))
+    ;; DROP TABLE uses the parser's already-normalized catalog key directly.
+    (:drop-table
+     (find-if #'logical-private-metadata-table-name-p (getf ast :names)))
+    ;; ALTER TABLE resolves the AST name through lookup-table.
+    (:alter-table
+     (let ((name (getf ast :table)))
+       (or (and (logical-private-metadata-table-name-p name) name)
+           (logical-private-metadata-resolved-table-name database name))))
+    (:create-index
+     (let ((table-name (getf ast :table))
+           (index-name (getf ast :name)))
+       (or (and (logical-private-metadata-table-name-p table-name)
+                table-name)
+           (logical-private-metadata-resolved-table-name database table-name)
+           (logical-private-metadata-index-owner-name database index-name)
+           (and (stringp index-name)
+                (logical-private-metadata-index-owner-name
+                 database (strip-schema index-name))))))
+    ;; DROP INDEX uses the parser's already-normalized catalog key directly.
+    (:drop-index
+     (loop for name in (getf ast :names)
+           for owner = (logical-private-metadata-index-owner-name
+                        database name)
+           when owner return owner))
+    ;; ALTER INDEX resolves the AST name through lookup-index.
+    (:alter-index
+     (let ((name (getf ast :name)))
+       (or (logical-private-metadata-index-owner-name database name)
+           (and (stringp name)
+                (logical-private-metadata-index-owner-name
+                 database (strip-schema name))))))
+    (otherwise nil)))
+
 (defun logical-private-metadata-ddl-target-name (database ast)
   "Return the subscriber-owned table name targeted by replicated DDL AST."
   (with-write-lock
-    (case (getf ast :type)
-      (:create-table
-       (let ((name (getf ast :name)))
-         (or (and (logical-private-metadata-table-name-p name) name)
-             (logical-private-metadata-resolved-table-name database name))))
-      ;; DROP TABLE uses the parser's already-normalized catalog key directly.
-      (:drop-table
-       (find-if #'logical-private-metadata-table-name-p (getf ast :names)))
-      ;; ALTER TABLE resolves the AST name through lookup-table.
-      (:alter-table
-       (let ((name (getf ast :table)))
-         (or (and (logical-private-metadata-table-name-p name) name)
-             (logical-private-metadata-resolved-table-name database name))))
-      (:create-index
-       (let ((table-name (getf ast :table))
-             (index-name (getf ast :name)))
-         (or (and (logical-private-metadata-table-name-p table-name)
-                  table-name)
-             (logical-private-metadata-resolved-table-name database table-name)
-             (logical-private-metadata-index-owner-name database index-name)
-             (and (stringp index-name)
-                  (logical-private-metadata-index-owner-name
-                   database (strip-schema index-name))))))
-      ;; DROP INDEX uses the parser's already-normalized catalog key directly.
-      (:drop-index
-       (loop for name in (getf ast :names)
-             for owner = (logical-private-metadata-index-owner-name
-                          database name)
-             when owner return owner))
-      ;; ALTER INDEX resolves the AST name through lookup-index.
-      (:alter-index
-       (let ((name (getf ast :name)))
-         (or (logical-private-metadata-index-owner-name database name)
-             (and (stringp name)
-                  (logical-private-metadata-index-owner-name
-                   database (strip-schema name))))))
-      (otherwise nil))))
+    (logical-private-metadata-ddl-target-name-under-write-lock database ast)))
 
 (defun logical-current-schema-contract-under-write-lock ()
   (logical-bootstrap-schema-contract
@@ -219,6 +223,36 @@ bootstrap payloads without index owners are rejected before schema changes."
 (defun logical-validate-schema-contract (expected phase)
   (with-write-lock
     (logical-validate-schema-contract-under-write-lock expected phase)))
+
+(defun call-with-logical-ddl-publication-under-lock (ast function)
+  (unless (and (sb-thread:holding-mutex-p *write-lock*)
+               (sb-thread:holding-mutex-p *catalog-lock*))
+    (error "logical DDL publication requires write and catalog locks"))
+  (let* ((*logical-source-schema-precondition*
+           (logical-current-schema-contract-under-write-lock))
+         (expected-before
+           (and *logical-event-schema-contract*
+                (getf *logical-event-schema-contract* :schema-before))))
+    (when (and expected-before
+               (not (equal expected-before *logical-source-schema-precondition*)))
+      (error "subscriber schema differs from publisher schema before DDL"))
+    (when *logical-event-schema-contract*
+      (let ((target-name
+              (logical-private-metadata-ddl-target-name-under-write-lock
+               (current-database) ast)))
+        (when target-name
+          (error "replicated DDL cannot target subscriber metadata relation ~s"
+                 target-name))))
+    (funcall function)))
+
+(defmacro with-logical-ddl-publication ((ast) &body body)
+  `(with-write-catalog-locks
+     (call-with-logical-ddl-publication-under-lock
+      ,ast (lambda () ,@body))))
+
+(defun call-with-logical-ddl-durability-rollback (ast rollback function)
+  (with-logical-ddl-publication (ast)
+    (call-with-catalog-durability-rollback-under-lock rollback function)))
 
 (defun logical-supported-ddl-ast-p (ast)
   (and (listp ast)
