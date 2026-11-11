@@ -3288,12 +3288,12 @@ and supplies POLICY and KEEP-MB from the same captured configuration."
         while end
         do (setf start (1+ end))))
 
-(defun wal-decode-replication-slot (bytes expected-name)
-  ;; Decode a fresh object; process-local creation and drop fences are not stored.
+(defun wal-decode-replication-slot-image (bytes expected-name)
+  ;; Decode detached bytes without granting storage or replay authority.
   (unless (and (typep bytes '(vector (unsigned-byte 8))) (<= 1 (length bytes) 2048))
     (error "invalid replication slot state bytes"))
   (when (physical-slot-image-p bytes)
-    (return-from wal-decode-replication-slot
+    (return-from wal-decode-replication-slot-image
       (physical-slot-decode bytes expected-name)))
   (with-input-from-string (stream (bytes->string bytes))
     (let* ((line (read-line stream nil nil))
@@ -3340,20 +3340,32 @@ and supplies POLICY and KEEP-MB from the same captured configuration."
                      (wal-valid-slot-plugin-state-p plugin database-oid confirmed-flush-lsn)
                      (or (and (not v5-p) (string= profile "text"))
                          (and v5-p database-oid (string= profile "binary-bytea") (string= plugin "pg_lisp")))
-                     (<= 0 restart-lsn *wal-durable-lsn* #xffffffffffffffff)
-                     (<= 0 consistent-lsn *wal-durable-lsn* #xffffffffffffffff)
+                     (<= 0 restart-lsn #xffffffffffffffff)
+                     (<= 0 consistent-lsn #xffffffffffffffff)
                      (or (null confirmed-flush-lsn)
-                         (and (<= consistent-lsn confirmed-flush-lsn *wal-durable-lsn*)
+                         (and (<= consistent-lsn confirmed-flush-lsn #xffffffffffffffff)
                               (<= restart-lsn confirmed-flush-lsn)))
                      (or confirmed-flush-lsn (<= restart-lsn consistent-lsn))
                      (= crc (wal-crc32 (string->bytes prefix))))
-          (error "replication slot file ~a is corrupt or outside durable WAL" expected-name))
+          (error "replication slot file ~a is corrupt" expected-name))
         (let ((slot (make-wal-replication-slot
                      :name name :database-oid database-oid :restart-lsn restart-lsn
                      :consistent-lsn consistent-lsn :confirmed-flush-lsn confirmed-flush-lsn
                      :wal-status wal-status :plugin plugin)))
           (when v5-p (wal-slot-set-initial-profile slot :binary-bytea))
           slot)))))
+
+(defun wal-decode-replication-slot (bytes expected-name)
+  (let ((slot (wal-decode-replication-slot-image bytes expected-name)))
+    (when (wal-logical-slot-p slot)
+      (unless (and (typep *wal-durable-lsn* '(unsigned-byte 64))
+                   (<= (wal-replication-slot-restart-lsn slot) *wal-durable-lsn*)
+                   (<= (wal-replication-slot-consistent-lsn slot) *wal-durable-lsn*)
+                   (or (null (wal-replication-slot-confirmed-flush-lsn slot))
+                       (<= (wal-replication-slot-confirmed-flush-lsn slot)
+                           *wal-durable-lsn*)))
+        (error "replication slot file ~a is corrupt or outside durable WAL" expected-name)))
+    slot))
 
 (defun wal-read-replication-slot (path &key stabilize)
   ;; Canonical state is read through the held slot directory descriptor.

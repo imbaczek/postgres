@@ -494,6 +494,114 @@
            (funcall function))
       (uiop:delete-directory-tree base :validate t :if-does-not-exist :ignore))))
 
+(cl-spec:defproperty logical-slot-image-preserves-source-frontiers
+    ((confirmed (range integer 1 18446744073709551615))
+     (frontier (range integer 0 18446744073709551615))
+     (binary (range integer 0 1)))
+  (:about wal-decode-replication-slot-image)
+  (:trials (:normal 200))
+  (let* ((*wal-durable-lsn* frontier)
+         (slot (make-wal-replication-slot
+                :name "source_frontier" :database-oid 42 :restart-lsn 0
+                :consistent-lsn 0 :confirmed-flush-lsn confirmed
+                :plugin (if (plusp binary) "pg_lisp" "pgoutput"))))
+    (when (plusp binary) (wal-slot-set-initial-profile slot :binary-bytea))
+    (let* ((bytes (wal-encode-replication-slot slot))
+           (decoded (funcall (symbol-function 'wal-decode-replication-slot-image)
+                             bytes "source_frontier"))
+           (local (handler-case (wal-decode-replication-slot bytes "source_frontier")
+                    (error () nil))))
+      (and (= confirmed (wal-replication-slot-confirmed-flush-lsn decoded))
+           (equalp bytes (wal-encode-replication-slot decoded))
+           (eq (not (null local)) (<= confirmed frontier))))))
+
+(rove:deftest generated-logical-slot-source-frontiers
+    (let ((data (cl-spec:result-data
+                 (cl-spec:run-property 'logical-slot-image-preserves-source-frontiers :seed 42))))
+      (rove:ok (eq :passed (getf data :status)) (format nil "~s" data))
+      (rove:ok (= 200 (getf data :trials))))
+  (let* ((*wal-durable-lsn* nil)
+         (maximum #xffffffffffffffff)
+         (slot (make-wal-replication-slot
+                :name "maximum_image" :database-oid 42 :restart-lsn maximum
+                :consistent-lsn maximum :confirmed-flush-lsn maximum :plugin "pgoutput"))
+         (bytes (wal-encode-replication-slot slot))
+         (decoded (wal-decode-replication-slot-image bytes "maximum_image")))
+    (rove:ok (= maximum (wal-replication-slot-restart-lsn decoded)
+                (wal-replication-slot-consistent-lsn decoded)
+                (wal-replication-slot-confirmed-flush-lsn decoded)))
+    (let ((*wal-durable-lsn* maximum))
+      (rove:ok (equalp bytes (wal-encode-replication-slot
+                              (wal-decode-replication-slot bytes "maximum_image")))))))
+
+(rove:deftest logical-slot-image-does-not-admit-ahead-of-local-wal
+    (call-with-canonical-wal-slot-fixture
+     (lambda ()
+       (let* ((registry *wal-replication-slots*)
+              (slot (make-wal-replication-slot
+                     :name "ahead_image" :database-oid 42 :restart-lsn 400
+                     :consistent-lsn 600 :confirmed-flush-lsn 1000 :plugin "pgoutput"))
+              (bytes (wal-encode-replication-slot slot))
+              (decoded (funcall (symbol-function 'wal-decode-replication-slot-image)
+                                bytes "ahead_image")))
+         (rove:ok (= 400 (wal-replication-slot-restart-lsn decoded)))
+         (rove:ok (= 600 (wal-replication-slot-consistent-lsn decoded)))
+         (rove:ok (= 1000 (wal-replication-slot-confirmed-flush-lsn decoded)))
+         (rove:ok (not (eq slot decoded)))
+         (rove:ok (null (wal-replication-slot-active-owner decoded)))
+         (rove:ok (null (wal-replication-slot-drop-claim decoded)))
+         (rove:ok (not (wal-replication-slot-creation-failed-p decoded)))
+         (rove:ok (handler-case
+                      (progn (wal-decode-replication-slot bytes "ahead_image") nil)
+                    (error (condition) (search "outside durable WAL" (princ-to-string condition)))))
+         (wal-create-replication-slot-file slot)
+         (rove:ok (handler-case
+                      (progn (wal-read-replication-slot (wal-replication-slot-path "ahead_image")) nil)
+                    (error (condition) (search "outside durable WAL" (princ-to-string condition)))))
+         (rove:ok (handler-case (progn (wal-load-replication-slots) nil) (error () t)))
+         (rove:ok (eq registry *wal-replication-slots*))
+         (rove:ok (zerop (hash-table-count registry)))
+         (let ((*wal-durable-lsn* 1000))
+           (rove:ok (= 1000 (wal-replication-slot-confirmed-flush-lsn
+                             (wal-decode-replication-slot bytes "ahead_image")))))))))
+
+(rove:deftest logical-slot-image-rejects-corrupt-and-inconsistent-source-state
+    (dolist (prefix
+             '("PGSLOT4 source_image 42 -1 0 1 reserved pgoutput"
+               "PGSLOT4 source_image 42 0 18446744073709551616 18446744073709551616 reserved pgoutput"
+               "PGSLOT4 source_image 42 20 10 15 reserved pgoutput"
+               "PGSLOT4 source_image 42 0 20 10 reserved pgoutput"
+               "PGSLOT4 source_image 42 0 0 1 unknown pgoutput"
+               "PGSLOT5 source_image 42 0 0 1 reserved pgoutput binary-bytea"))
+      (let ((bytes (string->bytes
+                    (format nil "~a ~8,'0X~%" prefix (wal-crc32 (string->bytes prefix))))))
+        (rove:ok (handler-case
+                     (progn (funcall (symbol-function 'wal-decode-replication-slot-image)
+                                     bytes "source_image") nil)
+                   (error () t)))))
+  (let* ((slot (make-wal-replication-slot
+                :name "source_image" :database-oid 42 :restart-lsn 0
+                :consistent-lsn 0 :confirmed-flush-lsn 1000 :plugin "pgoutput"))
+         (bytes (wal-encode-replication-slot slot)))
+    (rove:ok (handler-case
+                 (progn (funcall (symbol-function 'wal-decode-replication-slot-image)
+                                 bytes "other_name") nil)
+               (error () t)))
+    (rove:ok (wal-decode-replication-slot-image bytes "source_image"))
+    (let* ((corrupt (copy-seq bytes))
+           (index (1+ (position (char-code #\Space) corrupt :from-end t))))
+      (setf (aref corrupt index)
+            (if (= (aref corrupt index) (char-code #\0))
+                (char-code #\1) (char-code #\0)))
+      (rove:ok (handler-case
+                   (progn (wal-decode-replication-slot-image corrupt "source_image") nil)
+                 (error () t))))
+    (setf (aref bytes 0) (char-code #\X))
+    (rove:ok (handler-case
+                 (progn (funcall (symbol-function 'wal-decode-replication-slot-image)
+                                 bytes "source_image") nil)
+               (error () t)))))
+
 (rove:deftest canonical-wal-slot-roundtrip-and-strict-update
     (call-with-canonical-wal-slot-fixture
      (lambda ()
