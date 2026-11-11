@@ -187,7 +187,17 @@
   (with-promotion-fixture (root store :system-id
                                 (pg::catalog-system-identifier
                                  (pg::make-catalog :cluster-identity "history-source")))
-    (let* ((pg::*catalog-identity-needs-persist-p* nil)
+    (let* ((pg::*wal-storage-incarnation* (gensym "FIXTURE-CHILD-WAL-"))
+           (pg::*wal-fpw-state* nil)
+           (pg::*wal-logical-policy* nil)
+           (pg::*wal-logical-info* nil)
+           (pg::*wal-logical-info-disable-pending* nil)
+           (pg::*logical-capture-force* nil)
+           (pg::*logical-capture-live-slots* 0)
+           (pg::*logical-capture-xid-modes* (make-hash-table :test #'eql))
+           (pg::*backend-registry* (make-hash-table :test #'eql))
+           (pg::*shutdown-abandoned-backends* nil)
+           (pg::*catalog-identity-needs-persist-p* nil)
            (pg::*catalog* (pg::load-catalog))
            (pg::*active-xids* nil) (pg::*active-snapshots* 0)
            (pg::*active-snapshot-set* (make-hash-table :test #'eq))
@@ -220,6 +230,39 @@
              (funcall function root store))
         (pg::reset-backend-transaction pg::*backend*)
         (when pg::*clog-stream* (close pg::*clog-stream*) (setf pg::*clog-stream* nil))))))
+
+(deftest live-child-fixture-preserves-outer-reporting-state
+    (let* ((outer (gensym "OUTER-PROMOTION-WAL-"))
+           (pg::*wal-storage-incarnation* outer)
+           (pg::*wal-logical-info* (pg::%make-wal-logical-info outer 1 t))
+           (pg::*wal-logical-policy* nil)
+           (pg::*wal-fpw-state* nil)
+           (pg::*logical-capture-force* t)
+           (saved pg::*wal-logical-info*)
+           (cache (pg::%make-wal-logical-info-cache 1 t nil nil))
+           (idle (pg::make-backend :pid 8103 :logical-info-cache cache))
+           (abandoned (pg::make-backend :pid 8104 :logical-info-cache cache))
+           (pg::*backend-registry* (make-hash-table :test #'eql))
+           (pg::*shutdown-abandoned-backends* (list abandoned)))
+      (setf (gethash 8103 pg::*backend-registry*) idle)
+      (call-with-live-child-fixture
+       (lambda (root store)
+         (declare (ignore root store))
+         (ok (not (eq outer pg::*wal-storage-incarnation*)))
+         (ok (null pg::*wal-logical-info*))
+         (ok (not pg::*logical-capture-force*))
+         (pg::with-wal-critical
+           (pg::wal-logical-info-publish-under-lock
+            nil :rebase t :incarnation (gensym "CHILD-WAL-"))
+           (pg::wal-set-logical-capture-under-lock nil)))
+       :committed-child nil)
+      (ok (eq outer pg::*wal-storage-incarnation*))
+      (ok (eq saved pg::*wal-logical-info*))
+      (ok pg::*logical-capture-force*)
+      (ok (null pg::*wal-logical-policy*))
+      (ok (null pg::*wal-fpw-state*))
+      (ok (eq cache (pg::backend-logical-info-cache idle)))
+      (ok (eq cache (pg::backend-logical-info-cache abandoned)))))
 
 (defun call-with-promotion-reader-fixture (function)
   (call-with-live-child-fixture
