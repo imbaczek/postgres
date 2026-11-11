@@ -42,6 +42,7 @@ an absent key leaves the legacy byte plan in use."
                          (applied-timeline timeline) history-target history-digest
                          promotion-child promotion-generation promotion-source-namespace retained-reference resource-fact fpw-fact logical-fact
                          (promotion-full-page-writes nil promotion-fpw-intent-p)
+                         (promotion-logical-decoding-enabled nil promotion-logical-intent-p)
                        &allow-other-keys)
       control
     (and (member phase '(0 1 2 3))
@@ -52,6 +53,9 @@ an absent key leaves the legacy byte plan in use."
          (member control-version '(1 2 3 4))
          (or (not promotion-fpw-intent-p)
              (and (= phase 3) (= control-version 4) (member promotion-full-page-writes '(nil t))))
+         (or (not promotion-logical-intent-p)
+             (and (= phase 3) (= control-version 4)
+                  (member promotion-logical-decoding-enabled '(nil t))))
          (or (null resource-fact)
              (and (member control-version '(3 4))
                   (typep applied-timeline '(integer 1 4294967295))
@@ -116,7 +120,8 @@ an absent key leaves the legacy byte plan in use."
                                           (state-time (- (get-universal-time) 2208988800))
                                           (applied-timeline timeline) history-target history-digest
                                           promotion-child promotion-generation promotion-source-namespace retained-reference resource-fact fpw-fact logical-fact
-                                          (promotion-full-page-writes nil promotion-fpw-intent-p))
+                                          (promotion-full-page-writes nil promotion-fpw-intent-p)
+                                          (promotion-logical-decoding-enabled nil promotion-logical-intent-p))
   "Encode recovery progress and optional extensions under one CRC.
 Ordinary and pending images may append a 48-byte resource fact and a 72-byte source
 FPW fact. Pending images may then append a 17-byte PGFPWPI1 promotion intent.
@@ -132,7 +137,9 @@ covered by the outer CRC."
                                (resource-offset (+ reference-offset (if retained-reference 44 0)))
                                (fpw-offset (+ resource-offset (if resource-fact +wal-resource-fact-size+ 0)))
                                (intent-offset (+ fpw-offset (if fpw-fact +physical-fpw-fact-size+ 0)))
-                               (logical-offset (+ intent-offset (if promotion-fpw-intent-p +physical-promotion-fpw-intent-size+ 0)))
+                               (logical-intent-offset (+ intent-offset (if promotion-fpw-intent-p +physical-promotion-fpw-intent-size+ 0)))
+                               (logical-offset (+ logical-intent-offset
+                                                  (if promotion-logical-intent-p +physical-promotion-logical-intent-size+ 0)))
                                (crc-offset (+ logical-offset (if logical-fact +physical-logical-fact-size+ 0))))
     (unless (physical-recovery-control-valid-p
              (append (list :control-version version :phase phase :system-id system-id :timeline timeline
@@ -143,7 +150,9 @@ covered by the outer CRC."
                            :promotion-source-namespace promotion-source-namespace :retained-reference retained-reference
                            :resource-fact resource-fact :fpw-fact fpw-fact :logical-fact logical-fact)
                      (when promotion-fpw-intent-p
-                       (list :promotion-full-page-writes promotion-full-page-writes))))
+                       (list :promotion-full-page-writes promotion-full-page-writes))
+                     (when promotion-logical-intent-p
+                       (list :promotion-logical-decoding-enabled promotion-logical-decoding-enabled))))
       (error "unrepresentable physical recovery control state"))
     (let ((bytes (make-array (+ crc-offset 4) :element-type '(unsigned-byte 8) :initial-element 0)))
       (replace bytes (if pending #(80 71 82 83 84 65 84 52) #(80 71 82 83 84 65 84 51)))
@@ -173,6 +182,9 @@ covered by the outer CRC."
         (replace bytes (physical-fpw-encode-fact fpw-fact) :start1 fpw-offset))
       (when promotion-fpw-intent-p
         (replace bytes (physical-fpw-encode-promotion-intent promotion-full-page-writes) :start1 intent-offset))
+      (when promotion-logical-intent-p
+        (replace bytes (physical-logical-encode-promotion-intent promotion-logical-decoding-enabled)
+                 :start1 logical-intent-offset))
       (when logical-fact
         (replace bytes (physical-logical-encode-fact logical-fact) :start1 logical-offset))
       (wal-set-u32 bytes crc-offset (wal-crc32 bytes))
@@ -187,7 +199,8 @@ Length modulo four distinguishes an intent from earlier layouts; the decoder als
 checks its magic, value and reserved bytes. An absent intent preserves the legacy
 byte plan, while a present NIL policy means OFF."
   (multiple-value-bind (logical-size logical-p) (physical-logical-control-core-size bytes)
-    (multiple-value-bind (size promotion-fpw-intent-p) (physical-fpw-control-core-size bytes logical-size)
+    (multiple-value-bind (size promotion-fpw-intent-p promotion-logical-intent-p)
+        (physical-promotion-intents-core-size logical-size)
       (unless (member size '(60 72 88 104 120 132 136 144 148 152 160 176 180
                              192 196 204 208 220 224 252 268))
         (error "invalid physical recovery control length"))
@@ -220,8 +233,8 @@ byte plan, while a present NIL policy means OFF."
                      (= crc (wal-crc32 copy))
                      (or (not exhausted) (zerop (wal-u64 bytes 48))))
           (error "corrupt or unsupported physical recovery control"))
-        (when (and promotion-fpw-intent-p (not pending))
-          (error "promotion FPW intent requires pending recovery control"))
+        (when (and (or promotion-fpw-intent-p promotion-logical-intent-p) (not pending))
+          (error "promotion policy intent requires pending recovery control"))
         (let ((control
                 (list :control-version version
                       :phase (if (member version '(3 4)) (logand raw-phase #x3fffffff) raw-phase)
@@ -252,7 +265,12 @@ byte plan, while a present NIL policy means OFF."
                   (physical-fpw-decode-fact (subseq bytes (- size 76) (- size 4)))))
           (when promotion-fpw-intent-p
             (setf (getf control :promotion-full-page-writes)
-                  (physical-fpw-decode-promotion-intent (subseq bytes (- size 4) logical-offset))))
+                  (physical-fpw-decode-promotion-intent
+                   (subseq bytes (- size 4) (+ (- size 4) +physical-promotion-fpw-intent-size+)))))
+          (when promotion-logical-intent-p
+            (setf (getf control :promotion-logical-decoding-enabled)
+                  (physical-logical-decode-promotion-intent
+                   (subseq bytes (- logical-offset +physical-promotion-logical-intent-size+) logical-offset))))
           (when logical-p
             (setf (getf control :logical-fact)
                   (physical-logical-decode-fact (subseq bytes logical-offset crc-offset))))

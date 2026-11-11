@@ -1,7 +1,7 @@
 (in-package #:pg)
 
 (defun unit-source-logical-control (logical &key pending selected resources fpw retained
-                                              (intent :absent) exhausted)
+                                              (intent :absent) (logical-intent :absent) exhausted)
   (apply #'physical-recovery-control-image
          (append
           (list (if pending 3 2) 42 1 4 32 80
@@ -15,7 +15,8 @@
                                  '(:resource-parameters (100 8 10 0 128) :resource-lsn 16 :resource-timeline 1))
                 :fpw-fact (when fpw (unit-source-fpw-fact))
                 :logical-fact logical)
-          (unless (eq intent :absent) (list :promotion-full-page-writes intent)))))
+          (unless (eq intent :absent) (list :promotion-full-page-writes intent))
+          (unless (eq logical-intent :absent) (list :promotion-logical-decoding-enabled logical-intent)))))
 
 (rove:deftest source-logical-control-roundtrips-all-existing-extension-combinations
     (dolist (pending '(nil t))
@@ -52,7 +53,7 @@
     (let ((fact (unit-source-logical-fact :enabled t)))
       (setf (getf fact :through) 80)
       (let* ((bytes (unit-source-logical-control fact :pending t :selected t :resources t
-                                                      :fpw t :retained t :intent nil :exhausted t))
+                                                      :fpw t :retained t :intent nil :logical-intent nil :exhausted t))
              (offset (- (length bytes) 92)))
         (rove:ok (= +physical-recovery-control-maximum-bytes+ (length bytes)))
         (dotimes (i 88)

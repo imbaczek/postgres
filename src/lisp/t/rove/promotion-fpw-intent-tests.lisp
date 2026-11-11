@@ -75,7 +75,7 @@
                     (rove:ok (equal old-control decoded)))))))))
       (rove:ok (equal '(88 104 132 136 148 152 160 176 180 196 204 208 220 224 252 268)
                       (sort (remove-duplicates lengths) #'<)))
-      (rove:ok (= (+ 285 +physical-logical-fact-size+) +physical-recovery-control-maximum-bytes+))))
+      (rove:ok (= (+ 285 +physical-logical-fact-size+ +physical-promotion-logical-intent-size+) +physical-recovery-control-maximum-bytes+))))
 
 (rove:deftest promotion-fpw-control-rejects-valid-crc-malformed-intent
     (let* ((bytes (unit-promotion-fpw-image nil :resources t :source t :selected t :retained t))

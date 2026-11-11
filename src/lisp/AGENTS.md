@@ -308,6 +308,11 @@ appropriate instead of replacing the native C peer or adding a message relay.
   balanced parentheses alone do not prove that cleanup is inside `unwind-protect`.
 - A changed macro needs its callers recompiled. Clear the `pg` FASLs and reload
   before testing expanded call sites; redefining the macro alone leaves old code.
+- Recompile consumers after changing a `DEFCONSTANT` value. Loading the constant
+  and selected functions into a warm image can leave old literal bounds in other
+  compiled functions. A control codec limit change left the backup metadata bound
+  stale until that consumer was recompiled. Use a fresh forced ASDF build for the
+  acceptance gate.
 - Renamed Rove tests can remain in a warm registry. Check `get-test` for obsolete
   names and remove confirmed orphans with `remove-test` before counting a suite.
 - An interop `run-tests` call was followed by a missing unit suite in a warm

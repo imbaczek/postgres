@@ -30,15 +30,6 @@
     (error "invalid promotion full page writes intent"))
   (= 1 (aref bytes 8)))
 
-(defun physical-fpw-control-core-size (bytes &optional (end (length bytes)))
-  "Return the old layout size and whether a 17-byte intent follows it.
-END excludes later suffixes but includes the final CRC's four bytes.
-The caller must still check the layout, intent and CRC."
-  (case (mod end 4)
-    (0 (values end nil))
-    (1 (values (- end +physical-promotion-fpw-intent-size+) t))
-    (otherwise (error "invalid physical recovery control length"))))
-
 (defun physical-fpw-state-fields (fact incarnation)
   "Construct fold evidence with the supplied private owner token."
   (%make-wal-fpw-state

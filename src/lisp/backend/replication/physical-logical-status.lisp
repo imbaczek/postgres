@@ -7,8 +7,36 @@
 
 (defconstant +physical-logical-fact-size+ 88)
 
+(defconstant +physical-promotion-logical-intent-size+ 18)
+
+(defun physical-logical-encode-promotion-intent (enabled)
+  (unless (member enabled '(nil t)) (error "invalid promotion logical decoding policy"))
+  (let ((bytes (make-array +physical-promotion-logical-intent-size+
+                           :element-type '(unsigned-byte 8) :initial-element 0)))
+    (replace bytes #(80 71 76 79 71 80 73 49))
+    (setf (aref bytes 8) (if enabled 1 0))
+    bytes))
+
+(defun physical-logical-decode-promotion-intent (bytes)
+  (unless (and (typep bytes '(vector (unsigned-byte 8)))
+               (= (length bytes) +physical-promotion-logical-intent-size+)
+               (equalp (subseq bytes 0 8) #(80 71 76 79 71 80 73 49))
+               (member (aref bytes 8) '(0 1))
+               (every #'zerop (subseq bytes 9)))
+    (error "invalid promotion logical decoding intent"))
+  (= 1 (aref bytes 8)))
+
+(defun physical-promotion-intents-core-size (size)
+  (let* ((residue (mod size 4))
+         (fpw (logbitp 0 residue))
+         (logical (logbitp 1 residue))
+         (core (- size (if fpw +physical-promotion-fpw-intent-size+ 0)
+                  (if logical +physical-promotion-logical-intent-size+ 0))))
+    (unless (>= core 60) (error "truncated promotion intent control"))
+    (values core fpw logical)))
+
 (defconstant +physical-recovery-control-maximum-bytes+
-  (+ 196 +physical-fpw-fact-size+ +physical-promotion-fpw-intent-size+ +physical-logical-fact-size+))
+  (+ 196 +physical-fpw-fact-size+ +physical-promotion-fpw-intent-size+ +physical-logical-fact-size+ +physical-promotion-logical-intent-size+))
 
 (defun physical-logical-control-core-size (bytes)
   "Separate an optional 88-byte logical suffix, retaining the outer CRC size.
