@@ -262,6 +262,43 @@
        (funcall function root store snapshot
                 (pg::physical-fpw-copy-fact (getf pg::*physical-recovery-state* :source-fpw-fact)))))))
 
+(deftest source-fpw-restartpoint-recovers-retained-coverage-before-checkpoint-fallback
+    (dolist (enabled '(nil t))
+      (call-with-source-fpw-restartpoint-fixture
+       enabled
+       (lambda (root store snapshot prior)
+         (declare (ignore root))
+         (let* ((begin (pg::physical-store-flushed-lsn store))
+                (start (+ begin pg::+wal-header-size+))
+                (checkpoint (copy-tree snapshot))
+                (end (+ start (pg::wal-checkpoint-record-size checkpoint))))
+           (setf (getf checkpoint :start) start (getf checkpoint :redo) start
+                 (getf checkpoint :end) end)
+           (loop for (key value) on (pg::wal-copy-control-resource-fields
+                                     (getf pg::*physical-recovery-state* :source-resource-fact))
+                 by #'cddr
+                 do (setf (getf checkpoint key) value))
+           (pg::physical-store-input store begin (sample-physical-record begin))
+           (pg::physical-store-input
+            store start (pg::wal-encode-record pg::+wal-record-checkpoint+ 0 start
+                                               (pg::wal-encode-checkpoint-snapshot checkpoint)))
+           (pg::physical-store-flush store)
+           (ok (= end (pg::physical-replay-from begin)))
+           (let ((expected (copy-tree (getf pg::*physical-recovery-state* :source-fpw-fact))))
+             (pg::physical-restartpoint-publish (pg::physical-store-prefix-digest store end))
+             (multiple-value-bind (metadata catalog prefix)
+                 (pg::physical-restartpoint-read pg::*physical-recovery-state*)
+               (remf metadata :source-fpw-fact)
+               (source-fpw-publish-test-restartpoint metadata catalog prefix))
+             (dotimes (retry 2)
+               (declare (ignorable retry))
+               (remf pg::*physical-recovery-state* :source-fpw-fact)
+               (ok (= end (pg::physical-restartpoint-prepare-storage store)))
+               (let ((actual (getf pg::*physical-recovery-state* :source-fpw-fact)))
+                 (ok (equal expected actual))
+                 (ok (not (eq expected actual)))
+                 (ok (= (getf prior :coverage-start) (getf actual :coverage-start)))))))))))
+
 (deftest source-fpw-private-scan-requires-exact-seed-even-at-empty-prefix
     (dolist (enabled '(nil t))
       (call-with-source-fpw-restartpoint-fixture

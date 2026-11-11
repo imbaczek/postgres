@@ -228,6 +228,49 @@
                      #xCBF29CE484222325 (pg::string->bytes "history-source"))
          :checkpoint-status checkpoint-status :separate-witness-segment t))))
 
+(deftest source-logical-restartpoint-recovers-anchor-coverage-before-checkpoint-fallback
+    (dolist (enabled '(nil t))
+      (call-with-source-logical-anchor-base
+       enabled
+       (lambda (root snapshot anchor)
+         (let* ((base (nth-value 0 (pg::physical-recovery-verify-base-state)))
+                (directory (merge-pathnames "anchor-restartpoint/" root)) (store nil))
+           (pg::wal-ensure-directory-durable directory)
+           (pg::wal-atomic-write-bytes (pg::pgdata-path "PG_VERSION")
+                                       (pg::string->bytes (format nil "16~%")))
+           (unwind-protect
+                (let* ((pg::*physical-recovery-state* base)
+                       (pg::*last-replay-lsn* (getf snapshot :end))
+                       (pg::*next-xid* 50) (pg::*xid-batch-end* 50)
+                       (pg::*physical-receive-store*
+                         (setf store (pg::physical-store-open
+                                      directory (getf base :system-id) 1 :create t
+                                      :start-lsn (getf snapshot :end)
+                                      :retained-directory (pg::physical-recovery-retained-directory)
+                                      :retained-identity (pg::physical-recovery-retained-identity base)))))
+                  (let* ((checkpoint (append-source-logical-test-checkpoint store enabled))
+                         (end (getf checkpoint :end)))
+                    (ok (= end (pg::physical-replay-from (getf snapshot :end))))
+                    (let ((expected (copy-tree (getf pg::*physical-recovery-state* :source-logical-fact))))
+                      (pg::physical-restartpoint-publish (pg::physical-store-prefix-digest store end))
+                      (multiple-value-bind (metadata catalog prefix)
+                          (pg::physical-restartpoint-read pg::*physical-recovery-state*)
+                        (remf metadata :source-logical-fact)
+                        (source-fpw-publish-test-restartpoint metadata catalog prefix))
+                      (ok (= (getf base :end) (pg::physical-store-floor-lsn store)))
+                      (dotimes (retry 2)
+                        (declare (ignorable retry))
+                        (remf pg::*physical-recovery-state* :source-logical-fact)
+                        (ok (= end (pg::physical-restartpoint-prepare-storage store)))
+                        (let ((actual (getf pg::*physical-recovery-state* :source-logical-fact)))
+                          (ok (equal expected actual))
+                          (ok (not (eq expected actual)))
+                          (ok (= (getf anchor :coverage-start) (getf actual :coverage-start)))
+                          (ok (equal (getf anchor :last-disable-lsn) (getf actual :last-disable-lsn))))))))
+             (when store (pg::physical-store-close store)))))
+       :system-id (pg::physical-store-update-digest
+                   #xCBF29CE484222325 (pg::string->bytes "history-source")))))
+
 (defun source-logical-anchor-test-fact (enabled offset)
   (multiple-value-bind (off on later) (source-logical-persistence-facts)
     (declare (ignore later))

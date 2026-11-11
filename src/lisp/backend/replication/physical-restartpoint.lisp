@@ -205,6 +205,7 @@ Source checkpoint policy is distinct from local writer policy."
                              store from to nil state :fpw-seed initial
                              :checkpoint-seed checkpoint :next-xid-seed next))))
       (when (and (null fact) checkpoint
+                 (or (null metadata) (> (physical-store-floor-lsn store) base))
                  (= (getf checkpoint :end) start) (= (getf checkpoint :timeline) timeline))
         (setf fact (checkpoint-fact)))
       (when (and metadata (null fact))
@@ -260,6 +261,7 @@ If known base coverage cannot be reconstructed, require a fresh base backup."
                              store from to nil state :logical-seed initial
                              :checkpoint-seed checkpoint :next-xid-seed next))))
       (when (and (null fact) checkpoint
+                 (or (null metadata) (> (physical-store-floor-lsn store) base))
                  (= (getf checkpoint :end) start) (= (getf checkpoint :timeline) timeline))
         (setf fact (checkpoint-fact)))
       (when (and metadata (null fact))
