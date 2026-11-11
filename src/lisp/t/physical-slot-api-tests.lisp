@@ -16,6 +16,8 @@
             (physical-slot-test-configuration
              (pg::make-wal-slot-retention-policy :mode :bytes :limit 1073741824) 0))
           (pg::*logical-capture-live-slots* 0)
+          (pg::*wal-logical-policy* nil)
+          (pg::*logical-capture-force* nil)
           (pg::*logical-slot-owner-termination-requests* (make-hash-table :test #'eq))
           (pg::*exported-logical-snapshots* (make-hash-table :test #'equal))
           (pg::*expired-exported-logical-snapshots* (make-hash-table :test #'equal))
@@ -394,6 +396,16 @@
              (gethash "public_physical" pg::*wal-replication-slots*) slot)
        (pg::wal-save-replication-slot slot)
        (funcall function slot owner backend checkpoint)))))
+
+(deftest physical-slot-api-fixtures-do-not-inherit-another-stores-logical-policy
+    (let ((pg::*wal-logical-policy* (pg::%make-wal-logical-policy (gensym "FOREIGN-WAL-") nil nil))
+          (pg::*logical-capture-force* t))
+      (call-with-active-slot-recycling-fixture
+       (lambda (&rest arguments)
+         (declare (ignore arguments))
+         (sb-thread:with-mutex (pg::*wal-lock*)
+           (ok (null (pg::wal-current-logical-decoding-fields))))
+         (ok (null pg::*logical-capture-force*))))))
 
 (deftest wal-keep-reload-rechecks-the-frozen-owner-endpoint
     (call-with-active-slot-recycling-fixture
@@ -1211,6 +1223,109 @@
                     ("SELECT pg_create_physical_replication_slot(bogus=>1,bogus=>2)" "42601")))
       (destructuring-bind (sql state) case
         (ok (equal state (recovery-state-of (lambda () (physical-slot-test-analyze-call sql))))))))
+
+(deftest logical-slot-sql-binds-c-defaults-and-record-fields
+    (dolist (sql '("SELECT pg_catalog.pg_create_logical_replication_slot('sql_slot','pgoutput')"
+                   "SELECT pg_create_logical_replication_slot(plugin=>'pgoutput',slot_name=>'sql_slot')"))
+      (let ((call (physical-slot-test-analyze-call sql)))
+        (ok (eq :record (pg::expr-type call)))
+        (ok (equal '(("slot_name" :name) ("lsn" :pg-lsn)) (getf (cdddr call) :fields)))
+        (ok (equal '("sql_slot" "pgoutput" nil nil nil) (mapcar #'second (third call))))))
+  (ok (equal '(("slot_name" :name) ("lsn" :pg-lsn))
+             (pg::sql-composite-call-fields
+              '(:func "pg_create_logical_replication_slot" nil)))))
+
+(cl-spec:defproperty logical-slot-sql-preserves-named-option-values
+    ((temporary (member nil t)) (twophase (member nil t)) (failover (member nil t)))
+  (:about pg::analyze-expr)
+  (:trials (:normal 100))
+  (let ((call (physical-slot-test-analyze-call
+               (format nil "SELECT pg_create_logical_replication_slot(failover=>~a,plugin=>'pgoutput',twophase=>~a,slot_name=>'named_slot',temporary=>~a)"
+                       (if failover "true" "false") (if twophase "true" "false")
+                       (if temporary "true" "false")))))
+    (and (equal '(:name :name :bool :bool :bool) (mapcar #'pg::expr-type (third call)))
+         (equal (list "named_slot" "pgoutput" temporary twophase failover)
+                (mapcar #'second (third call))))))
+
+(deftest generated-logical-slot-sql-option-binding
+    (let ((data (cl-spec:result-data
+                 (cl-spec:run-property 'logical-slot-sql-preserves-named-option-values
+                                       :seed 317 :profile :normal))))
+      (ok (eq :passed (getf data :status)) (format nil "~s" data))))
+
+(deftest logical-slot-sql-analysis-rejects-invalid-calls
+    (dolist (case '(("SELECT pg_create_logical_replication_slot('x')" "42883")
+                    ("SELECT pg_create_logical_replication_slot('x','pgoutput',false,false,false,false)" "42883")
+                    ("SELECT pg_create_logical_replication_slot('x','pgoutput',two_phase=>false)" "42883")
+                    ("SELECT pg_create_logical_replication_slot('x','pgoutput',twophase=>'junk')" "22P02")
+                    ("SELECT pg_create_logical_replication_slot(slot_name=>'x',slot_name=>'y',plugin=>'pgoutput')" "42601")
+                    ("SELECT pg_create_logical_replication_slot(plugin=>'pgoutput',missing_column)" "42703")))
+      (destructuring-bind (sql state) case
+        (ok (equal state (recovery-state-of (lambda () (physical-slot-test-analyze-call sql))))))))
+
+(deftest logical-slot-sql-null-inputs-have-no-creation-side-effects
+    (dotimes (index 5)
+      (let ((arguments (list "sql_slot" "pgoutput" nil nil nil)))
+        (setf (nth index arguments) pg::+null+)
+        (ok (eq pg::+null+ (pg::eval-func "pg_create_logical_replication_slot" arguments))))))
+
+(deftest logical-slot-sql-uses-the-confirmed-core-with-drain-before-lifecycle-lock
+    (let ((pg::*backend* (pg::make-backend :pid 1701 :explicit t :read-only t))
+          (pg::*physical-recovery-state* nil)
+          (arm (symbol-function 'pg::call-with-logical-capture-armed))
+          (core (symbol-function 'pg::%create-standard-logical-slot))
+          (events nil))
+      (unwind-protect
+           (progn
+             (setf (symbol-function 'pg::call-with-logical-capture-armed)
+                   (lambda (function &key activation)
+                     (ok (not (sb-thread:holding-mutex-p pg::*logical-slot-lifecycle-lock*)))
+                     (ok (equal "sql_slot" (pg::wal-logical-info-activation-slot-name activation)))
+                     (push :armed events)
+                     (funcall function))
+                   (symbol-function 'pg::%create-standard-logical-slot)
+                   (lambda (name action)
+                     (ok (sb-thread:holding-mutex-p pg::*logical-slot-lifecycle-lock*))
+                     (ok (equal "sql_slot" name))
+                     (ok (eq :nothing action))
+                     (ok (eq :text pg::*wal-new-slot-profile*))
+                     (push :created events)
+                     (values 123456 nil)))
+             (let ((row (pg::eval-func "pg_create_logical_replication_slot"
+                                       (list "sql_slot" "pgoutput" nil nil nil))))
+               (ok (equal '(("slot_name" :name) ("lsn" :pg-lsn)) (pg::sql-record-fields row)))
+               (ok (equalp #("sql_slot" 123456) (pg::sql-record-values row)))
+               (ok (equal '(:armed :created) (nreverse events)))))
+        (setf (symbol-function 'pg::call-with-logical-capture-armed) arm
+              (symbol-function 'pg::%create-standard-logical-slot) core))))
+
+(deftest logical-slot-sql-preflight-rejects-unsupported-state-before-activation
+    (let ((pg::*backend* (pg::make-backend :pid 1702))
+          (pg::*physical-recovery-state* nil)
+          (arm (symbol-function 'pg::call-with-logical-capture-armed))
+          (calls 0))
+      (unwind-protect
+           (progn
+             (setf (symbol-function 'pg::call-with-logical-capture-armed)
+                   (lambda (&rest arguments) (declare (ignore arguments)) (incf calls)
+                           (error "unexpected logical activation")))
+             (dolist (arguments '(("sql_slot" "unsupported" nil nil nil)
+                                  ("sql_slot" "pgoutput" t nil nil)
+                                  ("sql_slot" "pgoutput" nil t nil)
+                                  ("sql_slot" "pgoutput" nil nil t)))
+               (ok (equal "0A000" (recovery-state-of
+                                   (lambda () (pg::eval-func "pg_create_logical_replication_slot" arguments))))))
+             (setf (pg::backend-xid pg::*backend*) 37)
+             (ok (equal "25001" (recovery-state-of
+                                 (lambda () (pg::eval-func "pg_create_logical_replication_slot"
+                                                           (list "sql_slot" "pgoutput" nil nil nil))))))
+             (setf (pg::backend-xid pg::*backend*) nil)
+             (let ((pg::*physical-recovery-state* '(:phase 3)))
+               (ok (equal "55000" (recovery-state-of
+                                   (lambda () (pg::eval-func "pg_create_logical_replication_slot"
+                                                             (list "sql_slot" "pgoutput" nil nil nil)))))))
+             (ok (zerop calls)))
+        (setf (symbol-function 'pg::call-with-logical-capture-armed) arm))))
 
 (deftest physical-slots-do-not-enable-the-logical-capture-mirror
     (call-with-physical-slot-api-fixture

@@ -1617,6 +1617,226 @@
           (when pg::*clog-stream* (close pg::*clog-stream*))
           (pg::smgr-close-all)))))
 
+(defun call-with-primary-reader-identity-fixture (function)
+  (let ((pg::*physical-recovery-state* nil)
+        (pg::*backend* (pg::make-backend :pid 1801 :state :in-progress))
+        (pg::*catalog* (pg::make-catalog :cluster-identity "primary-reader-test"))
+        (pg::*wal-ready* nil) (pg::*next-xid* 50) (pg::*xid-batch-end* 100)
+        (pg::*active-xids* nil)
+        (pg::*recovery-reader-xid-counter* 0)
+        (pg::*recovery-reader-xids* (make-hash-table :test #'eql))
+        (pg::*relation-readers* (make-hash-table :test #'eql))
+        (pg::*relation-writers* (make-hash-table :test #'eql))
+        (pg::*relation-builders* (make-hash-table :test #'eql))
+        (pg::*relation-reader-blockers* (make-hash-table :test #'eql))
+        (pg::*relation-build-groups* (make-hash-table :test #'eq))
+        (pg::*relation-maintainers* (make-hash-table :test #'eql))
+        (pg::*relation-resource-requests* (make-hash-table :test #'eq))
+        (pg::*transaction-exclusive-relation-locks* (make-hash-table :test #'eq))
+        (pg::*logical-capture-xid-modes* (make-hash-table :test #'eql))
+        (pg::*logical-binary-required-xids* (make-hash-table :test #'eql))
+        (pg::*wal-xid-first-lsn* (make-hash-table :test #'eql)))
+    (unwind-protect (funcall function)
+      (when (pg::backend-xid pg::*backend*)
+        (pg::release-xid (pg::backend-xid pg::*backend*))
+        (setf (pg::backend-xid pg::*backend*) nil))
+      (pg::reset-backend-transaction pg::*backend*))))
+
+(deftest primary-relation-readers-do-not-allocate-durable-xids
+    (call-with-primary-reader-identity-fixture
+     (lambda ()
+       (let ((reader (pg::get-current-reader-xid)))
+         (ok (minusp reader))
+         (ok (null (pg::backend-xid pg::*backend*)))
+         (ok (= 50 pg::*next-xid*))
+         (pg::register-relation-readers '(900) reader)
+         (ok (equal (list reader) (gethash 900 pg::*relation-readers*)))
+         (ok (not (pg::xid-active-p reader)))
+         (ok (pg::relation-user-active-p reader))))))
+
+(deftest primary-reader-write-upgrade-keeps-one-relation-owner
+    (call-with-primary-reader-identity-fixture
+     (lambda ()
+       (let* ((reader (pg::get-current-reader-xid)))
+         (pg::register-relation-readers '(900) reader)
+         (let ((xid (pg::get-current-xid)))
+           (ok (= 50 xid))
+           (ok (minusp reader))
+           (ok (pg::xid-active-p xid))
+           (pg::register-relation-writer 900 xid)
+           (pg::register-relation-readers '(901) (pg::get-current-reader-xid))
+           (ok (equal (list reader) (gethash 900 pg::*relation-writers*)))
+           (ok (equal (list reader) (gethash 901 pg::*relation-readers*)))
+           (ok (equal '(2 2) (multiple-value-list (pg::relation-resource-footprint))))
+           (pg::release-xid xid)
+           (setf (pg::backend-xid pg::*backend*) nil)
+           (ok (pg::relation-user-active-p reader))
+           (ok (equal (list reader) (gethash 900 pg::*relation-writers*)))
+           (pg::reset-backend-transaction pg::*backend*)
+           (ok (not (pg::relation-user-active-p reader)))
+           (ok (equal '(0 0) (multiple-value-list (pg::relation-resource-footprint)))))))))
+
+(deftest primary-reader-can-acquire-own-ddl-gates-before-and-after-write-upgrade
+    (call-with-primary-reader-identity-fixture
+     (lambda ()
+       (let ((reader (pg::get-current-reader-xid)))
+         (pg::register-relation-readers '(900 901) reader)
+         (ok (handler-case
+                 (sb-ext:with-timeout 1
+                   (pg::with-relation-build-locks ('(900) t) t))
+               (sb-ext:timeout () nil)))
+         (pg::get-current-xid)
+         (ok (handler-case
+                 (sb-ext:with-timeout 1
+                   (pg::acquire-transaction-relation-locks '(901))
+                   t)
+               (sb-ext:timeout () nil)))
+         (ok (equal (list reader) (gethash 901 pg::*relation-writers*)))
+         (ok (zerop (hash-table-count pg::*relation-resource-requests*)))))))
+
+(deftest primary-reader-write-upgrade-obeys-group-admission-and-owner-limits
+    (call-with-primary-reader-identity-fixture
+     (lambda ()
+       (let* ((reader (pg::get-current-reader-xid))
+              (pg::*relation-lock-object-limit* 1)
+              (pg::*relation-lock-owner-limit* 1))
+         (pg::register-relation-readers '(900) reader)
+         (let ((xid (pg::get-current-xid)))
+           (pg::register-relation-writer 900 xid)
+           (ok (equal '(1 1) (multiple-value-list (pg::relation-resource-footprint))))
+           (let ((token (pg::make-relation-gate-token 99))
+                 (pg::*relation-lock-object-limit* 2)
+                 (pg::*relation-lock-owner-limit* 4))
+             (setf (gethash token pg::*relation-build-groups*) '((900 901) t))
+             (dolist (node '(900 901))
+               (setf (gethash node pg::*relation-builders*) token
+                     (gethash node pg::*relation-reader-blockers*) token))
+             (ok (handler-case
+                     (sb-ext:with-timeout 1 (pg::register-relation-writer 901 xid) t)
+                   (sb-ext:timeout () nil)))
+             (ok (equal (list reader) (gethash 901 pg::*relation-writers*)))
+             (ok (equal '(2 4) (multiple-value-list (pg::relation-resource-footprint))))
+             (ok (member (gethash xid pg::*logical-capture-xid-modes*) '(:skip-written :capture-written)))
+             (ok (not (nth-value 1 (gethash reader pg::*logical-capture-xid-modes*))))
+             (ok (equal "53200" (recovery-state-of
+                                 (lambda () (pg::register-relation-readers '(900) 88)))))
+             (let ((pg::*relation-lock-owner-limit* nil))
+               (pg::release-relation-build-locks '(900 901) token)
+               (pg::register-relation-readers '(900) 88)
+               (ok (member 88 (gethash 900 pg::*relation-readers*))))))))))
+
+(deftest primary-reader-cancellation-after-xid-allocation-releases-both-identities
+    (call-with-primary-reader-identity-fixture
+     (lambda ()
+       (let ((reader (pg::get-current-reader-xid)))
+         (pg::register-relation-readers '(900) reader)
+         (let ((xid (pg::get-current-xid))
+               (token (pg::make-relation-gate-token 99)))
+           (setf (gethash 901 pg::*relation-builders*) token
+                 (gethash token pg::*relation-build-groups*) '((901) nil)
+                 (pg::backend-cancel-pending pg::*backend*) t)
+           (ok (equal "57014" (recovery-state-of
+                               (lambda () (pg::register-relation-writer 901 xid)))))
+           (ok (= xid (pg::backend-xid pg::*backend*)))
+           (ok (= reader (pg::backend-virtual-reader-xid pg::*backend*)))
+           (ok (zerop (hash-table-count pg::*relation-resource-requests*)))
+           (pg::release-xid xid)
+           (setf (pg::backend-xid pg::*backend*) nil
+                 (pg::backend-cancel-pending pg::*backend*) nil)
+           (pg::reset-backend-transaction pg::*backend*)
+           (ok (null pg::*active-xids*))
+           (ok (zerop (hash-table-count pg::*recovery-reader-xids*)))
+           (ok (zerop (hash-table-count pg::*relation-readers*))))))))
+
+(deftest writer-first-transactions-keep-their-real-relation-identity
+    (call-with-primary-reader-identity-fixture
+     (lambda ()
+       (let ((xid (pg::get-current-xid)))
+         (ok (= xid (pg::get-current-reader-xid)))
+         (ok (null (pg::backend-virtual-reader-xid pg::*backend*)))
+         (pg::register-relation-readers '(900) xid)
+         (pg::register-relation-writer 900 xid)
+         (ok (equal (list xid) (gethash 900 pg::*relation-writers*)))
+         (ok (equal '(1 1) (multiple-value-list (pg::relation-resource-footprint))))
+         (ok (zerop (hash-table-count pg::*recovery-reader-xids*)))))))
+
+(deftest logical-activation-refuses-a-relation-owner-before-on-or-xid-wait
+    (call-with-primary-reader-identity-fixture
+     (lambda ()
+       (let ((reader (pg::get-current-reader-xid))
+             (pg::*logical-capture-arming* (make-hash-table :test #'eq))
+             (begin (symbol-function 'pg::wal-logical-info-begin-activation))
+             (on-count 0))
+         (pg::register-relation-readers '(900) reader)
+         (setf pg::*active-xids* '(77)
+               (gethash 77 pg::*logical-capture-xid-modes*) :skip-written)
+         (unwind-protect
+              (progn
+                (setf (symbol-function 'pg::wal-logical-info-begin-activation)
+                      (lambda (&rest arguments) (declare (ignore arguments)) (incf on-count)))
+                (ok (equal "55000"
+                           (handler-case
+                               (sb-ext:with-timeout 1
+                                 (recovery-state-of
+                                  (lambda ()
+                                    (pg::call-with-logical-capture-armed
+                                     (lambda () (error "unexpected slot callback"))
+                                     :activation (pg::make-wal-logical-info-activation :slot-name "guard_slot")))))
+                             (sb-ext:timeout () :timeout))))
+                (ok (zerop on-count))
+                (ok (zerop (hash-table-count pg::*logical-capture-arming*))))
+           (setf (symbol-function 'pg::wal-logical-info-begin-activation) begin))))))
+
+(deftest logical-activation-can-drain-with-an-empty-virtual-reader
+    (call-with-primary-reader-identity-fixture
+     (lambda ()
+       (let ((reader (pg::get-current-reader-xid))
+             (pg::*logical-capture-arming* (make-hash-table :test #'eq))
+             (begin (symbol-function 'pg::wal-logical-info-begin-activation))
+             (wait (symbol-function 'pg::wait-for-xid))
+             (on-count 0) (wait-count 0))
+         (setf pg::*active-xids* '(77)
+               (gethash 77 pg::*logical-capture-xid-modes*) :skip-written)
+         (unwind-protect
+              (progn
+                (setf (symbol-function 'pg::wal-logical-info-begin-activation)
+                      (lambda (&rest arguments) (declare (ignore arguments)) (incf on-count))
+                      (symbol-function 'pg::wait-for-xid)
+                      (lambda (xid)
+                        (ok (= 77 xid))
+                        (incf wait-count)
+                        (setf pg::*active-xids* nil)))
+                (ok (eq :created
+                        (pg::call-with-logical-capture-armed
+                         (lambda () :created)
+                         :activation (pg::make-wal-logical-info-activation :slot-name "guard_slot"))))
+                (ok (minusp reader))
+                (ok (= 1 on-count))
+                (ok (= 1 wait-count))
+                (ok (zerop (hash-table-count pg::*logical-capture-arming*))))
+           (setf (symbol-function 'pg::wal-logical-info-begin-activation) begin
+                 (symbol-function 'pg::wait-for-xid) wait))))))
+
+(deftest logical-activation-relation-guard-checks-active-owners-and-held-gates
+    (call-with-primary-reader-identity-fixture
+     (lambda ()
+       (let ((reader (pg::get-current-reader-xid)))
+         (pg::register-relation-readers '(900) reader)
+         (setf pg::*active-xids* '(77))
+         (ok (pg::logical-activation-relation-wait-p '(77)))
+         (ok (not (pg::logical-activation-relation-wait-p '(88))))
+         (setf pg::*active-xids* nil)
+         (ok (not (pg::logical-activation-relation-wait-p '(77))))
+         (setf pg::*active-xids* '(77))
+         (clrhash pg::*relation-readers*)
+         (setf (gethash 900 pg::*relation-readers*) '(88))
+         (ok (not (pg::logical-activation-relation-wait-p '(77))))
+         (setf (gethash 901 pg::*relation-builders*) (pg::make-relation-gate-token pg::*backend*))
+         (ok (pg::logical-activation-relation-wait-p '(77)))
+         (clrhash pg::*relation-builders*)
+         (setf (gethash 901 pg::*relation-maintainers*) (pg::make-relation-gate-token reader))
+         (ok (pg::logical-activation-relation-wait-p '(77)))))))
+
 (deftest recovery-readers-use-virtual-lock-identities
     (let* ((pg::*physical-recovery-state* (sample-recovery-manifest))
            (pg::*backend* (pg::make-backend))

@@ -974,6 +974,13 @@ Without an owner, the caller remains responsible for releasing the active XID."
     ;; Never acquire WAL while holding XID; checkpoints take WAL then XID.
     (xid-assign-with-wal-reservation oldest owner)))
 
+(defun relation-lock-owner-xid (xid &optional (backend *backend*))
+  (if (and backend (backend-virtual-reader-xid backend)
+           (or (null xid) (eql xid (backend-xid backend))
+               (eql xid (backend-virtual-reader-xid backend))))
+      (backend-virtual-reader-xid backend)
+      xid))
+
 (defun relation-build-group-has-user-p (token xid writers-p readers-p)
   (let ((group (gethash token *relation-build-groups*)))
     (and group
@@ -1009,21 +1016,22 @@ Without an owner, the caller remains responsible for releasing the active XID."
 Reserve the complete set before waiting; transaction cleanup owns granted access."
   (when (and write-relfilenodes *backend* (eql xid (backend-xid *backend*)))
     (logical-note-xid-mutation-needs-capture-p xid))
-  (let* ((writes (sort (remove-duplicates (copy-list write-relfilenodes) :test #'=) #'<))
+  (let* ((relation-xid (relation-lock-owner-xid xid))
+         (writes (sort (remove-duplicates (copy-list write-relfilenodes) :test #'=) #'<))
          (reads (sort (set-difference (copy-list read-relfilenodes) writes :test #'=) #'<)))
     (call-with-relation-resource-request
-     (append writes reads) (make-relation-gate-token xid)
+     (append writes reads) (make-relation-gate-token relation-xid)
      (lambda (request)
        (sb-thread:with-mutex (*relation-lock-mutex*)
          (loop
-           (when (and (every (lambda (node) (relation-writer-admissible-p node xid)) writes)
-                      (every (lambda (node) (relation-reader-admissible-p node xid)) reads))
+           (when (and (every (lambda (node) (relation-writer-admissible-p node relation-xid)) writes)
+                      (every (lambda (node) (relation-reader-admissible-p node relation-xid)) reads))
              (sb-sys:without-interrupts
                (remhash request *relation-resource-requests*)
                (dolist (node writes)
-                 (pushnew xid (gethash node *relation-writers*) :test #'=))
+                 (pushnew relation-xid (gethash node *relation-writers*) :test #'=))
                (dolist (node reads)
-                 (pushnew xid (gethash node *relation-readers*) :test #'=)))
+                 (pushnew relation-xid (gethash node *relation-readers*) :test #'=)))
              (return))
            (check-for-interrupts)
            (condition-wait-with-timeout *relation-lock-cv* *relation-lock-mutex*))))))
@@ -1109,18 +1117,19 @@ for each other.  Gate ownership and writer registrations are published together
 under the relation mutex, with interrupts disabled."
   (let* ((backend *backend*)
          (xid (get-current-xid))
+         (relation-xid (relation-lock-owner-xid xid backend))
          (requested (remove-if (lambda (node)
                                  (transaction-held-relation-lock-p node backend))
                                nodes)))
     (when requested
       (logical-note-xid-mutation-needs-capture-p xid)
       (acquire-relation-build-locks
-       requested xid t
+       requested relation-xid t
        (lambda (relations token)
          (push (cons relations token)
                (gethash backend *transaction-exclusive-relation-locks*))
          (dolist (node relations)
-           (pushnew xid (gethash node *relation-writers*) :test #'=))))))
+           (pushnew relation-xid (gethash node *relation-writers*) :test #'=))))))
   (values))
 
 (defun release-transaction-relation-locks (backend)
@@ -1138,6 +1147,7 @@ ON-ACQUIRED publishes cleanup ownership as gates become visible. It is
 called under the relation mutex with interrupts disabled. Raw callers retain
 responsibility for release after successful return. Without ON-ACQUIRED they
 must protect the return-to-owner handoff from interrupts; prefer the scoped macros."
+  (setf own-xid (relation-lock-owner-xid own-xid))
   (let ((relfilenodes (sort (remove-duplicates (remove-if
                                                 (lambda (node)
                                                   (and *backend*
@@ -1416,6 +1426,27 @@ Pass BACKEND when releasing its virtual reader ID."
     (wal-note-logical-slot-count-under-lock count))
   (values))
 
+(defun logical-activation-relation-wait-p (old-xids &optional (backend *backend*))
+  (let ((real (and backend (backend-xid backend)))
+        (virtual (and backend (backend-virtual-reader-xid backend))))
+    (labels ((owned-p (actor)
+               (cond ((null actor) nil)
+                     ((relation-gate-token-p actor) (owned-p (relation-gate-token-owner actor)))
+                     (t (or (eq actor backend) (and real (eql actor real))
+                            (and virtual (eql actor virtual)))))))
+      (and backend old-xids
+           (sb-thread:with-mutex (*relation-lock-mutex*)
+             (and (or (loop for users being the hash-values of *relation-readers*
+                              thereis (some #'owned-p users))
+                      (loop for users being the hash-values of *relation-writers*
+                              thereis (some #'owned-p users))
+                      (loop for token being the hash-values of *relation-builders*
+                              thereis (owned-p token))
+                      (loop for token being the hash-values of *relation-maintainers*
+                              thereis (owned-p token)))
+                  (sb-thread:with-mutex (*xid-lock*)
+                    (some (lambda (xid) (member xid *active-xids* :test #'=)) old-xids))))))))
+
 (defun call-with-logical-capture-armed (function &key activation)
   "Arm capture for new XIDs, then drain older uncaptured XIDs before FUNCTION.
 An activation publishes provisional logical-info ON before draining old XIDs
@@ -1451,6 +1482,9 @@ reconsider deferred disable after release, without holding the XID lock."
                           (or (backend-holds-schema-read-lock-p)
                               *schema-read-lock-held* *schema-write-lock-held*))
                  (ereport "55000" "cannot wait for uncaptured transactions while holding a schema lock"))
+               (when (logical-activation-relation-wait-p old-xids)
+                 (ereport "55000"
+                          "cannot wait for uncaptured transactions while holding relation locks"))
                (when activation (wal-logical-info-begin-activation token activation))
                (dolist (xid old-xids) (wait-for-xid xid))
                (multiple-value-prog1 (funcall function) (setf finished t))))
@@ -1873,6 +1907,24 @@ between snapshot capture and this durable publication."
    (lambda () (%create-standard-logical-slot slot-name snapshot-action))
    :activation (make-wal-logical-info-activation :slot-name slot-name)))
 
+(defun create-sql-logical-replication-slot (name plugin temporary twophase failover)
+  (unless (and *backend* (not (eq (backend-replication-mode *backend*) :physical)))
+    (ereport "55000" "logical decoding requires a database connection"))
+  (prevent-recovery-primary-operation "SQL logical slot creation")
+  (when (backend-xid *backend*)
+    (ereport "25001" "cannot create logical replication slot in transaction that has performed writes"))
+  (unless (string= plugin "pgoutput")
+    (ereport "0A000" "unsupported logical output plugin ~s" plugin))
+  (when temporary (ereport "0A000" "temporary logical replication slots are not supported"))
+  (when twophase (ereport "0A000" "two-phase logical replication slots are not supported"))
+  (when failover (ereport "0A000" "failover logical replication slots are not supported"))
+  (let ((*wal-new-slot-profile* :text))
+    (call-with-logical-capture-armed
+     (lambda ()
+       (sb-thread:with-mutex (*logical-slot-lifecycle-lock*)
+         (%create-standard-logical-slot name :nothing)))
+     :activation (make-wal-logical-info-activation :slot-name name))))
+
 (defun %create-exported-logical-snapshot-slot (slot-name)
   "Create an unconfirmed logical slot and return its copy boundary and token.
 
@@ -2225,13 +2277,8 @@ transaction until cleanup and is not a durable XID."
         xid))))
 
 (defun get-current-reader-xid ()
-  "Return the transaction's relation-lock identity.
-
-A recovery reader uses a virtual ID.  Keep that ID across a role change until
-transaction cleanup; otherwise obtain a real XID outside recovery."
-  (if (or (backend-virtual-reader-xid *backend*) (recovery-in-progress-p))
-      (ensure-recovery-reader-identity *backend*)
-      (get-current-xid)))
+  (or (backend-xid *backend*)
+      (ensure-recovery-reader-identity *backend*)))
 
 (defun refresh-statement-snapshot ()
   "Take a fresh snapshot after DDL has waited for prior table writers."

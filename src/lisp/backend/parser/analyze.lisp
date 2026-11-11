@@ -894,11 +894,13 @@ then argument types. Only ambiguity and type failures carry the cast hint."
      name analyzed :schema schema :named-p t
      :signature (random-call-signature analyzed (nreverse argument-names)))))
 
-(defun physical-slot-function-signature (name)
-  "Return the supported public slot function's input names, types and defaults."
+(defun replication-slot-function-signature (name)
   (cond
     ((string= name "pg_create_physical_replication_slot")
      '(("slot_name" :name :required) ("immediately_reserve" :bool nil) ("temporary" :bool nil)))
+    ((string= name "pg_create_logical_replication_slot")
+     '(("slot_name" :name :required) ("plugin" :name :required)
+       ("temporary" :bool nil) ("twophase" :bool nil) ("failover" :bool nil)))
     ((string= name "pg_replication_slot_advance")
      '(("slot_name" :name :required) ("upto_lsn" :pg-lsn :required)))
     ((string= name "pg_drop_replication_slot") '((nil :name :required)))))
@@ -918,10 +920,10 @@ then argument types. Only ambiguity and type failures carry the cast hint."
         (when name (push name names))))
     (values analyzed names)))
 
-(defun analyze-physical-slot-arguments (name arguments table variadic)
+(defun analyze-replication-slot-arguments (name arguments table variadic)
   "Bind supported physical slot arguments and defaults to the catalog signature."
   (multiple-value-bind (analyzed names) (analyze-catalog-call-inputs arguments table)
-    (let* ((signature (physical-slot-function-signature name))
+    (let* ((signature (replication-slot-function-signature name))
            (assigned (make-array (length signature) :initial-element nil))
            (slots (make-array (length signature) :initial-element nil))
            (position 0) (bindings nil))
@@ -948,16 +950,15 @@ then argument types. Only ambiguity and type failures carry the cast hint."
           (setf (aref slots index) (coerce-common-expression expression type))))
       (coerce slots 'list))))
 
-(defun analyze-physical-slot-function (name arguments)
-  "Resolve the result type of a supported public slot function."
+(defun analyze-replication-slot-function (name arguments)
   (if (string= name "pg_drop_replication_slot")
       (list :func name arguments :type :void :typmod -1)
       (list :func name arguments :type :record :typmod -1
-                                 :fields (if (string= name "pg_create_physical_replication_slot")
+                                 :fields (if (member name '("pg_create_physical_replication_slot"
+                                                            "pg_create_logical_replication_slot") :test #'string=)
                                              +physical-slot-create-result-fields+ +physical-slot-advance-result-fields+))))
 
-(defun eval-physical-slot-function (name arguments)
-  "Execute a bound public slot call using its evaluated SQL arguments."
+(defun eval-replication-slot-function (name arguments)
   (if (some (lambda (argument) (eq argument +null+)) arguments)
       +null+
       (cond
@@ -969,6 +970,10 @@ then argument types. Only ambiguity and type failures carry the cast hint."
             :fields +physical-slot-create-result-fields+
             :values (vector (wal-replication-slot-name slot)
                             (or (wal-replication-slot-restart-lsn slot) +null+)))))
+        ((string= name "pg_create_logical_replication_slot")
+         (let ((lsn (apply #'create-sql-logical-replication-slot arguments)))
+           (make-sql-record :fields +physical-slot-create-result-fields+
+                            :values (vector (first arguments) lsn))))
         ((string= name "pg_replication_slot_advance")
          (make-sql-record
           :fields +physical-slot-advance-result-fields+
@@ -978,8 +983,8 @@ then argument types. Only ambiguity and type failures carry the cast hint."
 
 (defun analyze-call-argument-list (name arguments table &optional variadic schema)
   "Analyze call arguments, binding supported named arguments."
-  (cond ((physical-slot-function-signature name)
-         (analyze-physical-slot-arguments name arguments table variadic))
+  (cond ((replication-slot-function-signature name)
+         (analyze-replication-slot-arguments name arguments table variadic))
         ((string= name "pg_get_replication_slots")
          (analyze-catalog-call-inputs arguments table))
         ((string= name "pg_promote")
@@ -1651,7 +1656,7 @@ only when a non-NULL call executes; explicit text arguments arrive here then."
         (analyze-publication-table-call name args (getf (cdddr expr) :variadic))))
     (cond
       ((string= name "pg_get_replication_slots") (analyze-replication-slot-call name args))
-      ((physical-slot-function-signature name) (analyze-physical-slot-function name args))
+      ((replication-slot-function-signature name) (analyze-replication-slot-function name args))
       ((or (numeric-function-p name)
            (member name '("random" "setseed") :test #'string=))
        ;; ParseFuncOrColumn selects the candidate before rejecting decorations,
@@ -3491,7 +3496,8 @@ candidate selection."
           ((string= name "pg_stat_get_wal_senders") +wal-sender-result-fields+)
           ((string= name "pg_stat_get_activity") +activity-result-fields+)
           ((string= name "pg_get_replication_slots") +replication-slot-result-fields+)
-          ((string= name "pg_create_physical_replication_slot") +physical-slot-create-result-fields+)
+          ((member name '("pg_create_physical_replication_slot" "pg_create_logical_replication_slot")
+                   :test #'string=) +physical-slot-create-result-fields+)
           ((string= name "pg_replication_slot_advance") +physical-slot-advance-result-fields+)
           (t (ereport "42809" "expression is not a supported composite type")))))
 
@@ -4547,7 +4553,7 @@ the full 64-bit ID as a signed value."
 
 (defun eval-func (name args)
   (cond
-    ((physical-slot-function-signature name) (eval-physical-slot-function name args))
+    ((replication-slot-function-signature name) (eval-replication-slot-function name args))
     ((string= name "width_bucket") (sql-width-bucket args))
     ((and (member name '("nextval" "currval" "setval") :test #'string=)
           (member +null+ args))
