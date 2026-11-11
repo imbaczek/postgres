@@ -1110,7 +1110,7 @@ This configuration path does not take live admission or the code reload lock."
                 return (format nil "~d~a" (/ value multiplier) unit)))))
 
 (defun startup-check-session-setting (name)
-  "Enforce guc.c's POSTMASTER/SIGHUP contexts for SQL SET and RESET."
+  "Reject SQL changes to POSTMASTER, SIGHUP and internal settings with 55P02."
   (let ((spec (assoc name *startup-setting-specs* :test #'string=)))
     (when (or (and spec (not (eq (second spec) :user)))
               (member name '("config_file" "effective_wal_level") :test #'string=))
@@ -1120,6 +1120,12 @@ This configuration path does not take live admission or the code reload lock."
                         " without restarting the server" " now")))))
 
 (defun startup-effective-wal-level (&optional (configuration (startup-capture-configuration)))
+  "Return the effective WAL level using the caller's admitted server state.
+In recovery, check the published source fact at actual replay progress; ignore
+local policy and future required facts. Unknown legacy status displays replica
+without establishing OFF evidence. On a primary, combine the captured configured
+level with checked published status under the WAL lock; missing state is an error.
+This reports published policy, not C's per-backend transaction cache timing."
   (let* ((recovery *physical-recovery-state*)
          (fact (getf recovery :source-logical-fact)))
     (if recovery
@@ -1142,6 +1148,7 @@ This configuration path does not take live admission or the code reload lock."
                   "logical" "replica")))))))
 
 (defun startup-effective-wal-level-settings-row (configuration)
+  "Build the internal computed settings row from the captured configuration."
   (vector "effective_wal_level" (startup-effective-wal-level configuration) +null+
           "internal" "enum" "default"
           (make-sql-array :element-type-id :text :elements (vector "minimal" "replica" "logical")
@@ -1188,7 +1195,8 @@ environment."
 
 (defun startup-settings-rows ()
   "Snapshot supported installed server and session GUCs; omit custom placeholders.
-Use one root for all server rows and emit one effective synchronous commit row.
+Use one root for all server rows, including the computed effective WAL level,
+and emit one effective synchronous commit row.
 Without an installed root, return session rows."
   (let* ((configuration (startup-capture-configuration))
          (settings (when configuration (startup-configuration-settings configuration))))
