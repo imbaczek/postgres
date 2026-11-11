@@ -610,7 +610,7 @@ A policy fence must leave a clean batch boundary; an allowed open tail may remai
                              reservation (physical-source-reservation-next reservation record next)
                              source-xids (physical-source-xids-next source-xids record next))
                        (progn
-                         (physical-replay-check-child-initialization record next fpw-fact)
+                         (physical-replay-check-child-initialization record next fpw-fact logical-fact)
                          (setf next (physical-replay-observed-next-xid record next)
                                reservation (physical-source-reservation-next reservation record next)
                                source-xids (physical-source-xids-next source-xids record next))

@@ -27,13 +27,13 @@
              (pg::wal-atomic-write-bytes (pg::clog-path) (empty-octets))
              (pg::wal-atomic-write-bytes (pg::pgdata-path "PG_VERSION") (pg::string->bytes (format nil "16~%")))
              (unless (eq source :unknown) (promotion-fpw-append-source-checkpoint store source))
-             (let ((capture (symbol-function 'pg::startup-promotion-fpw-policy-arguments))
+             (let ((capture (symbol-function 'pg::startup-promotion-policy-arguments))
                    (calls 0)
                    (current desired)
                    (pg::*startup-installed-configuration* nil))
                (unwind-protect
                     (progn
-                      (setf (symbol-function 'pg::startup-promotion-fpw-policy-arguments)
+                      (setf (symbol-function 'pg::startup-promotion-policy-arguments)
                             (lambda ()
                               (incf calls)
                               (list :promotion-full-page-writes current)))
@@ -75,7 +75,7 @@
                           (ok (eql (eq source :unknown) (null (getf cold :required-fpw-fact))))
                           (ok (equalp (getf before :frames)
                                       (getf (pg::physical-promotion-checkpoint-plan cold 20000 1003) :frames))))))
-                 (setf (symbol-function 'pg::startup-promotion-fpw-policy-arguments) capture))))
+                 (setf (symbol-function 'pg::startup-promotion-policy-arguments) capture))))
            :namespace namespace
            :system-id (pg::physical-store-update-digest
                        #xCBF29CE484222325 (pg::string->bytes "history-source")))))))
@@ -84,11 +84,11 @@
     (dolist (intent '(:legacy nil t))
       (with-promotion-fixture (root store)
         (declare (ignore root store))
-        (let ((capture (symbol-function 'pg::startup-promotion-fpw-policy-arguments))
+        (let ((capture (symbol-function 'pg::startup-promotion-policy-arguments))
               (pg::*startup-installed-configuration* nil))
           (unwind-protect
                (progn
-                 (setf (symbol-function 'pg::startup-promotion-fpw-policy-arguments)
+                 (setf (symbol-function 'pg::startup-promotion-policy-arguments)
                        (lambda () (unless (eq intent :legacy)
                                     (list :promotion-full-page-writes intent))))
                  (let ((pending (call-with-promotion-exclusion
@@ -116,4 +116,4 @@
                                 (call-with-promotion-exclusion
                                  (lambda ()
                                    (pg::physical-promotion-check-pending bad metadata prefix generation)))))))))))
-            (setf (symbol-function 'pg::startup-promotion-fpw-policy-arguments) capture))))))
+            (setf (symbol-function 'pg::startup-promotion-policy-arguments) capture))))))

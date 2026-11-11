@@ -390,7 +390,9 @@ Older pending control may lack the fact; then the selected generation supplies i
 
 (defun physical-promotion-make-pending
     (state metadata prefix generation namespace child time reference
-     &key (promotion-full-page-writes nil promotion-fpw-intent-p))
+     &key (promotion-full-page-writes nil promotion-fpw-intent-p)
+       (promotion-logical-decoding-enabled nil promotion-logical-intent-p)
+       (promotion-wal-level nil promotion-wal-level-p))
   "Build pending control bytes and runtime state for the selected archive.
 The caller publishes the bytes and installs the state after owner handoff.
 Freeze source evidence from the selected restartpoint and save the supplied
@@ -412,7 +414,10 @@ capturing it again."
                        :fpw-fact source-fpw
                        (append (when source-logical (list :logical-fact source-logical))
                                (when promotion-fpw-intent-p
-                                 (list :promotion-full-page-writes promotion-full-page-writes)))))
+                                 (list :promotion-full-page-writes promotion-full-page-writes))
+                               (when promotion-logical-intent-p
+                                 (list :promotion-logical-decoding-enabled promotion-logical-decoding-enabled))
+                               (when promotion-wal-level-p (list :promotion-wal-level promotion-wal-level)))))
          (pending (copy-list state)))
     (loop for (key value) on (physical-recovery-decode-control bytes) by #'cddr
           do (setf (getf pending key) value))
@@ -446,7 +451,7 @@ mutex.  Install pending runtime state only after control readback and owner
 handoff.  Failure during publication fences recovery.
 A resource pause prevents publishing intent."
   (with-physical-promotion-exclusion (2)
-    (let ((fpw-policy-arguments (startup-promotion-fpw-policy-arguments)))
+    (let ((policy-arguments (startup-promotion-policy-arguments)))
       (check-physical-resource-promotion)
       (physical-follow-promotion-cleanup-config)
       (physical-recovery-publish-selected-history *physical-receive-store*)
@@ -471,7 +476,7 @@ A resource pause prevents publishing intent."
                             (lambda (reference)
                               (apply #'physical-promotion-make-pending
                                      state metadata prefix generation namespace child time reference
-                                     fpw-policy-arguments)))))
+                                     policy-arguments)))))
                      (setf *physical-recovery-state* pending)
                      (physical-recovery-control-test-point :after-write +db-in-archive-recovery+)
                      (setf finished t)
@@ -523,9 +528,13 @@ child state is published. History publication ends prefix-install eligibility."
                     '(:control-version :phase :system-id :timeline :manifest-digest
                       :checkpoint :applied :next-xid :db-state :state-time
                       :promotion-child :promotion-generation :promotion-source-namespace
-                      :promotion-full-page-writes))
+                      :promotion-full-page-writes :promotion-logical-decoding-enabled :promotion-wal-level))
              (eql (not (null (get-properties state '(:promotion-full-page-writes))))
                   (not (null (get-properties control '(:promotion-full-page-writes)))))
+             (eql (not (null (get-properties state '(:promotion-logical-decoding-enabled))))
+                  (not (null (get-properties control '(:promotion-logical-decoding-enabled)))))
+             (eql (not (null (get-properties state '(:promotion-wal-level))))
+                  (not (null (get-properties control '(:promotion-wal-level)))))
              (equal (getf state :required-fpw-fact)
                     (physical-promotion-frozen-fpw-fact control metadata))
              (equal (getf state :required-logical-fact)

@@ -91,7 +91,8 @@
                               :resource-fact '(:resource-parameters (100 8 10 0 128)
                                                :resource-lsn 16 :resource-timeline 1)
                               :fpw-fact off :logical-fact fact :promotion-full-page-writes nil
-                              :promotion-logical-decoding-enabled (not enabled)))
+                              :promotion-logical-decoding-enabled (not enabled)
+                              :promotion-wal-level (if enabled :replica :logical)))
                       (path (pg::physical-recovery-control-path)))
                  (ok (= 391 (length bytes) pg::+physical-recovery-control-maximum-bytes+))
                  (pg::wal-atomic-write-bytes path bytes)

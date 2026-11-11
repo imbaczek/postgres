@@ -22,29 +22,42 @@
 ;;;; Writer admission stays closed until child control is durable.
 (in-package #:pg)
 
-(defun physical-promotion-fpw-prefix (state cursor)
-  "Plan an FPW change when frozen local policy differs from the source fact.
-Unknown source state requires a change; absent legacy intent emits none."
-  (let ((source (physical-fpw-copy-fact (getf state :source-fpw-fact))))
+(defun physical-promotion-policy-prefix
+    (state cursor source-key intent-key checkpoint-key copy-fact fact-at-p record-type encode)
+  (let ((source (funcall copy-fact (getf state source-key))))
     (when (and source
-               (not (physical-fpw-fact-at-p source (getf state :applied)
-                                            (physical-recovery-replay-timeline state))))
-      (error "promotion FPW source differs from its frozen frontier"))
-    (unless (get-properties state '(:promotion-full-page-writes))
-      (return-from physical-promotion-fpw-prefix (values nil cursor nil)))
-    (let* ((desired (getf state :promotion-full-page-writes))
-           (fields (list :full-page-writes desired)))
-      (unless (member desired '(nil t)) (error "invalid frozen promotion FPW policy"))
+               (not (funcall fact-at-p source (getf state :applied)
+                             (physical-recovery-replay-timeline state))))
+      (error "promotion ~s source differs from its frozen frontier" intent-key))
+    (unless (get-properties state (list intent-key))
+      (return-from physical-promotion-policy-prefix (values nil cursor nil)))
+    (let* ((desired (getf state intent-key))
+           (fields (list checkpoint-key desired)))
+      (unless (member desired '(nil t)) (error "invalid frozen promotion policy ~s" intent-key))
       (when (and source (eql desired (getf source :enabled)))
-        (return-from physical-promotion-fpw-prefix (values nil cursor fields)))
-      (let* ((batch (wal-record-start-after cursor +wal-header-size+))
+        (return-from physical-promotion-policy-prefix (values nil cursor fields)))
+      (let* ((payload (funcall encode desired))
+             (batch (wal-record-start-after cursor +wal-header-size+))
              (start (wal-record-start-after (+ batch +wal-header-size+)
-                                            (+ +wal-header-size+ +wal-full-page-writes-change-size+)))
-             (bytes (wal-encode-record +wal-record-full-page-writes-change+ 0 start
-                                       (wal-encode-full-page-writes-change desired))))
+                                            (+ +wal-header-size+ (length payload))))
+             (bytes (wal-encode-record record-type 0 start payload)))
         (values (list (list batch (wal-encode-record +wal-record-batch-start+ 0 batch #()))
                       (list start bytes))
                 (+ start (length bytes)) fields)))))
+
+(defun physical-promotion-fpw-prefix (state cursor)
+  "Plan an FPW change when frozen local policy differs from the source fact.
+Unknown source state requires a change; absent legacy intent emits none."
+  (physical-promotion-policy-prefix
+   state cursor :source-fpw-fact :promotion-full-page-writes :full-page-writes
+   #'physical-fpw-copy-fact #'physical-fpw-fact-at-p
+   +wal-record-full-page-writes-change+ #'wal-encode-full-page-writes-change))
+
+(defun physical-promotion-logical-prefix (state cursor)
+  (physical-promotion-policy-prefix
+   state cursor :source-logical-fact :promotion-logical-decoding-enabled :logical-decoding-enabled
+   #'physical-logical-copy-fact #'physical-logical-fact-at-p
+   +wal-record-logical-decoding-status-change+ #'wal-encode-logical-decoding-status-change))
 
 (defun physical-promotion-checkpoint-plan (state next-oid local-floor)
   "Build the child WAL plan without changing files or runtime state.
@@ -65,32 +78,34 @@ and enter the snapshot, so placement and retries use the same captured facts."
                (typep local-floor '(integer 3 18446744073709551616)))
     (error "child checkpoint lacks allocation proof"))
   (multiple-value-bind (eor eor-start) (physical-promotion-eor-image state)
-    (multiple-value-bind (prefix cursor fpw-fields)
+    (multiple-value-bind (fpw-prefix fpw-cursor fpw-fields)
         (physical-promotion-fpw-prefix state (+ eor-start (length eor)))
-      (let* ((checkpoint-facts
-               (append (copy-tree (getf state :source-resource-fact))
-                       (wal-copy-checkpoint-commit-ts-fields (getf state :source-checkpoint))
-                       fpw-fields))
-             (record-size (wal-checkpoint-record-size checkpoint-facts))
-             (batch-start (wal-record-start-after cursor +wal-header-size+))
-             (start (wal-record-start-after (+ batch-start +wal-header-size+) record-size))
-             (end (+ start record-size))
-             (next (canonical-next-full-xid
-                    (max (getf state :next-xid) local-floor
-                         (1+ (getf (getf state :source-reservation) :bound)))))
-             (snapshot (list :version 2 :start start :end end :redo start
-                             :next-xid next :xid-reserved-through (1- next) :next-oid next-oid
-                             :time (getf state :state-time) :timeline (getf state :promotion-child)
-                             :prev-timeline (physical-recovery-replay-timeline state) :oldest-active-xid next)))
-        (setf snapshot (append snapshot checkpoint-facts))
-        (unless (and (<= end #xffffffffffffffff) (wal-checkpoint-snapshot-valid-p snapshot))
-          (error "invalid child checkpoint plan"))
-        (list :fork (getf state :applied) :child (getf state :promotion-child)
-              :snapshot snapshot :end end
-              :frames (append (list (list eor-start eor)) prefix
-                              (list (list batch-start (wal-encode-record +wal-record-batch-start+ 0 batch-start #()))
-                                    (list start (wal-encode-record +wal-record-checkpoint+ 0 start
-                                                                   (wal-encode-checkpoint-snapshot snapshot))))))))))
+      (multiple-value-bind (logical-prefix cursor logical-fields)
+          (physical-promotion-logical-prefix state fpw-cursor)
+        (let* ((checkpoint-facts
+                 (append (copy-tree (getf state :source-resource-fact))
+                         (wal-copy-checkpoint-commit-ts-fields (getf state :source-checkpoint))
+                         fpw-fields logical-fields))
+               (record-size (wal-checkpoint-record-size checkpoint-facts))
+               (batch-start (wal-record-start-after cursor +wal-header-size+))
+               (start (wal-record-start-after (+ batch-start +wal-header-size+) record-size))
+               (end (+ start record-size))
+               (next (canonical-next-full-xid
+                      (max (getf state :next-xid) local-floor
+                           (1+ (getf (getf state :source-reservation) :bound)))))
+               (snapshot (list :version 2 :start start :end end :redo start
+                               :next-xid next :xid-reserved-through (1- next) :next-oid next-oid
+                               :time (getf state :state-time) :timeline (getf state :promotion-child)
+                               :prev-timeline (physical-recovery-replay-timeline state) :oldest-active-xid next)))
+          (setf snapshot (append snapshot checkpoint-facts))
+          (unless (and (<= end #xffffffffffffffff) (wal-checkpoint-snapshot-valid-p snapshot))
+            (error "invalid child checkpoint plan"))
+          (list :fork (getf state :applied) :child (getf state :promotion-child)
+                :snapshot snapshot :end end
+                :frames (append (list (list eor-start eor)) fpw-prefix logical-prefix
+                                (list (list batch-start (wal-encode-record +wal-record-batch-start+ 0 batch-start #()))
+                                      (list start (wal-encode-record +wal-record-checkpoint+ 0 start
+                                                                     (wal-encode-checkpoint-snapshot snapshot)))))))))))
 
 (defun physical-promotion-checkpoint-files (plan prefix)
   "Return the complete expected child files as (segment bytes) pairs.
@@ -207,7 +222,8 @@ Close the stream on every exit; the enclosing publisher fences failures."
                (physical-promotion-test-point
                 (ecase (wal-u16 record 6)
                   (13 :after-child-eor-write) (6 :after-child-batch-write)
-                  (17 :after-child-fpw-write) (4 :after-child-checkpoint-write)))
+                  (17 :after-child-fpw-write) (18 :after-child-logical-write)
+                  (4 :after-child-checkpoint-write)))
                (wal-sync-output-bytes stream t))
           (close stream))))))
 

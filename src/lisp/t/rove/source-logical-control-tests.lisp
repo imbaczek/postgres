@@ -16,7 +16,8 @@
                 :fpw-fact (when fpw (unit-source-fpw-fact))
                 :logical-fact logical)
           (unless (eq intent :absent) (list :promotion-full-page-writes intent))
-          (unless (eq logical-intent :absent) (list :promotion-logical-decoding-enabled logical-intent)))))
+          (unless (eq logical-intent :absent) (list :promotion-logical-decoding-enabled logical-intent
+                                                    :promotion-wal-level (if logical-intent :logical :replica))))))
 
 (rove:deftest source-logical-control-roundtrips-all-existing-extension-combinations
     (dolist (pending '(nil t))

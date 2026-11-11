@@ -11,9 +11,18 @@
   (let* ((fork (getf state :applied))
          (remaining (- +wal-segment-size+ (mod fork +wal-segment-size+)))
          (start (if (<= +wal-end-of-recovery-record-size+ remaining) fork (+ fork remaining)))
-         (time (* 1000000 (- (getf state :state-time) 946684800))))
+         (time (* 1000000 (- (getf state :state-time) 946684800)))
+         (intent-p (not (null (get-properties state '(:promotion-logical-decoding-enabled)))))
+         (level-p (not (null (get-properties state '(:promotion-wal-level)))))
+         (level (getf state :promotion-wal-level)))
+    (unless (and (eql intent-p level-p)
+                 (or (not intent-p)
+                     (physical-logical-promotion-intent-valid-p
+                      (getf state :promotion-logical-decoding-enabled) level)))
+      (error "promotion end-of-recovery lacks its frozen configured WAL level"))
     (values (wal-encode-end-of-recovery-record
-             start time (getf state :promotion-child) (physical-recovery-replay-timeline state) 2)
+             start time (getf state :promotion-child) (physical-recovery-replay-timeline state)
+             (if intent-p (ecase level (:replica 1) (:logical 2)) 2))
             start)))
 
 (defun physical-promotion-valid-tail-frame-p (bytes)

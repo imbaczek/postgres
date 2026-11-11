@@ -175,7 +175,7 @@ A violation is an error; the outer replay path fences recovery."
             (return-from physical-row-replay-prefix :deferred))
           (when *physical-replay-test-hook*
             (funcall *physical-replay-test-hook* :before-record record))
-          (physical-replay-check-child-initialization record next-xid fpw-fact)
+          (physical-replay-check-child-initialization record next-xid fpw-fact logical-fact)
           (setf next-xid (physical-replay-observed-next-xid record next-xid)
                 reservation (physical-source-reservation-next reservation record next-xid)
                 source-xids (physical-source-xids-next source-xids record next-xid))

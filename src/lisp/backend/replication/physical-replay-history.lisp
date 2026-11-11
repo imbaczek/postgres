@@ -136,7 +136,27 @@ caller state."
            (error "child initialization checkpoint loses its FPW change"))))))
   t)
 
-(defun physical-replay-check-child-initialization (record next-xid &optional (fpw-fact (getf *physical-recovery-state* :source-fpw-fact)))
+(defun physical-replay-check-child-logical-policy (record logical-fact timeline)
+  (let* ((type (wal-record-type record))
+         (marker-seen (and logical-fact (eq :change (getf logical-fact :witness-kind))
+                           (eql timeline (getf logical-fact :witness-timeline)))))
+    (cond
+      ((= type +wal-record-logical-decoding-status-change+)
+       (unless (and *wal-recovery-group-active* *wal-recovery-reservation-batch-clean-p*
+                    (not marker-seen))
+         (error "child initialization requires one clean logical change batch"))
+       (wal-logical-decoding-status-record-info record))
+      ((and marker-seen (= type +wal-record-full-page-writes-change+))
+       (error "child initialization places FPW after logical status"))
+      ((and marker-seen (= type +wal-record-checkpoint+))
+       (let ((checkpoint (wal-checkpoint-record-snapshot record)))
+         (unless (and checkpoint (get-properties checkpoint '(:logical-decoding-enabled))
+                      (eql (getf logical-fact :enabled) (getf checkpoint :logical-decoding-enabled)))
+           (error "child initialization checkpoint loses its logical change"))))))
+  t)
+
+(defun physical-replay-check-child-initialization (record next-xid &optional (fpw-fact (getf *physical-recovery-state* :source-fpw-fact))
+                                                                     (logical-fact (getf *physical-recovery-state* :source-logical-fact)))
   "Check native checkpoint timeline and selected child initialization during replay.
 Only a validated selected EOR can switch the replay timeline. After EOR,
 require the child initialization checkpoint before later child work. One validated
@@ -153,10 +173,12 @@ published source fact. Validation leaves caller state unchanged."
           (error "native checkpoint differs from its replay timeline"))))
     (when (/= timeline (getf snapshot :timeline (getf state :timeline)))
       (physical-replay-check-child-policy record fpw-fact timeline)
+      (physical-replay-check-child-logical-policy record logical-fact timeline)
       (cond
         ((= type +wal-record-batch-start+)
          (when *wal-recovery-group-active* (error "child initialization has repeated batch framing")))
-        ((= type +wal-record-full-page-writes-change+) nil)
+        ((or (= type +wal-record-full-page-writes-change+)
+             (= type +wal-record-logical-decoding-status-change+)) nil)
         ((= type +wal-record-checkpoint+)
          (let* ((child (wal-checkpoint-record-snapshot record))
                 (selection (loop for item = (physical-store-selection *physical-receive-store*)

@@ -9,13 +9,20 @@
 
 (defconstant +physical-promotion-logical-intent-size+ 18)
 
-(defun physical-logical-encode-promotion-intent (enabled)
+(defun physical-logical-promotion-intent-valid-p (enabled level)
+  (and (member enabled '(nil t)) (member level '(:replica :logical))
+       (or (eq level :replica) enabled)))
+
+(defun physical-logical-encode-promotion-intent
+    (enabled &optional (level (if enabled :logical :replica)))
   "Encode logical decoding ON or OFF in the 18-byte PGLOGPI1 promotion intent."
-  (unless (member enabled '(nil t)) (error "invalid promotion logical decoding policy"))
+  (unless (physical-logical-promotion-intent-valid-p enabled level)
+    (error "invalid promotion logical decoding policy"))
   (let ((bytes (make-array +physical-promotion-logical-intent-size+
                            :element-type '(unsigned-byte 8) :initial-element 0)))
     (replace bytes #(80 71 76 79 71 80 73 49))
-    (setf (aref bytes 8) (if enabled 1 0))
+    (setf (aref bytes 8) (if enabled 1 0)
+          (aref bytes 9) (ecase level (:replica 1) (:logical 2)))
     bytes))
 
 (defun physical-logical-decode-promotion-intent (bytes)
@@ -23,10 +30,14 @@
   (unless (and (typep bytes '(vector (unsigned-byte 8)))
                (= (length bytes) +physical-promotion-logical-intent-size+)
                (equalp (subseq bytes 0 8) #(80 71 76 79 71 80 73 49))
-               (member (aref bytes 8) '(0 1))
-               (every #'zerop (subseq bytes 9)))
+               (member (aref bytes 8) '(0 1)) (member (aref bytes 9) '(1 2))
+               (every #'zerop (subseq bytes 10)))
     (error "invalid promotion logical decoding intent"))
-  (= 1 (aref bytes 8)))
+  (let ((enabled (= 1 (aref bytes 8)))
+        (level (case (aref bytes 9) (1 :replica) (2 :logical))))
+    (unless (physical-logical-promotion-intent-valid-p enabled level)
+      (error "inconsistent promotion logical decoding intent"))
+    (values enabled level)))
 
 (defun physical-promotion-intents-core-size (size)
   "Separate intent lengths from SIZE, keeping the final four CRC bytes.

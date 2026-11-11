@@ -86,26 +86,35 @@ supported, so a canonical off setting establishes invalid XIDs (0/0)."
             (error "invalid installed commit timestamp policy"))))
       (list :oldest-commit-ts-xid 0 :newest-commit-ts-xid 0))))
 
-(defun startup-full-page-writes-policy ()
+(defun startup-full-page-writes-policy (&optional (configuration (startup-capture-configuration)))
   "Return the installed desired FPW policy and a presence flag.
 No installed root returns NIL/NIL. A present NIL value means known OFF."
-  (let ((configuration (startup-capture-configuration)))
-    (when configuration
-      (let ((settings (startup-configuration-settings configuration)))
-        (unless (hash-table-p settings)
+  (when configuration
+    (let ((settings (startup-configuration-settings configuration)))
+      (unless (hash-table-p settings)
+        (error "invalid installed full page writes policy"))
+      (let* ((entry (gethash "full_page_writes" settings))
+             (length (and (listp entry) (list-length entry))))
+        (unless (and length (evenp length)
+                     (= 1 (loop for key in entry by #'cddr count (eq key :value)))
+                     (member (getf entry :value) '(nil t)))
           (error "invalid installed full page writes policy"))
-        (let* ((entry (gethash "full_page_writes" settings))
-               (length (and (listp entry) (list-length entry))))
-          (unless (and length (evenp length)
-                       (= 1 (loop for key in entry by #'cddr count (eq key :value)))
-                       (member (getf entry :value) '(nil t)))
-            (error "invalid installed full page writes policy"))
-          (values (getf entry :value) t))))))
+        (values (getf entry :value) t)))))
 
 (defun startup-promotion-fpw-policy-arguments ()
   "Return promotion arguments for the installed policy, preserving known OFF."
   (multiple-value-bind (enabled known) (startup-full-page-writes-policy)
     (when known (list :promotion-full-page-writes enabled))))
+
+(defun startup-promotion-policy-arguments ()
+  (let ((configuration (startup-capture-configuration)))
+    (when configuration
+      (let ((level (startup-configuration-wal-level configuration)))
+        (unless (member level '(:replica :logical))
+          (error "invalid installed promotion logical policy"))
+        (list :promotion-full-page-writes (startup-full-page-writes-policy configuration)
+              :promotion-logical-decoding-enabled (eq level :logical)
+              :promotion-wal-level level)))))
 
 (defun startup-copy-input (value)
   "Copy mutable storage in configuration input trees.

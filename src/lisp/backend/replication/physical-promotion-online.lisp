@@ -127,7 +127,7 @@ rechecks after their final flush."
              (setf timeline (physical-replay-check-selected-eor store record raw terminal timeline)
                    (getf *physical-recovery-state* :replay-timeline) timeline)
              (progn
-               (physical-replay-check-child-initialization record next fpw-fact)
+               (physical-replay-check-child-initialization record next fpw-fact logical-fact)
                (setf next (physical-replay-observed-next-xid record next))
                (physical-history-accept-record
                 record (getf *physical-recovery-state* :cluster-identity) removed)

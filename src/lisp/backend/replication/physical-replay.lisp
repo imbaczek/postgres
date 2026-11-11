@@ -194,7 +194,7 @@ explicit NIL. Otherwise preserve the two-value interface."
                    (setf timeline (physical-replay-check-selected-eor store record raw terminal timeline)
                          (getf *physical-recovery-state* :replay-timeline) timeline))
                  (progn
-                   (physical-replay-check-child-initialization record observed fpw-fact)
+                   (physical-replay-check-child-initialization record observed fpw-fact logical-fact)
                    (setf observed (physical-replay-observed-next-xid record observed))
                    (physical-history-accept-record record (getf state :cluster-identity) removed)))
              (unless *wal-recovery-group-active*
@@ -702,7 +702,7 @@ Stop before the next record when a published terminal causes a resource pause."
                        (append (when fpw-fact (list :fpw-fact fpw-fact))
                                (when logical-fact (list :logical-fact logical-fact)))))
               (progn
-                (physical-replay-check-child-initialization record next-xid fpw-fact)
+                (physical-replay-check-child-initialization record next-xid fpw-fact logical-fact)
                 (setf next-xid (physical-replay-observed-next-xid record next-xid)
                       reservation (physical-source-reservation-next reservation record next-xid)
                       source-xids (physical-source-xids-next source-xids record next-xid))

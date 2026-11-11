@@ -44,6 +44,7 @@ from the source logical fact."
                          promotion-child promotion-generation promotion-source-namespace retained-reference resource-fact fpw-fact logical-fact
                          (promotion-full-page-writes nil promotion-fpw-intent-p)
                          (promotion-logical-decoding-enabled nil promotion-logical-intent-p)
+                         (promotion-wal-level nil promotion-wal-level-p)
                        &allow-other-keys)
       control
     (and (member phase '(0 1 2 3))
@@ -54,9 +55,11 @@ from the source logical fact."
          (member control-version '(1 2 3 4))
          (or (not promotion-fpw-intent-p)
              (and (= phase 3) (= control-version 4) (member promotion-full-page-writes '(nil t))))
+         (eql promotion-logical-intent-p promotion-wal-level-p)
          (or (not promotion-logical-intent-p)
              (and (= phase 3) (= control-version 4)
-                  (member promotion-logical-decoding-enabled '(nil t))))
+                  (physical-logical-promotion-intent-valid-p
+                   promotion-logical-decoding-enabled promotion-wal-level)))
          (or (null resource-fact)
              (and (member control-version '(3 4))
                   (typep applied-timeline '(integer 1 4294967295))
@@ -122,7 +125,8 @@ from the source logical fact."
                                           (applied-timeline timeline) history-target history-digest
                                           promotion-child promotion-generation promotion-source-namespace retained-reference resource-fact fpw-fact logical-fact
                                           (promotion-full-page-writes nil promotion-fpw-intent-p)
-                                          (promotion-logical-decoding-enabled nil promotion-logical-intent-p))
+                                          (promotion-logical-decoding-enabled nil promotion-logical-intent-p)
+                                          (promotion-wal-level nil promotion-wal-level-p))
   "Encode recovery progress and optional extensions under one CRC.
 Ordinary and pending images may append resource and source FPW facts. Pending
 images may then append a 17-byte FPW intent and an 18-byte logical intent, in
@@ -153,7 +157,8 @@ extensions do not change the format version."
                      (when promotion-fpw-intent-p
                        (list :promotion-full-page-writes promotion-full-page-writes))
                      (when promotion-logical-intent-p
-                       (list :promotion-logical-decoding-enabled promotion-logical-decoding-enabled))))
+                       (list :promotion-logical-decoding-enabled promotion-logical-decoding-enabled))
+                     (when promotion-wal-level-p (list :promotion-wal-level promotion-wal-level))))
       (error "unrepresentable physical recovery control state"))
     (let ((bytes (make-array (+ crc-offset 4) :element-type '(unsigned-byte 8) :initial-element 0)))
       (replace bytes (if pending #(80 71 82 83 84 65 84 52) #(80 71 82 83 84 65 84 51)))
@@ -184,7 +189,7 @@ extensions do not change the format version."
       (when promotion-fpw-intent-p
         (replace bytes (physical-fpw-encode-promotion-intent promotion-full-page-writes) :start1 intent-offset))
       (when promotion-logical-intent-p
-        (replace bytes (physical-logical-encode-promotion-intent promotion-logical-decoding-enabled)
+        (replace bytes (physical-logical-encode-promotion-intent promotion-logical-decoding-enabled promotion-wal-level)
                  :start1 logical-intent-offset))
       (when logical-fact
         (replace bytes (physical-logical-encode-fact logical-fact) :start1 logical-offset))
@@ -269,9 +274,11 @@ preserves the old image; a present NIL means OFF independently of source facts."
                   (physical-fpw-decode-promotion-intent
                    (subseq bytes (- size 4) (+ (- size 4) +physical-promotion-fpw-intent-size+)))))
           (when promotion-logical-intent-p
-            (setf (getf control :promotion-logical-decoding-enabled)
-                  (physical-logical-decode-promotion-intent
-                   (subseq bytes (- logical-offset +physical-promotion-logical-intent-size+) logical-offset))))
+            (multiple-value-bind (enabled level)
+                (physical-logical-decode-promotion-intent
+                 (subseq bytes (- logical-offset +physical-promotion-logical-intent-size+) logical-offset))
+              (setf (getf control :promotion-logical-decoding-enabled) enabled
+                    (getf control :promotion-wal-level) level)))
           (when logical-p
             (setf (getf control :logical-fact)
                   (physical-logical-decode-fact (subseq bytes logical-offset crc-offset))))

@@ -238,7 +238,7 @@ resets. No database files are written."
                      (setf timeline (physical-replay-check-selected-eor store record raw terminal timeline)
                            (getf *physical-recovery-state* :replay-timeline) timeline))
                    (progn
-                     (physical-replay-check-child-initialization record observed fpw-fact)
+                     (physical-replay-check-child-initialization record observed fpw-fact logical-fact)
                      (setf observed (physical-replay-observed-next-xid record observed))
                      (physical-history-accept-record record identity removed)))
                (unless *wal-recovery-group-active*
