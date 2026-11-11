@@ -27,6 +27,7 @@
     (getf record :anchor) *physical-follow-anchor-keys* (getf record :source-history))))
 
 (defun physical-adoption-follow-logical-fact (record)
+  "Derive the staged immutable base fact using the requested source history."
   (physical-logical-base-fact
    (getf record :stage)
    (getf (physical-adoption-install-image-state record) :snapshot)

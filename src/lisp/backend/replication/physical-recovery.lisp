@@ -483,6 +483,7 @@ Child images may include history files no newer than their selected timeline."
       (- (getf manifest :checkpoint) +wal-header-size+)))
 
 (defun recovery-manifest-keys-valid-p (manifest)
+  "Check manifest keys, including the ordered optional v3 authentication and anchor suffix."
   (let* ((version (getf manifest :version))
          (keys (loop for (key value) on manifest by #'cddr collect key))
          (legacy (if (member version '(2 3))
@@ -665,10 +666,9 @@ A nonpending standby cannot fall back to primary startup when validation fails."
 (defun physical-recovery-verify-base-control-with-namespace (control)
   "Verify base provenance in the selected namespace without publishing control.
 Return the reconstructed state and durable control; do not install runtime state.
-The nested source checkpoint records base facts, not later applied resources;
-the manifest does not add another authority for those facts. Reconstruct base FPW
-from the source checkpoint and retain any later required fact from control.
-Keep a separate copy of the immutable base checkpoint for later prefix scans."
+Derive immutable base facts from the checkpoint and any validated logical anchor.
+Keep them separate from control's later required facts.
+Retain a copy of the base checkpoint for later prefix scans."
   ;; Pending control must never fall through the ordinary phase rewrite/redo path.
   ;; A later milestone will verify and reconcile this exact generation before SQL.
   (when (= 3 (getf control :phase))

@@ -196,8 +196,9 @@ A replayed child uses timeline-qualified WAL even when the base used legacy name
                                      &key (fpw-fact (getf *physical-recovery-state* :source-fpw-fact))
                                        (logical-fact (getf *physical-recovery-state* :source-logical-fact)))
   "Apply a verified selected EOR and durably publish replay progress.
-The applied timeline and source FPW fact advance with durable recovery control.
-This does not end recovery or grant writer authority."
+The applied timeline and source FPW and logical facts advance with durable
+recovery control. The fourth return value is the new logical fact. This does
+not end recovery or grant writer authority."
   (let* ((child (physical-replay-check-selected-eor
                  *physical-receive-store* record raw *last-replay-lsn*
                  (physical-recovery-replay-timeline)))

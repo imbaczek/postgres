@@ -197,6 +197,7 @@ enable end; retain the last OFF boundary across later records."
       fact)))
 
 (defun physical-logical-encode-base-anchor (fact)
+  "Encode the 88-byte source fact as 176 uppercase hexadecimal characters."
   (let* ((bytes (physical-logical-encode-fact fact))
          (digits "0123456789ABCDEF")
          (text (make-string (* 2 (length bytes)) :element-type 'base-char)))
@@ -206,6 +207,7 @@ enable end; retain the last OFF boundary across later records."
     text))
 
 (defun physical-logical-decode-base-anchor (text)
+  "Decode a canonical uppercase base anchor and validate its source fact."
   (unless (and (stringp text) (= (length text) (* 2 +physical-logical-fact-size+))
                (every (lambda (digit) (find digit "0123456789ABCDEF" :test #'char=)) text))
     (error "invalid immutable logical base anchor"))
@@ -217,6 +219,11 @@ enable end; retain the last OFF boundary across later records."
     (physical-logical-decode-fact bytes)))
 
 (defun physical-logical-base-fact (manifest checkpoint history)
+  "Derive the immutable base's logical fact on HISTORY.
+A checkpoint with known logical status starts fresh coverage; any anchor must
+agree with its witness. If the checkpoint omits status, an anchor preserves its
+earlier coverage and witness, which must end by checkpoint start.
+Without either witness, return NIL."
   (let* ((end (getf manifest :end)) (timeline (getf manifest :timeline))
                                     (checkpoint-fact (physical-logical-fact-from-checkpoint checkpoint))
                                     (anchor (when (get-properties manifest '(:logical-base-anchor))

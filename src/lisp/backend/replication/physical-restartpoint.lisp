@@ -483,10 +483,9 @@ Omit an unknown logical fact; known OFF remains a present fact."
 
 (defun physical-restartpoint-prepare-storage (store)
   "Validate provenance, suffix and surviving forks before restoring an R catalog.
-Reconstruct logical history only when generation or recovery state already
-carries a logical fact. A checkpoint alone does not activate persisted tracking. Validate seeds before drop proof so a bad suffix cannot grant
-file exemptions. Resource-only synthetic candidates omit both FPW and logical
-facts. All checks precede restoration writes."
+Derive the logical seed even when no fact was persisted; a checkpoint or
+retained WAL may establish it. Validate seeds before drop proof so a bad suffix
+cannot grant file exemptions. All checks precede restoration writes."
   (let* ((state *physical-recovery-state*)
          (identity (getf state :cluster-identity))
          (required (getf state :required-applied)))

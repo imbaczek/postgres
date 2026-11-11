@@ -569,7 +569,7 @@ The progress save copies facts at the publication boundary."
                                                                                    (resource-fact (getf *physical-recovery-state* :source-resource-fact))
                                                                                    (fpw-fact (getf *physical-recovery-state* :source-fpw-fact))
                                                                                    (logical-fact (getf *physical-recovery-state* :source-logical-fact)))
-  "Make redo durable before publishing the applied terminal and visibility state.
+  "Make redo durable before publishing the applied terminal and source facts.
 Source allocation capacity stays separate from the observed next XID.
 Updating source membership does not change existing snapshots."
   (smgr-fsync-all)

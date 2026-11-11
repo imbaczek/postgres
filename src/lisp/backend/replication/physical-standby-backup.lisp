@@ -106,6 +106,10 @@ snapshot in both cases."
     (list relative (length bytes) (physical-store-update-digest #xCBF29CE484222325 bytes))))
 
 (defun physical-standby-backup-logical-facts (snapshot)
+  "Return the exported base fact and optional anchor at the frozen checkpoint.
+Only a checkpoint without logical status and with a known current fact needs
+an anchor. Read history when evidence is known, and check the fact against the
+checkpoint."
   (let* ((end (getf snapshot :end)) (timeline (getf snapshot :timeline))
                                     (current (physical-logical-copy-fact (getf *physical-recovery-state* :source-logical-fact)))
                                     (history (when (or current (get-properties snapshot '(:logical-decoding-enabled)))
