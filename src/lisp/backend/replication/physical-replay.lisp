@@ -114,18 +114,13 @@ Return FACT unchanged when the checkpoint does not prove policy at START."
       fact))
 
 (defun physical-recovery-scan-checkpoint-logical (checkpoint fact start timeline)
-  "Use logical status from a checkpoint ending at START, checking any seed's
-witness agrees. An absent checkpoint status leaves the seed unchanged."
   (if (and checkpoint (= start (getf checkpoint :end))
            (get-properties checkpoint '(:logical-decoding-enabled)))
       (let ((expected (physical-logical-fact-from-state
                        (wal-logical-status-from-checkpoint checkpoint) :checkpoint
                        (getf checkpoint :start) (getf checkpoint :timeline)
                        start timeline nil nil)))
-        (when fact
-          (unless (physical-policy-witness-equal-p fact expected)
-            (error "suffix scan logical seed differs from its starting checkpoint")))
-        (or fact expected))
+        (if fact (physical-logical-merge-checkpoint-interval fact expected) expected))
       fact))
 
 (defun physical-recovery-scan-resource-fact (store start end seed state

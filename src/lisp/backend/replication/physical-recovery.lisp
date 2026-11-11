@@ -146,7 +146,7 @@ extensions do not change the format version."
                                (logical-intent-offset (+ intent-offset (if promotion-fpw-intent-p +physical-promotion-fpw-intent-size+ 0)))
                                (logical-offset (+ logical-intent-offset
                                                   (if promotion-logical-intent-p +physical-promotion-logical-intent-size+ 0)))
-                               (crc-offset (+ logical-offset (if logical-fact +physical-logical-fact-size+ 0))))
+                               (crc-offset (+ logical-offset (if logical-fact (physical-logical-fact-image-size logical-fact) 0))))
     (unless (physical-recovery-control-valid-p
              (append (list :control-version version :phase phase :system-id system-id :timeline timeline
                            :manifest-digest manifest-digest :checkpoint checkpoint :applied applied

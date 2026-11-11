@@ -2,17 +2,17 @@
 
 (defstruct (wal-logical-status
             (:constructor %make-wal-logical-status
-                (enabled start end timeline last-enable-lsn last-enable-timeline)))
-  "Immutable evidence from a checkpoint or status change, not published authority.
-START, END and TIMELINE identify its latest witness. LAST-ENABLE-LSN and
-LAST-ENABLE-TIMELINE identify the end of the latest observed enable record.
-NIL for both means none was observed; it does not prove earlier continuity."
+                (enabled start end timeline last-enable-lsn last-enable-timeline
+                 &optional on-start-lsn on-start-timeline)))
+  "Immutable evidence from a checkpoint or status change, not published authority."
   (enabled nil :read-only t)
   (start 0 :read-only t)
   (end 0 :read-only t)
   (timeline 1 :read-only t)
   (last-enable-lsn nil :read-only t)
-  (last-enable-timeline nil :read-only t))
+  (last-enable-timeline nil :read-only t)
+  (on-start-lsn nil :read-only t)
+  (on-start-timeline nil :read-only t))
 
 (defun wal-encode-logical-decoding-status-change (enabled)
   "Encode Boolean ENABLED as a newly allocated one-byte status payload."
@@ -38,7 +38,6 @@ This gate does not persist or publish the status fact."
   t)
 
 (defun wal-logical-status-valid-p (state)
-  "Check evidence shape and numeric ordering; this does not prove ancestry."
   (and (wal-logical-status-p state)
        (member (wal-logical-status-enabled state) '(nil t))
        (typep (wal-logical-status-start state) '(unsigned-byte 64))
@@ -51,19 +50,49 @@ This gate does not persist or publish the status fact."
              (and (typep lsn '(integer 1 18446744073709551615))
                   (typep timeline '(integer 1 4294967295))
                   (<= lsn (wal-logical-status-end state))
-                  (<= timeline (wal-logical-status-timeline state)))))))
+                  (<= timeline (wal-logical-status-timeline state)))))
+       (wal-logical-on-interval-valid-p
+        (wal-logical-status-enabled state)
+        (wal-logical-status-on-start-lsn state) (wal-logical-status-on-start-timeline state)
+        (wal-logical-status-end state) (wal-logical-status-timeline state))
+       (or (null (wal-logical-status-on-start-lsn state))
+           (null (wal-logical-status-last-enable-lsn state))
+           (<= (wal-logical-status-on-start-lsn state)
+               (wal-logical-status-last-enable-lsn state)))))
 
 (defun wal-logical-status-from-checkpoint (snapshot)
-  "Seed private evidence from a checkpoint, or return NIL when status is absent.
-A present NIL is known off. A checkpoint marked on has no observed enable
-position, and does not establish earlier continuity."
   (when snapshot
     (unless (wal-checkpoint-snapshot-valid-p snapshot)
       (error "invalid logical status checkpoint seed"))
     (when (get-properties snapshot '(:logical-decoding-enabled))
       (%make-wal-logical-status
        (getf snapshot :logical-decoding-enabled)
-       (getf snapshot :start) (getf snapshot :end) (getf snapshot :timeline) nil nil))))
+       (getf snapshot :start) (getf snapshot :end) (getf snapshot :timeline) nil nil
+       (getf snapshot :logical-on-start-lsn) (getf snapshot :logical-on-start-timeline)))))
+
+(defun wal-logical-status-next-on-interval (prior record timeline checkpoint enabled change-p)
+  (unless enabled (return-from wal-logical-status-next-on-interval (values nil nil)))
+  (if change-p
+      (if (and prior (wal-logical-status-enabled prior))
+          (values (wal-logical-status-on-start-lsn prior)
+                  (wal-logical-status-on-start-timeline prior))
+          (values (wal-record-end record) timeline))
+      (let ((current (getf checkpoint :logical-on-start-lsn))
+            (owner (getf checkpoint :logical-on-start-timeline))
+            (saved (and prior (wal-logical-status-on-start-lsn prior)))
+            (saved-owner (and prior (wal-logical-status-on-start-timeline prior))))
+        (when (and current saved (not (and (= current saved) (= owner saved-owner))))
+          (error "checkpoint logical ON interval differs from preceding WAL"))
+        (when (and current prior (null saved)
+                   (or (> current (if (eql (wal-logical-status-last-enable-lsn prior)
+                                           (wal-logical-status-end prior))
+                                      (wal-logical-status-end prior)
+                                      (wal-logical-status-start prior)))
+                       (> owner (wal-logical-status-timeline prior))
+                       (and (wal-logical-status-last-enable-lsn prior)
+                            (> current (wal-logical-status-last-enable-lsn prior)))))
+          (error "checkpoint invented a logical ON interval inside preceding WAL"))
+        (values (or saved current) (or saved-owner owner)))))
 
 (defun wal-logical-status-next (prior record timeline)
   "Fold a later record into private logical-status evidence without publication.
@@ -90,9 +119,12 @@ updates the last-enable end and timeline, even if status was already on."
                      (or (/= timeline (getf checkpoint :timeline))
                          (and prior (not (eq enabled (wal-logical-status-enabled prior))))))
             (error "checkpoint logical status differs from preceding WAL"))
-          (%make-wal-logical-status
-           enabled (wal-record-start record) (wal-record-end record) timeline
-           (if (and change-p enabled) (wal-record-end record)
-               (and prior (wal-logical-status-last-enable-lsn prior)))
-           (if (and change-p enabled) timeline
-               (and prior (wal-logical-status-last-enable-timeline prior))))))))
+          (multiple-value-bind (on-start on-timeline)
+              (wal-logical-status-next-on-interval prior record timeline checkpoint enabled change-p)
+            (%make-wal-logical-status
+             enabled (wal-record-start record) (wal-record-end record) timeline
+             (if (and change-p enabled) (wal-record-end record)
+                 (and prior (wal-logical-status-last-enable-lsn prior)))
+             (if (and change-p enabled) timeline
+                 (and prior (wal-logical-status-last-enable-timeline prior)))
+             on-start on-timeline))))))

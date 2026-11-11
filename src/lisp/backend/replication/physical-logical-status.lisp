@@ -7,6 +7,12 @@
 
 (defconstant +physical-logical-fact-size+ 88)
 
+(defconstant +physical-logical-interval-fact-size+ 104)
+
+(defun physical-logical-fact-image-size (fact)
+  (if (getf fact :logical-on-start-lsn)
+      +physical-logical-interval-fact-size+ +physical-logical-fact-size+))
+
 (defconstant +physical-promotion-logical-intent-size+ 18)
 
 (defun physical-logical-promotion-intent-valid-p (enabled level)
@@ -59,24 +65,27 @@ CRC."
     (values core fpw logical)))
 
 (defconstant +physical-recovery-control-maximum-bytes+
-  (+ 196 +physical-fpw-fact-size+ +physical-promotion-fpw-intent-size+ +physical-logical-fact-size+ +physical-promotion-logical-intent-size+))
+  (+ 196 +physical-fpw-fact-size+ +physical-promotion-fpw-intent-size+
+     +physical-logical-interval-fact-size+ +physical-promotion-logical-intent-size+))
 
 (defun physical-logical-control-core-size (bytes)
-  "Separate an optional 88-byte logical suffix, retaining the outer CRC size.
-Bit 30 signals presence; the bounded image is at most 391 bytes."
   (unless (and (typep bytes '(vector (unsigned-byte 8)))
                (<= 60 (length bytes) +physical-recovery-control-maximum-bytes+))
     (error "invalid physical recovery control length"))
   (let* ((present (logbitp 30 (wal-u32 bytes 8)))
-         (size (- (length bytes) (if present +physical-logical-fact-size+ 0))))
-    (unless (>= size 60) (error "truncated logical recovery control fact"))
+         (extension (if present (wal-u32 bytes (- (length bytes) 8)) 0))
+         (size (- (length bytes)
+                  (if present (+ +physical-logical-fact-size+ extension) 0))))
+    (unless (and (member extension '(0 16)) (>= size 60))
+      (error "truncated or unsupported logical recovery control fact"))
     (values size present)))
 
 (defun physical-logical-state-fields (fact)
   (%make-wal-logical-status
    (getf fact :enabled) (getf fact :witness-start) (getf fact :witness-end)
    (getf fact :witness-timeline) (getf fact :last-enable-lsn)
-   (getf fact :last-enable-timeline)))
+   (getf fact :last-enable-timeline)
+   (getf fact :logical-on-start-lsn) (getf fact :logical-on-start-timeline)))
 
 (defun physical-logical-boundary-valid-p (lsn timeline end owner)
   (or (and (null lsn) (null timeline))
@@ -86,11 +95,15 @@ Bit 30 signals presence; the bounded image is at most 391 bytes."
 
 (defun physical-logical-fact-valid-p (fact)
   "Check fact shape and ordering, not history geometry or prefix identity."
-  (and (eql 26 (ignore-errors (list-length fact)))
+  (and (member (ignore-errors (list-length fact)) '(26 30))
        (equal (loop for (key value) on fact by #'cddr collect key)
-              '(:enabled :witness-kind :witness-start :witness-end :witness-timeline
-                :coverage-start :coverage-timeline :through :through-timeline
-                :last-enable-lsn :last-enable-timeline :last-disable-lsn :last-disable-timeline))
+              (append '(:enabled :witness-kind :witness-start :witness-end :witness-timeline
+                        :coverage-start :coverage-timeline :through :through-timeline
+                        :last-enable-lsn :last-enable-timeline :last-disable-lsn :last-disable-timeline)
+                      (when (= 30 (list-length fact))
+                        '(:logical-on-start-lsn :logical-on-start-timeline))))
+       (or (= 26 (list-length fact))
+           (and (getf fact :logical-on-start-lsn) (getf fact :logical-on-start-timeline)))
        (member (getf fact :witness-kind) '(:checkpoint :change))
        (wal-logical-status-valid-p (physical-logical-state-fields fact))
        (typep (getf fact :coverage-start) '(unsigned-byte 64))
@@ -106,6 +119,12 @@ Bit 30 signals presence; the bounded image is at most 391 bytes."
                  (getf fact (first keys)) (getf fact (second keys))
                  (getf fact :witness-end) (getf fact :witness-timeline)))
               '((:last-enable-lsn :last-enable-timeline) (:last-disable-lsn :last-disable-timeline)))
+       (let ((interval (getf fact :logical-on-start-lsn)))
+         (or (null interval)
+             (and (or (null (getf fact :last-disable-lsn))
+                      (> interval (getf fact :last-disable-lsn)))
+                  (or (not (eq :checkpoint (getf fact :witness-kind)))
+                      (<= interval (getf fact :witness-start))))))
        (let ((enabled (getf fact :enabled))
              (on (getf fact :last-enable-lsn)) (off (getf fact :last-disable-lsn)))
          (and (if enabled (or (null off) (and on (> on off)))
@@ -131,17 +150,21 @@ Bit 30 signals presence; the bounded image is at most 391 bytes."
 
 (defun physical-logical-fact-from-state
     (state kind coverage-start coverage-timeline through through-timeline disable disable-timeline)
-  "Wrap private STATE with coverage and transition provenance in a new fact."
   (when state
-    (let ((fact (list :enabled (wal-logical-status-enabled state)
-                      :witness-kind kind :witness-start (wal-logical-status-start state)
-                      :witness-end (wal-logical-status-end state)
-                      :witness-timeline (wal-logical-status-timeline state)
-                      :coverage-start coverage-start :coverage-timeline coverage-timeline
-                      :through through :through-timeline through-timeline
-                      :last-enable-lsn (wal-logical-status-last-enable-lsn state)
-                      :last-enable-timeline (wal-logical-status-last-enable-timeline state)
-                      :last-disable-lsn disable :last-disable-timeline disable-timeline)))
+    (let ((fact
+            (append
+             (list :enabled (wal-logical-status-enabled state)
+                   :witness-kind kind :witness-start (wal-logical-status-start state)
+                   :witness-end (wal-logical-status-end state)
+                   :witness-timeline (wal-logical-status-timeline state)
+                   :coverage-start coverage-start :coverage-timeline coverage-timeline
+                   :through through :through-timeline through-timeline
+                   :last-enable-lsn (wal-logical-status-last-enable-lsn state)
+                   :last-enable-timeline (wal-logical-status-last-enable-timeline state)
+                   :last-disable-lsn disable :last-disable-timeline disable-timeline)
+             (when (wal-logical-status-on-start-lsn state)
+               (list :logical-on-start-lsn (wal-logical-status-on-start-lsn state)
+                     :logical-on-start-timeline (wal-logical-status-on-start-timeline state))))))
       (unless (physical-logical-fact-valid-p fact) (error "invalid source logical export"))
       fact)))
 
@@ -167,7 +190,8 @@ The caller must separately prove source identity and the verified WAL prefix."
     (unless (= (getf fact :coverage-timeline) (timeline-at-point (getf fact :coverage-start) history))
       (error "logical coverage belongs to a different timeline"))
     (dolist (keys '((:last-enable-lsn :last-enable-timeline)
-                    (:last-disable-lsn :last-disable-timeline)))
+                    (:last-disable-lsn :last-disable-timeline)
+                    (:logical-on-start-lsn :logical-on-start-timeline)))
       (when (getf fact (first keys))
         (physical-policy-check-record-owner
          (- (getf fact (first keys)) (1+ +wal-header-size+))
@@ -203,15 +227,16 @@ enable end; retain the last OFF boundary across later records."
     (physical-logical-check-fact fact history (wal-record-end record) timeline)))
 
 (defun physical-logical-encode-fact (fact)
-  "Encode known source evidence as the 88-byte PGLOGFC1 suffix."
+  "Encode source evidence, appending an ON interval only when known."
   (unless (physical-logical-fact-valid-p fact) (error "invalid source logical fact"))
-  (let ((bytes (make-array +physical-logical-fact-size+ :element-type '(unsigned-byte 8)
-                                                        :initial-element 0)))
+  (let ((bytes (make-array (physical-logical-fact-image-size fact) :element-type '(unsigned-byte 8)
+                                                                   :initial-element 0)))
     (replace bytes #(80 71 76 79 71 70 67 49))
     (wal-set-u32 bytes 8 (logior (if (getf fact :enabled) 1 0)
                                  (if (eq :checkpoint (getf fact :witness-kind)) 2 0)
                                  (if (getf fact :last-disable-lsn) 4 0)
-                                 (if (getf fact :last-enable-lsn) 8 0)))
+                                 (if (getf fact :last-enable-lsn) 8 0)
+                                 (if (getf fact :logical-on-start-lsn) 16 0)))
     (loop for key in '(:witness-start :witness-end :coverage-start :through)
           for offset in '(16 24 40 48) do (wal-set-u64 bytes offset (getf fact key)))
     (loop for key in '(:witness-timeline :coverage-timeline :through-timeline)
@@ -221,16 +246,23 @@ enable end; retain the last OFF boundary across later records."
       (when (getf fact (first item))
         (wal-set-u64 bytes (third item) (getf fact (first item)))
         (wal-set-u32 bytes (fourth item) (getf fact (second item)))))
+    (when (getf fact :logical-on-start-lsn)
+      (wal-set-u64 bytes 88 (getf fact :logical-on-start-lsn))
+      (wal-set-u32 bytes 96 (getf fact :logical-on-start-timeline))
+      (wal-set-u32 bytes 100 16))
     bytes))
 
 (defun physical-logical-decode-fact (bytes)
-  "Decode and shape-check the 88-byte suffix, including reserved fields."
+  "Decode exact source fact layouts and reject inconsistent extension flags."
   (unless (and (typep bytes '(vector (unsigned-byte 8)))
-               (= (length bytes) +physical-logical-fact-size+)
+               (member (length bytes) (list +physical-logical-fact-size+ +physical-logical-interval-fact-size+))
                (equalp (subseq bytes 0 8) #(80 71 76 79 71 70 67 49)))
     (error "invalid source logical encoding"))
-  (let* ((flags (wal-u32 bytes 8)) (on (logbitp 3 flags)) (off (logbitp 2 flags)))
-    (unless (and (<= flags 15) (zerop (wal-u32 bytes 12)) (zerop (wal-u32 bytes 84))
+  (let* ((flags (wal-u32 bytes 8)) (on (logbitp 3 flags)) (off (logbitp 2 flags))
+                                   (interval (= (length bytes) +physical-logical-interval-fact-size+)))
+    (unless (and (<= flags 31) (eq interval (logbitp 4 flags))
+                 (or (not interval) (= 16 (wal-u32 bytes 100)))
+                 (zerop (wal-u32 bytes 12)) (zerop (wal-u32 bytes 84))
                  (or on (and (zerop (wal-u64 bytes 72)) (zerop (wal-u32 bytes 80))))
                  (or off (and (zerop (wal-u64 bytes 64)) (zerop (wal-u32 bytes 60)))))
       (error "invalid source logical encoding flags"))
@@ -244,6 +276,9 @@ enable end; retain the last OFF boundary across later records."
                       :last-enable-timeline (when on (wal-u32 bytes 80))
                       :last-disable-lsn (when off (wal-u64 bytes 64))
                       :last-disable-timeline (when off (wal-u32 bytes 60)))))
+      (when interval
+        (setf fact (append fact (list :logical-on-start-lsn (wal-u64 bytes 88)
+                                      :logical-on-start-timeline (wal-u32 bytes 96)))))
       (unless (physical-logical-fact-valid-p fact) (error "invalid decoded source logical fact"))
       fact)))
 
@@ -259,15 +294,36 @@ enable end; retain the last OFF boundary across later records."
 
 (defun physical-logical-decode-base-anchor (text)
   "Decode a canonical uppercase base anchor and validate its source fact."
-  (unless (and (stringp text) (= (length text) (* 2 +physical-logical-fact-size+))
+  (unless (and (stringp text) (member (length text)
+                                      (list (* 2 +physical-logical-fact-size+)
+                                            (* 2 +physical-logical-interval-fact-size+)))
                (every (lambda (digit) (find digit "0123456789ABCDEF" :test #'char=)) text))
     (error "invalid immutable logical base anchor"))
-  (let ((bytes (make-array +physical-logical-fact-size+ :element-type '(unsigned-byte 8))))
+  (let ((bytes (make-array (/ (length text) 2) :element-type '(unsigned-byte 8))))
     (loop for index below (length bytes) for position from 0 by 2
           do (setf (aref bytes index)
                    (logior (ash (digit-char-p (char text position) 16) 4)
                            (digit-char-p (char text (1+ position)) 16))))
     (physical-logical-decode-fact bytes)))
+
+(defun physical-logical-merge-checkpoint-interval (target witness)
+  (unless (and (physical-logical-fact-valid-p target)
+               (physical-logical-fact-valid-p witness)
+               (physical-policy-witness-equal-p target witness))
+    (error "logical checkpoint differs from its retained witness"))
+  (let ((current (getf target :logical-on-start-lsn))
+        (owner (getf target :logical-on-start-timeline))
+        (other (getf witness :logical-on-start-lsn))
+        (other-owner (getf witness :logical-on-start-timeline)))
+    (when (and current other (not (and (= current other) (= owner other-owner))))
+      (error "logical checkpoint ON intervals disagree"))
+    (let ((copy (if (and (null current) other)
+                    (append target (list :logical-on-start-lsn other
+                                         :logical-on-start-timeline other-owner))
+                    (copy-list target))))
+      (unless (physical-logical-fact-valid-p copy)
+        (error "logical checkpoint ON interval contradicts retained transitions"))
+      copy)))
 
 (defun physical-logical-base-fact (manifest checkpoint history)
   "Derive the immutable base's logical fact on HISTORY.
@@ -283,9 +339,9 @@ Without either witness, return NIL."
     (cond
       (checkpoint-fact
        (physical-logical-check-fact checkpoint-fact history end timeline)
-       (when (and anchor (not (physical-policy-witness-equal-p anchor checkpoint-fact)))
-         (error "logical base anchor contradicts its known checkpoint"))
-       checkpoint-fact)
+       (if anchor
+           (physical-logical-merge-checkpoint-interval checkpoint-fact anchor)
+           checkpoint-fact))
       (anchor
        (unless (and checkpoint (wal-checkpoint-snapshot-valid-p checkpoint)
                     (= end (getf checkpoint :end)) (= timeline (getf checkpoint :timeline))
@@ -310,6 +366,44 @@ Without either witness, return NIL."
         (setf (getf copy (first keys)) nil (getf copy (second keys)) nil)))
     copy))
 
+(defun physical-logical-interval-refines-p (fact minimum required)
+  "Check whether verified FACT supplies interval knowledge missing from MINIMUM.
+The interval must be part of the caller's verified source evidence."
+  (let ((interval (getf fact :logical-on-start-lsn))
+        (owner (getf fact :logical-on-start-timeline))
+        (on (getf minimum :last-enable-lsn))
+        (off (getf minimum :last-disable-lsn)))
+    (and interval
+         (null (getf minimum :logical-on-start-lsn))
+         (getf minimum :enabled)
+         (<= interval required)
+         (<= owner (getf minimum :witness-timeline))
+         (or (null off) (> interval off))
+         (or (null on) (<= interval on))
+         (<= interval (getf minimum
+                            (if (eq :checkpoint (getf minimum :witness-kind))
+                                :witness-start :witness-end))))))
+
+(defun physical-logical-check-on-interval-extension (fact minimum required)
+  (let* ((current (getf fact :logical-on-start-lsn))
+         (owner (getf fact :logical-on-start-timeline))
+         (saved (getf minimum :logical-on-start-lsn))
+         (saved-owner (getf minimum :logical-on-start-timeline))
+         (off (getf fact :last-disable-lsn))
+         (later-on (and current (>= (- current (1+ +wal-header-size+)) required)))
+         (later-off (and off (>= (- off (1+ +wal-header-size+)) required))))
+    (unless
+        (if saved
+            (if (getf fact :enabled)
+                (or (and current (= current saved) (= owner saved-owner))
+                    (and later-on later-off))
+                later-off)
+            (or (null current)
+                (physical-logical-interval-refines-p fact minimum required)
+                (and later-on (or (not (getf minimum :enabled)) later-off))))
+      (error "logical ON interval changed inside the required prefix")))
+  (values))
+
 (defun physical-logical-check-extension (fact minimum required)
   "Reject new witnesses or transitions invented inside the required prefix."
   (unless (or (physical-policy-witness-equal-p fact minimum)
@@ -326,6 +420,7 @@ Without either witness, return NIL."
                   (or (null current) (<= current (getf minimum :coverage-start))
                       (>= (- current (1+ +wal-header-size+)) required)))
         (error "logical transition history differs inside a required prefix"))))
+  (physical-logical-check-on-interval-extension fact minimum required)
   (values))
 
 (defun physical-logical-required-fact (source minimum applied timeline required required-timeline)
@@ -351,7 +446,11 @@ verified-prefix proofs from the caller."
                           (= (getf source :coverage-timeline) (getf minimum :coverage-timeline)))))
       (error "required logical coverage was lost"))
     (if (= applied required)
-        (unless (equal minimum (physical-logical-restrict-fact source minimum))
-          (error "reconstructed logical evidence differs at its required boundary"))
+        (let ((projection (physical-logical-restrict-fact source minimum)))
+          (when (physical-logical-interval-refines-p source minimum required)
+            (remf projection :logical-on-start-lsn)
+            (remf projection :logical-on-start-timeline))
+          (unless (equal minimum projection)
+            (error "reconstructed logical evidence differs at its required boundary")))
         (physical-logical-check-extension source minimum required)))
   (physical-logical-copy-fact source))

@@ -364,10 +364,13 @@ Reject an unrecovered witness rather than treating it as an OFF state."
   *wal-logical-policy*)
 
 (defun wal-current-logical-decoding-fields ()
-  "Return checkpoint fields for known status, omitting unknown status."
   (let* ((policy (wal-checked-logical-policy-under-lock))
          (state (and policy (wal-logical-policy-state policy))))
-    (when state (list :logical-decoding-enabled (wal-logical-status-enabled state)))))
+    (when state
+      (append (list :logical-decoding-enabled (wal-logical-status-enabled state))
+              (when (wal-logical-status-on-start-lsn state)
+                (list :logical-on-start-lsn (wal-logical-status-on-start-lsn state)
+                      :logical-on-start-timeline (wal-logical-status-on-start-timeline state)))))))
 
 (defun wal-prepare-logical-policy-recovery (snapshot marker-p)
   "Mark policy unrecovered when checkpoint or WAL supplies a witness."

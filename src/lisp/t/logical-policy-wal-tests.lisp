@@ -10,6 +10,61 @@
        (let ((pg::*backend* nil) (pg::*active-xids* nil))
          (funcall function))))))
 
+(deftest primary-logical-on-interval-survives-recycling-checkpoint-and-clog-reset
+    (call-with-logical-policy-wal-fixture
+     (lambda ()
+       (flet ((state-interval (state)
+                (list (pg::wal-logical-status-on-start-lsn state)
+                      (pg::wal-logical-status-on-start-timeline state))))
+         (unwind-protect
+              (let* ((enabled-end (pg::wal-report-logical-decoding-status t))
+                     (interval (list enabled-end 1))
+                     (old-path (pg::wal-segment-path (floor (1- enabled-end) pg::+wal-segment-size+)))
+                     (slot (pg::make-wal-replication-slot
+                            :name "on_interval_pin" :restart-lsn enabled-end :consistent-lsn enabled-end
+                            :confirmed-flush-lsn enabled-end)))
+                (pg::wal-ensure-directory-durable (pg::wal-replication-slot-directory))
+                (sb-thread:with-mutex (pg::*wal-lock*)
+                  (setf (gethash "on_interval_pin" pg::*wal-replication-slots*) slot)
+                  (pg::wal-create-replication-slot-file slot)
+                  (pg::wal-refresh-logical-capture-slot-mirror-under-wal-lock))
+                (let ((page (pg::page-init (pg::make-page))))
+                  (dotimes (block (+ 8 (/ pg::+wal-segment-size+ pg::+blcksz+)))
+                    (pg::wal-buffer-write 777 block page)))
+                (pg::wal-commit-maintenance)
+                (pg::wal-checkpoint-core)
+                (ok (> (getf pg::*wal-checkpoint-snapshot* :start) pg::+wal-segment-size+))
+                (pg::wal-acknowledge-replication-slot "on_interval_pin" pg::*wal-durable-lsn*)
+                (pg::wal-checkpoint-core)
+                (ok (not (probe-file old-path)))
+                (let ((old-policy pg::*wal-logical-policy*))
+                  (pg::clog-reset)
+                  (ok (not (eq old-policy pg::*wal-logical-policy*)))
+                  (ok (equal interval
+                             (state-interval
+                              (pg::wal-logical-policy-state pg::*wal-logical-policy*)))))
+                (pg::wal-checkpoint-core)
+                (ok (eql enabled-end (getf pg::*wal-checkpoint-snapshot* :logical-on-start-lsn)))
+                (ok (equal pg::*wal-checkpoint-snapshot*
+                           (third (multiple-value-list (pg::wal-read-control-fields)))))
+                (fpw-reopen-wal)
+                (ok (eq :unrecovered pg::*wal-logical-policy*))
+                (pg::wal-recover)
+                (pg::wal-load-replication-slots)
+                (sb-thread:with-mutex (pg::*wal-lock*)
+                  (pg::wal-refresh-logical-capture-slot-mirror-under-wal-lock)
+                  (ok (gethash "on_interval_pin" pg::*wal-replication-slots*))
+                  (let* ((policy (pg::wal-checked-logical-policy-under-lock))
+                         (state (pg::wal-logical-policy-state policy)))
+                    (ok (equal interval (state-interval state)))
+                    (ok (null (pg::wal-logical-status-last-enable-lsn state)))
+                    (ok (pg::wal-logical-status-enabled state))))
+                (pg::wal-report-logical-decoding-status t)
+                (pg::wal-checkpoint-core)
+                (ok (eql enabled-end (getf pg::*wal-checkpoint-snapshot* :logical-on-start-lsn)))
+                (ok (not (probe-file old-path))))
+           (pg::smgr-close-all))))))
+
 (deftest primary-logical-policy-real-wal-recovery-preserves-status-through-clog-reset
     (call-with-logical-policy-wal-fixture
      (lambda ()
@@ -64,7 +119,7 @@
            (ok (eq :unrecovered pg::*wal-logical-policy*))
            (pg::wal-recover)
            (sb-thread:with-mutex (pg::*wal-lock*)
-             (ok (equal (list :logical-decoding-enabled enabled)
+             (ok (equal (pg::wal-copy-checkpoint-logical-decoding-fields snapshot)
                         (pg::wal-current-logical-decoding-fields)))
              (ok (eq enabled pg::*logical-capture-force*))
              (ok (= (getf snapshot :end)

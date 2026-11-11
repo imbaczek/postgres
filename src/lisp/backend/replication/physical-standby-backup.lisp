@@ -106,18 +106,20 @@ snapshot in both cases."
     (list relative (length bytes) (physical-store-update-digest #xCBF29CE484222325 bytes))))
 
 (defun physical-standby-backup-logical-facts (snapshot)
-  "Return the exported base fact and optional anchor at the frozen checkpoint.
-Only a checkpoint without logical status and with a known current fact needs
-an anchor. Read history when evidence is known, and check the fact against the
-checkpoint."
   (let* ((end (getf snapshot :end)) (timeline (getf snapshot :timeline))
-                                    (current (physical-logical-copy-fact (getf *physical-recovery-state* :source-logical-fact)))
+                                    (current (physical-logical-copy-fact
+                                              (getf *physical-recovery-state* :source-logical-fact)))
                                     (history (when (or current (get-properties snapshot '(:logical-decoding-enabled)))
-                                               (physical-recovery-resource-history *physical-receive-store* *physical-recovery-state*))))
+                                               (physical-recovery-resource-history
+                                                *physical-receive-store* *physical-recovery-state*))))
     (when current (physical-logical-check-fact current history end timeline))
-    (physical-recovery-scan-checkpoint-logical snapshot current end timeline)
-    (let* ((anchor (when (and current (not (get-properties snapshot '(:logical-decoding-enabled))))
-                     (physical-logical-encode-base-anchor current)))
+    (setf current (physical-recovery-scan-checkpoint-logical snapshot current end timeline))
+    (let* ((anchor
+             (when (and current
+                        (or (not (get-properties snapshot '(:logical-decoding-enabled)))
+                            (and (getf current :logical-on-start-lsn)
+                                 (null (getf snapshot :logical-on-start-lsn)))))
+               (physical-logical-encode-base-anchor current)))
            (manifest (append (list :end end :timeline timeline)
                              (when anchor (list :logical-base-anchor anchor)))))
       (values (physical-logical-base-fact manifest snapshot history) anchor))))

@@ -51,26 +51,42 @@ Absence means unknown; present NIL means off and present T means on."
   (when (get-properties facts '(:full-page-writes))
     (list :full-page-writes (getf facts :full-page-writes))))
 
+(defconstant +wal-checkpoint-logical-interval-size+ 16)
+
+(defun wal-logical-on-interval-valid-p (enabled lsn timeline end owner)
+  (or (and (null lsn) (null timeline))
+      (and (eq enabled t)
+           (typep lsn '(integer 33 18446744073709551615))
+           (typep timeline '(integer 1 4294967295))
+           (<= lsn end) (<= timeline owner))))
+
 (defun wal-checkpoint-logical-decoding-fields-valid-p (facts)
-  "Accept an optional Boolean logical-decoding fact.
-Absent means unknown; present NIL means off and present T means on."
-  (wal-checkpoint-boolean-fact-valid-p facts :logical-decoding-enabled))
+  (and (wal-checkpoint-boolean-fact-valid-p facts :logical-decoding-enabled)
+       (let ((positions (loop for key in facts by #'cddr
+                              count (eq key :logical-on-start-lsn)))
+             (timelines (loop for key in facts by #'cddr
+                              count (eq key :logical-on-start-timeline))))
+         (or (and (zerop positions) (zerop timelines))
+             (and (= positions timelines 1)
+                  (getf facts :logical-on-start-lsn)
+                  (getf facts :logical-on-start-timeline)
+                  (wal-logical-on-interval-valid-p
+                   (getf facts :logical-decoding-enabled)
+                   (getf facts :logical-on-start-lsn)
+                   (getf facts :logical-on-start-timeline)
+                   #xffffffffffffffff #xffffffff))))))
 
 (defun wal-copy-checkpoint-logical-decoding-fields (facts)
-  "Validate and copy the caller's optional logical-decoding fact, including NIL."
   (unless (wal-checkpoint-logical-decoding-fields-valid-p facts)
     (error "invalid checkpoint logical decoding fact"))
   (when (get-properties facts '(:logical-decoding-enabled))
-    (list :logical-decoding-enabled (getf facts :logical-decoding-enabled))))
+    (append (list :logical-decoding-enabled (getf facts :logical-decoding-enabled))
+            (when (getf facts :logical-on-start-lsn)
+              (list :logical-on-start-lsn (getf facts :logical-on-start-lsn)
+                    :logical-on-start-timeline (getf facts :logical-on-start-timeline))))))
 
 (defun wal-checkpoint-snapshot-length-p (length)
-  "Recognize the 88, 96, 136 and 144 byte checkpoint payload lengths."
-  (member length
-          (list +wal-checkpoint-snapshot-size+
-                (+ +wal-checkpoint-snapshot-size+ +wal-checkpoint-commit-ts-size+)
-                +wal-checkpoint-resource-snapshot-size+
-                (+ +wal-checkpoint-resource-snapshot-size+ +wal-checkpoint-commit-ts-size+))
-          :test #'=))
+  (member length '(88 96 104 112 136 144 152 160) :test #'=))
 
 (declaim (ftype function wal-control-resource-fields-valid-p wal-control-resource-parameters
                 wal-copy-control-resource-fields))
@@ -86,7 +102,8 @@ Absent means unknown; present NIL means off and present T means on."
      (if (wal-control-resource-parameters facts)
          +wal-checkpoint-resource-snapshot-size+
          +wal-checkpoint-snapshot-size+)
-     (if (getf facts :oldest-commit-ts-xid) +wal-checkpoint-commit-ts-size+ 0)))
+     (if (getf facts :oldest-commit-ts-xid) +wal-checkpoint-commit-ts-size+ 0)
+     (if (getf facts :logical-on-start-lsn) +wal-checkpoint-logical-interval-size+ 0)))
 
 (defun wal-checkpoint-record-length-p (length)
   (or (= length +wal-header-size+)
@@ -129,6 +146,10 @@ unknown history. Ancestry requires separate history validation."
              (and (= version 2)
                   (<= (getf snapshot :resource-lsn) start)
                   (<= (getf snapshot :resource-timeline) (getf snapshot :timeline))))
+         (wal-logical-on-interval-valid-p
+          (getf snapshot :logical-decoding-enabled)
+          (getf snapshot :logical-on-start-lsn) (getf snapshot :logical-on-start-timeline)
+          start (getf snapshot :timeline))
          (<= (getf snapshot :prev-timeline) (getf snapshot :timeline)))))
 
 (defun wal-encode-checkpoint-snapshot (snapshot)
@@ -136,7 +157,7 @@ unknown history. Ancestry requires separate history validation."
 PGCKPT02 uses flags for one-past FullXIDs. Bit 3 marks full-page-writes
 presence and bit 4 its value; bits 5 and 6 do the same for logical decoding.
 These status bits add no payload bytes. Version 1 has no extensions.
-Payload lengths are 88, 96, 136 or 144 bytes.  Resource facts add 48 bytes.
+Resource facts add 48 bytes. Bit 7 adds the final 16-byte ON interval.
 Flag bit 2 adds the eight-byte oldest and newest u32 commit timestamp pair
 after the base payload and any resource extension. Currently, both values
 must be zero. Absence preserves unknown history."
@@ -160,13 +181,19 @@ must be zero. Absence preserves unknown history."
                                   (if (get-properties snapshot '(:full-page-writes)) 8 0)
                                   (if (getf snapshot :full-page-writes) 16 0)
                                   (if (get-properties snapshot '(:logical-decoding-enabled)) 32 0)
-                                  (if (getf snapshot :logical-decoding-enabled) 64 0)))
+                                  (if (getf snapshot :logical-decoding-enabled) 64 0)
+                                  (if (getf snapshot :logical-on-start-lsn) 128 0)))
     (when (getf snapshot :resource-parameters)
       (replace bytes (wal-encode-resource-fact (wal-copy-control-resource-fields snapshot)) :start1 88))
     (when (getf snapshot :oldest-commit-ts-xid)
-      (let ((offset (- (length bytes) +wal-checkpoint-commit-ts-size+)))
+      (let ((offset (- (length bytes) +wal-checkpoint-commit-ts-size+
+                       (if (getf snapshot :logical-on-start-lsn) +wal-checkpoint-logical-interval-size+ 0))))
         (wal-set-u32 bytes offset (getf snapshot :oldest-commit-ts-xid))
         (wal-set-u32 bytes (+ offset 4) (getf snapshot :newest-commit-ts-xid))))
+    (when (getf snapshot :logical-on-start-lsn)
+      (let ((offset (- (length bytes) +wal-checkpoint-logical-interval-size+)))
+        (wal-set-u64 bytes offset (getf snapshot :logical-on-start-lsn))
+        (wal-set-u32 bytes (+ offset 8) (getf snapshot :logical-on-start-timeline))))
     bytes))
 
 (defun wal-decode-checkpoint-snapshot (bytes)
@@ -183,10 +210,15 @@ unknown; present NIL is off and present T is on."
                         ((equalp (subseq bytes 0 8) #(80 71 67 75 80 84 48 50)) 2)))
          (flags (wal-u32 bytes 84))
          (commit-ts-p (logbitp 2 flags))
-         (resource-end (- (length bytes) (if commit-ts-p +wal-checkpoint-commit-ts-size+ 0))))
-    (unless (and version (if (= version 1) (zerop flags) (<= 0 flags 127))
+         (interval-p (logbitp 7 flags))
+         (resource-end (- (length bytes) (if commit-ts-p +wal-checkpoint-commit-ts-size+ 0)
+                          (if interval-p +wal-checkpoint-logical-interval-size+ 0))))
+    (unless (and version (if (= version 1) (zerop flags) (<= 0 flags 255))
                  (or (not (logbitp 4 flags)) (logbitp 3 flags))
                  (or (not (logbitp 6 flags)) (logbitp 5 flags))
+                 (or (not interval-p)
+                     (and (logbitp 5 flags) (logbitp 6 flags)
+                          (zerop (wal-u32 bytes (- (length bytes) 4)))))
                  (member resource-end
                          (list +wal-checkpoint-snapshot-size+ +wal-checkpoint-resource-snapshot-size+))
                  (or (= (length bytes) +wal-checkpoint-snapshot-size+) (= version 2))
@@ -219,6 +251,11 @@ unknown; present NIL is off and present T is on."
         (setf snapshot (append snapshot (list :full-page-writes (logbitp 4 flags)))))
       (when (logbitp 5 flags)
         (setf snapshot (append snapshot (list :logical-decoding-enabled (logbitp 6 flags)))))
+      (when interval-p
+        (let ((offset (- (length bytes) +wal-checkpoint-logical-interval-size+)))
+          (setf snapshot (append snapshot
+                                 (list :logical-on-start-lsn (wal-u64 bytes offset)
+                                       :logical-on-start-timeline (wal-u32 bytes (+ offset 8)))))))
       (unless (wal-checkpoint-snapshot-valid-p snapshot)
         (error "invalid native checkpoint snapshot"))
       snapshot)))

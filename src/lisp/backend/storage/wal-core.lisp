@@ -3061,6 +3061,11 @@ changes throughout."
                   (if (and new-p terminal-p)
                       (wal-logical-status-next logical-status record *wal-insert-timeline*)
                       logical-status)))
+           (when (and new-p (= (wal-record-type record) +wal-record-checkpoint+))
+             (let ((snapshot (wal-checkpoint-record-snapshot record)))
+               (when (getf snapshot :logical-on-start-lsn)
+                 (timeline-check-resource-origin
+                  snapshot (timeline-read-history *wal-insert-timeline*)))))
            (wal-replay-record record)
            (multiple-value-setq (fpw-state incarnation)
              (wal-recovery-policy-incarnation

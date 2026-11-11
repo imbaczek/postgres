@@ -5,10 +5,14 @@
           (unless (eq status :unknown) (list :logical-decoding-enabled status))))
 
 (cl-spec:defgenerator unit-logical-status-fact-arguments ()
-  (let ((status (nth (random 3) '(:unknown nil t))))
+  (let* ((status (nth (random 3) '(:unknown nil t)))
+         (known-interval (and (eq status t) (zerop (random 2)))))
     (list (append (list :unrelated 7)
                   (unless (eq status :unknown)
-                    (list :logical-decoding-enabled status))))))
+                    (list :logical-decoding-enabled status))
+                  (when known-interval
+                    (list :logical-on-start-lsn (+ 33 (random 100000))
+                          :logical-on-start-timeline (1+ (random 4))))))))
 
 (cl-spec:defspec-function wal-copy-checkpoint-logical-decoding-fields
     (:args (facts (type list)))
@@ -16,7 +20,10 @@
   (:returns (type list))
   (:post (if (get-properties facts '(:logical-decoding-enabled))
              (and (equal result
-                         (list :logical-decoding-enabled (getf facts :logical-decoding-enabled)))
+                         (append (list :logical-decoding-enabled (getf facts :logical-decoding-enabled))
+                                 (when (getf facts :logical-on-start-lsn)
+                                   (list :logical-on-start-lsn (getf facts :logical-on-start-lsn)
+                                         :logical-on-start-timeline (getf facts :logical-on-start-timeline)))))
                   (not (eq result facts)))
              (null result))))
 

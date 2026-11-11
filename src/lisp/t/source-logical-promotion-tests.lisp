@@ -548,8 +548,11 @@
   (eql enabled (pg::physical-logical-decode-promotion-intent
                 (pg::physical-logical-encode-promotion-intent enabled))))
 
-(defun promotion-logical-codec-image (logical &key (fpw :absent) resources fpw-source source selected retained)
+(defun promotion-logical-codec-image (logical &key (fpw :absent) resources fpw-source source selected retained legacy-source)
   (let ((logical-fact (when source (source-logical-promotion-fact t 32))))
+    (when legacy-source
+      (remf logical-fact :logical-on-start-lsn)
+      (remf logical-fact :logical-on-start-timeline))
     (when logical-fact (setf (getf logical-fact :through) 152))
     (apply #'pg::physical-recovery-control-image
            (append
@@ -608,7 +611,7 @@
          (loop for fpw in '(:absent nil t) collect
                                            (loop for full in '(nil t) collect
                                                                       (let ((bytes (promotion-logical-codec-image
-                                                                                    :absent :fpw fpw :resources full :fpw-source full :source full
+                                                                                    :absent :legacy-source t :fpw fpw :resources full :fpw-source full :source full
                                                                                     :selected full :retained full)))
                                                                         (list (length bytes)
                                                                               (pg::physical-store-update-digest #xCBF29CE484222325 bytes)))))))
@@ -633,6 +636,8 @@
                     (remf decoded :promotion-wal-level)
                     (ok (equal old-control decoded)))))))))))
   (ok (= 391 (length (promotion-logical-codec-image
+                      nil :legacy-source t :fpw nil :resources t :fpw-source t :source t :selected t :retained t))))
+  (ok (= 407 (length (promotion-logical-codec-image
                       nil :fpw nil :resources t :fpw-source t :source t :selected t :retained t)))))
 
 (deftest promotion-logical-control-rejects-malformed-intent-under-valid-crc

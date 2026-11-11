@@ -57,12 +57,21 @@ Unknown source state requires a change; absent legacy intent emits none."
    +wal-record-full-page-writes-change+ #'wal-encode-full-page-writes-change))
 
 (defun physical-promotion-logical-prefix (state cursor)
-  "Plan a logical status marker when needed and its checkpoint field.
-A matching known source status omits the marker but retains the frozen field."
-  (physical-promotion-policy-prefix
-   state cursor :source-logical-fact :promotion-logical-decoding-enabled :logical-decoding-enabled
-   #'physical-logical-copy-fact #'physical-logical-fact-at-p
-   +wal-record-logical-decoding-status-change+ #'wal-encode-logical-decoding-status-change))
+  (multiple-value-bind (frames next fields)
+      (physical-promotion-policy-prefix
+       state cursor :source-logical-fact :promotion-logical-decoding-enabled :logical-decoding-enabled
+       #'physical-logical-copy-fact #'physical-logical-fact-at-p
+       +wal-record-logical-decoding-status-change+ #'wal-encode-logical-decoding-status-change)
+    (let ((source (getf state :source-logical-fact)))
+      (values frames next
+              (append fields
+                      (when (getf fields :logical-decoding-enabled)
+                        (cond
+                          (frames (list :logical-on-start-lsn next
+                                        :logical-on-start-timeline (getf state :promotion-child)))
+                          ((getf source :logical-on-start-lsn)
+                           (list :logical-on-start-lsn (getf source :logical-on-start-lsn)
+                                 :logical-on-start-timeline (getf source :logical-on-start-timeline))))))))))
 
 (defun physical-promotion-checkpoint-plan (state next-oid local-floor)
   "Build the child WAL plan without changing files or runtime state.
