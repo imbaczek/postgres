@@ -1412,7 +1412,9 @@ Pass BACKEND when releasing its virtual reader ID."
   (values))
 
 (defun call-with-logical-capture-armed (function)
-  "Enable capture for new XIDs, then drain older uncaptured XIDs before FUNCTION."
+  "Arm capture for new XIDs, then drain older uncaptured XIDs before FUNCTION.
+Keep the arm until FUNCTION exits, including on error; after release, reconsider
+any deferred disable without holding the XID lock."
   (let ((token (gensym "LOGICAL-CAPTURE-ARM-")) (old-xids nil) (registered nil))
     (sb-sys:without-interrupts
       (unwind-protect
@@ -1595,7 +1597,9 @@ excluded, so a sequence advance before slot publication remains streamable."
 (defun wal-publish-replication-slot-under-wal-lock
     (name boundary-lsn restart-lsn register active-owner
      &optional active-xids database-oid (plugin "pg_lisp"))
-  "Persist and publish a slot while *WAL-LOCK* protects its retention point."
+  "Persist and publish a slot while *WAL-LOCK* protects its retention point.
+The capture arm must remain held, older uncaptured XIDs must have drained, and
+ON status must be durable before the slot is published."
   (sb-thread:with-mutex (*xid-lock*)
     (unless (plusp (hash-table-count *logical-capture-arming*))
       (error "logical slot publication requires an armed capture gate"))

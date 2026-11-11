@@ -39,7 +39,9 @@ When both locks are needed, take WAL before the writer state lock."
                 (service generation thread epoch old-incarnation new-incarnation
                  timeline ownership replacement &optional fpw-predecessor fpw-replacement
                                                   logical-predecessor logical-replacement)))
-  "Preallocated reset identities, FPW evidence and writer registration.
+  "Preallocated reset identities, policy evidence and writer registration.
+LOGICAL-PREDECESSOR and LOGICAL-REPLACEMENT carry logical status across the
+same validated incarnation change.
 FPW-PREDECESSOR captures the exact prior state; FPW-REPLACEMENT transfers its
 evidence to the new incarnation. Descriptors are immutable; CONSUMED-P
 prevents reuse."
@@ -100,7 +102,8 @@ prevents reuse."
   t)
 
 (defun prepare-primary-wal-writer-clog-reset-under-lock ()
-  "Preallocate the reset identity, FPW replacement and writer epoch before file effects.
+  "Preallocate the reset identity, FPW and logical policy replacements, and any
+writer epoch before file effects.
 Hold WAL then state lock. A writer already stopping cannot be prepared; a later
 stop remains in effect. Reset WAL can retire dirty scratch, so the temp domain
 need not yet be empty."
@@ -139,8 +142,8 @@ need not yet be empty."
 
 (defun validate-primary-wal-writer-clog-reset-plan-under-state-lock (plan)
   "Check an unused plan against its captured writer and storage descriptors.
-Require the exact FPW predecessor and a valid replacement preserving its
-evidence under the new token. A later stop request remains in effect."
+Require the exact FPW and logical policy predecessors, with valid replacements
+preserving their evidence under the new token. A later stop request remains in effect."
   (assert (sb-thread:holding-mutex-p *wal-lock*))
   (assert (sb-thread:holding-mutex-p *primary-wal-writer-lock*))
   (unless (and (clog-reset-epoch-plan-p plan)
@@ -205,7 +208,8 @@ evidence under the new token. A later stop request remains in effect."
     (validate-primary-wal-writer-clog-reset-plan-under-state-lock plan)))
 
 (defun publish-primary-wal-writer-clog-reset-under-lock (plan)
-  "Revalidate and publish storage identity, FPW and any prepared writer epoch.
+  "Revalidate and publish storage identity, FPW and logical policy, plus any
+prepared writer epoch.
 After durability, hold WAL then state lock, consume PLAN and publish with
 interrupts masked. Revalidation can fail after file effects; the enclosing reset
 fail-stops rather than rolling those effects back."
@@ -440,7 +444,8 @@ Sync WAL before draining page and CLOG publications through the durable frontier
 
 (defun primary-wal-writer-background-step (writer policy)
   "Capture desired FPW policy before WAL locking, then validate the writer epoch.
-Publish policy only for the validated epoch, and run the background cycle."
+Publish policy only for the validated epoch, process a deferred logical OFF,
+and run the background cycle."
   (when (primary-wal-writer-stopping-p writer)
     (return-from primary-wal-writer-background-step :stop))
   (multiple-value-bind (enabled known) (startup-full-page-writes-policy)

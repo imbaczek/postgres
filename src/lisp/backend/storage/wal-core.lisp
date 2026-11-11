@@ -269,9 +269,11 @@ It is separate from the source identity used for remote acknowledgments.")
 A state with ENABLED NIL is known OFF. It belongs to the current storage
 incarnation and is reconstructed from checkpoint and WAL, not a control extension.")
 
-(defvar *wal-logical-policy* nil)
+(defvar *wal-logical-policy* nil
+  "WAL-owned logical status evidence; NIL is unknown, :UNRECOVERED awaits redo.")
 
-(defvar *logical-capture-force* nil)
+(defvar *logical-capture-force* nil
+  "Capture mode for new XIDs, protected by the XID lock and changed under WAL.")
 
 (declaim (ftype function wal-reset-logical-policy-under-lock
                 wal-current-logical-decoding-fields wal-prepare-logical-policy-recovery
@@ -2992,11 +2994,11 @@ Return the rebound evidence and current token, or the unchanged pair."
 
 (defun wal-recover ()
   "Redo durable complete batches before loading the catalog.
-Validate logical status privately before each new terminal's redo; it is not
-published as authoritative state. Carry private FPW evidence to a new token
-only after a validated CLOG reset terminal closes its batch; reject other storage
-rotations. Install FPW after the full scan and CLOG sync succeed. The caller
-must exclude storage lifecycle changes throughout."
+Validate logical status privately before each new terminal's redo. Carry private
+FPW evidence to a new token only after a validated CLOG reset terminal closes its
+batch; reject other storage rotations. Publish FPW and logical status only after
+the full scan and CLOG sync succeed. The caller must exclude storage lifecycle
+changes throughout."
   (let* ((incarnation *wal-storage-incarnation*)
          (fpw-state (wal-fpw-state-from-checkpoint *wal-checkpoint-snapshot* incarnation))
          (logical-status (wal-logical-status-from-checkpoint *wal-checkpoint-snapshot*))
@@ -3777,7 +3779,8 @@ Capture installed commit timestamp facts before taking storage locks. Under the
 WAL lock, freeze resource facts before planning placement and rotation. Check the
 encoded size against that plan before appending the checkpoint. Include known
 full page writes policy, including OFF, and advance its checkpoint witness only
-after checkpoint control publication. Extra full page images remain native format
+after checkpoint control publication. Include known logical status and advance
+its witness at the same boundary. Extra full page images remain native format
 when the policy is OFF.
 Settle pending pages, then require page and CLOG debt to be empty before appending
 any checkpoint batch records. Shutdown can defer recycling until its senders
