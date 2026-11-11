@@ -30,6 +30,8 @@
 
 (defconstant +wal-record-full-page-writes-change+ 17)
 
+(declaim (ftype function wal-fpw-rebind-incarnation))
+
 (defconstant +wal-record-logical-decoding-status-change+ 18)
 
 (declaim (ftype function wal-logical-decoding-status-record-info
@@ -2961,6 +2963,17 @@ published separately after primary redo completes."
        (unwind-protect (wal-recovery-close-page-spool)
          (wal-recovery-reset-logical-change-batch)))))
 
+(defun wal-recovery-policy-incarnation (state incarnation record completed-p)
+  (let ((current *wal-storage-incarnation*))
+    (cond
+      ((and completed-p (= (wal-record-type record) +wal-record-clog-reset+))
+       (when (eq current incarnation)
+         (error "completed CLOG reset did not replace its storage identity"))
+       (values (wal-fpw-rebind-incarnation state incarnation current) current))
+      ((not (eq current incarnation))
+       (error "WAL recovery storage changed outside a completed CLOG reset"))
+      (t (values state incarnation)))))
+
 (defun wal-recover ()
   "Redo durable complete batches before loading the catalog.
 Validate logical status privately before each new terminal's redo; it is not
@@ -2975,6 +2988,8 @@ lifecycle changes throughout."
     (with-wal-replay-staging ()
       (wal-scan
        (lambda (record)
+         (unless (eq incarnation *wal-storage-incarnation*)
+           (error "WAL recovery storage changed before replay"))
          (let* ((new-p (> (wal-record-end record) *wal-checkpoint-lsn*))
                 (terminal-p (wal-terminal-record-type-p (wal-record-type record)))
                 (next-logical-status
@@ -2982,6 +2997,10 @@ lifecycle changes throughout."
                       (wal-logical-status-next logical-status record *wal-insert-timeline*)
                       logical-status)))
            (wal-replay-record record)
+           (multiple-value-setq (fpw-state incarnation)
+             (wal-recovery-policy-incarnation
+              fpw-state incarnation record
+              (and new-p terminal-p (not *wal-recovery-group-active*))))
            (when new-p
              (when (= (wal-record-type record) +wal-record-parameter-change+)
                (setf resource-record record))

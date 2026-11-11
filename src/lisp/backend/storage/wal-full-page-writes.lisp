@@ -110,6 +110,33 @@ The caller's payload decoder validates the payload itself."
                           (floor (+ disabled +wal-header-size+ +wal-full-page-writes-change-size+ -1)
                                  +wal-segment-size+))))))))
 
+(defun wal-fpw-rebinding-valid-p (prior replacement old new)
+  (and (symbolp old) old (symbolp new) new
+       (if (member prior '(nil :unrecovered))
+           (eq prior replacement)
+           (and (wal-fpw-state-valid-p prior) (wal-fpw-state-valid-p replacement)
+                (eq old (wal-fpw-state-incarnation prior))
+                (eq new (wal-fpw-state-incarnation replacement))
+                (every (lambda (accessor)
+                         (eql (funcall accessor prior) (funcall accessor replacement)))
+                       '(wal-fpw-state-enabled wal-fpw-state-witness-kind
+                         wal-fpw-state-start wal-fpw-state-end wal-fpw-state-timeline
+                         wal-fpw-state-coverage-start wal-fpw-state-coverage-timeline
+                         wal-fpw-state-last-disable-start wal-fpw-state-last-disable-timeline))))))
+
+(defun wal-fpw-rebind-incarnation (state old new)
+  (unless (and (symbolp old) old (symbolp new) new
+               (or (member state '(nil :unrecovered))
+                   (and (wal-fpw-state-valid-p state)
+                        (eq old (wal-fpw-state-incarnation state)))))
+    (error "invalid FPW storage identity transfer"))
+  (if (member state '(nil :unrecovered)) state
+      (%make-wal-fpw-state
+       new (wal-fpw-state-enabled state) (wal-fpw-state-witness-kind state)
+       (wal-fpw-state-start state) (wal-fpw-state-end state) (wal-fpw-state-timeline state)
+       (wal-fpw-state-coverage-start state) (wal-fpw-state-coverage-timeline state)
+       (wal-fpw-state-last-disable-start state) (wal-fpw-state-last-disable-timeline state))))
+
 (defun wal-fpw-state-from-checkpoint (snapshot incarnation)
   "Seed evidence from a checkpoint with a policy field, or return NIL if absent.
 A present NIL field is known OFF. The checkpoint starts the coverage floor."

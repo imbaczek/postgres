@@ -37,7 +37,7 @@ When both locks are needed, take WAL before the writer state lock."
 (defstruct (clog-reset-epoch-plan
             (:constructor %make-clog-reset-epoch-plan
                 (service generation thread epoch old-incarnation new-incarnation
-                 timeline ownership replacement)))
+                 timeline ownership replacement &optional fpw-predecessor fpw-replacement)))
   "Preallocated reset identities and writer registration for one publication.
 The descriptors are immutable; CONSUMED-P prevents reuse."
   (service nil :read-only t)
@@ -49,6 +49,8 @@ The descriptors are immutable; CONSUMED-P prevents reuse."
   (timeline nil :read-only t)
   (ownership nil :read-only t)
   (replacement nil :read-only t)
+  (fpw-predecessor nil :read-only t)
+  (fpw-replacement nil :read-only t)
   consumed-p)
 
 (defvar *primary-wal-writer* nil)
@@ -98,11 +100,15 @@ A writer already stopping cannot be prepared; a later stop remains in effect.
 Do not require an empty temp domain here: reset WAL can retire dirty scratch."
   (assert (sb-thread:holding-mutex-p *wal-lock*))
   (wal-require-no-pending-storage)
+  (when (wal-fpw-state-p *wal-fpw-state*) (wal-checked-fpw-state-under-lock))
   (sb-thread:with-mutex (*primary-wal-writer-lock*)
     (let* ((service *primary-wal-writer*)
            (active-p (not (primary-wal-writer-retired-under-state-lock-p service)))
            (epoch (when active-p (primary-wal-writer-epoch service)))
-           (incarnation (gensym "WAL-STORE-")))
+           (incarnation (gensym "WAL-STORE-"))
+           (fpw-predecessor *wal-fpw-state*)
+           (fpw-replacement (wal-fpw-rebind-incarnation
+                             fpw-predecessor *wal-storage-incarnation* incarnation)))
       (when active-p
         (unless (and (= (primary-wal-writer-generation service) *primary-wal-writer-generation*)
                      (primary-wal-writer-thread service)
@@ -118,7 +124,8 @@ Do not require an empty temp domain here: reset WAL can retire dirty scratch."
        (when service (primary-wal-writer-thread service))
        epoch *wal-storage-incarnation* incarnation *wal-insert-timeline* *postmaster-data-lock*
        (when active-p
-         (make-wal-writer-epoch incarnation *wal-insert-timeline* *postmaster-data-lock*))))))
+         (make-wal-writer-epoch incarnation *wal-insert-timeline* *postmaster-data-lock*))
+       fpw-predecessor fpw-replacement))))
 
 (defun validate-primary-wal-writer-clog-reset-plan-under-state-lock (plan)
   "Check one unused plan and its captured writer and storage descriptors.
@@ -127,6 +134,11 @@ An accepted plan permits a subsequent stop without clearing that request."
   (assert (sb-thread:holding-mutex-p *primary-wal-writer-lock*))
   (unless (and (clog-reset-epoch-plan-p plan)
                (not (clog-reset-epoch-plan-consumed-p plan))
+               (eq *wal-fpw-state* (clog-reset-epoch-plan-fpw-predecessor plan))
+               (wal-fpw-rebinding-valid-p
+                *wal-fpw-state* (clog-reset-epoch-plan-fpw-replacement plan)
+                (clog-reset-epoch-plan-old-incarnation plan)
+                (clog-reset-epoch-plan-new-incarnation plan))
                (clog-reset-epoch-plan-new-incarnation plan)
                (not (eq (clog-reset-epoch-plan-old-incarnation plan)
                         (clog-reset-epoch-plan-new-incarnation plan)))
@@ -183,7 +195,8 @@ Consume PLAN in the same critical section so it cannot be reused."
     (validate-primary-wal-writer-clog-reset-plan-under-state-lock plan)
     (sb-sys:without-interrupts
       (setf (clog-reset-epoch-plan-consumed-p plan) t
-            *wal-storage-incarnation* (clog-reset-epoch-plan-new-incarnation plan))
+            *wal-storage-incarnation* (clog-reset-epoch-plan-new-incarnation plan)
+            *wal-fpw-state* (clog-reset-epoch-plan-fpw-replacement plan))
       (when (clog-reset-epoch-plan-replacement plan)
         (setf (primary-wal-writer-epoch (clog-reset-epoch-plan-service plan))
               (clog-reset-epoch-plan-replacement plan)))))
