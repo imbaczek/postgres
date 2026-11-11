@@ -296,12 +296,12 @@ byte plan, while a present NIL policy means OFF."
       (write-sequence bytes stream))))
 
 (defun physical-recovery-control-frontier (state applied)
-  "Return required position, timeline, resource fact and FPW fact.
-Check current and required facts at their respective replay positions.
-Before required replay is reached, preserve its durable fact and position.
-A known required fact must match at the boundary; later facts may have lower
-resource values, but their reporting position cannot move backward. FPW evidence
-is restricted for boundary comparison and checked for extension beyond it."
+  "Return the required or current position, timeline, resource, FPW and logical facts.
+Check current and required facts at their respective replay positions. Before
+required replay is reached, preserve its durable facts and position. A known
+required fact must match at the boundary; later resource values may decrease,
+but their reporting position cannot move backward. FPW and logical evidence are
+reconciled against the required boundary and checked for later extension."
   (let* ((base (getf state :timeline))
          (runtime (getf state :replay-timeline base))
          (required (getf state :required-applied))
@@ -340,8 +340,10 @@ is restricted for boundary comparison and checked for extension beyond it."
 (defun physical-recovery-write-control (state phase applied next-xid
                                         &key (db-state +db-in-archive-recovery+))
   "Publish ordinary progress and return a plist copy for the caller to install.
-Pending child state needs its dedicated publisher. An ambiguous failure can leave
-disk advanced while the input remains unchanged; the outer caller must fence it."
+Copy current and required facts before I/O, and encode the selected logical fact
+under the control CRC. Pending child state needs its dedicated publisher. An
+ambiguous failure can leave disk advanced while the input remains unchanged;
+the outer caller must fence it."
   (when *physical-recovery-failed-p*
     (error "failed recovery cannot publish ordinary progress"))
   (when (or (eql phase 3) (eql (getf state :phase) 3) (getf state :promotion-child)

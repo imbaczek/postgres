@@ -256,7 +256,10 @@ does not excuse a missing file or a different fork."
                                           (resource-fact (getf *physical-recovery-state* :source-resource-fact))
                                           (fpw-fact (getf *physical-recovery-state* :source-fpw-fact))
                                           (logical-fact (getf *physical-recovery-state* :source-logical-fact)))
-  "Publish the replay position and copied source facts together after redo is durable."
+  "Publish the replay position and source facts together after redo is durable.
+Copy the supplied facts into a candidate before delegation, then install the
+returned state only after the control writer returns. The caller must fence an
+ambiguous failure that may have advanced control on disk."
   (let ((candidate (copy-list *physical-recovery-state*)))
     (setf (getf candidate :replay-timeline) replay-timeline)
     (when (or resource-fact (getf candidate :source-resource-fact))

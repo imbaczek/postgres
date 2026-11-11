@@ -121,6 +121,10 @@ optional.
   connection, then inspect and instrument that same image through control or
   Swank. Prefer this to repeated blind restarts and inference from logs alone.
   Keep fresh, isolated peers for acceptance and intentional crash/restart tests.
+- Storage fixtures can replace global WAL identity even when most storage state
+  is dynamically bound. Run them in a separate task-owned test image. A private
+  stdin REPL can keep that image alive after the usual `--script` initialization;
+  verify test counts and results separately from whether the process is alive.
 - A control evaluation runs in its own thread, not the failing SQL backend's
   dynamic environment. Capture the relevant backend/thread explicitly; do not
   assume its `*backend*` binding is visible in the control REPL. Keep inspections
