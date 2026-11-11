@@ -548,10 +548,10 @@
                            (lambda (visit from) (pg::physical-store-map-durable-records candidate visit :start-lsn from))
                            nil)))
              (ok (equal fact (getf result :required-fpw-fact)))
-             (ok (intake-fails-p (lambda () (pg::physical-follow-check-fpw-publication result binding))))
+             (ok (intake-fails-p (lambda () (pg::physical-follow-check-policy-publication result binding))))
              (ok (equalp before (pg::recovery-read-bytes (pg::physical-recovery-control-path root))))
              (setf (getf (getf binding :recovery) :fpw-fact) (copy-list fact))
-             (ok (eq result (pg::physical-follow-check-fpw-publication result binding)))
+             (ok (eq result (pg::physical-follow-check-policy-publication result binding)))
              (ok (not (pg::physical-store-failed-p store)))))))))
 
 (deftest source-fpw-ahead-restartpoint-keeps-older-unknown-required-boundary
@@ -595,7 +595,7 @@
                            nil)))
              (ok (null (getf result :required-fpw-fact)))
              (ok (equal fact (getf result :applied-fpw-fact)))
-             (ok (eq result (pg::physical-follow-check-fpw-publication result binding)))
+             (ok (eq result (pg::physical-follow-check-policy-publication result binding)))
              (ok (equalp before (pg::recovery-read-bytes (pg::physical-recovery-control-path root)))))
            (ok (= end (pg::physical-restartpoint-prepare-storage store)))
            (ok (equal fact (getf pg::*physical-recovery-state* :source-fpw-fact)))

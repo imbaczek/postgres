@@ -17,7 +17,8 @@
      :applied-timeline (second required)
      :history-target (if selected (eighth after) (getf witness :history-target))
      :history-digest (if selected (ninth after) (getf witness :history-digest))
-     :resource-fact (getf witness :resource-fact) :fpw-fact (getf witness :fpw-fact) :state-time time)))
+     :resource-fact (getf witness :resource-fact) :fpw-fact (getf witness :fpw-fact)
+     :logical-fact (getf witness :logical-fact) :state-time time)))
 
 ;; Build the named history and selected control byte images from a private empty
 ;; model.  Check that its resulting selection agrees with the binding.

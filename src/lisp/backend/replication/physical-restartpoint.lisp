@@ -209,13 +209,13 @@ A historical source checkpoint can record OFF regardless of local writer policy.
         (setf fact (checkpoint-fact)))
       (when (and metadata (null fact))
         (cond
+          ((<= (physical-store-floor-lsn store) base)
+           (multiple-value-bind (base-checkpoint base-next) (physical-restartpoint-scan-seeds nil state)
+             (setf fact (scan base start base-fact base-checkpoint base-next))))
           ((and checkpoint
                 (<= (physical-store-floor-lsn store) (getf checkpoint :end) start))
            (setf fact (scan (getf checkpoint :end) start (checkpoint-fact)
-                            checkpoint (getf checkpoint :next-xid))))
-          ((<= (physical-store-floor-lsn store) base)
-           (multiple-value-bind (base-checkpoint base-next) (physical-restartpoint-scan-seeds nil state)
-             (setf fact (scan base start base-fact base-checkpoint base-next))))))
+                            checkpoint (getf checkpoint :next-xid))))))
       (when fact
         (physical-fpw-check-fact fact (physical-recovery-resource-history store state) start timeline))
       (when minimum
@@ -263,13 +263,13 @@ cannot be reconstructed, require a fresh base backup."
         (setf fact (checkpoint-fact)))
       (when (and metadata (null fact))
         (cond
+          ((<= (physical-store-floor-lsn store) base)
+           (multiple-value-bind (base-checkpoint base-next) (physical-restartpoint-scan-seeds nil state)
+             (setf fact (scan base start base-fact base-checkpoint base-next))))
           ((and checkpoint
                 (<= (physical-store-floor-lsn store) (getf checkpoint :end) start))
            (setf fact (scan (getf checkpoint :end) start (checkpoint-fact)
-                            checkpoint (getf checkpoint :next-xid))))
-          ((<= (physical-store-floor-lsn store) base)
-           (multiple-value-bind (base-checkpoint base-next) (physical-restartpoint-scan-seeds nil state)
-             (setf fact (scan base start base-fact base-checkpoint base-next))))))
+                            checkpoint (getf checkpoint :next-xid))))))
       (when (and metadata (null fact) base-fact)
         (error "restartpoint lost known logical coverage; take a fresh base backup"))
       (when fact
