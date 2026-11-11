@@ -1,5 +1,103 @@
 (in-package #:pg)
 
+(defun call-with-effective-level-test (level source recovery function &key pending)
+  (let* ((snapshot (unless (eq source :unknown)
+                     (%make-wal-logical-status source 32 152 1 nil nil)))
+         (*startup-installed-configuration*
+           (make-startup-configuration :settings (make-hash-table :test #'equal) :wal-level level))
+         (*physical-recovery-state*
+           (when recovery
+             (list :timeline 1 :replay-timeline 1
+                   :source-logical-fact (physical-logical-fact-from-state snapshot :checkpoint 32 1 152 1 nil nil)
+                   :required-logical-fact
+                   (physical-logical-fact-from-state
+                    (%make-wal-logical-status (not source) 152 272 1 nil nil)
+                    :checkpoint 152 1 272 1 nil nil))))
+         (*last-replay-lsn* 152)
+         (*backend* (make-backend))
+         (*wal-storage-incarnation* (gensym "EFFECTIVE-LEVEL-"))
+         (*wal-level* (if (eq level :logical) :replica :logical))
+         (*wal-ready* t) (*wal-poisoned* nil) (*wal-insert-timeline* 1)
+         (*wal-durable-lsn* 152) (*wal-end-lsn* 152)
+         (*logical-capture-force* (and snapshot source))
+         (*wal-logical-policy*
+           (%make-wal-logical-policy *wal-storage-incarnation*
+                                     snapshot pending)))
+    (funcall function)))
+
+(cl-spec:defproperty effective-level-recovery-uses-published-source
+    ((source (member :unknown nil t)) (level (member :replica :logical)))
+  (:about startup-effective-wal-level)
+  (:trials (:normal 100))
+  (call-with-effective-level-test
+   level source t
+   (lambda ()
+     (let ((before (copy-tree *physical-recovery-state*)))
+       (and (string= (if (eq source t) "logical" "replica") (startup-effective-wal-level))
+            (equal before *physical-recovery-state*))))))
+
+(rove:deftest effective-level-recovery-ignores-local-and-future-policy
+    (dolist (level '(:replica :logical))
+      (dolist (source '(:unknown nil t))
+        (call-with-effective-level-test
+         level source t
+         (lambda ()
+           (let ((before (copy-tree *physical-recovery-state*)))
+             (rove:ok (string= (if (eq source t) "logical" "replica")
+                               (startup-effective-wal-level)))
+             (rove:ok (equal before *physical-recovery-state*))
+             (when (eq source :unknown)
+               (rove:ok (null (getf *physical-recovery-state* :source-logical-fact))))))))))
+
+(rove:deftest effective-level-primary-uses-configured-level-and-published-status
+    (dolist (level '(:replica :logical))
+      (dolist (source '(nil t))
+        (dolist (pending (if source '(nil t) '(nil)))
+          (call-with-effective-level-test
+           level source nil
+           (lambda ()
+             (rove:ok (string= (if (or source (eq level :logical)) "logical" "replica")
+                               (startup-effective-wal-level))))
+           :pending pending))))
+  (call-with-effective-level-test
+   :replica :unknown nil
+   (lambda ()
+     (rove:ok (rove:signals (startup-effective-wal-level) 'error))
+     (setf *wal-logical-policy* :unrecovered)
+     (rove:ok (rove:signals (startup-effective-wal-level) 'error)))))
+
+(rove:deftest effective-level-sql-value-and-settings-row-share-readonly-authority
+    (call-with-effective-level-test
+     :logical nil t
+     (lambda ()
+       (rove:ok (string= "replica" (sql-setting-value "EFFECTIVE_WAL_LEVEL")))
+       (let* ((row (startup-effective-wal-level-settings-row *startup-installed-configuration*))
+              (choices (sql-array-elements (aref row 6))))
+         (rove:ok (equalp (vector "effective_wal_level" "replica" +null+ "internal" "enum" "default")
+                          (subseq row 0 6)))
+         (rove:ok (equalp #("minimal" "replica" "logical") choices))
+         (rove:ok (every (lambda (x) (eq x +null+)) (list (aref row 7) (aref row 8))))
+         (rove:ok (null (aref row 9))))
+       (let ((rows (remove-if-not
+                    (lambda (row) (string= "effective_wal_level" (aref row 0)))
+                    (startup-settings-rows))))
+         (rove:ok (= 1 (length rows)))
+         (rove:ok (string= "replica" (aref (first rows) 1))))
+       (dolist (operation
+                (list (lambda () (startup-check-session-setting "effective_wal_level"))
+                      (lambda () (exec-set (make-broadcast-stream)
+                                           (first (parse-statements "SET effective_wal_level = logical"))))
+                      (lambda () (exec-reset (make-broadcast-stream)
+                                             (first (parse-statements "RESET effective_wal_level"))))
+                      (lambda () (set-config-value "effective_wal_level" "logical" nil))))
+         (let ((condition (handler-case (progn (funcall operation) nil)
+                            (pg-error (condition) condition))))
+           (rove:ok (and condition (string= "55P02" (pg-error-sqlstate condition))))))
+       (rove:ok (null (assoc "effective_wal_level" *startup-setting-specs* :test #'string=))))))
+
+(rove:deftest effective-level-generated-recovery-contract
+    (unit-check-property 'effective-level-recovery-uses-published-source))
+
 (defun call-with-logical-policy-test (function)
   (let ((*wal-logical-policy* nil) (*logical-capture-force* nil)
                                    (*wal-level* :replica) (*wal-logical-policy-test-hook* nil)

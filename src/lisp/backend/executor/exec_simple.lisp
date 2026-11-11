@@ -798,6 +798,8 @@ Do not perform wire I/O while restoring transaction state."
 (defun sql-setting-value (name &optional missing-ok)
   "Shared SHOW/current_setting value path, using C's human unit formatting."
   (setf name (string-downcase name))
+  (when (string= name "effective_wal_level")
+    (return-from sql-setting-value (startup-effective-wal-level)))
   (multiple-value-bind (value present-p) (session-extra-setting-value name)
     (when present-p (return-from sql-setting-value value)))
   (multiple-value-bind (value present-p) (startup-setting-show-value name)

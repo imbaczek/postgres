@@ -16,6 +16,76 @@
          (close pg::*clog-stream*)
          (setf pg::*clog-stream* nil))))))
 
+(deftest effective-level-changes-only-with-published-replay-in-both-paths
+    (dolist (mode '(:full :rows))
+      (call-with-source-logical-replay-fixture
+       mode
+       (lambda (root store replay)
+         (declare (ignore root))
+         (let ((pg::*startup-installed-configuration*
+                 (pg::make-startup-configuration :wal-level :logical)))
+           (ok (string= "replica" (pg::sql-setting-value "effective_wal_level")))
+           (ok (null (getf pg::*physical-recovery-state* :source-logical-fact)))
+           (let ((on (append-source-logical-test-status store t)))
+             (ok (string= "replica" (pg::sql-setting-value "effective_wal_level")))
+             (ok (= on (funcall replay)))
+             (ok (string= "logical" (pg::sql-setting-value "effective_wal_level"))))
+           (let ((off (append-source-logical-test-status store nil)))
+             (ok (string= "logical" (pg::sql-setting-value "effective_wal_level")))
+             (ok (= off (funcall replay)))
+             (ok (string= "replica" (pg::sql-setting-value "effective_wal_level")))
+             (ok (= off (getf (getf pg::*physical-recovery-state* :source-logical-fact) :through)))))))))
+
+(deftest effective-level-failed-status-publication-keeps-current-report
+    (dolist (mode '(:full :rows))
+      (call-with-source-logical-replay-fixture
+       mode
+       (lambda (root store replay)
+         (declare (ignore root))
+         (let ((saved (symbol-function 'pg::physical-recovery-write-control)))
+           (assert (= (append-source-logical-test-status store t) (funcall replay)))
+           (append-source-logical-test-status store nil)
+           (let ((before (copy-tree pg::*physical-recovery-state*)))
+             (unwind-protect
+                  (progn
+                    (setf (symbol-function 'pg::physical-recovery-write-control)
+                          (lambda (&rest arguments)
+                            (declare (ignore arguments))
+                            (throw 'effective-level-cut :cut)))
+                    (ok (eq :cut (catch 'effective-level-cut (funcall replay)))))
+               (setf (symbol-function 'pg::physical-recovery-write-control) saved))
+             (ok (equal before pg::*physical-recovery-state*))
+             (ok (string= "logical" (pg::sql-setting-value "effective_wal_level")))))))))
+
+(deftest effective-level-live-promotion-switches-source-to-local-authority
+    (dolist (enabled '(nil t))
+      (call-with-live-child-fixture
+       (lambda (root store)
+         (pg::wal-atomic-write-bytes (merge-pathnames "PG_VERSION" root)
+                                     (pg::string->bytes (format nil "16~%")))
+         (let* ((pg::*physical-replay-restarting-p* t)
+                (end (append-source-logical-test-status store (not enabled))))
+           (assert (= end (pg::physical-replay-from pg::*last-replay-lsn*)))
+           (pg::physical-store-compact store end #'pg::physical-restartpoint-publish))
+         (let ((pg::*startup-installed-configuration*
+                 (promotion-logical-test-configuration nil (if enabled :logical :replica)))
+               (pg::*wal-level* (if enabled :logical :replica)))
+           (ok (string= (if enabled "replica" "logical")
+                        (pg::sql-setting-value "effective_wal_level")))
+           (call-with-current-promotion-owner
+            (lambda ()
+              (call-with-promotion-exclusion
+               (lambda ()
+                 (pg::call-with-physical-promotion-readers
+                  (lambda ()
+                    (pg::physical-promotion-publish-intent)
+                    (pg::physical-promotion-install-prefix)
+                    (pg::physical-promotion-complete-child)))))))
+           (ok (not (pg::recovery-in-progress-p)))
+           (ok (string= (if enabled "logical" "replica")
+                        (pg::sql-setting-value "effective_wal_level")))))
+       :committed-child nil)))
+
 (defun append-source-logical-test-eor (store)
   (let* ((fork (pg::physical-store-flushed-lsn store))
          (eor (pg::wal-encode-end-of-recovery-record

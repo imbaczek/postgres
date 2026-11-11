@@ -1112,11 +1112,41 @@ This configuration path does not take live admission or the code reload lock."
 (defun startup-check-session-setting (name)
   "Enforce guc.c's POSTMASTER/SIGHUP contexts for SQL SET and RESET."
   (let ((spec (assoc name *startup-setting-specs* :test #'string=)))
-    (when (or (and spec (not (eq (second spec) :user))) (string= name "config_file"))
+    (when (or (and spec (not (eq (second spec) :user)))
+              (member name '("config_file" "effective_wal_level") :test #'string=))
       (ereport "55P02" "parameter ~s cannot be changed~a"
                name (if (or (string= name "config_file")
                             (eq (second spec) :postmaster))
                         " without restarting the server" " now")))))
+
+(defun startup-effective-wal-level (&optional (configuration (startup-capture-configuration)))
+  (let* ((recovery *physical-recovery-state*)
+         (fact (getf recovery :source-logical-fact)))
+    (if recovery
+        (progn
+          (when (and fact
+                     (not (physical-logical-fact-at-p
+                           fact *last-replay-lsn* (physical-recovery-replay-timeline recovery))))
+            (error "published logical status differs from replay progress"))
+          (if (getf fact :enabled) "logical" "replica"))
+        (progn
+          (unless (and configuration
+                       (member (startup-configuration-wal-level configuration) '(:replica :logical)))
+            (error "effective WAL level requires installed configuration"))
+          (sb-thread:with-mutex (*wal-lock*)
+            (let* ((policy (wal-checked-logical-policy-under-lock))
+                   (state (and policy (wal-logical-policy-state policy))))
+              (unless state (error "effective WAL level requires recovered logical status"))
+              (if (or (eq :logical (startup-configuration-wal-level configuration))
+                      (wal-logical-status-enabled state))
+                  "logical" "replica")))))))
+
+(defun startup-effective-wal-level-settings-row (configuration)
+  (vector "effective_wal_level" (startup-effective-wal-level configuration) +null+
+          "internal" "enum" "default"
+          (make-sql-array :element-type-id :text :elements (vector "minimal" "replica" "logical")
+                          :dimensions '(3) :lower-bounds '(1))
+          +null+ +null+ nil))
 
 (defun startup-settings-row (name entry &optional (configuration (startup-capture-configuration)))
   "Expose actual installed settings in guc_funcs.c column units and provenance.
@@ -1167,6 +1197,7 @@ Without an installed root, return session rows."
        (loop for name in (sort (loop for name being the hash-keys of settings collect name) #'string<)
              unless (string= name "synchronous_commit")
                collect (startup-settings-row name (gethash name settings) configuration)))
+     (when configuration (list (startup-effective-wal-level-settings-row configuration)))
      (let ((row (session-synchronous-commit-settings-row configuration)))
        (when row (list row)))
      (list (session-timeout-settings-row) (session-application-name-settings-row)))))
