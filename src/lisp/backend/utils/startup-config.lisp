@@ -1124,8 +1124,9 @@ This configuration path does not take live admission or the code reload lock."
 In recovery, check the published source fact at actual replay progress; ignore
 local policy and future required facts. Unknown legacy status displays replica
 without establishing OFF evidence. On a primary, combine the captured configured
-level with checked published status under the WAL lock; missing state is an error.
-This reports published policy, not C's per-backend transaction cache timing."
+level with the backend's acknowledged logical-info cache; missing state is an error.
+The getter takes no WAL lock, so SHOW can see provisional ON before its marker.
+SELECT current_setting or pg_settings may first wait while settling a snapshot."
   (let* ((recovery *physical-recovery-state*)
          (fact (getf recovery :source-logical-fact)))
     (if recovery

@@ -15,12 +15,16 @@
 
 (defstruct (wal-logical-info
             (:constructor %make-wal-logical-info (incarnation generation enabled)))
+  "Incarnation-owned bit and generation published under the XID lock.
+ON is also a positive reason for native capture."
   (incarnation nil :read-only t)
   (generation 0 :read-only t)
   (enabled nil :read-only t))
 
 (defstruct (wal-logical-info-cache
             (:constructor %make-wal-logical-info-cache (generation enabled pending held-xid)))
+  "Backend reporting cache; pending delays refresh until its real XID ends.
+HELD-XID retains logical ownership in a failed block after resource cleanup."
   (generation 0 :read-only t)
   (enabled nil :read-only t)
   (pending nil :read-only t)
@@ -58,6 +62,7 @@
   (values))
 
 (defun wal-logical-info-deliver-cache (cache info xid)
+  "Acknowledge INFO now, retaining the cached bit while a real XID is held."
   (wal-logical-info-check-cache-input cache info xid)
   (when (and (null cache) xid)
     (error "logical info cache must be initialized before XID assignment"))
@@ -76,6 +81,7 @@
             (%make-wal-logical-info-cache generation (wal-logical-info-enabled info) nil nil)))))
 
 (defun wal-logical-info-end-cache (cache info xid preserve-failed)
+  "Refresh at transaction cleanup, or latch the XID through a failed block."
   (wal-logical-info-check-cache-input cache info xid)
   (unless (member preserve-failed '(nil t)) (error "invalid logical info cleanup mode"))
   (let ((held (or xid (and cache (wal-logical-info-cache-held-xid cache)))))
@@ -119,6 +125,7 @@
   backend)
 
 (defun wal-logical-info-finish-backend-under-xid-lock (backend preserve-failed)
+  "Finish cache ownership under the leaf XID lock before later admission work."
   (assert (sb-thread:holding-mutex-p *xid-lock*))
   (let* ((info (wal-logical-info-current-under-xid-lock t))
          (cache (backend-logical-info-cache backend))
@@ -129,6 +136,8 @@
   (values))
 
 (defun wal-logical-info-backend-enabled (backend)
+  "Read the backend reporting cache without taking the WAL lock.
+Native row capture uses a separately pinned, conservative XID decision."
   (wal-check-healthy)
   (unless *wal-ready* (error "logical info requires initialized WAL"))
   (sb-thread:with-mutex (*xid-lock*)
@@ -164,6 +173,8 @@
                                                   (unless rebase (backend-xid backend))))))))
 
 (defun wal-logical-info-publish-under-lock (enabled &key rebase incarnation extra-backends)
+  "Publish and acknowledge a reporting generation under WAL, registry, then XID locks.
+A full storage replacement requires all real XIDs and activation arms to drain."
   (assert (sb-thread:holding-mutex-p *wal-lock*))
   (unless (and (member enabled '(nil t)) (member rebase '(nil t))
                (or (null incarnation) (and (symbolp incarnation) rebase)))
@@ -203,6 +214,8 @@
            (eq (wal-logical-info-enabled prior) (wal-logical-info-enabled replacement)))))
 
 (defun wal-logical-info-rebind-incarnation (prior old new)
+  "Prepare the same bit and generation for a CLOG rebind. This object grants no
+writer authority; activation tokens remain separate."
   (when prior
     (unless (and (wal-logical-info-valid-p prior)
                  (eq old (wal-logical-info-incarnation prior))
@@ -212,6 +225,7 @@
                             (wal-logical-info-enabled prior))))
 
 (defstruct wal-logical-info-activation
+  "Preflight request and interest token, without writer authority."
   (incarnation nil :read-only t)
   (slot-name nil :read-only t))
 
@@ -221,6 +235,7 @@
       (sb-thread:with-mutex (*wal-lock*) (funcall function))))
 
 (defun wal-logical-info-begin-activation (token activation)
+  "Publish provisional logical-info ON before old XIDs drain and durable status."
   (call-with-logical-info-wal-lock
    (lambda ()
      (wal-check-healthy)
@@ -259,6 +274,7 @@ transition while an enabled state is still in force."
   (pending-disable nil :read-only t))
 
 (defun wal-logical-info-end-activation (token failed)
+  "Release activation interest and queue disable after failure when needed."
   (call-with-logical-info-wal-lock
    (lambda ()
      (let ((removed (sb-thread:with-mutex (*xid-lock*)
@@ -537,6 +553,9 @@ removes the force only after flush. An incomplete publication poisons WAL."
         (publish))))
 
 (defun wal-process-pending-logical-disable-under-lock (begin-publication)
+  "Process queued disable without waiting. Clear it if interest returns; defer
+while an arm or activation remains. Otherwise publish durable OFF, or clear
+provisional logical info without an OFF record if ON was never durable."
   (let* ((policy (wal-checked-logical-policy-under-lock))
          (state (and policy (wal-logical-policy-state policy)))
          (pending (or *wal-logical-info-disable-pending*

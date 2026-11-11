@@ -134,7 +134,9 @@ cannot change. Exhaustion raises FATAL before authentication success is sent."
   backend)
 
 (defun register-backend (backend)
-  "Register a unique PID and enroll late arrivals for closed-gate cleanup."
+  "Register a unique PID and enroll late arrivals for closed-gate cleanup.
+Initialize its logical cache before enrollment under live-operation, registry,
+then XID exclusion."
   ;; Serialize with the reload snapshot. A provisional backend registered after
   ;; admission closes may finish teardown during drain, but must not gain SQL
   ;; transaction-drain eligibility merely by arriving late.

@@ -272,13 +272,17 @@ incarnation and is reconstructed from checkpoint and WAL, not a control extensio
 (defvar *wal-logical-policy* nil
   "WAL-owned logical status evidence; NIL is unknown, :UNRECOVERED awaits redo.")
 
-(defvar *wal-logical-info* nil)
+(defvar *wal-logical-info* nil
+  "Current incarnation-owned logical info, protected by the XID lock.")
 
-(defvar *wal-logical-info-generation* 0)
+(defvar *wal-logical-info-generation* 0
+  "Monotone generation under XID lock; CLOG rebind retains the same generation.")
 
-(defvar *wal-logical-info-activations* (make-hash-table :test #'eq))
+(defvar *wal-logical-info-activations* (make-hash-table :test #'eq)
+  "Activation interest tokens, protected by the XID lock.")
 
-(defvar *wal-logical-info-disable-pending* nil)
+(defvar *wal-logical-info-disable-pending* nil
+  "Deferred logical info disable request, protected by the WAL lock.")
 
 (defvar *logical-capture-force* nil
   "Capture mode for new XIDs, protected by the XID lock and changed under WAL.")
@@ -660,9 +664,9 @@ Legacy 16-hex segment names always belong to timeline 1."
 (defun wal-crc32-typed-range (bytes start end table &optional (seed #xffffffff))
   "Return the final inverted CRC for a validated octet range and raw SEED.
 The caller supplies a simple octet vector, valid fixnum bounds, a 256-entry
-unsigned 32-bit table and a 32-bit SEED.  On x86-64, PCLMUL is used when
-available for slices of at least 128 bytes and an exact IEEE table; otherwise
-use the seeded scalar recurrence.  Inputs are read only."
+unsigned 32-bit table and a 32-bit SEED. For slices of at least 128 bytes and
+an exact IEEE table, use x86-64 PCLMUL or ARM64 CRC32 when available; otherwise
+use the seeded scalar recurrence. Inputs are read only."
   (declare (type (simple-array (unsigned-byte 8) (*)) bytes)
            (type (simple-array (unsigned-byte 32) (256)) table)
            (type fixnum start end)
@@ -684,9 +688,9 @@ use the seeded scalar recurrence.  Inputs are read only."
 
 (defun wal-crc32 (bytes &optional (start 0) (end (length bytes)))
   "Return the final IEEE CRC-32 of BYTES from START inclusive to END exclusive.
-The initial running state is #xffffffff.  On x86-64, valid simple octet
-slices of at least 128 bytes use PCLMUL when available and when all 256 table
-entries match the IEEE table.  Other inputs retain the scalar calculation,
+The initial running state is #xffffffff. Valid simple octet slices of at
+least 128 bytes use x86-64 PCLMUL or ARM64 CRC32 when available and when all
+256 table entries match the IEEE table. Other inputs retain the scalar calculation,
 including the behavior of a modified table.  BYTES is read without mutation.
 This native WAL checksum remains IEEE CRC-32; PostgreSQL C uses CRC-32C."
   (let ((table (and (boundp '*wal-crc32-table*) *wal-crc32-table*)))

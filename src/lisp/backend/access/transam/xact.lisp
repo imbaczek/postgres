@@ -932,9 +932,9 @@ holding a portal snapshot must be allowed to run so it can release its pin."
 
 (defun xid-allocate-under-lock (&optional owner)
   "Assign an XID and fix its logical capture decision under the XID lock.
-Logical level always captures. At replica level, live slots, an arming slot or
-an unknown live-slot count require capture. The decision stays with the XID as
-its mutations arrive.
+Logical level always captures. At replica level, shared logical info, capture
+force, live slots, an arming slot or an unknown live-slot count require capture.
+The decision stays with the XID as its mutations arrive.
 When OWNER is supplied, publish its XID with the active registration and next
 counter under the XID lock and interrupt mask, so cleanup can find it."
   (xid-check-allocation-owner owner)
@@ -1418,8 +1418,9 @@ Pass BACKEND when releasing its virtual reader ID."
 
 (defun call-with-logical-capture-armed (function &key activation)
   "Arm capture for new XIDs, then drain older uncaptured XIDs before FUNCTION.
-Keep the arm until FUNCTION exits, including on error; after release, reconsider
-any deferred disable without holding the XID lock."
+An activation publishes provisional logical-info ON before draining old XIDs
+and before the durable status record. Keep the arm through FUNCTION and
+reconsider deferred disable after release, without holding the XID lock."
   (when (and activation (not (wal-logical-info-activation-p activation)))
     (error "invalid logical activation scope"))
   (let ((token (gensym "LOGICAL-CAPTURE-ARM-")) (old-xids nil)
