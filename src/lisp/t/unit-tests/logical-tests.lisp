@@ -420,6 +420,8 @@
          (*pgdata* test-pgdata)
          (*backend* nil)
          (*wal-ready* t)
+         (*wal-logical-policy* nil)
+         (*logical-capture-force* nil)
          (*wal-end-lsn* 0)
          (*wal-checkpoint-lsn* 0)
          (*wal-durable-lsn* 0)

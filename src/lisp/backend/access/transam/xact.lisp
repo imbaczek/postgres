@@ -2134,6 +2134,7 @@ VACUUM FULL wait for this scope."
   ;; Match statement-start admission before this transaction can publish the
   ;; long-lived snapshot that wraparound coordination must drain.
   (prepare-xid-wraparound-for-statement *backend*)
+  (wal-report-logical-decoding-status t)
   (let ((backend *backend*))
     (with-schema-read-lock
       (let ((registration (make-snapshot-registration))
@@ -2238,6 +2239,7 @@ VACUUM FULL wait for this scope."
   (unless *backend* (ereport "55000" "exported snapshots require an active backend"))
   (unless (eq (backend-state *backend*) :idle)
     (ereport "25001" "cannot export a snapshot from inside a transaction"))
+  (prepare-xid-wraparound-for-statement *backend*)
   (call-with-logical-capture-armed
    (lambda () (%call-with-exported-snapshot slot-name function))
    :activation (make-wal-logical-info-activation :slot-name slot-name)))
