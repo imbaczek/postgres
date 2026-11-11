@@ -177,9 +177,15 @@ The saved restart floor remains internal; consumer cleanup runs after locks drai
        (let ((candidate (wal-copy-replication-slot-with-profile slot)))
          (setf (wal-replication-slot-wal-status candidate) :lost
                (wal-replication-slot-pending-xids candidate) (make-hash-table :test #'eql))
-         (wal-save-replication-slot candidate)
-         (setf (wal-replication-slot-wal-status slot) :lost
-               (wal-replication-slot-pending-xids slot) (wal-replication-slot-pending-xids candidate))
+         (if (wal-logical-slot-p slot)
+             (progn
+               (setf (wal-replication-slot-invalidation-cause candidate) :wal-removed)
+               (logical-slot-save-update-under-lock slot candidate))
+             (progn
+               (wal-save-replication-slot candidate)
+               (setf (wal-replication-slot-wal-status slot) :lost
+                     (wal-replication-slot-pending-xids slot)
+                     (wal-replication-slot-pending-xids candidate))))
          (when *wal-replication-slot-loss-collector*
            (push slot (car *wal-replication-slot-loss-collector*))))))
    *wal-replication-slots*)

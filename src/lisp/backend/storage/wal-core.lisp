@@ -188,6 +188,9 @@ other logical provenance and cause integration remains a codec foundation."
   (when (wal-replication-slot-creation-failed-p slot)
     (ereport "55000" "replication slot ~s creation failed; restart required"
              (wal-replication-slot-name slot)))
+  (when (wal-replication-slot-state-uncertain-p slot)
+    (ereport "55000" "replication slot ~s state is uncertain; restart required"
+             (wal-replication-slot-name slot)))
   slot)
 
 (defun wal-require-usable-replication-slot (slot)
@@ -3108,6 +3111,8 @@ changes throughout."
 (defun wal-slot-reserved-p (slot)
   "Return the healthy internal restart floor, if any.
 This is distinct from the advisory public reserved, extended or unreserved status."
+  (when (wal-replication-slot-state-uncertain-p slot)
+    (error "cannot recycle WAL while a replication slot state is uncertain"))
   (and (eq :reserved (wal-replication-slot-wal-status slot))
        (wal-replication-slot-restart-lsn slot)))
 
@@ -3504,6 +3509,8 @@ must separately validate system, history, lifetime, replay and storage context."
              pending)
     restart-lsn))
 
+(declaim (ftype function logical-slot-save-update-under-lock))
+
 (defun wal-persist-replication-slot-ack-under-lock (slot acknowledged-lsn
                                                     &optional (restart-floor acknowledged-lsn))
   "Persist an already-validated slot acknowledgment while *WAL-LOCK* is held."
@@ -3514,13 +3521,7 @@ must separately validate system, history, lifetime, replay and storage context."
     (setf (wal-replication-slot-confirmed-flush-lsn candidate) acknowledged-lsn
           (wal-replication-slot-restart-lsn candidate) restart-lsn
           (wal-replication-slot-pending-xids candidate) pending)
-    ;; Persist first: checkpoint recycling cannot observe the new horizon until
-    ;; the durable slot file records the consumer's acknowledgment.
-    (wal-save-replication-slot candidate)
-    (setf (wal-replication-slot-confirmed-flush-lsn slot) acknowledged-lsn
-          (wal-replication-slot-restart-lsn slot) restart-lsn
-          (wal-replication-slot-pending-xids slot) pending)
-    slot))
+    (logical-slot-save-update-under-lock slot candidate)))
 
 (defun wal-acknowledge-replication-slot
     (name acknowledged-lsn &optional expected-owner)

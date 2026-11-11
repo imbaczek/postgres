@@ -143,6 +143,172 @@
     (wal-slot-set-initial-profile slot profile)
     slot))
 
+(rove:deftest logical-slot-retention-invalidation-uses-guarded-save
+    (dolist (fail-p '(nil t))
+      (call-with-canonical-wal-slot-fixture
+       (lambda ()
+         (let* ((slot (unit-logical-provenance-slot))
+                (fired nil)
+                (marker (make-condition 'simple-error :format-control "invalidation save fault")))
+           (wal-create-replication-slot-file slot)
+           (setf (gethash "fixture" *wal-replication-slots*) slot)
+           (let ((*logical-test-failpoint-hook*
+                   (lambda (point &rest ignored)
+                     (declare (ignore ignored))
+                     (when (and fail-p
+                                (eq point :slot-file-after-directory-fsync-before-memory-publication))
+                       (setf fired t)
+                       (error marker)))))
+             (rove:ok
+              (eq (if fail-p marker :complete)
+                  (handler-case
+                      (progn
+                        (sb-thread:with-mutex (*wal-lock*)
+                          (wal-invalidate-replication-slots-matching-under-lock (constantly t)))
+                        :complete)
+                    (error (condition) condition)))))
+           (rove:ok (eq fail-p fired))
+           (rove:ok (eq fail-p (wal-replication-slot-state-uncertain-p slot)))
+           (rove:ok (= 32 (wal-replication-slot-restart-lsn slot)))
+           (rove:ok (eq (if fail-p :none :wal-removed)
+                        (logical-slot-effective-invalidation-cause slot)))
+           (rove:ok (eq (if fail-p :reserved :lost) (wal-replication-slot-wal-status slot)))
+           (rove:ok (eq :wal-removed
+                        (logical-slot-effective-invalidation-cause
+                         (wal-read-replication-slot (wal-replication-slot-path "fixture"))))))))))
+
+(rove:deftest logical-slot-guard-publishes-one-checked-candidate
+    (call-with-canonical-wal-slot-fixture
+     (lambda ()
+       (let* ((slot (unit-logical-provenance-slot))
+              (candidate (wal-copy-replication-slot-with-profile slot)))
+         (wal-create-replication-slot-file slot)
+         (setf (gethash "fixture" *wal-replication-slots*) slot
+               (wal-replication-slot-confirmed-flush-lsn candidate) 90
+               (wal-replication-slot-restart-lsn candidate) 48)
+         (rove:ok (eq slot
+                      (sb-thread:with-mutex (*wal-lock*)
+                        (logical-slot-save-update-under-lock slot candidate))))
+         (rove:ok (= 90 (wal-replication-slot-confirmed-flush-lsn slot)))
+         (rove:ok (= 48 (wal-replication-slot-restart-lsn slot)))
+         (rove:ok (eq (wal-replication-slot-pending-xids candidate)
+                      (wal-replication-slot-pending-xids slot)))
+         (rove:ok (not (wal-replication-slot-state-uncertain-p slot)))
+         (rove:ok (equalp (wal-encode-replication-slot slot)
+                          (wal-encode-replication-slot
+                           (wal-read-replication-slot (wal-replication-slot-path "fixture")))))))))
+
+(rove:deftest logical-slot-guard-rejects-identity-and-progress-changes-before-save
+    (dolist (mode '(:stale :provenance :database :birth :plugin :profile :backward))
+      (call-with-canonical-wal-slot-fixture
+       (lambda ()
+         (let* ((slot (unit-logical-provenance-slot :plugin "pg_lisp"))
+                (candidate (if (eq mode :provenance)
+                               (unit-logical-provenance-slot :plugin "pg_lisp" :generation 1)
+                               (wal-copy-replication-slot-with-profile slot)))
+                (writes 0))
+           (wal-create-replication-slot-file slot)
+           (setf (gethash "fixture" *wal-replication-slots*) slot)
+           (ecase mode
+             (:stale (setf (gethash "fixture" *wal-replication-slots*)
+                           (wal-copy-replication-slot-with-profile slot)))
+             (:provenance)
+             (:database (setf (wal-replication-slot-database-oid candidate) 8))
+             (:birth (setf (wal-replication-slot-consistent-lsn candidate) 66))
+             (:plugin (setf (wal-replication-slot-plugin candidate) "pgoutput"))
+             (:profile (setf (gethash candidate *wal-slot-profiles*) :binary-bytea))
+             (:backward (setf (wal-replication-slot-confirmed-flush-lsn candidate) 79)))
+           (let ((*logical-test-failpoint-hook*
+                   (lambda (point &rest ignored)
+                     (declare (ignore ignored))
+                     (when (eq point :slot-file-before-write) (incf writes)))))
+             (rove:ok (handler-case
+                          (progn
+                            (sb-thread:with-mutex (*wal-lock*)
+                              (logical-slot-save-update-under-lock slot candidate))
+                            nil)
+                        (error () t))
+                      (format nil "~a rejected" mode)))
+           (rove:ok (zerop writes) "validation precedes every disk write")
+           (rove:ok (not (wal-replication-slot-state-uncertain-p slot))
+                    "pre-save validation does not fence a healthy slot"))))))
+
+(rove:deftest logical-slot-guard-keeps-first-terminal-cause
+    (dolist (cause '(:wal-removed :wal-level-insufficient))
+      (call-with-canonical-wal-slot-fixture
+       (lambda ()
+         (let* ((slot (unit-logical-provenance-slot :cause cause))
+                (candidate (wal-copy-replication-slot-with-profile slot)))
+           (wal-create-replication-slot-file slot)
+           (setf (gethash "fixture" *wal-replication-slots*) slot
+                 (wal-replication-slot-invalidation-cause candidate)
+                 (if (eq cause :wal-removed) :wal-level-insufficient :wal-removed))
+           (rove:ok (handler-case
+                        (progn
+                          (sb-thread:with-mutex (*wal-lock*)
+                            (logical-slot-save-update-under-lock slot candidate))
+                          nil)
+                      (error () t)))
+           (rove:ok (eq cause (logical-slot-effective-invalidation-cause slot)))
+           (rove:ok (not (wal-replication-slot-state-uncertain-p slot))))))))
+
+(rove:deftest logical-slot-ambiguous-ack-save-fences-old-pin
+    (dolist (exit-kind '(:error :throw))
+      (call-with-canonical-wal-slot-fixture
+       (lambda ()
+         (let* ((slot (unit-logical-provenance-slot))
+                (old-pending (wal-replication-slot-pending-xids slot))
+                (fired nil)
+                (marker (make-condition 'simple-error :format-control "ambiguous slot save")))
+           (wal-create-replication-slot-file slot)
+           (setf (gethash "fixture" *wal-replication-slots*) slot)
+           (let ((*logical-test-failpoint-hook*
+                   (lambda (point &rest ignored)
+                     (declare (ignore ignored))
+                     (when (eq point :slot-file-after-directory-fsync-before-memory-publication)
+                       (setf fired t)
+                       (if (eq exit-kind :error) (error marker) (throw :slot-save-abort :aborted))))))
+             (rove:ok
+              (eq (if (eq exit-kind :error) marker :aborted)
+                  (catch :slot-save-abort
+                    (handler-case
+                        (sb-thread:with-mutex (*wal-lock*)
+                          (wal-persist-replication-slot-ack-under-lock slot 90))
+                      (error (condition) condition))))
+              "the intended error or nonlocal exit escapes"))
+           (rove:ok fired "fault reached the durable publication boundary")
+           (rove:ok (= 90 (wal-replication-slot-confirmed-flush-lsn
+                           (wal-read-replication-slot (wal-replication-slot-path "fixture"))))
+                    "new image can be durable despite the failed call")
+           (rove:ok (= 80 (wal-replication-slot-confirmed-flush-lsn slot)))
+           (rove:ok (= 32 (wal-replication-slot-restart-lsn slot)) "old retention pin remains")
+           (rove:ok (eq old-pending (wal-replication-slot-pending-xids slot)))
+           (rove:ok (wal-replication-slot-state-uncertain-p slot))
+           (rove:ok (handler-case (progn (wal-require-usable-replication-slot slot) nil)
+                      (error () t)) "uncertain slot rejects further use")
+           (let* ((owner (gensym "FENCED-SLOT-OWNER-"))
+                  (*wal-logical-slot-owner* owner))
+             (setf (wal-replication-slot-active-owner slot) owner)
+             (dolist (operation
+                      (list (lambda () (wal-acknowledge-replication-slot "fixture" 90 owner))
+                            (lambda () (wal-save-replication-slot slot))
+                            (lambda ()
+                              (call-with-wal-retained-slot-scan
+                               "fixture" 80 100 (lambda (scan) (declare (ignore scan)) t)))))
+               (rove:ok (handler-case (progn (funcall operation) nil)
+                          (pg-error (condition) (string= "55000" (pg-error-sqlstate condition))))
+                        "ACK, save and retained scan all reject uncertain state")))
+           (rove:ok
+            (handler-case
+                (progn
+                  (sb-thread:with-mutex (*wal-lock*)
+                    (wal-slot-removal-segment
+                     10 10 (* 10 +wal-segment-size+)
+                     (make-wal-slot-retention-policy :mode :segments :limit 0)))
+                  nil)
+              (error () t))
+            "a retention cap cannot bypass an uncertain slot"))))))
+
 (rove:deftest logical-slot-startup-reads-durable-catalog-before-catalog-init
     (dolist (known-p '(t nil))
       (call-with-canonical-wal-slot-fixture
