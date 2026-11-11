@@ -17,6 +17,63 @@
                        collect (list name (list (list name :file #o600 1 (+ 1000 index) 1 42))))
             :stage-tree (tree 2000) :new (tree 3000)))))
 
+(defun metadata-codec-test-storage (image shape)
+  (let ((size (length image)))
+    (ecase shape
+      (:simple image)
+      (:adjustable
+       (make-array size :element-type '(unsigned-byte 8) :initial-contents image :adjustable t))
+      (:fill-pointer
+       (let ((result (make-array (+ size 7) :element-type '(unsigned-byte 8)
+                                            :initial-element 255 :adjustable t :fill-pointer size)))
+         (replace result image)
+         result))
+      (:displaced
+       (let ((backing (make-array (+ size 6) :element-type '(unsigned-byte 8) :initial-element 255)))
+         (replace backing image :start1 3)
+         (make-array size :element-type '(unsigned-byte 8)
+                          :displaced-to backing :displaced-index-offset 3))))))
+
+(cl-spec:defproperty adoption-install-storage-shapes-preserve-progress
+    ((shape (member :simple :adjustable :fill-pointer :displaced))
+     (old-count (range integer 1 4)) (index (range integer 0 200)) (cut (range integer 0 50)))
+  (:about pg::physical-adoption-install-decode)
+  (:trials (:normal 100))
+  (let* ((plan (adoption-install-codec-fixture old-count))
+         (last (pg::physical-adoption-install-last-step plan))
+         (step (mod index last))
+         (before (pg::physical-adoption-install-image plan step))
+         (after (pg::physical-adoption-install-image plan (1+ step)))
+         (prefix (mod cut (- (length after) (length before))))
+         (image (subseq after 0 (+ (length before) prefix)))
+         (bytes (metadata-codec-test-storage image shape))
+         (state (pg::physical-adoption-install-decode bytes)))
+    (fill bytes 0)
+    (and (equal plan (getf state :plan))
+         (= step (getf state :step))
+         (= (length before) (getf state :valid-length))
+         (eq (plusp prefix) (not (null (getf state :partial)))))))
+
+(deftest adoption-install-generated-storage-contract
+    (let ((data (cl-spec:result-data
+                 (cl-spec:run-property 'adoption-install-storage-shapes-preserve-progress
+                                       :seed 316 :profile :normal))))
+      (ok (eq :passed (getf data :status)) (format nil "~s" data))))
+
+(deftest adoption-install-decoder-bounds-progress-limit-traversals
+    (let* ((plan (adoption-install-codec-fixture 32))
+           (last (pg::physical-adoption-install-last-step plan))
+           (image (pg::physical-adoption-install-image plan last))
+           (original (symbol-function 'pg::physical-adoption-install-last-step))
+           (calls 0))
+      (unwind-protect
+           (progn
+             (setf (symbol-function 'pg::physical-adoption-install-last-step)
+                   (lambda (value) (incf calls) (funcall original value)))
+             (ok (= last (getf (pg::physical-adoption-install-decode image) :step)))
+             (ok (<= 1 calls 2) (format nil "progress-limit helper called ~d times" calls)))
+        (setf (symbol-function 'pg::physical-adoption-install-last-step) original))))
+
 (deftest adoption-install-codec-roundtrips-the-immutable-plan-and-progress
     (let* ((plan (adoption-install-codec-fixture))
            (last (+ 1 (length (getf plan :old)) (length (getf plan :new)))))

@@ -33,6 +33,36 @@
                      collect (list (copy-seq name) 1 inode (if size #o100600 #o040700) (if size 1 2)
                                    1000 (or size 4096) 20 30 digest)))))
 
+(cl-spec:defproperty reseed-install-storage-shapes-preserve-unicode-progress
+    ((shape (member :simple :adjustable :fill-pointer :displaced))
+     (unicode (member nil t)) (old-count (range integer 0 4))
+     (index (range integer 0 200)) (cut (range integer 0 50)))
+  (:about pg::physical-reseed-install-decode)
+  (:trials (:normal 100))
+  (let ((plan (reseed-install-codec-fixture old-count)))
+    (when unicode
+      (setf (getf (getf (getf plan :attempt) :local) :directory)
+            "/tmp/reseed-attempt-λ-🦉/"))
+    (let* ((last (pg::physical-reseed-install-last-step plan))
+           (step (mod index last))
+           (before (pg::physical-reseed-install-image plan step))
+           (after (pg::physical-reseed-install-image plan (1+ step)))
+           (prefix (mod cut (- (length after) (length before))))
+           (image (subseq after 0 (+ (length before) prefix)))
+           (bytes (metadata-codec-test-storage image shape))
+           (state (pg::physical-reseed-install-decode bytes)))
+      (fill bytes 0)
+      (and (equal plan (getf state :plan))
+           (= step (getf state :step))
+           (= (length before) (getf state :valid-length))
+           (eq (plusp prefix) (not (null (getf state :partial))))))))
+
+(deftest reseed-install-generated-storage-and-unicode-contract
+    (let ((data (cl-spec:result-data
+                 (cl-spec:run-property 'reseed-install-storage-shapes-preserve-unicode-progress
+                                       :seed 315 :profile :normal))))
+      (ok (eq :passed (getf data :status)) (format nil "~s" data))))
+
 (cl-spec:defproperty reseed-install-codec-preserves-plan-and-next-step-prefix
     ((old-count (range integer 0 5)) (index (range integer 0 200)) (cut (range integer 0 25)))
   (:about pg::physical-reseed-install-image pg::physical-reseed-install-decode)

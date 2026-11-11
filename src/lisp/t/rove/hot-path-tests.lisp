@@ -69,6 +69,49 @@
     (dotimes (iteration 4096) (apply function arguments))
     (- (sb-ext:get-bytes-consed) before)))
 
+(cl-spec:defproperty install-progress-scratch-matches-canonical-writers
+    ((crc (range integer 0 4294967295)) (step (range integer 1 200001)))
+  (:about %physical-install-write-progress)
+  (:trials (:normal 200))
+  (let* ((scratch (make-array 32 :element-type '(unsigned-byte 8) :initial-element 255))
+         (size (%physical-install-write-progress crc step scratch))
+         (expected (physical-adoption-install-step-image crc step)))
+    (and (= size (length expected))
+         (equalp (subseq scratch 0 size) expected)
+         (equalp expected (physical-reseed-install-step-image crc step)))))
+
+(rove:deftest install-progress-generated-scratch-encoding-contract
+    (unit-check-property 'install-progress-scratch-matches-canonical-writers))
+
+(rove:deftest install-progress-scratch-covers-decimal-and-hex-boundaries
+    (dolist (crc '(0 1 2147483648 4294967295))
+      (let ((scratch (make-array 32 :element-type '(unsigned-byte 8) :initial-element 255)))
+        (dolist (step '(1 9 10 99 100 999 1000 9999 10000 99999 100000 200001))
+          (let ((size (%physical-install-write-progress crc step scratch)))
+            (rove:ok (equalp (subseq scratch 0 size)
+                             (physical-adoption-install-step-image crc step))))))))
+
+(rove:deftest install-progress-scratch-is-allocation-free-with-scalar-crc
+    (let* ((*wal-crc32-table* (make-array 256 :element-type t :initial-contents *wal-crc32-table*))
+           (scratch (make-array 32 :element-type '(unsigned-byte 8) :initial-element 255))
+           (arguments (list 4294967295 200001 scratch)))
+      (rove:ok (zerop (unit-hot-call-allocated-bytes #'%physical-install-write-progress arguments)))
+      (let ((size (%physical-install-write-progress 4294967295 200001 scratch)))
+        (rove:ok (equalp (subseq scratch 0 size)
+                         (physical-adoption-install-step-image 4294967295 200001))))))
+
+(setf (gethash '%physical-install-write-u32-hex *unit-hot-probes*)
+      (let ((scratch (make-array 32 :element-type '(unsigned-byte 8) :initial-element 255)))
+        (list (list 0 scratch 0) (list 4294967295 scratch 24) (list 2147483648 scratch 8)))
+      (gethash '%physical-install-write-step *unit-hot-probes*)
+      (let ((scratch (make-array 32 :element-type '(unsigned-byte 8) :initial-element 255)))
+        (loop for step in '(1 9 10 99 100 999 1000 9999 10000 99999 100000 200001)
+              collect (list step scratch 26)))
+      (gethash '%physical-install-write-progress *unit-hot-probes*)
+      (let ((scratch (make-array 32 :element-type '(unsigned-byte 8) :initial-element 255)))
+        (loop for step in '(1 9 10 99 100 999 1000 9999 10000 99999 100000 200001)
+              append (list (list 0 step scratch) (list 4294967295 step scratch)))))
+
 (setf (gethash '%wal-crc32-octets *unit-hot-probes*)
       (let ((bytes (make-array 257 :element-type '(unsigned-byte 8) :initial-element 127))
             (table *wal-crc32-table*))

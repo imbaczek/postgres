@@ -20,6 +20,39 @@
                         :owner (pg::physical-libpq-frozen-profile-datum
                                 (pg::make-physical-libpq-frozen-profile info))))))
 
+(cl-spec:defproperty reseed-attempt-storage-shapes-preserve-owned-unicode-intent
+    ((shape (member :simple :adjustable :fill-pointer :displaced))
+     (unicode (member nil t)) (phase (range integer 0 2)))
+  (:about pg::physical-reseed-attempt-decode)
+  (:trials (:normal 100))
+  (let ((record (reseed-attempt-test-record)))
+    (setf (getf record :phase) (nth phase '(:premanifest :aborting :aborted)))
+    (when unicode
+      (setf (getf (getf record :local) :directory) "/tmp/reseed-attempt-λ-🦉/"))
+    (let* ((expected (pg::physical-reseed-attempt-copy record))
+           (bytes (metadata-codec-test-storage (pg::physical-reseed-attempt-image expected) shape))
+           (decoded (pg::physical-reseed-attempt-decode bytes)))
+      (fill bytes 0)
+      (equal expected decoded))))
+
+(deftest reseed-attempt-generated-storage-and-unicode-contract
+    (let ((data (cl-spec:result-data
+                 (cl-spec:run-property 'reseed-attempt-storage-shapes-preserve-owned-unicode-intent
+                                       :seed 314 :profile :normal))))
+      (ok (eq :passed (getf data :status)) (format nil "~s" data))))
+
+(deftest reseed-attempt-rejects-checksummed-invalid-utf8-in-all-storage-shapes
+    (dolist (shape '(:simple :adjustable :fill-pointer :displaced))
+      (let* ((image (pg::physical-reseed-attempt-image (reseed-attempt-test-record)))
+             (start (1+ (position 10 image)))
+             (end (1- (length image))))
+        (setf (aref image start) 255)
+        (replace image (pg::string->bytes (format nil "~8,'0X" (pg::wal-crc32 image start end)))
+                 :start1 (length "PGRESEEDATTEMPT1 "))
+        (ok (intake-fails-p
+             (lambda () (pg::physical-reseed-attempt-decode
+                         (metadata-codec-test-storage image shape))))))))
+
 (cl-spec:defproperty reseed-attempt-codec-preserves-intent-and-private-ownership
     ((number (range integer 0 18446744073709551615)) (phase (range integer 0 2)))
   (:about pg::physical-reseed-attempt-copy pg::physical-reseed-attempt-decode)

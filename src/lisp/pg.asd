@@ -219,6 +219,7 @@
                    (:file "../replication/physical-adoption-install-fs")
                    (:file "../replication/physical-reseed-image")
                    (:file "../replication/physical-reseed-install-inventory")
+                   (:file "../replication/physical-install-progress.hot")
                    (:file "../replication/physical-reseed-install-codec")
                    (:file "../replication/physical-reseed-install-auxiliary")
                    (:file "../replication/physical-reseed-install-owner")

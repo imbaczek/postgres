@@ -107,7 +107,7 @@
     (let* ((body (subseq text (1+ newline)))
            (crc (parse-integer text :start (length prefix) :end newline :radix 16)))
       (unless (and (plusp (length body)) (char= #\Newline (char body (1- (length body))))
-                   (= crc (wal-crc32 (string->bytes (subseq body 0 (1- (length body)))))))
+                   (= crc (wal-crc32 bytes (1+ newline) (1- (length bytes)))))
         (error "reseed attempt checksum mismatch"))
       (let ((record (physical-reseed-attempt-copy (recovery-parse-manifest-text body))))
         (unless (equalp bytes (physical-reseed-attempt-image record))
