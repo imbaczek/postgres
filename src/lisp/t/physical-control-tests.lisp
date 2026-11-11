@@ -275,15 +275,15 @@
     (let* ((old (sample-resource-fact 100 64)) (required (sample-resource-fact 50 192))
                                                (state (list :timeline 1 :replay-timeline 1 :required-applied 256 :required-timeline 1
                                                             :source-resource-fact old :required-resource-fact required)))
-      (ok (equal (list 256 1 required)
+      (ok (equal (list 256 1 required nil nil)
                  (multiple-value-list (pg::physical-recovery-control-frontier state 128))))
       (ok (intake-fails-p (lambda () (pg::physical-recovery-control-frontier state 256))))
       (setf (getf state :source-resource-fact) (copy-tree required))
-      (ok (equal (list 256 1 required)
+      (ok (equal (list 256 1 required nil nil)
                  (multiple-value-list (pg::physical-recovery-control-frontier state 256))))
       (let ((decreased (sample-resource-fact 25 320)))
         (setf (getf state :source-resource-fact) decreased)
-        (ok (equal (list 384 1 decreased)
+        (ok (equal (list 384 1 decreased nil nil)
                    (multiple-value-list (pg::physical-recovery-control-frontier state 384)))))))
 
 (deftest recovery-control-publishes-required-position-and-fact-in-one-image
