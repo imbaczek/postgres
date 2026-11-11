@@ -41,6 +41,33 @@
         (rove:skip "CPU has no PCLMULQDQ; scalar fallback remains covered.")))
 
 #+x86-64
+(rove:deftest native-crc32-unchecked-loads-cover-all-short-lengths-and-alignments
+    (if *native-ieee-crc32-available-p*
+        (let ((mismatch nil)
+              (checks 0))
+          (block check
+            (loop for size from 0 to 257
+                  do (dotimes (start 32)
+                       ;; End the array at END so loads at the slice boundary have
+                       ;; no extra array elements available beyond it.
+                       (let* ((end (+ start size))
+                              (bytes (make-array end :element-type '(unsigned-byte 8))))
+                         (dotimes (index end)
+                           (setf (aref bytes index)
+                                 (mod (+ 17 (* 73 index) (floor index 17)) 256)))
+                         (dolist (seed '(0 #xffffffff #x12345678 #x80000001))
+                           (unless (= (unit-crc32-bit-reference-seeded bytes start end seed)
+                                      (%wal-crc32-ieee-octets
+                                       bytes start end *wal-crc32-table*
+                                       *native-ieee-crc32-constants* seed))
+                             (setf mismatch (list size start seed))
+                             (return-from check))
+                           (incf checks))))))
+          (rove:ok (null mismatch) (format nil "First mismatched size/offset/seed: ~s" mismatch))
+          (rove:ok (= checks (* 258 32 4))))
+        (rove:skip "CPU has no PCLMULQDQ; scalar fallback remains covered.")))
+
+#+x86-64
 (rove:deftest native-crc32-noncanonical-tables-retain-their-byte-recurrence
     (let ((bytes (make-array 2048 :element-type '(unsigned-byte 8) :initial-element 173))
           (*wal-crc32-table* (copy-seq *wal-crc32-table*)))

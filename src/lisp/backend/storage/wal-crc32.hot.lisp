@@ -25,12 +25,14 @@
 #+x86-64
 (defun %wal-crc32-ieee-octets (bytes start end table constants seed)
   "Return the final inverted IEEE CRC-32 for BYTES[START, END).
-SEED is the uncomplemented 32-bit running state.  BYTES must be a simple
-octet vector and START and END valid fixnum bounds. TABLE must be the IEEE
+SEED is the uncomplemented 32-bit running state. BYTES must be a simple
+octet vector with 0 <= START <= END <= its length. TABLE must be the IEEE
 256-entry table and CONSTANTS the preallocated eight unsigned 64-bit folding
-coefficients.  PCLMUL support is required for lengths of at least 16 bytes.
+coefficients. PCLMUL support is required for lengths of at least 16 bytes.
+The caller validates these inputs; the slice bounds cover every unchecked
+vector load.
 Inputs are read only; valid calls allocate no heap storage."
-  (declare (optimize (speed 3) (safety 3))
+  (declare (optimize (speed 3) (safety 0))
            (type (simple-array (unsigned-byte 8) (*)) bytes)
            (type (simple-array (unsigned-byte 32) (256)) table)
            (type fixnum start end)
@@ -42,41 +44,42 @@ Inputs are read only; valid calls allocate no heap storage."
       (let* ((multipliers (sb-simd-sse2:u64.2-aref constants 0))
              (barrett (sb-simd-sse2:u64.2-aref constants 2))
              (state (sb-simd-sse2:u64.2-xor
-                     (sb-simd-sse2:u64.2! (sb-simd-sse2:u8.16-aref bytes index))
+                     (%native-ieee-crc32-load bytes index)
                      (sb-simd-sse2:u64.2! crc))))
         (declare (type sb-simd-sse2:u64.2 state multipliers barrett))
         (incf index 16)
         (when (>= (- end index) 48)
-          (let ((state1 (sb-simd-sse2:u64.2! (sb-simd-sse2:u8.16-aref bytes index)))
-                (state2 (sb-simd-sse2:u64.2! (sb-simd-sse2:u8.16-aref bytes (+ index 16))))
-                (state3 (sb-simd-sse2:u64.2! (sb-simd-sse2:u8.16-aref bytes (+ index 32))))
+          (let ((state1 (%native-ieee-crc32-load bytes index))
+                (state2 (%native-ieee-crc32-load bytes index 16))
+                (state3 (%native-ieee-crc32-load bytes index 32))
                 (mult4 (sb-simd-sse2:u64.2-aref constants 4))
                 (mult2 (sb-simd-sse2:u64.2-aref constants 6)))
             (declare (type sb-simd-sse2:u64.2 state1 state2 state3 mult4 mult2))
             (incf index 48)
-            (loop while (<= (+ index 64) end)
+            ;; The limit admits only complete 64-byte groups. The LOOP cursor
+            ;; keeps their common byte index in one register; each load uses a
+            ;; constant displacement from that index.
+            (loop for cursor of-type sb-int:index from index below (- end 63) by 64
                   do (setf state (%native-ieee-crc32-fold state
-                                                          (sb-simd-sse2:u64.2! (sb-simd-sse2:u8.16-aref bytes index))
+                                                          (%native-ieee-crc32-load bytes cursor)
                                                           mult4)
                            state1 (%native-ieee-crc32-fold state1
-                                                           (sb-simd-sse2:u64.2! (sb-simd-sse2:u8.16-aref bytes (+ index 16)))
+                                                           (%native-ieee-crc32-load bytes cursor 16)
                                                            mult4)
                            state2 (%native-ieee-crc32-fold state2
-                                                           (sb-simd-sse2:u64.2! (sb-simd-sse2:u8.16-aref bytes (+ index 32)))
+                                                           (%native-ieee-crc32-load bytes cursor 32)
                                                            mult4)
                            state3 (%native-ieee-crc32-fold state3
-                                                           (sb-simd-sse2:u64.2! (sb-simd-sse2:u8.16-aref bytes (+ index 48)))
+                                                           (%native-ieee-crc32-load bytes cursor 48)
                                                            mult4))
-                     (incf index 64))
+                  finally (setf index cursor))
             (setf state (%native-ieee-crc32-fold state state2 mult2)
                   state1 (%native-ieee-crc32-fold state1 state3 mult2)
                   state (%native-ieee-crc32-fold state state1 multipliers))))
         (loop while (<= (+ index 16) end)
               do (setf state
                        (%native-ieee-crc32-fold
-                        state
-                        (sb-simd-sse2:u64.2! (sb-simd-sse2:u8.16-aref bytes index))
-                        multipliers))
+                        state (%native-ieee-crc32-load bytes index) multipliers))
                  (incf index 16))
         (setf state
               (sb-simd-sse2:u64.2-xor
@@ -95,4 +98,3 @@ Inputs are read only; valid calls allocate no heap storage."
           do (setf crc (logxor (ash crc -8) (aref table slot)))
              (incf index))
     (logxor crc #xffffffff)))
-

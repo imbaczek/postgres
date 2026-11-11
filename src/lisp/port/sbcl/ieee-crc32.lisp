@@ -85,6 +85,14 @@ constant.  The Lisp body rejects calls that bypass the VOP."
   (declare (ignore left right selector))
   (error "The IEEE CRC-32 intrinsic must be compiled."))
 
+(defmacro %native-ieee-crc32-load (bytes index &optional (offset 0))
+  "Load sixteen octets at INDEX + OFFSET without checking bounds.
+The caller must establish that the whole load lies within the simple octet
+vector. OFFSET is a constant byte displacement, so consecutive loads share
+one unboxed index. This depends on SB-SIMD's internal unchecked load
+intrinsic; keep that dependency confined here."
+  `(sb-simd-sse2:u64.2! (sb-simd-sse2::%u8.16-load ,bytes ,index ,offset)))
+
 (defmacro %native-ieee-crc32-fold (state next multipliers)
   "Fold STATE into NEXT using MULTIPLIERS, evaluating each argument once.
 The expansion keeps SIMD packs unboxed within the caller; a standalone
