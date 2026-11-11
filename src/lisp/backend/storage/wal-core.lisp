@@ -3289,7 +3289,9 @@ and supplies POLICY and KEEP-MB from the same captured configuration."
         do (setf start (1+ end))))
 
 (defun wal-decode-replication-slot-image (bytes expected-name)
-  ;; Decode detached bytes without granting storage or replay authority.
+  "Decode a slot image without applying the local WAL frontier.
+Preserve full 64-bit LSNs. This grants no import or runtime authority; callers
+must separately validate system, history, lifetime, replay and storage context."
   (unless (and (typep bytes '(vector (unsigned-byte 8))) (<= 1 (length bytes) 2048))
     (error "invalid replication slot state bytes"))
   (when (physical-slot-image-p bytes)
@@ -3356,6 +3358,7 @@ and supplies POLICY and KEEP-MB from the same captured configuration."
           slot)))))
 
 (defun wal-decode-replication-slot (bytes expected-name)
+  "Decode a slot for local reads and startup, checking logical LSNs against durable WAL."
   (let ((slot (wal-decode-replication-slot-image bytes expected-name)))
     (when (wal-logical-slot-p slot)
       (unless (and (typep *wal-durable-lsn* '(unsigned-byte 64))
