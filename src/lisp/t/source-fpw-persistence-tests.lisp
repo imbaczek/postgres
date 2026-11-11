@@ -59,15 +59,54 @@
                                         :resource-lsn 16 :resource-timeline 1)
                        :fpw-fact off)))
            (ok (= 268 (length bytes)))
-           (ok (= 285 pg::+physical-recovery-control-maximum-bytes+))
-           (ok (= 285 (second (assoc "physical-recovery.control"
-                                     (pg::physical-backup-metadata-bounds) :test #'equal))))
+           (ok (= (+ 285 pg::+physical-logical-fact-size+) pg::+physical-recovery-control-maximum-bytes+))
+           (ok (= (+ 285 pg::+physical-logical-fact-size+) (second (assoc "physical-recovery.control"
+                                                                          (pg::physical-backup-metadata-bounds) :test #'equal))))
            (pg::wal-atomic-write-bytes (pg::physical-recovery-control-path) bytes)
            (let ((control (pg::physical-recovery-read-control pg::*pgdata*)))
              (ok (= 3 (getf control :phase)))
              (ok (equal off (getf control :fpw-fact)))
              (ok (getf control :retained-reference))
              (ok (getf control :resource-fact))))))))
+
+(deftest source-logical-control-largest-image-survives-bounded-disk-read
+    (call-with-fpw-wal-fixture
+     (lambda ()
+       (multiple-value-bind (off ignored) (source-fpw-persistence-facts)
+         (declare (ignore ignored))
+         (dolist (enabled '(nil t))
+           (dolist (exhausted '(nil t))
+             (let* ((record (pg::make-wal-record
+                             :version 8 :type 18 :xid 0 :start 32 :end 65
+                             :payload (pg::wal-encode-logical-decoding-status-change enabled)))
+                    (fact (pg::physical-logical-fact-next nil record 1 (pg::timeline-parse-history 1 ""))))
+               (setf (getf fact :through) 80)
+               (let* ((bytes (pg::physical-recovery-control-image
+                              3 42 1 4 32 80 (if exhausted 18446744073709551616 3) :state-time 0
+                              :applied-timeline 1 :history-target 3 :history-digest 7
+                              :promotion-child 4 :promotion-generation 9 :promotion-source-namespace :legacy
+                              :retained-reference '(:root-id 1 :base-timeline 1 :base 32
+                                                    :manifest-digest 4 :end 80 :end-digest 7)
+                              :resource-fact '(:resource-parameters (100 8 10 0 128)
+                                               :resource-lsn 16 :resource-timeline 1)
+                              :fpw-fact off :logical-fact fact :promotion-full-page-writes nil))
+                      (path (pg::physical-recovery-control-path)))
+                 (ok (= 373 (length bytes) pg::+physical-recovery-control-maximum-bytes+))
+                 (pg::wal-atomic-write-bytes path bytes)
+                 (dotimes (attempt 2)
+                   (declare (ignorable attempt))
+                   (let ((control (pg::physical-recovery-read-control pg::*pgdata*)))
+                     (ok (equal fact (getf control :logical-fact)))
+                     (ok (not (eq fact (getf control :logical-fact))))
+                     (ok (eq enabled (getf (getf control :logical-fact) :enabled)))
+                     (ok (equal off (getf control :fpw-fact)))
+                     (ok (get-properties control '(:promotion-full-page-writes)))
+                     (ok (null (getf control :promotion-full-page-writes)))
+                     (ok (= (if exhausted 18446744073709551616 3) (getf control :next-xid)))))
+                 (setf (aref bytes (- (length bytes) 5)) 1)
+                 (pg::wal-atomic-write-bytes path bytes)
+                 (ok (handler-case (progn (pg::physical-recovery-read-control pg::*pgdata*) nil)
+                       (error () t)))))))))))
 
 (deftest source-fpw-progress-publication-failures-preserve-runtime-input
     (dolist (point '(:before-write :before-fsync :after-fsync :before-rename

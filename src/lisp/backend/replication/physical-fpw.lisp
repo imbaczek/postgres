@@ -30,18 +30,14 @@
     (error "invalid promotion full page writes intent"))
   (= 1 (aref bytes 8)))
 
-(defun physical-fpw-control-core-size (bytes)
+(defun physical-fpw-control-core-size (bytes &optional (end (length bytes)))
   "Return the old layout size and whether a 17-byte intent follows it.
-Old layouts have lengths divisible by four; the intent adds one modulo four.
+END excludes later suffixes but includes the final CRC's four bytes.
 The caller must still check the layout, intent and CRC."
-  (let ((size (length bytes)))
-    (case (mod size 4)
-      (0 (values size nil))
-      (1 (values (- size +physical-promotion-fpw-intent-size+) t))
-      (otherwise (error "invalid physical recovery control length")))))
-
-(defconstant +physical-recovery-control-maximum-bytes+ (+ 196 +physical-fpw-fact-size+ +physical-promotion-fpw-intent-size+)
-  "Maximum recovery control image size, shared by all bounded readers.")
+  (case (mod end 4)
+    (0 (values end nil))
+    (1 (values (- end +physical-promotion-fpw-intent-size+) t))
+    (otherwise (error "invalid physical recovery control length"))))
 
 (defun physical-fpw-state-fields (fact incarnation)
   "Construct fold evidence with the supplied private owner token."
@@ -100,12 +96,28 @@ must prove coverage through the supplied pair; export checks shape only."
       (unless (physical-fpw-fact-valid-p fact) (error "invalid FPW state export frontier"))
       fact)))
 
-(defun physical-fpw-check-record-owner (start end timeline history)
-  "Check that START and END-1 belong to TIMELINE in selected HISTORY."
+(defun physical-policy-check-record-owner (start end timeline history)
   (unless (and (typep start '(unsigned-byte 64)) (typep end '(unsigned-byte 64))
                (< start end) (= timeline (timeline-at-point start history))
-               (= timeline (timeline-at-point (1- end) history)))
-    (error "FPW evidence crosses its selected timeline"))
+               (= timeline (timeline-at-point (1- end) history))
+               (= (floor start +wal-segment-size+) (floor (1- end) +wal-segment-size+)))
+    (error "policy evidence crosses its selected timeline or segment"))
+  (values))
+
+(defun physical-policy-check-terminal (record timeline history prior-through)
+  (unless (and (wal-record-p record)
+               (or (wal-terminal-record-type-p (wal-record-type record))
+                   (= (wal-record-type record) +wal-record-end-of-recovery+)))
+    (error "policy coverage requires a complete terminal"))
+  (physical-policy-check-record-owner (wal-record-start record) (wal-record-end record) timeline history)
+  (when (and prior-through (> prior-through (wal-record-start record)))
+    (error "policy coverage moved backwards"))
+  (when (= (wal-record-type record) +wal-record-end-of-recovery+)
+    (let* ((info (wal-end-of-recovery-record-info record))
+           (parent (second (member timeline history :key #'timeline-history-entry-timeline))))
+      (unless (and (= timeline (getf info :timeline)) parent
+                   (= (getf info :prev-timeline) (timeline-history-entry-timeline parent)))
+        (error "policy coverage uses a different recovery ancestry"))))
   (values))
 
 (defun physical-fpw-check-fact (fact history through through-timeline)
@@ -116,12 +128,12 @@ Source identity and the verified WAL prefix must be established separately."
                  (eql through (getf fact :through))
                  (eql through-timeline (getf fact :through-timeline)))
       (error "source FPW fact differs from its replay boundary"))
-    (physical-fpw-check-record-owner
+    (physical-policy-check-record-owner
      (getf fact :witness-start) (getf fact :witness-end) (getf fact :witness-timeline) history)
     (unless (= (getf fact :coverage-timeline) (timeline-at-point (getf fact :coverage-start) history))
       (error "FPW coverage belongs to a different timeline"))
     (when (getf fact :last-disable-start)
-      (physical-fpw-check-record-owner
+      (physical-policy-check-record-owner
        (getf fact :last-disable-start)
        (+ (getf fact :last-disable-start) +wal-header-size+ +wal-full-page-writes-change-size+)
        (getf fact :last-disable-timeline) history))
@@ -133,21 +145,9 @@ Source identity and the verified WAL prefix must be established separately."
   "Derive a source fact from PRIOR and a complete terminal.
 The caller verifies complete batch framing, source identity and the WAL prefix.
 The fold uses a fresh private owner token which is not stored in the fact."
-  (unless (and (wal-record-p record)
-               (or (wal-terminal-record-type-p (wal-record-type record))
-                   (= (wal-record-type record) +wal-record-end-of-recovery+)))
-    (error "FPW coverage requires a complete terminal"))
-  (physical-fpw-check-record-owner (wal-record-start record) (wal-record-end record) timeline history)
   (when prior
-    (physical-fpw-check-fact prior history (getf prior :through) (getf prior :through-timeline))
-    (unless (<= (getf prior :through) (wal-record-start record))
-      (error "FPW coverage moved backwards")))
-  (when (= (wal-record-type record) +wal-record-end-of-recovery+)
-    (let* ((info (wal-end-of-recovery-record-info record))
-           (parent (second (member timeline history :key #'timeline-history-entry-timeline))))
-      (unless (and (= timeline (getf info :timeline)) parent
-                   (= (getf info :prev-timeline) (timeline-history-entry-timeline parent)))
-        (error "FPW coverage uses a different recovery ancestry"))))
+    (physical-fpw-check-fact prior history (getf prior :through) (getf prior :through-timeline)))
+  (physical-policy-check-terminal record timeline history (getf prior :through))
   (let* ((incarnation (make-symbol "SOURCE-FPW-FOLD"))
          (state (physical-fpw-state-from-fact prior incarnation))
          (next (wal-fpw-state-next state record timeline incarnation))

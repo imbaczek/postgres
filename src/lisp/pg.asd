@@ -138,6 +138,7 @@
                    (:file "../utils/session-config")
                    (:file "../access/transam/timeline")
                    (:file "../replication/physical-fpw")
+                   (:file "../replication/physical-logical-status")
                    (:file "../replication/physical-bootstrap")
                    (:file "../replication/physical-recovery")
                    (:file "../replication/physical-store-history")

@@ -59,7 +59,7 @@ its initialization checkpoint."
                        (<= (getf checkpoint :end) start)
                        next (<= (getf checkpoint :next-xid) next))
             (error "suffix scan checkpoint and XID seeds differ from its prefix"))
-          (physical-fpw-check-record-owner
+          (physical-policy-check-record-owner
            (getf checkpoint :start) (getf checkpoint :end) (getf checkpoint :timeline)
            (physical-recovery-resource-history store state)))
         (unless (or next (and (= timeline (getf state :timeline))

@@ -39,7 +39,7 @@ an absent key leaves the legacy byte plan in use."
   (destructuring-bind (&key phase system-id timeline manifest-digest checkpoint
                          applied next-xid db-state state-time (control-version 3)
                          (applied-timeline timeline) history-target history-digest
-                         promotion-child promotion-generation promotion-source-namespace retained-reference resource-fact fpw-fact
+                         promotion-child promotion-generation promotion-source-namespace retained-reference resource-fact fpw-fact logical-fact
                          (promotion-full-page-writes nil promotion-fpw-intent-p)
                        &allow-other-keys)
       control
@@ -60,6 +60,9 @@ an absent key leaves the legacy byte plan in use."
          (or (null fpw-fact)
              (and (member control-version '(3 4))
                   (physical-fpw-fact-at-p fpw-fact applied applied-timeline)))
+         (or (null logical-fact)
+             (and (member control-version '(3 4))
+                  (physical-logical-fact-at-p logical-fact applied applied-timeline)))
          (or (null retained-reference)
              (and (= phase 3) (= control-version 4)
                   (wal-retained-reference-valid-p retained-reference)
@@ -111,7 +114,7 @@ an absent key leaves the legacy byte plan in use."
                                         &key (db-state (if (zerop phase) +db-startup+ +db-in-archive-recovery+))
                                           (state-time (- (get-universal-time) 2208988800))
                                           (applied-timeline timeline) history-target history-digest
-                                          promotion-child promotion-generation promotion-source-namespace retained-reference resource-fact fpw-fact
+                                          promotion-child promotion-generation promotion-source-namespace retained-reference resource-fact fpw-fact logical-fact
                                           (promotion-full-page-writes nil promotion-fpw-intent-p))
   "Encode recovery progress and optional extensions under one CRC.
 Ordinary and pending images may append a 48-byte resource fact and a 72-byte source
@@ -126,7 +129,8 @@ extensions precede and are covered by the outer CRC."
                                (resource-offset (+ reference-offset (if retained-reference 44 0)))
                                (fpw-offset (+ resource-offset (if resource-fact +wal-resource-fact-size+ 0)))
                                (intent-offset (+ fpw-offset (if fpw-fact +physical-fpw-fact-size+ 0)))
-                               (crc-offset (+ intent-offset (if promotion-fpw-intent-p +physical-promotion-fpw-intent-size+ 0))))
+                               (logical-offset (+ intent-offset (if promotion-fpw-intent-p +physical-promotion-fpw-intent-size+ 0)))
+                               (crc-offset (+ logical-offset (if logical-fact +physical-logical-fact-size+ 0))))
     (unless (physical-recovery-control-valid-p
              (append (list :control-version version :phase phase :system-id system-id :timeline timeline
                            :manifest-digest manifest-digest :checkpoint checkpoint :applied applied
@@ -134,13 +138,14 @@ extensions precede and are covered by the outer CRC."
                            :applied-timeline applied-timeline :history-target history-target :history-digest history-digest
                            :promotion-child promotion-child :promotion-generation promotion-generation
                            :promotion-source-namespace promotion-source-namespace :retained-reference retained-reference
-                           :resource-fact resource-fact :fpw-fact fpw-fact)
+                           :resource-fact resource-fact :fpw-fact fpw-fact :logical-fact logical-fact)
                      (when promotion-fpw-intent-p
                        (list :promotion-full-page-writes promotion-full-page-writes))))
       (error "unrepresentable physical recovery control state"))
     (let ((bytes (make-array (+ crc-offset 4) :element-type '(unsigned-byte 8) :initial-element 0)))
       (replace bytes (if pending #(80 71 82 83 84 65 84 52) #(80 71 82 83 84 65 84 51)))
-      (wal-set-u32 bytes 8 (logior phase (if (= next-xid 18446744073709551616) #x80000000 0)))
+      (wal-set-u32 bytes 8 (logior phase (if logical-fact #x40000000 0)
+                                   (if (= next-xid 18446744073709551616) #x80000000 0)))
       (wal-set-u32 bytes 12 timeline)
       (wal-set-u64 bytes 16 system-id)
       (wal-set-u64 bytes 24 manifest-digest)
@@ -165,6 +170,8 @@ extensions precede and are covered by the outer CRC."
         (replace bytes (physical-fpw-encode-fact fpw-fact) :start1 fpw-offset))
       (when promotion-fpw-intent-p
         (replace bytes (physical-fpw-encode-promotion-intent promotion-full-page-writes) :start1 intent-offset))
+      (when logical-fact
+        (replace bytes (physical-logical-encode-fact logical-fact) :start1 logical-offset))
       (wal-set-u32 bytes crc-offset (wal-crc32 bytes))
       bytes)))
 
@@ -174,73 +181,79 @@ The optional source FPW fact and pending-only promotion intent precede the CRC.
 Length modulo four distinguishes an intent from earlier layouts; the decoder also
 checks its magic, value and reserved bytes. An absent intent preserves the legacy
 byte plan, while a present NIL policy means OFF."
-  (multiple-value-bind (size promotion-fpw-intent-p) (physical-fpw-control-core-size bytes)
-    (unless (member size '(60 72 88 104 120 132 136 144 148 152 160 176 180
-                           192 196 204 208 220 224 252 268))
-      (error "invalid physical recovery control length"))
-    (let* ((magic (subseq bytes 0 8))
-           (ordinary (equalp magic #(80 71 82 83 84 65 84 51)))
-           (child (equalp magic #(80 71 82 83 84 65 84 52)))
-           (fpw (or (and ordinary (member size '(144 160 192 208)))
-                    (and child (member size '(160 176 204 208 220 224 252 268)))))
-           (resource-size (- size (if fpw +physical-fpw-fact-size+ 0)))
-           (resources (or (and ordinary (member resource-size '(120 136)))
-                          (and child (member resource-size '(136 152 180 196)))))
-           (layout-size (- resource-size (if resources +wal-resource-fact-size+ 0)))
-           (version (cond
-                      ((and (= size 60) (equalp magic #(80 71 82 83 84 65 84 69))) 1)
-                      ((and (= size 72) (equalp magic #(80 71 82 83 84 65 84 50))) 2)
-                      ((and ordinary (member layout-size '(72 88))) 3)
-                      ((and child (member layout-size '(88 104 132 148))) 4)))
-           (legacy (eql version 1)) (pending (eql version 4))
-           (extension-start (if pending 84 68))
-           (retained (and pending (member layout-size '(132 148))))
-           (selected (and (member version '(3 4))
-                          (= layout-size (+ extension-start 20 (if retained 44 0)))))
-           (crc-offset (- (length bytes) 4))
-           (copy (copy-seq bytes)) (crc (wal-u32 copy crc-offset))
-           (raw-phase (wal-u32 bytes 8))
-           (exhausted (and (member version '(3 4)) (logbitp 31 raw-phase))))
-      (wal-set-u32 copy crc-offset 0)
-      (unless (and version (= crc (wal-crc32 copy))
-                   (or (not exhausted) (zerop (wal-u64 bytes 48))))
-        (error "corrupt or unsupported physical recovery control"))
-      (when (and promotion-fpw-intent-p (not pending))
-        (error "promotion FPW intent requires pending recovery control"))
-      (let ((control
-              (list :control-version version
-                    :phase (if (member version '(3 4)) (logand raw-phase #x7fffffff) raw-phase)
-                    :timeline (wal-u32 bytes 12)
-                    :system-id (wal-u64 bytes 16) :manifest-digest (wal-u64 bytes 24)
-                    :checkpoint (wal-u64 bytes 32) :applied (wal-u64 bytes 40)
-                    :next-xid (if exhausted 18446744073709551616 (wal-u64 bytes 48))
-                    :db-state (unless legacy (wal-u32 bytes 56))
-                    :state-time (unless legacy (wal-i64 bytes 60)))))
-        (when pending
-          (setf (getf control :promotion-child) (wal-u32 bytes 68)
-                (getf control :promotion-source-namespace)
-                (case (wal-u32 bytes 72) (0 :legacy) (1 :timeline))
-                (getf control :promotion-generation) (wal-u64 bytes 76)))
-        (when selected
-          (setf (getf control :applied-timeline) (wal-u32 bytes extension-start)
-                (getf control :history-target) (wal-u32 bytes (+ extension-start 4))
-                (getf control :history-digest) (wal-u64 bytes (+ extension-start 8))))
-        (when retained
-          (setf (getf control :retained-reference)
-                (physical-recovery-read-retained-reference bytes (- layout-size 48))))
-        (when resources
-          (setf (getf control :resource-fact)
-                (wal-decode-resource-fact
-                 (subseq bytes (- resource-size 52) (- resource-size 4)))))
-        (when fpw
-          (setf (getf control :fpw-fact)
-                (physical-fpw-decode-fact (subseq bytes (- size 76) (- size 4)))))
-        (when promotion-fpw-intent-p
-          (setf (getf control :promotion-full-page-writes)
-                (physical-fpw-decode-promotion-intent (subseq bytes (- size 4) crc-offset))))
-        (unless (physical-recovery-control-valid-p control :legacy legacy)
+  (multiple-value-bind (logical-size logical-p) (physical-logical-control-core-size bytes)
+    (multiple-value-bind (size promotion-fpw-intent-p) (physical-fpw-control-core-size bytes logical-size)
+      (unless (member size '(60 72 88 104 120 132 136 144 148 152 160 176 180
+                             192 196 204 208 220 224 252 268))
+        (error "invalid physical recovery control length"))
+      (let* ((magic (subseq bytes 0 8))
+             (ordinary (equalp magic #(80 71 82 83 84 65 84 51)))
+             (child (equalp magic #(80 71 82 83 84 65 84 52)))
+             (fpw (or (and ordinary (member size '(144 160 192 208)))
+                      (and child (member size '(160 176 204 208 220 224 252 268)))))
+             (resource-size (- size (if fpw +physical-fpw-fact-size+ 0)))
+             (resources (or (and ordinary (member resource-size '(120 136)))
+                            (and child (member resource-size '(136 152 180 196)))))
+             (layout-size (- resource-size (if resources +wal-resource-fact-size+ 0)))
+             (version (cond
+                        ((and (= size 60) (equalp magic #(80 71 82 83 84 65 84 69))) 1)
+                        ((and (= size 72) (equalp magic #(80 71 82 83 84 65 84 50))) 2)
+                        ((and ordinary (member layout-size '(72 88))) 3)
+                        ((and child (member layout-size '(88 104 132 148))) 4)))
+             (legacy (eql version 1)) (pending (eql version 4))
+             (extension-start (if pending 84 68))
+             (retained (and pending (member layout-size '(132 148))))
+             (selected (and (member version '(3 4))
+                            (= layout-size (+ extension-start 20 (if retained 44 0)))))
+             (logical-offset (- logical-size 4))
+             (crc-offset (- (length bytes) 4))
+             (copy (copy-seq bytes)) (crc (wal-u32 copy crc-offset))
+             (raw-phase (wal-u32 bytes 8))
+             (exhausted (and (member version '(3 4)) (logbitp 31 raw-phase))))
+        (wal-set-u32 copy crc-offset 0)
+        (unless (and version (or (not logical-p) (member version '(3 4)))
+                     (= crc (wal-crc32 copy))
+                     (or (not exhausted) (zerop (wal-u64 bytes 48))))
           (error "corrupt or unsupported physical recovery control"))
-        control))))
+        (when (and promotion-fpw-intent-p (not pending))
+          (error "promotion FPW intent requires pending recovery control"))
+        (let ((control
+                (list :control-version version
+                      :phase (if (member version '(3 4)) (logand raw-phase #x3fffffff) raw-phase)
+                      :timeline (wal-u32 bytes 12)
+                      :system-id (wal-u64 bytes 16) :manifest-digest (wal-u64 bytes 24)
+                      :checkpoint (wal-u64 bytes 32) :applied (wal-u64 bytes 40)
+                      :next-xid (if exhausted 18446744073709551616 (wal-u64 bytes 48))
+                      :db-state (unless legacy (wal-u32 bytes 56))
+                      :state-time (unless legacy (wal-i64 bytes 60)))))
+          (when pending
+            (setf (getf control :promotion-child) (wal-u32 bytes 68)
+                  (getf control :promotion-source-namespace)
+                  (case (wal-u32 bytes 72) (0 :legacy) (1 :timeline))
+                  (getf control :promotion-generation) (wal-u64 bytes 76)))
+          (when selected
+            (setf (getf control :applied-timeline) (wal-u32 bytes extension-start)
+                  (getf control :history-target) (wal-u32 bytes (+ extension-start 4))
+                  (getf control :history-digest) (wal-u64 bytes (+ extension-start 8))))
+          (when retained
+            (setf (getf control :retained-reference)
+                  (physical-recovery-read-retained-reference bytes (- layout-size 48))))
+          (when resources
+            (setf (getf control :resource-fact)
+                  (wal-decode-resource-fact
+                   (subseq bytes (- resource-size 52) (- resource-size 4)))))
+          (when fpw
+            (setf (getf control :fpw-fact)
+                  (physical-fpw-decode-fact (subseq bytes (- size 76) (- size 4)))))
+          (when promotion-fpw-intent-p
+            (setf (getf control :promotion-full-page-writes)
+                  (physical-fpw-decode-promotion-intent (subseq bytes (- size 4) logical-offset))))
+          (when logical-p
+            (setf (getf control :logical-fact)
+                  (physical-logical-decode-fact (subseq bytes logical-offset crc-offset))))
+          (unless (physical-recovery-control-valid-p control :legacy legacy)
+            (error "corrupt or unsupported physical recovery control"))
+          control)))))
 
 (defun physical-recovery-read-control (directory)
   (physical-recovery-decode-control
