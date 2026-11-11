@@ -39,7 +39,7 @@ Zero is valid when every registered snapshot is covered."
       (t (member type (list +wal-record-batch-start+ +wal-record-pages+
                             +wal-record-logical-changes+ +wal-record-xid-reservation+
                             +wal-record-running-xacts+ +wal-record-parameter-change+
-                            +wal-record-full-page-writes-change+))))))
+                            +wal-record-full-page-writes-change+ +wal-record-logical-decoding-status-change+))))))
 
 (defun physical-row-replay-check-covered-commit (record snapshots)
   "Check a source COMMIT against each covered snapshot before applying images.

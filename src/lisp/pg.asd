@@ -40,6 +40,7 @@
                    (:file "wal-eor")
                    (:file "wal-checkpoint")
                    (:file "wal-full-page-writes")
+                   (:file "wal-logical-status")
                    (:file "bufmgr")))
      (:file "utils/adt/pglz")
      (:file "utils/adt/json")

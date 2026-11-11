@@ -1,0 +1,79 @@
+(in-package #:pg)
+
+(defstruct (wal-logical-status
+            (:constructor %make-wal-logical-status
+                (enabled start end timeline last-enable-lsn last-enable-timeline)))
+  (enabled nil :read-only t)
+  (start 0 :read-only t)
+  (end 0 :read-only t)
+  (timeline 1 :read-only t)
+  (last-enable-lsn nil :read-only t)
+  (last-enable-timeline nil :read-only t))
+
+(defun wal-encode-logical-decoding-status-change (enabled)
+  (unless (member enabled '(nil t)) (error "invalid logical decoding status"))
+  (make-array 1 :element-type '(unsigned-byte 8) :initial-element (if enabled 1 0)))
+
+(defun wal-decode-logical-decoding-status-change (bytes)
+  (unless (and (= (length bytes) 1) (member (aref bytes 0) '(0 1)))
+    (error "invalid native logical decoding status change"))
+  (= 1 (aref bytes 0)))
+
+(defun wal-logical-decoding-status-record-info (record)
+  (wal-require-boolean-change-envelope record +wal-record-logical-decoding-status-change+ 1)
+  (wal-decode-logical-decoding-status-change (wal-record-payload record)))
+
+(defun wal-require-logical-status-physical-replay-supported (record)
+  (when (= (wal-record-type record) +wal-record-logical-decoding-status-change+)
+    (wal-logical-decoding-status-record-info record))
+  t)
+
+(defun wal-logical-status-valid-p (state)
+  (and (wal-logical-status-p state)
+       (member (wal-logical-status-enabled state) '(nil t))
+       (typep (wal-logical-status-start state) '(unsigned-byte 64))
+       (typep (wal-logical-status-end state) '(unsigned-byte 64))
+       (< (wal-logical-status-start state) (wal-logical-status-end state))
+       (typep (wal-logical-status-timeline state) '(integer 1 4294967295))
+       (let ((lsn (wal-logical-status-last-enable-lsn state))
+             (timeline (wal-logical-status-last-enable-timeline state)))
+         (or (and (null lsn) (null timeline))
+             (and (typep lsn '(integer 1 18446744073709551615))
+                  (typep timeline '(integer 1 4294967295))
+                  (<= lsn (wal-logical-status-end state))
+                  (<= timeline (wal-logical-status-timeline state)))))))
+
+(defun wal-logical-status-from-checkpoint (snapshot)
+  (when snapshot
+    (unless (wal-checkpoint-snapshot-valid-p snapshot)
+      (error "invalid logical status checkpoint seed"))
+    (when (get-properties snapshot '(:logical-decoding-enabled))
+      (%make-wal-logical-status
+       (getf snapshot :logical-decoding-enabled)
+       (getf snapshot :start) (getf snapshot :end) (getf snapshot :timeline) nil nil))))
+
+(defun wal-logical-status-next (prior record timeline)
+  (unless (and (typep timeline '(integer 1 4294967295))
+               (or (null prior)
+                   (and (wal-logical-status-valid-p prior)
+                        (<= (wal-logical-status-end prior) (wal-record-start record))
+                        (<= (wal-logical-status-timeline prior) timeline))))
+    (error "logical status seed belongs to a later replay position"))
+  (let* ((type (wal-record-type record))
+         (checkpoint (when (= type +wal-record-checkpoint+)
+                       (wal-checkpoint-record-snapshot record)))
+         (change-p (= type +wal-record-logical-decoding-status-change+))
+         (known-p (or change-p (get-properties checkpoint '(:logical-decoding-enabled)))))
+    (if (not known-p) prior
+        (let ((enabled (if change-p (wal-logical-decoding-status-record-info record)
+                           (getf checkpoint :logical-decoding-enabled))))
+          (when (and checkpoint
+                     (or (/= timeline (getf checkpoint :timeline))
+                         (and prior (not (eq enabled (wal-logical-status-enabled prior))))))
+            (error "checkpoint logical status differs from preceding WAL"))
+          (%make-wal-logical-status
+           enabled (wal-record-start record) (wal-record-end record) timeline
+           (if (and change-p enabled) (wal-record-end record)
+               (and prior (wal-logical-status-last-enable-lsn prior)))
+           (if (and change-p enabled) timeline
+               (and prior (wal-logical-status-last-enable-timeline prior))))))))

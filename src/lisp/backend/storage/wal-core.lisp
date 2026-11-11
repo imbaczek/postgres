@@ -30,6 +30,11 @@
 
 (defconstant +wal-record-full-page-writes-change+ 17)
 
+(defconstant +wal-record-logical-decoding-status-change+ 18)
+
+(declaim (ftype function wal-logical-decoding-status-record-info
+                wal-logical-status-from-checkpoint wal-logical-status-next))
+
 (declaim (ftype function wal-current-full-page-writes-fields
                 wal-fpw-note-published-checkpoint wal-fpw-state-from-checkpoint
                 wal-fpw-state-next wal-fpw-install-recovered-state wal-fpw-prepare-recovery))
@@ -2416,6 +2421,7 @@ Follow a symlink at the WAL directory itself. Enumeration errors are reported."
            (and (= type +wal-record-relation-reset+) (>= version 8))
            (and (= type +wal-record-parameter-change+) (>= version 8))
            (and (= type +wal-record-full-page-writes-change+) (>= version 8))
+           (and (= type +wal-record-logical-decoding-status-change+) (>= version 8))
            (and (= type +wal-record-xid-reservation+) (>= version +wal-version-v7+))
            (and (= type +wal-record-running-xacts+) (>= version 7))
            (and (= type +wal-record-end-of-recovery+) (>= version 7))
@@ -2780,7 +2786,8 @@ src/backend/access/transam/xlogreader.c."
 (defun wal-empty-metadata-terminal-type-p (type)
   "Recognize terminals that must be the only record after a batch marker."
   (member type (list +wal-record-running-xacts+ +wal-record-xid-reservation+
-                     +wal-record-parameter-change+ +wal-record-full-page-writes-change+) :test #'=))
+                     +wal-record-parameter-change+ +wal-record-full-page-writes-change+
+                     +wal-record-logical-decoding-status-change+) :test #'=))
 
 (defun wal-note-recovery-batch-record (record)
   "Track whether a metadata terminal can follow the batch marker alone."
@@ -2804,6 +2811,7 @@ CLEAN-P must certify that only a valid batch marker precedes the terminal."
       ((= type +wal-record-running-xacts+) (wal-running-xacts-record-info record))
       ((= type +wal-record-parameter-change+) (wal-parameter-change-record-info record))
       ((= type +wal-record-full-page-writes-change+) (wal-full-page-writes-change-record-info record))
+      ((= type +wal-record-logical-decoding-status-change+) (wal-logical-decoding-status-record-info record))
       ((= type +wal-record-xid-reservation+) (wal-xid-reservation-record-bound record))
       (t (error "unsupported empty metadata terminal")))))
 
@@ -2959,19 +2967,26 @@ Build policy evidence privately and install it only after the full scan and CLOG
 sync succeed. The caller must exclude storage lifecycle changes throughout."
   (let* ((incarnation *wal-storage-incarnation*)
          (fpw-state (wal-fpw-state-from-checkpoint *wal-checkpoint-snapshot* incarnation))
+         (logical-status (wal-logical-status-from-checkpoint *wal-checkpoint-snapshot*))
          (*wal-recovery-page-spool-enabled* t)
          (resource-record nil))
     (with-wal-replay-staging ()
       (wal-scan
        (lambda (record)
-         (wal-replay-record record)
-         (when (> (wal-record-end record) *wal-checkpoint-lsn*)
-           (when (= (wal-record-type record) +wal-record-parameter-change+)
-             (setf resource-record record))
-           (when (and (wal-terminal-record-type-p (wal-record-type record))
-                      (not *wal-recovery-group-active*))
-             (setf fpw-state (wal-fpw-state-next
-                              fpw-state record *wal-insert-timeline* incarnation)))))))
+         (let* ((new-p (> (wal-record-end record) *wal-checkpoint-lsn*))
+                (terminal-p (wal-terminal-record-type-p (wal-record-type record)))
+                (next-logical-status
+                  (if (and new-p terminal-p)
+                      (wal-logical-status-next logical-status record *wal-insert-timeline*)
+                      logical-status)))
+           (wal-replay-record record)
+           (when new-p
+             (when (= (wal-record-type record) +wal-record-parameter-change+)
+               (setf resource-record record))
+             (when (and terminal-p (not *wal-recovery-group-active*))
+               (setf fpw-state (wal-fpw-state-next
+                                fpw-state record *wal-insert-timeline* incarnation)
+                     logical-status next-logical-status)))))))
     (when resource-record
       (with-wal-critical (wal-recover-resource-parameters resource-record)))
     (clog-fsync)
@@ -3252,7 +3267,7 @@ and supplies POLICY and KEEP-MB from the same captured configuration."
                      +wal-record-catalog-commit+ +wal-record-checkpoint+
                      +wal-record-maintenance+ +wal-record-clog-reset+ +wal-record-xid-reservation+
                      +wal-record-running-xacts+ +wal-record-parameter-change+
-                     +wal-record-full-page-writes-change+)
+                     +wal-record-full-page-writes-change+ +wal-record-logical-decoding-status-change+)
           :test #'=))
 
 (defun wal-slot-terminal-ack-p (slot target-lsn)

@@ -43,18 +43,21 @@ not its end. A timeline number alone does not prove ancestry."
     (error "invalid native full page writes change"))
   (= 1 (aref bytes 8)))
 
-(defun wal-full-page-writes-change-record-info (record)
-  "Validate a type-17 WAL terminal and return its boolean policy."
-  (unless (and (= (wal-record-type record) +wal-record-full-page-writes-change+)
+(defun wal-require-boolean-change-envelope (record type size)
+  (unless (and (= (wal-record-type record) type)
                (>= (wal-record-version record) 8) (zerop (wal-record-xid record))
                (typep (wal-record-start record) '(unsigned-byte 64))
                (typep (wal-record-end record) '(unsigned-byte 64))
-               (= (wal-record-end record)
-                  (+ (wal-record-start record) +wal-header-size+
-                     +wal-full-page-writes-change-size+))
+               (= (wal-record-end record) (+ (wal-record-start record) +wal-header-size+ size))
                (= (floor (wal-record-start record) +wal-segment-size+)
                   (floor (1- (wal-record-end record)) +wal-segment-size+)))
-    (error "invalid native full page writes terminal"))
+    (error "invalid native Boolean change terminal"))
+  t)
+
+(defun wal-full-page-writes-change-record-info (record)
+  "Validate a type-17 WAL terminal and return its boolean policy."
+  (wal-require-boolean-change-envelope record +wal-record-full-page-writes-change+
+                                       +wal-full-page-writes-change-size+)
   (wal-decode-full-page-writes-change (wal-record-payload record)))
 
 (defun wal-fpw-state-valid-p (state)
