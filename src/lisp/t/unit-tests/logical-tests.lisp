@@ -24,7 +24,7 @@
   (let* ((stem (format nil "pg-logical-failpoint-~d-~d"
                        (sb-posix:getpid) (get-internal-real-time)))
          (target (merge-pathnames (make-pathname :name stem :type "slot")
-                                  #p"/tmp/"))
+                                  (uiop:temporary-directory)))
          (temporary (make-pathname :name stem :type "tmp" :defaults target))
          (directory (make-pathname :name nil :type nil :defaults target))
          (stages '((:slot-file-before-write . "old")
@@ -713,6 +713,8 @@
        (setf (gethash "logical_slot" *wal-replication-slots*) slot
              (gethash "other_slot" *wal-replication-slots*) other-slot
              (gethash "lost_slot" *wal-replication-slots*) lost-slot)
+       (dolist (initial (list slot other-slot lost-slot))
+         (wal-create-replication-slot-file initial))
        ;; An unterminated batch before a later batch mirrors a crash tail that
        ;; wal-replay-record discards when it sees the next batch-start record.
        (logical-test-append-batch
@@ -819,6 +821,7 @@
             (delivered-kind nil)
             (crashed nil)
             (crash-actions nil))
+       (wal-create-replication-slot-file slot)
        (setf (gethash "scan_progress_slot" *wal-replication-slots*) slot
              (symbol-function 'logical-persist-progress)
              (lambda (client slot-name lsn state token &rest options)
@@ -1030,6 +1033,7 @@
                    :consistent-lsn 0 :confirmed-flush-lsn 0))
             (below-end nil)
             (at-end nil))
+       (wal-create-replication-slot-file slot)
        (setf (gethash "count_limit_slot" *wal-replication-slots*) slot)
        (dotimes (index 129)
          (logical-test-append-batch
@@ -1720,7 +1724,7 @@
                     :slot-name "drop_export" :slot-object slot :token token
                     :database-oid 7))
             (caught nil))
-       (wal-save-replication-slot slot)
+       (wal-create-replication-slot-file slot)
        (setf (gethash "drop_export" *wal-replication-slots*) slot
              (gethash token *exported-logical-snapshots*) state)
        (let ((*logical-test-failpoint-hook*

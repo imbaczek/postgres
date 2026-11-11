@@ -136,6 +136,8 @@ This policy is a choice, distinct from a WAL receipt's historical facts."
 Owners are process-local; the appropriate codec stores durable slot fields."
   name database-oid restart-lsn consistent-lsn confirmed-flush-lsn active-owner
   active-owner-backend
+  ;; Process-local retirement identity; never encoded in durable slot state.
+  (drop-claim nil) (creation-failed-p nil)
   ;; PGSLOT1-3 were the private protocol even though the old wire name was pgoutput.
   (plugin "pg_lisp")
   (kind :logical) system-id restart-timeline (temporary-p nil) temporary-owner
@@ -176,8 +178,29 @@ Owners are process-local; the appropriate codec stores durable slot fields."
   "Test the explicit slot kind; a nullable database alone does not identify it."
   (eq :logical (wal-replication-slot-kind slot)))
 
+(defun wal-require-known-replication-slot (slot)
+  (when (wal-replication-slot-creation-failed-p slot)
+    (ereport "55000" "replication slot ~s creation failed; restart required"
+             (wal-replication-slot-name slot)))
+  slot)
+
+(defun wal-require-usable-replication-slot (slot)
+  (wal-require-known-replication-slot slot)
+  (when (wal-replication-slot-drop-claim slot)
+    (ereport "55000" "replication slot ~s has a pending drop"
+             (wal-replication-slot-name slot)))
+  slot)
+
+(declaim (special *wal-lock*))
+
+(defun wal-find-usable-replication-slot-under-lock (name)
+  (assert (sb-thread:holding-mutex-p *wal-lock*))
+  (let ((slot (gethash name *wal-replication-slots*)))
+    (when slot (wal-require-usable-replication-slot slot))))
+
 (defun wal-require-logical-slot (slot)
   "Reject physical slots before logical decoding or acknowledgment."
+  (wal-require-usable-replication-slot slot)
   (unless (wal-logical-slot-p slot)
     (ereport "55000" "physical replication slot cannot use logical acknowledgment or decoding"))
   slot)
@@ -603,8 +626,7 @@ Legacy 16-hex segment names always belong to timeline 1."
   (merge-pathnames "pg_replslot/" *pgdata*))
 
 (defun wal-replication-slot-path (name)
-  (merge-pathnames (format nil "~a.slot" name)
-                   (wal-replication-slot-directory)))
+  (slot-state-path (wal-replication-slot-directory) name))
 
 (defun wal-u16 (bytes offset)
   (logior (aref bytes offset)
@@ -3167,13 +3189,7 @@ and supplies POLICY and KEEP-MB from the same captured configuration."
             (t "extended")))))
 
 (defun wal-valid-replication-slot-name-p (name)
-  (and (stringp name)
-       (<= 1 (length name) 63)
-       (every (lambda (char)
-                (or (and (char>= char #\a) (char<= char #\z))
-                    (and (char>= char #\0) (char<= char #\9))
-                    (char= char #\_)))
-              name)))
+  (slot-state-valid-name-p name))
 
 (declaim (ftype function physical-slot-encode physical-slot-decode physical-slot-image-p))
 
@@ -3215,25 +3231,43 @@ and supplies POLICY and KEEP-MB from the same captured configuration."
            (crc (wal-crc32 (string->bytes prefix))))
       (string->bytes (format nil "~a ~8,'0X~%" prefix crc)))))
 
-(defun wal-save-replication-slot (slot)
-  (unless (string= (wal-replication-slot-name slot)
-                   (pathname-name
-                    (wal-replication-slot-path
-                     (wal-replication-slot-name slot))))
-    (error "invalid replication slot filename"))
-  (wal-atomic-write-bytes (wal-replication-slot-path
-                           (wal-replication-slot-name slot))
-                          (wal-encode-replication-slot slot))
+(defun wal-finish-replication-slot-creation-under-lock (slot receipt completed)
+  (assert (sb-thread:holding-mutex-p *wal-lock*))
+  (when (and (not completed)
+             (eq slot (gethash (wal-replication-slot-name slot) *wal-replication-slots*)))
+    (if (eq (car receipt) :unpublished)
+        (remhash (wal-replication-slot-name slot) *wal-replication-slots*)
+        (setf (wal-replication-slot-creation-failed-p slot) t
+              (wal-replication-slot-active-owner slot) nil
+              (wal-replication-slot-active-owner-backend slot) nil)))
   (values))
 
-(defun wal-delete-replication-slot-file (name)
-  (let ((path (wal-replication-slot-path name)))
-    (when (probe-file path)
-      (delete-file path))
-    ;; Also sync when the file is already absent: a prior unlink may have
-    ;; succeeded while its directory fsync failed, and retry must make that
-    ;; deletion durable before releasing the in-memory WAL pin.
-    (fsync-directory (wal-replication-slot-directory)))
+(defun wal-create-replication-slot-file (slot &optional publication-receipt)
+  (wal-require-usable-replication-slot slot)
+  (slot-state-create (wal-replication-slot-directory)
+                     (wal-replication-slot-name slot)
+                     (wal-encode-replication-slot slot)
+                     :publication-receipt publication-receipt)
+  (values))
+
+(defun wal-save-replication-slot (slot)
+  (wal-require-usable-replication-slot slot)
+  (slot-state-update (wal-replication-slot-directory)
+                     (wal-replication-slot-name slot)
+                     (wal-encode-replication-slot slot))
+  (values))
+
+(defun wal-delete-replication-slot-file (name &optional expected-slot)
+  (assert (sb-thread:holding-mutex-p *wal-lock*))
+  (let ((slot (gethash name *wal-replication-slots*)))
+    (unless (and slot (or (null expected-slot) (eq slot expected-slot)))
+      (error "replication slot deletion requires its exact registered object"))
+    (wal-require-known-replication-slot slot)
+    (unless (wal-replication-slot-drop-claim slot)
+      (setf (wal-replication-slot-drop-claim slot)
+            (slot-state-claim-drop (wal-replication-slot-directory) name)))
+    (slot-state-drop (wal-replication-slot-directory) name
+                     (wal-replication-slot-drop-claim slot)))
   (values))
 
 (defun wal-split-fields (line)
@@ -3243,71 +3277,81 @@ and supplies POLICY and KEEP-MB from the same captured configuration."
         while end
         do (setf start (1+ end))))
 
+(defun wal-decode-replication-slot (bytes expected-name)
+  (unless (and (typep bytes '(vector (unsigned-byte 8))) (<= 1 (length bytes) 2048))
+    (error "invalid replication slot state bytes"))
+  (when (physical-slot-image-p bytes)
+    (return-from wal-decode-replication-slot
+      (physical-slot-decode bytes expected-name)))
+  (with-input-from-string (stream (bytes->string bytes))
+    (let* ((line (read-line stream nil nil))
+           (fields (and line (wal-split-fields line)))
+           (version (first fields))
+           (legacy-v1-p (equal version "PGSLOT1"))
+           (legacy-v2-p (equal version "PGSLOT2"))
+           (v3-p (equal version "PGSLOT3"))
+           (v4-p (equal version "PGSLOT4"))
+           (v5-p (equal version "PGSLOT5"))
+           (expected-count (cond (legacy-v1-p 5) (legacy-v2-p 7) (v3-p 8) (v4-p 9) (v5-p 10)))
+           (database-index (when (or v3-p v4-p v5-p) 2))
+           (restart-index (if database-index 3 2))
+           (consistent-index (1+ restart-index))
+           (confirmed-index (unless legacy-v1-p (+ restart-index 2)))
+           (status-index (unless legacy-v1-p (+ restart-index 3))))
+      (unless (and expected-count (= (length fields) expected-count)
+                   (every (lambda (field) (plusp (length field))) fields)
+                   (null (read-line stream nil nil)))
+        (error "replication slot file ~a is malformed" expected-name))
+      (let* ((name (second fields))
+             (database-text (when database-index (nth database-index fields)))
+             (database-oid (when (and database-text (not (string= database-text "-")))
+                             (ignore-errors (parse-integer database-text))))
+             (database-valid-p (or (null database-index) (string= database-text "-")
+                                   (and database-oid (<= 1 database-oid #xffffffff))))
+             (restart-lsn (ignore-errors (parse-integer (nth restart-index fields))))
+             (consistent-lsn (ignore-errors (parse-integer (nth consistent-index fields))))
+             (confirmed-text (when confirmed-index (nth confirmed-index fields)))
+             (confirmed-flush-lsn (when (and confirmed-text (not (string= confirmed-text "-")))
+                                    (ignore-errors (parse-integer confirmed-text))))
+             (status-text (if legacy-v1-p "reserved" (nth status-index fields)))
+             (wal-status (cond ((string= status-text "reserved") :reserved)
+                               ((string= status-text "lost") :lost)))
+             ;; Every older format was the private extension protocol.
+             (plugin (if (or v4-p v5-p) (nth 7 fields) "pg_lisp"))
+             (profile (if v5-p (nth 8 fields) "text"))
+             (prefix (format nil "~{~a~^ ~}" (butlast fields)))
+             (crc (ignore-errors (parse-integer (car (last fields)) :radix 16))))
+        (unless (and (wal-valid-replication-slot-name-p name)
+                     (string= name expected-name)
+                     restart-lsn consistent-lsn crc wal-status database-valid-p
+                     (or legacy-v1-p (string= confirmed-text "-") confirmed-flush-lsn)
+                     (wal-valid-slot-plugin-state-p plugin database-oid confirmed-flush-lsn)
+                     (or (and (not v5-p) (string= profile "text"))
+                         (and v5-p database-oid (string= profile "binary-bytea") (string= plugin "pg_lisp")))
+                     (<= 0 restart-lsn *wal-durable-lsn* #xffffffffffffffff)
+                     (<= 0 consistent-lsn *wal-durable-lsn* #xffffffffffffffff)
+                     (or (null confirmed-flush-lsn)
+                         (and (<= consistent-lsn confirmed-flush-lsn *wal-durable-lsn*)
+                              (<= restart-lsn confirmed-flush-lsn)))
+                     (or confirmed-flush-lsn (<= restart-lsn consistent-lsn))
+                     (= crc (wal-crc32 (string->bytes prefix))))
+          (error "replication slot file ~a is corrupt or outside durable WAL" expected-name))
+        (let ((slot (make-wal-replication-slot
+                     :name name :database-oid database-oid :restart-lsn restart-lsn
+                     :consistent-lsn consistent-lsn :confirmed-flush-lsn confirmed-flush-lsn
+                     :wal-status wal-status :plugin plugin)))
+          (when v5-p (wal-slot-set-initial-profile slot :binary-bytea))
+          slot)))))
+
 (defun wal-read-replication-slot (path &key stabilize)
-  "Read physical or legacy logical state; startup may stabilize it before decoding."
-  (let ((bytes (read-bounded-regular-file path 2048 :stabilize stabilize)))
-    (when (physical-slot-image-p bytes)
-      (return-from wal-read-replication-slot
-        (physical-slot-decode bytes (pathname-name path))))
-    (with-input-from-string (stream (bytes->string bytes))
-      (let* ((line (read-line stream nil nil))
-             (fields (and line (wal-split-fields line)))
-             (version (first fields))
-             (legacy-v1-p (equal version "PGSLOT1"))
-             (legacy-v2-p (equal version "PGSLOT2"))
-             (v3-p (equal version "PGSLOT3"))
-             (v4-p (equal version "PGSLOT4"))
-             (v5-p (equal version "PGSLOT5"))
-             (expected-count (cond (legacy-v1-p 5) (legacy-v2-p 7) (v3-p 8) (v4-p 9) (v5-p 10)))
-             (database-index (when (or v3-p v4-p v5-p) 2))
-             (restart-index (if database-index 3 2))
-             (consistent-index (1+ restart-index))
-             (confirmed-index (unless legacy-v1-p (+ restart-index 2)))
-             (status-index (unless legacy-v1-p (+ restart-index 3))))
-        (unless (and expected-count (= (length fields) expected-count)
-                     (every (lambda (field) (plusp (length field))) fields)
-                     (null (read-line stream nil nil)))
-          (error "replication slot file ~a is malformed" path))
-        (let* ((name (second fields))
-               (database-text (when database-index (nth database-index fields)))
-               (database-oid (when (and database-text (not (string= database-text "-")))
-                               (ignore-errors (parse-integer database-text))))
-               (database-valid-p (or (null database-index) (string= database-text "-")
-                                     (and database-oid (<= 1 database-oid #xffffffff))))
-               (restart-lsn (ignore-errors (parse-integer (nth restart-index fields))))
-               (consistent-lsn (ignore-errors (parse-integer (nth consistent-index fields))))
-               (confirmed-text (when confirmed-index (nth confirmed-index fields)))
-               (confirmed-flush-lsn (when (and confirmed-text (not (string= confirmed-text "-")))
-                                      (ignore-errors (parse-integer confirmed-text))))
-               (status-text (if legacy-v1-p "reserved" (nth status-index fields)))
-               (wal-status (cond ((string= status-text "reserved") :reserved)
-                                 ((string= status-text "lost") :lost)))
-               ;; Every older format was the private extension protocol.
-               (plugin (if (or v4-p v5-p) (nth 7 fields) "pg_lisp"))
-               (profile (if v5-p (nth 8 fields) "text"))
-               (prefix (format nil "~{~a~^ ~}" (butlast fields)))
-               (crc (ignore-errors (parse-integer (car (last fields)) :radix 16))))
-          (unless (and (wal-valid-replication-slot-name-p name)
-                       (string= name (pathname-name path))
-                       restart-lsn consistent-lsn crc wal-status database-valid-p
-                       (or legacy-v1-p (string= confirmed-text "-") confirmed-flush-lsn)
-                       (wal-valid-slot-plugin-state-p plugin database-oid confirmed-flush-lsn)
-                       (or (and (not v5-p) (string= profile "text"))
-                           (and v5-p database-oid (string= profile "binary-bytea") (string= plugin "pg_lisp")))
-                       (<= 0 restart-lsn *wal-durable-lsn* #xffffffffffffffff)
-                       (<= 0 consistent-lsn *wal-durable-lsn* #xffffffffffffffff)
-                       (or (null confirmed-flush-lsn)
-                           (and (<= consistent-lsn confirmed-flush-lsn *wal-durable-lsn*)
-                                (<= restart-lsn confirmed-flush-lsn)))
-                       (or confirmed-flush-lsn (<= restart-lsn consistent-lsn))
-                       (= crc (wal-crc32 (string->bytes prefix))))
-            (error "replication slot file ~a is corrupt or outside durable WAL" path))
-          (let ((slot (make-wal-replication-slot
-                       :name name :database-oid database-oid :restart-lsn restart-lsn
-                       :consistent-lsn consistent-lsn :confirmed-flush-lsn confirmed-flush-lsn
-                       :wal-status wal-status :plugin plugin)))
-            (when v5-p (wal-slot-set-initial-profile slot :binary-bytea))
-            slot))))))
+  (if (equal (file-namestring path) "state")
+      (let* ((directory (uiop:pathname-directory-pathname path))
+             (name (car (last (pathname-directory directory))))
+             (root (uiop:pathname-parent-directory-pathname directory)))
+        (slot-state-read root name #'wal-decode-replication-slot :stabilize stabilize))
+      (wal-decode-replication-slot
+       (read-bounded-regular-file path 2048 :stabilize stabilize)
+       (pathname-name path))))
 
 (defun wal-validate-replication-slot-wal (slot segments)
   (let ((restart-lsn (wal-replication-slot-restart-lsn slot)))
@@ -3454,7 +3498,7 @@ and supplies POLICY and KEEP-MB from the same captured configuration."
     (ereport "22023" "invalid replication slot acknowledgment LSN"))
   (sb-thread:with-mutex (*wal-lock*)
     (wal-check-healthy)
-    (let* ((slot (gethash name *wal-replication-slots*))
+    (let* ((slot (wal-find-usable-replication-slot-under-lock name))
            (confirmed (and slot
                            (wal-replication-slot-confirmed-flush-lsn slot))))
       (unless slot
@@ -3494,7 +3538,7 @@ and supplies POLICY and KEEP-MB from the same captured configuration."
     (ereport "22023" "invalid initial replication slot boundary LSN"))
   (sb-thread:with-mutex (*wal-lock*)
     (wal-check-healthy)
-    (let ((slot (gethash name *wal-replication-slots*)))
+    (let ((slot (wal-find-usable-replication-slot-under-lock name)))
       (unless slot
         (ereport "42704" "replication slot \"~a\" does not exist" name))
       (wal-require-logical-slot slot)
@@ -3542,36 +3586,34 @@ and supplies POLICY and KEEP-MB from the same captured configuration."
 (declaim (ftype function physical-slot-restore physical-slot-check-standby-slots physical-slot-startup-system-id))
 
 (defun wal-load-replication-slots ()
-  "Load durable slots before checkpoints can recycle WAL, under startup exclusion.
-Stabilize the inventory and each selected file before trusting its state. Entries
-are published incrementally; a later error fails startup after earlier publication.
-Remove temporary physical slots and validate persistent physical slots using
-primary WAL or a standby batch proof. Logical slot restoration during native
-recovery is unsupported. Standby loading requires startup quiescence."
+  "Validate a complete startup inventory before publishing its registry.
+Logical restoration during native recovery remains unsupported."
   (let ((segments (wal-discover-segments))
-        (inactive-since (postgres-current-timestamp)))
-    (clrhash *wal-replication-slots*)
-    (dolist (path (durable-state-file-paths (wal-replication-slot-directory) "slot"))
-      (let* ((slot (wal-read-replication-slot path :stabilize t))
-             (name (wal-replication-slot-name slot)))
-        (when (gethash name *wal-replication-slots*)
-          (error "duplicate WAL replication slot ~a" name))
-        (when (if (wal-physical-slot-p slot)
-                  (physical-slot-restore slot inactive-since)
-                  (progn
-                    (when (recovery-in-progress-p)
-                      (error "logical slot restoration during native recovery is unsupported"))
-                    (wal-validate-replication-slot-wal slot segments)))
-          (wal-check-replication-slot-capacity)
-          (setf (gethash name *wal-replication-slots*) slot))))
-    (when (and (recovery-in-progress-p) (plusp (hash-table-count *wal-replication-slots*)))
-      (physical-slot-check-standby-slots
-       (loop for slot being the hash-values of *wal-replication-slots* collect slot)
-       (physical-slot-startup-system-id)))
-    (maphash (lambda (name slot)
-               (declare (ignore name))
-               (wal-slot-rebuild-progress slot))
-             *wal-replication-slots*))
+        (inactive-since (postgres-current-timestamp))
+        (restored (make-hash-table :test #'equal))
+        (candidates (slot-state-map (wal-replication-slot-directory)
+                                    #'wal-decode-replication-slot :cleanup t)))
+    (let ((*wal-replication-slots* restored))
+      (dolist (slot candidates)
+        (let ((name (wal-replication-slot-name slot)))
+          (when (gethash name restored) (error "duplicate WAL replication slot ~a" name))
+          (when (if (wal-physical-slot-p slot)
+                    (physical-slot-restore slot inactive-since)
+                    (progn
+                      (when (recovery-in-progress-p)
+                        (error "logical slot restoration during native recovery is unsupported"))
+                      (wal-validate-replication-slot-wal slot segments)))
+            (wal-check-replication-slot-capacity)
+            (setf (gethash name restored) slot))))
+      (when (and (recovery-in-progress-p) (plusp (hash-table-count restored)))
+        (physical-slot-check-standby-slots
+         (loop for slot being the hash-values of restored collect slot)
+         (physical-slot-startup-system-id)))
+      (maphash (lambda (name slot)
+                 (declare (ignore name))
+                 (wal-slot-rebuild-progress slot))
+               restored))
+    (setf *wal-replication-slots* restored))
   (values))
 
 (defun wal-read-control-fields ()

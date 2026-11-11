@@ -1675,7 +1675,9 @@ ON status must be durable before the slot is published."
   (when (gethash name *wal-replication-slots*)
     (ereport "42710" "replication slot \"~a\" already exists" name))
   (wal-check-replication-slot-capacity)
-  (let ((slot (make-wal-replication-slot
+  (let ((publication-receipt (list :unpublished))
+        (completed nil)
+        (slot (make-wal-replication-slot
                :name name :restart-lsn restart-lsn
                :consistent-lsn boundary-lsn :plugin plugin
                :confirmed-flush-lsn (when (string= plugin "pgoutput") boundary-lsn)
@@ -1690,16 +1692,14 @@ ON status must be durable before the slot is published."
          (progn
            (setf (gethash name *wal-replication-slots*) slot)
            (wal-slot-seed-active-xids-under-wal-lock slot active-xids)
-           (wal-save-replication-slot slot)
+           (wal-create-replication-slot-file slot publication-receipt)
            ;; The durable slot now owns the same restart horizon; dropping
            ;; this temporary snapshot pin keeps one retention owner and lets
            ;; the configured slot cap invalidate it atomically at checkpoint.
-           (release-snapshot-registration-wal-pin-under-wal-lock register))
+           (release-snapshot-registration-wal-pin-under-wal-lock register)
+           (setf completed t))
       (sb-sys:without-interrupts
-        (unless (handler-case
-                    (probe-file (wal-replication-slot-path name))
-                  (error () t))
-          (remhash name *wal-replication-slots*))
+        (wal-finish-replication-slot-creation-under-lock slot publication-receipt completed)
         (wal-refresh-logical-capture-slot-mirror-under-wal-lock)))
     slot))
 

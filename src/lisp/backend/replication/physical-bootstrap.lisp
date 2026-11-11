@@ -367,6 +367,7 @@ The new base receives its own archive; the old primary archive is not copied."
   (unless (sb-thread:holding-mutex-p *wal-lock*)
     (error "native backup export validation requires WAL exclusion"))
   (wal-check-healthy)
+  (wal-require-usable-replication-slot slot)
   (unless (and (not (recovery-in-progress-p))
                (eq slot (gethash name *wal-replication-slots*))
                (physical-slot-state-valid-p slot)

@@ -50,6 +50,8 @@ For a sender context also check the calling backend and source incarnation."
                                 (and (eq slot (gethash (physical-sender-public-name owner)
                                                        *wal-replication-slots*))
                                      (wal-physical-slot-p slot)
+                                     (not (wal-replication-slot-drop-claim slot))
+                                     (not (wal-replication-slot-creation-failed-p slot))
                                      (not (eq :lost (wal-replication-slot-wal-status slot)))
                                      (eq owner (wal-replication-slot-active-owner slot))
                                      (eq (physical-sender-backend owner)

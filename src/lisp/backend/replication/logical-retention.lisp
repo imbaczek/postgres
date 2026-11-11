@@ -170,7 +170,10 @@ The saved restart floor remains internal; consumer cleanup runs after locks drai
   (maphash
    (lambda (name slot)
      (declare (ignore name))
-     (when (and (wal-slot-reserved-p slot) (funcall predicate slot))
+     (when (and (wal-slot-reserved-p slot)
+                (not (wal-replication-slot-drop-claim slot))
+                (not (wal-replication-slot-creation-failed-p slot))
+                (funcall predicate slot))
        (let ((candidate (wal-copy-replication-slot-with-profile slot)))
          (setf (wal-replication-slot-wal-status candidate) :lost
                (wal-replication-slot-pending-xids candidate) (make-hash-table :test #'eql))
@@ -298,6 +301,7 @@ Preserve FUNCTION's values; callers may choose a nonwaiting retry."
               (return-from wal-drop-replication-slot (values)))
             (unless slot
               (ereport "42704" "replication slot \"~a\" does not exist" name))
+            (wal-require-known-replication-slot slot)
             (when (and (wal-replication-slot-active-owner slot)
                        (not (physical-slot-owned-by-backend-p slot *backend*)))
               (ereport "55006" "replication slot \"~a\" is active" name))
@@ -350,7 +354,7 @@ sender's acknowledged outcome and the claim release are checked separately."
            ;; interrupt-atomic so invalidation sees both owner fields or neither.
            (sb-sys:without-interrupts
              (sb-thread:with-mutex (*wal-lock*)
-               (setf slot (gethash name *wal-replication-slots*))
+               (setf slot (wal-find-usable-replication-slot-under-lock name))
                (unless slot
                  (ereport "42704" "replication slot \"~a\" does not exist" name))
                (wal-require-logical-slot slot)
@@ -397,7 +401,7 @@ sender's acknowledged outcome and the claim release are checked separately."
                   (gethash token *transaction-exported-snapshots*))
           (error "duplicate exported logical snapshot token"))
         (sb-thread:with-mutex (*wal-lock*)
-          (unless (and (eq slot-object (gethash slot-name *wal-replication-slots*))
+          (unless (and (eq slot-object (wal-find-usable-replication-slot-under-lock slot-name))
                        (eq (wal-replication-slot-wal-status slot-object) :reserved))
             (ereport "55000"
                      "replication slot was lost before snapshot publication"))

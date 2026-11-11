@@ -712,7 +712,7 @@
                        :wal-status (if (eq kind :lost) :lost :reserved)
                        :temporary-p (eq kind :temporary) :temporary-owner owner
                        :active-owner owner :active-owner-backend owner)))
-           (pg::wal-save-replication-slot slot)
+           (physical-slot-test-create-state slot)
            (setf (pg::wal-replication-slot-inactive-since slot) 123456
                  (gethash "promotion_public" pg::*wal-replication-slots*) slot)
            (let ((before (lineage-test-bytes

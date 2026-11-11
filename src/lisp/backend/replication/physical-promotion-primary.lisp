@@ -174,34 +174,27 @@ allocation. All four values must be canonical counters or the exhaustion sentine
            (= floor (min +max-xid-one-past+ (xid-next-epoch-boundary actual))))))
 
 (defun physical-promotion-read-physical-slots (&key reconcile-live)
-  "Read the canonical physical-only disk inventory under promotion exclusion.
-For live promotion require an exact registry match, normalizing only inactivity
-time before comparing durable fields. Return the existing objects so creator and
-runtime ownership survive; do not replace live generations."
-  (let* ((directory (wal-replication-slot-directory))
-         (entries (directory-entry-names directory))
-         (paths (durable-state-file-paths directory "slot"))
-         (slots nil))
-    (unless (= (length entries) (length paths))
-      (error "promotion found an unrecognized slot inventory entry"))
-    (dolist (path paths)
-      (let* ((name (pathname-name path))
-             (slot (physical-slot-decode (read-bounded-regular-file path 2048 :stabilize t) name)))
-        (unless (string= (file-namestring path) (format nil "~a.slot" name))
-          (error "promotion found a noncanonical slot filename"))
-        (when reconcile-live
-          (let ((live (gethash name *wal-replication-slots*)))
-            (unless (and (wal-replication-slot-p live) (wal-physical-slot-p live))
-              (error "promotion slot registry differs from its physical inventory"))
-            (setf (wal-replication-slot-inactive-since slot)
-                  (wal-replication-slot-inactive-since live))
-            (unless (equalp (physical-slot-encode slot) (physical-slot-encode live))
-              (error "promotion slot durable state differs from its live generation"))
-            (setf slot live)))
-        (push slot slots)))
+  "Read canonical physical state under promotion exclusion, rejecting unfinished I/O.
+Live promotion preserves exact registry objects and their runtime ownership."
+  (let ((slots
+          (slot-state-map
+           (wal-replication-slot-directory)
+           (lambda (bytes name)
+             (let ((slot (physical-slot-decode bytes name)))
+               (when reconcile-live
+                 (let ((live (gethash name *wal-replication-slots*)))
+                   (unless (and (wal-replication-slot-p live) (wal-physical-slot-p live))
+                     (error "promotion slot registry differs from its physical inventory"))
+                   (wal-require-usable-replication-slot live)
+                   (setf (wal-replication-slot-inactive-since slot)
+                         (wal-replication-slot-inactive-since live))
+                   (unless (equalp (physical-slot-encode slot) (physical-slot-encode live))
+                     (error "promotion slot durable state differs from its live generation"))
+                   (setf slot live)))
+               slot)))))
     (when (and reconcile-live (/= (length slots) (hash-table-count *wal-replication-slots*)))
       (error "promotion slot registry has unpersisted generations"))
-    slots))
+    (nreverse slots)))
 
 (defun physical-promotion-check-slot-prefix (slots state &key committed)
   "Check physical identity and prove reserved restart floors through STATE's fork.

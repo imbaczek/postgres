@@ -78,7 +78,7 @@
     (wal-ensure-directory-durable (wal-directory))
     (wal-ensure-directory-durable (wal-replication-slot-directory))
     (setf (gethash "ack_slot" *wal-replication-slots*) slot)
-    (wal-save-replication-slot slot)
+    (wal-create-replication-slot-file slot)
     (setf (symbol-function 'wal-scan)
           (lambda (function &optional scan-from-lsn)
             (push scan-from-lsn scan-starts)
@@ -183,7 +183,7 @@
                                      :if-does-not-exist :create)
                (write-byte 0 stream)))
            (setf (gethash "lag_slot" *wal-replication-slots*) slot)
-           (wal-save-replication-slot slot)
+           (wal-create-replication-slot-file slot)
            (wal-remove-checkpointed-segments *wal-durable-lsn*)
            (let ((row (first (wal-replication-slot-rows))))
              (check (and (eq (wal-replication-slot-wal-status slot) :lost)
@@ -1211,7 +1211,8 @@
          (checkpoint-lsn nil)
          (registration (make-snapshot-registration))
          (original-fsync-directory (symbol-function 'fsync-directory))
-         (failed nil))
+         (failed nil) (root-stat nil) (attempts 0)
+         (marker (make-condition 'simple-error :format-control "slot root fsync failure")))
     (setf (gethash 6411 *wal-xid-first-lsn*) 100)
     (wal-ensure-directory-durable *pgdata*)
     (wal-ensure-directory-durable (wal-directory))
@@ -1219,11 +1220,14 @@
     (unwind-protect
          (progn
            (wal-test-write-retention-segments initial-end)
+           (setf root-stat (sb-posix:stat (wal-replication-slot-directory)))
            (setf (symbol-function 'fsync-directory)
                  (lambda (directory)
-                   (if (equal directory (wal-replication-slot-directory))
-                       (error "injected slot directory fsync failure")
-                       (funcall original-fsync-directory directory))))
+                   (let ((actual (sb-posix:stat directory)))
+                     (if (and (= (sb-posix:stat-dev root-stat) (sb-posix:stat-dev actual))
+                              (= (sb-posix:stat-ino root-stat) (sb-posix:stat-ino actual)))
+                         (progn (incf attempts) (error marker))
+                         (funcall original-fsync-directory directory)))))
            (setf failed
                  (handler-case
                      (progn
@@ -1234,14 +1238,16 @@
                               (wal-create-replication-slot-under-writer-lock
                                "fsync_slot" 7 registration)))))
                        nil)
-                   (error () t)))
+                   (error (condition) (eq condition marker))))
            (setf (symbol-function 'fsync-directory) original-fsync-directory
                  checkpoint-lsn *wal-durable-lsn*)
            (wal-test-check-logical-enable-tail initial-end checkpoint-lsn)
-           (check (and failed
+           (check (and failed (= 1 attempts)
                        (probe-file (wal-replication-slot-path "fsync_slot")))
                   "directory fsync failure occurs after the slot file rename")
-           (check (gethash "fsync_slot" *wal-replication-slots*)
+           (check (and (gethash "fsync_slot" *wal-replication-slots*)
+                       (wal-replication-slot-creation-failed-p
+                        (gethash "fsync_slot" *wal-replication-slots*)))
                   "a slot file that may survive restart keeps its WAL pin")
            (release-xid 6411)
            (release-snapshot-registration registration)
@@ -1260,43 +1266,50 @@
                                                :if-does-not-exist :ignore)))))
 
 (defun test-wal-drop-fsync-retry-keeps-pin ()
-  (let* ((test-pgdata (merge-pathnames "wal-replication-slot-drop-test/"
-                                       *pgdata*))
-         (*pgdata* test-pgdata)
-         (*wal-durable-lsn* 1000)
+  (let* ((test-pgdata (merge-pathnames "wal-replication-slot-drop-test/" *pgdata*))
+         (*pgdata* test-pgdata) (*wal-durable-lsn* 1000)
          (*wal-replication-slots* (make-hash-table :test #'equal))
          (*wal-poisoned* nil)
          (slot (make-wal-replication-slot
                 :name "drop_slot" :restart-lsn 500 :consistent-lsn 1000))
-         (original-fsync-directory (symbol-function 'fsync-directory)))
+         (original-fsync-directory (symbol-function 'fsync-directory))
+         (marker (make-condition 'simple-error :format-control "slot root fsync failure"))
+         (attempts 0) (observed nil))
     (wal-ensure-directory-durable *pgdata*)
     (wal-ensure-directory-durable (wal-replication-slot-directory))
-    (wal-save-replication-slot slot)
+    (wal-create-replication-slot-file slot)
     (setf (gethash "drop_slot" *wal-replication-slots*) slot)
     (unwind-protect
-         (progn
+         (let ((root (sb-posix:stat (wal-replication-slot-directory))))
            (setf (symbol-function 'fsync-directory)
                  (lambda (directory)
-                   (if (equal directory (wal-replication-slot-directory))
-                       (error "injected slot directory fsync failure")
-                       (funcall original-fsync-directory directory))))
-           (check (handler-case
-                      (progn (wal-drop-replication-slot "drop_slot") nil)
-                    (error () t))
-                  "slot drop surfaces a directory fsync failure")
+                   (let ((actual (sb-posix:stat directory)))
+                     (if (and (= (sb-posix:stat-dev root) (sb-posix:stat-dev actual))
+                              (= (sb-posix:stat-ino root) (sb-posix:stat-ino actual)))
+                         (progn (incf attempts) (error marker))
+                         (funcall original-fsync-directory directory)))))
+           (handler-case (wal-drop-replication-slot "drop_slot")
+             (error (condition) (setf observed condition)))
+           (check (and (= 1 attempts) (eq marker observed))
+                  "slot drop surfaces the intended root directory fsync failure")
            (setf (symbol-function 'fsync-directory) original-fsync-directory)
-           (check (and (gethash "drop_slot" *wal-replication-slots*)
-                       (not (probe-file (wal-replication-slot-path "drop_slot"))))
-                  "failed directory fsync retains the in-memory WAL pin")
+           (check (and (eq slot (gethash "drop_slot" *wal-replication-slots*))
+                       (= 500 (wal-slot-reserved-p slot))
+                       (wal-replication-slot-drop-claim slot)
+                       (not (probe-file (wal-replication-slot-path "drop_slot")))
+                       (probe-file
+                        (merge-pathnames "state"
+                                         (slot-state-directory
+                                          (wal-replication-slot-directory) "drop_slot" t))))
+                  "failed root fsync retains the exact slot, claim and WAL pin")
            (wal-drop-replication-slot "drop_slot")
-           (check (null (gethash "drop_slot" *wal-replication-slots*))
-                  "retry syncs an earlier unlink before releasing its WAL pin")
-           (check (not *wal-poisoned*)
-                  "slot metadata fsync failures do not poison WAL records"))
+           (check (and (null (gethash "drop_slot" *wal-replication-slots*))
+                       (null (directory-entry-names (wal-replication-slot-directory))))
+                  "retry syncs and removes the tombstone before releasing its WAL pin")
+           (check (not *wal-poisoned*) "slot metadata fsync failures do not poison WAL records"))
       (setf (symbol-function 'fsync-directory) original-fsync-directory)
       (ignore-errors
-       (uiop:delete-directory-tree test-pgdata :validate t
-                                               :if-does-not-exist :ignore)))))
+       (uiop:delete-directory-tree test-pgdata :validate t :if-does-not-exist :ignore)))))
 
 (defun test-wal-replication-slot-load-rejects-missing-wal ()
   (let* ((test-pgdata (merge-pathnames "wal-replication-slot-missing-wal-test/"
@@ -1313,7 +1326,7 @@
     (wal-ensure-directory-durable (wal-replication-slot-directory))
     (unwind-protect
          (progn
-           (wal-save-replication-slot slot)
+           (wal-create-replication-slot-file slot)
            (dolist (segment '(0 2))
              (with-open-file (stream (wal-segment-path segment)
                                      :direction :output

@@ -389,8 +389,9 @@ end-of-recovery bytes use text."
 A temporary slot may be claimed by its creator; other active owners are refused."
   (let ((name (logical-replication-command-slot-name command)))
     (when name
-      (let ((slot (gethash name *wal-replication-slots*)))
+      (let ((slot (wal-find-usable-replication-slot-under-lock name)))
         (unless slot (ereport "42704" "replication slot ~s does not exist" name))
+
         (unless (wal-physical-slot-p slot)
           (ereport "55000" "cannot use a logical slot for physical replication"))
         (when (eq :lost (wal-replication-slot-wal-status slot))

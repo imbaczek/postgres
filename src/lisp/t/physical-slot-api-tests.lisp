@@ -26,6 +26,7 @@
           (pg::*wal-segment-namespace* :legacy)
           (pg::*backend* (pg::make-backend :pid 1234)))
       (declare (special pg::*max-replication-slots*))
+      (pg::wal-ensure-directory-durable (pg::wal-replication-slot-directory))
       (funcall function root))))
 
 (defun physical-slot-test-analyze-call (sql)
@@ -121,7 +122,7 @@
            (dotimes (segment 5)
              (pg::wal-atomic-write-bytes (pg::wal-segment-path segment) #(0)))
            (setf (gethash "public_physical" pg::*wal-replication-slots*) slot)
-           (pg::wal-save-replication-slot slot)
+           (physical-slot-test-create-state slot)
            (sb-thread:with-mutex (pg::*wal-lock*)
              (pg::wal-remove-checkpointed-segments-under-wal-lock (+ (* 4 size) 32)))
            (dotimes (segment 5)
@@ -235,6 +236,7 @@
               (invalidate (symbol-function 'pg::physical-source-invalidate-lagging-pins-under-wal-lock))
               (captures 0))
          (pg::wal-ensure-directory-durable (pg::wal-replication-slot-directory))
+         (physical-slot-test-create-state slot)
          (setf (gethash "public_physical" pg::*wal-replication-slots*) slot)
          (unwind-protect
               (progn
@@ -295,7 +297,7 @@
          (pg::wal-ensure-directory-durable (pg::wal-directory))
          (pg::wal-ensure-directory-durable (pg::wal-replication-slot-directory))
          (pg::wal-atomic-write-bytes (pg::wal-segment-path 0) #(0))
-         (pg::wal-save-replication-slot slot)
+         (physical-slot-test-create-state slot)
          (setf (gethash "public_physical" pg::*wal-replication-slots*) slot)
          (sb-thread:with-mutex (pg::*wal-lock*)
            (pg::wal-remove-checkpointed-segments-under-wal-lock 32))
@@ -330,7 +332,7 @@
            (setf (pg::wal-replication-slot-active-owner slot) owner
                  (pg::wal-replication-slot-active-owner-backend slot) backend
                  (gethash "public_physical" pg::*wal-replication-slots*) slot)
-           (pg::wal-save-replication-slot slot)
+           (physical-slot-test-create-state slot)
            (sb-thread:with-mutex (pg::*wal-lock*)
              (pg::wal-remove-checkpointed-segments-under-wal-lock (+ size 32)))
            (ok (eq :reserved (pg::wal-replication-slot-wal-status slot)))
@@ -394,7 +396,7 @@
        (setf (pg::wal-replication-slot-active-owner slot) owner
              (pg::wal-replication-slot-active-owner-backend slot) backend
              (gethash "public_physical" pg::*wal-replication-slots*) slot)
-       (pg::wal-save-replication-slot slot)
+       (physical-slot-test-create-state slot)
        (funcall function slot owner backend checkpoint)))))
 
 (deftest physical-slot-api-fixtures-do-not-inherit-another-stores-logical-policy
@@ -450,6 +452,7 @@
          (pg::wal-ensure-directory-durable (pg::wal-directory))
          (pg::wal-ensure-directory-durable (pg::wal-replication-slot-directory))
          (pg::wal-atomic-write-bytes (pg::wal-segment-path 0) #(0))
+         (physical-slot-test-create-state slot)
          (setf (gethash "public_physical" pg::*wal-replication-slots*) slot)
          (sb-thread:with-mutex (pg::*wal-lock*)
            (pg::wal-remove-checkpointed-segments-under-wal-lock (+ (* 3 size) 32))
@@ -483,6 +486,7 @@
          (pg::wal-ensure-directory-durable (pg::wal-replication-slot-directory))
          (pg::wal-atomic-write-bytes (pg::wal-segment-path 0) #(0))
          (setf (gethash "public_physical" pg::*wal-replication-slots*) slot)
+         (physical-slot-test-create-state slot)
          (sb-thread:with-mutex (pg::*wal-lock*)
            (pg::wal-remove-checkpointed-segments-under-wal-lock (+ (* 3 size) 32)))
          (ok (eq :lost (pg::wal-replication-slot-wal-status slot)))
@@ -1009,7 +1013,7 @@
            (setf (pg::wal-replication-slot-active-owner slot) owner
                  (pg::wal-replication-slot-active-owner-backend slot) backend
                  (gethash "public_physical" pg::*wal-replication-slots*) slot)
-           (pg::wal-save-replication-slot slot)
+           (physical-slot-test-create-state slot)
            (let ((pg::*backend* nil))
              (pg::wal-remove-checkpointed-segments checkpoint))
            (ok (= 1 requests))
@@ -1408,7 +1412,7 @@
        (let ((slot (physical-slot-test-object
                     :restart 32 :system-id (pg::catalog-system-identifier))))
          (pg::wal-ensure-directory-durable (pg::wal-replication-slot-directory))
-         (pg::wal-save-replication-slot slot)
+         (physical-slot-test-create-state slot)
          (setf (gethash "public_physical" pg::*wal-replication-slots*) slot)
          (setf (pg::wal-replication-slot-inactive-since slot) 1)
          (ok (= 32 (pg::wal-advance-physical-replication-slot "public_physical" 32)))
@@ -1430,18 +1434,27 @@
          (declare (ignore root))
          (let* ((slot (physical-slot-test-object
                        :restart 32 :system-id (pg::catalog-system-identifier)))
-                (save (symbol-function 'pg::wal-save-replication-slot)))
+                (save (symbol-function 'pg::wal-save-replication-slot))
+                (create (symbol-function 'pg::wal-create-replication-slot-file))
+                (save-attempts 0) (create-attempts 0))
            (pg::wal-ensure-directory-durable (pg::wal-replication-slot-directory))
-           (funcall save slot)
+           (physical-slot-test-create-state slot)
            (setf (gethash "public_physical" pg::*wal-replication-slots*) slot)
            (unwind-protect
                 (progn
                   (setf (symbol-function 'pg::wal-save-replication-slot)
                         (lambda (candidate)
+                          (incf save-attempts)
                           (when after-save (funcall save candidate))
-                          (error "injected slot publication failure")))
+                          (error "injected slot publication failure"))
+                        (symbol-function 'pg::wal-create-replication-slot-file)
+                        (lambda (candidate &optional publication-receipt)
+                          (incf create-attempts)
+                          (when after-save (funcall create candidate publication-receipt))
+                          (error "injected slot creation failure")))
                   (ok (intake-fails-p
                        (lambda () (pg::wal-advance-physical-replication-slot "public_physical" 99))))
+                  (ok (= 1 save-attempts))
                   (ok (eq slot (gethash "public_physical" pg::*wal-replication-slots*)))
                   (ok (= 32 (pg::wal-replication-slot-restart-lsn slot)))
                   (ok (= (if after-save 99 32)
@@ -1450,6 +1463,7 @@
                            (pg::wal-replication-slot-path "public_physical")))))
                   (ok (intake-fails-p
                        (lambda () (pg::wal-create-physical-replication-slot "failed_create"))))
+                  (ok (= 1 create-attempts))
                   (if after-save
                       (progn
                         (ok (gethash "failed_create" pg::*wal-replication-slots*))
@@ -1459,7 +1473,8 @@
                       (progn
                         (ok (null (gethash "failed_create" pg::*wal-replication-slots*)))
                         (ok (not (probe-file (pg::wal-replication-slot-path "failed_create")))))))
-             (setf (symbol-function 'pg::wal-save-replication-slot) save)))))))
+             (setf (symbol-function 'pg::wal-save-replication-slot) save
+                   (symbol-function 'pg::wal-create-replication-slot-file) create)))))))
 
 (deftest invalidated-physical-temporary-slot-retires-creator-outside-storage-locks
     (call-with-physical-slot-api-fixture

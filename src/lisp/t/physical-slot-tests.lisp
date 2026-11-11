@@ -8,6 +8,10 @@
                :consistent-lsn nil :confirmed-flush-lsn nil :plugin nil
                :temporary-p temporary)))
 
+(defun physical-slot-test-create-state (slot)
+  (pg::wal-ensure-directory-durable (pg::wal-replication-slot-directory))
+  (pg::wal-create-replication-slot-file slot))
+
 (deftest physical-slot-retention-checks-identity-lineage-and-interior-bytes
     (let* ((history (pg::timeline-parse-history 2 (format nil "1~c0/00000040~cpromoted~%" #\Tab #\Tab)))
            (slot (physical-slot-test-object :restart 33 :timeline 1))
@@ -117,8 +121,8 @@
         (let ((pg::*catalog* durable-catalog))
           (pg::write-catalog-image (pg::catalog-image-bytes)))
         (setf (pg::wal-replication-slot-inactive-since slot) 1)
-        (pg::wal-save-replication-slot slot)
-        (pg::wal-save-replication-slot temporary)
+        (physical-slot-test-create-state slot)
+        (physical-slot-test-create-state temporary)
         (pg::wal-load-replication-slots)
         (let ((loaded (gethash "public_physical" pg::*wal-replication-slots*)))
           (ok (pg::wal-physical-slot-p loaded))
@@ -208,15 +212,14 @@
           (pg::wal-ensure-directory-durable (pg::wal-replication-slot-directory))
           (ensure-directories-exist (pg::catalog-path))
           (pg::write-catalog-image (pg::catalog-image-bytes))
-          (pg::wal-save-replication-slot slot)
-          (pg::wal-save-replication-slot logical)
+          (physical-slot-test-create-state slot)
+          (physical-slot-test-create-state logical)
           (call-with-metadata-sync-observer
            (lambda (events streams)
              (if failure
                  (progn
                    (ok (intake-fails-p #'pg::wal-load-replication-slots))
-                   (ok (= (if (eq failure :second-file) 1 0)
-                          (hash-table-count pg::*wal-replication-slots*)))
+                   (ok (zerop (hash-table-count pg::*wal-replication-slots*)))
                    (ok (null (gethash "public_physical" pg::*wal-replication-slots*))))
                  (progn
                    (pg::wal-load-replication-slots)
@@ -231,7 +234,7 @@
                           (when (eq stage :file)
                             (incf file-syncs)
                             (when (and (eq failure :second-file) (= 2 file-syncs))
-                              (ok (gethash "logical_restore" pg::*wal-replication-slots*))
+                              (ok (null (gethash "logical_restore" pg::*wal-replication-slots*)))
                               (ok (null (gethash "public_physical" pg::*wal-replication-slots*)))
                               (error "injected second metadata file sync failure")))))))))
 
@@ -300,7 +303,7 @@
              (path (pg::wal-replication-slot-path "public_physical")))
         (pg::wal-ensure-directory-durable (pg::wal-replication-slot-directory))
         (setf (pg::wal-replication-slot-active-owner slot) (gensym "SOURCE-SESSION"))
-        (pg::wal-save-replication-slot slot)
+        (physical-slot-test-create-state slot)
         (let ((loaded (pg::wal-read-replication-slot path)))
           (ok (pg::wal-physical-slot-p loaded))
           (ok (= 33 (pg::wal-replication-slot-restart-lsn loaded)))

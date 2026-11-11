@@ -845,10 +845,11 @@ keepalive's WAL-end field, which may include changes not yet applied."
 
 (defun validate-stream-status (slot-name sent-lsn status)
   (let ((position (replication-status-position status)))
-    (unless (<= (wal-replication-slot-confirmed-flush-lsn
-                 (gethash slot-name *wal-replication-slots*))
-                position sent-lsn)
-      (ereport "22023" "standby status is outside sent logical replication progress"))
+    (sb-thread:with-mutex (*wal-lock*)
+      (let ((slot (wal-find-usable-replication-slot-under-lock slot-name)))
+        (unless slot (ereport "42704" "replication slot ~s does not exist" slot-name))
+        (unless (<= (wal-replication-slot-confirmed-flush-lsn slot) position sent-lsn)
+          (ereport "22023" "standby status is outside sent logical replication progress"))))
     (logical-test-failpoint :before-slot-acknowledgment slot-name position)
     (wal-logical-slot-acknowledge slot-name position)
     ;; LogicalConfirmReceivedLocation() makes the persisted consumer horizon
@@ -907,7 +908,7 @@ The caller releases the slot before sending shutdown completion."
 (defun start-logical-replication (stream slot-name requested-lsn &optional command)
   (when (and command
              (sb-thread:with-mutex (*wal-lock*)
-               (let ((slot (gethash slot-name *wal-replication-slots*)))
+               (let ((slot (wal-find-usable-replication-slot-under-lock slot-name)))
                  (and slot (equal (wal-replication-slot-plugin slot) "pgoutput")))))
     (return-from start-logical-replication
       (start-standard-logical-replication stream command)))

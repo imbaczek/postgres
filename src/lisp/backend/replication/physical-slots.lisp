@@ -238,7 +238,11 @@ precedes catalog initialization, so startup must not invent an identity."
 Validate primary WAL here; standby slots are checked together after loading."
   (cond
     ((wal-replication-slot-temporary-p slot)
-     (wal-delete-replication-slot-file (wal-replication-slot-name slot))
+     (let* ((name (wal-replication-slot-name slot))
+            (root (wal-replication-slot-directory)))
+       (when (gethash name *wal-replication-slots*)
+         (error "startup temporary slot removal found a live generation"))
+       (slot-state-drop root name (slot-state-claim-drop root name)))
      nil)
     (t
      (unless (recovery-in-progress-p)
@@ -326,7 +330,9 @@ The returned slot has fresh process-local ownership and transaction state."
 and retention floor until the durable state can be resolved."
   (wal-check-healthy)
   (wal-check-physical-slot-create name)
-  (let ((slot (make-wal-replication-slot
+  (let ((publication-receipt (list :unpublished))
+        (completed nil)
+        (slot (make-wal-replication-slot
                :name name :kind :physical :system-id (catalog-system-identifier)
                :restart-lsn restart :restart-timeline timeline
                :consistent-lsn nil :confirmed-flush-lsn nil :plugin nil
@@ -337,11 +343,10 @@ and retention floor until the durable state can be resolved."
     (unwind-protect
          (progn
            (setf (gethash name *wal-replication-slots*) slot)
-           (wal-save-replication-slot slot)
-           (setf (wal-replication-slot-inactive-since slot) (postgres-current-timestamp)))
-      (unless (handler-case (probe-file (wal-replication-slot-path name))
-                (error () t))
-        (remhash name *wal-replication-slots*)))
+           (wal-create-replication-slot-file slot publication-receipt)
+           (setf (wal-replication-slot-inactive-since slot) (postgres-current-timestamp)
+                 completed t))
+      (wal-finish-replication-slot-creation-under-lock slot publication-receipt completed))
     slot))
 
 (defun physical-slot-primary-reserve-under-lock ()
@@ -470,8 +475,9 @@ interior position on a standby."
       (wal-check-healthy)
       (let* ((frontier (if (recovery-in-progress-p) *last-replay-lsn* *wal-durable-lsn*))
              (target (min target frontier))
-             (slot (gethash name *wal-replication-slots*)))
+             (slot (wal-find-usable-replication-slot-under-lock name)))
         (unless slot (ereport "42704" "replication slot ~s does not exist" name))
+
         (unless (wal-physical-slot-p slot)
           (ereport "0A000" "logical slot SQL advancement is not supported"))
         (when (and (wal-replication-slot-active-owner slot)
@@ -499,7 +505,8 @@ interior position on a standby."
     (let ((slots
             (sb-thread:with-mutex (*wal-lock*)
               (loop for slot being the hash-values of *wal-replication-slots*
-                    when (physical-slot-owned-by-backend-p slot backend)
+                    when (and (not (wal-replication-slot-creation-failed-p slot))
+                              (physical-slot-owned-by-backend-p slot backend))
                       collect slot)))
           (*backend* backend))
       (dolist (slot slots)

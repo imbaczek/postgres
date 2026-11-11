@@ -78,7 +78,7 @@
                         :temporary-p (eq kind :temporary-orphan)
                         :wal-status (if (eq kind :lost) :lost :reserved))))
             (handoff-test-select-pending-reference reference)
-            (pg::wal-save-replication-slot slot)
+            (physical-slot-test-create-state slot)
             (ok (zerop (hash-table-count pg::*wal-replication-slots*)))
             (let* ((before (lineage-test-bytes (pg::wal-control-path)))
                    (result (handler-case
@@ -110,8 +110,8 @@
                           :consistent-lsn nil :confirmed-flush-lsn nil :plugin nil))
               (initializer (symbol-function 'pg::initialize-primary-storage)))
          (handoff-test-select-pending-reference reference)
-         (pg::wal-save-replication-slot slot)
-         (pg::wal-save-replication-slot temporary)
+         (physical-slot-test-create-state slot)
+         (physical-slot-test-create-state temporary)
          (call-with-promotion-exclusion #'pg::physical-promotion-publish-child-control)
          (ok (null (pg::physical-retained-root-current (pg::physical-promotion-retained-owner :primary))))
          (unwind-protect
@@ -147,7 +147,7 @@
                      :restart-lsn 153 :restart-timeline 1
                      :consistent-lsn nil :confirmed-flush-lsn nil :plugin nil)))
          (handoff-test-select-pending-reference reference)
-         (pg::wal-save-replication-slot slot)
+         (physical-slot-test-create-state slot)
          (setf (gethash "divergent_public" pg::*wal-replication-slots*) slot)
          (call-with-promotion-exclusion #'pg::physical-promotion-publish-child-control)
          (let* ((path (pg::wal-segment-path 0 2 :timeline))

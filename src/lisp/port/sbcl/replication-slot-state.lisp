@@ -184,11 +184,15 @@ The descriptor is valid only during the callback and must not escape it."
   (fsync-directory (physical-image-fd-path root-fd))
   (slot-state-point :slot-file-after-directory-fsync-before-memory-publication root name))
 
-(defun slot-state-create (root name bytes)
+(defun slot-state-create (root name bytes &key publication-receipt)
   "Create a new slot directory and publish BYTES; existing directories fail.
 Success follows child and root directory fsync. An error after rename can leave
 visible state, so the caller must retain slot and retention protection until
 the outcome is resolved."
+  (when publication-receipt
+    (unless (and (consp publication-receipt)
+                 (eq (car publication-receipt) :unpublished) (null (cdr publication-receipt)))
+      (error "invalid replication slot publication receipt")))
   (slot-state-directory root name)
   (slot-state-check-bytes bytes)
   (call-with-slot-state-root
@@ -208,8 +212,11 @@ the outcome is resolved."
            (fsync-directory (physical-image-fd-path child-fd))
            (slot-state-check-binding temporary-path child-fd)
            (slot-state-point :slot-file-before-rename root name)
-           (slot-state-rename root-fd temporary root-fd name t)
-           (setf (car *slot-state-child-scope*) final-path)
+           (sb-sys:without-interrupts
+             (when publication-receipt (setf (car publication-receipt) :uncertain))
+             (slot-state-rename root-fd temporary root-fd name t)
+             (when publication-receipt (setf (car publication-receipt) :published))
+             (setf (car *slot-state-child-scope*) final-path))
            (slot-state-point :slot-file-after-rename root name)
            (slot-state-check-binding final-path child-fd)
            (slot-state-sync-publication root-fd child-fd root name)

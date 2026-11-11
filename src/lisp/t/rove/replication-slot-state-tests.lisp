@@ -473,3 +473,348 @@
                            +slot-state-maximum-bytes+))
                   "the original state bytes remain intact"))
             (uiop:delete-directory-tree base :validate t :if-does-not-exist :ignore))))))
+
+(defun call-with-canonical-wal-slot-fixture (function)
+  (let* ((base (merge-pathnames (format nil "canonical-wal-slot-~a/" (gensym))
+                                (uiop:temporary-directory)))
+         (*pgdata* base)
+         (*wal-lock* (sb-thread:make-mutex :name "canonical WAL slot fixture"))
+         (*wal-replication-slots* (make-hash-table :test #'equal))
+         (*wal-poisoned* nil) (*wal-ready* nil)
+         (*wal-durable-lsn* 100) (*wal-end-lsn* 100)
+         (*wal-insert-timeline* 1) (*wal-segment-namespace* :legacy)
+         (*physical-recovery-state* nil) (*physical-recovery-failed-p* nil)
+         (*logical-capture-live-slots* 0) (*wal-logical-policy* nil)
+         (*logical-capture-force* nil) (*backend* nil)
+         (*exported-logical-snapshots* (make-hash-table :test #'equal))
+         (*expired-exported-logical-snapshots* (make-hash-table :test #'equal)))
+    (unwind-protect
+         (progn
+           (ensure-directories-exist (wal-replication-slot-directory))
+           (funcall function))
+      (uiop:delete-directory-tree base :validate t :if-does-not-exist :ignore))))
+
+(rove:deftest canonical-wal-slot-roundtrip-and-strict-update
+    (call-with-canonical-wal-slot-fixture
+     (lambda ()
+       (let ((slot (make-wal-replication-slot :name "roundtrip" :restart-lsn 0
+                                              :consistent-lsn 0 :wal-status :lost)))
+         (rove:ok (handler-case (progn (wal-save-replication-slot slot) nil) (error () t))
+                  "save cannot create an absent slot")
+         (wal-create-replication-slot-file slot)
+         (rove:ok (probe-file (merge-pathnames "roundtrip/state"
+                                               (wal-replication-slot-directory))))
+         (rove:ok (not (probe-file (merge-pathnames "roundtrip.slot"
+                                                    (wal-replication-slot-directory)))))
+         (rove:ok (equalp (wal-encode-replication-slot slot)
+                          (wal-encode-replication-slot
+                           (wal-read-replication-slot (wal-replication-slot-path "roundtrip")))))
+         (wal-save-replication-slot slot)
+         (let* ((old-registry *wal-replication-slots*)
+                (sentinel (make-wal-replication-slot :name "old_registry")))
+           (setf (gethash "old_registry" old-registry) sentinel)
+           (wal-load-replication-slots)
+           (rove:ok (not (eq old-registry *wal-replication-slots*))))
+         (rove:ok (= 1 (hash-table-count *wal-replication-slots*)))
+         (rove:ok (gethash "roundtrip" *wal-replication-slots*))))))
+
+(rove:deftest canonical-wal-slot-startup-failure-is-atomic
+    (call-with-canonical-wal-slot-fixture
+     (lambda ()
+       (let ((original *wal-replication-slots*)
+             (sentinel (make-wal-replication-slot :name "existing")))
+         (setf (gethash "existing" original) sentinel)
+         (dolist (name '("a_good" "z_bad"))
+           (wal-create-replication-slot-file
+            (make-wal-replication-slot :name name :restart-lsn 0
+                                       :consistent-lsn 0 :wal-status :lost)))
+         (with-open-file (stream (wal-replication-slot-path "z_bad")
+                                 :direction :output :if-exists :overwrite)
+           (write-string "CORRUPT" stream))
+         (rove:ok (handler-case (progn (wal-load-replication-slots) nil) (error () t)))
+         (rove:ok (eq original *wal-replication-slots*) "failed restore preserves registry identity")
+         (rove:ok (= 1 (hash-table-count original)))
+         (rove:ok (eq sentinel (gethash "existing" original)))
+         (rove:ok (null (gethash "a_good" original)) "no partial slot was published")))))
+
+(rove:deftest canonical-wal-slot-failed-drop-keeps-claim-and-pin
+    (dolist (point '(:slot-drop-before-rename :slot-drop-after-rename
+                     :slot-drop-before-directory-fsync :slot-drop-after-directory-fsync
+                     :slot-drop-after-cleanup))
+      (call-with-canonical-wal-slot-fixture
+       (lambda ()
+         (let* ((slot (make-wal-replication-slot :name "pending" :restart-lsn 40
+                                                 :consistent-lsn 40))
+                (marker (make-condition 'simple-error :format-control "WAL drop fault"))
+                (observed nil) (fired nil))
+           (wal-create-replication-slot-file slot)
+           (setf (gethash "pending" *wal-replication-slots*) slot)
+           (let ((*logical-test-failpoint-hook*
+                   (lambda (actual &rest details)
+                     (declare (ignore details))
+                     (when (eq actual point) (setf fired t) (error marker)))))
+             (handler-case (wal-drop-replication-slot "pending")
+               (error (condition) (setf observed condition))))
+           (rove:ok fired "intended drop boundary was reached")
+           (rove:ok (eq marker observed))
+           (rove:ok (eq slot (gethash "pending" *wal-replication-slots*)))
+           (rove:ok (wal-replication-slot-drop-claim slot))
+           (rove:ok (= 40 (wal-slot-reserved-p slot)) "failed drop retains the WAL pin")
+           (sb-thread:with-mutex (*wal-lock*)
+             (rove:ok (handler-case
+                          (progn (wal-find-usable-replication-slot-under-lock "pending") nil)
+                        (pg-error (condition) (equal "55000" (pg-error-sqlstate condition))))))
+           (rove:ok (handler-case (progn (wal-save-replication-slot slot) nil)
+                      (pg-error (condition) (equal "55000" (pg-error-sqlstate condition)))))
+           (wal-drop-replication-slot "pending")
+           (rove:ok (null (gethash "pending" *wal-replication-slots*)))
+           (rove:ok (null (directory-entry-names (wal-replication-slot-directory)))))))))
+
+(rove:deftest canonical-wal-slot-delete-rejects-a-stale-generation
+    (call-with-canonical-wal-slot-fixture
+     (lambda ()
+       (let* ((slot (make-wal-replication-slot :name "current" :restart-lsn 0
+                                               :consistent-lsn 0 :wal-status :lost))
+              (stale (copy-wal-replication-slot slot)))
+         (wal-create-replication-slot-file slot)
+         (setf (gethash "current" *wal-replication-slots*) slot)
+         (sb-thread:with-mutex (*wal-lock*)
+           (rove:ok (handler-case
+                        (progn (wal-delete-replication-slot-file "current" stale) nil)
+                      (error () t))))
+         (rove:ok (null (wal-replication-slot-drop-claim slot)))
+         (rove:ok (probe-file (wal-replication-slot-path "current")))))))
+
+(rove:deftest canonical-wal-slot-pending-drop-fences-normal-operations
+    (call-with-canonical-wal-slot-fixture
+     (lambda ()
+       (let ((slot (make-wal-replication-slot :name "pending" :restart-lsn 40
+                                              :consistent-lsn 40 :confirmed-flush-lsn 40
+                                              :database-oid 16384))
+             (*wal-logical-slot-owner* (gensym "DROP-GUARD-OWNER")))
+         (wal-create-replication-slot-file slot)
+         (setf (gethash "pending" *wal-replication-slots*) slot)
+         (sb-thread:with-mutex (*wal-lock*)
+           (setf (wal-replication-slot-drop-claim slot)
+                 (slot-state-claim-drop (wal-replication-slot-directory) "pending"))
+           (wal-invalidate-replication-slots-matching-under-lock
+            (lambda (candidate) (declare (ignore candidate))
+              (error "a pending drop must not be invalidated"))))
+         (dolist (operation
+                  (list (lambda () (wal-acknowledge-replication-slot "pending" 40))
+                        (lambda () (wal-acknowledge-standard-replication-slot "pending" 40 40 40))
+                        (lambda () (wal-finalize-replication-slot-copy "pending" 40 nil))
+                        (lambda () (wal-logical-slot-validate-start-position "pending" 40))
+                        (lambda () (wal-logical-slot-accept-resume-position "pending" 40))
+                        (lambda () (call-with-logical-replication-slot
+                                    "pending" (lambda (ignored) (declare (ignore ignored)))))
+                        (lambda () (call-with-wal-retained-slot-scan
+                                    "pending" 40 40 (lambda (ignored) (declare (ignore ignored)))))
+                        (lambda () (validate-stream-status
+                                    "pending" 40 '(:write 40 :flush 40 :apply 40)))
+                        (lambda () (start-logical-replication
+                                    nil "pending" 40 (make-logical-replication-command)))
+                        (lambda () (wal-advance-physical-replication-slot "pending" 40))
+                        (lambda () (sb-thread:with-mutex (*wal-lock*)
+                                     (physical-source-public-slot-under-lock
+                                      (make-logical-replication-command :slot-name "pending"))))))
+           (rove:ok (handler-case (progn (funcall operation) nil)
+                      (pg-error (condition)
+                        (and (equal "55000" (pg-error-sqlstate condition))
+                             (search "pending drop" (pg-error-message condition)))))
+                    "normal operations reject the pending drop before other work"))
+         (rove:ok (= 40 (wal-slot-reserved-p slot)))
+         (rove:ok (eq :reserved (wal-replication-slot-wal-status slot)))))))
+
+(rove:deftest canonical-slot-state-publication-receipt-survives-namespace-loss
+    (dolist (kind '(:before-root :after-root :after-child :collision))
+      (let* ((base (merge-pathnames (format nil "slot-receipt-~a/" (gensym))
+                                    (uiop:temporary-directory)))
+             (root (merge-pathnames "pg_replslot/" base))
+             (moved (merge-pathnames "moved/" base))
+             (bytes (make-array 1 :element-type '(unsigned-byte 8) :initial-element 7))
+             (receipt (list :unpublished))
+             (marker (make-condition 'simple-error :format-control "receipt namespace fault"))
+             (observed nil) (fired nil))
+        (unwind-protect
+             (progn
+               (ensure-directories-exist root)
+               (let ((*logical-test-failpoint-hook*
+                       (lambda (point &rest details)
+                         (declare (ignore details))
+                         (when (eq point (if (member kind '(:before-root :collision))
+                                             :slot-file-before-rename :slot-file-after-rename))
+                           (setf fired t)
+                           (if (eq kind :collision)
+                               (ensure-directories-exist (slot-state-directory root "receipt_slot"))
+                               (let ((victim (if (eq kind :after-child)
+                                                 (slot-state-directory root "receipt_slot") root)))
+                                 (sb-posix:rename (string-right-trim "/" (namestring victim))
+                                                  (string-right-trim "/" (namestring moved)))
+                                 (unless (eq kind :after-child) (ensure-directories-exist root))
+                                 (error marker)))))))
+                 (handler-case
+                     (slot-state-create root "receipt_slot" bytes :publication-receipt receipt)
+                   (error (condition) (setf observed condition))))
+               (rove:ok fired "the intended namespace mutation happened")
+               (rove:ok (eq (case kind (:before-root :unpublished) (:collision :uncertain)
+                                  (otherwise :published))
+                            (car receipt))
+                        "receipt records only successful final namespace publication")
+               (rove:ok (if (eq kind :collision)
+                            (and (typep observed 'sb-posix:syscall-error)
+                                 (= sb-posix:eexist (sb-posix:syscall-errno observed)))
+                            (eq marker observed))
+                        "publication bookkeeping preserves the original condition"))
+          (uiop:delete-directory-tree base :validate t :if-does-not-exist :ignore)))))
+
+(rove:deftest canonical-wal-slot-create-retains-published-pin-after-namespace-loss
+    (dolist (kind '(:before-root :after-root :after-child))
+      (call-with-canonical-wal-slot-fixture
+       (lambda ()
+         (let* ((*catalog* (make-catalog :cluster-identity "slot-receipt"))
+                (root (wal-replication-slot-directory))
+                (moved (merge-pathnames "moved/" *pgdata*))
+                (marker (make-condition 'simple-error :format-control "WAL create namespace fault"))
+                (observed nil) (fired nil))
+           (let ((*logical-test-failpoint-hook*
+                   (lambda (point &rest details)
+                     (declare (ignore details))
+                     (when (eq point (if (eq kind :before-root)
+                                         :slot-file-before-rename :slot-file-after-rename))
+                       (setf fired t)
+                       (let ((victim (if (eq kind :after-child)
+                                         (slot-state-directory root "receipt_slot") root)))
+                         (sb-posix:rename (string-right-trim "/" (namestring victim))
+                                          (string-right-trim "/" (namestring moved)))
+                         (unless (eq kind :after-child) (ensure-directories-exist root))
+                         (error marker))))))
+             (handler-case
+                 (sb-thread:with-mutex (*wal-lock*)
+                   (physical-slot-publish-create-under-lock "receipt_slot" 40 1 nil))
+               (error (condition) (setf observed condition))))
+           (rove:ok fired)
+           (rove:ok (eq marker observed) "caller propagates the exact namespace fault")
+           (rove:ok (null (slot-state-lstat
+                           (slot-state-directory (wal-replication-slot-directory) "receipt_slot")))
+                    "the public pathname cannot witness the earlier rename")
+           (let ((slot (gethash "receipt_slot" *wal-replication-slots*)))
+             (if (eq kind :before-root)
+                 (rove:ok (null slot) "unpublished attempt releases its registry claim")
+                 (progn
+                   (rove:ok (wal-physical-slot-p slot) "published attempt retains its exact name")
+                   (rove:ok (= 40 (wal-slot-reserved-p slot)) "published attempt retains its WAL pin")
+                   (rove:ok (wal-replication-slot-creation-failed-p slot))
+                   (rove:ok (handler-case (progn (wal-save-replication-slot slot) nil)
+                              (pg-error (condition) (search "restart required" (pg-error-message condition)))))
+                   (rove:ok (handler-case (progn (wal-drop-replication-slot "receipt_slot") nil)
+                              (pg-error (condition) (search "restart required" (pg-error-message condition)))))
+                   (rove:ok (null (wal-replication-slot-drop-claim slot)))))))))))
+
+(rove:deftest canonical-wal-slot-startup-resolves-failed-creation
+    (call-with-canonical-wal-slot-fixture
+     (lambda ()
+       (let ((slot (make-wal-replication-slot :name "restart_slot" :restart-lsn 0
+                                              :consistent-lsn 0 :wal-status :lost)))
+         (wal-create-replication-slot-file slot)
+         (setf (wal-replication-slot-creation-failed-p slot) t
+               (gethash "restart_slot" *wal-replication-slots*) slot)
+         (rove:ok (handler-case (progn (wal-drop-replication-slot "restart_slot") nil)
+                    (pg-error (condition) (search "restart required" (pg-error-message condition)))))
+         (wal-load-replication-slots)
+         (let ((restored (gethash "restart_slot" *wal-replication-slots*)))
+           (rove:ok (not (eq restored slot)) "startup creates a freshly validated generation")
+           (rove:ok (not (wal-replication-slot-creation-failed-p restored)))
+           (wal-save-replication-slot restored))
+         (wal-drop-replication-slot "restart_slot")
+         (rove:ok (null (gethash "restart_slot" *wal-replication-slots*)))))))
+
+(rove:deftest canonical-wal-slot-create-cannot-adopt-a-foreign-collision
+    (dolist (late-p '(nil t))
+      (call-with-canonical-wal-slot-fixture
+       (lambda ()
+         (let* ((*catalog* (make-catalog :cluster-identity "slot-collision"))
+                (name "foreign_collision")
+                (foreign (make-wal-replication-slot
+                          :name name :kind :physical :system-id (catalog-system-identifier)
+                          :restart-lsn 10 :restart-timeline 1
+                          :plugin nil :consistent-lsn nil :confirmed-flush-lsn nil))
+                (bytes (wal-encode-replication-slot foreign))
+                (fired nil) (observed nil) (inode nil))
+           (labels ((install-foreign ()
+                      (ensure-directories-exist
+                       (slot-state-directory (wal-replication-slot-directory) name))
+                      (with-open-file (stream (wal-replication-slot-path name)
+                                              :direction :output :if-exists :error
+                                              :element-type '(unsigned-byte 8))
+                        (write-sequence bytes stream)
+                        (fsync-stream stream))
+                      (setf inode (sb-posix:stat-ino
+                                   (sb-posix:lstat (wal-replication-slot-path name))))))
+             (unless late-p (install-foreign))
+             (let ((*logical-test-failpoint-hook*
+                     (lambda (point &rest details)
+                       (declare (ignore details))
+                       (when (and late-p (eq point :slot-file-before-rename))
+                         (setf fired t)
+                         (install-foreign)))))
+               (handler-case
+                   (sb-thread:with-mutex (*wal-lock*)
+                     (physical-slot-publish-create-under-lock name 40 1 nil))
+                 (error (condition) (setf observed condition)))))
+           (rove:ok (eq late-p fired) "only a late collision reaches the publication syscall")
+           (rove:ok (if late-p
+                        (and (typep observed 'sb-posix:syscall-error)
+                             (= sb-posix:eexist (sb-posix:syscall-errno observed)))
+                        (and observed (search "already exists" (princ-to-string observed))))
+                    "the intended collision rejected creation")
+           (let ((candidate (gethash name *wal-replication-slots*)))
+             (if late-p
+                 (progn
+                   (rove:ok (wal-replication-slot-creation-failed-p candidate))
+                   (rove:ok (= 40 (wal-slot-reserved-p candidate)))
+                   (rove:ok (handler-case (progn (wal-save-replication-slot candidate) nil)
+                              (pg-error (condition)
+                                (search "restart required" (pg-error-message condition)))))
+                   (rove:ok (handler-case (progn (wal-drop-replication-slot name) nil)
+                              (pg-error (condition)
+                                (search "restart required" (pg-error-message condition)))))
+                   (rove:ok (null (wal-replication-slot-drop-claim candidate))))
+                 (rove:ok (null candidate) "certified unpublished candidate is removed")))
+           (rove:ok (= inode (sb-posix:stat-ino (sb-posix:lstat (wal-replication-slot-path name))))
+                    "the foreign inode is preserved")
+           (rove:ok (equalp bytes (read-bounded-regular-file (wal-replication-slot-path name) 2048))
+                    "no later use or drop altered foreign state"))))))
+
+(rove:deftest canonical-wal-slot-backend-cleanup-skips-failed-temporary-creation
+    (call-with-canonical-wal-slot-fixture
+     (lambda ()
+       (let* ((*catalog* (make-catalog :cluster-identity "temporary-slot-fence"))
+              (*backend* (make-backend))
+              (marker (make-condition 'simple-error :format-control "temporary slot publication fault"))
+              (observed nil))
+         (let ((*logical-test-failpoint-hook*
+                 (lambda (point &rest details)
+                   (declare (ignore details))
+                   (when (eq point :slot-file-after-rename) (error marker)))))
+           (handler-case
+               (sb-thread:with-mutex (*wal-lock*)
+                 (physical-slot-publish-create-under-lock "failed_temporary" 40 1 t))
+             (error (condition) (setf observed condition))))
+         (rove:ok (eq marker observed))
+         (let ((failed (gethash "failed_temporary" *wal-replication-slots*)))
+           (rove:ok (wal-replication-slot-creation-failed-p failed))
+           (rove:ok (eq *backend* (wal-replication-slot-temporary-owner failed)))
+           (rove:ok (null (wal-replication-slot-active-owner failed)))
+           (sb-thread:with-mutex (*wal-lock*)
+             (wal-invalidate-replication-slots-matching-under-lock
+              (lambda (slot) (declare (ignore slot))
+                (error "failed creation must not reach invalidation"))))
+           (sb-thread:with-mutex (*wal-lock*)
+             (physical-slot-publish-create-under-lock "ordinary_temporary" nil nil t))
+           (wal-cleanup-backend-physical-slots *backend*)
+           (rove:ok (eq failed (gethash "failed_temporary" *wal-replication-slots*)))
+           (rove:ok (= 40 (wal-slot-reserved-p failed)))
+           (rove:ok (probe-file (wal-replication-slot-path "failed_temporary")))
+           (rove:ok (null (gethash "ordinary_temporary" *wal-replication-slots*)))
+           (rove:ok (not (probe-file (wal-replication-slot-path "ordinary_temporary")))))))))

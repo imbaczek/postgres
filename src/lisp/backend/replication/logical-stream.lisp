@@ -1670,7 +1670,7 @@ RESTART-FLOOR is a complete batch boundary at or below the reported flush,
 tracked by the bounded sender. SENT-LSN never includes an unfinished frame."
   (sb-thread:with-mutex (*wal-lock*)
     (wal-check-healthy)
-    (let ((slot (gethash name *wal-replication-slots*)))
+    (let ((slot (wal-find-usable-replication-slot-under-lock name)))
       (unless slot
         (ereport "42704" "replication slot ~s does not exist" name))
       (unless (and *wal-logical-slot-owner*
@@ -1703,7 +1703,7 @@ tracked by the bounded sender. SENT-LSN never includes an unfinished frame."
     (ereport "22023" "invalid logical replication start LSN"))
   (sb-thread:with-mutex (*wal-lock*)
     (wal-check-healthy)
-    (let ((slot (gethash name *wal-replication-slots*)))
+    (let ((slot (wal-find-usable-replication-slot-under-lock name)))
       (unless slot
         (ereport "42704" "replication slot \"~a\" does not exist" name))
       (when (eq (wal-replication-slot-wal-status slot) :lost)
@@ -1731,7 +1731,7 @@ tracked by the bounded sender. SENT-LSN never includes an unfinished frame."
     (ereport "55000" "logical replication slot is not owned by this reader"))
   (sb-thread:with-mutex (*wal-lock*)
     (wal-check-healthy)
-    (let* ((slot (gethash name *wal-replication-slots*))
+    (let* ((slot (wal-find-usable-replication-slot-under-lock name))
            (confirmed (and slot
                            (wal-replication-slot-confirmed-flush-lsn slot))))
       (unless slot
@@ -1756,7 +1756,7 @@ tracked by the bounded sender. SENT-LSN never includes an unfinished frame."
 
 (defun wal-retained-slot-scan-validate-under-lock (scan)
   (wal-check-healthy)
-  (let ((slot (gethash (wal-retained-slot-scan-name scan) *wal-replication-slots*)))
+  (let ((slot (wal-find-usable-replication-slot-under-lock (wal-retained-slot-scan-name scan))))
     (unless (and (eq slot (wal-retained-slot-scan-slot scan))
                  (eq (wal-replication-slot-active-owner slot) (wal-retained-slot-scan-owner scan))
                  (eq (wal-replication-slot-wal-status slot) :reserved)
@@ -1776,7 +1776,7 @@ tracked by the bounded sender. SENT-LSN never includes an unfinished frame."
            (sb-sys:without-interrupts
              (sb-thread:with-mutex (*wal-lock*)
                (wal-check-healthy)
-               (let* ((slot (gethash name *wal-replication-slots*))
+               (let* ((slot (wal-find-usable-replication-slot-under-lock name))
                       (owner (and slot (wal-replication-slot-active-owner slot)))
                       (start (and slot (or from-lsn (wal-replication-slot-confirmed-flush-lsn slot)
                                            (wal-replication-slot-consistent-lsn slot))))

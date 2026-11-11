@@ -29,6 +29,8 @@ ALLOW-DEPARTED accepts a fully released claim for cleanup checks."
                  (eq (logical-shutdown-owner-incarnation owner) *wal-storage-incarnation*)
                  (eq slot (gethash (logical-shutdown-owner-name owner) *wal-replication-slots*))
                  (wal-logical-slot-p slot)
+                 (not (wal-replication-slot-drop-claim slot))
+                 (not (wal-replication-slot-creation-failed-p slot))
                  (string= (logical-shutdown-owner-name owner) (wal-replication-slot-name slot))
                  (string= (logical-shutdown-owner-plugin owner) (wal-replication-slot-plugin slot))
                  (= (logical-shutdown-owner-database owner) (wal-replication-slot-database-oid slot))

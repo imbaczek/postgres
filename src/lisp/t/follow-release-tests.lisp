@@ -393,7 +393,7 @@
                        :restart-lsn 64 :consistent-lsn 64 :confirmed-flush-lsn 64))
                 (path (pg::wal-replication-slot-path "release_follow")))
            (pg::wal-ensure-directory-durable (pg::wal-replication-slot-directory))
-           (pg::wal-save-replication-slot slot)
+           (physical-slot-test-create-state slot)
            (setf (gethash "release_follow" pg::*wal-replication-slots*) slot)
            (let ((before (lineage-test-bytes path)))
              (if (eq operation :release)
