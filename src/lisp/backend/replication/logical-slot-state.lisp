@@ -9,9 +9,9 @@
   "Immutable slot identity and optional logical ON interval evidence.
 Provenance validation checks shape. The image codec also checks framing, CRC
 and canonical bytes. Startup checks known system IDs against the durable
-catalog and available control metadata. Creation stamping, acknowledgment
-guards, cause publication, SQL projection and import remain unwired; callers
-must separately prove history and lifetime."
+catalog and available control metadata. Guarded updates retain the same
+provenance object. Creation stamping, SQL projection and import remain unwired;
+callers must separately prove history and lifetime."
   (system-id nil :read-only t)
   (generation nil :read-only t)
   (birth-timeline nil :read-only t)
@@ -74,6 +74,10 @@ repair the catalog, or prove history and lifetime."
   (values))
 
 (defun logical-slot-check-update-under-lock (slot candidate)
+  "Check CANDIDATE against the exact live registry SLOT under the WAL lock.
+Require the same provenance object, identity fields and transport profile.
+Confirmed progress cannot move backward. Once a terminal cause is set, its
+cause and durable progress positions cannot change."
   (assert (sb-thread:holding-mutex-p *wal-lock*))
   (wal-require-logical-slot slot)
   (wal-require-logical-slot candidate)
@@ -109,6 +113,10 @@ repair the catalog, or prove history and lifetime."
   (values))
 
 (defun logical-slot-save-update-under-lock (slot candidate)
+  "Save CANDIDATE and publish its fixed fields to SLOT under the WAL lock.
+Interrupts are deferred across save and publication. Any incomplete save or
+publication marks the live SLOT uncertain and retains its old pin; a cold load
+is required before acknowledgment, saving or scanning can resume."
   (logical-slot-check-update-under-lock slot candidate)
   (sb-sys:without-interrupts
     (let ((completed nil))

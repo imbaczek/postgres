@@ -166,7 +166,10 @@ for admission or park. Unsafe resource and quiescence contexts defer the work."
 
 (defun wal-invalidate-replication-slots-matching-under-lock (predicate)
   "Save loss before publishing it on each matching reserved slot under WAL.
-The saved restart floor remains internal; consumer cleanup runs after locks drain."
+Logical slots use the guarded update to record WAL removal; physical slots use
+their existing save path. An uncertain slot blocks WAL recycling before a cap can
+bypass its old pin. The saved restart floor remains internal; consumer cleanup
+runs after locks drain."
   (maphash
    (lambda (name slot)
      (declare (ignore name))

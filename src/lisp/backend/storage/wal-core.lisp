@@ -134,12 +134,12 @@ This policy is a choice, distinct from a WAL receipt's historical facts."
 (defstruct wal-replication-slot
   "KIND distinguishes logical and physical slots, including unbound logical slots.
 Owners are process-local; the appropriate codec stores durable slot fields.
-Startup checks known logical provenance system IDs against the local cluster;
-other logical provenance and cause integration remains a codec foundation."
+Startup checks known logical provenance system IDs against the local cluster.
+Logical updates guard identity, progress and the first terminal cause."
   name database-oid restart-lsn consistent-lsn confirmed-flush-lsn active-owner
   active-owner-backend
-  ;; Process-local publication and retirement state. STATE-UNCERTAIN-P is
-  ;; reserved for future guarded integration.
+  ;; Process-local publication and retirement state. An uncertain logical slot
+  ;; keeps its old pin and requires a cold load before further use.
   (drop-claim nil) (creation-failed-p nil) (state-uncertain-p nil)
   (logical-provenance nil :read-only t)
   confirmed-timeline invalidation-cause
@@ -184,6 +184,7 @@ other logical provenance and cause integration remains a codec foundation."
   (eq :logical (wal-replication-slot-kind slot)))
 
 (defun wal-require-known-replication-slot (slot)
+  "Reject failed creation or uncertain state until a cold load."
   ;; A failed publication may still be visible on disk and must retain its pin.
   (when (wal-replication-slot-creation-failed-p slot)
     (ereport "55000" "replication slot ~s creation failed; restart required"
@@ -3110,7 +3111,8 @@ changes throughout."
 
 (defun wal-slot-reserved-p (slot)
   "Return the healthy internal restart floor, if any.
-This is distinct from the advisory public reserved, extended or unreserved status."
+This is distinct from the advisory public reserved, extended or unreserved status.
+Reject uncertainty before retention limits can bypass the old pin."
   (when (wal-replication-slot-state-uncertain-p slot)
     (error "cannot recycle WAL while a replication slot state is uncertain"))
   (and (eq :reserved (wal-replication-slot-wal-status slot))
@@ -3513,7 +3515,8 @@ must separately validate system, history, lifetime, replay and storage context."
 
 (defun wal-persist-replication-slot-ack-under-lock (slot acknowledged-lsn
                                                     &optional (restart-floor acknowledged-lsn))
-  "Persist an already-validated slot acknowledgment while *WAL-LOCK* is held."
+  "Persist an already-validated acknowledgment while *WAL-LOCK* is held.
+The guarded update saves before publishing progress to the live slot."
   (wal-require-logical-slot slot)
   (let* ((pending (wal-slot-pending-after-ack slot acknowledged-lsn))
          (restart-lsn (wal-slot-restart-for-ack restart-floor pending))
