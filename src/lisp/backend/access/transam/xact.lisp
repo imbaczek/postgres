@@ -1578,7 +1578,7 @@ of transaction and portal snapshots."
 
 (defvar *wal-test-after-snapshot-boundary-registration-hook* nil)
 
-(declaim (ftype function logical-slot-primary-history-under-lock logical-slot-make-snapshot-boundary))
+(declaim (ftype function logical-slot-primary-history-under-lock logical-slot-make-snapshot-boundary logical-slot-creation-evidence-under-lock))
 
 (defun wal-capture-snapshot-boundary-under-writer-lock
     (curcid register &key after-capture)
@@ -1663,7 +1663,8 @@ ON status must be durable before the slot is published."
     (unless (plusp (hash-table-count *logical-capture-arming*))
       (error "logical slot publication requires an armed capture gate"))
     (when (loop for xid in *active-xids*
-                  thereis (member (gethash xid *logical-capture-xid-modes* :capture) '(:skip :skip-written)))
+                  thereis (member (gethash xid *logical-capture-xid-modes* :capture)
+                                  '(:skip :skip-written)))
       (error "logical slot publication requires uncaptured XIDs to drain")))
   (unless (getf (wal-current-logical-decoding-fields) :logical-decoding-enabled)
     (wal-invalid-input "logical slot publication requires durable enabled status"))
@@ -1676,33 +1677,39 @@ ON status must be durable before the slot is published."
   (when (gethash name *wal-replication-slots*)
     (ereport "42710" "replication slot \"~a\" already exists" name))
   (wal-check-replication-slot-capacity)
-  (let ((publication-receipt (list :unpublished))
-        (completed nil)
-        (slot (make-wal-replication-slot
-               :name name :restart-lsn restart-lsn
-               :consistent-lsn boundary-lsn :plugin plugin
-               :confirmed-flush-lsn (when (string= plugin "pgoutput") boundary-lsn)
-               :database-oid database-oid
-               :active-owner active-owner
-               :active-owner-backend (and active-owner *backend*))))
-    (wal-slot-set-initial-profile slot *wal-new-slot-profile*)
-    ;; Reserve the in-memory pin before slot-file I/O. The receipt distinguishes
-    ;; an unpublished candidate from a possibly visible one; COMPLETED also
-    ;; covers the remaining work after the directory is published.
-    (unwind-protect
-         (progn
-           (setf (gethash name *wal-replication-slots*) slot)
-           (wal-slot-seed-active-xids-under-wal-lock slot active-xids)
-           (wal-create-replication-slot-file slot publication-receipt)
-           ;; The durable slot now owns the same restart horizon; dropping
-           ;; this temporary snapshot pin keeps one retention owner and lets
-           ;; the configured slot cap invalidate it atomically at checkpoint.
-           (release-snapshot-registration-wal-pin-under-wal-lock register)
-           (setf completed t))
-      (sb-sys:without-interrupts
-        (wal-finish-replication-slot-creation-under-lock slot publication-receipt completed)
-        (wal-refresh-logical-capture-slot-mirror-under-wal-lock)))
-    slot))
+  (multiple-value-bind (provenance restart-timeline birth-timeline)
+      (logical-slot-creation-evidence-under-lock boundary-lsn restart-lsn register)
+    (let ((publication-receipt (list :unpublished))
+          (completed nil)
+          (slot (make-wal-replication-slot
+                 :name name :restart-lsn restart-lsn
+                 :consistent-lsn boundary-lsn :plugin plugin
+                 :logical-provenance provenance :restart-timeline restart-timeline
+                 :invalidation-cause :none
+                 :confirmed-flush-lsn (when (string= plugin "pgoutput") boundary-lsn)
+                 :confirmed-timeline (when (string= plugin "pgoutput")
+                                       birth-timeline)
+                 :database-oid database-oid
+                 :active-owner active-owner
+                 :active-owner-backend (and active-owner *backend*))))
+      (wal-slot-set-initial-profile slot *wal-new-slot-profile*)
+      ;; Reserve the in-memory pin before slot-file I/O. The receipt distinguishes
+      ;; an unpublished candidate from a possibly visible one; COMPLETED also
+      ;; covers the remaining work after the directory is published.
+      (unwind-protect
+           (progn
+             (setf (gethash name *wal-replication-slots*) slot)
+             (wal-slot-seed-active-xids-under-wal-lock slot active-xids)
+             (wal-create-replication-slot-file slot publication-receipt)
+             ;; The durable slot now owns the same restart horizon; dropping
+             ;; this temporary snapshot pin keeps one retention owner and lets
+             ;; the configured slot cap invalidate it atomically at checkpoint.
+             (release-snapshot-registration-wal-pin-under-wal-lock register)
+             (setf completed t))
+        (sb-sys:without-interrupts
+          (wal-finish-replication-slot-creation-under-lock slot publication-receipt completed)
+          (wal-refresh-logical-capture-slot-mirror-under-wal-lock)))
+      slot)))
 
 (defun wal-create-replication-slot-under-writer-lock
     (name curcid register &optional active-owner database-oid)

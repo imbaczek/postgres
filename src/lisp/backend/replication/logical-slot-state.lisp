@@ -48,6 +48,53 @@ History and source identity require separate verification."
       (error "invalid logical slot provenance"))
     provenance))
 
+(defun logical-slot-creation-evidence-under-lock
+    (boundary-lsn restart-lsn registration)
+  (assert (sb-thread:holding-mutex-p *wal-lock*))
+  (let* ((boundary (snapshot-registration-wal-boundary registration))
+         (system-id (physical-slot-startup-system-id))
+         (history (logical-slot-primary-history-under-lock)))
+    (unless (and *catalog*
+                 (not *catalog-identity-needs-persist-p*)
+                 (eql system-id (catalog-system-identifier))
+                 (or (null *wal-control-metadata*)
+                     (eql system-id (getf *wal-control-metadata* :system-id))))
+      (error "logical slot creation requires matching durable catalog identity"))
+    (sb-thread:with-mutex (*snapshot-count-lock*)
+      (unless (and (snapshot-registration-active-p registration)
+                   (not (snapshot-registration-releasing-p registration))
+                   (snapshot-wal-boundary-p boundary)
+                   (typep boundary-lsn '(integer 1 18446744073709551615))
+                   (= boundary-lsn (snapshot-wal-boundary-lsn boundary))
+                   (= restart-lsn (snapshot-wal-boundary-restart-lsn boundary))
+                   (eql restart-lsn (snapshot-registration-wal-retention-lsn registration))
+                   (eql restart-lsn (gethash registration *wal-snapshot-retention-pins*))
+                   (<= restart-lsn boundary-lsn)
+                   (timeline-prefix-boundary-p
+                    (snapshot-wal-boundary-timeline boundary) boundary-lsn history)
+                   (case (snapshot-wal-boundary-restart-role boundary)
+                     (:record-start
+                      (eql (snapshot-wal-boundary-restart-timeline boundary)
+                           (timeline-at-point restart-lsn history)))
+                     (:prefix-end
+                      (and (plusp restart-lsn)
+                           (timeline-prefix-boundary-p
+                            (snapshot-wal-boundary-restart-timeline boundary)
+                            restart-lsn history)))))
+        (error "logical slot creation requires matching captured WAL evidence")))
+    (let ((on (snapshot-wal-boundary-logical-on-start-lsn boundary))
+          (on-timeline (snapshot-wal-boundary-logical-on-start-timeline boundary)))
+      (unless (or (and (null on) (null on-timeline))
+                  (and on on-timeline
+                       (timeline-prefix-boundary-p on-timeline on history)))
+        (error "logical slot creation ON interval is outside primary history"))
+      (values
+       (make-logical-slot-provenance
+        system-id (logical-slot-new-generation) boundary-lsn
+        (snapshot-wal-boundary-timeline boundary) on on-timeline)
+       (snapshot-wal-boundary-restart-timeline boundary)
+       (snapshot-wal-boundary-timeline boundary)))))
+
 (defun logical-slot-check-startup-identities (slots)
   "Check known logical slot system IDs before publishing the startup registry.
 When any logical slot has known provenance, read the durable catalog identity

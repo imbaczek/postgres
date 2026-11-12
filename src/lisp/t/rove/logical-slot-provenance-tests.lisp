@@ -125,6 +125,306 @@
       (rove:ok (eq :passed (getf data :status)) (format nil "~s" data))
       (rove:ok (= 200 (getf data :trials)))))
 
+(defun call-with-logical-slot-creation-test (function)
+  (call-with-logical-policy-test
+   (lambda (writer)
+     (declare (ignore writer))
+     (let ((*catalog* nil)
+           (*catalog-identity-needs-persist-p* nil)
+           (*catalog-oldest-relfrozenxid* nil)
+           (*catalog-durable-generation* 0)
+           (*catalog-logical-event-publication-p* nil)
+           (*wal-control-metadata* nil)
+           (*wal-replication-slots* (make-hash-table :test #'equal))
+           (*wal-snapshot-retention-pins* (make-hash-table :test #'eq))
+           (*wal-logical-catalog-event-interests* (make-hash-table :test #'eq))
+           (*active-snapshots* 0)
+           (*active-snapshot-set* (make-hash-table :test #'eq))
+           (*backend* (make-backend)))
+       (ensure-directories-exist (catalog-path))
+       (catalog-init)
+       (wal-ensure-directory-durable (wal-replication-slot-directory))
+       (unwind-protect
+            (funcall function)
+         (end-backend-session))))))
+
+(rove:deftest logical-slot-public-creation-persists-captured-provenance
+    (dolist (entry '(("standard" :standard) ("sql" :sql)))
+      (call-with-logical-slot-creation-test
+       (lambda ()
+         (let ((name (first entry))
+               (expected-on (wal-report-logical-decoding-status t)))
+           (ecase (second entry)
+             (:standard (create-standard-logical-slot name :nothing))
+             (:sql (create-sql-logical-replication-slot name "pgoutput" nil nil nil)))
+           (let* ((slot (gethash name *wal-replication-slots*))
+                  (saved (wal-read-replication-slot (wal-replication-slot-path name)))
+                  (provenance (wal-replication-slot-logical-provenance slot))
+                  (restored (wal-replication-slot-logical-provenance saved)))
+             (rove:ok provenance)
+             (rove:ok restored)
+             (when (and provenance restored)
+               (rove:ok (= (catalog-system-identifier)
+                           (logical-slot-provenance-system-id provenance)
+                           (logical-slot-provenance-system-id restored)))
+               (rove:ok (= (logical-slot-provenance-generation provenance)
+                           (logical-slot-provenance-generation restored)))
+               (rove:ok (= 1 (logical-slot-provenance-birth-timeline provenance)
+                           (wal-replication-slot-restart-timeline slot)
+                           (wal-replication-slot-confirmed-timeline slot)))
+               (rove:ok (= expected-on
+                           (logical-slot-provenance-on-start-lsn provenance)
+                           (logical-slot-provenance-on-start-lsn restored)))
+               (rove:ok (= 1 (logical-slot-provenance-on-start-timeline provenance)
+                           (logical-slot-provenance-on-start-timeline restored)))
+               (rove:ok (= (wal-replication-slot-consistent-lsn slot)
+                           (wal-replication-slot-confirmed-flush-lsn slot)))
+               (rove:ok (eq :none (wal-replication-slot-invalidation-cause saved))))
+             (rove:ok (zerop (hash-table-count *wal-snapshot-retention-pins*)))))))))
+
+(rove:deftest logical-slot-private-creation-keeps-copy-unconfirmed
+    (call-with-logical-slot-creation-test
+     (lambda ()
+       (multiple-value-bind (birth token) (create-exported-logical-snapshot-slot "private")
+         (unwind-protect
+              (let* ((slot (gethash "private" *wal-replication-slots*))
+                     (saved (wal-read-replication-slot (wal-replication-slot-path "private"))))
+                (rove:ok (plusp birth))
+                (rove:ok (wal-replication-slot-logical-provenance saved))
+                (rove:ok (null (wal-replication-slot-confirmed-flush-lsn slot)))
+                (rove:ok (null (wal-replication-slot-confirmed-timeline saved)))
+                (rove:ok (= 1 (wal-replication-slot-restart-timeline saved))))
+           (remove-exported-logical-snapshot-token token))))))
+
+(rove:deftest logical-slot-creation-rejects-identity-before-publication
+    (dolist (failure '(:missing :live :control :entropy))
+      (call-with-logical-slot-creation-test
+       (lambda ()
+         (let ((generation (symbol-function 'logical-slot-new-generation))
+               (calls 0))
+           (unwind-protect
+                (progn
+                  (setf (symbol-function 'logical-slot-new-generation)
+                        (lambda ()
+                          (incf calls)
+                          (if (eq failure :entropy) (error "entropy fault")
+                              (funcall generation))))
+                  (ecase failure
+                    (:missing (delete-file (catalog-path)))
+                    (:live (setf *catalog* (make-catalog)))
+                    (:control (setf *wal-control-metadata*
+                                    (make-wal-control-metadata
+                                     (logxor 1 (catalog-system-identifier))
+                                     +db-in-production+)))
+                    (:entropy))
+                  (rove:ok (handler-case
+                               (progn (create-standard-logical-slot "rejected" :nothing) nil)
+                             (error () t)))
+                  (rove:ok (= calls (if (eq failure :entropy) 1 0)))
+                  (rove:ok (null (gethash "rejected" *wal-replication-slots*)))
+                  (rove:ok (null (probe-file (wal-replication-slot-path "rejected"))))
+                  (rove:ok (zerop (hash-table-count *wal-snapshot-retention-pins*))))
+             (setf (symbol-function 'logical-slot-new-generation) generation)))))))
+
+(rove:deftest logical-slot-creation-rejects-detached-capture-evidence
+    (dolist (failure '(:boundary :restart :missing :pin))
+      (call-with-logical-slot-creation-test
+       (lambda ()
+         (call-with-logical-capture-armed
+          (lambda ()
+            (let ((registration (make-snapshot-registration)))
+              (unwind-protect
+                   (with-write-lock
+                     (wal-report-logical-decoding-status t)
+                     (multiple-value-bind (snapshot birth restart)
+                         (wal-capture-snapshot-boundary-under-writer-lock 0 registration)
+                       (declare (ignore snapshot))
+                       (ecase failure
+                         (:boundary (incf birth))
+                         (:restart (decf restart))
+                         (:missing (setf (snapshot-registration-wal-boundary registration) nil))
+                         (:pin (incf (gethash registration *wal-snapshot-retention-pins*))))
+                       (sb-thread:with-mutex (*wal-lock*)
+                         (rove:ok (handler-case
+                                      (progn
+                                        (wal-publish-replication-slot-under-wal-lock
+                                         "detached" birth restart registration nil nil 16384 "pgoutput")
+                                        nil)
+                                    (error () t)))
+                         (rove:ok (null (gethash "detached" *wal-replication-slots*)))
+                         (rove:ok (null (probe-file (wal-replication-slot-path "detached")))))))
+                (release-snapshot-registration registration)))))))))
+
+(rove:deftest logical-slot-created-image-restores-through-startup
+    (call-with-logical-slot-creation-test
+     (lambda ()
+       (create-standard-logical-slot "restored" :nothing)
+       (let* ((before (gethash "restored" *wal-replication-slots*))
+              (provenance (wal-replication-slot-logical-provenance before))
+              (*catalog* nil)
+              (*wal-replication-slots* (make-hash-table :test #'equal)))
+         (wal-load-replication-slots)
+         (let* ((restored (gethash "restored" *wal-replication-slots*))
+                (after (wal-replication-slot-logical-provenance restored)))
+           (rove:ok (null *catalog*))
+           (rove:ok (not (eq before restored)))
+           (rove:ok (= (logical-slot-provenance-system-id provenance)
+                       (logical-slot-provenance-system-id after)))
+           (rove:ok (= (logical-slot-provenance-generation provenance)
+                       (logical-slot-provenance-generation after)))
+           (rove:ok (= (wal-replication-slot-consistent-lsn before)
+                       (wal-replication-slot-consistent-lsn restored)))
+           (rove:ok (= 1 (wal-replication-slot-restart-timeline restored)
+                       (wal-replication-slot-confirmed-timeline restored)))
+           (rove:ok (null (wal-replication-slot-active-owner restored))))))))
+
+(rove:deftest logical-slot-creation-preserves-fork-position-roles
+    (dolist (pending-p '(nil t))
+      (call-with-logical-slot-creation-test
+       (lambda ()
+         (let* ((fork 100)
+                (*wal-insert-timeline* 2)
+                (registration (make-snapshot-registration))
+                (boundary (make-snapshot-wal-boundary
+                           :lsn fork :timeline 1 :restart-lsn fork
+                           :restart-timeline (if pending-p 2 1)
+                           :restart-role (if pending-p :record-start :prefix-end))))
+           ;; Geometry only: this does not claim a child WAL record exists at FORK.
+           (timeline-write-history 2 1 fork "logical creation geometry fixture")
+           (sb-thread:with-mutex (*xid-lock*)
+             (register-active-snapshot (make-snapshot-struct :xmin 100 :xmax 100) registration))
+           (setf (snapshot-registration-wal-boundary registration) boundary
+                 (snapshot-registration-wal-retention-lsn registration) fork
+                 (gethash registration *wal-snapshot-retention-pins*) fork)
+           (sb-thread:with-mutex (*wal-lock*)
+             (multiple-value-bind (provenance restart-timeline birth-timeline)
+                 (logical-slot-creation-evidence-under-lock fork fork registration)
+               (rove:ok (= 1 birth-timeline
+                           (logical-slot-provenance-birth-timeline provenance)))
+               (rove:ok (= (if pending-p 2 1) restart-timeline))
+               (rove:ok (null (logical-slot-provenance-on-start-lsn provenance))))
+             (when pending-p
+               (setf (snapshot-registration-wal-boundary registration)
+                     (make-snapshot-wal-boundary
+                      :lsn fork :timeline 1 :restart-lsn fork :restart-timeline 1
+                      :restart-role :record-start))
+               (rove:ok (handler-case
+                            (progn
+                              (logical-slot-creation-evidence-under-lock fork fork registration)
+                              nil)
+                          (error () t))
+                        "a record start at the child fork cannot be stamped as its parent"))))))))
+
+(rove:deftest logical-slot-factory-persists-fork-position-roles
+    (dolist (pending-p '(nil t))
+      (call-with-logical-slot-creation-test
+       (lambda ()
+         (call-with-logical-capture-armed
+          (lambda ()
+            (wal-report-logical-decoding-status t)
+            (let* ((fork *wal-durable-lsn*)
+                   (registration (make-snapshot-registration)))
+              (unwind-protect
+                   (progn
+                     (make-snapshot 0 :register registration)
+                     (timeline-write-history 2 1 fork "factory position-role fixture")
+                     ;; Supply frozen geometry to the factory; child-record byte
+                     ;; availability and end-to-end promotion are separate oracles.
+                     (setf (snapshot-registration-wal-boundary registration)
+                           (make-snapshot-wal-boundary
+                            :lsn fork :timeline 1 :restart-lsn fork
+                            :restart-timeline (if pending-p 2 1)
+                            :restart-role (if pending-p :record-start :prefix-end))
+                           (snapshot-registration-wal-retention-lsn registration) fork
+                           (gethash registration *wal-snapshot-retention-pins*) fork)
+                     (let* ((*wal-insert-timeline* 2)
+                            (*wal-logical-policy*
+                              (%make-wal-logical-policy
+                               *wal-storage-incarnation*
+                               (%make-wal-logical-status t 0 fork 2 nil nil) nil)))
+                       (sb-thread:with-mutex (*wal-lock*)
+                         (wal-publish-replication-slot-under-wal-lock
+                          "fork" fork fork registration nil nil 16384 "pgoutput")))
+                     (let* ((saved (wal-read-replication-slot (wal-replication-slot-path "fork")))
+                            (provenance (wal-replication-slot-logical-provenance saved)))
+                       (rove:ok (= 1 (logical-slot-provenance-birth-timeline provenance)
+                                   (wal-replication-slot-confirmed-timeline saved)))
+                       (rove:ok (= (if pending-p 2 1)
+                                   (wal-replication-slot-restart-timeline saved)))
+                       (rove:ok (= fork (wal-replication-slot-consistent-lsn saved)
+                                   (wal-replication-slot-restart-lsn saved)
+                                   (wal-replication-slot-confirmed-flush-lsn saved)))))
+                (release-snapshot-registration registration)))))))))
+
+(rove:deftest logical-slot-creation-rechecks-concurrent-snapshot-release
+    (call-with-logical-slot-creation-test
+     (lambda ()
+       (call-with-logical-capture-armed
+        (lambda ()
+          (let* ((registration (make-snapshot-registration))
+                 (start (sb-thread:make-semaphore))
+                 (marked (sb-thread:make-semaphore))
+                 (finish (sb-thread:make-semaphore))
+                 (active-set *active-snapshot-set*)
+                 (pins *wal-snapshot-retention-pins*)
+                 (identity-reader (symbol-function 'physical-slot-startup-system-id))
+                 (generation-reader (symbol-function 'logical-slot-new-generation))
+                 (generations 0)
+                 (release-result nil)
+                 (releaser nil))
+            (unwind-protect
+                 (with-write-lock
+                   (wal-report-logical-decoding-status t)
+                   (multiple-value-bind (snapshot birth restart)
+                       (wal-capture-snapshot-boundary-under-writer-lock 0 registration)
+                     (declare (ignore snapshot))
+                     (setf releaser
+                           (sb-thread:make-thread
+                            (lambda ()
+                              (let ((*active-snapshot-set* active-set)
+                                    (*active-snapshots* 1)
+                                    (*wal-snapshot-retention-pins* pins)
+                                    (*wal-test-after-snapshot-release-mark-hook*
+                                      (lambda (token)
+                                        (declare (ignore token))
+                                        (sb-thread:signal-semaphore marked)
+                                        (sb-thread:wait-on-semaphore finish))))
+                                (when (sb-thread:wait-on-semaphore start :timeout 5)
+                                  (release-snapshot-registration registration)
+                                  (setf release-result t))))
+                            :name "logical slot snapshot release"))
+                     (setf (symbol-function 'logical-slot-new-generation)
+                           (lambda () (incf generations) (funcall generation-reader))
+                           (symbol-function 'physical-slot-startup-system-id)
+                           (lambda ()
+                             ;; The factory has passed its initial active check,
+                             ;; but the release still cannot remove the WAL pin.
+                             (sb-thread:signal-semaphore start)
+                             (assert (sb-thread:wait-on-semaphore marked :timeout 5))
+                             (funcall identity-reader)))
+                     (sb-thread:with-mutex (*wal-lock*)
+                       (rove:ok (handler-case
+                                    (progn
+                                      (wal-publish-replication-slot-under-wal-lock
+                                       "released" birth restart registration nil nil 16384 "pgoutput")
+                                      nil)
+                                  (error () t)))
+                       (rove:ok (zerop generations))
+                       (rove:ok (null (gethash "released" *wal-replication-slots*)))
+                       (rove:ok (null (probe-file (wal-replication-slot-path "released")))))))
+              (setf (symbol-function 'physical-slot-startup-system-id) identity-reader
+                    (symbol-function 'logical-slot-new-generation) generation-reader)
+              (sb-thread:signal-semaphore finish)
+              (sb-thread:signal-semaphore start)
+              (when releaser (sb-thread:join-thread releaser))
+              ;; The actor decremented its own dynamic counter; reconcile this
+              ;; fixture's counter only after its shared registration set is empty.
+              (sb-thread:with-mutex (*snapshot-count-lock*)
+                (rove:ok (zerop (hash-table-count *active-snapshot-set*)))
+                (setf *active-snapshots* 0))
+              (release-snapshot-registration registration))
+            (rove:ok release-result)))))))
+
 (defun unit-logical-provenance-slot (&key (provenance t) (known-on t) (cause :none)
                                        (generation 0) (system-id 42) (end 80) (timeline 1)
                                        (plugin "pgoutput") (profile :text))
