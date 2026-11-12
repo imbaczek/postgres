@@ -10,6 +10,7 @@
                (:file "t/rove/replication-slot-state-tests")
                (:file "t/rove/logical-slot-provenance-tests")
                (:file "t/rove/logical-slot-copy-descriptor-tests")
+               (:file "t/rove/logical-slot-copy-binding-tests")
                (:file "t/rove/logical-wal-cursor-tests")
                (:file "t/rove/pglz-tests")
                (:file "t/rove/numeric-storage-tests")

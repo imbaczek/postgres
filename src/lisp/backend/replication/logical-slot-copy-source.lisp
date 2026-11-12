@@ -2,6 +2,8 @@
 
 (defvar *logical-slot-copy-restoration-failure* nil)
 
+(declaim (ftype function logical-slot-copy-check-startup-image))
+
 (defun logical-slot-copy-check-startup ()
   (let ((stat
           (handler-case
@@ -11,6 +13,7 @@
                 (error condition))))))
     (when stat
       (error "unfinished logical slot copy cannot start")))
+  (logical-slot-copy-check-startup-image)
   (values))
 
 (defun logical-slot-copy-check-identity (gate-owner ownership)
@@ -114,7 +117,30 @@
                            (logical-slot-copy-check-paused-writer writer system-id gate-owner ownership))))
                   (logical-slot-copy-restore-writer writer system-id gate-owner ownership primary)))))))))))
 
-(defun call-with-logical-slot-copy-source-directory (gate-owner ownership function)
+(defun logical-slot-copy-open-pin-directory (root &key create)
+  (when (and create
+             (not (zerop (physical-image-mkdirat root "pg_physical_pins" #o700)))
+             (/= sb-posix:eexist (sb-alien:get-errno)))
+    (error "cannot prepare logical slot copy pin directory"))
+  (let ((fd nil))
+    (sb-sys:without-interrupts
+      (unwind-protect
+           (progn
+             (setf fd (physical-image-openat
+                       root "pg_physical_pins"
+                       (logior sb-posix:o-rdonly sb-posix:o-directory
+                               sb-posix:o-nofollow +postmaster-o-cloexec+) 0))
+             (when (minusp fd) (setf fd nil) (error "cannot open logical slot copy pin directory"))
+             (let ((held (physical-image-check-directory fd (sb-posix:stat-dev (sb-posix:fstat root))))
+                   (named (physical-image-file-facts root "pg_physical_pins")))
+               (unless (and (= (sb-posix:stat-dev held) (first named))
+                            (= (sb-posix:stat-ino held) (second named)))
+                 (error "logical slot copy pin directory changed")))
+             (when create (sb-posix:fsync fd) (sb-posix:fsync root))
+             (prog1 fd (setf fd nil)))
+        (when fd (sb-posix:close fd))))))
+
+(defun call-with-logical-slot-copy-source-directory (gate-owner ownership function &key prepare-pins)
   (check-primary-storage-startup-context gate-owner ownership)
   (let ((fd nil))
     (sb-sys:without-interrupts
@@ -125,10 +151,18 @@
                (unless (and (= (postmaster-ownership-device ownership) (sb-posix:stat-dev stat))
                             (= (postmaster-ownership-inode ownership) (sb-posix:stat-ino stat)))
                  (error "logical slot copy source directory changed")))
+             (when prepare-pins
+               (sb-posix:close (logical-slot-copy-open-pin-directory fd :create t)))
              (sb-sys:with-local-interrupts
                (call-with-physical-backup-image-directory
                 fd
                 (lambda (root)
+                  (when prepare-pins
+                    (sb-sys:without-interrupts
+                      (push (cons "pg_physical_pins"
+                                  (logical-slot-copy-open-pin-directory
+                                   (physical-image-context-root-fd *physical-image-context*)))
+                            (physical-image-context-children *physical-image-context*))))
                   (let ((*pgdata* root))
                     (check-primary-storage-startup-context gate-owner ownership)
                     (multiple-value-prog1 (funcall function *physical-image-context*)

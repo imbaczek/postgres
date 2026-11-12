@@ -511,7 +511,7 @@ Child images may include history files no newer than their selected timeline."
       (- (getf manifest :checkpoint) +wal-header-size+)))
 
 (defun recovery-manifest-keys-valid-p (manifest)
-  "Check manifest keys, including the ordered optional v3 authentication and anchor suffix."
+  "Check manifest keys and the ordered optional v3 suffix."
   (let* ((version (getf manifest :version))
          (keys (loop for (key value) on manifest by #'cddr collect key))
          (legacy (if (member version '(2 3))
@@ -521,11 +521,18 @@ Child images may include history files no newer than their selected timeline."
                        :end :next-xid :source-pin :files)))
          (auth (get-properties manifest '(:auth-policy-required)))
          (anchor (get-properties manifest '(:logical-base-anchor)))
+         (copy (get-properties manifest '(:logical-slot-copy-id)))
          (suffix (append (when auth '(:auth-policy-required))
-                         (when anchor '(:logical-base-anchor)))))
+                         (when anchor '(:logical-base-anchor))
+                         (when copy '(:logical-slot-copy-id)))))
     (or (equal keys legacy)
         (and (eql version 3) suffix
              (or (not auth) (eql 1 (getf manifest :auth-policy-required)))
+             (or (not copy)
+                 (and auth
+                      (handler-case-noninterrupt
+                       (progn (logical-slot-parse-generation (getf manifest :logical-slot-copy-id)) t)
+                       (condition nil))))
              (equal keys (append legacy suffix))))))
 
 (defun recovery-check-manifest-schema (manifest)

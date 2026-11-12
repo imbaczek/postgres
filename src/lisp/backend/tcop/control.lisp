@@ -1141,7 +1141,7 @@ this listener evaluates arbitrary Lisp."
                (cond
                  ((and (consp form) (eq (first form) 'reload) (null (rest form)))
                   (reload))
-                 ((and (consp form) (member (first form) '(physical-base-backup physical-standby-base-backup))
+                 ((and (consp form) (member (first form) '(physical-base-backup physical-standby-base-backup logical-slot-base-copy))
                        (= (length form) 3) (every #'stringp (rest form)))
                   ;; Literal arguments only: do not evaluate arbitrary argument
                   ;; expressions outside live admission. The backup owns its gate.

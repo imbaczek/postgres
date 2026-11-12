@@ -579,6 +579,8 @@ Check the file length and digest before sending the end frame."
 
 (defun physical-backup-bundle-entries (directory manifest)
   (recovery-check-manifest-schema manifest)
+  (when (get-properties manifest '(:logical-slot-copy-id))
+    (error "ordinary native backup bundles cannot carry logical slot copy adjuncts"))
   (unless (equal manifest (recovery-read-manifest directory))
     (error "native backup bundle manifest changed"))
   (append
@@ -716,6 +718,8 @@ The caller checks the file header and owns the output."
           (unless (<= 6 count 1000000) (error "invalid native backup bundle file count"))
           (physical-backup-receive-file directory "physical-backup.manifest" 16777216 #'receive-frame)
           (let ((manifest (recovery-check-manifest-schema (recovery-read-manifest directory))))
+            (when (get-properties manifest '(:logical-slot-copy-id))
+              (error "ordinary native backup bundles cannot receive logical slot copy adjuncts"))
             (unless (and (eql 3 (getf manifest :version))
                          (= count (+ 6 (length (getf manifest :files)))))
               (error "native backup bundle inventory disagrees with its manifest"))

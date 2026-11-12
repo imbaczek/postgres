@@ -80,14 +80,93 @@ For a retained-timeline pin that endpoint is the requested fork."
 
 (declaim (ftype function physical-source-pin-path physical-source-pin-encode))
 
-(defun physical-source-pin-save (pin)
+(defun physical-source-pin-held-directory ()
+  (let ((context *physical-image-context*))
+    (when (and context (physical-image-read-context-p context)
+               (equal *pgdata* (physical-image-context-root-path context)))
+      (physical-image-check-children context)
+      (or (cdr (assoc "pg_physical_pins" (physical-image-context-children context) :test #'equal))
+          (error "physical source pin requires its held directory")))))
+
+(defun physical-source-pin-readback-at (parent leaf bytes &optional expected-inode)
+  (call-with-physical-image-input-at
+   parent leaf
+   (lambda (stream)
+     (let* ((fd (sb-sys:fd-stream-fd stream))
+            (before (physical-image-file-facts fd))
+            (actual (make-array (length bytes) :element-type '(unsigned-byte 8))))
+       (unless (and (= (length bytes) (sixth before))
+                    (or (null expected-inode) (= expected-inode (second before)))
+                    (= (length bytes) (read-sequence actual stream))
+                    (eq :eof (read-byte stream nil :eof))
+                    (equalp bytes actual)
+                    (equal before (physical-image-file-facts fd))
+                    (equal before (physical-image-file-facts parent leaf)))
+         (error "physical source pin held readback changed"))))
+   :element-type '(unsigned-byte 8)))
+
+(defun physical-source-pin-remove-owned-temporary (parent temporary fd)
+  (ignore-errors
+   (let ((held (physical-image-file-facts fd))
+         (named (physical-image-file-facts parent temporary)))
+     (when (and (= (first held) (first named)) (= (second held) (second named)))
+       (unless (zerop (port-unlinkat parent temporary 0))
+         (error "cannot remove owned physical source pin temporary"))
+       (sb-posix:fsync parent)))))
+
+(defun physical-source-pin-check-temporary (name)
+  (let ((parent (physical-source-pin-held-directory)))
+    (when (and parent
+               (wal-namespace-file-stat
+                (merge-pathnames (format nil "~a.pin.tmp" name) (physical-image-fd-path parent)) t))
+      (wal-invalid-input "physical source pin ~a has a stale temporary file" name))))
+
+(defun physical-source-pin-write-at (parent leaf bytes create)
+  (unless (and (stringp leaf) (plusp (length leaf))
+               (not (find #\/ leaf)) (not (find (code-char 0) leaf))
+               (not (member leaf '("." "..") :test #'equal)))
+    (error "physical source pin requires one file name"))
+  (let ((temporary (concatenate 'string leaf ".tmp")) (fd nil) (stream nil))
+    (sb-sys:without-interrupts
+      (unwind-protect
+           (progn
+             (setf fd (physical-image-openat
+                       parent temporary (logior sb-posix:o-wronly sb-posix:o-creat sb-posix:o-excl
+                                                sb-posix:o-nofollow +postmaster-o-cloexec+) #o600))
+             (when (minusp fd) (setf fd nil) (error "cannot create exclusive physical source pin temporary"))
+             (sb-posix:fchmod fd #o600)
+             (setf stream (sb-sys:make-fd-stream fd :output t :element-type '(unsigned-byte 8)))
+             (sb-sys:with-local-interrupts
+               (write-sequence bytes stream)
+               (fsync-stream stream)
+               (let ((facts (physical-image-file-facts fd)))
+                 (unless (and (sb-posix:s-isreg (third facts)) (= 1 (fourth facts))
+                              (= (sb-posix:geteuid) (fifth facts))
+                              (= #o600 (logand #o7777 (third facts))) (= (length bytes) (sixth facts))
+                              (equal facts (physical-image-file-facts parent temporary)))
+                   (error "physical source pin temporary binding changed"))
+                 (unless (zerop (if create
+                                    (slot-state-renameat2 parent temporary parent leaf 1)
+                                    (port-renameat parent temporary parent leaf)))
+                   (error "cannot publish held physical source pin"))
+                 (sb-posix:fsync parent)
+                 (physical-source-pin-readback-at parent leaf bytes (second facts)))))
+        (when fd (physical-source-pin-remove-owned-temporary parent temporary fd))
+        (if stream (close stream) (when fd (sb-posix:close fd)))))))
+
+(defun physical-source-pin-save (pin &optional create)
   (physical-source-pin-test-point :before-save pin)
-  (wal-atomic-write-bytes (physical-source-pin-path (physical-source-pin-name pin))
-                          (physical-source-pin-encode pin))
+  (let ((parent (physical-source-pin-held-directory))
+        (bytes (physical-source-pin-encode pin)))
+    (if parent
+        (progn
+          (physical-source-pin-write-at parent (format nil "~a.pin" (physical-source-pin-name pin)) bytes create)
+          (physical-image-check-children *physical-image-context*))
+        (wal-atomic-write-bytes (physical-source-pin-path (physical-source-pin-name pin)) bytes)))
   (physical-source-pin-test-point :after-save pin))
 
 (defun physical-source-pin-directory ()
-  (merge-pathnames "pg_physical_pins/" *pgdata*))
+  (pgdata-resolve-path "pg_physical_pins/" *pgdata*))
 
 (defun physical-source-pin-path (name)
   (merge-pathnames (format nil "~a.pin" name) (physical-source-pin-directory)))
@@ -299,9 +378,17 @@ their endpoint; lost pins need no WAL."
                    :consistent-lsn end
                    :restart-lsn (wal-checkpoint-record-start end))))
         (physical-source-pin-check-wal pin)
+        (physical-source-pin-check-temporary name)
         (begin-publication)
-        (wal-ensure-directory-durable (physical-source-pin-directory))
-        (physical-source-pin-save pin)
+        (let ((parent (physical-source-pin-held-directory)))
+          (if parent
+              (progn
+                (sb-posix:fsync parent)
+                (sb-posix:fsync (physical-image-context-root-fd *physical-image-context*))
+                (physical-source-pin-save pin t))
+              (progn
+                (wal-ensure-directory-durable (physical-source-pin-directory))
+                (physical-source-pin-save pin))))
         (setf (gethash pin *wal-snapshot-retention-pins*)
               (physical-source-pin-restart-lsn pin)
               (gethash name *physical-source-pins*) pin)
@@ -324,6 +411,11 @@ Publish the in-memory binding only after saving the candidate pin."
                    (null (physical-source-pin-manifest-digest pin))
                    (null (gethash (physical-source-pin-name pin) *physical-source-senders*)))
         (wal-invalid-input "physical source pin cannot bind this backup manifest"))
+      (let ((parent (physical-source-pin-held-directory)))
+        (when parent
+          (physical-source-pin-readback-at
+           parent (format nil "~a.pin" (physical-source-pin-name pin))
+           (physical-source-pin-encode pin))))
       (let ((candidate (copy-physical-source-pin pin)))
         (setf (physical-source-pin-manifest-digest candidate) digest)
         (physical-source-pin-save candidate)
