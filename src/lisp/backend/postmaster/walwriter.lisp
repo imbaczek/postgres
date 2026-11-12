@@ -607,12 +607,7 @@ ready primary after installing source identity and before enabling reload."
       (start-primary-wal-writer-under-lock)
       (sb-thread:with-mutex (*wal-lock*) (start-primary-wal-writer-under-lock))))
 
-(defun stop-primary-wal-writer (&key shutdown-p)
-  "Stop and join outside live admission and the lifecycle locks checked below.
-Ordinary stop permits restart; SHUTDOWN-P closes startup permanently. Publish
-the joined state under WAL then state lock after the thread exits. Final shutdown
-joins after reload workers stop and before storage finalization. After joining,
-settle healthy FIFO debt under definition then WAL lock, even without a writer."
+(defun check-primary-wal-writer-join-context ()
   (when (or (sb-thread:holding-mutex-p *wal-lock*)
             (sb-thread:holding-mutex-p *primary-wal-writer-lock*)
             (sb-thread:holding-mutex-p *reload-definition-lock*)
@@ -621,6 +616,15 @@ settle healthy FIFO debt under definition then WAL lock, even without a writer."
             (sb-thread:holding-mutex-p *live-operation-lock*)
             (plusp *live-operation-depth*))
     (error "primary WAL writer join requires an outside lifecycle caller"))
+  (values))
+
+(defun stop-primary-wal-writer (&key shutdown-p)
+  "Stop and join outside live admission and the lifecycle locks checked below.
+Ordinary stop permits restart; SHUTDOWN-P closes startup permanently. Publish
+the joined state under WAL then state lock after the thread exits. Final shutdown
+joins after reload workers stop and before storage finalization. After joining,
+settle healthy FIFO debt under definition then WAL lock, even without a writer."
+  (check-primary-wal-writer-join-context)
   (let ((writer (if shutdown-p
                     (request-primary-wal-writer-shutdown)
                     (request-primary-wal-writer-stop))))

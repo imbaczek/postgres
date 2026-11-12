@@ -976,6 +976,7 @@ Then check the cached handles and workers under startup exclusion."
           *query-temp-file-limit-bytes* temp-file-limit-bytes
           *query-sort-arena-limit-bytes* sort-arena-limit-bytes
           *max-slot-wal-keep-bytes* max-slot-wal-keep-bytes)
+    (logical-slot-copy-check-startup)
     (authentication-preflight-startup startup-settings)
     (startup-install-initial-settings startup-settings startup-native startup-overrides)
     (startup-install-resource-capacity startup-settings)

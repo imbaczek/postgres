@@ -1320,9 +1320,14 @@ The zero marker remains sticky for uncertified writes; XIDs are full XIDs."
   (when (= type +wal-record-end-of-recovery+)
     (wal-invalid-input "end-of-recovery requires a verified timeline transition")))
 
+(defvar *wal-fail-stop-cause-cell* nil
+  "Dynamically bound cell retaining the first fail-stop cause in an operation.")
+
 (defun wal-fail-stop (condition)
   "Poison WAL, retain CONDITION on this backend, and request fast shutdown.
 Re-signal CONDITION after requesting shutdown."
+  (when (and *wal-fail-stop-cause-cell* (not (car *wal-fail-stop-cause-cell*)))
+    (setf (car *wal-fail-stop-cause-cell*) condition))
   (setf *wal-poisoned* t)
   (when (fboundp 'note-backend-wal-failure)
     (funcall 'note-backend-wal-failure condition))

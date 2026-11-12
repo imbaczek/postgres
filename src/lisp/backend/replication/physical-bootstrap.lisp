@@ -56,6 +56,8 @@ A missing name is harmless; other lstat failures stop cleanup."
   (when (physical-recovery-signal-retirement-stat name)
     (sb-posix:unlink (namestring (merge-pathnames name *pgdata*)))))
 
+(declaim (ftype function logical-slot-copy-check-startup))
+
 (defun physical-bootstrap-check-startup ()
   "Choose recovery or primary startup before listeners or ordinary storage setup.
 Recovery artifacts without recovery control are an error: pending control is
@@ -64,6 +66,7 @@ standby control requires recovery validation. A pending request is reconciled
 against parent or committed child control. Return :PRIMARY-READY when pending
 completion already initialized storage. Invalid proof is an error. Resolve the
 active timeline goal before recovery preparation or redo."
+  (logical-slot-copy-check-startup)
   (let ((signal-mode (physical-recovery-read-signal-mode))
         (timeline-goal (startup-recovery-timeline-goal)))
     (when (and (not (wal-namespace-file-stat (physical-recovery-control-path) t))
