@@ -316,7 +316,8 @@ The new base receives its own archive; the old primary archive is not copied."
                 (physical-store-update-digest #xCBF29CE484222325 actual)))))))
 
 (defun physical-bootstrap-copy-file (relative target &key limit)
-  "Copy and fsync a stable source file or exact prefix, returning its length and checksum."
+  "Copy and fsync a stable source file or exact prefix, returning its length and checksum.
+Each read writes and hashes the same bytes.  A requested prefix must be complete."
   (when (equal relative "global/pg_wal_control")
     (let ((derived (physical-bootstrap-derived-wal-control target)))
       (when derived
@@ -523,6 +524,9 @@ The slot is dropped on every exit; a verified origin remains after cancellation.
       (recovery-manifest-path-p name timeline)))
 
 (defun physical-backup-send-file (directory entry timeline emit)
+  "Send a checked bundle file as a header, data frames and an end frame.
+Each data frame owns a fresh payload; hash the same bytes copied into it.
+Check the file length and digest before sending the end frame."
   (destructuring-bind (name size expected-digest) entry
     (unless (and (physical-backup-bundle-path-p name timeline)
                  (typep size '(unsigned-byte 64))
@@ -627,6 +631,9 @@ The slot is dropped on every exit; a verified origin remains after cancellation.
 ;; the digest; the caller owns the output stream and its durability.
 
 (defun physical-backup-receive-file-content (size expected-digest next output)
+  "Receive file data and return its digest after checking the end frame.
+Validate each data extent before writing it, and hash the same bytes written.
+The caller checks the file header and owns the output."
   (let ((digest #xCBF29CE484222325))
     (loop with remaining = size
           while (plusp remaining)
