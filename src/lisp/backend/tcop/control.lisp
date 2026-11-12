@@ -800,6 +800,38 @@ lane must not run query or storage work."
               ,@body)
          (open-live-operation-admission ,owner)))))
 
+(defun check-live-operation-startup-quiescence (owner)
+  (call-with-live-operation-lock
+   (lambda ()
+     (unless (and owner (eq owner *live-operation-quiescence-owner*)
+                  (eq sb-thread:*current-thread* *live-operation-quiescence-owner-thread*)
+                  (not *live-operation-admission-open*) (not *live-operation-drain-open*)
+                  (not *live-operation-shutdown-drain-open*) (not *live-operation-terminal-shutdown*)
+                  (zerop *live-operation-depth*) (not *live-operation-parked-p*)
+                  (zerop *live-operation-count*) (zerop (hash-table-count *live-operation-parked*)))
+       (error "startup requires its owned, fully drained admission gate"))
+     owner)))
+
+(defun call-with-live-operation-startup-quiescence (function)
+  (when (or (plusp *live-operation-depth*) *live-operation-parked-p*)
+    (error "startup quiescence requires an unadmitted, unparked caller"))
+  (labels ((invoke (owner)
+             (check-live-operation-startup-quiescence owner)
+             (multiple-value-prog1 (funcall function owner)
+               (check-live-operation-startup-quiescence owner))))
+    (let ((owner
+            (call-with-live-operation-lock
+             (lambda ()
+               (when *live-operation-terminal-shutdown*
+                 (error "startup cannot enter terminal shutdown admission"))
+               (when (eq sb-thread:*current-thread* *live-operation-quiescence-owner-thread*)
+                 (or *live-operation-quiescence-owner*
+                     (error "startup admission owner is missing")))))))
+      (if owner
+          (invoke owner)
+          (with-live-operation-quiescence
+            (invoke *live-operation-quiescence-owner*))))))
+
 (defun try-call-with-live-operation-reload (function)
   ;; Check both censuses while admission is closed. Return their generations
   ;; instead of waiting here, so the caller can reopen admission first.

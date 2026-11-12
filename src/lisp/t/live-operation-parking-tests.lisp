@@ -64,6 +64,95 @@
         (if (second entry) (set (first entry) (third entry))
             (makunbound (first entry)))))))
 
+(deftest startup-quiescence-acquires-and-borrows-real-gate-ownership
+    (call-with-parking-test-state
+     (lambda ()
+       (let ((captured nil))
+         (ok (equal '(17 nil 23)
+                    (multiple-value-list
+                     (pg::call-with-live-operation-startup-quiescence
+                      (lambda (owner)
+                        (setf captured owner)
+                        (ok (eq owner pg::*live-operation-quiescence-owner*))
+                        (ok (not pg::*live-operation-admission-open*))
+                        (ok (not pg::*live-operation-drain-open*))
+                        (values 17 nil 23))))))
+         (ok captured)
+         (ok pg::*live-operation-admission-open*)
+         (ok (null pg::*live-operation-quiescence-owner*)))
+       (pg::with-live-operation-quiescence
+         (let ((outer pg::*live-operation-quiescence-owner*))
+           (pg::call-with-live-operation-startup-quiescence
+            (lambda (owner) (ok (eq outer owner))))
+           (ok (eq outer pg::*live-operation-quiescence-owner*)))
+         (ok (not pg::*live-operation-admission-open*))))))
+
+(deftest startup-quiescence-unwind-releases-only-an-acquired-gate
+    (call-with-parking-test-state
+     (lambda ()
+       (ok (eq :cut
+               (catch 'startup-cut
+                 (pg::call-with-live-operation-startup-quiescence
+                  (lambda (owner) (declare (ignore owner)) (throw 'startup-cut :cut))))))
+       (ok pg::*live-operation-admission-open*)
+       (pg::with-live-operation-quiescence
+         (let ((outer pg::*live-operation-quiescence-owner*))
+           (ok (eq :borrowed-cut
+                   (catch 'startup-cut
+                     (pg::call-with-live-operation-startup-quiescence
+                      (lambda (owner) (declare (ignore owner)) (throw 'startup-cut :borrowed-cut))))))
+           (ok (eq outer pg::*live-operation-quiescence-owner*))
+           (ok (not pg::*live-operation-admission-open*)))))))
+
+(deftest startup-quiescence-rejects-parked-and-incomplete-drain-contexts
+    (call-with-parking-test-state
+     (lambda ()
+       (pg::with-live-operation-quiescence
+         (let ((outer pg::*live-operation-quiescence-owner*) (called nil)
+                                                             (token (pg::make-live-operation-token)))
+           (unwind-protect
+                (progn
+                  (setf (gethash token pg::*live-operation-parked*) t)
+                  (ok (signals
+                       (pg::call-with-live-operation-startup-quiescence
+                        (lambda (owner) (declare (ignore owner)) (setf called t)))
+                       'error))
+                  (ok (not called)))
+             (remhash token pg::*live-operation-parked*))
+           (let ((pg::*live-operation-drain-open* t))
+             (ok (signals
+                  (pg::call-with-live-operation-startup-quiescence
+                   (lambda (owner) (declare (ignore owner)) (setf called t)))
+                  'error)))
+           (ok (not called))
+           (ok (eq outer pg::*live-operation-quiescence-owner*))
+           (ok (not pg::*live-operation-admission-open*)))))))
+
+(deftest startup-quiescence-rechecks-the-borrowed-gate-after-callback
+    (call-with-parking-test-state
+     (lambda ()
+       (pg::with-live-operation-quiescence
+         (let ((outer pg::*live-operation-quiescence-owner*) (completed nil))
+           (unwind-protect
+                (let ((message
+                        (handler-case
+                            (progn
+                              (pg::call-with-live-operation-startup-quiescence
+                               (lambda (owner)
+                                 (declare (ignore owner))
+                                 (pg::call-with-live-operation-lock
+                                  (lambda () (setf pg::*live-operation-drain-open* t)))
+                                 (setf completed t)
+                                 (values 17)))
+                              nil)
+                          (error (condition) (princ-to-string condition)))))
+                  (ok completed)
+                  (ok (and message (search "fully drained admission gate" message)))
+                  (ok (eq outer pg::*live-operation-quiescence-owner*))
+                  (ok (not pg::*live-operation-admission-open*)))
+             (pg::call-with-live-operation-lock
+              (lambda () (setf pg::*live-operation-drain-open* nil)))))))))
+
 (deftest parked-operation-preserves-depth-owner-and-multiple-values
     (call-with-parking-test-state
      (lambda ()
