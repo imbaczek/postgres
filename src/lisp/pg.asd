@@ -329,6 +329,7 @@
                    (:file "../replication/standard-subscriber")
                    (:file "extended-query")
                    (:file "../replication/logical-slot-copy-target")
+                   (:file "../replication/logical-slot-copy-descriptor")
                    (:file "postgres")))
      (:file "replication/logical-retention")
      (:file "replication/logical-shutdown")))))
