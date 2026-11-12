@@ -105,7 +105,8 @@
 
 (defmacro physical-reseed-check-directory-flock (fd active message)
   ;; The probe permits local interrupts, so check ACTIVE again after it returns.
-  ;; A failed observation latches the scope inactive before signaling the error.
+  ;; An ordinary failed observation latches the scope inactive before signaling;
+  ;; fatal and cancellation conditions escape without revoking a healthy scope.
   `(sb-sys:without-interrupts
      (unless (and (sb-sys:with-local-interrupts
                     (handler-case-noninterrupt (physical-file-holds-exclusive-flock-p ,fd)

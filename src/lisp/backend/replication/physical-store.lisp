@@ -44,8 +44,9 @@ the archive outside the receive spool; otherwise it is stored beneath the spool.
 (defun physical-store-check-held-lock (store)
   ;; Compare the named receive.lock with the held descriptor on both sides of
   ;; the flock check.  The caller must serialize access to the store.  These
-  ;; checks give evidence at this boundary.  A signaled error latches the store
-  ;; and revokes its ownership before the error escapes.
+  ;; checks give evidence at this boundary.  An ordinary validation failure
+  ;; latches the store and revokes ownership; an interrupt of a healthy check
+  ;; escapes without revocation.
   (let ((stream (physical-store-lock-stream store)))
     (handler-case-noninterrupt
      (progn

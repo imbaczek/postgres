@@ -5,6 +5,7 @@
   :serial t
   :components
   ((:file "packages")
+   ;; Port lock checks use the condition handlers in elog.
    (:file "elog" :pathname "backend/utils/elog")
    (:module "include"
     :serial t

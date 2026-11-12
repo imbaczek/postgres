@@ -160,6 +160,8 @@ This context is invalid after its enclosing call exits."
                   (gethash (physical-adoption-owner-lock owner) revoked) t
                   (physical-adoption-owner-active-p owner) nil))
           (error "offline adoption lost its exclusive directory lock")))
+      ;; A nested check may have revoked this owner or its lock stream while
+      ;; the probe ran, even if the probe itself returned true.
       (check-revocation)
       owner)))
 

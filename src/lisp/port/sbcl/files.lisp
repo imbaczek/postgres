@@ -177,6 +177,8 @@ callers needing a coherent view across publications must compare control images.
                          t)))
                (error "physical file lost its exclusive lock"))))
       (check-revocation)
+      ;; The probe can be interrupted.  Mask only the transition from an
+      ;; ordinary failed observation to permanent revocation.
       (sb-sys:without-interrupts
         (unless (sb-sys:with-local-interrupts
                   (handler-case-noninterrupt

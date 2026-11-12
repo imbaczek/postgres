@@ -1568,6 +1568,13 @@
   loading passed in both images, while the plain consumer failed during test
   loading. Keep cache reuse within one read-time feature context while the wider
   audit remains open.
+  Ownership proof handlers now need `elog` before the port files; verify that
+  dependency in fresh compilation rather than relying on a loaded macro.
+
+- [ ] Test ownership revocation across live ASDF reloads with the same streams
+  and owner tokens. The stream and directory proof modules keep their weak
+  revocation tables in top-level `LET` forms. Check that reloading cannot make
+  an observed lock loss reusable after the lock is reacquired.
 
 - [ ] Audit destructive sequence operations on quoted or shared lists, including
   `SORT`, `NREVERSE`, `NCONC` and the final argument to `APPEND`. Installation
