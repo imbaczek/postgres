@@ -64,6 +64,7 @@
                (:file "t/running-xacts-tests")
                (:file "t/wal-namespace-tests")
                (:file "t/wal-lineage-tests")
+               (:file "t/logical-wal-cursor-tests")
                (:file "t/physical-adoption-tests")
                (:file "t/physical-owner-lock-tests")
                (:file "t/physical-adoption-stage-tests")
