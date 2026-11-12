@@ -38,6 +38,31 @@ def lsn_number(value):
     return int(high, 16) << 32 | int(low, 16)
 
 
+def check_native_cursor(server, name, timeline):
+    response = server.control(f'''(progn
+      (call-with-logical-replication-slot "{name}"
+        (lambda (slot)
+          (let ((confirmed (wal-replication-slot-confirmed-flush-lsn slot)) (count 0))
+            (call-with-logical-slot-wal-cursor "{name}" nil nil
+              (wal-replication-slot-confirmed-timeline slot) :prefix-end
+              (lambda (cursor)
+                (loop
+                  (multiple-value-bind (record bytes owner carrier kind) (logical-wal-cursor-next cursor)
+                    (declare (ignore bytes))
+                    (unless record (return))
+                    (assert (= owner carrier {timeline}))
+                    (assert (eq kind :ordinary))
+                    (incf count)))
+                (assert (= (logical-wal-cursor-position cursor) (logical-wal-cursor-end cursor)))
+                (assert (eql (zerop count) (= confirmed (logical-wal-cursor-end cursor))))))
+            (assert (eql confirmed (wal-replication-slot-confirmed-flush-lsn slot)))
+            (format t "CURSOR-CHECKED=~d~%" count))))
+      (values))''')
+    counts = re.findall(r'CURSOR-CHECKED=(\d+)', response)
+    assert len(counts) == 1, response
+    print(f'logical-slot-cursor: {name} timeline={timeline} records={counts[0]}', flush=True)
+
+
 def check_restored_slots(server, connection, before, timeline=1, on_pair=None):
     for name, (raw, fields) in before.items():
         assert slot_image(server, name, timeline, on_pair)[0] == raw, name
@@ -47,6 +72,8 @@ def check_restored_slots(server, connection, before, timeline=1, on_pair=None):
         assert len(rows) == 1 and rows[0][:2] == ['logical', 'f'], rows
         restart, confirmed = map(lsn_number, rows[0][2:])
         assert (restart, confirmed) == (int(fields[3]), int(fields[5])), (rows, fields)
+        check_native_cursor(server, name, timeline)
+        assert slot_image(server, name, timeline, on_pair)[0] == raw, name
 
 
 def crash(server):
