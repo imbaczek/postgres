@@ -192,7 +192,7 @@
         (unless (equal row (logical-slot-copy-file-row context (first row)))
           (error "logical copy input failed its final byte verification")))
       (logical-slot-copy-input-inventory owner context manifest descriptor)
-      (values manifest descriptor (nreverse results) records))))
+      (values manifest descriptor (nreverse results) records observations))))
 
 (defun logical-slot-copy-verify (directory scratch)
   (call-with-physical-adoption-owner

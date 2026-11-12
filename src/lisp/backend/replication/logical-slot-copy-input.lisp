@@ -35,6 +35,7 @@
   (let* ((root (physical-image-context-root-path context))
          (files (getf manifest :files))
          (expected (append
+                    (physical-adoption-owner-extra-root-names owner)
                     (list ".pg_lisp.lock" "base" "global" "pg_wal" "logical_slot_wal"
                           "recovery.required" "physical-recovery.control" "physical-backup.manifest"
                           "logical-slot-copy.descriptor" "pg_hba.conf" "pg_ident.conf"
