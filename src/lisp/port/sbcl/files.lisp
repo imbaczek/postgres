@@ -124,6 +124,9 @@ callers needing a coherent view across publications must compare control images.
                               (= inode (parse-integer (third file))))))))))))
 
 (defun physical-file-exclusive-flock-p (text inode)
+  ;; Use stack scratch for simple strings and unsigned 64-bit inode values,
+  ;; rejecting text longer than 4096 characters.  Other input types use the
+  ;; generic parser to preserve their existing behavior.
   (declare (optimize (speed 3) (safety 2) (debug 1)))
   (if (and (typep text 'simple-string) (typep inode '(unsigned-byte 64)))
       (and (<= (length text) 4096)
@@ -135,6 +138,8 @@ callers needing a coherent view across publications must compare control images.
 (defun physical-file-fdinfo-text (buffer end)
   (declare (type (simple-array (unsigned-byte 8) (*)) buffer) (type fixnum end)
            (optimize (speed 3) (safety 2) (debug 1)))
+  ;; A decoding condition can retain its input.  Copy non-ASCII data before
+  ;; decoding so a malformed input cannot retain the caller's stack buffer.
   (sb-ext:octets-to-string
    (if (loop for index fixnum below end always (< (aref buffer index) 128))
        buffer

@@ -3,6 +3,7 @@
 (declaim (inline %fdinfo-token= %fdinfo-fields %fdinfo-unsigned-p %fdinfo-inode=))
 
 (defun %fdinfo-token= (text start end literal)
+  ;; Compare a field in TEXT without making a substring.
   (declare (type simple-string text literal) (type fixnum start end)
            (optimize (speed 3) (safety 1) (debug 1)))
   (and (= (- end start) (length literal))
@@ -11,6 +12,8 @@
              always (char= (char text index) (char literal offset)))))
 
 (defun %fdinfo-fields (text start end spans maximum)
+  ;; Record field start and end offsets in the caller's 18-element u32 array.
+  ;; Return -1 if there are more than MAXIMUM fields; MAXIMUM is at most 9.
   (declare (type simple-string text) (type fixnum start end)
            (type (simple-array (unsigned-byte 32) (18)) spans)
            (type (integer 0 9) maximum)
@@ -31,6 +34,8 @@
       (incf count))))
 
 (defun %fdinfo-unsigned-p (text start end radix positive)
+  ;; Match the generic parser's spelling-based test for a positive field:
+  ;; a digit other than ASCII zero counts, including a Unicode zero digit.
   (declare (type simple-string text) (type fixnum start end)
            (type (member 10 16) radix)
            (optimize (speed 3) (safety 1) (debug 1)))
@@ -40,6 +45,8 @@
            (loop for index fixnum from start below end thereis (char/= (char text index) #\0)))))
 
 (defun %fdinfo-inode= (text start end inode)
+  ;; Parse decimal into two 32-bit halves, rejecting overflow without boxing a
+  ;; 64-bit intermediate.  Positivity uses the generic parser's spelling test.
   (declare (type simple-string text) (type fixnum start end)
            (type (unsigned-byte 64) inode)
            (optimize (speed 3) (safety 1) (debug 1)))
@@ -59,6 +66,9 @@
          (= high (ldb (byte 32 32) inode)))))
 
 (defun %fdinfo-flock-p (text inode spans)
+  ;; Check the bounded fdinfo text using caller-provided scratch space.  These
+  ;; five parsing kernels allocate no heap storage; offsets fit in u32 because the
+  ;; input is limited to 4096 characters.
   (declare (type simple-string text) (type (unsigned-byte 64) inode)
            (type (simple-array (unsigned-byte 32) (18)) spans)
            (optimize (speed 3) (safety 1) (debug 1)))
