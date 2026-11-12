@@ -143,6 +143,149 @@
     (wal-slot-set-initial-profile slot profile)
     slot))
 
+(rove:deftest logical-slot-capture-cannot-publish-evidence-after-release-or-reuse
+    (dolist (reuse-p '(nil t))
+      (call-with-canonical-wal-slot-fixture
+       (lambda ()
+         (let* ((*wal-ready* t) (*wal-insert-timeline* 1)
+                                (*active-snapshots* 0)
+                                (*active-snapshot-set* (make-hash-table :test #'eq))
+                                (*active-xids* nil) (*next-xid* 5000)
+                                (*wal-xid-first-lsn* (make-hash-table :test #'eql))
+                                (*wal-snapshot-retention-pins* (make-hash-table :test #'eq))
+                                (*wal-pending-page-publication* nil) (*wal-pending-page-publication-tail* nil)
+                                (*clog-pending-commits* (make-hash-table :test #'eql))
+                                (registration (make-snapshot-registration))
+                                (fired nil))
+           (unwind-protect
+                (let ((*wal-test-after-snapshot-boundary-registration-hook*
+                        (lambda (token)
+                          (setf fired t)
+                          (release-snapshot-registration token)
+                          (when reuse-p (make-snapshot-under-xid-lock 8 :register token)))))
+                  (let ((condition
+                          (handler-case
+                              (with-write-lock
+                                (wal-capture-snapshot-boundary-under-writer-lock 7 registration)
+                                nil)
+                            (error (condition) condition))))
+                    (rove:ok fired)
+                    (rove:ok (and condition
+                                  (search "snapshot registration was released"
+                                          (princ-to-string condition)))
+                             "the stale capture fails at registration validation")
+                    (rove:ok (null (gethash registration *wal-snapshot-retention-pins*))))
+                  (rove:ok (null (snapshot-registration-wal-boundary registration))
+                           "no stale frozen evidence is published"))
+             (release-snapshot-registration registration))
+           (rove:ok (zerop *active-snapshots*)))))))
+
+(rove:deftest logical-slot-snapshot-capture-freezes-actual-on-interval
+    (call-with-logical-policy-test
+     (lambda (writer)
+       (declare (ignore writer))
+       (let* ((*backend* nil)
+              (*active-snapshots* 0)
+              (*active-snapshot-set* (make-hash-table :test #'eq))
+              (*wal-snapshot-retention-pins* (make-hash-table :test #'eq))
+              (registration (make-snapshot-registration)))
+         (unwind-protect
+              (let ((first-on (wal-report-logical-decoding-status t)))
+                (with-write-lock
+                  (wal-capture-snapshot-boundary-under-writer-lock 7 registration))
+                (let ((captured (snapshot-registration-wal-boundary registration)))
+                  (rove:ok (= first-on (snapshot-wal-boundary-logical-on-start-lsn captured)))
+                  (rove:ok (= 1 (snapshot-wal-boundary-logical-on-start-timeline captured)))
+                  (wal-report-logical-decoding-status nil)
+                  (let ((next-on (wal-report-logical-decoding-status t)))
+                    (rove:ok (> next-on first-on))
+                    (rove:ok (= first-on (snapshot-wal-boundary-logical-on-start-lsn captured))
+                             "later OFF/ON does not replace capture-time evidence")
+                    (release-snapshot-registration registration)
+                    (rove:ok (null (snapshot-registration-wal-boundary registration)))
+                    (with-write-lock
+                      (wal-capture-snapshot-boundary-under-writer-lock 8 registration))
+                    (rove:ok (= next-on
+                                (snapshot-wal-boundary-logical-on-start-lsn
+                                 (snapshot-registration-wal-boundary registration)))
+                             "reuse captures the new interval")
+                    (sb-thread:with-mutex (*wal-lock*)
+                      (release-snapshot-registration-wal-pin-under-wal-lock registration))
+                    (rove:ok (null (snapshot-registration-wal-boundary registration))
+                             "pin transfer clears the frozen evidence too"))))
+           (release-snapshot-registration registration))))))
+
+(rove:deftest logical-slot-snapshot-capture-freezes-fork-owners
+    (dolist (pending-p '(nil t))
+      (call-with-canonical-wal-slot-fixture
+       (lambda ()
+         (let* ((*wal-ready* t)
+                (*wal-insert-timeline* 2)
+                (*active-snapshots* 0)
+                (*active-snapshot-set* (make-hash-table :test #'eq))
+                (*next-xid* 5000)
+                (*active-xids* (when pending-p (list 4101)))
+                (*wal-xid-first-lsn* (make-hash-table :test #'eql))
+                (*wal-snapshot-retention-pins* (make-hash-table :test #'eq))
+                (*wal-pending-page-publication* nil)
+                (*wal-pending-page-publication-tail* nil)
+                (*clog-pending-commits* (make-hash-table :test #'eql))
+                (registration (make-snapshot-registration)))
+           (timeline-write-history 2 1 100 "snapshot owner test")
+           (when pending-p (setf (gethash 4101 *wal-xid-first-lsn*) 100))
+           (unwind-protect
+                (progn
+                  (with-write-lock
+                    (wal-capture-snapshot-boundary-under-writer-lock 7 registration))
+                  (let ((boundary (snapshot-registration-wal-boundary registration)))
+                    (rove:ok (= 100 (snapshot-wal-boundary-lsn boundary)))
+                    (rove:ok (= 1 (snapshot-wal-boundary-timeline boundary))
+                             "consumed prefix at the fork belongs to the parent")
+                    (rove:ok (= 100 (snapshot-wal-boundary-restart-lsn boundary)))
+                    (rove:ok (= (if pending-p 2 1)
+                                (snapshot-wal-boundary-restart-timeline boundary))
+                             "a pending child start wins the equal-LSN tie")
+                    (rove:ok (eq (if pending-p :record-start :prefix-end)
+                                 (snapshot-wal-boundary-restart-role boundary)))
+                    (rove:ok (null (snapshot-wal-boundary-logical-on-start-lsn boundary)))
+                    (rove:ok (null (snapshot-wal-boundary-logical-on-start-timeline boundary)))))
+             (release-snapshot-registration registration))
+           (rove:ok (null (snapshot-registration-wal-boundary registration))
+                    "registration release clears frozen evidence"))))))
+
+(rove:deftest logical-slot-zero-snapshot-prefix-has-no-invented-owner
+    (call-with-canonical-wal-slot-fixture
+     (lambda ()
+       (let* ((*wal-ready* t) (*wal-end-lsn* 0) (*wal-durable-lsn* 0)
+                              (*wal-insert-timeline* 1)
+                              (*active-snapshots* 0)
+                              (*active-snapshot-set* (make-hash-table :test #'eq))
+                              (*next-xid* 5000) (*active-xids* nil)
+                              (*wal-xid-first-lsn* (make-hash-table :test #'eql))
+                              (*wal-snapshot-retention-pins* (make-hash-table :test #'eq))
+                              (*wal-pending-page-publication* nil) (*wal-pending-page-publication-tail* nil)
+                              (*clog-pending-commits* (make-hash-table :test #'eql))
+                              (registration (make-snapshot-registration)))
+         (unwind-protect
+              (progn
+                (with-write-lock
+                  (wal-capture-snapshot-boundary-under-writer-lock 7 registration))
+                (let ((boundary (snapshot-registration-wal-boundary registration)))
+                  (rove:ok (zerop (snapshot-wal-boundary-lsn boundary)))
+                  (rove:ok (null (snapshot-wal-boundary-timeline boundary)))
+                  (rove:ok (null (snapshot-wal-boundary-restart-timeline boundary)))))
+           (release-snapshot-registration registration))))))
+
+(rove:deftest logical-slot-new-generation-is-fresh-and-full-width
+    (let ((generations (loop repeat 32 collect (logical-slot-new-generation))))
+      (rove:ok (= 32 (length (remove-duplicates generations :test #'=)))
+               "separate creations mint separate generation identities")
+      (dolist (generation generations)
+        (rove:ok (typep generation '(unsigned-byte 128)))
+        (rove:ok (= generation
+                    (logical-slot-parse-generation
+                     (logical-slot-generation-token generation)))))))
+
 (rove:deftest logical-slot-retention-invalidation-uses-guarded-save
     (dolist (fail-p '(nil t))
       (call-with-canonical-wal-slot-fixture

@@ -142,6 +142,42 @@ is required before acknowledgment, saving or scanning can resume."
           (setf (wal-replication-slot-state-uncertain-p slot) t)))))
   slot)
 
+(defun logical-slot-new-generation ()
+  (let ((bytes (make-array 16 :element-type '(unsigned-byte 8))))
+    (with-open-file (input #p"/dev/urandom" :element-type '(unsigned-byte 8))
+      (unless (= 16 (read-sequence bytes input))
+        (error "could not read logical slot generation entropy")))
+    (loop with generation = 0
+          for octet across bytes
+          do (setf generation (logior (ash generation 8) octet))
+          finally (return generation))))
+
+(defun logical-slot-primary-history-under-lock ()
+  (assert (sb-thread:holding-mutex-p *wal-lock*))
+  (timeline-check-lineage (timeline-read-history *wal-insert-timeline*)))
+
+(defun logical-slot-make-snapshot-boundary (boundary-lsn pending-lsns history logical-fields)
+  (unless (typep boundary-lsn '(unsigned-byte 64))
+    (error "invalid snapshot WAL boundary"))
+  (let* ((birth-timeline (when (plusp boundary-lsn)
+                           (timeline-at-point (1- boundary-lsn) history)))
+         (pending
+           (mapcar (lambda (lsn)
+                     (unless (and (typep lsn '(unsigned-byte 64)) (<= lsn boundary-lsn))
+                       (error "pending snapshot WAL start is outside its durable boundary"))
+                     (cons lsn (timeline-at-point lsn history)))
+                   pending-lsns)))
+    (multiple-value-bind (restart-lsn restart-timeline role)
+        (logical-slot-select-restart-position
+         boundary-lsn (or birth-timeline (timeline-at-point 0 history)) pending)
+      (make-snapshot-wal-boundary
+       :lsn boundary-lsn :timeline birth-timeline :restart-lsn restart-lsn
+       :restart-timeline (unless (and (null birth-timeline) (eq role :prefix-end))
+                           restart-timeline)
+       :restart-role role
+       :logical-on-start-lsn (getf logical-fields :logical-on-start-lsn)
+       :logical-on-start-timeline (getf logical-fields :logical-on-start-timeline)))))
+
 (defun logical-slot-generation-token (generation)
   "Encode an unsigned 128-bit generation as 32 lowercase hex digits."
   (unless (typep generation '(unsigned-byte 128))

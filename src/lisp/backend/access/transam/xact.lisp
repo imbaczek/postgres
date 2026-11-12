@@ -1578,6 +1578,8 @@ of transaction and portal snapshots."
 
 (defvar *wal-test-after-snapshot-boundary-registration-hook* nil)
 
+(declaim (ftype function logical-slot-primary-history-under-lock logical-slot-make-snapshot-boundary))
+
 (defun wal-capture-snapshot-boundary-under-writer-lock
     (curcid register &key after-capture)
   "Capture a registered MVCC snapshot and its matching WAL position.
@@ -1595,38 +1597,33 @@ AFTER-CAPTURE runs under *WAL-LOCK* but after *XID-LOCK* is released."
     (ereport "55000" "cannot capture a replication snapshot before WAL startup"))
   (call-with-settled-primary-snapshot
    (lambda ()
-     (multiple-value-bind (snapshot boundary-lsn restart-lsn)
-         (sb-thread:with-mutex (*xid-lock*)
-           (let* ((snapshot (make-snapshot-under-xid-lock
-                             curcid :register register))
-                  (boundary-lsn *wal-durable-lsn*)
-                  (restart-lsn boundary-lsn))
-             (when *wal-test-after-snapshot-boundary-registration-hook*
-               (funcall *wal-test-after-snapshot-boundary-registration-hook*
-                        register))
-             (dolist (xid (snapshot-xip snapshot))
-               (let ((first-lsn (gethash xid *wal-xid-first-lsn*)))
-                 (when (and first-lsn (< first-lsn restart-lsn))
-                   (setf restart-lsn first-lsn))))
-             ;; Keep the returned restart point alive after active XIDs finish.
-             ;; The registered snapshot owns this pin until its caller releases
-             ;; the registration or a durable replication slot takes over.
-             (sb-thread:with-mutex (*snapshot-count-lock*)
-               (unless (and (snapshot-registration-active-p register)
-                            (eq snapshot
-                                (snapshot-registration-snapshot register)))
-                 (error "snapshot registration was released during WAL boundary capture"))
-               (sb-sys:without-interrupts
-                 (setf (gethash register *wal-snapshot-retention-pins*)
-                       restart-lsn
-                       (snapshot-registration-wal-retention-lsn register)
-                       restart-lsn)))
-             (values snapshot boundary-lsn restart-lsn)))
-       ;; Checkpoint recycling sees the temporary snapshot pin until durable
-       ;; slot publication completes, because WAL remains locked throughout.
-       (when after-capture
-         (funcall after-capture snapshot boundary-lsn restart-lsn))
-       (values snapshot boundary-lsn restart-lsn)))))
+     (let ((history (logical-slot-primary-history-under-lock))
+           (logical-fields (wal-current-logical-decoding-fields)))
+       (multiple-value-bind (snapshot boundary-lsn restart-lsn)
+           (sb-thread:with-mutex (*xid-lock*)
+             (let* ((snapshot (make-snapshot-under-xid-lock curcid :register register))
+                    (boundary-lsn *wal-durable-lsn*))
+               (when *wal-test-after-snapshot-boundary-registration-hook*
+                 (funcall *wal-test-after-snapshot-boundary-registration-hook* register))
+               (let* ((pending (loop for xid in (snapshot-xip snapshot)
+                                     for first-lsn = (gethash xid *wal-xid-first-lsn*)
+                                     when first-lsn collect first-lsn))
+                      (boundary (logical-slot-make-snapshot-boundary
+                                 boundary-lsn pending history logical-fields))
+                      (restart-lsn (snapshot-wal-boundary-restart-lsn boundary)))
+                 ;; WAL remains locked until both the pin and its owners are frozen.
+                 (sb-thread:with-mutex (*snapshot-count-lock*)
+                   (unless (and (snapshot-registration-active-p register)
+                                (eq snapshot (snapshot-registration-snapshot register)))
+                     (error "snapshot registration was released during WAL boundary capture"))
+                   (sb-sys:without-interrupts
+                     (setf (gethash register *wal-snapshot-retention-pins*) restart-lsn
+                           (snapshot-registration-wal-retention-lsn register) restart-lsn
+                           (snapshot-registration-wal-boundary register) boundary)))
+                 (values snapshot boundary-lsn restart-lsn))))
+         (when after-capture
+           (funcall after-capture snapshot boundary-lsn restart-lsn))
+         (values snapshot boundary-lsn restart-lsn))))))
 
 (declaim (ftype function catalog-sequence-bootstrap-snapshot))
 

@@ -16,10 +16,20 @@
   ;; Coverage and XIP stay fixed while replay advances.
   (source-xids-complete-p nil))
 
+(defstruct snapshot-wal-boundary
+  (lsn nil :read-only t)
+  (timeline nil :read-only t)
+  (restart-lsn nil :read-only t)
+  (restart-timeline nil :read-only t)
+  (restart-role nil :read-only t)
+  (logical-on-start-lsn nil :read-only t)
+  (logical-on-start-timeline nil :read-only t))
+
 (defstruct (snapshot-registration
             (:constructor make-snapshot-registration ()))
   snapshot
   wal-retention-lsn
+  wal-boundary
   exported-state
   importer-backend
   (lifecycle-generation 0)
@@ -154,6 +164,7 @@ reusable token also checks a generation before delayed cleanup."
                                (snapshot-registration-importer-backend registration)
                                nil)))
                      (setf (snapshot-registration-wal-retention-lsn registration) nil
+                           (snapshot-registration-wal-boundary registration) nil
                            (snapshot-registration-releasing-p registration) nil
                            completed t))))))
       ;; Unpinned registrations use only the snapshot and importer locks. This
@@ -227,7 +238,8 @@ the already-persisted slot restart point, never a gap. If release is underway,
 its owner finishes the remaining importer cleanup before reuse."
   (sb-thread:with-mutex (*snapshot-count-lock*)
     (remhash registration *wal-snapshot-retention-pins*)
-    (setf (snapshot-registration-wal-retention-lsn registration) nil))
+    (setf (snapshot-registration-wal-retention-lsn registration) nil
+          (snapshot-registration-wal-boundary registration) nil))
   (values))
 
 (defun register-exported-logical-snapshot-importer (state registration backend)
