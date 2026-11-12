@@ -404,3 +404,133 @@
          (ok (= count pg::*logical-capture-live-slots*))
          (ok (eq policy pg::*wal-logical-policy*))
          (ok (eq disable pg::*wal-logical-info-disable-pending*))))))
+
+(defun startup-on-test-state (&key (enabled t) (on 65) (owner 1) (end 300) (timeline 1))
+  (pg::%make-wal-logical-status enabled (- end 33) end timeline nil nil
+                                (and enabled on) (and enabled on owner)))
+
+(cl-spec:defgenerator startup-on-coverage-arguments ()
+  (list (startup-on-test-state)
+        (list (pg::make-timeline-history-entry :timeline 1 :begin 0))
+        (1+ (random 330)) 1 :prefix-end 300 1))
+
+(cl-spec:defspec-function pg::logical-slot-on-coverage
+    (:args (state (type pg::wal-logical-status)) (history (type list))
+           (required (type integer)) (owner (type integer)) (role (type keyword))
+           (through (type integer)) (through-owner (type integer)))
+  (:args-generator startup-on-coverage-arguments)
+  (:returns (member :proved-on :insufficient :unknown))
+  (:post (eq result (cond ((> required through) :unknown)
+                          ((< required 65) :insufficient)
+                          (t :proved-on)))))
+
+(cl-spec:defproperty startup-on-coverage-keeps-unknown-ahead-of-replay
+    ((required (range integer 1 330)))
+  (:about pg::logical-slot-on-coverage)
+  (:trials (:normal 200))
+  (eq (cond ((> required 300) :unknown) ((< required 65) :insufficient) (t :proved-on))
+      (pg::logical-slot-on-coverage
+       (startup-on-test-state) (list (pg::make-timeline-history-entry :timeline 1 :begin 0))
+       required 1 :prefix-end 300 1)))
+
+(deftest startup-on-coverage-generated-contracts
+    (dolist (result
+             (list (cl-spec:check-function 'pg::logical-slot-on-coverage :trials 200 :seed 2304)
+                   (cl-spec:run-property 'startup-on-coverage-keeps-unknown-ahead-of-replay :seed 2304)))
+      (let ((data (cl-spec:result-data result)))
+        (ok (eq :passed (getf data :status)) (format nil "~s" data)))))
+
+(deftest startup-on-coverage-distinguishes-off-unknown-and-later-on
+    (let ((history (list (pg::make-timeline-history-entry :timeline 1 :begin 0))))
+      (flet ((classify (state required)
+               (pg::logical-slot-on-coverage state history required 1 :prefix-end 300 1)))
+        (ok (eq :unknown (classify nil 100)))
+        (ok (eq :unknown (classify (startup-on-test-state :on nil) 100)))
+        (ok (eq :insufficient (classify (startup-on-test-state :enabled nil) 100)))
+        (ok (eq :unknown (classify (startup-on-test-state :enabled nil) 301)))
+        (ok (eq :insufficient (classify (startup-on-test-state :on 165) 100)))
+        (ok (eq :proved-on (classify (startup-on-test-state) 65)))
+        (ok (eq :proved-on (classify (startup-on-test-state) 300)))
+        (ok (eq :insufficient (classify (startup-on-test-state) 32)))
+        (ok (eq :proved-on (classify (startup-on-test-state) 100))))))
+
+(deftest startup-on-coverage-keeps-fork-position-roles
+    (let ((history (startup-slot-test-history 100))
+          (parent (startup-on-test-state :end 100)))
+      (ok (eq :proved-on (pg::logical-slot-on-coverage parent history 100 1 :prefix-end 100 1)))
+      (ok (eq :unknown (pg::logical-slot-on-coverage parent history 100 2 :record-start 100 1)))
+      (ok (eq :unknown
+              (pg::logical-slot-on-coverage (startup-on-test-state :enabled nil :end 100)
+                                            history 100 2 :record-start 100 1)))
+      (ok (eq :proved-on
+              (pg::logical-slot-on-coverage (startup-on-test-state :on 100 :timeline 2)
+                                            history 100 2 :record-start 300 2)))
+      (dolist (arguments
+               (list (list parent history 100 2 :prefix-end 100 1)
+                     (list parent history 100 1 :record-start 100 1)
+                     (list parent history 100 1 :prefix-end 100 2)
+                     (list (startup-on-test-state :on 100 :owner 2 :timeline 2)
+                           history 100 2 :record-start 300 2)
+                     (list (startup-on-test-state :on 103 :owner 2 :timeline 2)
+                           history 200 2 :prefix-end 300 2)))
+        (ok (intake-fails-p (lambda () (apply #'pg::logical-slot-on-coverage arguments)))))))
+
+(deftest startup-on-coverage-uses-uninterrupted-origin-across-real-status-folds
+    (let* ((history (list (pg::make-timeline-history-entry :timeline 1 :begin 0)))
+           (first (pg::wal-logical-status-next
+                   nil (pg::make-wal-record
+                        :version 8 :type pg::+wal-record-logical-decoding-status-change+
+                        :xid 0 :start 32 :end 65
+                        :payload (pg::wal-encode-logical-decoding-status-change t)) 1))
+           (repeated (pg::wal-logical-status-next
+                      first (pg::make-wal-record
+                             :version 8 :type pg::+wal-record-logical-decoding-status-change+
+                             :xid 0 :start 100 :end 133
+                             :payload (pg::wal-encode-logical-decoding-status-change t)) 1))
+           (off (pg::wal-logical-status-next
+                 repeated (pg::make-wal-record
+                           :version 8 :type pg::+wal-record-logical-decoding-status-change+
+                           :xid 0 :start 200 :end 233
+                           :payload (pg::wal-encode-logical-decoding-status-change nil)) 1))
+           (later (pg::wal-logical-status-next
+                   off (pg::make-wal-record
+                        :version 8 :type pg::+wal-record-logical-decoding-status-change+
+                        :xid 0 :start 240 :end 273
+                        :payload (pg::wal-encode-logical-decoding-status-change t)) 1)))
+      (ok (= 65 (pg::wal-logical-status-on-start-lsn repeated)))
+      (ok (= 133 (pg::wal-logical-status-last-enable-lsn repeated)))
+      (ok (eq :proved-on (pg::logical-slot-on-coverage repeated history 100 1 :prefix-end 133 1)))
+      (ok (eq :insufficient (pg::logical-slot-on-coverage repeated history 32 1 :record-start 133 1)))
+      (ok (eq :insufficient (pg::logical-slot-on-coverage off history 100 1 :prefix-end 233 1)))
+      (ok (eq :insufficient (pg::logical-slot-on-coverage later history 100 1 :prefix-end 273 1)))
+      (let* ((unknown (startup-on-test-state :on nil :end 152))
+             (still-unknown (pg::wal-logical-status-next
+                             unknown (pg::make-wal-record
+                                      :version 8 :type pg::+wal-record-logical-decoding-status-change+
+                                      :xid 0 :start 160 :end 193
+                                      :payload (pg::wal-encode-logical-decoding-status-change t)) 1)))
+        (ok (eq :unknown
+                (pg::logical-slot-on-coverage still-unknown history 170 1 :prefix-end 193 1))))))
+
+(deftest startup-on-coverage-checks-full-width-and-malformed-witnesses
+    (let* ((history (list (pg::make-timeline-history-entry :timeline 1 :begin 0)))
+           (maximum 18446744073709551615)
+           (state (startup-on-test-state :on maximum :end maximum)))
+      (ok (eq :proved-on
+              (pg::logical-slot-on-coverage state history maximum 1 :prefix-end maximum 1)))
+      (dolist (arguments
+               (list (list nil history 0 1 :prefix-end 300 1)
+                     (list nil history 1 1 :other 300 1)
+                     (list nil history 1 1 :prefix-end 0 1)
+                     (list nil history -1 1 :record-start 300 1)
+                     (list nil history (1+ maximum) 1 :prefix-end maximum 1)
+                     (list 42 history 1 1 :prefix-end 300 1)
+                     (list (startup-on-test-state :on (1+ pg::+wal-segment-size+)
+                                                  :end (+ pg::+wal-segment-size+ 200))
+                           history (+ pg::+wal-segment-size+ 100) 1 :prefix-end
+                           (+ pg::+wal-segment-size+ 200) 1)
+                     (list (startup-on-test-state :end (1+ pg::+wal-segment-size+))
+                           history pg::+wal-segment-size+ 1 :prefix-end
+                           (1+ pg::+wal-segment-size+) 1)
+                     (list (startup-on-test-state :end 301) history 350 1 :prefix-end 300 1)))
+        (ok (intake-fails-p (lambda () (apply #'pg::logical-slot-on-coverage arguments)))))))

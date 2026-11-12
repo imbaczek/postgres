@@ -102,6 +102,46 @@
        :archive archive :batch-policy :logical-reader))
     (logical-slot-startup-progress-pending progress)))
 
+(defun logical-slot-on-coverage
+    (state history required owner role through through-owner)
+  (timeline-check-lineage history)
+  (flet ((check-position (lsn timeline position-role)
+           (unless
+               (and (logical-slot-position-valid-p lsn timeline)
+                    (case position-role
+                      (:record-start (eql timeline (timeline-at-point lsn history)))
+                      (:prefix-end (and (plusp lsn)
+                                        (eql timeline (timeline-at-point (1- lsn) history))))))
+             (error "logical ON coverage requires valid selected-history positions"))))
+    (check-position through through-owner :prefix-end)
+    (check-position required owner role)
+    (when state
+      (unless (and (wal-logical-status-valid-p state)
+                   (<= (wal-logical-status-end state) through))
+        (error "logical status witness is outside frozen replay prefix"))
+      (physical-policy-check-record-owner
+       (wal-logical-status-start state) (wal-logical-status-end state)
+       (wal-logical-status-timeline state) history)
+      (when (wal-logical-status-on-start-lsn state)
+        (physical-policy-check-record-owner
+         (- (wal-logical-status-on-start-lsn state) (1+ +wal-header-size+))
+         (wal-logical-status-on-start-lsn state)
+         (wal-logical-status-on-start-timeline state) history))
+      (when (wal-logical-status-last-enable-lsn state)
+        (physical-policy-check-record-owner
+         (- (wal-logical-status-last-enable-lsn state) (1+ +wal-header-size+))
+         (wal-logical-status-last-enable-lsn state)
+         (wal-logical-status-last-enable-timeline state) history)))
+    (cond
+      ((or (> required through)
+           (and (= required through) (not (eql owner through-owner))))
+       :unknown)
+      ((null state) :unknown)
+      ((not (wal-logical-status-enabled state)) :insufficient)
+      ((null (wal-logical-status-on-start-lsn state)) :unknown)
+      ((<= (wal-logical-status-on-start-lsn state) required) :proved-on)
+      (t :insufficient))))
+
 (defun logical-slot-startup-check-eligibility (source slot)
   ;; Reserved slots currently require local anchors and current logical ON.
   ;; Ancestral or imported generation and lifetime, and uninterrupted ON/OFF
