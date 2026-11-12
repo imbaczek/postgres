@@ -352,10 +352,10 @@ A stale certificate returns NIL so the reader can replay from restart."
     (when (and certificate
                (eq slot (logical-wal-source-slot (logical-wal-continuation-source certificate)))
                (eql position (logical-wal-continuation-position certificate)))
-      (handler-case
-          (when (logical-wal-check-source (logical-wal-continuation-source certificate) end)
-            certificate)
-        (error () nil)))))
+      (handler-case-nonfatal
+       (when (logical-wal-check-source (logical-wal-continuation-source certificate) end)
+         certificate)
+       (condition nil)))))
 
 (defun logical-wal-certify-boundary (source position)
   "Make boundary evidence after the caller has rechecked the finished prefix."

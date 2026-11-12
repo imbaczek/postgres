@@ -534,3 +534,33 @@
                (ok (= 1 (count-if #'pg::logical-spool-closed-p
                                   (car pg::*logical-reader-spool-scope*))))))
            :batch-policy :logical-reader))))))
+
+(deftest logical-wal-continuation-propagates-fatal-and-latched-wal-errors
+    (let* ((slot (pg::make-wal-replication-slot :name "interrupt-proof"))
+           (source (pg::%make-logical-wal-source :slot slot))
+           (pg::*wal-logical-slot-read-continuation*
+             (pg::%make-logical-wal-continuation :source source :position 64 :owner 1))
+           (original (symbol-function 'pg::logical-wal-check-source))
+           (attempts 0))
+      (unwind-protect
+           (dolist (kind '(:ordinary :fatal :wal-failure))
+             (let* ((condition (make-condition 'pg::pg-error
+                                               :severity (if (eq kind :fatal) "FATAL" "ERROR")
+                                               :sqlstate (if (eq kind :fatal) "57P01" "XX000")))
+                    (pg::*backend* (pg::make-backend
+                                    :wal-failure (when (eq kind :wal-failure) condition)))
+                    (proof nil) (caught nil))
+               (setf (symbol-function 'pg::logical-wal-check-source)
+                     (lambda (&rest arguments)
+                       (declare (ignore arguments))
+                       (incf attempts) (error condition)))
+               (handler-case
+                   (setf proof (sb-thread:with-mutex (pg::*wal-lock*)
+                                 (pg::logical-wal-reusable-continuation slot 64 64)))
+                 (error (error) (setf caught error)))
+               (ok (null proof))
+               (if (eq kind :ordinary)
+                   (ok (null caught) "ordinary validation errors remain cache misses")
+                   (ok (eq condition caught) "fatal conditions propagate unchanged"))))
+        (setf (symbol-function 'pg::logical-wal-check-source) original))
+      (ok (= 3 attempts))))

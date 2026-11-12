@@ -3414,8 +3414,13 @@ must separately validate system, history, lifetime, replay and storage context."
                      +wal-record-full-page-writes-change+ +wal-record-logical-decoding-status-change+)
           :test #'=))
 
+(declaim (ftype function logical-wal-reusable-continuation))
+
 (defun wal-slot-terminal-ack-p (slot target-lsn)
   "Check a terminal acknowledgment, validating metadata batches without applying them."
+  (when (and (wal-replication-slot-logical-provenance slot)
+             (logical-wal-reusable-continuation slot target-lsn target-lsn))
+    (return-from wal-slot-terminal-ack-p t))
   (let ((*wal-recovery-reservation-batch-clean-p* nil)
         (batch-open nil)
         (found nil)
