@@ -58,6 +58,9 @@
             *postmaster-pid-port* *postmaster-pid-host* status)))
 
 (defun postmaster-parse-pid (line)
+  ;; Parse a signed PID and return its absolute value, or NIL for zero or a
+  ;; magnitude greater than 2147483647.  Malformed input signals an error;
+  ;; the file reader handles that without swallowing interruptions.
   (let ((pid (parse-integer line)))
     (and (not (zerop pid)) (<= (abs pid) 2147483647) (abs pid))))
 
@@ -98,9 +101,14 @@
               (= (sb-posix:stat-dev stat)
                  (sb-posix:stat-dev (sb-posix:fstat (sb-sys:fd-stream-fd *postmaster-pid-stream*))))))))
 
-(defvar *postmaster-ownership-contexts* nil)
+(defvar *postmaster-ownership-contexts*
+  ;; Dynamically scoped ownership objects active on the current thread.
+  nil)
 
 (defstruct (postmaster-ownership (:constructor %make-postmaster-ownership))
+  ;; This object borrows the published streams; it neither acquires the lock
+  ;; nor closes either stream.  Save the canonical root and descriptor identities
+  ;; so later checks can detect replacement.  A copy is not an active scope.
   (directory nil :read-only t)
   (device nil :read-only t) (inode nil :read-only t)
   (lock nil :read-only t) (lock-fd nil :read-only t)
@@ -113,6 +121,7 @@
   (print-unreadable-object (owner stream :type t :identity t)))
 
 (defun postmaster-ownership-file-p (stat device inode)
+  ;; Both the name and descriptor must still identify the private regular file.
   (and (sb-posix:s-isreg (sb-posix:stat-mode stat))
        (= 1 (sb-posix:stat-nlink stat))
        (= (sb-posix:geteuid) (sb-posix:stat-uid stat))
@@ -121,6 +130,8 @@
        (= inode (sb-posix:stat-ino stat))))
 
 (defun postmaster-check-ownership-identities (owner)
+  ;; Check the published streams, root and both names against the saved
+  ;; identities.  The root must remain owned by us with mode 0700 or 0750.
   (let ((directory (postmaster-ownership-directory owner))
         (lock (postmaster-ownership-lock owner))
         (pid-stream (postmaster-ownership-pid-stream owner)))
@@ -152,6 +163,11 @@
   owner)
 
 (defun postmaster-check-ownership (owner)
+  ;; Only the exact object in the active dynamic scope on its creator thread
+  ;; has authority.  Check identities on both sides of the passive flock proof;
+  ;; the proof does not reacquire the lock.  An ordinary failed observation
+  ;; revokes the object and reports the original condition.  Fatal, cancellation,
+  ;; and latched WAL errors propagate unchanged.
   (unless (and (postmaster-ownership-p owner) (postmaster-ownership-active-p owner)
                (eq sb-thread:*current-thread* (postmaster-ownership-thread owner))
                (member owner *postmaster-ownership-contexts* :test #'eq))
@@ -173,6 +189,9 @@
   owner)
 
 (defun call-with-postmaster-ownership (function)
+  ;; Borrow the postmaster's published streams for this call.  Check ownership
+  ;; before entering and again on normal return, then revoke it on every exit.
+  ;; Cleanup does not close the streams or replace the reason for unwinding.
   (unless (and *postmaster-data-lock* (open-stream-p *postmaster-data-lock*)
                *postmaster-pid-stream* (open-stream-p *postmaster-pid-stream*)
                (postmaster-pid-owned-p))

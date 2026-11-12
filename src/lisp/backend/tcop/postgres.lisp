@@ -906,6 +906,8 @@ CL's RENAME-FILE merges a relative target with the source's directory."
 ;;; ---- hot reload (SIGHUP) and control REPL live in tcop/control.lisp ----
 
 (defun startup-check-retired-storage ()
+  ;; Require the primary writer to be retired and any page, CLOG, or WAL
+  ;; temporary cleanup work to be finished before startup.
   (require-primary-wal-writer-retired)
   (wal-require-no-pending-storage)
   (sb-thread:with-mutex (*wal-lock*)
@@ -913,6 +915,9 @@ CL's RENAME-FILE merges a relative target with the source's directory."
   (values))
 
 (defun check-primary-storage-startup-context (gate-owner ownership)
+  ;; The drained gate, postmaster ownership, absence of retained readers, and
+  ;; retired storage are separate requirements.  Ownership of PGDATA alone
+  ;; does not establish source, history, or lifetime eligibility.
   (check-live-operation-startup-quiescence gate-owner)
   (postmaster-check-ownership ownership)
   (when (physical-recovery-reader-conflict-p)
@@ -927,12 +932,15 @@ Hold the drained admission gate and borrow the real postmaster ownership."
    (lambda (gate-owner)
      (call-with-postmaster-ownership
       (lambda (ownership)
+        ;; Check before the first storage mutation.
         (check-primary-storage-startup-context gate-owner ownership)
         (wal-mark-primary-startup)
         (wal-init)
         (xact-init)
         (wal-recover)
         (note-primary-startup-replay)
+        ;; Replay can change the state checked above.  Check again before
+        ;; restoring slots, which can also remove temporary slot files.
         (check-primary-storage-startup-context gate-owner ownership)
         (wal-load-replication-slots)
         (sb-thread:with-mutex (*wal-lock*)
