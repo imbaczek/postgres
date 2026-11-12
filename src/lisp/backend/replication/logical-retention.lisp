@@ -384,6 +384,7 @@ sender's acknowledged outcome and the claim release are checked separately."
                      (wal-replication-slot-active-owner-backend slot) *backend*)))
            (logical-test-failpoint :after-logical-slot-owner-publication name)
            (let ((*wal-logical-slot-owner* owner)
+                 (*wal-logical-slot-read-continuation* nil)
                  (*wal-logical-slot-read-progress*
                    (or (wal-replication-slot-confirmed-flush-lsn slot)
                        (wal-replication-slot-consistent-lsn slot))))

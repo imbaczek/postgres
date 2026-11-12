@@ -13,6 +13,7 @@
 The guard is checked under the captured WAL mutex before each copy and advance."
   (history nil :read-only t) (namespace nil :read-only t)
   (end 0 :read-only t) (guard nil :read-only t) (archive nil :read-only t)
+  (batch-policy :strict :read-only t)
   (thread sb-thread:*current-thread* :read-only t)
   (position 0) (batch-open nil))
 
@@ -33,7 +34,7 @@ The guard is checked under the captured WAL mutex before each copy and advance."
                                       (logical-wal-cursor-history cursor)
                                       (logical-wal-cursor-namespace cursor))))
 
-(defun call-with-logical-wal-cursor (history namespace start end owner role guard function &key archive)
+(defun call-with-logical-wal-cursor (history namespace start end owner role guard function &key archive (batch-policy :strict))
   "Call FUNCTION with a cursor over START through the frozen END.
 The caller must prove the source and start boundary and supply a guard that
 checks that proof under the WAL mutex.  A geometrically valid empty interval
@@ -41,7 +42,8 @@ alone does not verify record bytes or a record boundary.  The cursor is valid
 only in this call, on this thread, with the captured mutex.  An optional
 archive must also pass its own context check."
   (timeline-check-lineage history)
-  (unless (and (functionp guard)
+  (unless (and (member batch-policy '(:strict :logical-reader))
+               (functionp guard)
                (typep start '(unsigned-byte 64)) (typep end '(unsigned-byte 64))
                (<= start end) (member namespace '(:legacy :timeline))
                (or (eq namespace :timeline)
@@ -56,6 +58,7 @@ archive must also pass its own context check."
          (cursor (%make-logical-wal-cursor
                   :history (mapcar #'copy-timeline-history-entry history)
                   :namespace namespace :position start :end end :archive archive
+                  :batch-policy batch-policy
                   :guard (lambda () (and active (eq mutex *wal-lock*) (funcall guard))))))
     (unwind-protect
          (progn
@@ -164,7 +167,8 @@ a ready EOF may instead move the private position over a checked rotation gap."
     (when (and continuation (/= original (third continuation)))
       (error "logical WAL cursor changed during archive preparation"))
     (when (= position end)
-      (when (logical-wal-cursor-batch-open cursor)
+      (when (and (logical-wal-cursor-batch-open cursor)
+                 (eq :strict (logical-wal-cursor-batch-policy cursor)))
         (error "logical WAL horizon ends inside a batch"))
       (return-from logical-wal-cursor-copy-next nil))
     (when (> position end) (error "logical WAL cursor passed its horizon"))
@@ -224,7 +228,8 @@ End-of-recovery is metadata, not an ordinary logical record."
             (error "logical WAL end-of-recovery disagrees with selected history")))
         (progn
           (wal-require-ordinary-record-type type)
-          (when (and (= type +wal-record-batch-start+) (logical-wal-cursor-batch-open cursor))
+          (when (and (= type +wal-record-batch-start+) (logical-wal-cursor-batch-open cursor)
+                     (eq :strict (logical-wal-cursor-batch-policy cursor)))
             (error "nested logical WAL batch"))))
     (values owner (if eor :end-of-recovery :ordinary))))
 
@@ -250,6 +255,116 @@ record owner, carrier and kind; local progress is not slot acknowledgement."
 
 (declaim (ftype function physical-slot-startup-system-id))
 
+(declaim (ftype function logical-slot-wal-check-control-coordinates logical-slot-wal-start-proven-p))
+
+(defstruct (logical-wal-source (:constructor %make-logical-wal-source))
+  (slot nil :read-only t) (name nil :read-only t) (owner nil :read-only t)
+  (database nil :read-only t) (plugin nil :read-only t)
+  (catalog nil :read-only t) (system-id nil :read-only t)
+  (profile nil :read-only t) (provenance nil :read-only t) (birth nil :read-only t)
+  (root nil :read-only t) (history nil :read-only t) (history-bytes nil :read-only t)
+  (timeline nil :read-only t) (namespace nil :read-only t)
+  (thread nil :read-only t) (mutex nil :read-only t))
+
+(defstruct (logical-wal-continuation (:constructor %make-logical-wal-continuation))
+  (source nil :read-only t) (position nil :read-only t) (owner nil :read-only t))
+
+(defun logical-wal-current-root-identity ()
+  (let* ((path (truename *pgdata*)) (info (sb-posix:stat path)))
+    (list path (sb-posix:stat-dev info) (sb-posix:stat-ino info))))
+
+(defun logical-wal-capture-source (scan)
+  (assert (sb-thread:holding-mutex-p *wal-lock*))
+  (let* ((slot (wal-retained-slot-scan-slot scan))
+         (timeline (wal-retained-slot-scan-timeline scan))
+         (bytes (unless (= timeline 1) (timeline-history-bytes timeline)))
+         (history (timeline-check-lineage
+                   (timeline-parse-history timeline (if bytes (bytes->string bytes) ""))))
+         (provenance (wal-replication-slot-logical-provenance slot))
+         (system-id (physical-slot-startup-system-id)))
+    (unless (and *catalog* provenance
+                 (eql system-id (logical-slot-provenance-system-id provenance)))
+      (error "logical WAL cursor requires known primary slot identity"))
+    (logical-slot-check-primary-history slot history)
+    (%make-logical-wal-source
+     :slot slot :name (copy-seq (wal-retained-slot-scan-name scan))
+     :owner (wal-retained-slot-scan-owner scan)
+     :database (wal-retained-slot-scan-database scan)
+     :plugin (copy-seq (wal-retained-slot-scan-plugin scan))
+     :catalog *catalog* :system-id system-id :profile (wal-slot-profile slot)
+     :provenance provenance :birth (wal-replication-slot-consistent-lsn slot)
+     :root (logical-wal-current-root-identity) :history history :history-bytes bytes
+     :timeline timeline :namespace (wal-retained-slot-scan-namespace scan)
+     :thread sb-thread:*current-thread* :mutex *wal-lock*)))
+
+(defun logical-wal-check-source (source end)
+  (assert (sb-thread:holding-mutex-p *wal-lock*))
+  (let* ((slot (logical-wal-source-slot source))
+         (system-id (logical-wal-source-system-id source))
+         (timeline (logical-wal-source-timeline source)))
+    (wal-check-healthy)
+    (unless (and (eq *wal-lock* (logical-wal-source-mutex source))
+                 (eq sb-thread:*current-thread* (logical-wal-source-thread source))
+                 *wal-ready* (not (recovery-in-progress-p))
+                 (eq slot (wal-find-usable-replication-slot-under-lock (logical-wal-source-name source)))
+                 (eq (logical-wal-source-owner source) *wal-logical-slot-owner*)
+                 (eq (logical-wal-source-owner source) (wal-replication-slot-active-owner slot))
+                 (eq :reserved (wal-replication-slot-wal-status slot))
+                 (eql (logical-wal-source-database source) (wal-replication-slot-database-oid slot))
+                 (equal (logical-wal-source-plugin source) (wal-replication-slot-plugin slot))
+                 (eq (logical-wal-source-catalog source) *catalog*)
+                 (eq (logical-wal-source-profile source) (wal-slot-profile slot))
+                 (eq (logical-wal-source-provenance source) (wal-replication-slot-logical-provenance slot))
+                 (eql (logical-wal-source-birth source) (wal-replication-slot-consistent-lsn slot))
+                 (equal (logical-wal-source-root source) (logical-wal-current-root-identity))
+                 (eql timeline *wal-insert-timeline*)
+                 (eq (logical-wal-source-namespace source) *wal-segment-namespace*)
+                 (eql system-id (catalog-system-identifier))
+                 (eql system-id (physical-slot-startup-system-id))
+                 (or (null *wal-control-metadata*)
+                     (eql system-id (getf *wal-control-metadata* :system-id)))
+                 (<= end *wal-durable-lsn*)
+                 (equalp (logical-wal-source-history-bytes source)
+                         (unless (= timeline 1) (timeline-history-bytes timeline))))
+      (error "logical WAL source changed during cursor scope"))
+    (logical-slot-wal-check-control-coordinates
+     timeline (logical-wal-source-namespace source) end system-id)
+    t))
+
+(defun logical-wal-reusable-continuation (slot position end)
+  (assert (sb-thread:holding-mutex-p *wal-lock*))
+  (let ((certificate *wal-logical-slot-read-continuation*))
+    (when (and certificate
+               (eq slot (logical-wal-source-slot (logical-wal-continuation-source certificate)))
+               (eql position (logical-wal-continuation-position certificate)))
+      (handler-case
+          (when (logical-wal-check-source (logical-wal-continuation-source certificate) end)
+            certificate)
+        (error () nil)))))
+
+(defun logical-wal-certify-boundary (source position)
+  (assert (sb-thread:holding-mutex-p *wal-lock*))
+  (unless (plusp position) (error "logical WAL continuation requires a completed prefix"))
+  (%make-logical-wal-continuation
+   :source source :position position
+   :owner (timeline-at-point (1- position) (logical-wal-source-history source))))
+
+(defun logical-slot-wal-scan-start-position (scan)
+  (assert (sb-thread:holding-mutex-p *wal-lock*))
+  (wal-retained-slot-scan-validate-under-lock scan)
+  (let ((certificate (wal-retained-slot-scan-continuation scan))
+        (slot (wal-retained-slot-scan-slot scan)))
+    (if certificate
+        (progn
+          (logical-wal-check-source (logical-wal-continuation-source certificate)
+                                    (wal-retained-slot-scan-end scan))
+          (values (logical-wal-continuation-owner certificate) :prefix-end))
+        (let ((owner (wal-replication-slot-restart-timeline slot)))
+          (values owner
+                  (if (logical-slot-wal-start-proven-p
+                       slot (wal-retained-slot-scan-start scan) owner :record-start)
+                      :record-start :prefix-end))))))
+
 (defun logical-slot-wal-start-proven-p (slot start owner role)
   "Check a start against the slot's persisted anchors and position role.
 Standard feedback can be unaligned, so its exact confirmed position alone is
@@ -274,16 +389,50 @@ proof from the consistent position and birth timeline."
       (:record-start
        (and restart (or pending (zerop start)))))))
 
-(defun logical-slot-wal-check-control (scan system-id)
+(defun logical-slot-wal-check-control-coordinates (timeline namespace end system-id)
   "Check persisted control against the captured primary and durable horizon."
   (let* ((fields (multiple-value-list (wal-read-control-fields)))
          (metadata (seventh fields)))
     (unless (and (integerp (first fields))
-                 (eql (fourth fields) (wal-retained-slot-scan-timeline scan))
-                 (eq (sixth fields) (wal-retained-slot-scan-namespace scan))
-                 (<= (wal-retained-slot-scan-end scan) (second fields) *wal-durable-lsn*)
+                 (eql (fourth fields) timeline) (eq (sixth fields) namespace)
+                 (<= end (second fields) *wal-durable-lsn*)
                  (or (null metadata) (eql system-id (getf metadata :system-id))))
       (error "logical WAL control differs from its captured primary source"))))
+
+(defun call-with-logical-slot-wal-cursor-from-scan (scan owner role function &key (batch-policy :strict))
+  "Traverse an already captured and pinned scan; pass cursor and source facts to FUNCTION."
+  (let ((source nil) (certificate (wal-retained-slot-scan-continuation scan)))
+    (labels ((check-source ()
+               (wal-retained-slot-scan-validate-under-lock scan)
+               (logical-wal-check-source source (wal-retained-slot-scan-end scan))))
+      (sb-thread:with-mutex (*wal-lock*)
+        (wal-retained-slot-scan-validate-under-lock scan)
+        (setf source (if certificate (logical-wal-continuation-source certificate)
+                         (logical-wal-capture-source scan)))
+        (unless (and (eq (logical-wal-source-slot source) (wal-retained-slot-scan-slot scan))
+                     (eq (logical-wal-source-owner source) (wal-retained-slot-scan-owner scan))
+                     (eql (logical-wal-source-timeline source) (wal-retained-slot-scan-timeline scan))
+                     (eq (logical-wal-source-namespace source) (wal-retained-slot-scan-namespace scan)))
+          (error "logical WAL continuation source differs from its scan"))
+        (unless (if certificate
+                    (and (eql (wal-retained-slot-scan-start scan)
+                              (logical-wal-continuation-position certificate))
+                         (eql owner (logical-wal-continuation-owner certificate))
+                         (eq role :prefix-end))
+                    (logical-slot-wal-start-proven-p
+                     (wal-retained-slot-scan-slot scan) (wal-retained-slot-scan-start scan) owner role))
+          (error "logical WAL start lacks a captured slot boundary"))
+        (check-source))
+      (call-with-optional-logical-wal-archive
+       (logical-wal-source-system-id source) (logical-wal-source-history source)
+       (logical-wal-source-namespace source) #'check-source
+       (lambda (archive)
+         (call-with-logical-wal-cursor
+          (logical-wal-source-history source) (logical-wal-source-namespace source)
+          (wal-retained-slot-scan-start scan) (wal-retained-slot-scan-end scan)
+          owner role (if archive (constantly t) #'check-source)
+          (lambda (cursor) (funcall function cursor source))
+          :archive archive :batch-policy batch-policy))))))
 
 (defun call-with-logical-slot-wal-cursor (name from-lsn upto-lsn owner role function)
   "Traverse a retained slot interval using captured primary source evidence.
@@ -296,57 +445,5 @@ thread, mutex and lifetime checks.  This grants no import authority."
   (call-with-wal-retained-slot-scan
    name from-lsn upto-lsn
    (lambda (scan)
-     (let ((catalog nil) (system-id nil) (provenance nil)
-                         (history nil) (history-bytes nil) (root nil) (birth nil) (profile nil))
-       (labels ((check-source ()
-                  (wal-retained-slot-scan-validate-under-lock scan)
-                  (unless (and *wal-ready* (not (recovery-in-progress-p))
-                               (eq catalog *catalog*)
-                               (eq profile (wal-slot-profile (wal-retained-slot-scan-slot scan)))
-                               (equal root (truename *pgdata*))
-                               (eql system-id (catalog-system-identifier))
-                               (eql system-id (physical-slot-startup-system-id))
-                               (or (null *wal-control-metadata*)
-                                   (eql system-id (getf *wal-control-metadata* :system-id)))
-                               (eql birth (wal-replication-slot-consistent-lsn
-                                           (wal-retained-slot-scan-slot scan)))
-                               (eq provenance
-                                   (wal-replication-slot-logical-provenance
-                                    (wal-retained-slot-scan-slot scan)))
-                               (<= (wal-retained-slot-scan-end scan) *wal-durable-lsn*)
-                               (equalp history-bytes
-                                       (unless (= (wal-retained-slot-scan-timeline scan) 1)
-                                         (timeline-history-bytes
-                                          (wal-retained-slot-scan-timeline scan)))))
-                    (error "logical WAL source changed during cursor scope"))
-                  (logical-slot-wal-check-control scan system-id)
-                  t))
-         (sb-thread:with-mutex (*wal-lock*)
-           (wal-retained-slot-scan-validate-under-lock scan)
-           (setf catalog *catalog* system-id (physical-slot-startup-system-id)
-                 provenance (wal-replication-slot-logical-provenance
-                             (wal-retained-slot-scan-slot scan))
-                 root (truename *pgdata*)
-                 birth (wal-replication-slot-consistent-lsn (wal-retained-slot-scan-slot scan))
-                 profile (wal-slot-profile (wal-retained-slot-scan-slot scan))
-                 history-bytes (unless (= (wal-retained-slot-scan-timeline scan) 1)
-                                 (timeline-history-bytes (wal-retained-slot-scan-timeline scan)))
-                 history (timeline-check-lineage
-                          (timeline-parse-history (wal-retained-slot-scan-timeline scan)
-                                                  (if history-bytes (bytes->string history-bytes) ""))))
-           (unless (and catalog provenance
-                        (eql system-id (logical-slot-provenance-system-id provenance)))
-             (error "logical WAL cursor requires known primary slot identity"))
-           (unless (logical-slot-wal-start-proven-p
-                    (wal-retained-slot-scan-slot scan)
-                    (wal-retained-slot-scan-start scan) owner role)
-             (error "logical WAL start lacks a captured slot boundary"))
-           (logical-slot-check-primary-history (wal-retained-slot-scan-slot scan) history)
-           (check-source))
-         (call-with-optional-logical-wal-archive
-          system-id history (wal-retained-slot-scan-namespace scan) #'check-source
-          (lambda (archive)
-            (call-with-logical-wal-cursor
-             history (wal-retained-slot-scan-namespace scan)
-             (wal-retained-slot-scan-start scan) (wal-retained-slot-scan-end scan)
-             owner role (if archive (constantly t) #'check-source) function :archive archive))))))))
+     (call-with-logical-slot-wal-cursor-from-scan
+      scan owner role (lambda (cursor source) (declare (ignore source)) (funcall function cursor))))))

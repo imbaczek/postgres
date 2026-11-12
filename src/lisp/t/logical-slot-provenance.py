@@ -98,6 +98,74 @@ def check_native_cursor(server, name, timeline):
     print(f'logical-slot-cursor: {name} timeline={timeline} records={counts[0]}', flush=True)
 
 
+def check_native_reader(server, name):
+    """Exercise the real reader and an aligned continuation without acknowledging the slot."""
+    response = server.control(f'''(progn
+      (call-with-logical-replication-slot "{name}"
+        (lambda (slot)
+          (let ((confirmed (wal-replication-slot-confirmed-flush-lsn slot))
+                (original (symbol-function 'call-with-logical-slot-wal-cursor-from-scan))
+                (decoder (symbol-function 'wal-decode-record))
+                (before-roots (sb-thread:with-mutex (*physical-retained-inventory-publish-lock*)
+                                (loop for key being the hash-keys of *physical-retained-root-references* collect key)))
+                (pins nil) (roots nil) (decoded 0) (calls 0))
+            (unwind-protect
+                (progn
+                  (setf (symbol-function 'call-with-logical-slot-wal-cursor-from-scan)
+                        (lambda (&rest arguments)
+                          (let* ((scan (first arguments)) (callback (fourth arguments)))
+                            (push (wal-retained-slot-scan-pin scan) pins)
+                            (sb-thread:with-mutex (*wal-lock*)
+                              (assert (eql (wal-retained-slot-scan-start scan)
+                                           (gethash (first pins) *wal-snapshot-retention-pins*))))
+                            (setf (fourth arguments)
+                                  (lambda (cursor source)
+                                    (when (logical-wal-cursor-archive cursor)
+                                      (sb-thread:with-mutex (*physical-retained-inventory-publish-lock*)
+                                        (let ((keys (set-difference
+                                                     (loop for key being the hash-keys of *physical-retained-root-references*
+                                                           collect key)
+                                                     before-roots :test #'eq)))
+                                          (assert (= 1 (length keys)))
+                                          (push (first keys) roots))))
+                                    (funcall callback cursor source))))
+                          (multiple-value-prog1 (apply original arguments) (incf calls))))
+                  (setf (symbol-function 'wal-decode-record)
+                        (lambda (&rest arguments) (incf decoded) (apply decoder arguments)))
+                  (call-with-logical-reader-spools
+                    (lambda ()
+                      (multiple-value-bind (transactions progress exhausted)
+                          (wal-logical-slot-read-transactions "{name}")
+                        (assert exhausted)
+                        (assert (<= confirmed progress *wal-durable-lsn*))
+                        (assert (eql progress *wal-logical-slot-read-progress*))
+                        (assert (every (lambda (tx) (> (logical-transaction-commit-lsn tx) confirmed))
+                                       transactions))
+                        (let ((before decoded) (proof *wal-logical-slot-read-continuation*))
+                          (when (> progress confirmed) (assert proof))
+                          (multiple-value-bind (more continued done)
+                              (wal-logical-slot-read-transactions "{name}" :from-lsn progress)
+                            (assert (null more))
+                            (assert (eql continued progress))
+                            (assert done)
+                            (assert (= before decoded))
+                            (assert (eq proof *wal-logical-slot-read-continuation*)))))))
+                  (assert (= calls 2))
+                  (assert (= 2 (length (remove-duplicates pins :test #'eq))))
+                  (sb-thread:with-mutex (*wal-lock*)
+                    (dolist (pin pins) (assert (not (nth-value 1 (gethash pin *wal-snapshot-retention-pins*))))))
+                  (when roots
+                    (assert (= 2 (length (remove-duplicates roots :test #'eq))))
+                    (sb-thread:with-mutex (*physical-retained-inventory-publish-lock*)
+                      (dolist (key roots) (assert (not (nth-value 1 (gethash key *physical-retained-root-references*)))))))
+                  (assert (eql confirmed (wal-replication-slot-confirmed-flush-lsn slot)))
+                  (format t "READER-CHECKED=~d~%" calls))
+              (setf (symbol-function 'call-with-logical-slot-wal-cursor-from-scan) original
+                    (symbol-function 'wal-decode-record) decoder)))))
+      (values))''')
+    assert re.findall(r'READER-CHECKED=(\d+)', response) == ['2'], response
+
+
 def check_restored_slots(server, connection, before, timeline=1, on_pair=None):
     for name, (raw, fields) in before.items():
         assert slot_image(server, name, timeline, on_pair)[0] == raw, name
@@ -108,6 +176,7 @@ def check_restored_slots(server, connection, before, timeline=1, on_pair=None):
         restart, confirmed = map(lsn_number, rows[0][2:])
         assert (restart, confirmed) == (int(fields[3]), int(fields[5])), (rows, fields)
         check_native_cursor(server, name, timeline)
+        check_native_reader(server, name)
         assert slot_image(server, name, timeline, on_pair)[0] == raw, name
 
 
@@ -278,6 +347,202 @@ def check_promoted():
         source.stop(immediate=True)
 
 
+def check_delayed_feedback_reader():
+    """Prove linear decoding and fence continuation reuse across source/owner changes."""
+    started = time.monotonic()
+    server = api['OwnedLisp']()
+    count = 64
+    try:
+        server.start()
+        connection = RawConnection(server.port)
+        try:
+            connection.query('CREATE TABLE continuation_rows (id integer)')
+            connection.query("SELECT pg_create_logical_replication_slot('delayed_reader','pgoutput')")
+            before = slot_image(server, 'delayed_reader')[0]
+            for value in range(1, count + 1):
+                connection.query(f'INSERT INTO continuation_rows VALUES ({value})')
+            response = server.control(f'''(progn
+              (let ((saved nil) (saved-progress nil))
+                (call-with-logical-replication-slot "delayed_reader"
+                  (lambda (slot)
+                    (let* ((confirmed (wal-replication-slot-confirmed-flush-lsn slot))
+                           (restart (wal-replication-slot-restart-lsn slot))
+                           (end (sb-thread:with-mutex (*wal-lock*) *wal-durable-lsn*))
+                           (reference 0) (decoded 0) (rows 0) (fast 0) (progress confirmed) (first-progress nil)
+                           (decoder (symbol-function 'wal-decode-record))
+                           (original (symbol-function 'call-with-logical-slot-wal-cursor-from-scan)))
+                      (call-with-logical-slot-wal-cursor "delayed_reader" nil end
+                        (wal-replication-slot-confirmed-timeline slot) :prefix-end
+                        (lambda (cursor)
+                          (loop while (logical-wal-cursor-next cursor) do (incf reference))))
+                      (unwind-protect
+                          (progn
+                            (setf (symbol-function 'wal-decode-record)
+                                  (lambda (&rest args) (incf decoded) (apply decoder args))
+                                  (symbol-function 'call-with-logical-slot-wal-cursor-from-scan)
+                                  (lambda (&rest args)
+                                    (when (wal-retained-slot-scan-continuation (first args)) (incf fast))
+                                    (apply original args)))
+                            (let ((start (get-internal-real-time)) (bytes (sb-ext:get-bytes-consed)))
+                              (loop
+                                (when (> rows {count}) (error "reader duplicated rows"))
+                                (when
+                                    (call-with-logical-reader-spools
+                                      (lambda ()
+                                        (multiple-value-bind (transactions next exhausted)
+                                            (wal-logical-slot-read-transactions
+                                             "delayed_reader" :from-lsn progress :upto-lsn end
+                                             :max-transactions 1)
+                                          (dolist (tx transactions)
+                                            (logical-transaction-map-changes tx
+                                              (lambda (change)
+                                                (when (eq (logical-change-kind change) :insert)
+                                                  (incf rows)
+                                                  (assert (= rows (aref (logical-change-new-values change) 0)))))))
+                                          (assert (<= progress next end))
+                                          (unless first-progress (setf first-progress next))
+                                          (setf progress next)
+                                          exhausted)))
+                                  (return)))
+                              (assert (= rows {count}))
+                              (assert (= decoded reference))
+                              (assert (>= fast {count}))
+                              (format t "CONTINUATION-LINEAR rows=~d decoded=~d reference=~d fast=~d seconds=~,6f allocated=~d~%"
+                                      rows decoded reference fast
+                                      (/ (- (get-internal-real-time) start)
+                                         (float internal-time-units-per-second 1d0))
+                                      (- (sb-ext:get-bytes-consed) bytes)))
+                            (assert (= confirmed (wal-replication-slot-confirmed-flush-lsn slot)))
+                            (assert (= restart (wal-replication-slot-restart-lsn slot)))
+                            (setf saved *wal-logical-slot-read-continuation* saved-progress progress)
+                            (assert saved)
+                            (sb-thread:with-mutex (*wal-lock*)
+                              (assert (eq saved (logical-wal-reusable-continuation slot progress end)))
+                              (flet ((invalid-source ()
+                                       (let ((message
+                                               (handler-case
+                                                   (logical-wal-check-source (logical-wal-continuation-source saved) end)
+                                                 (error (condition) (princ-to-string condition)))))
+                                         (assert (and message (search "source changed" message)))
+                                         (assert (null (logical-wal-reusable-continuation slot progress end))))))
+                                (let ((*wal-ready* nil)) (invalid-source))
+                                (let ((*wal-insert-timeline* (1+ *wal-insert-timeline*))) (invalid-source))
+                                (let ((*wal-segment-namespace* (if (eq *wal-segment-namespace* :legacy) :timeline :legacy)))
+                                  (invalid-source))
+                                (let ((*pgdata* (uiop:pathname-parent-directory-pathname (truename *pgdata*))))
+                                  (invalid-source))
+                                (let ((*wal-logical-slot-owner* (gensym "other-owner"))) (invalid-source))
+                                (let ((*catalog* (copy-catalog *catalog*))) (invalid-source))
+                                (let ((profile (wal-slot-profile slot)))
+                                  (unwind-protect
+                                      (progn (setf (gethash slot *wal-slot-profiles*)
+                                                   (if (eq profile :text) :binary-bytea :text))
+                                             (invalid-source))
+                                    (setf (gethash slot *wal-slot-profiles*) profile)))
+                                (let* ((provenance (copy-structure (wal-replication-slot-logical-provenance slot)))
+                                       (replacement
+                                         (make-wal-replication-slot
+                                          :name (wal-replication-slot-name slot)
+                                          :database-oid (wal-replication-slot-database-oid slot)
+                                          :restart-lsn (wal-replication-slot-restart-lsn slot)
+                                          :restart-timeline (wal-replication-slot-restart-timeline slot)
+                                          :consistent-lsn (wal-replication-slot-consistent-lsn slot)
+                                          :confirmed-flush-lsn (wal-replication-slot-confirmed-flush-lsn slot)
+                                          :confirmed-timeline (wal-replication-slot-confirmed-timeline slot)
+                                          :plugin (wal-replication-slot-plugin slot)
+                                          :active-owner *wal-logical-slot-owner*
+                                          :pending-xids (wal-replication-slot-pending-xids slot)
+                                          :logical-provenance provenance)))
+                                  (unwind-protect
+                                      (progn (setf (gethash "delayed_reader" *wal-replication-slots*) replacement)
+                                             (assert (eq provenance (wal-replication-slot-logical-provenance
+                                                                      (gethash "delayed_reader" *wal-replication-slots*))))
+                                             (invalid-source))
+                                    (setf (gethash "delayed_reader" *wal-replication-slots*) slot))))
+                              (let ((*wal-durable-lsn* (+ *wal-durable-lsn* 128)))
+                                (assert (eq saved (logical-wal-reusable-continuation slot progress end))))
+                              (assert (eq saved (logical-wal-reusable-continuation slot progress end))))
+                            (let* ((owner *wal-logical-slot-owner*)
+                                   (thread (sb-thread:make-thread
+                                            (lambda ()
+                                              (let ((*wal-logical-slot-owner* owner)
+                                                    (*wal-logical-slot-read-continuation* saved))
+                                                (sb-thread:with-mutex (*wal-lock*)
+                                                  (logical-wal-reusable-continuation slot progress end)))))))
+                              (assert (null (sb-thread:join-thread thread))))
+                            ;; A different valid continuation retains the replay fallback.
+                            (let ((*wal-logical-slot-read-continuation* saved) (replayed nil) (ids nil))
+                              (setf (symbol-function 'call-with-logical-slot-wal-cursor-from-scan)
+                                    (lambda (&rest args)
+                                      (assert (null (wal-retained-slot-scan-continuation (first args))))
+                                      (multiple-value-prog1 (apply original args) (setf replayed t))))
+                              (call-with-logical-reader-spools
+                                (lambda ()
+                                  (multiple-value-bind (transactions next exhausted)
+                                      (wal-logical-slot-read-transactions "delayed_reader" :from-lsn first-progress
+                                                                          :upto-lsn end :max-transactions 1)
+                                    (assert (> next first-progress)) (assert (not exhausted))
+                                    (dolist (tx transactions)
+                                      (logical-transaction-map-changes tx
+                                        (lambda (change)
+                                          (when (eq (logical-change-kind change) :insert)
+                                            (push (aref (logical-change-new-values change) 0) ids))))))))
+                              (assert replayed) (assert (equal ids '(2))))
+                            ;; Invalidate the snapshot after fast admission but before wrapper entry.
+                            (let ((injected nil) (message nil) (old-progress *wal-logical-slot-read-progress*))
+                              (setf (symbol-function 'call-with-logical-slot-wal-cursor-from-scan)
+                                    (lambda (&rest args)
+                                      (assert (wal-retained-slot-scan-continuation (first args)))
+                                      (let ((*catalog* (copy-catalog *catalog*)))
+                                        (setf injected t)
+                                        (apply original args))))
+                              (setf message
+                                    (handler-case
+                                        (wal-logical-slot-read-transactions "delayed_reader" :from-lsn progress :upto-lsn end)
+                                      (error (condition) (princ-to-string condition))))
+                              (assert injected)
+                              (assert (and message (search "source changed" message)))
+                              (assert (eq saved *wal-logical-slot-read-continuation*))
+                              (assert (eql old-progress *wal-logical-slot-read-progress*)))
+                            ;; A changed catalog at admission must miss the certificate and replay.
+                            (let ((*catalog* (copy-catalog *catalog*))
+                                  (*wal-logical-slot-read-continuation* saved)
+                                  (replayed nil))
+                              (setf (symbol-function 'call-with-logical-slot-wal-cursor-from-scan)
+                                    (lambda (&rest args)
+                                      (assert (null (wal-retained-slot-scan-continuation (first args))))
+                                      (multiple-value-prog1 (apply original args) (setf replayed t))))
+                              (call-with-logical-reader-spools
+                                (lambda ()
+                                  (multiple-value-bind (transactions next exhausted)
+                                      (wal-logical-slot-read-transactions "delayed_reader" :from-lsn progress :upto-lsn end)
+                                    (assert (null transactions)) (assert (= progress next)) (assert exhausted))))
+                              (assert replayed)))
+                        (setf (symbol-function 'wal-decode-record) decoder
+                              (symbol-function 'call-with-logical-slot-wal-cursor-from-scan) original)))))
+                ;; Ownership release clears the dynamic certificate; a stolen old token cannot be reused.
+                (assert (null *wal-logical-slot-read-continuation*))
+                (call-with-logical-replication-slot "delayed_reader"
+                  (lambda (slot)
+                    (let ((*wal-logical-slot-read-continuation* saved))
+                      (sb-thread:with-mutex (*wal-lock*)
+                        (assert (null (logical-wal-reusable-continuation slot saved-progress *wal-durable-lsn*))))))))
+              (values))''', timeout=45)
+            matches = re.findall(r'CONTINUATION-LINEAR rows=(\d+) decoded=(\d+) reference=(\d+) fast=(\d+) seconds=([0-9.]+) allocated=(\d+)', response)
+            assert len(matches) == 1, response
+            result = matches[0]
+            assert int(result[0]) == count and result[1] == result[2] and int(result[3]) >= count, result
+            assert slot_image(server, 'delayed_reader')[0] == before
+            print('logical-slot-continuation: ' + ' '.join(result), flush=True)
+        finally:
+            connection.close()
+        print(f'logical-slot-provenance: PASS (linear delayed feedback and source/owner fences) '
+              f'{time.monotonic() - started:.6f}s; artifacts: {server.root}', flush=True)
+    finally:
+        server.stop(immediate=True)
+
+
 if __name__ == '__main__':
     check()
     check_promoted()
+    check_delayed_feedback_reader()

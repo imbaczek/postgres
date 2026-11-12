@@ -23,6 +23,8 @@
 
 (defvar *wal-logical-slot-read-progress* nil)
 
+(defvar *wal-logical-slot-read-continuation* nil)
+
 (defconstant +logical-unchanged-toast+ :logical-unchanged-toast
   "Internal row-codec marker for an unchanged external non-key value.")
 
@@ -1573,7 +1575,7 @@ executor, so capture the same operation before transaction commit."
         (logical-reader-store-change state change))))
   (values))
 
-(defun wal-logical-reader-finish-batch (state record)
+(defun wal-logical-reader-finish-batch (state record &optional (emit t))
   (unless (logical-reader-state-batch-open-p state)
     (error "logical WAL terminal appears outside a batch"))
   (let* ((record-type (wal-record-type record))
@@ -1586,6 +1588,7 @@ executor, so capture the same operation before transaction commit."
               (= (logical-change-database-oid change)
                  (logical-reader-state-database-oid state)))
             (logical-reader-state-changes state)))
+         (commit-timestamp nil)
          (spool (logical-reader-state-spool state))
          (has-changes (or changes spool))
          (catalog-event-p (or (logical-reader-state-catalog-p state)
@@ -1598,6 +1601,8 @@ executor, so capture the same operation before transaction commit."
       (wal-validate-empty-metadata-terminal record *wal-recovery-reservation-batch-clean-p*))
     (cond
       ((= record-type +wal-record-commit+)
+       (when has-changes
+         (setf commit-timestamp (wal-decode-commit-timestamp (wal-record-payload record))))
        (when (logical-reader-state-fragment-batch state)
          (logical-fragment-batch-finish (logical-reader-state-fragment-batch state)
                                         (wal-record-xid record)))
@@ -1609,11 +1614,10 @@ executor, so capture the same operation before transaction commit."
                       (= (logical-reader-state-next-chunk state)
                          (logical-reader-state-chunk-count state)))
            (error "logical WAL chunks do not match their commit record")))
-       (when has-changes
+       (when (and emit has-changes)
          (when spool (logical-spool-seal spool))
          (push (make-logical-transaction :spool spool :xid (wal-record-xid record)
-                                         :commit-timestamp
-                                         (wal-decode-commit-timestamp (wal-record-payload record))
+                                         :commit-timestamp commit-timestamp
                                          :commit-record-lsn (wal-record-start record)
                                          :commit-lsn (wal-record-end record)
                                          :changes changes)
@@ -1622,7 +1626,7 @@ executor, so capture the same operation before transaction commit."
       (catalog-terminal-p
        (when (or (logical-reader-state-chunk-count state) row-change-p)
          (error "logical row changes are attached to a catalog WAL batch"))
-       (when has-changes
+       (when (and emit has-changes)
          (when spool (logical-spool-seal spool))
          (push (make-logical-transaction :spool spool :xid 0
                                          :commit-record-lsn (wal-record-start record)
@@ -1752,7 +1756,7 @@ tracked by the bounded sender. SENT-LSN never includes an unfinished frame."
       requested-lsn)))
 
 (defstruct wal-retained-slot-scan
-  name slot owner database plugin timeline namespace start end cursor pin)
+  name slot owner database plugin timeline namespace start end cursor pin continuation)
 
 (defun wal-retained-slot-scan-validate-under-lock (scan)
   "Recheck the slot, owner, pin, timeline and namespace before reading.
@@ -1774,12 +1778,19 @@ WAL source or invalidating the retention pin, so it is not compared here."
 
 (declaim (ftype function logical-slot-check-primary-history logical-slot-primary-history-under-lock))
 
-(defun call-with-wal-retained-slot-scan (name from-lsn upto-lsn function)
+(declaim (ftype function logical-wal-reusable-continuation logical-slot-wal-scan-start-position
+                logical-wal-certify-boundary))
+
+(defun call-with-wal-retained-slot-scan (name from-lsn upto-lsn function &key replay-from-restart)
   "Capture a durable slot horizon and pin its retained start for FUNCTION.
 Check known provenance against primary history before installing the pin.
 This checks lineage geometry, not exact WAL bytes, slot lifetime or import
-authority."
-  (let ((scan nil))
+authority. With REPLAY-FROM-RESTART, capture and pin the restart anchor under
+that same lock and pass the requested output position as FUNCTION's second
+argument. The value :KNOWN enables replay only for slots with provenance;
+other slots retain the one-argument callback. The reader must independently
+prove the anchor's position role."
+  (let ((scan nil) (requested nil) (replay nil) (continuation nil))
     (unwind-protect
          (progn
            (sb-sys:without-interrupts
@@ -1806,15 +1817,24 @@ authority."
                  (when (wal-replication-slot-logical-provenance slot)
                    (logical-slot-check-primary-history
                     slot (logical-slot-primary-history-under-lock)))
+                 (setf requested start
+                       replay (and replay-from-restart
+                                   (or (not (eq replay-from-restart :known))
+                                       (wal-replication-slot-logical-provenance slot))))
+                 (when replay
+                   (setf continuation (logical-wal-reusable-continuation slot requested end)
+                         start (if continuation requested (wal-replication-slot-restart-lsn slot))))
                  (let ((pin (gensym "LOGICAL-SCAN-PIN-")))
                    (setf scan (make-wal-retained-slot-scan
                                :name name :slot slot :owner owner
                                :database (wal-replication-slot-database-oid slot)
                                :plugin (copy-seq (wal-replication-slot-plugin slot))
                                :timeline *wal-insert-timeline* :namespace *wal-segment-namespace*
-                               :start start :end end :cursor start :pin pin))
+                               :start start :end end :cursor start :pin pin :continuation continuation))
                    (setf (gethash pin *wal-snapshot-retention-pins*) start)))))
-           (funcall function scan))
+           (if replay
+               (funcall function scan requested)
+               (funcall function scan)))
       (when scan
         (sb-sys:without-interrupts
           (sb-thread:with-mutex (*wal-lock*)
@@ -1876,23 +1896,35 @@ authority."
       (setf (wal-retained-slot-scan-cursor scan) (wal-record-end record))
       record)))
 
-(defun wal-logical-slot-read-transactions-from-scan (scan max-transactions max-bytes max-scan-bytes)
-  (let ((start-lsn (wal-retained-slot-scan-start scan))
-        (end-lsn (wal-retained-slot-scan-end scan)))
-    (when (= start-lsn end-lsn)
+(declaim (ftype function logical-wal-cursor-next logical-wal-cursor-check-scope
+                logical-slot-wal-start-proven-p call-with-logical-slot-wal-cursor-from-scan))
+
+(defun wal-logical-reader-next-record (scan cursor)
+  (if (null cursor)
+      (wal-retained-slot-scan-next scan)
+      (loop
+        (multiple-value-bind (record bytes owner carrier kind) (logical-wal-cursor-next cursor)
+          (declare (ignore bytes owner carrier))
+          (unless record (return nil))
+          (ecase kind
+            (:ordinary (return record))
+            (:end-of-recovery))))))
+
+(defun wal-logical-slot-read-transactions-from-scan
+    (scan max-transactions max-bytes max-scan-bytes
+     &key cursor (output-start (wal-retained-slot-scan-start scan)) allow-filter)
+  (let* ((start-lsn output-start)
+         (end-lsn (wal-retained-slot-scan-end scan))
+         (boundary-proven (or allow-filter (= start-lsn (wal-retained-slot-scan-start scan)))))
+    (when (= (wal-retained-slot-scan-start scan) end-lsn)
       (return-from wal-logical-slot-read-transactions-from-scan
-        (values '() start-lsn t)))
+        (values '() start-lsn t nil)))
     (let ((*wal-recovery-reservation-batch-clean-p* nil)
-          (state (make-logical-reader-state
-                  :database-oid (wal-retained-slot-scan-database scan)))
-          (transaction-count 0)
-          (change-bytes 0)
-          (progress-lsn start-lsn))
+          (state (make-logical-reader-state :database-oid (wal-retained-slot-scan-database scan)))
+          (transaction-count 0) (change-bytes 0) (progress-lsn start-lsn) (finished-terminal nil))
       (unwind-protect
            (progn
-             ;; Read from the captured durable horizon. The retention pin protects
-             ;; segments while each record is copied under the WAL lock.
-             (loop for record = (wal-retained-slot-scan-next scan)
+             (loop for record = (wal-logical-reader-next-record scan cursor)
                    while record do
                      (wal-note-recovery-batch-record record)
                      (let ((record-type (wal-record-type record)))
@@ -1903,26 +1935,27 @@ authority."
                           (wal-logical-reader-add-chunk state record))
                          ((= record-type +wal-record-logical-catalog-event+)
                           (wal-logical-reader-add-catalog-event state record))
-                         (t
-                          (when (wal-terminal-record-type-p record-type)
-                            (let* ((has-changes
-                                     (and (or (= record-type +wal-record-commit+)
-                                              (= record-type +wal-record-catalog+)
-                                              (= record-type +wal-record-catalog-commit+))
-                                          (wal-logical-reader-has-database-changes-p
-                                           state)))
-                                   (batch-bytes
-                                     (logical-reader-state-change-bytes state)))
-                              (when (and has-changes
-                                         (plusp transaction-count)
-                                         (or (>= transaction-count max-transactions)
-                                             (> (+ change-bytes batch-bytes) max-bytes)))
-                                (return-from wal-logical-slot-read-transactions-from-scan
-                                  (values
-                                   (nreverse
-                                    (logical-reader-state-transactions state))
-                                   progress-lsn nil)))
-                              (wal-logical-reader-finish-batch state record)
+                         ((wal-terminal-record-type-p record-type)
+                          (let* ((emit (> (wal-record-end record) start-lsn))
+                                 (has-changes
+                                   (and (member record-type
+                                                (list +wal-record-commit+ +wal-record-catalog+
+                                                      +wal-record-catalog-commit+))
+                                        (wal-logical-reader-has-database-changes-p state)))
+                                 (batch-bytes (logical-reader-state-change-bytes state)))
+                            (when (and emit (not boundary-proven))
+                              (error "requested position is not a completed logical WAL boundary"))
+                            (when (and emit has-changes (plusp transaction-count)
+                                       (or (>= transaction-count max-transactions)
+                                           (> (+ change-bytes batch-bytes) max-bytes)))
+                              (return-from wal-logical-slot-read-transactions-from-scan
+                                (values (nreverse (logical-reader-state-transactions state))
+                                        progress-lsn nil finished-terminal)))
+                            (wal-logical-reader-finish-batch state record emit)
+                            (setf finished-terminal (wal-record-end record))
+                            (when (= (wal-record-end record) start-lsn)
+                              (setf boundary-proven t))
+                            (when emit
                               (setf progress-lsn (wal-record-end record))
                               (when has-changes
                                 (incf transaction-count)
@@ -1931,15 +1964,31 @@ authority."
                                         (>= change-bytes max-bytes)
                                         (>= (- progress-lsn start-lsn) max-scan-bytes))
                                 (return-from wal-logical-slot-read-transactions-from-scan
-                                  (values
-                                   (nreverse
-                                    (logical-reader-state-transactions state))
-                                   progress-lsn nil)))))))))
-             ;; An open batch at the durable scan horizon is an incomplete commit
-             ;; tail. Its changes stay invisible, as in DecodeCommit/reorderbuffer.
-             (values
-              (nreverse (logical-reader-state-transactions state)) progress-lsn t))
+                                  (values (nreverse (logical-reader-state-transactions state))
+                                          progress-lsn nil finished-terminal)))))))))
+             (unless boundary-proven
+               (error "requested position is not a completed logical WAL boundary"))
+             (values (nreverse (logical-reader-state-transactions state)) progress-lsn t finished-terminal))
         (wal-logical-reader-reset-batch state nil)))))
+
+(defun wal-logical-slot-read-transactions-from-cursor
+    (scan requested allow-filter max-transactions max-bytes max-scan-bytes)
+  (multiple-value-bind (owner role)
+      (sb-thread:with-mutex (*wal-lock*) (logical-slot-wal-scan-start-position scan))
+    (call-with-logical-slot-wal-cursor-from-scan
+     scan owner role
+     (lambda (cursor source)
+       (multiple-value-bind (transactions progress exhausted finished-terminal)
+           (wal-logical-slot-read-transactions-from-scan
+            scan max-transactions max-bytes max-scan-bytes
+            :cursor cursor :output-start requested :allow-filter allow-filter)
+         (sb-thread:with-mutex (*wal-lock*)
+           (logical-wal-cursor-check-scope cursor)
+           (when (eql progress finished-terminal)
+             (setf *wal-logical-slot-read-continuation*
+                   (logical-wal-certify-boundary source progress)))
+           (wal-logical-reader-return transactions progress exhausted))))
+     :batch-policy :logical-reader)))
 
 (defun wal-logical-slot-read-transactions
     (name &key upto-lsn from-lsn
@@ -1952,12 +2001,17 @@ scan reached its horizon rather than stopping at a configured limit."
   (wal-logical-reader-validate-limits max-transactions max-bytes max-scan-bytes)
   (call-with-wal-retained-slot-scan
    name from-lsn upto-lsn
-   (lambda (scan)
-     (multiple-value-bind (transactions progress exhausted)
-         (wal-logical-slot-read-transactions-from-scan scan max-transactions max-bytes max-scan-bytes)
-       (sb-thread:with-mutex (*wal-lock*)
-         (wal-retained-slot-scan-validate-under-lock scan)
-         (wal-logical-reader-return transactions progress exhausted))))))
+   (lambda (scan &optional requested)
+     (if requested
+         (wal-logical-slot-read-transactions-from-cursor
+          scan requested (and (null from-lsn) (equal (wal-retained-slot-scan-plugin scan) "pgoutput"))
+          max-transactions max-bytes max-scan-bytes)
+         (multiple-value-bind (transactions progress exhausted)
+             (wal-logical-slot-read-transactions-from-scan scan max-transactions max-bytes max-scan-bytes)
+           (sb-thread:with-mutex (*wal-lock*)
+             (wal-retained-slot-scan-validate-under-lock scan)
+             (wal-logical-reader-return transactions progress exhausted)))))
+   :replay-from-restart :known))
 
 (defun wal-logical-slot-acknowledge (name acknowledged-lsn)
   "Acknowledge scanned WAL after all preceding row changes are durable."
