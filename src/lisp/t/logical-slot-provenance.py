@@ -1,4 +1,8 @@
-"""Check public logical slot identity across a native server crash and restart."""
+"""Check SQL and wire slot identity across primary and promoted-server crashes.
+
+The promoted case creates fresh slots after a checkpoint on the child timeline,
+with the source's logical ON origin retained through promotion.
+"""
 from pathlib import Path
 import re
 import runpy
