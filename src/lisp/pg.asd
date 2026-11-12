@@ -203,6 +203,7 @@
                    (:file "../replication/physical-promotion-resume")
                    (:file "../replication/physical-promotion-commit")
                    (:file "../replication/physical-promotion-retained")
+                   (:file "../replication/logical-wal-archive")
                    (:file "../replication/physical-origin-proof")
                    (:file "../replication/physical-slots")
                    (:file "../replication/physical-promotion-primary")
