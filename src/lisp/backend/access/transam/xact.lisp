@@ -1588,8 +1588,12 @@ The caller holds *WRITE-LOCK*. This establishes the same brief writer barrier
 used by logical slot startpoint selection in PostgreSQL; holding WAL before XID
 publication makes the snapshot and durable WAL end one boundary. Pending page
 publications are settled before selecting the durable LSN. The returned
-restart LSN reaches back to the earliest page batch that contains an XID still
-active in the snapshot. Its registration pins that WAL position until release.
+restart LSN reaches back to the earliest pending first-batch start for an XID
+in the snapshot, or remains at the durable prefix end if there is none.
+History and logical policy evidence are copied under WAL before the snapshot's
+XID critical section. The registration publishes the pin and its
+immutable boundary together under the snapshot-count lock. It retains them
+until release or pin transfer.
 AFTER-CAPTURE runs under *WAL-LOCK* but after *XID-LOCK* is released."
   (unless (snapshot-registration-p register)
     (error "WAL snapshot boundaries require a snapshot-registration token"))

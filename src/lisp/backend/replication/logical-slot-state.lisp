@@ -143,6 +143,7 @@ is required before acknowledgment, saving or scanning can resume."
   slot)
 
 (defun logical-slot-new-generation ()
+  "Return a random 128-bit generation from 16 entropy bytes."
   (let ((bytes (make-array 16 :element-type '(unsigned-byte 8))))
     (with-open-file (input #p"/dev/urandom" :element-type '(unsigned-byte 8))
       (unless (= 16 (read-sequence bytes input))
@@ -153,10 +154,15 @@ is required before acknowledgment, saving or scanning can resume."
           finally (return generation))))
 
 (defun logical-slot-primary-history-under-lock ()
+  "Read and check the insertion timeline's history under the WAL lock."
   (assert (sb-thread:holding-mutex-p *wal-lock*))
   (timeline-check-lineage (timeline-read-history *wal-insert-timeline*)))
 
 (defun logical-slot-make-snapshot-boundary (boundary-lsn pending-lsns history logical-fields)
+  "Build immutable boundary evidence from the captured history and policy.
+The prefix end belongs to the timeline of its last byte; prefix zero has no
+owner. Pending starts belong to the timeline at their position and win a tie
+with the prefix end, including at a fork. Copy the optional ON pair as captured."
   (unless (typep boundary-lsn '(unsigned-byte 64))
     (error "invalid snapshot WAL boundary"))
   (let* ((birth-timeline (when (plusp boundary-lsn)

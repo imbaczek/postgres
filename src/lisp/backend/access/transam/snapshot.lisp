@@ -17,6 +17,11 @@
   (source-xids-complete-p nil))
 
 (defstruct snapshot-wal-boundary
+  "Immutable evidence captured with a snapshot's WAL pin.
+LSN is the durable prefix end and TIMELINE owns its last byte; TIMELINE is NIL
+for the empty prefix at LSN zero. RESTART-LSN and RESTART-TIMELINE identify the selected retention point and RESTART-ROLE
+says whether it is the prefix end or a pending start. The optional logical ON
+pair records actual captured policy evidence."
   (lsn nil :read-only t)
   (timeline nil :read-only t)
   (restart-lsn nil :read-only t)
@@ -29,6 +34,8 @@
             (:constructor make-snapshot-registration ()))
   snapshot
   wal-retention-lsn
+  ;; Published with the pin under the snapshot-count lock; cleared on release
+  ;; or pin transfer.
   wal-boundary
   exported-state
   importer-backend
@@ -123,7 +130,8 @@ generation, so an older WAL-pin release cannot retire this snapshot."
       oldest)))
 
 (defun finish-snapshot-registration-release (registration generation pinned)
-  "Remove PINNED and detach its importer only for this release generation.
+  "Remove PINNED and its boundary evidence for this release generation.
+Detach its importer before the token can be reused.
 
 WAL precedes the snapshot-count lock when a pin exists, matching the local
 boundary-capture path. PostgreSQL's snapmgr.c:AtEOXact_Snapshot is the
@@ -231,7 +239,7 @@ reusable token also checks a generation before delayed cleanup."
   (values))
 
 (defun release-snapshot-registration-wal-pin-under-wal-lock (registration)
-  "Drop a provisional snapshot pin after its durable slot owns the same LSN.
+  "Drop a provisional snapshot pin and boundary after the durable slot owns the LSN.
 
 The caller holds *WAL-LOCK*, so checkpoint recycling sees either this pin or
 the already-persisted slot restart point, never a gap. If release is underway,
