@@ -109,6 +109,8 @@ or authority."
   "Check known logical slot identities against the durable catalog once.
 Return its system ID when needed, without initializing or repairing the catalog.
 This does not prove history, slot lifetime or import authority."
+  ;; Include known lost slots: loss of WAL does not waive cluster identity.
+  ;; This read-only catalog parse may be repeated by later source checks.
   (let ((known (remove-if-not
                 (lambda (slot)
                   (and (wal-logical-slot-p slot) (wal-replication-slot-logical-provenance slot)))

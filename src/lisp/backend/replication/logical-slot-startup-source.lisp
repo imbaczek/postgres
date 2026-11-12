@@ -3,10 +3,14 @@
 (declaim (ftype function check-primary-storage-startup-context))
 
 (defstruct (logical-slot-startup-entry (:constructor %make-logical-slot-startup-entry))
+  ;; Keep both the decoded candidate and its disk image for later rechecks.
   (slot nil :read-only t) (bytes nil :read-only t) (image nil :read-only t)
   (profile nil :read-only t) (provenance nil :read-only t))
 
 (defstruct (logical-slot-startup-source (:constructor %make-logical-slot-startup-source))
+  ;; Freeze the post-replay source before catalog initialization: durable
+  ;; catalog system ID, control, history, durable end and slot candidates.
+  ;; The gate and postmaster ownership are separate, borrowed authority.
   (gate-owner nil :read-only t) (ownership nil :read-only t)
   (entries nil :read-only t) (system-id nil :read-only t)
   (root nil :read-only t) (history nil :read-only t) (history-bytes nil :read-only t)
@@ -50,6 +54,9 @@
   source)
 
 (defun logical-slot-startup-check-authority (source)
+  ;; Check the drained gate and postmaster ownership outside the WAL mutex.
+  ;; When needed, the read-only system ID lookup parses the full catalog on
+  ;; each check; avoiding repeated parses is a performance followup.
   (logical-slot-startup-check-live source)
   (when (sb-thread:holding-mutex-p *wal-lock*)
     (error "startup authority must be checked before taking the WAL mutex"))
@@ -61,6 +68,8 @@
   t)
 
 (defun logical-slot-startup-check-source-facts (source)
+  ;; Under the WAL mutex, compare the frozen source and candidates with the
+  ;; current post-replay state.  This does not prove slot lifetime or import.
   (unless (and *wal-ready* (not (recovery-in-progress-p))
                (eq (logical-slot-startup-source-incarnation source) *wal-storage-incarnation*)
                (eql (logical-slot-startup-source-timeline source) *wal-insert-timeline*)
@@ -104,6 +113,8 @@
   t)
 
 (defun call-with-logical-slot-startup-source (gate-owner ownership entries function)
+  ;; Capture one thread-bound source under the real startup authority.  A
+  ;; failed ordinary source observation revokes it; every exit ends its scope.
   (check-primary-storage-startup-context gate-owner ownership)
   (let* ((slots (mapcar #'logical-slot-startup-entry-slot entries))
          (system-id (logical-slot-check-startup-identities slots))
@@ -144,6 +155,7 @@
         (setf (logical-slot-startup-source-active-p source) nil)))))
 
 (defun logical-slot-startup-start-position (slot history)
+  ;; A restart may name a record start at a fork or the end of a prefix.
   (let ((start (wal-replication-slot-restart-lsn slot))
         (owner (wal-replication-slot-restart-timeline slot)))
     (cond
@@ -159,6 +171,7 @@
       (t (values owner :prefix-end)))))
 
 (defun logical-slot-startup-local-anchor-p (slot history)
+  ;; Only current-timeline anchors are eligible for this startup path.
   (let* ((tip (timeline-history-entry-timeline (first history)))
          (begin (timeline-history-entry-begin (first history)))
          (provenance (wal-replication-slot-logical-provenance slot))
@@ -172,6 +185,9 @@
              (and (eql tip (wal-replication-slot-confirmed-timeline slot)) (>= confirmed begin))))))
 
 (defun call-with-logical-slot-startup-archive (source function)
+  ;; Use only a retained root already restored in committed primary control.
+  ;; The archive reader lease must cover preparation and publication; readable
+  ;; archive bytes alone do not establish a slot's eligibility.
   (logical-slot-startup-check-authority source)
   (flet ((guard () (logical-slot-startup-check-source source)))
     (let ((present

@@ -202,6 +202,9 @@ GUARD supplies the caller's source proof; this scope also checks persisted
 control, history and root.  It rechecks both under the captured WAL mutex on
 the owning thread.  A retained-root reader lease spans the callback.  The
 index and cache are cleared on every exit, and the archive then expires."
+  ;; Startup supplies a pre-catalog identity only after the retained root has
+  ;; been restored in committed control.  The callback can publish while the
+  ;; reader lease is held; the runtime wrapper supplies the live catalog ID.
   (unless (and (functionp guard) (functionp identity-function) (functionp function) (eq namespace :timeline))
     (error "logical WAL archive requires a timeline source scope"))
   (timeline-check-lineage history)

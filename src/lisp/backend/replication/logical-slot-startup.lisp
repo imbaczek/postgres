@@ -1,6 +1,8 @@
 (in-package #:pg)
 
 (defun logical-slot-prepare-startup-inventory (candidates segments inactive-since &optional prepare-known)
+  ;; Build a private registry.  Known logical slots need the caller's source
+  ;; preparation; legacy and physical slots retain their existing paths.
   (let ((restored (make-hash-table :test #'equal)))
     (let ((*wal-replication-slots* restored))
       (dolist (slot candidates)
@@ -27,6 +29,8 @@
     restored))
 
 (defun logical-slot-startup-check-inventory (source)
+  ;; Compare disk bytes with the captured inventory after allowed temporary
+  ;; physical slot cleanup, while retaining startup authority.
   (logical-slot-startup-check-authority source)
   (let ((expected
           (loop for entry in (logical-slot-startup-source-entries source)
@@ -50,6 +54,8 @@
     (values *logical-capture-live-slots* *wal-logical-policy* *wal-logical-info-disable-pending*)))
 
 (defun logical-slot-startup-publish (source restored &optional archive)
+  ;; Finish all fallible preparation and checks before fixed publication under
+  ;; WAL then XID lock.  The archive lease, when present, still spans this step.
   (logical-slot-startup-check-inventory source)
   (sb-thread:with-mutex (*wal-lock*)
     (logical-slot-startup-check-source source)
@@ -68,6 +74,8 @@
   (values))
 
 (defun logical-slot-startup-restore (source segments inactive-since)
+  ;; Known lost slots still undergo identity checks in the source scope, but
+  ;; only reserved slots need eligibility checks and pending-XID reconstruction.
   (let ((candidates (mapcar #'logical-slot-startup-entry-slot
                             (logical-slot-startup-source-entries source))))
     (flet ((prepare (archive)
