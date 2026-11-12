@@ -108,8 +108,8 @@
   ;; A failed observation latches the scope inactive before signaling the error.
   `(sb-sys:without-interrupts
      (unless (and (sb-sys:with-local-interrupts
-                    (handler-case (physical-file-holds-exclusive-flock-p ,fd)
-                      (error () nil)))
+                    (handler-case-noninterrupt (physical-file-holds-exclusive-flock-p ,fd)
+                                               (condition nil)))
                   ,active)
        (setf ,active nil)
        (error ,message))))

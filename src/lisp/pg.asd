@@ -5,6 +5,7 @@
   :serial t
   :components
   ((:file "packages")
+   (:file "elog" :pathname "backend/utils/elog")
    (:module "include"
     :serial t
     :components ((:file "pg-limits")
@@ -24,8 +25,7 @@
    (:module "backend"
     :serial t
     :components
-    ((:file "utils/elog")
-     (:file "utils/recovery")
+    ((:file "utils/recovery")
      (:file "utils/lwlock")
      (:module "libpq"
       :serial t

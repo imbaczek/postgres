@@ -179,10 +179,10 @@ callers needing a coherent view across publications must compare control images.
       (check-revocation)
       (sb-sys:without-interrupts
         (unless (sb-sys:with-local-interrupts
-                  (handler-case
-                      (and (open-stream-p stream)
-                           (physical-file-holds-exclusive-flock-p (sb-sys:fd-stream-fd stream)))
-                    (error () nil)))
+                  (handler-case-noninterrupt
+                   (and (open-stream-p stream)
+                        (physical-file-holds-exclusive-flock-p (sb-sys:fd-stream-fd stream)))
+                   (condition nil)))
           (sb-thread:with-mutex (lock)
             (setf (gethash stream revoked) t)
             (when owner (setf (gethash owner revoked) t)))

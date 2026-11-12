@@ -230,6 +230,170 @@
             (ok (funcall original fd))
             (ok (signals (pg::physical-file-check-exclusive-flock stream owner) 'error)))))))
 
+(defun owner-lock-test-call-proof (kind function)
+  (with-physical-store-directory (root)
+    (ecase kind
+      (:directory
+       (sb-posix:chmod (namestring root) #o700)
+       (pg::wal-atomic-write-bytes (merge-pathnames ".pg_lisp.lock" root)
+                                   (make-array 0 :element-type '(unsigned-byte 8)))
+       (pg::call-with-physical-adoption-owner
+        root
+        (lambda (owner)
+          (flet ((check () (pg::physical-directory-check-owner-common owner)))
+            (funcall function #'check
+                     (lambda () (check) (pg::physical-adoption-owner-active-p owner))
+                     (sb-sys:fd-stream-fd (pg::physical-adoption-owner-lock owner)))))))
+      (:store
+       (let ((store (pg::physical-store-open root 123 1 :create t)))
+         (unwind-protect
+              (flet ((check () (pg::physical-store-check-held-lock store)))
+                (funcall function #'check
+                         (lambda () (check) (not (pg::physical-store-failed-p store)))
+                         (sb-sys:fd-stream-fd (pg::physical-store-lock-stream store))))
+           (pg::physical-store-close store))))
+      ((:stream :scope)
+       (with-open-file (stream (merge-pathnames "interrupted.lock" root)
+                               :direction :io :if-exists :error :if-does-not-exist :create
+                               :element-type '(unsigned-byte 8))
+         (let ((fd (sb-sys:fd-stream-fd stream)) (owner (list :owner)) (active t))
+           (unless (zerop (pg::physical-store-flock fd 6))
+             (error "cannot acquire the test-owned lock"))
+           (flet ((check ()
+                    (ecase kind
+                      (:stream (pg::physical-file-check-exclusive-flock stream owner))
+                      (:scope (pg::physical-reseed-check-directory-flock fd active "test lock lost")))))
+             (funcall function #'check (lambda () (check) active) fd))))))))
+
+(defun owner-lock-test-interruption (check healthy fd delivery kind)
+  (let ((original (symbol-function 'pg::physical-file-holds-exclusive-flock-p))
+        (pg::*backend* (pg::make-backend))
+        (sentinel nil) (caught nil) (calls 0) (delivered 0))
+    (unwind-protect
+         (progn
+           (setf (symbol-function 'pg::physical-file-holds-exclusive-flock-p)
+                 (lambda (borrowed-fd)
+                   (incf calls)
+                   (flet ((deliver ()
+                            (incf delivered)
+                            (handler-bind ((pg::pg-error (lambda (condition) (setf sentinel condition))))
+                              (ecase kind
+                                (:termination (setf (pg::backend-termination-pending pg::*backend*) t))
+                                (:cancel (setf (pg::backend-cancel-pending pg::*backend*) t))
+                                (:timeout (setf (pg::backend-statement-deadline pg::*backend*)
+                                                (1- (get-internal-real-time))))
+                                (:wal-failure
+                                 (setf sentinel (make-condition 'simple-error :format-control "latched WAL failure")
+                                       (pg::backend-wal-failure pg::*backend*) sentinel)
+                                 (error sentinel)))
+                              (pg::check-for-interrupts))))
+                     (if (eq delivery :synchronous)
+                         (deliver)
+                         (sb-thread:interrupt-thread sb-thread:*current-thread* #'deliver)))
+                   (funcall original borrowed-fd)))
+           (handler-case (funcall check)
+             (error (condition) (setf caught condition))))
+      (setf (symbol-function 'pg::physical-file-holds-exclusive-flock-p) original))
+    (ok (and sentinel (eq sentinel caught)) "the original backend interruption escapes")
+    (unless (eq kind :wal-failure)
+      (ok (and (typep caught 'pg::pg-error)
+               (string= (if (eq kind :termination) "57P01" "57014") (pg::pg-error-sqlstate caught))))
+      (ok (and (typep caught 'pg::pg-error)
+               (string= (if (eq kind :termination) "FATAL" "ERROR") (pg::pg-error-severity caught)))))
+    (ok (= 1 calls delivered))
+    (ok (null (pg::backend-termination-pending pg::*backend*)))
+    (ok (null (pg::backend-cancel-pending pg::*backend*)))
+    (ok (null (pg::backend-statement-deadline pg::*backend*)))
+    (ok (funcall original fd) "the descriptor remains exclusively locked")
+    (ok (handler-case (funcall healthy) (error () nil))
+        "an interrupted successful inspection does not revoke ownership")))
+
+(deftest offline-stream-flock-preserves-backend-interruptions-without-revocation
+    (dolist (proof '(:stream :directory :store :scope))
+      (dolist (delivery '(:synchronous :asynchronous))
+        (dolist (kind '(:termination :cancel :timeout :wal-failure))
+          (owner-lock-test-call-proof
+           proof (lambda (check healthy fd)
+                   (owner-lock-test-interruption check healthy fd delivery kind)))))))
+
+(deftest offline-directory-owner-rechecks-revocation-after-inspection
+    (dolist (nested-copy '(nil t))
+      (with-physical-store-directory (root)
+        (sb-posix:chmod (namestring root) #o700)
+        (pg::wal-atomic-write-bytes (merge-pathnames ".pg_lisp.lock" root)
+                                    (make-array 0 :element-type '(unsigned-byte 8)))
+        (pg::call-with-physical-adoption-owner
+         root
+         (lambda (owner)
+           (let ((original (symbol-function 'pg::physical-file-holds-exclusive-flock-p))
+                 (nested (if nested-copy (copy-structure owner) owner))
+                 (calls 0) (refused nil) (message nil))
+             (unwind-protect
+                  (progn
+                    (setf (symbol-function 'pg::physical-file-holds-exclusive-flock-p)
+                          (lambda (fd)
+                            (declare (ignore fd))
+                            (incf calls)
+                            (if (= 1 calls)
+                                (progn
+                                  (handler-case (pg::physical-directory-check-owner-common nested)
+                                    (error () (setf refused t)))
+                                  t)
+                                nil)))
+                    (setf message
+                          (handler-case (progn (pg::physical-directory-check-owner-common owner) nil)
+                            (error (condition) (princ-to-string condition)))))
+               (setf (symbol-function 'pg::physical-file-holds-exclusive-flock-p) original))
+             (ok refused)
+             (ok (= 2 calls))
+             (ok (and message (search "lost its exclusive directory lock" message)))
+             (ok (not (pg::physical-adoption-owner-active-p owner)))
+             (ok (signals (pg::physical-directory-check-owner-common owner) 'error))))))))
+
+(deftest offline-lock-loss-is-latched-before-a-queued-interruption
+    (dolist (proof '(:stream :directory :store :scope))
+      (dolist (loss '(:missing :error :unlocked))
+        (owner-lock-test-call-proof
+         proof
+         (lambda (check healthy fd)
+           (let ((original (symbol-function 'pg::physical-file-holds-exclusive-flock-p))
+                 (pg::*backend* (pg::make-backend))
+                 (sentinel nil) (caught nil) (queued 0) (delivered 0) (calls 0))
+             (unwind-protect
+                  (handler-case
+                      (sb-sys:without-interrupts
+                        (when (eq loss :unlocked)
+                          (unless (zerop (pg::physical-store-flock fd 8))
+                            (error "cannot release the test-owned lock")))
+                        (setf (symbol-function 'pg::physical-file-holds-exclusive-flock-p)
+                              (lambda (borrowed-fd)
+                                (incf calls) (incf queued)
+                                (sb-thread:interrupt-thread
+                                 sb-thread:*current-thread*
+                                 (lambda ()
+                                   (incf delivered)
+                                   (handler-bind ((pg::pg-error
+                                                    (lambda (condition) (setf sentinel condition))))
+                                     (setf (pg::backend-termination-pending pg::*backend*) t)
+                                     (pg::check-for-interrupts))))
+                                (ecase loss
+                                  (:missing nil)
+                                  (:error (error "injected fdinfo read failure"))
+                                  (:unlocked (funcall original borrowed-fd)))))
+                        (funcall check))
+                    (error (condition) (setf caught condition)))
+               (setf (symbol-function 'pg::physical-file-holds-exclusive-flock-p) original)
+               (when (eq loss :unlocked)
+                 (unless (zerop (pg::physical-store-flock fd 6))
+                   (error "cannot restore the test-owned lock"))))
+             (ok (and sentinel (eq sentinel caught)))
+             (ok (and (typep caught 'pg::pg-error) (string= "57P01" (pg::pg-error-sqlstate caught))))
+             (ok (= 1 calls queued delivered))
+             (ok (null (pg::backend-termination-pending pg::*backend*)))
+             (ok (funcall original fd))
+             (ok (not (handler-case (funcall healthy) (error () nil)))
+                 "a completed failed observation stays revoked after rearming the lock")))))))
+
 (deftest physical-store-owned-lock-check-permanently-revokes-missing-stream
     (with-physical-store-directory (root)
       (let* ((store (pg::physical-store-open root 123 1 :create t))

@@ -121,43 +121,47 @@ This context is invalid after its enclosing call exits."
                  (eq sb-thread:*current-thread* (physical-adoption-owner-thread owner))
                  (open-stream-p (physical-adoption-owner-lock owner)))
       (error "offline adoption no longer owns its data directory"))
-    (when (sb-sys:without-interrupts
-            (sb-thread:with-mutex (revocation-lock)
-              (when (or (gethash owner revoked)
-                        (gethash (physical-adoption-owner-lock owner) revoked))
-                (setf (gethash owner revoked) t
-                      (physical-adoption-owner-active-p owner) nil)
-                t)))
-      (error "offline adoption lost its exclusive directory lock"))
-    (let* ((directory (physical-adoption-owner-directory owner))
-           (stat (sb-posix:lstat (namestring directory)))
-           (lock (sb-posix:lstat (namestring (merge-pathnames ".pg_lisp.lock" directory)))))
-      (unless (and (sb-posix:s-isdir (sb-posix:stat-mode stat))
-                   (= (sb-posix:geteuid) (sb-posix:stat-uid stat))
-                   (zerop (logand #o077 (sb-posix:stat-mode stat)))
-                   (= (physical-adoption-owner-device owner) (sb-posix:stat-dev stat))
-                   (= (physical-adoption-owner-inode owner) (sb-posix:stat-ino stat))
-                   (sb-posix:s-isreg (sb-posix:stat-mode lock))
-                   (= 1 (sb-posix:stat-nlink lock))
-                   (= (sb-posix:geteuid) (sb-posix:stat-uid lock))
-                   (= (physical-adoption-owner-lock-device owner) (sb-posix:stat-dev lock))
-                   (= (physical-adoption-owner-lock-inode owner) (sb-posix:stat-ino lock)))
-        (error "offline adoption data directory or lock inode changed")))
-    (sb-sys:without-interrupts
-      (unless (sb-sys:with-local-interrupts
-                (handler-case
-                    (let* ((fd (sb-sys:fd-stream-fd (physical-adoption-owner-lock owner)))
-                           (held (sb-posix:fstat fd)))
-                      (and (= (physical-adoption-owner-lock-device owner) (sb-posix:stat-dev held))
-                           (= (physical-adoption-owner-lock-inode owner) (sb-posix:stat-ino held))
-                           (physical-file-holds-exclusive-flock-p fd)))
-                  (error () nil)))
-        (sb-thread:with-mutex (revocation-lock)
-          (setf (gethash owner revoked) t
-                (gethash (physical-adoption-owner-lock owner) revoked) t
-                (physical-adoption-owner-active-p owner) nil))
-        (error "offline adoption lost its exclusive directory lock")))
-    owner))
+    (flet ((check-revocation ()
+             (when (sb-sys:without-interrupts
+                     (sb-thread:with-mutex (revocation-lock)
+                       (when (or (not (physical-adoption-owner-active-p owner))
+                                 (gethash owner revoked)
+                                 (gethash (physical-adoption-owner-lock owner) revoked))
+                         (setf (gethash owner revoked) t
+                               (physical-adoption-owner-active-p owner) nil)
+                         t)))
+               (error "offline adoption lost its exclusive directory lock"))))
+      (check-revocation)
+      (let* ((directory (physical-adoption-owner-directory owner))
+             (stat (sb-posix:lstat (namestring directory)))
+             (lock (sb-posix:lstat (namestring (merge-pathnames ".pg_lisp.lock" directory)))))
+        (unless (and (sb-posix:s-isdir (sb-posix:stat-mode stat))
+                     (= (sb-posix:geteuid) (sb-posix:stat-uid stat))
+                     (zerop (logand #o077 (sb-posix:stat-mode stat)))
+                     (= (physical-adoption-owner-device owner) (sb-posix:stat-dev stat))
+                     (= (physical-adoption-owner-inode owner) (sb-posix:stat-ino stat))
+                     (sb-posix:s-isreg (sb-posix:stat-mode lock))
+                     (= 1 (sb-posix:stat-nlink lock))
+                     (= (sb-posix:geteuid) (sb-posix:stat-uid lock))
+                     (= (physical-adoption-owner-lock-device owner) (sb-posix:stat-dev lock))
+                     (= (physical-adoption-owner-lock-inode owner) (sb-posix:stat-ino lock)))
+          (error "offline adoption data directory or lock inode changed")))
+      (sb-sys:without-interrupts
+        (unless (sb-sys:with-local-interrupts
+                  (handler-case-noninterrupt
+                   (let* ((fd (sb-sys:fd-stream-fd (physical-adoption-owner-lock owner)))
+                          (held (sb-posix:fstat fd)))
+                     (and (= (physical-adoption-owner-lock-device owner) (sb-posix:stat-dev held))
+                          (= (physical-adoption-owner-lock-inode owner) (sb-posix:stat-ino held))
+                          (physical-file-holds-exclusive-flock-p fd)))
+                   (condition nil)))
+          (sb-thread:with-mutex (revocation-lock)
+            (setf (gethash owner revoked) t
+                  (gethash (physical-adoption-owner-lock owner) revoked) t
+                  (physical-adoption-owner-active-p owner) nil))
+          (error "offline adoption lost its exclusive directory lock")))
+      (check-revocation)
+      owner)))
 
 ;; Open the owned root and lend its descriptor and scoped path to FUNCTION.
 ;; Check common ownership before and after the call and close the descriptor
