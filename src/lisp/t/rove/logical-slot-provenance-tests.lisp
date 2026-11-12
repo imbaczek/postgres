@@ -143,6 +143,182 @@
     (wal-slot-set-initial-profile slot profile)
     slot))
 
+(defun unit-logical-lineage-slot (kind)
+  (let ((slot
+          (case kind
+            (:on
+             (make-wal-replication-slot
+              :name "fixture" :database-oid 7 :plugin "pgoutput"
+              :restart-lsn 32 :restart-timeline 1 :consistent-lsn 115
+              :confirmed-flush-lsn 130 :confirmed-timeline 3
+              :logical-provenance (make-logical-slot-provenance 42 0 115 3 65 2)
+              :invalidation-cause :none))
+            (:legacy (unit-logical-provenance-slot :provenance nil :cause nil))
+            (:lost (unit-logical-provenance-slot :timeline 2 :cause :wal-removed))
+            (:birth (unit-logical-provenance-slot :timeline 2))
+            (:child (unit-logical-provenance-slot :timeline 3 :end 130))
+            (:zero (unit-logical-provenance-slot :end 15 :known-on nil))
+            (t (unit-logical-provenance-slot)))))
+    (case kind
+      (:confirmed (setf (wal-replication-slot-confirmed-flush-lsn slot) 150
+                        (wal-replication-slot-confirmed-timeline slot) 2))
+      (:restart (setf (wal-replication-slot-confirmed-flush-lsn slot) 150
+                      (wal-replication-slot-confirmed-timeline slot) 3
+                      (wal-replication-slot-restart-timeline slot) 2))
+      (:child (setf (wal-replication-slot-restart-lsn slot) 100))
+      (:zero (setf (wal-replication-slot-restart-lsn slot) 0)))
+    slot))
+
+(rove:deftest logical-slot-retained-scan-survives-a-safe-clog-reset
+    (call-with-logical-policy-test
+     (lambda (writer)
+       (declare (ignore writer))
+       (let* ((*wal-replication-slots* (make-hash-table :test #'equal))
+              (*wal-snapshot-retention-pins* (make-hash-table :test #'eq))
+              (*active-snapshots* 0)
+              (*active-snapshot-set* (make-hash-table :test #'eq))
+              (owner (gensym "CLOG-SCAN-OWNER-"))
+              (*wal-logical-slot-owner* owner)
+              (boundary (wal-report-logical-decoding-status t))
+              (slot (make-wal-replication-slot
+                     :name "fixture" :database-oid 7 :plugin "pgoutput"
+                     :restart-lsn boundary :restart-timeline 1 :consistent-lsn boundary
+                     :confirmed-flush-lsn boundary :confirmed-timeline 1
+                     :logical-provenance (make-logical-slot-provenance 42 0 boundary 1 boundary 1)
+                     :invalidation-cause :none :active-owner owner)))
+         (ensure-directories-exist (wal-replication-slot-directory))
+         (wal-create-replication-slot-file slot)
+         (setf (gethash "fixture" *wal-replication-slots*) slot)
+         (sb-thread:with-mutex (*wal-lock*)
+           (wal-refresh-logical-capture-slot-mirror-under-wal-lock))
+         (let ((end (with-wal-critical
+                      (wal-append-batch-start)
+                      (let ((end (wal-append-record
+                                  +wal-record-maintenance+ 0
+                                  (make-array 0 :element-type '(unsigned-byte 8)))))
+                        (wal-flush-core)
+                        end))))
+           (call-with-wal-retained-slot-scan
+            "fixture" boundary end
+            (lambda (scan)
+              (let ((before *wal-storage-incarnation*))
+                (clog-reset)
+                (rove:ok (not (eq before *wal-storage-incarnation*))
+                         "CLOG reset rotates the internal storage epoch")
+                (let ((records (loop for record = (wal-retained-slot-scan-next scan)
+                                     while record collect record)))
+                  (rove:ok (equal (list +wal-record-batch-start+ +wal-record-maintenance+)
+                                  (mapcar #'wal-record-type records))
+                           "the captured WAL records remain readable after CLOG reset")
+                  (rove:ok (= end (wal-record-end (car (last records))))))))))
+         (rove:ok (eq slot (gethash "fixture" *wal-replication-slots*)))
+         (rove:ok (zerop (hash-table-count *wal-snapshot-retention-pins*)))))))
+
+(rove:deftest logical-slot-scan-validates-known-lineage-before-pinning
+    (dolist (kind '(:valid :child :legacy :lost :birth :confirmed :on :restart :zero))
+      (call-with-canonical-wal-slot-fixture
+       (lambda ()
+         (let* ((*wal-insert-timeline* 3) (*wal-durable-lsn* 200) (*wal-end-lsn* 200)
+                                          (*wal-snapshot-retention-pins* (make-hash-table :test #'eq))
+                                          (owner (gensym "LINEAGE-SCAN-OWNER-"))
+                                          (*wal-logical-slot-owner* owner)
+                                          (slot (unit-logical-lineage-slot kind))
+                                          (entered nil)
+                                          (admitted-p (not (null (member kind '(:valid :child :legacy))))))
+           (unless (eq kind :legacy)
+             (timeline-write-history 3 1 100 "scan lineage admission"))
+           (wal-create-replication-slot-file slot)
+           (setf (gethash "fixture" *wal-replication-slots*) slot
+                 (wal-replication-slot-active-owner slot) owner)
+           (rove:ok
+            (eq admitted-p
+                (handler-case
+                    (progn
+                      (call-with-wal-retained-slot-scan
+                       "fixture" (wal-replication-slot-confirmed-flush-lsn slot)
+                       (wal-replication-slot-confirmed-flush-lsn slot)
+                       (lambda (scan)
+                         (setf entered t)
+                         (rove:ok (null (wal-retained-slot-scan-next scan)))))
+                      t)
+                  (error () nil)))
+            (format nil "~a scan geometry" kind))
+           (rove:ok (eq admitted-p entered) "rejected geometry never reaches the scan callback")
+           (rove:ok (zerop (hash-table-count *wal-snapshot-retention-pins*))))))))
+
+(rove:deftest logical-slot-retained-scan-rechecks-slot-pin-and-source-position
+    (dolist (change '(:slot :pin :timeline :namespace))
+      (call-with-canonical-wal-slot-fixture
+       (lambda ()
+         (let* ((*wal-insert-timeline* 3) (*wal-durable-lsn* 200) (*wal-end-lsn* 200)
+                                          (*wal-snapshot-retention-pins* (make-hash-table :test #'eq))
+                                          (owner (gensym "SOURCE-SCAN-OWNER-"))
+                                          (*wal-logical-slot-owner* owner)
+                                          (slot (unit-logical-lineage-slot :valid))
+                                          (rejected nil))
+           (timeline-write-history 3 1 100 "scan source identity")
+           (wal-create-replication-slot-file slot)
+           (setf (gethash "fixture" *wal-replication-slots*) slot
+                 (wal-replication-slot-active-owner slot) owner)
+           (call-with-wal-retained-slot-scan
+            "fixture" 80 80
+            (lambda (scan)
+              (ecase change
+                (:slot (setf (gethash "fixture" *wal-replication-slots*)
+                             (wal-copy-replication-slot-with-profile slot)))
+                (:pin (setf *wal-snapshot-retention-pins* (make-hash-table :test #'eq)))
+                (:timeline (setf *wal-insert-timeline* 4))
+                (:namespace (setf *wal-segment-namespace* :timeline)))
+              (setf rejected (handler-case (progn (wal-retained-slot-scan-next scan) nil)
+                               (error () t)))))
+           (rove:ok rejected (format nil "~a change invalidates the scan" change))
+           (rove:ok (= 80 (wal-replication-slot-confirmed-flush-lsn slot)))
+           (rove:ok (zerop (hash-table-count *wal-snapshot-retention-pins*))))))))
+
+(rove:deftest logical-slot-startup-validates-reserved-known-lineage-before-publication
+    (dolist (kind '(:valid :child :legacy :lost :birth :confirmed :on :restart :zero))
+      (call-with-canonical-wal-slot-fixture
+       (lambda ()
+         (let* ((*wal-insert-timeline* 3) (*wal-durable-lsn* 200) (*wal-end-lsn* 200)
+                                          (*wal-control-metadata* nil)
+                                          (slot (unit-logical-lineage-slot kind))
+                                          (original *wal-replication-slots*)
+                                          (sentinel (make-wal-replication-slot :name "existing"))
+                                          (reader (symbol-function 'physical-slot-startup-system-id))
+                                          (validate (symbol-function 'wal-validate-replication-slot-wal))
+                                          (rebuild (symbol-function 'wal-slot-rebuild-progress))
+                                          (reads 0) (validations 0) (rebuilds 0)
+                                          (admitted-p (not (null (member kind '(:valid :child :legacy :lost))))))
+           (timeline-write-history 3 1 100 "startup lineage admission")
+           (wal-create-replication-slot-file slot)
+           (setf (gethash "existing" original) sentinel)
+           (unwind-protect
+                (progn
+                  ;; Recovery/WAL-range proof is a separate prerequisite in this geometry test.
+                  (setf (symbol-function 'physical-slot-startup-system-id)
+                        (lambda () (incf reads) 42)
+                        (symbol-function 'wal-validate-replication-slot-wal)
+                        (lambda (candidate segments)
+                          (declare (ignore segments)) (incf validations) candidate)
+                        (symbol-function 'wal-slot-rebuild-progress)
+                        (lambda (candidate) (incf rebuilds) candidate))
+                  (rove:ok
+                   (eq admitted-p
+                       (handler-case (progn (wal-load-replication-slots) t) (error () nil)))
+                   (format nil "~a startup geometry" kind))
+                  (rove:ok (= (if (eq kind :legacy) 0 1) reads))
+                  (rove:ok (= (if admitted-p 1 0) validations))
+                  (rove:ok (= (if admitted-p 1 0) rebuilds))
+                  (if admitted-p
+                      (rove:ok (gethash "fixture" *wal-replication-slots*))
+                      (progn
+                        (rove:ok (eq original *wal-replication-slots*))
+                        (rove:ok (eq sentinel (gethash "existing" original)))
+                        (rove:ok (null (gethash "fixture" original))))))
+             (setf (symbol-function 'physical-slot-startup-system-id) reader
+                   (symbol-function 'wal-validate-replication-slot-wal) validate
+                   (symbol-function 'wal-slot-rebuild-progress) rebuild)))))))
+
 (rove:deftest logical-slot-legacy-acknowledgment-keeps-unknown-timelines
     (call-with-canonical-wal-slot-fixture
      (lambda ()

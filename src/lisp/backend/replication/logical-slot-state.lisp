@@ -216,6 +216,21 @@ This does not prove exact WAL bytes, slot lifetime or import authority."
       (error "logical slot provenance is outside current primary history")))
   (values))
 
+(defun logical-slot-check-startup-history (slots)
+  (unless (recovery-in-progress-p)
+    (let ((known (remove-if-not
+                  (lambda (slot)
+                    (and (wal-logical-slot-p slot)
+                         (wal-replication-slot-logical-provenance slot)
+                         (eq :reserved (wal-replication-slot-wal-status slot))))
+                  slots)))
+      (when known
+        (sb-thread:with-mutex (*wal-lock*)
+          (let ((history (logical-slot-primary-history-under-lock)))
+            (dolist (slot known)
+              (logical-slot-check-primary-history slot history)))))))
+  (values))
+
 (defun logical-slot-acknowledgment-positions-under-lock (slot acknowledged-lsn restart-floor pending)
   "Select confirmed and restart owners under the WAL lock.
 The first confirmation uses the frozen birth owner; an unchanged confirmation

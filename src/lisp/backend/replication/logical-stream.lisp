@@ -1768,6 +1768,8 @@ tracked by the bounded sender. SENT-LSN never includes an unfinished frame."
                       (wal-retained-slot-scan-start scan)))
       (error "logical replication slot changed or lost retained WAL during scan"))))
 
+(declaim (ftype function logical-slot-check-primary-history logical-slot-primary-history-under-lock))
+
 (defun call-with-wal-retained-slot-scan (name from-lsn upto-lsn function)
   "Capture a durable slot horizon and pin its retained start for FUNCTION."
   (let ((scan nil))
@@ -1794,6 +1796,9 @@ tracked by the bounded sender. SENT-LSN never includes an unfinished frame."
                    (ereport "22023" "logical replication cursor is outside retained WAL"))
                  (unless (and (integerp end) (<= start end *wal-durable-lsn*))
                    (ereport "22023" "logical replication read end is outside durable WAL"))
+                 (when (wal-replication-slot-logical-provenance slot)
+                   (logical-slot-check-primary-history
+                    slot (logical-slot-primary-history-under-lock)))
                  (let ((pin (gensym "LOGICAL-SCAN-PIN-")))
                    (setf scan (make-wal-retained-slot-scan
                                :name name :slot slot :owner owner

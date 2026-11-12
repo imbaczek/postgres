@@ -3636,6 +3636,8 @@ An unchanged acknowledgment returns without changing its stored owners."
 
 (declaim (ftype function logical-slot-check-startup-identities))
 
+(declaim (ftype function logical-slot-check-startup-history))
+
 (defun wal-load-replication-slots ()
   "Validate a complete startup inventory before publishing its registry.
 Logical restoration during native recovery remains unsupported."
@@ -3645,6 +3647,7 @@ Logical restoration during native recovery remains unsupported."
         (candidates (slot-state-map (wal-replication-slot-directory)
                                     #'wal-decode-replication-slot :cleanup t)))
     (logical-slot-check-startup-identities candidates)
+    (logical-slot-check-startup-history candidates)
     (let ((*wal-replication-slots* restored))
       (dolist (slot candidates)
         (let ((name (wal-replication-slot-name slot)))
