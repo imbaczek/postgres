@@ -57,6 +57,10 @@
             (sb-posix:getpid) canonical *postmaster-start-time*
             *postmaster-pid-port* *postmaster-pid-host* status)))
 
+(defun postmaster-parse-pid (line)
+  (let ((pid (parse-integer line)))
+    (and (not (zerop pid)) (<= (abs pid) 2147483647) (abs pid))))
+
 (defun postmaster-existing-pid ()
   "Read bounded regular PID metadata without following links or blocking on a FIFO."
   (let* ((path (postmaster-data-path "postmaster.pid"))
@@ -72,10 +76,9 @@
                                                   :external-format :utf-8 :auto-close t))
            (unless (<= 1 (sb-posix:stat-size (sb-posix:fstat fd)) 16384) (error "invalid postmaster.pid length"))
            (let* ((line (read-line stream nil ""))
-                  (pid (ignore-errors (parse-integer line))))
-             (unless (and pid (not (zerop pid)) (<= (abs pid) 2147483647))
-               (error "invalid process ID in postmaster.pid"))
-             (abs pid)))
+                  (pid (handler-case-noninterrupt (postmaster-parse-pid line) (condition nil))))
+             (unless pid (error "invalid process ID in postmaster.pid"))
+             pid))
       (if stream (close stream) (sb-posix:close fd)))))
 
 (defun postmaster-pid-is-live-p (pid)
@@ -94,6 +97,105 @@
          (and (= (sb-posix:stat-ino stat) *postmaster-pid-inode*)
               (= (sb-posix:stat-dev stat)
                  (sb-posix:stat-dev (sb-posix:fstat (sb-sys:fd-stream-fd *postmaster-pid-stream*))))))))
+
+(defvar *postmaster-ownership-contexts* nil)
+
+(defstruct (postmaster-ownership (:constructor %make-postmaster-ownership))
+  (directory nil :read-only t)
+  (device nil :read-only t) (inode nil :read-only t)
+  (lock nil :read-only t) (lock-fd nil :read-only t)
+  (lock-device nil :read-only t) (lock-inode nil :read-only t)
+  (pid-stream nil :read-only t) (pid-fd nil :read-only t)
+  (pid-device nil :read-only t) (pid-inode nil :read-only t)
+  (thread nil :read-only t) active-p)
+
+(defmethod print-object ((owner postmaster-ownership) stream)
+  (print-unreadable-object (owner stream :type t :identity t)))
+
+(defun postmaster-ownership-file-p (stat device inode)
+  (and (sb-posix:s-isreg (sb-posix:stat-mode stat))
+       (= 1 (sb-posix:stat-nlink stat))
+       (= (sb-posix:geteuid) (sb-posix:stat-uid stat))
+       (zerop (logand #o077 (sb-posix:stat-mode stat)))
+       (= device (sb-posix:stat-dev stat))
+       (= inode (sb-posix:stat-ino stat))))
+
+(defun postmaster-check-ownership-identities (owner)
+  (let ((directory (postmaster-ownership-directory owner))
+        (lock (postmaster-ownership-lock owner))
+        (pid-stream (postmaster-ownership-pid-stream owner)))
+    (unless (and (eq lock *postmaster-data-lock*) (open-stream-p lock)
+                 (= (postmaster-ownership-lock-fd owner) (sb-sys:fd-stream-fd lock))
+                 (eq pid-stream *postmaster-pid-stream*) (open-stream-p pid-stream)
+                 (= (postmaster-ownership-pid-fd owner) (sb-sys:fd-stream-fd pid-stream))
+                 (equal directory *postmaster-pid-directory*)
+                 (equal directory (uiop:ensure-directory-pathname (truename *pgdata*)))
+                 (eql (postmaster-ownership-pid-inode owner) *postmaster-pid-inode*))
+      (error "postmaster ownership lost its published context"))
+    (let ((root (sb-posix:lstat (namestring directory))))
+      (unless (and (sb-posix:s-isdir (sb-posix:stat-mode root))
+                   (= (sb-posix:geteuid) (sb-posix:stat-uid root))
+                   (member (logand #o777 (sb-posix:stat-mode root)) '(#o700 #o750))
+                   (= (postmaster-ownership-device owner) (sb-posix:stat-dev root))
+                   (= (postmaster-ownership-inode owner) (sb-posix:stat-ino root)))
+        (error "postmaster data directory identity changed")))
+    (flet ((check-file (path fd device inode)
+             (unless (and (postmaster-ownership-file-p (sb-posix:lstat (namestring path)) device inode)
+                          (postmaster-ownership-file-p (sb-posix:fstat fd) device inode))
+               (error "postmaster ownership file identity changed: ~a" path))))
+      (check-file (merge-pathnames ".pg_lisp.lock" directory) (postmaster-ownership-lock-fd owner)
+                  (postmaster-ownership-lock-device owner) (postmaster-ownership-lock-inode owner))
+      (check-file (merge-pathnames "postmaster.pid" directory) (postmaster-ownership-pid-fd owner)
+                  (postmaster-ownership-pid-device owner) (postmaster-ownership-pid-inode owner)))
+    (unless (and (postmaster-pid-owned-p) (eql (sb-posix:getpid) (postmaster-existing-pid)))
+      (error "postmaster PID no longer identifies this process")))
+  owner)
+
+(defun postmaster-check-ownership (owner)
+  (unless (and (postmaster-ownership-p owner) (postmaster-ownership-active-p owner)
+               (eq sb-thread:*current-thread* (postmaster-ownership-thread owner))
+               (member owner *postmaster-ownership-contexts* :test #'eq))
+    (error "postmaster ownership scope ended or changed thread"))
+  (sb-sys:without-interrupts
+    (let ((result (sb-sys:with-local-interrupts
+                    (handler-case-noninterrupt
+                     (progn
+                       (postmaster-check-ownership-identities owner)
+                       (physical-file-check-exclusive-flock (postmaster-ownership-lock owner) owner)
+                       (postmaster-check-ownership-identities owner)
+                       t)
+                     (condition condition)))))
+      (unless (eq t result)
+        (setf (postmaster-ownership-active-p owner) nil)
+        (error result))
+      (unless (postmaster-ownership-active-p owner)
+        (error "postmaster ownership was revoked during inspection"))))
+  owner)
+
+(defun call-with-postmaster-ownership (function)
+  (unless (and *postmaster-data-lock* (open-stream-p *postmaster-data-lock*)
+               *postmaster-pid-stream* (open-stream-p *postmaster-pid-stream*)
+               (postmaster-pid-owned-p))
+    (error "postmaster ownership requires published lock and PID streams"))
+  (let* ((directory (uiop:ensure-directory-pathname (truename *pgdata*)))
+         (root (sb-posix:lstat (namestring directory)))
+         (lock-fd (sb-sys:fd-stream-fd *postmaster-data-lock*))
+         (pid-fd (sb-sys:fd-stream-fd *postmaster-pid-stream*))
+         (lock (sb-posix:fstat lock-fd)) (pid (sb-posix:fstat pid-fd))
+         (owner (%make-postmaster-ownership
+                 :directory directory :device (sb-posix:stat-dev root) :inode (sb-posix:stat-ino root)
+                 :lock *postmaster-data-lock* :lock-fd lock-fd
+                 :lock-device (sb-posix:stat-dev lock) :lock-inode (sb-posix:stat-ino lock)
+                 :pid-stream *postmaster-pid-stream* :pid-fd pid-fd
+                 :pid-device (sb-posix:stat-dev pid) :pid-inode (sb-posix:stat-ino pid)
+                 :thread sb-thread:*current-thread* :active-p t)))
+    (let ((*postmaster-ownership-contexts* (cons owner *postmaster-ownership-contexts*)))
+      (unwind-protect
+           (progn
+             (postmaster-check-ownership owner)
+             (multiple-value-prog1 (funcall function owner)
+               (postmaster-check-ownership owner)))
+        (setf (postmaster-ownership-active-p owner) nil)))))
 
 (defun postmaster-update-pid-status (status)
   "Update the owned inode in place; observers may see a partial metadata read."

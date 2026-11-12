@@ -1675,3 +1675,14 @@ also returned success for that deferred warning. It now rejects deferred
 compilation-unit warnings; the broader dependency audit remains open.
 
 The active HA/backend implementation roadmap is [PHYSICAL-HA.md](PHYSICAL-HA.md).
+
+- [ ] Replace lock reacquisition in the two older startup ownership proofs.
+  `call-with-physical-adoption-startup-owner` and
+  `physical-reseed-follow-retirement-check-startup-owner` still call flock with
+  `LOCK_EX | LOCK_NB` while checking an already borrowed lock. That can reacquire
+  a released lock and conceal a gap in ownership. Give each role passive flock
+  checks and permanent loss tests without changing its startup or journal
+  authority. Include actual competing-descriptor acquisition after release,
+  interruption identity, rearming, and the existing role-specific native tests.
+  The new primary postmaster capability uses the passive checker independently;
+  these older paths remain a separate safety fix.

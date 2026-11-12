@@ -82,6 +82,7 @@
                (:file "t/physical-adoption-retire-codec-tests")
                (:file "t/physical-adoption-follow-tests")
                (:file "t/physical-adoption-startup-tests")
+               (:file "t/postmaster-ownership-tests")
                (:file "t/physical-reseed-owner-tests")
                (:file "t/physical-reseed-attempt-tests")
                (:file "t/physical-image-tests")

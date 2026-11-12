@@ -905,35 +905,49 @@ CL's RENAME-FILE merges a relative target with the source's directory."
 
 ;;; ---- hot reload (SIGHUP) and control REPL live in tcop/control.lisp ----
 
-(defun initialize-primary-storage ()
-  "Initialize a cold or promoted primary from its durable WAL/control checkpoint.
-Hold the drained admission gate throughout.  PGDATA ownership and storage
-idleness require separate checks."
-  (call-with-live-operation-startup-quiescence
-   (lambda (owner)
-     (declare (ignore owner))
-     (wal-mark-primary-startup)
-     (wal-init)
-     (xact-init)
-     (wal-recover)
-     (note-primary-startup-replay)
-     (wal-load-replication-slots)
-     (sb-thread:with-mutex (*wal-lock*)
-       (wal-refresh-logical-capture-slot-mirror-under-wal-lock))
-     (catalog-init)
-     (wal-ensure-directory-durable (merge-pathnames "base/" *pgdata*))
-     (physical-backup-lease-load-records)
-     (physical-source-pin-load)
-     (catalog-remove-orphan-relations)
-     (complete-xid-wraparound))))
-
-(defun startup-check-cold-installation-state ()
-  "Require no page, CLOG or WAL temporary cleanup debt before a cold stage.
-Then check the cached handles and workers under startup exclusion."
+(defun startup-check-retired-storage ()
   (require-primary-wal-writer-retired)
   (wal-require-no-pending-storage)
   (sb-thread:with-mutex (*wal-lock*)
     (wal-require-no-temp-cleanup-under-lock))
+  (values))
+
+(defun check-primary-storage-startup-context (gate-owner ownership)
+  (check-live-operation-startup-quiescence gate-owner)
+  (postmaster-check-ownership ownership)
+  (when (physical-recovery-reader-conflict-p)
+    (error "primary storage startup requires no retained readers or idle transactions"))
+  (startup-check-retired-storage)
+  (values))
+
+(defun initialize-primary-storage ()
+  "Initialize a cold or promoted primary from its durable WAL/control checkpoint.
+Hold the drained admission gate and borrow the real postmaster ownership."
+  (call-with-live-operation-startup-quiescence
+   (lambda (gate-owner)
+     (call-with-postmaster-ownership
+      (lambda (ownership)
+        (check-primary-storage-startup-context gate-owner ownership)
+        (wal-mark-primary-startup)
+        (wal-init)
+        (xact-init)
+        (wal-recover)
+        (note-primary-startup-replay)
+        (check-primary-storage-startup-context gate-owner ownership)
+        (wal-load-replication-slots)
+        (sb-thread:with-mutex (*wal-lock*)
+          (wal-refresh-logical-capture-slot-mirror-under-wal-lock))
+        (catalog-init)
+        (wal-ensure-directory-durable (merge-pathnames "base/" *pgdata*))
+        (physical-backup-lease-load-records)
+        (physical-source-pin-load)
+        (catalog-remove-orphan-relations)
+        (complete-xid-wraparound))))))
+
+(defun startup-check-cold-installation-state ()
+  "Require no page, CLOG or WAL temporary cleanup debt before a cold stage.
+Then check the cached handles and workers under startup exclusion."
+  (startup-check-retired-storage)
   (unless (and (not *wal-ready*) (not *wal-output-stream*) (not *catalog*)
                (not *clog-stream*) (zerop (hash-table-count *relation-streams*))
                (not *physical-recovery-state*) (not *physical-receive-store*)
