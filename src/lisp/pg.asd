@@ -16,6 +16,7 @@
     :components ((:module "sbcl"
                   :serial t
                   :components ((:file "sockets")
+                               (:file "files.hot")
                                (:file "files")
                                (:file "physical-image")
                                (:file "replication-slot-state")

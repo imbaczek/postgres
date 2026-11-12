@@ -87,7 +87,7 @@ callers needing a coherent view across publications must compare control images.
              bytes))
       (close stream))))
 
-(defun physical-file-exclusive-flock-p (text inode)
+(defun physical-file-exclusive-flock-generic-p (text inode)
   ;; Accept the current Linux fdinfo format only when one whole-file advisory
   ;; write flock and the fdinfo inode both identify INODE.  Keep the input and
   ;; numeric fields bounded and reject ambiguous or incomplete lock records.
@@ -123,6 +123,24 @@ callers needing a coherent view across publications must compare control images.
                               (unsigned (third file) 10 t)
                               (= inode (parse-integer (third file))))))))))))
 
+(defun physical-file-exclusive-flock-p (text inode)
+  (declare (optimize (speed 3) (safety 2) (debug 1)))
+  (if (and (typep text 'simple-string) (typep inode '(unsigned-byte 64)))
+      (and (<= (length text) 4096)
+           (let ((spans (make-array 18 :element-type '(unsigned-byte 32))))
+             (declare (dynamic-extent spans))
+             (%fdinfo-flock-p text inode spans)))
+      (physical-file-exclusive-flock-generic-p text inode)))
+
+(defun physical-file-fdinfo-text (buffer end)
+  (declare (type (simple-array (unsigned-byte 8) (*)) buffer) (type fixnum end)
+           (optimize (speed 3) (safety 2) (debug 1)))
+  (sb-ext:octets-to-string
+   (if (loop for index fixnum below end always (< (aref buffer index) 128))
+       buffer
+       (copy-seq buffer))
+   :end end :external-format :ascii))
+
 (defun physical-file-holds-exclusive-flock-p (borrowed-fd)
   ;; BORROWED-FD stays with its caller.  This function owns and closes only
   ;; the fdinfo descriptor or its stream.  Proc files can report a zero stat
@@ -131,7 +149,8 @@ callers needing a coherent view across publications must compare control images.
   ;; the caller remains responsible for the lock descriptor's lifetime.
   (let ((before (sb-posix:fstat borrowed-fd))
         (fd nil) (stream nil)
-        (buffer (make-array 4097 :element-type '(unsigned-byte 8))))
+        (buffer (make-array 4097 :element-type '(unsigned-byte 8) :initial-element 0)))
+    (declare (dynamic-extent buffer))
     (unwind-protect
          (progn
            (sb-sys:without-interrupts
@@ -145,7 +164,7 @@ callers needing a coherent view across publications must compare control images.
                   (= (sb-posix:stat-dev before) (sb-posix:stat-dev after))
                   (= (sb-posix:stat-ino before) (sb-posix:stat-ino after))
                   (physical-file-exclusive-flock-p
-                   (sb-ext:octets-to-string buffer :end length :external-format :ascii)
+                   (physical-file-fdinfo-text buffer length)
                    (sb-posix:stat-ino after)))))
       (if stream (close stream) (when fd (sb-posix:close fd))))))
 

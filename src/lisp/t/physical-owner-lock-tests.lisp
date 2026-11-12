@@ -40,6 +40,76 @@
       (ok (eq :passed (getf result :status)))
       (ok (= 100 (getf result :trials)))))
 
+(cl-spec:defproperty fdinfo-parser-preserves-generic-reference
+    ((shape (range integer 0 11))
+     (inode (range integer 1 18446744073709551615))
+     (offset (range integer 0 4096))
+     (code (range integer 0 1114111)))
+  (:about pg::physical-file-exclusive-flock-p)
+  (:trials (:normal 1000))
+  (let* ((text (owner-lock-test-fdinfo shape inode))
+         (mutated (make-array (length text) :element-type 'character :initial-contents text))
+         (character (code-char code)))
+    (when (and character (plusp (length mutated)))
+      (setf (char mutated (mod offset (length mutated))) character))
+    (and (eql (not (null (pg::physical-file-exclusive-flock-generic-p text inode)))
+              (not (null (pg::physical-file-exclusive-flock-p text inode))))
+         (eql (not (null (pg::physical-file-exclusive-flock-generic-p mutated inode)))
+              (not (null (pg::physical-file-exclusive-flock-p mutated inode)))))))
+
+(deftest generated-fdinfo-parser-reference-equivalence
+    (let ((data (cl-spec:result-data
+                 (cl-spec:run-property 'fdinfo-parser-preserves-generic-reference :seed 202))))
+      (ok (eq :passed (getf data :status)) (format nil "~s" data))
+      (ok (= 1000 (getf data :trials)))))
+
+(deftest fdinfo-decoding-error-keeps-owned-octets-after-scratch-expires
+    (let* ((expected (make-array 3 :element-type '(unsigned-byte 8) :initial-contents '(65 255 66)))
+           (condition
+             (let ((scratch (make-array 3 :element-type '(unsigned-byte 8) :initial-contents expected)))
+               (declare (dynamic-extent scratch))
+               (handler-case (pg::physical-file-fdinfo-text scratch 3)
+                 (error (condition)
+                   (let ((owned (slot-value condition 'array)))
+                     (ok (not (eq scratch owned)))
+                     condition))))))
+      (ok (typep condition 'sb-impl::malformed-ascii))
+      (sb-ext:gc :full t)
+      (ok (equalp expected (slot-value condition 'array))))
+  (let ((octets (make-array 3 :element-type '(unsigned-byte 8) :initial-contents '(65 66 67))))
+    (ok (string= "ABC" (pg::physical-file-fdinfo-text octets 3)))
+    (ok (string= "" (pg::physical-file-fdinfo-text octets 0)))))
+
+(deftest fdinfo-parser-preserves-legacy-number-and-string-inputs
+    (dolist (inode '(1 4294967295 4294967296 9223372036854775808 18446744073709551615
+                     18446744073709551616 99999999999999999999))
+      (let ((text (owner-lock-test-fdinfo 0 inode)))
+        (ok (pg::physical-file-exclusive-flock-p text inode))
+        (ok (eql (pg::physical-file-exclusive-flock-generic-p text inode)
+                 (pg::physical-file-exclusive-flock-p text inode)))))
+  (let* ((text (owner-lock-test-fdinfo 0 1))
+         (wide (make-array (length text) :element-type 'character :initial-contents text))
+         (adjustable (make-array (+ 4 (length text)) :element-type 'character
+                                                     :fill-pointer (length text) :initial-element #\x)))
+    (replace adjustable text)
+    (dolist (value (list text wide adjustable
+                         (concatenate 'string (string (code-char 955)) (string #\Newline) text)))
+      (ok (pg::physical-file-exclusive-flock-p value 1))
+      (ok (eql (pg::physical-file-exclusive-flock-generic-p value 1)
+               (pg::physical-file-exclusive-flock-p value 1))))
+    (dolist (inode '(1.0 1.0d0 -1 0))
+      (ok (eql (pg::physical-file-exclusive-flock-generic-p text inode)
+               (pg::physical-file-exclusive-flock-p text inode))))
+    (ok (signals (pg::physical-file-exclusive-flock-p text "1") 'type-error))))
+
+(deftest fdinfo-parser-preserves-unicode-zero-spelling
+    (dolist (code '(1776 65296 120792))
+      (let* ((character (code-char code))
+             (text (format nil "ino: ~c~%lock: 1: FLOCK ADVISORY WRITE 123 08:30:~c 0 EOF~%"
+                           character character)))
+        (ok (eql (pg::physical-file-exclusive-flock-generic-p text 0)
+                 (pg::physical-file-exclusive-flock-p text 0))))))
+
 (deftest offline-owner-flock-evidence-rejects-every-invalid-shape
     (loop for shape from 0 to 11
           for text = (owner-lock-test-fdinfo shape 12345)
