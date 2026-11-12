@@ -110,6 +110,18 @@ inputs use the historical generic calculation.  BYTES is read without mutation."
                                       (* (logxor digest octet) #x100000001B3))))
         digest)))
 
+(defun physical-store-update-digest-span (digest bytes start end)
+  (if (and (typep digest '(unsigned-byte 64))
+           (typep bytes '(simple-array (unsigned-byte 8) (*)))
+           (typep start 'fixnum) (typep end 'fixnum)
+           (<= 0 start end (length bytes)))
+      (if (= start end)
+          digest
+          (multiple-value-bind (low high)
+              (%physical-store-fnv1a64-span-parts digest bytes start end)
+            (logior low (ash high 32))))
+      (physical-store-update-digest digest (subseq bytes start end))))
+
 (defun physical-store-encode-control (store flush-lsn &key
                                                         (digest (physical-store-written-digest store))
                                                         (floor-lsn (physical-store-floor-lsn store))

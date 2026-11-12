@@ -125,6 +125,14 @@
               (list #xffffffffffffffff bytes)
               (list #x8000000000000000 bytes))))
 
+(setf (gethash '%physical-store-fnv1a64-span-parts *unit-hot-probes*)
+      (let ((bytes (make-array 257 :element-type '(unsigned-byte 8) :initial-element 255)))
+        (list (list #xcbf29ce484222325 bytes 0 0)
+              (list 0 bytes 0 (length bytes))
+              (list #xffffffffffffffff bytes 1 (1- (length bytes)))
+              (list #x8000000000000000 bytes 2 2)
+              (list #xffffffffffffffff bytes (length bytes) (length bytes)))))
+
 (rove:deftest hot-files-reject-explicit-allocation
     (rove:ok (equal '("MAKE-ARRAY") (unit-hot-explicit-allocations '((make-array 8)))))
   (rove:ok (equal '("LOOP/COLLECTOR")

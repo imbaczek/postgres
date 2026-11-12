@@ -45,6 +45,83 @@
         (physical-store-update-digest seed (subseq bytes 0 split))
         (subseq bytes split)))))
 
+(defun unit-fnv64-span-reference (digest bytes start end)
+  (unit-fnv64-reference digest (subseq bytes start end)))
+
+(defun unit-fnv64-span-outcome (function digest bytes start end)
+  (handler-case (list :value (funcall function digest bytes start end))
+    (error (condition) (list :error (type-of condition)))))
+
+(cl-spec:defgenerator unit-fnv64-span-arguments ()
+  (destructuring-bind (seed bytes) (funcall (cl-spec:custom-generator-function
+                                             (cl-spec:find-generator 'unit-fnv64-arguments)))
+    (let* ((length (length bytes))
+           (start (random (1+ length)))
+           (end (+ start (random (1+ (- length start))))))
+      (list seed bytes start end))))
+
+(cl-spec:defspec-function physical-store-update-digest-span
+    (:args (digest (type (unsigned-byte 64))) (bytes (type vector))
+           (start (type fixnum)) (end (type fixnum)))
+  (:args-generator unit-fnv64-span-arguments)
+  (:pre (and (<= 0 start end (length bytes))
+             (every (lambda (octet) (typep octet '(unsigned-byte 8))) bytes)))
+  (:returns (type (unsigned-byte 64)))
+  (:post (and (= result (unit-fnv64-span-reference digest bytes start end))
+              (or (< start end) (eq result digest)))))
+
+(cl-spec:defproperty fnv64-span-preserves-prefix-composition
+    ((length (range integer 0 1024)) (salt (range integer 0 255))
+                                     (left (range integer 0 128)) (right (range integer 0 128)))
+  (:about physical-store-update-digest-span)
+  (:trials (:normal 100))
+  (let* ((bytes (make-array (+ left length right) :element-type '(unsigned-byte 8)))
+         (split (+ left (floor length 2)))
+         (end (+ left length))
+         (seed #xcbf29ce484222325))
+    (dotimes (index (length bytes))
+      (setf (aref bytes index) (mod (+ salt (* index 73)) 256)))
+    (= (unit-fnv64-span-reference seed bytes left end)
+       (physical-store-update-digest-span seed bytes left end)
+       (physical-store-update-digest-span
+        (physical-store-update-digest-span seed bytes left split)
+        bytes split end))))
+
+(rove:deftest fnv64-span-preserves-slice-values-and-errors
+    (let ((base (make-array 4 :element-type '(unsigned-byte 8)
+                              :initial-contents '(0 1 128 255))))
+      (dolist (seed (list -1 (ash 1 100) 1/2 :opaque #xcbf29ce484222325))
+        (dolist (bytes (list (make-array 0 :element-type '(unsigned-byte 8))
+                             base (vector 0 1 128 255) (vector :outside 0 1 255 :outside)
+                             (make-array 4 :element-type '(unsigned-byte 8)
+                                           :initial-contents base :adjustable t :fill-pointer 3)
+                             (make-array 2 :element-type '(unsigned-byte 8)
+                                           :displaced-to base :displaced-index-offset 1)
+                             "" "abc" '(0 1)))
+          (dolist (span '((0 0) (0 nil) (0 1) (1 1) (1 3) (0 4)
+                          (-1 0) (3 1) (0 100) (:bad 1) (0 :bad)))
+            (destructuring-bind (start end) span
+              (rove:ok
+               (equal (unit-fnv64-span-outcome #'unit-fnv64-span-reference seed bytes start end)
+                      (unit-fnv64-span-outcome #'physical-store-update-digest-span
+                                               seed bytes start end)))))))))
+
+(rove:deftest fnv64-span-excludes-unselected-data-and-preserves-empty-identity
+    (dolist (seed (list #xffffffffffffffff (list :opaque-seed)))
+      (let ((bytes (make-array 6 :element-type '(unsigned-byte 8) :initial-element 255)))
+        (rove:ok (eq seed (physical-store-update-digest-span seed bytes 3 3)))))
+  (let ((bytes (vector :outside 0 1 128 255 :outside)))
+    (rove:ok (= (unit-fnv64-reference #xcbf29ce484222325 #(0 1 128 255))
+                (physical-store-update-digest-span #xcbf29ce484222325 bytes 1 5)))))
+
+(rove:deftest fnv64-span-generated-function-and-prefix-contracts
+    (dolist (data (list (cl-spec:result-data
+                         (cl-spec:check-function 'physical-store-update-digest-span
+                                                 :trials 100 :seed 643))
+                        (cl-spec:result-data
+                         (cl-spec:run-property 'fnv64-span-preserves-prefix-composition :seed 644))))
+      (rove:ok (eq :passed (getf data :status)) (format nil "~s" data))))
+
 (rove:deftest fnv64-matches-historical-vectors-and-empty-identity
     (rove:ok (= #xa430d84680aabd0b
                 (physical-store-update-digest #xcbf29ce484222325 (string->bytes "hello"))))
