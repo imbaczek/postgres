@@ -217,6 +217,10 @@ This does not prove exact WAL bytes, slot lifetime or import authority."
   (values))
 
 (defun logical-slot-check-startup-history (slots)
+  "Check reserved logical slots with known provenance against primary history.
+Lost slots and slots with unknown provenance skip this geometry check. Native
+recovery does not use it; logical restoration there remains unsupported. Lineage geometry does not
+prove exact WAL bytes, slot lifetime or import authority."
   (unless (recovery-in-progress-p)
     (let ((known (remove-if-not
                   (lambda (slot)

@@ -3518,10 +3518,10 @@ must separately validate system, history, lifetime, replay and storage context."
 (defun wal-persist-replication-slot-ack-under-lock (slot acknowledged-lsn
                                                     &optional (restart-floor acknowledged-lsn))
   "Persist an already-validated acknowledgment while *WAL-LOCK* is held.
-Known provenance selects timeline owners from primary history; legacy slots
-retain the LSN-only path. The guarded update saves before publishing progress
-to the live slot. Startup and scan admission must also check history, since
-no-op acknowledgments and resume paths can return before this helper."
+Known provenance selects timeline owners from primary history; slots with
+unknown provenance retain the LSN-only path. The guarded update saves before publishing progress
+to the live slot. Startup and scan admission also check history, since no-op
+acknowledgments and resume paths can return before this helper."
   (wal-require-logical-slot slot)
   (let* ((pending (wal-slot-pending-after-ack slot acknowledged-lsn))
          (candidate (wal-copy-replication-slot-with-profile slot)))
@@ -3640,6 +3640,8 @@ An unchanged acknowledgment returns without changing its stored owners."
 
 (defun wal-load-replication-slots ()
   "Validate a complete startup inventory before publishing its registry.
+Check known logical identities, then reserved known slots' primary history.
+Lost logical slots and those with unknown provenance skip the history check.
 Logical restoration during native recovery remains unsupported."
   (let ((segments (wal-discover-segments))
         (inactive-since (postgres-current-timestamp))

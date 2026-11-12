@@ -1755,6 +1755,10 @@ tracked by the bounded sender. SENT-LSN never includes an unfinished frame."
   name slot owner database plugin timeline namespace start end cursor pin)
 
 (defun wal-retained-slot-scan-validate-under-lock (scan)
+  "Recheck the slot, owner, pin, timeline and namespace before reading.
+These checks fence supported source switches while the scan is active. CLOG
+reset can change the internal writer incarnation without replacing the selected
+WAL source or invalidating the retention pin, so it is not compared here."
   (wal-check-healthy)
   (let ((slot (wal-find-usable-replication-slot-under-lock (wal-retained-slot-scan-name scan))))
     (unless (and (eq slot (wal-retained-slot-scan-slot scan))
@@ -1771,7 +1775,10 @@ tracked by the bounded sender. SENT-LSN never includes an unfinished frame."
 (declaim (ftype function logical-slot-check-primary-history logical-slot-primary-history-under-lock))
 
 (defun call-with-wal-retained-slot-scan (name from-lsn upto-lsn function)
-  "Capture a durable slot horizon and pin its retained start for FUNCTION."
+  "Capture a durable slot horizon and pin its retained start for FUNCTION.
+Check known provenance against primary history before installing the pin.
+This checks lineage geometry, not exact WAL bytes, slot lifetime or import
+authority."
   (let ((scan nil))
     (unwind-protect
          (progn
