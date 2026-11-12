@@ -1,6 +1,6 @@
 (asdf:defsystem "pg-interop-tests"
   :description "Independent PostgreSQL logical replication wire contracts"
-  :depends-on ("pg" "rove" "cl-spec/check-it")
+  :depends-on ("pg/logical-slot-fixtures" "rove" "cl-spec/check-it")
   :serial t
   :components ((:file "t/interop/protocol-tests")
                (:file "t/interop/sum-tests")

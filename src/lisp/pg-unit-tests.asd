@@ -1,7 +1,7 @@
 ;;;; Fast, independently selectable regressions migrated from t/unit-tests/.
 (asdf:defsystem "pg-unit-tests"
   :description "Unit regressions and generated contracts"
-  :depends-on ("pg" "rove" "cl-spec/check-it")
+  :depends-on ("pg/logical-slot-fixtures" "rove" "cl-spec/check-it")
   :serial t
   :components ((:file "t/rove/support")
                (:file "t/rove/hot-path-tests")

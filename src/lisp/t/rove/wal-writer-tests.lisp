@@ -4,46 +4,6 @@
 (declaim (special *primary-wal-writer* *primary-wal-writer-generation*
                   *primary-wal-writer-lock*))
 
-(defun call-with-primary-writer-authority-test (function &key (isolate t))
-  (let* ((*wal-lock* (if isolate (sb-thread:make-mutex :name "writer authority test WAL")
-                         *wal-lock*))
-         (*wal-temp-cleanup-domain* (unless isolate *wal-temp-cleanup-domain*))
-         (*primary-wal-writer-lock* (sb-thread:make-mutex :name "writer authority test state"))
-         (*primary-wal-writer-generation* 7)
-         (*wal-storage-incarnation* (if isolate (gensym "WRITER-TEST-STORE-")
-                                        *wal-storage-incarnation*))
-         (*wal-insert-timeline* (if isolate 3 *wal-insert-timeline*))
-         (*wal-logical-policy* (unless isolate *wal-logical-policy*))
-         (*wal-logical-info* (unless isolate *wal-logical-info*))
-         (*wal-logical-info-disable-pending* (unless isolate *wal-logical-info-disable-pending*))
-         (*wal-logical-info-activations* (if isolate (make-hash-table :test #'eq)
-                                             *wal-logical-info-activations*))
-         (*logical-capture-force* (unless isolate *logical-capture-force*))
-         (*postmaster-data-lock* (list :owned-directory))
-         (*physical-recovery-state* nil)
-         (*wal-ready* t)
-         (*wal-poisoned* nil)
-         (*wal-end-lsn* (if isolate 0 *wal-end-lsn*))
-         (*wal-durable-lsn* (if isolate 0 *wal-durable-lsn*))
-         (*wal-pending-page-publication* (unless isolate *wal-pending-page-publication*))
-         (*clog-pending-commits* (if isolate (make-hash-table :test #'eql)
-                                     *clog-pending-commits*))
-         (*wal-control-metadata* (make-wal-control-metadata 1 +db-in-production+))
-         (*wal-pending-page-publication-tail* nil)
-         (*primary-wal-writer*
-           (%make-primary-wal-writer
-            7 (make-wal-writer-epoch *wal-storage-incarnation* *wal-insert-timeline*
-                                     *postmaster-data-lock*)
-            *standard-output* *error-output*))
-         (owned (symbol-function 'postmaster-pid-owned-p)))
-    (setf (primary-wal-writer-thread *primary-wal-writer*) sb-thread:*current-thread*
-          (primary-wal-writer-state *primary-wal-writer*) :running)
-    (unwind-protect
-         (progn
-           (setf (symbol-function 'postmaster-pid-owned-p) (lambda () t))
-           (funcall function *primary-wal-writer*))
-      (setf (symbol-function 'postmaster-pid-owned-p) owned))))
-
 (defun primary-writer-idle-flush-result (debt)
   (call-with-primary-writer-authority-test
    (lambda (writer)
@@ -291,19 +251,6 @@
                     (wal-replace-storage-incarnation)
                     (rove:ok (not (eq incarnation *wal-storage-incarnation*)))))
              (setf (symbol-function 'wal-read-control-fields) read-control)))))))
-
-(defun call-with-writer-clog-reset-test (function)
-  (call-with-queued-clog-test
-   (lambda ()
-     (call-with-primary-writer-authority-test
-      (lambda (writer)
-        (let ((log-reset (symbol-function 'wal-log-clog-reset-under-lock)))
-          (unwind-protect
-               (progn
-                 (setf (symbol-function 'wal-log-clog-reset-under-lock) #'values)
-                 (funcall function writer))
-            (setf (symbol-function 'wal-log-clog-reset-under-lock) log-reset))))
-      :isolate nil))))
 
 (rove:deftest primary-writer-clog-reset-publishes-a-new-epoch-after-durability
     (call-with-writer-clog-reset-test

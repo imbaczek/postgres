@@ -125,29 +125,6 @@
       (rove:ok (eq :passed (getf data :status)) (format nil "~s" data))
       (rove:ok (= 200 (getf data :trials)))))
 
-(defun call-with-logical-slot-creation-test (function)
-  (call-with-logical-policy-test
-   (lambda (writer)
-     (declare (ignore writer))
-     (let ((*catalog* nil)
-           (*catalog-identity-needs-persist-p* nil)
-           (*catalog-oldest-relfrozenxid* nil)
-           (*catalog-durable-generation* 0)
-           (*catalog-logical-event-publication-p* nil)
-           (*wal-control-metadata* nil)
-           (*wal-replication-slots* (make-hash-table :test #'equal))
-           (*wal-snapshot-retention-pins* (make-hash-table :test #'eq))
-           (*wal-logical-catalog-event-interests* (make-hash-table :test #'eq))
-           (*active-snapshots* 0)
-           (*active-snapshot-set* (make-hash-table :test #'eq))
-           (*backend* (make-backend)))
-       (ensure-directories-exist (catalog-path))
-       (catalog-init)
-       (wal-ensure-directory-durable (wal-replication-slot-directory))
-       (unwind-protect
-            (funcall function)
-         (end-backend-session))))))
-
 (rove:deftest logical-slot-public-creation-persists-captured-provenance
     (dolist (entry '(("standard" :standard) ("sql" :sql)))
       (call-with-logical-slot-creation-test

@@ -491,19 +491,6 @@
 (rove:deftest effective-level-generated-recovery-contract
     (unit-check-property 'effective-level-recovery-uses-published-source))
 
-(defun call-with-logical-policy-test (function)
-  (let ((*wal-logical-policy* nil) (*logical-capture-force* nil)
-                                   (*wal-level* :replica) (*wal-logical-policy-test-hook* nil)
-                                   (*logical-capture-live-slots* 0)
-                                   (*logical-capture-arming* (make-hash-table :test #'eq))
-                                   (*logical-capture-xid-modes* (make-hash-table :test #'eql)))
-    (call-with-writer-clog-reset-test
-     (lambda (writer)
-       (let ((*backend* nil))
-         (sb-thread:with-mutex (*wal-lock*)
-           (wal-logical-info-publish-under-lock nil :rebase t))
-         (funcall function writer))))))
-
 (rove:deftest logical-info-activation-continues-through-clog-reset
     (call-with-logical-policy-test
      (lambda (writer)

@@ -323,3 +323,9 @@
                    (:file "postgres")))
      (:file "replication/logical-retention")
      (:file "replication/logical-shutdown")))))
+
+(asdf:defsystem "pg/logical-slot-fixtures"
+  :description "Shared storage and writer fixtures for logical slot tests"
+  :depends-on ("pg")
+  :serial t
+  :components ((:file "t/support/logical-slot-fixtures")))
