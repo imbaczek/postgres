@@ -235,3 +235,83 @@
                  (cl-spec:run-property 'copy-verification-lifetime-keeps-slot-bytes :seed 2331))))
       (rove:ok (eq :passed (getf data :status)) (format nil "~s" data))
       (rove:ok (= 100 (getf data :trials)))))
+
+(defun copy-base-proof-test-value (generation position)
+  (list :phase :base-verified :copy-id (logical-slot-generation-token generation)
+        :device position :inode position
+        :manifest-digest position :descriptor-digest position :system-id position
+        :end position :timeline (1+ (mod position 4294967295))
+        :history-digest position :slots 1 :pieces (mod position 65537)))
+
+(cl-spec:defproperty copy-base-proof-roundtrip-preserves-binding
+    ((generation (range integer 0 340282366920938463463374607431768211455))
+     (position (range integer 0 18446744073709551615)))
+  (:about logical-slot-copy-base-proof-image logical-slot-copy-base-proof-decode)
+  (:trials (:normal 200))
+  (let* ((value (copy-base-proof-test-value generation position))
+         (before (copy-tree value))
+         (image (logical-slot-copy-base-proof-image value))
+         (bad (copy-seq image))
+         (decoded (logical-slot-copy-base-proof-decode image)))
+    (setf (aref bad (- (length bad) 2)) (logxor 1 (aref bad (- (length bad) 2))))
+    (and (equal value decoded) (equal before value)
+         (equalp image (logical-slot-copy-base-proof-image decoded))
+         (handler-case (progn (logical-slot-copy-base-proof-decode bad) nil) (error () t)))))
+
+(rove:deftest copy-base-proof-generated-contract
+    (let ((result (cl-spec:result-data
+                   (cl-spec:run-property 'copy-base-proof-roundtrip-preserves-binding :seed 2341))))
+      (rove:ok (eq :passed (getf result :status)) (format nil "~s" result))
+      (rove:ok (= 200 (getf result :trials)))))
+
+(rove:deftest copy-base-proof-rejects-invalid-and-noncanonical-images
+    (let* ((value (copy-base-proof-test-value 0 0))
+           (image (logical-slot-copy-base-proof-image value)))
+      (dolist (position (list 0 18446744073709551615))
+        (dolist (generation (list 0 340282366920938463463374607431768211455))
+          (let ((boundary (copy-base-proof-test-value generation position)))
+            (rove:ok (equal boundary (logical-slot-copy-base-proof-decode
+                                      (logical-slot-copy-base-proof-image boundary)))))))
+      (dolist (pair '((:phase . :active) (:copy-id . "not-a-copy")
+                      (:device . -1) (:inode . 18446744073709551616)
+                      (:manifest-digest . -1) (:descriptor-digest . -1)
+                      (:system-id . -1) (:end . -1) (:timeline . 0)
+                      (:history-digest . -1) (:slots . 0) (:pieces . 65537)))
+        (let ((bad (copy-tree value)))
+          (setf (getf bad (car pair)) (cdr pair))
+          (rove:ok (handler-case (progn (logical-slot-copy-base-proof-image bad) nil) (error () t)))))
+      (rove:ok (handler-case
+                   (progn (logical-slot-copy-base-proof-image (append value '(:end 0))) nil)
+                 (error () t)))
+      (dolist (bad (list (subseq image 0 (1- (length image)))
+                         (concatenate '(vector (unsigned-byte 8)) image #(10))
+                         (string->bytes (concatenate 'string " " (bytes->string image)))))
+        (rove:ok (handler-case (progn (logical-slot-copy-base-proof-decode bad) nil) (error () t))))))
+
+(rove:deftest copy-base-proof-alone-always-fences-startup
+    (let* ((directory (uiop:ensure-directory-pathname
+                       (sb-posix:mkdtemp
+                        (namestring (merge-pathnames "copy-proof-fence-XXXXXX"
+                                                     (uiop:temporary-directory))))))
+           (*pgdata* directory))
+      (unwind-protect
+           (dolist (name '("logical-slot-copy.base-verified" "logical-slot-copy.base-verified.tmp"))
+             (let ((path (merge-pathnames name directory)))
+               (dolist (kind '(:regular :symlink :directory :fifo))
+                 (ecase kind
+                   (:regular (with-open-file (out path :direction :output :if-exists :error)
+                               (write-string "receipt fence" out)))
+                   (:symlink (sb-posix:symlink "absent" (namestring path)))
+                   (:directory (sb-posix:mkdir (namestring path) #o700))
+                   (:fifo (sb-posix:mkfifo (namestring path) #o600)))
+                 (unwind-protect
+                      (let ((before (slot-state-lstat path)))
+                        (rove:ok (handler-case
+                                     (progn (logical-slot-copy-check-startup) nil)
+                                   (error (condition)
+                                     (search "requires child-owner import" (princ-to-string condition)))))
+                        (rove:ok (= (sb-posix:stat-ino before)
+                                    (sb-posix:stat-ino (slot-state-lstat path)))))
+                   (if (eq kind :directory) (sb-posix:rmdir (namestring path))
+                       (sb-posix:unlink (namestring path)))))))
+        (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))

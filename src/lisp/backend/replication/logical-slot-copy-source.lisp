@@ -4,7 +4,10 @@
 
 (declaim (ftype function logical-slot-copy-check-startup-image))
 
+(declaim (ftype function logical-slot-copy-check-base-proof-fence))
+
 (defun logical-slot-copy-check-startup ()
+  (logical-slot-copy-check-base-proof-fence)
   (let ((stat
           (handler-case
               (sb-posix:lstat (namestring (merge-pathnames "logical-slot-copy.in-progress" *pgdata*)))

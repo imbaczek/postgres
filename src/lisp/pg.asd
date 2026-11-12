@@ -337,6 +337,7 @@
                    (:file "../replication/logical-slot-copy-operation")
                    (:file "../replication/logical-slot-copy-input")
                    (:file "../replication/logical-slot-copy-validation")
+                   (:file "../replication/logical-slot-copy-base-proof")
                    (:file "postgres")))
      (:file "replication/logical-retention")
      (:file "replication/logical-shutdown")))))
