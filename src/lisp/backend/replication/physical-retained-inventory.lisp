@@ -230,7 +230,12 @@ The CRC detects accidental corruption; it does not authenticate the payload."
 Keep only the current segment's shared prefix between images. ON-RECORD receives
 each validated record and its original bytes; validation continues through every
 entry even when a caller only uses a prefix. Later validation can still fail, so
-callbacks must keep partial results private until this function returns."
+callbacks must keep partial results private until this function returns.
+Return T and the longest checked prefix of the final segment, not of all
+segments. With no entries, the second value is the supplied overlap buffer or NIL.
+The overlap is borrowed. An extent-decoded buffer is fresh relative to the encoded loader image.
+The prefix contains bytes only; callers must establish metadata, base and fork
+proof, logical coverage and source authority."
   (let ((segment (when overlap (floor (1- (getf (first overlap) :base)) +wal-segment-size+)))
         (prefix (second overlap)))
     (dolist (entry entries)
