@@ -255,3 +255,28 @@
                (cursor-test-call (pg::timeline-parse-history 1 "") 0 (+ (length a) (length b))
                                  (lambda (cursor) (cursor-test-collect cursor)))
                'error))))))
+
+(deftest logical-wal-slot-start-proof-distinguishes-feedback-and-restart-roles
+    (let* ((pending (make-hash-table :test #'eql))
+           (slot (pg::make-wal-replication-slot
+                  :name "cursor-proof" :plugin "pgoutput"
+                  :restart-lsn 64 :restart-timeline 1
+                  :confirmed-flush-lsn 97 :confirmed-timeline 1
+                  :pending-xids pending)))
+      (ok (not (pg::logical-slot-wal-start-proven-p slot 97 1 :prefix-end))
+          "exact standard feedback need not be a record boundary")
+      (ok (pg::logical-slot-wal-start-proven-p slot 64 1 :prefix-end)
+          "a consumed restart floor is a prefix boundary")
+      (ok (not (pg::logical-slot-wal-start-proven-p slot 64 1 :record-start)))
+      (ok (not (pg::logical-slot-wal-start-proven-p slot 64 2 :prefix-end)))
+      (setf (gethash 7 pending) (cons 64 128))
+      (ok (pg::logical-slot-wal-start-proven-p slot 64 1 :record-start))
+      (ok (not (pg::logical-slot-wal-start-proven-p slot 64 1 :prefix-end))
+          "a pending restart is a record start, even at the same numeric position")
+      (clrhash pending)
+      (setf (pg::wal-replication-slot-restart-lsn slot) 0)
+      (ok (pg::logical-slot-wal-start-proven-p slot 0 1 :record-start))
+      (ok (not (pg::logical-slot-wal-start-proven-p slot 0 1 :prefix-end)))
+      (setf (pg::wal-replication-slot-plugin slot) "pg_lisp")
+      (ok (pg::logical-slot-wal-start-proven-p slot 97 1 :prefix-end)
+          "private terminal acknowledgments retain their boundary proof")))

@@ -251,20 +251,25 @@ record owner, carrier and kind; local progress is not slot acknowledgement."
 (declaim (ftype function physical-slot-startup-system-id))
 
 (defun logical-slot-wal-start-proven-p (slot start owner role)
-  "Accept a captured confirmed or birth prefix, or a pending restart record."
-  (let ((pending (loop for entry being the hash-values
-                         of (wal-replication-slot-pending-xids slot)
-                           thereis (= start (car entry))))
-        (provenance (wal-replication-slot-logical-provenance slot)))
+  "Accept a birth or consumed prefix, or a retained pending record start.
+Standard feedback may be unaligned; only its retained restart floor is a
+decoding anchor. A zero restart keeps the writer's record-start semantics."
+  (let* ((pending (loop for entry being the hash-values
+                          of (wal-replication-slot-pending-xids slot)
+                            thereis (= start (car entry))))
+         (restart (and (eql start (wal-replication-slot-restart-lsn slot))
+                       (eql owner (wal-replication-slot-restart-timeline slot))))
+         (provenance (wal-replication-slot-logical-provenance slot)))
     (ecase role
       (:prefix-end
-       (or (and (eql start (wal-replication-slot-confirmed-flush-lsn slot))
+       (or (and restart (plusp start) (not pending))
+           (and (not (equal (wal-replication-slot-plugin slot) "pgoutput"))
+                (eql start (wal-replication-slot-confirmed-flush-lsn slot))
                 (eql owner (wal-replication-slot-confirmed-timeline slot)))
            (and (eql start (wal-replication-slot-consistent-lsn slot))
                 provenance (eql owner (logical-slot-provenance-birth-timeline provenance)))))
       (:record-start
-       (and pending (eql start (wal-replication-slot-restart-lsn slot))
-            (eql owner (wal-replication-slot-restart-timeline slot)))))))
+       (and restart (or pending (zerop start)))))))
 
 (defun logical-slot-wal-check-control (scan system-id)
   "Check persisted control against the captured primary and durable horizon."
