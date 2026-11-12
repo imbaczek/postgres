@@ -12,6 +12,16 @@ def check_writer_pause():
     server = api['OwnedLisp']()
     try:
         server.start()
+        prefix_bytes = b'0123456789'
+        for name in ('copy-prefix-probe', 'copy-prefix-race', 'copy-prefix-overwrite'):
+            probe = server.data / 'global' / name
+            probe.write_bytes(prefix_bytes)
+            probe.chmod(0o600)
+        prefix_stat = (server.data / 'global/copy-prefix-probe').stat()
+        prefix_facts = ' '.join(str(value) for value in (
+            prefix_stat.st_dev, prefix_stat.st_ino, prefix_stat.st_mode,
+            prefix_stat.st_nlink, prefix_stat.st_uid, prefix_stat.st_size,
+            prefix_stat.st_mtime_ns, prefix_stat.st_ctime_ns))
         connection = RawConnection(server.port)
         try:
             connection.query('CREATE TABLE copy_lifecycle (id integer)')
@@ -58,7 +68,56 @@ def check_writer_pause():
                                                 (digest (physical-store-update-digest
                                                          #xCBF29CE484222325 bytes)))
                                            (physical-image-copy-file source destination "PG_VERSION"
-                                                                     (length bytes) digest))))))
+                                                                      (length bytes) digest)
+                                            (let* ((prefix (string->bytes "0123"))
+                                                   (digest (physical-store-update-digest
+                                                            #xCBF29CE484222325 prefix)))
+                                              (with-physical-image-input
+                                                  (input (pgdata-path "global/copy-prefix-probe")
+                                                         :element-type '(unsigned-byte 8))
+                                                (let ((facts (physical-image-file-facts
+                                                              (sb-sys:fd-stream-fd input))))
+                                                  (assert (equal '({prefix_facts}) (subseq facts 0 8)))
+                                                  (assert (plusp (ninth facts)))))
+                                              (dolist (arguments '(nil (:source-size 9) (:source-size 3)))
+                                                (let ((caught nil))
+                                                  (handler-case
+                                                      (apply #'physical-image-copy-file source destination
+                                                             "global/copy-prefix-probe" 4 digest arguments)
+                                                    (error (condition) (setf caught condition)))
+                                                  (assert (and caught
+                                                               (search (if (equal arguments '(:source-size 3))
+                                                                           "bounded file entry"
+                                                                           "source length changed")
+                                                                       (princ-to-string caught))))))
+                                              (assert
+                                               (equal (list "global/copy-prefix-probe" 4 digest)
+                                                      (physical-image-copy-file
+                                                       source destination "global/copy-prefix-probe"
+                                                       4 digest :source-size 10)))
+                                              (dolist (relative '("global/copy-prefix-race"
+                                                                  "global/copy-prefix-overwrite"))
+                                                (let ((*physical-image-test-hook*
+                                                        (lambda (point actual)
+                                                          (when (and (eq point :after-copy-chunk)
+                                                                     (equal actual relative))
+                                                            (with-open-file
+                                                                (output (pgdata-path relative) :direction :io
+                                                                        :if-exists :overwrite
+                                                                        :element-type '(unsigned-byte 8))
+                                                              (file-position output
+                                                                (if (equal relative "global/copy-prefix-race") 10 9))
+                                                              (write-byte
+                                                                (if (equal relative "global/copy-prefix-race") 33 88)
+                                                                output)))))
+                                                      (caught nil))
+                                                  (handler-case
+                                                      (physical-image-copy-file
+                                                       source destination relative 4 digest :source-size 10)
+                                                    (error (condition) (setf caught condition)))
+                                                  (assert (and caught
+                                                               (search "identity or checksum changed"
+                                                                       (princ-to-string caught))))))))))))
                                    (values :copied 27))))))
                        (healthy)
                        (assert (= (1+ initial) *primary-wal-writer-generation*))
@@ -128,6 +187,10 @@ def check_writer_pause():
         connection = RawConnection(server.port)
         try:
             assert (target / 'PG_VERSION').read_bytes() == (server.data / 'PG_VERSION').read_bytes()
+            assert (target / 'global/copy-prefix-probe').read_bytes() == prefix_bytes[:4]
+            assert (server.data / 'global/copy-prefix-probe').read_bytes() == prefix_bytes
+            assert (server.data / 'global/copy-prefix-race').read_bytes() == prefix_bytes + b'!'
+            assert (server.data / 'global/copy-prefix-overwrite').read_bytes() == prefix_bytes[:-1] + b'X'
             assert (target / 'logical-slot-copy.in-progress').is_file()
             assert connection.query('SELECT id FROM copy_lifecycle') == [['1']]
             connection.query('INSERT INTO copy_lifecycle VALUES (2)')

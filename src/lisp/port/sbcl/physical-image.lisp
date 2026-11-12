@@ -11,6 +11,38 @@
 ;; The scope and its /proc/self/fd paths are valid only in the owning thread
 ;; until cleanup closes the descriptors, including on a nonlocal exit.
 
+(sb-alien:define-alien-routine ("statx" physical-image-statx) sb-alien:int
+  (directory sb-alien:int) (name sb-alien:c-string) (flags sb-alien:int)
+  (mask sb-alien:unsigned-int) (buffer (* sb-alien:unsigned-char)))
+
+(defun physical-image-file-facts (descriptor &optional (name ""))
+  (unless (and (typep descriptor '(signed-byte 32)) (stringp name)
+               (not (find (code-char 0) name)))
+    (error "invalid physical image file observation"))
+  (sb-alien:with-alien ((buffer (sb-alien:array sb-alien:unsigned-char 256)))
+    (unless (zerop (physical-image-statx
+                    descriptor name (if (zerop (length name)) #x1100 #x100) #x17ff
+                    (sb-alien:cast (sb-alien:addr buffer) (* sb-alien:unsigned-char))))
+      (error "cannot inspect physical image file: errno ~d" (sb-alien:get-errno)))
+    (let ((sap (sb-alien:alien-sap (sb-alien:addr buffer))))
+      (unless (= #x13cf (logand #x13cf (sb-sys:sap-ref-32 sap 0)))
+        (error "physical image file requires complete statx facts"))
+      (flet ((timestamp (offset)
+               (let ((seconds (sb-sys:signed-sap-ref-64 sap offset))
+                     (nanos (sb-sys:sap-ref-32 sap (+ offset 8))))
+                 (unless (< nanos 1000000000)
+                   (error "invalid physical image statx timestamp"))
+                 (+ (* seconds 1000000000) nanos))))
+        (let* ((major (sb-sys:sap-ref-32 sap #x88))
+               (minor (sb-sys:sap-ref-32 sap #x8c))
+               (device (logior (logand minor #xff) (ash (logand major #xfff) 8)
+                               (ash (logand minor #xffffff00) 12)
+                               (ash (logand major #xfffff000) 32))))
+          (list device (sb-sys:sap-ref-64 sap #x20) (sb-sys:sap-ref-16 sap #x1c)
+                (sb-sys:sap-ref-32 sap #x10) (sb-sys:sap-ref-32 sap #x14)
+                (sb-sys:sap-ref-64 sap #x28) (timestamp #x70) (timestamp #x60)
+                (sb-sys:sap-ref-64 sap #x90)))))))
+
 (defstruct (physical-image-context (:constructor %make-physical-image-context))
   root-fd root-path children (owner sb-thread:*current-thread*) (active t))
 

@@ -4,21 +4,23 @@
 ;; and descriptor and pathname facts before accepting the file.  An error leaves
 ;; any partial destination in place for the caller to inspect or clean up.
 
-(defun physical-image-copy-file (source-context target-context relative size expected-digest)
+(defun physical-image-copy-file
+    (source-context target-context relative size expected-digest &key (source-size size))
   (physical-image-check-context source-context)
   (physical-image-check-context target-context)
   (unless (and (physical-image-read-context-p source-context)
                (not (physical-image-read-context-p target-context))
                (stringp relative)
                (typep size '(unsigned-byte 64))
+               (typep source-size '(unsigned-byte 64)) (<= size source-size)
                (typep expected-digest '(unsigned-byte 64)))
     (error "physical image copy requires read and receive scopes with a bounded file entry"))
   (let* ((*physical-image-context* source-context)
          (path (pgdata-resolve-path relative (physical-image-context-root-path source-context))))
     (with-physical-image-input (input path :element-type '(unsigned-byte 8))
       (let* ((input-fd (sb-sys:fd-stream-fd input))
-             (before (physical-reseed-file-facts (sb-posix:fstat input-fd))))
-        (unless (= size (sixth before)) (error "physical image copy source length changed"))
+             (before (physical-image-file-facts input-fd)))
+        (unless (= source-size (sixth before)) (error "physical image copy source length changed"))
         (let ((*physical-image-context* target-context))
           (call-with-physical-image-output
            (physical-image-context-root-path target-context) relative
@@ -34,10 +36,10 @@
                         (decf remaining count)
                         (when *physical-image-test-hook*
                           (funcall *physical-image-test-hook* :after-copy-chunk relative)))
-               (unless (and (eq :eof (read-byte input nil :eof))
+               (unless (and (or (< size source-size) (eq :eof (read-byte input nil :eof)))
                             (= expected-digest digest)
-                            (equal before (physical-reseed-file-facts (sb-posix:fstat input-fd)))
-                            (equal before (physical-reseed-file-facts (sb-posix:lstat (namestring path)))))
+                            (equal before (physical-image-file-facts input-fd))
+                            (equal before (physical-image-file-facts -100 (namestring path))))
                  (error "physical image copy source identity or checksum changed"))
                (list relative size digest)))))))))
 
