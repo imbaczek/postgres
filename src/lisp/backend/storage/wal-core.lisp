@@ -3513,17 +3513,26 @@ must separately validate system, history, lifetime, replay and storage context."
 
 (declaim (ftype function logical-slot-save-update-under-lock))
 
+(declaim (ftype function logical-slot-acknowledgment-positions-under-lock))
+
 (defun wal-persist-replication-slot-ack-under-lock (slot acknowledged-lsn
                                                     &optional (restart-floor acknowledged-lsn))
   "Persist an already-validated acknowledgment while *WAL-LOCK* is held.
 The guarded update saves before publishing progress to the live slot."
   (wal-require-logical-slot slot)
   (let* ((pending (wal-slot-pending-after-ack slot acknowledged-lsn))
-         (restart-lsn (wal-slot-restart-for-ack restart-floor pending))
          (candidate (wal-copy-replication-slot-with-profile slot)))
     (setf (wal-replication-slot-confirmed-flush-lsn candidate) acknowledged-lsn
-          (wal-replication-slot-restart-lsn candidate) restart-lsn
           (wal-replication-slot-pending-xids candidate) pending)
+    (if (wal-replication-slot-logical-provenance slot)
+        (multiple-value-bind (restart-lsn restart-timeline confirmed-timeline)
+            (logical-slot-acknowledgment-positions-under-lock
+             slot acknowledged-lsn restart-floor pending)
+          (setf (wal-replication-slot-restart-lsn candidate) restart-lsn
+                (wal-replication-slot-restart-timeline candidate) restart-timeline
+                (wal-replication-slot-confirmed-timeline candidate) confirmed-timeline))
+        (setf (wal-replication-slot-restart-lsn candidate)
+              (wal-slot-restart-for-ack restart-floor pending)))
     (logical-slot-save-update-under-lock slot candidate)))
 
 (defun wal-acknowledge-replication-slot

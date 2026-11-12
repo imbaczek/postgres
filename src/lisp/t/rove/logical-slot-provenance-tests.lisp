@@ -143,6 +143,156 @@
     (wal-slot-set-initial-profile slot profile)
     slot))
 
+(rove:deftest logical-slot-legacy-acknowledgment-keeps-unknown-timelines
+    (call-with-canonical-wal-slot-fixture
+     (lambda ()
+       (let* ((*wal-insert-timeline* 7)
+              (slot (unit-logical-provenance-slot :provenance nil :cause nil)))
+         (wal-create-replication-slot-file slot)
+         (setf (gethash "fixture" *wal-replication-slots*) slot)
+         (sb-thread:with-mutex (*wal-lock*)
+           (wal-persist-replication-slot-ack-under-lock slot 90))
+         (rove:ok (= 90 (wal-replication-slot-confirmed-flush-lsn slot)))
+         (rove:ok (null (wal-replication-slot-restart-timeline slot)))
+         (rove:ok (null (wal-replication-slot-confirmed-timeline slot)))
+         (rove:ok (string= "PGSLOT4 " (bytes->string (wal-encode-replication-slot slot))
+                           :end2 8))))))
+
+(rove:deftest logical-slot-acknowledgment-cannot-retag-a-divergent-source
+    (dolist (birth-diverged-p '(nil t))
+      (call-with-canonical-wal-slot-fixture
+       (lambda ()
+         (let* ((*wal-insert-timeline* 3) (*wal-durable-lsn* 200) (*wal-end-lsn* 200)
+                                          (slot (unit-logical-provenance-slot :timeline (if birth-diverged-p 2 1)))
+                                          (confirmed (if birth-diverged-p 80 150))
+                                          (writes 0))
+           (timeline-write-history 2 1 (if birth-diverged-p 0 100) "previous source branch")
+           (timeline-write-history 3 1 (if birth-diverged-p 0 100) "divergent current branch")
+           (unless birth-diverged-p
+             (setf (wal-replication-slot-confirmed-flush-lsn slot) confirmed
+                   (wal-replication-slot-confirmed-timeline slot) 2))
+           (wal-create-replication-slot-file slot)
+           (setf (gethash "fixture" *wal-replication-slots*) slot)
+           (let ((*logical-test-failpoint-hook*
+                   (lambda (point &rest ignored)
+                     (declare (ignore ignored))
+                     (when (eq point :slot-file-before-write) (incf writes)))))
+             (rove:ok (handler-case
+                          (progn
+                            (sb-thread:with-mutex (*wal-lock*)
+                              (wal-persist-replication-slot-ack-under-lock slot 180 160))
+                            nil)
+                        (error () t))
+                      "current history cannot replace the slot's stored source history"))
+           (rove:ok (zerop writes))
+           (rove:ok (= confirmed (wal-replication-slot-confirmed-flush-lsn slot)))
+           (rove:ok (not (wal-replication-slot-state-uncertain-p slot))))))))
+
+(rove:deftest logical-slot-zero-restart-retains-only-a-proven-record-owner
+    (dolist (ack '(100 150))
+      (call-with-canonical-wal-slot-fixture
+       (lambda ()
+         (let* ((*wal-insert-timeline* 1) (*wal-durable-lsn* 200) (*wal-end-lsn* 200)
+                                          (slot (unit-logical-provenance-slot)))
+           (setf (wal-replication-slot-restart-lsn slot) 0
+                 (gethash 71 (wal-replication-slot-pending-xids slot)) (cons 0 150))
+           (wal-create-replication-slot-file slot)
+           (setf (gethash "fixture" *wal-replication-slots*) slot)
+           (sb-thread:with-mutex (*wal-lock*)
+             (wal-persist-replication-slot-ack-under-lock slot ack 0))
+           (rove:ok (= ack (wal-replication-slot-confirmed-flush-lsn slot)))
+           (rove:ok (zerop (wal-replication-slot-restart-lsn slot)))
+           (rove:ok (= 1 (wal-replication-slot-restart-timeline slot)))))))
+  (dolist (wrong-history-p '(nil t))
+    (call-with-canonical-wal-slot-fixture
+     (lambda ()
+       (let* ((*wal-insert-timeline* (if wrong-history-p 2 1))
+              (*wal-durable-lsn* 200) (*wal-end-lsn* 200)
+              (slot (unit-logical-provenance-slot :timeline (if wrong-history-p 2 1))))
+         (when wrong-history-p
+           (timeline-write-history 2 1 0 "zero restart owner test")
+           (setf (wal-replication-slot-restart-lsn slot) 0
+                 (wal-replication-slot-restart-timeline slot) 1))
+         (wal-create-replication-slot-file slot)
+         (setf (gethash "fixture" *wal-replication-slots*) slot)
+         (rove:ok
+          (handler-case
+              (progn
+                (sb-thread:with-mutex (*wal-lock*)
+                  (wal-persist-replication-slot-ack-under-lock slot 150 0))
+                nil)
+            (error () t))
+          "zero floor requires the old zero restart and its verified record owner")
+         (rove:ok (= 80 (wal-replication-slot-confirmed-flush-lsn slot)))
+         (rove:ok (not (wal-replication-slot-state-uncertain-p slot))
+                  "rejected ownership cannot reach the save"))))))
+
+(rove:deftest logical-slot-acknowledgment-carries-prefix-and-pending-owners
+    (dolist (case '((100 100 1 2) (150 100 2 1)))
+      (call-with-canonical-wal-slot-fixture
+       (lambda ()
+         (let* ((*wal-insert-timeline* 2) (*wal-durable-lsn* 200) (*wal-end-lsn* 200)
+                                          (slot (unit-logical-provenance-slot)))
+           (timeline-write-history 2 1 100 "acknowledgment owner test")
+           (setf (gethash 71 (wal-replication-slot-pending-xids slot)) (cons 100 150))
+           (when (= 150 (first case))
+             (setf (wal-replication-slot-confirmed-flush-lsn slot) 100
+                   (wal-replication-slot-restart-lsn slot) 100
+                   (wal-replication-slot-restart-timeline slot) 2))
+           (wal-create-replication-slot-file slot)
+           (setf (gethash "fixture" *wal-replication-slots*) slot)
+           (sb-thread:with-mutex (*wal-lock*)
+             (wal-persist-replication-slot-ack-under-lock slot (first case) (second case)))
+           (rove:ok (= (first case) (wal-replication-slot-confirmed-flush-lsn slot)))
+           (rove:ok (= 100 (wal-replication-slot-restart-lsn slot)))
+           (rove:ok (= (third case) (wal-replication-slot-confirmed-timeline slot))
+                    "acknowledgment owns a consumed prefix end")
+           (rove:ok (= (fourth case) (wal-replication-slot-restart-timeline slot))
+                    "surviving pending start wins a floor tie; otherwise floor owns the prefix")
+           (rove:ok (equalp (wal-encode-replication-slot slot)
+                            (wal-encode-replication-slot
+                             (wal-read-replication-slot (wal-replication-slot-path "fixture"))))))))))
+
+(rove:deftest logical-slot-initial-copy-confirms-frozen-birth-owner
+    (call-with-canonical-wal-slot-fixture
+     (lambda ()
+       (let* ((*wal-insert-timeline* 2) (*wal-durable-lsn* 200) (*wal-end-lsn* 200)
+                                        (owner (gensym "INITIAL-COPY-OWNER-"))
+                                        (*wal-logical-slot-owner* owner)
+                                        (slot (unit-logical-provenance-slot :plugin "pg_lisp" :end 115)))
+         (timeline-write-history 2 1 100 "initial copy owner test")
+         (setf (wal-replication-slot-confirmed-flush-lsn slot) nil
+               (wal-replication-slot-confirmed-timeline slot) nil
+               (wal-replication-slot-restart-lsn slot) 100
+               (wal-replication-slot-restart-timeline slot) 2
+               (wal-replication-slot-active-owner slot) owner
+               (gethash 71 (wal-replication-slot-pending-xids slot)) (cons 100 150))
+         (wal-create-replication-slot-file slot)
+         (setf (gethash "fixture" *wal-replication-slots*) slot)
+         (wal-finalize-replication-slot-copy "fixture" 100 owner)
+         (rove:ok (= 100 (wal-replication-slot-confirmed-flush-lsn slot)))
+         (rove:ok (= 1 (wal-replication-slot-confirmed-timeline slot)))
+         (rove:ok (= 2 (wal-replication-slot-restart-timeline slot)))
+         (rove:ok (not (wal-replication-slot-state-uncertain-p slot)))))))
+
+(rove:deftest logical-slot-noop-acknowledgment-keeps-persisted-owners
+    (call-with-canonical-wal-slot-fixture
+     (lambda ()
+       (let* ((*wal-insert-timeline* 2) (*wal-durable-lsn* 200) (*wal-end-lsn* 200)
+                                        (slot (unit-logical-provenance-slot))
+                                        (writes 0))
+         (timeline-write-history 2 1 80 "no-op owner test")
+         (wal-create-replication-slot-file slot)
+         (setf (gethash "fixture" *wal-replication-slots*) slot)
+         (let ((*logical-test-failpoint-hook*
+                 (lambda (point &rest ignored)
+                   (declare (ignore ignored))
+                   (when (eq point :slot-file-before-write) (incf writes)))))
+           (rove:ok (eq slot (wal-acknowledge-replication-slot "fixture" 80))))
+         (rove:ok (zerop writes))
+         (rove:ok (= 1 (wal-replication-slot-confirmed-timeline slot)))
+         (rove:ok (= 1 (wal-replication-slot-restart-timeline slot)))))))
+
 (rove:deftest logical-slot-capture-cannot-publish-evidence-after-release-or-reuse
     (dolist (reuse-p '(nil t))
       (call-with-canonical-wal-slot-fixture

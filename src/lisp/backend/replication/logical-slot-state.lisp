@@ -184,6 +184,69 @@ with the prefix end, including at a fork. Copy the optional ON pair as captured.
        :logical-on-start-lsn (getf logical-fields :logical-on-start-lsn)
        :logical-on-start-timeline (getf logical-fields :logical-on-start-timeline)))))
 
+(defun logical-slot-prefix-timeline (lsn history)
+  (unless (typep lsn '(integer 1 18446744073709551615))
+    (error "an empty WAL prefix has no timeline owner"))
+  (timeline-at-point (1- lsn) history))
+
+(defun logical-slot-check-primary-history (slot history)
+  (let* ((provenance (wal-replication-slot-logical-provenance slot))
+         (birth (wal-replication-slot-consistent-lsn slot))
+         (on (logical-slot-provenance-on-start-lsn provenance))
+         (confirmed (wal-replication-slot-confirmed-flush-lsn slot))
+         (restart (wal-replication-slot-restart-lsn slot))
+         (restart-timeline (wal-replication-slot-restart-timeline slot)))
+    (unless (and (plusp birth)
+                 (timeline-prefix-boundary-p
+                  (logical-slot-provenance-birth-timeline provenance) birth history)
+                 (or (null on)
+                     (and (plusp on)
+                          (timeline-prefix-boundary-p
+                           (logical-slot-provenance-on-start-timeline provenance) on history)))
+                 (or (null confirmed)
+                     (and (plusp confirmed)
+                          (timeline-prefix-boundary-p
+                           (wal-replication-slot-confirmed-timeline slot) confirmed history)))
+                 (if (zerop restart)
+                     (eql restart-timeline (timeline-at-point 0 history))
+                     (timeline-prefix-boundary-p restart-timeline restart history)))
+      (error "logical slot provenance is outside current primary history")))
+  (values))
+
+(defun logical-slot-acknowledgment-positions-under-lock (slot acknowledged-lsn restart-floor pending)
+  (let ((history (logical-slot-primary-history-under-lock)))
+    (logical-slot-check-primary-history slot history)
+    (let* ((provenance (wal-replication-slot-logical-provenance slot))
+           (confirmed (wal-replication-slot-confirmed-flush-lsn slot))
+           (confirmed-timeline
+             (cond
+               ((null confirmed)
+                (unless (and (plusp acknowledged-lsn)
+                             (= acknowledged-lsn (wal-replication-slot-consistent-lsn slot)))
+                  (error "initial logical slot acknowledgment must confirm its birth"))
+                (logical-slot-provenance-birth-timeline provenance))
+               ((= acknowledged-lsn confirmed) (wal-replication-slot-confirmed-timeline slot))
+               (t (logical-slot-prefix-timeline acknowledged-lsn history))))
+           (floor-timeline
+             (if (eql restart-floor 0)
+                 (let ((prior (wal-replication-slot-restart-timeline slot)))
+                   (unless (and (eql (wal-replication-slot-restart-lsn slot) 0)
+                                (eql prior (timeline-at-point 0 history)))
+                     (error "zero restart requires its previously proven record owner"))
+                   prior)
+                 (logical-slot-prefix-timeline restart-floor history)))
+           (pending-positions
+             (loop for entry being the hash-values of pending
+                   collect (cons (car entry) (timeline-at-point (car entry) history)))))
+      (unless (timeline-prefix-boundary-p confirmed-timeline acknowledged-lsn history)
+        (error "logical slot acknowledgment owner is outside current history"))
+      (multiple-value-bind (restart-lsn restart-timeline role)
+          (logical-slot-select-restart-position restart-floor floor-timeline pending-positions)
+        (when (< restart-lsn (wal-replication-slot-restart-lsn slot))
+          (error "logical slot restart position cannot move backwards"))
+        (values restart-lsn restart-timeline confirmed-timeline
+                (if (zerop restart-floor) :record-start role))))))
+
 (defun logical-slot-generation-token (generation)
   "Encode an unsigned 128-bit generation as 32 lowercase hex digits."
   (unless (typep generation '(unsigned-byte 128))
