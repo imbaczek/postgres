@@ -185,11 +185,14 @@ with the prefix end, including at a fork. Copy the optional ON pair as captured.
        :logical-on-start-timeline (getf logical-fields :logical-on-start-timeline)))))
 
 (defun logical-slot-prefix-timeline (lsn history)
+  "Return the owner of the last byte in a nonempty consumed WAL prefix."
   (unless (typep lsn '(integer 1 18446744073709551615))
     (error "an empty WAL prefix has no timeline owner"))
   (timeline-at-point (1- lsn) history))
 
 (defun logical-slot-check-primary-history (slot history)
+  "Check stored logical slot positions against primary lineage geometry.
+This does not prove exact WAL bytes, slot lifetime or import authority."
   (let* ((provenance (wal-replication-slot-logical-provenance slot))
          (birth (wal-replication-slot-consistent-lsn slot))
          (on (logical-slot-provenance-on-start-lsn provenance))
@@ -214,6 +217,14 @@ with the prefix end, including at a fork. Copy the optional ON pair as captured.
   (values))
 
 (defun logical-slot-acknowledgment-positions-under-lock (slot acknowledged-lsn restart-floor pending)
+  "Select confirmed and restart owners under the WAL lock.
+The first confirmation uses the frozen birth owner; an unchanged confirmation
+keeps its owner. Positive floors describe consumed prefixes, while pending
+positions are record starts. After a pending start is consumed, a positive
+restart at the same fork LSN may acquire the prefix owner. A zero floor keeps
+only the previously stored record-start owner if it matches history; it does not
+invent an owner for an empty prefix. These checks establish lineage geometry,
+not exact WAL bytes, slot lifetime or import authority."
   (let ((history (logical-slot-primary-history-under-lock)))
     (logical-slot-check-primary-history slot history)
     (let* ((provenance (wal-replication-slot-logical-provenance slot))

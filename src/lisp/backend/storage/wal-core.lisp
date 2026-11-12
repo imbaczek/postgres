@@ -3518,7 +3518,10 @@ must separately validate system, history, lifetime, replay and storage context."
 (defun wal-persist-replication-slot-ack-under-lock (slot acknowledged-lsn
                                                     &optional (restart-floor acknowledged-lsn))
   "Persist an already-validated acknowledgment while *WAL-LOCK* is held.
-The guarded update saves before publishing progress to the live slot."
+Known provenance selects timeline owners from primary history; legacy slots
+retain the LSN-only path. The guarded update saves before publishing progress
+to the live slot. Startup and scan admission must also check history, since
+no-op acknowledgments and resume paths can return before this helper."
   (wal-require-logical-slot slot)
   (let* ((pending (wal-slot-pending-after-ack slot acknowledged-lsn))
          (candidate (wal-copy-replication-slot-with-profile slot)))
@@ -3537,7 +3540,8 @@ The guarded update saves before publishing progress to the live slot."
 
 (defun wal-acknowledge-replication-slot
     (name acknowledged-lsn &optional expected-owner)
-  "Durably advance a slot after a consumer completes a terminal WAL batch."
+  "Durably advance a slot after a consumer completes a terminal WAL batch.
+An unchanged acknowledgment returns without changing its stored owners."
   (unless (and (integerp acknowledged-lsn)
                (<= 0 acknowledged-lsn #xFFFFFFFFFFFFFFFF))
     (ereport "22023" "invalid replication slot acknowledgment LSN"))
