@@ -354,7 +354,8 @@ A temporary physical slot returns to its creator and records inactivity time."
 (defun call-with-logical-replication-slot (name function &key allow-initial-copy)
   "Hold an exclusive runtime claim and remember its backend for invalidation.
 On unwind, mark the sender leaving before releasing the exact slot claim. The
-sender's acknowledged outcome and the claim release are checked separately."
+sender's acknowledged outcome and the claim release are checked separately.
+The continuation binding is private to this owner and starts empty."
   (let ((owner (gensym "LOGICAL-SLOT-"))
         (slot nil))
     (unwind-protect

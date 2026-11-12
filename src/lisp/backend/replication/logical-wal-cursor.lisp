@@ -40,7 +40,10 @@ The caller must prove the source and start boundary and supply a guard that
 checks that proof under the WAL mutex.  A geometrically valid empty interval
 alone does not verify record bytes or a record boundary.  The cursor is valid
 only in this call, on this thread, with the captured mutex.  An optional
-archive must also pass its own context check."
+archive must also pass its own context check. Strict batch policy rejects
+nested starts and an open batch at the horizon. The logical-reader policy
+lets the consumer discard abandoned batches and hide an incomplete tail;
+both policies reject end-of-recovery inside an open batch."
   (timeline-check-lineage history)
   (unless (and (member batch-policy '(:strict :logical-reader))
                (functionp guard)
@@ -204,7 +207,8 @@ a ready EOF may instead move the private position over a checked rotation gap."
 
 (defun logical-wal-cursor-check-record (cursor record)
   "Check record ownership, fork and batch rules against the selected history.
-End-of-recovery is metadata, not an ordinary logical record."
+End-of-recovery is metadata, not an ordinary logical record.  Strict policy
+rejects nested batch starts; the logical reader applies its own batch rules."
   (let* ((history (logical-wal-cursor-history cursor))
          (start (wal-record-start record))
          (owner (timeline-at-point start history))
@@ -258,6 +262,8 @@ record owner, carrier and kind; local progress is not slot acknowledgement."
 (declaim (ftype function logical-slot-wal-check-control-coordinates logical-slot-wal-start-proven-p))
 
 (defstruct (logical-wal-source (:constructor %make-logical-wal-source))
+  "Captured source facts for rechecking a slot reader under the WAL mutex.
+These facts retain history metadata, not pins, leases or WAL payload buffers."
   (slot nil :read-only t) (name nil :read-only t) (owner nil :read-only t)
   (database nil :read-only t) (plugin nil :read-only t)
   (catalog nil :read-only t) (system-id nil :read-only t)
@@ -267,13 +273,17 @@ record owner, carrier and kind; local progress is not slot acknowledgement."
   (thread nil :read-only t) (mutex nil :read-only t))
 
 (defstruct (logical-wal-continuation (:constructor %make-logical-wal-continuation))
+  "Evidence for a returned, finished prefix within one slot owner scope.
+Reuse requires a fresh source check and new scan and archive scopes."
   (source nil :read-only t) (position nil :read-only t) (owner nil :read-only t))
 
 (defun logical-wal-current-root-identity ()
+  "Identify the data root by its resolved path, device and inode."
   (let* ((path (truename *pgdata*)) (info (sb-posix:stat path)))
     (list path (sb-posix:stat-dev info) (sb-posix:stat-ino info))))
 
 (defun logical-wal-capture-source (scan)
+  "Capture primary slot and source facts under WAL exclusion."
   (assert (sb-thread:holding-mutex-p *wal-lock*))
   (let* ((slot (wal-retained-slot-scan-slot scan))
          (timeline (wal-retained-slot-scan-timeline scan))
@@ -298,6 +308,9 @@ record owner, carrier and kind; local progress is not slot acknowledgement."
      :thread sb-thread:*current-thread* :mutex *wal-lock*)))
 
 (defun logical-wal-check-source (source end)
+  "Recheck captured facts and durable control under WAL exclusion.
+WAL and control may advance beyond END. CLOG rotation does not replace the
+selected WAL source."
   (assert (sb-thread:holding-mutex-p *wal-lock*))
   (let* ((slot (logical-wal-source-slot source))
          (system-id (logical-wal-source-system-id source))
@@ -332,6 +345,8 @@ record owner, carrier and kind; local progress is not slot acknowledgement."
     t))
 
 (defun logical-wal-reusable-continuation (slot position end)
+  "Reuse a matching owner-scoped boundary only while its source still matches.
+A stale certificate returns NIL so the reader can replay from restart."
   (assert (sb-thread:holding-mutex-p *wal-lock*))
   (let ((certificate *wal-logical-slot-read-continuation*))
     (when (and certificate
@@ -343,6 +358,7 @@ record owner, carrier and kind; local progress is not slot acknowledgement."
         (error () nil)))))
 
 (defun logical-wal-certify-boundary (source position)
+  "Make boundary evidence after the caller has rechecked the finished prefix."
   (assert (sb-thread:holding-mutex-p *wal-lock*))
   (unless (plusp position) (error "logical WAL continuation requires a completed prefix"))
   (%make-logical-wal-continuation
@@ -350,6 +366,7 @@ record owner, carrier and kind; local progress is not slot acknowledgement."
    :owner (timeline-at-point (1- position) (logical-wal-source-history source))))
 
 (defun logical-slot-wal-scan-start-position (scan)
+  "Choose the owner and role for the scan's captured start."
   (assert (sb-thread:holding-mutex-p *wal-lock*))
   (wal-retained-slot-scan-validate-under-lock scan)
   (let ((certificate (wal-retained-slot-scan-continuation scan))
@@ -400,7 +417,9 @@ proof from the consistent position and birth timeline."
       (error "logical WAL control differs from its captured primary source"))))
 
 (defun call-with-logical-slot-wal-cursor-from-scan (scan owner role function &key (batch-policy :strict))
-  "Traverse an already captured and pinned scan; pass cursor and source facts to FUNCTION."
+  "Traverse a pinned scan with a fresh archive and cursor scope.
+Pass the cursor and rechecked source facts to FUNCTION; neither a saved
+continuation nor its facts retain a pin, reader lease or cached WAL payload."
   (let ((source nil) (certificate (wal-retained-slot-scan-continuation scan)))
     (labels ((check-source ()
                (wal-retained-slot-scan-validate-under-lock scan)

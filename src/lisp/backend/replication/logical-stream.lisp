@@ -1576,6 +1576,7 @@ executor, so capture the same operation before transaction commit."
   (values))
 
 (defun wal-logical-reader-finish-batch (state record &optional (emit t))
+  "Validate and finish a batch; retain its transaction only when EMIT is true."
   (unless (logical-reader-state-batch-open-p state)
     (error "logical WAL terminal appears outside a batch"))
   (let* ((record-type (wal-record-type record))
@@ -1788,8 +1789,10 @@ This checks lineage geometry, not exact WAL bytes, slot lifetime or import
 authority. With REPLAY-FROM-RESTART, capture and pin the restart anchor under
 that same lock and pass the requested output position as FUNCTION's second
 argument. The value :KNOWN enables replay only for slots with provenance;
-other slots retain the one-argument callback. The reader must independently
-prove the anchor's position role."
+other slots retain the one-argument callback. A matching, rechecked continuation
+may start at the requested position. Stale evidence at admission falls back to
+restart replay; a source change after pinning aborts the scan. The reader must
+independently prove the anchor's position role."
   (let ((scan nil) (requested nil) (replay nil) (continuation nil))
     (unwind-protect
          (progn
@@ -1900,6 +1903,8 @@ prove the anchor's position role."
                 logical-slot-wal-start-proven-p call-with-logical-slot-wal-cursor-from-scan))
 
 (defun wal-logical-reader-next-record (scan cursor)
+  "Read the next ordinary record. Logical cursors consume checked end-of-recovery
+metadata; the legacy scan path rejects it."
   (if (null cursor)
       (wal-retained-slot-scan-next scan)
       (loop
@@ -1913,6 +1918,12 @@ prove the anchor's position role."
 (defun wal-logical-slot-read-transactions-from-scan
     (scan max-transactions max-bytes max-scan-bytes
      &key cursor (output-start (wal-retained-slot-scan-start scan)) allow-filter)
+  "Read complete batches and return transactions, progress, exhaustion and the
+last finished terminal.  Replay before OUTPUT-START validates independently
+within the frozen horizon.  MAX-SCAN-BYTES is a soft forward limit measured
+from OUTPUT-START to completed ordinary batch progress, including WAL without
+rows; it is not a cap on total decoding. Check limits at completed batches
+and leave an incomplete tail invisible."
   (let* ((start-lsn output-start)
          (end-lsn (wal-retained-slot-scan-end scan))
          (boundary-proven (or allow-filter (= start-lsn (wal-retained-slot-scan-start scan)))))
@@ -1973,6 +1984,9 @@ prove the anchor's position role."
 
 (defun wal-logical-slot-read-transactions-from-cursor
     (scan requested allow-filter max-transactions max-bytes max-scan-bytes)
+  "Read with a fresh cursor scope and certify only a returned finished prefix.
+Recheck the scope before certification. Cursor position, an unaligned filter
+baseline and end-of-recovery alone do not establish a continuation."
   (multiple-value-bind (owner role)
       (sb-thread:with-mutex (*wal-lock*) (logical-slot-wal-scan-start-position scan))
     (call-with-logical-slot-wal-cursor-from-scan
@@ -1997,7 +2011,11 @@ prove the anchor's position role."
             (max-scan-bytes +max-logical-read-scan-bytes+))
   "Read committed transactions at a pinned, fixed durable horizon.
 Return transactions, processed progress and a third value indicating that the
-scan reached its horizon rather than stopping at a configured limit."
+scan reached its horizon rather than stopping at a configured limit.
+MAX-SCAN-BYTES is a soft forward limit at completed batch boundaries, measured
+from the requested output position, including batches without rows.  Replay
+before that position is separate, interruptible validation within the frozen
+horizon. This limit does not bound total WAL decoded."
   (wal-logical-reader-validate-limits max-transactions max-bytes max-scan-bytes)
   (call-with-wal-retained-slot-scan
    name from-lsn upto-lsn
