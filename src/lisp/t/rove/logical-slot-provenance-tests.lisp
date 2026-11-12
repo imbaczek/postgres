@@ -233,14 +233,16 @@
                 (release-snapshot-registration registration)))))))))
 
 (rove:deftest logical-slot-created-image-restores-through-startup
-    (call-with-logical-slot-creation-test
+    (call-with-logical-slot-real-startup-test
      (lambda ()
        (create-standard-logical-slot "restored" :nothing)
        (let* ((before (gethash "restored" *wal-replication-slots*))
               (provenance (wal-replication-slot-logical-provenance before))
               (*catalog* nil)
               (*wal-replication-slots* (make-hash-table :test #'equal)))
-         (wal-load-replication-slots)
+         (call-with-logical-slot-owned-startup-test
+          (lambda (gate-owner ownership)
+            (wal-load-replication-slots :gate-owner gate-owner :ownership ownership)))
          (let* ((restored (gethash "restored" *wal-replication-slots*))
                 (after (wal-replication-slot-logical-provenance restored)))
            (rove:ok (null *catalog*))
@@ -560,41 +562,15 @@
                                           (*wal-control-metadata* nil)
                                           (slot (unit-logical-lineage-slot kind))
                                           (original *wal-replication-slots*)
-                                          (sentinel (make-wal-replication-slot :name "existing"))
-                                          (reader (symbol-function 'physical-slot-startup-system-id))
-                                          (validate (symbol-function 'wal-validate-replication-slot-wal))
-                                          (rebuild (symbol-function 'wal-slot-rebuild-progress))
-                                          (reads 0) (validations 0) (rebuilds 0)
                                           (admitted-p (not (null (member kind '(:valid :child :legacy :lost))))))
            (timeline-write-history 3 1 100 "startup lineage admission")
-           (wal-create-replication-slot-file slot)
-           (setf (gethash "existing" original) sentinel)
-           (unwind-protect
-                (progn
-                  ;; Recovery/WAL-range proof is a separate prerequisite in this geometry test.
-                  (setf (symbol-function 'physical-slot-startup-system-id)
-                        (lambda () (incf reads) 42)
-                        (symbol-function 'wal-validate-replication-slot-wal)
-                        (lambda (candidate segments)
-                          (declare (ignore segments)) (incf validations) candidate)
-                        (symbol-function 'wal-slot-rebuild-progress)
-                        (lambda (candidate) (incf rebuilds) candidate))
-                  (rove:ok
-                   (eq admitted-p
-                       (handler-case (progn (wal-load-replication-slots) t) (error () nil)))
-                   (format nil "~a startup geometry" kind))
-                  (rove:ok (= (if (eq kind :legacy) 0 1) reads))
-                  (rove:ok (= (if admitted-p 1 0) validations))
-                  (rove:ok (= (if admitted-p 1 0) rebuilds))
-                  (if admitted-p
-                      (rove:ok (gethash "fixture" *wal-replication-slots*))
-                      (progn
-                        (rove:ok (eq original *wal-replication-slots*))
-                        (rove:ok (eq sentinel (gethash "existing" original)))
-                        (rove:ok (null (gethash "fixture" original))))))
-             (setf (symbol-function 'physical-slot-startup-system-id) reader
-                   (symbol-function 'wal-validate-replication-slot-wal) validate
-                   (symbol-function 'wal-slot-rebuild-progress) rebuild)))))))
+           (rove:ok
+            (eq admitted-p
+                (handler-case (progn (logical-slot-check-startup-history (list slot)) t)
+                  (error () nil)))
+            (format nil "~a startup geometry" kind))
+           (rove:ok (eq original *wal-replication-slots*)
+                    "pure geometry preparation never publishes the inventory"))))))
 
 (rove:deftest logical-slot-legacy-acknowledgment-keeps-unknown-timelines
     (call-with-canonical-wal-slot-fixture
@@ -1055,6 +1031,11 @@
               (error () t))
             "a retention cap cannot bypass an uncertain slot"))))))
 
+(defun unit-logical-slot-startup-identity ()
+  ;; Exercise identity preparation without granting startup publication authority.
+  (let ((slots (slot-state-map (wal-replication-slot-directory) #'wal-decode-replication-slot)))
+    (values (logical-slot-check-startup-identities slots) slots)))
+
 (rove:deftest logical-slot-startup-reads-durable-catalog-before-catalog-init
     (dolist (known-p '(t nil))
       (call-with-canonical-wal-slot-fixture
@@ -1073,7 +1054,7 @@
            (let ((before (uiop:read-file-string (catalog-path)))
                  (*catalog* nil))
              (rove:ok (eq known-p
-                          (handler-case (progn (wal-load-replication-slots) t)
+                          (handler-case (progn (unit-logical-slot-startup-identity) t)
                             (error () nil)))
                       "a durable identity is required; a legacy catalog cannot invent one")
              (rove:ok (null *catalog*) "startup validation does not initialize the live catalog")
@@ -1082,7 +1063,7 @@
              (rove:ok (string= before (uiop:read-file-string (catalog-path)))
                       "durable catalog is never rewritten")
              (if known-p
-                 (rove:ok (gethash "fixture" *wal-replication-slots*))
+                 (rove:ok (eq original *wal-replication-slots*) "pure preparation does not publish a registry")
                  (rove:ok (eq original *wal-replication-slots*)))))))))
 
 (rove:deftest logical-slot-startup-rejects-control-identity-mismatch
@@ -1096,7 +1077,7 @@
          (unwind-protect
               (progn
                 (setf (symbol-function 'physical-slot-startup-system-id) (lambda () 42))
-                (rove:ok (handler-case (progn (wal-load-replication-slots) nil) (error () t)))
+                (rove:ok (handler-case (progn (unit-logical-slot-startup-identity) nil) (error () t)))
                 (rove:ok (eq original *wal-replication-slots*)))
            (setf (symbol-function 'physical-slot-startup-system-id) reader))))))
 
@@ -1108,7 +1089,7 @@
          (wal-create-replication-slot-file
           (unit-logical-provenance-slot :cause :wal-removed))
          (rove:ok (null (probe-file (catalog-path))))
-         (rove:ok (handler-case (progn (wal-load-replication-slots) nil) (error () t)))
+         (rove:ok (handler-case (progn (unit-logical-slot-startup-identity) nil) (error () t)))
          (rove:ok (null (probe-file (catalog-path))) "validation never creates a catalog")
          (rove:ok (eq original *wal-replication-slots*))))))
 
@@ -1142,7 +1123,7 @@
               (progn
                 (setf (symbol-function 'physical-slot-startup-system-id)
                       (lambda () (incf reads) 42))
-                (rove:ok (handler-case (progn (wal-load-replication-slots) nil)
+                (rove:ok (handler-case (progn (unit-logical-slot-startup-identity) nil)
                            (error () t))
                          "foreign provenance prevents startup")
                 (rove:ok (eq original *wal-replication-slots*)
@@ -1165,8 +1146,9 @@
                 (progn
                   (setf (symbol-function 'physical-slot-startup-system-id)
                         (lambda () (incf reads) system-id))
-                  (wal-load-replication-slots)
-                  (rove:ok (= 2 (hash-table-count *wal-replication-slots*)))
+                  (multiple-value-bind (checked slots) (unit-logical-slot-startup-identity)
+                    (rove:ok (eql system-id checked))
+                    (rove:ok (= 2 (length slots))))
                   (rove:ok (= reads 1) "one catalog read for a known-provenance inventory"))
              (setf (symbol-function 'physical-slot-startup-system-id) reader)))))))
 

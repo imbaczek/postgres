@@ -1,6 +1,6 @@
 (asdf:defsystem "pg-physical-tests"
   :description "Native physical WAL intake and recovery contracts"
-  :depends-on ("pg" "rove" "cl-spec/check-it")
+  :depends-on ("pg" "rove" "cl-spec/check-it" "pg/logical-slot-fixtures")
   :serial t
   :components ((:file "t/physical-tests")
                (:file "t/physical-store-tests")
@@ -83,6 +83,7 @@
                (:file "t/physical-adoption-follow-tests")
                (:file "t/physical-adoption-startup-tests")
                (:file "t/postmaster-ownership-tests")
+               (:file "t/logical-slot-startup-tests")
                (:file "t/physical-reseed-owner-tests")
                (:file "t/physical-reseed-attempt-tests")
                (:file "t/physical-image-tests")

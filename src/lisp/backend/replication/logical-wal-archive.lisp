@@ -196,13 +196,13 @@ The required base overlap does not itself establish logical coverage."
      (getf index :entries))
     index))
 
-(defun call-with-logical-wal-archive (system-id history namespace guard function)
+(defun call-with-logical-wal-archive-core (system-id history namespace guard identity-function function)
   "Call FUNCTION with a private archive selected from committed primary control.
 GUARD supplies the caller's source proof; this scope also checks persisted
 control, history and root.  It rechecks both under the captured WAL mutex on
 the owning thread.  A retained-root reader lease spans the callback.  The
 index and cache are cleared on every exit, and the archive then expires."
-  (unless (and (functionp guard) (functionp function) (eq namespace :timeline))
+  (unless (and (functionp guard) (functionp identity-function) (functionp function) (eq namespace :timeline))
     (error "logical WAL archive requires a timeline source scope"))
   (timeline-check-lineage history)
   (let ((archive nil) (owner nil) (active t)
@@ -219,7 +219,7 @@ index and cache are cleared on every exit, and the archive then expires."
             (physical-promotion-retained-parent-history history)
           (unless (and (= fork (getf reference :end))
                        (eql parent (getf (third fields) :prev-timeline))
-                       (eql system-id (catalog-system-identifier)))
+                       (eql system-id (funcall identity-function)))
             (error "logical WAL archive differs from its writer or fixed fork"))
           (setf history-bytes (timeline-history-bytes tip))
           (unless (equalp history (timeline-parse-history tip (bytes->string history-bytes)))
@@ -234,7 +234,7 @@ index and cache are cleared on every exit, and the archive then expires."
                  :guard (lambda ()
                           (and active (eq thread sb-thread:*current-thread*)
                                (eq mutex *wal-lock*) (equal root (truename *pgdata*))
-                               (eql system-id (catalog-system-identifier))
+                               (eql system-id (funcall identity-function))
                                (equalp history-bytes (timeline-history-bytes tip))
                                (funcall guard)
                                (logical-wal-archive-check-selection archive owner))))))))
@@ -253,6 +253,10 @@ index and cache are cleared on every exit, and the archive then expires."
         (setf active nil
               (logical-wal-archive-index archive) nil)
         (logical-wal-archive-clear-cache archive)))))
+
+(defun call-with-logical-wal-archive (system-id history namespace guard function)
+  (call-with-logical-wal-archive-core
+   system-id history namespace guard #'catalog-system-identifier function))
 
 (defun logical-wal-archive-segment-entries (archive segment carrier)
   "Select entries for the exact last-byte carrier in the child history.

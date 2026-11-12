@@ -106,15 +106,12 @@ or authority."
        (snapshot-wal-boundary-timeline boundary)))))
 
 (defun logical-slot-check-startup-identities (slots)
-  "Check known logical slot system IDs before publishing the startup registry.
-When any logical slot has known provenance, read the durable catalog identity
-once and compare it with each known ID and available control metadata. Zero is
-valid; slots with unknown provenance are unchanged. This does not initialize or
-repair the catalog, or prove history and lifetime."
+  "Check known logical slot identities against the durable catalog once.
+Return its system ID when needed, without initializing or repairing the catalog.
+This does not prove history, slot lifetime or import authority."
   (let ((known (remove-if-not
                 (lambda (slot)
-                  (and (wal-logical-slot-p slot)
-                       (wal-replication-slot-logical-provenance slot)))
+                  (and (wal-logical-slot-p slot) (wal-replication-slot-logical-provenance slot)))
                 slots)))
     (when known
       (let ((system-id (physical-slot-startup-system-id)))
@@ -124,11 +121,9 @@ repair the catalog, or prove history and lifetime."
           (error "logical slot startup catalog and control identities differ"))
         (dolist (slot known)
           (unless (= system-id
-                     (logical-slot-provenance-system-id
-                      (wal-replication-slot-logical-provenance slot)))
-            (error "logical slot ~a belongs to another cluster"
-                   (wal-replication-slot-name slot)))))))
-  (values))
+                     (logical-slot-provenance-system-id (wal-replication-slot-logical-provenance slot)))
+            (error "logical slot ~a belongs to another cluster" (wal-replication-slot-name slot))))
+        system-id))))
 
 (defun logical-slot-check-update-under-lock (slot candidate)
   "Check CANDIDATE against the exact live registry SLOT under the WAL lock.

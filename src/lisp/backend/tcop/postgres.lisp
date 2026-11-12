@@ -942,9 +942,7 @@ Hold the drained admission gate and borrow the real postmaster ownership."
         ;; Replay can change the state checked above.  Check again before
         ;; restoring slots, which can also remove temporary slot files.
         (check-primary-storage-startup-context gate-owner ownership)
-        (wal-load-replication-slots)
-        (sb-thread:with-mutex (*wal-lock*)
-          (wal-refresh-logical-capture-slot-mirror-under-wal-lock))
+        (wal-load-replication-slots :gate-owner gate-owner :ownership ownership)
         (catalog-init)
         (wal-ensure-directory-durable (merge-pathnames "base/" *pgdata*))
         (physical-backup-lease-load-records)

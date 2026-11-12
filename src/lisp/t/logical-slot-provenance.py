@@ -518,6 +518,24 @@ def crash(server):
     return process.pid
 
 
+def append_unfinished_batch(server):
+    """Sync complete records without a terminal, then let the caller SIGKILL."""
+    response = server.control('''(progn
+      (sb-thread:with-mutex (*wal-lock*)
+        (wal-append-batch-start)
+        (let* ((images (list (make-wal-page-image
+                              :relfilenode 700 :block 0 :page (page-init (make-page))
+                              :xids '(999) :provenance :row)))
+               (end (+ *wal-end-lsn* +wal-header-size+ (wal-page-payload-length images))))
+          (wal-append-record +wal-record-pages+ 0 (wal-encode-page-images images end)))
+        (wal-flush-core)
+        (format t "UNFINISHED-END=~d~%" *wal-durable-lsn*))
+      (values))''')
+    ends = re.findall(r'UNFINISHED-END=(\d+)', response)
+    assert len(ends) == 1, response
+    return int(ends[0])
+
+
 def check():
     started = time.monotonic()
     server = api['OwnedLisp']()
@@ -551,6 +569,46 @@ def check():
         finally:
             connection.close()
         print(f'logical-slot-provenance: PASS (SQL and wire slots, native crash/restart) '
+              f'{time.monotonic() - started:.6f}s; artifacts: {server.root}', flush=True)
+    finally:
+        server.stop(immediate=True)
+
+
+def check_unfinished_tail():
+    """Startup discards an open batch without losing completed slot progress."""
+    started = time.monotonic()
+    server = api['OwnedLisp']()
+    try:
+        server.start()
+        connection = RawConnection(server.port)
+        try:
+            connection.query('CREATE TABLE tail_rows (id integer)')
+            connection.query("SELECT pg_create_logical_replication_slot('tail_identity','pgoutput')")
+            connection.query('INSERT INTO tail_rows VALUES (1)')
+        finally:
+            connection.close()
+        before = slot_image(server, 'tail_identity')[0]
+        unfinished_end = append_unfinished_batch(server)
+        first_pid = crash(server)
+        server.start()
+        assert server.process.pid != first_pid
+        assert slot_image(server, 'tail_identity')[0] == before
+        server.control(f'''(progn
+          (sb-thread:with-mutex (*wal-lock*)
+            (assert (>= *wal-durable-lsn* {unfinished_end}))
+            (let ((pending (wal-replication-slot-pending-xids
+                             (gethash "tail_identity" *wal-replication-slots*))))
+              (assert (= 1 (hash-table-count pending)))
+              (assert (not (gethash 999 pending)))))
+          (values))''')
+        connection = RawConnection(server.port)
+        try:
+            assert connection.query('SELECT id FROM tail_rows') == [['1']]
+            connection.query('INSERT INTO tail_rows VALUES (2)')
+            assert connection.query('SELECT id FROM tail_rows ORDER BY id') == [['1'], ['2']]
+        finally:
+            connection.close()
+        print(f'logical-slot-provenance: PASS (unfinished durable batch, native crash/restart) '
               f'{time.monotonic() - started:.6f}s; artifacts: {server.root}', flush=True)
     finally:
         server.stop(immediate=True)
@@ -881,5 +939,6 @@ def check_delayed_feedback_reader():
 
 if __name__ == '__main__':
     check()
+    check_unfinished_tail()
     check_promoted()
     check_delayed_feedback_reader()

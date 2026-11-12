@@ -3651,41 +3651,12 @@ An unchanged acknowledgment returns without changing its stored owners."
 
 (declaim (ftype function logical-slot-check-startup-history))
 
-(defun wal-load-replication-slots ()
-  "Validate a complete startup inventory before publishing its registry.
-Check known logical identities, then reserved known slots' primary history.
-Lost logical slots and those with unknown provenance skip the history check.
-Logical restoration during native recovery remains unsupported."
-  (let ((segments (wal-discover-segments))
-        (inactive-since (postgres-current-timestamp))
-        (restored (make-hash-table :test #'equal))
-        (candidates (slot-state-map (wal-replication-slot-directory)
-                                    #'wal-decode-replication-slot :cleanup t)))
-    (logical-slot-check-startup-identities candidates)
-    (logical-slot-check-startup-history candidates)
-    (let ((*wal-replication-slots* restored))
-      (dolist (slot candidates)
-        (let ((name (wal-replication-slot-name slot)))
-          (when (gethash name restored) (error "duplicate WAL replication slot ~a" name))
-          (when (if (wal-physical-slot-p slot)
-                    (physical-slot-restore slot inactive-since)
-                    (progn
-                      (when (recovery-in-progress-p)
-                        (error "logical slot restoration during native recovery is unsupported"))
-                      (wal-validate-replication-slot-wal slot segments)))
-            (wal-check-replication-slot-capacity)
-            (setf (gethash name restored) slot))))
-      (when (and (recovery-in-progress-p) (plusp (hash-table-count restored)))
-        (physical-slot-check-standby-slots
-         (loop for slot being the hash-values of restored collect slot)
-         (physical-slot-startup-system-id)))
-      (maphash (lambda (name slot)
-                 (declare (ignore name))
-                 (wal-slot-rebuild-progress slot))
-               restored))
-    ;; Replace the registry only after every candidate has been checked.
-    (setf *wal-replication-slots* restored))
-  (values))
+(declaim (ftype function logical-slot-load-startup-inventory))
+
+(defun wal-load-replication-slots (&key gate-owner ownership)
+  "Validate startup slots before publishing their registry.
+Known logical slots require the real postmaster and gate-owned startup source."
+  (logical-slot-load-startup-inventory gate-owner ownership))
 
 (defun wal-read-control-fields ()
   "Read one bounded regular control image, returning NIL only when absent.

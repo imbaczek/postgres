@@ -163,3 +163,63 @@
        (unwind-protect
             (funcall function)
          (end-backend-session))))))
+
+(defun call-with-logical-slot-real-startup-test (function)
+  (call-with-queued-clog-test
+   (lambda ()
+     (let ((*wal-ready* nil) (*wal-dirty-resident-limit-pages* 512)
+                             (*query-temp-file-limit-bytes* nil) (*logical-capture-memory-bytes* (* 1024 1024))
+                             (*wal-fpw-state* nil) (*wal-control-metadata* nil)
+                             (*wal-insert-timeline* 1) (*wal-checkpoint-timeline* 1)
+                             (*wal-segment-namespace* :legacy) (*wal-prev-timeline* 1)
+                             (*wal-checkpoint-snapshot* nil) (*wal-xid-reserved-through* nil)
+                             (*catalog* nil) (*catalog-identity-needs-persist-p* nil)
+                             (*catalog-oldest-relfrozenxid* nil) (*catalog-durable-generation* 0)
+                             (*catalog-logical-event-publication-p* nil)
+                             (*wal-level* :logical) (*backend* nil)
+                             (*startup-installed-configuration* nil) (*physical-follow-desired* nil)
+                             (*active-xids* nil) (*next-xid* 3) (*xid-batch-end* 3)
+                             (*active-snapshots* 0) (*active-snapshot-set* (make-hash-table :test #'eq))
+                             (*recovery-reader-xids* (make-hash-table :test #'eql))
+                             (*backend-registry* (make-hash-table :test #'eql)) (*n-backends* 0)
+                             (*shutdown-abandoned-backends* nil)
+                             (*xid-wrap-pending* nil) (*xid-wrap-failure* nil) (*xid-wrap-completed-through* nil)
+                             (*postmaster-data-lock* nil) (*postmaster-pid-stream* nil)
+                             (*postmaster-pid-directory* nil) (*postmaster-pid-inode* nil)
+                             (*postmaster-start-time* nil) (*postmaster-start-timestamp* nil)
+                             (*postmaster-pid-host* nil) (*postmaster-pid-port* nil)
+                             (*physical-recovery-state* nil) (*physical-recovery-failed-p* nil)
+                             (*physical-receive-store* nil) (*physical-follow-runtime* nil)
+                             (*physical-restartpoint-worker* nil) (*primary-wal-writer* nil)
+                             (*logical-capture-live-slots* 0) (*logical-capture-arming* (make-hash-table :test #'eq))
+                             (*logical-capture-xid-modes* (make-hash-table :test #'eql))
+                             (*pm-requested-mode* +no-shutdown+) (*accept-stop-requested* nil)
+                             (*shutdown-finalizing-p* nil) (*shutdown-finished* nil)
+                             (saved-exit-hooks sb-ext:*exit-hooks*))
+       (unwind-protect
+            (progn
+              (let ((settings (startup-default-settings (namestring *pgdata*))))
+                (setf (getf (gethash "wal_level" settings) :value) "logical"
+                      *startup-installed-configuration*
+                      (startup-prepare-installation settings (make-hash-table :test #'equal)
+                                                    (make-hash-table :test #'equal) nil)))
+              (sb-posix:chmod (namestring *pgdata*) #o700)
+              (postmaster-own-data-directory "127.0.0.1" 5439)
+              (when *clog-stream* (close *clog-stream*) (setf *clog-stream* nil))
+              (initialize-primary-storage)
+              (setf *wal-control-metadata*
+                    (make-wal-control-metadata (catalog-system-identifier) +db-in-crash-recovery+))
+              (wal-save-control-fields *wal-checkpoint-lsn* *wal-durable-lsn*)
+              (let ((*backend* (make-backend)))
+                (register-backend *backend*)
+                (unwind-protect (funcall function)
+                  (unwind-protect (end-backend-session) (unregister-backend *backend*)))))
+         (postmaster-remove-pid-file)
+         (when *postmaster-data-lock* (close *postmaster-data-lock*))
+         (setf sb-ext:*exit-hooks* saved-exit-hooks))))))
+
+(defun call-with-logical-slot-owned-startup-test (function)
+  (call-with-live-operation-startup-quiescence
+   (lambda (gate-owner)
+     (call-with-postmaster-ownership
+      (lambda (ownership) (funcall function gate-owner ownership))))))
