@@ -111,6 +111,12 @@ inputs use the historical generic calculation.  BYTES is read without mutation."
         digest)))
 
 (defun physical-store-update-digest-span (digest bytes start end)
+  "Extend DIGEST over the half-open span [START, END) without changing BYTES.
+For an unsigned 64-bit digest, simple octet vector and valid fixnum bounds,
+use the span kernel; an empty span returns the identical DIGEST object.
+Joining the result halves may box a full-width integer. Other inputs use SUBSEQ
+and the existing whole-vector updater to preserve generic values and errors.
+FNV-1a is a checksum, not a cryptographic hash."
   (if (and (typep digest '(unsigned-byte 64))
            (typep bytes '(simple-array (unsigned-byte 8) (*)))
            (typep start 'fixnum) (typep end 'fixnum)
