@@ -9,9 +9,10 @@
   "Immutable slot identity and optional logical ON interval evidence.
 Provenance validation checks shape. The image codec also checks framing, CRC
 and canonical bytes. Startup checks known system IDs against the durable
-catalog and available control metadata. Guarded updates retain the same
-provenance object. Creation stamping, SQL projection and import remain unwired;
-callers must separately prove history and lifetime."
+catalog and available control metadata. Slot creation stamps provenance from
+the captured boundary; guarded updates retain the same object. SQL projection,
+provenance-aware slot import and adoption remain unwired; callers must separately
+prove history and lifetime."
   (system-id nil :read-only t)
   (generation nil :read-only t)
   (birth-timeline nil :read-only t)
@@ -50,6 +51,15 @@ History and source identity require separate verification."
 
 (defun logical-slot-creation-evidence-under-lock
     (boundary-lsn restart-lsn registration)
+  "Build creation provenance from the frozen snapshot boundary under WAL lock.
+Require the durable catalog system ID to match the live catalog and any control
+identity. Under the snapshot-count lock, verify the active registration and
+exact pin along with a positive birth and its prefix owner. The restart owner
+must match its captured role, either prefix end or record start. This check
+linearizes against release; WAL retains the pin through durable slot transfer.
+Copy the captured optional ON evidence and mint one generation before the
+first slot publication. History checks establish geometry, not import lifetime
+or authority."
   (assert (sb-thread:holding-mutex-p *wal-lock*))
   (let* ((boundary (snapshot-registration-wal-boundary registration))
          (system-id (physical-slot-startup-system-id))

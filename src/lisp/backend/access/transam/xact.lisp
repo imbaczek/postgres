@@ -1658,7 +1658,10 @@ excluded, so a sequence advance before slot publication remains streamable."
      &optional active-xids database-oid (plugin "pg_lisp"))
   "Persist and publish a slot while *WAL-LOCK* protects its retention point.
 The capture arm must remain held, older uncaptured XIDs must have drained, and
-ON status must be durable before the slot is published."
+ON status must be durable before the slot is published. Validate the frozen
+snapshot boundary and pin, then mint provenance before publishing the slot.
+WAL exclusion keeps the snapshot pin until the durable slot takes its horizon;
+validation under the snapshot-count lock linearizes creation against release."
   (sb-thread:with-mutex (*xid-lock*)
     (unless (plusp (hash-table-count *logical-capture-arming*))
       (error "logical slot publication requires an armed capture gate"))
