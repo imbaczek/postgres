@@ -264,6 +264,7 @@ record owner, carrier and kind; local progress is not slot acknowledgement."
 (defstruct (logical-wal-source (:constructor %make-logical-wal-source))
   "Captured source facts for rechecking a slot reader under the WAL mutex.
 These facts retain history metadata, not pins, leases or WAL payload buffers."
+  (purpose :stream :read-only t)
   (slot nil :read-only t) (name nil :read-only t) (owner nil :read-only t)
   (database nil :read-only t) (plugin nil :read-only t)
   (catalog nil :read-only t) (system-id nil :read-only t)
@@ -282,7 +283,7 @@ Reuse requires a fresh source check and new scan and archive scopes."
   (let* ((path (truename *pgdata*)) (info (sb-posix:stat path)))
     (list path (sb-posix:stat-dev info) (sb-posix:stat-ino info))))
 
-(defun logical-wal-capture-source (scan)
+(defun logical-wal-capture-source (scan &key (purpose :stream))
   "Capture primary slot and source facts under WAL exclusion."
   (assert (sb-thread:holding-mutex-p *wal-lock*))
   (let* ((slot (wal-retained-slot-scan-slot scan))
@@ -292,12 +293,18 @@ Reuse requires a fresh source check and new scan and archive scopes."
                    (timeline-parse-history timeline (if bytes (bytes->string bytes) ""))))
          (provenance (wal-replication-slot-logical-provenance slot))
          (system-id (physical-slot-startup-system-id)))
+    (ecase purpose
+      (:stream
+       (unless (and (wal-retained-slot-scan-owner scan)
+                    (eq (wal-retained-slot-scan-owner scan) *wal-logical-slot-owner*))
+         (error "logical WAL stream source requires its real reader owner")))
+      (:terminal-check))
     (unless (and *catalog* provenance
                  (eql system-id (logical-slot-provenance-system-id provenance)))
       (error "logical WAL cursor requires known primary slot identity"))
     (logical-slot-check-primary-history slot history)
     (%make-logical-wal-source
-     :slot slot :name (copy-seq (wal-retained-slot-scan-name scan))
+     :purpose purpose :slot slot :name (copy-seq (wal-retained-slot-scan-name scan))
      :owner (wal-retained-slot-scan-owner scan)
      :database (wal-retained-slot-scan-database scan)
      :plugin (copy-seq (wal-retained-slot-scan-plugin scan))
@@ -320,7 +327,10 @@ selected WAL source."
                  (eq sb-thread:*current-thread* (logical-wal-source-thread source))
                  *wal-ready* (not (recovery-in-progress-p))
                  (eq slot (wal-find-usable-replication-slot-under-lock (logical-wal-source-name source)))
-                 (eq (logical-wal-source-owner source) *wal-logical-slot-owner*)
+                 (ecase (logical-wal-source-purpose source)
+                   (:stream (and (logical-wal-source-owner source)
+                                 (eq (logical-wal-source-owner source) *wal-logical-slot-owner*)))
+                   (:terminal-check t))
                  (eq (logical-wal-source-owner source) (wal-replication-slot-active-owner slot))
                  (eq :reserved (wal-replication-slot-wal-status slot))
                  (eql (logical-wal-source-database source) (wal-replication-slot-database-oid slot))
@@ -352,20 +362,19 @@ timeout (57014). A miss leaves the caller to validate anew."
   (assert (sb-thread:holding-mutex-p *wal-lock*))
   (let ((certificate *wal-logical-slot-read-continuation*))
     (when (and certificate
+               (eq :stream (logical-wal-source-purpose (logical-wal-continuation-source certificate)))
                (eq slot (logical-wal-source-slot (logical-wal-continuation-source certificate)))
                (eql position (logical-wal-continuation-position certificate)))
-      (handler-case-nonfatal
+      (handler-case-noninterrupt
        (when (logical-wal-check-source (logical-wal-continuation-source certificate) end)
          certificate)
-       (condition
-        (if (and (typep condition 'pg-error)
-                 (string= "57014" (pg-error-sqlstate condition)))
-            (error condition)
-            nil))))))
+       (condition nil)))))
 
 (defun logical-wal-certify-boundary (source position)
   "Make boundary evidence after the caller has rechecked the finished prefix."
   (assert (sb-thread:holding-mutex-p *wal-lock*))
+  (unless (eq :stream (logical-wal-source-purpose source))
+    (error "read-only terminal evidence cannot certify a reader continuation"))
   (unless (plusp position) (error "logical WAL continuation requires a completed prefix"))
   (%make-logical-wal-continuation
    :source source :position position
@@ -434,6 +443,8 @@ continuation nor its facts retain a pin, reader lease or cached WAL payload."
         (wal-retained-slot-scan-validate-under-lock scan)
         (setf source (if certificate (logical-wal-continuation-source certificate)
                          (logical-wal-capture-source scan)))
+        (unless (eq :stream (logical-wal-source-purpose source))
+          (error "read-only terminal evidence cannot open a slot reader"))
         (unless (and (eq (logical-wal-source-slot source) (wal-retained-slot-scan-slot scan))
                      (eq (logical-wal-source-owner source) (wal-retained-slot-scan-owner scan))
                      (eql (logical-wal-source-timeline source) (wal-retained-slot-scan-timeline scan))
@@ -472,3 +483,81 @@ thread, mutex and lifetime checks.  This grants no import authority."
    (lambda (scan)
      (call-with-logical-slot-wal-cursor-from-scan
       scan owner role (lambda (cursor source) (declare (ignore source)) (funcall function cursor))))))
+
+(defun logical-wal-cursor-terminal-p (cursor target)
+  (let ((*wal-recovery-reservation-batch-clean-p* nil) (batch-open nil))
+    (loop
+      (multiple-value-bind (record bytes owner carrier kind) (logical-wal-cursor-next cursor)
+        (declare (ignore bytes owner carrier))
+        (unless record (return nil))
+        (when (eq kind :ordinary)
+          (wal-note-recovery-batch-record record)
+          (let ((type (wal-record-type record)))
+            (when (wal-empty-metadata-terminal-type-p type)
+              (wal-validate-empty-metadata-terminal
+               record (and batch-open *wal-recovery-reservation-batch-clean-p*)))
+            (cond ((= type +wal-record-batch-start+) (setf batch-open t))
+                  ((wal-terminal-record-type-p type)
+                   (when (and batch-open (= target (wal-record-end record))) (return t))
+                   (setf batch-open nil *wal-recovery-reservation-batch-clean-p* nil)))))
+        (when (>= (wal-record-end record) target) (return nil))))))
+
+(defun call-with-logical-terminal-cursor (scan source owner role target finish)
+  (labels ((check-source ()
+             (wal-retained-slot-scan-validate-under-lock scan)
+             (unless (and (eq :terminal-check (logical-wal-source-purpose source))
+                          (eq (logical-wal-source-slot source) (wal-retained-slot-scan-slot scan))
+                          (eq (logical-wal-source-owner source) (wal-retained-slot-scan-owner scan)))
+               (error "logical terminal proof source differs from its scan"))
+             (logical-wal-check-source source (wal-retained-slot-scan-end scan))))
+    (call-with-optional-logical-wal-archive
+     (logical-wal-source-system-id source) (logical-wal-source-history source)
+     (logical-wal-source-namespace source) #'check-source
+     (lambda (archive)
+       (call-with-logical-wal-cursor
+        (logical-wal-source-history source) (logical-wal-source-namespace source)
+        (wal-retained-slot-scan-start scan) (wal-retained-slot-scan-end scan)
+        owner role (if archive (constantly t) #'check-source)
+        (lambda (cursor)
+          (let ((found (logical-wal-cursor-terminal-p cursor target)))
+            (sb-thread:with-mutex (*wal-lock*)
+              (logical-wal-cursor-check-scope cursor)
+              (funcall finish (wal-retained-slot-scan-slot scan) found))))
+        :archive archive :batch-policy :logical-reader)))))
+
+(defun call-with-logical-slot-terminal-check (name target prepare finish)
+  (let ((scan nil) (source nil) (owner nil) (role nil))
+    (unwind-protect
+         (progn
+           (sb-thread:with-mutex (*wal-lock*)
+             (wal-check-healthy)
+             (let ((slot (wal-find-usable-replication-slot-under-lock name)))
+               (multiple-value-bind (done result) (funcall prepare slot)
+                 (when done (return-from call-with-logical-slot-terminal-check result)))
+               (unless (wal-replication-slot-logical-provenance slot)
+                 (return-from call-with-logical-slot-terminal-check
+                   (funcall finish slot (wal-slot-terminal-ack-p slot target))))
+               (when (logical-wal-reusable-continuation slot target target)
+                 (return-from call-with-logical-slot-terminal-check (funcall finish slot t)))
+               (let ((start (wal-replication-slot-restart-lsn slot))
+                     (end *wal-durable-lsn*)
+                     (pin (gensym "LOGICAL-TERMINAL-PIN-")))
+                 (unless (and (typep start '(unsigned-byte 64))
+                              (typep target '(unsigned-byte 64)) (<= start target end))
+                   (error "logical terminal target is outside retained durable WAL"))
+                 (sb-sys:without-interrupts
+                   (setf scan (make-wal-retained-slot-scan
+                               :name name :slot slot :owner (wal-replication-slot-active-owner slot)
+                               :database (wal-replication-slot-database-oid slot)
+                               :plugin (copy-seq (wal-replication-slot-plugin slot))
+                               :timeline *wal-insert-timeline* :namespace *wal-segment-namespace*
+                               :start start :end end :cursor start :pin pin))
+                   (setf (gethash pin *wal-snapshot-retention-pins*) start))
+                 (setf source (logical-wal-capture-source scan :purpose :terminal-check))
+                 (multiple-value-setq (owner role) (logical-slot-wal-scan-start-position scan))
+                 (logical-wal-check-source source end))))
+           (call-with-logical-terminal-cursor scan source owner role target finish))
+      (when scan
+        (sb-sys:without-interrupts
+          (sb-thread:with-mutex (*wal-lock*)
+            (remhash (wal-retained-slot-scan-pin scan) *wal-snapshot-retention-pins*)))))))

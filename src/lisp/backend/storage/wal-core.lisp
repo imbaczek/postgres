@@ -3547,6 +3547,30 @@ acknowledgments and resume paths can return before this helper."
               (wal-slot-restart-for-ack restart-floor pending)))
     (logical-slot-save-update-under-lock slot candidate)))
 
+(declaim (ftype function call-with-logical-slot-terminal-check))
+
+(defun wal-check-replication-slot-ack-under-lock (slot name acknowledged-lsn expected-owner)
+  (assert (sb-thread:holding-mutex-p *wal-lock*))
+  (wal-check-healthy)
+  (unless slot (ereport "42704" "replication slot \"~a\" does not exist" name))
+  (wal-require-logical-slot slot)
+  (when (and expected-owner
+             (not (eq (wal-replication-slot-active-owner slot) expected-owner)))
+    (ereport "55006" "replication slot \"~a\" is not owned by this reader" name))
+  (when (and (wal-replication-slot-active-owner slot)
+             (not (eq (wal-replication-slot-active-owner slot) *wal-logical-slot-owner*)))
+    (ereport "55006" "replication slot \"~a\" is active" name))
+  (when (eq (wal-replication-slot-wal-status slot) :lost)
+    (ereport "55000" "replication slot \"~a\" has lost its WAL" name))
+  (let ((confirmed (wal-replication-slot-confirmed-flush-lsn slot)))
+    (unless confirmed
+      (ereport "55000" "initial replication slot acknowledgment requires its owner"))
+    (when (< acknowledged-lsn confirmed)
+      (ereport "22023" "replication slot acknowledgment cannot move backwards"))
+    (when (> acknowledged-lsn *wal-durable-lsn*)
+      (ereport "22023" "replication slot acknowledgment is past durable WAL"))
+    confirmed))
+
 (defun wal-acknowledge-replication-slot
     (name acknowledged-lsn &optional expected-owner)
   "Durably advance a slot after a consumer completes a terminal WAL batch.
@@ -3554,40 +3578,19 @@ An unchanged acknowledgment returns without changing its stored owners."
   (unless (and (integerp acknowledged-lsn)
                (<= 0 acknowledged-lsn #xFFFFFFFFFFFFFFFF))
     (ereport "22023" "invalid replication slot acknowledgment LSN"))
-  (sb-thread:with-mutex (*wal-lock*)
-    (wal-check-healthy)
-    (let* ((slot (wal-find-usable-replication-slot-under-lock name))
-           (confirmed (and slot
-                           (wal-replication-slot-confirmed-flush-lsn slot))))
-      (unless slot
-        (ereport "42704" "replication slot \"~a\" does not exist" name))
-      (wal-require-logical-slot slot)
-      (when (and expected-owner
-                 (not (eq (wal-replication-slot-active-owner slot)
-                          expected-owner)))
-        (ereport "55006" "replication slot \"~a\" is not owned by this reader"
-                 name))
-      (when (and (wal-replication-slot-active-owner slot)
-                 (not (eq (wal-replication-slot-active-owner slot)
-                          *wal-logical-slot-owner*)))
-        (ereport "55006" "replication slot \"~a\" is active" name))
-      (when (eq (wal-replication-slot-wal-status slot) :lost)
-        (ereport "55000" "replication slot \"~a\" has lost its WAL" name))
-      ;; Initial copy completion has a separate owner-checked finalizer below.
-      ;; Keeping it out of this general path prevents an unowned client from
-      ;; advancing a snapshot slot after its runtime owner was released.
-      (unless confirmed
-        (ereport "55000" "initial replication slot acknowledgment requires its owner"))
-      (when (and confirmed (< acknowledged-lsn confirmed))
-        (ereport "22023" "replication slot acknowledgment cannot move backwards"))
-      (when (> acknowledged-lsn *wal-durable-lsn*)
-        (ereport "22023" "replication slot acknowledgment is past durable WAL"))
-      (when (= (or confirmed -1) acknowledged-lsn)
-        (return-from wal-acknowledge-replication-slot slot))
-      (unless (wal-slot-terminal-ack-p slot acknowledged-lsn)
-        (ereport "22023"
-                 "replication slot acknowledgment must name a terminal WAL batch LSN"))
-      (wal-persist-replication-slot-ack-under-lock slot acknowledged-lsn))))
+  (call-with-logical-slot-terminal-check
+   name acknowledged-lsn
+   (lambda (slot)
+     (let ((confirmed (wal-check-replication-slot-ack-under-lock
+                       slot name acknowledged-lsn expected-owner)))
+       (values (= confirmed acknowledged-lsn) slot)))
+   (lambda (slot found)
+     (let ((confirmed (wal-check-replication-slot-ack-under-lock
+                       slot name acknowledged-lsn expected-owner)))
+       (cond ((= confirmed acknowledged-lsn) slot)
+             (found (wal-persist-replication-slot-ack-under-lock slot acknowledged-lsn))
+             (t (ereport "22023"
+                         "replication slot acknowledgment must name a terminal WAL batch LSN")))))))
 
 (defun wal-finalize-replication-slot-copy (name boundary-lsn expected-owner)
   "Confirm an initial snapshot boundary for its exact active slot owner."
@@ -3693,9 +3696,10 @@ Reject extra lines before decoding its CRC and checkpoint metadata."
           (let ((line (read-line stream nil nil)))
             (unless (and line (<= (length line) +wal-control-maximum-bytes+) (null (read-line stream nil nil)))
               (error "WAL control file ~a is corrupt" path))
-            (handler-case (wal-decode-control-line line)
-              (error (condition)
-                (error "WAL control file ~a is corrupt: ~a" path condition)))))
+            (sb-sys:without-interrupts
+              (handler-case-noninterrupt (wal-decode-control-line line)
+                                         (condition
+                                          (error "WAL control file ~a is corrupt: ~a" path condition))))))
       (sb-posix:syscall-error (condition)
         (unless (= sb-posix:enoent (sb-posix:syscall-errno condition))
           (error condition))))))

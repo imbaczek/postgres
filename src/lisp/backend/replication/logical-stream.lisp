@@ -1701,60 +1701,72 @@ tracked by the bounded sender. SENT-LSN never includes an unfinished frame."
       (wal-persist-replication-slot-ack-under-lock
        slot acknowledged-lsn restart-floor))))
 
-(defun wal-logical-slot-validate-start-position (name requested-lsn)
+(defun wal-check-logical-start-under-lock (slot name requested-lsn)
+  (assert (sb-thread:holding-mutex-p *wal-lock*))
+  (wal-check-healthy)
+  (unless slot (ereport "42704" "replication slot \"~a\" does not exist" name))
+  (when (eq (wal-replication-slot-wal-status slot) :lost)
+    (ereport "55000" "replication slot \"~a\" has lost its WAL" name))
+  (unless (wal-replication-slot-database-oid slot)
+    (ereport "55000" "logical replication slot has no database binding"))
+  (let ((confirmed (wal-replication-slot-confirmed-flush-lsn slot)))
+    (if (null confirmed)
+        (unless (= requested-lsn (wal-replication-slot-consistent-lsn slot))
+          (ereport "22023" "initial logical replication must start at the consistent LSN"))
+        (unless (<= confirmed requested-lsn *wal-durable-lsn*)
+          (ereport "22023" "logical replication start LSN is outside retained durable WAL")))
+    confirmed))
+
+(defun wal-logical-slot-validate-start-position (name requested-lsn &key (validate-wal t))
   "Validate the requested initial or resumed stream boundary for NAME."
-  (unless (and (integerp requested-lsn)
-               (<= 0 requested-lsn #xFFFFFFFFFFFFFFFF))
+  (unless (and (integerp requested-lsn) (<= 0 requested-lsn #xFFFFFFFFFFFFFFFF))
     (ereport "22023" "invalid logical replication start LSN"))
-  (sb-thread:with-mutex (*wal-lock*)
-    (wal-check-healthy)
-    (let ((slot (wal-find-usable-replication-slot-under-lock name)))
-      (unless slot
-        (ereport "42704" "replication slot \"~a\" does not exist" name))
-      (when (eq (wal-replication-slot-wal-status slot) :lost)
-        (ereport "55000" "replication slot \"~a\" has lost its WAL" name))
-      (unless (wal-replication-slot-database-oid slot)
-        (ereport "55000" "logical replication slot has no database binding"))
-      (if (null (wal-replication-slot-confirmed-flush-lsn slot))
-          (unless (= requested-lsn (wal-replication-slot-consistent-lsn slot))
-            (ereport "22023"
-                     "initial logical replication must start at the consistent LSN"))
-          (let ((confirmed
-                  (wal-replication-slot-confirmed-flush-lsn slot)))
-            (unless (<= confirmed requested-lsn *wal-durable-lsn*)
-              (ereport "22023"
-                       "logical replication start LSN is outside retained durable WAL"))
-            (when (and (> requested-lsn confirmed)
-                       (not (wal-slot-terminal-ack-p slot requested-lsn)))
-              (ereport "22023"
-                       "logical replication start LSN must be a terminal WAL batch")))))
-    (values)))
+  (if validate-wal
+      (call-with-logical-slot-terminal-check
+       name requested-lsn
+       (lambda (slot)
+         (let ((confirmed (wal-check-logical-start-under-lock slot name requested-lsn)))
+           (values (or (null confirmed) (= confirmed requested-lsn)) nil)))
+       (lambda (slot found)
+         (let ((confirmed (wal-check-logical-start-under-lock slot name requested-lsn)))
+           (when (and confirmed (> requested-lsn confirmed) (not found))
+             (ereport "22023" "logical replication start LSN must be a terminal WAL batch")))))
+      (sb-thread:with-mutex (*wal-lock*)
+        (wal-check-logical-start-under-lock
+         (wal-find-usable-replication-slot-under-lock name) name requested-lsn)))
+  (values))
+
+(defun wal-check-logical-resume-under-lock (slot name requested-lsn)
+  (assert (sb-thread:holding-mutex-p *wal-lock*))
+  (wal-check-healthy)
+  (unless slot (ereport "42704" "replication slot \"~a\" does not exist" name))
+  (unless (eq (wal-replication-slot-active-owner slot) *wal-logical-slot-owner*)
+    (ereport "55006" "logical replication slot is not owned by this reader"))
+  (let ((confirmed (wal-replication-slot-confirmed-flush-lsn slot)))
+    (unless confirmed (ereport "55000" "initial copy requires its consistent-point handshake"))
+    (unless (and (integerp requested-lsn) (<= confirmed requested-lsn *wal-durable-lsn*))
+      (ereport "22023" "resume status is outside confirmed durable WAL"))
+    confirmed))
 
 (defun wal-logical-slot-accept-resume-position (name requested-lsn)
   "Confirm a target's durable marker as the first status on a resumed stream."
   (unless *wal-logical-slot-owner*
     (ereport "55000" "logical replication slot is not owned by this reader"))
-  (sb-thread:with-mutex (*wal-lock*)
-    (wal-check-healthy)
-    (let* ((slot (wal-find-usable-replication-slot-under-lock name))
-           (confirmed (and slot
-                           (wal-replication-slot-confirmed-flush-lsn slot))))
-      (unless slot
-        (ereport "42704" "replication slot \"~a\" does not exist" name))
-      (unless (eq (wal-replication-slot-active-owner slot)
-                  *wal-logical-slot-owner*)
-        (ereport "55006" "logical replication slot is not owned by this reader"))
-      (unless confirmed
-        (ereport "55000" "initial copy requires its consistent-point handshake"))
-      (unless (and (integerp requested-lsn)
-                   (<= confirmed requested-lsn *wal-durable-lsn*))
-        (ereport "22023" "resume status is outside confirmed durable WAL"))
-      (when (> requested-lsn confirmed)
-        (unless (wal-slot-terminal-ack-p slot requested-lsn)
-          (ereport "22023" "resume status must name a terminal WAL batch"))
-        (wal-persist-replication-slot-ack-under-lock slot requested-lsn))
-      (setf *wal-logical-slot-read-progress* requested-lsn)
-      requested-lsn)))
+  (call-with-logical-slot-terminal-check
+   name requested-lsn
+   (lambda (slot)
+     (let ((confirmed (wal-check-logical-resume-under-lock slot name requested-lsn)))
+       (if (= confirmed requested-lsn)
+           (progn (setf *wal-logical-slot-read-progress* requested-lsn)
+                  (values t requested-lsn))
+           (values nil nil))))
+   (lambda (slot found)
+     (let ((confirmed (wal-check-logical-resume-under-lock slot name requested-lsn)))
+       (when (> requested-lsn confirmed)
+         (unless found (ereport "22023" "resume status must name a terminal WAL batch"))
+         (wal-persist-replication-slot-ack-under-lock slot requested-lsn))
+       (setf *wal-logical-slot-read-progress* requested-lsn)
+       requested-lsn))))
 
 (defstruct wal-retained-slot-scan
   name slot owner database plugin timeline namespace start end cursor pin continuation)

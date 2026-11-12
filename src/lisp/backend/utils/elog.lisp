@@ -41,6 +41,15 @@ Every error is fatal once this backend has latched a WAL failure."
            (error ,condition)
            (progn ,@handler-body)))))
 
+(defmacro handler-case-noninterrupt (form (condition &body handler-body))
+  "Handle ordinary errors, preserving fatal and cancellation conditions."
+  `(handler-case-nonfatal ,form
+                          (,condition
+                           (if (and (typep ,condition 'pg-error)
+                                    (string= "57014" (pg-error-sqlstate ,condition)))
+                               (error ,condition)
+                               (progn ,@handler-body)))))
+
 (defun make-pg-error (severity sqlstate control-string args)
   "Build, but do not signal, a PG-ERROR.
 

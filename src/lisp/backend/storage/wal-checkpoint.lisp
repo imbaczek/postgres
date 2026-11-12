@@ -354,7 +354,7 @@ An absent key means unknown; a present NIL is malformed."
          (present (intersection keys '(:resource-parameters :resource-lsn :resource-timeline))))
     (or (null present)
         (and (= 3 (length present))
-             (ignore-errors (wal-control-resource-parameters metadata))
+             (handler-case-noninterrupt (wal-control-resource-parameters metadata) (condition nil))
              (typep (getf metadata :resource-lsn) '(integer 1 18446744073709551615))
              (typep (getf metadata :resource-timeline) '(integer 1 4294967295))))))
 
@@ -379,16 +379,16 @@ five integers as a list so EQUAL compares metadata without case-folding strings.
   (when (member (length fields) '(11 15 17 21))
     (let ((metadata
             (make-wal-control-metadata
-             (ignore-errors (parse-integer (eighth fields)))
-             (ignore-errors (parse-integer (ninth fields)))
-             (ignore-errors (parse-integer (tenth fields))))))
+             (handler-case-noninterrupt (parse-integer (eighth fields)) (condition nil))
+             (handler-case-noninterrupt (parse-integer (ninth fields)) (condition nil))
+             (handler-case-noninterrupt (parse-integer (tenth fields)) (condition nil)))))
       (when (member (length fields) '(17 21))
         (setf metadata
               (append metadata
                       (list :retained-reference
                             (loop for key in *wal-retained-reference-keys*
                                   for field in (subseq fields 10 16)
-                                  append (list key (ignore-errors (parse-integer field))))))))
+                                  append (list key (handler-case-noninterrupt (parse-integer field) (condition nil))))))))
       (when (member (length fields) '(15 21))
         (let ((offset (if (= 21 (length fields)) 16 10)))
           (unless (equal "R" (nth offset fields))
@@ -396,8 +396,8 @@ five integers as a list so EQUAL compares metadata without case-folding strings.
           (setf metadata
                 (append metadata
                         (list :resource-parameters (resource-parameters-values (wal-resource-parameters-from-hex (nth (1+ offset) fields)))
-                              :resource-lsn (ignore-errors (parse-integer (nth (+ offset 2) fields)))
-                              :resource-timeline (ignore-errors (parse-integer (nth (+ offset 3) fields))))))))
+                              :resource-lsn (handler-case-noninterrupt (parse-integer (nth (+ offset 2) fields)) (condition nil))
+                              :resource-timeline (handler-case-noninterrupt (parse-integer (nth (+ offset 3) fields)) (condition nil)))))))
       (unless (wal-control-metadata-valid-p metadata)
         (error "invalid primary control metadata"))
       metadata)))
@@ -482,14 +482,14 @@ follow the fixed key order. The CRC covers every supplied field."
          (v6 (equal version "PGWAL6"))
          (identities (member version '("PGWAL5" "PGWAL6") :test #'equal))
          (v4 (equal version "PGWAL4"))
-         (checkpoint (ignore-errors (parse-integer (second fields))))
-         (durable (ignore-errors (parse-integer (third fields))))
-         (timeline (if identities (ignore-errors (parse-integer (fourth fields))) 1))
-         (checkpoint-timeline (if identities (ignore-errors (parse-integer (fifth fields))) 1))
+         (checkpoint (handler-case-noninterrupt (parse-integer (second fields)) (condition nil)))
+         (durable (handler-case-noninterrupt (parse-integer (third fields)) (condition nil)))
+         (timeline (if identities (handler-case-noninterrupt (parse-integer (fourth fields)) (condition nil)) 1))
+         (checkpoint-timeline (if identities (handler-case-noninterrupt (parse-integer (fifth fields)) (condition nil)) 1))
          (namespace (if v6 (cond ((equal (sixth fields) "legacy") :legacy)
                                  ((equal (sixth fields) "timeline") :timeline))
                         :legacy))
-         (crc (ignore-errors (parse-integer (car (last fields)) :radix 16))))
+         (crc (handler-case-noninterrupt (parse-integer (car (last fields)) :radix 16) (condition nil))))
     (unless (and (cond (v6 (member (length fields) '(8 11 15 17 21)))
                        (identities (= (length fields) 7))
                        (v4 (= (length fields) 5))

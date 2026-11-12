@@ -564,3 +564,144 @@
                    (ok (eq condition caught) "interruptions and fatal errors propagate unchanged"))))
         (setf (symbol-function 'pg::logical-wal-check-source) original))
       (ok (= 4 attempts))))
+
+(deftest logical-terminal-cursor-classifies-interior-records-with-a-full-horizon
+    (call-with-reader-row-batches
+     (lambda (scan first-end end event-bytes)
+       (declare (ignore scan event-bytes))
+       (dolist (target (list first-end end (1- first-end) 32))
+         (pg::call-with-logical-wal-cursor
+          (pg::timeline-parse-history 1 "") :timeline 0 end 1 :prefix-end (lambda () t)
+          (lambda (cursor)
+            (ok (eql (not (null (member target (list first-end end))))
+                     (pg::logical-wal-cursor-terminal-p cursor target))))
+          :batch-policy :logical-reader)))))
+
+(deftest logical-terminal-cursor-does-not-acknowledge-end-of-recovery
+    (with-physical-store-directory (root)
+      (let* ((pg::*pgdata* root) (empty (make-array 0 :element-type '(unsigned-byte 8)))
+                                 (a (pg::wal-encode-record pg::+wal-record-batch-start+ 0 0 empty))
+                                 (b (pg::wal-encode-record pg::+wal-record-maintenance+ 0 32 empty))
+                                 (eor (pg::wal-encode-end-of-recovery-record 64 0 2 1 1))
+                                 (end (+ 64 (length eor))))
+        (lineage-test-file 2 0 a b eor)
+        (dolist (target (list 64 65 end))
+          (pg::call-with-logical-wal-cursor
+           (lineage-test-history 64) :timeline 0 end 1 :prefix-end (lambda () t)
+           (lambda (cursor) (ok (eql (= target 64) (pg::logical-wal-cursor-terminal-p cursor target))))
+           :batch-policy :logical-reader)))))
+
+(deftest logical-read-only-terminal-evidence-cannot-create-reader-authority
+    (let* ((slot (pg::make-wal-replication-slot :name "observed-slot"))
+           (source (pg::%make-logical-wal-source :purpose :terminal-check :slot slot))
+           (pg::*wal-logical-slot-read-continuation*
+             (pg::%make-logical-wal-continuation :source source :position 64 :owner 1)))
+      (sb-thread:with-mutex (pg::*wal-lock*)
+        (ok (null (pg::logical-wal-reusable-continuation slot 64 64)))
+        (let ((message (handler-case (progn (pg::logical-wal-certify-boundary source 64) nil)
+                         (error (condition) (princ-to-string condition)))))
+          (ok (and message (search "read-only terminal evidence cannot certify" message)))))))
+
+(deftest logical-read-only-terminal-evidence-cannot-open-a-slot-reader
+    (let* ((pg::*wal-poisoned* nil) (pg::*backend* nil)
+                                    (pg::*wal-replication-slots* (make-hash-table :test #'equal))
+                                    (pg::*wal-snapshot-retention-pins* (make-hash-table :test #'eq))
+                                    (slot (pg::make-wal-replication-slot :name "observed-reader" :wal-status :reserved
+                                                                         :database-oid 1 :plugin "pgoutput"))
+                                    (source (pg::%make-logical-wal-source :purpose :terminal-check :slot slot))
+                                    (certificate (pg::%make-logical-wal-continuation :source source :position 64 :owner 1))
+                                    (pin (gensym "READ-ONLY-PIN-"))
+                                    (scan (pg::make-wal-retained-slot-scan
+                                           :name "observed-reader" :slot slot :database 1 :plugin "pgoutput"
+                                           :timeline pg::*wal-insert-timeline* :namespace pg::*wal-segment-namespace*
+                                           :start 64 :end 64 :pin pin :continuation certificate))
+                                    (called nil))
+      (setf (gethash "observed-reader" pg::*wal-replication-slots*) slot
+            (gethash pin pg::*wal-snapshot-retention-pins*) 64)
+      (let ((message (handler-case
+                         (pg::call-with-logical-slot-wal-cursor-from-scan
+                          scan 1 :prefix-end
+                          (lambda (&rest arguments) (declare (ignore arguments)) (setf called t)))
+                       (error (condition) (princ-to-string condition)))))
+        (ok (and message (search "read-only terminal evidence cannot open a slot reader" message)))
+        (ok (not called)))))
+
+(cl-spec:defproperty logical-terminal-classification-matches-constructed-batch-ends
+    ((raw (range integer 0 4294967295)))
+  (:about pg::logical-wal-cursor-terminal-p)
+  (:trials (:normal 100))
+  (call-with-reader-row-batches
+   (lambda (scan first-end end event-bytes)
+     (declare (ignore scan event-bytes))
+     (let ((target (1+ (mod raw end))))
+       (pg::call-with-logical-wal-cursor
+        (pg::timeline-parse-history 1 "") :timeline 0 end 1 :prefix-end (lambda () t)
+        (lambda (cursor)
+          (eql (not (null (member target (list first-end end))))
+               (pg::logical-wal-cursor-terminal-p cursor target)))
+        :batch-policy :logical-reader)))))
+
+(deftest generated-logical-terminal-classification
+    (let ((data (cl-spec:result-data
+                 (cl-spec:run-property 'logical-terminal-classification-matches-constructed-batch-ends :seed 748))))
+      (ok (eq :passed (getf data :status)) (format nil "~s" data))
+      (ok (= 100 (getf data :trials)))))
+
+(deftest logical-control-decode-preserves-interruption-conditions
+    (with-physical-store-directory (root)
+      (let* ((pg::*pgdata* root)
+             (pg::*backend* (pg::make-backend))
+             (metadata (append (pg::make-wal-control-metadata 42 1 0)
+                               (list :resource-parameters '(100 8 10 0 64)
+                                     :resource-lsn 64 :resource-timeline 1)))
+             (original (symbol-function 'pg::wal-control-resource-parameters)))
+        (pg::wal-atomic-write-bytes
+         (pg::wal-control-path) (pg::wal-encode-control-image 0 64 nil :metadata metadata))
+        (unwind-protect
+             (dolist (delivery '(:synchronous :asynchronous))
+               (dolist (kind '(:fatal :cancel :termination :query-cancel :timeout))
+                 (let ((sentinel (make-condition 'pg::pg-error
+                                                 :severity (if (eq kind :fatal) "FATAL" "ERROR")
+                                                 :sqlstate (if (eq kind :fatal) "57P01" "57014")
+                                                 :detail "decode interruption"))
+                       (attempts 0) (delivered 0) (caught nil))
+                   (setf (symbol-function 'pg::wal-control-resource-parameters)
+                         (lambda (value)
+                           (when (= 1 (incf attempts))
+                             (flet ((deliver ()
+                                      (incf delivered)
+                                      (handler-bind ((pg::pg-error (lambda (condition) (setf sentinel condition))))
+                                        (case kind
+                                          (:termination
+                                           (setf (pg::backend-termination-pending pg::*backend*) t
+                                                 (pg::backend-cancel-pending pg::*backend*) t)
+                                           (pg::deliver-backend-termination pg::*backend*))
+                                          (:query-cancel
+                                           (setf (pg::backend-cancel-pending pg::*backend*) t)
+                                           (pg::check-for-interrupts))
+                                          (:timeout
+                                           (setf (pg::backend-statement-deadline pg::*backend*)
+                                                 (1- (get-internal-real-time)))
+                                           (pg::check-for-interrupts))
+                                          (otherwise (error sentinel))))))
+                               (if (eq delivery :synchronous)
+                                   (deliver)
+                                   (sb-thread:interrupt-thread sb-thread:*current-thread* #'deliver))))
+                           (funcall original value)))
+                   (handler-case (pg::wal-read-control-fields)
+                     (error (condition) (setf caught condition)))
+                   (ok (eq sentinel caught) "the original interruption escapes the control decoder")
+                   (ok (string= (if (member kind '(:fatal :termination)) "57P01" "57014")
+                                (pg::pg-error-sqlstate caught)))
+                   (ok (string= (if (member kind '(:fatal :termination)) "FATAL" "ERROR")
+                                (pg::pg-error-severity caught)))
+                   (ok (= 1 attempts delivered))
+                   (ok (null (pg::backend-termination-pending pg::*backend*)))
+                   (ok (null (pg::backend-cancel-pending pg::*backend*)))
+                   (ok (null (pg::backend-statement-deadline pg::*backend*))))))
+          (setf (symbol-function 'pg::wal-control-resource-parameters) original))
+        (ok (pg::wal-read-control-fields) "valid metadata still decodes")
+        (pg::wal-atomic-write-bytes (pg::wal-control-path) (pg::string->bytes "broken"))
+        (let ((message (handler-case (progn (pg::wal-read-control-fields) nil)
+                         (error (condition) (princ-to-string condition)))))
+          (ok (and message (search "WAL control file" message) (search "corrupt" message)))))))

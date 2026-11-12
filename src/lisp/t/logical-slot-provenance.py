@@ -232,6 +232,271 @@ def check_native_reader(server, name):
     assert re.findall(r'READER-CHECKED=(\d+)', response) == ['2'], response
 
 
+def check_unowned_terminal_advance(server, name, archive_expected=False):
+    """Advance without inventing an owner; keep proof resources live through save."""
+    check_terminal_owner_race(server, name)
+    check_terminal_interruption_cleanup(server, name, archive_expected)
+    response = server.control(f'''(progn
+      (let* ((slot (sb-thread:with-mutex (*wal-lock*)
+                     (wal-find-usable-replication-slot-under-lock "{name}")))
+             (target (sb-thread:with-mutex (*wal-lock*) *wal-durable-lsn*))
+             (archive-call (symbol-function 'call-with-optional-logical-wal-archive))
+             (persist (symbol-function 'wal-persist-replication-slot-ack-under-lock))
+             (scanner (symbol-function 'wal-scan))
+             (before-pins (sb-thread:with-mutex (*wal-lock*)
+                            (loop for key being the hash-keys of *wal-snapshot-retention-pins* collect key)))
+             (before-roots (sb-thread:with-mutex (*physical-retained-inventory-publish-lock*)
+                             (loop for key being the hash-keys of *physical-retained-root-references* collect key)))
+             (pins nil) (roots nil) (archives 0) (saves 0))
+        (assert (null *wal-logical-slot-owner*))
+        (assert (null (wal-replication-slot-active-owner slot)))
+        (assert (> target (wal-replication-slot-confirmed-flush-lsn slot)))
+        (unwind-protect
+            (progn
+              (setf (symbol-function 'wal-scan)
+                    (lambda (&rest args) (declare (ignore args))
+                      (error "unowned terminal proof fell back to locked local scan"))
+                    (symbol-function 'call-with-optional-logical-wal-archive)
+                    (lambda (&rest args)
+                      (assert (not (sb-thread:holding-mutex-p *wal-lock*)))
+                      (incf archives) (apply archive-call args))
+                    (symbol-function 'wal-persist-replication-slot-ack-under-lock)
+                    (lambda (&rest args)
+                      (assert (sb-thread:holding-mutex-p *wal-lock*))
+                      (assert (null *wal-logical-slot-owner*))
+                      (assert (null (wal-replication-slot-active-owner slot)))
+                      (setf pins (set-difference
+                                  (loop for key being the hash-keys of *wal-snapshot-retention-pins* collect key)
+                                  before-pins :test #'eq))
+                      (assert (= 1 (length pins)))
+                      (sb-thread:with-mutex (*physical-retained-inventory-publish-lock*)
+                        (setf roots (set-difference
+                                     (loop for key being the hash-keys of *physical-retained-root-references* collect key)
+                                     before-roots :test #'eq)))
+                      (assert (= {1 if archive_expected else 0} (length roots)))
+                      (multiple-value-prog1 (apply persist args) (incf saves))))
+              (assert (eq slot (wal-acknowledge-replication-slot "{name}" target)))
+              (assert (= 1 archives saves))
+              (assert (= target (wal-replication-slot-confirmed-flush-lsn slot)))
+              (sb-thread:with-mutex (*wal-lock*)
+                (dolist (pin pins) (assert (not (nth-value 1 (gethash pin *wal-snapshot-retention-pins*))))))
+              (sb-thread:with-mutex (*physical-retained-inventory-publish-lock*)
+                (dolist (key roots) (assert (not (nth-value 1 (gethash key *physical-retained-root-references*))))))
+              (assert (null (wal-replication-slot-active-owner slot)))
+              (format t "UNOWNED-ADVANCED=~d~%" target))
+          (setf (symbol-function 'wal-scan) scanner
+                (symbol-function 'call-with-optional-logical-wal-archive) archive-call
+                (symbol-function 'wal-persist-replication-slot-ack-under-lock) persist)))
+      (values))''')
+    assert len(re.findall(r'UNOWNED-ADVANCED=\d+', response)) == 1, response
+
+
+def check_terminal_ack_overtake(server, name):
+    """A newer durable ACK wins while an older proof is outside the WAL lock."""
+    response = server.control(f'''(progn
+      (let* ((classifier (symbol-function 'logical-wal-cursor-terminal-p))
+             (persist (symbol-function 'wal-persist-replication-slot-ack-under-lock))
+             (ready (sb-thread:make-semaphore)) (worker nil) (worker-error nil)
+             (target nil) (end (sb-thread:with-mutex (*wal-lock*) *wal-durable-lsn*))
+             (triggered nil) (caught nil) (saves 0)
+             (before-pins (sb-thread:with-mutex (*wal-lock*)
+                            (hash-table-count *wal-snapshot-retention-pins*))))
+        (call-with-logical-replication-slot "{name}"
+          (lambda (slot)
+            (let ((confirmed (wal-replication-slot-confirmed-flush-lsn slot)))
+              (call-with-logical-slot-wal-cursor "{name}" nil end
+                (wal-replication-slot-confirmed-timeline slot) :prefix-end
+                (lambda (cursor)
+                  (loop for record = (logical-wal-cursor-next cursor) while record
+                        when (and (> (wal-record-end record) confirmed)
+                                  (wal-terminal-record-type-p (wal-record-type record)))
+                          do (setf target (wal-record-end record)) (return)))))))
+        (assert (and target (< target end)))
+        (unwind-protect
+            (progn
+              (setf (symbol-function 'wal-persist-replication-slot-ack-under-lock)
+                    (lambda (&rest args)
+                      (multiple-value-prog1 (apply persist args) (incf saves)))
+                    (symbol-function 'logical-wal-cursor-terminal-p)
+                    (lambda (&rest args)
+                      (multiple-value-prog1 (apply classifier args)
+                        (unless triggered
+                          (assert (not (sb-thread:holding-mutex-p *wal-lock*)))
+                          (setf triggered t
+                                worker (sb-thread:make-thread
+                                        (lambda ()
+                                          (let ((*backend* nil))
+                                            (unwind-protect
+                                                 (handler-case
+                                                     (wal-acknowledge-replication-slot "{name}" end)
+                                                   (error (condition) (setf worker-error condition)))
+                                              (sb-thread:signal-semaphore ready))))
+                                        :name "terminal-proof-ack-overtake"))
+                          (assert (sb-thread:wait-on-semaphore ready :timeout 10))
+                          (assert (null worker-error))))))
+              (handler-case (wal-acknowledge-replication-slot "{name}" target)
+                (pg-error (condition) (setf caught condition)))
+              (assert (and caught (string= "22023" (pg-error-sqlstate caught))
+                           (search "backwards" (pg-error-message caught))))
+              (assert (= 1 saves))
+              (sb-thread:with-mutex (*wal-lock*)
+                (let ((slot (wal-find-usable-replication-slot-under-lock "{name}")))
+                  (assert (= end (wal-replication-slot-confirmed-flush-lsn slot)))
+                  (assert (null (wal-replication-slot-active-owner slot))))
+                (assert (= before-pins (hash-table-count *wal-snapshot-retention-pins*))))
+              (format t "TERMINAL-ACK-OVERTAKE-REJECTED=~d~%" end))
+          (when worker
+            (assert (not (eq :timeout (sb-thread:join-thread worker :timeout 10 :default :timeout)))))
+          (setf (symbol-function 'logical-wal-cursor-terminal-p) classifier
+                (symbol-function 'wal-persist-replication-slot-ack-under-lock) persist)))
+      (values))''')
+    match = re.search(r'TERMINAL-ACK-OVERTAKE-REJECTED=(\d+)', response)
+    assert match, response
+    assert int(slot_image(server, name)[1][5]) == int(match[1])
+
+
+def check_terminal_owner_race(server, name):
+    """An actual reader acquiring the slot invalidates an unowned proof."""
+    before = (server.data / 'pg_replslot' / name / 'state').read_bytes()
+    response = server.control(f'''(progn
+      (let* ((classifier (symbol-function 'logical-wal-cursor-terminal-p))
+             (persist (symbol-function 'wal-persist-replication-slot-ack-under-lock))
+             (ready (sb-thread:make-semaphore)) (release (sb-thread:make-semaphore))
+             (worker nil) (worker-error nil) (caught nil) (saves 0)
+             (before-pins (sb-thread:with-mutex (*wal-lock*)
+                            (hash-table-count *wal-snapshot-retention-pins*)))
+             (before-roots (sb-thread:with-mutex (*physical-retained-inventory-publish-lock*)
+                             (hash-table-count *physical-retained-root-references*)))
+             (target (sb-thread:with-mutex (*wal-lock*) *wal-durable-lsn*)))
+        (unwind-protect
+            (progn
+              (setf (symbol-function 'wal-persist-replication-slot-ack-under-lock)
+                    (lambda (&rest args) (declare (ignore args)) (incf saves)
+                      (error "stale terminal proof attempted persistence"))
+                    (symbol-function 'logical-wal-cursor-terminal-p)
+                    (lambda (&rest args)
+                      (assert (not (sb-thread:holding-mutex-p *wal-lock*)))
+                      (multiple-value-prog1 (apply classifier args)
+                        (setf worker
+                              (sb-thread:make-thread
+                               (lambda ()
+                                 (let ((*backend* nil))
+                                   (handler-case
+                                       (call-with-logical-replication-slot "{name}"
+                                         (lambda (slot)
+                                           (declare (ignore slot))
+                                           (sb-thread:signal-semaphore ready)
+                                           (assert (sb-thread:wait-on-semaphore release :timeout 10))))
+                                     (error (condition)
+                                       (setf worker-error condition)
+                                       (sb-thread:signal-semaphore ready)))))
+                               :name "terminal-proof-owner-race"))
+                        (assert (sb-thread:wait-on-semaphore ready :timeout 10))
+                        (assert (null worker-error)))))
+              (handler-case (wal-acknowledge-replication-slot "{name}" target)
+                (error (condition) (setf caught condition)))
+              (assert (and caught (search "changed" (princ-to-string caught))))
+              (assert (zerop saves))
+              (sb-thread:with-mutex (*wal-lock*)
+                (assert (= before-pins (hash-table-count *wal-snapshot-retention-pins*))))
+              (sb-thread:with-mutex (*physical-retained-inventory-publish-lock*)
+                (assert (= before-roots (hash-table-count *physical-retained-root-references*))))
+              (format t "TERMINAL-OWNER-RACE-REJECTED~%"))
+          (setf (symbol-function 'logical-wal-cursor-terminal-p) classifier
+                (symbol-function 'wal-persist-replication-slot-ack-under-lock) persist)
+          (sb-thread:signal-semaphore release)
+          (when worker
+            (assert (not (eq :timeout (sb-thread:join-thread worker :timeout 10 :default :timeout)))))
+          (assert (null worker-error))))
+      (values))''')
+    assert 'TERMINAL-OWNER-RACE-REJECTED' in response, response
+    assert (server.data / 'pg_replslot' / name / 'state').read_bytes() == before
+
+
+def check_terminal_interruption_cleanup(server, name, archive_expected):
+    """Interrupt real source validation while the terminal proof owns its leases."""
+    before = (server.data / 'pg_replslot' / name / 'state').read_bytes()
+    response = server.control(f'''(progn
+      (let* ((slot (sb-thread:with-mutex (*wal-lock*)
+                     (wal-find-usable-replication-slot-under-lock "{name}")))
+             (target (sb-thread:with-mutex (*wal-lock*) *wal-durable-lsn*))
+             (image (wal-encode-replication-slot slot))
+             (decoder (symbol-function 'wal-decode-control-line))
+             (classifier (symbol-function 'logical-wal-cursor-terminal-p))
+             (persist (symbol-function 'wal-persist-replication-slot-ack-under-lock))
+             (scanner (symbol-function 'wal-scan))
+             (before-pins (sb-thread:with-mutex (*wal-lock*)
+                            (loop for key being the hash-keys of *wal-snapshot-retention-pins* collect key)))
+             (before-roots (sb-thread:with-mutex (*physical-retained-inventory-publish-lock*)
+                             (loop for key being the hash-keys of *physical-retained-root-references* collect key)))
+             (armed nil) (queued 0) (delivered 0) (saves 0) (sentinel nil)
+             (pins nil) (roots nil))
+        (assert (> target (wal-replication-slot-confirmed-flush-lsn slot)))
+        (unwind-protect
+            (dolist (kind '(:termination :cancel :timeout))
+              (let ((*backend* (make-backend)) (caught nil))
+                (setf queued 0 delivered 0 sentinel nil pins nil roots nil)
+                (setf (symbol-function 'wal-scan)
+                      (lambda (&rest args) (declare (ignore args))
+                        (error "interrupted terminal proof used legacy scan"))
+                      (symbol-function 'wal-persist-replication-slot-ack-under-lock)
+                      (lambda (&rest args) (declare (ignore args)) (incf saves)
+                        (error "interrupted terminal proof attempted persistence"))
+                      (symbol-function 'logical-wal-cursor-terminal-p)
+                      (lambda (&rest args) (setf armed t) (apply classifier args))
+                      (symbol-function 'wal-decode-control-line)
+                      (lambda (line)
+                        (when armed
+                          (setf armed nil)
+                          (assert (sb-thread:holding-mutex-p *wal-lock*))
+                          (setf pins (set-difference
+                                      (loop for key being the hash-keys of *wal-snapshot-retention-pins* collect key)
+                                      before-pins :test #'eq))
+                          (assert (= 1 (length pins)))
+                          (sb-thread:with-mutex (*physical-retained-inventory-publish-lock*)
+                            (setf roots (set-difference
+                                         (loop for key being the hash-keys of *physical-retained-root-references* collect key)
+                                         before-roots :test #'eq)))
+                          (assert (= {1 if archive_expected else 0} (length roots)))
+                          (incf queued)
+                          (sb-thread:interrupt-thread sb-thread:*current-thread*
+                            (lambda ()
+                              (incf delivered)
+                              (handler-bind ((pg-error (lambda (condition) (setf sentinel condition))))
+                                (ecase kind
+                                  (:termination (setf (backend-termination-pending *backend*) t
+                                                      (backend-cancel-pending *backend*) t))
+                                  (:cancel (setf (backend-cancel-pending *backend*) t))
+                                  (:timeout (setf (backend-statement-deadline *backend*)
+                                                 (1- (get-internal-real-time)))))
+                                (check-for-interrupts)))))
+                        (funcall decoder line)))
+                (handler-case (wal-acknowledge-replication-slot "{name}" target)
+                  (pg-error (condition) (setf caught condition)))
+                (assert (and caught (eq caught sentinel)))
+                (assert (string= (if (eq kind :termination) "57P01" "57014")
+                                 (pg-error-sqlstate caught)))
+                (assert (= 1 queued delivered))
+                (assert (zerop saves))
+                (assert (null (backend-termination-pending *backend*)))
+                (assert (null (backend-cancel-pending *backend*)))
+                (assert (null (backend-statement-deadline *backend*)))
+                (assert (equalp image (wal-encode-replication-slot slot)))
+                (assert (null (wal-replication-slot-active-owner slot)))
+                (sb-thread:with-mutex (*wal-lock*)
+                  (dolist (pin pins) (assert (not (nth-value 1 (gethash pin *wal-snapshot-retention-pins*))))))
+                (sb-thread:with-mutex (*physical-retained-inventory-publish-lock*)
+                  (dolist (key roots) (assert (not (nth-value 1 (gethash key *physical-retained-root-references*))))))
+                (format t "TERMINAL-INTERRUPT-CLEANED=~a~%" kind)))
+          (setf (symbol-function 'wal-decode-control-line) decoder
+                (symbol-function 'logical-wal-cursor-terminal-p) classifier
+                (symbol-function 'wal-persist-replication-slot-ack-under-lock) persist
+                (symbol-function 'wal-scan) scanner)))
+      (values))''')
+    assert len(re.findall(r'TERMINAL-INTERRUPT-CLEANED=', response)) == 3, response
+    assert (server.data / 'pg_replslot' / name / 'state').read_bytes() == before
+
+
 def check_restored_slots(server, connection, before, timeline=1, on_pair=None):
     for name, (raw, fields) in before.items():
         assert slot_image(server, name, timeline, on_pair)[0] == raw, name
@@ -401,8 +666,10 @@ def check_promoted():
                 assert replication.query('IDENTIFY_SYSTEM')[0][:2] == [system_id, '2']
             finally:
                 replication.close()
+            connection.query("SELECT pg_create_logical_replication_slot('admin_child','pgoutput')")
             connection.query('INSERT INTO provenance_rows VALUES (5)')
             assert connection.query('SELECT count(*) FROM provenance_rows') == [['5']]
+            check_unowned_terminal_advance(child, 'admin_child', archive_expected=True)
         finally:
             connection.close()
         print(f'logical-slot-provenance: PASS (new child-tail SQL/wire slots, promotion, crash/restart) '
@@ -424,6 +691,8 @@ def check_delayed_feedback_reader():
         try:
             connection.query('CREATE TABLE continuation_rows (id integer)')
             connection.query("SELECT pg_create_logical_replication_slot('delayed_reader','pgoutput')")
+            connection.query("SELECT pg_create_logical_replication_slot('admin_advance','pgoutput')")
+            connection.query("SELECT pg_create_logical_replication_slot('admin_overtake','pgoutput')")
             before = slot_image(server, 'delayed_reader')[0]
             for value in range(1, count + 1):
                 connection.query(f'INSERT INTO continuation_rows VALUES ({value})')
@@ -599,6 +868,8 @@ def check_delayed_feedback_reader():
             result = matches[0]
             assert int(result[0]) == count and result[1] == result[2] and int(result[3]) >= count, result
             assert slot_image(server, 'delayed_reader')[0] == before
+            check_unowned_terminal_advance(server, 'admin_advance')
+            check_terminal_ack_overtake(server, 'admin_overtake')
             print('logical-slot-continuation: ' + ' '.join(result), flush=True)
         finally:
             connection.close()

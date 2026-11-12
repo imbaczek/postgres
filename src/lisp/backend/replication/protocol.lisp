@@ -921,7 +921,7 @@ The caller releases the slot before sending shutdown completion."
      (let ((copy-mode-p nil) (reason nil) (io-state nil))
        (handler-case-nonfatal
         (progn
-          (wal-logical-slot-validate-start-position slot-name requested-lsn)
+          (wal-logical-slot-validate-start-position slot-name requested-lsn :validate-wal nil)
           (call-with-logical-replication-slot
            slot-name
            (lambda (slot)
