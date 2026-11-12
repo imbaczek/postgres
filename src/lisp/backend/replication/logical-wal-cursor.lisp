@@ -262,7 +262,9 @@ record owner, carrier and kind; local progress is not slot acknowledgement."
 (declaim (ftype function logical-slot-wal-check-control-coordinates logical-slot-wal-start-proven-p))
 
 (defstruct (logical-wal-source (:constructor %make-logical-wal-source))
-  "Captured source facts for rechecking a slot reader under the WAL mutex.
+  "Captured source facts for rechecking under the WAL mutex.
+:STREAM requires the real reader owner and can certify a continuation.
+:TERMINAL-CHECK records the observed owner, including NIL, for read-only proof.
 These facts retain history metadata, not pins, leases or WAL payload buffers."
   (purpose :stream :read-only t)
   (slot nil :read-only t) (name nil :read-only t) (owner nil :read-only t)
@@ -485,6 +487,10 @@ thread, mutex and lifetime checks.  This grants no import authority."
       scan owner role (lambda (cursor source) (declare (ignore source)) (funcall function cursor))))))
 
 (defun logical-wal-cursor-terminal-p (cursor target)
+  "Return true only for the end of a finished ordinary batch at TARGET.
+The caller must ensure the frozen durable end covers TARGET; a target inside a
+record is false.
+Verified end-of-recovery metadata is not an ordinary batch terminal."
   (let ((*wal-recovery-reservation-batch-clean-p* nil) (batch-open nil))
     (loop
       (multiple-value-bind (record bytes owner carrier kind) (logical-wal-cursor-next cursor)
@@ -503,6 +509,9 @@ thread, mutex and lifetime checks.  This grants no import authority."
         (when (>= (wal-record-end record) target) (return nil))))))
 
 (defun call-with-logical-terminal-cursor (scan source owner role target finish)
+  "Scan the frozen interval and call FINISH under WAL exclusion.
+The scan pin and, when present, fresh archive lease remain live through source
+validation and FINISH, including any slot save performed there."
   (labels ((check-source ()
              (wal-retained-slot-scan-validate-under-lock scan)
              (unless (and (eq :terminal-check (logical-wal-source-purpose source))
@@ -526,6 +535,14 @@ thread, mutex and lifetime checks.  This grants no import authority."
         :archive archive :batch-policy :logical-reader)))))
 
 (defun call-with-logical-slot-terminal-check (name target prepare finish)
+  "Check TARGET against a retained durable prefix before calling FINISH.
+PREPARE runs under the WAL lock and returns DONE and RESULT; when DONE is true,
+return RESULT.  Legacy slots use their existing check, and an exact owned
+continuation can supply proof.  A fresh proof for a slot with known provenance
+captures the restart anchor and its role before scanning.  The WAL lock is
+not held across the entire scan; individual record reads still take it.
+WAL and pending transactions may grow during the scan; FINISH must recheck
+current slot state under the lock before acting on the proof."
   (let ((scan nil) (source nil) (owner nil) (role nil))
     (unwind-protect
          (progn

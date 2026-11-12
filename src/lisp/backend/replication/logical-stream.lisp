@@ -1702,6 +1702,7 @@ tracked by the bounded sender. SENT-LSN never includes an unfinished frame."
        slot acknowledged-lsn restart-floor))))
 
 (defun wal-check-logical-start-under-lock (slot name requested-lsn)
+  "Check start bounds and return confirmed LSN, or NIL for initial copy."
   (assert (sb-thread:holding-mutex-p *wal-lock*))
   (wal-check-healthy)
   (unless slot (ereport "42704" "replication slot \"~a\" does not exist" name))
@@ -1718,7 +1719,9 @@ tracked by the bounded sender. SENT-LSN never includes an unfinished frame."
     confirmed))
 
 (defun wal-logical-slot-validate-start-position (name requested-lsn &key (validate-wal t))
-  "Validate the requested initial or resumed stream boundary for NAME."
+  "Validate the requested initial or resumed stream boundary for NAME.
+With VALIDATE-WAL false, check only current slot state before acquiring the
+reader owner; the owned caller must repeat the full check."
   (unless (and (integerp requested-lsn) (<= 0 requested-lsn #xFFFFFFFFFFFFFFFF))
     (ereport "22023" "invalid logical replication start LSN"))
   (if validate-wal
@@ -1737,6 +1740,8 @@ tracked by the bounded sender. SENT-LSN never includes an unfinished frame."
   (values))
 
 (defun wal-check-logical-resume-under-lock (slot name requested-lsn)
+  "Check resume bounds and reader ownership; return the confirmed LSN.
+The caller must bind the actual reader owner."
   (assert (sb-thread:holding-mutex-p *wal-lock*))
   (wal-check-healthy)
   (unless slot (ereport "42704" "replication slot \"~a\" does not exist" name))
@@ -1749,7 +1754,8 @@ tracked by the bounded sender. SENT-LSN never includes an unfinished frame."
     confirmed))
 
 (defun wal-logical-slot-accept-resume-position (name requested-lsn)
-  "Confirm a target's durable marker as the first status on a resumed stream."
+  "Confirm a target's durable marker as the first status on a resumed stream.
+Recheck current slot permission after proving the boundary before saving it."
   (unless *wal-logical-slot-owner*
     (ereport "55000" "logical replication slot is not owned by this reader"))
   (call-with-logical-slot-terminal-check

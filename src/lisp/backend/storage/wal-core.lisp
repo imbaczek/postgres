@@ -3550,6 +3550,7 @@ acknowledgments and resume paths can return before this helper."
 (declaim (ftype function call-with-logical-slot-terminal-check))
 
 (defun wal-check-replication-slot-ack-under-lock (slot name acknowledged-lsn expected-owner)
+  "Check acknowledgment permission and bounds; return the confirmed LSN."
   (assert (sb-thread:holding-mutex-p *wal-lock*))
   (wal-check-healthy)
   (unless slot (ereport "42704" "replication slot \"~a\" does not exist" name))
@@ -3696,6 +3697,8 @@ Reject extra lines before decoding its CRC and checkpoint metadata."
           (let ((line (read-line stream nil nil)))
             (unless (and line (<= (length line) +wal-control-maximum-bytes+) (null (read-line stream nil nil)))
               (error "WAL control file ~a is corrupt" path))
+            ;; Keep asynchronous interrupts out of the bounded decode and its
+            ;; error converter; they can run again once the handler is gone.
             (sb-sys:without-interrupts
               (handler-case-noninterrupt (wal-decode-control-line line)
                                          (condition

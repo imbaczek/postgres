@@ -42,7 +42,9 @@ Every error is fatal once this backend has latched a WAL failure."
            (progn ,@handler-body)))))
 
 (defmacro handler-case-noninterrupt (form (condition &body handler-body))
-  "Handle ordinary errors, preserving fatal and cancellation conditions."
+  "Handle ordinary errors, preserving fatal and 57014 cancellation conditions
+and any error after WAL failure is latched.
+Callers that mask asynchronous interrupts must restore them outside this handler."
   `(handler-case-nonfatal ,form
                           (,condition
                            (if (and (typep ,condition 'pg-error)
