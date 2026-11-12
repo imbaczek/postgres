@@ -262,6 +262,56 @@
           (write-line "existing target" stream))
         (ok (intake-fails-p (lambda () (pg::physical-bootstrap-target target)))))))
 
+(defun physical-backup-test-wire-number (value width)
+  (coerce (loop for shift from (* 8 (1- width)) downto 0 by 8
+                collect (ldb (byte 8 shift) value))
+          '(vector (unsigned-byte 8))))
+
+(declaim (ftype function metadata-codec-test-storage))
+
+(deftest physical-backup-file-wire-bytes-and-storage-shapes
+    (dolist (size '(0 1 65534 65535 65536 131079))
+      (with-physical-store-directory (source)
+        (let* ((name "global/pg_control")
+               (path (pg::string->bytes name))
+               (bytes (make-array size :element-type '(unsigned-byte 8)))
+               (frames nil))
+          (dotimes (index size) (setf (aref bytes index) (mod (+ 19 (* index 73)) 256)))
+          (ensure-directories-exist (merge-pathnames name source))
+          (with-open-file (output (merge-pathnames name source) :direction :output
+                                                                :element-type '(unsigned-byte 8))
+            (write-sequence bytes output))
+          (let* ((digest (pg::physical-store-update-digest #xcbf29ce484222325 bytes))
+                 (entry (list name size digest))
+                 (expected
+                   (cons
+                    (concatenate '(vector (unsigned-byte 8)) #(70)
+                                 (physical-backup-test-wire-number (length path) 4) path
+                                 (physical-backup-test-wire-number size 8)
+                                 (physical-backup-test-wire-number digest 8))
+                    (append
+                     (loop for start from 0 below size by 65535
+                           collect (concatenate '(vector (unsigned-byte 8)) #(68)
+                                                (subseq bytes start (min size (+ start 65535)))))
+                     (list #(69))))))
+            (pg::physical-backup-send-file source entry 1 (lambda (frame) (push frame frames)))
+            (setf frames (nreverse frames))
+            (ok (equalp expected frames)
+                (format nil "exact header, data chunks and end for ~d bytes" size))
+            (dolist (shape '(:simple :adjustable :fill-pointer :displaced))
+              (with-physical-store-directory (target)
+                (let* ((input (mapcar (lambda (frame) (metadata-codec-test-storage frame shape)) frames))
+                       (before (mapcar #'copy-seq input))
+                       (pending input))
+                  (ok (equal entry
+                             (pg::physical-backup-receive-file
+                              target name size (lambda () (pop pending)) :expected entry)))
+                  (ok (null pending))
+                  (ok (equalp input before) "receiver does not change its input frames")
+                  (ok (equalp bytes
+                              (pg::read-bounded-regular-file (merge-pathnames name target) size))
+                      (format nil "exact received file for ~d bytes in ~s storage" size shape))))))))))
+
 (deftest physical-backup-file-stream-bounds-chunks-and-verifies-before-end
     (with-physical-store-directory (root)
       (let* ((name "global/pg_control")
