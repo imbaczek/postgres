@@ -1,4 +1,4 @@
-;; Read a proven local WAL interval for a logical slot.  The segment carrier
+;; Read a proven WAL interval from local files or a selected retained root. The carrier
 ;; comes from the selected history; the owner comes from each record's position.
 ;; Traversal supplies local record progress, not slot acknowledgement authority.
 
@@ -38,7 +38,8 @@ The guard is checked under the captured WAL mutex before each copy and advance."
 The caller must prove the source and start boundary and supply a guard that
 checks that proof under the WAL mutex.  A geometrically valid empty interval
 alone does not verify record bytes or a record boundary.  The cursor is valid
-only in this call, on this thread, with the captured mutex."
+only in this call, on this thread, with the captured mutex.  An optional
+archive must also pass its own context check."
   (timeline-check-lineage history)
   (unless (and (functionp guard)
                (typep start '(unsigned-byte 64)) (typep end '(unsigned-byte 64))
@@ -63,6 +64,7 @@ only in this call, on this thread, with the captured mutex."
       (sb-sys:without-interrupts (setf active nil)))))
 
 (defun logical-wal-check-record-length (bytes header-offset position size end)
+  "Check the shared record length bounds for a live or archived header."
   (let ((offset (mod position +wal-segment-size+)))
     (unless (and (<= (+ header-offset +wal-header-size+) (length bytes))
                  (<= (+ offset +wal-header-size+) size)
@@ -76,6 +78,9 @@ only in this call, on this thread, with the captured mutex."
       length)))
 
 (defun logical-wal-cursor-copy-at (cursor position carrier)
+  "Copy from the exact local carrier, or consult the archive on open ENOENT.
+Return bytes, size and ready; ready true with NIL bytes means EOF, while a
+false ready value requests preparation.  Other open failures remain errors."
   (let ((stream nil) (size nil) (missing nil)
                      (archive (logical-wal-cursor-archive cursor))
                      (segment (floor position +wal-segment-size+)))
@@ -107,6 +112,10 @@ only in this call, on this thread, with the captured mutex."
       (when stream (close stream)))))
 
 (defun logical-wal-cursor-read-next (cursor)
+  "Prepare the archive segment outside WAL exclusion and retry the local open.
+Keep position, gap and original position private across retries.  At most two
+segments may be prepared; each retry checks the scope and original position.
+Return bytes, position, carrier and original position."
   (let ((original nil) (continuation nil) (prepared nil))
     (dotimes (attempt 3)
       (declare (ignorable attempt))
@@ -127,6 +136,7 @@ only in this call, on this thread, with the captured mutex."
     (error "logical WAL archive preparation exceeded its segment bound")))
 
 (defun logical-wal-copy-record (stream size position end)
+  "Return a fresh copy of a complete live record using the shared length check."
   (let* ((offset (mod position +wal-segment-size+))
          (header (make-array +wal-header-size+ :element-type '(unsigned-byte 8))))
     (unless (and (<= (+ offset +wal-header-size+) size)
@@ -142,6 +152,9 @@ only in this call, on this thread, with the captured mutex."
       bytes)))
 
 (defun logical-wal-cursor-copy-next (cursor &optional continuation)
+  "Copy the next record under WAL exclusion using the last-byte carrier.
+Never fall back to an older filename.  A miss returns a private continuation;
+a ready EOF may instead move the private position over a checked rotation gap."
   (logical-wal-cursor-check-scope cursor)
   (let* ((original (logical-wal-cursor-position cursor))
          (position (if continuation (first continuation) original))
@@ -216,6 +229,9 @@ End-of-recovery is metadata, not an ordinary logical record."
     (values owner (if eor :end-of-recovery :ordinary))))
 
 (defun logical-wal-cursor-next (cursor)
+  "Decode a fresh record copy outside WAL exclusion, then recheck the full
+scope and original position before advancing.  Return the record, bytes,
+record owner, carrier and kind; local progress is not slot acknowledgement."
   (multiple-value-bind (bytes position carrier original)
       (logical-wal-cursor-read-next cursor)
     (unless bytes (return-from logical-wal-cursor-next nil))
@@ -265,7 +281,10 @@ End-of-recovery is metadata, not an ordinary logical record."
   "Traverse a retained slot interval using captured primary source evidence.
 Hold the pin and slot identity fixed. Recheck control coordinates and exact
 history bytes, root, profile and birth, and require a proven start. The end
-is frozen; later WAL growth and CLOG reset are allowed. This grants no import authority."
+is frozen; later WAL growth and CLOG reset are allowed.  The slot pin encloses
+the optional retained-root lease.  The archive captures the same source check,
+so the cursor need not run it twice; both scopes still enforce their own
+thread, mutex and lifetime checks.  This grants no import authority."
   (call-with-wal-retained-slot-scan
    name from-lsn upto-lsn
    (lambda (scan)

@@ -1,5 +1,5 @@
 ;; Prepare bytes from a committed primary's retained WAL root in a private scope.
-;; This is not yet a cursor fallback or a slot import path.
+;; Supply checked archive bytes when the exact selected local carrier is absent.
 
 (in-package #:pg)
 
@@ -8,7 +8,9 @@
                                  (lambda (object stream)
                                    (print-unreadable-object (object stream :type t :identity t)))))
   "Private retained-root selection and one-segment cache for one reader scope.
-Its accessors do not grant authority to produce or consume logical WAL."
+CACHE-BYTES holds a checked physical prefix; CACHE-START and CACHE-END bound
+logical record coverage.  Equal bounds can witness EOF at the base.  Accessors
+do not grant authority to produce or consume logical WAL."
   (directory nil :read-only t) (identity nil :read-only t)
   (reference nil :read-only t) (history nil :read-only t)
   (parent-history nil :read-only t) (guard nil :read-only t)
@@ -16,6 +18,7 @@ Its accessors do not grant authority to produce or consume logical WAL."
   (index nil) (cache-segment nil) (cache-bytes nil) (cache-start 0) (cache-end 0))
 
 (defun logical-wal-archive-clear-cache (archive)
+  "Clear the private cache bytes and bounds without interruption."
   (sb-sys:without-interrupts
     (setf (logical-wal-archive-cache-segment archive) nil
           (logical-wal-archive-cache-bytes archive) nil
@@ -23,6 +26,7 @@ Its accessors do not grant authority to produce or consume logical WAL."
           (logical-wal-archive-cache-end archive) 0)))
 
 (defun logical-wal-archive-check-cursor (archive history namespace)
+  "Check the archive scope and its match to the cursor history and namespace."
   (logical-wal-archive-check archive)
   (unless (and (eq namespace :timeline)
                (equalp history (logical-wal-archive-history archive)))
@@ -30,6 +34,8 @@ Its accessors do not grant authority to produce or consume logical WAL."
   t)
 
 (defun logical-wal-archive-base-gap-p (archive segment carrier)
+  "Recognize an overlap-only EOF witness at the base, anchored by the next
+indexed extent and the exact carrier in the timeline namespace."
   (let* ((reference (logical-wal-archive-reference archive))
          (index (logical-wal-archive-index archive))
          (base (getf reference :base))
@@ -44,6 +50,10 @@ Its accessors do not grant authority to produce or consume logical WAL."
          (eql base (getf first :start)))))
 
 (defun logical-wal-archive-copy-at (archive position end carrier)
+  "Copy a record within indexed logical coverage using the shared length check.
+Return (bytes, size, T), (NIL, size, T) for EOF, or (NIL, NIL, NIL) for a
+cache miss.  The returned bytes are fresh.  The checked physical prefix may
+extend before the base, but cannot supply a record there."
   (logical-wal-archive-check archive)
   (let* ((reference (logical-wal-archive-reference archive))
          (segment (floor position +wal-segment-size+))
@@ -67,6 +77,9 @@ Its accessors do not grant authority to produce or consume logical WAL."
         (values (subseq bytes offset (+ offset length)) size t)))))
 
 (defun logical-wal-archive-certified-end (archive segment carrier)
+  "Return the indexed EOF position for a segment wholly before the fork, or NIL.
+Its entries must name CARRIER. A base gap witness can also supply the EOF
+position. This check does not verify the live file's contents."
   (unless (<= (* (1+ segment) +wal-segment-size+)
               (getf (logical-wal-archive-reference archive) :end))
     (return-from logical-wal-archive-certified-end nil))
@@ -85,6 +98,11 @@ Its accessors do not grant authority to produce or consume logical WAL."
            (getf (logical-wal-archive-reference archive) :base)))))
 
 (defun logical-wal-archive-compare-live (archive position carrier size bytes)
+  "Check live EOF geometry from index metadata, even before cache preparation.
+Return whether a matching cache is present.  NIL bytes requests geometry only;
+otherwise compare the full raw record span with the checked physical prefix,
+including any header before the base.  This only rejects inconsistency; it does
+not certify bytes of the live file that were not read."
   (logical-wal-archive-check archive)
   (let* ((segment (floor position +wal-segment-size+))
          (origin (* segment +wal-segment-size+))
@@ -108,6 +126,7 @@ Its accessors do not grant authority to produce or consume logical WAL."
     (eql segment (logical-wal-archive-cache-segment archive))))
 
 (defun call-with-optional-logical-wal-archive (system-id history namespace guard function)
+  "Call FUNCTION with the committed archive when present, otherwise NIL."
   (let ((present
           (sb-thread:with-mutex (*wal-lock*)
             (unless (funcall guard) (error "logical WAL archive source is unavailable"))
@@ -236,6 +255,8 @@ index and cache are cleared on every exit, and the archive then expires."
         (logical-wal-archive-clear-cache archive)))))
 
 (defun logical-wal-archive-segment-entries (archive segment carrier)
+  "Select entries for the exact last-byte carrier in the child history.
+An overlap-only base gap is a zero-width EOF witness, not record coverage."
   (unless (and (typep segment '(integer 0 1099511627775))
                (eql carrier (logical-wal-segment-carrier
                              segment (logical-wal-archive-history archive))))
@@ -255,6 +276,8 @@ index and cache are cleared on every exit, and the archive then expires."
     entries))
 
 (defun logical-wal-archive-prepare (archive segment carrier)
+  "Validate all selected extent versions outside WAL exclusion, then install
+their physical prefix and separate logical bounds under a renewed source check."
   (when (sb-thread:holding-mutex-p *wal-lock*)
     (error "logical WAL archive preparation must run outside WAL exclusion"))
   (let ((entries nil))

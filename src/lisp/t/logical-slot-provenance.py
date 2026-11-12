@@ -39,7 +39,10 @@ def lsn_number(value):
 
 
 def check_native_cursor(server, name, timeline):
-    """Read the durable interval without changing the slot's confirmed LSN."""
+    """Read the slot's current durable interval and check pin and optional root lease lifetimes.
+
+    Archive payload substitution is covered by structural tests separately.
+    """
     response = server.control(f'''(progn
       (call-with-logical-replication-slot "{name}"
         (lambda (slot)
