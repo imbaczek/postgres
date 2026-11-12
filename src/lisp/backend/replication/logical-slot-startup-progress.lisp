@@ -104,6 +104,19 @@
 
 (defun logical-slot-on-coverage
     (state history required owner role through through-owner)
+  ;; The caller must provide the latest logical status from complete ordered
+  ;; replay through the frozen positive THROUGH prefix, with verified source and
+  ;; history.  This helper does not establish those facts; STATE's end being within
+  ;; THROUGH alone does not prove it is latest.
+  ;; Return :proved-on, :insufficient, or :unknown; this is not an admission
+  ;; certificate.  Compare the uninterrupted ON origin, not a redundant ON.
+  ;; Known OFF or an ON origin after REQUIRED is insufficient; absent state,
+  ;; legacy ON without an origin, or REQUIRED beyond replay is unknown.
+  ;; REQUIRED may equal THROUGH with the same owner.  A child record start at
+  ;; the parent prefix fork is unknown, even with known OFF.  Malformed positions
+  ;; or witnesses fail range, timeline, or segment checks with an error.
+  ;; A local slot uses birth for lifetime, separately from older restart retention;
+  ;; imported or remote anchors require separate provenance authority.
   (timeline-check-lineage history)
   (flet ((check-position (lsn timeline position-role)
            (unless
