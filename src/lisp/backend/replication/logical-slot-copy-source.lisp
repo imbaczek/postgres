@@ -19,6 +19,9 @@
   (prevent-recovery-primary-operation "logical slot base copy")
   (when *swank-listener-enabled-p*
     (error "logical slot base copy requires Swank to be off"))
+  (when (or (not (active-xids-empty-p)) *xid-wrap-pending*
+            (probe-file (xid-wrap-marker-path)))
+    (error "logical slot base copy requires no active transaction IDs or pending XID wrap"))
   (when (physical-recovery-reader-conflict-p)
     (error "logical slot base copy requires no retained readers or idle transactions"))
   (let ((system-id (physical-slot-startup-system-id)))

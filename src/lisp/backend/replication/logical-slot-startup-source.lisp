@@ -31,15 +31,15 @@
         (wal-encode-replication-slot copy))
       (wal-encode-replication-slot slot)))
 
-(defun logical-slot-startup-read-inventory (&key cleanup)
-  (slot-state-map
-   (wal-replication-slot-directory)
-   (lambda (bytes name)
-     (let ((slot (wal-decode-replication-slot bytes name)))
-       (%make-logical-slot-startup-entry
-        :slot slot :bytes (copy-seq bytes) :image (logical-slot-startup-candidate-image slot)
-        :profile (wal-slot-profile slot) :provenance (wal-replication-slot-logical-provenance slot))))
-   :cleanup cleanup))
+(defun logical-slot-startup-read-inventory (&key cleanup root parent-fd)
+  (apply #'slot-state-map
+         (or root (wal-replication-slot-directory))
+         (lambda (bytes name)
+           (let ((slot (wal-decode-replication-slot bytes name)))
+             (%make-logical-slot-startup-entry
+              :slot slot :bytes (copy-seq bytes) :image (logical-slot-startup-candidate-image slot)
+              :profile (wal-slot-profile slot) :provenance (wal-replication-slot-logical-provenance slot))))
+         :cleanup cleanup (when parent-fd (list :parent-fd parent-fd))))
 
 (defun logical-slot-startup-control-image ()
   (read-bounded-regular-file (wal-control-path) (1+ +wal-control-maximum-bytes+) :minimum 1))

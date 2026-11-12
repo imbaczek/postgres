@@ -330,6 +330,7 @@
                    (:file "extended-query")
                    (:file "../replication/logical-slot-copy-target")
                    (:file "../replication/logical-slot-copy-descriptor")
+                   (:file "../replication/logical-slot-copy-capture")
                    (:file "postgres")))
      (:file "replication/logical-retention")
      (:file "replication/logical-shutdown")))))

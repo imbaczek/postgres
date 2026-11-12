@@ -474,6 +474,70 @@
                   "the original state bytes remain intact"))
             (uiop:delete-directory-tree base :validate t :if-does-not-exist :ignore))))))
 
+(rove:deftest canonical-slot-state-borrowed-parent
+    (let* ((base (merge-pathnames (format nil "canonical-slot-parent-~a/" (gensym))
+                                  (uiop:temporary-directory)))
+           (root (merge-pathnames "pg_replslot/" base))
+           (other (merge-pathnames "other/" base))
+           (moved (merge-pathnames (format nil "canonical-slot-moved-~a/" (gensym))
+                                   (uiop:temporary-directory)))
+           (bytes (make-array 3 :element-type '(unsigned-byte 8) :initial-contents '(3 1 4)))
+           (parent-fd nil) (other-fd nil) (escaped nil))
+      (unwind-protect
+           (progn
+             (ensure-directories-exist root)
+             (ensure-directories-exist other)
+             (slot-state-create root "held_slot" bytes)
+             (setf parent-fd (slot-state-open-directory base)
+                   other-fd (slot-state-open-directory other))
+             (rove:ok
+              (equalp (slot-state-map root (lambda (actual name) (list name actual))
+                                      :parent-fd parent-fd)
+                      (list (list "held_slot" bytes))))
+             (call-with-slot-state-root
+              root (lambda (fd)
+                     (declare (ignore fd))
+                     (setf escaped (third *slot-state-root-scope*))
+                     (rove:ok (/= escaped parent-fd))
+                     (rove:ok (logbitp 0 (sb-posix:fcntl escaped sb-posix:f-getfd))))
+              nil parent-fd)
+             (rove:ok (handler-case (progn (sb-posix:fstat escaped) nil)
+                        (sb-posix:syscall-error () t))
+                      "the duplicate closes after the callback")
+             (rove:ok (sb-posix:fstat parent-fd) "the caller still owns its descriptor")
+             (let ((called nil))
+               (rove:ok
+                (handler-case
+                    (progn
+                      (slot-state-map root (lambda (&rest ignored)
+                                             (declare (ignore ignored))
+                                             (setf called t))
+                                      :parent-fd other-fd)
+                      nil)
+                  (error (condition) (search "binding changed" (princ-to-string condition)))))
+               (rove:ok (not called)))
+             (let ((called 0))
+               (rove:ok
+                (handler-case
+                    (progn
+                      (slot-state-map
+                       root (lambda (actual name)
+                              (declare (ignore actual name))
+                              (incf called)
+                              (sb-posix:rename (string-right-trim "/" (namestring base))
+                                               (string-right-trim "/" (namestring moved)))
+                              (ensure-directories-exist root))
+                       :parent-fd parent-fd)
+                      nil)
+                  (error (condition) (search "binding changed" (princ-to-string condition)))))
+               (rove:ok (= called 1))
+               (rove:ok (null (directory-entry-names root))))
+             (rove:ok (sb-posix:fstat parent-fd)))
+        (when other-fd (sb-posix:close other-fd))
+        (when parent-fd (sb-posix:close parent-fd))
+        (uiop:delete-directory-tree base :validate t :if-does-not-exist :ignore)
+        (uiop:delete-directory-tree moved :validate t :if-does-not-exist :ignore))))
+
 (defun call-with-canonical-wal-slot-fixture (function)
   (let* ((base (merge-pathnames (format nil "canonical-wal-slot-~a/" (gensym))
                                 (uiop:temporary-directory)))

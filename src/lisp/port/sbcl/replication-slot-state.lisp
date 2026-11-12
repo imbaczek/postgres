@@ -68,16 +68,22 @@
     (error "replication slot storage permits unowned mutation"))
   stat)
 
-(defun slot-state-open-directory (path &optional missing-ok)
+(defun slot-state-open-directory (path &optional missing-ok borrowed-fd)
   (handler-case
       (let ((fd nil) (complete nil))
         (unwind-protect
              (progn
-               (setf fd (sb-posix:open
-                         (string-right-trim "/" (namestring path))
-                         (logior sb-posix:o-rdonly sb-posix:o-directory
-                                 sb-posix:o-nofollow +postmaster-o-cloexec+)))
-               (slot-state-check-private-owner (sb-posix:fstat fd))
+               (setf fd (if borrowed-fd
+                            (sb-posix:fcntl borrowed-fd 1030 0)
+                            (sb-posix:open
+                             (string-right-trim "/" (namestring path))
+                             (logior sb-posix:o-rdonly sb-posix:o-directory
+                                     sb-posix:o-nofollow +postmaster-o-cloexec+))))
+               (let ((stat (sb-posix:fstat fd)))
+                 (unless (sb-posix:s-isdir (sb-posix:stat-mode stat))
+                   (error "replication slot parent descriptor is not a directory"))
+                 (slot-state-check-private-owner stat))
+               (when borrowed-fd (slot-state-check-binding path fd))
                (setf complete t)
                fd)
           (when (and fd (not complete)) (sb-posix:close fd))))
@@ -85,16 +91,16 @@
       (unless (and missing-ok (= (sb-posix:syscall-errno condition) sb-posix:enoent))
         (error condition)))))
 
-(defmacro with-slot-state-directory ((fd path &optional missing-ok) &body body)
+(defmacro with-slot-state-directory ((fd path &optional missing-ok borrowed-fd) &body body)
   `(let ((,fd nil))
      (unwind-protect
           (progn
             (sb-sys:without-interrupts
-              (setf ,fd (slot-state-open-directory ,path ,missing-ok)))
+              (setf ,fd (slot-state-open-directory ,path ,missing-ok ,borrowed-fd)))
             ,@body)
        (when ,fd (sb-posix:close ,fd)))))
 
-(defun call-with-slot-state-root (root function &optional missing-ok)
+(defun call-with-slot-state-root (root function &optional missing-ok borrowed-parent-fd)
   "Call FUNCTION with a held root descriptor, checking its path binding.
 The descriptor is valid only during the callback and must not escape it."
   (let* ((root (uiop:ensure-directory-pathname root))
@@ -102,7 +108,7 @@ The descriptor is valid only during the callback and must not escape it."
          (leaf (car (last (pathname-directory root)))))
     (unless (and (stringp leaf) (not (member leaf '("" "." "..") :test #'equal)))
       (error "invalid replication slot root"))
-    (with-slot-state-directory (parent-fd parent)
+    (with-slot-state-directory (parent-fd parent nil borrowed-parent-fd)
       (let ((anchored (slot-state-fd-path parent-fd leaf)))
         (with-slot-state-directory (root-fd anchored missing-ok)
           (let ((*slot-state-root-scope*
@@ -326,39 +332,39 @@ A temporary directory need not contain the final state file."
     (slot-state-check-scope)
     (fsync-directory (physical-image-fd-path root-fd))))
 
-(defun slot-state-map (root function &key cleanup)
+(defun slot-state-map (root function &key cleanup parent-fd)
   "Call FUNCTION with state bytes and name for each canonical slot.
 With CLEANUP, remove staging directories and state.tmp files in canonical
 directories; use it only at startup with writers quiescent. Without CLEANUP,
 unfinished state is an error."
-  (call-with-slot-state-root
-   root
-   (lambda (root-fd)
-     (when root-fd
-       (fsync-directory (physical-image-fd-path root-fd))
-       (let ((items (mapcar (lambda (entry)
-                              (slot-state-inventory-entry root-fd entry cleanup))
-                            (slot-state-directory-entries root-fd))))
-         (dolist (item items)
-           (when (third item) (slot-state-remove-staging root-fd item)))
-         (loop for item in items
-               unless (third item)
-                 collect
-                 (let ((path (slot-state-fd-path root-fd (first item))))
-                   (with-slot-state-directory (child-fd path)
-                     (let ((*slot-state-child-scope* (cons path child-fd)))
-                       (slot-state-check-inventory-binding item child-fd)
-                       (when (member "state.tmp" (sixth item) :test #'string=)
-                         (slot-state-unlink child-fd "state.tmp")
-                         (fsync-directory (physical-image-fd-path child-fd)))
-                       (multiple-value-prog1
-                           (funcall function
-                                    (read-bounded-regular-file
-                                     (slot-state-fd-path child-fd "state")
-                                     +slot-state-maximum-bytes+ :stabilize t)
-                                    (second item))
-                         (slot-state-check-scope)))))))))
-   t))
+  (apply #'call-with-slot-state-root
+         root
+         (lambda (root-fd)
+           (when root-fd
+             (fsync-directory (physical-image-fd-path root-fd))
+             (let ((items (mapcar (lambda (entry)
+                                    (slot-state-inventory-entry root-fd entry cleanup))
+                                  (slot-state-directory-entries root-fd))))
+               (dolist (item items)
+                 (when (third item) (slot-state-remove-staging root-fd item)))
+               (loop for item in items
+                     unless (third item)
+                       collect
+                       (let ((path (slot-state-fd-path root-fd (first item))))
+                         (with-slot-state-directory (child-fd path)
+                           (let ((*slot-state-child-scope* (cons path child-fd)))
+                             (slot-state-check-inventory-binding item child-fd)
+                             (when (member "state.tmp" (sixth item) :test #'string=)
+                               (slot-state-unlink child-fd "state.tmp")
+                               (fsync-directory (physical-image-fd-path child-fd)))
+                             (multiple-value-prog1
+                                 (funcall function
+                                          (read-bounded-regular-file
+                                           (slot-state-fd-path child-fd "state")
+                                           +slot-state-maximum-bytes+ :stabilize t)
+                                          (second item))
+                               (slot-state-check-scope)))))))))
+         t (when parent-fd (list parent-fd))))
 
 (defun slot-state-claim-drop (root name)
   "Capture NAME and numeric root and child device/inode identities for drop.

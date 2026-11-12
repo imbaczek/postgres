@@ -30,7 +30,8 @@ class Connection(QueryConnection):
 class OwnedLisp:
     """Own a disposable server; retain its data and log for inspection after stop."""
 
-    def __init__(self):
+    def __init__(self, parameters=()):
+        self.parameters = tuple(parameters)
         self.root = Path(tempfile.mkdtemp(prefix="pg-transaction-response-"))
         self.data = self.root / "data"
         control_dir = self.root / "control"
@@ -48,7 +49,9 @@ class OwnedLisp:
         with (self.root / "server.log").open("ab") as log:
             self.process = subprocess.Popen(
                 [str(LISP / "pg-lisp.sh"), "-p", str(self.port), "-D", str(self.data),
-                 "--control-socket", str(self.control_socket)],
+                   "--control-socket", str(self.control_socket)]
+                  + [argument for name, value in self.parameters
+                     for argument in ("-c", f"{name}={value}")],
                 cwd=LISP, stdout=log, stderr=subprocess.STDOUT)
         deadline = time.monotonic() + 45
         while time.monotonic() < deadline:
