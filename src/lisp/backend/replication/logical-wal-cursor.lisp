@@ -13,7 +13,7 @@
 The guard is checked under the captured WAL mutex before each copy and advance."
   (history nil :read-only t) (namespace nil :read-only t)
   (end 0 :read-only t) (guard nil :read-only t) (archive nil :read-only t)
-  (batch-policy :strict :read-only t)
+  (batch-policy :strict :read-only t) (segment-reader nil :read-only t)
   (thread sb-thread:*current-thread* :read-only t)
   (position 0) (batch-open nil))
 
@@ -34,7 +34,7 @@ The guard is checked under the captured WAL mutex before each copy and advance."
                                       (logical-wal-cursor-history cursor)
                                       (logical-wal-cursor-namespace cursor))))
 
-(defun call-with-logical-wal-cursor (history namespace start end owner role guard function &key archive (batch-policy :strict))
+(defun call-with-logical-wal-cursor (history namespace start end owner role guard function &key archive segment-reader (batch-policy :strict))
   "Call FUNCTION with a cursor over START through the frozen END.
 The caller must prove the source and start boundary and supply a guard that
 checks that proof under the WAL mutex.  A geometrically valid empty interval
@@ -47,6 +47,7 @@ both policies reject end-of-recovery inside an open batch."
   (timeline-check-lineage history)
   (unless (and (member batch-policy '(:strict :logical-reader))
                (functionp guard)
+               (or (null segment-reader) (and (functionp segment-reader) (null archive)))
                (typep start '(unsigned-byte 64)) (typep end '(unsigned-byte 64))
                (<= start end) (member namespace '(:legacy :timeline))
                (or (eq namespace :timeline)
@@ -61,7 +62,7 @@ both policies reject end-of-recovery inside an open batch."
          (cursor (%make-logical-wal-cursor
                   :history (mapcar #'copy-timeline-history-entry history)
                   :namespace namespace :position start :end end :archive archive
-                  :batch-policy batch-policy
+                  :batch-policy batch-policy :segment-reader segment-reader
                   :guard (lambda () (and active (eq mutex *wal-lock*) (funcall guard))))))
     (unwind-protect
          (progn
@@ -83,10 +84,54 @@ both policies reject end-of-recovery inside an open batch."
         (error "incomplete or out-of-range logical WAL record"))
       length)))
 
+(defun logical-wal-cursor-read-segment (cursor position stream size)
+  (assert (sb-thread:holding-mutex-p *wal-lock*))
+  (unless (and (typep size '(unsigned-byte 64)) (<= size +wal-segment-size+)
+               (streamp stream) (input-stream-p stream)
+               (subtypep (stream-element-type stream) '(unsigned-byte 8)))
+    (error "logical WAL segment reader supplied an invalid stream or size"))
+  (let ((stat (sb-posix:fstat (sb-sys:fd-stream-fd stream)))
+        (offset (mod position +wal-segment-size+)))
+    (unless (and (sb-posix:s-isreg (sb-posix:stat-mode stat)) (<= size (sb-posix:stat-size stat)))
+      (error "logical WAL segment reader requires a bounded regular file"))
+    (when (> offset size) (error "logical WAL start exceeds carrier length"))
+    (values (unless (= offset size)
+              (logical-wal-copy-record stream size position (logical-wal-cursor-end cursor)))
+            size t)))
+
+(defun logical-wal-cursor-copy-provided (cursor position carrier)
+  (logical-wal-cursor-check-scope cursor)
+  (let ((active t) (called nil) (complete nil) (bytes nil) (size nil)
+                   (original (logical-wal-cursor-position cursor)))
+    (unwind-protect
+         (progn
+           (funcall
+            (logical-wal-cursor-segment-reader cursor)
+            (floor position +wal-segment-size+) carrier
+            (lambda (stream length)
+              (unless (and active (not called))
+                (error "logical WAL segment consumer is expired or already used"))
+              (logical-wal-cursor-check-scope cursor)
+              (unless (= original (logical-wal-cursor-position cursor))
+                (error "logical WAL cursor changed during segment reading"))
+              (setf called t)
+              (multiple-value-setq (bytes size complete)
+                (logical-wal-cursor-read-segment cursor position stream length))
+              (values bytes size complete)))
+           (unless complete (error "logical WAL segment reader did not finish its one read"))
+           (logical-wal-cursor-check-scope cursor)
+           (unless (= original (logical-wal-cursor-position cursor))
+             (error "logical WAL cursor changed during segment reading"))
+           (values bytes size t))
+      (sb-sys:without-interrupts (setf active nil)))))
+
 (defun logical-wal-cursor-copy-at (cursor position carrier)
   "Copy from the exact local carrier, or consult the archive on open ENOENT.
 Return bytes, size and ready; ready true with NIL bytes means EOF, while a
 false ready value requests preparation.  Other open failures remain errors."
+  (when (logical-wal-cursor-segment-reader cursor)
+    (return-from logical-wal-cursor-copy-at
+      (logical-wal-cursor-copy-provided cursor position carrier)))
   (let ((stream nil) (size nil) (missing nil)
                      (archive (logical-wal-cursor-archive cursor))
                      (segment (floor position +wal-segment-size+)))
@@ -106,15 +151,12 @@ false ready value requests preparation.  Other open failures remain errors."
              (return-from logical-wal-cursor-copy-at
                (logical-wal-archive-copy-at archive position (logical-wal-cursor-end cursor) carrier)))
            (let ((matched-cache (and archive (logical-wal-archive-compare-live
-                                              archive position carrier size nil)))
-                 (offset (mod position +wal-segment-size+)))
-             (when (> offset size) (error "logical WAL start exceeds carrier length"))
-             (let ((bytes (unless (= offset size)
-                            (logical-wal-copy-record stream size position
-                                                     (logical-wal-cursor-end cursor)))))
+                                              archive position carrier size nil))))
+             (multiple-value-bind (bytes observed-size ready)
+                 (logical-wal-cursor-read-segment cursor position stream size)
                (when (and matched-cache bytes)
                  (logical-wal-archive-compare-live archive position carrier size bytes))
-               (values bytes size t))))
+               (values bytes observed-size ready))))
       (when stream (close stream)))))
 
 (defun logical-wal-cursor-read-next (cursor)
