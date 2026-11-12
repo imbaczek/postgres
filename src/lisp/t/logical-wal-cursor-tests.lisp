@@ -543,10 +543,10 @@
            (original (symbol-function 'pg::logical-wal-check-source))
            (attempts 0))
       (unwind-protect
-           (dolist (kind '(:ordinary :fatal :wal-failure))
+           (dolist (kind '(:ordinary :fatal :cancel :wal-failure))
              (let* ((condition (make-condition 'pg::pg-error
                                                :severity (if (eq kind :fatal) "FATAL" "ERROR")
-                                               :sqlstate (if (eq kind :fatal) "57P01" "XX000")))
+                                               :sqlstate (case kind (:fatal "57P01") (:cancel "57014") (t "XX000"))))
                     (pg::*backend* (pg::make-backend
                                     :wal-failure (when (eq kind :wal-failure) condition)))
                     (proof nil) (caught nil))
@@ -561,6 +561,6 @@
                (ok (null proof))
                (if (eq kind :ordinary)
                    (ok (null caught) "ordinary validation errors remain cache misses")
-                   (ok (eq condition caught) "fatal conditions propagate unchanged"))))
+                   (ok (eq condition caught) "interruptions and fatal errors propagate unchanged"))))
         (setf (symbol-function 'pg::logical-wal-check-source) original))
-      (ok (= 3 attempts))))
+      (ok (= 4 attempts))))

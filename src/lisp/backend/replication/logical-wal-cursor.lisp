@@ -355,7 +355,11 @@ A stale certificate returns NIL so the reader can replay from restart."
       (handler-case-nonfatal
        (when (logical-wal-check-source (logical-wal-continuation-source certificate) end)
          certificate)
-       (condition nil)))))
+       (condition
+        (if (and (typep condition 'pg-error)
+                 (string= "57014" (pg-error-sqlstate condition)))
+            (error condition)
+            nil))))))
 
 (defun logical-wal-certify-boundary (source position)
   "Make boundary evidence after the caller has rechecked the finished prefix."
