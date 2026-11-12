@@ -3417,7 +3417,11 @@ must separately validate system, history, lifetime, replay and storage context."
 (declaim (ftype function logical-wal-reusable-continuation))
 
 (defun wal-slot-terminal-ack-p (slot target-lsn)
-  "Check a terminal acknowledgment, validating metadata batches without applying them."
+  "Check a terminal acknowledgment without applying metadata batches.
+An exact completed prefix with rechecked source and owner can establish the
+target without a rescan; a numeric frontier alone cannot. Otherwise scan the
+current local timeline for the terminal. Callers check ownership, range and
+durability before saving the slot."
   (when (and (wal-replication-slot-logical-provenance slot)
              (logical-wal-reusable-continuation slot target-lsn target-lsn))
     (return-from wal-slot-terminal-ack-p t))

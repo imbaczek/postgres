@@ -345,8 +345,10 @@ selected WAL source."
     t))
 
 (defun logical-wal-reusable-continuation (slot position end)
-  "Reuse a matching owner-scoped boundary only while its source still matches.
-A stale certificate returns NIL so the reader can replay from restart."
+  "Reuse an exact owner-scoped boundary only while its source still matches.
+Ordinary validation errors return NIL. FATAL errors and any error after WAL
+failure is latched propagate unchanged, as do cancellation and statement
+timeout (57014). A miss leaves the caller to validate anew."
   (assert (sb-thread:holding-mutex-p *wal-lock*))
   (let ((certificate *wal-logical-slot-read-continuation*))
     (when (and certificate
