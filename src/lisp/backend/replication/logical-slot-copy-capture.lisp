@@ -81,7 +81,12 @@
               (error "logical copy requires its exact inactive registered logical slots"))
             (list (copy-seq name) live (wal-slot-profile live)
                   (wal-replication-slot-logical-provenance live)
-                  (copy-seq (logical-slot-startup-entry-bytes entry))))))
+                  (copy-seq (logical-slot-startup-entry-bytes entry))
+                  (wal-replication-slot-pending-xids live)
+                  (let ((copy (make-hash-table :test #'eql)))
+                    (maphash (lambda (xid value) (setf (gethash xid copy) (copy-tree value)))
+                             (wal-replication-slot-pending-xids live))
+                    copy)))))
 
 (defun logical-slot-copy-check-slot-lifetime-under-lock (source policy history)
   (assert (sb-thread:holding-mutex-p *wal-lock*))
@@ -148,11 +153,13 @@
                                 (timeline-history-bytes (getf facts :timeline)))))
          (error "logical copy frozen source changed"))
        (dolist (row (logical-slot-copy-capture-owners capture))
-         (destructuring-bind (name slot profile provenance image) row
+         (destructuring-bind (name slot profile provenance image pending pending-image) row
            (unless (and (eq slot (gethash name *wal-replication-slots*))
                         (null (wal-replication-slot-active-owner slot))
                         (eq profile (wal-slot-profile slot))
                         (eq provenance (wal-replication-slot-logical-provenance slot))
+                        (eq pending (wal-replication-slot-pending-xids slot))
+                        (equalp pending-image pending)
                         (equalp image (wal-encode-replication-slot slot)))
              (error "logical copy registered slot changed"))))
        t))))

@@ -156,7 +156,8 @@ def check_capture():
                          (error (condition) (setf caught condition)))
                        (assert (and caught
                                     (search "published checkpoint policy" (princ-to-string caught)))))
-                     (dolist (mutation '(:facts :active-owner :next-xid :cluster-identity))
+                     (dolist (mutation '(:facts :active-owner :next-xid :cluster-identity
+                                        :pending-table :pending-contents))
                        (let ((caught nil) (revoked nil))
                          (handler-case
                              (call-with-logical-slot-copy-writer-paused
@@ -172,6 +173,7 @@ def check_capture():
                                              (slot (second (first (logical-slot-copy-capture-owners capture))))
                                              (old-xid (getf facts :next-xid))
                                              (old-next *next-xid*)
+                                             (old-pending (wal-replication-slot-pending-xids slot))
                                              (old-cluster (catalog-cluster-identity *catalog*)))
                                         (sb-thread:with-mutex (*wal-lock*)
                                           (unwind-protect
@@ -182,6 +184,13 @@ def check_capture():
                                                    (:cluster-identity
                                                     (setf (catalog-cluster-identity *catalog*)
                                                           (new-catalog-cluster-identity)))
+                                                   (:pending-table
+                                                    (setf (wal-replication-slot-pending-xids slot)
+                                                          (make-hash-table :test #'eql)))
+                                                   (:pending-contents
+                                                    (assert (not (gethash 7999 old-pending)))
+                                                    (setf (gethash 7999 old-pending)
+                                                          (cons 0 *wal-durable-lsn*)))
                                                    (:active-owner
                                                     (setf (wal-replication-slot-active-owner slot) :changed)))
                                                  (assert
@@ -190,14 +199,16 @@ def check_capture():
                                                         (logical-slot-copy-check-captured-source-under-lock capture)
                                                         nil)
                                                     (error (condition)
-                                                      (search (if (eq mutation :active-owner)
+                                                      (search (if (member mutation '(:active-owner :pending-table :pending-contents))
                                                                   "registered slot changed"
                                                                   "frozen source changed")
                                                               (princ-to-string condition))))))
                                             (setf (getf facts :next-xid) old-xid
                                                   *next-xid* old-next
+                                                  (wal-replication-slot-pending-xids slot) old-pending
                                                   (catalog-cluster-identity *catalog*) old-cluster
-                                                  (wal-replication-slot-active-owner slot) nil)))
+                                                  (wal-replication-slot-active-owner slot) nil)
+                                            (when (eq mutation :pending-contents) (remhash 7999 old-pending))))
                                         (setf revoked
                                               (handler-case
                                                   (progn (logical-slot-copy-check-capture capture) nil)
