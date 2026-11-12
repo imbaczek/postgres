@@ -251,9 +251,12 @@ record owner, carrier and kind; local progress is not slot acknowledgement."
 (declaim (ftype function physical-slot-startup-system-id))
 
 (defun logical-slot-wal-start-proven-p (slot start owner role)
-  "Accept a birth or consumed prefix, or a retained pending record start.
-Standard feedback may be unaligned; only its retained restart floor is a
-decoding anchor. A zero restart keeps the writer's record-start semantics."
+  "Check a start against the slot's persisted anchors and position role.
+Standard feedback can be unaligned, so its exact confirmed position alone is
+not a decoding anchor.  A positive restart can prove a prefix end unless a
+pending transaction names it as a record start.  Zero restart retains its
+record-start owner, not an empty-prefix owner.  The birth prefix has its own
+proof from the consistent position and birth timeline."
   (let* ((pending (loop for entry being the hash-values
                           of (wal-replication-slot-pending-xids slot)
                             thereis (= start (car entry))))
