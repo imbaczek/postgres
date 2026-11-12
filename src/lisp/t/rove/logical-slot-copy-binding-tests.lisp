@@ -202,3 +202,36 @@
         (when parent (sb-posix:close parent))
         (when root (sb-posix:close root))
         (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))
+
+(cl-spec:defproperty copy-verification-lifetime-keeps-slot-bytes
+    ((generation (range integer 0 340282366920938463463374607431768211455))
+     (mode (member :good :off :unknown :later)))
+  (:about logical-slot-copy-check-slot-lifetime)
+  (:trials (:normal 100))
+  (multiple-value-bind (descriptor manifest digest) (copy-binding-test-data generation)
+    (declare (ignore manifest digest))
+    (let* ((slot (logical-slot-state-decode
+                  (second (first (logical-slot-copy-descriptor-slots descriptor))) "alpha"))
+           (before (logical-slot-state-encode slot))
+           (snapshot (copy-tree (third (logical-slot-copy-control-fields
+                                        (logical-slot-copy-descriptor-base-control descriptor)))))
+           (history (timeline-parse-history 1 "")))
+      (case mode
+        (:off (setf (getf snapshot :logical-decoding-enabled) nil)
+         (remf snapshot :logical-on-start-lsn)
+         (remf snapshot :logical-on-start-timeline))
+        (:later (setf (getf snapshot :logical-on-start-lsn) 98)))
+      (setf (getf snapshot :end) (+ (getf snapshot :start) (wal-checkpoint-record-size snapshot)))
+      (let* ((state (unless (eq mode :unknown) (wal-logical-status-from-checkpoint snapshot)))
+             (accepted (handler-case
+                           (eq slot (logical-slot-copy-check-slot-lifetime
+                                     slot state history (getf snapshot :end)))
+                         (error () nil))))
+        (and (eq accepted (eq mode :good))
+             (equalp before (logical-slot-state-encode slot)))))))
+
+(rove:deftest copy-verification-generated-lifetime-contract
+    (let ((data (cl-spec:result-data
+                 (cl-spec:run-property 'copy-verification-lifetime-keeps-slot-bytes :seed 2331))))
+      (rove:ok (eq :passed (getf data :status)) (format nil "~s" data))
+      (rove:ok (= 100 (getf data :trials)))))

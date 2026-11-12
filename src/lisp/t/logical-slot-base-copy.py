@@ -218,6 +218,160 @@ def check_publication_fault(server, point, label, mutate=False):
     shutil.rmtree(target)
 
 
+def descriptor_piece_offset(data):
+    position = 60
+    for _ in range(4):
+        size = struct.unpack_from('<I', data, position)[0]
+        position += 4 + size
+    count = struct.unpack_from('<I', data, position)[0]
+    position += 4
+    for _ in range(count):
+        position += 1 + data[position]
+        size = struct.unpack_from('<I', data, position)[0]
+        position += 4 + size
+    assert struct.unpack_from('<I', data, position)[0] >= 1
+    return position + 4
+
+
+def rewrite_descriptor_crc(data):
+    struct.pack_into('<I', data, len(data) - 4, 0)
+    struct.pack_into('<I', data, len(data) - 4, crc32c(data))
+    return data
+
+
+def verification_refused(server, target, scratch, expected):
+    before = {str(p.relative_to(target)): p.read_bytes()
+              for p in target.rglob('*') if p.is_file()}
+    try:
+        server.control(f'(logical-slot-copy-verify {lisp_string(target)} {lisp_string(scratch)})', timeout=90)
+    except AssertionError as error:
+        assert ';; error:' in str(error) and expected in str(error), error
+    else:
+        raise AssertionError('changed logical copy was accepted')
+    assert before == {str(p.relative_to(target)): p.read_bytes()
+                      for p in target.rglob('*') if p.is_file()}
+    server.control('(progn (assert (not *wal-poisoned*)) (assert *live-operation-admission-open*) (values))')
+
+
+def check_verification_mutations(server, target, scratch, pieces):
+    for path in [target / 'unexpected', target / 'logical_slot_wal/unexpected.wal',
+                 target / 'logical-slot-copy.in-progress']:
+        path.write_bytes(b'injected verification fixture')
+        try:
+            verification_refused(server, target, scratch,
+                                 'unfinished logical slot copy' if path.name.endswith('in-progress')
+                                 else 'inventory differs')
+        finally:
+            path.unlink()
+    leftover = scratch / 'unclaimed.tmp'
+    before = {str(p.relative_to(target)): p.read_bytes()
+              for p in target.rglob('*') if p.is_file()}
+    try:
+        server.control(f'''(let ((fired nil) (caught nil))
+          (let ((*logical-slot-copy-verification-test-hook*
+                  (lambda (point context)
+                    (declare (ignore context))
+                    (when (eq point :after-scratch-lock)
+                      (setf fired t)
+                      (with-open-file (out {lisp_string(leftover)} :direction :output :if-exists :error)
+                        (write-string "unclaimed scratch evidence" out))))))
+            (handler-case (logical-slot-copy-verify {lisp_string(target)} {lisp_string(scratch)})
+              (error (condition) (setf caught condition))))
+          (assert (and fired caught (search "scratch changed before initialization"
+                                           (princ-to-string caught)))) (values))''', timeout=90)
+        assert leftover.read_text() == 'unclaimed scratch evidence'
+        assert before == {str(p.relative_to(target)): p.read_bytes()
+                          for p in target.rglob('*') if p.is_file()}
+    finally:
+        leftover.unlink(missing_ok=True)
+    displaced = scratch.with_name(scratch.name + '_held')
+    try:
+        server.control(f'''(let ((fired nil) (caught nil) (attempts 0)
+                                 (thread sb-thread:*current-thread*)
+                                 (retry (symbol-function 'retry-pending-query-temp-cleanup)))
+          (unwind-protect
+              (progn
+                (setf (symbol-function 'retry-pending-query-temp-cleanup)
+                      (lambda (&optional domain)
+                        (when (and fired (eq thread sb-thread:*current-thread*)) (incf attempts))
+                        (funcall retry domain)))
+                (let ((*logical-slot-copy-verification-test-hook*
+                        (lambda (point context)
+                          (declare (ignore context))
+                          (when (and (eq point :before-scratch-cleanup) (not fired))
+                            (setf fired t)
+                            (sb-posix:rename {lisp_string(scratch)} {lisp_string(displaced)})
+                            (sb-posix:mkdir {lisp_string(scratch)} #o700)
+                            (with-open-file (out {lisp_string(scratch / 'sentinel')}
+                                                 :direction :output :if-exists :error)
+                              (write-string "replacement scratch is untouched" out))))))
+                  (handler-case (logical-slot-copy-verify {lisp_string(target)} {lisp_string(scratch)})
+                    (error (condition) (setf caught condition)))))
+            (setf (symbol-function 'retry-pending-query-temp-cleanup) retry))
+          (assert (and fired caught)) (assert (zerop attempts))
+          (assert (not *wal-poisoned*)) (values))''', timeout=90)
+        assert (scratch / 'sentinel').read_text() == 'replacement scratch is untouched'
+        assert before == {str(p.relative_to(target)): p.read_bytes()
+                          for p in target.rglob('*') if p.is_file()}
+    finally:
+        if displaced.exists():
+            (scratch / 'sentinel').unlink(missing_ok=True)
+            scratch.rmdir()
+            displaced.rename(scratch)
+        # The rejected cleanup left only the operation's known empty namespace
+        # directories. Remove empty directories, never recursively delete files.
+        for directory in sorted((p for p in scratch.rglob('*') if p.is_dir()),
+                                key=lambda p: len(p.parts), reverse=True):
+            directory.rmdir()
+    descriptor = target / 'logical-slot-copy.descriptor'
+    original = descriptor.read_bytes()
+    position = descriptor_piece_offset(original)
+    changed = bytearray(original)
+    struct.pack_into('<Q', changed, position + 24, pieces[0][4] + 1)
+    descriptor.write_bytes(rewrite_descriptor_crc(changed))
+    try:
+        verification_refused(server, target, scratch, 'declared piece coverage')
+    finally:
+        descriptor.write_bytes(original)
+    timeline, segment, size, checksum, first, end = pieces[0]
+    leaf = f'{timeline:08X}{segment // 256:08X}{segment % 256:08X}.wal'
+    path = target / 'logical_slot_wal' / leaf
+    raw = path.read_bytes()
+    assert first < end and first % (16 * 1024 * 1024) + 32 < len(raw)
+    corrupt = bytearray(raw)
+    corrupt[first % (16 * 1024 * 1024)] ^= 1
+    changed = bytearray(original)
+    struct.pack_into('<Q', changed, position + 16, fnv64(corrupt))
+    path.write_bytes(corrupt)
+    descriptor.write_bytes(rewrite_descriptor_crc(changed))
+    try:
+        verification_refused(server, target, scratch, 'WAL')
+    finally:
+        path.write_bytes(raw)
+        descriptor.write_bytes(original)
+    # Touch an already validated piece without changing its bytes. The next
+    # held-FD observation must reject the changed file facts.
+    before = {str(p.relative_to(target)): p.read_bytes()
+              for p in target.rglob('*') if p.is_file()}
+    server.control(f'''(let ((fired nil) (caught nil))
+      (let ((*logical-slot-copy-verification-test-hook*
+              (lambda (point context)
+                (declare (ignore context))
+                (when (and (eq point :after-record) (not fired))
+                  (setf fired t)
+                  (with-open-file (stream {lisp_string(path)} :direction :io
+                                          :element-type '(unsigned-byte 8) :if-exists :overwrite)
+                    (let ((byte (read-byte stream)))
+                      (file-position stream 0) (write-byte byte stream) (fsync-stream stream)))))))
+        (handler-case (logical-slot-copy-verify {lisp_string(target)} {lisp_string(scratch)})
+          (error (condition) (setf caught condition))))
+      (assert (and fired caught (search "selected WAL piece changed" (princ-to-string caught))))
+      (assert (not *wal-poisoned*)) (values))''', timeout=90)
+    assert before == {str(p.relative_to(target)): p.read_bytes()
+                      for p in target.rglob('*') if p.is_file()}
+    assert sorted(p.name for p in scratch.iterdir()) == ['.pg_lisp.lock']
+
+
 def run():
     start = time.monotonic()
     server = api['OwnedLisp'](parameters=(('wal_level', 'logical'),))
@@ -248,6 +402,7 @@ def run():
             check_preflight_refusal(server, not_private, 'private_pin', 'private and owned')
             check_active_slot_refusal(server)
             check_stale_pin_refusal(server)
+            connection.query("INSERT INTO copy_rows VALUES (900000, '" + ('v' * (5 * 1024 * 1024)) + "')")
             fill_past_rotation(connection)
         finally:
             connection.close()
@@ -299,6 +454,48 @@ def run():
             raw = (target / 'logical_slot_wal' / name).read_bytes()
             assert len(raw) == size and fnv64(raw) == checksum
             assert segment * 16 * 1024 * 1024 <= first <= end <= segment * 16 * 1024 * 1024 + size
+        scratch = server.root / 'verification_scratch'
+        scratch.mkdir(mode=0o700)
+        before_verify = {str(p.relative_to(target)): p.read_bytes()
+                         for p in target.rglob('*') if p.is_file()}
+        server.control(f'''(let ((opened nil) (thread sb-thread:*current-thread*)
+                                    (old (symbol-function 'open-query-temp-io))
+                                    (catalog *catalog*) (slots *wal-replication-slots*)
+                                    (incarnation *wal-storage-incarnation*)
+                                    (temporary *query-temp-instance-directory*)
+                                    (expected (make-hash-table :test #'eql)) (verified 0))
+          (sb-thread:with-mutex (*wal-lock*)
+            (maphash (lambda (xid value) (setf (gethash xid expected) (copy-tree value)))
+                     (wal-replication-slot-pending-xids (gethash "copy_slot" *wal-replication-slots*))))
+          (let ((*logical-slot-copy-verification-test-hook*
+                  (lambda (point context)
+                    (when (eq point :slot-verified)
+                      (incf verified)
+                      (assert (equalp expected (logical-slot-startup-progress-pending (second context))))))))
+          (unwind-protect
+              (progn
+                (setf (symbol-function 'open-query-temp-io)
+                      (lambda ()
+                        (multiple-value-bind (path stream) (funcall old)
+                          (when (eq thread sb-thread:*current-thread*)
+                            (assert (uiop:subpathp path (pathname {lisp_string(str(scratch) + '/')})))
+                            (push path opened))
+                          (values path stream))))
+                (let ((summary (logical-slot-copy-verify {lisp_string(target)} {lisp_string(scratch)})))
+                  (assert (= 1 (getf summary :slots)))
+                  (assert (plusp (getf summary :records)))
+                  (assert (= (hash-table-count expected) (getf summary :pending-xids))))
+                (assert (= 1 verified)) (assert opened)
+                (assert (every #'query-temp-file-absent-p opened))
+                (assert (eq catalog *catalog*)) (assert (eq slots *wal-replication-slots*))
+                (assert (eq incarnation *wal-storage-incarnation*))
+                (assert (equal temporary *query-temp-instance-directory*)))
+            (setf (symbol-function 'open-query-temp-io) old)))
+          (values))''', timeout=90)
+        assert before_verify == {str(p.relative_to(target)): p.read_bytes()
+                                 for p in target.rglob('*') if p.is_file()}
+        assert sorted(p.name for p in scratch.iterdir()) == ['.pg_lisp.lock']
+        check_verification_mutations(server, target, scratch, pieces)
         check_startup_refusal(target, 'requires durable child-owner import')
         missing = server.root / 'missing_descriptor'
         shutil.copytree(target, missing)
