@@ -1,9 +1,14 @@
+;; Prepare bytes from a committed primary's retained WAL root in a private scope.
+;; This is not yet a cursor fallback or a slot import path.
+
 (in-package #:pg)
 
 (defstruct (logical-wal-archive (:constructor %make-logical-wal-archive)
                                 (:print-object
                                  (lambda (object stream)
                                    (print-unreadable-object (object stream :type t :identity t)))))
+  "Private retained-root selection and one-segment cache for one reader scope.
+Its accessors do not grant authority to produce or consume logical WAL."
   (directory nil :read-only t) (identity nil :read-only t)
   (reference nil :read-only t) (history nil :read-only t)
   (parent-history nil :read-only t) (guard nil :read-only t)
@@ -11,12 +16,15 @@
   (index nil) (cache-segment nil) (cache-bytes nil))
 
 (defun logical-wal-archive-check (archive)
+  "Recheck the caller's source proof and this archive's scope under the WAL mutex."
   (assert (sb-thread:holding-mutex-p *wal-lock*))
   (unless (funcall (logical-wal-archive-guard archive))
     (error "logical WAL archive is outside its selected source scope"))
   t)
 
 (defun logical-wal-archive-check-selection (archive owner)
+  "Check the committed primary control and retained-root owner under the WAL mutex.
+The captured minimum end permits durable growth, but not regression."
   (let* ((reference (logical-wal-archive-reference archive))
          (fields (multiple-value-list (wal-read-control-fields)))
          (metadata (seventh fields))
@@ -48,6 +56,8 @@
   t)
 
 (defun logical-wal-archive-read-index (archive)
+  "Read the selected index and check its identity, parent ancestry and chain.
+The required base overlap does not itself establish logical coverage."
   (let* ((reference (logical-wal-archive-reference archive))
          (history (logical-wal-archive-parent-history archive))
          (index (physical-retained-inventory-read-index
@@ -66,6 +76,11 @@
     index))
 
 (defun call-with-logical-wal-archive (system-id history namespace guard function)
+  "Call FUNCTION with a private archive selected from committed primary control.
+GUARD supplies the caller's source proof; this scope also checks persisted
+control, history and root.  It rechecks both under the captured WAL mutex on
+the owning thread.  A retained-root reader lease spans the callback.  The
+index and cache are cleared on every exit, and the archive then expires."
   (unless (and (functionp guard) (functionp function) (eq namespace :timeline))
     (error "logical WAL archive requires a timeline source scope"))
   (timeline-check-lineage history)
@@ -120,6 +135,9 @@
               (logical-wal-archive-cache-bytes archive) nil)))))
 
 (defun logical-wal-archive-segment-entries (archive segment carrier)
+  "Select entries for the exact carrier chosen by the child history.
+The carrier is the timeline at the segment's last byte, so a parent archive
+file for the fork segment is rejected when the child carries that segment."
   (unless (and (typep segment '(integer 0 1099511627775))
                (eql carrier (logical-wal-segment-carrier
                              segment (logical-wal-archive-history archive))))
@@ -138,6 +156,10 @@
     entries))
 
 (defun logical-wal-archive-prepare (archive segment carrier)
+  "Prepare one segment's bytes outside WAL exclusion.
+Validate every extent for this segment before installing the cache under
+a renewed source check.  These bytes do not grant logical coverage or any
+cursor, import, acknowledgement, replay or coordination authority."
   (when (sb-thread:holding-mutex-p *wal-lock*)
     (error "logical WAL archive preparation must run outside WAL exclusion"))
   (let ((entries nil))
