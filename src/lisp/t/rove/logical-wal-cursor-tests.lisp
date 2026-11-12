@@ -9,6 +9,8 @@
       end)))
 
 (defun call-with-owned-cursor-test (function)
+  "Use the real reset logger and production metadata for the fixture catalog.
+The shared slot fixture mocks the logger and leaves control metadata unset."
   (let ((real-log-reset (symbol-function 'wal-log-clog-reset-under-lock)))
     (call-with-logical-slot-creation-test
      (lambda ()

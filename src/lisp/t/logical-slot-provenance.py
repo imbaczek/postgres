@@ -39,6 +39,7 @@ def lsn_number(value):
 
 
 def check_native_cursor(server, name, timeline):
+    """Read the durable interval without changing the slot's confirmed LSN."""
     response = server.control(f'''(progn
       (call-with-logical-replication-slot "{name}"
         (lambda (slot)

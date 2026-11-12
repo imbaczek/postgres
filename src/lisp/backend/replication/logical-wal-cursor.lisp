@@ -1,23 +1,36 @@
+;; Read a proven local WAL interval for a logical slot.  The segment carrier
+;; comes from the selected history; the owner comes from each record's position.
+;; Traversal supplies local record progress, not slot acknowledgement authority.
+
 (in-package #:pg)
 
 (defstruct (logical-wal-cursor (:constructor %make-logical-wal-cursor))
+  "A scoped, thread-bound traversal of a frozen durable WAL interval.
+The guard is checked under the captured WAL mutex before each copy and advance."
   (history nil :read-only t) (namespace nil :read-only t)
   (end 0 :read-only t) (guard nil :read-only t)
   (thread sb-thread:*current-thread* :read-only t)
   (position 0) (batch-open nil))
 
 (defun logical-wal-segment-carrier (segment history)
+  "Choose the timeline carrying the last byte of SEGMENT in the selected history."
   (unless (typep segment '(integer 0 1099511627775))
     (error "invalid logical WAL segment"))
   (timeline-at-point (1- (* (1+ segment) +wal-segment-size+)) history))
 
 (defun logical-wal-cursor-check-scope (cursor)
+  "Require the owning thread and live source scope under the WAL mutex."
   (assert (sb-thread:holding-mutex-p *wal-lock*))
   (unless (and (eq sb-thread:*current-thread* (logical-wal-cursor-thread cursor))
                (funcall (logical-wal-cursor-guard cursor)))
     (error "logical WAL cursor is outside its source scope")))
 
 (defun call-with-logical-wal-cursor (history namespace start end owner role guard function)
+  "Call FUNCTION with a cursor over START through the frozen END.
+The caller must prove the source and start boundary and supply a guard that
+checks that proof under the WAL mutex.  A geometrically valid empty interval
+alone does not verify record bytes or a record boundary.  The cursor is valid
+only in this call, on this thread, with the captured mutex."
   (timeline-check-lineage history)
   (unless (and (functionp guard)
                (typep start '(unsigned-byte 64)) (typep end '(unsigned-byte 64))
@@ -42,6 +55,7 @@
       (sb-sys:without-interrupts (setf active nil)))))
 
 (defun logical-wal-copy-record (stream size position end)
+  "Copy one complete record within the carrier and frozen end bounds."
   (let* ((offset (mod position +wal-segment-size+))
          (header (make-array +wal-header-size+ :element-type '(unsigned-byte 8))))
     (unless (and (<= (+ offset +wal-header-size+) size)
@@ -61,6 +75,8 @@
         bytes))))
 
 (defun logical-wal-cursor-copy-next (cursor)
+  "Copy the next record under the WAL mutex from its exact carrier file.
+Do not search older timelines or use an archive as recovery might."
   (logical-wal-cursor-check-scope cursor)
   (let ((position (logical-wal-cursor-position cursor))
         (end (logical-wal-cursor-end cursor))
@@ -104,11 +120,14 @@
     (error "logical WAL rotation destination is empty")))
 
 (defun logical-wal-eor-position (fork)
+  "Return the expected child end-of-recovery record position for FORK."
   (if (<= (+ (mod fork +wal-segment-size+) +wal-end-of-recovery-record-size+)
           +wal-segment-size+)
       fork (* (1+ (floor fork +wal-segment-size+)) +wal-segment-size+)))
 
 (defun logical-wal-cursor-check-record (cursor record)
+  "Check record ownership, fork and batch rules against the selected history.
+End-of-recovery is metadata, not an ordinary logical record."
   (let* ((history (logical-wal-cursor-history cursor))
          (start (wal-record-start record))
          (owner (timeline-at-point start history))
@@ -137,6 +156,9 @@
     (values owner (if eor :end-of-recovery :ordinary))))
 
 (defun logical-wal-cursor-next (cursor)
+  "Copy under the WAL mutex, decode outside it, then recheck before progress.
+Return record, bytes, record owner, file carrier and kind.  Local progress
+does not establish slot acknowledgement eligibility."
   (multiple-value-bind (bytes position carrier)
       (sb-thread:with-mutex (*wal-lock*) (logical-wal-cursor-copy-next cursor))
     (unless bytes (return-from logical-wal-cursor-next nil))
@@ -154,6 +176,7 @@
 (declaim (ftype function physical-slot-startup-system-id))
 
 (defun logical-slot-wal-start-proven-p (slot start owner role)
+  "Accept a captured confirmed or birth prefix, or a pending restart record."
   (let ((pending (loop for entry being the hash-values
                          of (wal-replication-slot-pending-xids slot)
                            thereis (= start (car entry))))
@@ -169,6 +192,7 @@
             (eql owner (wal-replication-slot-restart-timeline slot)))))))
 
 (defun logical-slot-wal-check-control (scan system-id)
+  "Check persisted control against the captured primary and durable horizon."
   (let* ((fields (multiple-value-list (wal-read-control-fields)))
          (metadata (seventh fields)))
     (unless (and (integerp (first fields))
@@ -179,6 +203,10 @@
       (error "logical WAL control differs from its captured primary source"))))
 
 (defun call-with-logical-slot-wal-cursor (name from-lsn upto-lsn owner role function)
+  "Traverse a retained slot interval using captured primary source evidence.
+Hold the pin and slot identity fixed. Recheck control coordinates and exact
+history bytes, root, profile and birth, and require a proven start. The end
+is frozen; later WAL growth and CLOG reset are allowed. This grants no import authority."
   (call-with-wal-retained-slot-scan
    name from-lsn upto-lsn
    (lambda (scan)

@@ -319,6 +319,12 @@ appropriate instead of replacing the native C peer or adding a message relay.
   registry. Check suite counts explicitly; after other tracked threads finish,
   load `pg-unit-tests` and run the explicit package suite. Never count zero tests
   as a pass. The cause of the registry change has not been established.
+- `rove:run` takes the ASDF system name `pg-unit-tests`; `find-suite` and
+  `run-suite` take the migrated unit suite's package, `PG`. Do not change the
+  system runner name to fix a package lookup. A package summary can count as one
+  test, so custom runners must compare registered test names with executed headings
+  and failure markers. A wrong selector produced a zero-test run; the corrected
+  run matched all 1,190 registered names.
 - Run the full physical package with `rove:run-suite :pg-physical-tests` in a
   tracked background thread and verify the actual test count. `rove:run` on
   the system found zero tests in this worker despite reporting success.
