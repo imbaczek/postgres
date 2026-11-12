@@ -856,7 +856,6 @@
                          (lambda (directory kind id maximum)
                            (let ((image (funcall original directory kind id maximum)))
                              (when (eq kind :extent)
-                               (setf called t)
                                (ecase failure
                                  (:reference
                                   (let ((metadata (copy-tree (getf fixture :metadata))))
@@ -869,20 +868,40 @@
                                       :timeline 2 :checkpoint-timeline 2 :namespace :timeline
                                       :metadata metadata))))
                                  (:history
-                                  (pg::timeline-write-history 2 1 (getf fixture :fork) "changed reason"))
+                                  (pg::wal-atomic-write-bytes
+                                   (pg::timeline-history-path 2 pg::*pgdata*)
+                                   (pg::timeline-encode-history 2 1 (getf fixture :fork) "changed reason" nil))
+                                  (ok (search "changed reason" (pg::bytes->string (pg::timeline-history-bytes 2)))))
                                  (:owner
                                   (sb-thread:with-mutex (pg::*physical-retained-inventory-publish-lock*)
                                     (pg::physical-retained-root-install owner nil))
                                   (ok (pg::physical-retained-root-protected-p
                                        directory :inventory (getf (getf fixture :reference) :root-id))))
                                  (:update
-                                  (setf hold
-                                        (pg::physical-retained-root-prepare-update
-                                         owner directory (getf fixture :identity)
-                                         (getf (getf fixture :reference) :root-id))))))
+                                  (sb-thread:with-mutex (pg::*physical-retained-inventory-publish-lock*)
+                                    (let ((prepared
+                                            (pg::physical-retained-root-prepare-update
+                                             owner directory (getf fixture :identity)
+                                             (getf (getf fixture :reference) :root-id))))
+                                      (sb-sys:without-interrupts
+                                        (setf hold prepared
+                                              (gethash hold pg::*physical-retained-root-holds*) hold
+                                              (gethash owner pg::*physical-retained-root-updates*) hold))
+                                      (ok (eq hold (gethash owner pg::*physical-retained-root-updates*)))
+                                      (ok (eq hold (gethash hold pg::*physical-retained-root-holds*)))))))
+                               (setf called t))
                              image)))
-                   (ok (signals (pg::logical-wal-archive-prepare archive 0 1) 'error)
-                       (format nil "reject ~a after checked payload I/O" failure))
+                   (let ((message
+                           (handler-case
+                               (progn (pg::logical-wal-archive-prepare archive 0 1) nil)
+                             (error (condition) (princ-to-string condition)))))
+                     (ok (and message
+                              (search (ecase failure
+                                        (:reference "differs from committed primary control")
+                                        (:history "outside its selected source scope")
+                                        ((:owner :update) "owner changed or has an unresolved update"))
+                                      message))
+                         (format nil "reject ~a after completed fault injection: ~a" failure message)))
                    (ok called)
                    (ok (null (pg::logical-wal-archive-cache-bytes archive)))))
              (setf (symbol-function 'pg::physical-retained-object-read) original)
