@@ -906,7 +906,9 @@ CL's RENAME-FILE merges a relative target with the source's directory."
 ;;; ---- hot reload (SIGHUP) and control REPL live in tcop/control.lisp ----
 
 (defun initialize-primary-storage ()
-  "Initialize a cold or promoted primary from its durable WAL/control checkpoint."
+  "Initialize a cold or promoted primary from its durable WAL/control checkpoint.
+Hold the drained admission gate throughout.  PGDATA ownership and storage
+idleness require separate checks."
   (call-with-live-operation-startup-quiescence
    (lambda (owner)
      (declare (ignore owner))

@@ -801,6 +801,8 @@ lane must not run query or storage work."
          (open-live-operation-admission ,owner)))))
 
 (defun check-live-operation-startup-quiescence (owner)
+  "Check OWNER and thread under the admission mutex and return OWNER.
+Require closed lanes, no shutdown, and no active, parked or nested operation."
   (call-with-live-operation-lock
    (lambda ()
      (unless (and owner (eq owner *live-operation-quiescence-owner*)
@@ -813,6 +815,9 @@ lane must not run query or storage work."
      owner)))
 
 (defun call-with-live-operation-startup-quiescence (function)
+  "Call FUNCTION with the gate owner token outside the admission mutex.
+Acquire the gate or borrow the current thread's existing owner; check it before
+and after FUNCTION and preserve its values.  Unwind releases only an acquired gate."
   (when (or (plusp *live-operation-depth*) *live-operation-parked-p*)
     (error "startup quiescence requires an unadmitted, unparked caller"))
   (labels ((invoke (owner)
