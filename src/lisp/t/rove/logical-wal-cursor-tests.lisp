@@ -156,7 +156,7 @@
                            (third fields)
                            :timeline (if (eq failure :timeline) 2 (fourth fields))
                            :checkpoint-timeline (fifth fields)
-                           :namespace (if (member failure '(:timeline :namespace))
+                           :namespace (if (eq failure :namespace)
                                           :timeline (sixth fields))
                            :metadata (seventh fields))))
               (if (eq failure :missing)
