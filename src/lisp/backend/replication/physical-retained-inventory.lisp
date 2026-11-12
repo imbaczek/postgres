@@ -249,8 +249,8 @@ callbacks must keep partial results private until this function returns."
                        (mismatch prefix bytes :end1 size :end2 size)))
             (error "retained WAL inventory has conflicting segment prefixes"))
           (when (or (null prefix) (> (length bytes) (length prefix)))
-            (setf prefix bytes))))))
-  t)
+            (setf prefix bytes)))))
+    (values t prefix)))
 
 (defun physical-retained-inventory-load (directory id identity history &key on-record)
   "Read an inventory and validate all referenced extents sequentially.

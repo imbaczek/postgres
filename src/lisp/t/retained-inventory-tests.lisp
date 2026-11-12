@@ -17,6 +17,97 @@
          (ok (= id (pg::physical-retained-inventory-publish root identity 2 text images)))
          (ok (= 3 (length (pg::directory-entry-names root))))))))
 
+(cl-spec:defproperty retained-validator-returns-checked-final-prefix
+    ((count (range integer 0 2)))
+  (:about pg::physical-retained-inventory-verify-entries)
+  (:trials (:normal 100))
+  (multiple-value-bind (images identity history) (retained-extent-chain)
+    (declare (ignore identity))
+    (let* ((selected (subseq images 0 count))
+           (entries
+             (mapcar (lambda (image)
+                       (list (pg::physical-store-update-digest #xCBF29CE484222325 image)
+                             (length image)
+                             (nth-value 0 (pg::physical-retained-extent-decode image))))
+                     selected))
+           (loads 0)
+           (expected (when selected
+                       (nth-value 1 (pg::physical-retained-extent-decode (car (last selected)))))))
+      (multiple-value-bind (valid prefix)
+          (funcall (symbol-function 'pg::physical-retained-inventory-verify-entries)
+                   entries history
+                   (lambda (id)
+                     (incf loads)
+                     (or (find id selected
+                               :key (lambda (image)
+                                      (pg::physical-store-update-digest #xCBF29CE484222325 image)))
+                         (error "unexpected retained test image"))))
+        (and (eq t valid) (= count loads) (equalp expected prefix))))))
+
+(deftest generated-retained-validator-checked-final-prefix
+    (let ((data (cl-spec:result-data
+                 (cl-spec:run-property 'retained-validator-returns-checked-final-prefix :seed 746))))
+      (ok (eq :passed (getf data :status)) (format nil "~s" data))
+      (ok (= 100 (getf data :trials)))))
+
+(deftest retained-validator-final-prefix-belongs-only-to-the-last-segment
+    (let* ((size pg::+wal-segment-size+)
+           (seed #xCBF29CE484222325)
+           (a (pg::wal-encode-record
+               pg::+wal-record-maintenance+ 0 0
+               (make-array (- size 72) :element-type '(unsigned-byte 8) :initial-element 0)))
+           (b (pg::wal-encode-record
+               pg::+wal-record-maintenance+ 0 size
+               (make-array 32 :element-type '(unsigned-byte 8) :initial-element 1)))
+           (first-digest (pg::physical-store-update-digest seed a))
+           (metadata
+             (loop for bytes in (list a b)
+                   for segment from 0
+                   for start in (list 0 (- size 40))
+                   for initial in (list seed first-digest)
+                   collect (list :version 1 :system-id 42 :base-timeline 1 :base 0
+                                 :manifest-digest 77 :history-target 1 :history-digest nil
+                                 :history-text "" :start start
+                                 :end (+ (* segment size) (length bytes))
+                                 :start-digest initial
+                                 :end-digest (pg::physical-store-update-digest initial bytes)
+                                 :segment segment :file-timeline 1
+                                 :prefix-digest (pg::physical-store-update-digest seed bytes))))
+           (images (mapcar #'pg::physical-retained-extent-encode metadata (list a b)))
+           (entries (mapcar (lambda (image fields)
+                              (list (pg::physical-store-update-digest seed image) (length image) fields))
+                            images metadata))
+           (loads 0))
+      (multiple-value-bind (valid prefix)
+          (pg::physical-retained-inventory-verify-entries
+           entries (pg::timeline-parse-history 1 "")
+           (lambda (id)
+             (incf loads)
+             (nth (position id entries :key #'first) images)))
+        (ok (eq t valid))
+        (ok (= 2 loads))
+        (ok (= 64 (length prefix)))
+        (ok (equalp b prefix))
+        (fill prefix 0)
+        (ok (equalp b (nth-value 1 (pg::physical-retained-extent-decode (second images))))))))
+
+(deftest retained-validator-empty-entries-return-only-the-supplied-physical-overlap
+    (let* ((bytes (legacy-checkpoint-record 0))
+           (metadata (list :version 1 :system-id 42 :base-timeline 1 :base 32 :manifest-digest 77
+                           :checkpoint-start 0 :namespace :legacy
+                           :file (list "pg_wal/0000000000000000.wal" 32
+                                       (pg::physical-store-update-digest #xCBF29CE484222325 bytes)))))
+      (multiple-value-bind (checked restored)
+          (pg::physical-retained-overlap-decode (pg::physical-retained-overlap-encode metadata bytes))
+        (multiple-value-bind (valid prefix)
+            (pg::physical-retained-inventory-verify-entries
+             nil (pg::timeline-parse-history 1 "")
+             (lambda (id) (declare (ignore id)) (error "empty inventory must not load an extent"))
+             (list checked restored))
+          (ok (eq t valid))
+          (ok (eq restored prefix))
+          (ok (equalp bytes prefix))))))
+
 (deftest retained-inventory-append-preserves-old-generation
     (call-with-retained-inventory
      (lambda (root images identity history text)
