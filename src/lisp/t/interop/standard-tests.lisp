@@ -1,20 +1,37 @@
 (in-package #:pg-interop-tests)
 
+(defvar *standard-stream-test-boundaries* nil)
+
+(defvar *standard-stream-test-feedback* nil)
+
 (defun call-with-owned-standard-stream (function)
   (call-with-standard-slot-fixture
    (lambda ()
      (pg::create-standard-logical-slot "native_slot" :nothing)
-     (pg::call-with-logical-replication-slot
-      "native_slot"
-      (lambda (slot)
-        (let ((pg::*wal-durable-lsn* 256)
-              (pg::*wal-logical-slot-read-progress* 256))
-          (funcall function
-                   (pg::make-standard-stream
-                    :slot-name "native_slot" :slot-object slot :emit-floor 256
-                    :scan-cursor 128 :safe-frontier 128 :reported-flush 128
-                    :restart-floor 32)
-                   slot)))))))
+     (let ((*standard-stream-test-boundaries* nil)
+           (*standard-stream-test-feedback* nil))
+       (setf *standard-stream-test-boundaries*
+             (pg::with-write-lock
+               (loop for xid from 9 to 11 collect
+                                          (pg::wal-commit-transaction xid #'values :source-id 'standard-stream-fixture))))
+       (destructuring-bind (first second end) *standard-stream-test-boundaries*
+         (let ((write (- end 10)) (flush (1+ first)) (apply (- end 5)))
+           (assert (< *standard-slot-test-boundary* first flush second write apply end))
+           (setf *standard-stream-test-feedback* (list write flush apply))))
+       (pg::call-with-logical-replication-slot
+        "native_slot"
+        (lambda (slot)
+          (let ((pg::*wal-logical-slot-read-progress*
+                  (third *standard-stream-test-boundaries*)))
+            (funcall function
+                     (pg::make-standard-stream
+                      :slot-name "native_slot" :slot-object slot
+                      :emit-floor pg::*wal-logical-slot-read-progress*
+                      :scan-cursor *standard-slot-test-boundary*
+                      :safe-frontier *standard-slot-test-boundary*
+                      :reported-flush *standard-slot-test-boundary*
+                      :restart-floor *standard-slot-test-restart*)
+                     slot))))))))
 
 (defun standard-test-feedback (write flush apply &optional reply)
   (let ((payload (pg::make-payload)))
@@ -29,45 +46,55 @@
 (deftest standard-feedback-resume-and-unaligned-confirmation
     (call-with-owned-standard-stream
      (lambda (state slot)
-       (pg::standard-accept-feedback state (standard-test-feedback 230 200 240 t))
-       (ok (= 128 (pg::wal-replication-slot-confirmed-flush-lsn slot)))
-       (ok (pg::standard-stream-reply-p state))
-       (pg::standard-note-frontier state 160)
-       (pg::standard-acknowledge-flush state)
-       (ok (= 160 (pg::wal-replication-slot-confirmed-flush-lsn slot))
-           "a lost-feedback resume claim confirms only the safely scanned prefix")
-       (ok (= 32 (pg::wal-replication-slot-restart-lsn slot))
-           "the pre-boundary active XID still pins its earlier WAL")
-       (clrhash (pg::wal-replication-slot-pending-xids slot))
-       (pg::standard-note-frontier state 224)
-       (pg::standard-acknowledge-flush state)
-       (ok (= 200 (pg::wal-replication-slot-confirmed-flush-lsn slot)))
-       (ok (= 160 (pg::wal-replication-slot-restart-lsn slot))
-           "an interior flush retains an aligned restart floor")
-       (let ((decoded (pg::wal-read-replication-slot
-                       (pg::wal-replication-slot-path "native_slot"))))
-         (ok (= 200 (pg::wal-replication-slot-confirmed-flush-lsn decoded)))
-         (ok (= 160 (pg::wal-replication-slot-restart-lsn decoded))))
-       (pg::standard-accept-feedback state (standard-test-feedback 0 0 0))
-       (ok (= 200 (pg::wal-replication-slot-confirmed-flush-lsn slot)))
-       (ok (equal '(224) (pg::standard-stream-pending-boundaries state)))
-       (ok (equal "22023" (sqlstate-of (pg::standard-accept-feedback
-                                        state (standard-test-feedback 300 300 300))))))))
+       (destructuring-bind (first second end) *standard-stream-test-boundaries*
+         (destructuring-bind (write flush apply) *standard-stream-test-feedback*
+           (pg::standard-accept-feedback state
+                                         (standard-test-feedback write flush apply t))
+           (ok (= *standard-slot-test-boundary*
+                  (pg::wal-replication-slot-confirmed-flush-lsn slot)))
+           (ok (pg::standard-stream-reply-p state))
+           (pg::standard-note-frontier state first)
+           (pg::standard-acknowledge-flush state)
+           (ok (= first (pg::wal-replication-slot-confirmed-flush-lsn slot))
+               "a lost-feedback resume claim confirms only the safely scanned prefix")
+           (ok (= *standard-slot-test-restart* (pg::wal-replication-slot-restart-lsn slot))
+               "the pre-boundary active XID still pins its earlier WAL")
+           (clrhash (pg::wal-replication-slot-pending-xids slot))
+           (pg::standard-note-frontier state second)
+           (pg::standard-acknowledge-flush state)
+           (ok (= flush (pg::wal-replication-slot-confirmed-flush-lsn slot)))
+           (ok (= first (pg::wal-replication-slot-restart-lsn slot))
+               "an interior flush retains an aligned restart floor")
+           (let ((decoded (pg::wal-read-replication-slot
+                           (pg::wal-replication-slot-path "native_slot"))))
+             (ok (= flush (pg::wal-replication-slot-confirmed-flush-lsn decoded)))
+             (ok (= first (pg::wal-replication-slot-restart-lsn decoded))))
+           (pg::standard-accept-feedback state (standard-test-feedback 0 0 0))
+           (ok (= flush (pg::wal-replication-slot-confirmed-flush-lsn slot)))
+           (ok (equal (list second) (pg::standard-stream-pending-boundaries state)))
+           (ok (equal "22023"
+                      (sqlstate-of
+                       (pg::standard-accept-feedback
+                        state (standard-test-feedback (1+ end) (1+ end) (1+ end)))))))))))
 
 (deftest standard-feedback-status-keeps-logical-positions-independent
     (call-with-owned-standard-stream
      (lambda (state slot)
        (let* ((pg::*wal-sender-registry* (make-hash-table :test #'eq))
               (backend (pg::make-backend :pid 2350 :replication-mode :database))
-              (pg::*wal-sender* (pg::wal-sender-register backend)))
+              (pg::*wal-sender* (pg::wal-sender-register backend))
+              (write (first *standard-stream-test-feedback*))
+              (flush (second *standard-stream-test-feedback*))
+              (apply (third *standard-stream-test-feedback*)))
          (unwind-protect
               (progn
-                (pg::standard-accept-feedback state (standard-test-feedback 230 200 240))
+                (pg::standard-accept-feedback state (standard-test-feedback write flush apply))
                 (let ((snapshot (first (pg::wal-sender-snapshots))))
-                  (ok (= 230 (getf snapshot :write-lsn)))
-                  (ok (= 200 (getf snapshot :flush-lsn)))
-                  (ok (= 240 (getf snapshot :replay-lsn)))
-                  (ok (= 128 (pg::wal-replication-slot-confirmed-flush-lsn slot))))
+                  (ok (= write (getf snapshot :write-lsn)))
+                  (ok (= flush (getf snapshot :flush-lsn)))
+                  (ok (= apply (getf snapshot :replay-lsn)))
+                  (ok (= *standard-slot-test-boundary*
+                         (pg::wal-replication-slot-confirmed-flush-lsn slot))))
                 (pg::standard-accept-feedback state (standard-test-feedback 0 0 0))
                 (ok (zerop (getf (first (pg::wal-sender-snapshots)) :flush-lsn))))
            (pg::wal-sender-unregister backend pg::*wal-sender*))))))
@@ -109,13 +136,18 @@
     (call-with-owned-standard-stream
      (lambda (state slot)
        (declare (ignore state))
-       (ok (eq slot (pg::wal-acknowledge-standard-replication-slot
-                     "native_slot" 0 0 0)))
-       (ok (equal "22023" (sqlstate-of (pg::wal-acknowledge-standard-replication-slot
-                                        "native_slot" 160 128 150))))
-       (let ((pg::*wal-logical-slot-owner* nil))
-         (ok (equal "55006" (sqlstate-of (pg::wal-acknowledge-standard-replication-slot
-                                          "native_slot" 160 128 192))))))))
+       (destructuring-bind (first second end) *standard-stream-test-boundaries*
+         (declare (ignore end))
+         (ok (eq slot (pg::wal-acknowledge-standard-replication-slot "native_slot" 0 0 0)))
+         (ok (equal "22023"
+                    (sqlstate-of
+                     (pg::wal-acknowledge-standard-replication-slot
+                      "native_slot" first *standard-slot-test-boundary* (1- first)))))
+         (let ((pg::*wal-logical-slot-owner* nil))
+           (ok (equal "55006"
+                      (sqlstate-of
+                       (pg::wal-acknowledge-standard-replication-slot
+                        "native_slot" first *standard-slot-test-boundary* second)))))))))
 
 (deftest standard-start-negotiation
     (dolist (version '(1 2 3 4))
