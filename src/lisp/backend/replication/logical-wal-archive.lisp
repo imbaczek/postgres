@@ -13,7 +13,109 @@ Its accessors do not grant authority to produce or consume logical WAL."
   (reference nil :read-only t) (history nil :read-only t)
   (parent-history nil :read-only t) (guard nil :read-only t)
   (minimum-end 0 :read-only t)
-  (index nil) (cache-segment nil) (cache-bytes nil))
+  (index nil) (cache-segment nil) (cache-bytes nil) (cache-start 0) (cache-end 0))
+
+(defun logical-wal-archive-clear-cache (archive)
+  (sb-sys:without-interrupts
+    (setf (logical-wal-archive-cache-segment archive) nil
+          (logical-wal-archive-cache-bytes archive) nil
+          (logical-wal-archive-cache-start archive) 0
+          (logical-wal-archive-cache-end archive) 0)))
+
+(defun logical-wal-archive-check-cursor (archive history namespace)
+  (logical-wal-archive-check archive)
+  (unless (and (eq namespace :timeline)
+               (equalp history (logical-wal-archive-history archive)))
+    (error "logical WAL cursor differs from its archive history or namespace"))
+  t)
+
+(defun logical-wal-archive-base-gap-p (archive segment carrier)
+  (let* ((reference (logical-wal-archive-reference archive))
+         (index (logical-wal-archive-index archive))
+         (base (getf reference :base))
+         (overlap (third (getf index :base-overlap)))
+         (first (third (first (getf index :entries)))))
+    (and (< base (getf reference :end))
+         (plusp (mod base +wal-segment-size+))
+         (= segment (floor base +wal-segment-size+))
+         (= carrier (getf overlap :base-timeline))
+         (eq :timeline (getf overlap :namespace))
+         (eql (1+ segment) (getf first :segment))
+         (eql base (getf first :start)))))
+
+(defun logical-wal-archive-copy-at (archive position end carrier)
+  (logical-wal-archive-check archive)
+  (let* ((reference (logical-wal-archive-reference archive))
+         (segment (floor position +wal-segment-size+))
+         (offset (mod position +wal-segment-size+)))
+    (unless (and (<= (getf reference :base) position)
+                 (< position (getf reference :end))
+                 (eql carrier (logical-wal-segment-carrier
+                               segment (logical-wal-archive-history archive))))
+      (error "logical WAL position is outside certified archive coverage"))
+    (unless (eql segment (logical-wal-archive-cache-segment archive))
+      (return-from logical-wal-archive-copy-at (values nil nil nil)))
+    (unless (<= (logical-wal-archive-cache-start archive) position
+                (logical-wal-archive-cache-end archive))
+      (error "logical WAL position is outside its checked segment coverage"))
+    (let* ((bytes (logical-wal-archive-cache-bytes archive))
+           (size (length bytes)))
+      (when (= offset size)
+        (return-from logical-wal-archive-copy-at (values nil size t)))
+      (let ((length (logical-wal-check-record-length
+                     bytes offset position size (min end (logical-wal-archive-cache-end archive)))))
+        (values (subseq bytes offset (+ offset length)) size t)))))
+
+(defun logical-wal-archive-certified-end (archive segment carrier)
+  (unless (<= (* (1+ segment) +wal-segment-size+)
+              (getf (logical-wal-archive-reference archive) :end))
+    (return-from logical-wal-archive-certified-end nil))
+  (let ((end nil) (eligible t))
+    (dolist (entry (getf (logical-wal-archive-index archive) :entries))
+      (let ((metadata (third entry)))
+        (when (= segment (getf metadata :segment))
+          (unless (and (typep (getf metadata :end) '(unsigned-byte 64))
+                       (< (* segment +wal-segment-size+) (getf metadata :end))
+                       (<= (getf metadata :end) (* (1+ segment) +wal-segment-size+)))
+            (error "invalid certified logical WAL segment geometry"))
+          (unless (= carrier (getf metadata :file-timeline)) (setf eligible nil))
+          (setf end (getf metadata :end)))))
+    (cond ((and eligible end) end)
+          ((and (null end) (logical-wal-archive-base-gap-p archive segment carrier))
+           (getf (logical-wal-archive-reference archive) :base)))))
+
+(defun logical-wal-archive-compare-live (archive position carrier size bytes)
+  (logical-wal-archive-check archive)
+  (let* ((segment (floor position +wal-segment-size+))
+         (origin (* segment +wal-segment-size+))
+         (end (logical-wal-archive-certified-end archive segment carrier)))
+    (when (and end (/= size (- end origin)))
+      (error "live logical WAL geometry differs from certified archive"))
+    (when (eql segment (logical-wal-archive-cache-segment archive))
+      (unless (and end
+                   (eql carrier (logical-wal-segment-carrier
+                                 segment (logical-wal-archive-history archive)))
+                   (= size (length (logical-wal-archive-cache-bytes archive))))
+        (error "live logical WAL geometry differs from certified archive"))
+      (when bytes
+        (let* ((offset (- position origin))
+               (stop (+ offset (length bytes)))
+               (prefix (logical-wal-archive-cache-bytes archive)))
+          (unless (<= 0 offset stop (length prefix))
+            (error "live logical WAL record exceeds its checked physical prefix"))
+          (when (mismatch bytes prefix :start2 offset :end2 stop)
+            (error "live logical WAL record differs from certified archive")))))
+    (eql segment (logical-wal-archive-cache-segment archive))))
+
+(defun call-with-optional-logical-wal-archive (system-id history namespace guard function)
+  (let ((present
+          (sb-thread:with-mutex (*wal-lock*)
+            (unless (funcall guard) (error "logical WAL archive source is unavailable"))
+            (not (null (getf (seventh (multiple-value-list (wal-read-control-fields)))
+                             :retained-reference))))))
+    (if present
+        (call-with-logical-wal-archive system-id history namespace guard function)
+        (funcall function nil))))
 
 (defun logical-wal-archive-check (archive)
   "Recheck the caller's source proof and this archive's scope under the WAL mutex."
@@ -130,14 +232,10 @@ index and cache are cleared on every exit, and the archive then expires."
           (getf (logical-wal-archive-reference archive) :root-id))
       (sb-sys:without-interrupts
         (setf active nil
-              (logical-wal-archive-index archive) nil
-              (logical-wal-archive-cache-segment archive) nil
-              (logical-wal-archive-cache-bytes archive) nil)))))
+              (logical-wal-archive-index archive) nil)
+        (logical-wal-archive-clear-cache archive)))))
 
 (defun logical-wal-archive-segment-entries (archive segment carrier)
-  "Select entries for the exact carrier chosen by the child history.
-The carrier is the timeline at the segment's last byte, so a parent archive
-file for the fork segment is rejected when the child carries that segment."
   (unless (and (typep segment '(integer 0 1099511627775))
                (eql carrier (logical-wal-segment-carrier
                              segment (logical-wal-archive-history archive))))
@@ -147,19 +245,16 @@ file for the fork segment is rejected when the child carries that segment."
          (entries (remove-if-not
                    (lambda (entry) (= segment (getf (third entry) :segment)))
                    (getf (logical-wal-archive-index archive) :entries))))
-    (unless (and entries
-                 (< origin (getf reference :end))
-                 (< (getf reference :base) (+ origin +wal-segment-size+))
-                 (every (lambda (entry)
-                          (= carrier (getf (third entry) :file-timeline))) entries))
+    (unless (or (and (null entries) (logical-wal-archive-base-gap-p archive segment carrier))
+                (and entries
+                     (< origin (getf reference :end))
+                     (< (getf reference :base) (+ origin +wal-segment-size+))
+                     (every (lambda (entry)
+                              (= carrier (getf (third entry) :file-timeline))) entries)))
       (error "logical WAL archive has no certified coverage for the selected carrier"))
     entries))
 
 (defun logical-wal-archive-prepare (archive segment carrier)
-  "Prepare one segment's bytes outside WAL exclusion.
-Validate every extent for this segment before installing the cache under
-a renewed source check.  These bytes do not grant logical coverage or any
-cursor, import, acknowledgement, replay or coordination authority."
   (when (sb-thread:holding-mutex-p *wal-lock*)
     (error "logical WAL archive preparation must run outside WAL exclusion"))
   (let ((entries nil))
@@ -171,10 +266,13 @@ cursor, import, acknowledgement, replay or coordination authority."
           (error "logical WAL archive request differs from the selected carrier"))
         (return-from logical-wal-archive-prepare t))
       (setf entries (logical-wal-archive-segment-entries archive segment carrier))
-      (setf (logical-wal-archive-cache-segment archive) nil
-            (logical-wal-archive-cache-bytes archive) nil))
+      (logical-wal-archive-clear-cache archive))
     (let* ((directory (logical-wal-archive-directory archive))
-           (base (getf (logical-wal-archive-reference archive) :base))
+           (reference (logical-wal-archive-reference archive))
+           (base (getf reference :base))
+           (origin (* segment +wal-segment-size+))
+           (start (if entries (max base origin (getf (third (first entries)) :start)) base))
+           (end (if entries (min (getf reference :end) (getf (third (car (last entries))) :end)) base))
            (overlap (when (= segment (floor (1- base) +wal-segment-size+))
                       (physical-retained-inventory-read-overlap
                        directory (logical-wal-archive-index archive))))
@@ -187,6 +285,9 @@ cursor, import, acknowledgement, replay or coordination authority."
                       overlap))))
       (sb-thread:with-mutex (*wal-lock*)
         (logical-wal-archive-check archive)
-        (setf (logical-wal-archive-cache-segment archive) segment
-              (logical-wal-archive-cache-bytes archive) bytes)))
+        (sb-sys:without-interrupts
+          (setf (logical-wal-archive-cache-start archive) start
+                (logical-wal-archive-cache-end archive) end
+                (logical-wal-archive-cache-bytes archive) bytes
+                (logical-wal-archive-cache-segment archive) segment))))
     t))

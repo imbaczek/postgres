@@ -4,11 +4,15 @@
 
 (in-package #:pg)
 
+(declaim (ftype function logical-wal-archive-check-cursor logical-wal-archive-copy-at
+                logical-wal-archive-compare-live logical-wal-archive-prepare
+                call-with-optional-logical-wal-archive))
+
 (defstruct (logical-wal-cursor (:constructor %make-logical-wal-cursor))
   "A scoped, thread-bound traversal of a frozen durable WAL interval.
 The guard is checked under the captured WAL mutex before each copy and advance."
   (history nil :read-only t) (namespace nil :read-only t)
-  (end 0 :read-only t) (guard nil :read-only t)
+  (end 0 :read-only t) (guard nil :read-only t) (archive nil :read-only t)
   (thread sb-thread:*current-thread* :read-only t)
   (position 0) (batch-open nil))
 
@@ -23,9 +27,13 @@ The guard is checked under the captured WAL mutex before each copy and advance."
   (assert (sb-thread:holding-mutex-p *wal-lock*))
   (unless (and (eq sb-thread:*current-thread* (logical-wal-cursor-thread cursor))
                (funcall (logical-wal-cursor-guard cursor)))
-    (error "logical WAL cursor is outside its source scope")))
+    (error "logical WAL cursor is outside its source scope"))
+  (when (logical-wal-cursor-archive cursor)
+    (logical-wal-archive-check-cursor (logical-wal-cursor-archive cursor)
+                                      (logical-wal-cursor-history cursor)
+                                      (logical-wal-cursor-namespace cursor))))
 
-(defun call-with-logical-wal-cursor (history namespace start end owner role guard function)
+(defun call-with-logical-wal-cursor (history namespace start end owner role guard function &key archive)
   "Call FUNCTION with a cursor over START through the frozen END.
 The caller must prove the source and start boundary and supply a guard that
 checks that proof under the WAL mutex.  A geometrically valid empty interval
@@ -46,7 +54,7 @@ only in this call, on this thread, with the captured mutex."
          (mutex *wal-lock*)
          (cursor (%make-logical-wal-cursor
                   :history (mapcar #'copy-timeline-history-entry history)
-                  :namespace namespace :position start :end end
+                  :namespace namespace :position start :end end :archive archive
                   :guard (lambda () (and active (eq mutex *wal-lock*) (funcall guard))))))
     (unwind-protect
          (progn
@@ -54,8 +62,71 @@ only in this call, on this thread, with the captured mutex."
            (funcall function cursor))
       (sb-sys:without-interrupts (setf active nil)))))
 
+(defun logical-wal-check-record-length (bytes header-offset position size end)
+  (let ((offset (mod position +wal-segment-size+)))
+    (unless (and (<= (+ header-offset +wal-header-size+) (length bytes))
+                 (<= (+ offset +wal-header-size+) size)
+                 (<= (+ position +wal-header-size+) end))
+      (error "incomplete logical WAL header"))
+    (let ((length (wal-u32 bytes (+ header-offset 8))))
+      (unless (and (<= +wal-header-size+ length +wal-segment-size+)
+                   (<= (+ offset length) size +wal-segment-size+)
+                   (<= (+ position length) end))
+        (error "incomplete or out-of-range logical WAL record"))
+      length)))
+
+(defun logical-wal-cursor-copy-at (cursor position carrier)
+  (let ((stream nil) (size nil) (missing nil)
+                     (archive (logical-wal-cursor-archive cursor))
+                     (segment (floor position +wal-segment-size+)))
+    (unwind-protect
+         (progn
+           (sb-sys:without-interrupts
+             (handler-case
+                 (multiple-value-setq (stream size)
+                   (open-bounded-regular-file
+                    (wal-segment-path segment carrier (logical-wal-cursor-namespace cursor))
+                    +wal-segment-size+))
+               (sb-posix:syscall-error (condition)
+                 (if (and archive (= sb-posix:enoent (sb-posix:syscall-errno condition)))
+                     (setf missing t)
+                     (error condition)))))
+           (when missing
+             (return-from logical-wal-cursor-copy-at
+               (logical-wal-archive-copy-at archive position (logical-wal-cursor-end cursor) carrier)))
+           (let ((matched-cache (and archive (logical-wal-archive-compare-live
+                                              archive position carrier size nil)))
+                 (offset (mod position +wal-segment-size+)))
+             (when (> offset size) (error "logical WAL start exceeds carrier length"))
+             (let ((bytes (unless (= offset size)
+                            (logical-wal-copy-record stream size position
+                                                     (logical-wal-cursor-end cursor)))))
+               (when (and matched-cache bytes)
+                 (logical-wal-archive-compare-live archive position carrier size bytes))
+               (values bytes size t))))
+      (when stream (close stream)))))
+
+(defun logical-wal-cursor-read-next (cursor)
+  (let ((original nil) (continuation nil) (prepared nil))
+    (dotimes (attempt 3)
+      (declare (ignorable attempt))
+      (multiple-value-bind (bytes position carrier missing)
+          (sb-thread:with-mutex (*wal-lock*)
+            (unless original (setf original (logical-wal-cursor-position cursor)))
+            (unless (= original (logical-wal-cursor-position cursor))
+              (error "logical WAL cursor changed during archive preparation"))
+            (logical-wal-cursor-copy-next cursor continuation))
+        (unless missing
+          (return-from logical-wal-cursor-read-next (values bytes position carrier original)))
+        (let ((segment (floor position +wal-segment-size+)))
+          (when (or (member segment prepared) (= 2 (length prepared)))
+            (error "logical WAL archive preparation did not stabilize"))
+          (push segment prepared)
+          (setf continuation missing)
+          (logical-wal-archive-prepare (logical-wal-cursor-archive cursor) segment carrier))))
+    (error "logical WAL archive preparation exceeded its segment bound")))
+
 (defun logical-wal-copy-record (stream size position end)
-  "Copy one complete record within the carrier and frozen end bounds."
   (let* ((offset (mod position +wal-segment-size+))
          (header (make-array +wal-header-size+ :element-type '(unsigned-byte 8))))
     (unless (and (<= (+ offset +wal-header-size+) size)
@@ -63,25 +134,22 @@ only in this call, on this thread, with the captured mutex."
                  (file-position stream offset)
                  (= (read-sequence header stream) +wal-header-size+))
       (error "incomplete logical WAL header"))
-    (let ((length (wal-u32 header 8)))
-      (unless (and (<= +wal-header-size+ length +wal-segment-size+)
-                   (<= (+ offset length) size +wal-segment-size+)
-                   (<= (+ position length) end))
-        (error "incomplete or out-of-range logical WAL record"))
-      (let ((bytes (make-array length :element-type '(unsigned-byte 8))))
-        (replace bytes header)
-        (unless (= (read-sequence bytes stream :start +wal-header-size+) length)
-          (error "short logical WAL record read"))
-        bytes))))
+    (let* ((length (logical-wal-check-record-length header 0 position size end))
+           (bytes (make-array length :element-type '(unsigned-byte 8))))
+      (replace bytes header)
+      (unless (= (read-sequence bytes stream :start +wal-header-size+) length)
+        (error "short logical WAL record read"))
+      bytes)))
 
-(defun logical-wal-cursor-copy-next (cursor)
-  "Copy the next record under the WAL mutex from its exact carrier file.
-Do not search older timelines or use an archive as recovery might."
+(defun logical-wal-cursor-copy-next (cursor &optional continuation)
   (logical-wal-cursor-check-scope cursor)
-  (let ((position (logical-wal-cursor-position cursor))
-        (end (logical-wal-cursor-end cursor))
-        (history (logical-wal-cursor-history cursor))
-        (gap nil))
+  (let* ((original (logical-wal-cursor-position cursor))
+         (position (if continuation (first continuation) original))
+         (end (logical-wal-cursor-end cursor))
+         (history (logical-wal-cursor-history cursor))
+         (gap (second continuation)))
+    (when (and continuation (/= original (third continuation)))
+      (error "logical WAL cursor changed during archive preparation"))
     (when (= position end)
       (when (logical-wal-cursor-batch-open cursor)
         (error "logical WAL horizon ends inside a batch"))
@@ -91,32 +159,24 @@ Do not search older timelines or use an archive as recovery might."
       (declare (ignorable attempt))
       (let* ((segment (floor position +wal-segment-size+))
              (offset (mod position +wal-segment-size+))
-             (carrier (logical-wal-segment-carrier segment history))
-             (stream nil) (size nil))
-        (unwind-protect
-             (progn
-               (sb-sys:without-interrupts
-                 (multiple-value-setq (stream size)
-                   (open-bounded-regular-file
-                    (wal-segment-path segment carrier (logical-wal-cursor-namespace cursor))
-                    +wal-segment-size+)))
-               (cond
-                 ((> offset size) (error "logical WAL start exceeds carrier length"))
-                 ((= offset size)
-                  (let ((next (* (1+ segment) +wal-segment-size+)))
-                    (when (or gap (zerop offset) (>= next end)
-                              (some (lambda (entry)
-                                      (< position (timeline-history-entry-begin entry) next))
-                                    history))
-                      (error "invalid logical WAL rotation gap"))
-                    (setf gap position position next)))
-                 (t
-                  (let ((bytes (logical-wal-copy-record stream size position end)))
-                    (when (and gap (<= (length bytes) (- position gap)))
-                      (error "logical WAL record fits in the skipped segment capacity"))
-                    (return-from logical-wal-cursor-copy-next
-                      (values bytes position carrier))))))
-          (when stream (close stream)))))
+             (carrier (logical-wal-segment-carrier segment history)))
+        (multiple-value-bind (bytes size ready)
+            (logical-wal-cursor-copy-at cursor position carrier)
+          (unless ready
+            (return-from logical-wal-cursor-copy-next
+              (values nil position carrier (list position gap original))))
+          (if (= offset size)
+              (let ((next (* (1+ segment) +wal-segment-size+)))
+                (when (or gap (zerop offset) (>= next end)
+                          (some (lambda (entry)
+                                  (< position (timeline-history-entry-begin entry) next)) history))
+                  (error "invalid logical WAL rotation gap"))
+                (setf gap position position next))
+              (progn
+                (when (and gap (<= (length bytes) (- position gap)))
+                  (error "logical WAL record fits in the skipped segment capacity"))
+                (return-from logical-wal-cursor-copy-next
+                  (values bytes position carrier)))))))
     (error "logical WAL rotation destination is empty")))
 
 (defun logical-wal-eor-position (fork)
@@ -156,16 +216,15 @@ End-of-recovery is metadata, not an ordinary logical record."
     (values owner (if eor :end-of-recovery :ordinary))))
 
 (defun logical-wal-cursor-next (cursor)
-  "Copy under the WAL mutex, decode outside it, then recheck before progress.
-Return record, bytes, record owner, file carrier and kind.  Local progress
-does not establish slot acknowledgement eligibility."
-  (multiple-value-bind (bytes position carrier)
-      (sb-thread:with-mutex (*wal-lock*) (logical-wal-cursor-copy-next cursor))
+  (multiple-value-bind (bytes position carrier original)
+      (logical-wal-cursor-read-next cursor)
     (unless bytes (return-from logical-wal-cursor-next nil))
     (let ((record (wal-decode-record bytes position)))
       (multiple-value-bind (owner kind) (logical-wal-cursor-check-record cursor record)
         (sb-thread:with-mutex (*wal-lock*)
           (logical-wal-cursor-check-scope cursor)
+          (unless (= original (logical-wal-cursor-position cursor))
+            (error "logical WAL cursor changed during record decode"))
           (setf (logical-wal-cursor-position cursor) (wal-record-end record))
           (cond ((= (wal-record-type record) +wal-record-batch-start+)
                  (setf (logical-wal-cursor-batch-open cursor) t))
@@ -257,7 +316,10 @@ is frozen; later WAL growth and CLOG reset are allowed. This grants no import au
              (error "logical WAL start lacks a captured slot boundary"))
            (logical-slot-check-primary-history (wal-retained-slot-scan-slot scan) history)
            (check-source))
-         (call-with-logical-wal-cursor
-          history (wal-retained-slot-scan-namespace scan)
-          (wal-retained-slot-scan-start scan) (wal-retained-slot-scan-end scan)
-          owner role #'check-source function))))))
+         (call-with-optional-logical-wal-archive
+          system-id history (wal-retained-slot-scan-namespace scan) #'check-source
+          (lambda (archive)
+            (call-with-logical-wal-cursor
+             history (wal-retained-slot-scan-namespace scan)
+             (wal-retained-slot-scan-start scan) (wal-retained-slot-scan-end scan)
+             owner role (if archive (constantly t) #'check-source) function :archive archive))))))))

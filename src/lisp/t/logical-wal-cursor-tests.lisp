@@ -17,6 +17,28 @@
       (ok (eq :passed (getf data :status)) (format nil "~s" data))
       (ok (= 100 (getf data :trials)))))
 
+(cl-spec:defproperty logical-wal-record-length-preserves-native-bounds
+    ((offset (range integer 0 16777215))
+     (length (range integer 32 16777216))
+     (margin (range integer -1 1)))
+  (:about pg::logical-wal-check-record-length)
+  (:trials (:normal 100))
+  (let ((header (make-array pg::+wal-header-size+ :element-type '(unsigned-byte 8) :initial-element 0))
+        (size (+ offset length)))
+    (pg::wal-set-u32 header 8 length)
+    (let ((result (handler-case
+                      (pg::logical-wal-check-record-length header 0 offset size (+ size margin))
+                    (error () nil))))
+      (if (and (<= size pg::+wal-segment-size+) (not (minusp margin)))
+          (eql length result)
+          (null result)))))
+
+(deftest generated-logical-wal-record-length-bounds
+    (let ((data (cl-spec:result-data
+                 (cl-spec:run-property 'logical-wal-record-length-preserves-native-bounds :seed 747))))
+      (ok (eq :passed (getf data :status)) (format nil "~s" data))
+      (ok (= 100 (getf data :trials)))))
+
 (defun cursor-test-call (history start end function &key (owner 1) (role :prefix-end)
                                                       (guard (lambda () t)))
   (pg::call-with-logical-wal-cursor history :timeline start end owner role guard function))

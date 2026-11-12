@@ -43,10 +43,36 @@ def check_native_cursor(server, name, timeline):
     response = server.control(f'''(progn
       (call-with-logical-replication-slot "{name}"
         (lambda (slot)
-          (let ((confirmed (wal-replication-slot-confirmed-flush-lsn slot)) (count 0))
+          (let ((confirmed (wal-replication-slot-confirmed-flush-lsn slot)) (count 0)
+                (before-pins (sb-thread:with-mutex (*wal-lock*)
+                               (loop for key being the hash-keys of *wal-snapshot-retention-pins* collect key)))
+                (before-roots (sb-thread:with-mutex (*physical-retained-inventory-publish-lock*)
+                                (loop for key being the hash-keys of *physical-retained-root-references* collect key)))
+                (scan-pin nil) (archive-reader nil))
             (call-with-logical-slot-wal-cursor "{name}" nil nil
               (wal-replication-slot-confirmed-timeline slot) :prefix-end
               (lambda (cursor)
+                (sb-thread:with-mutex (*wal-lock*)
+                  (let ((pins (set-difference
+                               (loop for key being the hash-keys of *wal-snapshot-retention-pins* collect key)
+                               before-pins :test #'eq))
+                        (archive (logical-wal-cursor-archive cursor)))
+                    (assert (= 1 (length pins)))
+                    (setf scan-pin (first pins))
+                    (assert (eql confirmed (gethash scan-pin *wal-snapshot-retention-pins*)))
+                    (assert (eql (null archive) (= {timeline} 1)))
+                    (when archive
+                      (logical-wal-archive-check-cursor
+                       archive (logical-wal-cursor-history cursor) (logical-wal-cursor-namespace cursor))
+                      (sb-thread:with-mutex (*physical-retained-inventory-publish-lock*)
+                        (setf archive-reader
+                              (loop for key being the hash-keys of *physical-retained-root-references*
+                                      using (hash-value reference)
+                                    when (and (not (member key before-roots :test #'eq))
+                                              (eql (physical-retained-root-reference-root-id reference)
+                                                   (getf (logical-wal-archive-reference archive) :root-id)))
+                                      return key))
+                        (assert archive-reader)))))
                 (loop
                   (multiple-value-bind (record bytes owner carrier kind) (logical-wal-cursor-next cursor)
                     (declare (ignore bytes))
@@ -56,6 +82,11 @@ def check_native_cursor(server, name, timeline):
                     (incf count)))
                 (assert (= (logical-wal-cursor-position cursor) (logical-wal-cursor-end cursor)))
                 (assert (eql (zerop count) (= confirmed (logical-wal-cursor-end cursor))))))
+            (sb-thread:with-mutex (*wal-lock*)
+              (assert (not (nth-value 1 (gethash scan-pin *wal-snapshot-retention-pins*)))))
+            (when archive-reader
+              (sb-thread:with-mutex (*physical-retained-inventory-publish-lock*)
+                (assert (not (nth-value 1 (gethash archive-reader *physical-retained-root-references*))))))
             (assert (eql confirmed (wal-replication-slot-confirmed-flush-lsn slot)))
             (format t "CURSOR-CHECKED=~d~%" count))))
       (values))''')
