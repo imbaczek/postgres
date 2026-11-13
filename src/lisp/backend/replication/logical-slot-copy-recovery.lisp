@@ -34,7 +34,7 @@
        (unless (and (wal-physical-slot-p slot) (physical-slot-state-valid-p slot)
                     (eql system-id (wal-replication-slot-system-id slot)))
          (error "logical copy recovery requires source logical slots to remain descriptor-only"))))
-   :cleanup nil :stabilize nil :parent-fd (physical-image-context-root-fd context)))
+   :cleanup nil :stabilize nil :local-workspace t :parent-fd (physical-image-context-root-fd context)))
 
 (defun logical-slot-copy-check-bound-receipt
     (owner context proof-bytes allowed-phases verify-state)

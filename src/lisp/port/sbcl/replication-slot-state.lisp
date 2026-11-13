@@ -336,7 +336,7 @@ A temporary directory need not contain the final state file."
     (slot-state-check-scope)
     (fsync-directory (physical-image-fd-path root-fd))))
 
-(defun slot-state-map (root function &key cleanup parent-fd (stabilize t) local-workspace)
+(defun slot-state-map (root function &key cleanup parent-fd (stabilize t) local-workspace require-root)
   "Call FUNCTION with state bytes and name for each canonical slot.
 With CLEANUP, remove staging directories and state.tmp files in canonical
 directories; use it only at startup with writers quiescent. Without CLEANUP,
@@ -346,6 +346,8 @@ type. The NIL default keeps incoming inventory strict. This local inventory
 option grants no ownership, adoption or deletion of the entry's contents."
   (unless (member local-workspace '(nil t))
     (error "local slot workspace exemption requires an explicit boolean"))
+  (unless (member require-root '(nil t))
+    (error "required slot root mode requires an explicit boolean"))
   (when (and cleanup (not stabilize))
     (error "replication slot cleanup requires stabilization"))
   (call-with-slot-state-root
@@ -375,7 +377,7 @@ option grants no ownership, adoption or deletion of the entry's contents."
                                      +slot-state-maximum-bytes+ :stabilize stabilize)
                                     (second item))
                          (slot-state-check-scope)))))))))
-   t parent-fd stabilize))
+   (not require-root) parent-fd stabilize))
 
 (defun slot-state-claim-drop (root name)
   "Capture NAME and numeric root and child device/inode identities for drop.

@@ -16,6 +16,161 @@
       (when fd (sb-posix:close fd))
       (uiop:delete-directory-tree base :validate t :if-does-not-exist :ignore))))
 
+(cl-spec:defproperty local-root-workspace-filter-is-exact
+    ((suffix (member "" ".tmp" "_more" "/nested" "-other"))
+     (enabled (member nil t)))
+  (:about physical-adoption-install-inventory-names)
+  (:trials (:normal 200))
+  (let* ((name (concatenate 'string "logical-slot-copy.work" suffix))
+         (names (list "kept" name "logical-slot-copy.install"))
+         (before (copy-list names))
+         (actual (physical-adoption-install-inventory-names names enabled)))
+    (and (equal names before)
+         (equal actual
+                (if (and enabled (string= suffix ""))
+                    '("kept" "logical-slot-copy.install") names)))))
+
+(rove:deftest local-root-workspace-filter-generated-contract
+    (let ((data (cl-spec:result-data
+                 (cl-spec:run-property 'local-root-workspace-filter-is-exact
+                                       :seed 7525 :profile :normal))))
+      (rove:ok (eq :passed (getf data :status)) (format nil "~s" data)))
+  (rove:ok (handler-case
+               (progn (physical-adoption-install-inventory-names nil :implicit) nil)
+             (error () t))))
+
+(rove:deftest local-root-workspace-snapshot-skips-before-inspection
+    (call-with-unit-slot-workspace
+     (lambda (root fd bytes)
+       (declare (ignore bytes))
+       (let* ((workspace (merge-pathnames "logical-slot-copy.work" root))
+              (expected (physical-adoption-install-snapshot root)))
+         (dolist (kind '(:directory :regular :symlink :fifo))
+           (unwind-protect
+                (progn
+                  (ecase kind
+                    (:directory
+                     (sb-posix:mkdir (namestring workspace) #o700)
+                     (sb-posix:mkfifo
+                      (namestring (merge-pathnames "never-open"
+                                                   (uiop:ensure-directory-pathname workspace)))
+                      #o600))
+                    (:regular
+                     (with-open-file (out workspace :direction :output) (write-line "opaque" out)))
+                    (:symlink (sb-posix:symlink "missing-target" (namestring workspace)))
+                    (:fifo (sb-posix:mkfifo (namestring workspace) #o600)))
+                  (let ((facts (physical-image-file-facts fd "logical-slot-copy.work")))
+                    (rove:ok (equal expected
+                                    (physical-adoption-install-snapshot root :local-workspace t)))
+                    (rove:ok (physical-adoption-install-names-p
+                              root '("kept") :local-workspace t))
+                    (rove:ok (not (physical-adoption-install-names-p root '("kept"))))
+                    (rove:ok (equal facts (physical-image-file-facts fd "logical-slot-copy.work")))))
+             (if (eq kind :directory)
+                 (uiop:delete-directory-tree (uiop:ensure-directory-pathname workspace) :validate t)
+                 (sb-posix:unlink (namestring workspace)))))
+         (rove:ok (equal expected
+                         (physical-adoption-install-snapshot root :local-workspace t)))
+         (rove:ok (physical-adoption-install-names-p root '("kept") :local-workspace t))))))
+
+(rove:deftest copy-base-input-slot-parent-must-be-real-and-descriptor-only
+    (call-with-unit-slot-workspace
+     (lambda (slots fd bytes)
+       (declare (ignore fd bytes))
+       (let* ((base (uiop:pathname-parent-directory-pathname slots))
+              (saved (merge-pathnames "saved-slots/" base))
+              (root-fd nil))
+         (unwind-protect
+              (progn
+                (dolist (name '("base/" "global/" "pg_wal/"))
+                  (sb-posix:mkdir (namestring (merge-pathnames name base)) #o700))
+                (slot-state-update slots "kept"
+                                   (wal-encode-replication-slot
+                                    (make-wal-replication-slot :name "kept" :restart-lsn 0
+                                                               :consistent-lsn 0 :wal-status :lost)))
+                (setf root-fd (physical-backup-open-directory base))
+                (call-with-physical-backup-image-directory
+                 root-fd
+                 (lambda (held)
+                   (declare (ignore held))
+                   (let ((context *physical-image-context*))
+                     (rove:ok (handler-case
+                                  (progn (logical-slot-copy-input-empty-slot-root
+                                          context '("pg_replslot") base) nil)
+                                (error (condition) (search "remain descriptor-only" (princ-to-string condition)))))
+                     (uiop:delete-directory-tree (merge-pathnames "kept/" slots) :validate t)
+                     (sb-posix:mkfifo (namestring (merge-pathnames ".logical-slot-copy.work" slots)) #o600)
+                     (rove:ok (equal '("pg_replslot")
+                                     (logical-slot-copy-input-empty-slot-root context '("pg_replslot") base)))
+                     (rove:ok (null (logical-slot-copy-input-empty-slot-root context '("base" "global" "pg_wal") base)))
+                     (rove:ok (handler-case
+                                  (progn (physical-image-check-inventory
+                                          (physical-image-context-root-path context) nil) nil)
+                                (error () t))
+                              "the incoming image checker still rejects the extra root")
+                     (sb-posix:rename (namestring slots) (namestring saved))
+                     (unwind-protect
+                          (progn
+                            (rove:ok (handler-case
+                                         (progn (logical-slot-copy-input-empty-slot-root
+                                                 context '("pg_replslot") base) nil)
+                                       (error () t))
+                                     "a raw-name-present parent cannot disappear before it opens")
+                            (sb-posix:symlink "saved-slots" (namestring (merge-pathnames "pg_replslot" base)))
+                            (unwind-protect
+                                 (rove:ok (handler-case
+                                              (progn (logical-slot-copy-input-empty-slot-root
+                                                      context '("pg_replslot") base) nil)
+                                            (error () t)))
+                              (sb-posix:unlink (namestring (merge-pathnames "pg_replslot" base)))))
+                       (sb-posix:rename (namestring saved) (namestring slots)))))))
+           (when root-fd (sb-posix:close root-fd)))))))
+
+(rove:deftest old-slot-workspace-inventory-is-opaque-and-explicit
+    (call-with-unit-slot-workspace
+     (lambda (slots fd bytes)
+       (declare (ignore bytes))
+       (let* ((base (uiop:pathname-parent-directory-pathname slots))
+              (workspace (merge-pathnames ".logical-slot-copy.work" slots))
+              (expected (physical-adoption-install-snapshot base)))
+         (dolist (kind '(:directory :regular :symlink :fifo))
+           (unwind-protect
+                (progn
+                  (ecase kind
+                    (:directory
+                     (sb-posix:mkdir (namestring workspace) #o700)
+                     (sb-posix:mkfifo
+                      (namestring (merge-pathnames "never-open"
+                                                   (uiop:ensure-directory-pathname workspace)))
+                      #o600))
+                    (:regular
+                     (with-open-file (out workspace :direction :output) (write-line "opaque" out)))
+                    (:symlink (sb-posix:symlink "missing-target" (namestring workspace)))
+                    (:fifo (sb-posix:mkfifo (namestring workspace) #o600)))
+                  (let ((facts (physical-image-file-facts fd ".logical-slot-copy.work")))
+                    (rove:ok (equal expected (physical-adoption-install-snapshot
+                                              base :local-slot-workspace t)))
+                    (rove:ok (not (equal expected
+                                         (handler-case (physical-adoption-install-snapshot base)
+                                           (error () :rejected)))))
+                    (rove:ok (equal facts (physical-image-file-facts fd ".logical-slot-copy.work")))))
+             (if (eq kind :directory)
+                 (uiop:delete-directory-tree (uiop:ensure-directory-pathname workspace) :validate t)
+                 (sb-posix:unlink (namestring workspace)))))
+         (dolist (relative '(".logical-slot-copy.work.tmp" "kept/.logical-slot-copy.work"))
+           (let ((path (merge-pathnames relative slots)))
+             (unwind-protect
+                  (progn
+                    (sb-posix:mkfifo (namestring path) #o600)
+                    (rove:ok (handler-case
+                                 (progn (physical-adoption-install-snapshot
+                                         base :local-slot-workspace t) nil)
+                               (error () t))))
+               (sb-posix:unlink (namestring path)))))
+         (rove:ok (handler-case
+                      (progn (physical-adoption-install-snapshot base :local-slot-workspace :implicit) nil)
+                    (error () t)))))))
+
 (rove:deftest slot-state-local-workspace-is-opaque-and-default-inventory-remains-strict
     (call-with-unit-slot-workspace
      (lambda (root fd bytes)
@@ -844,6 +999,26 @@
                  (progn (funcall (symbol-function 'wal-decode-replication-slot-image)
                                  bytes "source_image") nil)
                (error () t)))))
+
+(rove:deftest canonical-slot-startup-ignores-only-the-local-workspace
+    (call-with-canonical-wal-slot-fixture
+     (lambda ()
+       (wal-create-replication-slot-file
+        (make-wal-replication-slot :name "kept" :restart-lsn 0
+                                   :consistent-lsn 0 :wal-status :lost))
+       (let* ((workspace (merge-pathnames ".logical-slot-copy.work"
+                                          (wal-replication-slot-directory)))
+              (before nil))
+         (sb-posix:mkfifo (namestring workspace) #o600)
+         (setf before (slot-state-lstat workspace))
+         (rove:ok (handler-case (progn (logical-slot-startup-read-inventory) nil) (error () t)))
+         (rove:ok (= 1 (length (logical-slot-startup-read-inventory :local-workspace t))))
+         (wal-load-replication-slots)
+         (rove:ok (= 1 (hash-table-count *wal-replication-slots*)))
+         (rove:ok (gethash "kept" *wal-replication-slots*))
+         (let ((after (slot-state-lstat workspace)))
+           (rove:ok (= (sb-posix:stat-ino before) (sb-posix:stat-ino after)))
+           (rove:ok (sb-posix:s-isfifo (sb-posix:stat-mode after))))))))
 
 (rove:deftest canonical-wal-slot-roundtrip-and-strict-update
     (call-with-canonical-wal-slot-fixture

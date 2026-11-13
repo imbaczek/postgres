@@ -52,18 +52,33 @@
         (push actual observations))))
   (values observations index))
 
+(defun logical-slot-copy-input-empty-slot-root (context names directory)
+  (when (member "pg_replslot" names :test #'equal)
+    (slot-state-map
+     (merge-pathnames "pg_replslot/" directory)
+     (lambda (bytes name)
+       (declare (ignore bytes name))
+       (error "logical copy base input requires source slots to remain descriptor-only"))
+     :parent-fd (physical-image-context-root-fd context)
+     :cleanup nil :stabilize nil :local-workspace t :require-root t)
+    (list "pg_replslot")))
+
 (defun logical-slot-copy-input-inventory (owner context manifest descriptor)
   (logical-slot-copy-check-input owner context)
   (let* ((root (physical-image-context-root-path context))
          (files (getf manifest :files))
          (expected (append
                     (physical-adoption-owner-extra-root-names owner)
+                    (logical-slot-copy-input-empty-slot-root
+                     context (directory-entry-names root :follow-symlinks t)
+                     (physical-adoption-owner-directory owner))
                     (list ".pg_lisp.lock" "base" "global" "pg_wal" "logical_slot_wal"
                           "recovery.required" "physical-recovery.control" "physical-backup.manifest"
                           "logical-slot-copy.descriptor" "pg_hba.conf" "pg_ident.conf"
                           "authentication.initialized")
                     (loop for (name) in files unless (find #\/ name) collect name))))
-    (unless (equal (sort (directory-entry-names root :follow-symlinks t) #'string<)
+    (unless (equal (sort (physical-adoption-install-inventory-names
+                          (directory-entry-names root :follow-symlinks t) t) #'string<)
                    (sort expected #'string<))
       (error "logical copy input root inventory differs from its completed image"))
     (logical-slot-copy-input-sidecar-inventory context descriptor)

@@ -205,7 +205,7 @@ pair disables stabilization."
                      (error "promotion slot durable state differs from its live generation"))
                    (setf slot live)))
                slot))
-           :parent-fd (and parent (cdr parent)) :stabilize (null parent))))
+           :parent-fd (and parent (cdr parent)) :stabilize (null parent) :local-workspace t)))
     (when (and reconcile-live (/= (length slots) (hash-table-count *wal-replication-slots*)))
       (error "promotion slot registry has unpersisted generations"))
     (nreverse slots)))

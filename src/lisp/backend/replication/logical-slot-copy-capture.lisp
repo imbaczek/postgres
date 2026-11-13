@@ -190,7 +190,7 @@
                        (postmaster-ownership-directory
                         (logical-slot-startup-source-ownership source)))
                       (lambda (bytes name) (cons name bytes))
-                      :parent-fd (physical-image-context-root-fd context))))
+                      :parent-fd (physical-image-context-root-fd context) :local-workspace t)))
          (unless (equalp (sort expected #'string< :key #'car) (sort actual #'string< :key #'car))
            (error "logical copy disk slot inventory changed")))
        (when files
@@ -213,7 +213,7 @@
   (let ((system-id (logical-slot-copy-check-identity gate-owner ownership))
         (entries
           (logical-slot-startup-read-inventory
-           :cleanup nil
+           :cleanup nil :local-workspace t
            :root (merge-pathnames "pg_replslot/" (postmaster-ownership-directory ownership))
            :parent-fd (physical-image-context-root-fd context))))
     (call-with-logical-slot-startup-source

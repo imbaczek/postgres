@@ -287,7 +287,7 @@
                                           (physical-recovery-control-path) +physical-recovery-control-maximum-bytes+)))
                  (assert (recovery-in-progress-p))
                  (assert (zerop (hash-table-count *wal-replication-slots*)))
-                 (assert (null (slot-state-map (wal-replication-slot-directory) #'list :stabilize nil)))
+                 (assert (null (slot-state-map (wal-replication-slot-directory) #'list :stabilize nil :local-workspace t)))
                  (logical-import-native-rejects #'physical-promotion-publish-child-control
                                                 "child-owner import before promotion")
                  (format t "~&LOGICAL-IMPORT-LIVE-CHILD-CONTROL-PASS ~d~%" end)
