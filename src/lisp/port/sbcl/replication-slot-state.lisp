@@ -195,7 +195,9 @@ The descriptor is valid only during the callback and must not escape it."
   "Create a new slot directory and publish BYTES; existing directories fail.
 Success follows child and root directory fsync. An error after rename can leave
 visible state, so the caller must retain slot and retention protection until
-the outcome is resolved."
+the outcome is resolved. Optional PARENT-FD names ROOT's PGDATA parent; its
+named binding is checked. A duplicate is held only during the operation, and
+the caller retains its descriptor."
   (when publication-receipt
     ;; The fresh receipt is :UNPUBLISHED. Under interrupt exclusion it becomes
     ;; :UNCERTAIN before the no-replace rename and :PUBLISHED on success,
