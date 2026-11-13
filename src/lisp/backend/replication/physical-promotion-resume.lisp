@@ -24,7 +24,10 @@
 ;;; membership, including unknown coverage when that optional field is absent.
 
 (defun physical-promotion-reconstruct-pending-state (manifest control snapshot namespace)
-  "Reconstruct observed pending state from verified inputs and the actual selected generation."
+  "Reconstruct observed pending state from verified MANIFEST, CONTROL, D SNAPSHOT
+and NAMESPACE, reading the actual selected restartpoint generation R.
+The caller supplies ownership, locks and independent provenance checks. This
+returns observations without installing state or granting admission."
   (let ((state (copy-list manifest)))
     (loop for (key value) on control by #'cddr do (setf (getf state key) value))
     (setf (getf state :wal-namespace) namespace
