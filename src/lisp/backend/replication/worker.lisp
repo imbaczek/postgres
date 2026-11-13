@@ -127,6 +127,8 @@
     options))
 
 (defun logical-sql-literal (value)
+  "Return NULL for NIL, or quote a string or coerced character vector.
+Double apostrophes and preserve backslashes for standard-conforming strings."
   (if (null value)
       "NULL"
       (let* ((text (if (stringp value) value (coerce (the vector value) 'string)))
