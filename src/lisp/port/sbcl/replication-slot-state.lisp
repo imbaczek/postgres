@@ -191,7 +191,7 @@ The descriptor is valid only during the callback and must not escape it."
   (fsync-directory (physical-image-fd-path root-fd))
   (slot-state-point :slot-file-after-directory-fsync-before-memory-publication root name))
 
-(defun slot-state-create (root name bytes &key publication-receipt)
+(defun slot-state-create (root name bytes &key publication-receipt parent-fd)
   "Create a new slot directory and publish BYTES; existing directories fail.
 Success follows child and root directory fsync. An error after rename can leave
 visible state, so the caller must retain slot and retention protection until
@@ -230,7 +230,8 @@ the outcome is resolved."
            (slot-state-point :slot-file-after-rename root name)
            (slot-state-check-binding final-path child-fd)
            (slot-state-sync-publication root-fd child-fd root name)
-           (slot-state-check-binding final-path child-fd))))))
+           (slot-state-check-binding final-path child-fd)))))
+   nil parent-fd)
   (values))
 
 (defun slot-state-update (root name bytes)

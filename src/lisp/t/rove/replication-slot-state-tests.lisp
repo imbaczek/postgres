@@ -522,6 +522,63 @@
                   "the original state bytes remain intact"))
             (uiop:delete-directory-tree base :validate t :if-does-not-exist :ignore))))))
 
+(rove:deftest canonical-slot-state-create-borrowed-parent
+    (let* ((base (uiop:ensure-directory-pathname
+                  (sb-posix:mkdtemp
+                   (namestring (merge-pathnames "slot-create-parent-XXXXXX"
+                                                (uiop:temporary-directory))))))
+           (root (merge-pathnames "pg_replslot/" base))
+           (other (merge-pathnames "other/" base))
+           (moved (merge-pathnames "moved/" base))
+           (bytes (make-array 3 :element-type '(unsigned-byte 8)
+                                :initial-contents '(3 1 4)))
+           (parent nil) (wrong-parent nil)
+           (receipt (list :unpublished)))
+      (unwind-protect
+           (progn
+             (ensure-directories-exist root)
+             (ensure-directories-exist other)
+             (setf parent (slot-state-open-directory base)
+                   wrong-parent (slot-state-open-directory other))
+             (rove:ok
+              (handler-case
+                  (progn (slot-state-create root "wrong" bytes :parent-fd wrong-parent
+                                                               :publication-receipt receipt)
+                         nil)
+                (error (condition) (search "binding changed" (princ-to-string condition)))))
+             (rove:ok (eq :unpublished (car receipt)))
+             (rove:ok (null (directory-entry-names root)))
+             (rove:ok (null (directory-entry-names other)))
+             (slot-state-create root "held_slot" bytes :parent-fd parent
+                                                       :publication-receipt receipt)
+             (rove:ok (eq :published (car receipt)))
+             (rove:ok (sb-posix:fstat parent))
+             (rove:ok
+              (equalp (list (list bytes "held_slot"))
+                      (slot-state-map root #'list :parent-fd parent :stabilize nil)))
+             (rove:ok
+              (handler-case
+                  (progn (slot-state-create root "held_slot" bytes :parent-fd parent) nil)
+                (error () t)))
+             (let ((*logical-test-failpoint-hook*
+                     (lambda (point detail)
+                       (declare (ignore detail))
+                       (when (eq point :slot-file-before-write)
+                         (sb-posix:rename (string-right-trim "/" (namestring root))
+                                          (string-right-trim "/" (namestring moved)))
+                         (ensure-directories-exist root)))))
+               (rove:ok (handler-case
+                            (progn (slot-state-create root "swapped" bytes :parent-fd parent)
+                                   nil)
+                          (error (condition)
+                            (search "binding changed" (princ-to-string condition))))))
+             (rove:ok (null (directory-entry-names root)))
+             (rove:ok (not (slot-state-lstat (merge-pathnames "swapped/" root))))
+             (rove:ok (sb-posix:fstat parent)))
+        (when wrong-parent (sb-posix:close wrong-parent))
+        (when parent (sb-posix:close parent))
+        (uiop:delete-directory-tree base :validate t :if-does-not-exist :ignore))))
+
 (rove:deftest canonical-slot-state-borrowed-parent
     (let* ((base (merge-pathnames (format nil "canonical-slot-parent-~a/" (gensym))
                                   (uiop:temporary-directory)))
