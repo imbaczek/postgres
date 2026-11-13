@@ -17,7 +17,7 @@
              (write-sequence buffer destination :end length)
              (decf remaining length))))
 
-(defun wal-stage-timeline-prefix (source-timeline fork &key (namespace *wal-segment-namespace*) (prefix nil prefix-p))
+(defun wal-stage-timeline-prefix (source-timeline fork &key (namespace *wal-segment-namespace*) (prefix nil prefix-p) directory-fd)
   "Prepare C XLogInitNewTimeline's prefix in a unique, synced temporary inode.
 The caller pins immutable source files and has already verified FORK as a durable
 applied terminal with cluster/history provenance. This copies bytes, not proof.
@@ -47,7 +47,7 @@ is written. At an exact segment boundary no parent file is needed."
                  (declare (ignore timeline))
                  (setf source stream)
                  (unless (<= offset size) (error "parent WAL prefix is incomplete"))))
-             (wal-ensure-directory-durable (wal-directory))
+             (wal-ensure-directory-durable (wal-directory) directory-fd)
              (multiple-value-setq (fd temporary)
                (sb-posix:mkstemp (namestring (merge-pathnames ".timeline-XXXXXX" (wal-directory)))))
              (setf destination (sb-sys:make-fd-stream fd :output t :element-type '(unsigned-byte 8))
@@ -73,7 +73,7 @@ is written. At an exact segment boundary no parent file is needed."
         (when (and temporary (not finished))
           (ignore-errors (sb-posix:unlink temporary)))))))
 
-(defun wal-install-timeline-prefix (source-timeline child fork prefix namespace)
+(defun wal-install-timeline-prefix (source-timeline child fork prefix namespace &optional directory-fd)
   "Force-install owned uncommitted bytes; caller proves intent and excludes history.
 The caller fences uncertain publication and must never use this after history."
   (let ((destination (wal-segment-path (floor fork +wal-segment-size+) child :timeline))
@@ -82,7 +82,7 @@ The caller fences uncertain publication and must never use this after history."
     (unwind-protect
          (progn
            (setf temporary (wal-stage-timeline-prefix source-timeline fork
-                                                      :namespace namespace :prefix prefix))
+                                                      :namespace namespace :prefix prefix :directory-fd directory-fd))
            (when (wal-namespace-file-stat destination t)
              (sb-posix:unlink (namestring destination)))
            (wal-timeline-test-point :after-child-unlink)

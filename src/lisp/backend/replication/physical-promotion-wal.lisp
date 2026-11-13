@@ -48,11 +48,11 @@ An absent legacy intent retains the historical level 2 bytes."
         (error "pending child contains a different complete record"))
       (equalp tail eor))))
 
-(defun physical-promotion-sync-history (state)
+(defun physical-promotion-sync-history (state &optional directory-fd)
   "History inode and directory must be durable even when retry finds matching bytes."
   (let ((path (timeline-history-path (getf state :promotion-child) *pgdata*))
         (expected (physical-promotion-history-image state)))
-    (unless (wal-namespace-file-stat path t) (timeline-publish-history-bytes path expected))
+    (unless (wal-namespace-file-stat path t) (timeline-publish-history-bytes path expected :directory-fd directory-fd))
     (multiple-value-bind (stream size) (physical-promotion-open-file path t)
       (unwind-protect
            (let ((bytes (make-array size :element-type '(unsigned-byte 8))))

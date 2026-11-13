@@ -590,8 +590,21 @@ short check alone cannot do so."
                        :name nil :type nil :version nil
                        :defaults path))))
 
-(defun wal-ensure-directory-durable (directory)
+(defun wal-ensure-directory-durable (directory &optional borrowed-fd)
   "Create DIRECTORY's path one level at a time and sync each parent entry."
+  (when borrowed-fd
+    (unless (and (typep borrowed-fd '(integer 0 2147483647))
+                 (physical-image-context-p *physical-image-context*)
+                 (member borrowed-fd
+                         (cons (physical-image-context-root-fd *physical-image-context*)
+                               (mapcar #'cdr (physical-image-context-children *physical-image-context*))))
+                 (equal (pathname directory) (physical-image-fd-path borrowed-fd)))
+      (error "existing WAL directory differs from its borrowed descriptor"))
+    (physical-image-check-context *physical-image-context*)
+    (physical-image-check-children *physical-image-context*)
+    (physical-image-check-directory borrowed-fd)
+    (sb-posix:fsync borrowed-fd)
+    (return-from wal-ensure-directory-durable (pathname directory)))
   (let* ((path (pathname directory))
          (parent (wal-parent-directory path)))
     (unless (equal path parent)

@@ -250,10 +250,10 @@ Native ancestry requires the parent history and a forward fork; no role is chang
   (if (= timeline 1) (timeline-parse-history 1 "")
       (timeline-parse-history timeline (bytes->string (timeline-history-bytes timeline directory)))))
 
-(defun timeline-publish-history-bytes (path bytes)
+(defun timeline-publish-history-bytes (path bytes &key directory-fd)
   "Exclusively install a synced inode; never replace an existing pathname."
   (let ((directory (uiop:pathname-directory-pathname path)))
-    (wal-ensure-directory-durable directory)
+    (wal-ensure-directory-durable directory directory-fd)
     (multiple-value-bind (fd temporary)
         (sb-posix:mkstemp (namestring (merge-pathnames ".history-XXXXXX" directory)))
       (unwind-protect
