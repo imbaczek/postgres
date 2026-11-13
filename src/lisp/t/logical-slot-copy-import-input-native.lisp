@@ -180,6 +180,33 @@
                 #'logical-slot-copy-publish-import-pending "aliases a copied identity"))
           (overwrite bytes))))))
 
+(defun logical-import-native-evidence-binding (certificate)
+  (let* ((bytes (read-bounded-regular-file
+                 (merge-pathnames "logical-slot-copy.evidence" *pgdata*)
+                 +logical-slot-copy-evidence-maximum-bytes+))
+         (evidence (logical-slot-copy-import-evidence-decode bytes))
+         (descriptor (logical-slot-copy-descriptor-decode
+                      (read-bounded-regular-file
+                       (merge-pathnames "logical-slot-copy.descriptor" *pgdata*)
+                       +logical-slot-copy-descriptor-maximum-bytes+)))
+         (proof (read-bounded-regular-file
+                 (merge-pathnames "logical-slot-copy.base-verified" *pgdata*)
+                 +logical-slot-copy-base-proof-maximum-bytes+)))
+    (logical-slot-copy-import-evidence-check-certificate evidence certificate descriptor proof)
+    (dolist (key '(:manifest :checkpoint :control :selected-history :child-history))
+      (let* ((bad (logical-slot-copy-import-evidence-decode bytes))
+             (blob (getf bad key)))
+        (if (zerop (length blob))
+            (setf (getf bad key) (make-array 1 :element-type '(unsigned-byte 8) :initial-element 0))
+            (setf (aref blob 0) (logxor 1 (aref blob 0))))
+        (let ((image (logical-slot-copy-import-evidence-encode bad)))
+          (logical-import-native-rejects
+           (lambda ()
+             (logical-slot-copy-import-evidence-check-certificate
+              (logical-slot-copy-import-evidence-decode image) certificate descriptor proof))))))
+    (format t "~&LOGICAL-IMPORT-EVIDENCE-BINDING-PASS~%")
+    (finish-output)))
+
 (defun logical-import-native-pending-publication ()
   (let* ((path (merge-pathnames "logical-slot-copy.import" *pgdata*))
          (temporary (merge-pathnames "logical-slot-copy.import.tmp" *pgdata*)))
@@ -206,6 +233,24 @@
       (assert (and (probe-file temporary) (not (probe-file path))))
       (logical-import-native-rejects #'logical-slot-copy-publish-import-pending
                                      "unexpected pending import temporary")
+      (delete-file temporary))
+    (let* ((evidence-path (merge-pathnames "logical-slot-copy.evidence" *pgdata*))
+           (evidence (read-bounded-regular-file evidence-path +logical-slot-copy-evidence-maximum-bytes+))
+           (changed nil)
+           (*logical-slot-copy-verification-test-hook*
+             (lambda (point context)
+               (declare (ignore context))
+               (when (eq point :before-import-pending-file-fsync)
+                 (with-open-file (out evidence-path :direction :output :if-exists :overwrite
+                                                    :element-type '(unsigned-byte 8))
+                   (write-sequence evidence out)
+                   (force-output out))
+                 (setf changed t)))))
+      (logical-import-native-rejects #'logical-slot-copy-publish-import-pending
+                                     "synced unchanged evidence")
+      (assert (and changed (probe-file temporary) (not (probe-file path))))
+      (assert (equalp evidence (read-bounded-regular-file
+                                evidence-path +logical-slot-copy-evidence-maximum-bytes+)))
       (delete-file temporary))
     (let ((cut nil))
       (let ((*logical-slot-copy-verification-test-hook*
@@ -244,6 +289,7 @@
                           *logical-import-native-expected-disposition*)
                       (logical-slot-effective-invalidation-cause slot)))))
       (logical-import-native-reject-copy-id-owner path saved bytes)
+      (logical-import-native-evidence-binding saved)
       (format t "~&LOGICAL-IMPORT-PENDING-PUBLICATION-PASS ~A~%" (getf saved :owner))
       (finish-output))))
 

@@ -155,6 +155,61 @@ def pending_crash_matrix(peer, disposition):
     assert before == tree_image(peer.data), 'crash matrix changed pending source inputs'
 
 
+def evidence_crash_matrix(peer, disposition):
+    certificate = peer.data / 'logical-slot-copy.import'
+    evidence = peer.data / 'logical-slot-copy.evidence'
+    temporary = peer.data / 'logical-slot-copy.evidence.tmp'
+    saved_certificate = certificate.read_bytes()
+    saved_evidence = evidence.read_bytes()
+    before = tree_image(peer.data)
+    cuts = [('before-import-evidence-file-fsync', False),
+            ('after-import-evidence-file-fsync', False),
+            ('before-import-evidence-rename', False),
+            ('after-import-evidence-rename', True),
+            ('before-import-evidence-root-fsync', True),
+            ('after-import-evidence-root-fsync', True)]
+    for cut, published in cuts:
+        certificate.unlink()
+        evidence.unlink()
+        cold_probe(peer, f'kill-{cut}', disposition, cut=cut)
+        assert not certificate.exists(), cut
+        assert evidence.exists() == published, cut
+        assert temporary.exists() != published, cut
+        if published:
+            image = evidence.read_bytes()
+            inode = evidence.stat().st_ino
+            assert image == saved_evidence, cut
+            cold_probe(peer, f'kill-{cut}-create', disposition, create=True)
+            pending = certificate.read_bytes()
+            for retry in range(2):
+                cold_probe(peer, f'kill-{cut}-retry-{retry}', disposition)
+                assert evidence.read_bytes() == image, cut
+                assert evidence.stat().st_ino == inode, cut
+                assert certificate.read_bytes() == pending, cut
+        else:
+            cold_probe(peer, f'kill-{cut}-quarantine', disposition,
+                       failure='unexpected import evidence temporary file')
+            assert temporary.exists() and not certificate.exists(), cut
+            temporary.unlink()  # Explicit fixture repair; production keeps quarantine.
+        after = tree_image(peer.data)
+        changed = {certificate.name, evidence.name}
+        assert {k: v for k, v in after.items() if k not in changed} == {
+            k: v for k, v in before.items() if k not in changed}, cut
+        certificate.write_bytes(saved_certificate)
+        certificate.chmod(0o600)
+        evidence.write_bytes(saved_evidence)
+        evidence.chmod(0o600)
+        print(f'LOGICAL-IMPORT-EVIDENCE-SIGKILL-PASS {cut}', flush=True)
+    evidence.unlink()
+    cold_probe(peer, 'certificate-without-evidence', disposition,
+               failure='no permanent evidence')
+    assert certificate.read_bytes() == saved_certificate
+    assert not evidence.exists() and not temporary.exists()
+    evidence.write_bytes(saved_evidence)
+    evidence.chmod(0o600)
+    assert before == tree_image(peer.data), 'evidence crash matrix changed source inputs'
+
+
 def run_healthy(*, intent_failure=False):
     started = time.monotonic()
     source = OwnedLisp(parameters=(('wal_level', 'logical'),))
@@ -190,9 +245,11 @@ def run_healthy(*, intent_failure=False):
             assert 'logical-slot-copy.import' not in before
             cold_probe(child, 'intent-owner-exit-create', 'eligible', create=True)
             after = tree_image(child.data)
-            assert {k: v for k, v in after.items() if k != 'logical-slot-copy.import'} == before
+            imported = {'logical-slot-copy.import', 'logical-slot-copy.evidence'}
+            assert {k: v for k, v in after.items() if k not in imported} == before
             print('LOGICAL-IMPORT-INTENT-OWNER-EXIT-COLD-PASS', flush=True)
         else:
+            evidence_crash_matrix(child, 'eligible')
             pending_crash_matrix(child, 'eligible')
         before = tree_image(child.data)
         cold_probe(child, 'healthy-first', 'eligible')

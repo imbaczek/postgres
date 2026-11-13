@@ -8,7 +8,7 @@
   (metadata nil :read-only t) (prefix nil :read-only t) (generation nil :read-only t)
   (control nil :read-only t) (child-plan nil :read-only t)
   (descriptor nil :read-only t) (observations nil :read-only t)
-  (selected-history nil :read-only t))
+  (selected-history nil :read-only t) (evidence nil :read-only t))
 
 (defun logical-slot-copy-import-digest (bytes)
   (physical-store-update-digest #xCBF29CE484222325 bytes))
@@ -18,17 +18,19 @@
     (if (= 1 target) (make-array 0 :element-type '(unsigned-byte 8))
         (timeline-history-bytes target))))
 
-(defun logical-slot-copy-import-child-plan-digest (state plan)
-  "Digest the deterministic child checkpoint plan and its frame contents."
+(defun logical-slot-copy-import-plan-image-digest (plan history)
   (logical-slot-copy-import-digest
    (string->bytes
     (physical-bootstrap-manifest-text
      (list :fork (getf plan :fork) :child (getf plan :child) :end (getf plan :end)
-           :snapshot (getf plan :snapshot)
-           :history (logical-slot-copy-import-digest (physical-promotion-history-image state))
+           :snapshot (getf plan :snapshot) :history (logical-slot-copy-import-digest history)
            :frames (loop for (start bytes) in (getf plan :frames)
                          collect (list start (length bytes)
                                        (logical-slot-copy-import-digest bytes))))))))
+
+(defun logical-slot-copy-import-child-plan-digest (state plan)
+  "Digest the deterministic child checkpoint plan and its frame contents."
+  (logical-slot-copy-import-plan-image-digest plan (physical-promotion-history-image state)))
 
 (defun logical-slot-copy-import-check-capacity (owner context source)
   "Reject excess slots, deferred rows and collisions with local physical names."
@@ -137,7 +139,9 @@ requiring the reconstructed value to match."
            :value value :state state :state-image (logical-slot-copy-import-state-image state)
            :metadata metadata :prefix prefix :generation generation
            :control (getf source :control-bytes) :child-plan plan
-           :descriptor descriptor :observations observations :selected-history selected))))))
+           :descriptor descriptor :observations observations :selected-history selected
+           :evidence (logical-slot-copy-import-build-evidence
+                      context descriptor state plan selected (getf source :control-bytes))))))))
 
 (defun logical-slot-copy-import-check-pending-plan (owner context attempt)
   "Recheck the source and selected plan before publication."
@@ -161,6 +165,13 @@ requiring the reconstructed value to match."
                  (equalp (logical-slot-copy-import-pending-plan-selected-history attempt)
                          (logical-slot-copy-import-selected-history state)))
       (error "logical import child plan or selected history changed before publication"))
+    (unless (equalp (logical-slot-copy-import-pending-plan-evidence attempt)
+                    (logical-slot-copy-import-build-evidence
+                     context (logical-slot-copy-import-pending-plan-descriptor attempt)
+                     state (logical-slot-copy-import-pending-plan-child-plan attempt)
+                     (logical-slot-copy-import-pending-plan-selected-history attempt)
+                     (logical-slot-copy-import-pending-plan-control attempt)))
+      (error "logical import evidence changed before publication"))
     (logical-slot-copy-input-check-observations owner context observations)
     (dolist (row observations)
       (unless (equal row (logical-slot-copy-file-row context (first row)))

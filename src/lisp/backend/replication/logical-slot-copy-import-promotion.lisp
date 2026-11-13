@@ -32,7 +32,8 @@
   (unless (logical-slot-copy-import-intent-owner-p owner)
     (error "logical import policy requires its intent owner"))
   (logical-slot-copy-check-input owner context)
-  (dolist (name '("logical-slot-copy.import" "logical-slot-copy.import.tmp"))
+  (dolist (name '("logical-slot-copy.import" "logical-slot-copy.import.tmp"
+                  "logical-slot-copy.evidence" "logical-slot-copy.evidence.tmp"))
     (when (slot-state-lstat (merge-pathnames name (physical-image-context-root-path context)))
       (error "phase 2 import intent found an unexpected import certificate")))
   (let ((source (logical-slot-copy-prepare-import-source owner context)))

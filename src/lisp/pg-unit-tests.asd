@@ -12,6 +12,7 @@
                (:file "t/rove/replication-slot-state-tests")
                (:file "t/rove/logical-slot-provenance-tests")
                (:file "t/rove/logical-slot-copy-import-tests")
+               (:file "t/rove/logical-slot-copy-evidence-tests")
                (:file "t/rove/logical-slot-copy-import-owner-tests")
                (:file "t/rove/logical-slot-copy-descriptor-tests")
                (:file "t/rove/logical-slot-copy-binding-tests")

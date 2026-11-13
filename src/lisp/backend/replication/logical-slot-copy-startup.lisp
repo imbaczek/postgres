@@ -1,6 +1,10 @@
 (in-package #:pg)
 
 (defun logical-slot-copy-preflight-startup ()
+  (dolist (name '("logical-slot-copy.import" "logical-slot-copy.import.tmp"
+                  "logical-slot-copy.evidence" "logical-slot-copy.evidence.tmp"))
+    (when (slot-state-lstat (merge-pathnames name *pgdata*))
+      (error "logical copy requires child-owner import before promotion; import artifacts require reconciliation")))
   (when (slot-state-lstat (merge-pathnames "logical-slot-copy.in-progress" *pgdata*))
     (error "unfinished logical slot copy cannot start"))
   (when (slot-state-lstat (merge-pathnames "logical-slot-copy.base-verified.tmp" *pgdata*))
@@ -114,7 +118,9 @@
   (when (getf *physical-recovery-state* :logical-slot-copy-id)
     (error "logical copy requires child-owner import before promotion"))
   (dolist (name '("logical-slot-copy.in-progress" "logical-slot-copy.descriptor"
-                  "logical-slot-copy.base-verified" "logical-slot-copy.base-verified.tmp" "logical_slot_wal"))
+                  "logical-slot-copy.base-verified" "logical-slot-copy.base-verified.tmp" "logical_slot_wal"
+                  "logical-slot-copy.import" "logical-slot-copy.import.tmp"
+                  "logical-slot-copy.evidence" "logical-slot-copy.evidence.tmp"))
     (when (slot-state-lstat (merge-pathnames name *pgdata*))
       (error "logical copy requires child-owner import before promotion")))
   (values))
