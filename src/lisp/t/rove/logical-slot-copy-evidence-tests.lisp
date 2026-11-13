@@ -170,3 +170,31 @@
           (:snapshot-extra (setf (getf (getf plan :snapshot) :extra) 1)))
         (rove:ok (rove:signals (logical-slot-copy-import-evidence-encode value) 'error)
                  (format nil "~s" mode)))))
+
+(rove:deftest logical-import-evidence-missing-control-fact-requires-source-replay
+    (let* ((certificate (unit-logical-import-value))
+           (source (unit-logical-provenance-slot :generation 0 :end 80 :plugin "pg_lisp" :profile :text))
+           (bytes (logical-slot-state-encode source))
+           (descriptor (make-logical-slot-copy-descriptor :slots (list (list "fixture" bytes))))
+           (history (timeline-parse-history 1 "")))
+      (rove:ok (eq :requires-source-replay
+                   (logical-slot-copy-evidence-check-rows certificate descriptor nil history)))
+      (rove:ok (rove:signals
+                (logical-slot-copy-evidence-check-rows certificate descriptor nil nil) 'error))
+      (let ((bad (copy-tree certificate)))
+        (setf (second (first (getf bad :slots))) (logical-slot-generation-token 3))
+        (rove:ok (rove:signals
+                  (logical-slot-copy-evidence-check-rows bad descriptor nil history) 'error)))
+      (setf source (unit-logical-provenance-slot
+                    :generation 0 :end 80 :plugin "pg_lisp" :profile :text :child-owner 2)
+            bytes (logical-slot-state-encode source)
+            (logical-slot-copy-descriptor-slots descriptor) (list (list "fixture" bytes)))
+      (let* ((bad (copy-tree certificate))
+             (row (first (getf bad :slots)))
+             (child (unit-logical-provenance-slot
+                     :generation 0 :end 80 :plugin "pg_lisp" :profile :text :child-owner 2)))
+        (setf (getf bad :owner) (logical-slot-generation-token 2)
+              (third row) (logical-slot-copy-import-digest bytes)
+              (fourth row) (bytes->string (logical-slot-state-encode child)))
+        (rove:ok (rove:signals
+                  (logical-slot-copy-evidence-check-rows bad descriptor nil history) 'error)))))

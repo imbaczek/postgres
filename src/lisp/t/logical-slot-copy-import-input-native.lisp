@@ -191,8 +191,10 @@
                        +logical-slot-copy-descriptor-maximum-bytes+)))
          (proof (read-bounded-regular-file
                  (merge-pathnames "logical-slot-copy.base-verified" *pgdata*)
-                 +logical-slot-copy-base-proof-maximum-bytes+)))
-    (logical-slot-copy-import-evidence-check-certificate evidence certificate descriptor proof)
+                 +logical-slot-copy-base-proof-maximum-bytes+))
+         (status (nth-value 3
+                            (logical-slot-copy-import-evidence-check-certificate
+                             evidence certificate descriptor proof))))
     (dolist (key '(:manifest :checkpoint :control :selected-history :child-history))
       (let* ((bad (logical-slot-copy-import-evidence-decode bytes))
              (blob (getf bad key)))
@@ -205,6 +207,58 @@
              (logical-slot-copy-import-evidence-check-certificate
               (logical-slot-copy-import-evidence-decode image) certificate descriptor proof))))))
     (format t "~&LOGICAL-IMPORT-EVIDENCE-BINDING-PASS~%")
+    (finish-output)
+    status))
+
+(defun logical-import-native-optional-control-fact ()
+  (let* ((*logical-slot-copy-verification-test-hook* nil)
+         (control-path (physical-recovery-control-path))
+         (certificate-path (merge-pathnames "logical-slot-copy.import" *pgdata*))
+         (evidence-path (merge-pathnames "logical-slot-copy.evidence" *pgdata*))
+         (original (read-bounded-regular-file control-path +physical-recovery-control-maximum-bytes+))
+         (certificate (read-bounded-regular-file certificate-path +logical-slot-copy-import-maximum-bytes+))
+         (evidence (read-bounded-regular-file evidence-path +logical-slot-copy-evidence-maximum-bytes+))
+         (control (physical-recovery-decode-control original))
+         (compat (apply #'physical-recovery-control-image
+                        (append (loop for key in '(:phase :system-id :timeline :manifest-digest
+                                                   :checkpoint :applied :next-xid)
+                                      collect (getf control key))
+                                (loop for key in '(:db-state :state-time :applied-timeline
+                                                   :history-target :history-digest :promotion-child
+                                                   :promotion-generation :promotion-source-namespace
+                                                   :retained-reference :resource-fact :fpw-fact
+                                                   :promotion-full-page-writes
+                                                   :promotion-logical-decoding-enabled :promotion-wal-level)
+                                      when (get-properties control (list key))
+                                        append (list key (getf control key)))))))
+    (assert (and (getf control :logical-fact) (getf control :promotion-logical-decoding-enabled)))
+    (assert (null (getf (physical-recovery-decode-control compat) :logical-fact)))
+    (flet ((overwrite (path bytes)
+             (with-open-file (out path :direction :output :if-exists :supersede
+                                       :element-type '(unsigned-byte 8))
+               (write-sequence bytes out)
+               (fsync-stream out))
+             (sb-posix:chmod (namestring path) #o600)))
+      (unwind-protect
+           (progn
+             (overwrite control-path compat)
+             (delete-file certificate-path)
+             (delete-file evidence-path)
+             (call-with-logical-slot-copy-import-input
+              (lambda (owner context)
+                (let ((source (logical-slot-copy-prepare-import-source owner context)))
+                  (assert (getf source :logical-fact))
+                  (assert (getf source :eligible-interest)))))
+             (format t "~&LOGICAL-IMPORT-OPTIONAL-C3-SOURCE-ELIGIBLE~%")
+             (finish-output)
+             (let ((value (logical-slot-copy-publish-import-pending)))
+               (assert (= (getf value :child-plan-digest)
+                          (getf (logical-slot-copy-import-decode certificate) :child-plan-digest)))
+               (assert (eq :requires-source-replay (logical-import-native-evidence-binding value)))))
+        (overwrite control-path original)
+        (overwrite certificate-path certificate)
+        (overwrite evidence-path evidence)))
+    (format t "~&LOGICAL-IMPORT-OPTIONAL-C3-FACT-PASS~%")
     (finish-output)))
 
 (defun logical-import-native-pending-publication ()
@@ -290,6 +344,8 @@
                       (logical-slot-effective-invalidation-cause slot)))))
       (logical-import-native-reject-copy-id-owner path saved bytes)
       (logical-import-native-evidence-binding saved)
+      (when (eq *logical-import-native-expected-disposition* :eligible)
+        (logical-import-native-optional-control-fact))
       (format t "~&LOGICAL-IMPORT-PENDING-PUBLICATION-PASS ~A~%" (getf saved :owner))
       (finish-output))))
 

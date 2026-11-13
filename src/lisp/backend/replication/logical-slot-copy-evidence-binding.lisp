@@ -38,17 +38,25 @@ The selected tip may be newer than the applied parent."
   "Rebuild child PGSLOT7 images from supplied descriptor slots and frozen status.
 Use the shared child-image guard to check owner and terminal cause."
   (let ((sources (logical-slot-copy-descriptor-slots descriptor))
-        (owner (logical-slot-parse-generation (getf certificate :owner))))
+        (owner (logical-slot-parse-generation (getf certificate :owner)))
+        (fact (getf control :logical-fact)))
     (unless (and (/= owner (logical-slot-parse-generation (getf certificate :copy-id)))
                  (equal (mapcar #'first sources) (mapcar #'first (getf certificate :slots))))
       (error "import evidence source slot inventory or owner differs"))
+    (unless (timeline-prefix-boundary-p
+             (getf certificate :parent-timeline) (getf certificate :fork) history)
+      (error "import evidence source fork differs from its history"))
     (loop for (name bytes) in sources
           for row in (getf certificate :slots)
           for source = (logical-slot-state-decode bytes name)
-          for disposition = (logical-slot-copy-import-disposition
-                             source (getf control :logical-fact) history
-                             (getf certificate :fork) (getf certificate :parent-timeline))
-          do (unless (and (not (eq disposition :deferred)) (eq disposition (fifth row))
+          for disposition = (fifth row)
+          for classified = (if fact
+                               (logical-slot-copy-import-disposition
+                                source fact history (getf certificate :fork)
+                                (getf certificate :parent-timeline))
+                               (progn (logical-slot-check-primary-history source history) nil))
+          do (unless (and (member disposition '(:eligible :wal-removed :wal-level-insufficient))
+                          (or (null fact) (eq classified disposition))
                           (= (third row) (logical-slot-copy-import-digest bytes))
                           (equal (second row)
                                  (logical-slot-generation-token
@@ -57,8 +65,8 @@ Use the shared child-image guard to check owner and terminal cause."
                           (equalp (string->bytes (fourth row))
                                   (logical-slot-copy-import-child-image
                                    source owner (if (eq disposition :eligible) :none disposition))))
-               (error "import evidence planned slot differs from its actual source"))))
-  t)
+               (error "import evidence planned slot differs from its actual source")))
+    (if fact :control-fact-checked :requires-source-replay)))
 
 (defun logical-slot-copy-import-evidence-check-certificate (evidence certificate descriptor proof-bytes)
   "Check evidence against the certificate, descriptor and base proof without I/O.
@@ -121,7 +129,8 @@ This observational binding does not grant owner authority or replace D to F repl
                    (if (get-properties control '(:promotion-wal-level))
                        (ecase (getf control :promotion-wal-level) (:replica 1) (:logical 2)) 2))
           (error "import evidence EOR loses frozen configured WAL level")))
-      (logical-slot-copy-evidence-check-rows
-       certificate descriptor control
-       (logical-slot-copy-evidence-check-history evidence certificate descriptor control))
-      (values manifest control plan))))
+      (let ((status
+              (logical-slot-copy-evidence-check-rows
+               certificate descriptor control
+               (logical-slot-copy-evidence-check-history evidence certificate descriptor control))))
+        (values manifest control plan status)))))
