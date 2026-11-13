@@ -351,6 +351,11 @@ Each read writes and hashes the same bytes.  A requested prefix must be complete
 
 (defun physical-bootstrap-manifest-text (manifest)
   "Print portable literal strings rather than SBCL's readable BASE-CHAR #A arrays."
+  (when (%metadata-literal-tree-p manifest 0)
+    (return-from physical-bootstrap-manifest-text
+      (with-standard-io-syntax
+        (let ((*print-readably* nil))
+          (prin1-to-string manifest)))))
   (labels ((literal (value)
              (typecase value
                (string (map 'string #'identity value))
