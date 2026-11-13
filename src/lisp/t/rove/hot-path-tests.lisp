@@ -27,6 +27,19 @@
             collect (list value (make-string (+ 2 (length value) (count #\' value))
                                              :element-type 'character))))
 
+(setf (gethash '%logical-sql-quote-base-into *unit-hot-probes*)
+      (let* ((backing (make-array 4100 :element-type 'base-char :initial-element #\'))
+             (values (list (make-string 0 :element-type 'base-char)
+                           (make-string 1 :element-type 'base-char :initial-element #\a)
+                           backing
+                           (make-array 3 :element-type 'base-char :displaced-to backing
+                                         :displaced-index-offset 1)
+                           (make-array 8 :element-type 'base-char :initial-element #\a
+                                         :fill-pointer 3 :adjustable t))))
+        (loop for value in values
+              collect (list value (make-string (+ 2 (length value) (count #\' value))
+                                               :element-type 'base-char)))))
+
 (defun unit-timeline-lineage-fixture (depth stride finite-head-p)
   (loop for index downfrom (1- depth) to 0
         collect (make-timeline-history-entry

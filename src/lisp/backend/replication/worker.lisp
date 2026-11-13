@@ -132,10 +132,10 @@ Double apostrophes and preserve backslashes for standard-conforming strings."
   (if (null value)
       "NULL"
       (let* ((text (if (stringp value) value (coerce (the vector value) 'string)))
-             (length (length text))
-             (output (make-string (+ length (count #\' text) 2)
-                                  :element-type 'character)))
-        (%logical-sql-quote-into text output))))
+             (size (+ (length text) (count #\' text) 2)))
+        (if (typep text 'base-string)
+            (%logical-sql-quote-base-into text (make-string size :element-type 'base-char))
+            (%logical-sql-quote-into text (make-string size :element-type 'character))))))
 
 (defun logical-progress-table-ddl ()
   (format nil "CREATE TABLE IF NOT EXISTS ~a (source_slot varchar PRIMARY KEY, source_lsn varchar, state varchar NOT NULL, snapshot_token varchar)"

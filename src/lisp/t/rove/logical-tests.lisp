@@ -195,6 +195,44 @@
                  (write-char character stream))
         (write-char #\' stream))))
 
+(defun unit-sql-literal-representation (shape size base-p)
+  (let* ((element-type (if base-p 'base-char 'character))
+         (alphabet (if base-p (map 'string #'code-char '(0 39 92 65 127))
+                       (coerce (list #\λ #\' #\\ #\🙂) 'string)))
+         (backing (make-string (+ size 4) :element-type element-type
+                                          :initial-element #\a)))
+    (dotimes (index size)
+      (setf (char backing (+ index 2)) (char alphabet (mod index (length alphabet)))))
+    (ecase shape
+      (:simple (subseq backing 2 (+ size 2)))
+      (:displaced (make-array size :element-type element-type :displaced-to backing
+                                   :displaced-index-offset 2))
+      (:fill-pointer
+       (let ((value (make-array (+ size 4) :element-type element-type
+                                           :fill-pointer size :adjustable t)))
+         (replace value backing :start2 2 :end2 (+ size 2))
+         value)))))
+
+(cl-spec:defproperty sql-literal-preserves-compact-representation
+    ((shape (member :simple :displaced :fill-pointer))
+     (size (range integer 0 4096)) (base-p (member nil t)))
+  (:about logical-sql-literal %logical-sql-quote-into %logical-sql-quote-base-into)
+  (:trials (:normal 200))
+  (let* ((input (unit-sql-literal-representation shape size base-p))
+         (before (copy-seq input))
+         (output (logical-sql-literal input)))
+    (and (string= output (unit-sql-literal-reference input))
+         (string= input before)
+         (not (eq input output))
+         (if base-p (typep output 'simple-base-string)
+             (typep output '(simple-array character (*)))))))
+
+(rove:deftest sql-literal-compact-representation-contract
+    (let ((data (cl-spec:result-data
+                 (cl-spec:run-property 'sql-literal-preserves-compact-representation
+                                       :seed 7524 :profile :normal))))
+      (rove:ok (eq :passed (getf data :status)) (format nil "~s" data))))
+
 (cl-spec:defproperty sql-literal-direct-fill-matches-stream
     ((shape (member :simple :fill-pointer :displaced))
      (size (range integer 0 8195)) (offset (range integer 0 12)))
