@@ -2,6 +2,21 @@
 
 (defvar *unit-hot-probes* (make-hash-table :test #'equal))
 
+(setf (gethash '%string-span-utf8-size *unit-hot-probes*)
+      (let ((text (coerce (mapcar #'code-char
+                                  '(0 127 128 2047 2048 55295 57344 65535 65536 1114111))
+                          'string)))
+        (list (list "" 0 0)
+              (list text 0 (length text))
+              (list text 2 8)
+              (list (make-string 4096 :initial-element #\a) 0 4096)
+              (list (make-array 3 :element-type 'character :displaced-to text
+                                  :displaced-index-offset 2) 0 3)
+              (list (make-array 16 :element-type 'character :initial-element #\λ
+                                   :fill-pointer 3 :adjustable t) 0 3)
+              (list (string (code-char #xd800)) 0 1)
+              (list (string (code-char #xdfff)) 0 1))))
+
 (defun unit-timeline-lineage-fixture (depth stride finite-head-p)
   (loop for index downfrom (1- depth) to 0
         collect (make-timeline-history-entry

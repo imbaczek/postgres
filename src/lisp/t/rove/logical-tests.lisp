@@ -166,6 +166,83 @@
         (rove:ok (rove:signals
                   (logical-wal-archive-compare-live archive 64 1 63 nil) 'error)))))
 
+(defun unit-utf8-size-string (shape size offset)
+  (let* ((codes #(0 39 127 128 2047 2048 55295 57344 65535 65536 128578 1114111))
+         (text (make-string size :element-type 'character)))
+    (dotimes (index size)
+      (setf (char text index) (code-char (aref codes (mod (+ index offset) (length codes))))))
+    (ecase shape
+      (:simple text)
+      (:fill-pointer
+       (let ((result (make-array (+ size 7) :element-type 'character
+                                            :initial-element #\x :fill-pointer size :adjustable t)))
+         (replace result text)
+         result))
+      (:displaced
+       (let ((backing (make-array (+ size 6) :element-type 'character
+                                             :initial-element (code-char #xd800))))
+         (replace backing text :start1 3)
+         (make-array size :element-type 'character :displaced-to backing
+                          :displaced-index-offset 3))))))
+
+(cl-spec:defproperty utf8-size-counters-match-encoder
+    ((shape (member :simple :fill-pointer :displaced))
+     (size (range integer 0 8195)) (offset (range integer 0 12)))
+  (:about logical-utf8-size-bounded pgoutput-string-utf8-size)
+  (:trials (:normal 200))
+  (let* ((text (unit-utf8-size-string shape size offset))
+         (expected (length (sb-ext:string-to-octets text :external-format :utf-8))))
+    (and (= expected (logical-utf8-size-bounded text))
+         (= expected (pgoutput-string-utf8-size text)))))
+
+(rove:deftest utf8-size-counters-generated-contract
+    (let ((data (cl-spec:result-data
+                 (cl-spec:run-property 'utf8-size-counters-match-encoder
+                                       :seed 7515 :profile :normal))))
+      (rove:ok (eq :passed (getf data :status)) (format nil "~s" data))))
+
+(rove:deftest utf8-size-counters-preserve-encoding-errors
+    (dolist (position '(0 4095 4096 8192))
+      (let ((text (make-string 8193 :initial-element #\a :element-type 'character)))
+        (setf (char text position) (code-char #xd800))
+        (dolist (function (list #'logical-utf8-size-bounded #'pgoutput-string-utf8-size))
+          (rove:ok
+           (equal (handler-case (funcall function text)
+                    (error (condition) (type-of condition)))
+                  (handler-case (length (sb-ext:string-to-octets text :external-format :utf-8))
+                    (error (condition) (type-of condition)))))))))
+
+(rove:deftest utf8-size-counters-cover-chunk-boundaries-and-active-length
+    (dolist (size '(0 1 4095 4096 4097 8192 8193))
+      (dolist (element-type '(base-char character))
+        (let ((text (make-string size :element-type element-type :initial-element #\a)))
+          (rove:ok (= size (logical-utf8-size-bounded text)))
+          (rove:ok (= size (pgoutput-string-utf8-size text))))))
+  (let ((text (make-array 4097 :element-type 'character :initial-element #\λ
+                               :fill-pointer 4096 :adjustable t)))
+    (setf (aref text 4096) (code-char #xd800))
+    (rove:ok (= 8192 (logical-utf8-size-bounded text)))
+    (rove:ok (= 8192 (pgoutput-string-utf8-size text))))
+  (dolist (input (list nil "" #() #(1) '(#\a)))
+    (flet ((outcome (function)
+             (handler-case (funcall function input)
+               (error (condition) (type-of condition)))))
+      (rove:ok
+       (equal (outcome #'logical-utf8-size-bounded)
+              (outcome (lambda (value)
+                         (loop for start from 0 below (length value) by 4096
+                               sum (length (string->bytes
+                                            (subseq value start (min (length value)
+                                                                     (+ start 4096))))))))))
+      (rove:ok
+       (equal (outcome #'pgoutput-string-utf8-size)
+              (outcome (lambda (value)
+                         (loop for start from 0 below (length value) by 4096
+                               sum (length (sb-ext:string-to-octets
+                                            value :external-format :utf-8
+                                            :start start :end (min (length value)
+                                                                   (+ start 4096))))))))))))
+
 (defun unit-byte-span-vector (shape)
   (let* ((bytes (concatenate '(vector (unsigned-byte 8))
                              (make-array 1 :element-type '(unsigned-byte 8) :initial-element 255)

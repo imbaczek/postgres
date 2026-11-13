@@ -21,3 +21,25 @@ OUTPUT is a preallocated simple CHARACTER array of exactly END - START elements.
         for destination fixnum from 0
         do (setf (aref output destination) (code-char (aref bytes index))))
   output)
+
+(defun %string-span-utf8-size (string start end)
+  (declare (type string string)
+           (type fixnum start end))
+  (sb-kernel:with-array-data ((data string) (begin start) (finish end))
+    (if (typep data 'simple-base-string)
+        (- finish begin)
+        (locally
+            (declare (type (simple-array character (*)) data))
+          (let ((size 0))
+            (declare (type fixnum size))
+            (loop for index fixnum from begin below finish
+                  for code fixnum = (char-code (schar data index))
+                  do (incf size
+                           (cond ((< code #x80) 1)
+                                 ((< code #x800) 2)
+                                 ((<= #xd800 code #xdfff)
+                                  (return-from %string-span-utf8-size nil))
+                                 ((< code #x10000) 3)
+                                 ((<= code #x10ffff) 4)
+                                 (t (return-from %string-span-utf8-size nil)))))
+            size)))))

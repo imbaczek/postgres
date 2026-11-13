@@ -449,7 +449,9 @@ and an empty Terminate as EOF. Other malformed messages remain protocol errors."
   (loop for start from 0 below (length string) by 4096
         for end = (min (length string) (+ start 4096))
         do (check-for-interrupts)
-        sum (length (sb-ext:string-to-octets string :external-format :utf-8 :start start :end end))))
+        sum (or (and (stringp string) (%string-span-utf8-size string start end))
+                (length (sb-ext:string-to-octets string :external-format :utf-8
+                                                        :start start :end end)))))
 
 (defun pgoutput-emit-string (sink string)
   (loop for start from 0 below (length string) by 4096

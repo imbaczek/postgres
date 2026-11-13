@@ -502,7 +502,9 @@ including appended NOT VALID ALTERs, rather than reinstalling constraints."
 (defun logical-utf8-size-bounded (value)
   "Count UTF-8 bytes without allocating an encoding of the entire string."
   (loop for start from 0 below (length value) by 4096
-        sum (length (string->bytes (subseq value start (min (length value) (+ start 4096)))))))
+        for end = (min (length value) (+ start 4096))
+        sum (or (and (stringp value) (%string-span-utf8-size value start end))
+                (length (string->bytes (subseq value start end))))))
 
 (defun logical-copy-row-size (row)
   (+ 32 (* 16 (length row))
