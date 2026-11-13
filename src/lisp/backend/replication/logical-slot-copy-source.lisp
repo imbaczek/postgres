@@ -2,22 +2,10 @@
 
 (defvar *logical-slot-copy-restoration-failure* nil)
 
-(declaim (ftype function logical-slot-copy-check-startup-image))
-
-(declaim (ftype function logical-slot-copy-check-base-proof-fence))
+(declaim (ftype function logical-slot-copy-validate-startup))
 
 (defun logical-slot-copy-check-startup ()
-  (logical-slot-copy-check-base-proof-fence)
-  (let ((stat
-          (handler-case
-              (sb-posix:lstat (namestring (merge-pathnames "logical-slot-copy.in-progress" *pgdata*)))
-            (sb-posix:syscall-error (condition)
-              (unless (= (sb-posix:syscall-errno condition) sb-posix:enoent)
-                (error condition))))))
-    (when stat
-      (error "unfinished logical slot copy cannot start")))
-  (logical-slot-copy-check-startup-image)
-  (values))
+  (logical-slot-copy-validate-startup))
 
 (defun logical-slot-copy-check-identity (gate-owner ownership)
   (check-live-operation-startup-quiescence gate-owner)

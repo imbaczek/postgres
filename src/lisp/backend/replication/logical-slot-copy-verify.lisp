@@ -106,28 +106,3 @@
       (unless (equal (fourth row) (physical-image-file-facts parent leaf))
         (error "logical copy verified target changed before publication"))))
   t)
-
-(defun logical-slot-copy-check-startup-image ()
-  (let* ((manifest-path (merge-pathnames "physical-backup.manifest" *pgdata*))
-         (descriptor-path (merge-pathnames "logical-slot-copy.descriptor" *pgdata*))
-         (descriptor-p (slot-state-lstat descriptor-path)))
-    (multiple-value-bind (manifest digest)
-        (when (slot-state-lstat manifest-path) (recovery-read-manifest *pgdata*))
-      (let ((copy-p (and manifest (get-properties manifest '(:logical-slot-copy-id)))))
-        (when (or copy-p descriptor-p)
-          (unless (and copy-p descriptor-p)
-            (error "logical copy manifest and descriptor must both be present"))
-          (let ((descriptor (logical-slot-copy-descriptor-decode
-                             (read-bounded-regular-file
-                              descriptor-path +logical-slot-copy-descriptor-maximum-bytes+))))
-            (logical-slot-copy-check-binding descriptor manifest digest)
-            (unless (and (equalp (logical-slot-copy-descriptor-base-control descriptor)
-                                 (recovery-read-bytes (wal-control-path)
-                                                      :maximum (1+ +wal-control-maximum-bytes+)))
-                         (equalp (logical-slot-copy-descriptor-recovery-control descriptor)
-                                 (recovery-read-bytes
-                                  (physical-recovery-control-path)
-                                  :maximum +physical-recovery-control-maximum-bytes+)))
-              (error "logical copy initial controls changed without child-owner import")))
-          (error "logical slot copy requires durable child-owner import before startup")))))
-  t)

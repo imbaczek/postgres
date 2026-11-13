@@ -20,6 +20,7 @@
 Call under admission or owned quiescence. Report shutdown separately so the
 orchestrator can yield before intent without marking recovery failed.
 ALLOW-RESOURCE-PAUSE is used only to restore recovery workers after a failed attempt."
+  (logical-slot-copy-check-promotion)
   (check-recovery-available)
   (unless allow-resource-pause (check-physical-resource-promotion))
   (when (shutdown-in-progress-p) (error 'physical-promotion-shutdown))

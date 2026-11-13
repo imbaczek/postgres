@@ -12,12 +12,15 @@ succeeds and stopping is cleared."
 The default is NIL, so cold completion retains its strict checks.  This is not
 a configuration setting.")
 
+(declaim (ftype function logical-slot-copy-check-promotion))
+
 (defun physical-promotion-check-context (phase &key preserve-readers)
   "Check PHASE and the caller's promotion exclusion.
 
 The caller owns follow-command, reload and quiescence in that order; no worker
 joins occur here.  PRESERVE-READERS permits retained reader transactions; their
 ownership must be checked by the live promotion path."
+  (logical-slot-copy-check-promotion)
   (unless (and (zerop *live-operation-depth*)
                (sb-thread:holding-mutex-p *physical-follow-command-lock*)
                (sb-thread:holding-mutex-p *reload-run-lock*)

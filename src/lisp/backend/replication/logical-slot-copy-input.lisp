@@ -30,6 +30,28 @@
         (when fd (sb-posix:close fd)))))
   (logical-slot-copy-check-input owner context))
 
+(defun logical-slot-copy-input-sidecar-inventory (context descriptor)
+  (physical-image-check-children context)
+  (let ((sidecar (cdr (assoc "logical_slot_wal" (physical-image-context-children context) :test #'equal))))
+    (unless (and sidecar
+                 (equal (sort (directory-entry-names (physical-image-fd-path sidecar)
+                                                     :follow-symlinks t) #'string<)
+                        (sort (loop for (timeline segment) in (logical-slot-copy-descriptor-wal-pieces descriptor)
+                                    collect (wal-segment-filename segment timeline :timeline)) #'string<)))
+      (error "logical copy input sidecar inventory differs from its descriptor")))
+  t)
+
+(defun logical-slot-copy-observe-pieces (context descriptor observations index)
+  (dolist (piece (logical-slot-copy-descriptor-wal-pieces descriptor))
+    (destructuring-bind (timeline segment size digest start end) piece
+      (declare (ignore start end))
+      (let ((actual (logical-slot-copy-file-row context (logical-slot-copy-piece-path timeline segment))))
+        (unless (and (= size (second actual)) (= digest (third actual)))
+          (error "logical copy WAL piece differs from its descriptor"))
+        (setf (gethash (list timeline segment) index) (list piece actual))
+        (push actual observations))))
+  (values observations index))
+
 (defun logical-slot-copy-input-inventory (owner context manifest descriptor)
   (logical-slot-copy-check-input owner context)
   (let* ((root (physical-image-context-root-path context))
@@ -40,16 +62,11 @@
                           "recovery.required" "physical-recovery.control" "physical-backup.manifest"
                           "logical-slot-copy.descriptor" "pg_hba.conf" "pg_ident.conf"
                           "authentication.initialized")
-                    (loop for (name) in files unless (find #\/ name) collect name)))
-         (sidecar (cdr (assoc "logical_slot_wal" (physical-image-context-children context) :test #'equal)))
-         (pieces (logical-slot-copy-descriptor-wal-pieces descriptor)))
+                    (loop for (name) in files unless (find #\/ name) collect name))))
     (unless (equal (sort (directory-entry-names root :follow-symlinks t) #'string<)
                    (sort expected #'string<))
       (error "logical copy input root inventory differs from its completed image"))
-    (unless (equal (sort (directory-entry-names (physical-image-fd-path sidecar) :follow-symlinks t) #'string<)
-                   (sort (loop for (timeline segment) in pieces
-                               collect (wal-segment-filename segment timeline :timeline)) #'string<))
-      (error "logical copy input sidecar inventory differs from its descriptor"))
+    (logical-slot-copy-input-sidecar-inventory context descriptor)
     (let ((*physical-image-context* context))
       (recovery-check-image-directories manifest root)))
   t)
@@ -65,15 +82,7 @@
     (dolist (name '("physical-backup.manifest" "logical-slot-copy.descriptor" "recovery.required"
                     "physical-recovery.control" "pg_hba.conf" "pg_ident.conf" "authentication.initialized"))
       (push (logical-slot-copy-file-row context name) observations))
-    (dolist (piece (logical-slot-copy-descriptor-wal-pieces descriptor))
-      (destructuring-bind (timeline segment size digest start end) piece
-        (declare (ignore start end))
-        (let ((actual (logical-slot-copy-file-row context (logical-slot-copy-piece-path timeline segment))))
-          (unless (and (= size (second actual)) (= digest (third actual)))
-            (error "logical copy WAL piece differs from its descriptor"))
-          (setf (gethash (list timeline segment) index) (list piece actual))
-          (push actual observations))))
-    (values observations index)))
+    (logical-slot-copy-observe-pieces context descriptor observations index)))
 
 (defun logical-slot-copy-input-check-observations (owner context observations)
   (logical-slot-copy-check-input owner context)

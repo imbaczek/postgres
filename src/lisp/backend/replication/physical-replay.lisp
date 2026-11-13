@@ -242,6 +242,10 @@ does not excuse a missing file or a different fork."
                             (and reset-forks (gethash (list node fork) reset-forks)))
                   (error "still-live base relation fork is truncated: ~a" name))))))))))
 
+(defun physical-recovery-immutable-base-file-p (name)
+  (or (member name '("PG_VERSION" "global/pg_control" "global/pg_wal_control") :test #'equal)
+      (uiop:string-prefix-p "pg_wal/" name)))
+
 (defun physical-recovery-check-streaming-base (manifest control)
   "Validate unchanged provenance; changed relation/CLOG/catalog bytes require redo."
   (unless (and (<= (getf manifest :end) (getf control :applied))
@@ -254,12 +258,7 @@ does not excuse a missing file or a different fork."
   ;; the original base, while mutable files are validated/repaired by redo.
   (let ((immutable (copy-list manifest)))
     (setf (getf immutable :files)
-          (remove-if-not
-           (lambda (entry)
-             (or (member (first entry) '("PG_VERSION" "global/pg_control" "global/pg_wal_control")
-                         :test #'equal)
-                 (uiop:string-prefix-p "pg_wal/" (first entry))))
-           (getf manifest :files)))
+          (remove-if-not #'physical-recovery-immutable-base-file-p (getf manifest :files) :key #'first))
     (recovery-check-manifest-files immutable *pgdata*))
   (let ((*catalog-identity-needs-persist-p* nil)
         (catalog (load-catalog)))

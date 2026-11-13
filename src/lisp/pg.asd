@@ -340,6 +340,8 @@
                    (:file "../replication/logical-slot-copy-base-proof")
                    (:file "../replication/logical-slot-copy-startup-input")
                    (:file "../replication/logical-slot-copy-base-publication")
+                   (:file "../replication/logical-slot-copy-recovery")
+                   (:file "../replication/logical-slot-copy-startup")
                    (:file "postgres")))
      (:file "replication/logical-retention")
      (:file "replication/logical-shutdown")))))

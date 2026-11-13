@@ -976,7 +976,7 @@ Then check the cached handles and workers under startup exclusion."
           *query-temp-file-limit-bytes* temp-file-limit-bytes
           *query-sort-arena-limit-bytes* sort-arena-limit-bytes
           *max-slot-wal-keep-bytes* max-slot-wal-keep-bytes)
-    (logical-slot-copy-check-startup)
+    (logical-slot-copy-preflight-startup)
     (authentication-preflight-startup startup-settings)
     (startup-install-initial-settings startup-settings startup-native startup-overrides)
     (startup-install-resource-capacity startup-settings)
@@ -984,6 +984,7 @@ Then check the cached handles and workers under startup exclusion."
     ;; Observe before PID repair and consume terminal retirement under ownership
     ;; before mutable bootstrap or storage initialization begins.
     (physical-reseed-follow-own-startup host port)
+    (logical-slot-copy-owned-startup)
     (physical-backup-cleanup-stages)
     ;; Complete authentication using the captured inputs after PGDATA ownership.
     ;; Do not reread configuration files or reinstall startup resource capacity.

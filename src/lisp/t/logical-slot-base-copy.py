@@ -168,12 +168,35 @@ def check_startup_refusal(data, expected):
             assert expected in (peer.root / 'server.log').read_text(), peer.root
             assert peer.process.poll() is not None
         else:
-            raise AssertionError('copied logical slots started before child-owner import')
+            raise AssertionError('invalid copied logical image started')
         after = {str(p.relative_to(data)): p.read_bytes()
                  for p in data.rglob('*') if p.is_file()}
         assert before == after, peer.root
     finally:
         peer.stop(immediate=True)
+
+
+
+def check_startup_standby(data):
+    peer = api['OwnedLisp'](parameters=(('wal_level', 'logical'),))
+    peer.data = data
+    descriptor = (data / 'logical-slot-copy.descriptor').read_bytes()
+    carriers = {p.name: p.read_bytes() for p in (data / 'logical_slot_wal').iterdir()}
+    try:
+        peer.start()
+        connection = RawConnection(peer.port)
+        try:
+            assert connection.query('SELECT pg_is_in_recovery()') == [['t']]
+            assert connection.query('SELECT id FROM copy_rows WHERE id < 3 ORDER BY id') == [['1'], ['2']]
+        finally:
+            connection.close()
+        peer.control('(assert (zerop (loop for slot being the hash-values of *wal-replication-slots* '
+                     'count (wal-logical-slot-p slot))))')
+        assert (data / 'logical-slot-copy.base-verified').is_file()
+        assert descriptor == (data / 'logical-slot-copy.descriptor').read_bytes()
+        assert carriers == {p.name: p.read_bytes() for p in (data / 'logical_slot_wal').iterdir()}
+    finally:
+        peer.stop()
 
 
 def check_publication_fault(server, point, label, mutate=False):
@@ -496,7 +519,10 @@ def run():
                                  for p in target.rglob('*') if p.is_file()}
         assert sorted(p.name for p in scratch.iterdir()) == ['.pg_lisp.lock']
         check_verification_mutations(server, target, scratch, pieces)
-        check_startup_refusal(target, 'requires durable child-owner import')
+        admitted = server.root / 'admitted_standby'
+        shutil.copytree(target, admitted)
+        check_startup_standby(admitted)
+        shutil.rmtree(admitted)
         missing = server.root / 'missing_descriptor'
         shutil.copytree(target, missing)
         (missing / 'logical-slot-copy.descriptor').unlink()
