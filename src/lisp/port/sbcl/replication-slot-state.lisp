@@ -343,7 +343,9 @@ directories; use it only at startup with writers quiescent. Without CLEANUP,
 unfinished state is an error. LOCAL-WORKSPACE T skips only the fixed
 .logical-slot-copy.work entry before inspection or cleanup, regardless of its
 type. The NIL default keeps incoming inventory strict. This local inventory
-option grants no ownership, adoption or deletion of the entry's contents."
+option grants no ownership, adoption or deletion of the entry's contents.
+REQUIRE-ROOT defaults to NIL, allowing a missing root.  When T, the root must
+be present and open successfully."
   (unless (member local-workspace '(nil t))
     (error "local slot workspace exemption requires an explicit boolean"))
   (unless (member require-root '(nil t))

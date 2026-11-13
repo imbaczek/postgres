@@ -32,6 +32,9 @@
       (wal-encode-replication-slot slot)))
 
 (defun logical-slot-startup-read-inventory (&key cleanup root parent-fd local-workspace)
+  "Read canonical slot state into startup entries.
+Inventory is strict by default.  Local startup, capture, recovery and
+promotion may explicitly skip the local workspace; incoming images stay strict."
   (apply #'slot-state-map
          (or root (wal-replication-slot-directory))
          (lambda (bytes name)

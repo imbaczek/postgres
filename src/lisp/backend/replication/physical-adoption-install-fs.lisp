@@ -132,6 +132,10 @@
           :mount (physical-adoption-install-mount-id canonical))))
 
 (defun physical-adoption-install-tree (root name device mount &optional (budget (list 100000 16777216)) local-slot-workspace)
+  "Inventory a tree, checking directory names and identity after traversal.
+LOCAL-SLOT-WORKSPACE skips pg_replslot/.logical-slot-copy.work before inspection;
+the raw parent names and identity are still checked.  Callers quarantine the
+old slot parent as a whole, without interpreting the skipped entry."
   (unless (member local-slot-workspace '(nil t))
     (error "local slot workspace exemption requires an explicit boolean"))
   (labels ((visit (relative)
@@ -177,6 +181,8 @@
     (sort (visit name) #'string< :key #'first)))
 
 (defun physical-adoption-install-inventory-names (names local-workspace)
+  "With LOCAL-WORKSPACE T, omit only logical-slot-copy.work from local root names.
+This leaves the entry opaque and grants no ownership of it or its contents."
   (unless (member local-workspace '(nil t))
     (error "local root workspace exemption requires an explicit boolean"))
   (if local-workspace
@@ -184,6 +190,10 @@
       names))
 
 (defun physical-adoption-install-snapshot (root &key exclude local-workspace local-slot-workspace)
+  "Inventory ROOT and recheck its raw names and identity after traversal.
+Both workspace exemptions default to NIL, keeping staged and incoming trees
+strict.  Use LOCAL-SLOT-WORKSPACE only for old slot trees.  The independent
+LOCAL-WORKSPACE option skips the opaque PGDATA root entry before traversal."
   (unless (and (listp exclude)
                (every (lambda (name) (member name *physical-adoption-install-retained-names* :test #'equal)) exclude))
     (error "adoption inventory can exclude only fixed management entries"))

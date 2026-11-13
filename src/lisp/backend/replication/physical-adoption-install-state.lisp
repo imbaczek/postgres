@@ -22,6 +22,7 @@
    fact (append (when directory '(:directory)) '(:device :inode :lock-inode :fence-inode))))
 
 (defun physical-adoption-install-names-p (directory names &key local-workspace)
+  "Compare root names, ignoring the local workspace only when requested."
   (equal (sort (copy-list names) #'string<)
          (physical-adoption-install-inventory-names
           (physical-adoption-install-entry-names directory) local-workspace)))

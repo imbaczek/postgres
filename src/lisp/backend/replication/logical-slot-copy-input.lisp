@@ -53,6 +53,10 @@
   (values observations index))
 
 (defun logical-slot-copy-input-empty-slot-root (context names directory)
+  "Check a present slot root without accepting canonical slots in the base.
+The caller has verified the owner and paired DIRECTORY with CONTEXT's held
+root descriptor.  Open pg_replslot only when its raw name is present, and
+leave its local workspace opaque.  Slot data must remain descriptor-only."
   (when (member "pg_replslot" names :test #'equal)
     (slot-state-map
      (merge-pathnames "pg_replslot/" directory)
