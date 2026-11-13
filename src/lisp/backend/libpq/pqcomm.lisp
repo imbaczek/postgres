@@ -37,7 +37,9 @@
 
 (defun bytes->string (bytes &key (start 0) (end (length bytes)))
   "Decode UTF-8 from the byte span [START, END) into a new string.
-BYTES must remain stable during decoding; the returned string owns its contents."
+BYTES must remain stable during decoding; the returned string owns its contents.
+A validated simple octet span uses the fast path only when all bytes are ASCII.
+Other inputs, including invalid spans, go through the SBCL UTF-8 decoder."
   (when (and (typep bytes '(simple-array (unsigned-byte 8) (*)))
              (typep start 'fixnum)
              (or (null end) (typep end 'fixnum)))
