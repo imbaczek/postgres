@@ -116,6 +116,9 @@
        :element-type '(unsigned-byte 8)))))
 
 (defun logical-slot-copy-check-checkpoint-bytes (bytes manifest descriptor)
+  "Check the D record against manifest coordinates and copied control.
+Require canonical snapshot payload when present; accept the legacy NIL snapshot.
+This checks bytes without establishing file ownership."
   (let* ((fields (logical-slot-copy-control-fields
                   (logical-slot-copy-descriptor-base-control descriptor)))
          (record (wal-decode-record bytes (physical-manifest-checkpoint-start manifest)))

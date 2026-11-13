@@ -460,6 +460,8 @@ the outer caller must fence it."
         manifest))))
 
 (defun recovery-decode-manifest (bytes)
+  "Parse the bounded original manifest envelope and return its value and digest.
+This checks bytes only and grants no filesystem authority."
   (unless (and (typep bytes '(vector (unsigned-byte 8)))
                (<= 1 (length bytes) (* 16 1024 1024)))
     (error "invalid physical recovery manifest bytes"))

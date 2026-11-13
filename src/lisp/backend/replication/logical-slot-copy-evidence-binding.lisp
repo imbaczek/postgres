@@ -1,6 +1,11 @@
+;;; Bind recorded evidence to the certificate and copied source facts.
+
+;;; Permanent import evidence checks describe recorded facts, not authority.
 (in-package #:pg)
 
 (defun logical-slot-copy-evidence-check-history (evidence certificate descriptor control)
+  "Bind selected and child history through the applied parent and fork.
+The selected tip may be newer than the applied parent."
   (let* ((target (or (getf control :history-target) (getf control :timeline)))
          (parent (getf certificate :parent-timeline))
          (fork (getf certificate :fork))
@@ -30,6 +35,8 @@
     selected))
 
 (defun logical-slot-copy-evidence-check-rows (certificate descriptor control history)
+  "Rebuild child PGSLOT7 images from supplied descriptor slots and frozen status.
+Use the shared child-image guard to check owner and terminal cause."
   (let ((sources (logical-slot-copy-descriptor-slots descriptor))
         (owner (logical-slot-parse-generation (getf certificate :owner))))
     (unless (and (/= owner (logical-slot-parse-generation (getf certificate :copy-id)))
@@ -54,6 +61,8 @@
   t)
 
 (defun logical-slot-copy-import-evidence-check-certificate (evidence certificate descriptor proof-bytes)
+  "Check evidence against the certificate, descriptor and base proof without I/O.
+This observational binding does not grant owner authority or replace D to F replay."
   (logical-slot-copy-import-check certificate)
   (logical-slot-copy-import-evidence-parts evidence)
   (multiple-value-bind (manifest digest) (recovery-decode-manifest (getf evidence :manifest))

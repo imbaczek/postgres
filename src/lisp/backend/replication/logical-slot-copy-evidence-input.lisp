@@ -1,6 +1,11 @@
+;;; Capture evidence from the owned input and selected promotion plan.
+
+;;; Permanent import evidence checks describe recorded facts, not authority.
 (in-package #:pg)
 
 (defun logical-slot-copy-import-build-evidence (context descriptor state plan selected control)
+  "Capture raw manifest, D checkpoint, pending C3 control, histories and frame plan.
+This does not capture full F metadata or catalog; D through F replay is separate."
   (let ((manifest-bytes (logical-slot-copy-read-file context "physical-backup.manifest"
                                                      (* 16 1024 1024))))
     (multiple-value-bind (manifest digest) (recovery-decode-manifest manifest-bytes)

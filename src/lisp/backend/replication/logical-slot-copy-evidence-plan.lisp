@@ -1,3 +1,6 @@
+;;; Validate the child checkpoint and exact initialization frame plan.
+
+;;; Permanent import evidence checks describe recorded facts, not authority.
 (in-package #:pg)
 
 (defconstant +logical-slot-copy-evidence-record-maximum+
@@ -5,6 +8,7 @@
      +wal-checkpoint-commit-ts-size+ +wal-checkpoint-logical-interval-size+))
 
 (defun logical-slot-copy-evidence-check-snapshot (snapshot record)
+  "Match the checkpoint snapshot and its canonical payload to RECORD."
   (let* ((actual (wal-checkpoint-record-snapshot record))
          (count (logical-slot-copy-descriptor-list-count snapshot 80))
          (keys (loop for key in snapshot by #'cddr collect key)))
@@ -17,6 +21,8 @@
       (error "import evidence checkpoint snapshot differs from its frame"))))
 
 (defun logical-slot-copy-evidence-check-plan (plan)
+  "Check canonical 3, 5 or 7 frame initialization grammar and checkpoint fields.
+EOR time converts snapshot Unix seconds to PostgreSQL microseconds."
   (unless (and (= 10 (logical-slot-copy-descriptor-list-count plan 10))
                (equal (loop for key in plan by #'cddr collect key)
                       '(:fork :child :snapshot :end :frames))

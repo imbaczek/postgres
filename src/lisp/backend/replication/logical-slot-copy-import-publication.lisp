@@ -4,7 +4,8 @@
             (:include logical-slot-copy-import-owner)
             (:constructor %make-logical-slot-copy-import-publication-owner)
             (:print-function physical-libpq-print-private-object))
-  "Typed phase 3 publication owner, subject to the base import exclusions."
+  "Typed phase 3 publication owner, subject to the base import exclusions.
+Saved evidence facts are required and rechecked before certificate publication."
   pending-fd
   (pending-name "logical-slot-copy.import.tmp")
   evidence-ready)
@@ -26,6 +27,7 @@
                   collect name)))
 
 (defun logical-slot-copy-import-file-spec (kind)
+  "Return fixed names, bound and decoder for an import artifact kind."
   (ecase kind
     (:pending (values "logical-slot-copy.import" "logical-slot-copy.import.tmp"
                       +logical-slot-copy-import-maximum-bytes+ #'logical-slot-copy-import-decode))
@@ -34,6 +36,7 @@
                        #'logical-slot-copy-import-evidence-decode))))
 
 (defun logical-slot-copy-import-read-artifact (context kind)
+  "Read a private regular artifact and its file facts under caller-owned CONTEXT."
   (multiple-value-bind (name temporary maximum decode) (logical-slot-copy-import-file-spec kind)
     (declare (ignore temporary))
     (when (slot-state-lstat (merge-pathnames name (physical-image-context-root-path context)))
@@ -45,6 +48,7 @@
         (values (funcall decode bytes) bytes facts)))))
 
 (defun logical-slot-copy-import-file-test-point (kind point context)
+  "Select the publication test point for KIND and POINT."
   (logical-slot-copy-verification-test-point
    (or (cdr (assoc point
                    (ecase kind
@@ -64,6 +68,8 @@
    context))
 
 (defun logical-slot-copy-import-check-evidence-ready (owner context attempt)
+  "Require the synced evidence bytes and file facts captured by this owner.
+Rewrites are rejected even when the bytes are unchanged."
   (multiple-value-bind (value bytes facts) (logical-slot-copy-import-read-artifact context :evidence)
     (declare (ignore value))
     (unless (and (logical-slot-copy-import-publication-owner-evidence-ready owner)
@@ -102,6 +108,8 @@
   t)
 
 (defun logical-slot-copy-import-check-publication-plan (owner context attempt store tuple kind)
+  "Recheck source and evidence binding, receive tuple and owner before publication.
+Certificate writes also require the pinned evidence bytes and file facts."
   (logical-slot-copy-check-import-publication owner context)
   (logical-slot-copy-import-check-pending-plan owner context attempt)
   (logical-slot-copy-import-evidence-check-certificate
@@ -118,11 +126,13 @@
   t)
 
 (defun logical-slot-copy-import-check-file-bytes (context kind bytes)
+  "Require the named artifact to retain the expected bytes."
   (let ((actual (nth-value 1 (logical-slot-copy-import-read-artifact context kind))))
     (unless (equalp bytes actual)
       (error "logical import metadata changed during publication"))))
 
 (defun logical-slot-copy-import-sync-file (owner context attempt store tuple kind bytes)
+  "Recheck and sync the artifact and root, then read back bytes and file identity."
   (let ((root (physical-image-context-root-fd context))
         (name (logical-slot-copy-import-file-spec kind)))
     (logical-slot-copy-import-check-publication-plan owner context attempt store tuple kind)
@@ -150,6 +160,8 @@
     bytes))
 
 (defun logical-slot-copy-import-write-file (owner context attempt store tuple kind existing)
+  "Publish or resync an artifact under the owned scope with exclusive rename.
+Check the plan around file and root fsync and readback; stale temporaries fail."
   (let* ((bytes (ecase kind
                   (:pending (logical-slot-copy-import-image
                              (logical-slot-copy-import-pending-plan-value attempt)))
@@ -198,7 +210,9 @@
 
 (defun logical-slot-copy-publish-import-pending ()
   "Verify actual source proof and publish only a pending import certificate.
-This zero-argument entry grants no admission and writes no PGSLOT7 or child WAL."
+Sync and read back permanent evidence before writing the certificate. An existing
+certificate without evidence is refused. This zero-argument entry grants no
+admission and writes no PGSLOT7 or child WAL; ordinary fences remain in place."
   (call-with-logical-slot-copy-import-input-kind
    #'%make-logical-slot-copy-import-publication-owner
    (lambda (owner context)

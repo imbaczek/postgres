@@ -3,7 +3,8 @@
 (defstruct (logical-slot-copy-import-pending-plan
             (:constructor %make-logical-slot-copy-import-pending-plan)
             (:print-function physical-libpq-print-private-object))
-  "Opaque facts for a pending attempt; possession does not grant authority."
+  "Opaque facts for a pending attempt; possession does not grant authority.
+Encoded evidence is independent of the minted child owner."
   (value nil :read-only t) (state nil :read-only t) (state-image nil :read-only t)
   (metadata nil :read-only t) (prefix nil :read-only t) (generation nil :read-only t)
   (control nil :read-only t) (child-plan nil :read-only t)
@@ -19,6 +20,7 @@
         (timeline-history-bytes target))))
 
 (defun logical-slot-copy-import-plan-image-digest (plan history)
+  "Digest the child plan and history used by both planning and evidence binding."
   (logical-slot-copy-import-digest
    (string->bytes
     (physical-bootstrap-manifest-text

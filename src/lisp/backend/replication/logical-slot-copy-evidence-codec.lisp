@@ -1,3 +1,6 @@
+;;; Encode and decode the bounded permanent evidence envelope.
+
+;;; Permanent import evidence checks describe recorded facts, not authority.
 (in-package #:pg)
 
 (defconstant +logical-slot-copy-evidence-snapshot-maximum+ 16384)
@@ -9,6 +12,8 @@
      (* 7 (+ 12 +logical-slot-copy-evidence-record-maximum+))))
 
 (defun logical-slot-copy-import-evidence-parts (value)
+  "Validate bounded raw evidence parts and the exact child frame plan.
+The roughly 48 MiB bound includes three large blobs without hex expansion."
   (unless (and (= 12 (logical-slot-copy-descriptor-list-count value 12))
                (equal (loop for key in value by #'cddr collect key)
                       '(:manifest :checkpoint :control :selected-history :child-history :plan)))
@@ -33,6 +38,7 @@
     (values blobs plan snapshot size)))
 
 (defun logical-slot-copy-import-evidence-encode (value)
+  "Encode observational evidence; CRC covers all bytes except its four-byte trailer."
   (multiple-value-bind (blobs plan snapshot size) (logical-slot-copy-import-evidence-parts value)
     (let ((bytes (make-array size :element-type '(unsigned-byte 8) :initial-element 0))
           (position 20))
@@ -54,6 +60,7 @@
       bytes)))
 
 (defun logical-slot-copy-import-evidence-decode (bytes)
+  "Decode bounded, checksummed canonical evidence without granting authority."
   (unless (and (typep bytes '(vector (unsigned-byte 8)))
                (<= 24 (length bytes) +logical-slot-copy-evidence-maximum-bytes+)
                (equalp (subseq bytes 0 16) #(80 71 76 79 71 73 77 80 79 82 84 68 65 84 65 49))
