@@ -12,6 +12,33 @@
          (funcall function root (getf state :owner) stage client workspace prepared))))
    :fork-distance fork-distance :generations generations))
 
+(deftest adoption-stage-workspace-name-does-not-gain-local-exemption
+    (call-with-adoption-proof-driver-fixture
+     (lambda (root state stage client profile record counts)
+       (declare (ignore record counts))
+       (with-physical-store-directory (workspace)
+         (sb-posix:chmod (namestring workspace) #o700)
+         (pg::physical-adoption-attempt-start-proof state stage client profile)
+         (let ((path (merge-pathnames "logical-slot-copy.work" (getf stage :directory))))
+           (sb-posix:mkfifo (namestring path) #o600)
+           (ok (intake-fails-p
+                (lambda () (pg::physical-adoption-install-prepare
+                            (getf state :owner) workspace :client client)))))
+         (ok (not (probe-file (pg::physical-adoption-install-path root))))))))
+
+(deftest adoption-incoming-workspace-name-does-not-gain-local-exemption
+    (call-with-adoption-install-prepared-fixture
+     (lambda (root owner stage client workspace prepared)
+       (declare (ignore stage client workspace))
+       (let* ((incoming (pg::physical-adoption-install-directory (getf prepared :plan) :incoming))
+              (path (merge-pathnames "logical-slot-copy.work" incoming)))
+         (sb-posix:mkfifo (namestring path) #o600)
+         (ok (intake-fails-p (lambda () (pg::physical-adoption-install-resume owner))))
+         (ok (equal prepared (pg::physical-adoption-install-read owner)))
+         (ok (eq :proved (getf (pg::physical-adoption-attempt-read owner) :phase)))
+         (ok (sb-posix:s-isfifo (sb-posix:stat-mode (sb-posix:lstat (namestring path)))))
+         (ok (probe-file (pg::physical-adoption-install-path root)))))))
+
 (deftest adoption-install-preparation-is-durable-without-moving-original-files
     (call-with-adoption-install-prepared-fixture
      (lambda (root owner stage client workspace prepared)

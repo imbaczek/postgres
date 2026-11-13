@@ -58,7 +58,8 @@
          (removed (mapcar #'first (subseq (physical-adoption-retire-files value) 0 prefix)))
          (names (remove-if (lambda (name) (member name removed :test #'equal))
                            (physical-adoption-follow-root-names value positions owner))))
-    (and (physical-adoption-install-names-p (physical-adoption-owner-directory owner) names)
+    (and (physical-adoption-install-names-p (physical-adoption-owner-directory owner) names
+                                            :local-workspace t)
          (physical-adoption-follow-position-namespace-p value positions mount))))
 
 (defun physical-adoption-retire-validate (owner state)

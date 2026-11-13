@@ -92,6 +92,8 @@
   (let ((names (append (copy-list *physical-adoption-install-root-names*)
                        (cond (installed (copy-list *physical-adoption-install-retained-names*))
                              (auxiliary (list ".pg_lisp.lock" "physical-adoption.install"))))))
-    (unless (equal (sort names #'string<) (physical-adoption-install-entry-names directory))
+    (unless (equal (sort names #'string<) (physical-adoption-install-inventory-names
+                                           (physical-adoption-install-entry-names directory)
+                                           (not (null installed))))
       (error "adoption installed image has unexpected root entries"))
     (physical-adoption-installed-base directory record)))

@@ -142,7 +142,7 @@
   (let ((positions (physical-adoption-follow-positions value step)))
     (and (physical-adoption-install-names-p
           (physical-adoption-follow-directory value :root)
-          (physical-adoption-follow-root-names value positions owner))
+          (physical-adoption-follow-root-names value positions owner) :local-workspace t)
          (physical-adoption-follow-position-namespace-p value positions mount))))
 
 (defun physical-adoption-follow-check-content (owner value step mount)

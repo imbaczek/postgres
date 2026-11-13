@@ -32,6 +32,61 @@
                 (funcall function root startup-owner state directory)))))))))
    :fork-distance distance :generations generations))
 
+(defun adoption-test-opaque-workspace (path kind)
+  (ecase kind
+    (:directory
+     (sb-posix:mkdir (namestring path) #o700)
+     (sb-posix:mkfifo
+      (namestring (merge-pathnames "never-open" (uiop:ensure-directory-pathname path))) #o600))
+    (:regular
+     (with-open-file (out path :direction :output :if-exists :error)
+       (write-line "opaque residue" out)))
+    (:symlink (sb-posix:symlink "missing-target" (namestring path)))
+    (:fifo (sb-posix:mkfifo (namestring path) #o600)))
+  (adoption-test-opaque-identity path))
+
+(defun adoption-test-opaque-identity (path)
+  (let ((stat (sb-posix:lstat (namestring path))))
+    (list (sb-posix:stat-dev stat) (sb-posix:stat-ino stat)
+          (sb-posix:stat-mode stat) (sb-posix:stat-size stat))))
+
+(deftest adoption-local-workspaces-survive-install-handoff-follow-and-retirement
+    (dolist (kind '(:directory :regular :symlink :fifo))
+      (let ((original (symbol-function 'pg::physical-adoption-install-prepare))
+            (root-fact nil) (slot-fact nil) (seen 0))
+        (unwind-protect
+             (progn
+               (setf (symbol-function 'pg::physical-adoption-install-prepare)
+                     (lambda (owner directory &key client)
+                       (incf seen)
+                       (let* ((root (pg::physical-adoption-owner-directory owner))
+                              (slots (merge-pathnames "pg_replslot/" root)))
+                         (unless (probe-file slots) (sb-posix:mkdir (namestring slots) #o700))
+                         (setf root-fact (adoption-test-opaque-workspace
+                                          (merge-pathnames "logical-slot-copy.work" root) kind)
+                               slot-fact (adoption-test-opaque-workspace
+                                          (merge-pathnames ".logical-slot-copy.work" slots) kind)))
+                       (funcall original owner directory :client client)))
+               (call-with-adoption-retirement-fixture
+                (lambda (root owner state directory)
+                  (declare (ignore directory))
+                  (let* ((installation (getf (getf (getf state :plan) :handoff) :installation))
+                         (quarantine (pg::physical-adoption-install-directory installation :quarantine))
+                         (root-work (merge-pathnames "logical-slot-copy.work" root))
+                         (old-slot-work (merge-pathnames "pg_replslot/.logical-slot-copy.work" quarantine)))
+                    (ok (= 1 seen))
+                    (ok (null (assoc "logical-slot-copy.work" (getf installation :old) :test #'equal)))
+                    (ok (not (find "pg_replslot/.logical-slot-copy.work"
+                                   (second (assoc "pg_replslot" (getf installation :old) :test #'equal))
+                                   :key #'first :test #'equal)))
+                    (ok (equal root-fact (adoption-test-opaque-identity root-work)))
+                    (ok (equal slot-fact (adoption-test-opaque-identity old-slot-work)))
+                    (ok (zerop (pg::physical-adoption-retire-validate owner state)))
+                    (ok (eq :retired (pg::physical-adoption-retire-resume owner)))
+                    (ok (equal root-fact (adoption-test-opaque-identity root-work)))
+                    (ok (equal slot-fact (adoption-test-opaque-identity old-slot-work)))))))
+          (setf (symbol-function 'pg::physical-adoption-install-prepare) original)))))
+
 (deftest adoption-retirement-validates-each-ordered-authority-prefix
     (dolist (distance '(0 64))
       (dolist (generations '(1 3))

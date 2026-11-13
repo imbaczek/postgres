@@ -106,7 +106,8 @@
                                       (mapcar #'first (second pair))))
                    (equal (second pair)
                           (physical-adoption-install-snapshot
-                           directory :exclude *physical-adoption-install-retained-names*)))
+                           directory :exclude *physical-adoption-install-retained-names*
+                           :local-slot-workspace (eq (first pair) :quarantine))))
         (error "adoption preserved quarantine or incoming tree changed"))))
   (unless (equal (getf plan :stage-tree)
                  (physical-adoption-install-snapshot (physical-adoption-install-directory plan :stage)))
@@ -157,10 +158,11 @@
                             (copy-list *physical-adoption-install-retained-names*)
                             (list "physical-adoption.handoff")))
         (guards '(".pg_lisp.lock" "physical-adoption.install")))
-    (cond ((and (physical-adoption-install-names-p root root-names)
+    (cond ((and (physical-adoption-install-names-p root root-names :local-workspace t)
                 (physical-adoption-install-names-p workspace (append guards (list "spool"))))
            :prepared)
-          ((and (physical-adoption-install-names-p root (append root-names (list "pg_physical_receive")))
+          ((and (physical-adoption-install-names-p root (append root-names (list "pg_physical_receive"))
+                                                   :local-workspace t)
                 (physical-adoption-install-names-p workspace guards))
            :ready)
           (t (error "adoption handoff has no single explained receive spool location")))))

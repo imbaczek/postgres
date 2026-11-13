@@ -131,7 +131,9 @@
     (list :directory (namestring canonical) :device (first identity) :inode (second identity)
           :mount (physical-adoption-install-mount-id canonical))))
 
-(defun physical-adoption-install-tree (root name device mount &optional (budget (list 100000 16777216)))
+(defun physical-adoption-install-tree (root name device mount &optional (budget (list 100000 16777216)) local-slot-workspace)
+  (unless (member local-slot-workspace '(nil t))
+    (error "local slot workspace exemption requires an explicit boolean"))
   (labels ((visit (relative)
              (when (or (minusp (decf (first budget)))
                        (minusp (decf (second budget) (+ 128 (* 2 (length (string->bytes relative)))))))
@@ -158,7 +160,10 @@
                  ((sb-posix:s-isdir mode)
                   (let* ((directory (uiop:ensure-directory-pathname path))
                          (names (physical-adoption-install-entry-names directory))
-                         (children (mapcan (lambda (child) (visit (concatenate 'string relative "/" child))) names))
+                         (children (mapcan (lambda (child) (visit (concatenate 'string relative "/" child)))
+                                           (if (and local-slot-workspace (equal relative "pg_replslot"))
+                                               (remove ".logical-slot-copy.work" names :test #'equal)
+                                               names)))
                          (after (sb-posix:lstat (namestring path))))
                     (unless (and (equal names (physical-adoption-install-entry-names directory))
                                  (= inode (sb-posix:stat-ino after))
@@ -171,18 +176,27 @@
                  (t (error "adoption installation refuses symlinks and special files"))))))
     (sort (visit name) #'string< :key #'first)))
 
-(defun physical-adoption-install-snapshot (root &key exclude)
+(defun physical-adoption-install-inventory-names (names local-workspace)
+  (unless (member local-workspace '(nil t))
+    (error "local root workspace exemption requires an explicit boolean"))
+  (if local-workspace
+      (remove "logical-slot-copy.work" names :test #'equal)
+      names))
+
+(defun physical-adoption-install-snapshot (root &key exclude local-workspace local-slot-workspace)
   (unless (and (listp exclude)
                (every (lambda (name) (member name *physical-adoption-install-retained-names* :test #'equal)) exclude))
     (error "adoption inventory can exclude only fixed management entries"))
+  (unless (member local-slot-workspace '(nil t))
+    (error "local slot workspace exemption requires an explicit boolean"))
   (let* ((fact (physical-adoption-install-directory-fact root))
          (names (physical-adoption-install-entry-names root))
          (budget (list 100000 16777216))
          (entries
-           (loop for name in names
+           (loop for name in (physical-adoption-install-inventory-names names local-workspace)
                  unless (member name exclude :test #'equal)
                    collect (list name (physical-adoption-install-tree
-                                       root name (getf fact :device) (getf fact :mount) budget)))))
+                                       root name (getf fact :device) (getf fact :mount) budget local-slot-workspace)))))
     (physical-adoption-install-test-point :before-snapshot-recheck root)
     (unless (and (equal fact (physical-adoption-install-directory-fact root))
                  (equal names (physical-adoption-install-entry-names root)))

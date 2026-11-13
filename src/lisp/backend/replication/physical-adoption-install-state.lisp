@@ -21,8 +21,10 @@
   (physical-adoption-attempt-fields-copy
    fact (append (when directory '(:directory)) '(:device :inode :lock-inode :fence-inode))))
 
-(defun physical-adoption-install-names-p (directory names)
-  (equal (sort (copy-list names) #'string<) (physical-adoption-install-entry-names directory)))
+(defun physical-adoption-install-names-p (directory names &key local-workspace)
+  (equal (sort (copy-list names) #'string<)
+         (physical-adoption-install-inventory-names
+          (physical-adoption-install-entry-names directory) local-workspace)))
 
 (defun physical-adoption-install-check-directories (owner plan)
   (physical-adoption-attempt-check-owner owner (getf plan :attempt))
@@ -83,7 +85,8 @@
           (quarantine (physical-adoption-install-directory plan :quarantine)))
       (and (physical-adoption-install-names-p
             root (append (copy-list *physical-adoption-install-retained-names*)
-                         (mapcar #'first (physical-adoption-install-root-entries plan evacuated installed))))
+                         (mapcar #'first (physical-adoption-install-root-entries plan evacuated installed)))
+            :local-workspace t)
            (physical-adoption-install-names-p
             incoming (append '(".pg_lisp.lock" "physical-adoption.install")
                              (mapcar #'first (subseq (getf plan :new) installed))))
@@ -144,7 +147,12 @@
       (unless (equal (second pair)
                      (physical-adoption-install-snapshot
                       (physical-adoption-install-directory plan (first pair))
-                      :exclude *physical-adoption-install-retained-names*))
+                      :exclude *physical-adoption-install-retained-names*
+                      :local-workspace (eq (first pair) :root)
+                      :local-slot-workspace (not (null
+                                                  (and (not (eq (first pair) :incoming))
+                                                       (member (assoc "pg_replslot" (getf plan :old) :test #'equal)
+                                                               (second pair) :test #'equal))))))
         (error "adoption installation object contents changed")))
     (unless (equal (getf plan :stage-tree)
                    (physical-adoption-install-snapshot (physical-adoption-install-directory plan :stage)))
@@ -196,7 +204,8 @@
     (physical-adoption-check-no-install root)
     (unless (and (equal (getf plan :attempt) (physical-adoption-attempt-read owner))
                  (physical-adoption-install-names-p
-                  root (append '(".pg_lisp.lock" "physical-adoption.attempt") (mapcar #'first (getf plan :old))))
+                  root (append '(".pg_lisp.lock" "physical-adoption.attempt") (mapcar #'first (getf plan :old)))
+                  :local-workspace t)
                  (physical-adoption-install-names-p
                   workspace '(".pg_lisp.lock" "physical-adoption.install" "incoming" "quarantine" "journal.pending"))
                  (physical-adoption-install-names-p quarantine '(".pg_lisp.lock" "physical-adoption.install"))
@@ -294,7 +303,8 @@
       (physical-adoption-install-check-image incoming record :auxiliary t)
       (unless (equal record (physical-adoption-attempt-resume-proof owner :client client))
         (error "adoption proved attempt changed during installation preparation"))
-      (let ((old (physical-adoption-install-snapshot root :exclude *physical-adoption-install-retained-names*)))
+      (let ((old (physical-adoption-install-snapshot root :exclude *physical-adoption-install-retained-names*
+                                                          :local-workspace t :local-slot-workspace t)))
         (physical-adoption-install-sync-tree root old)
         (physical-adoption-install-sync-tree stage stage-tree)
         (dolist (path (list root stage workspace))
