@@ -3,11 +3,13 @@
 (defstruct (logical-slot-copy-install-prepare-owner
             (:include logical-slot-copy-committed-owner)
             (:constructor %make-logical-slot-copy-install-prepare-owner)
-            (:print-function physical-libpq-print-private-object)))
+            (:print-function physical-libpq-print-private-object))
+  "Committed input owner for a scoped pending installation preparation.")
 
 (defstruct (logical-slot-copy-install-preparation
             (:constructor %make-logical-slot-copy-install-preparation)
             (:print-function physical-libpq-print-private-object))
+  "Sealed pending attempt bound to its owner, context, store and proof."
   (owner nil :read-only t) (context nil :read-only t) (store nil :read-only t)
   (certificate nil :read-only t) (plan nil :read-only t)
   (fact nil :read-only t) (history nil :read-only t) (proof nil :read-only t))
@@ -15,6 +17,7 @@
 (defvar *logical-slot-copy-install-preparations* nil)
 
 (defun logical-slot-copy-install-preparation-image (attempt)
+  "Make an independent image of the attempt's proof and inputs."
   (let ((proof (logical-slot-copy-install-preparation-proof attempt)))
     (list
      (logical-slot-copy-import-image (logical-slot-copy-install-preparation-certificate attempt))
@@ -34,6 +37,7 @@
             (logical-slot-copy-committed-proof-observations proof))))))
 
 (defun logical-slot-copy-install-preparation-record (owner context attempt)
+  "Require the registered attempt and its matching owner and context."
   (let ((record (assoc attempt *logical-slot-copy-install-preparations* :test #'eq)))
     (unless (and record (logical-slot-copy-install-prepare-owner-p owner)
                  (logical-slot-copy-install-preparation-p attempt)
@@ -43,6 +47,7 @@
     record))
 
 (defun logical-slot-copy-install-recheck-source (context attempt)
+  "Recheck the committed source against the detached proof."
   (let ((proof (logical-slot-copy-install-preparation-proof attempt)))
     (multiple-value-bind (fact history tuple)
         (logical-slot-copy-check-committed-source
@@ -65,6 +70,8 @@
         (error "logical installation preparation source proof changed")))))
 
 (defun logical-slot-copy-install-check-preparation (owner context attempt &key source)
+  "Check the registered attempt, held input, receive tuple and capacity.
+With SOURCE, also recheck the full committed source proof."
   (let* ((record (logical-slot-copy-install-preparation-record owner context attempt))
          (proof (logical-slot-copy-install-preparation-proof attempt))
          (store (logical-slot-copy-install-preparation-store attempt)))
@@ -85,6 +92,10 @@
     t))
 
 (defun logical-slot-copy-install-call-with-write (owner context attempt function)
+  "Recheck the pending proof around a trusted filesystem write.
+Arm failure handling before calling FUNCTION.  FUNCTION must perform the full
+operation and its checks without masking errors.  Any error or nonlocal exit
+before the post-write check completes fails the attempt."
   (let ((record (logical-slot-copy-install-preparation-record owner context attempt))
         (completed nil))
     (unwind-protect
@@ -97,6 +108,12 @@
       (unless completed (funcall (third record) :fail)))))
 
 (defun call-with-logical-slot-copy-install-preparation (function)
+  "Call FUNCTION with a registered, pending-only preparation attempt.
+The attempt is revoked on exit.  After a write is armed, an error or incomplete
+scope latches recovery failure, including failure during the final source
+recheck.  End this scope before exchanging an active certificate; that needs
+an owner which can check active state.  This scope does not build files, move
+journals, activate slots or admit them."
   (let ((started nil) (failed nil) (finished nil))
     (labels ((control (action)
                (ecase action

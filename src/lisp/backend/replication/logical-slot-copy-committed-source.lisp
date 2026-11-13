@@ -117,6 +117,7 @@ slots and checking complete child files. Recheck source observations."
 (defstruct (logical-slot-copy-committed-proof
             (:constructor %make-logical-slot-copy-committed-proof)
             (:print-function physical-libpq-print-private-object))
+  "Detached images and observations used to recheck the committed source."
   (evidence nil :read-only t) (descriptor nil :read-only t)
   (manifest nil :read-only t) (control nil :read-only t)
   (state nil :read-only t) (metadata nil :read-only t)
@@ -125,6 +126,7 @@ slots and checking complete child files. Recheck source observations."
 
 (defun logical-slot-copy-committed-proof-image
     (evidence descriptor manifest control state metadata prefix generation tuple observations)
+  "Copy committed source facts into an independent proof capsule."
   (%make-logical-slot-copy-committed-proof
    :evidence (logical-slot-copy-import-evidence-decode (logical-slot-copy-import-evidence-encode evidence))
    :descriptor (logical-slot-copy-descriptor-decode (logical-slot-copy-descriptor-encode descriptor))
@@ -182,6 +184,9 @@ this scope grants neither installation nor admission."
                       state metadata prefix generation store)))))))))))))
 
 (defun call-with-logical-slot-copy-committed-source (function)
+  "Verify source and child bytes and call FUNCTION under read ownership.
+Recheck the binding after the callback.  This scope grants no installation
+or admission."
   (call-with-logical-slot-copy-committed-source-kind
    #'%make-logical-slot-copy-committed-owner
    (lambda (owner context store certificate plan fact history proof)

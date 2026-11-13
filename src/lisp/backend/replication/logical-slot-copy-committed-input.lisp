@@ -200,6 +200,9 @@ This scope grants no installation or admission."
              (logical-slot-copy-input-sidecar-inventory context descriptor))))))))
 
 (defun call-with-logical-slot-copy-committed-input (function)
+  "Call FUNCTION under committed read ownership and recheck the input afterward.
+Cold mode requires unopened globals; live mode borrows the caller's store.
+This scope grants no installation or admission."
   (call-with-logical-slot-copy-committed-input-kind
    #'%make-logical-slot-copy-committed-owner
    (lambda (owner context certificate evidence descriptor manifest control plan status observations)
