@@ -1,6 +1,13 @@
+;;; Read-only, owner-bound import preflight for live phase 2 or live/cold
+;;; phase 3. D is the copy base end and F the selected fork. The result is
+;;; observational; promotion remains fenced until import publication is complete.
+;;; PostgreSQL's src/backend/replication/logical/slotsync.c is a reference for
+;;; retaining a first invalidation cause and leaving ineligible slots pending.
 (in-package #:pg)
 
 (defun logical-slot-copy-import-disposition (slot fact history fork parent)
+  "Classify the source slot at F, preserving its first terminal cause.
+Unknown or ahead positions defer; proved ON coverage must match its frozen origin."
   (unless (and (logical-slot-state-valid-p slot)
                (timeline-prefix-boundary-p parent fork history))
     (error "invalid logical import source positions"))
@@ -33,6 +40,8 @@
            (t (error "logical import ON origin differs from its copied source"))))))))
 
 (defun logical-slot-copy-import-base-state (manifest descriptor control)
+  "Build the explicit D seed from the descriptor checkpoint and base evidence.
+D is the copy base end; the pending source checkpoint at F is distinct."
   (let* ((base (copy-tree manifest))
          (snapshot (third (logical-slot-copy-control-fields
                            (logical-slot-copy-descriptor-base-control descriptor))))
@@ -56,6 +65,8 @@
     base))
 
 (defun logical-slot-copy-import-scan (store state manifest descriptor control)
+  "Check D through durable flush and derive logical evidence at clean F.
+Capture the receive tuple and independent state image for later rechecking."
   (let* ((tuple (physical-store-control-tuple store))
          (state-image (logical-slot-copy-import-state-image state))
          (candidate (physical-follow-copy-checked-store store))
@@ -81,6 +92,7 @@
       (values fact history tuple state-image))))
 
 (defun logical-slot-copy-import-recovery-plan (owner control)
+  "Select the live restartpoint or the pending promotion state and metadata."
   (if (= 3 (getf control :phase))
       (physical-promotion-read-pending-state)
       (let ((state (logical-slot-copy-import-owner-state owner)))
@@ -89,6 +101,7 @@
           (values state metadata prefix generation)))))
 
 (defun logical-slot-copy-import-state-image (value)
+  "Copy recovery lists, strings, vectors and timeline entries to detect alias changes."
   (typecase value
     (timeline-history-entry (copy-timeline-history-entry value))
     (cons (cons (logical-slot-copy-import-state-image (car value))
@@ -104,6 +117,7 @@
     (t value)))
 
 (defun logical-slot-copy-import-recheck-plan (owner control state state-image metadata prefix generation)
+  "Recheck selected state, its independent image, metadata, prefix and generation."
   (multiple-value-bind (current current-metadata current-prefix current-generation)
       (logical-slot-copy-import-recovery-plan owner control)
     (unless (and (if (= 2 (getf control :phase)) (eq state current) (equalp state current))
@@ -113,6 +127,7 @@
       (error "logical import selected restartpoint changed during source preparation"))))
 
 (defun call-with-logical-slot-copy-import-store (owner state function)
+  "Borrow the caller's live store, or open and close a cold pending store."
   (if (eq :live (logical-slot-copy-import-owner-mode owner))
       (funcall function (logical-slot-copy-import-owner-store owner))
       (let ((store nil))
@@ -125,6 +140,7 @@
 
 (defun logical-slot-copy-import-check-progress
     (owner context state metadata prefix generation store)
+  "Check selected progress under the owned root before scanning."
   (if (= 3 (getf state :phase))
       (physical-promotion-validate-cold-state
        state metadata prefix generation store #'physical-promotion-wal-plan
@@ -137,6 +153,7 @@
         (physical-promotion-check-progress state metadata prefix generation))))
 
 (defun logical-slot-copy-import-source-rows (descriptor fact history fork parent)
+  "Return detached source bytes and classifications without changing slot profiles."
   (loop for (name bytes) in (logical-slot-copy-descriptor-slots descriptor)
         for slot = (logical-slot-state-decode bytes name)
         for provenance = (wal-replication-slot-logical-provenance slot)
@@ -148,6 +165,9 @@
                       (logical-slot-copy-import-disposition slot fact history fork parent))))
 
 (defun logical-slot-copy-prepare-import-source (owner context)
+  "Prepare detached observational source data under the owned read-only scope.
+Check receipt, selected progress, retained receive root and final input observations.
+This grants no publication or admission; public promotion remains fenced."
   (multiple-value-bind (descriptor observations manifest control)
       (logical-slot-copy-check-import-receipt owner context)
     (let ((*pgdata* (physical-image-context-root-path context))
