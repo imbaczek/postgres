@@ -40,21 +40,13 @@
       (error "history ancestor timeline must precede child timeline"))
     (cons (make-timeline-history-entry :timeline child :begin previous-end :end nil) entries)))
 
+(declaim (ftype (function (t) boolean) %timeline-valid-lineage-p))
+
 (defun timeline-check-lineage (history)
   "Require forward native ancestry before using parsed C history for a safety check."
   (unless history (error "empty timeline lineage"))
-  (let ((previous-end 0) (previous-timeline 0))
-    (dolist (entry (reverse history))
-      (let ((timeline (timeline-history-entry-timeline entry))
-            (begin (timeline-history-entry-begin entry))
-            (end (timeline-history-entry-end entry)))
-        (unless (and (typep timeline '(integer 1 4294967295))
-                     (> timeline previous-timeline)
-                     (typep begin '(unsigned-byte 64)) (= begin previous-end)
-                     (if end (and (typep end '(unsigned-byte 64)) (<= begin end))
-                         (eq entry (first history))))
-          (error "invalid forward timeline lineage"))
-        (setf previous-timeline timeline previous-end end))))
+  (unless (%timeline-valid-lineage-p history)
+    (error "invalid forward timeline lineage"))
   history)
 
 (defun timeline-common-ancestor (left right)

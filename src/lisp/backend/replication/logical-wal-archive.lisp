@@ -106,10 +106,20 @@ not certify bytes of the live file that were not read."
   (logical-wal-archive-check archive)
   (let* ((segment (floor position +wal-segment-size+))
          (origin (* segment +wal-segment-size+))
-         (end (logical-wal-archive-certified-end archive segment carrier)))
+         (cached-p (eql segment (logical-wal-archive-cache-segment archive)))
+         (end (if cached-p
+                  (when (<= (+ origin +wal-segment-size+)
+                            (getf (logical-wal-archive-reference archive) :end))
+                    (let ((cached-end (logical-wal-archive-cache-end archive)))
+                      (unless (and (typep cached-end '(unsigned-byte 64))
+                                   (< origin cached-end)
+                                   (<= cached-end (+ origin +wal-segment-size+)))
+                        (error "invalid certified logical WAL segment geometry"))
+                      cached-end))
+                  (logical-wal-archive-certified-end archive segment carrier))))
     (when (and end (/= size (- end origin)))
       (error "live logical WAL geometry differs from certified archive"))
-    (when (eql segment (logical-wal-archive-cache-segment archive))
+    (when cached-p
       (unless (and end
                    (eql carrier (logical-wal-segment-carrier
                                  segment (logical-wal-archive-history archive)))
@@ -123,7 +133,7 @@ not certify bytes of the live file that were not read."
             (error "live logical WAL record exceeds its checked physical prefix"))
           (when (mismatch bytes prefix :start2 offset :end2 stop)
             (error "live logical WAL record differs from certified archive")))))
-    (eql segment (logical-wal-archive-cache-segment archive))))
+    cached-p))
 
 (defun call-with-optional-logical-wal-archive (system-id history namespace guard function)
   "Call FUNCTION with the committed archive when present, otherwise NIL."

@@ -2,6 +2,13 @@
 
 (defvar *unit-hot-probes* (make-hash-table :test #'equal))
 
+(defun unit-timeline-lineage-fixture (depth stride finite-head-p)
+  (loop for index downfrom (1- depth) to 0
+        collect (make-timeline-history-entry
+                 :timeline (1+ index) :begin (* index stride)
+                 :end (when (or finite-head-p (< index (1- depth)))
+                        (* (1+ index) stride)))))
+
 (defun unit-hot-definitions ()
   (loop for path in (directory (merge-pathnames "**/*.hot.lisp"
                                                 (asdf:system-source-directory "pg")))
@@ -181,6 +188,32 @@
                               (format nil "ino: 1~%lock: 1: FLOCK ADVISORY WRITE 123 :30:1 0 EOF~%")
                               (format nil "ino: 1~%lock: 1: FLOCK ADVISORY WRITE 123 08:30:2 0 EOF~%"))
                collect (list text 1 spans)))))
+
+(setf (gethash '%timeline-valid-lineage-p *unit-hot-probes*)
+      (append
+       (list (list nil))
+       (loop for depth in '(1 2 8)
+             append (loop for stride in '(0 1 2305843009213693951)
+                          append (loop for finite-head-p in '(nil t)
+                                       collect (list (unit-timeline-lineage-fixture
+                                                      depth stride finite-head-p)))))
+       (loop for field in '(:timeline :begin :end)
+             append (loop for bad in '(-1 18446744073709551616 :invalid)
+                          collect (let* ((history (unit-timeline-lineage-fixture 3 10 nil))
+                                         (entry (second history)))
+                                    (ecase field
+                                      (:timeline (setf (timeline-history-entry-timeline entry) bad))
+                                      (:begin (setf (timeline-history-entry-begin entry) bad))
+                                      (:end (setf (timeline-history-entry-end entry) bad)))
+                                    (list history))))
+       (loop for field in '(:timeline :begin :end)
+             collect (let* ((history (unit-timeline-lineage-fixture 3 10 nil))
+                            (entry (second history)))
+                       (ecase field
+                         (:timeline (setf (timeline-history-entry-timeline entry) 3))
+                         (:begin (setf (timeline-history-entry-begin entry) 11))
+                         (:end (setf (timeline-history-entry-end entry) nil)))
+                       (list history)))))
 
 (rove:deftest hot-files-reject-explicit-allocation
     (rove:ok (equal '("MAKE-ARRAY") (unit-hot-explicit-allocations '((make-array 8)))))

@@ -1,6 +1,171 @@
 ;;;; logical-tests.lisp -- migrated unit regressions; run with pg-unit-tests.
 (in-package #:pg)
 
+(defun unit-timeline-lineage-reference-p (history)
+  (and history
+       (let ((previous-end 0) (previous-timeline 0))
+         (dolist (entry (reverse history) t)
+           (let ((timeline (timeline-history-entry-timeline entry))
+                 (begin (timeline-history-entry-begin entry))
+                 (end (timeline-history-entry-end entry)))
+             (unless (and (typep timeline '(integer 1 4294967295))
+                          (> timeline previous-timeline)
+                          (typep begin '(unsigned-byte 64)) (= begin previous-end)
+                          (if end (and (typep end '(unsigned-byte 64)) (<= begin end))
+                              (eq entry (first history))))
+               (return nil))
+             (setf previous-timeline timeline previous-end end))))))
+
+(cl-spec:defproperty timeline-lineage-validation-matches-reverse-reference
+    ((depth (range integer 1 8)) (stride (range integer 0 2305843009213693951))
+                                 (finite-head-p (member nil t)) (index (range integer 0 7))
+                                 (mutation (member :none :timeline-zero :timeline-overflow :begin-negative
+                                                   :begin-overflow :begin-gap :end-negative :end-overflow :end-nil)))
+  (:about timeline-check-lineage)
+  (:trials (:normal 400))
+  (let* ((history (unit-timeline-lineage-fixture depth stride finite-head-p))
+         (entry (nth (mod index depth) history)))
+    (ecase mutation
+      (:none)
+      (:timeline-zero (setf (timeline-history-entry-timeline entry) 0))
+      (:timeline-overflow (setf (timeline-history-entry-timeline entry) 4294967296))
+      (:begin-negative (setf (timeline-history-entry-begin entry) -1))
+      (:begin-overflow (setf (timeline-history-entry-begin entry) (ash 1 64)))
+      (:begin-gap (incf (timeline-history-entry-begin entry)))
+      (:end-negative (setf (timeline-history-entry-end entry) -1))
+      (:end-overflow (setf (timeline-history-entry-end entry) (ash 1 64)))
+      (:end-nil (setf (timeline-history-entry-end entry) nil)))
+    (eq (not (null (unit-timeline-lineage-reference-p history)))
+        (handler-case (eq history (timeline-check-lineage history))
+          (error () nil)))))
+
+(rove:deftest timeline-lineage-validation-generated-contract
+    (let ((data (cl-spec:result-data
+                 (cl-spec:run-property 'timeline-lineage-validation-matches-reverse-reference
+                                       :seed 7513 :profile :normal))))
+      (rove:ok (eq :passed (getf data :status)) (format nil "~s" data))))
+
+(rove:deftest timeline-lineage-validation-preserves-input-and-finite-tip
+    (dolist (finite-head-p '(nil t))
+      (let* ((history (unit-timeline-lineage-fixture 8 0 finite-head-p))
+             (entries (copy-list history))
+             (before (mapcar #'copy-timeline-history-entry history)))
+        (rove:ok (eq history (timeline-check-lineage history)))
+        (rove:ok (every #'eq entries history))
+        (rove:ok (equalp before history))))
+  (rove:ok (rove:signals (timeline-check-lineage nil) 'error)))
+
+(defun unit-archive-eof-fixture (segment size versions &optional cached-p)
+  (let* ((origin (* segment +wal-segment-size+))
+         (end (+ origin size))
+         (entries (loop for version below versions
+                        collect (list nil nil
+                                      (list :segment segment :file-timeline 1
+                                            :end (- end (- versions version 1)))))))
+    (%make-logical-wal-archive
+     :reference (list :base origin :end (+ origin +wal-segment-size+))
+     :history (timeline-parse-history 1 "")
+     :guard (lambda () t) :index (list :entries entries)
+     :cache-segment (when cached-p segment)
+     :cache-bytes (when cached-p (make-array size :element-type '(unsigned-byte 8)
+                                                  :initial-element 0))
+     :cache-start origin :cache-end end)))
+
+(cl-spec:defproperty archive-cached-eof-matches-index
+    ((segment (range integer 0 31)) (size (range integer 8 256))
+                                    (versions (range integer 1 4)) (delta (member -1 0 1)))
+  (:about logical-wal-archive-compare-live)
+  (:trials (:normal 200))
+  (flet ((outcome (cached-p)
+           (handler-case
+               (sb-thread:with-mutex (*wal-lock*)
+                 (logical-wal-archive-compare-live
+                  (unit-archive-eof-fixture segment size versions cached-p)
+                  (* segment +wal-segment-size+) 1 (+ size delta) nil)
+                 :accepted)
+             (error (condition) (princ-to-string condition)))))
+    (equal (outcome nil) (outcome t))))
+
+(rove:deftest archive-cached-eof-generated-contract
+    (let ((data (cl-spec:result-data
+                 (cl-spec:run-property 'archive-cached-eof-matches-index
+                                       :seed 7512 :profile :normal))))
+      (rove:ok (eq :passed (getf data :status)) (format nil "~s" data))))
+
+(rove:deftest archive-cached-eof-does-not-rescan-index
+    (let ((original (symbol-function 'logical-wal-archive-certified-end))
+          (calls 0)
+          (archive (unit-archive-eof-fixture 2 64 3 t)))
+      (unwind-protect
+           (progn
+             (setf (symbol-function 'logical-wal-archive-certified-end)
+                   (lambda (&rest arguments)
+                     (incf calls)
+                     (apply original arguments)))
+             (sb-thread:with-mutex (*wal-lock*)
+               (rove:ok (logical-wal-archive-compare-live
+                         archive (* 2 +wal-segment-size+) 1 64 nil))
+               (rove:ok (rove:signals
+                         (logical-wal-archive-compare-live
+                          archive (* 2 +wal-segment-size+) 2 64 nil) 'error))
+               (rove:ok (rove:signals
+                         (logical-wal-archive-compare-live
+                          archive (* 2 +wal-segment-size+) 1 63 nil) 'error))
+               (rove:ok (rove:signals
+                         (logical-wal-archive-compare-live
+                          archive (* 2 +wal-segment-size+) 1 64
+                          (make-array 1 :element-type '(unsigned-byte 8)
+                                        :initial-element 1)) 'error)))
+             (rove:ok (zerop calls))
+             (logical-wal-archive-clear-cache archive)
+             (sb-thread:with-mutex (*wal-lock*)
+               (rove:ok (not (logical-wal-archive-compare-live
+                              archive (* 2 +wal-segment-size+) 1 64 nil))))
+             (rove:ok (= 1 calls)))
+        (setf (symbol-function 'logical-wal-archive-certified-end) original))))
+
+(rove:deftest archive-cached-eof-retains-fork-geometry-and-source-checks
+    (let* ((archive (unit-archive-eof-fixture 0 64 2 t))
+           (compare (lambda (&optional (size 64))
+                      (sb-thread:with-mutex (*wal-lock*)
+                        (logical-wal-archive-compare-live archive 0 1 size nil)))))
+      (rove:ok (funcall compare))
+      (rove:ok (rove:signals (funcall compare 65) 'error))
+      (dolist (end (list 0 (1+ +wal-segment-size+) :invalid))
+        (setf (logical-wal-archive-cache-end archive) end)
+        (rove:ok (rove:signals (funcall compare) 'error)))
+      (setf (logical-wal-archive-cache-end archive) 64)
+      (setf (cadr (member :end (logical-wal-archive-reference archive))) 64)
+      (rove:ok (rove:signals (funcall compare) 'error))
+      (setf (cadr (member :end (logical-wal-archive-reference archive))) +wal-segment-size+)
+      (setf (logical-wal-archive-cache-bytes archive)
+            (make-array 63 :element-type '(unsigned-byte 8)))
+      (rove:ok (rove:signals (funcall compare) 'error)))
+  (let ((archive (%make-logical-wal-archive
+                  :reference (list :end +wal-segment-size+)
+                  :guard (lambda () nil) :cache-segment 0)))
+    (sb-thread:with-mutex (*wal-lock*)
+      (rove:ok (rove:signals
+                (logical-wal-archive-compare-live archive 0 1 0 nil) 'error)))))
+
+(rove:deftest archive-cached-base-gap-eof-matches-uncached-witness
+    (let ((archive (%make-logical-wal-archive
+                    :reference (list :base 64 :end (* 2 +wal-segment-size+))
+                    :history (timeline-parse-history 1 "")
+                    :guard (lambda () t)
+                    :index (list :base-overlap (list nil nil (list :base-timeline 1 :namespace :timeline))
+                                 :entries (list (list nil nil (list :segment 1 :start 64))))
+                    :cache-segment 0 :cache-start 64 :cache-end 64
+                    :cache-bytes (make-array 64 :element-type '(unsigned-byte 8)))))
+      (sb-thread:with-mutex (*wal-lock*)
+        (rove:ok (= 64 (logical-wal-archive-certified-end archive 0 1)))
+        (rove:ok (logical-wal-archive-compare-live archive 64 1 64 nil)))
+      (logical-wal-archive-clear-cache archive)
+      (sb-thread:with-mutex (*wal-lock*)
+        (rove:ok (not (logical-wal-archive-compare-live archive 64 1 64 nil)))
+        (rove:ok (rove:signals
+                  (logical-wal-archive-compare-live archive 64 1 63 nil) 'error)))))
+
 (defun unit-byte-span-vector (shape)
   (let* ((bytes (concatenate '(vector (unsigned-byte 8))
                              (make-array 1 :element-type '(unsigned-byte 8) :initial-element 255)
