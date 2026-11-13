@@ -340,7 +340,10 @@ A temporary directory need not contain the final state file."
   "Call FUNCTION with state bytes and name for each canonical slot.
 With CLEANUP, remove staging directories and state.tmp files in canonical
 directories; use it only at startup with writers quiescent. Without CLEANUP,
-unfinished state is an error."
+unfinished state is an error. LOCAL-WORKSPACE T skips only the fixed
+.logical-slot-copy.work entry before inspection or cleanup, regardless of its
+type. The NIL default keeps incoming inventory strict. This local inventory
+option grants no ownership, adoption or deletion of the entry's contents."
   (unless (member local-workspace '(nil t))
     (error "local slot workspace exemption requires an explicit boolean"))
   (when (and cleanup (not stabilize))
