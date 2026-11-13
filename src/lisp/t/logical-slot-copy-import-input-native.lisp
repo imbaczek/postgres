@@ -3,10 +3,85 @@
 (defvar *logical-import-native-thread* nil)
 (defvar *logical-import-native-result* nil)
 
+(defvar *logical-import-native-expected-disposition* :wal-level-insufficient)
+
+(defvar *logical-import-native-expected-names* '("alpha"))
+
 (defun logical-import-native-rejects (function &optional message)
   (assert (handler-case (progn (funcall function) nil)
             (error (condition)
               (or (null message) (search message (princ-to-string condition)))))))
+
+(defun logical-import-native-source-change (owner context)
+  (let* ((path (merge-pathnames "logical-slot-copy.descriptor"
+                                (physical-image-context-root-path context)))
+         (bytes (read-bounded-regular-file path +logical-slot-copy-descriptor-maximum-bytes+))
+         (injected nil) (changed nil)
+         (*logical-slot-copy-verification-test-hook*
+           (lambda (point observed)
+             (declare (ignore observed))
+             (when (and (eq point :after-import-source-scan) (not injected))
+               (with-open-file (out path :direction :io :element-type '(unsigned-byte 8)
+                                         :if-exists :overwrite)
+                 (write-byte (logxor 1 (aref bytes 0)) out)
+                 (force-output out))
+               (setf changed (= (logxor 1 (aref bytes 0))
+                                (aref (read-bounded-regular-file
+                                       path +logical-slot-copy-descriptor-maximum-bytes+) 0))
+                     injected t)))))
+    (unwind-protect
+         (logical-import-native-rejects
+          (lambda () (logical-slot-copy-prepare-import-source owner context)))
+      (with-open-file (out path :direction :output :element-type '(unsigned-byte 8)
+                                :if-exists :overwrite)
+        (write-sequence bytes out)))
+    (assert (and injected changed))
+    (logical-slot-copy-check-import-receipt owner context)))
+
+(defun logical-import-native-state-change (owner context)
+  (let* ((state *physical-recovery-state*)
+         (snapshot (getf state :source-checkpoint))
+         (injected nil)
+         (*logical-slot-copy-verification-test-hook*
+           (lambda (point observed)
+             (declare (ignore observed))
+             (when (and (eq point :after-import-source-scan) (not injected))
+               (setf (getf state :source-checkpoint) (copy-list snapshot))
+               (incf (getf (getf state :source-checkpoint) :time))
+               (setf injected t)))))
+    (assert snapshot)
+    (unwind-protect
+         (logical-import-native-rejects
+          (lambda () (logical-slot-copy-prepare-import-source owner context))
+          "selected restartpoint changed")
+      (setf (getf state :source-checkpoint) snapshot))
+    (assert injected)
+    (assert (eq state *physical-recovery-state*))
+    (logical-slot-copy-check-input owner context)))
+
+(defun logical-import-native-source (owner context descriptor control)
+  (let* ((source (logical-slot-copy-prepare-import-source owner context))
+         (rows (getf source :slots)))
+    (assert (= (getf control :phase) (getf source :phase)))
+    (assert (= (getf control :applied) (getf source :fork)))
+    (assert (equal control (physical-recovery-decode-control (getf source :control-bytes))))
+    (assert (eq (eq :eligible *logical-import-native-expected-disposition*)
+                (getf source :eligible-interest)))
+    (assert (equal *logical-import-native-expected-names* (mapcar #'first rows)))
+    (assert (= (length rows) (length (logical-slot-copy-descriptor-slots descriptor))))
+    (loop for row in rows
+          for (name bytes) in (logical-slot-copy-descriptor-slots descriptor)
+          do (assert (equal name (first row)))
+             (assert (equalp bytes (string->bytes (fourth row))))
+             (assert (= (third row) (physical-store-update-digest #xCBF29CE484222325 bytes)))
+             (assert (eq *logical-import-native-expected-disposition* (fifth row)))
+             (let ((slot (logical-slot-state-decode bytes name)))
+               (assert (equal "pgoutput"
+                              (wal-replication-slot-plugin slot)))
+               (assert (eq :text (wal-slot-profile slot)))))
+    (format t "~&LOGICAL-IMPORT-SOURCE-PASS ~D ~D~%" (getf source :phase) (length rows))
+    (finish-output)
+    source))
 
 (defun logical-import-native-live-scope (phase)
   (let* ((store *physical-receive-store*) (state *physical-recovery-state*)
@@ -23,7 +98,11 @@
        (multiple-value-bind (descriptor observations manifest control)
            (logical-slot-copy-check-import-receipt owner context)
          (assert (and descriptor observations manifest (= phase (getf control :phase))
-                      (= *last-replay-lsn* (getf control :applied)))))
+                      (= *last-replay-lsn* (getf control :applied))))
+         (logical-import-native-source owner context descriptor control)
+         (when (= phase 2)
+           (logical-import-native-source-change owner context)
+           (logical-import-native-state-change owner context)))
        (logical-import-native-rejects
         (lambda () (logical-slot-copy-check-base-proof-input owner context nil)))
        (let ((*physical-recovery-state* (copy-list state)))
@@ -45,6 +124,8 @@
     (assert (not (physical-adoption-owner-active-p escaped)))
     (logical-import-native-rejects
      (lambda () (logical-slot-copy-check-input escaped escaped-context)))
+    (logical-import-native-rejects
+     (lambda () (logical-slot-copy-prepare-import-source escaped escaped-context)))
     (unwind-protect
          (progn
            (setf (physical-adoption-owner-active-p escaped) t)
@@ -71,6 +152,11 @@
         (base-control (read-bounded-regular-file
                        (merge-pathnames "global/pg_wal_control" *pgdata*)
                        (1+ +wal-control-maximum-bytes+))))
+    (call-with-logical-slot-copy-import-input
+     (lambda (owner context)
+       (let ((source (logical-slot-copy-prepare-import-source owner context)))
+         (when (getf source :eligible-interest)
+           (setf (getf policy :promotion-logical-decoding-enabled) t)))))
     (check-physical-resource-promotion)
     (physical-follow-promotion-cleanup-config)
     (physical-recovery-publish-selected-history *physical-receive-store*)
@@ -156,7 +242,10 @@
                  (assert (and (eq :cold (logical-slot-copy-import-owner-mode owner))
                               (= 3 (logical-slot-copy-import-owner-phase owner))
                               (not (logical-slot-copy-startup-owner-p owner))))
-                 (logical-slot-copy-check-import-receipt owner context)
+                 (multiple-value-bind (descriptor observations manifest control)
+                     (logical-slot-copy-check-import-receipt owner context)
+                   (declare (ignore observations manifest))
+                   (logical-import-native-source owner context descriptor control))
                  (let ((directory (physical-adoption-owner-directory owner))
                        (fd (physical-image-context-root-fd context))
                        (other (cdr (assoc "global" (physical-image-context-children context)

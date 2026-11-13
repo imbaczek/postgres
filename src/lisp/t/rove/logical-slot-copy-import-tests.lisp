@@ -168,3 +168,47 @@
       (rove:ok (equal value (logical-slot-copy-import-decode (logical-slot-copy-import-image value))))
       (setf (getf (getf value :retained-reference) :end) 99)
       (rove:ok (rove:signals (logical-slot-copy-import-image value) 'error))))
+
+(cl-spec:defproperty logical-import-disposition-keeps-first-cause
+    ((cause (member :none :wal-removed :wal-level-insufficient))
+     (disable (member nil t)) (offset (range integer 0 100000))
+     (profile (member :text :binary-bytea)))
+  (:about logical-slot-copy-import-disposition)
+  (:trials (:normal 150))
+  (let* ((history (timeline-parse-history 1 ""))
+         (slot (unit-logical-provenance-slot :cause cause :end (+ 80 offset)
+                                             :plugin "pg_lisp" :profile profile))
+         (before (wal-encode-replication-slot slot))
+         (fact (physical-logical-fact-next
+                nil (unit-logical-status-record t :start (+ 32 offset)) 1 history)))
+    (when disable
+      (setf fact (physical-logical-fact-next
+                  fact (unit-logical-status-record nil :start (+ 128 offset)) 1 history)))
+    (setf fact (physical-logical-fact-next
+                fact (unit-logical-status-record t :start (+ 256 offset)) 1 history))
+    (and (eq (if (not (eq :none cause)) cause
+                 (if disable :wal-level-insufficient :eligible))
+             (logical-slot-copy-import-disposition slot fact history (+ 289 offset) 1))
+         (equalp before (wal-encode-replication-slot slot)))))
+
+(rove:deftest logical-import-source-disposition-contract
+    (let ((data (cl-spec:result-data
+                 (cl-spec:run-property 'logical-import-disposition-keeps-first-cause
+                                       :profile :normal :seed 7411))))
+      (rove:ok (eq :passed (getf data :status)) (format nil "~S" data))))
+
+(rove:deftest logical-import-source-unknown-and-ahead-stay-deferred
+    (let* ((history (timeline-parse-history 1 ""))
+           (slot (unit-logical-provenance-slot))
+           (fact (physical-logical-fact-next
+                  nil (unit-logical-status-record t :start 32) 1 history)))
+      (setf fact (physical-logical-fact-next fact (unit-logical-status-record t :start 256) 1 history))
+      (rove:ok (eq :deferred (logical-slot-copy-import-disposition slot nil history 289 1)))
+      (rove:ok (eq :deferred (logical-slot-copy-import-disposition
+                              (unit-logical-provenance-slot :provenance nil) fact history 289 1)))
+      (rove:ok (eq :deferred (logical-slot-copy-import-disposition
+                              (unit-logical-provenance-slot :known-on nil) fact history 289 1)))
+      (rove:ok (eq :deferred (logical-slot-copy-import-disposition
+                              (unit-logical-provenance-slot :end 300) fact history 289 1)))
+      (rove:ok (rove:signals
+                (logical-slot-copy-import-disposition slot fact history 288 1) 'error))))
