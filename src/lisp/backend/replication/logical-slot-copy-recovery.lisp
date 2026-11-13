@@ -1,6 +1,7 @@
 (in-package #:pg)
 
 (defun logical-slot-copy-check-observed-bytes (observations name bytes &optional facts)
+  "Compare byte size, digest and optional file facts with their recorded observation."
   (let ((row (find name observations :key #'first :test #'equal)))
     (unless (and row (= (length bytes) (second row))
                  (= (physical-store-update-digest #xCBF29CE484222325 bytes) (third row))
@@ -8,6 +9,7 @@
       (error "logical copy recovery metadata changed while binding its input"))))
 
 (defun logical-slot-copy-recovery-observations (owner context manifest descriptor)
+  "Observe immutable base files, input metadata and WAL sidecar pieces for rechecking."
   (logical-slot-copy-check-input owner context)
   (logical-slot-copy-input-sidecar-inventory context descriptor)
   (let ((observations nil) (index (make-hash-table :test #'equal)))
@@ -24,6 +26,7 @@
     (logical-slot-copy-observe-pieces context descriptor observations index)))
 
 (defun logical-slot-copy-check-recovery-slots (owner context system-id)
+  "Require local slot images to be physical and match the source system."
   (slot-state-map
    (merge-pathnames "pg_replslot/" (physical-adoption-owner-directory owner))
    (lambda (bytes name)
@@ -35,6 +38,8 @@
 
 (defun logical-slot-copy-check-bound-receipt
     (owner context proof-bytes allowed-phases verify-state)
+  "Bind receipt and observed input bytes under OWNER and CONTEXT.
+Require an allowed phase, call VERIFY-STATE, then recheck the observations."
   (logical-slot-copy-check-input owner context)
   (let* ((root (physical-image-context-root-path context))
          (proof (logical-slot-copy-base-proof-decode proof-bytes))
@@ -81,6 +86,7 @@
             (values descriptor observations manifest control)))))))
 
 (defun logical-slot-copy-check-recovery-receipt (owner context)
+  "Check the startup receipt using the cold startup phase allowlist."
   (unless (and (logical-slot-copy-startup-owner-p owner)
                (logical-slot-copy-startup-owner-existing-proof owner))
     (error "logical copy recovery requires base verification receipt"))
@@ -93,4 +99,5 @@
       (physical-recovery-verify-base-state)))))
 
 (defun logical-slot-copy-verify-recovery-startup ()
+  "Verify the receipt within the guarded cold startup input scope."
   (call-with-logical-slot-copy-startup-input #'logical-slot-copy-check-recovery-receipt))

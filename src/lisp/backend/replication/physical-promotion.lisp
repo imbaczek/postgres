@@ -520,7 +520,9 @@ A published child must match the saved history and the intervening probe."
 (defun physical-promotion-check-pending (state metadata prefix generation &key allow-history slot-parent)
   "Revalidate durable promotion ownership and persistent slot floors before the
 child state is published. Check intent values and presence against durable control.
-History publication ends prefix-install eligibility."
+History publication ends prefix-install eligibility.
+SLOT-PARENT, if supplied, is the original named directory paired with its held
+root FD. The caller retains the pair for the call; it passes to slot inventory."
   (let ((control (physical-recovery-read-control *pgdata*)))
     (unless (equal (getf state :retained-reference) (getf control :retained-reference))
       (error "retained promotion archive pending reference changed"))

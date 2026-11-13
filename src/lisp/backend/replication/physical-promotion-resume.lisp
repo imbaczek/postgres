@@ -123,7 +123,9 @@ Use the verified pending base identity and the recovery retained archive."
                          :on-open on-open)))
 
 (defun physical-promotion-validate-cold-state (state metadata prefix generation store &optional (artifact-checker #'physical-promotion-wal-plan) slot-parent)
-  "Use the live publisher's proof checker without installing candidate globals."
+  "Use the live publisher's proof checker without installing candidate globals.
+SLOT-PARENT, if supplied, is the original named directory paired with its held
+root FD. The caller retains the pair for the call; it passes to slot inventory."
   (let ((*physical-recovery-state* state) (*physical-receive-store* store)
                                           (*last-replay-lsn* (getf state :applied)) (*next-xid* (getf state :next-xid))
                                           (*wal-segment-namespace* (getf state :wal-namespace))

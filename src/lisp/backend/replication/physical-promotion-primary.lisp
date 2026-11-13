@@ -175,7 +175,11 @@ allocation. All four values must be canonical counters or the exhaustion sentine
 
 (defun physical-promotion-read-physical-slots (&key reconcile-live parent)
   "Read canonical physical state under promotion exclusion, rejecting unfinished I/O.
-Live promotion preserves exact registry objects and their runtime ownership."
+Live promotion preserves exact registry objects and their runtime ownership.
+PARENT, when supplied, pairs the original named absolute PGDATA directory with
+its held root FD. The name supports lstat binding; the FD is duplicated for
+relative opens. Do not use a /proc alias as the named root. Only this borrowed
+pair disables stabilization."
   ;; Inventory is read through held directory descriptors. Reconciliation
   ;; returns the matching live objects so their owners remain intact.
   (unless (or (null parent)

@@ -1,8 +1,12 @@
+;;; Thread-owned, read-only import input scope. This sibling owner is not a
+;;; cold publisher and grants neither admission nor publication.
 (in-package #:pg)
 
 (defstruct (logical-slot-copy-import-owner
             (:include physical-adoption-owner)
             (:constructor %make-logical-slot-copy-import-owner))
+  "Owner valid within its thread and input scope.
+Construction captures the live recovery state and store, or NIL in cold mode."
   (ownership nil :read-only t)
   (mode nil :read-only t)
   (phase nil :read-only t)
@@ -11,6 +15,7 @@
   existing-proof)
 
 (defun logical-slot-copy-check-import-locks ()
+  "Require import exclusion and stopped workers at the worker join boundary."
   (unless (and (zerop *live-operation-depth*)
                (sb-thread:holding-mutex-p *physical-follow-command-lock*)
                (sb-thread:holding-mutex-p *reload-run-lock*)
@@ -64,6 +69,9 @@
             (list "logical-slot-copy.base-verified"))))
 
 (defun call-with-logical-slot-copy-import-input (function)
+  "Run FUNCTION in a sibling read-only import input scope.
+This grants neither publication nor admission. Live mode borrows the caller's
+store; cold mode requires unopened storage globals. Public fences still apply."
   (logical-slot-copy-check-import-locks)
   (let ((mode (if *wal-ready* :live :cold))
         (state *physical-recovery-state*)
@@ -81,6 +89,7 @@
        (funcall function owner context)))))
 
 (defun logical-slot-copy-check-import-receipt (owner context)
+  "Check the bound receipt for the captured import phase and its recovery state."
   (unless (and (logical-slot-copy-import-owner-p owner)
                (logical-slot-copy-import-owner-existing-proof owner))
     (error "logical import receipt requires its owned input scope"))

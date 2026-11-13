@@ -7,6 +7,7 @@
   existing-proof)
 
 (defun logical-slot-copy-check-postmaster-owner (owner ownership)
+  "Check that OWNER still names the held postmaster directory and lock."
   (physical-directory-check-reseed-intent (physical-adoption-owner-directory owner))
   (postmaster-check-ownership ownership)
   (unless (and (equal (physical-adoption-owner-directory owner)
@@ -18,6 +19,7 @@
   owner)
 
 (defun logical-slot-copy-owner-arguments (ownership)
+  "Capture the postmaster identity for a thread-owned input scope."
   (list :directory (postmaster-ownership-directory ownership)
         :device (postmaster-ownership-device ownership)
         :inode (postmaster-ownership-inode ownership)
@@ -38,6 +40,8 @@
             (list "logical-slot-copy.base-verified"))))
 
 (defun call-with-logical-slot-copy-owned-input (constructor function)
+  "Run FUNCTION with a read-only owned image context and optional base proof.
+On normal return, recheck the input before leaving. Retire the owner on every exit."
   (call-with-postmaster-ownership
    (lambda (ownership)
      (let ((owner (apply constructor (logical-slot-copy-owner-arguments ownership))))
@@ -70,6 +74,7 @@
          (setf (physical-adoption-owner-active-p owner) nil))))))
 
 (defun call-with-logical-slot-copy-startup-input (function)
+  "Run the cold startup input scope under the existing quiescence guard."
   (physical-adoption-check-startup-quiescence)
   (call-with-logical-slot-copy-owned-input
    #'%make-logical-slot-copy-startup-owner
