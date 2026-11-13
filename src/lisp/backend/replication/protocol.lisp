@@ -446,6 +446,8 @@ and an empty Terminate as EOF. Other malformed messages remain protocol errors."
   (loop for shift in '(24 16 8 0) do (funcall sink (ldb (byte 8 shift) value))))
 
 (defun pgoutput-string-utf8-size (string)
+  "Count UTF-8 bytes in bounded chunks, checking interrupts per chunk.
+Invalid scalars fall back to the encoder and retain its error behavior."
   (loop for start from 0 below (length string) by 4096
         for end = (min (length string) (+ start 4096))
         do (check-for-interrupts)

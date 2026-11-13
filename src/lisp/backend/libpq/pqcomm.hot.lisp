@@ -23,6 +23,9 @@ OUTPUT is a preallocated simple CHARACTER array of exactly END - START elements.
   output)
 
 (defun %string-span-utf8-size (string start end)
+  "Count UTF-8 bytes without allocation, or return NIL for an invalid scalar.
+The caller supplies a stable string and valid fixnum span of at most 4096 characters.
+WITH-ARRAY-DATA resolves displaced storage; BASE-CHAR data uses ASCII width."
   (declare (type string string)
            (type fixnum start end))
   (sb-kernel:with-array-data ((data string) (begin start) (finish end))
