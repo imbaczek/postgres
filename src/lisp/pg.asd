@@ -337,6 +337,7 @@
                    (:file "../replication/logical-slot-copy-operation")
                    (:file "../replication/logical-slot-copy-input")
                    (:file "../replication/logical-slot-copy-validation")
+                   (:file "../replication/logical-slot-copy-literal")
                    (:file "../replication/logical-slot-copy-base-proof")
                    (:file "../replication/logical-slot-copy-startup-input")
                    (:file "../replication/logical-slot-copy-base-publication")

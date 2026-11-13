@@ -27,33 +27,11 @@
 (defun logical-slot-copy-base-proof-image (value)
   (unless (logical-slot-copy-base-proof-valid-p value)
     (error "invalid logical copy base verification proof"))
-  (let* ((body (string->bytes (physical-bootstrap-manifest-text value)))
-         (header (string->bytes
-                  (format nil "PGLOGICALBASE1 ~d ~8,'0X~%" (length body) (wal-crc32 body))))
-         (image (concatenate '(vector (unsigned-byte 8)) header body #(10))))
-    (unless (<= (length image) +logical-slot-copy-base-proof-maximum-bytes+)
-      (error "logical copy base verification proof exceeds its bound"))
-    image))
+  (logical-slot-copy-literal-image
+   "PGLOGICALBASE1" +logical-slot-copy-base-proof-maximum-bytes+ value
+   "logical copy base verification proof"))
 
 (defun logical-slot-copy-base-proof-decode (bytes)
-  (unless (and (typep bytes '(vector (unsigned-byte 8)))
-               (<= 1 (length bytes) +logical-slot-copy-base-proof-maximum-bytes+))
-    (error "invalid logical copy base verification proof bytes"))
-  (let* ((newline (position 10 bytes))
-         (parts (and newline
-                     (uiop:split-string (bytes->string (subseq bytes 0 newline)) :separator " "))))
-    (unless (and (= 3 (length parts)) (equal "PGLOGICALBASE1" (first parts))
-                 (<= 1 (length (second parts)) 4) (every #'digit-char-p (second parts))
-                 (= 8 (length (third parts)))
-                 (every (lambda (char) (find char "0123456789ABCDEF")) (third parts)))
-      (error "invalid logical copy base verification proof header"))
-    (let* ((start (1+ newline)) (size (parse-integer (second parts)))
-                                (end (+ start size)))
-      (unless (and (= (1+ end) (length bytes)) (= 10 (aref bytes end))
-                   (= (parse-integer (third parts) :radix 16)
-                      (wal-crc32 (subseq bytes start end))))
-        (error "logical copy base verification proof length or checksum mismatch"))
-      (let ((value (recovery-parse-manifest-text (bytes->string (subseq bytes start end)))))
-        (unless (equalp bytes (logical-slot-copy-base-proof-image value))
-          (error "noncanonical logical copy base verification proof"))
-        value))))
+  (logical-slot-copy-literal-decode
+   bytes "PGLOGICALBASE1" +logical-slot-copy-base-proof-maximum-bytes+
+   #'logical-slot-copy-base-proof-image "logical copy base verification proof"))
