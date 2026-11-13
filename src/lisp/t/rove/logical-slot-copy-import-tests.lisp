@@ -212,3 +212,38 @@
                               (unit-logical-provenance-slot :end 300) fact history 289 1)))
       (rove:ok (rove:signals
                 (logical-slot-copy-import-disposition slot fact history 288 1) 'error))))
+
+(cl-spec:defproperty logical-import-owner-excludes-copied-identities
+    ((generation (range integer 0 340282366920938463463374607431768211455)))
+  (:about logical-slot-copy-import-new-owner)
+  (:trials (:normal 150))
+  (let* ((source (unit-logical-import-value :generation generation))
+         (prior (mod (1+ generation) (ash 1 128)))
+         (fresh (mod (+ generation 19) (ash 1 128)))
+         (original (symbol-function 'logical-slot-new-generation))
+         (calls 0))
+    (when (= fresh 17) (setf fresh 18))
+    (let ((choices (list generation prior 17 fresh)))
+      (unwind-protect
+           (progn
+             (setf (symbol-function 'logical-slot-new-generation)
+                   (lambda () (incf calls) (pop choices)))
+             (and (= fresh (logical-slot-copy-import-new-owner source)) (= calls 4)))
+        (setf (symbol-function 'logical-slot-new-generation) original)))))
+
+(rove:deftest logical-import-owner-selection-contract
+    (let ((data (cl-spec:result-data
+                 (cl-spec:run-property 'logical-import-owner-excludes-copied-identities
+                                       :profile :normal :seed 7511))))
+      (rove:ok (eq :passed (getf data :status)) (format nil "~S" data))))
+
+(rove:deftest logical-import-owner-selection-bounds-collision-retries
+    (let ((original (symbol-function 'logical-slot-new-generation)) (calls 0))
+      (unwind-protect
+           (progn
+             (setf (symbol-function 'logical-slot-new-generation)
+                   (lambda () (incf calls) 17))
+             (rove:ok (rove:signals
+                       (logical-slot-copy-import-new-owner (unit-logical-import-value)) 'error))
+             (rove:ok (= 32 calls)))
+        (setf (symbol-function 'logical-slot-new-generation) original))))

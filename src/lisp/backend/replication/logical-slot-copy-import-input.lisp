@@ -68,10 +68,7 @@ Construction captures the live recovery state and store, or NIL in cold mode."
           (when (logical-slot-copy-import-owner-existing-proof owner)
             (list "logical-slot-copy.base-verified"))))
 
-(defun call-with-logical-slot-copy-import-input (function)
-  "Run FUNCTION in a sibling read-only import input scope.
-This grants neither publication nor admission. Live mode borrows the caller's
-store; cold mode requires unopened storage globals. Public fences still apply."
+(defun call-with-logical-slot-copy-import-input-kind (constructor function)
   (logical-slot-copy-check-import-locks)
   (let ((mode (if *wal-ready* :live :cold))
         (state *physical-recovery-state*)
@@ -81,12 +78,19 @@ store; cold mode requires unopened storage globals. Public fences still apply."
        (let* ((ownership (getf arguments :ownership))
               (control (physical-recovery-read-control
                         (postmaster-ownership-directory ownership))))
-         (apply #'%make-logical-slot-copy-import-owner
-                :mode mode :phase (getf control :phase) :state state :store store arguments)))
+         (apply constructor :mode mode :phase (getf control :phase)
+                            :state state :store store arguments)))
      (lambda (owner context proof)
        (unless proof (error "logical import input requires base verification receipt"))
        (setf (logical-slot-copy-import-owner-existing-proof owner) proof)
        (funcall function owner context)))))
+
+(defun call-with-logical-slot-copy-import-input (function)
+  "Run FUNCTION in a sibling read-only import input scope.
+This grants neither publication nor admission. Live mode borrows the caller's
+store; cold mode requires unopened storage globals. Public fences still apply."
+  (call-with-logical-slot-copy-import-input-kind
+   #'%make-logical-slot-copy-import-owner function))
 
 (defun logical-slot-copy-check-import-receipt (owner context)
   "Check the bound receipt for the captured import phase and its recovery state."

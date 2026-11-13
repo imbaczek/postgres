@@ -95,6 +95,9 @@
        (assert (and (eq :live (logical-slot-copy-import-owner-mode owner))
                     (not (logical-slot-copy-startup-owner-p owner))))
        (logical-slot-copy-check-input owner context)
+       (logical-import-native-rejects
+        (lambda () (logical-slot-copy-check-import-publication owner context))
+        "publication owner")
        (multiple-value-bind (descriptor observations manifest control)
            (logical-slot-copy-check-import-receipt owner context)
          (assert (and descriptor observations manifest (= phase (getf control :phase))
@@ -140,8 +143,104 @@
                  (not (physical-store-closed-p store)) (not (physical-store-failed-p store))
                  (equal tuple (physical-store-control-tuple store))))
     (physical-store-check-held-lock store)
+    (when (= phase 2)
+      (logical-import-native-rejects #'logical-slot-copy-publish-import-pending "requires phase 3"))
     (format t "~&LOGICAL-IMPORT-LIVE-SCOPE-PASS ~D~%" phase)
     (finish-output)))
+
+(defun logical-import-native-reject-copy-id-owner (path saved bytes)
+  (let* ((bad (copy-tree saved))
+         (owner (logical-slot-parse-generation (getf saved :copy-id))))
+    (setf (getf bad :owner) (getf saved :copy-id)
+          (getf bad :slots)
+          (loop for row in (getf saved :slots)
+                for slot = (logical-slot-state-decode (string->bytes (fourth row)) (first row))
+                collect (list (first row) (second row) (third row)
+                              (bytes->string
+                               (logical-slot-copy-import-child-image
+                                slot owner (logical-slot-effective-invalidation-cause slot)))
+                              (fifth row))))
+    (let ((forged (logical-slot-copy-import-image bad)))
+      (assert (equal bad (logical-slot-copy-import-decode forged)))
+      (assert (= (length forged) (length bytes)))
+      (flet ((overwrite (image)
+               (with-open-file (output path :direction :output :if-exists :overwrite
+                                            :if-does-not-exist :error
+                                            :element-type '(unsigned-byte 8))
+                 (write-sequence image output))))
+        (unwind-protect
+             (progn
+               (overwrite forged)
+               (logical-import-native-rejects
+                #'logical-slot-copy-publish-import-pending "aliases a copied identity"))
+          (overwrite bytes))))))
+
+(defun logical-import-native-pending-publication ()
+  (let* ((path (merge-pathnames "logical-slot-copy.import" *pgdata*))
+         (temporary (merge-pathnames "logical-slot-copy.import.tmp" *pgdata*)))
+    (assert (not (probe-file path)))
+    (assert (not (probe-file temporary)))
+    (let ((*max-replication-slots* 0) (minted 0))
+      (let ((*logical-slot-copy-verification-test-hook*
+              (lambda (point context)
+                (declare (ignore context))
+                (when (eq point :before-import-owner-mint) (incf minted)))))
+        (logical-import-native-rejects #'logical-slot-copy-publish-import-pending
+                                       "max_replication_slots")
+        (assert (zerop minted))))
+    (let ((cut nil))
+      (let ((*logical-slot-copy-verification-test-hook*
+              (lambda (point context)
+                (declare (ignore context))
+                (when (eq point :before-import-pending-file-fsync)
+                  (setf cut t)
+                  (error "pending-before-fsync-cut")))))
+        (logical-import-native-rejects #'logical-slot-copy-publish-import-pending
+                                       "pending-before-fsync-cut"))
+      (assert cut)
+      (assert (and (probe-file temporary) (not (probe-file path))))
+      (logical-import-native-rejects #'logical-slot-copy-publish-import-pending
+                                     "unexpected pending import temporary")
+      (delete-file temporary))
+    (let ((cut nil))
+      (let ((*logical-slot-copy-verification-test-hook*
+              (lambda (point context)
+                (declare (ignore context))
+                (when (eq point :after-import-pending-rename)
+                  (setf cut t)
+                  (error "pending-after-rename-cut")))))
+        (logical-import-native-rejects #'logical-slot-copy-publish-import-pending
+                                       "pending-after-rename-cut"))
+      (assert (and cut (probe-file path) (not (probe-file temporary)))))
+    (let* ((bytes (read-bounded-regular-file path +logical-slot-copy-import-maximum-bytes+))
+           (saved (logical-slot-copy-import-decode bytes))
+           (inode (sb-posix:stat-ino (slot-state-lstat path)))
+           (*logical-slot-copy-verification-test-hook*
+             (lambda (point context)
+               (declare (ignore context))
+               (when (eq point :before-import-owner-mint)
+                 (error "pending retry minted another owner")))))
+      (dotimes (retry 2)
+        (declare (ignorable retry))
+        (assert (equal saved (logical-slot-copy-publish-import-pending)))
+        (assert (= inode (sb-posix:stat-ino (slot-state-lstat path))))
+        (assert (equalp bytes (read-bounded-regular-file path +logical-slot-copy-import-maximum-bytes+))))
+      (assert (eq :pending (getf saved :phase)))
+      (assert (equal *logical-import-native-expected-names* (mapcar #'first (getf saved :slots))))
+      (assert (= (getf saved :pending-control-digest)
+                 (logical-slot-copy-import-digest
+                  (read-bounded-regular-file (physical-recovery-control-path)
+                                             +physical-recovery-control-maximum-bytes+))))
+      (dolist (row (getf saved :slots))
+        (let ((slot (logical-slot-state-decode (string->bytes (fourth row)) (first row))))
+          (assert (= (logical-slot-parse-generation (getf saved :owner))
+                     (wal-replication-slot-child-owner slot)))
+          (assert (eq (if (eq *logical-import-native-expected-disposition* :eligible) :none
+                          *logical-import-native-expected-disposition*)
+                      (logical-slot-effective-invalidation-cause slot)))))
+      (logical-import-native-reject-copy-id-owner path saved bytes)
+      (format t "~&LOGICAL-IMPORT-PENDING-PUBLICATION-PASS ~A~%" (getf saved :owner))
+      (finish-output))))
 
 (defun logical-import-native-make-pending ()
   ;; This fixture uses the durable intent producer, never the public promotion
@@ -189,6 +288,7 @@
                      (1+ +wal-control-maximum-bytes+)))))
   (logical-import-native-rejects #'logical-slot-copy-check-promotion
                                  "child-owner import before promotion")
+  (logical-import-native-pending-publication)
   (logical-import-native-live-scope 3))
 
 (defun logical-import-native-run-live (&optional pending)
@@ -229,12 +329,36 @@
          :name "logical import native input probe"))
   :started)
 
+(defun logical-import-native-crash-pending (cut)
+  (sb-thread:with-mutex (*physical-follow-command-lock*)
+    (sb-thread:with-mutex (*reload-run-lock*)
+      (with-live-operation-quiescence
+        (sb-thread:with-mutex (*physical-restartpoint-start-lock*)
+          (sb-thread:with-mutex (*timeline-history-lock*)
+            (let ((*logical-slot-copy-verification-test-hook*
+                    (lambda (point context)
+                      (declare (ignore context))
+                      (when (eq point cut)
+                        (format t "~&LOGICAL-IMPORT-SIGKILL-CUT ~S~%" cut)
+                        (finish-output)
+                        (sb-posix:kill (sb-posix:getpid) sb-posix:sigkill)))))
+              (logical-slot-copy-publish-import-pending)
+              (error "pending import SIGKILL cut was not reached"))))))))
+
 (defun logical-import-native-cold-probe ()
   (sb-thread:with-mutex (*physical-follow-command-lock*)
     (sb-thread:with-mutex (*reload-run-lock*)
       (with-live-operation-quiescence
         (sb-thread:with-mutex (*physical-restartpoint-start-lock*)
           (sb-thread:with-mutex (*timeline-history-lock*)
+            (let ((bytes (read-bounded-regular-file
+                          (merge-pathnames "logical-slot-copy.import" *pgdata*)
+                          +logical-slot-copy-import-maximum-bytes+)))
+              (assert (equal (logical-slot-copy-import-decode bytes)
+                             (logical-slot-copy-publish-import-pending)))
+              (assert (equalp bytes (read-bounded-regular-file
+                                     (merge-pathnames "logical-slot-copy.import" *pgdata*)
+                                     +logical-slot-copy-import-maximum-bytes+))))
             (let ((escaped nil))
               (call-with-logical-slot-copy-import-input
                (lambda (owner context)

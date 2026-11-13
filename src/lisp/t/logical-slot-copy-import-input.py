@@ -2,6 +2,7 @@
 from pathlib import Path
 import runpy
 import os
+import signal
 import subprocess
 import time
 
@@ -79,12 +80,14 @@ def tree_image(data):
             if p.is_file() and p.name != 'postmaster.pid'}
 
 
-def cold_probe(peer, label, disposition='wal-level-insufficient'):
+def cold_probe(peer, label, disposition='wal-level-insufficient', *, cut=None, failure=None):
     hook = Path(__file__).with_name('logical-slot-copy-import-input-native.lisp')
+    operation = (f'(logical-import-native-crash-pending :{cut or "never"})' if cut or failure else
+                 '(logical-import-native-cold-probe)')
     form = f'''(let ((*pgdata* (directory-pathname {lisp_string(peer.data)})) (done nil))
       (unwind-protect
            (postmaster-own-data-directory "127.0.0.1" 6543
-             :startup-reconcile (lambda () (logical-import-native-cold-probe) (setf done t)))
+             :startup-reconcile (lambda () {operation} (setf done t)))
         (when *postmaster-pid-stream* (postmaster-remove-pid-file))
         (when *postmaster-data-lock* (close *postmaster-data-lock*) (setf *postmaster-data-lock* nil)))
       (assert done))'''
@@ -99,8 +102,55 @@ def cold_probe(peer, label, disposition='wal-level-insufficient'):
     log = peer.root / f'import-cold-{label}.log'
     with log.open('w') as output:
         result = subprocess.run(command, stdout=output, stderr=subprocess.STDOUT, timeout=90)
-    assert result.returncode == 0 and 'LOGICAL-IMPORT-COLD-SCOPE-PASS 3' in log.read_text(), log
+    text = log.read_text()
+    if cut:
+        assert result.returncode == -signal.SIGKILL, (result.returncode, log)
+        assert f'LOGICAL-IMPORT-SIGKILL-CUT :{cut.upper()}' in text, log
+        return
+    if failure:
+        assert result.returncode == 1 and failure in text, (result.returncode, log)
+        return
+    assert result.returncode == 0 and 'LOGICAL-IMPORT-COLD-SCOPE-PASS 3' in text, log
     assert not (peer.data / 'postmaster.pid').exists()
+
+
+def pending_crash_matrix(peer, disposition):
+    certificate = peer.data / 'logical-slot-copy.import'
+    temporary = peer.data / 'logical-slot-copy.import.tmp'
+    saved = certificate.read_bytes()
+    before = tree_image(peer.data)
+    cuts = [('before-import-pending-file-fsync', False),
+            ('after-import-pending-file-fsync', False),
+            ('before-import-pending-rename', False),
+            ('after-import-pending-rename', True),
+            ('before-import-pending-root-fsync', True),
+            ('after-import-pending-root-fsync', True)]
+    for cut, published in cuts:
+        certificate.unlink()
+        cold_probe(peer, f'kill-{cut}', disposition, cut=cut)
+        assert certificate.exists() == published, cut
+        assert temporary.exists() != published, cut
+        if published:
+            image = certificate.read_bytes()
+            inode = certificate.stat().st_ino
+            for retry in range(2):
+                cold_probe(peer, f'kill-{cut}-retry-{retry}', disposition)
+                assert certificate.read_bytes() == image, cut
+                assert certificate.stat().st_ino == inode, cut
+        else:
+            cold_probe(peer, f'kill-{cut}-quarantine', disposition,
+                       failure='unexpected pending import temporary file')
+            assert temporary.exists() and not certificate.exists(), cut
+            temporary.unlink()  # Explicit fixture repair; production never removes quarantine.
+            certificate.write_bytes(saved)
+            certificate.chmod(0o600)
+        after = tree_image(peer.data)
+        assert {k: v for k, v in after.items() if k != certificate.name} == {
+            k: v for k, v in before.items() if k != certificate.name}, cut
+        print(f'LOGICAL-IMPORT-SIGKILL-PASS {cut}', flush=True)
+    certificate.write_bytes(saved)
+    certificate.chmod(0o600)
+    assert before == tree_image(peer.data), 'crash matrix changed pending source inputs'
 
 
 def run_healthy():
@@ -131,6 +181,7 @@ def run_healthy():
                                       (getf *physical-recovery-state* :promotion-logical-decoding-enabled)))''')
         child.control('(assert (zerop (loop for slot being the hash-values of *wal-replication-slots* count (wal-logical-slot-p slot))))')
         child.stop(immediate=True)
+        pending_crash_matrix(child, 'eligible')
         before = tree_image(child.data)
         cold_probe(child, 'healthy-first', 'eligible')
         assert before == tree_image(child.data), 'healthy cold preparation changed pending inputs'
