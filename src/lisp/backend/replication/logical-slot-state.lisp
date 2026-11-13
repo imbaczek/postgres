@@ -109,6 +109,8 @@ or authority."
   "Check known logical slot identities against the durable catalog once.
 Return its system ID when needed, without initializing or repairing the catalog.
 This does not prove history, slot lifetime or import authority."
+  (when (some #'wal-replication-slot-child-owner slots)
+    (error "child-owned logical slots require active import reconciliation"))
   ;; Include known lost slots: loss of WAL does not waive cluster identity.
   ;; This read-only catalog parse may be repeated by later source checks.
   (let ((known (remove-if-not
@@ -144,6 +146,8 @@ cause and durable progress positions cannot change."
                (eql (wal-replication-slot-consistent-lsn slot) (wal-replication-slot-consistent-lsn candidate))
                (equal (wal-replication-slot-plugin slot) (wal-replication-slot-plugin candidate))
                (eq (wal-slot-profile slot) (wal-slot-profile candidate))
+               (eql (wal-replication-slot-child-owner slot)
+                    (wal-replication-slot-child-owner candidate))
                (eq (wal-replication-slot-logical-provenance slot)
                    (wal-replication-slot-logical-provenance candidate))
                (hash-table-p (wal-replication-slot-pending-xids candidate)))
@@ -409,6 +413,9 @@ may belong to a child timeline while confirmed belongs to its parent."
                                          (wal-replication-slot-database-oid slot) confirmed)
           (or (null (wal-replication-slot-database-oid slot))
               (typep (wal-replication-slot-database-oid slot) '(integer 1 4294967295)))
+          (or (null (wal-replication-slot-child-owner slot))
+              (and provenance
+                   (typep (wal-replication-slot-child-owner slot) '(unsigned-byte 128))))
           (typep restart '(unsigned-byte 64))
           (typep birth '(unsigned-byte 64))
           (if confirmed
@@ -437,14 +444,17 @@ may belong to a child timeline while confirmed belongs to its parent."
 
 (defun logical-slot-state-required-p (slot)
   "Use PGSLOT6 for provenance or a cause the older images cannot represent."
-  (or (wal-replication-slot-logical-provenance slot)
+  (or (wal-replication-slot-child-owner slot)
+      (wal-replication-slot-logical-provenance slot)
       (eq :wal-level-insufficient (logical-slot-effective-invalidation-cause slot))))
 
 (defun logical-slot-state-image-p (bytes)
-  "Recognize the PGSLOT6 prefix; full validation belongs to the decoder."
+  "Recognize PGSLOT6/7 prefixes; full validation belongs to the decoder."
   (and (typep bytes '(vector (unsigned-byte 8))) (>= (length bytes) 8)
-       (loop for char across "PGSLOT6 " for i from 0
-             always (= (char-code char) (aref bytes i)))))
+       (loop for char across "PGSLOT" for i from 0
+             always (= (char-code char) (aref bytes i)))
+       (member (aref bytes 6) '(54 55))
+       (= 32 (aref bytes 7))))
 
 (defun logical-slot-integer-token (value)
   "Encode an integer in decimal, or a dash for NIL."
@@ -466,15 +476,15 @@ confirmed LSN is absent."
         '("-" "-" "-" "-" "-" "-" "-"))))
 
 (defun logical-slot-state-encode (slot)
-  "Encode a canonical PGSLOT6 image with an explicit invalidation cause.
-Its 17 tokens are magic, name, database, restart, birth, confirmed, plugin,
-profile, system ID, generation, birth timeline, ON LSN, ON timeline, restart
-timeline, confirmed timeline, cause and CRC. Consistent LSN is the birth LSN."
+  "Encode canonical logical state, using PGSLOT7 for a child-owner token.
+PGSLOT6 keeps its 17 tokens. PGSLOT7 adds the child owner before the CRC.
+Neither image grants import authority."
   (unless (and (logical-slot-state-valid-p slot)
                (wal-replication-slot-invalidation-cause slot))
     (error "invalid durable logical slot state"))
-  (let* ((fields (append
-                  (list "PGSLOT6" (wal-replication-slot-name slot)
+  (let* ((owner (wal-replication-slot-child-owner slot))
+         (fields (append
+                  (list (if owner "PGSLOT7" "PGSLOT6") (wal-replication-slot-name slot)
                         (logical-slot-integer-token (wal-replication-slot-database-oid slot))
                         (logical-slot-integer-token (wal-replication-slot-restart-lsn slot))
                         (logical-slot-integer-token (wal-replication-slot-consistent-lsn slot))
@@ -482,7 +492,8 @@ timeline, confirmed timeline, cause and CRC. Consistent LSN is the birth LSN."
                         (wal-replication-slot-plugin slot)
                         (if (eq :text (wal-slot-profile slot)) "text" "binary-bytea"))
                   (logical-slot-state-provenance-tokens slot)
-                  (list (logical-slot-cause-token (logical-slot-effective-invalidation-cause slot)))))
+                  (list (logical-slot-cause-token (logical-slot-effective-invalidation-cause slot)))
+                  (when owner (list (logical-slot-generation-token owner)))))
          (prefix (format nil "~{~A~^ ~}" fields)))
     (string->bytes (format nil "~A ~8,'0X~%" prefix (wal-crc32 (string->bytes prefix))))))
 
@@ -497,20 +508,21 @@ The caller checks range and canonical bytes."
         (parse-integer token :radix 10))))
 
 (defun logical-slot-state-read-fields (bytes expected-name)
-  "Read a bounded one-line PGSLOT6 frame, checking name and CRC.
+  "Read a bounded one-line PGSLOT6/7 frame, checking name and CRC.
 The complete decoder checks canonical tokens and line termination by re-encoding."
   (unless (and (typep bytes '(vector (unsigned-byte 8))) (<= 1 (length bytes) 2048))
     (error "invalid logical slot image bytes"))
   (with-input-from-string (stream (bytes->string bytes))
     (let* ((line (read-line stream nil nil))
-           (fields (and line (wal-split-fields line))))
-      (unless (and (= 17 (length fields))
+           (fields (and line (wal-split-fields line)))
+           (count (cond ((equal (first fields) "PGSLOT6") 17)
+                        ((equal (first fields) "PGSLOT7") 18))))
+      (unless (and count (= count (length fields))
                    (every (lambda (field) (plusp (length field))) fields)
-                   (string= (first fields) "PGSLOT6")
                    (stringp expected-name) (string= (second fields) expected-name)
                    (null (read-line stream nil nil)))
         (error "invalid logical slot image frame"))
-      (let ((crc (nth 16 fields)) (prefix (format nil "~{~A~^ ~}" (butlast fields))))
+      (let ((crc (car (last fields))) (prefix (format nil "~{~A~^ ~}" (butlast fields))))
         (unless (and (= 8 (length crc))
                      (every (lambda (char) (find char "0123456789ABCDEF")) crc)
                      (= (parse-integer crc :radix 16) (wal-crc32 (string->bytes prefix))))
@@ -555,7 +567,9 @@ ahead of local WAL. Admission requires separate identity and history checks."
                    :confirmed-flush-lsn (logical-slot-state-parse-integer (nth 5 fields) t)
                    :plugin (nth 6 fields) :logical-provenance provenance
                    :restart-timeline restart-timeline :confirmed-timeline confirmed-timeline
-                   :invalidation-cause cause :wal-status (if (eq cause :none) :reserved :lost))))
+                   :invalidation-cause cause :wal-status (if (eq cause :none) :reserved :lost)
+                   :child-owner (when (string= (first fields) "PGSLOT7")
+                                  (logical-slot-parse-generation (nth 16 fields))))))
         (wal-slot-set-initial-profile slot profile)
         (unless (equalp bytes (logical-slot-state-encode slot))
           (error "noncanonical logical slot image"))

@@ -406,7 +406,7 @@
 
 (defun unit-logical-provenance-slot (&key (provenance t) (known-on t) (cause :none)
                                        (generation 0) (system-id 42) (end 80) (timeline 1)
-                                       (plugin "pgoutput") (profile :text))
+                                       (plugin "pgoutput") (profile :text) child-owner)
   (let* ((birth (- end 15))
          (slot (make-wal-replication-slot
                 :name "fixture" :database-oid 7 :restart-lsn (- end 48)
@@ -417,7 +417,7 @@
                                        (when known-on birth) (when known-on timeline)))
                 :restart-timeline (when provenance timeline)
                 :confirmed-timeline (when provenance timeline)
-                :invalidation-cause cause
+                :invalidation-cause cause :child-owner child-owner
                 :wal-status (if (member cause '(nil :none)) :reserved :lost))))
     (wal-slot-set-initial-profile slot profile)
     slot))
@@ -1303,3 +1303,128 @@
       (rove:ok (zerop (logical-slot-provenance-system-id provenance)))
       (rove:ok (zerop (logical-slot-provenance-generation provenance)))
       (rove:ok (equalp bytes (wal-encode-replication-slot decoded)))))
+
+(cl-spec:defproperty logical-slot-child-owner-detached-roundtrip
+    ((owner (range integer 0 340282366920938463463374607431768211455))
+     (end (range integer 80 18446744073709551615)))
+  (:about wal-encode-replication-slot wal-decode-replication-slot-image)
+  (:trials (:normal 100))
+  (let* ((slot (unit-logical-provenance-slot :child-owner owner :end end))
+         (bytes (wal-encode-replication-slot slot))
+         (decoded (wal-decode-replication-slot-image bytes "fixture")))
+    (and (search "PGSLOT7 " (bytes->string bytes))
+         (eql owner (wal-replication-slot-child-owner decoded))
+         (= end (wal-replication-slot-confirmed-flush-lsn decoded))
+         (equalp bytes (wal-encode-replication-slot decoded)))))
+
+(rove:deftest logical-slot-child-owner-generated-contract
+    (dolist (owner '(0 340282366920938463463374607431768211455))
+      (let* ((bytes (wal-encode-replication-slot
+                     (unit-logical-provenance-slot :child-owner owner)))
+             (decoded (wal-decode-replication-slot-image bytes "fixture")))
+        (rove:ok (eql 0 (search "PGSLOT7 " (bytes->string bytes))))
+        (rove:ok (eql owner (wal-replication-slot-child-owner decoded)))
+        (rove:ok (equalp bytes (wal-encode-replication-slot decoded)))))
+  (let ((data (cl-spec:result-data
+               (cl-spec:run-property 'logical-slot-child-owner-detached-roundtrip :seed 627))))
+    (rove:ok (eq :passed (getf data :status)) (format nil "~s" data))
+    (rove:ok (= 100 (getf data :trials)))))
+
+(rove:deftest logical-slot-child-owner-rejects-malformed-images
+    (let* ((bytes (wal-encode-replication-slot (unit-logical-provenance-slot :child-owner 1)))
+           (fields (butlast (wal-split-fields (string-right-trim '(#\Newline) (bytes->string bytes))))))
+      (dotimes (i (length bytes))
+        (let ((bad (copy-seq bytes)))
+          (setf (aref bad i) (logxor 1 (aref bad i)))
+          (rove:ok (rove:signals (wal-decode-replication-slot-image bad "fixture") 'error))))
+      (dolist (token '("-" "1" "-0000000000000000000000000000001"
+                       "0000000000000000000000000000000A"
+                       "100000000000000000000000000000000"))
+        (let ((bad (copy-list fields)))
+          (setf (nth 16 bad) token)
+          (rove:ok (rove:signals
+                    (wal-decode-replication-slot-image (unit-logical-slot-state-fields-image bad) "fixture")
+                    'error)))))
+  (dolist (owner '(-1 340282366920938463463374607431768211456 :unknown))
+    (rove:ok (rove:signals
+              (wal-encode-replication-slot (unit-logical-provenance-slot :child-owner owner)) 'error)))
+  (rove:ok (rove:signals
+            (wal-encode-replication-slot (unit-logical-provenance-slot :child-owner 1 :provenance nil))
+            'error))
+  (rove:ok (rove:signals
+            (physical-slot-encode (make-wal-replication-slot
+                                   :name "physical" :kind :physical :plugin nil :system-id 42
+                                   :restart-lsn 32 :restart-timeline 1 :child-owner 1)) 'error)))
+
+(rove:deftest logical-slot-child-owner-does-not-authorize-startup
+    (let ((slot (unit-logical-provenance-slot :child-owner 0))
+          (reads 0) (reader (symbol-function 'physical-slot-startup-system-id)))
+      (unwind-protect
+           (progn
+             (setf (symbol-function 'physical-slot-startup-system-id)
+                   (lambda () (incf reads) 42))
+             (rove:ok (rove:signals (logical-slot-check-startup-identities (list slot)) 'error))
+             (rove:ok (zerop reads)))
+        (setf (symbol-function 'physical-slot-startup-system-id) reader))))
+
+(rove:deftest logical-slot-child-owner-update-rejects-source-image-grafts
+    (dolist (owner '(nil 2))
+      (call-with-canonical-wal-slot-fixture
+       (lambda ()
+         (let* ((slot (unit-logical-provenance-slot :child-owner 1))
+                (candidate (make-wal-replication-slot
+                            :name "fixture" :database-oid 7 :restart-lsn 32 :consistent-lsn 65
+                            :confirmed-flush-lsn 80 :plugin "pgoutput"
+                            :logical-provenance (wal-replication-slot-logical-provenance slot)
+                            :restart-timeline 1 :confirmed-timeline 1 :invalidation-cause :none
+                            :child-owner owner))
+                (writes 0))
+           (setf (gethash "fixture" *wal-replication-slots*) slot)
+           (let ((*logical-test-failpoint-hook*
+                   (lambda (point &rest ignored)
+                     (declare (ignore ignored))
+                     (when (eq point :slot-file-before-write) (incf writes)))))
+             (rove:ok (rove:signals
+                       (sb-thread:with-mutex (*wal-lock*)
+                         (logical-slot-save-update-under-lock slot candidate)) 'error)))
+           (rove:ok (zerop writes))
+           (rove:ok (not (wal-replication-slot-state-uncertain-p slot))))))))
+
+(rove:deftest logical-slot-child-owner-survives-ack-and-loss
+    (call-with-canonical-wal-slot-fixture
+     (lambda ()
+       (let ((slot (unit-logical-provenance-slot :child-owner #xffffffffffffffffffffffffffffffff)))
+         (wal-create-replication-slot-file slot)
+         (setf (gethash "fixture" *wal-replication-slots*) slot)
+         (sb-thread:with-mutex (*wal-lock*)
+           (wal-persist-replication-slot-ack-under-lock slot 90)
+           (wal-invalidate-replication-slots-matching-under-lock (constantly t)))
+         (let ((decoded (wal-read-replication-slot (wal-replication-slot-path "fixture"))))
+           (rove:ok (eql (wal-replication-slot-child-owner slot)
+                         (wal-replication-slot-child-owner decoded)))
+           (rove:ok (= 90 (wal-replication-slot-confirmed-flush-lsn decoded)))
+           (rove:ok (eq :wal-removed (logical-slot-effective-invalidation-cause decoded))))))))
+
+(rove:deftest logical-slot-child-owner-uncertain-save-keeps-old-pin
+    (call-with-canonical-wal-slot-fixture
+     (lambda ()
+       (let ((slot (unit-logical-provenance-slot :child-owner 1))
+             (fired nil))
+         (wal-create-replication-slot-file slot)
+         (setf (gethash "fixture" *wal-replication-slots*) slot)
+         (let ((*logical-test-failpoint-hook*
+                 (lambda (point &rest ignored)
+                   (declare (ignore ignored))
+                   (when (eq point :slot-file-after-directory-fsync-before-memory-publication)
+                     (setf fired t)
+                     (error "child-owned slot save fault")))))
+           (rove:ok (rove:signals
+                     (sb-thread:with-mutex (*wal-lock*)
+                       (wal-persist-replication-slot-ack-under-lock slot 90)) 'error)))
+         (rove:ok fired)
+         (rove:ok (wal-replication-slot-state-uncertain-p slot))
+         (rove:ok (= 32 (wal-replication-slot-restart-lsn slot)))
+         (rove:ok (= 80 (wal-replication-slot-confirmed-flush-lsn slot)))
+         (let ((decoded (wal-read-replication-slot (wal-replication-slot-path "fixture"))))
+           (rove:ok (eql 1 (wal-replication-slot-child-owner decoded)))
+           (rove:ok (= 90 (wal-replication-slot-confirmed-flush-lsn decoded))))))))

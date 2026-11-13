@@ -142,6 +142,7 @@ Logical updates guard identity, progress and the first terminal cause."
   ;; keeps its old pin and requires a cold load before further use.
   (drop-claim nil) (creation-failed-p nil) (state-uncertain-p nil)
   (logical-provenance nil :read-only t)
+  (child-owner nil :read-only t)
   confirmed-timeline invalidation-cause
   ;; PGSLOT1-3 were the private protocol even though the old wire name was pgoutput.
   (plugin "pg_lisp")

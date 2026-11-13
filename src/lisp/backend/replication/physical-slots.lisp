@@ -17,6 +17,7 @@ must be NIL. A null restart or lost slot does not retain WAL."
          (null (wal-replication-slot-plugin slot))
          (null (wal-replication-slot-consistent-lsn slot))
          (null (wal-replication-slot-logical-provenance slot))
+         (null (wal-replication-slot-child-owner slot))
          (null (wal-replication-slot-confirmed-timeline slot))
          (null (wal-replication-slot-invalidation-cause slot))
          (null (wal-replication-slot-confirmed-flush-lsn slot))
