@@ -212,7 +212,7 @@
                           (ok (not (find (concatenate 'string "pg_wal/"
                                                       (pg::wal-segment-filename 0 1 :timeline))
                                          (getf manifest :files) :key #'first :test #'equal)))
-                          (ok (eql (eq checkpoint-status :unknown)
+                          (ok (eql (or (eq checkpoint-status :unknown) enabled)
                                    (not (null (getf manifest :logical-base-anchor)))))
                           (let ((pg::*pgdata* target))
                             (multiple-value-bind (restored control) (pg::physical-recovery-verify-base-state)
@@ -274,10 +274,59 @@
 (defun source-logical-anchor-test-fact (enabled offset)
   (multiple-value-bind (off on later) (source-logical-persistence-facts)
     (declare (ignore later))
-    (let ((fact (if enabled on off)))
-      (dolist (key '(:witness-start :witness-end :coverage-start :through :last-enable-lsn :last-disable-lsn))
+    (let ((fact (copy-list (if enabled on off))))
+      (remf fact :logical-on-start-lsn)
+      (remf fact :logical-on-start-timeline)
+      (dolist (key '(:witness-start :witness-end :coverage-start :through
+                     :last-enable-lsn :last-disable-lsn))
         (when (getf fact key) (incf (getf fact key) offset)))
       fact)))
+
+(defun source-logical-anchor-test-interval-fact (offset)
+  (multiple-value-bind (off on later) (source-logical-persistence-facts)
+    (declare (ignore off later))
+    (let ((fact (copy-list on)))
+      (dolist (key '(:witness-start :witness-end :coverage-start :through
+                     :last-enable-lsn :last-disable-lsn :logical-on-start-lsn))
+        (when (getf fact key) (incf (getf fact key) offset)))
+      fact)))
+
+(cl-spec:defproperty source-logical-base-anchor-roundtrips-on-interval
+    ((offset (range integer 0 1000000)))
+  (:about pg::physical-logical-encode-base-anchor pg::physical-logical-decode-base-anchor)
+  (:trials (:normal 150))
+  (let* ((fact (source-logical-anchor-test-interval-fact offset))
+         (text (pg::physical-logical-encode-base-anchor fact))
+         (decoded (pg::physical-logical-decode-base-anchor text)))
+    (and (pg::physical-logical-fact-valid-p fact)
+         (= 208 (length text))
+         (string= text (string-upcase text))
+         (equal fact decoded)
+         (not (eq fact decoded)))))
+
+(deftest source-logical-base-anchor-on-interval-contract
+    (let ((data (cl-spec:result-data
+                 (cl-spec:run-property 'source-logical-base-anchor-roundtrips-on-interval
+                                       :profile :normal :seed 7303))))
+      (ok (eq :passed (getf data :status)) (format nil "~s" data))))
+
+(deftest source-logical-base-anchor-keeps-on-interval-at-known-checkpoint
+    (let* ((prior (source-logical-anchor-test-interval-fact 0))
+           (snapshot (source-logical-anchor-test-checkpoint t))
+           (history (pg::timeline-parse-history 1 ""))
+           (record (pg::make-wal-record
+                    :version 8 :type pg::+wal-record-checkpoint+ :xid 0 :start 256 :end 376
+                    :payload (pg::wal-encode-checkpoint-snapshot snapshot)))
+           (anchored (pg::physical-logical-fact-next prior record 1 history))
+           (manifest (list :end 376 :timeline 1
+                           :logical-base-anchor (pg::physical-logical-encode-base-anchor anchored)))
+           (actual (pg::physical-logical-base-fact manifest snapshot history)))
+      (ok (pg::physical-logical-fact-valid-p actual))
+      (ok (= 256 (getf actual :coverage-start)))
+      (ok (null (getf actual :last-enable-lsn)))
+      (ok (= (getf prior :logical-on-start-lsn) (getf actual :logical-on-start-lsn)))
+      (ok (= (getf prior :logical-on-start-timeline) (getf actual :logical-on-start-timeline)))
+      (ok (not (eq actual anchored)))))
 
 (defun source-logical-anchor-test-checkpoint (status)
   (let ((snapshot (sample-checkpoint-snapshot :version 2 :start 256 :redo 256 :end 376)))
