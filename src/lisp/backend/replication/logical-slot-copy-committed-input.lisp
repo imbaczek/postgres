@@ -170,7 +170,7 @@ String case and scalar types must match exactly."
         (logical-slot-copy-descriptor-encode descriptor)
         (logical-slot-copy-import-state-image (list manifest control plan))))
 
-(defun call-with-logical-slot-copy-committed-input (function)
+(defun call-with-logical-slot-copy-committed-input-kind (constructor function)
   "Call FUNCTION under the sibling read owner, then recheck input images and files.
 Cold mode requires unopened globals; live mode borrows the caller's store.
 This scope grants no installation or admission."
@@ -180,7 +180,7 @@ This scope grants no installation or admission."
         (store *physical-receive-store*))
     (call-with-logical-slot-copy-owned-input
      (lambda (&rest arguments)
-       (apply #'%make-logical-slot-copy-committed-owner
+       (apply constructor
               :mode mode :state state :store store arguments))
      (lambda (owner context proof)
        (multiple-value-bind (certificate evidence descriptor manifest control plan status observations)
@@ -188,7 +188,8 @@ This scope grants no installation or admission."
          (let ((image (logical-slot-copy-committed-input-image
                        certificate evidence descriptor manifest control plan)))
            (multiple-value-prog1
-               (funcall function owner context certificate evidence descriptor manifest control plan status)
+               (funcall function owner context certificate evidence descriptor manifest control plan status
+                        (logical-slot-copy-import-state-image observations))
              (unless (logical-slot-copy-committed-image-equal-p image (logical-slot-copy-committed-input-image
                                                                        certificate evidence descriptor manifest control plan))
                (error "committed import callback modified its input binding"))
@@ -197,3 +198,10 @@ This scope grants no installation or admission."
                (unless (equal row (logical-slot-copy-file-row context (first row)))
                  (error "committed import input changed during its scope")))
              (logical-slot-copy-input-sidecar-inventory context descriptor))))))))
+
+(defun call-with-logical-slot-copy-committed-input (function)
+  (call-with-logical-slot-copy-committed-input-kind
+   #'%make-logical-slot-copy-committed-owner
+   (lambda (owner context certificate evidence descriptor manifest control plan status observations)
+     (declare (ignore observations))
+     (funcall function owner context certificate evidence descriptor manifest control plan status))))

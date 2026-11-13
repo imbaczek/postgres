@@ -114,13 +114,36 @@ slots and checking complete child files. Recheck source observations."
          manifest control descriptor state metadata prefix generation)
         (values fact history tuple child-observations)))))
 
-(defun call-with-logical-slot-copy-committed-source (function)
+(defstruct (logical-slot-copy-committed-proof
+            (:constructor %make-logical-slot-copy-committed-proof)
+            (:print-function physical-libpq-print-private-object))
+  (evidence nil :read-only t) (descriptor nil :read-only t)
+  (manifest nil :read-only t) (control nil :read-only t)
+  (state nil :read-only t) (metadata nil :read-only t)
+  (prefix nil :read-only t) (generation nil :read-only t)
+  (tuple nil :read-only t) (observations nil :read-only t))
+
+(defun logical-slot-copy-committed-proof-image
+    (evidence descriptor manifest control state metadata prefix generation tuple observations)
+  (%make-logical-slot-copy-committed-proof
+   :evidence (logical-slot-copy-import-evidence-decode (logical-slot-copy-import-evidence-encode evidence))
+   :descriptor (logical-slot-copy-descriptor-decode (logical-slot-copy-descriptor-encode descriptor))
+   :manifest (logical-slot-copy-import-state-image manifest)
+   :control (logical-slot-copy-import-state-image control)
+   :state (logical-slot-copy-import-state-image state)
+   :metadata (logical-slot-copy-import-state-image metadata)
+   :prefix (copy-seq prefix) :generation (logical-slot-copy-import-state-image generation)
+   :tuple (logical-slot-copy-import-state-image tuple)
+   :observations (logical-slot-copy-import-state-image observations)))
+
+(defun call-with-logical-slot-copy-committed-source-kind (constructor function &key (include-proof t))
   "Verify actual source and child bytes, then call FUNCTION under read ownership.
 Protect the C3 retained root before taking the reader lease and recheck after
 callback. An installer must establish its own checks and fence before writing;
 this scope grants neither installation nor admission."
-  (call-with-logical-slot-copy-committed-input
-   (lambda (owner context certificate evidence descriptor manifest control plan status)
+  (call-with-logical-slot-copy-committed-input-kind
+   constructor
+   (lambda (owner context certificate evidence descriptor manifest control plan status input-observations)
      (declare (ignore status))
      (let ((*pgdata* (physical-image-context-root-path context))
            (*physical-image-context* nil))
@@ -140,7 +163,11 @@ this scope grants neither installation nor admission."
                  (let ((image (logical-slot-copy-import-state-image
                                (list certificate evidence manifest control plan state metadata prefix fact history))))
                    (multiple-value-prog1
-                       (funcall function owner context store certificate plan fact history)
+                       (funcall function owner context store certificate plan fact history
+                                (when include-proof
+                                  (logical-slot-copy-committed-proof-image
+                                   evidence descriptor manifest control state metadata prefix generation tuple
+                                   (append input-observations child-observations))))
                      (unless (and (equal tuple (physical-store-control-tuple store))
                                   (logical-slot-copy-committed-image-equal-p image (logical-slot-copy-import-state-image
                                                                                     (list certificate evidence manifest control
@@ -153,3 +180,11 @@ this scope grants neither installation nor admission."
                      (logical-slot-copy-check-committed-source
                       context certificate evidence descriptor manifest control plan
                       state metadata prefix generation store)))))))))))))
+
+(defun call-with-logical-slot-copy-committed-source (function)
+  (call-with-logical-slot-copy-committed-source-kind
+   #'%make-logical-slot-copy-committed-owner
+   (lambda (owner context store certificate plan fact history proof)
+     (declare (ignore proof))
+     (funcall function owner context store certificate plan fact history))
+   :include-proof nil))
