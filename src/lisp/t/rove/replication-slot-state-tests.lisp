@@ -1,5 +1,53 @@
 (in-package #:pg)
 
+(rove:deftest canonical-slot-state-observation-does-not-stabilize
+    (let* ((base (uiop:ensure-directory-pathname
+                  (sb-posix:mkdtemp
+                   (namestring (merge-pathnames "slot-observe-XXXXXX" (uiop:temporary-directory))))))
+           (root (merge-pathnames "pg_replslot/" base))
+           (bytes (make-array 3 :element-type '(unsigned-byte 8) :initial-contents '(1 2 3)))
+           (parent (physical-backup-open-directory base))
+           (old-directory (symbol-function 'fsync-directory))
+           (old-stream (symbol-function 'fsync-stream))
+           (thread sb-thread:*current-thread*)
+           (syncs 0))
+      (flet ((install-observers ()
+               (setf (symbol-function 'fsync-directory)
+                     (lambda (&rest args)
+                       (when (eq thread sb-thread:*current-thread*) (incf syncs))
+                       (apply old-directory args))
+                     (symbol-function 'fsync-stream)
+                     (lambda (&rest args)
+                       (when (eq thread sb-thread:*current-thread*) (incf syncs))
+                       (apply old-stream args))))
+             (restore-observers ()
+               (setf (symbol-function 'fsync-directory) old-directory
+                     (symbol-function 'fsync-stream) old-stream)))
+        (unwind-protect
+             (progn
+               (install-observers)
+               (rove:ok (null (slot-state-map root #'list :parent-fd parent :stabilize nil)))
+               (rove:ok (zerop syncs))
+               (rove:ok (not (slot-state-lstat root)))
+               (restore-observers)
+               (ensure-directories-exist root)
+               (slot-state-create root "test_slot" bytes)
+               (setf syncs 0)
+               (install-observers)
+               (rove:ok (equalp (list (list bytes "test_slot"))
+                                (slot-state-map root #'list :parent-fd parent :stabilize nil)))
+               (rove:ok (zerop syncs))
+               (rove:ok (handler-case
+                            (progn (slot-state-map root #'list :cleanup t :stabilize nil) nil)
+                          (error () t)))
+               (rove:ok (zerop syncs))
+               (slot-state-map root #'list :parent-fd parent)
+               (rove:ok (plusp syncs))
+               (rove:ok (equalp bytes (read-bounded-regular-file (slot-state-path root "test_slot") 4096))))
+          (restore-observers)
+          (sb-posix:close parent)
+          (uiop:delete-directory-tree base :validate t :if-does-not-exist :ignore)))))
+
 (rove:deftest canonical-slot-state-create-update
     (let* ((base (merge-pathnames (format nil "canonical-slot-state-~a/" (gensym))
                                   (uiop:temporary-directory)))

@@ -100,7 +100,7 @@
             ,@body)
        (when ,fd (sb-posix:close ,fd)))))
 
-(defun call-with-slot-state-root (root function &optional missing-ok borrowed-parent-fd)
+(defun call-with-slot-state-root (root function &optional missing-ok borrowed-parent-fd (stabilize t))
   "Call FUNCTION with a held root descriptor, checking its path binding.
 The descriptor is valid only during the callback and must not escape it."
   (let* ((root (uiop:ensure-directory-pathname root))
@@ -114,7 +114,8 @@ The descriptor is valid only during the callback and must not escape it."
           (let ((*slot-state-root-scope*
                   (list sb-thread:*current-thread* parent parent-fd anchored root-fd))
                 (*slot-state-child-scope* nil))
-            (unless root-fd (fsync-directory (physical-image-fd-path parent-fd)))
+            (when (and (null root-fd) stabilize)
+              (fsync-directory (physical-image-fd-path parent-fd)))
             (slot-state-check-scope)
             (multiple-value-prog1 (funcall function root-fd)
               (slot-state-check-scope))))))))
@@ -332,39 +333,41 @@ A temporary directory need not contain the final state file."
     (slot-state-check-scope)
     (fsync-directory (physical-image-fd-path root-fd))))
 
-(defun slot-state-map (root function &key cleanup parent-fd)
+(defun slot-state-map (root function &key cleanup parent-fd (stabilize t))
   "Call FUNCTION with state bytes and name for each canonical slot.
 With CLEANUP, remove staging directories and state.tmp files in canonical
 directories; use it only at startup with writers quiescent. Without CLEANUP,
 unfinished state is an error."
-  (apply #'call-with-slot-state-root
-         root
-         (lambda (root-fd)
-           (when root-fd
-             (fsync-directory (physical-image-fd-path root-fd))
-             (let ((items (mapcar (lambda (entry)
-                                    (slot-state-inventory-entry root-fd entry cleanup))
-                                  (slot-state-directory-entries root-fd))))
-               (dolist (item items)
-                 (when (third item) (slot-state-remove-staging root-fd item)))
-               (loop for item in items
-                     unless (third item)
-                       collect
-                       (let ((path (slot-state-fd-path root-fd (first item))))
-                         (with-slot-state-directory (child-fd path)
-                           (let ((*slot-state-child-scope* (cons path child-fd)))
-                             (slot-state-check-inventory-binding item child-fd)
-                             (when (member "state.tmp" (sixth item) :test #'string=)
-                               (slot-state-unlink child-fd "state.tmp")
-                               (fsync-directory (physical-image-fd-path child-fd)))
-                             (multiple-value-prog1
-                                 (funcall function
-                                          (read-bounded-regular-file
-                                           (slot-state-fd-path child-fd "state")
-                                           +slot-state-maximum-bytes+ :stabilize t)
-                                          (second item))
-                               (slot-state-check-scope)))))))))
-         t (when parent-fd (list parent-fd))))
+  (when (and cleanup (not stabilize))
+    (error "replication slot cleanup requires stabilization"))
+  (call-with-slot-state-root
+   root
+   (lambda (root-fd)
+     (when root-fd
+       (when stabilize (fsync-directory (physical-image-fd-path root-fd)))
+       (let ((items (mapcar (lambda (entry)
+                              (slot-state-inventory-entry root-fd entry cleanup))
+                            (slot-state-directory-entries root-fd))))
+         (dolist (item items)
+           (when (third item) (slot-state-remove-staging root-fd item)))
+         (loop for item in items
+               unless (third item)
+                 collect
+                 (let ((path (slot-state-fd-path root-fd (first item))))
+                   (with-slot-state-directory (child-fd path)
+                     (let ((*slot-state-child-scope* (cons path child-fd)))
+                       (slot-state-check-inventory-binding item child-fd)
+                       (when (member "state.tmp" (sixth item) :test #'string=)
+                         (slot-state-unlink child-fd "state.tmp")
+                         (fsync-directory (physical-image-fd-path child-fd)))
+                       (multiple-value-prog1
+                           (funcall function
+                                    (read-bounded-regular-file
+                                     (slot-state-fd-path child-fd "state")
+                                     +slot-state-maximum-bytes+ :stabilize stabilize)
+                                    (second item))
+                         (slot-state-check-scope)))))))))
+   t parent-fd stabilize))
 
 (defun slot-state-claim-drop (root name)
   "Capture NAME and numeric root and child device/inode identities for drop.
