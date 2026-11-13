@@ -288,6 +288,14 @@ appropriate instead of replacing the native C peer or adding a message relay.
 
 ### Reader and test-discovery checks
 
+- Bound printer settings only around diagnostics. When serializing Lisp forms
+  to a child or control process, do not inherit finite `*print-length*` or
+  `*print-level*`: their `...` or `#` truncation can cause a reader error such
+  as `too many dots`. Keep `*print-circle*` true if needed.
+- Immutable source snapshots lack the installed helper. Set `PG_CONFIG` to
+  the existing matching original C installation, or provide `PG_LIBPQ_HELPER`.
+  A missing `pg_config` produced exit 127 and a resolver failure; inspect the
+  owned resolver's stderr before treating this as a backend regression.
 - A more-specific CLOS role method bypasses its base method unless it calls
   `call-next-method`. Put shared ownership policy in an early helper and check
   every specialized role that needs it. The startup adoption owner initially

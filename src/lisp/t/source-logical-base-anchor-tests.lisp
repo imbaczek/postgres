@@ -272,6 +272,7 @@
                    #xCBF29CE484222325 (pg::string->bytes "history-source")))))
 
 (defun source-logical-anchor-test-fact (enabled offset)
+  "Copy and shift a fact for the explicit legacy 88-byte encoding."
   (multiple-value-bind (off on later) (source-logical-persistence-facts)
     (declare (ignore later))
     (let ((fact (copy-list (if enabled on off))))
@@ -283,6 +284,7 @@
       fact)))
 
 (defun source-logical-anchor-test-interval-fact (offset)
+  "Copy and shift an ON-interval fact for the 104-byte encoding."
   (multiple-value-bind (off on later) (source-logical-persistence-facts)
     (declare (ignore off later))
     (let ((fact (copy-list on)))
