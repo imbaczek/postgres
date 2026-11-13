@@ -438,6 +438,11 @@ parent's digest.  The caller holds the receive-store mutex."
     (values parent text (getf selection :digest))))
 
 (defun physical-promotion-ensure-retained-directory (&optional parent)
+  "Prepare the retained directory under PARENT's named root and held FD.
+Use mkdirat and no-follow openat, check directory identity and device, and sync
+both directory and root. The NIL path uses ordinary directory preparation.
+Do not recurse through /proc FD aliases to sync ancestors: they are not PGDATA
+parents. Retained ownership canonicalizes the directory after this operation."
   (if (null parent)
       (wal-ensure-directory-durable (physical-recovery-retained-directory))
       (progn
@@ -474,7 +479,8 @@ The caller holds the store mutex.  Check identity, archive path, floor and
 digest, full source control and the proven prefix, then restore source ownership.
 If the source root lacks overlap, capture the manifest-bound base WAL prefix;
 missing or corrupt base bytes fail.  At the base, the source root may be absent.  Beyond
-the base, an unrooted source requires reseeding."
+the base, an unrooted source requires reseeding.
+The optional parent pair is forwarded for held-root directory preparation."
   (physical-store-check-retained-identity store)
   (physical-promotion-ensure-retained-directory parent)
   (let* ((identity (physical-store-retained-identity store))
@@ -509,7 +515,8 @@ Hold the receive-store mutex through source validation, overlap capture, history
 projection, control publication, full receive and pending control readback, and
 pending owner handoff.  Keep the source owner.  At the base fork, the projected
 root has protected overlap and the fixed seed but no extents.  An uncertain
-control write retains its hold; the caller fences recovery on failure."
+control write retains its hold; the caller fences recovery on failure.
+The optional parent pair is forwarded for held-root directory preparation."
   (let ((store *physical-receive-store*))
     (with-physical-store (store)
       (multiple-value-bind (identity source-control history overlap-image)

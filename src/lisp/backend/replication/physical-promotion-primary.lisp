@@ -264,7 +264,8 @@ checks. Live promotion separately validates and preserves temporary owners."
 (defun physical-promotion-check-live-retention (fork &optional slot-parent)
   "Check live public physical slots and ordinary snapshot pins before promotion.
 Phase 2 uses the standby batch proof; a committed child checks its fork prefix.
-Logical slots and private source pins require separate ownership rules."
+Logical slots and private source pins require separate ownership rules.
+SLOT-PARENT, when supplied, is the caller-held named root and FD pair."
   (unless (and (zerop (hash-table-count *physical-source-pins*))
                (null (directory-entry-names (physical-source-pin-directory))))
     (error "live promotion requires an empty private source-pin inventory"))
@@ -311,7 +312,8 @@ This check does not repair stale bits as C TrimCLOG does."
   "Check runtime state and return the canonical child allocation floor.
 
 The floor covers actual next XID, complete source capacity and the local disk
-floor.  Use this check before intent and again under the child namespace."
+floor.  Use this check before intent and again under the child namespace.
+SLOT-PARENT, when supplied, is the caller-held named root and FD pair."
   (let* ((local-floor (load-next-xid))
          (next (canonical-next-full-xid (max actual (1+ bound) local-floor))))
     (unless (physical-promotion-live-xid-floor-valid-p actual next *xid-batch-end* local-floor)

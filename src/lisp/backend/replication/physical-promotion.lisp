@@ -16,6 +16,7 @@ a configuration setting.")
                 logical-slot-copy-import-intent-parent))
 
 (defun physical-promotion-check-lifecycle-context (phase &key preserve-readers)
+  "Check lifecycle exclusion and quiescence; this alone grants no copy authority."
   (unless (and (zerop *live-operation-depth*)
                (sb-thread:holding-mutex-p *physical-follow-command-lock*)
                (sb-thread:holding-mutex-p *reload-run-lock*)
@@ -440,9 +441,13 @@ the saved intents rather than capturing them again."
               (getf pending :required-resource-fact) fact)))
     (values bytes pending)))
 
-(defstruct physical-promotion-intent-publication started-p)
+(defstruct physical-promotion-intent-publication
+  "Track whether intent publication has crossed its failure fence."
+  started-p)
 
 (defun call-with-physical-promotion-intent-publication (function)
+  "Install returned pending state after the owned callback exits.
+Fence recovery if publication started but did not complete."
   (let ((publication (make-physical-promotion-intent-publication)) (finished nil))
     (unwind-protect
          (let ((pending (funcall function publication)))
@@ -458,6 +463,10 @@ the saved intents rather than capturing them again."
         (setf *physical-recovery-failed-p* t)))))
 
 (defun physical-promotion-publish-intent-core (publication requested-child &optional owner context)
+  "Build and publish pending control under checked promotion exclusion.
+With an import OWNER, prove its source before history and floor changes, then
+recheck before freezing and before retained publication. Return pending state;
+the outer scope installs it after the owner has retired."
   (unless (and (physical-promotion-intent-publication-p publication)
                (not (physical-promotion-intent-publication-started-p publication))
                (sb-thread:holding-mutex-p *physical-restartpoint-start-lock*)
