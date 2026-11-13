@@ -1,6 +1,7 @@
 (in-package #:pg)
 
 (defun logical-slot-copy-literal-image (magic maximum value label)
+  "Frame a caller-validated bounded literal with magic, length, CRC and newline."
   (let* ((body (string->bytes (physical-bootstrap-manifest-text value)))
          (header (string->bytes
                   (format nil "~a ~d ~8,'0X~%" magic (length body) (wal-crc32 body)))))
@@ -9,6 +10,8 @@
     (concatenate '(vector (unsigned-byte 8)) header body #(10))))
 
 (defun logical-slot-copy-literal-decode (bytes magic maximum encode label)
+  "Decode bounded literal framing and require a canonical re-encoding.
+ENCODE validates the literal schema as well as reproducing its frame."
   (unless (and (typep bytes '(vector (unsigned-byte 8))) (<= 1 (length bytes) maximum))
     (error "invalid ~a bytes" label))
   (let* ((newline (position 10 bytes))

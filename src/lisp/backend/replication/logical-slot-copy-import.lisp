@@ -1,8 +1,16 @@
+;;; The import model checks bounded canonical fields and internal consistency.
+;;; It grants no file identity, digest authority or admission. A future owned
+;;; phase 3 preparer must verify source bytes and regenerate PGSLOT7 images
+;;; before publication.
 (in-package #:pg)
 
+;;; Maximum framed import control size in bytes.
 (defconstant +logical-slot-copy-import-maximum-bytes+ (* 16 1024 1024))
 
 (defun logical-slot-copy-import-child-image (source owner cause)
+  "Build a child image from SOURCE with the supplied distinct OWNER and CAUSE.
+Preserve provenance, profile, positions and any first terminal cause. OWNER
+must differ from the source owner and generation; this does not mint authority."
   (unless (and (logical-slot-state-valid-p source)
                (wal-replication-slot-logical-provenance source)
                (typep owner '(unsigned-byte 128))
@@ -29,6 +37,8 @@
     (logical-slot-state-encode child)))
 
 (defun logical-slot-copy-import-check-row (row owner system-id fork phase)
+  "Check a planned row against its owner, source identity and fork position.
+A deferred row has a NIL image and is allowed only while pending."
   (unless (= 5 (logical-slot-copy-descriptor-list-count row 5))
     (error "invalid logical import slot row"))
   (destructuring-bind (name generation digest image disposition) row
@@ -63,6 +73,7 @@
   row)
 
 (defun logical-slot-copy-import-check-reference (value)
+  "Check retained reference fields and range against VALUE without reading the archive."
   (let ((reference (getf value :retained-reference)))
     (if reference
         (unless (and (= 12 (logical-slot-copy-descriptor-list-count reference 12))
@@ -79,6 +90,10 @@
   value)
 
 (defun logical-slot-copy-import-check (value)
+  "Check bounded control fields and internal consistency, without granting admission.
+The publisher must separately bind the actual descriptor and source slot bytes.
+D is the copy base end, F the fork and H the initial child checkpoint end;
+require D <= F < H. Active controls cannot contain deferred rows."
   (unless (and (= 44 (logical-slot-copy-descriptor-list-count value 44))
                (equal (loop for (key data) on value by #'cddr collect key)
                       '(:phase :copy-id :device :inode :manifest-digest :descriptor-digest
@@ -114,12 +129,14 @@
   value)
 
 (defun logical-slot-copy-import-image (value)
+  "Validate and frame a canonical bounded import control image."
   (logical-slot-copy-import-check value)
   (logical-slot-copy-literal-image
    "PGLOGICALIMPORT1" +logical-slot-copy-import-maximum-bytes+ value
    "logical import control"))
 
 (defun logical-slot-copy-import-decode (bytes)
+  "Decode a canonical bounded import control image and check its schema."
   (logical-slot-copy-literal-decode
    bytes "PGLOGICALIMPORT1" +logical-slot-copy-import-maximum-bytes+
    #'logical-slot-copy-import-image "logical import control"))
