@@ -31,7 +31,8 @@
      (:file "utils/lwlock")
      (:module "libpq"
       :serial t
-      :components ((:file "pqcomm")
+      :components ((:file "pqcomm.hot")
+                   (:file "pqcomm")
                    (:file "pqformat")
                    (:file "hba")))
      (:module "storage"

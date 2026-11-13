@@ -5,6 +5,7 @@
   :serial t
   :components ((:file "t/rove/support")
                (:file "t/rove/hot-path-tests")
+               (:file "t/rove/ascii-span-tests")
                (:file "t/rove/primitives-tests")
                (:file "t/rove/storage-tests")
                (:file "t/rove/replication-slot-state-tests")

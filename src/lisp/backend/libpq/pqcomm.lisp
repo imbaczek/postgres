@@ -38,6 +38,15 @@
 (defun bytes->string (bytes &key (start 0) (end (length bytes)))
   "Decode UTF-8 from the byte span [START, END) into a new string.
 BYTES must remain stable during decoding; the returned string owns its contents."
+  (when (and (typep bytes '(simple-array (unsigned-byte 8) (*)))
+             (typep start 'fixnum)
+             (or (null end) (typep end 'fixnum)))
+    (let ((limit (or end (length bytes))))
+      (when (and (<= 0 start limit (length bytes))
+                 (%octet-span-ascii-p bytes start limit))
+        (return-from bytes->string
+          (%octet-span-copy-ascii bytes start limit
+                                  (make-string (- limit start) :element-type 'character))))))
   (sb-ext:octets-to-string bytes :start start :end end :external-format :utf-8))
 
 ;;; ---- reading ----
