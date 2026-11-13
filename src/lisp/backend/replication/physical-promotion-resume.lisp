@@ -23,6 +23,45 @@
 ;;; Pending reconstruction keeps its own copy of the selected generation's
 ;;; membership, including unknown coverage when that optional field is absent.
 
+(defun physical-promotion-reconstruct-pending-state (manifest control snapshot namespace)
+  "Reconstruct observed pending state from verified inputs and the actual selected generation."
+  (let ((state (copy-list manifest)))
+    (loop for (key value) on control by #'cddr do (setf (getf state key) value))
+    (setf (getf state :wal-namespace) namespace
+          (getf state :required-applied) (getf control :applied)
+          (getf state :required-timeline) (getf control :applied-timeline (getf control :timeline))
+          (getf state :replay-timeline) (getf control :applied-timeline (getf control :timeline))
+          (getf state :observed-next-xid) (getf control :next-xid))
+    (multiple-value-bind (metadata catalog prefix generation) (physical-restartpoint-read state)
+      (declare (ignore catalog))
+      (unless (and metadata prefix (eql 4 (getf metadata :version))
+                   (eql generation (getf control :promotion-generation))
+                   (= (getf metadata :lsn) (getf control :applied))
+                   (= (getf metadata :next-xid) (getf control :next-xid)))
+        (error "pending promotion lost its exact selected generation"))
+      (setf (getf state :wal-prefix-lsn) (getf metadata :lsn)
+            (getf state :wal-prefix-bytes) prefix
+            (getf state :source-checkpoint) (copy-tree (getf metadata :source-checkpoint))
+            (getf state :source-reservation) (copy-list (getf metadata :source-reservation))
+            (getf state :source-xids) (copy-tree (getf metadata :source-xids)))
+      (let ((fact (physical-promotion-frozen-resource-fact control metadata)))
+        (when fact
+          (setf (getf state :source-resource-fact) (copy-tree fact)
+                (getf state :required-resource-fact) fact)))
+      (let ((fact (physical-promotion-frozen-fpw-fact control metadata)))
+        (setf (getf state :source-fpw-fact) (physical-fpw-copy-fact fact)
+              (getf state :required-fpw-fact) fact))
+      (let ((fact (physical-promotion-frozen-logical-fact control metadata)))
+        (when fact
+          (setf (getf state :source-logical-fact) (physical-logical-copy-fact fact)
+                (getf state :required-logical-fact) fact)))
+      (let ((fact (physical-logical-base-fact
+                   manifest snapshot (physical-recovery-resource-history nil manifest))))
+        (when fact (setf (getf state :base-source-logical-fact) fact)))
+      (physical-promotion-check-pending-retained control metadata)
+      (physical-promotion-timeline-floor state)
+      (values state metadata prefix generation))))
+
 (defun physical-promotion-read-pending-state ()
   "Read provenance and exact selected generation before opening or restoring storage.
 Check the frozen namespace floor and reject collisions with observed IDs, even
@@ -53,42 +92,7 @@ absence."
                      (= (physical-manifest-checkpoint-start manifest)
                         (if snapshot (getf snapshot :start) (- checkpoint +wal-header-size+))))
           (error "pending promotion base WAL control changed"))
-        (let ((state (copy-list manifest)))
-          (loop for (key value) on control by #'cddr do (setf (getf state key) value))
-          (setf (getf state :wal-namespace) namespace
-                (getf state :required-applied) (getf control :applied)
-                (getf state :required-timeline) (getf control :applied-timeline (getf control :timeline))
-                (getf state :replay-timeline) (getf control :applied-timeline (getf control :timeline))
-                (getf state :observed-next-xid) (getf control :next-xid))
-          (multiple-value-bind (metadata catalog prefix generation) (physical-restartpoint-read state)
-            (declare (ignore catalog))
-            (unless (and metadata prefix (eql 4 (getf metadata :version))
-                         (eql generation (getf control :promotion-generation))
-                         (= (getf metadata :lsn) (getf control :applied))
-                         (= (getf metadata :next-xid) (getf control :next-xid)))
-              (error "pending promotion lost its exact selected generation"))
-            (setf (getf state :wal-prefix-lsn) (getf metadata :lsn)
-                  (getf state :wal-prefix-bytes) prefix
-                  (getf state :source-checkpoint) (copy-tree (getf metadata :source-checkpoint))
-                  (getf state :source-reservation) (copy-list (getf metadata :source-reservation))
-                  (getf state :source-xids) (copy-tree (getf metadata :source-xids)))
-            (let ((fact (physical-promotion-frozen-resource-fact control metadata)))
-              (when fact
-                (setf (getf state :source-resource-fact) (copy-tree fact)
-                      (getf state :required-resource-fact) fact)))
-            (let ((fact (physical-promotion-frozen-fpw-fact control metadata)))
-              (setf (getf state :source-fpw-fact) (physical-fpw-copy-fact fact)
-                    (getf state :required-fpw-fact) fact))
-            (let ((fact (physical-promotion-frozen-logical-fact control metadata)))
-              (when fact
-                (setf (getf state :source-logical-fact) (physical-logical-copy-fact fact)
-                      (getf state :required-logical-fact) fact)))
-            (let ((fact (physical-logical-base-fact
-                         manifest snapshot (physical-recovery-resource-history nil manifest))))
-              (when fact (setf (getf state :base-source-logical-fact) fact)))
-            (physical-promotion-check-pending-retained control metadata)
-            (physical-promotion-timeline-floor state)
-            (values state metadata prefix generation)))))))
+        (physical-promotion-reconstruct-pending-state manifest control snapshot namespace)))))
 
 (defun physical-promotion-open-pending-store (state &key on-open)
   "Verify acknowledged files, then own the spool without creating or trimming.
