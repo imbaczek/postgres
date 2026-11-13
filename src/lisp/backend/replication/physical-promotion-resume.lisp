@@ -122,14 +122,17 @@ Use the verified pending base identity and the recovery retained archive."
                          :retained-directory (physical-recovery-retained-directory)
                          :on-open on-open)))
 
-(defun physical-promotion-validate-cold-state (state metadata prefix generation store &optional (artifact-checker #'physical-promotion-wal-plan))
+(defun physical-promotion-validate-cold-state (state metadata prefix generation store &optional (artifact-checker #'physical-promotion-wal-plan) slot-parent)
   "Use the live publisher's proof checker without installing candidate globals."
   (let ((*physical-recovery-state* state) (*physical-receive-store* store)
                                           (*last-replay-lsn* (getf state :applied)) (*next-xid* (getf state :next-xid))
                                           (*wal-segment-namespace* (getf state :wal-namespace))
                                           (*wal-insert-timeline* (getf state :timeline))
                                           (*wal-checkpoint-timeline* (getf state :timeline)))
-    (physical-promotion-check-pending state metadata prefix generation :allow-history t)
+    (if slot-parent
+        (physical-promotion-check-pending state metadata prefix generation
+                                          :allow-history t :slot-parent slot-parent)
+        (physical-promotion-check-pending state metadata prefix generation :allow-history t))
     (funcall artifact-checker state prefix :allow-uninstalled t)
     (physical-recovery-check-base-forks
      (list :files (getf metadata :forks)) (make-hash-table :test #'eql))))

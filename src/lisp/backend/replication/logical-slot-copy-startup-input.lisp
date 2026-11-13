@@ -6,18 +6,30 @@
   (ownership nil :read-only t)
   existing-proof)
 
+(defun logical-slot-copy-check-postmaster-owner (owner ownership)
+  (physical-directory-check-reseed-intent (physical-adoption-owner-directory owner))
+  (postmaster-check-ownership ownership)
+  (unless (and (equal (physical-adoption-owner-directory owner)
+                      (postmaster-ownership-directory ownership))
+               (= (physical-adoption-owner-device owner) (postmaster-ownership-device ownership))
+               (= (physical-adoption-owner-inode owner) (postmaster-ownership-inode ownership))
+               (eq (physical-adoption-owner-lock owner) (postmaster-ownership-lock ownership)))
+    (error "logical copy verification owner differs from its postmaster"))
+  owner)
+
+(defun logical-slot-copy-owner-arguments (ownership)
+  (list :directory (postmaster-ownership-directory ownership)
+        :device (postmaster-ownership-device ownership)
+        :inode (postmaster-ownership-inode ownership)
+        :lock (postmaster-ownership-lock ownership)
+        :lock-device (postmaster-ownership-lock-device ownership)
+        :lock-inode (postmaster-ownership-lock-inode ownership)
+        :thread sb-thread:*current-thread* :active-p t :ownership ownership))
+
 (defmethod physical-adoption-check-owner-role ((owner logical-slot-copy-startup-owner))
   (physical-adoption-check-startup-quiescence)
-  (physical-directory-check-reseed-intent (physical-adoption-owner-directory owner))
-  (let ((ownership (logical-slot-copy-startup-owner-ownership owner)))
-    (postmaster-check-ownership ownership)
-    (unless (and (equal (physical-adoption-owner-directory owner)
-                        (postmaster-ownership-directory ownership))
-                 (= (physical-adoption-owner-device owner) (postmaster-ownership-device ownership))
-                 (= (physical-adoption-owner-inode owner) (postmaster-ownership-inode ownership))
-                 (eq (physical-adoption-owner-lock owner) (postmaster-ownership-lock ownership)))
-      (error "logical copy verification owner differs from its postmaster")))
-  owner)
+  (logical-slot-copy-check-postmaster-owner
+   owner (logical-slot-copy-startup-owner-ownership owner)))
 
 (defmethod physical-adoption-owner-extra-root-names ((owner logical-slot-copy-startup-owner))
   (physical-directory-check-owner owner)
@@ -25,18 +37,10 @@
           (when (logical-slot-copy-startup-owner-existing-proof owner)
             (list "logical-slot-copy.base-verified"))))
 
-(defun call-with-logical-slot-copy-startup-input (function)
-  (physical-adoption-check-startup-quiescence)
+(defun call-with-logical-slot-copy-owned-input (constructor function)
   (call-with-postmaster-ownership
    (lambda (ownership)
-     (let ((owner (%make-logical-slot-copy-startup-owner
-                   :directory (postmaster-ownership-directory ownership)
-                   :device (postmaster-ownership-device ownership)
-                   :inode (postmaster-ownership-inode ownership)
-                   :lock (postmaster-ownership-lock ownership)
-                   :lock-device (postmaster-ownership-lock-device ownership)
-                   :lock-inode (postmaster-ownership-lock-inode ownership)
-                   :thread sb-thread:*current-thread* :active-p t :ownership ownership)))
+     (let ((owner (apply constructor (logical-slot-copy-owner-arguments ownership))))
        (unwind-protect
             (progn
               (physical-directory-check-owner owner)
@@ -50,18 +54,28 @@
                     (declare (ignore path))
                     (let ((context *physical-image-context*))
                       (logical-slot-copy-open-input-sidecar owner context)
-                      (when (member "logical-slot-copy.base-verified"
-                                    (directory-entry-names (physical-image-context-root-path context)
-                                                           :follow-symlinks t :maximum-entries 128)
-                                    :test #'equal)
-                        (let ((bytes (logical-slot-copy-read-file
-                                      context "logical-slot-copy.base-verified"
-                                      +logical-slot-copy-base-proof-maximum-bytes+)))
-                          (logical-slot-copy-base-proof-decode bytes)
-                          (setf (logical-slot-copy-startup-owner-existing-proof owner) bytes)))
-                      (multiple-value-prog1 (funcall function owner context)
-                        (logical-slot-copy-check-input owner context))))))))
+                      (let ((proof
+                              (when (member "logical-slot-copy.base-verified"
+                                            (directory-entry-names
+                                             (physical-image-context-root-path context)
+                                             :follow-symlinks t :maximum-entries 128)
+                                            :test #'equal)
+                                (let ((bytes (logical-slot-copy-read-file
+                                              context "logical-slot-copy.base-verified"
+                                              +logical-slot-copy-base-proof-maximum-bytes+)))
+                                  (logical-slot-copy-base-proof-decode bytes)
+                                  bytes))))
+                        (multiple-value-prog1 (funcall function owner context proof)
+                          (logical-slot-copy-check-input owner context)))))))))
          (setf (physical-adoption-owner-active-p owner) nil))))))
+
+(defun call-with-logical-slot-copy-startup-input (function)
+  (physical-adoption-check-startup-quiescence)
+  (call-with-logical-slot-copy-owned-input
+   #'%make-logical-slot-copy-startup-owner
+   (lambda (owner context proof)
+     (setf (logical-slot-copy-startup-owner-existing-proof owner) proof)
+     (funcall function owner context))))
 
 (defun logical-slot-copy-base-proof-value (context manifest descriptor)
   (logical-slot-copy-check-binding descriptor manifest

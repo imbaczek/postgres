@@ -517,7 +517,7 @@ A published child must match the saved history and the intervening probe."
 
 (declaim (ftype function physical-promotion-check-pending-slots))
 
-(defun physical-promotion-check-pending (state metadata prefix generation &key allow-history)
+(defun physical-promotion-check-pending (state metadata prefix generation &key allow-history slot-parent)
   "Revalidate durable promotion ownership and persistent slot floors before the
 child state is published. Check intent values and presence against durable control.
 History publication ends prefix-install eligibility."
@@ -553,7 +553,9 @@ History publication ends prefix-install eligibility."
       (error "pending promotion ownership or generation proof changed"))
     (multiple-value-prog1
         (physical-promotion-check-progress state metadata prefix generation 3)
-      (physical-promotion-check-pending-slots state))))
+      (if slot-parent
+          (physical-promotion-check-pending-slots state slot-parent)
+          (physical-promotion-check-pending-slots state)))))
 
 (defun physical-promotion-install-prefix ()
   "Install the verified pending child prefix before history/EOR; never admit writes.

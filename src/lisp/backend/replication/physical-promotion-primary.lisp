@@ -173,14 +173,21 @@ allocation. All four values must be canonical counters or the exhaustion sentine
        (or (= (floor actual +xid-cycle+) (floor floor +xid-cycle+))
            (= floor (min +max-xid-one-past+ (xid-next-epoch-boundary actual))))))
 
-(defun physical-promotion-read-physical-slots (&key reconcile-live)
+(defun physical-promotion-read-physical-slots (&key reconcile-live parent)
   "Read canonical physical state under promotion exclusion, rejecting unfinished I/O.
 Live promotion preserves exact registry objects and their runtime ownership."
   ;; Inventory is read through held directory descriptors. Reconciliation
   ;; returns the matching live objects so their owners remain intact.
+  (unless (or (null parent)
+              (and (consp parent) (pathnamep (car parent))
+                   (uiop:absolute-pathname-p (car parent))
+                   (uiop:directory-pathname-p (car parent))
+                   (typep (cdr parent) 'fixnum) (not (minusp (cdr parent)))))
+    (error "promotion slot parent requires a named directory and held descriptor"))
   (let ((slots
           (slot-state-map
-           (wal-replication-slot-directory)
+           (if parent (merge-pathnames "pg_replslot/" (car parent))
+               (wal-replication-slot-directory))
            (lambda (bytes name)
              (let ((slot (physical-slot-decode bytes name)))
                (when reconcile-live
@@ -193,7 +200,8 @@ Live promotion preserves exact registry objects and their runtime ownership."
                    (unless (equalp (physical-slot-encode slot) (physical-slot-encode live))
                      (error "promotion slot durable state differs from its live generation"))
                    (setf slot live)))
-               slot)))))
+               slot))
+           :parent-fd (and parent (cdr parent)) :stabilize (null parent))))
     (when (and reconcile-live (/= (length slots) (hash-table-count *wal-replication-slots*)))
       (error "promotion slot registry has unpersisted generations"))
     (nreverse slots)))
@@ -239,11 +247,13 @@ segment is available. A committed child must contain the same fork prefix."
            bytes))))
     t))
 
-(defun physical-promotion-check-pending-slots (state)
+(defun physical-promotion-check-pending-slots (state &optional parent)
   "Check persistent disk slots before pending promotion publishes child state.
 Skip valid temporary images here; cold startup removes them before resource
 checks. Live promotion separately validates and preserves temporary owners."
-  (let ((slots (physical-promotion-read-physical-slots)))
+  (let ((slots (if parent
+                   (physical-promotion-read-physical-slots :parent parent)
+                   (physical-promotion-read-physical-slots))))
     (physical-promotion-check-slot-prefix
      (remove-if #'wal-replication-slot-temporary-p slots) state)))
 
