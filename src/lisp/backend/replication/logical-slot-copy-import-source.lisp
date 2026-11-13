@@ -143,7 +143,7 @@ Capture the receive tuple and independent state image for later rechecking."
   "Check selected progress under the owned root before scanning."
   (if (= 3 (getf state :phase))
       (physical-promotion-validate-cold-state
-       state metadata prefix generation store #'physical-promotion-wal-plan
+       state metadata prefix generation store #'physical-promotion-checkpoint-artifacts
        (cons (physical-adoption-owner-directory owner)
              (physical-image-context-root-fd context)))
       (progn

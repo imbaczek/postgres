@@ -262,7 +262,92 @@ Parent segments are never selected. Sync the WAL directory after removals."
       (physical-promotion-test-point :after-child-orphan-unlink))
     (when orphans (fsync-directory (wal-directory)))))
 
-(defun physical-promotion-save-child-control (plan)
+(defun physical-promotion-sync-child-data (&optional context)
+  (smgr-fsync-all)
+  (clog-fsync)
+  (if context
+      (call-with-physical-image-input
+       (catalog-path) (lambda (stream) (fsync-stream stream))
+       :element-type '(unsigned-byte 8))
+      (with-open-file (stream (catalog-path) :element-type '(unsigned-byte 8))
+        (fsync-stream stream)))
+  (if context
+      (progn
+        (physical-image-check-children context)
+        (dolist (fd (list (physical-image-context-root-fd context)
+                          (cdr (assoc "base" (physical-image-context-children context) :test #'equal))
+                          (cdr (assoc "global" (physical-image-context-children context) :test #'equal))))
+          (sb-posix:fsync fd)))
+      (dolist (directory (list *pgdata* (merge-pathnames "base/" *pgdata*)
+                               (merge-pathnames "global/" *pgdata*)))
+        (fsync-directory directory))))
+
+(defun physical-promotion-check-installed-control (parent fd)
+  (unless (equal (physical-image-file-facts fd)
+                 (physical-image-file-facts parent "pg_wal_control"))
+    (error "child control inode changed after rename")))
+
+(defun physical-promotion-write-child-control-at (context bytes check)
+  (physical-image-check-children context)
+  (let ((parent (cdr (assoc "global" (physical-image-context-children context) :test #'equal)))
+        (fd nil) (stream nil))
+    (sb-sys:without-interrupts
+      (unwind-protect
+           (progn
+             (funcall check nil)
+             (setf fd (physical-image-openat
+                       parent "pg_wal_control.tmp"
+                       (logior sb-posix:o-rdwr sb-posix:o-creat sb-posix:o-excl
+                               sb-posix:o-nofollow +postmaster-o-cloexec+) #o600))
+             (when (minusp fd) (setf fd nil) (error "cannot create exclusive child control temporary"))
+             (setf stream (sb-sys:make-fd-stream fd :input t :output t :element-type '(unsigned-byte 8)))
+             (sb-sys:with-local-interrupts
+               (write-sequence bytes stream)
+               (force-output stream)
+               (physical-promotion-test-point :before-child-control-file-fsync)
+               (funcall check nil)
+               (sb-posix:fsync fd)
+               (physical-promotion-test-point :after-child-control-file-fsync)
+               (physical-promotion-test-point :before-child-control-rename)
+               (funcall check :final)
+               (physical-image-check-children context)
+               (let ((stat (sb-posix:fstat fd)))
+                 (unless (and (sb-posix:s-isreg (sb-posix:stat-mode stat))
+                              (= #o600 (logand #o7777 (sb-posix:stat-mode stat)))
+                              (= (sb-posix:geteuid) (sb-posix:stat-uid stat))
+                              (= 1 (sb-posix:stat-nlink stat))
+                              (= (length bytes) (sb-posix:stat-size stat))
+                              (equal (physical-image-file-facts fd)
+                                     (physical-image-file-facts parent "pg_wal_control.tmp")))
+                   (error "child control temporary changed before rename")))
+               (file-position stream 0)
+               (let ((actual (make-array (length bytes) :element-type '(unsigned-byte 8))))
+                 (unless (and (= (length bytes) (read-sequence actual stream)) (equalp bytes actual))
+                   (error "child control temporary bytes differ before rename")))
+               (unless (zerop (port-renameat parent "pg_wal_control.tmp" parent "pg_wal_control"))
+                 (error "cannot publish child control"))
+               (physical-promotion-test-point :after-child-control-rename)
+               (funcall check t)
+               (physical-promotion-check-installed-control parent fd)
+               (sb-posix:fsync fd)
+               (sb-posix:fsync parent)
+               (physical-promotion-test-point :after-child-control-directory-fsync)
+               (funcall check t)
+               (physical-promotion-check-installed-control parent fd)))
+        (if stream (close stream) (when fd (sb-posix:close fd)))))))
+
+(defun physical-promotion-child-control-image (plan &optional (time (- (get-universal-time) 2208988800)))
+  (let* ((snapshot (getf plan :snapshot))
+         (metadata (make-wal-control-metadata (getf *physical-recovery-state* :system-id)
+                                              +db-in-crash-recovery+ time))
+         (reference (getf *physical-recovery-state* :retained-reference)))
+    (setf metadata (append metadata (wal-copy-control-resource-fields snapshot)))
+    (when reference (setf (getf metadata :retained-reference) (copy-list reference)))
+    (wal-encode-control-image (getf plan :end) (getf plan :end) snapshot
+                              :timeline (getf plan :child) :checkpoint-timeline (getf plan :child)
+                              :namespace :timeline :metadata metadata)))
+
+(defun physical-promotion-save-child-control (plan &key context check)
   "Atomically commit the planned child checkpoint and durable end in PGWAL6.
 The caller must already have synced all referenced WAL and database files.
 Once this image survives, startup must recover the child even if later cleanup
@@ -270,24 +355,98 @@ fails. Do not restore parent control on an error after the rename.
 Carry any retained reference into child control at its fixed parent fork.
 Use crash-recovery state until primary initialization and trigger retirement
 finish; a durable child is not yet a production-ready postmaster."
-  (let* ((snapshot (getf plan :snapshot)) (child (getf plan :child)) (end (getf plan :end))
-                                          (metadata (make-wal-control-metadata (getf *physical-recovery-state* :system-id)
-                                                                               +db-in-crash-recovery+))
-                                          (reference (getf *physical-recovery-state* :retained-reference)))
-    (setf metadata (append metadata (wal-copy-control-resource-fields snapshot)))
-    (when reference (setf (getf metadata :retained-reference) (copy-list reference)))
-    (with-atomic-output
-        (stream (wal-control-path) (merge-pathnames "global/pg_wal_control.tmp" *pgdata*)
-                (merge-pathnames "global/" *pgdata*) :element-type '(unsigned-byte 8)
-                :rename-function (lambda (from to)
-                                   (sb-posix:rename from to)
-                                   (physical-promotion-test-point :after-child-control-rename))
-                :fsync-directory-function
-                (lambda (directory) (fsync-directory directory)
-                  (physical-promotion-test-point :after-child-control-directory-fsync)))
-      (write-sequence (wal-encode-control-image end end snapshot :timeline child
-                                                                 :checkpoint-timeline child :namespace :timeline :metadata metadata)
-                      stream))))
+  (let ((bytes (if context
+                   (physical-promotion-child-control-image plan (getf (getf plan :snapshot) :time))
+                   (physical-promotion-child-control-image plan))))
+    (if context
+        (physical-promotion-write-child-control-at context bytes check)
+        (with-atomic-output
+            (stream (wal-control-path) (merge-pathnames "global/pg_wal_control.tmp" *pgdata*)
+                    (merge-pathnames "global/" *pgdata*) :element-type '(unsigned-byte 8)
+                    :rename-function (lambda (from to)
+                                       (sb-posix:rename from to)
+                                       (physical-promotion-test-point :after-child-control-rename))
+                    :fsync-directory-function
+                    (lambda (directory) (fsync-directory directory)
+                      (physical-promotion-test-point :after-child-control-directory-fsync)))
+          (write-sequence bytes stream)))))
+
+(declaim (ftype function logical-slot-copy-import-commit-parent
+                logical-slot-copy-import-check-child-commit))
+
+(defun physical-promotion-publish-child-control-core (&optional owner context attempt)
+  (unless (and (sb-thread:holding-mutex-p *physical-follow-command-lock*)
+               (sb-thread:holding-mutex-p *reload-run-lock*)
+               (sb-thread:holding-mutex-p *physical-restartpoint-start-lock*)
+               (sb-thread:holding-mutex-p *timeline-history-lock*)
+               (eq *live-operation-quiescence-owner-thread* sb-thread:*current-thread*)
+               (zerop *live-operation-depth*) (not *live-operation-drain-open*))
+    (error "child publication requires owned promotion exclusion"))
+  (let ((parent (if owner
+                    (logical-slot-copy-import-commit-parent owner context attempt)
+                    (progn
+                      (when (or context attempt) (error "child publication has no import owner"))
+                      (logical-slot-copy-check-promotion)
+                      nil)))
+        (state *physical-recovery-state*) (finished nil) (staged nil)
+        (directory-fd (when context
+                        (cdr (assoc "pg_wal" (physical-image-context-children context) :test #'equal)))))
+    (labels ((check (&optional committed)
+               (when owner
+                 (logical-slot-copy-import-check-child-commit
+                  owner context attempt
+                  (case committed
+                    ((nil) (when staged :staged))
+                    (:final :final)
+                    ((t) t)
+                    (otherwise (error "unknown child publication proof phase")))))))
+      (multiple-value-bind (metadata catalog prefix generation) (physical-restartpoint-read state)
+        (declare (ignore catalog))
+        (physical-promotion-check-pending state metadata prefix generation
+                                          :allow-history t :slot-parent parent)
+        (physical-promotion-ensure-pending-retained state metadata)
+        (let* ((plan (physical-promotion-checkpoint-artifacts state prefix :allow-uninstalled (not (null owner))))
+               (files (physical-promotion-checkpoint-files plan prefix))
+               (child (getf state :promotion-child))
+               (history-p (wal-namespace-file-stat (timeline-history-path child *pgdata*) t)))
+          (unless (and (zerop (hash-table-count *wal-page-cache*)) (null *wal-dirty-store*)
+                       (null *wal-page-batch*) (null *active-xids*))
+            (error "child checkpoint requires an empty application write cache"))
+          (check)
+          (unwind-protect
+               (progn
+                 (physical-promotion-remove-child-orphans state files)
+                 (unless history-p
+                   (when owner
+                     (check)
+                     (wal-install-timeline-prefix (physical-recovery-replay-timeline state) child
+                                                  (getf plan :fork) prefix
+                                                  (physical-promotion-parent-namespace state) directory-fd))
+                   (dolist (entry (rest files))
+                     (check)
+                     (wal-install-timeline-prefix (physical-recovery-replay-timeline state) child
+                                                  (* (first entry) +wal-segment-size+)
+                                                  (make-array 0 :element-type '(unsigned-byte 8))
+                                                  (physical-promotion-parent-namespace state) directory-fd)))
+                 (check)
+                 (physical-promotion-sync-history state directory-fd)
+                 (physical-promotion-test-point :after-child-history-sync)
+                 (dolist (frame (getf plan :frames))
+                   (check)
+                   (physical-promotion-stage-frame child frame)
+                   (when (eq frame (first (getf plan :frames)))
+                     (physical-promotion-test-point :after-child-eor-flush)))
+                 (physical-promotion-test-point :after-child-checkpoint-flush)
+                 (setf staged t)
+                 (check)
+                 (physical-promotion-sync-child-data context)
+                 (physical-promotion-test-point :after-child-data-sync)
+                 (check)
+                 (physical-promotion-save-child-control plan :context context :check #'check)
+                 (check t)
+                 (setf finished t)
+                 (getf plan :end))
+            (unless finished (setf *physical-recovery-failed-p* t))))))))
 
 (defun physical-promotion-publish-child-control ()
   "Commit a pending promotion while writer admission remains closed.
@@ -299,42 +458,4 @@ This function does not initialize the primary or clear recovery exclusion.
 An error or nonlocal exit after publication starts fences this process; restart
 must determine from durable control whether parent or child is authoritative."
   (with-physical-promotion-exclusion (3)
-    (let ((state *physical-recovery-state*) (finished nil))
-      (multiple-value-bind (metadata catalog prefix generation) (physical-restartpoint-read state)
-        (declare (ignore catalog))
-        (physical-promotion-check-pending state metadata prefix generation :allow-history t)
-        (physical-promotion-ensure-pending-retained state metadata)
-        (let* ((plan (physical-promotion-checkpoint-artifacts state prefix))
-               (files (physical-promotion-checkpoint-files plan prefix))
-               (child (getf state :promotion-child))
-               (history-p (wal-namespace-file-stat (timeline-history-path child *pgdata*) t)))
-          (unless (and (zerop (hash-table-count *wal-page-cache*)) (null *wal-dirty-store*)
-                       (null *wal-page-batch*)
-                       (null *active-xids*))
-            (error "child checkpoint requires an empty application write cache"))
-          (unwind-protect
-               (progn
-                 (physical-promotion-remove-child-orphans state files)
-                 (unless history-p
-                   (dolist (entry (rest files))
-                     (wal-install-timeline-prefix (physical-recovery-replay-timeline state) child
-                                                  (* (first entry) +wal-segment-size+)
-                                                  (make-array 0 :element-type '(unsigned-byte 8))
-                                                  (physical-promotion-parent-namespace state))))
-                 (physical-promotion-sync-history state)
-                 (physical-promotion-test-point :after-child-history-sync)
-                 (dolist (frame (getf plan :frames))
-                   (physical-promotion-stage-frame child frame)
-                   (when (eq frame (first (getf plan :frames)))
-                     (physical-promotion-test-point :after-child-eor-flush)))
-                 (physical-promotion-test-point :after-child-checkpoint-flush)
-                 (smgr-fsync-all) (clog-fsync)
-                 (with-open-file (stream (catalog-path) :element-type '(unsigned-byte 8)) (fsync-stream stream))
-                 (dolist (directory (list *pgdata* (merge-pathnames "base/" *pgdata*)
-                                          (merge-pathnames "global/" *pgdata*)))
-                   (fsync-directory directory))
-                 (physical-promotion-test-point :after-child-data-sync)
-                 (physical-promotion-save-child-control plan)
-                 (setf finished t)
-                 (getf plan :end))
-            (unless finished (setf *physical-recovery-failed-p* t))))))))
+    (physical-promotion-publish-child-control-core)))

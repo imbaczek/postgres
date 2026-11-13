@@ -355,6 +355,7 @@
                    (:file "../replication/logical-slot-copy-evidence-binding")
                    (:file "../replication/logical-slot-copy-import-publication")
                    (:file "../replication/logical-slot-copy-import-promotion")
+                   (:file "../replication/logical-slot-copy-import-commit")
                    (:file "../replication/logical-slot-copy-startup")
                    (:file "postgres")))
      (:file "replication/logical-retention")
