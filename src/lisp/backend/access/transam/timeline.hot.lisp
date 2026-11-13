@@ -1,6 +1,9 @@
 (in-package #:pg)
 
 (defun %timeline-valid-lineage-p (history)
+  "Check a proper list of timeline-history-entry structures without allocation.
+Entries are newest first and adjacent, with oldest begin zero. Only the tip
+may have no end; a finite tip is allowed."
   (let ((newer nil) (oldest-begin nil))
     (dolist (entry history (and newer (eql oldest-begin 0)))
       (let ((timeline (timeline-history-entry-timeline entry))

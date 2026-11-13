@@ -10,7 +10,8 @@
   "Private retained-root selection and one-segment cache for one reader scope.
 CACHE-BYTES holds a checked physical prefix; CACHE-START and CACHE-END bound
 logical record coverage.  Equal bounds can witness EOF at the base.  Accessors
-do not grant authority to produce or consume logical WAL."
+do not grant authority to produce or consume logical WAL. The index and cache
+are private to the reader scope and must not be mutated by its callback."
   (directory nil :read-only t) (identity nil :read-only t)
   (reference nil :read-only t) (history nil :read-only t)
   (parent-history nil :read-only t) (guard nil :read-only t)
@@ -98,9 +99,11 @@ position. This check does not verify the live file's contents."
            (getf (logical-wal-archive-reference archive) :base)))))
 
 (defun logical-wal-archive-compare-live (archive position carrier size bytes)
-  "Check live EOF geometry from index metadata, even before cache preparation.
-Return whether a matching cache is present.  NIL bytes requests geometry only;
-otherwise compare the full raw record span with the checked physical prefix,
+  "Check live EOF geometry from prepared cache or index metadata.
+For a matching segment wholly before the fork, use the checked cache end;
+a cache miss scans the index. Return whether a matching cache is present.
+NIL bytes requests geometry only; otherwise compare the full raw record span
+with the checked physical prefix,
 including any header before the base.  This only rejects inconsistency; it does
 not certify bytes of the live file that were not read."
   (logical-wal-archive-check archive)
@@ -294,7 +297,8 @@ An overlap-only base gap is a zero-width EOF witness, not record coverage."
 
 (defun logical-wal-archive-prepare (archive segment carrier)
   "Validate all selected extent versions outside WAL exclusion, then install
-their physical prefix and separate logical bounds under a renewed source check."
+their physical prefix and separate logical bounds under a renewed source check.
+The private cache retains the checked result for this reader scope."
   (when (sb-thread:holding-mutex-p *wal-lock*)
     (error "logical WAL archive preparation must run outside WAL exclusion"))
   (let ((entries nil))

@@ -43,7 +43,9 @@
 (declaim (ftype (function (t) boolean) %timeline-valid-lineage-p))
 
 (defun timeline-check-lineage (history)
-  "Require forward native ancestry before using parsed C history for a safety check."
+  "Require nonempty forward ancestry before using parsed C history for a safety check.
+HISTORY must be a proper list of timeline-history-entry structures. Signal an
+error for invalid lineage; the predicate checks its newest-first geometry."
   (unless history (error "empty timeline lineage"))
   (unless (%timeline-valid-lineage-p history)
     (error "invalid forward timeline lineage"))
