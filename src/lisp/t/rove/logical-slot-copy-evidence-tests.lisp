@@ -1,5 +1,42 @@
 (in-package #:pg)
 
+(cl-spec:defproperty committed-input-images-preserve-exact-values
+    ((number (range integer 0 18446744073709551615))
+     (letter (range integer 65 90)) (size (range integer 0 512)))
+  (:about logical-slot-copy-committed-image-equal-p)
+  (:trials (:normal 200))
+  (let* ((value (list :number number :path (format nil "~c/Path" (code-char letter))
+                      :bytes (make-array size :element-type '(unsigned-byte 8)
+                                              :initial-element (mod number 256))
+                      :history (make-timeline-history-entry :timeline 1 :begin 0 :end number)))
+         (image (logical-slot-copy-import-state-image value)))
+    (and (logical-slot-copy-committed-image-equal-p image value)
+         (progn (setf (char (getf value :path) 0) (char-downcase (code-char letter)))
+                (not (logical-slot-copy-committed-image-equal-p image value)))
+         (progn (setf (char (getf value :path) 0) (code-char letter)
+                      (getf value :number) (float number 1d0))
+                (not (logical-slot-copy-committed-image-equal-p image value))))))
+
+(rove:deftest committed-input-exact-images-generated-contract
+    (let ((data (cl-spec:result-data
+                 (cl-spec:run-property 'committed-input-images-preserve-exact-values
+                                       :seed 7522 :profile :normal))))
+      (rove:ok (eq :passed (getf data :status)) (format nil "~s" data))
+      (rove:ok (= 200 (getf data :trials)))))
+
+(rove:deftest committed-input-images-distinguish-types-case-and-shape
+    (dolist (pair (list (list "Root" "root") (list 1 1d0) (list #\A #\a)
+                        (list #(1 2) #(1 2 3)) (list '(:a 1) '(:a 1.0))
+                        (list (make-array 2 :element-type '(unsigned-byte 8) :initial-element 0)
+                              #(0 0))
+                        (list (make-timeline-history-entry :timeline 1 :begin 0 :end 5)
+                              (make-timeline-history-entry :timeline 1 :begin 0 :end 6))))
+      (rove:ok (not (logical-slot-copy-committed-image-equal-p (first pair) (second pair))))
+      (rove:ok (not (logical-slot-copy-committed-image-equal-p (second pair) (first pair)))))
+  (rove:ok (logical-slot-copy-committed-image-equal-p
+            (list "Same" #(1 2) '(3 . 4))
+            (list (copy-seq "Same") (vector 1 2) '(3 . 4)))))
+
 (defun unit-logical-import-evidence (fork salt)
   (let* ((state (list :phase 3 :applied fork :timeline 1 :promotion-child 2
                       :next-xid 50 :state-time salt

@@ -1,5 +1,7 @@
 (in-package #:pg)
 
+(defvar *logical-import-commit-test-omit-control-fact* nil)
+
 (defvar *logical-import-commit-test-result* nil)
 (defvar *logical-import-commit-test-thread* nil)
 
@@ -113,6 +115,138 @@
      (setf *logical-import-commit-test-injected* t)
      (error "child commit owner exit cut"))))
 
+(defun logical-import-commit-test-binding ()
+  (sb-thread:with-mutex (*physical-restartpoint-start-lock*)
+    (sb-thread:with-mutex (*timeline-history-lock*)
+      (let ((saved-owner nil))
+        (call-with-logical-slot-copy-committed-input
+         (lambda (owner context certificate evidence descriptor manifest control plan status)
+           (declare (ignore context evidence descriptor manifest))
+           (assert (logical-slot-copy-committed-owner-p owner))
+           (assert (not (logical-slot-copy-import-owner-p owner)))
+           (assert (eq :pending (getf certificate :phase)))
+           (assert (= 3 (getf control :phase)))
+           (assert (= (getf plan :end) (getf certificate :child-end)))
+           (assert (eq status (if *logical-import-commit-test-omit-control-fact*
+                                  :requires-source-replay :control-fact-checked)))
+           (setf saved-owner owner)))
+        (assert (not (physical-adoption-owner-active-p saved-owner)))
+        (handler-case
+            (progn (physical-directory-check-owner saved-owner)
+                   (error "retired committed owner was accepted"))
+          (error (condition)
+            (assert (not (search "retired committed owner was accepted"
+                                 (princ-to-string condition))))))))))
+
+(defun logical-import-commit-test-source ()
+  (sb-thread:with-mutex (*physical-restartpoint-start-lock*)
+    (sb-thread:with-mutex (*timeline-history-lock*)
+      (call-with-logical-slot-copy-committed-source
+       (lambda (owner context store certificate plan fact history)
+         (declare (ignore context))
+         (assert (logical-slot-copy-committed-owner-p owner))
+         (assert (physical-store-p store))
+         (assert (= (getf plan :fork) (getf certificate :fork)))
+         (assert (< (getf certificate :base-end) (getf certificate :fork)))
+         (assert (physical-logical-fact-at-p
+                  fact (getf certificate :fork) (getf certificate :parent-timeline)))
+         (assert history)))
+      (format t "~&LOGICAL-IMPORT-COMMITTED-SOURCE-PASS~%")
+      (finish-output))))
+
+(defun logical-import-commit-test-cold-source ()
+  (assert (and (not *wal-ready*) (null *physical-recovery-state*)
+               (null *physical-receive-store*) (null *catalog*) (null *wal-output-stream*)))
+  (sb-thread:with-mutex (*physical-follow-command-lock*)
+    (sb-thread:with-mutex (*reload-run-lock*)
+      (with-live-operation-quiescence
+        (sb-thread:with-mutex (*physical-follow-generation-lock*)
+          (logical-import-commit-test-binding)
+          (logical-import-commit-test-source)))))
+  (assert (and (not *wal-ready*) (null *physical-recovery-state*)
+               (null *physical-receive-store*) (null *catalog*) (null *wal-output-stream*)
+               (null *clog-stream*) (zerop (hash-table-count *wal-replication-slots*))))
+  (format t "~&LOGICAL-IMPORT-COMMITTED-COLD-SOURCE-PASS~%")
+  (finish-output))
+
+(defun logical-import-commit-test-source-fault (mode)
+  (sb-thread:with-mutex (*physical-follow-command-lock*)
+    (sb-thread:with-mutex (*reload-run-lock*)
+      (with-live-operation-quiescence
+        (sb-thread:with-mutex (*physical-follow-generation-lock*)
+          (sb-thread:with-mutex (*physical-restartpoint-start-lock*)
+            (sb-thread:with-mutex (*timeline-history-lock*)
+              (call-with-logical-slot-copy-committed-source
+               (lambda (owner context store certificate plan fact history)
+                 (declare (ignore owner store history))
+                 (ecase mode
+                   (:certificate (incf (getf certificate :child-end)))
+                   (:plan (incf (getf plan :end)))
+                   (:fact (setf (car fact) :mutated))
+                   (:rewrite
+                    (let* ((path (merge-pathnames "logical-slot-copy.import"
+                                                  (physical-image-context-root-path context)))
+                           (bytes (read-bounded-regular-file
+                                   path +logical-slot-copy-import-maximum-bytes+)))
+                      (with-open-file (out path :direction :output :if-exists :supersede
+                                                :element-type '(unsigned-byte 8))
+                        (write-sequence bytes out)
+                        (fsync-stream out)))))))))))))
+  (error "committed source fault was accepted"))
+
+(defun logical-import-commit-test-input-fault (mode)
+  (sb-thread:with-mutex (*physical-follow-command-lock*)
+    (sb-thread:with-mutex (*reload-run-lock*)
+      (with-live-operation-quiescence
+        (sb-thread:with-mutex (*physical-follow-generation-lock*)
+          (sb-thread:with-mutex (*physical-restartpoint-start-lock*)
+            (sb-thread:with-mutex (*timeline-history-lock*)
+              (call-with-logical-slot-copy-committed-input
+               (lambda (owner context certificate evidence descriptor manifest control plan status)
+                 (declare (ignore owner context certificate evidence descriptor control plan status))
+                 (ecase mode
+                   (:case
+                       (let* ((text (getf manifest :cluster-identity))
+                              (position (position-if #'alpha-char-p text))
+                              (character (char text position)))
+                         (setf (char text position)
+                               (if (upper-case-p character)
+                                   (char-downcase character) (char-upcase character)))))
+                   (:number (setf (getf manifest :end) (float (getf manifest :end) 1d0))))))))))))
+  (error "committed input fault was accepted"))
+
+(defun logical-import-commit-test-omit-fact ()
+  (let* ((path (physical-recovery-control-path))
+         (control (physical-recovery-read-control *pgdata*))
+         (compat
+           (apply #'physical-recovery-control-image
+                  (append
+                   (loop for key in '(:phase :system-id :timeline :manifest-digest
+                                      :checkpoint :applied :next-xid)
+                         collect (getf control key))
+                   (loop for key in '(:db-state :state-time :applied-timeline
+                                      :history-target :history-digest :promotion-child
+                                      :promotion-generation :promotion-source-namespace
+                                      :retained-reference :resource-fact :fpw-fact
+                                      :promotion-full-page-writes
+                                      :promotion-logical-decoding-enabled :promotion-wal-level)
+                         when (get-properties control (list key))
+                           append (list key (getf control key)))))))
+    (assert (getf control :logical-fact))
+    (assert (null (getf (physical-recovery-decode-control compat) :logical-fact)))
+    (with-open-file (out path :direction :output :if-exists :supersede
+                              :element-type '(unsigned-byte 8))
+      (write-sequence compat out)
+      (fsync-stream out))
+    (sb-posix:chmod (namestring path) #o600)
+    (delete-file (merge-pathnames "logical-slot-copy.import" *pgdata*))
+    (delete-file (merge-pathnames "logical-slot-copy.evidence" *pgdata*))
+    (sb-thread:with-mutex (*physical-restartpoint-start-lock*)
+      (sb-thread:with-mutex (*timeline-history-lock*)
+        (logical-slot-copy-publish-import-pending)))
+    (format t "~&LOGICAL-IMPORT-COMMITTED-OPTIONAL-C3-PREPARED~%")
+    (finish-output)))
+
 (defun logical-import-commit-test-run ()
   (physical-follow-call-with-controller-blocked
    (lambda ()
@@ -121,6 +255,8 @@
          (sb-thread:with-mutex (*reload-run-lock*)
            (with-live-operation-quiescence
              (with-physical-follow-controller-publication (obsolete)
+               (when *logical-import-commit-test-omit-control-fact*
+                 (logical-import-commit-test-omit-fact))
                (let* ((certificate-path (merge-pathnames "logical-slot-copy.import" *pgdata*))
                       (certificate-bytes (read-bounded-regular-file
                                           certificate-path +logical-slot-copy-import-maximum-bytes+))
@@ -131,6 +267,8 @@
                                                           +physical-recovery-control-maximum-bytes+))
                       (end (logical-slot-copy-import-commit-child-control)))
                  (assert (= end (getf certificate :child-end)))
+                 (logical-import-commit-test-binding)
+                 (logical-import-commit-test-source)
                  (multiple-value-bind (checkpoint durable snapshot child checkpoint-child namespace)
                      (wal-read-control-fields)
                    (assert (= end checkpoint durable))
