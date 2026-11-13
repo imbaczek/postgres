@@ -74,6 +74,14 @@ def cold_matrix(peer, optional):
         finally:
             path.write_bytes(saved)
     cold_probe(peer, prefix + 'healthy-retry', healthy)
+    for mode, expected in (
+            ('mutation', 'logical installation preparation image changed'),
+            ('swallowed', 'logical installation preparation already failed'),
+            ('caught-nonlocal', 'logical installation preparation already failed'),
+            ('nonlocal', 'nonlocal preparation exit fenced'),
+            ('post-proof', 'post-preparation source reproof cut')):
+        cold_probe(peer, prefix + 'preparation-' + mode,
+                   f'(logical-import-commit-test-cold-preparation :{mode})', expected)
 
 
 def run(optional=False):

@@ -20,6 +20,61 @@
    :wal-pieces (list (list 1 0 128 salt 32 128)
                      (list 2 1 96 salt +wal-segment-size+ (+ +wal-segment-size+ 96)))))
 
+(cl-spec:defproperty committed-source-proof-detaches-all-input-images
+    ((generation (range integer 0 340282366920938463463374607431768211455))
+     (salt (range integer 0 2147483647)))
+  (:about logical-slot-copy-committed-proof-image)
+  (:trials (:normal 200))
+  (let* ((evidence (unit-logical-import-evidence 4096 salt))
+         (descriptor (copy-descriptor-test-value generation salt))
+         (value (list :name (copy-seq "Case") :number salt
+                      :bytes (make-array 3 :element-type '(unsigned-byte 8) :initial-element 1)))
+         (prefix (make-array 3 :element-type '(unsigned-byte 8) :initial-element 2))
+         (before (logical-slot-copy-import-state-image value))
+         (evidence-before (logical-slot-copy-import-evidence-encode evidence))
+         (descriptor-before (logical-slot-copy-descriptor-encode descriptor))
+         (proof (logical-slot-copy-committed-proof-image
+                 evidence descriptor value value value value prefix value value value)))
+    (setf (char (getf value :name) 0) #\c
+          (getf value :number) (float salt 1d0)
+          (aref (getf value :bytes) 0) 3
+          (aref prefix 0) 4
+          (aref (getf evidence :manifest) 0) 5
+          (aref (logical-slot-copy-descriptor-base-control descriptor) 0) 6)
+    (and (equalp evidence-before
+                 (logical-slot-copy-import-evidence-encode (logical-slot-copy-committed-proof-evidence proof)))
+         (equalp descriptor-before
+                 (logical-slot-copy-descriptor-encode (logical-slot-copy-committed-proof-descriptor proof)))
+         (= 2 (aref (logical-slot-copy-committed-proof-prefix proof) 0))
+         (every (lambda (image) (logical-slot-copy-committed-image-equal-p before image))
+                (list (logical-slot-copy-committed-proof-manifest proof)
+                      (logical-slot-copy-committed-proof-control proof)
+                      (logical-slot-copy-committed-proof-state proof)
+                      (logical-slot-copy-committed-proof-metadata proof)
+                      (logical-slot-copy-committed-proof-generation proof)
+                      (logical-slot-copy-committed-proof-tuple proof)
+                      (logical-slot-copy-committed-proof-observations proof))))))
+
+(rove:deftest committed-source-detached-proof-generated-contract
+    (let ((data (cl-spec:result-data
+                 (cl-spec:run-property 'committed-source-proof-detaches-all-input-images
+                                       :seed 7526 :profile :normal))))
+      (rove:ok (eq :passed (getf data :status)) (format nil "~s" data))
+      (rove:ok (= 200 (getf data :trials)))))
+
+(rove:deftest installation-preparation-rejects-unregistered-attempts-before-writes
+    (let* ((owner (%make-logical-slot-copy-install-prepare-owner))
+           (attempt (%make-logical-slot-copy-install-preparation :owner owner))
+           (*physical-recovery-failed-p* nil)
+           (called nil))
+      (dolist (candidate (list nil attempt))
+        (rove:ok (handler-case
+                     (progn (logical-slot-copy-install-call-with-write
+                             owner nil candidate (lambda () (setf called t))) nil)
+                   (error () t))))
+      (rove:ok (not called))
+      (rove:ok (not *physical-recovery-failed-p*))))
+
 (cl-spec:defgenerator copy-descriptor-arguments ()
   (list (copy-descriptor-test-value (random (ash 1 128)) (random (ash 1 64)))))
 

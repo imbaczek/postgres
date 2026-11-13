@@ -138,6 +138,89 @@
             (assert (not (search "retired committed owner was accepted"
                                  (princ-to-string condition))))))))))
 
+(defun logical-import-commit-test-preparation-body (mode owner context attempt)
+  (assert (logical-slot-copy-install-prepare-owner-p owner))
+  (assert (logical-slot-copy-committed-proof-p
+           (logical-slot-copy-install-preparation-proof attempt)))
+  (assert (handler-case
+              (progn (logical-slot-copy-install-check-preparation
+                      owner context (%make-logical-slot-copy-install-preparation)) nil)
+            (error () t)))
+  (when (eq mode :mutation)
+    (let ((certificate (logical-slot-copy-install-preparation-certificate attempt)))
+      (incf (getf certificate :child-end))))
+  (cond
+    ((eq mode :swallowed)
+     (handler-case
+         (logical-slot-copy-install-call-with-write
+          owner context attempt (lambda () (error "preparation write cut")))
+       (error () nil)))
+    ((eq mode :caught-nonlocal)
+     (assert (eq :caught
+                 (catch 'preparation-inner
+                   (logical-slot-copy-install-call-with-write
+                    owner context attempt (lambda () (throw 'preparation-inner :caught)))))))
+    (t
+     (assert
+      (equal '(:prepared 42)
+             (multiple-value-list
+              (logical-slot-copy-install-call-with-write
+               owner context attempt
+               (lambda ()
+                 (when (eq mode :nonlocal) (throw 'preparation-exit :unwound))
+                 (values :prepared 42)))))))))
+
+(defun logical-import-commit-test-preparation (&optional mode)
+  (let ((saved-owner nil) (saved-context nil) (saved-attempt nil)
+                          (original (symbol-function 'logical-slot-copy-check-committed-source))
+                          (callback-returned nil) (injected nil))
+    (unwind-protect
+         (progn
+           (when (eq mode :post-proof)
+             (setf (symbol-function 'logical-slot-copy-check-committed-source)
+                   (lambda (&rest arguments)
+                     (when callback-returned
+                       (setf injected t)
+                       (error "post-preparation source reproof cut"))
+                     (apply original arguments))))
+           (handler-case
+               (let ((outcome
+                       (catch 'preparation-exit
+                         (call-with-logical-slot-copy-install-preparation
+                          (lambda (owner context attempt)
+                            (setf saved-owner owner saved-context context saved-attempt attempt)
+                            (prog1 (logical-import-commit-test-preparation-body mode owner context attempt)
+                              (setf callback-returned t)))))))
+                 (when (eq mode :nonlocal)
+                   (assert (eq :unwound outcome))
+                   (assert *physical-recovery-failed-p*)
+                   (error "nonlocal preparation exit fenced"))
+                 (assert (null mode)))
+             (error (condition)
+               (assert (eq (not (null *physical-recovery-failed-p*))
+                           (not (null (member mode '(:swallowed :nonlocal :caught-nonlocal :post-proof))))))
+               (when (eq mode :post-proof) (assert injected))
+               (error condition)))
+           (assert (not (physical-adoption-owner-active-p saved-owner)))
+           (assert (handler-case
+                       (progn (logical-slot-copy-install-check-preparation
+                               saved-owner saved-context saved-attempt) nil)
+                     (error () t)))
+           (format t "~&LOGICAL-INSTALL-PREPARATION-PASS~%")
+           (finish-output))
+      (setf (symbol-function 'logical-slot-copy-check-committed-source) original))))
+
+(defun logical-import-commit-test-cold-preparation (mode)
+  (assert (and (not *wal-ready*) (null *physical-recovery-state*)
+               (null *physical-receive-store*) (null *catalog*) (null *wal-output-stream*)))
+  (sb-thread:with-mutex (*physical-follow-command-lock*)
+    (sb-thread:with-mutex (*reload-run-lock*)
+      (with-live-operation-quiescence
+        (sb-thread:with-mutex (*physical-follow-generation-lock*)
+          (sb-thread:with-mutex (*physical-restartpoint-start-lock*)
+            (sb-thread:with-mutex (*timeline-history-lock*)
+              (logical-import-commit-test-preparation mode))))))))
+
 (defun logical-import-commit-test-source ()
   (sb-thread:with-mutex (*physical-restartpoint-start-lock*)
     (sb-thread:with-mutex (*timeline-history-lock*)
@@ -151,6 +234,7 @@
          (assert (physical-logical-fact-at-p
                   fact (getf certificate :fork) (getf certificate :parent-timeline)))
          (assert history)))
+      (logical-import-commit-test-preparation)
       (format t "~&LOGICAL-IMPORT-COMMITTED-SOURCE-PASS~%")
       (finish-output))))
 

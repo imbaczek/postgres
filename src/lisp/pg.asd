@@ -360,6 +360,7 @@
                    (:file "../replication/logical-slot-copy-committed-input")
                    (:file "../replication/logical-slot-copy-committed-source")
                    (:file "../replication/logical-slot-copy-install-codec")
+                   (:file "../replication/logical-slot-copy-install-owner")
                    (:file "../replication/logical-slot-copy-startup")
                    (:file "postgres")))
      (:file "replication/logical-retention")
