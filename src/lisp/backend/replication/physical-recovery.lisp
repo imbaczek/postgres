@@ -459,10 +459,11 @@ the outer caller must fence it."
           (error "trailing recovery manifest data"))
         manifest))))
 
-(defun recovery-read-manifest (directory)
-  "Check the envelope CRC before safely reading its bounded literal payload."
-  (let* ((bytes (recovery-read-bytes (merge-pathnames "physical-backup.manifest" directory)))
-         (newline (position 10 bytes))
+(defun recovery-decode-manifest (bytes)
+  (unless (and (typep bytes '(vector (unsigned-byte 8)))
+               (<= 1 (length bytes) (* 16 1024 1024)))
+    (error "invalid physical recovery manifest bytes"))
+  (let* ((newline (position 10 bytes))
          (header (and newline (bytes->string bytes :end newline))))
     (unless (and header (= (length header) 26)
                  (uiop:string-prefix-p "PGPHYSICALBACKUP1 " header)
@@ -476,6 +477,11 @@ the outer caller must fence it."
       (values (recovery-parse-manifest-text
                (bytes->string bytes :start text-start :end text-end))
               (physical-store-update-digest #xCBF29CE484222325 bytes)))))
+
+(defun recovery-read-manifest (directory)
+  "Check the envelope CRC before safely reading its bounded literal payload."
+  (recovery-decode-manifest
+   (recovery-read-bytes (merge-pathnames "physical-backup.manifest" directory))))
 
 (defun recovery-history-file-timeline (name)
   "Return the timeline from a canonical child history path, or NIL if it is invalid."
