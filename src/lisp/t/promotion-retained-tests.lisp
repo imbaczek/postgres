@@ -1,5 +1,48 @@
 (in-package #:pg-physical-tests)
 
+(deftest promotion-retained-directory-uses-held-root-without-syncing-proc-ancestors
+    (with-physical-store-directory (root)
+      (let ((fd (pg::physical-backup-open-directory root)))
+        (unwind-protect
+             (let* ((pg::*pgdata* (pg::physical-image-fd-path fd))
+                    (parent (cons root fd))
+                    (path (merge-pathnames "pg_physical_retained/" root)))
+               (ok (not (probe-file path)))
+               (pg::physical-promotion-ensure-retained-directory parent)
+               (let ((inode (sb-posix:stat-ino (sb-posix:stat path))))
+                 (ok (= #o700 (logand #o7777 (sb-posix:stat-mode (sb-posix:stat path)))))
+                 (pg::physical-promotion-ensure-retained-directory parent)
+                 (ok (= inode (sb-posix:stat-ino (sb-posix:stat path)))))
+               (let* ((canonical (pg::physical-retained-root-directory
+                                  (pg::physical-recovery-retained-directory)))
+                      (bytes (make-array 8 :element-type '(unsigned-byte 8) :initial-element 19)))
+                 (ok (equal canonical (truename path)))
+                 (ok (not (search "/proc/self/fd/" (namestring canonical))))
+                 (let ((id (pg::physical-retained-object-publish canonical :extent bytes 16)))
+                   (ok (equalp bytes (pg::physical-retained-object-read canonical :extent id 16))))))
+          (sb-posix:close fd)))))
+
+(deftest promotion-retained-directory-rejects-substitute-root-symlink-and-permissions
+    (with-physical-store-directory (root)
+      (let* ((other (merge-pathnames "other/" root))
+             (target (merge-pathnames "pg_physical_retained" root))
+             (fd (pg::physical-backup-open-directory root)))
+        (ensure-directories-exist (merge-pathnames "dummy" other))
+        (sb-posix:chmod other #o700)
+        (unwind-protect
+             (progn
+               (ok (signals (pg::physical-promotion-ensure-retained-directory (cons other fd)) 'error))
+               (ok (not (probe-file target)))
+               (sb-posix:symlink (namestring other) (namestring target))
+               (ok (signals (pg::physical-promotion-ensure-retained-directory (cons root fd)) 'error))
+               (ok (null (pg::directory-entry-names other)))
+               (sb-posix:unlink target)
+               (ensure-directories-exist (merge-pathnames "pg_physical_retained/dummy" root))
+               (sb-posix:chmod target #o755)
+               (ok (signals (pg::physical-promotion-ensure-retained-directory (cons root fd)) 'error))
+               (ok (= #o755 (logand #o7777 (sb-posix:stat-mode (sb-posix:stat target))))))
+          (sb-posix:close fd)))))
+
 (defun handoff-test-reference ()
   (multiple-value-bind (metadata ignored prefix generation) (pg::physical-restartpoint-read pg::*physical-recovery-state*)
     (declare (ignore ignored generation))

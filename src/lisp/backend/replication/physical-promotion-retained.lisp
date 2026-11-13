@@ -437,7 +437,38 @@ parent's digest.  The caller holds the receive-store mutex."
       (error "promotion parent history differs from receive selection"))
     (values parent text (getf selection :digest))))
 
-(defun physical-promotion-retained-source (state metadata fork store)
+(defun physical-promotion-ensure-retained-directory (&optional parent)
+  (if (null parent)
+      (wal-ensure-directory-durable (physical-recovery-retained-directory))
+      (progn
+        (unless (and (consp parent) (pathnamep (car parent))
+                     (uiop:absolute-pathname-p (car parent))
+                     (uiop:directory-pathname-p (car parent))
+                     (typep (cdr parent) 'fixnum) (not (minusp (cdr parent))))
+          (error "promotion retained directory requires a named root and held descriptor"))
+        (let ((root (cdr parent)) (name "pg_physical_retained") (fd nil))
+          (physical-image-check-target (car parent) root)
+          (when (and (not (zerop (physical-image-mkdirat root name #o700)))
+                     (/= sb-posix:eexist (sb-alien:get-errno)))
+            (error "cannot prepare promotion retained directory"))
+          (sb-sys:without-interrupts
+            (unwind-protect
+                 (progn
+                   (setf fd (physical-image-openat
+                             root name (logior sb-posix:o-rdonly sb-posix:o-directory
+                                               sb-posix:o-nofollow +postmaster-o-cloexec+) 0))
+                   (when (minusp fd) (setf fd nil) (error "cannot open promotion retained directory"))
+                   (physical-image-check-directory fd (sb-posix:stat-dev (sb-posix:fstat root)))
+                   (unless (equal (physical-image-file-facts fd) (physical-image-file-facts root name))
+                     (error "promotion retained directory changed"))
+                   (sb-posix:fsync fd)
+                   (sb-posix:fsync root)
+                   (physical-image-check-target (car parent) root)
+                   (unless (equal (physical-image-file-facts fd) (physical-image-file-facts root name))
+                     (error "promotion retained directory changed after sync")))
+              (when fd (sb-posix:close fd))))))))
+
+(defun physical-promotion-retained-source (state metadata fork store &optional parent)
   "Check receive provenance and prepare any missing base overlap.
 The caller holds the store mutex.  Check identity, archive path, floor and
 digest, full source control and the proven prefix, then restore source ownership.
@@ -445,7 +476,7 @@ If the source root lacks overlap, capture the manifest-bound base WAL prefix;
 missing or corrupt base bytes fail.  At the base, the source root may be absent.  Beyond
 the base, an unrooted source requires reseeding."
   (physical-store-check-retained-identity store)
-  (wal-ensure-directory-durable (physical-recovery-retained-directory))
+  (physical-promotion-ensure-retained-directory parent)
   (let* ((identity (physical-store-retained-identity store))
          (expected (physical-store-control-tuple store))
          (digest (getf metadata :prefix-digest))
@@ -472,7 +503,7 @@ the base, an unrooted source requires reseeding."
                 (multiple-value-bind (overlap bytes) (physical-retained-overlap-capture state *pgdata*)
                   (physical-retained-overlap-encode overlap bytes)))))))
 
-(defun physical-promotion-publish-retained-intent (state metadata fork make-pending)
+(defun physical-promotion-publish-retained-intent (state metadata fork make-pending &optional parent-root)
   "Publish a fork-bounded root and durable pending control under store ownership.
 Hold the receive-store mutex through source validation, overlap capture, history
 projection, control publication, full receive and pending control readback, and
@@ -482,7 +513,8 @@ control write retains its hold; the caller fences recovery on failure."
   (let ((store *physical-receive-store*))
     (with-physical-store (store)
       (multiple-value-bind (identity source-control history overlap-image)
-          (physical-promotion-retained-source state metadata fork store)
+          (apply #'physical-promotion-retained-source state metadata fork store
+                 (when parent-root (list parent-root)))
         (multiple-value-bind (parent text parent-digest)
             (physical-promotion-retained-parent-selection state store)
           (let ((expected nil) (pending nil))
