@@ -336,11 +336,13 @@ A temporary directory need not contain the final state file."
     (slot-state-check-scope)
     (fsync-directory (physical-image-fd-path root-fd))))
 
-(defun slot-state-map (root function &key cleanup parent-fd (stabilize t))
+(defun slot-state-map (root function &key cleanup parent-fd (stabilize t) local-workspace)
   "Call FUNCTION with state bytes and name for each canonical slot.
 With CLEANUP, remove staging directories and state.tmp files in canonical
 directories; use it only at startup with writers quiescent. Without CLEANUP,
 unfinished state is an error."
+  (unless (member local-workspace '(nil t))
+    (error "local slot workspace exemption requires an explicit boolean"))
   (when (and cleanup (not stabilize))
     (error "replication slot cleanup requires stabilization"))
   (call-with-slot-state-root
@@ -348,9 +350,9 @@ unfinished state is an error."
    (lambda (root-fd)
      (when root-fd
        (when stabilize (fsync-directory (physical-image-fd-path root-fd)))
-       (let ((items (mapcar (lambda (entry)
-                              (slot-state-inventory-entry root-fd entry cleanup))
-                            (slot-state-directory-entries root-fd))))
+       (let ((items (loop for entry in (slot-state-directory-entries root-fd)
+                          unless (and local-workspace (equal entry ".logical-slot-copy.work"))
+                            collect (slot-state-inventory-entry root-fd entry cleanup))))
          (dolist (item items)
            (when (third item) (slot-state-remove-staging root-fd item)))
          (loop for item in items

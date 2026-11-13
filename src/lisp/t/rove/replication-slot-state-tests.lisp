@@ -1,5 +1,79 @@
 (in-package #:pg)
 
+(defun call-with-unit-slot-workspace (function)
+  (let* ((base (uiop:ensure-directory-pathname
+                (sb-posix:mkdtemp
+                 (namestring (merge-pathnames "slot-workspace-XXXXXX" (uiop:temporary-directory))))))
+         (root (merge-pathnames "pg_replslot/" base))
+         (bytes (make-array 3 :element-type '(unsigned-byte 8) :initial-contents '(1 2 3)))
+         (fd nil))
+    (unwind-protect
+         (progn
+           (sb-posix:mkdir (namestring root) #o700)
+           (slot-state-create root "kept" bytes)
+           (setf fd (slot-state-open-directory root))
+           (funcall function root fd bytes))
+      (when fd (sb-posix:close fd))
+      (uiop:delete-directory-tree base :validate t :if-does-not-exist :ignore))))
+
+(rove:deftest slot-state-local-workspace-is-opaque-and-default-inventory-remains-strict
+    (call-with-unit-slot-workspace
+     (lambda (root fd bytes)
+       (let ((workspace (merge-pathnames ".logical-slot-copy.work" root)))
+         (dolist (kind '(:directory :regular :symlink :fifo))
+           (unwind-protect
+                (progn
+                  (ecase kind
+                    (:directory
+                     (sb-posix:mkdir (namestring workspace) #o700)
+                     (let* ((directory (uiop:ensure-directory-pathname workspace))
+                            (partial (merge-pathnames "foreign.tmp/" directory)))
+                       (sb-posix:mkdir (namestring partial) #o700)
+                       (with-open-file (out (merge-pathnames "state.tmp" partial) :direction :output)
+                         (write-line "foreign partial state" out))
+                       (sb-posix:mkfifo (namestring (merge-pathnames "never-open" directory)) #o600)))
+                    (:regular (with-open-file (out workspace :direction :output)
+                                (write-line "opaque residue" out)))
+                    (:symlink (sb-posix:symlink "missing-target" (namestring workspace)))
+                    (:fifo (sb-posix:mkfifo (namestring workspace) #o600)))
+                  (let ((before (physical-image-file-facts fd ".logical-slot-copy.work")))
+                    (rove:ok (handler-case
+                                 (progn (slot-state-map root #'list :stabilize nil) nil)
+                               (error () t)))
+                    (rove:ok (equalp (list (list bytes "kept"))
+                                     (slot-state-map root #'list :stabilize nil :local-workspace t)))
+                    (rove:ok (equalp (list (list bytes "kept"))
+                                     (slot-state-map root #'list :cleanup t :local-workspace t)))
+                    (rove:ok (equal before (physical-image-file-facts fd ".logical-slot-copy.work")))
+                    (when (eq kind :directory)
+                      (rove:ok (string= "foreign partial state"
+                                        (with-open-file
+                                            (input (merge-pathnames "foreign.tmp/state.tmp"
+                                                                    (uiop:ensure-directory-pathname workspace)))
+                                          (read-line input)))))))
+             (if (eq kind :directory)
+                 (uiop:delete-directory-tree (uiop:ensure-directory-pathname workspace) :validate t)
+                 (sb-posix:unlink (namestring workspace)))))))))
+
+(rove:deftest slot-state-local-workspace-exemption-does-not-match-other-names
+    (call-with-unit-slot-workspace
+     (lambda (root fd bytes)
+       (declare (ignore fd bytes))
+       (dolist (name '(".logical-slot-copy.work.tmp" ".logical-slot-copy.work_more" "foreign-name"))
+         (let ((path (merge-pathnames name root)))
+           (unwind-protect
+                (progn
+                  (with-open-file (out path :direction :output :if-exists :error)
+                    (write-line "keep me" out))
+                  (rove:ok (handler-case
+                               (progn (slot-state-map root #'list :cleanup t :local-workspace t) nil)
+                             (error () t)))
+                  (rove:ok (string= "keep me" (with-open-file (in path) (read-line in)))))
+             (sb-posix:unlink (namestring path)))))
+       (rove:ok (handler-case
+                    (progn (slot-state-map root #'list :local-workspace :implicit) nil)
+                  (error () t))))))
+
 (rove:deftest canonical-slot-state-observation-does-not-stabilize
     (let* ((base (uiop:ensure-directory-pathname
                   (sb-posix:mkdtemp
