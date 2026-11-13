@@ -12,15 +12,10 @@ succeeds and stopping is cleared."
 The default is NIL, so cold completion retains its strict checks.  This is not
 a configuration setting.")
 
-(declaim (ftype function logical-slot-copy-check-promotion))
+(declaim (ftype function logical-slot-copy-check-promotion logical-slot-copy-import-intent-policy
+                logical-slot-copy-import-intent-parent))
 
-(defun physical-promotion-check-context (phase &key preserve-readers)
-  "Check PHASE and the caller's promotion exclusion.
-
-The caller owns follow-command, reload and quiescence in that order; no worker
-joins occur here.  PRESERVE-READERS permits retained reader transactions; their
-ownership must be checked by the live promotion path."
-  (logical-slot-copy-check-promotion)
+(defun physical-promotion-check-lifecycle-context (phase &key preserve-readers)
   (unless (and (zerop *live-operation-depth*)
                (sb-thread:holding-mutex-p *physical-follow-command-lock*)
                (sb-thread:holding-mutex-p *reload-run-lock*)
@@ -38,6 +33,11 @@ ownership must be checked by the live promotion path."
                (not (shutdown-in-progress-p)) (not *swank-listener-enabled-p*)
                (or preserve-readers (not (physical-recovery-reader-conflict-p))))
     (error "pending promotion requires stopped workers and no open reader transactions")))
+
+(defun physical-promotion-check-context (phase &key preserve-readers)
+  "Check PHASE, the caller's promotion exclusion and the copied-slot fence."
+  (logical-slot-copy-check-promotion)
+  (physical-promotion-check-lifecycle-context phase :preserve-readers preserve-readers))
 
 (defun physical-promotion-check-reader-snapshots (backends parked)
   "Check the exact active snapshot census against transaction, query and parked owners.
@@ -440,51 +440,76 @@ the saved intents rather than capturing them again."
               (getf pending :required-resource-fact) fact)))
     (values bytes pending)))
 
-(defun physical-promotion-publish-intent (&optional requested-child)
-  "Privately bind a chosen child to verified local recovery without granting writer authority.
+(defstruct physical-promotion-intent-publication started-p)
 
-Before publishing intent, check the saved catalog against any live catalog and
-preflight the runtime allocation and retention state. A preflight rejection
-leaves phase 2 unchanged. The caller owns PGDATA and follow-command, reload
-and quiescence in that order; worker shutdown and join occur outside this call.
-After preflight, freeze the namespace floor before publishing pending intent;
-the selected child still forks from the actual replay parent.
-Publish the retained parent prefix and pending control under the receive-store
-mutex.  Install pending runtime state only after control readback and owner
-handoff.  Failure during publication fences recovery.
-A resource pause prevents publishing intent."
+(defun call-with-physical-promotion-intent-publication (function)
+  (let ((publication (make-physical-promotion-intent-publication)) (finished nil))
+    (unwind-protect
+         (let ((pending (funcall function publication)))
+           (unless (and (physical-promotion-intent-publication-started-p publication)
+                        (eql 3 (getf pending :phase)))
+             (error "promotion intent publication did not produce pending state"))
+           (setf *physical-recovery-state* pending)
+           (physical-recovery-control-test-point :after-write +db-in-archive-recovery+)
+           (setf finished t)
+           pending)
+      (when (and (physical-promotion-intent-publication-started-p publication)
+                 (not finished))
+        (setf *physical-recovery-failed-p* t)))))
+
+(defun physical-promotion-publish-intent-core (publication requested-child &optional owner context)
+  (unless (and (physical-promotion-intent-publication-p publication)
+               (not (physical-promotion-intent-publication-started-p publication))
+               (sb-thread:holding-mutex-p *physical-restartpoint-start-lock*)
+               (sb-thread:holding-mutex-p *timeline-history-lock*))
+    (error "promotion intent core requires its owned publication scope"))
+  (let* ((configured (startup-promotion-policy-arguments))
+         (policy (if owner (logical-slot-copy-import-intent-policy owner context configured)
+                     (progn
+                       (when context (error "promotion intent has context without an owner"))
+                       (logical-slot-copy-check-promotion)
+                       configured)))
+         (parent (when owner (logical-slot-copy-import-intent-parent owner context))))
+    (check-physical-resource-promotion)
+    (physical-follow-promotion-cleanup-config)
+    (physical-recovery-publish-selected-history *physical-receive-store*)
+    (let* ((state *physical-recovery-state*)
+           (namespace (physical-promotion-check-base-control state))
+           (floor (physical-promotion-timeline-floor state))
+           (child (physical-promotion-select-child floor)))
+      (when (and requested-child (not (eql requested-child child)))
+        (error "requested promotion child is not the next local timeline"))
+      (multiple-value-bind (metadata catalog prefix generation) (physical-restartpoint-read state)
+        (when (and *catalog* (not (equalp catalog (catalog-image-bytes))))
+          (error "promotion retained catalog differs from its restartpoint"))
+        (multiple-value-bind (fork next) (physical-promotion-check-progress state metadata prefix generation)
+          (apply #'physical-promotion-preflight-runtime
+                 next (getf (getf metadata :source-reservation) :bound) fork
+                 (when parent (list parent)))
+          (when (and owner
+                     (not (equal policy
+                                 (logical-slot-copy-import-intent-policy owner context configured))))
+            (error "logical import promotion policy changed before freeze"))
+          (physical-promotion-freeze-timeline-floor floor)
+          (when owner
+            (physical-promotion-test-point :before-import-intent-final-proof)
+            (unless (equal policy (logical-slot-copy-import-intent-policy owner context configured))
+              (error "logical import promotion policy changed before intent")))
+          (setf (physical-promotion-intent-publication-started-p publication) t)
+          (apply #'physical-promotion-publish-retained-intent
+                 state metadata fork
+                 (lambda (reference)
+                   (apply #'physical-promotion-make-pending
+                          state metadata prefix generation namespace child
+                          (- (get-universal-time) 2208988800) reference policy))
+                 (when parent (list parent))))))))
+
+(defun physical-promotion-publish-intent (&optional requested-child)
+  "Publish checked pending control, then install runtime state after the owned scope returns."
   (with-physical-promotion-exclusion (2)
-    (let ((policy-arguments (startup-promotion-policy-arguments)))
-      (check-physical-resource-promotion)
-      (physical-follow-promotion-cleanup-config)
-      (physical-recovery-publish-selected-history *physical-receive-store*)
-      (let* ((state *physical-recovery-state*)
-             (namespace (physical-promotion-check-base-control state))
-             (floor (physical-promotion-timeline-floor state))
-             (child (physical-promotion-select-child floor)))
-        (when (and requested-child (not (eql requested-child child)))
-          (error "requested promotion child is not the next local timeline"))
-        (multiple-value-bind (metadata catalog prefix generation) (physical-restartpoint-read state)
-          (when (and *catalog* (not (equalp catalog (catalog-image-bytes))))
-            (error "promotion retained catalog differs from its restartpoint"))
-          (multiple-value-bind (fork next) (physical-promotion-check-progress state metadata prefix generation)
-            (physical-promotion-preflight-runtime
-             next (getf (getf metadata :source-reservation) :bound) fork)
-            (physical-promotion-freeze-timeline-floor floor)
-            (let ((time (- (get-universal-time) 2208988800)) (finished nil))
-              (unwind-protect
-                   (let ((pending
-                           (physical-promotion-publish-retained-intent
-                            state metadata fork
-                            (lambda (reference)
-                              (apply #'physical-promotion-make-pending
-                                     state metadata prefix generation namespace child time reference
-                                     policy-arguments)))))
-                     (setf *physical-recovery-state* pending)
-                     (physical-recovery-control-test-point :after-write +db-in-archive-recovery+)
-                     (setf finished t)
-                     pending)
-                (unless finished (setf *physical-recovery-failed-p* t))))))))))
+    (call-with-physical-promotion-intent-publication
+     (lambda (publication)
+       (physical-promotion-publish-intent-core publication requested-child)))))
 
 (defun physical-promotion-open-file (path &optional writable)
   "Open an existing bounded regular inode without following symlinks."

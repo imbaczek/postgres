@@ -11,9 +11,10 @@ OwnedLisp = standby['api']['OwnedLisp']
 lisp_string = standby['lisp_string']
 
 
-def probe(peer, pending=False, disposition='wal-level-insufficient'):
+def probe(peer, pending=False, disposition='wal-level-insufficient', *, intent_failure=False):
     peer.control(f'(load {lisp_string(Path(__file__).with_name("logical-slot-copy-import-input-native.lisp"))})')
     peer.control(f'(setf *logical-import-native-expected-disposition* :{disposition})')
+    peer.control(f'(setf *logical-import-native-intent-failure* {"t" if intent_failure else "nil"})')
     names = '("alpha" "beta")' if disposition == 'eligible' else '("alpha")'
     peer.control(f"(setf *logical-import-native-expected-names* '{names})")
     peer.control('(logical-import-native-start t)' if pending else '(logical-import-native-start)')
@@ -80,10 +81,11 @@ def tree_image(data):
             if p.is_file() and p.name != 'postmaster.pid'}
 
 
-def cold_probe(peer, label, disposition='wal-level-insufficient', *, cut=None, failure=None):
+def cold_probe(peer, label, disposition='wal-level-insufficient', *, cut=None, failure=None,
+               create=False):
     hook = Path(__file__).with_name('logical-slot-copy-import-input-native.lisp')
     operation = (f'(logical-import-native-crash-pending :{cut or "never"})' if cut or failure else
-                 '(logical-import-native-cold-probe)')
+                 f'(logical-import-native-cold-probe {"t" if create else "nil"})')
     form = f'''(let ((*pgdata* (directory-pathname {lisp_string(peer.data)})) (done nil))
       (unwind-protect
            (postmaster-own-data-directory "127.0.0.1" 6543
@@ -153,7 +155,7 @@ def pending_crash_matrix(peer, disposition):
     assert before == tree_image(peer.data), 'crash matrix changed pending source inputs'
 
 
-def run_healthy():
+def run_healthy(*, intent_failure=False):
     started = time.monotonic()
     source = OwnedLisp(parameters=(('wal_level', 'logical'),))
     child = OwnedLisp(parameters=(('wal_level', 'replica'),))
@@ -176,12 +178,22 @@ def run_healthy():
         standby['wait_rows'](child, [['1'], ['2']])
         child.control('(physical-follow-stop)')
         child.control('(physical-recovery-restartpoint)')
-        probe(child, pending=True, disposition='eligible')
-        child.control('''(assert (and (eq :replica (getf *physical-recovery-state* :promotion-wal-level))
-                                      (getf *physical-recovery-state* :promotion-logical-decoding-enabled)))''')
+        probe(child, pending=True, disposition='eligible', intent_failure=intent_failure)
+        if not intent_failure:
+            child.control('''(assert (and (eq :replica (getf *physical-recovery-state* :promotion-wal-level))
+                                          (getf *physical-recovery-state* :promotion-logical-decoding-enabled)))''')
         child.control('(assert (zerop (loop for slot being the hash-values of *wal-replication-slots* count (wal-logical-slot-p slot))))')
         child.stop(immediate=True)
-        pending_crash_matrix(child, 'eligible')
+        if intent_failure:
+            assert 'LOGICAL-IMPORT-INTENT-OWNER-EXIT-FENCED' in (child.root / 'server.log').read_text()
+            before = tree_image(child.data)
+            assert 'logical-slot-copy.import' not in before
+            cold_probe(child, 'intent-owner-exit-create', 'eligible', create=True)
+            after = tree_image(child.data)
+            assert {k: v for k, v in after.items() if k != 'logical-slot-copy.import'} == before
+            print('LOGICAL-IMPORT-INTENT-OWNER-EXIT-COLD-PASS', flush=True)
+        else:
+            pending_crash_matrix(child, 'eligible')
         before = tree_image(child.data)
         cold_probe(child, 'healthy-first', 'eligible')
         assert before == tree_image(child.data), 'healthy cold preparation changed pending inputs'
@@ -196,6 +208,7 @@ def run_healthy():
 def run():
     started = time.monotonic()
     run_healthy()
+    run_healthy(intent_failure=True)
     run_live()
     peer = run_live(pending=True)
     before = tree_image(peer.data)

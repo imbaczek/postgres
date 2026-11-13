@@ -3,6 +3,8 @@
 (defvar *logical-import-native-thread* nil)
 (defvar *logical-import-native-result* nil)
 
+(defvar *logical-import-native-intent-failure* nil)
+
 (defvar *logical-import-native-expected-disposition* :wal-level-insufficient)
 
 (defvar *logical-import-native-expected-names* '("alpha"))
@@ -98,6 +100,9 @@
        (logical-import-native-rejects
         (lambda () (logical-slot-copy-check-import-publication owner context))
         "publication owner")
+       (logical-import-native-rejects
+        (lambda () (logical-slot-copy-import-intent-policy owner context nil))
+        "intent owner")
        (multiple-value-bind (descriptor observations manifest control)
            (logical-slot-copy-check-import-receipt owner context)
          (assert (and descriptor observations manifest (= phase (getf control :phase))
@@ -243,53 +248,55 @@
       (finish-output))))
 
 (defun logical-import-native-make-pending ()
-  ;; This fixture uses the durable intent producer, never the public promotion
-  ;; entry point. The copied-slot fence must remain in place on both sides.
   (logical-import-native-rejects #'logical-slot-copy-check-promotion
                                  "child-owner import before promotion")
-  (let ((policy (startup-promotion-policy-arguments))
+  (let ((state *physical-recovery-state*)
+        (control (read-bounded-regular-file
+                  (physical-recovery-control-path) +physical-recovery-control-maximum-bytes+))
         (base-control (read-bounded-regular-file
                        (merge-pathnames "global/pg_wal_control" *pgdata*)
                        (1+ +wal-control-maximum-bytes+))))
-    (call-with-logical-slot-copy-import-input
-     (lambda (owner context)
-       (let ((source (logical-slot-copy-prepare-import-source owner context)))
-         (when (getf source :eligible-interest)
-           (setf (getf policy :promotion-logical-decoding-enabled) t)))))
-    (check-physical-resource-promotion)
-    (physical-follow-promotion-cleanup-config)
-    (physical-recovery-publish-selected-history *physical-receive-store*)
-    (let* ((state *physical-recovery-state*)
-           (namespace (physical-promotion-check-base-control state))
-           (floor (physical-promotion-timeline-floor state))
-           (child (physical-promotion-select-child floor)))
-      (multiple-value-bind (metadata catalog prefix generation) (physical-restartpoint-read state)
-        (assert (equalp catalog (catalog-image-bytes)))
-        (multiple-value-bind (fork next) (physical-promotion-check-progress state metadata prefix generation)
-          (physical-promotion-preflight-runtime
-           next (getf (getf metadata :source-reservation) :bound) fork)
-          (with-physical-follow-controller-publication (obsolete)
-            (physical-promotion-freeze-timeline-floor floor)
-            (let ((finished nil))
-              (unwind-protect
-                   (progn
-                     (setf *physical-recovery-state*
-                           (physical-promotion-publish-retained-intent
-                            state metadata fork
-                            (lambda (reference)
-                              (apply #'physical-promotion-make-pending
-                                     state metadata prefix generation namespace child
-                                     (- (get-universal-time) 2208988800) reference policy))))
-                     (setf finished t))
-                (unless finished (setf *physical-recovery-failed-p* t))))))))
+    (logical-import-native-rejects #'logical-slot-copy-import-publish-intent
+                                   "generation fence")
+    (with-physical-follow-controller-publication (obsolete)
+      (let ((*max-replication-slots* 0))
+        (logical-import-native-rejects #'logical-slot-copy-import-publish-intent
+                                       "max_replication_slots")))
+    (assert (and (eq state *physical-recovery-state*) (= 2 (getf state :phase))
+                 (not *physical-recovery-failed-p*)))
+    (assert (equalp control (read-bounded-regular-file
+                             (physical-recovery-control-path)
+                             +physical-recovery-control-maximum-bytes+)))
+    (with-physical-follow-controller-publication (obsolete)
+      (if *logical-import-native-intent-failure*
+          (let ((cut nil))
+            (let ((*logical-slot-copy-verification-test-hook*
+                    (lambda (point context)
+                      (declare (ignore context))
+                      (when (eq point :after-import-intent-control)
+                        (setf cut t)
+                        (error "intent owner exit cut")))))
+              (logical-import-native-rejects #'logical-slot-copy-import-publish-intent
+                                             "intent owner exit cut"))
+            (assert (and cut (eq state *physical-recovery-state*) *physical-recovery-failed-p*
+                         (= 2 (getf state :phase))
+                         (= 3 (getf (physical-recovery-read-control *pgdata*) :phase))))
+            (format t "~&LOGICAL-IMPORT-INTENT-OWNER-EXIT-FENCED~%"))
+          (logical-slot-copy-import-publish-intent)))
+    (unless *logical-import-native-intent-failure*
+      (assert (= 3 (getf *physical-recovery-state* :phase)))
+      (logical-import-native-rejects #'logical-slot-copy-import-publish-intent))
     (assert (equalp base-control
                     (read-bounded-regular-file
                      (merge-pathnames "global/pg_wal_control" *pgdata*)
                      (1+ +wal-control-maximum-bytes+)))))
   (logical-import-native-rejects #'logical-slot-copy-check-promotion
                                  "child-owner import before promotion")
-  (logical-import-native-pending-publication)
-  (logical-import-native-live-scope 3))
+  (unless *logical-import-native-intent-failure*
+    (sb-thread:with-mutex (*physical-restartpoint-start-lock*)
+      (sb-thread:with-mutex (*timeline-history-lock*)
+        (logical-import-native-pending-publication)
+        (logical-import-native-live-scope 3)))))
 
 (defun logical-import-native-run-live (&optional pending)
   (physical-follow-call-with-controller-blocked
@@ -308,8 +315,8 @@
                     (with-live-operation-quiescence
                       (sb-thread:with-mutex (*physical-restartpoint-start-lock*)
                         (sb-thread:with-mutex (*timeline-history-lock*)
-                          (logical-import-native-live-scope 2)
-                          (when pending (logical-import-native-make-pending)))))))
+                          (logical-import-native-live-scope 2)))
+                      (when pending (logical-import-native-make-pending)))))
              (unless pending
                (with-live-operation
                  (sb-thread:with-mutex (*physical-restartpoint-start-lock*)
@@ -324,7 +331,15 @@
         (sb-thread:make-thread
          (lambda ()
            (setf *logical-import-native-result*
-                 (handler-case (progn (logical-import-native-run-live pending) (list :passed))
+                 (handler-case
+                     (handler-bind
+                         ((error (lambda (condition)
+                                   (let ((*print-circle* t) (*print-level* 5) (*print-length* 8))
+                                     (format *error-output* "~&IMPORT-INTENT-ERROR ~A~%" condition)
+                                     (sb-debug:print-backtrace :stream *error-output* :count 30)
+                                     (finish-output *error-output*)))))
+                       (logical-import-native-run-live pending)
+                       (list :passed))
                    (error (condition) (list :error (princ-to-string condition))))))
          :name "logical import native input probe"))
   :started)
@@ -345,20 +360,19 @@
               (logical-slot-copy-publish-import-pending)
               (error "pending import SIGKILL cut was not reached"))))))))
 
-(defun logical-import-native-cold-probe ()
+(defun logical-import-native-cold-probe (&optional create)
   (sb-thread:with-mutex (*physical-follow-command-lock*)
     (sb-thread:with-mutex (*reload-run-lock*)
       (with-live-operation-quiescence
         (sb-thread:with-mutex (*physical-restartpoint-start-lock*)
           (sb-thread:with-mutex (*timeline-history-lock*)
-            (let ((bytes (read-bounded-regular-file
-                          (merge-pathnames "logical-slot-copy.import" *pgdata*)
-                          +logical-slot-copy-import-maximum-bytes+)))
-              (assert (equal (logical-slot-copy-import-decode bytes)
-                             (logical-slot-copy-publish-import-pending)))
-              (assert (equalp bytes (read-bounded-regular-file
-                                     (merge-pathnames "logical-slot-copy.import" *pgdata*)
-                                     +logical-slot-copy-import-maximum-bytes+))))
+            (let* ((path (merge-pathnames "logical-slot-copy.import" *pgdata*))
+                   (bytes (if create (progn (assert (not (probe-file path))) nil)
+                              (read-bounded-regular-file path +logical-slot-copy-import-maximum-bytes+)))
+                   (value (logical-slot-copy-publish-import-pending))
+                   (actual (read-bounded-regular-file path +logical-slot-copy-import-maximum-bytes+)))
+              (assert (equal value (logical-slot-copy-import-decode actual)))
+              (when bytes (assert (equalp bytes actual))))
             (let ((escaped nil))
               (call-with-logical-slot-copy-import-input
                (lambda (owner context)

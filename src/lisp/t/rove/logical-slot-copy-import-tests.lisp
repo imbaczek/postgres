@@ -247,3 +247,71 @@
                        (logical-slot-copy-import-new-owner (unit-logical-import-value)) 'error))
              (rove:ok (= 32 calls)))
         (setf (symbol-function 'logical-slot-new-generation) original))))
+
+(cl-spec:defproperty logical-import-interest-preserves-configured-policy
+    ((level (member :replica :logical)) (fpw (member nil t)) (interest (member nil t)))
+  (:about logical-slot-copy-import-add-interest)
+  (:trials (:normal 150))
+  (let* ((policy (list :promotion-full-page-writes fpw
+                       :promotion-logical-decoding-enabled (eq level :logical)
+                       :promotion-wal-level level))
+         (saved (copy-list policy))
+         (result (logical-slot-copy-import-add-interest policy interest)))
+    (and (equal policy saved)
+         (eql fpw (getf result :promotion-full-page-writes))
+         (eq level (getf result :promotion-wal-level))
+         (eql (or (eq level :logical) interest)
+              (getf result :promotion-logical-decoding-enabled)))))
+
+(rove:deftest logical-import-interest-policy-contract
+    (let ((data (cl-spec:result-data
+                 (cl-spec:run-property 'logical-import-interest-preserves-configured-policy
+                                       :profile :normal :seed 7514))))
+      (rove:ok (eq :passed (getf data :status)) (format nil "~S" data))))
+
+(rove:deftest logical-import-interest-keeps-absent-and-known-off-policies
+    (rove:ok (null (logical-slot-copy-import-add-interest nil nil)))
+  (rove:ok (equal '(:promotion-logical-decoding-enabled t)
+                  (logical-slot-copy-import-add-interest nil t)))
+  (let* ((policy (list :promotion-full-page-writes nil
+                       :promotion-logical-decoding-enabled nil :promotion-wal-level :replica))
+         (result (logical-slot-copy-import-add-interest policy nil)))
+    (rove:ok (equal policy result))
+    (rove:ok (not (eq policy result)))
+    (setf (getf result :promotion-logical-decoding-enabled) t)
+    (rove:ok (null (getf policy :promotion-logical-decoding-enabled)))))
+
+(rove:deftest logical-import-intent-runtime-waits-for-owner-exit-and-fences-uncertainty
+    (let* ((before (list :phase 2))
+           (*physical-recovery-state* before)
+           (*physical-recovery-failed-p* nil)
+           (*physical-recovery-control-test-hook* nil))
+      (rove:ok
+       (rove:signals
+        (call-with-physical-promotion-intent-publication
+         (lambda (publication)
+           (declare (ignore publication))
+           (error "preflight rejected")))
+        'error))
+      (rove:ok (and (eq before *physical-recovery-state*) (not *physical-recovery-failed-p*)))
+      (rove:ok
+       (rove:signals
+        (call-with-physical-promotion-intent-publication
+         (lambda (publication)
+           (setf (physical-promotion-intent-publication-started-p publication) t)
+           (unwind-protect (list :phase 3)
+             (assert (eq before *physical-recovery-state*))
+             (error "owned scope final check rejected"))))
+        'error))
+      (rove:ok (and (eq before *physical-recovery-state*) *physical-recovery-failed-p*)))
+  (let* ((before (list :phase 2)) (pending (list :phase 3))
+                                  (*physical-recovery-state* before) (*physical-recovery-failed-p* nil)
+                                  (*physical-recovery-control-test-hook* nil))
+    (rove:ok (eq pending
+                 (call-with-physical-promotion-intent-publication
+                  (lambda (publication)
+                    (assert (eq before *physical-recovery-state*))
+                    (setf (physical-promotion-intent-publication-started-p publication) t)
+                    pending))))
+    (rove:ok (eq pending *physical-recovery-state*))
+    (rove:ok (not *physical-recovery-failed-p*))))
