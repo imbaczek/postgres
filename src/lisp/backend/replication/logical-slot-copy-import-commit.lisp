@@ -1,13 +1,17 @@
+;;; Commit the verified child control under a live import owner.
+;;; Slot activation and writer admission remain separate.
 (in-package #:pg)
 
 (defstruct (logical-slot-copy-import-commit-owner
             (:include logical-slot-copy-import-publication-owner)
             (:constructor %make-logical-slot-copy-import-commit-owner)
-            (:print-function physical-libpq-print-private-object)))
+            (:print-function physical-libpq-print-private-object))
+  "Live commit owner with publication exclusions and generation fencing.")
 
 (defstruct (logical-slot-copy-import-commit-attempt
             (:constructor %make-logical-slot-copy-import-commit-attempt)
             (:print-function physical-libpq-print-private-object))
+  "Saved plan, certificate, evidence facts and receive tuple for rechecking."
   (plan nil :read-only t)
   (certificate nil :read-only t)
   (certificate-facts nil :read-only t)
@@ -22,6 +26,7 @@
   owner)
 
 (defun logical-slot-copy-import-check-committed-files (context attempt &optional (committed t))
+  "Compare exact child WAL inventory and bytes, history and, when committed, control."
   (let* ((plan (logical-slot-copy-import-commit-attempt-plan attempt))
          (child-plan (logical-slot-copy-import-pending-plan-child-plan plan))
          (evidence (logical-slot-copy-import-evidence-decode
@@ -47,6 +52,7 @@
         (error "committed import child WAL differs from its exact plan")))))
 
 (defun logical-slot-copy-import-check-child-file (context name maximum)
+  "Check an existing child artifact is private, bounded and bound to its name."
   (multiple-value-bind (parent leaf) (physical-image-parent context name)
     (call-with-physical-image-input-at
      parent leaf
@@ -60,6 +66,7 @@
      :element-type '(unsigned-byte 8) :if-does-not-exist nil)))
 
 (defun logical-slot-copy-import-check-child-staging (context plan)
+  "Check the staged child history and WAL file ownership."
   (let ((child (getf (logical-slot-copy-import-pending-plan-child-plan plan) :child)))
     (logical-slot-copy-import-check-child-file
      context (concatenate 'string "pg_wal/" (timeline-history-filename child)) (* 16 1024 1024))
@@ -69,6 +76,9 @@
        +wal-segment-size+))))
 
 (defun logical-slot-copy-import-check-child-commit (owner context attempt committed)
+  "Recheck certificate, evidence, receive tuple and child artifacts by proof phase.
+NIL checks pending, :STAGED checks child bytes, :FINAL repeats actual D to F
+source proof before control rename, and T checks committed control and bytes."
   (unless (and (logical-slot-copy-import-commit-owner-p owner)
                (logical-slot-copy-import-commit-attempt-p attempt))
     (error "child commit requires its typed owner and saved attempt"))
@@ -113,10 +123,15 @@
   t)
 
 (defun logical-slot-copy-import-commit-parent (owner context attempt)
+  "Check pending proof and return the caller-held named root and descriptor."
   (logical-slot-copy-import-check-child-commit owner context attempt nil)
   (cons (physical-adoption-owner-directory owner) (physical-image-context-root-fd context)))
 
 (defun logical-slot-copy-import-commit-child-control ()
+  "Commit the planned live child control under the typed owner and generation fence.
+Failure after starting through owner exit fences recovery. Leave interrupted
+control temporaries for reconciliation. This grants no admission and installs
+no PGSLOT7 slots."
   (physical-promotion-check-lifecycle-context
    3 :preserve-readers *physical-promotion-preserve-readers-p*)
   (unless (sb-thread:holding-mutex-p *physical-follow-generation-lock*)

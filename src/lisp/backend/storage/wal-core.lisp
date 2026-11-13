@@ -591,7 +591,8 @@ short check alone cannot do so."
                        :defaults path))))
 
 (defun wal-ensure-directory-durable (directory &optional borrowed-fd)
-  "Create DIRECTORY's path one level at a time and sync each parent entry."
+  "Create DIRECTORY's path and sync each parent entry. A borrowed FD instead
+names an existing context directory; check its binding and sync it in place."
   (when borrowed-fd
     (unless (and (typep borrowed-fd '(integer 0 2147483647))
                  (physical-image-context-p *physical-image-context*)

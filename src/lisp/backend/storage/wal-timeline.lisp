@@ -26,7 +26,8 @@ No canonical child file, history, WAL control or runtime identity is published.
 With PREFIX explicitly supplied, stage those independently authenticated bytes
 instead of reading a parent file; require its exact fork-offset length.
 Native variable-length segments end at the fork offset; unlike C, no zero tail
-is written. At an exact segment boundary no parent file is needed."
+is written. At an exact segment boundary no parent file is needed.
+DIRECTORY-FD, when supplied, is the caller-held WAL directory descriptor."
   (unless (and (typep fork '(unsigned-byte 64))
                (typep source-timeline '(integer 1 4294967295))
                (member namespace '(:legacy :timeline))
@@ -75,7 +76,8 @@ is written. At an exact segment boundary no parent file is needed."
 
 (defun wal-install-timeline-prefix (source-timeline child fork prefix namespace &optional directory-fd)
   "Force-install owned uncommitted bytes; caller proves intent and excludes history.
-The caller fences uncertain publication and must never use this after history."
+The caller fences uncertain publication and must never use this after history.
+DIRECTORY-FD is an optional borrowed WAL directory descriptor."
   (let ((destination (wal-segment-path (floor fork +wal-segment-size+) child :timeline))
         (temporary nil))
     (wal-namespace-file-stat destination t)

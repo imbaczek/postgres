@@ -49,7 +49,8 @@ An absent legacy intent retains the historical level 2 bytes."
       (equalp tail eor))))
 
 (defun physical-promotion-sync-history (state &optional directory-fd)
-  "History inode and directory must be durable even when retry finds matching bytes."
+  "History inode and directory must be durable even when retry finds matching bytes.
+DIRECTORY-FD is an optional caller-held WAL directory descriptor."
   (let ((path (timeline-history-path (getf state :promotion-child) *pgdata*))
         (expected (physical-promotion-history-image state)))
     (unless (wal-namespace-file-stat path t) (timeline-publish-history-bytes path expected :directory-fd directory-fd))

@@ -263,6 +263,8 @@ Parent segments are never selected. Sync the WAL directory after removals."
     (when orphans (fsync-directory (wal-directory)))))
 
 (defun physical-promotion-sync-child-data (&optional context)
+  "Sync child database files and directories before control publication.
+With CONTEXT, use its checked held descriptors for directory sync."
   (smgr-fsync-all)
   (clog-fsync)
   (if context
@@ -283,11 +285,16 @@ Parent segments are never selected. Sync the WAL directory after removals."
         (fsync-directory directory))))
 
 (defun physical-promotion-check-installed-control (parent fd)
+  "Check that the installed control name still binds the held descriptor."
   (unless (equal (physical-image-file-facts fd)
                  (physical-image-file-facts parent "pg_wal_control"))
     (error "child control inode changed after rename")))
 
 (defun physical-promotion-write-child-control-at (context bytes check)
+  "Write and read back a private read-write temporary under the held global FD.
+The caller retains CONTEXT and supplies CHECK for pending, final source and
+committed proof. Rename, then sync the held file and directory. Leave an
+interrupted temporary in place for reconciliation."
   (physical-image-check-children context)
   (let ((parent (cdr (assoc "global" (physical-image-context-children context) :test #'equal)))
         (fd nil) (stream nil))
@@ -337,6 +344,7 @@ Parent segments are never selected. Sync the WAL directory after removals."
         (if stream (close stream) (when fd (sb-posix:close fd)))))))
 
 (defun physical-promotion-child-control-image (plan &optional (time (- (get-universal-time) 2208988800)))
+  "Build child control bytes; private imports supply frozen Unix seconds for TIME."
   (let* ((snapshot (getf plan :snapshot))
          (metadata (make-wal-control-metadata (getf *physical-recovery-state* :system-id)
                                               +db-in-crash-recovery+ time))
@@ -375,6 +383,10 @@ finish; a durable child is not yet a production-ready postmaster."
                 logical-slot-copy-import-check-child-commit))
 
 (defun physical-promotion-publish-child-control-core (&optional owner context attempt)
+  "Publish the checked child plan under promotion exclusion with admission closed.
+An import owner supplies repeated proofs and held directories. Import callers
+bind *PGDATA* to CONTEXT's root and make CONTEXT the current image. Failure after
+publication starts fences recovery; the ordinary path keeps its existing fence."
   (unless (and (sb-thread:holding-mutex-p *physical-follow-command-lock*)
                (sb-thread:holding-mutex-p *reload-run-lock*)
                (sb-thread:holding-mutex-p *physical-restartpoint-start-lock*)

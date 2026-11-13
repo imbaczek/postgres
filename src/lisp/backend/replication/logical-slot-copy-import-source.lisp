@@ -140,7 +140,8 @@ Capture the receive tuple and independent state image for later rechecking."
 
 (defun logical-slot-copy-import-check-progress
     (owner context state metadata prefix generation store)
-  "Check selected progress under the owned root before scanning."
+  "Check selected progress under the owned root.
+In phase 3, also check full checkpoint artifacts before the final source replay."
   (if (= 3 (getf state :phase))
       (physical-promotion-validate-cold-state
        state metadata prefix generation store #'physical-promotion-checkpoint-artifacts
