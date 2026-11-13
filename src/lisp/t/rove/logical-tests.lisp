@@ -185,6 +185,44 @@
          (make-array size :element-type 'character :displaced-to backing
                           :displaced-index-offset 3))))))
 
+(defun unit-sql-literal-reference (value)
+  (if (null value)
+      "NULL"
+      (with-output-to-string (stream)
+        (write-char #\' stream)
+        (loop for character across value
+              do (when (char= character #\') (write-char #\' stream))
+                 (write-char character stream))
+        (write-char #\' stream))))
+
+(cl-spec:defproperty sql-literal-direct-fill-matches-stream
+    ((shape (member :simple :fill-pointer :displaced))
+     (size (range integer 0 8195)) (offset (range integer 0 12)))
+  (:about logical-sql-literal %logical-sql-quote-into)
+  (:trials (:normal 200))
+  (let* ((text (unit-utf8-size-string shape size offset))
+         (before (copy-seq text))
+         (expected (unit-sql-literal-reference text))
+         (actual (logical-sql-literal text)))
+    (and (string= expected actual) (string= before text)
+         (not (eq text actual)))))
+
+(rove:deftest sql-literal-direct-fill-generated-contract
+    (let ((data (cl-spec:result-data
+                 (cl-spec:run-property 'sql-literal-direct-fill-matches-stream
+                                       :seed 7521 :profile :normal))))
+      (rove:ok (eq :passed (getf data :status)) (format nil "~s" data))))
+
+(rove:deftest sql-literal-direct-fill-boundaries
+    (rove:ok (string= "NULL" (logical-sql-literal nil)))
+  (dolist (text (list #() (vector #\a #\' #\λ) "" "'" "''" "a'b" "a\\b" (string (code-char 0))
+                      (make-string 65536 :initial-element #\')
+                      (make-array 8 :element-type 'base-char :initial-element #\'
+                                    :fill-pointer 3 :adjustable t)
+                      (string (code-char #xd800))))
+    (rove:ok (string= (unit-sql-literal-reference text) (logical-sql-literal text))))
+  (rove:ok (handler-case (progn (logical-sql-literal #(1 2)) nil) (type-error () t))))
+
 (cl-spec:defproperty utf8-size-counters-match-encoder
     ((shape (member :simple :fill-pointer :displaced))
      (size (range integer 0 8195)) (offset (range integer 0 12)))

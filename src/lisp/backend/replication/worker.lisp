@@ -129,12 +129,11 @@
 (defun logical-sql-literal (value)
   (if (null value)
       "NULL"
-      (with-output-to-string (stream)
-        (write-char #\' stream)
-        (loop for char across value
-              do (when (char= char #\') (write-char #\' stream))
-                 (write-char char stream))
-        (write-char #\' stream))))
+      (let* ((text (if (stringp value) value (coerce (the vector value) 'string)))
+             (length (length text))
+             (output (make-string (+ length (count #\' text) 2)
+                                  :element-type 'character)))
+        (%logical-sql-quote-into text output))))
 
 (defun logical-progress-table-ddl ()
   (format nil "CREATE TABLE IF NOT EXISTS ~a (source_slot varchar PRIMARY KEY, source_lsn varchar, state varchar NOT NULL, snapshot_token varchar)"

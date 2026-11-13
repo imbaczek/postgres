@@ -17,6 +17,16 @@
               (list (string (code-char #xd800)) 0 1)
               (list (string (code-char #xdfff)) 0 1))))
 
+(setf (gethash '%logical-sql-quote-into *unit-hot-probes*)
+      (loop for value in (list "" "'" "a'b" "a\\b" "🙂λ"
+                               (make-string 4096 :initial-element #\')
+                               (make-array 8 :element-type 'base-char :initial-element #\'
+                                             :fill-pointer 3 :adjustable t)
+                               (make-array 2 :element-type 'character
+                                             :displaced-to "x'λy" :displaced-index-offset 1))
+            collect (list value (make-string (+ 2 (length value) (count #\' value))
+                                             :element-type 'character))))
+
 (defun unit-timeline-lineage-fixture (depth stride finite-head-p)
   (loop for index downfrom (1- depth) to 0
         collect (make-timeline-history-entry

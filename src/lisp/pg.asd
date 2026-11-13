@@ -328,6 +328,7 @@
                    (:file "../replication/physical-reseed-follow-startup-integration")
                    (:file "../replication/physical-promotion-online")
                    (:file "../replication/standard")
+                   (:file "../replication/worker.hot")
                    (:file "../replication/worker")
                    (:file "../replication/standard-subscriber")
                    (:file "extended-query")
