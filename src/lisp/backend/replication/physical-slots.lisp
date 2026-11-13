@@ -6,8 +6,8 @@
 
 (defun physical-slot-state-valid-p (slot)
   "Check physical kind and durable field shape, including the paired nullable
-restart LSN and timeline. Logical provenance, confirmed timeline and cause
-must be NIL. A null restart or lost slot does not retain WAL."
+restart LSN and timeline. Logical provenance, child owner, confirmed timeline
+and cause must be NIL. A null restart or lost slot does not retain WAL."
   (let ((restart (wal-replication-slot-restart-lsn slot))
         (timeline (wal-replication-slot-restart-timeline slot)))
     (and (eq :physical (wal-replication-slot-kind slot))

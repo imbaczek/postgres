@@ -131,7 +131,8 @@ This does not prove history, slot lifetime or import authority."
 
 (defun logical-slot-check-update-under-lock (slot candidate)
   "Check CANDIDATE against the exact live registry SLOT under the WAL lock.
-Require the same provenance object, identity fields and transport profile.
+Require the same provenance object, child owner, identity fields and
+transport profile.
 Confirmed progress cannot move backward. Once a terminal cause is set, its
 cause and durable progress positions cannot change."
   (assert (sb-thread:holding-mutex-p *wal-lock*))
@@ -443,7 +444,7 @@ may belong to a child timeline while confirmed belongs to its parent."
               (and (null restart-timeline) (null confirmed-timeline)))))))
 
 (defun logical-slot-state-required-p (slot)
-  "Use PGSLOT6 for provenance or a cause the older images cannot represent."
+  "Use PGSLOT6/7 when older images cannot store provenance, owner or cause."
   (or (wal-replication-slot-child-owner slot)
       (wal-replication-slot-logical-provenance slot)
       (eq :wal-level-insufficient (logical-slot-effective-invalidation-cause slot))))
@@ -548,9 +549,11 @@ Require all seven fields to be absent together when provenance is unknown."
        (logical-slot-state-parse-integer (nth 14 fields) t))))
 
 (defun logical-slot-state-decode (bytes expected-name)
-  "Decode a canonical PGSLOT6 image without granting runtime authority.
+  "Decode a canonical PGSLOT6/7 image without granting runtime authority.
 The detached image retains full unsigned 64-bit positions, including positions
-ahead of local WAL. Admission requires separate identity and history checks."
+ahead of local WAL. A child-owner token grants no admission; ordinary startup
+is fenced pending certificate reconciliation. Admission requires separate
+identity and history checks."
   (let* ((fields (logical-slot-state-read-fields bytes expected-name))
          (birth (logical-slot-state-parse-integer (nth 4 fields)))
          (cause (logical-slot-parse-cause (nth 15 fields)))
