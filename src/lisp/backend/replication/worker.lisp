@@ -128,7 +128,11 @@
 
 (defun logical-sql-literal (value)
   "Return NULL for NIL, or quote a string or coerced character vector.
-Double apostrophes and preserve backslashes for standard-conforming strings."
+The input must remain stable while it is counted and copied.  The result for
+non-NIL input is fresh: a simple base string for base strings, or a simple
+character string otherwise.  Displaced strings and fill pointers are handled
+using their active length.  Apostrophes are doubled and backslashes are copied
+unchanged for standard-conforming strings."
   (if (null value)
       "NULL"
       (let* ((text (if (stringp value) value (coerce (the vector value) 'string)))
