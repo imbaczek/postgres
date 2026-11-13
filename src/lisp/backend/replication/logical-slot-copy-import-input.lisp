@@ -69,6 +69,7 @@ Construction captures the live recovery state and store, or NIL in cold mode."
             (list "logical-slot-copy.base-verified"))))
 
 (defun call-with-logical-slot-copy-import-input-kind (constructor function)
+  "Run an owned import input scope using CONSTRUCTOR's role-specific owner."
   (logical-slot-copy-check-import-locks)
   (let ((mode (if *wal-ready* :live :cold))
         (state *physical-recovery-state*)

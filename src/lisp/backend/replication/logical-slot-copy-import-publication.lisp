@@ -4,6 +4,7 @@
             (:include logical-slot-copy-import-owner)
             (:constructor %make-logical-slot-copy-import-publication-owner)
             (:print-function physical-libpq-print-private-object))
+  "Typed phase 3 publication owner, subject to the base import exclusions."
   pending-fd
   (pending-name "logical-slot-copy.import.tmp"))
 
@@ -69,6 +70,7 @@
       (error "pending import certificate changed during publication"))))
 
 (defun logical-slot-copy-import-sync-pending (owner context attempt store tuple bytes)
+  "Recheck and sync the named certificate and root, then read back its bytes."
   (let ((root (physical-image-context-root-fd context)))
     (logical-slot-copy-import-check-publication-plan owner context attempt store tuple)
     (logical-slot-copy-import-check-certificate-bytes context bytes)
@@ -96,6 +98,9 @@
     bytes))
 
 (defun logical-slot-copy-import-write-pending (owner context attempt store tuple existing)
+  "Publish through a fixed temporary file, file fsync and NOREPLACE rename.
+Sync and read back the named file and root. A stale temporary is quarantined;
+a retry after rename reuses the stable certificate and its owner."
   (let* ((bytes (logical-slot-copy-import-image
                  (logical-slot-copy-import-pending-plan-value attempt)))
          (root (physical-image-context-root-fd context))
@@ -140,6 +145,8 @@
           (setf (logical-slot-copy-import-publication-owner-pending-fd owner) nil))))))
 
 (defun logical-slot-copy-publish-import-pending ()
+  "Verify actual source proof and publish only a pending import certificate.
+This zero-argument entry grants no admission and writes no PGSLOT7 or child WAL."
   (call-with-logical-slot-copy-import-input-kind
    #'%make-logical-slot-copy-import-publication-owner
    (lambda (owner context)

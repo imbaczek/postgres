@@ -3,6 +3,7 @@
 (defstruct (logical-slot-copy-import-pending-plan
             (:constructor %make-logical-slot-copy-import-pending-plan)
             (:print-function physical-libpq-print-private-object))
+  "Opaque facts for a pending attempt; possession does not grant authority."
   (value nil :read-only t) (state nil :read-only t) (state-image nil :read-only t)
   (metadata nil :read-only t) (prefix nil :read-only t) (generation nil :read-only t)
   (control nil :read-only t) (child-plan nil :read-only t)
@@ -18,6 +19,7 @@
         (timeline-history-bytes target))))
 
 (defun logical-slot-copy-import-child-plan-digest (state plan)
+  "Digest the deterministic child checkpoint plan and its frame contents."
   (logical-slot-copy-import-digest
    (string->bytes
     (physical-bootstrap-manifest-text
@@ -29,6 +31,7 @@
                                        (logical-slot-copy-import-digest bytes))))))))
 
 (defun logical-slot-copy-import-check-capacity (owner context source)
+  "Reject excess slots, deferred rows and collisions with local physical names."
   (let* ((slots (physical-promotion-read-physical-slots
                  :parent (cons (physical-adoption-owner-directory owner)
                                (physical-image-context-root-fd context))))
@@ -43,6 +46,7 @@
     t))
 
 (defun logical-slot-copy-import-excluded-owners (source)
+  "Collect copied identities that a new or retried child owner must not equal."
   (let ((excluded (list (logical-slot-parse-generation (getf source :copy-id)))))
     (dolist (row (getf source :slots) excluded)
       (let ((slot (logical-slot-state-decode (string->bytes (fourth row)) (first row))))
@@ -51,6 +55,7 @@
           (push (wal-replication-slot-child-owner slot) excluded))))))
 
 (defun logical-slot-copy-import-new-owner (source)
+  "Mint a child owner distinct from the verified source identities."
   (let ((excluded (logical-slot-copy-import-excluded-owners source)))
     (loop repeat 32 for owner = (logical-slot-new-generation)
           unless (member owner excluded :test #'eql)
@@ -87,6 +92,7 @@
                              disposition)))))
 
 (defun logical-slot-copy-import-check-new-child (state)
+  "Reject child WAL or history before a fresh pending certificate exists."
   (let ((prefix (format nil "~8,'0X" (getf state :promotion-child))))
     (when (some (lambda (name) (and (>= (length name) 8)
                                     (string= prefix name :end2 8)))
@@ -95,6 +101,9 @@
       (error "child WAL or history exists without a pending import certificate"))))
 
 (defun logical-slot-copy-import-build-pending (owner context existing)
+  "Build source-bound pending facts and a deterministic child plan.
+On retry, reuse the certificate owner only after checking source exclusions and
+requiring the reconstructed value to match."
   (multiple-value-bind (descriptor observations manifest control)
       (logical-slot-copy-check-import-receipt owner context)
     (declare (ignore manifest))
@@ -131,6 +140,7 @@
            :descriptor descriptor :observations observations :selected-history selected))))))
 
 (defun logical-slot-copy-import-check-pending-plan (owner context attempt)
+  "Recheck the source and selected plan before publication."
   (logical-slot-copy-check-input owner context)
   (let* ((state (logical-slot-copy-import-pending-plan-state attempt))
          (observations (logical-slot-copy-import-pending-plan-observations attempt))
