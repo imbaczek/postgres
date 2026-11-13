@@ -1,3 +1,11 @@
+;;; Pure install journal format: pending certificate, evidence digest, stage ID,
+;;; inode triples and ordered slot rows. It grants no ownership, write authority
+;;; or admission. File permissions and source proof require separate checks.
+;;;
+;;; Mount IDs record historical group consistency only; they are not stable
+;;; across remount or reboot. A filesystem reconciler must rebind current owned
+;;; FD paths, device and inode identities, and current mount topology rather
+;;; than compare old mount IDs as durable identity.
 (in-package #:pg)
 
 (defconstant +logical-slot-copy-install-maximum-bytes+
@@ -5,9 +13,11 @@
      (* +logical-slot-copy-descriptor-maximum-slots+ 115)))
 
 (defun logical-slot-copy-install-identity-keys ()
+  "Return the ordered inode identity fields in the journal."
   '(:container :slot-root :slot-work :slot-container :journal :pending-file :active-file))
 
 (defun logical-slot-copy-install-check-identity (identity)
+  "Check the shape of a recorded device, inode and mount ID triple."
   (unless (and (= 3 (logical-slot-copy-descriptor-list-count identity 3))
                (every (lambda (number) (typep number '(unsigned-byte 64))) identity)
                (plusp (second identity)) (plusp (third identity)))
@@ -15,6 +25,8 @@
   identity)
 
 (defun logical-slot-copy-install-active-image (certificate)
+  "Encode the pending certificate with only its phase changed to active.
+The active validator rejects deferred rows."
   (unless (eq :pending (getf certificate :phase))
     (error "logical slot installation requires its original pending certificate"))
   (let ((active (copy-list certificate)))
@@ -22,6 +34,9 @@
     (logical-slot-copy-import-image active)))
 
 (defun logical-slot-copy-install-parts (value)
+  "Check journal fields, ordered slot rows and historical identity groups.
+The PGDATA journal/certificate group and slot staging group may be on separate
+filesystems. The journal's own inode can be recorded before its contents."
   (unless (and (= 22 (logical-slot-copy-descriptor-list-count value 22))
                (equal (loop for key in value by #'cddr collect key)
                       '(:certificate :evidence-digest :stage-id :container :slot-root :slot-work
@@ -79,6 +94,7 @@
     (values certificate size)))
 
 (defun logical-slot-copy-install-encode (value)
+  "Encode a bounded canonical journal with a CRC trailer."
   (multiple-value-bind (certificate size) (logical-slot-copy-install-parts value)
     (declare (ignore certificate))
     (let ((bytes (make-array size :element-type '(unsigned-byte 8) :initial-element 0))
@@ -107,6 +123,7 @@
       bytes)))
 
 (defun logical-slot-copy-install-decode (bytes)
+  "Decode bounded fields and CRC, then require a canonical re-encoding."
   (unless (and (typep bytes '(vector (unsigned-byte 8)))
                (<= 240 (length bytes) +logical-slot-copy-install-maximum-bytes+)
                (equalp (subseq bytes 0 16) #(80 71 76 79 71 83 76 79 84 73 78 83 84 65 76 49))
