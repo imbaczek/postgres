@@ -350,7 +350,10 @@ Each read writes and hashes the same bytes.  A requested prefix must be complete
     (list relative length digest)))
 
 (defun physical-bootstrap-manifest-text (manifest)
-  "Print portable literal strings rather than SBCL's readable BASE-CHAR #A arrays."
+  "Print stable eligible literal trees directly, producing an owned string.
+Standard I/O syntax with readably NIL avoids SBCL's readable BASE-CHAR #A arrays.
+Ineligible trees use the historical copier fallback; depth or cycle rejection
+only declines the fast path and does not add a new cycle error."
   (when (%metadata-literal-tree-p manifest 0)
     (return-from physical-bootstrap-manifest-text
       (with-standard-io-syntax
