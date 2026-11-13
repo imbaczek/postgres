@@ -1,9 +1,16 @@
+;;; D is the copied base checkpoint end; C3 is saved phase 3 recovery control.
+;;; CF is committed child global control, R the selected restartpoint, and F
+;;; the promotion fork.
+
+;;; Bind preserved input to committed child control under read ownership.
 (in-package #:pg)
 
 (defstruct (logical-slot-copy-committed-owner
             (:include physical-adoption-owner)
             (:constructor %make-logical-slot-copy-committed-owner)
             (:print-function physical-libpq-print-private-object))
+  "Sibling read owner with held root, quiescence and generation exclusion.
+Live mode captures the caller\'s pending state and receive store; cold mode captures NIL."
   (ownership nil :read-only t)
   (mode nil :read-only t)
   (state nil :read-only t)
@@ -45,6 +52,7 @@
           collect name))
 
 (defun logical-slot-copy-committed-observations (owner context manifest descriptor)
+  "Observe immutable base files and sidecar pieces under the held input root."
   (logical-slot-copy-check-input owner context)
   (logical-slot-copy-input-sidecar-inventory context descriptor)
   (let ((observations nil) (index (make-hash-table :test #'equal)))
@@ -62,6 +70,8 @@
     (logical-slot-copy-observe-pieces context descriptor observations index)))
 
 (defun logical-slot-copy-read-committed-binding (owner context proof-bytes)
+  "Bind the preserved C3 control and evidence to exact child control CF.
+The D receipt alone grants no authority after CF; recheck private observations."
   (unless (logical-slot-copy-committed-owner-p owner)
     (error "committed import binding requires its sibling input owner"))
   (logical-slot-copy-check-input owner context)
@@ -130,6 +140,8 @@
                 (values certificate evidence descriptor manifest control plan status observations)))))))))
 
 (defun logical-slot-copy-committed-image-equal-p (left right)
+  "Compare finite input image trees, including vectors and timeline entries.
+String case and scalar types must match exactly."
   (cond
     ((eql left right) t)
     ((stringp left) (and (stringp right) (string= left right)))
@@ -152,12 +164,16 @@
 
 (defun logical-slot-copy-committed-input-image
     (certificate evidence descriptor manifest control plan)
+  "Build independent encoded and typed images for callback mutation checks."
   (list (logical-slot-copy-import-image certificate)
         (logical-slot-copy-import-evidence-encode evidence)
         (logical-slot-copy-descriptor-encode descriptor)
         (logical-slot-copy-import-state-image (list manifest control plan))))
 
 (defun call-with-logical-slot-copy-committed-input (function)
+  "Call FUNCTION under the sibling read owner, then recheck input images and files.
+Cold mode requires unopened globals; live mode borrows the caller's store.
+This scope grants no installation or admission."
   (logical-slot-copy-check-import-locks)
   (let ((mode (if *wal-ready* :live :cold))
         (state *physical-recovery-state*)

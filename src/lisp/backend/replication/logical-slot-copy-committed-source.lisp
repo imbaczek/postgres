@@ -1,6 +1,8 @@
+;;; Verify actual retained source and child artifacts without installing them.
 (in-package #:pg)
 
 (defun call-with-logical-slot-copy-committed-store (owner state function)
+  "Borrow the live store or open and close a cold pending store for this scope."
   (unless (logical-slot-copy-committed-owner-p owner)
     (error "committed receive input requires its sibling owner"))
   (if (eq :live (logical-slot-copy-committed-owner-mode owner))
@@ -14,6 +16,7 @@
           (when store (physical-store-close store))))))
 
 (defun logical-slot-copy-committed-state (manifest control descriptor)
+  "Reconstruct pending state from the bound base and C3, reading actual R."
   (unless (and (eql 4 (getf control :control-version)) (eql 3 (getf control :phase)))
     (error "committed source reconstruction requires preserved v4 phase 3"))
   (let* ((fields (logical-slot-copy-control-fields
@@ -31,6 +34,7 @@
     (physical-promotion-reconstruct-pending-state manifest control snapshot namespace)))
 
 (defun logical-slot-copy-check-committed-progress (state metadata prefix generation store)
+  "Check the actual selected restartpoint and its base fork inventory."
   (let ((*physical-recovery-state* state) (*physical-receive-store* store)
                                           (*last-replay-lsn* (getf state :applied)) (*next-xid* (getf state :next-xid))
                                           (*wal-segment-namespace* (getf state :wal-namespace))
@@ -41,6 +45,7 @@
      (list :files (getf metadata :forks)) (make-hash-table :test #'eql))))
 
 (defun logical-slot-copy-check-committed-child (context evidence plan prefix control)
+  "Check the complete child WAL inventory, history and control against exact bytes."
   (let* ((files (physical-promotion-checkpoint-files plan prefix))
          (child (getf plan :child))
          (*physical-recovery-state* control)
@@ -67,6 +72,7 @@
 
 (defun logical-slot-copy-recheck-committed-state
     (manifest control descriptor state metadata prefix generation)
+  "Re-read R and compare independent state, metadata, prefix and generation."
   (multiple-value-bind (actual-state actual-metadata actual-prefix actual-generation)
       (logical-slot-copy-committed-state manifest control descriptor)
     (unless (logical-slot-copy-committed-image-equal-p (logical-slot-copy-import-state-image
@@ -77,6 +83,9 @@
 
 (defun logical-slot-copy-check-committed-source
     (context certificate evidence descriptor manifest control plan state metadata prefix generation store)
+  "Check actual R, its prefix and the canonical child plan and history. Replay
+from D through clean F to resolve an absent C3 logical fact before classifying
+slots and checking complete child files. Recheck source observations."
   (logical-slot-copy-check-committed-progress state metadata prefix generation store)
   (unless (and (equalp (getf evidence :selected-history)
                        (logical-slot-copy-import-selected-history state))
@@ -106,6 +115,10 @@
         (values fact history tuple child-observations)))))
 
 (defun call-with-logical-slot-copy-committed-source (function)
+  "Verify actual source and child bytes, then call FUNCTION under read ownership.
+Protect the C3 retained root before taking the reader lease and recheck after
+callback. An installer must establish its own checks and fence before writing;
+this scope grants neither installation nor admission."
   (call-with-logical-slot-copy-committed-input
    (lambda (owner context certificate evidence descriptor manifest control plan status)
      (declare (ignore status))
