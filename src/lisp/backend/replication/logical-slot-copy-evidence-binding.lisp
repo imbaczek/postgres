@@ -35,8 +35,10 @@ The selected tip may be newer than the applied parent."
     selected))
 
 (defun logical-slot-copy-evidence-check-rows (certificate descriptor control history)
-  "Rebuild child PGSLOT7 images from supplied descriptor slots and frozen status.
-Use the shared child-image guard to check owner and terminal cause."
+  "Rebuild child PGSLOT7 images from descriptor slots, checking identity, history,
+owner and first terminal cause. Return :CONTROL-FACT-CHECKED when C3 supplies
+a logical fact, or :REQUIRES-SOURCE-REPLAY when it does not. Without that fact,
+the recorded disposition does not prove source logical status."
   (let ((sources (logical-slot-copy-descriptor-slots descriptor))
         (owner (logical-slot-parse-generation (getf certificate :owner)))
         (fact (getf control :logical-fact)))
@@ -70,7 +72,10 @@ Use the shared child-image guard to check owner and terminal cause."
 
 (defun logical-slot-copy-import-evidence-check-certificate (evidence certificate descriptor proof-bytes)
   "Check evidence against the certificate, descriptor and base proof without I/O.
-This observational binding does not grant owner authority or replace D to F replay."
+Return manifest, control, plan and the row check marker as the fourth value.
+A :REQUIRES-SOURCE-REPLAY marker requires actual D to F replay before activation.
+This observational binding grants no authority or admission. The pending
+publisher already prepares actual source evidence."
   (logical-slot-copy-import-check certificate)
   (logical-slot-copy-import-evidence-parts evidence)
   (multiple-value-bind (manifest digest) (recovery-decode-manifest (getf evidence :manifest))
