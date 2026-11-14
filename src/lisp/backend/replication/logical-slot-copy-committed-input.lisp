@@ -71,9 +71,14 @@ Live mode captures the caller\'s pending state and receive store; cold mode capt
 
 (defun logical-slot-copy-read-preserved-inputs (owner context proof-bytes certificate control-phase)
   "Check preserved inputs against the caller-bound original pending certificate.
-This does not observe the canonical import file or grant authority.  A caller
-using a journal must first prove its exact certificate pair.  The caller must
-recheck the returned input observations across its callback."
+CONTROL-PHASE selects exact parent control from the descriptor or exact child
+control from the evidence-checked plan.  Both require the same receipt, evidence,
+fences and input observations.  Parent control still requires the control
+temporary to be reconciled first.
+
+This read grants no authority and does not observe the canonical import file.
+The caller must bind the original pending certificate first; a journal caller
+must prove its exact certificate pair.  Recheck observations across the callback."
   (unless (member control-phase '(:parent :child))
     (error "unknown preserved import control phase"))
   (unless (logical-slot-copy-committed-owner-p owner)
@@ -145,10 +150,9 @@ recheck the returned input observations across its callback."
               (values certificate evidence descriptor manifest control plan status observations))))))))
 
 (defun logical-slot-copy-read-committed-inputs (owner context proof-bytes certificate)
-  "Check preserved inputs against the caller-bound original pending certificate.
-This does not observe the canonical import file or grant authority. A caller
-using a journal must first prove its exact certificate pair. The caller must
-recheck the returned input observations across its callback."
+  "Check preserved inputs against the exact committed child control.
+The caller must first bind the original pending certificate and recheck the
+returned observations across its callback.  This read grants no authority."
   (logical-slot-copy-read-preserved-inputs owner context proof-bytes certificate :child))
 
 (defun logical-slot-copy-read-committed-binding (owner context proof-bytes)
