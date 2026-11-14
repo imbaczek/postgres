@@ -13,6 +13,7 @@
                (:file "t/rove/promotion-directory-tests")
                (:file "t/rove/staging-observer-tests")
                (:file "t/rove/cold-wal-scratch-tests")
+               (:file "t/rove/cold-wal-ledger-tests")
                (:file "t/rove/logical-slot-provenance-tests")
                (:file "t/rove/logical-slot-copy-import-tests")
                (:file "t/rove/logical-slot-copy-evidence-tests")

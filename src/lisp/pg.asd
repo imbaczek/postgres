@@ -387,6 +387,8 @@
                    (:file "../replication/logical-slot-copy-catalog-write")
                    (:file "../replication/logical-slot-copy-catalog-restore")
                    (:file "../replication/logical-slot-copy-cold-wal-scratch")
+                   (:file "../replication/logical-slot-copy-cold-wal-ledger")
+                   (:file "../replication/logical-slot-copy-cold-wal-events")
                    (:file "../replication/logical-slot-copy-startup")
                    (:file "postgres")))
      (:file "replication/logical-retention")
