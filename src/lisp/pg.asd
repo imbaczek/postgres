@@ -363,6 +363,7 @@
                    (:file "../replication/logical-slot-copy-install-owner")
                    (:file "../replication/logical-slot-copy-install-fs")
                    (:file "../replication/logical-slot-copy-install-stage")
+                   (:file "../replication/logical-slot-copy-install-handoff")
                    (:file "../replication/logical-slot-copy-startup")
                    (:file "postgres")))
      (:file "replication/logical-retention")

@@ -84,7 +84,7 @@ def cold_matrix(peer, optional):
                    f'(logical-import-commit-test-cold-preparation :{mode})', expected)
 
 
-def run(optional=False):
+def run(optional=False, *, before_stop=None):
     started = time.monotonic()
     source = OwnedLisp(parameters=(('wal_level', 'logical'),))
     child = OwnedLisp(parameters=(('wal_level', 'replica'),))
@@ -127,6 +127,8 @@ def run(optional=False):
         assert 'LOGICAL-IMPORT-COMMITTED-SOURCE-PASS' in log
         if optional:
             assert 'LOGICAL-IMPORT-COMMITTED-OPTIONAL-C3-PREPARED' in log
+        if before_stop is not None:
+            before_stop(child, source)
         child.stop(immediate=True)
         source.stop(immediate=True)
         cold_matrix(child, optional)

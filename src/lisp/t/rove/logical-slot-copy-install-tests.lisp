@@ -1,5 +1,35 @@
 (in-package #:pg)
 
+(cl-spec:defproperty installation-handoffs-reject-unregistered-objects
+    ((word (range integer 0 18446744073709551615)))
+  (:about logical-slot-copy-install-handoff-image logical-slot-copy-install-consume-handoff)
+  (:trials (:normal 200))
+  (let* ((operation (%make-logical-slot-copy-install-operation
+                     :device word :inode word :lock-device word :lock-inode word
+                     :active-p t :thread sb-thread:*current-thread*))
+         (handoff (%make-logical-slot-copy-install-handoff :operation operation)))
+    (every (lambda (function)
+             (handler-case (progn (funcall function operation handoff) nil)
+               (error (condition) (search "scope ended" (princ-to-string condition)))))
+           (list #'logical-slot-copy-install-handoff-image
+                 #'logical-slot-copy-install-consume-handoff))))
+
+(rove:deftest installation-handoffs-generated-registry-contract
+    (let ((data (cl-spec:result-data
+                 (cl-spec:run-property 'installation-handoffs-reject-unregistered-objects
+                                       :seed 7529 :profile :normal))))
+      (rove:ok (eq :passed (getf data :status)) (format nil "~s" data))))
+
+(rove:deftest installation-handoff-reentry-is-rejected-before-locks
+    (let ((*logical-slot-copy-install-operations* (list :occupied)) (called nil))
+      (dolist (function (list #'call-with-logical-slot-copy-install-handoff
+                              #'call-with-logical-slot-copy-install-operation-under-locks))
+        (rove:ok (handler-case
+                     (progn (funcall function (lambda (&rest values)
+                                                (declare (ignore values)) (setf called t))) nil)
+                   (error (condition) (search "already active" (princ-to-string condition))))))
+      (rove:ok (not called))))
+
 (cl-spec:defproperty staged-node-images-do-not-alias-node-metadata
     ((number (range integer 0 18446744073709551615)))
   (:about logical-slot-copy-install-stage-node-image)
