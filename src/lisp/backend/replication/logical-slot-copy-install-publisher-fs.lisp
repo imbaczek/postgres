@@ -1,6 +1,9 @@
 (in-package #:pg)
 
+;;; Hold and check publication descriptors until the scoped ledger is drained.
 (defun logical-slot-copy-install-publisher-open (publisher parent name kind &key missing)
+  "Open a child under a held parent and register its descriptor before checks.
+Require the current root mount group and retain file facts for rechecking."
   (declare (notinline physical-image-openat sb-posix:close))
   (logical-slot-copy-install-check-publisher publisher)
   (unless (and (or (eq parent (logical-slot-copy-install-publisher-root publisher))
@@ -39,6 +42,7 @@
         (when (and fd (not registered)) (sb-posix:close fd))))))
 
 (defun logical-slot-copy-install-publisher-sync (publisher node point)
+  "Sync a registered inode and recheck publication bindings."
   (declare (notinline sb-posix:fsync))
   (logical-slot-copy-install-check-publisher publisher)
   (unless (or (eq node (logical-slot-copy-install-publisher-root publisher))
@@ -55,6 +59,7 @@
     (format nil "~{~a~^/~}" parts)))
 
 (defun logical-slot-copy-install-publisher-observations (publisher)
+  "Capture root-relative paths and inode facts before closing descriptors."
   (logical-slot-copy-install-check-publisher publisher)
   (mapcar (lambda (node)
             (list (logical-slot-copy-install-publisher-path node)
@@ -62,6 +67,7 @@
           (logical-slot-copy-install-publisher-nodes publisher)))
 
 (defun logical-slot-copy-install-publisher-check-closed (publisher observations phase prefix)
+  "Recheck the input, phase, prefix, and path bindings after descriptor cleanup."
   (let ((root (logical-slot-copy-install-publisher-root publisher)))
     (logical-slot-copy-install-check-input
      (logical-slot-copy-install-publisher-owner publisher)
@@ -78,6 +84,10 @@
         (error "logical installation publication changed after descriptor cleanup")))))
 
 (defun call-with-logical-slot-copy-install-publisher (owner context input function)
+  "Call FUNCTION with scoped publication authority backed by the retained input proof.
+Drain every owned descriptor with interrupts masked, then recheck its path facts.
+Preserve an original error if close also fails.  Failure, including a caught
+check failure or cleanup failure, revokes the input and fences the operation."
   (declare (notinline sb-posix:close))
   (let ((record (logical-slot-copy-install-input-record owner context input)))
     (when *logical-slot-copy-install-publishers*

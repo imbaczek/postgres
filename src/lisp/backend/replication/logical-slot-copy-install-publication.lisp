@@ -1,6 +1,9 @@
 (in-package #:pg)
 
+;;; Publish the journal container or resync its existing fixed form.
+;;; This does not install slot rows or activate the registry.
 (defun logical-slot-copy-install-publisher-check-phase (publisher phase prefix)
+  "Reprove the input and require the exact expected phase and prefix."
   (logical-slot-copy-install-publisher-proof publisher)
   (let ((record (logical-slot-copy-install-publisher-record publisher)))
     (unless (and (eq phase (logical-slot-copy-install-input-state-phase record))
@@ -9,6 +12,7 @@
   (logical-slot-copy-install-check-publisher publisher))
 
 (defun logical-slot-copy-install-publisher-bind (publisher)
+  "Bind the selected private or fixed container and its journal files."
   (let* ((record (logical-slot-copy-install-publisher-record publisher))
          (value (logical-slot-copy-install-decode (logical-slot-copy-install-publisher-image publisher)))
          (root (logical-slot-copy-install-publisher-root publisher))
@@ -35,6 +39,7 @@
     (logical-slot-copy-install-publisher-check-phase publisher phase prefix)))
 
 (defun logical-slot-copy-install-publisher-rebind (publisher)
+  "Bind the held container and children to their fixed names after rename."
   (let* ((old (logical-slot-copy-install-publisher-container publisher))
          (new (%make-logical-slot-copy-install-node
                :fd (logical-slot-copy-install-node-fd old)
@@ -61,6 +66,9 @@
                   :key #'logical-slot-copy-install-node-name :test #'equal)))))
 
 (defun logical-slot-copy-install-publisher-rename (publisher)
+  "Publish the fresh container exclusively using its original handoff.
+No read-only inspection may span the rename.  Consume the registered handoff
+immediately before NOREPLACE, then rebind held identities to the new path."
   (declare (notinline physical-adoption-renameat2))
   (let* ((record (logical-slot-copy-install-publisher-record publisher))
          (operation (logical-slot-copy-install-publisher-operation publisher))
@@ -85,6 +93,7 @@
     (logical-slot-copy-install-publisher-point publisher :after-journal-rename)))
 
 (defun logical-slot-copy-install-publisher-sync-journal (publisher)
+  "Sync journal, active file, container, source parent when present, and root."
   (logical-slot-copy-install-publisher-sync
    publisher (logical-slot-copy-install-publisher-journal publisher) :after-journal-file-sync)
   (logical-slot-copy-install-publisher-sync
@@ -98,6 +107,10 @@
    publisher (logical-slot-copy-install-publisher-root publisher) :after-journal-target-parent-sync))
 
 (defun logical-slot-copy-install-publish-journal (owner context input)
+  "Publish a fresh journal or resync a fixed one under a proved input.
+Cold resync preserves its validated pending prefix from zero through N, or
+active phase with prefix N.  It certifies journal and container durability,
+not moved-row durability, registry activation, or admission."
   (call-with-logical-slot-copy-install-publisher
    owner context input
    (lambda (publisher)
@@ -115,7 +128,9 @@
        phase))))
 
 (defun logical-slot-copy-install-publish-fresh-journal ()
+  "Prove a fresh handoff and publish its journal."
   (call-with-logical-slot-copy-install-fresh-input #'logical-slot-copy-install-publish-journal))
 
 (defun logical-slot-copy-install-resync-fixed-journal ()
+  "Reprove and resync an existing fixed journal during cold startup."
   (call-with-logical-slot-copy-install-cold-input #'logical-slot-copy-install-publish-journal))

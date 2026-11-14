@@ -1,8 +1,11 @@
 (in-package #:pg)
 
+;;; Publication has typed, scoped authority over a retained input proof.
+;;; A failed check revokes that authority even if the error is caught.
 (defstruct (logical-slot-copy-install-publisher
             (:constructor %make-logical-slot-copy-install-publisher)
             (:print-function physical-libpq-print-private-object))
+  "Scoped publication authority tied to a proved input and held root."
   (owner nil :read-only t) (context nil :read-only t) (input nil :read-only t)
   (record nil :read-only t) (operation nil :read-only t) (image nil :read-only t)
   (root nil :read-only t) nodes descriptors files work container journal active phase failed)
@@ -11,6 +14,7 @@
 (defvar *logical-slot-copy-install-publication-test-hook* nil)
 
 (defun logical-slot-copy-install-publisher-registration (publisher)
+  "Require the exact registered publisher and an active scope."
   (unless (and (logical-slot-copy-install-publisher-p publisher)
                (member publisher *logical-slot-copy-install-publishers* :test #'eq))
     (error "logical installation requires its registered publisher"))
@@ -19,10 +23,12 @@
   publisher)
 
 (defun logical-slot-copy-install-revoke-publisher (publisher)
+  "Fail the publisher and revoke its input and outer operation."
   (setf (logical-slot-copy-install-publisher-failed publisher) t)
   (logical-slot-copy-install-revoke-input (logical-slot-copy-install-publisher-record publisher)))
 
 (defun logical-slot-copy-install-check-publisher (publisher)
+  "Recheck the input seal and held inode bindings; revoke on failure."
   (logical-slot-copy-install-publisher-registration publisher)
   (let ((completed nil))
     (unwind-protect
@@ -58,6 +64,7 @@
   (logical-slot-copy-install-check-publisher publisher))
 
 (defun logical-slot-copy-install-publisher-proof (publisher)
+  "Recheck the retained input proof and publisher bindings."
   (logical-slot-copy-install-check-publisher publisher)
   (logical-slot-copy-install-check-input
    (logical-slot-copy-install-publisher-owner publisher)
