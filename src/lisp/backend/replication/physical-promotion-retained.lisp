@@ -39,12 +39,13 @@
     (timeline-check-lineage projected)
     (values parent fork projected)))
 
-(defun physical-promotion-check-retained-reference (system-id reference parent history &key end digest on-record)
+(defun physical-promotion-check-retained-reference
+    (system-id reference parent history &key end digest on-record
+                                          (directory (physical-recovery-retained-directory)) (reader #'physical-retained-object-read))
   "Validate the root, ancestry, base overlap and extent coverage without mutation."
   (handler-case
       (let* ((identity (physical-promotion-retained-identity system-id reference))
-             (fork (getf reference :end)) (base (getf reference :base))
-             (directory (physical-recovery-retained-directory)))
+             (fork (getf reference :end)) (base (getf reference :base)))
         (unless (and (eql parent (timeline-history-entry-timeline (first history)))
                      (or (null end) (= end fork))
                      (or (null digest) (= digest (getf reference :end-digest)))
@@ -53,7 +54,7 @@
                          (= parent (timeline-at-point (1- fork) history))))
           (error "reference differs from its parent or applied endpoint"))
         (let ((index (physical-retained-inventory-read-index
-                      directory (getf reference :root-id) identity history)))
+                      directory (getf reference :root-id) identity history reader)))
           (unless (and (eql parent (getf index :history-target))
                        (= (length history) (length (physical-retained-inventory-check index)))
                        (getf index :base-overlap))
@@ -62,7 +63,7 @@
            (%make-physical-store :base-lsn base :floor-lsn fork :floor-digest (getf reference :end-digest))
            (getf index :entries))
           (physical-retained-inventory-load directory (getf reference :root-id) identity history
-                                            :on-record on-record)))
+                                            :on-record on-record :reader reader)))
     (pg-error (condition) (error condition))
     (error (condition) (error "invalid retained promotion archive: ~a" condition))))
 
@@ -172,13 +173,14 @@ Return the complete control tuple for the subsequent retirement check."
            (error "retained promotion archive pending control has not been retired"))
          nil)))))
 
-(defun physical-follow-retained-segment (reference identity history segment)
+(defun physical-follow-retained-segment
+    (reference identity history segment &optional
+                                          (directory (physical-recovery-retained-directory)) (reader #'physical-retained-object-read))
   "Read SEGMENT from the selected source root and verify its inventory.
 The base overlap supplies physical prefix bytes, not logical coverage before
 base. In the base segment, compare the extent prefix with the immutable overlap."
-  (let* ((directory (physical-recovery-retained-directory))
-         (index (physical-retained-inventory-read-index
-                 directory (getf reference :root-id) identity history))
+  (let* ((index (physical-retained-inventory-read-index
+                 directory (getf reference :root-id) identity history reader))
          (entries (getf index :entries))
          (entry (find segment entries :from-end t
                                       :key (lambda (item) (getf (third item) :segment))))
@@ -196,16 +198,16 @@ base. In the base segment, compare the extent prefix with the immutable overlap.
     (multiple-value-bind (metadata bytes)
         (if entry
             (physical-retained-extent-decode
-             (physical-retained-object-read directory :extent (first entry)
-                                            +physical-retained-image-limit+))
+             (funcall reader directory :extent (first entry)
+                      +physical-retained-image-limit+))
             (if (= segment base-segment)
-                (values-list (physical-retained-inventory-read-overlap directory index))
+                (values-list (physical-retained-inventory-read-overlap directory index reader))
                 (error "historical source segment is outside retained coverage")))
       (when (and entry (not (equal metadata (third entry))))
         (error "historical source extent differs from selected inventory"))
       (when (= segment base-segment)
         (multiple-value-bind (ignored prefix)
-            (values-list (physical-retained-inventory-read-overlap directory index))
+            (values-list (physical-retained-inventory-read-overlap directory index reader))
           (declare (ignore ignored))
           (unless (and (<= (length prefix) (length bytes))
                        (equalp prefix (subseq bytes 0 (length prefix))))

@@ -83,13 +83,14 @@ syncs them; a collision is an error and leaves the existing file intact."
       (error "retained base overlap has foreign identity")))
   entry)
 
-(defun physical-retained-inventory-read-overlap (directory payload)
+(defun physical-retained-inventory-read-overlap
+    (directory payload &optional (reader #'physical-retained-object-read))
   "Read and validate the overlap named by an inventory, if present."
   (let ((entry (getf payload :base-overlap)))
     (when entry
       (physical-retained-inventory-check-overlap entry (getf payload :identity))
-      (let ((image (physical-retained-object-read directory :overlap (first entry)
-                                                  +physical-retained-image-limit+)))
+      (let ((image (funcall reader directory :overlap (first entry)
+                            +physical-retained-image-limit+)))
         (unless (= (length image) (second entry))
           (error "retained base overlap reference length differs"))
         (multiple-value-bind (metadata bytes) (physical-retained-overlap-decode image)
@@ -213,12 +214,13 @@ The CRC detects accidental corruption; it does not authenticate the payload."
       (physical-retained-inventory-check payload)
       payload)))
 
-(defun physical-retained-inventory-read-index (directory id identity history)
+(defun physical-retained-inventory-read-index
+    (directory id identity history &optional (reader #'physical-retained-object-read))
   "Read exactly ID and check identity and lineage, without opening extent files."
   (physical-follow-check-plist identity '(:system-id :base-timeline :base :manifest-digest))
   (timeline-check-lineage history)
   (let ((payload (physical-retained-inventory-decode
-                  (physical-retained-object-read directory :inventory id +physical-retained-inventory-limit+))))
+                  (funcall reader directory :inventory id +physical-retained-inventory-limit+))))
     (unless (and (every (lambda (key) (eql (getf identity key) (getf (getf payload :identity) key)))
                         '(:system-id :base-timeline :base :manifest-digest))
                  (physical-store-history-extends-p (physical-retained-inventory-check payload) history))
@@ -257,17 +259,18 @@ proof, logical coverage and source authority."
             (setf prefix bytes)))))
     (values t prefix)))
 
-(defun physical-retained-inventory-load (directory id identity history &key on-record)
+(defun physical-retained-inventory-load
+    (directory id identity history &key on-record (reader #'physical-retained-object-read))
   "Read an inventory and validate all referenced extents sequentially.
 
 ON-RECORD receives each validated record and its original bytes, including records
 past any endpoint of interest to the caller. Return the freshly decoded payload."
-  (let ((payload (physical-retained-inventory-read-index directory id identity history)))
+  (let ((payload (physical-retained-inventory-read-index directory id identity history reader)))
     (physical-retained-inventory-verify-entries
      (getf payload :entries) history
      (lambda (image-id)
-       (physical-retained-object-read directory :extent image-id +physical-retained-image-limit+))
-     (physical-retained-inventory-read-overlap directory payload) on-record)
+       (funcall reader directory :extent image-id +physical-retained-image-limit+))
+     (physical-retained-inventory-read-overlap directory payload reader) on-record)
     payload))
 
 (defun physical-retained-inventory-keep-entries (entries ids)

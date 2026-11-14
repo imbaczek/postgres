@@ -1718,6 +1718,45 @@
                                     (merge-pathnames "physical-backup.manifest" root))) name))))
                (delete-file path))))))))
 
+(deftest retained-promotion-readers-use-supplied-object-loader
+    (handoff-test-committed
+     (lambda (root store reference)
+       (declare (ignore root store))
+       (let* ((directory (pg::physical-recovery-retained-directory))
+              (descriptor (pg::physical-backup-open-directory directory))
+              (anchored (pg::physical-image-fd-path descriptor))
+              (system-id (getf pg::*physical-recovery-state* :system-id))
+              (identity (pg::physical-promotion-retained-identity system-id reference))
+              (history (pg::timeline-parse-history 1 ""))
+              (original (symbol-function 'pg::physical-retained-object-read))
+              (kinds nil))
+         (unwind-protect
+              (flet ((read-object (input kind id maximum)
+                       (ok (equal input anchored))
+                       (push kind kinds)
+                       (funcall original input kind id maximum)))
+                (unwind-protect
+                     (progn
+                       (setf (symbol-function 'pg::physical-retained-object-read)
+                             (lambda (&rest arguments)
+                               (declare (ignore arguments))
+                               (error "retained reader escaped its supplied object loader")))
+                       (ok (pg::physical-promotion-check-retained-reference
+                            system-id reference 1 history :directory anchored :reader #'read-object))
+                       (ok (every (lambda (kind) (member kind kinds))
+                                  '(:inventory :extent :overlap)))
+                       (setf kinds nil)
+                       (ok (plusp
+                            (length
+                             (pg::physical-follow-retained-segment
+                              reference identity history
+                              (floor (1- (getf reference :base)) pg::+wal-segment-size+)
+                              anchored #'read-object))))
+                       (ok (member :inventory kinds))
+                       (ok (member :overlap kinds)))
+                  (setf (symbol-function 'pg::physical-retained-object-read) original)))
+           (sb-posix:close descriptor))))))
+
 (deftest committed-archive-cannot-retire-rootless-pending-control
     (handoff-test-committed
      (lambda (root store reference)
