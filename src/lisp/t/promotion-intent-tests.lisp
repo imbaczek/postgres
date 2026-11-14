@@ -183,8 +183,10 @@
        (pg::smgr-close-all)
        (pg::postmaster-remove-pid-file))))
 
+(defvar *promotion-test-plain-cache* nil)
+
 (defun run-promotion-handoff-child (root driver boundary kind &key (form-builder #'promotion-handoff-child-form) cache)
-  (let* ((cache (or cache (merge-pathnames "cache/" driver)))
+  (let* ((cache (or *promotion-test-plain-cache* cache (merge-pathnames "cache/" driver)))
          (marker (merge-pathnames "result" driver))
          (log (merge-pathnames "child.log" driver))
          (directories
