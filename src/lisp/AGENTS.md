@@ -47,6 +47,8 @@ launcher is `./pg-lisp.sh`.
 Run `./t/compile.sh` for a forced ASDF compile with compiler warnings treated
 as errors. It uses `sbcl` from `PATH` by default and honors `SBCL` overrides.
 `./t/format.sh` uses Emacs + SLIME and the same inferior Lisp by default.
+Pass only `.lisp` and `.asd` paths to it. It treats every input as Lisp; filter
+mixed source-file lists before invoking it.
 
 ## Work the Lisp way: reload, don't restart
 

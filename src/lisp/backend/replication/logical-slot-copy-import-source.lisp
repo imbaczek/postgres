@@ -167,6 +167,8 @@ In phase 3, also check full checkpoint artifacts before the final source replay.
 
 (defun logical-slot-copy-read-import-source
     (owner context store descriptor observations manifest control state metadata prefix generation)
+  "Scan the retained source once and return detached classifications at F.
+Recheck the selected plan, receive tuple, input observations, and sidecars."
   (multiple-value-bind (fact history tuple state-image)
       (logical-slot-copy-import-scan store state manifest descriptor control)
     (let* ((fork (getf control :applied))
@@ -210,10 +212,11 @@ In phase 3, also check full checkpoint artifacts before the final source replay.
           (error "logical import input bytes changed during source preparation")))
       (logical-slot-copy-input-sidecar-inventory context descriptor)
       (logical-slot-copy-check-input owner context)
-      value))
-  )
+      value)))
 
 (defun call-with-logical-slot-copy-import-source-state (owner context function)
+  "Bind the checked receipt and selected progress to a store and receive-root lease.
+Call FUNCTION while that store and lease remain held."
   (multiple-value-bind (descriptor observations manifest control)
       (logical-slot-copy-check-import-receipt owner context)
     (let ((*pgdata* (physical-image-context-root-path context))
