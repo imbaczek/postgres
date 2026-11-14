@@ -22,6 +22,8 @@
     copy-id))
 
 (defun call-with-logical-slot-copy-target-descriptors (owner function)
+  ;; The image scope owns a duplicate root and its children.  Sync those
+  ;; directories after the target callback while ownership is still held.
   (call-with-physical-directory-root
    owner
    (lambda (borrowed-fd root)

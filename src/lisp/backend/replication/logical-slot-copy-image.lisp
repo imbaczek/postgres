@@ -30,6 +30,7 @@
 
 (defun logical-slot-copy-open-sidecar (owner context)
   (logical-slot-copy-check-target owner context)
+  ;; Transfer the new sidecar descriptor only after its directory checks.
   (let* ((name "logical_slot_wal")
          (root (physical-image-context-root-fd context))
          (fd nil))

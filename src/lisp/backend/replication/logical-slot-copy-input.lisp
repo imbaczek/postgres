@@ -13,6 +13,7 @@
 
 (defun logical-slot-copy-open-input-sidecar (owner context)
   (logical-slot-copy-check-input owner context)
+  ;; Retain local cleanup until the checked sidecar transfer succeeds.
   (when (assoc "logical_slot_wal" (physical-image-context-children context) :test #'equal)
     (error "logical copy input sidecar is already open"))
   (let ((fd nil) (root (physical-image-context-root-fd context)))

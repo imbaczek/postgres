@@ -1,6 +1,7 @@
 (in-package #:pg)
 
 (defun logical-slot-copy-catalog-open-restartpoints (context)
+  ;; Keep local cleanup until the restartpoint directory transfer succeeds.
   (declare (notinline physical-image-openat sb-posix:close))
   (physical-image-check-context context)
   (let ((root (physical-image-context-root-fd context)) (fd nil))

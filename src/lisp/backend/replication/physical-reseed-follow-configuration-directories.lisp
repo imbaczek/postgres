@@ -53,6 +53,8 @@
 ;; context.  Close only those duplicates when the callback exits.
 (defun call-with-physical-reseed-follow-held-base-directory
     (root-fd base-fd global-fd wal-fd function parent-check)
+  ;; Duplicate the held children before transfer; check each against its
+  ;; borrowed descriptor and name while the parent ownership remains held.
   (call-with-physical-image-owned-context
    root-fd t
    (lambda (context)

@@ -133,6 +133,8 @@
 
 (defun call-with-logical-slot-copy-source-directory (gate-owner ownership function &key prepare-pins)
   (check-primary-storage-startup-context gate-owner ownership)
+  ;; The read context owns the pin directory after registration; this scope
+  ;; retains and closes the root descriptor borrowed by that context.
   (let ((fd nil))
     (sb-sys:without-interrupts
       (unwind-protect

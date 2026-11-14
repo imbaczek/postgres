@@ -44,6 +44,8 @@
                 (sb-sys:sap-ref-64 sap #x90)))))))
 
 (defstruct (physical-image-context (:constructor %make-physical-image-context))
+  ;; ROOT-PATH is a pathname for the duplicated root descriptor.  CHILDREN
+  ;; exposes observations; the owner keeps separate conses and name copies.
   root-fd root-path children (owner sb-thread:*current-thread*) (active t))
 
 ;; This subtype marks an existing image scope as read-only for these image APIs;
@@ -60,6 +62,9 @@
 (defvar *physical-image-owners* nil)
 
 (defun physical-image-drain-descriptors (children root)
+  ;; Pop before close and unwind through the remaining descriptors.  Ordinary
+  ;; close errors are collected; a nonlocal exit from close can replace a
+  ;; pending exit, but the remaining descriptors are still drained.
   (declare (notinline sb-posix:close))
   (let ((failure nil))
     (labels ((close-one (fd)
@@ -77,6 +82,9 @@
       failure)))
 
 (defun call-with-physical-image-owned-context (borrowed-fd read-only function)
+  ;; Duplicate the borrowed root and bind a private owner to this exact context.
+  ;; On exit drain its descriptors once.  Report the first ordinary close error
+  ;; only after a normal body return; preserve ordinary body errors and throws.
   (let ((context (if read-only (%make-physical-image-read-context) (%make-physical-image-context)))
         (root nil) (path nil) (children nil) (active t) (complete nil))
     (labels ((check ()
@@ -121,11 +129,15 @@
             (when (and complete failure) (error failure))))))))
 
 (defun physical-image-register-child (context name fd)
+  ;; Transfer a newly opened or duplicated owned FD.  Keep the caller's cleanup
+  ;; fallback until this returns.  This checks the binding, not the provenance
+  ;; of an arbitrary FD, and cannot prevent an explicit close or reuse by caller.
   (physical-image-check-context context)
   (sb-sys:without-interrupts
     (funcall (cdr (assoc context *physical-image-owners* :test #'eq)) :register name fd)))
 
 (defun physical-image-check-context (context)
+  ;; Reject copied or expired contexts, changed inventories, and wrong-thread use.
   (unless (and (physical-image-context-active context)
                (eq sb-thread:*current-thread* (physical-image-context-owner context)))
     (error "physical image descriptor scope is not active in this thread"))
@@ -229,6 +241,7 @@
 ;; scopes open existing children.  Cleanup closes only descriptors owned here.
 
 (defun call-with-physical-image-directory (borrowed-fd function read-only)
+  ;; Writable receive scopes sync their owned children and root after the body.
   (call-with-physical-image-owned-context
    borrowed-fd read-only
    (lambda (context)
