@@ -110,6 +110,100 @@
                  (progn (logical-slot-copy-install-layout-prefix '("a") cycle nil) nil)
                (error () t)))))
 
+(cl-spec:defproperty installation-inputs-reject-unregistered-proofs
+    ((word (range integer 0 18446744073709551615)))
+  (:about logical-slot-copy-install-check-input physical-adoption-check-owner-role)
+  (:trials (:normal 200))
+  (let* ((operation (%make-logical-slot-copy-install-operation))
+         (owner (%make-logical-slot-copy-install-input-owner
+                 :operation operation :device word :inode word :active-p t))
+         (input (%make-logical-slot-copy-install-input :owner owner)))
+    (and (handler-case (progn (logical-slot-copy-install-check-input owner nil input) nil)
+           (error (condition) (search "registered" (princ-to-string condition))))
+         (handler-case (progn (physical-adoption-check-owner-role owner) nil)
+           (error (condition) (search "registered" (princ-to-string condition)))))))
+
+(rove:deftest installation-input-registration-generated-contract
+    (let ((data (cl-spec:result-data
+                 (cl-spec:run-property 'installation-inputs-reject-unregistered-proofs
+                                       :seed 7531 :profile :normal))))
+      (rove:ok (eq :passed (getf data :status)) (format nil "~s" data))
+      (rove:ok (= 200 (getf data :trials)))))
+
+(rove:deftest installation-input-reentry-is-rejected-before-lifecycle-locks
+    (let ((*logical-slot-copy-install-inputs* (list :occupied)) (called nil))
+      (dolist (function (list #'call-with-logical-slot-copy-install-fresh-input
+                              #'call-with-logical-slot-copy-install-cold-input))
+        (rove:ok (handler-case
+                     (progn (funcall function (lambda (&rest values)
+                                                (declare (ignore values)) (setf called t))) nil)
+                   (error (condition) (search "already active" (princ-to-string condition))))))
+      (rove:ok (not called))))
+
+(cl-spec:defproperty installation-physical-registry-keeps-the-live-object
+    ((word (range integer 1 4294967295)))
+  (:about logical-slot-copy-install-physical-registry)
+  (:trials (:normal 200))
+  (let* ((disk (make-wal-replication-slot
+                :name "physical" :kind :physical :system-id word :plugin nil
+                :consistent-lsn nil :confirmed-flush-lsn nil :inactive-since 0))
+         (before (physical-slot-encode disk))
+         (live (copy-wal-replication-slot disk))
+         (*wal-replication-slots* (make-hash-table :test #'equal)))
+    (setf (wal-replication-slot-inactive-since live) word
+          (gethash "physical" *wal-replication-slots*) live)
+    (and (eq live (first (logical-slot-copy-install-physical-registry :live (list disk) '("logical"))))
+         (equalp before (physical-slot-encode disk)))))
+
+(rove:deftest installation-physical-registry-generated-contract
+    (let ((data (cl-spec:result-data
+                 (cl-spec:run-property 'installation-physical-registry-keeps-the-live-object
+                                       :seed 7532 :profile :normal))))
+      (rove:ok (eq :passed (getf data :status)) (format nil "~s" data))
+      (rove:ok (= 200 (getf data :trials)))))
+
+(rove:deftest installation-physical-registry-rejects-cold-temporaries-and-grafts
+    (let* ((disk (make-wal-replication-slot
+                  :name "physical" :kind :physical :system-id 1 :plugin nil
+                  :consistent-lsn nil :confirmed-flush-lsn nil))
+           (*wal-replication-slots* (make-hash-table :test #'equal)))
+      (setf (wal-replication-slot-temporary-p disk) t)
+      (rove:ok (handler-case
+                   (progn (logical-slot-copy-install-physical-registry :cold (list disk) nil) nil)
+                 (error (condition) (search "temporary" (princ-to-string condition)))))
+      (setf (wal-replication-slot-temporary-p disk) nil
+            (gethash "physical" *wal-replication-slots*) disk)
+      (rove:ok (handler-case
+                   (progn (logical-slot-copy-install-physical-registry :cold (list disk) nil) nil)
+                 (error (condition) (search "unopened" (princ-to-string condition)))))
+      (rove:ok (handler-case
+                   (progn (logical-slot-copy-install-physical-registry :live (list disk) '("physical")) nil)
+                 (error (condition) (search "logical" (princ-to-string condition)))))
+      (setf (gethash "physical" *wal-replication-slots*) (copy-wal-replication-slot disk)
+            (wal-replication-slot-system-id (gethash "physical" *wal-replication-slots*)) 2)
+      (rove:ok (handler-case
+                   (progn (logical-slot-copy-install-physical-registry :live (list disk) nil) nil)
+                 (error (condition) (search "registry" (princ-to-string condition)))))))
+
+(rove:deftest installation-input-lifecycle-rejects-a-substituted-held-mutex
+    (let* ((operation (%make-logical-slot-copy-install-operation
+                       :active-p t :thread sb-thread:*current-thread*))
+           (record (%make-logical-slot-copy-install-operation-state
+                    :operation operation :thread sb-thread:*current-thread* :mode :live))
+           (*logical-slot-copy-install-operations* (list record))
+           (*physical-follow-controller-blocked-p* t)
+           (*physical-follow-controller-block-owner* sb-thread:*current-thread*)
+           (original (sb-thread:make-mutex :name "original shutdown"))
+           (replacement (sb-thread:make-mutex :name "replacement shutdown"))
+           (*physical-shutdown-lock* original))
+      (sb-thread:with-mutex (original)
+        (rove:ok (logical-slot-copy-install-check-input-lifecycle operation original))
+        (let ((*physical-shutdown-lock* replacement))
+          (sb-thread:with-mutex (replacement)
+            (rove:ok (handler-case
+                         (progn (logical-slot-copy-install-check-input-lifecycle operation original) nil)
+                       (error (condition) (search "controller and shutdown" (princ-to-string condition))))))))))
+
 (defun unit-logical-slot-install-value (word generation &optional same-mount)
   (let* ((certificate (unit-logical-import-value
                        :profile (if (oddp word) :text :binary-bytea)
