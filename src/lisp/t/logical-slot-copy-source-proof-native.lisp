@@ -36,11 +36,31 @@
 (defun logical-source-proof-test-rejected-p (function)
   (handler-case (progn (funcall function) nil) (error () t)))
 
+(defun logical-source-proof-test-preparation (owner context input expected)
+  (let ((saved nil))
+    (call-with-logical-slot-copy-source-proof-preparation
+     owner context input
+     (lambda (attempt)
+       (setf saved attempt)
+       (assert (equalp expected (logical-slot-copy-source-proof-preparation-image attempt)))
+       (assert (logical-source-proof-test-rejected-p
+                (lambda ()
+                  (logical-slot-copy-source-proof-check-preparation
+                   owner context input (copy-structure attempt)))))
+       (assert (logical-slot-copy-source-proof-check-preparation owner context input attempt :source nil))
+       (assert (logical-slot-copy-source-proof-check-preparation owner context input attempt))))
+    (assert (logical-source-proof-test-rejected-p
+             (lambda ()
+               (logical-slot-copy-source-proof-check-preparation owner context input saved))))
+    (logical-slot-copy-install-check-input owner context input)
+    (format t "~&SOURCE-PROOF-PREPARATION-PASS forged=t expired=t~%")))
+
 (defun logical-source-proof-test-check (owner context input)
   (let* ((parts (logical-source-proof-test-parts owner context input))
          (image (logical-slot-copy-source-proof-encode parts))
          (original-read (symbol-function 'physical-restartpoint-read))
          (facts nil))
+    (logical-source-proof-test-preparation owner context input image)
     (unwind-protect
          (progn
            (setf (symbol-function 'physical-restartpoint-read)
@@ -85,6 +105,49 @@
             (length image) (length (getf (getf facts :certificate) :slots)))
     (finish-output)
     (values image facts)))
+
+(defun logical-source-proof-test-preparation-failure (mode)
+  (let ((before (length (directory-entry-names "/proc/self/fd/" :follow-symlinks t)))
+        (injected nil) (sticky nil))
+    (let ((result
+            (handler-case
+                (catch 'source-preparation-exit
+                  (call-with-logical-slot-copy-install-cold-input
+                   (lambda (owner context input)
+                     (call-with-logical-slot-copy-source-proof-preparation
+                      owner context input
+                      (lambda (attempt)
+                        (setf injected t)
+                        (ecase mode
+                          (:error (error "injected source preparation failure"))
+                          (:throw (throw 'source-preparation-exit :escaped))
+                          (:mutation
+                           (let* ((image (logical-slot-copy-source-proof-preparation-image attempt))
+                                  (old (aref image 0)))
+                             (setf (aref image 0) (logxor old 1))
+                             (assert (logical-source-proof-test-rejected-p
+                                      (lambda ()
+                                        (logical-slot-copy-source-proof-check-preparation
+                                         owner context input attempt :source nil))))
+                             (setf (aref image 0) old)
+                             (assert (logical-source-proof-test-rejected-p
+                                      (lambda ()
+                                        (logical-slot-copy-source-proof-check-preparation
+                                         owner context input attempt))))
+                             (setf sticky t))))))))
+                  :unexpected-return)
+              (error () :rejected))))
+      (assert injected)
+      (assert (eq result (if (eq mode :throw) :escaped :rejected)))
+      (when (eq mode :mutation) (assert sticky)))
+    (assert *physical-recovery-failed-p*)
+    (assert (null *logical-slot-copy-source-proof-preparations*))
+    (assert (= before (length (directory-entry-names "/proc/self/fd/" :follow-symlinks t))))
+    (assert (and (null *physical-recovery-state*) (null *physical-receive-store*)
+                 (null *catalog*) (null *clog-stream*) (null *wal-output-stream*)
+                 (not *wal-ready*) (zerop (hash-table-count *wal-replication-slots*))))
+    (format t "~&SOURCE-PROOF-PREPARATION-FAILURE-PASS mode=~s injected=t sticky=~s~%"
+            mode sticky)))
 
 (defun logical-source-proof-test-fd-cleanup ()
   (declare (notinline sb-posix:close))
@@ -245,6 +308,45 @@
                          (namestring (merge-pathnames name *pgdata*))))
       (uiop:delete-directory-tree hidden :validate t :if-does-not-exist :ignore))))
 
+(defun logical-source-proof-test-publication (mode cut)
+  (let ((before (length (directory-entry-names "/proc/self/fd/" :follow-symlinks t)))
+        (injected nil) (result nil)
+        (*logical-slot-copy-source-proof-publication-write-limit*
+          (when (eq cut :after-source-proof-temp-write) 11)))
+    (let ((*logical-slot-copy-source-proof-publication-test-hook*
+            (lambda (point)
+              (when (eq point cut)
+                (setf injected t)
+                (ecase mode
+                  (:crash
+                   (format t "~&SOURCE-PROOF-PUBLICATION-KILL ~s~%" cut)
+                   (finish-output)
+                   (sb-posix:kill (sb-posix:getpid) sb-posix:sigkill))
+                  (:error (error "injected source proof publication failure"))
+                  (:throw (throw 'source-proof-publication-exit :escaped)))))))
+      (setf result
+            (handler-case
+                (catch 'source-proof-publication-exit
+                  (logical-slot-copy-publish-source-proof))
+              (error (condition)
+                (format t "~&SOURCE-PROOF-PUBLICATION-EXPECTED-ERROR ~a~%" condition)
+                :rejected))))
+    (ecase mode
+      (:run (assert (eq result :published)))
+      (:reject (assert (eq result :rejected)))
+      (:error (assert injected) (assert (eq result :rejected)))
+      (:throw (assert injected) (assert (eq result :escaped)))
+      (:crash (error "publication crash cut was not reached")))
+    (assert (eq (not (null *physical-recovery-failed-p*)) (not (eq mode :run))))
+    (assert (= before (length (directory-entry-names "/proc/self/fd/" :follow-symlinks t))))
+    (assert (and (null *physical-recovery-state*) (null *physical-receive-store*)
+                 (null *catalog*) (null *clog-stream*) (null *wal-output-stream*)
+                 (not *wal-ready*) (zerop (hash-table-count *wal-replication-slots*))
+                 (zerop (hash-table-count *physical-retained-root-holds*))
+                 (zerop (hash-table-count *physical-retained-root-updates*))))
+    (format t "~&SOURCE-PROOF-PUBLICATION-PASS mode=~s cut=~s injected=~s~%"
+            mode cut injected)))
+
 (defun logical-source-proof-test-run ()
   (let ((before (length (directory-entry-names "/proc/self/fd/" :follow-symlinks t)))
         (path (merge-pathnames "logical-slot-copy.source-proof" *pgdata*)))
@@ -252,19 +354,20 @@
       (unless (slot-state-lstat (merge-pathnames "logical-slot-copy.install" *pgdata*))
         (assert (eq :active (logical-slot-copy-install-fresh-active))))
       (let ((image (call-with-logical-slot-copy-install-cold-input #'logical-source-proof-test-check)))
-        (with-open-file (out path :direction :output :if-exists :error :element-type '(unsigned-byte 8))
-          (sb-posix:fchmod (sb-sys:fd-stream-fd out) #o600)
-          (write-sequence image out)
-          (finish-output out)
-          (sb-posix:fsync (sb-sys:fd-stream-fd out)))
-        (fsync-directory *pgdata*)))
+        (assert (eq :published (logical-slot-copy-publish-source-proof)))
+        (assert (equalp image (recovery-read-bytes
+                               path :maximum (logical-slot-copy-source-proof-maximum-bytes))))))
+    (assert (eq :published (logical-slot-copy-publish-source-proof)))
     (assert (zerop (hash-table-count *physical-retained-root-holds*)))
     (assert (zerop (hash-table-count *physical-retained-root-updates*)))
     (clrhash *physical-retained-root-references*)
     (logical-source-proof-test-read-independent)
     (let ((image (call-with-logical-slot-copy-install-cold-input
                   (lambda (owner context input)
-                    (logical-source-proof-test-parts owner context input)))))
+                    (let ((parts (logical-source-proof-test-parts owner context input)))
+                      (logical-source-proof-test-preparation
+                       owner context input (logical-slot-copy-source-proof-encode parts))
+                      parts)))))
       (assert (equalp (logical-slot-copy-source-proof-encode image)
                       (recovery-read-bytes path
                                            :maximum (logical-slot-copy-source-proof-maximum-bytes))))
