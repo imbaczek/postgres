@@ -1,6 +1,9 @@
 (in-package #:pg)
 
+;;; Fresh input uses the actual handoff; cold input uses only the fixed journal.
+;;; A future typed mutator needs its own write descriptor scope.
 (defun logical-slot-copy-install-new-input-state (operation image origin &optional handoff)
+  "Capture the registry, engine image, and live shutdown mutex for this scope."
   (logical-slot-copy-install-operation-record operation)
   (%make-logical-slot-copy-install-input-state
    :operation operation :image (copy-seq image) :origin origin :handoff handoff
@@ -11,6 +14,7 @@
    :engine (logical-slot-copy-import-state-image *physical-recovery-state*)))
 
 (defun call-with-logical-slot-copy-install-input (operation handoff function)
+  "Bind the actual fresh handoff to an input scope under the operation."
   (when *logical-slot-copy-install-inputs* (error "logical installation input is already active"))
   (let ((image (logical-slot-copy-install-handoff-image operation handoff)))
     (logical-slot-copy-install-check-input-lifecycle operation)
@@ -18,6 +22,7 @@
      (logical-slot-copy-install-new-input-state operation image :fresh handoff) function)))
 
 (defun logical-slot-copy-install-fixed-image (operation)
+  "Read the fixed journal image under inspection."
   (call-with-logical-slot-copy-install-inspection
    operation
    (lambda (root)
@@ -30,6 +35,7 @@
        bytes))))
 
 (defun call-with-logical-slot-copy-install-cold-input-under-locks (function)
+  "Inspect a fixed cold journal if present; do not adopt private orphans."
   (when *logical-slot-copy-install-inputs* (error "logical installation input is already active"))
   (when *wal-ready* (error "fixed installation input requires cold startup"))
   (call-with-logical-slot-copy-install-operation-scope
@@ -56,6 +62,7 @@
     (error "logical installation input requires an outer lifecycle entry")))
 
 (defun call-with-logical-slot-copy-install-fresh-input (function)
+  "Create a fresh handoff and prove its inputs under lifecycle exclusion."
   (logical-slot-copy-install-check-input-entry)
   (when (sb-thread:holding-mutex-p *physical-shutdown-lock*)
     (error "fresh installation input requires an outer lifecycle entry"))
@@ -67,6 +74,7 @@
           (call-with-logical-slot-copy-install-input operation handoff function)))))))
 
 (defun call-with-logical-slot-copy-install-cold-input (function)
+  "Prove a fixed journal's inputs during cold startup under exclusion."
   (logical-slot-copy-install-check-input-entry)
   (when *wal-ready* (error "fixed installation input requires cold startup"))
   (call-with-logical-slot-copy-install-exclusion

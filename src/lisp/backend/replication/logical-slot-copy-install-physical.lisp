@@ -1,6 +1,11 @@
 (in-package #:pg)
 
+;;; Bind disk physical-slot images to the current registry without activating it.
 (defun logical-slot-copy-install-physical-registry (mode physical logical-names)
+  "Check disk physical slots against the current registry and return slot objects.
+Cold mode requires an empty registry and rejects temporary images.  Live mode
+requires matching objects and durable images, normalizing inactive time to the
+live value for comparison."
   (dolist (slot physical) (physical-slot-encode slot))
   (ecase mode
     (:cold
@@ -30,6 +35,7 @@
              live)))))
 
 (defun logical-slot-copy-install-physical-witnesses (slots)
+  "Capture live slot identities, images, and owners for later comparison."
   (mapcar (lambda (slot)
             (list slot (physical-slot-encode slot)
                   (wal-replication-slot-active-owner slot)
@@ -38,6 +44,7 @@
           slots))
 
 (defun logical-slot-copy-install-check-physical-witnesses (expected slots)
+  "Require the same live slot objects, images, and owners."
   (unless (and (= (length expected) (length slots))
                (loop for witness in expected for slot in slots
                      always (and (eq (first witness) slot)

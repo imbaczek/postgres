@@ -183,6 +183,9 @@ Recheck the operation and decode the image before registering the handoff."
       handoff)))
 
 (defun call-with-logical-slot-copy-install-operation-scope (function)
+  "Call FUNCTION with an operation and a marker for starting durable work.
+After the marker is called, any failure through cleanup and the final
+postmaster check fences recovery.  Revoke the owner and handoffs on exit."
   (when *logical-slot-copy-install-operations*
     (error "logical installation operation is already active"))
   (logical-slot-copy-check-import-locks)
@@ -227,6 +230,7 @@ Recheck the operation and decode the image before registering the handoff."
        (funcall function operation handoff)))))
 
 (defun call-with-logical-slot-copy-install-exclusion (function)
+  "Hold the installation exclusion locks and quiescence gate for FUNCTION."
   (when *logical-slot-copy-install-operations*
     (error "logical installation operation is already active"))
   (sb-thread:with-mutex (*physical-follow-command-lock*)

@@ -69,7 +69,7 @@
       facts)))
 
 (defun logical-slot-copy-install-layout-physical (slot-root name)
-  "Check and observe an extra physical slot in the canonical directory."
+  "Check and observe an extra physical slot and return its decoded disk image."
   (let* ((directory (logical-slot-copy-install-inspection-open slot-root name :directory slot-root))
          (state (logical-slot-copy-install-inspection-open directory "state" :file slot-root)))
     (unless (equal '("state") (logical-slot-copy-install-inspection-names directory 2))
@@ -86,7 +86,8 @@
 (defun logical-slot-copy-install-layout-slots (root value)
   "Check the P7 prefix and physical extras, counting all rows against capacity.
 Recorded device and inode identities are checked with current mount groups;
-historical mount IDs are not used as authority."
+historical mount IDs are not used as authority.  Return decoded physical slots
+along with the prefix and observations."
   (let* ((slot-root (logical-slot-copy-install-inspection-open root "pg_replslot" :slot-root nil))
          (work (logical-slot-copy-install-inspection-open slot-root ".logical-slot-copy.work" :directory slot-root))
          (container (logical-slot-copy-install-inspection-open work (getf value :stage-id) :directory slot-root))

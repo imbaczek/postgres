@@ -1,9 +1,14 @@
 (in-package #:pg)
 
+;;; Check certificate inputs independently of the certificate's installation phase.
+;;; Live operation still requires recovery phase 3; cold operation requires unopened storage.
+;;; This read scope grants no publication, adoption, or admission authority.
 (defun logical-slot-copy-install-input-physical-facts (layout)
   (remove-if-not (lambda (row) (= 5 (length row))) (getf layout :observations)))
 
 (defun logical-slot-copy-install-check-input-layout (owner input record &key (physical-proof t))
+  "Check monotone phase and prefix and unchanged physical slot witnesses.
+When requested, also check physical slot WAL coverage under the source lease."
   (let* ((operation (logical-slot-copy-install-input-state-operation record))
          (layout (logical-slot-copy-install-read-layout
                   operation (logical-slot-copy-install-input-state-image record)))
@@ -34,6 +39,7 @@
     layout))
 
 (defun logical-slot-copy-install-check-input-observations (owner context input)
+  "Recheck the retained receive tuple and all stable input and child observations."
   (let* ((proof (logical-slot-copy-install-input-proof input))
          (store (logical-slot-copy-install-input-store input))
          (tuple (logical-slot-copy-committed-proof-tuple proof))
@@ -48,6 +54,7 @@
         (error "logical installation stable input or child bytes changed")))))
 
 (defun logical-slot-copy-install-recheck-input-source (context input)
+  "Reprove the actual retained source and child under the reader lease."
   (let ((proof (logical-slot-copy-install-input-proof input)))
     (multiple-value-bind (fact history tuple)
         (logical-slot-copy-check-committed-source
@@ -68,6 +75,9 @@
         (error "logical installation source proof changed")))))
 
 (defun logical-slot-copy-install-check-input (owner context input &key (source t))
+  "Recheck the seal, observations, layout, and by default the full source proof.
+A failed check revokes the scope.  The initial call may omit the source recheck
+because the enclosing source proof has just completed it under the lease."
   (let ((record (logical-slot-copy-install-input-record owner context input)) (completed nil))
     (unwind-protect
          (progn
@@ -88,6 +98,7 @@
       (unless completed (logical-slot-copy-install-revoke-input record)))))
 
 (defun logical-slot-copy-install-bind-input-layout (record)
+  "Bind a fresh private handoff or a cold fixed journal and capture the layout."
   (let* ((operation (logical-slot-copy-install-input-state-operation record))
          (outer (logical-slot-copy-install-operation-record operation))
          (image (logical-slot-copy-install-input-state-image record))
@@ -116,12 +127,18 @@
     (logical-slot-copy-import-decode (getf value :certificate))))
 
 (defun logical-slot-copy-install-check-stable-inputs (owner context observations)
+  "Recheck all saved stable input and child observations without replaying source WAL."
   (logical-slot-copy-input-check-observations owner context observations)
   (dolist (row observations)
     (unless (equal row (logical-slot-copy-file-row context (first row)))
       (error "logical installation stable input changed after source proof"))))
 
 (defun call-with-logical-slot-copy-install-input-state (record function)
+  "Prove source and layout, then call FUNCTION with a scoped input capsule.
+The proof covers actual restartpoint and WAL from D through F under the retained
+root lease.  After the cold store closes, recheck all stable and child facts,
+the seal, exact phase and prefix, and physical parity without replaying source WAL.
+The scope must end before registry or global engine activation."
   (when *logical-slot-copy-install-inputs* (error "logical installation input is already active"))
   (let* ((operation (logical-slot-copy-install-input-state-operation record))
          (outer (logical-slot-copy-install-operation-record operation))

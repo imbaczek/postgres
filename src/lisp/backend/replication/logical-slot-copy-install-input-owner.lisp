@@ -1,14 +1,18 @@
 (in-package #:pg)
 
+;;; The input owner and capsule are scoped to the registered operation.
+;;; The private seal is a finite clone; cycle or mutation failures revoke the scope.
 (defstruct (logical-slot-copy-install-input-owner
             (:include logical-slot-copy-committed-owner)
             (:constructor %make-logical-slot-copy-install-input-owner)
             (:print-function physical-libpq-print-private-object))
+  "Scoped read owner tied to an outer installation operation."
   (operation nil :read-only t))
 
 (defstruct (logical-slot-copy-install-input
             (:constructor %make-logical-slot-copy-install-input)
             (:print-function physical-libpq-print-private-object))
+  "Scoped capsule holding the bound certificate and source proof."
   (owner nil :read-only t) (context nil :read-only t) (store nil :read-only t)
   (image nil :read-only t) (certificate nil :read-only t) (plan nil :read-only t)
   (fact nil :read-only t) (history nil :read-only t) (proof nil :read-only t))
@@ -16,6 +20,7 @@
 (defstruct (logical-slot-copy-install-input-state
             (:constructor %make-logical-slot-copy-install-input-state)
             (:print-function physical-libpq-print-private-object))
+  "Private registry, cloned seal, lifecycle bindings, and sticky failure state."
   (operation nil :read-only t) (image nil :read-only t)
   (origin nil :read-only t) (handoff nil :read-only t)
   (registry nil :read-only t) (engine nil :read-only t) (shutdown-lock nil :read-only t)
@@ -25,6 +30,7 @@
 (defvar *logical-slot-copy-install-inputs* nil)
 
 (defun logical-slot-copy-install-input-owner-record (owner)
+  "Find the registered owner by identity and require its active operation."
   (let ((record (find owner *logical-slot-copy-install-inputs*
                       :key #'logical-slot-copy-install-input-state-owner :test #'eq)))
     (unless (and record (logical-slot-copy-install-input-owner-p owner))
@@ -36,6 +42,7 @@
     record))
 
 (defun logical-slot-copy-install-revoke-input (record)
+  "Permanently fail this input and its outer operation."
   (let* ((operation (logical-slot-copy-install-input-state-operation record))
          (operation-record (find operation *logical-slot-copy-install-operations*
                                  :key #'logical-slot-copy-install-operation-state-operation :test #'eq))
@@ -47,6 +54,7 @@
       (setf (logical-slot-copy-install-operation-state-failed operation-record) t))))
 
 (defun logical-slot-copy-install-check-input-lifecycle (operation &optional (shutdown-lock *physical-shutdown-lock*))
+  "Require live controller exclusion and the captured shutdown mutex."
   (let ((record (logical-slot-copy-install-operation-record operation)))
     (when (eq :live (logical-slot-copy-install-operation-state-mode record))
       (unless (and *physical-follow-controller-blocked-p*
@@ -57,6 +65,7 @@
     t))
 
 (defmethod physical-adoption-check-owner-role ((owner logical-slot-copy-install-input-owner))
+  "Check registered ownership and lifecycle without recursing into layout proof."
   (let* ((record (logical-slot-copy-install-input-owner-record owner))
          (operation (logical-slot-copy-install-input-state-operation record))
          (completed nil))
@@ -94,6 +103,7 @@
   (error "logical installation input does not authorize offline adoption"))
 
 (defun logical-slot-copy-install-input-record (owner context input)
+  "Require the exact registered owner, context, and input."
   (let ((record (logical-slot-copy-install-input-owner-record owner)))
     (unless (and (logical-slot-copy-install-input-p input)
                  (eq input (logical-slot-copy-install-input-state-input record))
@@ -104,6 +114,7 @@
     record))
 
 (defun logical-slot-copy-install-input-view (input)
+  "Build the current view compared with the private finite cloned seal."
   (let ((proof (logical-slot-copy-install-input-proof input)))
     (list
      (logical-slot-copy-install-input-image input)
@@ -123,6 +134,7 @@
            (logical-slot-copy-committed-proof-observations proof)))))
 
 (defun logical-slot-copy-install-check-input-seal (owner context input record)
+  "Check the input view, engine image, and held owner and root bindings."
   (logical-slot-copy-check-input owner context)
   (logical-slot-copy-install-check-operation-input
    (logical-slot-copy-install-input-state-operation record) context)
