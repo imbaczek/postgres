@@ -403,6 +403,8 @@
                    (:file "../replication/logical-slot-copy-source-proof-reader-fs")
                    (:file "../replication/logical-slot-copy-source-proof-reader-owner")
                    (:file "../replication/logical-slot-copy-source-proof-reader")
+                   (:file "../replication/logical-slot-copy-source-proof-preparation")
+                   (:file "../replication/logical-slot-copy-source-proof-publication-guard")
                    (:file "../replication/logical-slot-copy-startup")
                    (:file "postgres")))
      (:file "replication/logical-retention")
