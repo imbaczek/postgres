@@ -47,7 +47,12 @@
                  (lambda (&rest arguments)
                    (declare (ignore arguments))
                    (error "permanent pure checker attempted a forbidden R read")))
-           (setf facts (logical-slot-copy-check-source-proof image)))
+           (setf facts (logical-slot-copy-check-source-proof image))
+           (let ((directory (physical-recovery-retained-directory)))
+             (logical-slot-copy-source-proof-scan-archive
+              facts directory #'physical-retained-object-read)
+             (logical-slot-copy-source-proof-check-archive-prefix
+              facts directory #'physical-retained-object-read)))
       (setf (symbol-function 'physical-restartpoint-read) original-read))
     (assert (equal (getf facts :fact) (logical-slot-copy-install-input-fact input)))
     (assert (eq :pending (getf (getf facts :certificate) :phase)))
@@ -78,13 +83,186 @@
     (format t "~&SOURCE-PROOF-BINDING-PASS original-fact=~s bytes=~d rows=~d~%"
             (not (null (getf (getf facts :control) :logical-fact)))
             (length image) (length (getf (getf facts :certificate) :slots)))
-    (finish-output)))
+    (finish-output)
+    (values image facts)))
+
+(defun logical-source-proof-test-fd-cleanup ()
+  (declare (notinline sb-posix:close))
+  (let* ((parent (sb-posix:open (namestring *pgdata*)
+                                (logior sb-posix:o-rdonly sb-posix:o-directory) 0))
+         (before (length (directory-entry-names "/proc/self/fd/" :follow-symlinks t)))
+         (original-close (symbol-function 'sb-posix:close))
+         (owned nil) (foreign nil) (attempts 0))
+    (unwind-protect
+         (progn
+           (assert (eq :escaped
+                       (catch 'source-fd-exit
+                         (call-with-logical-slot-copy-source-proof-fd
+                          parent "logical-slot-copy.source-proof" nil
+                          (lambda (fd facts)
+                            (declare (ignore facts))
+                            (setf owned fd)
+                            (throw 'source-fd-exit :escaped))))))
+           (assert (handler-case (progn (sb-posix:fstat owned) nil)
+                     (sb-posix:syscall-error () t)))
+           (assert (logical-source-proof-test-rejected-p
+                    (lambda ()
+                      (call-with-logical-slot-copy-source-proof-fd
+                       parent "logical-slot-copy.source-proof" nil
+                       (lambda (fd facts)
+                         (declare (ignore facts))
+                         (setf owned fd)
+                         (funcall original-close fd)
+                         (setf foreign (sb-posix:open "/dev/null" sb-posix:o-rdonly 0))
+                         (assert (= owned foreign))
+                         :foreign-replacement)))))
+           (assert (sb-posix:fstat foreign))
+           (funcall original-close foreign)
+           (setf foreign nil)
+           (unwind-protect
+                (progn
+                  (setf (symbol-function 'sb-posix:close)
+                        (lambda (fd)
+                          (if (eql fd owned)
+                              (progn (incf attempts) (funcall original-close fd)
+                                     (error "injected source input close failure"))
+                              (funcall original-close fd))))
+                  (assert (logical-source-proof-test-rejected-p
+                           (lambda ()
+                             (call-with-logical-slot-copy-source-proof-fd
+                              parent "logical-slot-copy.source-proof" nil
+                              (lambda (fd facts)
+                                (declare (ignore facts))
+                                (setf owned fd)
+                                :normal-return)))))
+                  (assert (= 1 attempts)))
+             (setf (symbol-function 'sb-posix:close) original-close))
+           (assert (= before (length (directory-entry-names "/proc/self/fd/" :follow-symlinks t))))
+           (format t "~&SOURCE-PROOF-FD-CLEANUP-PASS throw=t reuse=t close-attempts=~d~%" attempts))
+      (setf (symbol-function 'sb-posix:close) original-close)
+      (when foreign (funcall original-close foreign))
+      (funcall original-close parent))))
+
+(defun logical-source-proof-test-reader-failures ()
+  (let ((before (length (directory-entry-names "/proc/self/fd/" :follow-symlinks t)))
+        (proof (merge-pathnames "logical-slot-copy.source-proof" *pgdata*))
+        (archive (merge-pathnames "pg_physical_retained/" *pgdata*))
+        (temporary (merge-pathnames "logical-slot-copy.source-proof.tmp" *pgdata*))
+        (cases 0))
+    (dolist (mode '(:error :throw :late-proof-mode :late-archive-mode :late-temporary))
+      (let ((injected nil)
+            (*logical-slot-copy-verification-test-hook* nil))
+        (unwind-protect
+             (progn
+               (setf *logical-slot-copy-verification-test-hook*
+                     (lambda (point context)
+                       (declare (ignore context))
+                       (when (eq point :after-source-proof-files-close)
+                         (assert (= 1 (hash-table-count *physical-retained-root-references*)))
+                         (setf injected t)
+                         (ecase mode
+                           (:error (error "injected source reader exit"))
+                           (:throw (throw 'source-reader-exit :escaped))
+                           (:late-proof-mode (sb-posix:chmod (namestring proof) #o644))
+                           (:late-archive-mode (sb-posix:chmod (namestring archive) #o755))
+                           (:late-temporary
+                            (with-open-file (out temporary :direction :output :if-exists :error)
+                              (write-line "untrusted temporary" out)))))))
+               (if (eq mode :throw)
+                   (assert (eq :escaped
+                               (catch 'source-reader-exit
+                                 (logical-slot-copy-read-source-proof)
+                                 :unexpected-return)))
+                   (assert (logical-source-proof-test-rejected-p
+                            #'logical-slot-copy-read-source-proof)))
+               (assert injected)
+               (assert (zerop (hash-table-count *physical-retained-root-references*)))
+               (assert (= before (length (directory-entry-names "/proc/self/fd/" :follow-symlinks t))))
+               (incf cases))
+          (setf *logical-slot-copy-verification-test-hook* nil)
+          (sb-posix:chmod (namestring proof) #o600)
+          (sb-posix:chmod (namestring archive) #o700)
+          (when (slot-state-lstat temporary) (delete-file temporary)))))
+    (assert (getf (logical-slot-copy-read-source-proof) :fact))
+    (assert (zerop (hash-table-count *physical-retained-root-references*)))
+    (assert (= before (length (directory-entry-names "/proc/self/fd/" :follow-symlinks t))))
+    (format t "~&SOURCE-PROOF-READER-FAILURES-PASS cases=~d retry=t~%" cases)))
+
+(defun logical-source-proof-test-read-independent ()
+  (let* ((hidden (uiop:ensure-directory-pathname
+                  (sb-posix:mkdtemp
+                   (namestring (merge-pathnames "source-proof-hidden-XXXXXX"
+                                                (uiop:temporary-directory))))))
+         (moved nil) (forbidden 0) (seen nil)
+         (saved (loop for name in '(physical-restartpoint-read physical-recovery-read-control
+                                    recovery-read-manifest physical-store-open physical-store-load-control
+                                    timeline-read-history timeline-history-bytes load-next-xid
+                                    wal-read-checkpoint-record)
+                      collect (cons name (symbol-function name)))))
+    (unwind-protect
+         (progn
+           (dolist (name '("physical-restartpoint.control" "pg_physical_restartpoints"
+                           "pg_physical_receive" "physical-recovery.control"
+                           "physical-backup.manifest" "logical-slot-copy.base-verified"
+                           "logical-slot-copy.descriptor" "logical-slot-copy.evidence"
+                           "logical-slot-copy.import" "logical-slot-copy.install"
+                           "logical-slot-copy.work" "global" "pg_wal"))
+             (let ((path (merge-pathnames name *pgdata*)))
+               (when (slot-state-lstat path)
+                 (sb-sys:without-interrupts
+                   (sb-posix:rename (namestring path) (namestring (merge-pathnames name hidden)))
+                   (push name moved)))))
+           (unwind-protect
+                (progn
+                  (dolist (row saved)
+                    (let ((name (car row)))
+                      (setf (symbol-function name)
+                            (lambda (&rest arguments)
+                              (declare (ignore arguments))
+                              (incf forbidden)
+                              (error "source proof reader attempted forbidden access through ~s" name)))))
+                  (let* ((*logical-slot-copy-verification-test-hook*
+                           (lambda (point context)
+                             (declare (ignore context))
+                             (when (eq point :after-source-proof-files-close)
+                               (push point seen)
+                               (assert (= 1 (hash-table-count *physical-retained-root-references*))))))
+                         (facts (logical-slot-copy-read-source-proof)))
+                    (assert (getf facts :fact))
+                    (assert (getf facts :certificate))
+                    (assert (= 1 (length seen)))
+                    (assert (zerop forbidden))
+                    (assert (zerop (hash-table-count *physical-retained-root-references*)))
+                    (let ((*logical-slot-copy-verification-test-hook* nil))
+                      (logical-source-proof-test-fd-cleanup)
+                      (logical-source-proof-test-reader-failures))
+                    (format t "~&SOURCE-PROOF-READER-PASS hidden=~d forbidden=~d~%"
+                            (length moved) forbidden)
+                    facts))
+             (dolist (row saved) (setf (symbol-function (car row)) (cdr row)))))
+      (dolist (name moved)
+        (sb-posix:rename (namestring (merge-pathnames name hidden))
+                         (namestring (merge-pathnames name *pgdata*))))
+      (uiop:delete-directory-tree hidden :validate t :if-does-not-exist :ignore))))
 
 (defun logical-source-proof-test-run ()
-  (let ((before (length (directory-entry-names "/proc/self/fd/" :follow-symlinks t))))
-    (unless (slot-state-lstat (merge-pathnames "logical-slot-copy.install" *pgdata*))
-      (assert (eq :active (logical-slot-copy-install-fresh-active))))
-    (call-with-logical-slot-copy-install-cold-input #'logical-source-proof-test-check)
+  (let ((before (length (directory-entry-names "/proc/self/fd/" :follow-symlinks t)))
+        (path (merge-pathnames "logical-slot-copy.source-proof" *pgdata*)))
+    (unless (slot-state-lstat path)
+      (unless (slot-state-lstat (merge-pathnames "logical-slot-copy.install" *pgdata*))
+        (assert (eq :active (logical-slot-copy-install-fresh-active))))
+      (let ((image (call-with-logical-slot-copy-install-cold-input #'logical-source-proof-test-check)))
+        (with-open-file (out path :direction :output :if-exists :error :element-type '(unsigned-byte 8))
+          (sb-posix:fchmod (sb-sys:fd-stream-fd out) #o600)
+          (write-sequence image out)
+          (finish-output out)
+          (sb-posix:fsync (sb-sys:fd-stream-fd out)))
+        (fsync-directory *pgdata*)))
+    (assert (zerop (hash-table-count *physical-retained-root-holds*)))
+    (assert (zerop (hash-table-count *physical-retained-root-updates*)))
+    (clrhash *physical-retained-root-references*)
+    (logical-source-proof-test-read-independent)
+    (assert (logical-source-proof-test-rejected-p #'logical-slot-copy-check-promotion))
     (assert (= before (length (directory-entry-names "/proc/self/fd/" :follow-symlinks t))))
     (assert (and (null *physical-recovery-state*) (null *physical-receive-store*)
                  (null *catalog*) (null *clog-stream*) (null *wal-output-stream*)

@@ -39,7 +39,7 @@ def probe(peer, label, *args, **kwargs):
         result = subprocess.run(command, stdout=output, stderr=subprocess.STDOUT,
                                 timeout=120)
     text = log.read_text()
-    assert result.returncode == 0 and 'SOURCE-PROOF-BINDING-PASS' in text, (result.returncode, log)
+    assert result.returncode == 0 and 'SOURCE-PROOF-READER-PASS' in text, (result.returncode, log)
     assert not (peer.data / 'postmaster.pid').exists()
     print(f'SOURCE-PROOF-CASE {label} PASS seconds={time.monotonic()-started:.6f}', flush=True)
 
