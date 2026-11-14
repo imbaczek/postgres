@@ -16,6 +16,10 @@
        (= (ninth left) (ninth right))))
 
 (defun logical-slot-copy-cold-scratch-preflight (rows directory-facts)
+  ;; A canonical history inode may have extra links only to known .history-
+  ;; scratch names in this directory.  The link count must equal the known
+  ;; aliases, leaving no outside links; cleanup leaves canonical history with
+  ;; one link.
   (dolist (row rows)
     (when (logical-slot-copy-cold-scratch-kind (first row))
       (let* ((facts (second row))
@@ -57,6 +61,8 @@
   t)
 
 (defun logical-slot-copy-cold-scratch-after-unlink (rows row fd)
+  ;; The held descriptor witnesses the unlinked inode.  Update link count and
+  ;; ctime only for its remaining aliases; never refresh unrelated ledger rows.
   (let* ((before (second row)) (after (physical-image-file-facts fd)))
     (unless (and (= (1- (fourth before)) (fourth after))
                  (loop for old in before for actual in after for index from 0
@@ -70,6 +76,16 @@
 
 (defun logical-slot-copy-cold-clean-wal-scratch (context check mark-started maximum)
   (declare (notinline physical-image-openat port-unlinkat sb-posix:fsync))
+  ;; Remove private WAL scratch before strict child preflight.  As with
+  ;; RemoveTempXlogFiles in xlog.c, this needs a period without WAL writers;
+  ;; the inode and alias checks here impose a stronger private-file policy.
+  ;; The caller owns exclusive cold root and store access, a retained R lease,
+  ;; and the incomplete-exit fence.  Interrupt masking does not exclude outside
+  ;; OS writers.  CHECK repeatedly verifies the caller's owner and retained-source
+  ;; guards.  MARK-STARTED must be idempotent and precedes unlink and directory fsync.
+  ;;
+  ;; The caller ensures MAXIMUM bounds the directory scan.  Return the number
+  ;; removed; do not read or adopt scratch bytes.  Source proof follows later.
   (unless (and (functionp check) (functionp mark-started) (typep maximum '(integer 1 *)))
     (error "invalid cold WAL scratch cleanup scope"))
   (funcall check)
