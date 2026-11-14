@@ -250,6 +250,9 @@ Native ancestry requires the parent history and a forward fork; no role is chang
   (if (= timeline 1) (timeline-parse-history 1 "")
       (timeline-parse-history timeline (bytes->string (timeline-history-bytes timeline directory)))))
 
+;; The hard link gives the inode two names at :installed.  Removing the scratch
+;; name leaves one link; directory fsync follows that removal.  Cleanup owns the
+;; scratch name and descriptor if an observer exits during publication.
 (defun timeline-publish-history-bytes (path bytes &key directory-fd observer)
   "Exclusively install a synced inode; never replace an existing pathname.
 DIRECTORY-FD, when supplied, is the caller-held history directory descriptor."

@@ -48,6 +48,8 @@ An absent legacy intent retains the historical level 2 bytes."
         (error "pending child contains a different complete record"))
       (equalp tail eor))))
 
+;; Retry may open matching history that was already published.  Its :written
+;; event follows fsync even when the bytes did not need another write.
 (defun physical-promotion-sync-history (state &optional directory-fd observer)
   "History inode and directory must be durable even when retry finds matching bytes.
 DIRECTORY-FD is an optional caller-held WAL directory descriptor."

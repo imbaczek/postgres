@@ -81,6 +81,9 @@ DIRECTORY-FD, when supplied, is the caller-held WAL directory descriptor."
           (when (and temporary (not finished))
             (ignore-errors (sb-posix:unlink (namestring temporary)))))))))
 
+;; Prefix staging can install several destination paths during rollover, so an
+;; observer's ledger must distinguish paths.  The scratch stream is closed before
+;; installation; install callbacks therefore have no borrowed descriptor.
 (defun wal-install-timeline-prefix (source-timeline child fork prefix namespace &optional directory-fd observer)
   "Force-install owned uncommitted bytes; caller proves intent and excludes history.
 The caller fences uncertain publication and must never use this after history.

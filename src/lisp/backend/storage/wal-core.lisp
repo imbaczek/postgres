@@ -577,6 +577,19 @@ short check alone cannot do so."
 (defun wal-directory ()
   (pgdata-resolve-path "pg_wal/" *pgdata*))
 
+;; Private staging observation hook; OBSERVER may be NIL.  Otherwise it receives
+;; (event operation name fd &optional destination).  Events are :created,
+;; :opened-existing, :written, :before-unlink, :unlinked, :before-install and
+;; :installed.  NAME identifies the path involved in the event; DESTINATION names
+;; the installed path for install events.  :written reports synced bytes, which
+;; may already have matched without a write.
+;;
+;; FD is borrowed and valid only during the callback.  It may be NIL after a
+;; prefix stream closes; an observer needing the inode later must dup it at
+;; :created.  File creation, file sync plus :written, and namespace changes are
+;; paired with their events while interrupts are masked.
+;; A callback may exit nonlocally; the caller's cleanup still owns its resources.
+;; An event does not itself certify directory durability or grant source-file authority.
 (defun wal-staging-observe (observer event operation name fd &optional destination)
   (when observer (funcall observer event operation name fd destination)))
 

@@ -207,6 +207,9 @@ Return the verified plan; signal an error for contradictory artifacts."
       (error "child checkpoint staging lost its durable EOR"))
     plan))
 
+;; Opening and reporting the child file are interrupt-masked until its descriptor
+;; has an owner.  A callback exit closes it; existing files are opened without
+;; replacing them.
 (defun physical-promotion-open-staging-file (path &optional observer)
   "Open a regular child file for reading and writing, or create it exclusively.
 Return its stream and size. The caller closes the stream. Do not follow a
@@ -264,6 +267,8 @@ Close the stream on every exit; the enclosing publisher fences failures."
                                           (sb-sys:fd-stream-fd stream)))))
             (close stream)))))))
 
+;; Report each selected orphan around its unlink while interrupts are masked.
+;; The observer does not grant authority to remove additional paths.
 (defun physical-promotion-remove-child-orphans (state files &optional observer)
   "Remove abandoned selected-child segments outside FILES before history exists.
 Preflight all orphan names as regular files before unlinking any of them.
