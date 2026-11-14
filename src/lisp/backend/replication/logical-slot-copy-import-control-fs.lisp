@@ -11,6 +11,8 @@
        (= (first facts) (first global-facts)) (= (ninth facts) (ninth global-facts))))
 
 (defun logical-slot-copy-import-bound-global-image (context manifest kind)
+  ;; Bind the manifest's private global children and allow only the temporary
+  ;; selected by KIND.  The other temporary and unknown names are rejected.
   (multiple-value-bind (target temporary label)
       (ecase kind
         (:control (values "pg_wal_control" "pg_wal_control.tmp" "control temporary"))

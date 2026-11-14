@@ -6,6 +6,7 @@
             (:print-function physical-libpq-print-private-object)))
 
 (defmethod physical-adoption-check-owner-role ((owner logical-slot-copy-catalog-owner))
+  ;; Catalog restoration is confined to cold, unopened storage.
   (call-next-method)
   (unless (and (eq :cold (logical-slot-copy-committed-owner-mode owner))
                (not *wal-ready*) (null *physical-recovery-state*) (null *physical-receive-store*)
@@ -17,6 +18,8 @@
 (defstruct (logical-slot-copy-catalog-attempt
             (:constructor %make-logical-slot-copy-catalog-attempt)
             (:print-function physical-libpq-print-private-object))
+  ;; The binding and operation seals protect different parts of an attempt.
+  ;; Descriptor ownership and the failure latch remain private to its closures.
   (owner nil :read-only t) (context nil :read-only t)
   (binding nil :read-only t) (root nil :read-only t) (global nil :read-only t)
   (source-check nil :read-only t) (mark-started nil :read-only t)
@@ -99,6 +102,8 @@
         (error "catalog restoration input or restartpoint changed")))))
 
 (defun logical-slot-copy-catalog-revoke (attempt)
+  ;; Only the exact attempt can trip the private latch.  A copied subject
+  ;; cannot revoke its owner, and resetting public fields cannot clear failure.
   (when (and (logical-slot-copy-catalog-attempt-p attempt)
              (functionp (logical-slot-copy-catalog-attempt-failure-operation attempt)))
     (funcall (logical-slot-copy-catalog-attempt-failure-operation attempt) :revoke attempt)))

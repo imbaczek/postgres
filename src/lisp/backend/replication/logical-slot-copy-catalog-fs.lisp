@@ -6,6 +6,8 @@
     (values global facts children (if present :residue :absent))))
 
 (defun logical-slot-copy-catalog-file-operations (attempt-reader)
+  ;; Keep descriptor ownership in this lexical scope, including during cleanup;
+  ;; the attempt fields and operation seal expose only the checked state.
   (declare (notinline physical-image-openat sb-posix:close))
   (let ((old-fd nil) (temp-fd nil))
     (lambda (operation subject)
@@ -68,6 +70,8 @@
           (unless complete (logical-slot-copy-catalog-revoke attempt)))))))
 
 (defun logical-slot-copy-catalog-open-one (attempt temporary)
+  ;; Residue is removable only when the private inode is bound to the name
+  ;; and its bytes are an exact prefix of the selected catalog.
   (with-logical-slot-copy-catalog-guard (attempt :files nil)
     (let* ((fd (funcall (logical-slot-copy-catalog-attempt-file-operation attempt)
                         (if temporary :open-temp :open-old) attempt))
@@ -87,6 +91,8 @@
   t)
 
 (defun logical-slot-copy-catalog-check-namespace (attempt)
+  ;; Keep the manifest inventory fixed, allowing only the catalog temporary
+  ;; and the expected replacement of the catalog target.
   (let* ((b (logical-slot-copy-catalog-attempt-binding attempt))
          (global (logical-slot-copy-catalog-attempt-global attempt))
          (before (getf b :global-facts)) (now (physical-image-file-facts global))

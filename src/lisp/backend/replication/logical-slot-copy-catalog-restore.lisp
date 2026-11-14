@@ -59,6 +59,8 @@
                     +wal-segment-size+)))))
 
 (defun logical-slot-copy-catalog-read-binding (owner context proof)
+  ;; Bind parent D control and the actual selected R catalog (R = F), including
+  ;; the pointer, generation, metadata and restartpoint file witnesses.
   (logical-slot-copy-import-control-fences context)
   (let ((global (cdr (assoc "global" (physical-image-context-children context) :test #'equal))))
     (unless (logical-slot-copy-import-control-private-facts-p
@@ -105,6 +107,9 @@
                    global phase))))))))))
 
 (defun logical-slot-copy-catalog-call-with-source (owner context proof mark-started function)
+  ;; Hold the retained store and receive-root lease across the callback and
+  ;; its final checks.  The internal restore accepts this attempt so a future
+  ;; publisher can use it within an existing lease.
   (multiple-value-bind (binding global phase)
       (logical-slot-copy-catalog-read-binding owner context proof)
     (call-with-logical-slot-copy-committed-store
@@ -171,6 +176,9 @@
                 (logical-slot-copy-catalog-close attempt))))))))))
 
 (defun logical-slot-copy-import-restore-parent-catalog ()
+  ;; Restore only the selected parent catalog under cold exclusion.  This does
+  ;; not install runtime globals, publish child control, admit writers or retire
+  ;; the copy.  Failure after mutation starts fences recovery.
   (when *logical-slot-copy-catalog-attempts*
     (error "catalog restoration is already active"))
   (logical-slot-copy-install-check-input-entry)

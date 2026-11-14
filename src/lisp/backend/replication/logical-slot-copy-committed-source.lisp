@@ -25,8 +25,8 @@
          (namespace (sixth fields)))
     (unless (eq namespace (getf control :promotion-source-namespace))
       (error "committed source namespace differs from its preserved D control"))
-    ;; The input owner already binds actual child control to the exact saved plan.
-    ;; All other base rows retain the ordinary streaming metadata checks.
+    ;; The input owner already binds actual control to parent D or the exact
+    ;; child plan.  Other base rows retain streaming metadata checks.
     (let ((base (copy-list manifest)))
       (setf (getf base :files)
             (remove "global/pg_wal_control" (getf manifest :files) :key #'first :test #'equal))
@@ -86,6 +86,9 @@
 
 (defun logical-slot-copy-check-retained-source
     (certificate evidence descriptor manifest control plan state metadata prefix generation store check-artifacts)
+  ;; Replay the retained source and require the caller's artifact check while
+  ;; the store lease is held.  The committed wrapper checks complete child files;
+  ;; parent catalog restoration supplies its own staged-artifact check.
   (logical-slot-copy-check-committed-progress state metadata prefix generation store)
   (unless (and (equalp (getf evidence :selected-history)
                        (logical-slot-copy-import-selected-history state))

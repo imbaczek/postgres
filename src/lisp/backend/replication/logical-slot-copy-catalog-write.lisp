@@ -58,6 +58,8 @@
     (logical-slot-copy-catalog-check attempt)))
 
 (defun logical-slot-copy-catalog-rename (attempt)
+  ;; Both the complete temporary and old target must be synced before rename.
+  ;; After rename a failure fences recovery; it does not roll the catalog back.
   (declare (notinline port-renameat))
   (with-logical-slot-copy-catalog-guard (attempt)
     (logical-slot-copy-catalog-point :before-cold-catalog-rename attempt)
@@ -115,6 +117,9 @@
     (logical-slot-copy-catalog-check attempt)))
 
 (defun logical-slot-copy-catalog-restore (attempt)
+  ;; Remove authenticated residue, then sync temporary and old files before
+  ;; rename.  Sync the installed file and directory before returning, even
+  ;; when the target already contains the selected catalog.
   (with-logical-slot-copy-catalog-guard (attempt)
     (let ((b (logical-slot-copy-catalog-attempt-binding attempt))
           (restored nil))
