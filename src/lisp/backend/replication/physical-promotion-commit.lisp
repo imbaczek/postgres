@@ -382,6 +382,39 @@ finish; a durable child is not yet a production-ready postmaster."
 (declaim (ftype function logical-slot-copy-import-commit-parent
                 logical-slot-copy-import-check-child-commit))
 
+(defun physical-promotion-stage-child-checkpoint
+    (state plan prefix files history-p check sync-data &key context install-prefix)
+  (let ((child (getf state :promotion-child))
+        (directory-fd (when context
+                        (cdr (assoc "pg_wal" (physical-image-context-children context) :test #'equal)))))
+    (physical-promotion-remove-child-orphans state files)
+    (unless history-p
+      (when install-prefix
+        (funcall check nil)
+        (wal-install-timeline-prefix (physical-recovery-replay-timeline state) child
+                                     (getf plan :fork) prefix
+                                     (physical-promotion-parent-namespace state) directory-fd))
+      (dolist (entry (rest files))
+        (funcall check nil)
+        (wal-install-timeline-prefix (physical-recovery-replay-timeline state) child
+                                     (* (first entry) +wal-segment-size+)
+                                     (make-array 0 :element-type '(unsigned-byte 8))
+                                     (physical-promotion-parent-namespace state) directory-fd)))
+    (funcall check nil)
+    (physical-promotion-sync-history state directory-fd)
+    (physical-promotion-test-point :after-child-history-sync)
+    (dolist (frame (getf plan :frames))
+      (funcall check nil)
+      (physical-promotion-stage-frame child frame)
+      (when (eq frame (first (getf plan :frames)))
+        (physical-promotion-test-point :after-child-eor-flush)))
+    (physical-promotion-test-point :after-child-checkpoint-flush)
+    (funcall check :staged)
+    (funcall sync-data)
+    (physical-promotion-test-point :after-child-data-sync)
+    (funcall check :staged)
+    (getf plan :end)))
+
 (defun physical-promotion-publish-child-control-core (&optional owner context attempt)
   "Publish the checked child plan under promotion exclusion with admission closed.
 An import owner supplies repeated proofs and held directories. Import callers
@@ -400,17 +433,13 @@ publication starts fences recovery; the ordinary path keeps its existing fence."
                       (when (or context attempt) (error "child publication has no import owner"))
                       (logical-slot-copy-check-promotion)
                       nil)))
-        (state *physical-recovery-state*) (finished nil) (staged nil)
-        (directory-fd (when context
-                        (cdr (assoc "pg_wal" (physical-image-context-children context) :test #'equal)))))
+        (state *physical-recovery-state*) (finished nil))
     (labels ((check (&optional committed)
                (when owner
                  (logical-slot-copy-import-check-child-commit
                   owner context attempt
                   (case committed
-                    ((nil) (when staged :staged))
-                    (:final :final)
-                    ((t) t)
+                    ((nil :staged :final t) committed)
                     (otherwise (error "unknown child publication proof phase")))))))
       (multiple-value-bind (metadata catalog prefix generation) (physical-restartpoint-read state)
         (declare (ignore catalog))
@@ -419,42 +448,20 @@ publication starts fences recovery; the ordinary path keeps its existing fence."
         (physical-promotion-ensure-pending-retained state metadata)
         (let* ((plan (physical-promotion-checkpoint-artifacts state prefix :allow-uninstalled (not (null owner))))
                (files (physical-promotion-checkpoint-files plan prefix))
-               (child (getf state :promotion-child))
-               (history-p (wal-namespace-file-stat (timeline-history-path child *pgdata*) t)))
+               (history-p (wal-namespace-file-stat
+                           (timeline-history-path (getf state :promotion-child) *pgdata*) t)))
           (unless (and (zerop (hash-table-count *wal-page-cache*)) (null *wal-dirty-store*)
                        (null *wal-page-batch*) (null *active-xids*))
             (error "child checkpoint requires an empty application write cache"))
           (check)
           (unwind-protect
                (progn
-                 (physical-promotion-remove-child-orphans state files)
-                 (unless history-p
-                   (when owner
-                     (check)
-                     (wal-install-timeline-prefix (physical-recovery-replay-timeline state) child
-                                                  (getf plan :fork) prefix
-                                                  (physical-promotion-parent-namespace state) directory-fd))
-                   (dolist (entry (rest files))
-                     (check)
-                     (wal-install-timeline-prefix (physical-recovery-replay-timeline state) child
-                                                  (* (first entry) +wal-segment-size+)
-                                                  (make-array 0 :element-type '(unsigned-byte 8))
-                                                  (physical-promotion-parent-namespace state) directory-fd)))
-                 (check)
-                 (physical-promotion-sync-history state directory-fd)
-                 (physical-promotion-test-point :after-child-history-sync)
-                 (dolist (frame (getf plan :frames))
-                   (check)
-                   (physical-promotion-stage-frame child frame)
-                   (when (eq frame (first (getf plan :frames)))
-                     (physical-promotion-test-point :after-child-eor-flush)))
-                 (physical-promotion-test-point :after-child-checkpoint-flush)
-                 (setf staged t)
-                 (check)
-                 (physical-promotion-sync-child-data context)
-                 (physical-promotion-test-point :after-child-data-sync)
-                 (check)
-                 (physical-promotion-save-child-control plan :context context :check #'check)
+                 (physical-promotion-stage-child-checkpoint
+                  state plan prefix files history-p #'check (lambda () (physical-promotion-sync-child-data context))
+                  :context context :install-prefix (not (null owner)))
+                 (physical-promotion-save-child-control
+                  plan :context context :check
+                  (lambda (&optional committed) (check (or committed :staged))))
                  (check t)
                  (setf finished t)
                  (getf plan :end))
