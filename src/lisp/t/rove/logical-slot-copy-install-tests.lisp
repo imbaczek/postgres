@@ -1,5 +1,53 @@
 (in-package #:pg)
 
+(cl-spec:defproperty staged-node-images-do-not-alias-node-metadata
+    ((number (range integer 0 18446744073709551615)))
+  (:about logical-slot-copy-install-stage-node-image)
+  (:trials (:normal 200))
+  (let* ((nodes
+           (loop for key in '(:root :work :slot-root :slot-work :container :slot-container
+                              :journal :pending-file :active-file)
+                 for fd from 10
+                 append (list key (%make-logical-slot-copy-install-node
+                                   :fd fd :name (copy-seq "Name") :kind :file
+                                   :identity (list number fd 42)))))
+         (image (logical-slot-copy-install-stage-node-image nodes))
+         (before (logical-slot-copy-import-state-image image))
+         (node (getf nodes :container)))
+    (setf (char (logical-slot-copy-install-node-name node) 0) #\n
+          (first (logical-slot-copy-install-node-identity node)) (logxor number 1))
+    (and (logical-slot-copy-committed-image-equal-p image before)
+         (not (logical-slot-copy-committed-image-equal-p
+               image (logical-slot-copy-install-stage-node-image nodes))))))
+
+(rove:deftest staged-node-images-generated-contract
+    (let ((data (cl-spec:result-data
+                 (cl-spec:run-property 'staged-node-images-do-not-alias-node-metadata
+                                       :seed 7527 :profile :normal))))
+      (rove:ok (eq :passed (getf data :status)) (format nil "~s" data))
+      (rove:ok (= 200 (getf data :trials)))))
+
+(rove:deftest staged-files-reject-unowned-operations-and-invalid-read-bounds
+    (let ((*logical-slot-copy-install-file-scope* nil) (called nil))
+      (rove:ok (handler-case
+                   (progn (logical-slot-copy-install-open-node nil "unused" :directory nil t t)
+                          (setf called t) nil)
+                 (error () t)))
+      (rove:ok (not called))
+      (dolist (size (list -1 (1+ +logical-slot-copy-install-maximum-bytes+) :invalid))
+        (rove:ok (handler-case (progn (logical-slot-copy-install-read-node nil size) nil)
+                   (error (condition) (search "read bound" (princ-to-string condition)))))))
+  (rove:ok (handler-case
+               (progn (logical-slot-copy-install-check-stage
+                       nil nil nil (%make-logical-slot-copy-install-stage)) nil)
+             (error () t))))
+
+(rove:deftest staged-node-images-reject-extra-and-cyclic-shapes
+    (dolist (nodes (list nil (make-list 20 :initial-element :foreign)
+                         (let ((cycle (list :root nil))) (setf (cddr cycle) cycle) cycle)))
+      (rove:ok (handler-case (progn (logical-slot-copy-install-stage-node-image nodes) nil)
+                 (error () t)))))
+
 (defun unit-logical-slot-install-value (word generation &optional same-mount)
   (let* ((certificate (unit-logical-import-value
                        :profile (if (oddp word) :text :binary-bytea)
