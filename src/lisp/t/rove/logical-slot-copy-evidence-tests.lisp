@@ -255,3 +255,170 @@
               (fourth row) (bytes->string (logical-slot-state-encode child)))
         (rove:ok (rove:signals
                   (logical-slot-copy-evidence-check-rows bad descriptor nil history) 'error)))))
+
+(cl-spec:defproperty resolved-import-fact-preserves-frozen-evidence
+    ((cause (member :none :wal-removed :wal-level-insufficient))
+     (offset (range integer 0 100000))
+     (generation (range integer 0 18446744073709551615))
+     (profile (member :text :binary-bytea))
+     (persisted (member nil t)))
+  (:about logical-slot-copy-evidence-check-resolved-fact)
+  (:trials (:normal 150))
+  (let* ((history (timeline-parse-history 1 ""))
+         (source (unit-logical-provenance-slot
+                  :cause cause :generation generation :end (+ 80 offset)
+                  :plugin "pg_lisp" :profile profile))
+         (certificate (unit-logical-import-value
+                       :generation generation :end (+ 80 offset) :profile profile :cause cause))
+         (descriptor (make-logical-slot-copy-descriptor
+                      :slots (list (list "fixture" (logical-slot-state-encode source)))))
+         (fact (physical-logical-fact-next
+                nil (unit-logical-status-record t :start (+ 32 offset)) 1 history))
+         (control (list :applied (+ 289 offset) :timeline 1
+                        :promotion-logical-decoding-enabled t)))
+    (setf fact (physical-logical-fact-next
+                fact (unit-logical-status-record t :start (+ 256 offset)) 1 history)
+          (getf certificate :fork) (+ 289 offset)
+          (getf certificate :child-end) (+ 290 offset)
+          (getf certificate :copy-id) (logical-slot-generation-token (+ generation 2))
+          (third (first (getf certificate :slots)))
+          (logical-slot-copy-import-digest (logical-slot-state-encode source))
+          (fourth (first (getf certificate :slots)))
+          (bytes->string (logical-slot-copy-import-child-image source (1+ generation) cause)))
+    (when persisted (setf (getf control :logical-fact) (copy-list fact)))
+    (let ((before (copy-tree control)) (fact-before (copy-list fact)))
+      (multiple-value-bind (checked marker)
+          (logical-slot-copy-evidence-check-resolved-fact
+           certificate descriptor control history fact)
+        (and (eq marker :control-fact-checked)
+             (equal checked fact) (not (eq checked fact))
+             (equal fact fact-before) (equal control before))))))
+
+(rove:deftest resolved-import-fact-generated-contract
+    (let ((data (cl-spec:result-data
+                 (cl-spec:run-property 'resolved-import-fact-preserves-frozen-evidence
+                                       :seed 7523 :profile :normal))))
+      (rove:ok (eq :passed (getf data :status)) (let ((*print-length* nil) (*print-level* nil)) (format nil "~s" data)))
+      (rove:ok (= 150 (getf data :trials)))))
+
+(rove:deftest resolved-import-fact-rejects-unproved-boundaries-and-policy
+    (let* ((history (timeline-parse-history 1 ""))
+           (source (unit-logical-provenance-slot :plugin "pg_lisp"))
+           (descriptor (make-logical-slot-copy-descriptor
+                        :slots (list (list "fixture" (logical-slot-state-encode source)))))
+           (baseline (physical-logical-fact-next
+                      nil (unit-logical-status-record t :start 32) 1 history)))
+      (setf baseline (physical-logical-fact-next
+                      baseline (unit-logical-status-record t :start 256) 1 history))
+      (dolist (mode '(:missing :through :timeline :control-boundary :control-parent
+                      :frozen-fact :disabled :disposition))
+        (let ((certificate (unit-logical-import-value))
+              (fact (copy-list baseline))
+              (control (list :applied 289 :timeline 1 :promotion-logical-decoding-enabled t)))
+          (setf (getf certificate :fork) 289 (getf certificate :child-end) 290)
+          (ecase mode
+            (:missing (setf fact nil))
+            (:through (incf (getf fact :through)))
+            (:timeline (setf (getf fact :through-timeline) 2))
+            (:control-boundary (incf (getf control :applied)))
+            (:control-parent (setf (getf control :applied-timeline) 2))
+            (:frozen-fact
+             (setf (getf control :logical-fact) (copy-list baseline))
+             (incf (getf (getf control :logical-fact) :coverage-start)))
+            (:disabled (setf (getf control :promotion-logical-decoding-enabled) nil))
+            (:disposition (setf (fifth (first (getf certificate :slots))) :wal-removed)))
+          (let ((before (copy-tree control)) (fact-before (copy-tree fact)))
+            (rove:ok (rove:signals
+                      (logical-slot-copy-evidence-check-resolved-fact
+                       certificate descriptor control history fact) 'error)
+                     (format nil "~s" mode))
+            (rove:ok (equal control before))
+            (rove:ok (equal fact fact-before)))))))
+
+(defun unit-source-proof-envelope (salt size)
+  (loop for (key minimum maximum) in (logical-slot-copy-source-proof-sections)
+        collect key
+        collect (make-array (+ minimum (mod size (1+ (min 16 (- maximum minimum)))))
+                            :element-type '(unsigned-byte 8) :initial-element salt)))
+
+(cl-spec:defproperty source-proof-envelope-preserves-bounded-sections
+    ((salt (range integer 0 255)) (size (range integer 0 256)))
+  (:about logical-slot-copy-source-proof-encode logical-slot-copy-source-proof-decode)
+  (:trials (:normal 150))
+  (let* ((value (unit-source-proof-envelope salt size))
+         (bytes (logical-slot-copy-source-proof-encode value))
+         (before (copy-seq bytes))
+         (decoded (logical-slot-copy-source-proof-decode bytes)))
+    (and (equalp value decoded)
+         (equalp bytes before)
+         (equalp bytes (logical-slot-copy-source-proof-encode decoded))
+         (every (lambda (key) (not (eq (getf value key) (getf decoded key))))
+                (loop for key in value by #'cddr collect key)))))
+
+(rove:deftest source-proof-envelope-generated-contract
+    (let ((data (cl-spec:result-data
+                 (cl-spec:run-property 'source-proof-envelope-preserves-bounded-sections
+                                       :seed 7524 :profile :normal))))
+      (rove:ok (eq :passed (getf data :status))
+               (let ((*print-length* nil) (*print-level* nil)) (format nil "~s" data)))
+      (rove:ok (= 150 (getf data :trials)))))
+
+(rove:deftest source-proof-envelope-rejects-corruption-and-length-forgeries
+    (let* ((value (unit-source-proof-envelope 7 4))
+           (image (logical-slot-copy-source-proof-encode value))
+           (position 20))
+      (dotimes (index (length image))
+        (let ((bad (copy-seq image)))
+          (setf (aref bad index) (logxor 1 (aref bad index)))
+          (rove:ok (rove:signals (logical-slot-copy-source-proof-decode bad) 'error))))
+      (loop for key in value by #'cddr
+            do (let ((bad (copy-seq image)))
+                 (wal-set-u32 bad position #xffffffff)
+                 (wal-set-u32 bad (- (length bad) 4) (wal-crc32 bad 0 (- (length bad) 4)))
+                 (rove:ok (rove:signals (logical-slot-copy-source-proof-decode bad) 'error)))
+               (incf position (+ 4 (length (getf value key)))))
+      (let ((bad (concatenate '(vector (unsigned-byte 8)) image #(0))))
+        (wal-set-u32 bad 16 (- (length bad) 24))
+        (wal-set-u32 bad (- (length bad) 4) (wal-crc32 bad 0 (- (length bad) 4)))
+        (rove:ok (rove:signals (logical-slot-copy-source-proof-decode bad) 'error)))
+      (rove:ok (rove:signals
+                (logical-slot-copy-source-proof-decode (subseq image 0 23)) 'error))
+      (let ((bad (copy-list value)))
+        (setf (getf bad :installation) #(1))
+        (rove:ok (rove:signals (logical-slot-copy-source-proof-encode bad) 'error)))
+      (rove:ok (rove:signals
+                (logical-slot-copy-source-proof-encode (append value '(:extra 1))) 'error))
+      (rove:ok (rove:signals
+                (logical-slot-copy-source-proof-encode (cons :extra value)) 'error))))
+
+(cl-spec:defproperty source-receipt-preserves-historical-observations
+    ((number (range integer 0 18446744073709551615))
+     (floor (range integer 3 18446744073709551616)))
+  (:about logical-slot-copy-source-receipt-image logical-slot-copy-source-receipt-decode)
+  (:trials (:normal 150))
+  (let* ((value (list :metadata (list :version 4 :lsn number)
+                      :generation-size 1024 :catalog-size 128 :catalog-digest number
+                      :next-oid number :local-floor floor))
+         (image (logical-slot-copy-source-receipt-image value))
+         (decoded (logical-slot-copy-source-receipt-decode image)))
+    (and (equal value decoded)
+         (not (eq (getf value :metadata) (getf decoded :metadata)))
+         (equalp image (logical-slot-copy-source-receipt-image decoded)))))
+
+(rove:deftest source-receipt-generated-contract-and-schema-rejections
+    (let ((data (cl-spec:result-data
+                 (cl-spec:run-property 'source-receipt-preserves-historical-observations
+                                       :seed 7525 :profile :normal))))
+      (rove:ok (eq :passed (getf data :status))
+               (let ((*print-length* nil) (*print-level* nil)) (format nil "~s" data)))
+      (rove:ok (= 150 (getf data :trials))))
+  (dolist (change '((:metadata nil) (:catalog-size 0) (:catalog-size 1024)
+                    (:generation-size 1073741825) (:catalog-digest -1)
+                    (:next-oid 1.0) (:local-floor 2) (:local-floor 18446744073709551617)
+                    (:extra 1)))
+    (let ((value (list :metadata '(:version 4 :lsn 80)
+                       :generation-size 1024 :catalog-size 128 :catalog-digest 0
+                       :next-oid 10000 :local-floor 3)))
+      (setf (getf value (first change)) (second change))
+      (rove:ok (rove:signals (logical-slot-copy-source-receipt-image value) 'error)
+               (format nil "~s" change)))))

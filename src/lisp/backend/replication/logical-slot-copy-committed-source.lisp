@@ -97,24 +97,15 @@
     (error "committed import source history or child plan differs from actual restartpoint"))
   (multiple-value-bind (fact history tuple state-image)
       (logical-slot-copy-import-scan store state manifest descriptor control)
-    (let ((observed (copy-list control)))
-      (when (and (getf control :logical-fact) (not (equal fact (getf control :logical-fact))))
-        (error "committed import source logical fact differs from its frozen control"))
-      (setf (getf observed :logical-fact) fact)
-      (unless (eq :control-fact-checked
-                  (logical-slot-copy-evidence-check-rows certificate descriptor observed history))
-        (error "committed import source logical replay did not resolve slot dispositions"))
-      (when (and (find :eligible (getf certificate :slots) :key #'fifth)
-                 (not (getf control :promotion-logical-decoding-enabled)))
-        (error "committed import disabled eligible logical interest"))
-      (let ((observations (funcall check-artifacts)))
-        (unless (and (equal tuple (physical-store-control-tuple store))
-                     (logical-slot-copy-committed-image-equal-p state-image (logical-slot-copy-import-state-image state)))
-          (error "committed import source changed during verification"))
-        (logical-slot-copy-check-committed-progress state metadata prefix generation store)
-        (logical-slot-copy-recheck-committed-state
-         manifest control descriptor state metadata prefix generation)
-        (values fact history tuple observations)))))
+    (logical-slot-copy-evidence-check-resolved-fact certificate descriptor control history fact)
+    (let ((observations (funcall check-artifacts)))
+      (unless (and (equal tuple (physical-store-control-tuple store))
+                   (logical-slot-copy-committed-image-equal-p state-image (logical-slot-copy-import-state-image state)))
+        (error "committed import source changed during verification"))
+      (logical-slot-copy-check-committed-progress state metadata prefix generation store)
+      (logical-slot-copy-recheck-committed-state
+       manifest control descriptor state metadata prefix generation)
+      (values fact history tuple observations))))
 
 (defun logical-slot-copy-check-committed-source
     (context certificate evidence descriptor manifest control plan state metadata prefix generation store)

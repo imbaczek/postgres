@@ -301,8 +301,7 @@ Older metadata without these fields uses the base timeline."
              (every (lambda (key) (loop for name in metadata by #'cddr thereis (eq key name)))
                     '(:replay-timeline :history-target :history-digest))))))
 
-(defun physical-restartpoint-check-metadata (metadata catalog-bytes state &optional prefix-bytes)
-  "Validate restartpoint identity, optional source facts, inventory and WAL prefix."
+(defun physical-restartpoint-check-source-metadata (metadata state)
   (physical-history-check-plist
    metadata (append '(:version :system-id :cluster-identity :timeline :manifest-digest
                       :base :lsn :prefix-digest :next-xid :forks :seen)
@@ -343,6 +342,11 @@ Older metadata without these fields uses the base timeline."
       (unless (and (wal-checkpoint-snapshot-valid-p snapshot)
                    (<= (getf state :end) (getf snapshot :end) (getf metadata :lsn)))
         (error "restartpoint source checkpoint lies outside its applied history"))))
+  metadata)
+
+(defun physical-restartpoint-check-metadata (metadata catalog-bytes state &optional prefix-bytes)
+  "Validate restartpoint identity, optional source facts, inventory and WAL prefix."
+  (physical-restartpoint-check-source-metadata metadata state)
   (let ((names (make-hash-table :test #'equal))
         (seen (make-hash-table :test #'eql))
         (live (physical-history-catalog-relfilenodes catalog-bytes (getf state :cluster-identity))))

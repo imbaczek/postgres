@@ -70,6 +70,28 @@ the recorded disposition does not prove source logical status."
                (error "import evidence planned slot differs from its actual source")))
     (if fact :control-fact-checked :requires-source-replay)))
 
+(defun logical-slot-copy-evidence-check-resolved-fact
+    (certificate descriptor control history fact)
+  (unless (and fact
+               (eql (getf certificate :fork) (getf control :applied))
+               (eql (getf certificate :parent-timeline)
+                    (getf control :applied-timeline (getf control :timeline))))
+    (error "resolved import fact lacks its frozen replay boundary"))
+  (let ((checked (physical-logical-check-fact
+                  fact history (getf certificate :fork) (getf certificate :parent-timeline)))
+        (observed (copy-list control)))
+    (when (and (getf control :logical-fact)
+               (not (equal checked (getf control :logical-fact))))
+      (error "resolved import fact differs from its frozen control"))
+    (setf (getf observed :logical-fact) checked)
+    (unless (eq :control-fact-checked
+                (logical-slot-copy-evidence-check-rows certificate descriptor observed history))
+      (error "resolved import fact did not prove slot dispositions"))
+    (when (and (find :eligible (getf certificate :slots) :key #'fifth)
+               (not (getf control :promotion-logical-decoding-enabled)))
+      (error "resolved import fact has disabled eligible logical interest"))
+    (values checked :control-fact-checked)))
+
 (defun logical-slot-copy-import-evidence-check-certificate (evidence certificate descriptor proof-bytes)
   "Check evidence against the certificate, descriptor and base proof without I/O.
 Return manifest, control, plan and the row check marker as the fourth value.
