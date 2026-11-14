@@ -243,6 +243,31 @@
   (rove:ok (handler-case (progn (logical-slot-copy-install-check-row-writer (%make-logical-slot-copy-install-publisher)) nil)
              (error (condition) (search "row writer" (princ-to-string condition))))))
 
+(cl-spec:defproperty installation-exchange-allows-only-ctime-change
+    ((word (range integer 0 18446744073709551615))
+     (index (range integer 0 8)))
+  (:about logical-slot-copy-install-exchange-facts-p)
+  (:trials (:normal 200))
+  (let* ((before (loop for i below 9 collect (+ i word)))
+         (after (copy-list before)))
+    (setf (nth index after) (1+ (nth index after)))
+    (eq (= index 7) (not (null (logical-slot-copy-install-exchange-facts-p before after))))))
+
+(rove:deftest installation-exchange-ctime-generated-contract
+    (let ((data (cl-spec:result-data
+                 (cl-spec:run-property 'installation-exchange-allows-only-ctime-change :seed 7535 :profile :normal))))
+      (rove:ok (eq :passed (getf data :status)) (format nil "~s" data))
+      (rove:ok (= 200 (getf data :trials)))))
+
+(rove:deftest installation-exchange-rejects-unowned-receipts-and-wrong-roles
+    (rove:ok (handler-case
+                 (progn (logical-slot-copy-install-exchange-certificate nil nil (%make-logical-slot-copy-install-input)
+                                                                        (%make-logical-slot-copy-install-row-receipt)) nil)
+               (error (condition) (search "registered owner" (princ-to-string condition)))))
+  (rove:ok (handler-case
+               (progn (logical-slot-copy-install-check-exchange-writer (%make-logical-slot-copy-install-publisher)) nil)
+             (error (condition) (search "exchange writer" (princ-to-string condition))))))
+
 (defun unit-logical-slot-install-value (word generation &optional same-mount)
   (let* ((certificate (unit-logical-import-value
                        :profile (if (oddp word) :text :binary-bytea)

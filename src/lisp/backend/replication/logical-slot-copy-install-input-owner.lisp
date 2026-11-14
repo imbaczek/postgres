@@ -25,7 +25,8 @@
   (origin nil :read-only t) (handoff nil :read-only t)
   (registry nil :read-only t) (engine nil :read-only t) (shutdown-lock nil :read-only t)
   owner context context-fd context-children input seal
-  phase prefix physical-images physical-facts physical-witnesses failed ready)
+  phase prefix physical-images physical-facts physical-witnesses failed ready
+  row-receipt row-receipt-seal row-receipt-state)
 
 (defvar *logical-slot-copy-install-inputs* nil)
 

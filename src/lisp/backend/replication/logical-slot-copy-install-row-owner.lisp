@@ -7,11 +7,12 @@
             (:constructor %make-logical-slot-copy-install-row-writer)
             (:print-function physical-libpq-print-private-object))
   "Publisher role holding the expected pending prefix and closed row facts."
-  (value nil :read-only t) prefix slot-root slot-work slots closed)
+  (value nil :read-only t) (expected-phase :pending :read-only t)
+  prefix slot-root slot-work slots closed)
 
 (defvar *logical-slot-copy-install-row-test-hook* nil)
 
-(defun logical-slot-copy-install-check-row-origin (writer)
+(defun logical-slot-copy-install-check-fixed-origin (writer)
   "Require the actual spent fresh handoff or cold fixed-journal authority."
   (let* ((record (logical-slot-copy-install-publisher-record writer))
          (operation (logical-slot-copy-install-publisher-operation writer)))
@@ -51,20 +52,25 @@
 
 (defmethod logical-slot-copy-install-publisher-check-role ((writer logical-slot-copy-install-row-writer))
   "Require the origin, exact pending prefix, and closed row observations."
-  (logical-slot-copy-install-check-row-origin writer)
+  (logical-slot-copy-install-check-fixed-origin writer)
   (let* ((layout (logical-slot-copy-install-read-layout
                   (logical-slot-copy-install-publisher-operation writer)
                   (logical-slot-copy-install-publisher-image writer)))
          (prefix (logical-slot-copy-install-row-writer-prefix writer)))
-    (unless (and (eq :pending (getf layout :phase)) (integerp prefix)
-                 (= prefix (getf layout :prefix)))
+    (unless (and (member (logical-slot-copy-install-row-writer-expected-phase writer) '(:pending :active))
+                 (eq (logical-slot-copy-install-row-writer-expected-phase writer) (getf layout :phase))
+                 (integerp prefix) (= prefix (getf layout :prefix))
+                 (or (eq :pending (getf layout :phase))
+                     (and (eq :cold (logical-slot-copy-install-input-state-origin
+                                     (logical-slot-copy-install-publisher-record writer)))
+                          (= prefix (length (getf (logical-slot-copy-install-row-writer-value writer) :entries))))))
       (error "logical installation row phase or expected prefix changed")))
   (logical-slot-copy-install-check-row-closed writer)
   writer)
 
 (defmethod logical-slot-copy-install-publisher-check-closed-role ((writer logical-slot-copy-install-row-writer))
   "Recheck origin and closed rows after publisher descriptor cleanup."
-  (logical-slot-copy-install-check-row-origin writer)
+  (logical-slot-copy-install-check-fixed-origin writer)
   (logical-slot-copy-install-check-row-closed writer))
 
 (defun logical-slot-copy-install-check-row-writer (writer)

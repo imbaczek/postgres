@@ -79,36 +79,55 @@ Save row facts and close its descriptors before processing the next row."
     (logical-slot-copy-install-publisher-close writer directory)
     (logical-slot-copy-install-row-point writer :after-row-close name)))
 
-(defun logical-slot-copy-install-rows (owner context input)
-  "Resync the visible pending prefix, then install remaining rows in order.
-Return the full pending prefix length.  This does not exchange the active
-certificate, activate the registry, grant admission, or run a coordinator;
-the fixed journal remains the startup fence."
+(defun logical-slot-copy-install-rows (owner context input &key (phase :pending))
   (let* ((record (logical-slot-copy-install-input-record owner context input))
-         (image (logical-slot-copy-install-input-state-image record)))
-    (call-with-logical-slot-copy-install-publisher
-     owner context input
-     (lambda (writer)
-       (logical-slot-copy-install-row-bind writer)
-       (let* ((value (logical-slot-copy-install-row-writer-value writer))
-              (rows (getf (logical-slot-copy-import-decode (getf value :certificate)) :slots))
-              (initial (logical-slot-copy-install-row-writer-prefix writer)))
-         (loop for row in rows for expected in (getf value :entries) for index from 0
-               do (multiple-value-bind (directory state)
-                      (logical-slot-copy-install-row-open writer row expected (< index initial))
-                    (logical-slot-copy-install-row-point writer :row-open (first row))
-                    (unless (< index initial)
-                      (multiple-value-setq (directory state)
-                        (logical-slot-copy-install-row-rename writer directory state)))
-                    (logical-slot-copy-install-row-finish writer directory state)))
-         (logical-slot-copy-install-row-proof writer)
-         (unless (= (length rows) (logical-slot-copy-install-row-writer-prefix writer))
-           (error "logical installation row prefix did not finish"))
-         (length rows)))
-     :constructor (lambda (&rest arguments)
-                    (apply #'%make-logical-slot-copy-install-row-writer
-                           :value (logical-slot-copy-install-decode image)
-                           :prefix (logical-slot-copy-install-input-state-prefix record) arguments)))))
+         (image (logical-slot-copy-install-input-state-image record))
+         (facts nil)
+         (count
+           (call-with-logical-slot-copy-install-publisher
+            owner context input
+            (lambda (writer)
+              (logical-slot-copy-install-row-bind writer)
+              (let* ((value (logical-slot-copy-install-row-writer-value writer))
+                     (rows (getf (logical-slot-copy-import-decode (getf value :certificate)) :slots))
+                     (initial (logical-slot-copy-install-row-writer-prefix writer)))
+                (loop for row in rows for expected in (getf value :entries) for index from 0
+                      do (multiple-value-bind (directory state)
+                             (logical-slot-copy-install-row-open writer row expected (< index initial))
+                           (logical-slot-copy-install-row-point writer :row-open (first row))
+                           (unless (< index initial)
+                             (multiple-value-setq (directory state)
+                               (logical-slot-copy-install-row-rename writer directory state)))
+                           (logical-slot-copy-install-row-finish writer directory state)))
+                (logical-slot-copy-install-row-proof writer)
+                (unless (= (length rows) (logical-slot-copy-install-row-writer-prefix writer))
+                  (error "logical installation row prefix did not finish"))
+                (setf facts (logical-slot-copy-import-state-image
+                             (logical-slot-copy-install-row-durable-facts
+                              (logical-slot-copy-install-input-state-operation record) image)))
+                (length rows)))
+            :constructor (lambda (&rest arguments)
+                           (apply #'%make-logical-slot-copy-install-row-writer
+                                  :value (logical-slot-copy-install-decode image) :expected-phase phase
+                                  :prefix (logical-slot-copy-install-input-state-prefix record) arguments)))))
+    (logical-slot-copy-install-check-input owner context input)
+    (unless (and (eq phase (logical-slot-copy-install-input-state-phase record))
+                 (= count (logical-slot-copy-install-input-state-prefix record))
+                 (logical-slot-copy-committed-image-equal-p
+                  facts (logical-slot-copy-install-row-durable-facts
+                         (logical-slot-copy-install-input-state-operation record) image)))
+      (logical-slot-copy-install-revoke-input record)
+      (error "logical installation rows changed after completion"))
+    (let ((receipt (%make-logical-slot-copy-install-row-receipt
+                    :owner owner :context context :input input
+                    :operation (logical-slot-copy-install-input-state-operation record)
+                    :image (copy-seq image) :phase phase :prefix count :facts facts)))
+      (sb-sys:without-interrupts
+        (setf (logical-slot-copy-install-input-state-row-receipt record) receipt
+              (logical-slot-copy-install-input-state-row-receipt-seal record)
+              (logical-slot-copy-import-state-image (logical-slot-copy-install-row-receipt-view receipt))
+              (logical-slot-copy-install-input-state-row-receipt-state record) :available))
+      (values count receipt))))
 
 (defun logical-slot-copy-install-fresh-rows ()
   "Publish a fresh journal and install its pending rows."
