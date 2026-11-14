@@ -138,6 +138,48 @@ slots and checking complete child files. Recheck source observations."
    :tuple (logical-slot-copy-import-state-image tuple)
    :observations (logical-slot-copy-import-state-image observations)))
 
+(defun call-with-logical-slot-copy-committed-proof
+    (owner context certificate evidence descriptor manifest control plan input-observations function
+     &key (include-proof t))
+  (logical-slot-copy-check-input owner context)
+  (unless (eq :pending (getf certificate :phase))
+    (error "committed source proof requires its original pending certificate"))
+  (let ((*pgdata* (physical-image-context-root-path context))
+        (*physical-image-context* nil))
+    (multiple-value-bind (state metadata prefix generation)
+        (logical-slot-copy-committed-state manifest control descriptor)
+      (call-with-logical-slot-copy-committed-store
+       owner state
+       (lambda (store)
+         (physical-promotion-ensure-pending-retained state metadata store)
+         (physical-follow-call-with-receive-root
+          store
+          (lambda ()
+            (multiple-value-bind (fact history tuple child-observations)
+                (logical-slot-copy-check-committed-source
+                 context certificate evidence descriptor manifest control plan
+                 state metadata prefix generation store)
+              (let ((image (logical-slot-copy-import-state-image
+                            (list certificate evidence manifest control plan state metadata prefix fact history))))
+                (multiple-value-prog1
+                    (funcall function owner context store certificate plan fact history
+                             (when include-proof
+                               (logical-slot-copy-committed-proof-image
+                                evidence descriptor manifest control state metadata prefix generation tuple
+                                (append input-observations child-observations))))
+                  (unless (and (equal tuple (physical-store-control-tuple store))
+                               (logical-slot-copy-committed-image-equal-p image (logical-slot-copy-import-state-image
+                                                                                 (list certificate evidence manifest control
+                                                                                       plan state metadata prefix fact history))))
+                    (error "committed import source binding was modified"))
+                  (logical-slot-copy-input-check-observations owner context child-observations)
+                  (dolist (row child-observations)
+                    (unless (equal row (logical-slot-copy-file-row context (first row)))
+                      (error "committed import child file changed during its scope")))
+                  (logical-slot-copy-check-committed-source
+                   context certificate evidence descriptor manifest control plan
+                   state metadata prefix generation store)))))))))))
+
 (defun call-with-logical-slot-copy-committed-source-kind (constructor function &key (include-proof t))
   "Verify actual source and child bytes, then call FUNCTION under read ownership.
 Protect the C3 retained root before taking the reader lease and recheck after
@@ -147,41 +189,9 @@ this scope grants neither installation nor admission."
    constructor
    (lambda (owner context certificate evidence descriptor manifest control plan status input-observations)
      (declare (ignore status))
-     (let ((*pgdata* (physical-image-context-root-path context))
-           (*physical-image-context* nil))
-       (multiple-value-bind (state metadata prefix generation)
-           (logical-slot-copy-committed-state manifest control descriptor)
-         (call-with-logical-slot-copy-committed-store
-          owner state
-          (lambda (store)
-            (physical-promotion-ensure-pending-retained state metadata store)
-            (physical-follow-call-with-receive-root
-             store
-             (lambda ()
-               (multiple-value-bind (fact history tuple child-observations)
-                   (logical-slot-copy-check-committed-source
-                    context certificate evidence descriptor manifest control plan
-                    state metadata prefix generation store)
-                 (let ((image (logical-slot-copy-import-state-image
-                               (list certificate evidence manifest control plan state metadata prefix fact history))))
-                   (multiple-value-prog1
-                       (funcall function owner context store certificate plan fact history
-                                (when include-proof
-                                  (logical-slot-copy-committed-proof-image
-                                   evidence descriptor manifest control state metadata prefix generation tuple
-                                   (append input-observations child-observations))))
-                     (unless (and (equal tuple (physical-store-control-tuple store))
-                                  (logical-slot-copy-committed-image-equal-p image (logical-slot-copy-import-state-image
-                                                                                    (list certificate evidence manifest control
-                                                                                          plan state metadata prefix fact history))))
-                       (error "committed import source binding was modified"))
-                     (logical-slot-copy-input-check-observations owner context child-observations)
-                     (dolist (row child-observations)
-                       (unless (equal row (logical-slot-copy-file-row context (first row)))
-                         (error "committed import child file changed during its scope")))
-                     (logical-slot-copy-check-committed-source
-                      context certificate evidence descriptor manifest control plan
-                      state metadata prefix generation store)))))))))))))
+     (call-with-logical-slot-copy-committed-proof
+      owner context certificate evidence descriptor manifest control plan input-observations function
+      :include-proof include-proof))))
 
 (defun call-with-logical-slot-copy-committed-source (function)
   "Verify source and child bytes and call FUNCTION under read ownership.
