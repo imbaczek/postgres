@@ -34,6 +34,12 @@ A cdr cycle declines the fast path."
       (when (eq slow fast) (return nil)))))
 
 (defun %physical-bootstrap-write-manifest-envelope (payload crc output)
+  "Write the manifest envelope into OUTPUT and return it.
+PAYLOAD is a simple octet vector of UTF-8 bytes and CRC is their checksum.
+OUTPUT must be a distinct simple octet vector of exactly
+(+ (length PAYLOAD) 28) bytes.
+Write the 18-byte magic, eight hexadecimal CRC digits, a newline, PAYLOAD,
+and a final newline.  Valid calls allocate no heap memory."
   (declare (optimize (speed 3) (safety 3))
            (type (simple-array (unsigned-byte 8) (*)) payload output)
            (type (unsigned-byte 32) crc))

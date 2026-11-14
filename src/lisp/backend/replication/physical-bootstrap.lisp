@@ -367,7 +367,8 @@ only declines the fast path and does not add a new cycle error."
     (with-standard-io-syntax (prin1-to-string (literal manifest)))))
 
 (defun physical-bootstrap-manifest-image (manifest)
-  "Encode the canonical manifest text with its CRC envelope."
+  "Return an owned manifest image with its CRC envelope.
+Encode the canonical text as UTF-8 once and calculate the CRC over those bytes."
   (let* ((payload (string->bytes (physical-bootstrap-manifest-text manifest)))
          (crc (wal-crc32 payload))
          (image (make-array (+ 28 (length payload)) :element-type '(unsigned-byte 8))))
