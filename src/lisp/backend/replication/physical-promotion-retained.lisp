@@ -43,6 +43,7 @@
     (system-id reference parent history &key end digest on-record
                                           (directory (physical-recovery-retained-directory)) (reader #'physical-retained-object-read))
   "Validate the root, ancestry, base overlap and extent coverage without mutation."
+  ;; An injected reader can keep archive I/O under an existing directory FD.
   (handler-case
       (let* ((identity (physical-promotion-retained-identity system-id reference))
              (fork (getf reference :end)) (base (getf reference :base)))
@@ -179,6 +180,7 @@ Return the complete control tuple for the subsequent retirement check."
   "Read SEGMENT from the selected source root and verify its inventory.
 The base overlap supplies physical prefix bytes, not logical coverage before
 base. In the base segment, compare the extent prefix with the immutable overlap."
+  ;; Use the same reader for the index, extent and overlap.
   (let* ((index (physical-retained-inventory-read-index
                  directory (getf reference :root-id) identity history reader))
          (entries (getf index :entries))

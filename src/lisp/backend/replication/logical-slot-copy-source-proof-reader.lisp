@@ -1,6 +1,9 @@
 (in-package #:pg)
 
 (defun logical-slot-copy-source-proof-read-held (owner context register)
+  ;; Verify historical proof and archive bytes under held ownership.  The
+  ;; receipt's catalog and local-floor observations still require a future
+  ;; owned publisher; this reader does not authorize promotion or retirement.
   (let* ((root (physical-image-context-root-fd context))
          (root-facts (physical-image-file-facts root))
          (named-root (namestring (physical-adoption-owner-directory owner))))
@@ -85,6 +88,8 @@
                          (funcall register directory input identity (getf reference :root-id)
                                   history #'read-object))
                        (prove)
+                       ;; Archive object FDs have closed here.  The proof and
+                       ;; archive directory FDs remain held between the passes.
                        (when *logical-slot-copy-verification-test-hook*
                          (funcall *logical-slot-copy-verification-test-hook*
                                   :after-source-proof-files-close nil))
@@ -93,6 +98,7 @@
                   (setf active nil)))))))))))
 
 (defun logical-slot-copy-read-source-proof ()
+  ;; Observe the canonical proof under cold ownership and a scoped reference.
   (logical-slot-copy-install-check-input-entry)
   (call-with-logical-slot-copy-install-exclusion
    (lambda ()

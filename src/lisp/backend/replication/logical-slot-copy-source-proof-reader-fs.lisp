@@ -1,6 +1,9 @@
 (in-package #:pg)
 
 (defun call-with-logical-slot-copy-source-proof-fd (parent name directory-p function)
+  ;; Hold one private, named input for FUNCTION and recheck its identity.
+  ;; Leave a reused descriptor open.  Close owned input once, without retrying
+  ;; a reported close failure; preserve an original body failure during cleanup.
   (declare (notinline sb-posix:close))
   (unless (and (stringp name) (plusp (length name))
                (not (find #\/ name)) (not (find (code-char 0) name))

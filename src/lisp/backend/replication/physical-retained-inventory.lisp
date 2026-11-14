@@ -265,6 +265,8 @@ proof, logical coverage and source authority."
 
 ON-RECORD receives each validated record and its original bytes, including records
 past any endpoint of interest to the caller. Return the freshly decoded payload."
+  ;; READER may bind I/O to a held archive directory.  Like the default reader,
+  ;; it must enforce each requested content ID and byte limit.
   (let ((payload (physical-retained-inventory-read-index directory id identity history reader)))
     (physical-retained-inventory-verify-entries
      (getf payload :entries) history

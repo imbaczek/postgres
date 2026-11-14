@@ -42,6 +42,8 @@ Unknown or ahead positions defer; proved ON coverage must match its frozen origi
 (defun logical-slot-copy-import-base-state (manifest descriptor control &key (reservation nil reservation-p))
   "Build the explicit D seed from the descriptor checkpoint and base evidence.
 D is the copy base end; the pending source checkpoint at F is distinct."
+  ;; A caller with an embedded checkpoint can supply its derived reservation;
+  ;; otherwise use the ordinary verified-base reservation.
   (let* ((base (copy-tree manifest))
          (snapshot (third (logical-slot-copy-control-fields
                            (logical-slot-copy-descriptor-base-control descriptor))))

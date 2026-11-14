@@ -1,6 +1,7 @@
 (in-package #:pg)
 
 (defun logical-slot-copy-source-proof-parent-history (facts)
+  ;; Recover the parent lineage and require the certificate's fixed fork.
   (let ((certificate (getf facts :certificate)))
     (multiple-value-bind (parent fork history)
         (physical-promotion-retained-parent-history
@@ -14,6 +15,8 @@
 
 (defun logical-slot-copy-source-proof-map-archive
     (facts directory reader candidate function start)
+  ;; Feed validated archive records from START to exact F, rejecting crossings
+  ;; and gaps that do not follow the embedded history.
   (let* ((certificate (getf facts :certificate))
          (reference (getf certificate :retained-reference))
          (history (getf facts :history))
@@ -50,6 +53,8 @@
     nil))
 
 (defun logical-slot-copy-source-proof-scan-archive (facts directory reader)
+  ;; Replay from the embedded D checkpoint seed to clean F and compare the
+  ;; resulting fact.  This is a historical observation, not promotion authority.
   (let* ((certificate (getf facts :certificate))
          (manifest (getf facts :manifest))
          (descriptor (getf facts :descriptor))
@@ -90,6 +95,7 @@
     result))
 
 (defun logical-slot-copy-source-proof-check-archive-prefix (facts directory reader)
+  ;; Match the saved F prefix against the selected archived segment.
   (let* ((certificate (getf facts :certificate))
          (reference (getf certificate :retained-reference))
          (fork (getf certificate :fork))

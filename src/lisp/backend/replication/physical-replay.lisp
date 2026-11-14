@@ -434,6 +434,8 @@ Direct control operation; does not promote, follow a network source or coordinat
        (member (getf state :complete) '(nil t))))
 
 (defun physical-recovery-checkpoint-reservation (manifest record next-xid)
+  ;; Derive a base reservation from the supplied checkpoint without I/O or
+  ;; replay-state mutation.  Old record formats do not prove completeness.
   (let* ((end (getf manifest :end))
          (bound (1- (canonical-next-full-xid next-xid)))
          (complete (>= (wal-record-version record) 7)))

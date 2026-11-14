@@ -23,6 +23,7 @@
   (error "permanent source reader does not authorize offline adoption"))
 
 (defun call-with-logical-slot-copy-source-reader-owner (function)
+  ;; This cold owner permits observation, not offline adoption or promotion.
   (call-with-postmaster-ownership
    (lambda (ownership)
      (let ((owner (apply #'%make-logical-slot-copy-source-reader-owner
@@ -32,6 +33,8 @@
          (setf (physical-adoption-owner-active-p owner) nil))))))
 
 (defun call-with-logical-slot-copy-source-reader-reference (function)
+  ;; Protect the archive root only for this scope.  DIRECTORY is the canonical
+  ;; registry key; INPUT and READER use the held archive FD for actual I/O.
   (let ((token (gensym "SOURCE-PROOF-READER")) (reference nil)
                                                (registered nil) (active t) (complete nil))
     (labels ((register (directory input identity id history reader)
