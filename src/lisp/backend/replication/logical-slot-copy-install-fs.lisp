@@ -4,6 +4,7 @@
 (in-package #:pg)
 
 (defstruct (logical-slot-copy-install-node (:constructor %make-logical-slot-copy-install-node))
+  "A held inode and its binding to a parent and name."
   (fd nil :read-only t) (parent nil :read-only t) (name nil :read-only t)
   (kind nil :read-only t) (identity nil :read-only t))
 
@@ -19,6 +20,7 @@
   (list (first facts) (second facts) (ninth facts)))
 
 (defun logical-slot-copy-install-check-node (node)
+  "Check inode identity, privacy, and its binding to the held parent."
   (let* ((facts (physical-image-file-facts (logical-slot-copy-install-node-fd node)))
          (kind (logical-slot-copy-install-node-kind node))
          (mode (third facts)) (parent (logical-slot-copy-install-node-parent node)))
@@ -41,6 +43,7 @@
     node))
 
 (defun logical-slot-copy-install-check-file-scope ()
+  "Recheck the preparation and all inode bindings in the active scope."
   (unless *logical-slot-copy-install-file-scope*
     (error "logical installation file operation requires its preparation scope"))
   (destructuring-bind (owner context attempt resources root) *logical-slot-copy-install-file-scope*
@@ -50,6 +53,7 @@
     resources))
 
 (defun logical-slot-copy-install-check-node-argument (node &optional allow-root)
+  "Require the actual registered node, or the borrowed root when allowed."
   (let ((resources (logical-slot-copy-install-check-file-scope)))
     (unless (or (member node (car resources) :test #'eq)
                 (and allow-root (eq node (fifth *logical-slot-copy-install-file-scope*))))
@@ -57,6 +61,9 @@
     (logical-slot-copy-install-check-node node)))
 
 (defun logical-slot-copy-install-open-node (parent name kind group create exclusive &optional expected)
+  "Open and register a child under a held parent, checking its filesystem group.
+The first descriptor opened after mkdir is the identity baseline.  This requires
+exclusive control of staging namespaces by cooperating local writers."
   (declare (notinline physical-image-mkdirat physical-image-openat sb-posix:fsync))
   (let ((resources (logical-slot-copy-install-check-file-scope))
         (fd nil) (registered nil) (created nil) (node nil))
@@ -112,6 +119,7 @@
     node))
 
 (defun logical-slot-copy-install-close-node (node)
+  "Close an owned node and remove it from the scope; the root is borrowed."
   (declare (notinline sb-posix:close))
   (destructuring-bind (owner context attempt resources root) *logical-slot-copy-install-file-scope*
     (declare (ignore owner context attempt root))
@@ -122,6 +130,7 @@
       (sb-posix:close (logical-slot-copy-install-node-fd node)))))
 
 (defun logical-slot-copy-install-sync-node (node)
+  "Sync a registered inode and recheck the scope."
   (declare (notinline sb-posix:fsync))
   (logical-slot-copy-install-check-node-argument node t)
   (sb-posix:fsync (logical-slot-copy-install-node-fd node))
@@ -130,6 +139,7 @@
   (logical-slot-copy-install-check-file-scope))
 
 (defun logical-slot-copy-install-write-node (node bytes)
+  "Write bounded bytes to a fresh owned file, then sync it."
   (declare (notinline sb-posix:write))
   (logical-slot-copy-install-check-node-argument node)
   (unless (and (eq :file (logical-slot-copy-install-node-kind node))
@@ -154,6 +164,7 @@
   (logical-slot-copy-install-sync-node node))
 
 (defun logical-slot-copy-install-read-node (node size)
+  "Read exactly SIZE bytes from an owned file and recheck its length."
   (declare (notinline sb-posix:read))
   (unless (and (integerp size) (<= 0 size +logical-slot-copy-install-maximum-bytes+))
     (error "invalid logical installation read bound"))
@@ -176,6 +187,9 @@
     bytes))
 
 (defun call-with-logical-slot-copy-install-file-scope (owner context attempt function)
+  "Call FUNCTION with the borrowed root and close every owned descriptor on exit.
+Preserve an original failure if closing also fails; the enclosing write scope
+fences a failed preparation.  Nodes have authority only within this scope."
   (logical-slot-copy-install-call-with-write
    owner context attempt
    (lambda ()

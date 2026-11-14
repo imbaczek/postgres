@@ -694,6 +694,12 @@ this mode.
 
 ### SBCL descriptor streams and global variables
 
+- Some contexts bind `*pgdata*` to `/proc/self/fd/N/`; an exec child cannot
+  use that path because the descriptor is close-on-exec. For a task-owned mount
+  fixture, use the checked `physical-adoption-owner-directory` and pair its
+  named path with the held descriptor. Production I/O stays descriptor-relative;
+  do not weaken close-on-exec. A bind-mount fixture reloaded in the same owned
+  Lisp image verified the new mount ID rejection.
 - Keep offline metadata operations on a held root descriptor across create,
   rename, sync and readback. Rechecking an absolute pathname before an operation
   still leaves a replacement window. Two reseed regressions created a temporary

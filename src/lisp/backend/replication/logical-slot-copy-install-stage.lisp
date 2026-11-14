@@ -3,12 +3,14 @@
 (defstruct (logical-slot-copy-install-stage
             (:constructor %make-logical-slot-copy-install-stage)
             (:print-function physical-libpq-print-private-object))
+  "Private evidence for a staged installation, valid only within its scope."
   (owner nil :read-only t) (context nil :read-only t) (attempt nil :read-only t)
   (nodes nil :read-only t) (value nil :read-only t) (image nil :read-only t))
 
 (defvar *logical-slot-copy-install-stages* nil)
 
 (defun logical-slot-copy-install-stage-node-image (nodes)
+  "Capture node, parent, name, and identity metadata."
   (unless (and (= 18 (logical-slot-copy-descriptor-list-count nodes 18))
                (equal (loop for key in nodes by #'cddr collect key)
                       '(:root :work :slot-root :slot-work :container :slot-container
@@ -23,6 +25,7 @@
                       (copy-list (logical-slot-copy-install-node-identity node)))))
 
 (defun logical-slot-copy-install-create-row (container root row)
+  "Write, verify, and sync one certified slot, then close its descriptors."
   (let* ((name (first row)) (bytes (string->bytes (fourth row))))
     (slot-state-check-bytes bytes)
     (let* ((directory (logical-slot-copy-install-open-node container name :directory root t t))
@@ -39,6 +42,7 @@
       identity)))
 
 (defun logical-slot-copy-install-observe-row (container root row expected)
+  "Reopen one slot by its recorded identities and check its inventory and bytes."
   (let* ((directory (logical-slot-copy-install-open-node
                      container (first row) :directory root nil nil (second expected)))
          (state (logical-slot-copy-install-open-node directory "state" :file root nil nil (third expected)))
@@ -56,6 +60,7 @@
       facts)))
 
 (defun logical-slot-copy-install-stage-observations (nodes value certificate)
+  "Capture full inode facts and check the staged inventories and slot rows."
   (let ((container (getf nodes :container)) (slots (getf nodes :slot-container)))
     (unless (and (equal '("active" "journal")
                         (sort (directory-entry-names
@@ -74,6 +79,7 @@
            collect (logical-slot-copy-install-observe-row slots (getf nodes :slot-root) row expected)))))
 
 (defun logical-slot-copy-install-check-stage (owner context attempt stage)
+  "Recheck stage authority, exact images, bindings, inventories, and inode facts."
   (let ((record (assoc stage *logical-slot-copy-install-stages* :test #'eq)))
     (unless (and record (logical-slot-copy-install-stage-p stage)
                  (eq owner (logical-slot-copy-install-stage-owner stage))
@@ -103,6 +109,7 @@
     t))
 
 (defun logical-slot-copy-install-stage-id (attempt requested)
+  "Choose a canonical stage ID that does not alias a source owner."
   (let* ((certificate (logical-slot-copy-install-preparation-certificate attempt))
          (excluded (logical-slot-copy-import-excluded-owners certificate))
          (number (if requested (logical-slot-parse-generation requested)
@@ -114,6 +121,7 @@
     token))
 
 (defun logical-slot-copy-install-build-stage-value (attempt nodes token rows)
+  "Build the installation journal value from certified evidence and staged identities."
   (list :certificate (logical-slot-copy-import-image
                       (logical-slot-copy-install-preparation-certificate attempt))
         :evidence-digest (logical-slot-copy-import-digest
@@ -131,6 +139,7 @@
         :entries rows))
 
 (defun logical-slot-copy-install-create-stage-nodes (root token)
+  "Create private containers in the root and slot-root filesystem groups."
   (let* ((work (logical-slot-copy-install-open-node root "logical-slot-copy.work" :directory root t nil))
          (slot-root (logical-slot-copy-install-open-node root "pg_replslot" :slot-root nil t nil))
          (slot-work (logical-slot-copy-install-open-node slot-root ".logical-slot-copy.work" :directory slot-root t nil))
@@ -143,6 +152,12 @@
           :container container :slot-container slots :journal journal :pending-file pending :active-file active)))
 
 (defun call-with-logical-slot-copy-install-staged (owner context attempt function &key stage-id)
+  "Create and sync the installation journal and P7 slot images, then call FUNCTION
+privately.  The callback must only observe the stage; checks before and after it
+reject changes to bindings, names, contents, and full inode facts.  Unpublished orphans are left
+in place and are never enumerated, adopted, or deleted here.  This does not
+publish the fixed journal, move canonical slots, or exchange active state;
+a later publisher needs its own authority and checks."
   (logical-slot-copy-install-check-preparation owner context attempt)
   (when (slot-state-lstat (slot-state-fd-path
                            (physical-image-context-root-fd context) "logical-slot-copy.install"))
