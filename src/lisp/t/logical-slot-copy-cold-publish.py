@@ -127,26 +127,30 @@ def matrix(peer, disposition):
         probe(peer, 'late-source-cf', late_source=True)
         probe(peer, 'late-source-cf-recovery')
     if '--crashes' in sys.argv or '--cuts' in sys.argv:
-        cases = ([(point, None) for point in CUTS] if '--crashes' in sys.argv else
-                 [(point, exit) for point in CUTS for exit in ('error', 'throw')])
+        cases = []
+        if '--crashes' in sys.argv:
+            cases.extend((point, None) for point in CUTS)
+        if '--cuts' in sys.argv:
+            cases.extend((point, exit) for point in CUTS for exit in ('error', 'throw'))
         for point, exit in cases:
             for name in children:
                 (peer.data / name).unlink(missing_ok=True)
             (peer.data / 'global/pg_wal_control').write_bytes(parent_control)
             target.write_bytes(base)
             prior = catalog['image'](peer.data)
+            label = (exit or 'kill')+'-'+point
             if exit:
-                probe(peer, exit+'-'+point, cut=(point, exit))
+                probe(peer, label, cut=(point, exit))
             else:
-                probe(peer, 'kill-'+point, kill=point)
-            probe(peer, 'recover-'+point)
+                probe(peer, label, kill=point)
+            probe(peer, 'recover-'+label)
             recovered = catalog['image'](peer.data)
             assert {k: v for k, v in prior.items() if k not in mutable} == {
                 k: v for k, v in recovered.items() if k not in mutable}, (point, 'unrelated file changed')
             assert target.read_bytes() == selected
             assert not (peer.data / 'global/pg_catalog.tmp').exists()
             assert not (peer.data / 'global/pg_wal_control.tmp').exists()
-            probe(peer, 'recovered-retry-'+point)
+            probe(peer, 'recovered-retry-'+label)
             assert recovered == catalog['image'](peer.data), (point, 'retry changed image')
     print(f'COLD-PUBLISH-WORKFLOW-PASS optional={environment["optional"]}', flush=True)
 
