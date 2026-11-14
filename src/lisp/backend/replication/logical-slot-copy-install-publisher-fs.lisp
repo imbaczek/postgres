@@ -121,36 +121,41 @@ check failure or cleanup failure, revokes the input and fences the operation."
   (let ((record (logical-slot-copy-install-input-record owner context input)))
     (when *logical-slot-copy-install-publishers*
       (error "logical installation publisher is already active"))
-    (let* ((operation (logical-slot-copy-install-input-state-operation record))
-           (fd (logical-slot-copy-install-operation-state-root-fd
-                (logical-slot-copy-install-operation-record operation)))
-           (publisher (funcall constructor
-                               :owner owner :context context :input input :record record :operation operation
-                               :image (copy-seq (logical-slot-copy-install-input-state-image record))
-                               :root (%make-logical-slot-copy-install-node
-                                      :fd fd :kind :root
-                                      :identity (logical-slot-copy-install-file-identity (physical-image-file-facts fd)))))
-           (*logical-slot-copy-install-publishers* (list publisher))
-           (completed nil) (body-completed nil) (close-error nil) (observations nil) (phase nil) (prefix nil))
+    (let ((returned nil))
       (unwind-protect
            (multiple-value-prog1
-               (unwind-protect
-                    (multiple-value-prog1
-                        (progn (logical-slot-copy-install-publisher-proof publisher) (funcall function publisher))
-                      (setf observations (logical-slot-copy-install-publisher-observations publisher)
-                            phase (logical-slot-copy-install-input-state-phase record)
-                            prefix (logical-slot-copy-install-input-state-prefix record)
-                            body-completed t))
-                 (sb-sys:without-interrupts
-                   (loop while (logical-slot-copy-install-publisher-descriptors publisher)
-                         for owned = (pop (logical-slot-copy-install-publisher-descriptors publisher))
-                         do (handler-case (sb-posix:close owned)
-                              (error (condition) (unless close-error (setf close-error condition))))))
+               (let* ((operation (logical-slot-copy-install-input-state-operation record))
+                      (fd (logical-slot-copy-install-operation-state-root-fd
+                           (logical-slot-copy-install-operation-record operation)))
+                      (publisher (funcall constructor
+                                          :owner owner :context context :input input :record record :operation operation
+                                          :image (copy-seq (logical-slot-copy-install-input-state-image record))
+                                          :root (%make-logical-slot-copy-install-node
+                                                 :fd fd :kind :root
+                                                 :identity (logical-slot-copy-install-file-identity (physical-image-file-facts fd)))))
+                      (*logical-slot-copy-install-publishers* (list publisher))
+                      (completed nil) (body-completed nil) (close-error nil) (observations nil) (phase nil) (prefix nil))
+                 (unwind-protect
+                      (multiple-value-prog1
+                          (unwind-protect
+                               (multiple-value-prog1
+                                   (progn (logical-slot-copy-install-publisher-proof publisher) (funcall function publisher))
+                                 (setf observations (logical-slot-copy-install-publisher-observations publisher)
+                                       phase (logical-slot-copy-install-input-state-phase record)
+                                       prefix (logical-slot-copy-install-input-state-prefix record)
+                                       body-completed t))
+                            (sb-sys:without-interrupts
+                              (loop while (logical-slot-copy-install-publisher-descriptors publisher)
+                                    for owned = (pop (logical-slot-copy-install-publisher-descriptors publisher))
+                                    do (handler-case (sb-posix:close owned)
+                                         (error (condition) (unless close-error (setf close-error condition))))))
 
-                 (when close-error
-                   (if body-completed (error close-error)
-                       (ignore-errors (report-query-temp-cleanup-failure "installation publisher descriptors" close-error)))))
-             (logical-slot-copy-install-publisher-check-closed publisher observations phase prefix)
-             (setf completed t))
-        (unless completed (logical-slot-copy-install-revoke-publisher publisher))
-        (setf (logical-slot-copy-install-publisher-failed publisher) t)))))
+                            (when close-error
+                              (if body-completed (error close-error)
+                                  (ignore-errors (report-query-temp-cleanup-failure "installation publisher descriptors" close-error)))))
+                        (logical-slot-copy-install-publisher-check-closed publisher observations phase prefix)
+                        (setf completed t))
+                   (unless completed (logical-slot-copy-install-revoke-publisher publisher))
+                   (setf (logical-slot-copy-install-publisher-failed publisher) t)))
+             (setf returned t))
+        (unless returned (logical-slot-copy-install-revoke-input record))))))
