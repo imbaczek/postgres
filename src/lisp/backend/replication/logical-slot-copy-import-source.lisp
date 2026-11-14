@@ -201,6 +201,7 @@ Recheck the selected plan, receive tuple, input observations, and sidecars."
       (when (and (= 3 (getf control :phase)) (getf value :eligible-interest)
                  (not (getf control :promotion-logical-decoding-enabled)))
         (error "pending promotion disabled eligible copied logical slots"))
+      ;; The terminal replay suppresses the :after-import-source-scan test hook.
       (when emit-test-point
         (logical-slot-copy-verification-test-point :after-import-source-scan context))
       (physical-slot-check-standby-receive store state fork)

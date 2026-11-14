@@ -45,7 +45,9 @@
      (list :files (getf metadata :forks)) (make-hash-table :test #'eql))))
 
 (defun logical-slot-copy-check-committed-child (context evidence plan prefix control &key (include-control t))
-  "Check the complete child WAL inventory, history and control against exact bytes."
+  "Check complete child WAL inventory, history and, when requested, control against exact bytes."
+  ;; During parent-control reconciliation, check staged child files without
+  ;; requiring the parent control file to contain the child image.
   (let* ((files (physical-promotion-checkpoint-files plan prefix))
          (child (getf plan :child))
          (*physical-recovery-state* control)

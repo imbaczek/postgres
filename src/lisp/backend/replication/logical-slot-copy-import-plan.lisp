@@ -109,6 +109,8 @@ Encoded evidence is independent of the minted child owner."
   "Build source-bound pending facts and a deterministic child plan.
 On retry, reuse the certificate owner only after checking source exclusions and
 requiring the reconstructed value to match."
+  ;; Reconciliation uses this same source-bound plan to authenticate the
+  ;; staged child and the expected control temporary.
   (let ((*pgdata* (physical-image-context-root-path context))
         (*physical-image-context* nil))
     (logical-slot-copy-import-check-capacity owner context source)

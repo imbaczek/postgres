@@ -71,6 +71,8 @@ and the held global directory's entries before changing files."
                     (unwind-protect
                          (multiple-value-prog1 (funcall function source #'check)
                            (check)
+                           ;; Replay without a test hook, then check metadata while the
+                           ;; store and receive-root lease are still held.
                            (verify nil)
                            (setf active nil)
                            (when final-check (funcall final-check)))

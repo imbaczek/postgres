@@ -1,6 +1,8 @@
 (in-package #:pg)
 
 (defun logical-slot-copy-import-control-new-state (owner context source source-check mark-started)
+  ;; Reconstruct the deterministic child image from the leased source and the
+  ;; original pending certificate before accepting any temporary file.
   (logical-slot-copy-import-control-fences context)
   (multiple-value-bind (certificate certificate-bytes certificate-facts)
       (logical-slot-copy-import-read-artifact context :pending)
@@ -45,6 +47,8 @@
   (logical-slot-copy-verification-test-point point (logical-slot-copy-import-control-state-context record)))
 
 (defun logical-slot-copy-import-control-execute (record)
+  ;; Unlink only the authenticated temporary, then sync its parent directory.
+  ;; Sync even when absent: a previous unlink may have failed before its sync.
   (declare (notinline logical-slot-copy-unlinkat sb-posix:fsync))
   (let ((complete nil))
     (unwind-protect
@@ -85,6 +89,8 @@
       (logical-slot-copy-import-control-close-temp record))))
 
 (defun logical-slot-copy-import-reconcile-parent-control-temp ()
+  ;; Hold exclusion and the source lease through removal and the final proof.
+  ;; Once mutation starts, any failure through scope exit fences recovery.
   (when *logical-slot-copy-import-control-states*
     (error "control temporary reconciliation is already active"))
   (logical-slot-copy-install-check-input-entry)

@@ -11,6 +11,8 @@
        (= (first facts) (first global-facts)) (= (ninth facts) (ninth global-facts))))
 
 (defun logical-slot-copy-import-control-global-image (context manifest)
+  ;; Bind the private global directory and every manifest child.  Only the
+  ;; control temporary is optional; another name is rejected and left untouched.
   (let* ((global (cdr (assoc "global" (physical-image-context-children context) :test #'equal)))
          (facts (physical-image-file-facts global))
          (names (sort (remove-duplicates
@@ -51,6 +53,8 @@
       (values bytes facts))))
 
 (defun logical-slot-copy-import-control-open-temp (record)
+  ;; Keep the no-follow descriptor open across unlink.  The name and descriptor
+  ;; must identify the same private, single-link inode and exact image prefix.
   (declare (notinline physical-image-openat))
   (logical-slot-copy-import-control-record record)
   (when (eq :present (logical-slot-copy-import-control-state-phase record))
@@ -102,6 +106,7 @@
   t)
 
 (defun logical-slot-copy-import-control-check-temp (record)
+  ;; After unlink the held inode must have no links; its bytes remain unchanged.
   (logical-slot-copy-import-control-check-namespace record)
   (let ((fd (logical-slot-copy-import-control-state-fd record))
         (phase (logical-slot-copy-import-control-state-phase record)))

@@ -8,6 +8,8 @@
 (defstruct (logical-slot-copy-import-control-state
             (:constructor %make-logical-slot-copy-import-control-state)
             (:print-function physical-libpq-print-private-object))
+  ;; This record is valid only in its registered owner scope.  Its seal binds
+  ;; the source proof, plan and file observations used to authorize removal.
   (owner nil :read-only t) (context nil :read-only t) (source nil :read-only t)
   (source-check nil :read-only t) (plan nil :read-only t) (certificate nil :read-only t)
   (certificate-bytes nil :read-only t) (certificate-facts nil :read-only t)
@@ -22,12 +24,14 @@
 (defvar *logical-slot-copy-import-control-states* nil)
 
 (defun logical-slot-copy-import-control-prefix-p (bytes expected)
+  ;; A partial write, including an empty one, must match the exact child image.
   (and (typep bytes '(vector (unsigned-byte 8)))
        (typep expected '(vector (unsigned-byte 8)))
        (<= (length bytes) (length expected))
        (null (mismatch bytes expected :end2 (length bytes)))))
 
 (defmethod physical-adoption-check-owner-role ((owner logical-slot-copy-import-control-owner))
+  ;; Only the typed cold phase 3 owner under generation exclusion may proceed.
   (call-next-method)
   (unless (and (eq :cold (logical-slot-copy-import-owner-mode owner))
                (= 3 (logical-slot-copy-import-owner-phase owner))
@@ -92,6 +96,9 @@
       (error "control temporary reconciliation has an unresolved installation or copy fence"))))
 
 (defun logical-slot-copy-import-control-check-proof (record &key (source t))
+  ;; Revalidate the source, certificate, evidence, child and held namespace.
+  ;; With SOURCE nil, omit the expired source checker and check metadata after
+  ;; the terminal source replay.  Failure revokes the owner and this record.
   (let ((complete nil))
     (unwind-protect
          (progn
