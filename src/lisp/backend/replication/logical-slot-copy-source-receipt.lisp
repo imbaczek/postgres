@@ -4,8 +4,8 @@
 
 (defun logical-slot-copy-source-receipt-image (value)
   ;; Store original R metadata and bounded historical catalog and generation
-  ;; observations, not the catalog or a recomputable generation proof.  An
-  ;; owned publisher must derive and seal these from fully validated R.
+  ;; observations, not the catalog or a recomputable generation proof.  The
+  ;; publisher derives and seals these from fully validated R.
   (unless (and (= 12 (logical-slot-copy-descriptor-list-count value 12))
                (equal (loop for key in value by #'cddr collect key)
                       '(:metadata :generation-size :catalog-size :catalog-digest :next-oid :local-floor))

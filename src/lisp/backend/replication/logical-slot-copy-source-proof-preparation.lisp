@@ -1,5 +1,8 @@
 (in-package #:pg)
 
+;; A handle tied to one owner, input, context and thread.  IMAGE is a callback
+;; view; the private registry keeps independent bytes and the failure latch.
+
 (defstruct (logical-slot-copy-source-proof-preparation
             (:constructor %make-logical-slot-copy-source-proof-preparation)
             (:print-function physical-libpq-print-private-object))
@@ -9,6 +12,8 @@
 (defvar *logical-slot-copy-source-proof-preparations* nil)
 
 (defun logical-slot-copy-source-proof-input-receipt (input)
+  ;; Read actual R, including its full catalog, and verify the canonical
+  ;; generation hash.  Record catalog observations, next OID and local XID floor.
   (let* ((proof (logical-slot-copy-install-input-proof input))
          (certificate (logical-slot-copy-install-input-certificate input)))
     (multiple-value-bind (metadata catalog prefix generation)
@@ -32,6 +37,8 @@
          prefix)))))
 
 (defun logical-slot-copy-source-proof-build-image (owner context input)
+  ;; Build proof bytes from the genuine active cold journal and its full slot
+  ;; prefix.  Keep the original pending certificate embedded in that journal.
   (let* ((record (logical-slot-copy-install-input-record owner context input))
          (outer (logical-slot-copy-install-operation-record
                  (logical-slot-copy-install-input-state-operation record)))
@@ -78,6 +85,8 @@
     record))
 
 (defun logical-slot-copy-source-proof-check-preparation (owner context input attempt &key (source t))
+  ;; Full source checks rebuild from actual R.  Without SOURCE, each write
+  ;; chunk still checks the sealed image, input observations and layout.
   (let ((record (logical-slot-copy-source-proof-preparation-record owner context input attempt))
         (complete nil))
     (unwind-protect
@@ -96,6 +105,8 @@
       (unless complete (funcall (fourth record) :fail)))))
 
 (defun call-with-logical-slot-copy-source-proof-preparation (owner context input function)
+  ;; Keep a private image and independent seal for this scope.  Any failed
+  ;; check or nonlocal exit revokes the input for the rest of the attempt.
   (let ((input-record (logical-slot-copy-install-input-record owner context input)))
     (when *logical-slot-copy-source-proof-preparations*
       (error "source proof preparation is already active"))

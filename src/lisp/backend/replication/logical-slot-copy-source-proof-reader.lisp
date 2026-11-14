@@ -1,9 +1,8 @@
 (in-package #:pg)
 
 (defun logical-slot-copy-source-proof-read-held (owner context register)
-  ;; Verify historical proof and archive bytes under held ownership.  The
-  ;; receipt's catalog and local-floor observations still require a future
-  ;; owned publisher; this reader does not authorize promotion or retirement.
+  ;; Verify historical proof and archive bytes under held ownership.  This
+  ;; observation does not authorize admission, promotion or retirement.
   (let* ((root (physical-image-context-root-fd context))
          (root-facts (physical-image-file-facts root))
          (named-root (namestring (physical-adoption-owner-directory owner))))
@@ -98,6 +97,8 @@
                   (setf active nil)))))))))))
 
 (defun logical-slot-copy-read-source-proof-under-locks ()
+  ;; Caller holds installation exclusion.  Keep ownership, archive reference
+  ;; and root context together for both public reads and publication readback.
   (call-with-logical-slot-copy-source-reader-owner
    (lambda (owner)
      (call-with-logical-slot-copy-source-reader-reference

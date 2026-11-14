@@ -19,6 +19,7 @@
       facts)))
 
 (defun logical-slot-copy-source-proof-check-open-file (context name fd identity)
+  ;; Match the held descriptor to the fixed name and its device, inode and mount.
   (let ((held (physical-image-file-facts fd)))
     (unless (and (equal identity (logical-slot-copy-install-file-identity held))
                  (equal held (logical-slot-copy-source-proof-check-file context name)))
@@ -54,6 +55,9 @@
            (when expected (error "canonical source proof disappeared")))))))
 
 (defun logical-slot-copy-source-proof-remove-temporary (owner context input attempt canonical)
+  ;; Check the canonical file first.  Discard a private orphan of size zero
+  ;; through the maximum, without adopting its contents; sync the root after
+  ;; unlinking it.
   (declare (notinline sb-posix:fsync))
   (call-with-logical-slot-copy-source-proof-action
    owner context input attempt
@@ -87,6 +91,8 @@
    :source t))
 
 (defun logical-slot-copy-source-proof-write-temporary (owner context input attempt)
+  ;; Create a fresh exclusive temporary.  Pop ownership before close and never
+  ;; close or retry a descriptor whose identity has been replaced.
   (declare (notinline sb-posix:write sb-posix:fsync sb-posix:close))
   (call-with-logical-slot-copy-source-proof-action
    owner context input attempt
@@ -152,6 +158,7 @@
    :source t))
 
 (defun logical-slot-copy-source-proof-install-temporary (owner context input attempt temporary)
+  ;; Install without replacement, then bind and read back the installed inode.
   (call-with-logical-slot-copy-source-proof-action
    owner context input attempt
    (lambda ()
@@ -175,6 +182,7 @@
    :source t))
 
 (defun logical-slot-copy-source-proof-sync-canonical (owner context input attempt canonical)
+  ;; Read back and sync the installed file and its root before accepting it.
   (declare (notinline sb-posix:fsync))
   (call-with-logical-slot-copy-source-proof-action
    owner context input attempt

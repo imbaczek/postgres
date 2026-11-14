@@ -67,9 +67,8 @@
   plan)
 
 (defun logical-slot-copy-check-source-proof (bytes)
-  ;; Bind the supplied images without I/O.  This supplies no ownership,
-  ;; registry or retirement admission; an owned publisher and canonical reader
-  ;; are still needed to establish provenance and authority.
+  ;; Bind supplied images without I/O.  This establishes neither ownership
+  ;; nor authority to install runtime state, admit clients or retire metadata.
   (let* ((parts (logical-slot-copy-source-proof-decode bytes))
          (journal (logical-slot-copy-install-decode (getf parts :installation)))
          (certificate (logical-slot-copy-import-decode (getf journal :certificate)))

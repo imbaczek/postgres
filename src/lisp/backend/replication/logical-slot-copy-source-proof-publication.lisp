@@ -1,6 +1,8 @@
 (in-package #:pg)
 
 (defun logical-slot-copy-source-proof-prove-canonical (owner context input attempt canonical)
+  ;; Run the anchored reader while the original input and source lease remain
+  ;; held.  Retry still requires actual R to match the preparation.
   (call-with-logical-slot-copy-source-proof-action
    owner context input attempt
    (lambda ()
@@ -19,6 +21,8 @@
    :source t))
 
 (defun logical-slot-copy-source-proof-publish-prepared (owner context input attempt)
+  ;; Check any canonical file before discarding an orphan, then sync and prove
+  ;; the result.  After the output close hook, run a quiet terminal proof.
   (logical-slot-copy-source-proof-check-preparation owner context input attempt)
   (logical-slot-copy-source-proof-publication-point
    owner context input attempt :after-source-proof-seal)
@@ -40,6 +44,9 @@
     :published))
 
 (defun logical-slot-copy-publish-source-proof ()
+  ;; Publish or resync from the active cold installation and actual R.
+  ;; A matching canonical file alone does not authorize retry.  Return success
+  ;; only after the outer input and preparation scopes have cleaned up.
   (let ((result
           (call-with-logical-slot-copy-install-cold-input
            (lambda (owner context input)

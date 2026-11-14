@@ -5,6 +5,7 @@
 
 (defun call-with-logical-slot-copy-source-proof-action
     (owner context input attempt function &key source)
+  ;; Check the preparation on both sides of an action; failure is sticky.
   (let ((record (logical-slot-copy-source-proof-preparation-record owner context input attempt))
         (complete nil))
     (unwind-protect
