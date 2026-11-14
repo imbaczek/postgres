@@ -1,5 +1,10 @@
 (in-package #:pg)
 
+;; Descriptor-relative control-file operations for a single cold attempt.
+;; Check the held directory and bound files at each phase.  Sync the old and
+;; temporary files before rename, then sync the installed file and directory.
+;; Owned descriptor ledgers remove an entry before close, so a close failure
+;; cannot cause a later cleanup to close a reused descriptor.
 (defun logical-slot-copy-cold-control-file-check (attempt runtime old temporary)
   (logical-slot-copy-cold-control-check-metadata attempt runtime)
   (let* ((b (logical-slot-copy-cold-control-attempt-binding attempt))
@@ -169,6 +174,10 @@
               (logical-slot-copy-cold-control-runtime-temporary-facts runtime) after))
       (logical-slot-copy-cold-control-advance-directory attempt runtime))))
 
+;; Create the private dispatcher and its close function for this attempt.
+;; Only the registered subject can use the fixed operations, and mutations
+;; require an active source check.  The lexical ledger takes ownership as each
+;; descriptor is opened and removes ownership before closing it.
 (defun logical-slot-copy-cold-control-file-operations (attempt-reader runtime)
   (declare (notinline physical-image-openat sb-posix:close))
   (let ((owned nil) (active t))

@@ -1,5 +1,10 @@
 (in-package #:pg)
 
+;; Run cold publication under lifecycle exclusion and a retained-source lease.
+;; Keep the source checker active through descriptor close and the after-close
+;; hook, then repeat the full source proof without hooks before success.  Expire
+;; the checker after that proof; release the reader lease when its caller exits.
+;; This operation installs no runtime globals, slots, or admission state.
 (defun logical-slot-copy-cold-control-new-runtime (binding)
   (%make-logical-slot-copy-cold-control-runtime
    :global (getf binding :global) :directory-facts (copy-list (getf binding :global-facts))
@@ -23,6 +28,10 @@
           (logical-slot-copy-cold-control-attempt-failure-operation attempt)
           (logical-slot-copy-cold-control-attempt-mark-started attempt))))
 
+;; Construct the private runtime and identity-checked closures for one attempt.
+;; The returned close and expire functions delimit descriptor ownership and
+;; callback authority.  An unsuccessful operation by the registered attempt
+;; revokes its owner.
 (defun logical-slot-copy-cold-control-make-attempt (owner context binding mark-started store-reader)
   (let ((attempt nil) (runtime (logical-slot-copy-cold-control-new-runtime binding))
                       (seal nil) (failed nil) (active t) (executed nil) (files nil) (close-files nil))
@@ -80,6 +89,10 @@
               (lambda ()
                 (setf active nil (logical-slot-copy-cold-control-runtime-source-active runtime) nil))))))
 
+;; Run the callback while the retained source is available.  On success, close
+;; the owned files, run the after-close hook, and replay the terminal proof
+;; without hooks before expiring the source callback.  Failure revokes the
+;; attempt and cleanup closes any remaining owned descriptors.
 (defun logical-slot-copy-cold-control-run-leased (attempt runtime close-files function)
   (let ((complete nil)
         (context (logical-slot-copy-cold-control-attempt-context attempt)))
@@ -108,6 +121,10 @@
       (unless complete (logical-slot-copy-cold-control-revoke attempt))
       (let ((failure (funcall close-files))) (when (and complete failure) (error failure))))))
 
+;; Hold the committed store and receive-root lease around the whole attempt,
+;; including its terminal proof and cleanup.  The callback expires after the
+;; terminal proof on success; the retained reader lease is released as this
+;; enclosing call exits, including on failure.
 (defun logical-slot-copy-cold-control-call-with-source (owner context proof mark-started function)
   (let* ((binding (logical-slot-copy-cold-control-bind-data
                    owner context (logical-slot-copy-cold-control-read-binding owner context proof)))
@@ -134,6 +151,10 @@
           (funcall expire)
           (let ((failure (funcall close-files))) (when (and complete failure) (error failure))))))))
 
+;; Publish cold control under lifecycle exclusion with healthy unopened
+;; storage.  If an operation fails after mutation has started, leave the
+;; recovery failure fence set.  This entry point installs no runtime slots,
+;; admission state, or coordinator.
 (defun logical-slot-copy-import-publish-cold-control ()
   (when *logical-slot-copy-cold-control-attempts* (error "cold control publication is already active"))
   (logical-slot-copy-install-check-input-entry)

@@ -1,5 +1,8 @@
 (in-package #:pg)
 
+;; Mutable observations for one attempt.  The binding is checked around
+;; operations as directory entries, catalog, WAL, and control move through
+;; their expected phases.  These fields do not install runtime server state.
 (defstruct (logical-slot-copy-cold-control-runtime
             (:constructor %make-logical-slot-copy-cold-control-runtime)
             (:print-function physical-libpq-print-private-object))
@@ -96,6 +99,9 @@
   (logical-slot-copy-cold-control-check-inputs attempt)
   (logical-slot-copy-cold-control-check-global attempt runtime))
 
+;; Recheck the retained source and current artifacts while the source callback
+;; is active.  The runtime phase determines which publication evidence the
+;; artifact check must establish.
 (defun logical-slot-copy-cold-control-check-source (attempt runtime store artifacts &optional (emit-hook t))
   (logical-slot-copy-cold-control-check-metadata attempt runtime)
   (unless (logical-slot-copy-cold-control-runtime-source-active runtime)

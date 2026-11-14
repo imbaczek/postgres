@@ -1,5 +1,9 @@
 (in-package #:pg)
 
+;; Publish the exact CF child from canonical parent D, or verify and sync an
+;; already published child.  Catalog restoration and selected data sync precede
+;; the control rename.  The checks on both sides of each boundary preserve the
+;; source and WAL evidence through publication and durability.
 (defun logical-slot-copy-cold-control-file (attempt operation)
   (funcall (logical-slot-copy-cold-control-attempt-operations attempt) :file attempt operation))
 
@@ -105,6 +109,10 @@
     (setf (logical-slot-copy-cold-control-runtime-wal-snapshot runtime)
           (logical-slot-copy-cold-wal-snapshot ledger))))
 
+;; Execute one publication attempt.  Parent D restores the selected catalog,
+;; stages and verifies the child, syncs selected data, then publishes control;
+;; an existing child is rechecked and synced.  Return :published or :synced
+;; only after the corresponding durability and source checks succeed.
 (defun logical-slot-copy-cold-control-execute (attempt runtime store)
   (with-logical-slot-copy-cold-control-guard (attempt)
     (logical-slot-copy-cold-control-runtime-record attempt runtime)

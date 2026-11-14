@@ -1,10 +1,16 @@
 (in-package #:pg)
 
+;; The owner and attempt bind one cold publication to its held input context.
+;; The attempt is registered by identity, so a copied subject cannot revoke
+;; the real attempt.  Failure revokes the active owner and remains sticky.
 (defstruct (logical-slot-copy-cold-control-owner
             (:include logical-slot-copy-catalog-owner)
             (:constructor %make-logical-slot-copy-cold-control-owner)
             (:print-function physical-libpq-print-private-object)))
 
+;; The attempt carries the immutable input binding and private operation
+;; closures.  Its identity is checked against the owner registration before
+;; those closures can act; copying this structure grants no authority.
 (defstruct (logical-slot-copy-cold-control-attempt
             (:constructor %make-logical-slot-copy-cold-control-attempt)
             (:print-function physical-libpq-print-private-object))

@@ -1,5 +1,12 @@
 (in-package #:pg)
 
+;; Track the exact WAL namespace and the planned child images while staging.
+;; Rows bind names to inode facts and, for mutable files, their bytes, including
+;; any torn suffix.  Witness descriptors keep those inodes alive.  The byte
+;; bound covers existing mutable child WAL and planned child images, not the
+;; retained source archive or total heap allocation.
+;; A failed observation poisons the lexical scope and its descriptors are drained
+;; on exit.  Scratch must be normalized before this ledger is constructed.
 (defstruct (logical-slot-copy-cold-wal-ledger
             (:constructor %make-logical-slot-copy-cold-wal-ledger)
             (:print-function physical-libpq-print-private-object))
@@ -94,6 +101,10 @@
                      (second frame) (mod (first frame) +wal-segment-size+)))
              (getf plan :frames)))))
 
+;; Build a schedule and initial namespace image from the sealed plan.  Mutable
+;; entries must be private regular files; their complete existing bytes are
+;; retained, including any suffix beyond the planned write.  The byte limit
+;; bounds the accounted planned and existing images, not all allocations.
 (defun logical-slot-copy-cold-wal-initialize (context state plan prefix history-p install-prefix maximum acquire maximum-bytes)
   (physical-image-check-children context)
   (let* ((directory (cdr (assoc "pg_wal" (physical-image-context-children context) :test #'equal)))
@@ -175,6 +186,9 @@
    state plan prefix (physical-promotion-checkpoint-files plan prefix) history-p check sync-data
    :context context :install-prefix install-prefix :observer observer))
 
+;; A snapshot is available only after the schedule is complete.  It copies the
+;; directory and row evidence for later read-only rechecking after witnesses
+;; have been closed.
 (defun logical-slot-copy-cold-wal-snapshot (ledger)
   (logical-slot-copy-cold-wal-complete ledger)
   (list :directory-facts (copy-list (logical-slot-copy-cold-wal-ledger-directory-facts ledger))
@@ -191,6 +205,10 @@
                  :maximum maximum)))
     (logical-slot-copy-cold-wal-check-rows ledger nil t)))
 
+;; Give FUNCTION an observer and a boundary verifier for this lexical scope.
+;; The verifier checks the namespace and bytes; :staged requires the complete
+;; child, and :snapshot returns its copied evidence.  Any failed invocation
+;; fences later use, and exit closes the retained inode witnesses.
 (defun call-with-logical-slot-copy-cold-wal-ledger
     (context state plan prefix guard function &key history-p install-prefix (maximum 4096)
                                                 (maximum-bytes (* 6 +wal-segment-size+)))

@@ -1,5 +1,9 @@
 (in-package #:pg)
 
+;; Apply the staging observer's ordered events to the WAL ledger.  Each event
+;; must name the scheduled file in the held pg_wal directory and match its
+;; witnessed inode and expected bytes.  An unexpected event or postimage fails
+;; the scope.  Written scratch bytes enter the ledger only after these checks.
 (defun logical-slot-copy-cold-wal-leaf (ledger path)
   (multiple-value-bind (parent leaf)
       (physical-image-input-parent (logical-slot-copy-cold-wal-ledger-context ledger) (pathname path))
@@ -169,6 +173,9 @@
     (logical-slot-copy-cold-wal-check-rows ledger t)
     (unless history-p (logical-slot-copy-cold-wal-finish ledger))))
 
+;; Consume only the next scheduled operation and its expected event phases.
+;; Creation, writes, unlink and installation update the witnessed postimage;
+;; in particular a frame write preserves and checks any unoverwritten suffix.
 (defun logical-slot-copy-cold-wal-observe (ledger event kind path fd &optional destination)
   (let ((name (logical-slot-copy-cold-wal-leaf ledger path))
         (target (when destination (logical-slot-copy-cold-wal-leaf ledger destination))))

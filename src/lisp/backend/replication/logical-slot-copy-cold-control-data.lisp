@@ -1,5 +1,8 @@
 (in-package #:pg)
 
+;; Sync the data files selected by restartpoint R before publishing child control.
+;; Raw data files must keep their bound inode facts and meet R's minimum sizes.
+;; The selected catalog is checked by bytes as well as inode facts.
 (defun logical-slot-copy-cold-control-bind-data (owner context binding)
   (logical-slot-copy-check-input owner context)
   (when (getf binding :data-observations) (error "cold data inventory is already bound"))
@@ -32,6 +35,9 @@
           (error "cold R data file changed")))))
   t)
 
+;; Open the selected file without following a symlink, check its bound inode,
+;; sync it, and check it again.  This function owns the descriptor and clears
+;; its local slot before close; a successful body still reports close failure.
 (defun logical-slot-copy-cold-control-sync-one-data (context row mark-started)
   (declare (notinline physical-image-openat sb-posix:fsync sb-posix:close))
   (multiple-value-bind (parent leaf) (physical-image-parent context (first row))
@@ -60,6 +66,10 @@
               (handler-case (sb-posix:close closing) (error (condition) (setf failure condition)))
               (when (and complete failure) (error failure)))))))))
 
+;; After the child WAL and R catalog are complete, sync the selected R files
+;; and the held base, global, and PGDATA directories before control publication.
+;; Raw data observations bind inode facts and minimum sizes; the catalog is
+;; also compared with the selected bytes.  Source checks bracket the work.
 (defun logical-slot-copy-cold-control-sync-data (attempt runtime)
   (declare (notinline sb-posix:fsync))
   (logical-slot-copy-cold-control-runtime-record attempt runtime)

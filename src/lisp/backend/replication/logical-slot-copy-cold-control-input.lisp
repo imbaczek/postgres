@@ -1,5 +1,8 @@
 (in-package #:pg)
 
+;; Read and bind the existing control, catalog, and restartpoint evidence
+;; under the held image context.  These observations establish the parent or
+;; already-published child phase before any cold publication is authorized.
 (defun logical-slot-copy-cold-control-global-image (context manifest)
   (let* ((global (cdr (assoc "global" (physical-image-context-children context) :test #'equal)))
          (catalog (slot-state-lstat (slot-state-fd-path global "pg_catalog.tmp")))
@@ -40,6 +43,10 @@
           (logical-slot-copy-check-input owner context)
           (values state metadata prefix generation catalog restartpoints facts observations))))))
 
+;; Bind the preserved source and selected restartpoint to exact parent or
+;; child control bytes.  Both temporary names at once are rejected; a control
+;; temporary is accepted only with the selected catalog already installed and
+;; with bytes that are a prefix of the exact child image.
 (defun logical-slot-copy-cold-control-read-binding (owner context proof)
   (let ((*pgdata* (physical-image-context-root-path context))
         (*physical-image-context* nil))
