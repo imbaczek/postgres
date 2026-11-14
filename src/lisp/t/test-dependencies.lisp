@@ -3,6 +3,7 @@
 (in-package #:cl-user)
 
 (defun load-pg-test-system (system)
+  ;; Keep an active Quicklisp installation; only initialize one if ASDF misses.
   (handler-case
       (asdf:load-system system)
     (asdf:missing-component (condition)

@@ -5,6 +5,7 @@
   (truename (merge-pathnames "../" (uiop:pathname-directory-pathname *load-truename*))))
 
 (defun check-pg-runner-compiler-lifecycle (mode)
+  ;; Stub loading and execution while exercising child ownership and failure gates.
   (let ((saved (mapcar (lambda (name) (cons name (symbol-function name)))
                        '(pg-test-start-compiler pg-test-phase pg-test-selected-heads
                          pg-test-execute-heads)))
@@ -59,6 +60,7 @@
     (finish-output)))
 
 (defun check-pg-runner-seeds ()
+  ;; Check both reproducibility and the no-seed preservation contract.
   (let ((*random-state* (make-random-state)))
     (dolist (seed '(nil ""))
       (let ((saved *random-state*))

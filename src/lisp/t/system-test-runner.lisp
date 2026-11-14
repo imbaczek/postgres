@@ -6,6 +6,7 @@
 (defvar *pg-test-system* "pg-unit-tests")
 
 (defun pg-test-phase (name function)
+  ;; CPU time here belongs to this image; the compiler records its own time.
   (let ((start (get-internal-real-time)) (cpu (get-internal-run-time)))
     (multiple-value-prog1 (funcall function)
       (format t "~&TEST-PHASE ~a wall=~,6f cpu=~,6f~%" name
@@ -14,6 +15,7 @@
       (finish-output))))
 
 (defun pg-test-start-compiler (source cache log)
+  ;; Use a fresh, no-init image and a plain cache, separate from Quicklisp FASLs.
   (let* ((forms
            (list
             '(require :asdf)
@@ -44,6 +46,7 @@
                         :wait nil :output log :error :output :if-output-exists :error)))
 
 (defun pg-test-finish-compiler (process log)
+  ;; Both a successful exit and the final marker are required before tests run.
   (sb-ext:process-wait process)
   (unless (and (eq :exited (sb-ext:process-status process))
                (zerop (sb-ext:process-exit-code process))
@@ -53,6 +56,7 @@
   t)
 
 (defun pg-test-close-compiler (process)
+  ;; The runner owns this child even when loading or waiting exits nonlocally.
   (when process
     (when (member (sb-ext:process-status process) '(:running :stopped))
       (sb-ext:process-kill process sb-posix:sigkill))
@@ -60,6 +64,7 @@
     (sb-ext:process-close process)))
 
 (defun pg-test-selected-heads (suite names)
+  ;; Resolve unqualified names against this suite before running any head.
   (let* ((package (find-package :rove/core/suite/package))
          (registered
            (funcall (find-symbol "SUITE-TESTS" package)
@@ -78,6 +83,7 @@
     heads))
 
 (defun pg-test-execute-heads (heads)
+  ;; Report every head and retain failures for the final status.
   (let ((failures nil))
     (dolist (head heads)
       (let ((start (get-internal-real-time))
@@ -90,6 +96,7 @@
     (null failures)))
 
 (defun pg-test-apply-seed (seed)
+  ;; An absent or empty seed leaves the inherited random state alone.
   (when (and seed (plusp (length seed)))
     (let ((value (parse-integer seed)))
       (unless (<= 0 value) (error "Test seed must be nonnegative"))
@@ -117,6 +124,8 @@
     (asdf:load-asd (merge-pathnames "pg.asd" source))
     (asdf:load-asd (merge-pathnames (format nil "~a.asd" system) source))
     (setf *print-circle* t *print-level* 6 *print-length* 12)
+    ;; Start compilation alongside loading, but wait for it before executing heads.
+    ;; Mask spawn and assignment so unwind cleanup always owns a returned child.
     (unwind-protect
          (progn
            (when strict
@@ -144,6 +153,8 @@
                               (find-symbol "*PROMOTION-TEST-PLAIN-CACHE*" :pg-physical-tests))))
                       (when (and strict (eq suite :pg-physical-tests) (null cache-symbol))
                         (error "Physical child cache binding is unavailable"))
+                      ;; Promotion handoff children use the plain compiler cache,
+                      ;; separate from any Quicklisp-initialized parent FASLs.
                       (progv (when cache-symbol (list cache-symbol)) (when cache-symbol (list cache))
                         (pg-test-execute-heads heads)))))
                (format t "~&TEST-TOTAL wall=~,6f~%"

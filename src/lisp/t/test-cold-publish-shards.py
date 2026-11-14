@@ -9,6 +9,7 @@ cut_cases = api['cut_cases']
 
 class CutShards(unittest.TestCase):
     def test_shards_partition_the_complete_fault_inventory(self):
+        # Every permitted shard count must cover each selected fault exactly once.
         for flags in (['--cuts'], ['--crashes'], ['--cuts', '--crashes']):
             full = cut_cases(flags)
             for count in range(1, len(full)+1):

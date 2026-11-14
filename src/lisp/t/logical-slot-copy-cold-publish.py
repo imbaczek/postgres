@@ -79,6 +79,7 @@ def probe(peer, label, *args, kill=None, late_source=False, cut=None,
 
 
 def cut_cases(arguments, shard=None):
+    """Partition the selected fault inventory into nonempty zero-based strides."""
     cases = []
     if '--crashes' in arguments:
         cases.extend((point, None) for point in CUTS)
@@ -98,6 +99,8 @@ def cut_cases(arguments, shard=None):
 
 
 def matrix(peer, disposition):
+    # The copied peer is already stopped. Stop the producer before announcing
+    # readiness; cold probes then read the copied data and local retained WAL.
     assert disposition == 'eligible'
     assert peer.process is None
     producer = catalog['peers'][0]

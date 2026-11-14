@@ -614,6 +614,24 @@ Remove the trace and its temporary helper after the demo:
 
 ## Tests
 
+- `./t/run-system-tests.sh unit|physical [--strict] [head ...]` runs direct
+  ASDF Rove heads; retain `./t/run-unit-tests.sh` for its legacy cases. The
+  runner uses a parent and compiler while loading, then a parent and the selected
+  fixture's concurrent Lisp children. Reserve two for the profiled promotion
+  selection; include other fixtures' child counts in their reservations. Strict
+  compilation uses a private plain cache and must finish successfully before
+  heads run. Its log and cache remain in the temporary work directory (under the
+  owned RAM root with the wrapper) for archiving or cleanup. Parent phase CPU
+  excludes the compiler; use external process-tree
+  accounting for complete CPU comparisons. See the README Testing section for
+  setup, seed and selection details.
+- For native cold-publish shards, give each job a private RAM workspace and
+  cache. Reserve three images per preparation until `COLD-PUBLISH-MATRIX-READY`;
+  afterward a smoke single-fixture job needs one, while a full two-certificate
+  job still needs three for later preparation. Keep all owned images within the
+  eight-image ceiling and never start three preparation groups together. Check
+  the printed cut inventories for complete coverage.
+
 - CLOG fixtures that scope `*wal-storage-incarnation*` must also scope
   `*wal-fpw-state*`, `*wal-logical-policy*` and `*wal-logical-info*`.
   Isolated wraparound fixtures must scope `*recovery-reader-xids*` as well as

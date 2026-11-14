@@ -1,3 +1,5 @@
+;; Resolve the requested checkout from this script and return failure to the shell.
+
 (require :asdf)
 
 (let* ((directory (uiop:pathname-directory-pathname *load-truename*))

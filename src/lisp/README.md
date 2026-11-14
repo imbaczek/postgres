@@ -1274,6 +1274,38 @@ CL_SOURCE_REGISTRY='(:source-registry (:directory "/path/to/cl-spec/") :inherit-
   ./t/run-unit-tests.sh
 ```
 
+For direct Rove suite runs, use `./t/run-system-tests.sh unit` or
+`./t/run-system-tests.sh physical`. Add `--strict` to compile `pg` in a fresh
+no-init child while the suite loads, treating warnings as errors. Tests wait
+for successful compilation. Optional unqualified head names select individual
+tests, for example
+`./t/run-system-tests.sh physical --strict promotion-cold-resume-closes-interrupted-store-handoffs`.
+This runner executes the ASDF suite only; use `./t/run-unit-tests.sh` when the
+deferred legacy cases are needed. It honors `SBCL` and normal init files. If
+`PG_LISP_TEST_RUN_DIR` is absent, it enters the test RAM-disk wrapper, which
+requires a provisioned RAM mount. `PG_LISP_TEST_SEED` may be a nonnegative
+integer; unset or empty leaves the normal random state. Phase and per-head timings
+are reported, with CPU times for the parent only; compiler CPU is in the log
+at the printed path. The strict compiler cache and log remain in the
+temporary work directory for archiving or explicit cleanup by their owner;
+the RAM-disk wrapper places that directory in the owned RAM root.
+
+Native cold-publish fault cases can be partitioned, for example:
+
+```sh
+./t/test-ramdisk.sh run env PG_LISP_TEST_CASE_SHARD=0/3 \
+  python3 t/logical-slot-copy-cold-publish.py --smoke --cuts
+```
+
+The index is zero-based; sharding requires `--smoke` and `--cuts` and/or
+`--crashes`, and each shard must be nonempty. Give each shard its own RAM
+workspace and cache. Compare the printed `COLD-PUBLISH-CUT-INVENTORY` records
+to check the union. For concurrent jobs reserve three Lisp images per fixture
+until `COLD-PUBLISH-MATRIX-READY`, which follows both server stops. Thereafter a
+smoke single-fixture job needs one image; a full job with both certificate
+variants still needs three for later fixture preparation. Keep the combined
+owned limit at eight and do not start three preparation groups simultaneously.
+
 The unit suite contains 68 regressions migrated from the legacy runner, eight
 Properties and one Function Spec, all explicitly executed through Rove. Loading
 it alone does not run tests. `./t/run-unit-tests.sh` executes this ASDF suite and
