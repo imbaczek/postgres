@@ -69,75 +69,87 @@ Live mode captures the caller\'s pending state and receive store; cold mode capt
       (push (logical-slot-copy-file-row context name) observations))
     (logical-slot-copy-observe-pieces context descriptor observations index)))
 
-(defun logical-slot-copy-read-committed-binding (owner context proof-bytes)
-  "Bind the preserved C3 control and evidence to exact child control CF.
-The D receipt alone grants no authority after CF; recheck private observations."
+(defun logical-slot-copy-read-committed-inputs (owner context proof-bytes certificate)
   (unless (logical-slot-copy-committed-owner-p owner)
     (error "committed import binding requires its sibling input owner"))
   (logical-slot-copy-check-input owner context)
   (unless proof-bytes (error "committed import lost its base receipt"))
-  (let ((root (physical-image-context-root-path context))
-        (bound-observations nil))
+  (unless (eq :pending (getf certificate :phase))
+    (error "committed import binding requires its original pending certificate"))
+  (let ((bound-observations nil))
     (dolist (name '("logical-slot-copy.in-progress" "logical-slot-copy.base-verified.tmp"
                     "logical-slot-copy.import.tmp" "logical-slot-copy.evidence.tmp"
                     "global/pg_wal_control.tmp"))
-      (when (slot-state-lstat (merge-pathnames name root))
+      (when (slot-state-lstat (merge-pathnames name (physical-image-context-root-path context)))
         (error "committed import has an unresolved temporary or copy fence")))
     (flet ((read-input (name maximum)
              (multiple-value-bind (bytes facts) (logical-slot-copy-read-file context name maximum)
                (push (list name (length bytes) (logical-slot-copy-import-digest bytes) facts)
                      bound-observations)
                bytes)))
-      (multiple-value-bind (certificate certificate-bytes certificate-facts)
-          (logical-slot-copy-import-read-certificate context)
-        (unless (eq :pending (getf certificate :phase))
-          (error "committed import binding requires a pending certificate"))
-        (push (list "logical-slot-copy.import" (length certificate-bytes)
-                    (logical-slot-copy-import-digest certificate-bytes) certificate-facts)
+      (multiple-value-bind (evidence evidence-bytes evidence-facts)
+          (logical-slot-copy-import-read-artifact context :evidence)
+        (unless evidence (error "committed import lost its durable evidence"))
+        (push (list "logical-slot-copy.evidence" (length evidence-bytes)
+                    (logical-slot-copy-import-digest evidence-bytes) evidence-facts)
               bound-observations)
-        (multiple-value-bind (evidence evidence-bytes evidence-facts)
-            (logical-slot-copy-import-read-artifact context :evidence)
-          (unless evidence (error "committed import lost its durable evidence"))
-          (push (list "logical-slot-copy.evidence" (length evidence-bytes)
-                      (logical-slot-copy-import-digest evidence-bytes) evidence-facts)
-                bound-observations)
-          (let ((descriptor
-                  (logical-slot-copy-descriptor-decode
-                   (read-input "logical-slot-copy.descriptor"
-                               +logical-slot-copy-descriptor-maximum-bytes+))))
-            (multiple-value-bind (manifest control plan status)
-                (logical-slot-copy-import-evidence-check-certificate
-                 evidence certificate descriptor proof-bytes)
-              (unless (and (equalp proof-bytes
-                                   (read-input "logical-slot-copy.base-verified"
-                                               +logical-slot-copy-base-proof-maximum-bytes+))
-                           (equal (logical-slot-copy-base-proof-decode proof-bytes)
-                                  (logical-slot-copy-base-proof-value context manifest descriptor)))
-                (error "committed import receipt differs from its held root"))
-              (unless (and (equalp (getf evidence :manifest)
-                                   (read-input "physical-backup.manifest" (* 16 1024 1024)))
-                           (equalp (getf evidence :control)
-                                   (read-input "physical-recovery.control"
-                                               +physical-recovery-control-maximum-bytes+))
-                           (equalp (physical-recovery-marker-bytes)
-                                   (read-input "recovery.required" 4096)))
-                (error "committed import differs from preserved base or pending control"))
-              (let ((*physical-recovery-state* control))
-                (unless (equalp (physical-promotion-child-control-image
-                                 plan (getf (getf plan :snapshot) :time))
-                                (read-input "global/pg_wal_control"
-                                            (1+ +wal-control-maximum-bytes+)))
-                  (error "committed import does not have its exact child control")))
-              (multiple-value-bind (observations index)
-                  (logical-slot-copy-committed-observations owner context manifest descriptor)
-                (declare (ignore index))
-                (setf observations (append bound-observations observations))
-                (logical-slot-copy-input-checkpoint context manifest descriptor)
-                (logical-slot-copy-input-check-observations owner context observations)
-                (dolist (row observations)
-                  (unless (equal row (logical-slot-copy-file-row context (first row)))
-                    (error "committed import binding changed during verification")))
-                (values certificate evidence descriptor manifest control plan status observations)))))))))
+        (let ((descriptor
+                (logical-slot-copy-descriptor-decode
+                 (read-input "logical-slot-copy.descriptor"
+                             +logical-slot-copy-descriptor-maximum-bytes+))))
+          (multiple-value-bind (manifest control plan status)
+              (logical-slot-copy-import-evidence-check-certificate
+               evidence certificate descriptor proof-bytes)
+            (unless (and (equalp proof-bytes
+                                 (read-input "logical-slot-copy.base-verified"
+                                             +logical-slot-copy-base-proof-maximum-bytes+))
+                         (equal (logical-slot-copy-base-proof-decode proof-bytes)
+                                (logical-slot-copy-base-proof-value context manifest descriptor)))
+              (error "committed import receipt differs from its held root"))
+            (unless (and (equalp (getf evidence :manifest)
+                                 (read-input "physical-backup.manifest" (* 16 1024 1024)))
+                         (equalp (getf evidence :control)
+                                 (read-input "physical-recovery.control"
+                                             +physical-recovery-control-maximum-bytes+))
+                         (equalp (physical-recovery-marker-bytes)
+                                 (read-input "recovery.required" 4096)))
+              (error "committed import differs from preserved base or pending control"))
+            (let ((*physical-recovery-state* control))
+              (unless (equalp (physical-promotion-child-control-image
+                               plan (getf (getf plan :snapshot) :time))
+                              (read-input "global/pg_wal_control"
+                                          (1+ +wal-control-maximum-bytes+)))
+                (error "committed import does not have its exact child control")))
+            (multiple-value-bind (observations index)
+                (logical-slot-copy-committed-observations owner context manifest descriptor)
+              (declare (ignore index))
+              (setf observations (append bound-observations observations))
+              (logical-slot-copy-input-checkpoint context manifest descriptor)
+              (logical-slot-copy-input-check-observations owner context observations)
+              (dolist (row observations)
+                (unless (equal row (logical-slot-copy-file-row context (first row)))
+                  (error "committed import binding changed during verification")))
+              (values certificate evidence descriptor manifest control plan status observations))))))))
+
+(defun logical-slot-copy-read-committed-binding (owner context proof-bytes)
+  "Bind the canonical pending certificate and preserved input to exact child control."
+  (unless (logical-slot-copy-committed-owner-p owner)
+    (error "committed import binding requires its sibling input owner"))
+  (logical-slot-copy-check-input owner context)
+  (unless proof-bytes (error "committed import lost its base receipt"))
+  (multiple-value-bind (certificate bytes facts)
+      (logical-slot-copy-import-read-certificate context)
+    (unless (eq :pending (getf certificate :phase))
+      (error "committed import binding requires a pending certificate"))
+    (let ((row (list "logical-slot-copy.import" (length bytes)
+                     (logical-slot-copy-import-digest bytes) facts)))
+      (multiple-value-bind (bound evidence descriptor manifest control plan status observations)
+          (logical-slot-copy-read-committed-inputs owner context proof-bytes certificate)
+        (logical-slot-copy-input-check-observations owner context (list row))
+        (unless (equal row (logical-slot-copy-file-row context "logical-slot-copy.import"))
+          (error "committed import binding changed during verification"))
+        (values bound evidence descriptor manifest control plan status
+                (cons row observations))))))
 
 (defun logical-slot-copy-committed-image-equal-p (left right)
   "Compare finite input image trees, including vectors and timeline entries.
