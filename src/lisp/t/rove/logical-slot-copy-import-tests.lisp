@@ -217,6 +217,29 @@
       (rove:ok (eq :passed (getf data :status)) (format nil "~s" data))
       (rove:ok (= 100 (getf data :trials)))))
 
+(cl-spec:defproperty import-control-temporaries-require-an-exact-prefix
+    ((word (range integer 0 18446744073709551615))
+     (size (range integer 0 8)))
+  (:about logical-slot-copy-import-control-prefix-p)
+  (:trials (:normal 200))
+  (let* ((expected (make-array 8 :element-type '(unsigned-byte 8)))
+         (prefix nil))
+    (wal-set-u64 expected 0 word)
+    (setf prefix (subseq expected 0 size))
+    (and (logical-slot-copy-import-control-prefix-p prefix expected)
+         (not (logical-slot-copy-import-control-prefix-p
+               (concatenate '(vector (unsigned-byte 8)) expected #(0)) expected))
+         (or (zerop size)
+             (progn (setf (aref prefix (1- size)) (logxor 1 (aref prefix (1- size))))
+                    (not (logical-slot-copy-import-control-prefix-p prefix expected)))))))
+
+(rove:deftest import-control-temporary-prefix-generated-contract
+    (let ((data (cl-spec:result-data
+                 (cl-spec:run-property 'import-control-temporaries-require-an-exact-prefix
+                                       :seed 7541 :profile :normal))))
+      (rove:ok (eq :passed (getf data :status)) (format nil "~s" data))
+      (rove:ok (= 200 (getf data :trials)))))
+
 (rove:deftest logical-import-source-unknown-and-ahead-stay-deferred
     (let* ((history (timeline-parse-history 1 ""))
            (slot (unit-logical-provenance-slot))

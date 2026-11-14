@@ -8,7 +8,7 @@ import time
 api = runpy.run_path(str(Path(__file__).with_name('logical-slot-copy-import-input.py')))
 LISP = api['standby']['api']['LISP']
 MODES = ('healthy', 'case', 'number', 'cycle', 'caught', 'control', 'extent',
-         'parent-rewrite', 'throw', 'close', 'optional')
+         'parent-rewrite', 'throw', 'close', 'optional', 'late-extent', 'post-check', 'post-error')
 
 
 def probe(peer, mode):

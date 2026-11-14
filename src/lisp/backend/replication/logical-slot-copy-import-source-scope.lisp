@@ -10,7 +10,7 @@
       (error "leased import source requires its exact parent control"))
     (list "global/pg_wal_control" (length bytes) (logical-slot-copy-import-digest bytes) facts)))
 
-(defun call-with-logical-slot-copy-import-source (owner context function)
+(defun call-with-logical-slot-copy-import-source (owner context function &key final-check)
   "Call FUNCTION with source data and a zero-argument checker under a cold lease.
 The cold phase 3 scope holds the same store and receive-root lease throughout.
 The checker compares a finite cloned seal and observations, then repeats the
@@ -22,7 +22,7 @@ and the held global directory's entries before changing files."
   (unless (and (logical-slot-copy-import-owner-p owner)
                (eq :cold (logical-slot-copy-import-owner-mode owner))
                (= 3 (logical-slot-copy-import-owner-phase owner))
-               (functionp function))
+               (functionp function) (or (null final-check) (functionp final-check)))
     (error "leased import source requires a cold phase 3 input owner and callback"))
   (logical-slot-copy-check-input owner context)
   (let ((finished nil))
@@ -41,7 +41,7 @@ and the held global directory's entries before changing files."
                        (image (logical-slot-copy-import-state-image
                                (list source state metadata prefix generation manifest control observations)))
                        (active t) (failed nil))
-                  (labels ((check ()
+                  (labels ((verify (emit-test-point)
                              (unless (and active (not failed))
                                (error "leased import source proof ended or failed"))
                              (let ((complete nil))
@@ -61,14 +61,19 @@ and the held global directory's entries before changing files."
                                                (first image)
                                                (logical-slot-copy-read-import-source
                                                 owner context store descriptor observations manifest control
-                                                state metadata prefix generation))
+                                                state metadata prefix generation
+                                                :emit-test-point emit-test-point))
                                         (error "leased import source changed during its scope"))
                                       (setf complete t))
                                  (unless complete
-                                   (setf failed t (physical-adoption-owner-active-p owner) nil))))))
+                                   (setf failed t (physical-adoption-owner-active-p owner) nil)))))
+                           (check () (verify t)))
                     (unwind-protect
                          (multiple-value-prog1 (funcall function source #'check)
-                           (check))
+                           (check)
+                           (verify nil)
+                           (setf active nil)
+                           (when final-check (funcall final-check)))
                       (setf active nil))))))
            (setf finished t))
       (unless finished (setf (physical-adoption-owner-active-p owner) nil)))))

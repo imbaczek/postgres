@@ -44,7 +44,7 @@
     (physical-recovery-check-base-forks
      (list :files (getf metadata :forks)) (make-hash-table :test #'eql))))
 
-(defun logical-slot-copy-check-committed-child (context evidence plan prefix control)
+(defun logical-slot-copy-check-committed-child (context evidence plan prefix control &key (include-control t))
   "Check the complete child WAL inventory, history and control against exact bytes."
   (let* ((files (physical-promotion-checkpoint-files plan prefix))
          (child (getf plan :child))
@@ -62,8 +62,9 @@
       (check (concatenate 'string "pg_wal/"
                           (file-namestring (timeline-history-path child *pgdata*)))
              (getf evidence :child-history))
-      (check "global/pg_wal_control"
-             (physical-promotion-child-control-image plan (getf (getf plan :snapshot) :time)))
+      (when include-control
+        (check "global/pg_wal_control"
+               (physical-promotion-child-control-image plan (getf (getf plan :snapshot) :time))))
       (dolist (entry files)
         (check (concatenate 'string "pg_wal/"
                             (wal-segment-filename (first entry) child :timeline))

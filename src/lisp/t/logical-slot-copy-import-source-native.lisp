@@ -139,12 +139,78 @@
            (finish-output))
       (setf (symbol-function 'logical-slot-copy-prepare-import-source) original))))
 
+(defun logical-import-source-test-terminal (mode)
+  (let* ((original (symbol-function 'logical-slot-copy-read-import-source))
+         (path (first (directory (merge-pathnames "pg_physical_retained/extent-*.wal" *pgdata*))))
+         (saved (read-bounded-regular-file path (* 32 1024 1024)))
+         (store nil) (owner nil) (lease nil) (escaped nil)
+         (armed nil) (fired nil) (called nil) (postcalls 0) (failure nil) (result nil)
+         (tuple-preserved nil))
+    (unwind-protect
+         (progn
+           (setf (symbol-function 'logical-slot-copy-read-import-source)
+                 (lambda (&rest args)
+                   (setf store (third args))
+                   (multiple-value-prog1 (apply original args)
+                     (when (and (eq mode :late-extent) armed (not fired)
+                                (getf (nthcdr 11 args) :emit-test-point t))
+                       (let ((tuple (copy-tree (physical-store-control-tuple store)))
+                             (bytes (copy-seq saved)))
+                         (setf (aref bytes 0) (logxor 1 (aref bytes 0)))
+                         (logical-import-source-test-write path bytes)
+                         (assert (equal tuple (physical-store-control-tuple store)))
+                         (setf fired t tuple-preserved t))))))
+           (handler-case
+               (call-with-logical-slot-copy-import-input
+                (lambda (input context)
+                  (setf owner input)
+                  (setf result
+                        (multiple-value-list
+                         (apply #'call-with-logical-slot-copy-import-source
+                                input context
+                                (lambda (source check)
+                                  (assert (getf source :logical-fact))
+                                  (setf called t escaped check armed t
+                                        lease (first (logical-import-source-test-reader-keys)))
+                                  (assert lease)
+                                  (values :one :two nil))
+                                (unless (eq mode :late-extent)
+                                  (list :final-check
+                                        (lambda ()
+                                          (incf postcalls)
+                                          (assert (and (not (physical-store-closed-p store))
+                                                       (eq lease (first (logical-import-source-test-reader-keys)))))
+                                          (assert (handler-case (progn (funcall escaped) nil)
+                                                    (error (condition)
+                                                      (search "proof ended or failed" (princ-to-string condition)))))
+                                          (when (eq mode :post-error) (error "terminal metadata cut"))))))))))
+             (error (condition) (setf failure (princ-to-string condition))))
+           (assert called)
+           (format t "~&SOURCE-TERMINAL-EVIDENCE ~s fired=~s tuple-preserved=~s failure=~s~%"
+                   mode fired tuple-preserved failure)
+           (finish-output)
+           (case mode
+             (:late-extent
+              (assert (and fired failure
+                           (search "retained WAL object differs from its immutable reference" failure))))
+             (:post-error (assert (and (= 1 postcalls) failure (search "terminal metadata cut" failure))))
+             (:post-check (assert (and (= 1 postcalls) (null failure)
+                                       (equal result '(:one :two nil))))))
+           (assert (and (physical-store-closed-p store)
+                        (not (physical-adoption-owner-active-p owner))
+                        (null (logical-import-source-test-reader-keys))))
+           (format t "~&LOGICAL-IMPORT-SOURCE-SCOPE-PASS ~s~%" mode)
+           (finish-output))
+      (setf (symbol-function 'logical-slot-copy-read-import-source) original)
+      (logical-import-source-test-write path saved))))
+
 (defun logical-import-source-test-run (mode)
   (sb-thread:with-mutex (*physical-follow-command-lock*)
     (sb-thread:with-mutex (*reload-run-lock*)
       (with-live-operation-quiescence
         (sb-thread:with-mutex (*physical-restartpoint-start-lock*)
           (sb-thread:with-mutex (*timeline-history-lock*)
-            (if (eq mode :optional)
-                (logical-import-source-test-optional)
-                (logical-import-source-test-body mode))))))))
+            (cond ((eq mode :optional) (logical-import-source-test-optional))
+                  ((member mode '(:late-extent :post-check :post-error))
+                   (logical-import-source-test-terminal mode))
+                  (t (logical-import-source-test-body mode)))))))))

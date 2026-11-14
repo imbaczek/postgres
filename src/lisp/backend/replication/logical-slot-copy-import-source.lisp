@@ -166,7 +166,8 @@ In phase 3, also check full checkpoint artifacts before the final source replay.
                       (logical-slot-copy-import-disposition slot fact history fork parent))))
 
 (defun logical-slot-copy-read-import-source
-    (owner context store descriptor observations manifest control state metadata prefix generation)
+    (owner context store descriptor observations manifest control state metadata prefix generation
+     &key (emit-test-point t))
   "Scan the retained source once and return detached classifications at F.
 Recheck the selected plan, receive tuple, input observations, and sidecars."
   (multiple-value-bind (fact history tuple state-image)
@@ -200,7 +201,8 @@ Recheck the selected plan, receive tuple, input observations, and sidecars."
       (when (and (= 3 (getf control :phase)) (getf value :eligible-interest)
                  (not (getf control :promotion-logical-decoding-enabled)))
         (error "pending promotion disabled eligible copied logical slots"))
-      (logical-slot-copy-verification-test-point :after-import-source-scan context)
+      (when emit-test-point
+        (logical-slot-copy-verification-test-point :after-import-source-scan context))
       (physical-slot-check-standby-receive store state fork)
       (unless (equal tuple (physical-store-control-tuple store))
         (error "logical import receive selection changed after source preparation"))

@@ -104,6 +104,44 @@ Encoded evidence is independent of the minted child owner."
                                                        :maximum-entries 65536))
       (error "child WAL or history exists without a pending import certificate"))))
 
+(defun logical-slot-copy-import-plan-from-source
+    (owner context existing source descriptor observations control)
+  "Build source-bound pending facts and a deterministic child plan.
+On retry, reuse the certificate owner only after checking source exclusions and
+requiring the reconstructed value to match."
+  (let ((*pgdata* (physical-image-context-root-path context))
+        (*physical-image-context* nil))
+    (logical-slot-copy-import-check-capacity owner context source)
+    (multiple-value-bind (state metadata prefix generation) (physical-promotion-read-pending-state)
+      (let* ((plan (physical-promotion-current-checkpoint-plan state))
+             (selected (logical-slot-copy-import-selected-history state))
+             (token (if existing
+                        (progn
+                          (unless (eq :pending (getf existing :phase))
+                            (error "active import certificate cannot select parent control"))
+                          (let ((owner (logical-slot-parse-generation (getf existing :owner))))
+                            (when (member owner (logical-slot-copy-import-excluded-owners source)
+                                          :test #'eql)
+                              (error "pending import owner aliases a copied identity"))
+                            owner))
+                        (progn
+                          (logical-slot-copy-import-check-new-child state)
+                          (logical-slot-copy-verification-test-point :before-import-owner-mint context)
+                          (logical-slot-copy-import-new-owner source))))
+             (value (logical-slot-copy-import-pending-value
+                     source descriptor state plan selected token)))
+        (unless (equal control (physical-recovery-decode-control (getf source :control-bytes)))
+          (error "logical import pending control changed while planning"))
+        (when (and existing (not (equal existing value)))
+          (error "existing pending import certificate differs from verified source or child plan"))
+        (%make-logical-slot-copy-import-pending-plan
+         :value value :state state :state-image (logical-slot-copy-import-state-image state)
+         :metadata metadata :prefix prefix :generation generation
+         :control (getf source :control-bytes) :child-plan plan
+         :descriptor descriptor :observations observations :selected-history selected
+         :evidence (logical-slot-copy-import-build-evidence
+                    context descriptor state plan selected (getf source :control-bytes)))))))
+
 (defun logical-slot-copy-import-build-pending (owner context existing)
   "Build source-bound pending facts and a deterministic child plan.
 On retry, reuse the certificate owner only after checking source exclusions and
@@ -111,39 +149,9 @@ requiring the reconstructed value to match."
   (multiple-value-bind (descriptor observations manifest control)
       (logical-slot-copy-check-import-receipt owner context)
     (declare (ignore manifest))
-    (let ((source (logical-slot-copy-prepare-import-source owner context))
-          (*pgdata* (physical-image-context-root-path context))
-          (*physical-image-context* nil))
-      (logical-slot-copy-import-check-capacity owner context source)
-      (multiple-value-bind (state metadata prefix generation) (physical-promotion-read-pending-state)
-        (let* ((plan (physical-promotion-current-checkpoint-plan state))
-               (selected (logical-slot-copy-import-selected-history state))
-               (token (if existing
-                          (progn
-                            (unless (eq :pending (getf existing :phase))
-                              (error "active import certificate cannot select parent control"))
-                            (let ((owner (logical-slot-parse-generation (getf existing :owner))))
-                              (when (member owner (logical-slot-copy-import-excluded-owners source)
-                                            :test #'eql)
-                                (error "pending import owner aliases a copied identity"))
-                              owner))
-                          (progn
-                            (logical-slot-copy-import-check-new-child state)
-                            (logical-slot-copy-verification-test-point :before-import-owner-mint context)
-                            (logical-slot-copy-import-new-owner source))))
-               (value (logical-slot-copy-import-pending-value
-                       source descriptor state plan selected token)))
-          (unless (equal control (physical-recovery-decode-control (getf source :control-bytes)))
-            (error "logical import pending control changed while planning"))
-          (when (and existing (not (equal existing value)))
-            (error "existing pending import certificate differs from verified source or child plan"))
-          (%make-logical-slot-copy-import-pending-plan
-           :value value :state state :state-image (logical-slot-copy-import-state-image state)
-           :metadata metadata :prefix prefix :generation generation
-           :control (getf source :control-bytes) :child-plan plan
-           :descriptor descriptor :observations observations :selected-history selected
-           :evidence (logical-slot-copy-import-build-evidence
-                      context descriptor state plan selected (getf source :control-bytes))))))))
+    (logical-slot-copy-import-plan-from-source
+     owner context existing (logical-slot-copy-prepare-import-source owner context)
+     descriptor observations control)))
 
 (defun logical-slot-copy-import-check-pending-plan (owner context attempt)
   "Recheck the source and selected plan before publication."
