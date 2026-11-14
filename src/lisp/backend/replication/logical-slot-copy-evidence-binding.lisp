@@ -72,6 +72,7 @@ the recorded disposition does not prove source logical status."
 
 (defun logical-slot-copy-evidence-check-resolved-fact
     (certificate descriptor control history fact)
+  ;; Check the supplied resolved fact at F against the frozen boundary and slot rows.
   (unless (and fact
                (eql (getf certificate :fork) (getf control :applied))
                (eql (getf certificate :parent-timeline)

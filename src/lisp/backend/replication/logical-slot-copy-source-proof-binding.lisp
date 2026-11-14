@@ -1,6 +1,8 @@
 (in-package #:pg)
 
 (defun logical-slot-copy-source-proof-plan-state (manifest control descriptor metadata prefix)
+  ;; Reconstruct the child plan inputs from original R and C3, not the
+  ;; separately resolved fact at F.
   (let* ((fields (logical-slot-copy-control-fields
                   (logical-slot-copy-descriptor-base-control descriptor)))
          (namespace (sixth fields))
@@ -37,6 +39,7 @@
     state))
 
 (defun logical-slot-copy-source-proof-check-receipt (receipt certificate prefix)
+  ;; Check the recorded R observations and supplied prefix against the binding.
   (let* ((metadata (getf receipt :metadata))
          (text (string->bytes (physical-bootstrap-manifest-text metadata)))
          (reference (getf certificate :retained-reference)))
@@ -51,6 +54,7 @@
     receipt))
 
 (defun logical-slot-copy-source-proof-check-plan (state plan receipt child-control)
+  ;; Rebuild the original plan and child control from the receipt's inputs.
   (let ((expected (physical-promotion-checkpoint-plan
                    state (getf receipt :next-oid) (getf receipt :local-floor))))
     (unless (logical-slot-copy-committed-image-equal-p expected plan)
@@ -63,6 +67,9 @@
   plan)
 
 (defun logical-slot-copy-check-source-proof (bytes)
+  ;; Bind the supplied images without I/O.  This supplies no ownership,
+  ;; registry or retirement admission; an owned publisher and canonical reader
+  ;; are still needed to establish provenance and authority.
   (let* ((parts (logical-slot-copy-source-proof-decode bytes))
          (journal (logical-slot-copy-install-decode (getf parts :installation)))
          (certificate (logical-slot-copy-import-decode (getf journal :certificate)))

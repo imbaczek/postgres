@@ -1,6 +1,7 @@
 (in-package #:pg)
 
 (defun logical-slot-copy-source-proof-sections ()
+  ;; Ordered section bounds define the structural envelope.
   (list (list :installation 1 +logical-slot-copy-install-maximum-bytes+)
         (list :base-proof 1 +logical-slot-copy-base-proof-maximum-bytes+)
         (list :descriptor 1 +logical-slot-copy-descriptor-maximum-bytes+)
@@ -11,10 +12,12 @@
         (list :child-control 1 (1+ +wal-control-maximum-bytes+))))
 
 (defun logical-slot-copy-source-proof-maximum-bytes ()
+  ;; Include the envelope and each section's length word.
   (+ 24 (loop for section in (logical-slot-copy-source-proof-sections)
               sum (+ 4 (third section)))))
 
 (defun logical-slot-copy-source-proof-parts (value)
+  ;; Check section order and size without interpreting their contents.
   (let ((sections (logical-slot-copy-source-proof-sections)))
     (unless (and (= (* 2 (length sections))
                     (logical-slot-copy-descriptor-list-count value (* 2 (length sections))))
@@ -30,6 +33,7 @@
                        (loop for bytes in parts sum (length bytes)))))))
 
 (defun logical-slot-copy-source-proof-encode (value)
+  ;; Encode the structural envelope; encoding grants no authority.
   (multiple-value-bind (parts size) (logical-slot-copy-source-proof-parts value)
     (let ((bytes (make-array size :element-type '(unsigned-byte 8) :initial-element 0))
           (position 20))
@@ -45,6 +49,8 @@
       bytes)))
 
 (defun logical-slot-copy-source-proof-decode (bytes)
+  ;; Check framing, bounds, checksum and canonical encoding only.  A valid
+  ;; envelope does not authorize startup or retirement.
   (unless (and (typep bytes '(vector (unsigned-byte 8)))
                (<= 24 (length bytes) (logical-slot-copy-source-proof-maximum-bytes))
                (equalp (subseq bytes 0 16) #(80 71 76 79 71 83 79 85 82 67 69 70 65 67 84 49))

@@ -302,6 +302,8 @@ Older metadata without these fields uses the base timeline."
                     '(:replay-timeline :history-target :history-digest))))))
 
 (defun physical-restartpoint-check-source-metadata (metadata state)
+  ;; Check identity and source facts without catalog bytes.  The full metadata
+  ;; checker also validates catalog membership and the fork inventory.
   (physical-history-check-plist
    metadata (append '(:version :system-id :cluster-identity :timeline :manifest-digest
                       :base :lsn :prefix-digest :next-xid :forks :seen)

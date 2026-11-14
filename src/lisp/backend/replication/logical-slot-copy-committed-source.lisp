@@ -97,6 +97,8 @@
     (error "committed import source history or child plan differs from actual restartpoint"))
   (multiple-value-bind (fact history tuple state-image)
       (logical-slot-copy-import-scan store state manifest descriptor control)
+    ;; Check the replayed F fact separately; do not substitute it into the
+    ;; original R and C3 inputs used for the child plan.
     (logical-slot-copy-evidence-check-resolved-fact certificate descriptor control history fact)
     (let ((observations (funcall check-artifacts)))
       (unless (and (equal tuple (physical-store-control-tuple store))
