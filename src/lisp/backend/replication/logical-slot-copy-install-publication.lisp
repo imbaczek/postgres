@@ -100,11 +100,11 @@ immediately before NOREPLACE, then rebind held identities to the new path."
    publisher (logical-slot-copy-install-publisher-active publisher) :after-journal-active-sync)
   (logical-slot-copy-install-publisher-sync
    publisher (logical-slot-copy-install-publisher-container publisher) :after-journal-container-sync)
+  (logical-slot-copy-install-publisher-sync
+   publisher (logical-slot-copy-install-publisher-root publisher) :after-journal-target-parent-sync)
   (when (logical-slot-copy-install-publisher-work publisher)
     (logical-slot-copy-install-publisher-sync
-     publisher (logical-slot-copy-install-publisher-work publisher) :after-journal-source-parent-sync))
-  (logical-slot-copy-install-publisher-sync
-   publisher (logical-slot-copy-install-publisher-root publisher) :after-journal-target-parent-sync))
+     publisher (logical-slot-copy-install-publisher-work publisher) :after-journal-source-parent-sync)))
 
 (defun logical-slot-copy-install-publish-journal (owner context input)
   "Publish a fresh journal or resync a fixed one under a proved input.
