@@ -97,22 +97,24 @@
                        facts)
                   (setf active nil)))))))))))
 
+(defun logical-slot-copy-read-source-proof-under-locks ()
+  (call-with-logical-slot-copy-source-reader-owner
+   (lambda (owner)
+     (call-with-logical-slot-copy-source-reader-reference
+      (lambda (register)
+        (call-with-physical-directory-root
+         owner
+         (lambda (borrowed path)
+           (declare (ignore path))
+           (call-with-physical-image-owned-context
+            borrowed t
+            (lambda (context)
+              (let ((*pgdata* (physical-image-context-root-path context))
+                    (*physical-image-context* context))
+                (logical-slot-copy-source-proof-read-held owner context register)))))))))))
+
 (defun logical-slot-copy-read-source-proof ()
   ;; Observe the canonical proof under cold ownership and a scoped reference.
   (logical-slot-copy-install-check-input-entry)
   (call-with-logical-slot-copy-install-exclusion
-   (lambda ()
-     (call-with-logical-slot-copy-source-reader-owner
-      (lambda (owner)
-        (call-with-logical-slot-copy-source-reader-reference
-         (lambda (register)
-           (call-with-physical-directory-root
-            owner
-            (lambda (borrowed path)
-              (declare (ignore path))
-              (call-with-physical-image-owned-context
-               borrowed t
-               (lambda (context)
-                 (let ((*pgdata* (physical-image-context-root-path context))
-                       (*physical-image-context* context))
-                   (logical-slot-copy-source-proof-read-held owner context register)))))))))))))
+   #'logical-slot-copy-read-source-proof-under-locks))
