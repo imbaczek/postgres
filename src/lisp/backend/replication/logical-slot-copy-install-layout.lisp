@@ -29,12 +29,11 @@
             (if suffix (error "logical installation rows do not form an installed prefix")
                 (incf prefix)))))))
 
-(defun logical-slot-copy-install-layout-pair (root container value)
+(defun logical-slot-copy-install-layout-pair (root container value active)
   "Determine certificate orientation from exact bytes and recorded inode identities."
   (let* ((canonical (logical-slot-copy-install-inspection-open root "logical-slot-copy.import" :file root))
          (other (logical-slot-copy-install-inspection-open container "active" :file root))
          (pending (getf value :certificate))
-         (active (logical-slot-copy-install-active-image (logical-slot-copy-import-decode pending)))
          (left (logical-slot-copy-install-inspection-read canonical +logical-slot-copy-import-maximum-bytes+))
          (right (logical-slot-copy-install-inspection-read other +logical-slot-copy-import-maximum-bytes+)))
     (prog1
@@ -83,7 +82,7 @@
       (logical-slot-copy-install-inspection-close directory)
       (values facts slot))))
 
-(defun logical-slot-copy-install-layout-slots (root value)
+(defun logical-slot-copy-install-layout-slots (root value certificate)
   "Check the P7 prefix and physical extras, counting all rows against capacity.
 Recorded device and inode identities are checked with current mount groups;
 historical mount IDs are not used as authority.  Return decoded physical slots
@@ -91,7 +90,6 @@ along with the prefix and observations."
   (let* ((slot-root (logical-slot-copy-install-inspection-open root "pg_replslot" :slot-root nil))
          (work (logical-slot-copy-install-inspection-open slot-root ".logical-slot-copy.work" :directory slot-root))
          (container (logical-slot-copy-install-inspection-open work (getf value :stage-id) :directory slot-root))
-         (certificate (logical-slot-copy-import-decode (getf value :certificate)))
          (rows (getf certificate :slots)) (names (mapcar #'first rows))
          (source (logical-slot-copy-install-inspection-names container (1+ +logical-slot-copy-descriptor-maximum-slots+)))
          (canonical (remove ".logical-slot-copy.work"
@@ -125,42 +123,42 @@ workspace orphans remain opaque."
   (unless (and (typep image '(vector (unsigned-byte 8)))
                (<= 240 (length image) +logical-slot-copy-install-maximum-bytes+))
     (error "invalid logical installation layout image"))
-  (let* ((bytes (copy-seq image)) (value (logical-slot-copy-install-decode bytes)))
-    (call-with-logical-slot-copy-install-inspection
-     operation
-     (lambda (root)
-       (let ((certificate (logical-slot-copy-import-decode (getf value :certificate)))
-             (identity (logical-slot-copy-install-node-identity root)))
-         (unless (and (= (first identity) (getf certificate :device))
-                      (= (second identity) (getf certificate :inode)))
-           (error "logical installation journal belongs to a different root")))
-       (let* ((fixed (logical-slot-copy-install-inspection-open
-                      root "logical-slot-copy.install" :directory root :missing t))
-              (work (logical-slot-copy-install-inspection-open
-                     root "logical-slot-copy.work" :directory root :missing t))
-              (private (when work
-                         (logical-slot-copy-install-inspection-open
-                          work (getf value :stage-id) :directory root :missing t)))
-              (container (or fixed private)))
-         (unless (and container (not (and fixed private)))
-           (error "logical installation container must have exactly one location"))
-         (logical-slot-copy-install-inspection-identity container (getf value :container))
-         (unless (equal '("active" "journal") (logical-slot-copy-install-inspection-names container 3))
-           (error "logical installation journal container inventory changed"))
-         (let ((journal (logical-slot-copy-install-inspection-open container "journal" :file root)))
-           (logical-slot-copy-install-inspection-identity journal (getf value :journal))
-           (unless (equalp bytes (logical-slot-copy-install-inspection-read
-                                  journal +logical-slot-copy-install-maximum-bytes+))
-             (error "logical installation journal differs from its selected image"))
-           (logical-slot-copy-install-inspection-close journal))
-         (let ((phase (logical-slot-copy-install-layout-pair root container value)))
-           (multiple-value-bind (prefix observations physical)
-               (logical-slot-copy-install-layout-slots root value)
-             (unless (and (or fixed (and (eq phase :pending) (zerop prefix)))
-                          (or (eq phase :pending) (= prefix (length (getf value :entries)))))
-               (error "logical installation certificate phase differs from its installed prefix"))
-             (list :phase (if fixed phase :private) :prefix prefix
-                   :image bytes :observations observations :physical physical))))))))
+  (let ((bytes (copy-seq image)))
+    (multiple-value-bind (value certificate active) (logical-slot-copy-install-decode bytes)
+      (call-with-logical-slot-copy-install-inspection
+       operation
+       (lambda (root)
+         (let ((identity (logical-slot-copy-install-node-identity root)))
+           (unless (and (= (first identity) (getf certificate :device))
+                        (= (second identity) (getf certificate :inode)))
+             (error "logical installation journal belongs to a different root")))
+         (let* ((fixed (logical-slot-copy-install-inspection-open
+                        root "logical-slot-copy.install" :directory root :missing t))
+                (work (logical-slot-copy-install-inspection-open
+                       root "logical-slot-copy.work" :directory root :missing t))
+                (private (when work
+                           (logical-slot-copy-install-inspection-open
+                            work (getf value :stage-id) :directory root :missing t)))
+                (container (or fixed private)))
+           (unless (and container (not (and fixed private)))
+             (error "logical installation container must have exactly one location"))
+           (logical-slot-copy-install-inspection-identity container (getf value :container))
+           (unless (equal '("active" "journal") (logical-slot-copy-install-inspection-names container 3))
+             (error "logical installation journal container inventory changed"))
+           (let ((journal (logical-slot-copy-install-inspection-open container "journal" :file root)))
+             (logical-slot-copy-install-inspection-identity journal (getf value :journal))
+             (unless (equalp bytes (logical-slot-copy-install-inspection-read
+                                    journal +logical-slot-copy-install-maximum-bytes+))
+               (error "logical installation journal differs from its selected image"))
+             (logical-slot-copy-install-inspection-close journal))
+           (let ((phase (logical-slot-copy-install-layout-pair root container value active)))
+             (multiple-value-bind (prefix observations physical)
+                 (logical-slot-copy-install-layout-slots root value certificate)
+               (unless (and (or fixed (and (eq phase :pending) (zerop prefix)))
+                            (or (eq phase :pending) (= prefix (length (getf value :entries)))))
+                 (error "logical installation certificate phase differs from its installed prefix"))
+               (list :phase (if fixed phase :private) :prefix prefix
+                     :image bytes :observations observations :physical physical)))))))))
 
 (defun logical-slot-copy-install-read-layout (operation image)
   "Read a selected layout without granting publication, source, or admission authority.

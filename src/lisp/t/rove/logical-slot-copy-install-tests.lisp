@@ -311,6 +311,35 @@
       (rove:ok (eq :passed (getf data :status)) (format nil "~s" data))
       (rove:ok (= 200 (getf data :trials)))))
 
+(cl-spec:defproperty installation-journal-decodes-detached-certificate-pair
+    ((word (range integer 0 18446744073709551615))
+     (generation (range integer 0 340282366920938463463374607431768211455)))
+  (:about logical-slot-copy-install-decode)
+  (:trials (:normal 200))
+  (let* ((value (unit-logical-slot-install-value word generation))
+         (image (logical-slot-copy-install-encode value))
+         (before (copy-seq image)))
+    (multiple-value-bind (decoded certificate active) (logical-slot-copy-install-decode image)
+      (and certificate active
+           (equalp (getf decoded :certificate) (logical-slot-copy-import-image certificate))
+           (equalp active (logical-slot-copy-install-active-image certificate))
+           (eq :pending (getf certificate :phase))
+           (progn
+             (setf (getf certificate :phase) :active)
+             (setf (aref active 0) 0)
+             (multiple-value-bind (again pending paired) (logical-slot-copy-install-decode image)
+               (and (eq :pending (getf pending :phase))
+                    (equalp before image)
+                    (equalp (getf again :certificate) (getf value :certificate))
+                    (equalp paired (logical-slot-copy-install-active-image pending)))))))))
+
+(rove:deftest installation-journal-certificate-pair-generated-contract
+    (let ((data (cl-spec:result-data
+                 (cl-spec:run-property 'installation-journal-decodes-detached-certificate-pair
+                                       :seed 7529 :profile :normal))))
+      (rove:ok (eq :passed (getf data :status)) (format nil "~s" data))
+      (rove:ok (= 200 (getf data :trials)))))
+
 (rove:deftest slot-installation-active-certificate-changes-only-phase
     (let* ((value (unit-logical-slot-install-value 18446744073709551615 42))
            (pending (logical-slot-copy-import-decode (getf value :certificate)))
