@@ -565,6 +565,14 @@ Remove the trace and its temporary helper after the demo:
   and reference libraries outside the mount. RAM-backed crash tests retain their
   fsync and fault assertions and provide process-crash and I/O-order evidence.
 
+- Keep permanent verification artifacts small. Retain summaries, timing records,
+  useful logs and the source revision or compact source delta. Do not archive
+  compiler caches or disposable database directories. Retire completed frozen
+  checkouts and worktrees after preserving any source changes needed to reproduce
+  the result; do not accumulate full PostgreSQL trees for each qualification.
+  Check for active process references before cleanup. Keep pinned runtimes and C
+  reference installations while current jobs or planned comparisons require them.
+
 - Record monotonic elapsed time for production compilation/loading, test-system
   loading, test execution, and each selected test or batch. Keep total elapsed
   time and setup costs alongside the phase timings.
