@@ -171,6 +171,9 @@ This context is invalid after its enclosing call exits."
 ;; also support a future private initial publisher.
 
 (defun call-with-physical-directory-root (owner function)
+  "Call FUNCTION with a checked root descriptor and close it on exit.
+Report a close error after normal completion; preserve the original failure
+when cleanup also fails."
   (declare (notinline sb-posix:close))
   (physical-directory-check-owner-common owner)
   (let ((fd nil) (completed nil))

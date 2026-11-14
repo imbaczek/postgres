@@ -1,14 +1,19 @@
 (in-package #:pg)
 
+;;; The handoff survives preparation's descriptor scope only within the outer
+;;; operation.  It is minted after source and stage postchecks.  Publishing the
+;;; fixed journal and moving canonical slots require a separate publisher.
 (defstruct (logical-slot-copy-install-operation
             (:include physical-adoption-owner)
             (:constructor %make-logical-slot-copy-install-operation)
             (:print-function physical-libpq-print-private-object))
+  "Thread-bound operation owner; it does not authorize offline adoption."
   (ownership nil :read-only t))
 
 (defstruct (logical-slot-copy-install-operation-state
             (:constructor %make-logical-slot-copy-install-operation-state)
             (:print-function physical-libpq-print-private-object))
+  "Scoped operation evidence, including the root, exclusion state, and handoffs."
   (operation nil :read-only t) (thread nil :read-only t)
   (root-fd nil :read-only t) (root-identity nil :read-only t)
   (mode nil :read-only t) (state nil :read-only t) (store nil :read-only t)
@@ -18,11 +23,13 @@
 (defstruct (logical-slot-copy-install-handoff
             (:constructor %make-logical-slot-copy-install-handoff)
             (:print-function physical-libpq-print-private-object))
+  "Opaque handle valid only in its creating operation."
   (operation nil :read-only t))
 
 (defstruct (logical-slot-copy-install-handoff-record
             (:constructor %make-logical-slot-copy-install-handoff-record)
             (:print-function physical-libpq-print-private-object))
+  "Private image and availability state for one handoff."
   (handoff nil :read-only t) (image nil :read-only t) state)
 
 (defvar *logical-slot-copy-install-operations* nil)
@@ -38,6 +45,7 @@
         *live-operation-lock* *live-operation-cv*))
 
 (defun logical-slot-copy-install-operation-record (operation)
+  "Find the active operation by identity and require its owning thread."
   (let ((record (find operation *logical-slot-copy-install-operations*
                       :key #'logical-slot-copy-install-operation-state-operation :test #'eq)))
     (unless (and record (logical-slot-copy-install-operation-p operation)
@@ -48,6 +56,7 @@
     record))
 
 (defun logical-slot-copy-install-check-operation-mode (record)
+  "Require the captured cold or live mode and its corresponding state."
   (ecase (logical-slot-copy-install-operation-state-mode record)
     (:cold
      (physical-adoption-check-startup-quiescence)
@@ -67,6 +76,8 @@
      (physical-store-check-live *physical-receive-store*))))
 
 (defun logical-slot-copy-install-check-operation (operation)
+  "Recheck ownership, locks, quiescence gate, root binding, and mode.
+A failed check revokes the operation."
   (let ((record (logical-slot-copy-install-operation-record operation)) (completed nil))
     (unwind-protect
          (progn
@@ -108,6 +119,7 @@
   (error "logical installation operation does not authorize offline adoption"))
 
 (defun logical-slot-copy-install-check-operation-input (operation context)
+  "Require the preparation context to hold the operation's root."
   (logical-slot-copy-install-check-operation operation)
   (physical-image-check-context context)
   (unless (equal (logical-slot-copy-install-operation-state-root-identity
@@ -117,6 +129,7 @@
     (error "logical installation preparation differs from its operation root")))
 
 (defun logical-slot-copy-install-handoff-record (operation handoff)
+  "Find an available handoff by identity in its active operation."
   (logical-slot-copy-install-check-operation operation)
   (let ((record (find handoff
                       (logical-slot-copy-install-operation-state-handoffs
@@ -129,10 +142,14 @@
     record))
 
 (defun logical-slot-copy-install-handoff-image (operation handoff)
+  "Return a defensive copy of the available handoff image."
   (copy-seq (logical-slot-copy-install-handoff-record-image
              (logical-slot-copy-install-handoff-record operation handoff))))
 
 (defun logical-slot-copy-install-consume-handoff (operation handoff)
+  "Spend the handoff once and return defensive bytes.
+These bytes do not authorize I/O or publication.  A future publisher must
+reprove its typed role, source, and stage under fresh ownership."
   (let ((image (logical-slot-copy-install-handoff-image operation handoff)))
     (sb-sys:without-interrupts
       (let ((record (logical-slot-copy-install-handoff-record operation handoff)))
@@ -140,6 +157,8 @@
     image))
 
 (defun logical-slot-copy-install-create-handoff (operation mark-started)
+  "Stage the installation and mint a handoff after preparation postchecks.
+Recheck the operation and decode the image before registering the handoff."
   (let ((image
           (call-with-logical-slot-copy-install-preparation
            (lambda (owner context attempt)
@@ -164,6 +183,9 @@
       handoff)))
 
 (defun call-with-logical-slot-copy-install-operation-under-locks (function)
+  "Run the scoped operation under the caller's exclusion locks.
+Revoke every handoff and the owner on exit.  After staging starts, failure
+through root close and the final postmaster ownership check fences recovery."
   (when *logical-slot-copy-install-operations*
     (error "logical installation operation is already active"))
   (logical-slot-copy-check-import-locks)
@@ -203,6 +225,7 @@
       (when (and started (not finished)) (setf *physical-recovery-failed-p* t)))))
 
 (defun call-with-logical-slot-copy-install-handoff (function)
+  "Hold the locks and quiescence gate while calling FUNCTION with a handoff."
   (when *logical-slot-copy-install-operations*
     (error "logical installation operation is already active"))
   (sb-thread:with-mutex (*physical-follow-command-lock*)
