@@ -69,11 +69,13 @@ Live mode captures the caller\'s pending state and receive store; cold mode capt
       (push (logical-slot-copy-file-row context name) observations))
     (logical-slot-copy-observe-pieces context descriptor observations index)))
 
-(defun logical-slot-copy-read-committed-inputs (owner context proof-bytes certificate)
+(defun logical-slot-copy-read-preserved-inputs (owner context proof-bytes certificate control-phase)
   "Check preserved inputs against the caller-bound original pending certificate.
 This does not observe the canonical import file or grant authority.  A caller
 using a journal must first prove its exact certificate pair.  The caller must
 recheck the returned input observations across its callback."
+  (unless (member control-phase '(:parent :child))
+    (error "unknown preserved import control phase"))
   (unless (logical-slot-copy-committed-owner-p owner)
     (error "committed import binding requires its sibling input owner"))
   (logical-slot-copy-check-input owner context)
@@ -118,12 +120,19 @@ recheck the returned input observations across its callback."
                          (equalp (physical-recovery-marker-bytes)
                                  (read-input "recovery.required" 4096)))
               (error "committed import differs from preserved base or pending control"))
-            (let ((*physical-recovery-state* control))
-              (unless (equalp (physical-promotion-child-control-image
-                               plan (getf (getf plan :snapshot) :time))
+            (let ((expected
+                    (ecase control-phase
+                      (:parent (logical-slot-copy-descriptor-base-control descriptor))
+                      (:child
+                       (let ((*physical-recovery-state* control))
+                         (physical-promotion-child-control-image
+                          plan (getf (getf plan :snapshot) :time)))))))
+              (unless (equalp expected
                               (read-input "global/pg_wal_control"
                                           (1+ +wal-control-maximum-bytes+)))
-                (error "committed import does not have its exact child control")))
+                (error (if (eq control-phase :child)
+                           "committed import does not have its exact child control"
+                           "preserved import does not have its exact parent control"))))
             (multiple-value-bind (observations index)
                 (logical-slot-copy-committed-observations owner context manifest descriptor)
               (declare (ignore index))
@@ -134,6 +143,13 @@ recheck the returned input observations across its callback."
                 (unless (equal row (logical-slot-copy-file-row context (first row)))
                   (error "committed import binding changed during verification")))
               (values certificate evidence descriptor manifest control plan status observations))))))))
+
+(defun logical-slot-copy-read-committed-inputs (owner context proof-bytes certificate)
+  "Check preserved inputs against the caller-bound original pending certificate.
+This does not observe the canonical import file or grant authority. A caller
+using a journal must first prove its exact certificate pair. The caller must
+recheck the returned input observations across its callback."
+  (logical-slot-copy-read-preserved-inputs owner context proof-bytes certificate :child))
 
 (defun logical-slot-copy-read-committed-binding (owner context proof-bytes)
   "Read and bind the canonical pending certificate to preserved input and child control.
