@@ -165,10 +165,55 @@ In phase 3, also check full checkpoint artifacts before the final source replay.
                       (bytes->string bytes)
                       (logical-slot-copy-import-disposition slot fact history fork parent))))
 
-(defun logical-slot-copy-prepare-import-source (owner context)
-  "Prepare detached observational source data under the owned read-only scope.
-Check receipt, selected progress, retained receive root and final input observations.
-This grants no publication or admission; public promotion remains fenced."
+(defun logical-slot-copy-read-import-source
+    (owner context store descriptor observations manifest control state metadata prefix generation)
+  (multiple-value-bind (fact history tuple state-image)
+      (logical-slot-copy-import-scan store state manifest descriptor control)
+    (let* ((fork (getf control :applied))
+           (parent (getf control :applied-timeline (getf control :timeline)))
+           (rows (logical-slot-copy-import-source-rows descriptor fact history fork parent))
+           (control-bytes (logical-slot-copy-read-file
+                           context "physical-recovery.control"
+                           +physical-recovery-control-maximum-bytes+))
+           (value
+             (list :copy-id (copy-seq (logical-slot-copy-descriptor-copy-id descriptor))
+                   :device (physical-adoption-owner-device owner)
+                   :inode (physical-adoption-owner-inode owner)
+                   :manifest-digest (getf control :manifest-digest)
+                   :descriptor-digest (third (find "logical-slot-copy.descriptor"
+                                                   observations :key #'first :test #'equal))
+                   :base-proof-digest (third (find "logical-slot-copy.base-verified"
+                                                   observations :key #'first :test #'equal))
+                   :system-id (getf manifest :system-id)
+                   :base-end (getf manifest :end) :base-timeline (getf manifest :timeline)
+                   :selected-history (mapcar (lambda (entry)
+                                               (list (timeline-history-entry-timeline entry)
+                                                     (timeline-history-entry-begin entry)
+                                                     (timeline-history-entry-end entry)))
+                                             history)
+                   :fork fork :parent-timeline parent :phase (getf control :phase)
+                   :control-bytes control-bytes :logical-fact fact
+                   :eligible-interest (not (null (find :eligible rows :key #'fifth)))
+                   :slots rows)))
+      (when (and (= 3 (getf control :phase)) (getf value :eligible-interest)
+                 (not (getf control :promotion-logical-decoding-enabled)))
+        (error "pending promotion disabled eligible copied logical slots"))
+      (logical-slot-copy-verification-test-point :after-import-source-scan context)
+      (physical-slot-check-standby-receive store state fork)
+      (unless (equal tuple (physical-store-control-tuple store))
+        (error "logical import receive selection changed after source preparation"))
+      (logical-slot-copy-import-recheck-plan
+       owner control state state-image metadata prefix generation)
+      (logical-slot-copy-input-check-observations owner context observations)
+      (dolist (row observations)
+        (unless (equal row (logical-slot-copy-file-row context (first row)))
+          (error "logical import input bytes changed during source preparation")))
+      (logical-slot-copy-input-sidecar-inventory context descriptor)
+      (logical-slot-copy-check-input owner context)
+      value))
+  )
+
+(defun call-with-logical-slot-copy-import-source-state (owner context function)
   (multiple-value-bind (descriptor observations manifest control)
       (logical-slot-copy-check-import-receipt owner context)
     (let ((*pgdata* (physical-image-context-root-path context))
@@ -183,47 +228,15 @@ This grants no publication or admission; public promotion remains fenced."
            (physical-follow-call-with-receive-root
             store
             (lambda ()
-              (multiple-value-bind (fact history tuple state-image)
-                  (logical-slot-copy-import-scan store state manifest descriptor control)
-                (let* ((fork (getf control :applied))
-                       (parent (getf control :applied-timeline (getf control :timeline)))
-                       (rows (logical-slot-copy-import-source-rows descriptor fact history fork parent))
-                       (control-bytes (logical-slot-copy-read-file
-                                       context "physical-recovery.control"
-                                       +physical-recovery-control-maximum-bytes+))
-                       (value
-                         (list :copy-id (copy-seq (logical-slot-copy-descriptor-copy-id descriptor))
-                               :device (physical-adoption-owner-device owner)
-                               :inode (physical-adoption-owner-inode owner)
-                               :manifest-digest (getf control :manifest-digest)
-                               :descriptor-digest (third (find "logical-slot-copy.descriptor"
-                                                               observations :key #'first :test #'equal))
-                               :base-proof-digest (third (find "logical-slot-copy.base-verified"
-                                                               observations :key #'first :test #'equal))
-                               :system-id (getf manifest :system-id)
-                               :base-end (getf manifest :end) :base-timeline (getf manifest :timeline)
-                               :selected-history (mapcar (lambda (entry)
-                                                           (list (timeline-history-entry-timeline entry)
-                                                                 (timeline-history-entry-begin entry)
-                                                                 (timeline-history-entry-end entry)))
-                                                         history)
-                               :fork fork :parent-timeline parent :phase (getf control :phase)
-                               :control-bytes control-bytes :logical-fact fact
-                               :eligible-interest (not (null (find :eligible rows :key #'fifth)))
-                               :slots rows)))
-                  (when (and (= 3 (getf control :phase)) (getf value :eligible-interest)
-                             (not (getf control :promotion-logical-decoding-enabled)))
-                    (error "pending promotion disabled eligible copied logical slots"))
-                  (logical-slot-copy-verification-test-point :after-import-source-scan context)
-                  (physical-slot-check-standby-receive store state fork)
-                  (unless (equal tuple (physical-store-control-tuple store))
-                    (error "logical import receive selection changed after source preparation"))
-                  (logical-slot-copy-import-recheck-plan
-                   owner control state state-image metadata prefix generation)
-                  (logical-slot-copy-input-check-observations owner context observations)
-                  (dolist (row observations)
-                    (unless (equal row (logical-slot-copy-file-row context (first row)))
-                      (error "logical import input bytes changed during source preparation")))
-                  (logical-slot-copy-input-sidecar-inventory context descriptor)
-                  (logical-slot-copy-check-input owner context)
-                  value))))))))))
+              (funcall function store descriptor observations manifest control
+                       state metadata prefix generation)))))))))
+
+(defun logical-slot-copy-prepare-import-source (owner context)
+  "Prepare detached observational source data under the owned read-only scope.
+Check receipt, selected progress, retained receive root and final input observations.
+This grants no publication or admission; public promotion remains fenced."
+  (call-with-logical-slot-copy-import-source-state
+   owner context
+   (lambda (store descriptor observations manifest control state metadata prefix generation)
+     (logical-slot-copy-read-import-source
+      owner context store descriptor observations manifest control state metadata prefix generation))))

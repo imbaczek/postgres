@@ -197,6 +197,26 @@
                                        :profile :normal :seed 7411))))
       (rove:ok (eq :passed (getf data :status)) (format nil "~S" data))))
 
+(cl-spec:defproperty cold-source-callbacks-reject-unregistered-owners
+    ((value (range integer -2147483648 2147483647)))
+  (:about call-with-logical-slot-copy-import-source)
+  (:trials (:normal 100))
+  (let ((called nil))
+    (and (handler-case
+             (progn
+               (call-with-logical-slot-copy-import-source
+                value nil (lambda (&rest ignored) (declare (ignore ignored)) (setf called t)))
+               nil)
+           (error () t))
+         (not called))))
+
+(rove:deftest cold-source-callback-registration-generated-contract
+    (let ((data (cl-spec:result-data
+                 (cl-spec:run-property 'cold-source-callbacks-reject-unregistered-owners
+                                       :seed 7537 :profile :normal))))
+      (rove:ok (eq :passed (getf data :status)) (format nil "~s" data))
+      (rove:ok (= 100 (getf data :trials)))))
+
 (rove:deftest logical-import-source-unknown-and-ahead-stay-deferred
     (let* ((history (timeline-parse-history 1 ""))
            (slot (unit-logical-provenance-slot))

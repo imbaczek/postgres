@@ -359,6 +359,7 @@
                    (:file "../replication/logical-slot-copy-import-commit")
                    (:file "../replication/logical-slot-copy-committed-input")
                    (:file "../replication/logical-slot-copy-committed-source")
+                   (:file "../replication/logical-slot-copy-import-source-scope")
                    (:file "../replication/logical-slot-copy-install-codec")
                    (:file "../replication/logical-slot-copy-install-owner")
                    (:file "../replication/logical-slot-copy-install-fs")
