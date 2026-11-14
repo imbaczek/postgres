@@ -19,12 +19,14 @@ string = base['string']
 
 
 def probe(peer, label, *args, failure=None, publication=None, cut='none', syscall=None,
-          mount=None, **kwargs):
+          mount=None, all_lost=False, **kwargs):
     assert failure in (None, 'error', 'throw', 'mutation')
     assert publication in (None, 'run', 'reject', 'error', 'throw', 'crash')
-    assert sum(bool(x) for x in (failure, publication, syscall, mount)) <= 1
+    assert sum(bool(x) for x in (failure, publication, syscall, mount, all_lost)) <= 1
     operation = (f'(logical-source-proof-test-preparation-failure :{failure})'
                  if failure else '(logical-source-proof-test-run)')
+    if all_lost:
+        operation = '(logical-source-proof-test-all-lost)'
     if publication:
         assert cut == 'none' or cut in PUBLICATION_CUTS
         operation = f'(logical-source-proof-test-publication :{publication} :{cut})'
@@ -62,7 +64,8 @@ def probe(peer, label, *args, failure=None, publication=None, cut='none', syscal
         assert f'SOURCE-PROOF-PUBLICATION-KILL :{cut.upper()}' in text, log
         print(f'SOURCE-PROOF-KILLED {label} seconds={time.monotonic()-started:.6f}', flush=True)
         return
-    marker = ('SOURCE-PROOF-MOUNT-PASS' if mount else
+    marker = ('SOURCE-PROOF-ALL-LOST-PASS' if all_lost else
+              'SOURCE-PROOF-MOUNT-PASS' if mount else
               'SOURCE-PROOF-SYSCALL-PASS' if syscall else
               'SOURCE-PROOF-PUBLICATION-PASS' if publication else
               'SOURCE-PROOF-PREPARATION-FAILURE-PASS' if failure
@@ -251,14 +254,35 @@ def matrix(peer, disposition):
     print(f'SOURCE-PROOF-WORKFLOW-PASS optional={environment["optional"]}', flush=True)
 
 
+def run_all_lost():
+    # The existing standby workflow drops alpha, restarts the actual producer
+    # with replica WAL, then restores logical WAL. ON cannot undo the OFF gap.
+    peer = api['run_live'](pending=True)
+    assert peer.process is None or peer.process.poll() is not None
+    base['probe'](peer, 'all-lost-cf')
+    probe(peer, 'all-lost-baseline', all_lost=True)
+    before = catalog['image'](peer.data)
+    for retry in range(2):
+        probe(peer, f'all-lost-retry-{retry}', all_lost=True)
+        assert before == catalog['image'](peer.data), 'all-lost retry changed bytes or inodes'
+    print('SOURCE-PROOF-ALL-LOST-WORKFLOW-PASS', flush=True)
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--smoke', action='store_true')
+    parser.add_argument('--all-lost', action='store_true')
     parser.add_argument('--publication-cuts', action='store_true')
     parser.add_argument('--publication-negative', action='store_true')
     parser.add_argument('--publication-syscalls', action='store_true')
     parser.add_argument('--publication-mounts', action='store_true')
     arguments = parser.parse_args()
+    if arguments.all_lost:
+        if any((arguments.publication_cuts, arguments.publication_negative,
+                arguments.publication_syscalls, arguments.publication_mounts)):
+            parser.error('--all-lost cannot be combined with publication fault matrices')
+        run_all_lost()
+        raise SystemExit(0)
     OwnedLisp.start = catalog['start']
     standby['insert'] = catalog['insert']
     workflow = api['run_healthy'].__globals__

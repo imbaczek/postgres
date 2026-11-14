@@ -378,3 +378,21 @@
                  (null *catalog*) (null *clog-stream*) (null *wal-output-stream*)
                  (not *wal-ready*) (not *physical-recovery-failed-p*)
                  (zerop (hash-table-count *wal-replication-slots*))))))
+
+(defun logical-source-proof-test-all-lost ()
+  (logical-source-proof-test-run)
+  (let* ((facts (logical-slot-copy-read-source-proof))
+         (certificate (getf facts :certificate))
+         (rows (getf certificate :slots)))
+    (assert (equal '("alpha") (mapcar #'first rows)))
+    (assert (getf (getf facts :fact) :last-disable-lsn))
+    (assert (zerop (count :eligible rows :key #'fifth)))
+    (dolist (row rows)
+      (assert (eq :wal-level-insufficient (fifth row)))
+      (let ((slot (logical-slot-state-decode (string->bytes (fourth row)) (first row))))
+        (assert (eq :wal-level-insufficient
+                    (logical-slot-effective-invalidation-cause slot)))))
+    (assert (logical-source-proof-test-rejected-p #'logical-slot-copy-check-promotion))
+    (format t "~&SOURCE-PROOF-ALL-LOST-PASS rows=~d eligible=0 cause=wal-level-insufficient~%"
+            (length rows))
+    (finish-output)))
