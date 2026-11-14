@@ -36,7 +36,8 @@ The active validator rejects deferred rows."
 (defun logical-slot-copy-install-parts (value)
   "Check journal fields, ordered slot rows and historical identity groups.
 The PGDATA journal/certificate group and slot staging group may be on separate
-filesystems. The journal's own inode can be recorded before its contents."
+filesystems. The journal's own inode can be recorded before its contents.
+Return the checked certificate, encoded size, and active certificate image."
   (unless (and (= 22 (logical-slot-copy-descriptor-list-count value 22))
                (equal (loop for key in value by #'cddr collect key)
                       '(:certificate :evidence-digest :stage-id :container :slot-root :slot-work
@@ -94,7 +95,8 @@ filesystems. The journal's own inode can be recorded before its contents."
     (values certificate size active)))
 
 (defun logical-slot-copy-install-encode (value)
-  "Encode a bounded canonical journal with a CRC trailer."
+  "Encode a bounded canonical journal with a CRC trailer.
+Also return the checked certificate and its active image."
   (multiple-value-bind (certificate size active) (logical-slot-copy-install-parts value)
     (let ((bytes (make-array size :element-type '(unsigned-byte 8) :initial-element 0))
           (position 20))
@@ -122,7 +124,8 @@ filesystems. The journal's own inode can be recorded before its contents."
       (values bytes certificate active))))
 
 (defun logical-slot-copy-install-decode (bytes)
-  "Decode bounded fields and CRC, then require a canonical re-encoding."
+  "Decode bounded fields and CRC, then require a canonical re-encoding.
+Only after that check, return the value, checked certificate, and active image."
   (unless (and (typep bytes '(vector (unsigned-byte 8)))
                (<= 240 (length bytes) +logical-slot-copy-install-maximum-bytes+)
                (equalp (subseq bytes 0 16) #(80 71 76 79 71 83 76 79 84 73 78 83 84 65 76 49))

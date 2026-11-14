@@ -118,7 +118,9 @@ Require the selected private or fixed container, exact journal and certificate
 pair, and phase-compatible slot prefix.  A private stage must be pending with
 no installed rows; an active certificate requires the full prefix.  The work
 parent is checked as it exists now; the journal records no identity for it.  Other
-workspace orphans remain opaque."
+workspace orphans remain opaque.  Reuse the certificate and active image from
+this invocation's canonical decode; each observation still performs its own I/O
+and checks, with no cache shared across checks."
   (logical-slot-copy-install-check-operation operation)
   (unless (and (typep image '(vector (unsigned-byte 8)))
                (<= 240 (length image) +logical-slot-copy-install-maximum-bytes+))

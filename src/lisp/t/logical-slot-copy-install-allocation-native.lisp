@@ -1,6 +1,8 @@
 (in-package #:pg)
 
 (defun logical-install-allocation-sample ()
+  "Run a cold installation sample and restore the captured namespace on exit.
+Private staging orphans may remain; later samples do not adopt them."
   (let ((root nil) (image nil))
     (unwind-protect
          (let ((*logical-slot-copy-install-publication-test-hook*
@@ -14,6 +16,10 @@
                    (sb-posix:close root))))))
 
 (defun logical-install-allocation-profile ()
+  "Profile a cold startup installation after a warmup sample.
+ALLOC-TOTAL includes namespace restoration.  Function counts, bytes, and times
+are inclusive and overlap for nested calls; they must not be summed.  Restore
+the original function definitions on exit, including on failure."
   (assert (logical-install-handoff-test-unopened-p))
   (let ((symbols '(physical-image-file-facts logical-slot-copy-install-file-identity
                    logical-slot-copy-import-state-image logical-slot-copy-install-input-view
