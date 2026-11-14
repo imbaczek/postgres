@@ -16,7 +16,7 @@
                (physical-image-check-directory fd (first (physical-image-file-facts root)))
                (unless (= (ninth (physical-image-file-facts fd)) (ninth (physical-image-file-facts root)))
                  (error "restartpoint directory crosses its owned mount"))
-               (push (cons "pg_physical_restartpoints" fd) (physical-image-context-children context))
+               (physical-image-register-child context "pg_physical_restartpoints" fd)
                (setf fd nil))
           (when fd (sb-posix:close fd)))))
     (let ((directory (cdr (assoc "pg_physical_restartpoints"

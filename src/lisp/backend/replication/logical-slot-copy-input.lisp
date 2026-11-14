@@ -25,7 +25,7 @@
                                +postmaster-o-cloexec+) 0))
              (when (minusp fd) (setf fd nil) (error "cannot open logical copy input sidecar"))
              (physical-image-check-directory fd (sb-posix:stat-dev (sb-posix:fstat root)))
-             (push (cons "logical_slot_wal" fd) (physical-image-context-children context))
+             (physical-image-register-child context "logical_slot_wal" fd)
              (setf fd nil))
         (when fd (sb-posix:close fd)))))
   (logical-slot-copy-check-input owner context))

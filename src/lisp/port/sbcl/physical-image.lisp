@@ -57,10 +57,81 @@
 
 (defvar *physical-image-test-hook* nil)
 
+(defvar *physical-image-owners* nil)
+
+(defun physical-image-drain-descriptors (children root)
+  (declare (notinline sb-posix:close))
+  (let ((failure nil))
+    (labels ((close-one (fd)
+               (handler-case (sb-posix:close fd)
+                 (error (condition) (unless failure (setf failure condition)))))
+             (drain ()
+               (if children
+                   (let ((fd (cdr (pop children))))
+                     (unwind-protect (close-one fd) (drain)))
+                   (when root
+                     (let ((fd root))
+                       (setf root nil)
+                       (close-one fd))))))
+      (drain)
+      failure)))
+
+(defun call-with-physical-image-owned-context (borrowed-fd read-only function)
+  (let ((context (if read-only (%make-physical-image-read-context) (%make-physical-image-context)))
+        (root nil) (path nil) (children nil) (active t) (complete nil))
+    (labels ((check ()
+               (unless (and active
+                            (eql root (physical-image-context-root-fd context))
+                            (equal path (physical-image-context-root-path context))
+                            (equal children (physical-image-context-children context)))
+                 (error "physical image owned descriptor binding changed")))
+             (operation (kind &optional name fd)
+               (check)
+               (ecase kind
+                 (:check t)
+                 (:register
+                  (unless (and (stringp name) (plusp (length name))
+                               (not (find #\/ name)) (not (find (code-char 0) name))
+                               (not (member name '("." "..") :test #'equal))
+                               (integerp fd) (not (minusp fd))
+                               (not (eql fd root)) (not (eql fd borrowed-fd))
+                               (not (assoc name children :test #'equal))
+                               (not (rassoc fd children)))
+                    (error "invalid physical image descriptor transfer"))
+                  (let ((owned (acons (copy-seq name) fd children))
+                        (observed (acons (copy-seq name) fd (physical-image-context-children context))))
+                    (setf children owned
+                          (physical-image-context-children context) observed))
+                  fd))))
+      (sb-sys:without-interrupts
+        (unwind-protect
+             (progn
+               (setf root (sb-posix:fcntl borrowed-fd 1030 0))
+               (physical-image-check-directory root)
+               (setf path (physical-image-fd-path root)
+                     (physical-image-context-root-fd context) root
+                     (physical-image-context-root-path context) path)
+               (let ((*physical-image-owners* (acons context #'operation *physical-image-owners*)))
+                 (sb-sys:with-local-interrupts
+                   (multiple-value-prog1 (funcall function context)
+                     (physical-image-check-context context)
+                     (setf complete t)))))
+          (setf active nil (physical-image-context-active context) nil)
+          (let ((failure (physical-image-drain-descriptors children root)))
+            (when (and complete failure) (error failure))))))))
+
+(defun physical-image-register-child (context name fd)
+  (physical-image-check-context context)
+  (sb-sys:without-interrupts
+    (funcall (cdr (assoc context *physical-image-owners* :test #'eq)) :register name fd)))
+
 (defun physical-image-check-context (context)
   (unless (and (physical-image-context-active context)
                (eq sb-thread:*current-thread* (physical-image-context-owner context)))
     (error "physical image descriptor scope is not active in this thread"))
+  (let ((owner (cdr (assoc context *physical-image-owners* :test #'eq))))
+    (unless owner (error "physical image context has no active descriptor owner"))
+    (funcall owner :check))
   context)
 
 (defun physical-image-fd-path (fd)
@@ -103,7 +174,7 @@
              (physical-image-check-directory fd (sb-posix:stat-dev (sb-posix:fstat root)))
              (unless (or existing (null (directory-entry-names (physical-image-fd-path fd) :follow-symlinks t)))
                (error "new physical image child directory is not empty"))
-             (push (cons name fd) (physical-image-context-children context))
+             (physical-image-register-child context name fd)
              (setf fd nil))
         (when fd (sb-posix:close fd))))))
 
@@ -158,33 +229,21 @@
 ;; scopes open existing children.  Cleanup closes only descriptors owned here.
 
 (defun call-with-physical-image-directory (borrowed-fd function read-only)
-  (let ((context (if read-only (%make-physical-image-read-context) (%make-physical-image-context))))
-    (sb-sys:without-interrupts
-      (unwind-protect
-           (progn
-             ;; 1030 is Linux F_DUPFD_CLOEXEC; the duplicate belongs to this scope.
-             (setf (physical-image-context-root-fd context) (sb-posix:fcntl borrowed-fd 1030 0))
-             (let ((fd (physical-image-context-root-fd context)))
-               (physical-image-check-directory fd)
-               (setf (physical-image-context-root-path context) (physical-image-fd-path fd))
-               (unless (or read-only
-                           (null (directory-entry-names (physical-image-context-root-path context)
-                                                        :follow-symlinks t)))
-                 (error "physical image receive directory is not empty")))
-             (sb-sys:with-local-interrupts
-               (dolist (name '("base" "global" "pg_wal"))
-                 (physical-image-open-child context name :existing read-only))
-               (let ((*physical-image-context* context))
-                 (multiple-value-prog1
-                     (funcall function (physical-image-context-root-path context))
-                   (physical-image-check-children context)
-                   (unless read-only
-                     (dolist (entry (physical-image-context-children context)) (sb-posix:fsync (cdr entry)))
-                     (sb-posix:fsync (physical-image-context-root-fd context)))))))
-        (setf (physical-image-context-active context) nil)
-        (dolist (entry (physical-image-context-children context)) (sb-posix:close (cdr entry)))
-        (when (physical-image-context-root-fd context)
-          (sb-posix:close (physical-image-context-root-fd context)))))))
+  (call-with-physical-image-owned-context
+   borrowed-fd read-only
+   (lambda (context)
+     (unless (or read-only
+                 (null (directory-entry-names (physical-image-context-root-path context)
+                                              :follow-symlinks t)))
+       (error "physical image receive directory is not empty"))
+     (dolist (name '("base" "global" "pg_wal"))
+       (physical-image-open-child context name :existing read-only))
+     (let ((*physical-image-context* context))
+       (multiple-value-prog1 (funcall function (physical-image-context-root-path context))
+         (physical-image-check-children context)
+         (unless read-only
+           (dolist (entry (physical-image-context-children context)) (sb-posix:fsync (cdr entry)))
+           (sb-posix:fsync (physical-image-context-root-fd context))))))))
 
 (defun call-with-physical-backup-receive-directory (borrowed-fd function)
   (call-with-physical-image-directory borrowed-fd function nil))

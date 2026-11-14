@@ -150,10 +150,14 @@
                 (lambda (root)
                   (when prepare-pins
                     (sb-sys:without-interrupts
-                      (push (cons "pg_physical_pins"
-                                  (logical-slot-copy-open-pin-directory
-                                   (physical-image-context-root-fd *physical-image-context*)))
-                            (physical-image-context-children *physical-image-context*))))
+                      (let ((pin nil))
+                        (unwind-protect
+                             (progn
+                               (setf pin (logical-slot-copy-open-pin-directory
+                                          (physical-image-context-root-fd *physical-image-context*)))
+                               (physical-image-register-child *physical-image-context* "pg_physical_pins" pin)
+                               (setf pin nil))
+                          (when pin (sb-posix:close pin))))))
                   (let ((*pgdata* root))
                     (check-primary-storage-startup-context gate-owner ownership)
                     (multiple-value-prog1 (funcall function *physical-image-context*)

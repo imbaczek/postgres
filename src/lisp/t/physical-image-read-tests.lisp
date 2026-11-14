@@ -18,6 +18,201 @@
              (funcall function root fd))
         (sb-posix:close fd)))))
 
+(defun call-with-image-cleanup-held-scope (borrowed function)
+  (pg::call-with-physical-backup-image-directory
+   borrowed
+   (lambda (path)
+     (declare (ignore path))
+     (let ((outer pg::*physical-image-context*))
+       (pg::call-with-physical-reseed-follow-held-base-directory
+        (pg::physical-image-context-root-fd outer)
+        (cdr (assoc "base" (pg::physical-image-context-children outer) :test #'equal))
+        (cdr (assoc "global" (pg::physical-image-context-children outer) :test #'equal))
+        (cdr (assoc "pg_wal" (pg::physical-image-context-children outer) :test #'equal))
+        function (lambda () (pg::physical-image-check-children outer)))))))
+
+(deftest physical-image-cleanup-ignores-mutated-descriptor-observations
+    (dolist (case '((:root nil) (:children nil) (:entry nil) (:extra nil)
+                    (:root t) (:children t) (:entry t) (:extra t)))
+      (call-with-physical-image-read-fixture
+       (lambda (root borrowed)
+         (declare (ignore root))
+         (let ((kind (first case))
+               (scope (if (second case) #'call-with-image-cleanup-held-scope
+                          #'pg::call-with-physical-backup-image-directory))
+               (foreign (sb-posix:fcntl borrowed 1030 0))
+               (owned nil) (context nil))
+           (unwind-protect
+                (progn
+                  (ok (eq :body-cut
+                          (catch 'image-cleanup-cut
+                            (funcall scope
+                                     borrowed
+                                     (lambda (path)
+                                       (declare (ignore path))
+                                       (setf context pg::*physical-image-context*
+                                             owned (cons (pg::physical-image-context-root-fd context)
+                                                         (mapcar #'cdr (pg::physical-image-context-children context))))
+                                       (ecase kind
+                                         (:root (setf (pg::physical-image-context-root-fd context) foreign))
+                                         (:children (setf (pg::physical-image-context-children context) nil))
+                                         (:entry (setf (cdar (pg::physical-image-context-children context)) foreign))
+                                         (:extra (push (cons "foreign" foreign) (pg::physical-image-context-children context))))
+                                       (throw 'image-cleanup-cut :body-cut))))))
+                  (ok (not (pg::physical-image-context-active context)))
+                  (ok (not (intake-fails-p (lambda () (sb-posix:fstat foreign)))))
+                  (ok (not (intake-fails-p (lambda () (sb-posix:fstat borrowed)))))
+                  (dolist (fd owned)
+                    (ok (intake-fails-p (lambda () (sb-posix:fstat fd))))))
+             (dolist (fd (cons foreign owned))
+               (ignore-errors (sb-posix:close fd)))))))))
+
+(deftest physical-image-cleanup-drains-after-close-errors-and-preserves-primary-exit
+    (dolist (case '((:normal 0 nil) (:normal 1 nil) (:normal 2 nil) (:normal 3 nil)
+                    (:throw 1 nil) (:error 1 nil) (:normal 1 t) (:throw 2 t) (:error 0 t)))
+      (call-with-physical-image-read-fixture
+       (lambda (root borrowed)
+         (declare (ignore root))
+         (let* ((mode (first case))
+                (scope (if (third case) #'call-with-image-cleanup-held-scope
+                           #'pg::call-with-physical-backup-image-directory))
+                (original (symbol-function 'sb-posix:close))
+                (foreign (sb-posix:fcntl borrowed 1030 0))
+                (owned nil) (counts nil) (injected nil) (reused nil)
+                (body-error (make-condition 'simple-error :format-control "primary image failure"))
+                (close-error (make-condition 'simple-error :format-control "image close failure")))
+           (unwind-protect
+                (let ((result
+                        (handler-case
+                            (catch 'image-primary-cut
+                              (funcall scope
+                                       borrowed
+                                       (lambda (path)
+                                         (declare (ignore path))
+                                         (setf owned (cons (pg::physical-image-context-root-fd pg::*physical-image-context*)
+                                                           (mapcar #'cdr (pg::physical-image-context-children pg::*physical-image-context*))))
+                                         (setf (symbol-function 'sb-posix:close)
+                                               (lambda (fd)
+                                                 (when (member fd owned) (push fd counts))
+                                                 (prog1 (funcall original fd)
+                                                   (when (and (eql fd (nth (second case) owned)) (not injected))
+                                                     (setf injected t reused fd)
+                                                     (sb-posix:dup2 foreign fd)
+                                                     (error close-error)))))
+                                         (ecase mode
+                                           (:normal (values :one :two))
+                                           (:throw (throw 'image-primary-cut :body-cut))
+                                           (:error (error body-error)))))
+                              :returned)
+                          (error (condition) condition))))
+                  (ok injected)
+                  (ok (eq result (ecase mode (:normal close-error) (:throw :body-cut) (:error body-error))))
+                  (dolist (fd owned)
+                    (ok (= 1 (count fd counts)))
+                    (unless (eql fd reused)
+                      (ok (intake-fails-p (lambda () (sb-posix:fstat fd))))))
+                  (ok (and reused (not (intake-fails-p (lambda () (sb-posix:fstat reused))))))
+                  (ok (not (intake-fails-p (lambda () (sb-posix:fstat foreign)))))
+                  (ok (not (intake-fails-p (lambda () (sb-posix:fstat borrowed))))))
+             (setf (symbol-function 'sb-posix:close) original)
+             (dolist (fd (cons foreign owned))
+               (ignore-errors (funcall original fd)))))))))
+
+(deftest physical-image-owned-context-rejects-copies-expiry-and-shortened-inventory
+    (call-with-physical-image-read-fixture
+     (lambda (root borrowed)
+       (declare (ignore root))
+       (let ((saved nil) (owned nil))
+         (ok (intake-fails-p
+              (lambda ()
+                (pg::call-with-physical-backup-image-directory
+                 borrowed
+                 (lambda (path)
+                   (declare (ignore path))
+                   (setf saved pg::*physical-image-context*
+                         owned (cons (pg::physical-image-context-root-fd saved)
+                                     (mapcar #'cdr (pg::physical-image-context-children saved))))
+                   (let ((copy (copy-structure saved)))
+                     (ok (intake-fails-p (lambda () (pg::physical-image-check-context copy))))
+                     (ok (intake-fails-p
+                          (lambda () (pg::physical-image-register-child copy "foreign" borrowed)))))
+                   (ok (intake-fails-p
+                        (lambda () (pg::physical-image-register-child saved "foreign" borrowed))))
+                   (setf (pg::physical-image-context-children saved) nil))))))
+         (dolist (fd owned) (ok (intake-fails-p (lambda () (sb-posix:fstat fd)))))
+         (setf (pg::physical-image-context-active saved) t)
+         (ok (intake-fails-p (lambda () (pg::physical-image-check-context saved))))
+         (ok (intake-fails-p
+              (lambda () (pg::physical-image-register-child saved "foreign" borrowed))))
+         (ok (not (intake-fails-p (lambda () (sb-posix:fstat borrowed)))))))))
+
+(deftest physical-image-cleanup-drains-after-a-close-nonlocal-exit
+    (call-with-physical-image-read-fixture
+     (lambda (root borrowed)
+       (declare (ignore root))
+       (let ((original (symbol-function 'sb-posix:close))
+             (foreign (sb-posix:fcntl borrowed 1030 0))
+             (owned nil) (counts nil) (reused nil) (saved nil))
+         (unwind-protect
+              (progn
+                (setf (symbol-function 'sb-posix:close)
+                      (lambda (fd)
+                        (when (member fd owned) (push fd counts))
+                        (prog1 (funcall original fd)
+                          (when (and (member fd owned) (null reused))
+                            (setf reused fd)
+                            (sb-posix:dup2 foreign fd)
+                            (ok (not (pg::physical-image-context-active saved)))
+                            (throw 'image-close-cut :close-cut)))))
+                (ok (eq :close-cut
+                        (catch 'image-close-cut
+                          (pg::call-with-physical-backup-image-directory
+                           borrowed
+                           (lambda (path)
+                             (declare (ignore path))
+                             (setf saved pg::*physical-image-context*
+                                   owned (cons (pg::physical-image-context-root-fd saved)
+                                               (mapcar #'cdr (pg::physical-image-context-children saved))))))
+                          :returned)))
+                (dolist (fd owned)
+                  (ok (= 1 (count fd counts)))
+                  (unless (eql fd reused)
+                    (ok (intake-fails-p (lambda () (sb-posix:fstat fd))))))
+                (ok (and reused (not (intake-fails-p (lambda () (sb-posix:fstat reused))))))
+                (ok (not (intake-fails-p (lambda () (sb-posix:fstat borrowed))))))
+           (setf (symbol-function 'sb-posix:close) original)
+           (dolist (fd (cons foreign owned))
+             (ignore-errors (funcall original fd))))))))
+
+(deftest physical-image-cleanup-retains-acquisitions-before-validation-failure
+    (dolist (cut '(1 2 3 4))
+      (call-with-physical-image-read-fixture
+       (lambda (root borrowed)
+         (declare (ignore root))
+         (let ((original (symbol-function 'pg::physical-image-check-directory))
+               (acquired nil) (entered nil) (calls 0) (injected nil))
+           (unwind-protect
+                (progn
+                  (setf (symbol-function 'pg::physical-image-check-directory)
+                        (lambda (fd &optional device)
+                          (prog1 (funcall original fd device)
+                            (pushnew fd acquired)
+                            (when (= cut (incf calls))
+                              (setf injected t)
+                              (error "image validation cut")))))
+                  (ok (intake-fails-p
+                       (lambda ()
+                         (pg::call-with-physical-backup-image-directory
+                          borrowed
+                          (lambda (path) (declare (ignore path)) (setf entered t))))))
+                  (ok injected)
+                  (ok (not entered))
+                  (ok (= cut (length acquired)))
+                  (dolist (fd acquired)
+                    (ok (intake-fails-p (lambda () (sb-posix:fstat fd)))))
+                  (ok (not (intake-fails-p (lambda () (sb-posix:fstat borrowed))))))
+             (setf (symbol-function 'pg::physical-image-check-directory) original)))))))
+
 (deftest physical-image-read-scope-opens-existing-files-without-output-authority
     (call-with-physical-image-read-fixture
      (lambda (root fd)

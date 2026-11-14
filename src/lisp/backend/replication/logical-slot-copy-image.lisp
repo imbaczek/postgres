@@ -47,7 +47,7 @@
              (physical-image-check-directory fd (sb-posix:stat-dev (sb-posix:fstat root)))
              (unless (null (directory-entry-names (physical-image-fd-path fd) :follow-symlinks t))
                (error "new logical copy WAL sidecar is not empty"))
-             (push (cons name fd) (physical-image-context-children context))
+             (physical-image-register-child context name fd)
              (setf fd nil))
         (when fd (sb-posix:close fd))))
     (logical-slot-copy-check-target owner context)))
