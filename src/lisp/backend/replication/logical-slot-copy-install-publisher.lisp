@@ -13,6 +13,16 @@
 (defvar *logical-slot-copy-install-publishers* nil)
 (defvar *logical-slot-copy-install-publication-test-hook* nil)
 
+(defgeneric logical-slot-copy-install-publisher-check-role (publisher))
+
+(defmethod logical-slot-copy-install-publisher-check-role ((publisher logical-slot-copy-install-publisher))
+  publisher)
+
+(defgeneric logical-slot-copy-install-publisher-check-closed-role (publisher))
+
+(defmethod logical-slot-copy-install-publisher-check-closed-role ((publisher logical-slot-copy-install-publisher))
+  publisher)
+
 (defun logical-slot-copy-install-publisher-registration (publisher)
   "Require the exact registered publisher and an active scope."
   (unless (and (logical-slot-copy-install-publisher-p publisher)
@@ -54,6 +64,7 @@
            (dolist (row (logical-slot-copy-install-publisher-files publisher))
              (unless (equal (second row) (physical-image-file-facts (first row)))
                (error "logical installation publisher file changed")))
+           (logical-slot-copy-install-publisher-check-role publisher)
            (setf completed t)
            publisher)
       (unless completed (logical-slot-copy-install-revoke-publisher publisher)))))

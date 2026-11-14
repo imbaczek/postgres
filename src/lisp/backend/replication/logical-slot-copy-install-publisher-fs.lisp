@@ -1,7 +1,7 @@
 (in-package #:pg)
 
 ;;; Hold and check publication descriptors until the scoped ledger is drained.
-(defun logical-slot-copy-install-publisher-open (publisher parent name kind &key missing)
+(defun logical-slot-copy-install-publisher-open (publisher parent name kind &key missing (group (logical-slot-copy-install-publisher-root publisher)))
   "Open a child under a held parent and register its descriptor before checks.
 Require the current root mount group and retain file facts for rechecking."
   (declare (notinline physical-image-openat sb-posix:close))
@@ -10,7 +10,13 @@ Require the current root mount group and retain file facts for rechecking."
                    (member parent (logical-slot-copy-install-publisher-nodes publisher) :test #'eq))
                (not (eq :file (logical-slot-copy-install-node-kind parent)))
                (physical-adoption-install-relative-p name) (not (find #\/ name))
-               (member kind '(:file :directory)))
+               (member kind '(:file :directory :slot-root))
+               (if (eq kind :slot-root)
+                   (and (null group) (eq parent (logical-slot-copy-install-publisher-root publisher))
+                        (equal name "pg_replslot"))
+                   (and group
+                        (or (eq group (logical-slot-copy-install-publisher-root publisher))
+                            (member group (logical-slot-copy-install-publisher-nodes publisher) :test #'eq)))))
     (error "invalid logical installation publisher leaf"))
   (let ((fd nil) (registered nil))
     (sb-sys:without-interrupts
@@ -28,14 +34,15 @@ Require the current root mount group and retain file facts for rechecking."
              (push fd (logical-slot-copy-install-publisher-descriptors publisher))
              (setf registered t)
              (let* ((identity (logical-slot-copy-install-file-identity (physical-image-file-facts fd)))
-                    (group (logical-slot-copy-install-node-identity
-                            (logical-slot-copy-install-publisher-root publisher)))
+                    (group-identity (when group (logical-slot-copy-install-node-identity group)))
                     (node (%make-logical-slot-copy-install-node
                            :fd fd :parent parent :name (copy-seq name) :kind kind :identity identity)))
                (push node (logical-slot-copy-install-publisher-nodes publisher))
                (when (eq kind :file)
                  (push (list fd (physical-image-file-facts fd)) (logical-slot-copy-install-publisher-files publisher)))
-               (unless (and (= (first identity) (first group)) (= (third identity) (third group)))
+               (unless (or (null group-identity)
+                           (and (= (first identity) (first group-identity))
+                                (= (third identity) (third group-identity))))
                  (error "logical installation publisher crosses its current mount group"))
                (logical-slot-copy-install-check-publisher publisher)
                node))
@@ -50,6 +57,23 @@ Require the current root mount group and retain file facts for rechecking."
     (error "logical installation publisher cannot sync an unregistered inode"))
   (sb-posix:fsync (logical-slot-copy-install-node-fd node))
   (logical-slot-copy-install-publisher-point publisher point))
+
+(defun logical-slot-copy-install-publisher-close (publisher node)
+  (declare (notinline sb-posix:close))
+  (logical-slot-copy-install-check-publisher publisher)
+  (unless (and (member node (logical-slot-copy-install-publisher-nodes publisher) :test #'eq)
+               (not (find node (logical-slot-copy-install-publisher-nodes publisher)
+                          :key #'logical-slot-copy-install-node-parent :test #'eq)))
+    (error "logical installation publisher can close only an owned leaf"))
+  (sb-sys:without-interrupts
+    (let ((fd (logical-slot-copy-install-node-fd node)))
+      (setf (logical-slot-copy-install-publisher-nodes publisher)
+            (delete node (logical-slot-copy-install-publisher-nodes publisher) :test #'eq)
+            (logical-slot-copy-install-publisher-files publisher)
+            (delete fd (logical-slot-copy-install-publisher-files publisher) :key #'first)
+            (logical-slot-copy-install-publisher-descriptors publisher)
+            (delete fd (logical-slot-copy-install-publisher-descriptors publisher)))
+      (sb-posix:close fd))))
 
 (defun logical-slot-copy-install-publisher-path (node)
   (let ((parts nil))
@@ -81,9 +105,10 @@ Require the current root mount group and retain file facts for rechecking."
     (dolist (row observations)
       (unless (equal (second row) (physical-image-file-facts
                                    (logical-slot-copy-install-node-fd root) (first row)))
-        (error "logical installation publication changed after descriptor cleanup")))))
+        (error "logical installation publication changed after descriptor cleanup")))
+    (logical-slot-copy-install-publisher-check-closed-role publisher)))
 
-(defun call-with-logical-slot-copy-install-publisher (owner context input function)
+(defun call-with-logical-slot-copy-install-publisher (owner context input function &key (constructor #'%make-logical-slot-copy-install-publisher))
   "Call FUNCTION with scoped publication authority backed by the retained input proof.
 Drain every owned descriptor with interrupts masked, then recheck its path facts.
 Preserve an original error if close also fails.  Failure, including a caught
@@ -95,12 +120,12 @@ check failure or cleanup failure, revokes the input and fences the operation."
     (let* ((operation (logical-slot-copy-install-input-state-operation record))
            (fd (logical-slot-copy-install-operation-state-root-fd
                 (logical-slot-copy-install-operation-record operation)))
-           (publisher (%make-logical-slot-copy-install-publisher
-                       :owner owner :context context :input input :record record :operation operation
-                       :image (copy-seq (logical-slot-copy-install-input-state-image record))
-                       :root (%make-logical-slot-copy-install-node
-                              :fd fd :kind :root
-                              :identity (logical-slot-copy-install-file-identity (physical-image-file-facts fd)))))
+           (publisher (funcall constructor
+                               :owner owner :context context :input input :record record :operation operation
+                               :image (copy-seq (logical-slot-copy-install-input-state-image record))
+                               :root (%make-logical-slot-copy-install-node
+                                      :fd fd :kind :root
+                                      :identity (logical-slot-copy-install-file-identity (physical-image-file-facts fd)))))
            (*logical-slot-copy-install-publishers* (list publisher))
            (completed nil) (body-completed nil) (close-error nil) (observations nil) (phase nil) (prefix nil))
       (unwind-protect
