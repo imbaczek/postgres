@@ -1,6 +1,8 @@
 (in-package #:pg)
 
 (defun logical-slot-copy-preflight-startup ()
+  ;; Neither a source proof nor its temporary file grants startup.  Import
+  ;; artifacts must be reconciled by the child owner first.
   (dolist (name '("logical-slot-copy.install" "logical-slot-copy.import" "logical-slot-copy.import.tmp"
                   "logical-slot-copy.evidence" "logical-slot-copy.evidence.tmp"
                   "logical-slot-copy.source-proof" "logical-slot-copy.source-proof.tmp"))
@@ -116,6 +118,9 @@
   (values))
 
 (defun logical-slot-copy-check-promotion ()
+  ;; Fence both promotion and destructive recovery retirement until the copied
+  ;; import is reconciled.  Proof files, including temporary files, do not
+  ;; authorize either operation.
   (when (getf *physical-recovery-state* :logical-slot-copy-id)
     (error "logical copy requires child-owner import before promotion"))
   (dolist (name '("logical-slot-copy.install" "logical-slot-copy.in-progress" "logical-slot-copy.descriptor"
@@ -125,6 +130,7 @@
                   "logical-slot-copy.source-proof" "logical-slot-copy.source-proof.tmp"))
     (when (slot-state-lstat (merge-pathnames name *pgdata*))
       (error "logical copy requires child-owner import before promotion")))
+  ;; Key presence is a backstop even when the other copy artifacts are gone.
   (when (slot-state-lstat (merge-pathnames "physical-backup.manifest" *pgdata*))
     (when (get-properties (recovery-read-manifest *pgdata*) '(:logical-slot-copy-id))
       (error "logical copy requires child-owner import before promotion")))

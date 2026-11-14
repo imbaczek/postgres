@@ -98,6 +98,7 @@ are no longer required for primary startup."
                         (not *live-operation-drain-open*))
                    (and (zerop *n-backends*) (not *wal-ready*))))
     (error "committed cleanup requires owned cold startup or quiescence"))
+  ;; Check before registering a primary owner or removing recovery provenance.
   (logical-slot-copy-check-promotion)
   (let ((fields (physical-promotion-restore-primary-retained))
         (names '(("standby.signal" :after-retire-standby-signal)
