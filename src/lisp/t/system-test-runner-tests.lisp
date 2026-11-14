@@ -9,9 +9,13 @@
   (let ((saved (mapcar (lambda (name) (cons name (symbol-function name)))
                        '(pg-test-start-compiler pg-test-phase pg-test-selected-heads
                          pg-test-execute-heads)))
-        (child nil) (executed nil) (failure nil) (result nil) (leaked nil))
+        (child nil) (compiler-log nil) (executed nil) (failure nil) (result nil) (leaked nil))
     (labels ((start (source cache log)
                (declare (ignore source cache))
+               (setf compiler-log log)
+               (when (eq mode :bad-exit)
+                 (with-open-file (out log :direction :output :if-exists :error)
+                   (write-line "TEST-STRICT-COMPILE-PASS" out)))
                (setf child
                      (sb-ext:run-program
                       (case mode (:interrupt "/usr/bin/sleep")
@@ -21,7 +25,8 @@
                       (case mode (:interrupt '("30"))
                             ((:bad-exit :missing-marker) nil)
                             (otherwise '("TEST-STRICT-COMPILE-PASS")))
-                      :wait nil :output log :error :output :if-output-exists :error))
+                      :wait nil :output log :error :output
+                      :if-output-exists (if (eq mode :bad-exit) :append :error)))
                (when (eq mode :interrupt)
                  (sb-thread:interrupt-thread sb-thread:*current-thread*
                                              (lambda () (throw 'runner-interrupted :cut))))
@@ -48,6 +53,9 @@
         (when child (pg-test-close-compiler child))))
     (assert child)
     (assert (not leaked))
+    (when (eq mode :bad-exit)
+      (assert (= 1 (sb-ext:process-exit-code child)))
+      (assert (search "TEST-STRICT-COMPILE-PASS" (uiop:read-file-string compiler-log))))
     (ecase mode
       (:interrupt (assert (eq result :cut)) (assert (null failure)) (assert (not executed)))
       ((:bad-exit :missing-marker)
