@@ -84,11 +84,8 @@
                                                         (list actual-state actual-metadata actual-prefix actual-generation)))
       (error "committed import selected restartpoint changed"))))
 
-(defun logical-slot-copy-check-committed-source
-    (context certificate evidence descriptor manifest control plan state metadata prefix generation store)
-  "Check actual R, its prefix and the canonical child plan and history. Replay
-from D through clean F to resolve an absent C3 logical fact before classifying
-slots and checking complete child files. Recheck source observations."
+(defun logical-slot-copy-check-retained-source
+    (certificate evidence descriptor manifest control plan state metadata prefix generation store check-artifacts)
   (logical-slot-copy-check-committed-progress state metadata prefix generation store)
   (unless (and (equalp (getf evidence :selected-history)
                        (logical-slot-copy-import-selected-history state))
@@ -107,15 +104,23 @@ slots and checking complete child files. Recheck source observations."
       (when (and (find :eligible (getf certificate :slots) :key #'fifth)
                  (not (getf control :promotion-logical-decoding-enabled)))
         (error "committed import disabled eligible logical interest"))
-      (let ((child-observations
-              (logical-slot-copy-check-committed-child context evidence plan prefix control)))
+      (let ((observations (funcall check-artifacts)))
         (unless (and (equal tuple (physical-store-control-tuple store))
                      (logical-slot-copy-committed-image-equal-p state-image (logical-slot-copy-import-state-image state)))
           (error "committed import source changed during verification"))
         (logical-slot-copy-check-committed-progress state metadata prefix generation store)
         (logical-slot-copy-recheck-committed-state
          manifest control descriptor state metadata prefix generation)
-        (values fact history tuple child-observations)))))
+        (values fact history tuple observations)))))
+
+(defun logical-slot-copy-check-committed-source
+    (context certificate evidence descriptor manifest control plan state metadata prefix generation store)
+  "Check actual R, its prefix and the canonical child plan and history. Replay
+from D through clean F to resolve an absent C3 logical fact before classifying
+slots and checking complete child files. Recheck source observations."
+  (logical-slot-copy-check-retained-source
+   certificate evidence descriptor manifest control plan state metadata prefix generation store
+   (lambda () (logical-slot-copy-check-committed-child context evidence plan prefix control))))
 
 (defstruct (logical-slot-copy-committed-proof
             (:constructor %make-logical-slot-copy-committed-proof)
