@@ -373,6 +373,8 @@
                    (:file "../replication/logical-slot-copy-install-publisher")
                    (:file "../replication/logical-slot-copy-install-publisher-fs")
                    (:file "../replication/logical-slot-copy-install-publication")
+                   (:file "../replication/logical-slot-copy-install-row-owner")
+                   (:file "../replication/logical-slot-copy-install-rows")
                    (:file "../replication/logical-slot-copy-startup")
                    (:file "postgres")))
      (:file "replication/logical-retention")
