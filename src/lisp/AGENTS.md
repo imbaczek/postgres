@@ -536,6 +536,13 @@ Remove the trace and its temporary helper after the demo:
   preserve canonical and ownership checks when removing copies. Keep allocating
   validation outside allocation-free `*.hot.lisp` kernels.
 
+- In the next performance window, prioritize total elapsed test time. Measure
+  compilation, system loading, fixture creation, server startup, execution and
+  teardown separately, and identify the critical path and unused concurrency.
+  Compare unchanged test selections under the same runtime, cache policy and
+  process limit. Spend the budget on the largest measured contributors; isolated
+  allocation or kernel gains do not establish that the suites are faster.
+
 ## Milestone verification timing
 
 - Run test data, temporary files, compiler caches, and live logs on the private
