@@ -39,7 +39,7 @@ Unknown or ahead positions defer; proved ON coverage must match its frozen origi
             :eligible)
            (t (error "logical import ON origin differs from its copied source"))))))))
 
-(defun logical-slot-copy-import-base-state (manifest descriptor control)
+(defun logical-slot-copy-import-base-state (manifest descriptor control &key (reservation nil reservation-p))
   "Build the explicit D seed from the descriptor checkpoint and base evidence.
 D is the copy base end; the pending source checkpoint at F is distinct."
   (let* ((base (copy-tree manifest))
@@ -53,7 +53,9 @@ D is the copy base end; the pending source checkpoint at F is distinct."
                (wal-fpw-state-from-checkpoint snapshot (make-symbol "IMPORT-FPW"))
                (getf manifest :end) (getf manifest :timeline))))
     (setf (getf base :source-checkpoint) snapshot
-          (getf base :source-reservation) (physical-recovery-initial-reservation manifest)
+          (getf base :source-reservation)
+          (if reservation-p (copy-list reservation)
+              (physical-recovery-initial-reservation manifest))
           (getf base :base-source-resource-fact) (wal-copy-control-resource-fields snapshot)
           (getf base :base-source-fpw-fact) fpw
           (getf base :base-source-logical-fact) logical)

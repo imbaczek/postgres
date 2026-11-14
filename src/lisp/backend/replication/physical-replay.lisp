@@ -433,18 +433,29 @@ Direct control operation; does not promote, follow a network source or coordinat
        (wal-xid-reservation-valid-bound-p (getf state :bound))
        (member (getf state :complete) '(nil t))))
 
-(defun physical-recovery-initial-reservation (manifest)
-  "Only after immutable base verification; old source formats do not prove coverage."
+(defun physical-recovery-checkpoint-reservation (manifest record next-xid)
   (let* ((end (getf manifest :end))
-         (record (wal-read-checkpoint-record (physical-manifest-checkpoint-start manifest) end))
-         (bound (1- (canonical-next-full-xid (load-next-xid))))
+         (bound (1- (canonical-next-full-xid next-xid)))
          (complete (>= (wal-record-version record) 7)))
+    (unless (and (= (wal-record-type record) +wal-record-checkpoint+)
+                 (zerop (wal-record-xid record))
+                 (= (wal-record-start record) (physical-manifest-checkpoint-start manifest))
+                 (= (wal-record-end record) end))
+      (error "base reservation record differs from checkpoint coordinates"))
     (when complete
       (let ((snapshot (wal-checkpoint-record-snapshot record)))
         (unless (and (= bound (getf snapshot :xid-reserved-through))
                      (= (getf manifest :next-xid) (getf snapshot :next-xid)))
           (error "base XID counters differ from checkpoint"))))
     (list :version 1 :through end :bound bound :complete complete)))
+
+(defun physical-recovery-initial-reservation (manifest)
+  "Only after immutable base verification; old source formats do not prove coverage."
+  (physical-recovery-checkpoint-reservation
+   manifest
+   (wal-read-checkpoint-record (physical-manifest-checkpoint-start manifest)
+                               (getf manifest :end))
+   (load-next-xid)))
 
 (defun physical-source-reservation-next (prior record observed-next)
   "Track source capacity separately from reader visibility; no promotion authority.
