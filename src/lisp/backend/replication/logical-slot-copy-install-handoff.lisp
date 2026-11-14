@@ -182,10 +182,7 @@ Recheck the operation and decode the image before registering the handoff."
       (logical-slot-copy-install-check-operation operation)
       handoff)))
 
-(defun call-with-logical-slot-copy-install-operation-under-locks (function)
-  "Run the scoped operation under the caller's exclusion locks.
-Revoke every handoff and the owner on exit.  After staging starts, failure
-through root close and the final postmaster ownership check fences recovery."
+(defun call-with-logical-slot-copy-install-operation-scope (function)
   (when *logical-slot-copy-install-operations*
     (error "logical installation operation is already active"))
   (logical-slot-copy-check-import-locks)
@@ -214,18 +211,22 @@ through root close and the final postmaster ownership check fences recovery."
                             (unwind-protect
                                  (progn
                                    (logical-slot-copy-install-check-operation operation)
-                                   (let ((handoff (logical-slot-copy-install-create-handoff
-                                                   operation (lambda () (setf started t)))))
-                                     (multiple-value-prog1 (funcall function operation handoff)
-                                       (logical-slot-copy-install-check-operation operation))))
+                                   (multiple-value-prog1
+                                       (funcall function operation (lambda () (setf started t)))
+                                     (logical-slot-copy-install-check-operation operation)))
                               (dolist (handoff-record (logical-slot-copy-install-operation-state-handoffs record))
                                 (setf (logical-slot-copy-install-handoff-record-state handoff-record) :revoked))))))
                     (setf (physical-adoption-owner-active-p operation) nil)))))
            (setf finished t))
       (when (and started (not finished)) (setf *physical-recovery-failed-p* t)))))
 
-(defun call-with-logical-slot-copy-install-handoff (function)
-  "Hold the locks and quiescence gate while calling FUNCTION with a handoff."
+(defun call-with-logical-slot-copy-install-operation-under-locks (function)
+  (call-with-logical-slot-copy-install-operation-scope
+   (lambda (operation mark-started)
+     (let ((handoff (logical-slot-copy-install-create-handoff operation mark-started)))
+       (funcall function operation handoff)))))
+
+(defun call-with-logical-slot-copy-install-exclusion (function)
   (when *logical-slot-copy-install-operations*
     (error "logical installation operation is already active"))
   (sb-thread:with-mutex (*physical-follow-command-lock*)
@@ -234,4 +235,9 @@ through root close and the final postmaster ownership check fences recovery."
         (sb-thread:with-mutex (*physical-follow-generation-lock*)
           (sb-thread:with-mutex (*physical-restartpoint-start-lock*)
             (sb-thread:with-mutex (*timeline-history-lock*)
-              (call-with-logical-slot-copy-install-operation-under-locks function))))))))
+              (funcall function))))))))
+
+(defun call-with-logical-slot-copy-install-handoff (function)
+  "Hold the locks and quiescence gate while calling FUNCTION with a handoff."
+  (call-with-logical-slot-copy-install-exclusion
+   (lambda () (call-with-logical-slot-copy-install-operation-under-locks function))))
