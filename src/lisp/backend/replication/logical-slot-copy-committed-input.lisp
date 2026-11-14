@@ -70,6 +70,8 @@ Live mode captures the caller\'s pending state and receive store; cold mode capt
     (logical-slot-copy-observe-pieces context descriptor observations index)))
 
 (defun logical-slot-copy-check-preserved-reader (owner context proof-bytes certificate)
+  ;; Check the owner, receipt presence, pending phase and root fences.  This
+  ;; does not establish that the supplied certificate is the canonical file.
   (unless (logical-slot-copy-committed-owner-p owner)
     (error "committed import binding requires its sibling input owner"))
   (logical-slot-copy-check-input owner context)
@@ -82,6 +84,13 @@ Live mode captures the caller\'s pending state and receive store; cold mode capt
       (error "committed import has an unresolved temporary or copy fence"))))
 
 (defun logical-slot-copy-read-preserved-source-inputs (owner context proof-bytes certificate)
+  ;; Check the supplied pending certificate against evidence, receipt, base and
+  ;; checkpoint, returning observations that exclude global control.  This read
+  ;; grants no authority and does not bind the canonical certificate, control
+  ;; file or its temporary.  The caller must bind and recheck the original
+  ;; pending certificate, through its canonical file or an exact journal pair,
+  ;; handle control and its temporary, and recheck these observations across
+  ;; its callback.
   (logical-slot-copy-check-preserved-reader owner context proof-bytes certificate)
   (let ((bound-observations nil))
     (flet ((read-input (name maximum)
@@ -128,6 +137,10 @@ Live mode captures the caller\'s pending state and receive store; cold mode capt
               (values certificate evidence descriptor manifest control plan status observations))))))))
 
 (defun logical-slot-copy-read-preserved-inputs (owner context proof-bytes certificate control-phase)
+  ;; Check preserved inputs and exact parent D or child control, rejecting a
+  ;; control temporary and rechecking all returned observations.  The caller
+  ;; must first bind the original pending certificate and recheck observations
+  ;; across its callback.  This read grants no authority.
   (unless (member control-phase '(:parent :child))
     (error "unknown preserved import control phase"))
   (logical-slot-copy-check-preserved-reader owner context proof-bytes certificate)

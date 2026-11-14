@@ -109,6 +109,10 @@
 
 (defun logical-slot-copy-catalog-call-with-bound-source
     (owner context binding global phase store mark-started function)
+  ;; The caller supplies the checked binding, global directory and phase under
+  ;; the current owner and context, with the store and receive-root lease held.
+  ;; This scope opens no lease.  Its attempt ends before later staging or other
+  ;; artifact changes.
   (let ((attempt nil) (source-active t) (complete nil) (failed nil))
     (setf (getf binding :source-proof)
           (multiple-value-list
@@ -165,6 +169,8 @@
         (logical-slot-copy-catalog-close attempt)))))
 
 (defun logical-slot-copy-catalog-call-with-source (owner context proof mark-started function)
+  ;; Bind the catalog inputs and hold the store and receive-root lease for the
+  ;; duration of the inner attempt.
   (multiple-value-bind (binding global phase)
       (logical-slot-copy-catalog-read-binding owner context proof)
     (call-with-logical-slot-copy-committed-store
