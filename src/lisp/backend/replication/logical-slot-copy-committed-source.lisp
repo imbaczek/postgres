@@ -141,6 +141,10 @@ slots and checking complete child files. Recheck source observations."
 (defun call-with-logical-slot-copy-committed-proof
     (owner context certificate evidence descriptor manifest control plan input-observations function
      &key (include-proof t))
+  "Check the retained source and child under a store and receive-root lease.
+Replay from D through F and recheck the proof and child observations after
+FUNCTION.  The caller must bind and recheck input observations and perform
+its phase-specific location checks across the callback."
   (logical-slot-copy-check-input owner context)
   (unless (eq :pending (getf certificate :phase))
     (error "committed source proof requires its original pending certificate"))
@@ -182,9 +186,11 @@ slots and checking complete child files. Recheck source observations."
 
 (defun call-with-logical-slot-copy-committed-source-kind (constructor function &key (include-proof t))
   "Verify actual source and child bytes, then call FUNCTION under read ownership.
-Protect the C3 retained root before taking the reader lease and recheck after
-callback. An installer must establish its own checks and fence before writing;
-this scope grants neither installation nor admission."
+The input wrapper binds the canonical pending certificate and rechecks its
+inputs after the callback.  Protect the C3 retained root before taking the
+reader lease and recheck the source afterward.  An installer must establish
+its own checks and fence before writing; this scope grants neither installation
+nor admission."
   (call-with-logical-slot-copy-committed-input-kind
    constructor
    (lambda (owner context certificate evidence descriptor manifest control plan status input-observations)

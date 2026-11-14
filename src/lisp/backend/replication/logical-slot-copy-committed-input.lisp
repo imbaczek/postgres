@@ -70,6 +70,10 @@ Live mode captures the caller\'s pending state and receive store; cold mode capt
     (logical-slot-copy-observe-pieces context descriptor observations index)))
 
 (defun logical-slot-copy-read-committed-inputs (owner context proof-bytes certificate)
+  "Check preserved inputs against the caller-bound original pending certificate.
+This does not observe the canonical import file or grant authority.  A caller
+using a journal must first prove its exact certificate pair.  The caller must
+recheck the returned input observations across its callback."
   (unless (logical-slot-copy-committed-owner-p owner)
     (error "committed import binding requires its sibling input owner"))
   (logical-slot-copy-check-input owner context)
@@ -132,7 +136,9 @@ Live mode captures the caller\'s pending state and receive store; cold mode capt
               (values certificate evidence descriptor manifest control plan status observations))))))))
 
 (defun logical-slot-copy-read-committed-binding (owner context proof-bytes)
-  "Bind the canonical pending certificate and preserved input to exact child control."
+  "Read and bind the canonical pending certificate to preserved input and child control.
+Include its file observation in the returned observations for the caller's
+callback checks."
   (unless (logical-slot-copy-committed-owner-p owner)
     (error "committed import binding requires its sibling input owner"))
   (logical-slot-copy-check-input owner context)
