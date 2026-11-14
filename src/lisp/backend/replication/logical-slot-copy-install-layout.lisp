@@ -1,5 +1,7 @@
 (in-package #:pg)
 
+;;; Observe a layout selected by detached journal bytes and validate its phase.
+;;; These observations do not authorize publication.
 (defun logical-slot-copy-install-name-index (names maximum)
   (logical-slot-copy-descriptor-list-count names maximum)
   (let ((index (make-hash-table :test #'equal)))
@@ -9,6 +11,7 @@
       (setf (gethash name index) t))))
 
 (defun logical-slot-copy-install-layout-prefix (names source canonical)
+  "Require each recorded row exactly once and return the installed prefix length."
   (unless (plusp (logical-slot-copy-descriptor-list-count names +logical-slot-copy-descriptor-maximum-slots+))
     (error "empty logical installation inventory"))
   (let ((expected (logical-slot-copy-install-name-index names +logical-slot-copy-descriptor-maximum-slots+))
@@ -27,6 +30,7 @@
                 (incf prefix)))))))
 
 (defun logical-slot-copy-install-layout-pair (root container value)
+  "Determine certificate orientation from exact bytes and recorded inode identities."
   (let* ((canonical (logical-slot-copy-install-inspection-open root "logical-slot-copy.import" :file root))
          (other (logical-slot-copy-install-inspection-open container "active" :file root))
          (pending (getf value :certificate))
@@ -48,6 +52,7 @@
       (logical-slot-copy-install-inspection-close canonical))))
 
 (defun logical-slot-copy-install-layout-row (parent slot-root row expected)
+  "Check one P7 slot's recorded identities, inventory, and exact state bytes."
   (let* ((directory (logical-slot-copy-install-inspection-open parent (first row) :directory slot-root))
          (state (logical-slot-copy-install-inspection-open directory "state" :file slot-root)))
     (logical-slot-copy-install-inspection-identity directory (second expected))
@@ -64,6 +69,7 @@
       facts)))
 
 (defun logical-slot-copy-install-layout-physical (slot-root name)
+  "Check and observe an extra physical slot in the canonical directory."
   (let* ((directory (logical-slot-copy-install-inspection-open slot-root name :directory slot-root))
          (state (logical-slot-copy-install-inspection-open directory "state" :file slot-root)))
     (unless (equal '("state") (logical-slot-copy-install-inspection-names directory 2))
@@ -78,6 +84,9 @@
         facts))))
 
 (defun logical-slot-copy-install-layout-slots (root value)
+  "Check the P7 prefix and physical extras, counting all rows against capacity.
+Recorded device and inode identities are checked with current mount groups;
+historical mount IDs are not used as authority."
   (let* ((slot-root (logical-slot-copy-install-inspection-open root "pg_replslot" :slot-root nil))
          (work (logical-slot-copy-install-inspection-open slot-root ".logical-slot-copy.work" :directory slot-root))
          (container (logical-slot-copy-install-inspection-open work (getf value :stage-id) :directory slot-root))
@@ -104,6 +113,12 @@
     (values prefix (nreverse observations))))
 
 (defun logical-slot-copy-install-observe-layout (operation image)
+  "Observe the layout selected by detached journal bytes under this operation.
+Require the selected private or fixed container, exact journal and certificate
+pair, and phase-compatible slot prefix.  A private stage must be pending with
+no installed rows; an active certificate requires the full prefix.  The work
+parent is checked as it exists now; the journal records no identity for it.  Other
+workspace orphans remain opaque."
   (logical-slot-copy-install-check-operation operation)
   (unless (and (typep image '(vector (unsigned-byte 8)))
                (<= 240 (length image) +logical-slot-copy-install-maximum-bytes+))
@@ -146,6 +161,10 @@
                    :image bytes :observations observations))))))))
 
 (defun logical-slot-copy-install-read-layout (operation image)
+  "Read a selected layout without granting publication, source, or admission authority.
+Failure revokes the operation even if caught and the layout is restored.  A
+future typed publisher must establish its live capability or cold journal
+authority, source proof, and physical slot eligibility before writing."
   (let ((record (logical-slot-copy-install-operation-record operation)) (completed nil))
     (unwind-protect
          (multiple-value-prog1 (logical-slot-copy-install-observe-layout operation image)

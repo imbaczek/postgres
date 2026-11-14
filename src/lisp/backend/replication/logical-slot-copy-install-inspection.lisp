@@ -1,13 +1,18 @@
 (in-package #:pg)
 
+;;; Read-only inspection borrows the operation root and owns opened descriptors.
+;;; Full inode facts are checked again after descriptor cleanup.
 (defstruct (logical-slot-copy-install-inspection
             (:constructor %make-logical-slot-copy-install-inspection)
             (:print-function physical-libpq-print-private-object))
+  "Scoped observations and owned descriptors under a borrowed operation root."
   operation root nodes active (facts (make-hash-table :test #'eq)) closed)
 
 (defvar *logical-slot-copy-install-inspection* nil)
 
 (defun logical-slot-copy-install-check-inspection (&key closed)
+  "Recheck the operation and root binding, and compare owned nodes' full inode facts.
+When CLOSED is true, also recheck closed nodes relative to the held root."
   (let ((scope *logical-slot-copy-install-inspection*))
     (unless (and (logical-slot-copy-install-inspection-p scope)
                  (logical-slot-copy-install-inspection-active scope))
@@ -31,6 +36,7 @@
     scope))
 
 (defun logical-slot-copy-install-inspection-node (node)
+  "Require the borrowed root or the exact node registered in this scope."
   (let ((scope (logical-slot-copy-install-check-inspection)))
     (unless (or (eq node (logical-slot-copy-install-inspection-root scope))
                 (member node (logical-slot-copy-install-inspection-nodes scope) :test #'eq))
@@ -38,6 +44,8 @@
     node))
 
 (defun logical-slot-copy-install-inspection-open (parent name kind group &key missing)
+  "Open and register a child without following links; files use nonblocking open.
+Check the supplied current mount group and capture full inode facts for later checks."
   (declare (notinline physical-image-openat sb-posix:close))
   (let ((scope (logical-slot-copy-install-check-inspection)) (fd nil) (registered nil))
     (logical-slot-copy-install-inspection-node parent)
@@ -87,6 +95,7 @@
     (format nil "~{~a~^/~}" parts)))
 
 (defun logical-slot-copy-install-inspection-close (node)
+  "Close an owned node and retain its root-relative facts for rechecking."
   (declare (notinline sb-posix:close))
   (let ((scope *logical-slot-copy-install-inspection*))
     (unless (and scope (member node (logical-slot-copy-install-inspection-nodes scope) :test #'eq))
@@ -101,6 +110,7 @@
       (sb-posix:close (logical-slot-copy-install-node-fd node)))))
 
 (defun logical-slot-copy-install-inspection-read (node maximum)
+  "Read a bounded file and reject changes to its full inode facts."
   (declare (notinline sb-posix:read))
   (logical-slot-copy-install-inspection-node node)
   (unless (and (eq :file (logical-slot-copy-install-node-kind node))
@@ -122,6 +132,7 @@
       bytes)))
 
 (defun logical-slot-copy-install-inspection-names (node maximum)
+  "Read a bounded directory inventory and recheck the scope."
   (logical-slot-copy-install-inspection-node node)
   (when (eq :file (logical-slot-copy-install-node-kind node))
     (error "logical installation inventory requires a directory"))
@@ -131,6 +142,7 @@
     (logical-slot-copy-install-check-inspection)))
 
 (defun logical-slot-copy-install-inspection-identity (node expected)
+  "Compare recorded device and inode; a supplied current group is checked on open."
   (logical-slot-copy-install-inspection-node node)
   (unless (equal (subseq expected 0 2)
                  (subseq (logical-slot-copy-install-node-identity node) 0 2))
@@ -138,6 +150,10 @@
   node)
 
 (defun call-with-logical-slot-copy-install-inspection (operation function)
+  "Inspect under the operation's borrowed root and close all owned descriptors.
+Recheck closed observations before and after cleanup.  Preserve an original
+failure if closing also fails; report a close or final check error on success.
+The inspection and its nodes are valid only within this scope."
   (logical-slot-copy-install-check-operation operation)
   (let* ((fd (logical-slot-copy-install-operation-state-root-fd
               (logical-slot-copy-install-operation-record operation)))
