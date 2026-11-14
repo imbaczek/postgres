@@ -396,3 +396,32 @@
     (format t "~&SOURCE-PROOF-ALL-LOST-PASS rows=~d eligible=0 cause=wal-level-insufficient~%"
             (length rows))
     (finish-output)))
+
+(defun logical-source-proof-test-empty-interval ()
+  (logical-source-proof-test-run)
+  (let* ((facts (logical-slot-copy-read-source-proof))
+         (certificate (getf facts :certificate))
+         (reference (getf certificate :retained-reference))
+         (fork (getf certificate :fork))
+         (records 0)
+         (directory (physical-recovery-retained-directory))
+         (index (physical-promotion-check-retained-reference
+                 (getf certificate :system-id) reference
+                 (getf certificate :parent-timeline)
+                 (logical-slot-copy-source-proof-parent-history facts)
+                 :end fork :directory directory
+                 :on-record (lambda (record raw)
+                              (declare (ignore record raw))
+                              (incf records))))
+         (result (logical-slot-copy-source-proof-scan-archive
+                  facts directory #'physical-retained-object-read)))
+    (assert (equal '("alpha" "beta") (mapcar #'first (getf certificate :slots))))
+    (assert (every (lambda (row) (eq :eligible (fifth row))) (getf certificate :slots)))
+    (assert (= fork (getf certificate :base-end)
+               (getf reference :base) (getf reference :end)))
+    (assert (null (getf index :entries)))
+    (assert (getf index :base-overlap))
+    (assert (zerop records))
+    (assert (= fork (getf result :terminal)))
+    (format t "~&SOURCE-PROOF-EMPTY-INTERVAL-PASS D=F=~d records=~d~%" fork records)
+    (finish-output)))

@@ -19,12 +19,14 @@ string = base['string']
 
 
 def probe(peer, label, *args, failure=None, publication=None, cut='none', syscall=None,
-          mount=None, all_lost=False, **kwargs):
+          mount=None, all_lost=False, empty_interval=False, **kwargs):
     assert failure in (None, 'error', 'throw', 'mutation')
     assert publication in (None, 'run', 'reject', 'error', 'throw', 'crash')
-    assert sum(bool(x) for x in (failure, publication, syscall, mount, all_lost)) <= 1
+    assert sum(bool(x) for x in (failure, publication, syscall, mount, all_lost, empty_interval)) <= 1
     operation = (f'(logical-source-proof-test-preparation-failure :{failure})'
                  if failure else '(logical-source-proof-test-run)')
+    if empty_interval:
+        operation = '(logical-source-proof-test-empty-interval)'
     if all_lost:
         operation = '(logical-source-proof-test-all-lost)'
     if publication:
@@ -64,7 +66,8 @@ def probe(peer, label, *args, failure=None, publication=None, cut='none', syscal
         assert f'SOURCE-PROOF-PUBLICATION-KILL :{cut.upper()}' in text, log
         print(f'SOURCE-PROOF-KILLED {label} seconds={time.monotonic()-started:.6f}', flush=True)
         return
-    marker = ('SOURCE-PROOF-ALL-LOST-PASS' if all_lost else
+    marker = ('SOURCE-PROOF-EMPTY-INTERVAL-PASS' if empty_interval else
+              'SOURCE-PROOF-ALL-LOST-PASS' if all_lost else
               'SOURCE-PROOF-MOUNT-PASS' if mount else
               'SOURCE-PROOF-SYSCALL-PASS' if syscall else
               'SOURCE-PROOF-PUBLICATION-PASS' if publication else
@@ -268,20 +271,66 @@ def run_all_lost():
     print('SOURCE-PROOF-ALL-LOST-WORKFLOW-PASS', flush=True)
 
 
+def run_empty_interval(optional):
+    started = time.monotonic()
+    source = OwnedLisp(parameters=(('wal_level', 'logical'),))
+    child = OwnedLisp(parameters=(('wal_level', 'replica'),))
+    try:
+        source.start()
+        connection = standby['RawConnection'](source.port)
+        try:
+            connection.query('CREATE TABLE copy_rows (id integer, body text)')
+            for name in ('alpha', 'beta'):
+                connection.query(f"SELECT * FROM pg_create_logical_replication_slot('{name}', 'pgoutput')")
+            connection.query("INSERT INTO copy_rows VALUES (1, 'empty interval base')")
+        finally:
+            connection.close()
+        child.data.mkdir(mode=0o700)
+        source.control(f'(logical-slot-base-copy {string(child.data)} "empty_interval_pin")', timeout=90)
+        child.start()
+        standby['wait_rows'](child, [['1']])
+        # Initialize phase-2 receive storage without post-D source writes.
+        # The actual restartpoint must still prove F equals the copied D.
+        child.control(f'(physical-follow-start "127.0.0.1" {source.port} "empty_interval_pin")')
+        child.control('(physical-follow-stop)')
+        child.control('(physical-recovery-restartpoint)')
+        environment['optional'] = optional
+        catalog['prepare'](child, pending=True, disposition='eligible')
+        child.stop(immediate=True)
+        source.stop(immediate=True)
+        base['probe'](child, 'empty-interval-cf')
+        probe(child, 'empty-interval-baseline', empty_interval=True)
+        before = catalog['image'](child.data)
+        for retry in range(2):
+            probe(child, f'empty-interval-retry-{retry}', empty_interval=True)
+            assert before == catalog['image'](child.data), 'empty interval retry changed files'
+        print(f'SOURCE-PROOF-EMPTY-INTERVAL-WORKFLOW-PASS optional={optional} '
+              f'seconds={time.monotonic()-started:.6f}', flush=True)
+    finally:
+        child.stop(immediate=True)
+        source.stop(immediate=True)
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--smoke', action='store_true')
-    parser.add_argument('--all-lost', action='store_true')
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument('--all-lost', action='store_true')
+    modes.add_argument('--empty-interval', action='store_true')
     parser.add_argument('--publication-cuts', action='store_true')
     parser.add_argument('--publication-negative', action='store_true')
     parser.add_argument('--publication-syscalls', action='store_true')
     parser.add_argument('--publication-mounts', action='store_true')
     arguments = parser.parse_args()
-    if arguments.all_lost:
+    if arguments.all_lost or arguments.empty_interval:
         if any((arguments.publication_cuts, arguments.publication_negative,
                 arguments.publication_syscalls, arguments.publication_mounts)):
-            parser.error('--all-lost cannot be combined with publication fault matrices')
-        run_all_lost()
+            parser.error('semantic modes cannot be combined with publication fault matrices')
+        if arguments.empty_interval:
+            for optional in ((False,) if arguments.smoke else (False, True)):
+                run_empty_interval(optional)
+        else:
+            run_all_lost()
         raise SystemExit(0)
     OwnedLisp.start = catalog['start']
     standby['insert'] = catalog['insert']
