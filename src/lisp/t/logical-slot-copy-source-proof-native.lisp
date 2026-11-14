@@ -262,6 +262,13 @@
     (assert (zerop (hash-table-count *physical-retained-root-updates*)))
     (clrhash *physical-retained-root-references*)
     (logical-source-proof-test-read-independent)
+    (let ((image (call-with-logical-slot-copy-install-cold-input
+                  (lambda (owner context input)
+                    (logical-source-proof-test-parts owner context input)))))
+      (assert (equalp (logical-slot-copy-source-proof-encode image)
+                      (recovery-read-bytes path
+                                           :maximum (logical-slot-copy-source-proof-maximum-bytes))))
+      (format t "~&SOURCE-PROOF-CANONICAL-INPUT-PASS~%"))
     (assert (logical-source-proof-test-rejected-p #'logical-slot-copy-check-promotion))
     (assert (= before (length (directory-entry-names "/proc/self/fd/" :follow-symlinks t))))
     (assert (and (null *physical-recovery-state*) (null *physical-receive-store*)
