@@ -204,6 +204,25 @@
                          (progn (logical-slot-copy-install-check-input-lifecycle operation original) nil)
                        (error (condition) (search "controller and shutdown" (princ-to-string condition))))))))))
 
+(cl-spec:defproperty installation-publishers-reject-unregistered-handles
+    ((word (range integer 0 18446744073709551615)))
+  (:about logical-slot-copy-install-check-publisher)
+  (:trials (:normal 200))
+  (let ((publisher (%make-logical-slot-copy-install-publisher :image (make-array 8 :element-type '(unsigned-byte 8) :initial-element (mod word 256)))))
+    (handler-case (progn (logical-slot-copy-install-check-publisher publisher) nil)
+      (error (condition) (search "registered publisher" (princ-to-string condition))))))
+
+(rove:deftest installation-publisher-registration-generated-contract
+    (let ((data (cl-spec:result-data
+                 (cl-spec:run-property 'installation-publishers-reject-unregistered-handles :seed 7533 :profile :normal))))
+      (rove:ok (eq :passed (getf data :status)) (format nil "~s" data))
+      (rove:ok (= 200 (getf data :trials)))))
+
+(rove:deftest installation-publication-rejects-unregistered-inputs-before-io
+    (rove:ok (handler-case
+                 (progn (logical-slot-copy-install-publish-journal nil nil (%make-logical-slot-copy-install-input)) nil)
+               (error (condition) (search "registered owner" (princ-to-string condition))))))
+
 (defun unit-logical-slot-install-value (word generation &optional same-mount)
   (let* ((certificate (unit-logical-import-value
                        :profile (if (oddp word) :text :binary-bytea)
