@@ -78,6 +78,38 @@
       (rove:ok (handler-case (progn (logical-slot-copy-install-stage-node-image nodes) nil)
                  (error () t)))))
 
+(cl-spec:defproperty installation-layout-requires-a-contiguous-prefix
+    ((mask (range integer 0 255)))
+  (:about logical-slot-copy-install-layout-prefix)
+  (:trials (:normal 400))
+  (let* ((names (loop for i below 8 collect (format nil "slot_~d" i)))
+         (source (loop for name in names for i from 0 unless (logbitp i mask) collect name))
+         (canonical (cons "physical" (loop for name in names for i from 0 when (logbitp i mask) collect name)))
+         (valid (zerop (logand mask (1+ mask)))))
+    (handler-case
+        (let ((prefix (logical-slot-copy-install-layout-prefix names source canonical)))
+          (and valid (= prefix (logcount mask))))
+      (error (condition)
+        (and (not valid) (search "prefix" (princ-to-string condition)))))))
+
+(rove:deftest installation-layout-prefix-generated-contract
+    (let ((data (cl-spec:result-data
+                 (cl-spec:run-property 'installation-layout-requires-a-contiguous-prefix
+                                       :seed 7530 :profile :normal))))
+      (rove:ok (eq :passed (getf data :status)) (format nil "~s" data))
+      (rove:ok (= 400 (getf data :trials)))))
+
+(rove:deftest installation-layout-prefix-rejects-ambiguous-inventories
+    (dolist (pair '((("a" "b") ("a")) (("a") nil) (("a" "b" "foreign") nil)
+                    (("a" "a" "b") nil) (("a" "b") ("physical" "physical"))))
+      (rove:ok (handler-case
+                   (progn (logical-slot-copy-install-layout-prefix '("a" "b") (first pair) (second pair)) nil)
+                 (error () t))))
+  (let ((cycle (list "a"))) (setf (cdr cycle) cycle)
+    (rove:ok (handler-case
+                 (progn (logical-slot-copy-install-layout-prefix '("a") cycle nil) nil)
+               (error () t)))))
+
 (defun unit-logical-slot-install-value (word generation &optional same-mount)
   (let* ((certificate (unit-logical-import-value
                        :profile (if (oddp word) :text :binary-bytea)

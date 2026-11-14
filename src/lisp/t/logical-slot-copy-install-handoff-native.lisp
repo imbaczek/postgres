@@ -29,6 +29,12 @@
          (value (logical-slot-copy-install-decode image))
          (token (getf value :stage-id)))
     (assert (eq :pending (getf (logical-slot-copy-import-decode (getf value :certificate)) :phase)))
+    (let ((layout (logical-slot-copy-install-read-layout operation image)))
+      (assert (eq :private (getf layout :phase)))
+      (assert (zerop (getf layout :prefix)))
+      (assert (equalp image (getf layout :image)))
+      (assert (= (length (getf value :entries)) (length (getf layout :observations)))))
+    (when cold (assert (= (1+ before) (logical-install-stage-test-fd-count))))
     (logical-install-handoff-test-denied
      (lambda () (logical-slot-copy-install-handoff-image (copy-structure operation) handoff)) "scope ended")
     (logical-install-handoff-test-denied
