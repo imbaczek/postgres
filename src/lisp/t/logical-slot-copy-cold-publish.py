@@ -1,5 +1,6 @@
 """Publish cold child control from a real copied, compacted standby."""
 import os
+import json
 from pathlib import Path
 import re
 import runpy
@@ -76,8 +77,35 @@ def probe(peer, label, *args, kill=None, late_source=False, cut=None,
     return names
 
 
+
+def cut_cases(arguments, shard=None):
+    cases = []
+    if '--crashes' in arguments:
+        cases.extend((point, None) for point in CUTS)
+    if '--cuts' in arguments:
+        cases.extend((point, exit) for point in CUTS for exit in ('error', 'throw'))
+    if shard is None:
+        return cases
+    if '--smoke' not in arguments or not cases:
+        raise ValueError('cut sharding requires --smoke and --cuts or --crashes')
+    fields = shard.split('/')
+    if len(fields) != 2:
+        raise ValueError('cut shard must be INDEX/COUNT, with a zero-based index')
+    index, count = map(int, fields)
+    if not 0 <= index < count <= len(cases):
+        raise ValueError('cut shard index/count is out of range or would leave empty shards')
+    return cases[index::count]
+
+
 def matrix(peer, disposition):
     assert disposition == 'eligible'
+    assert peer.process is None
+    producer = catalog['peers'][0]
+    assert producer is not peer and producer.process is not None
+    producer_process = producer.process
+    producer.stop(immediate=True)
+    assert producer_process.poll() is not None
+    print('COLD-PUBLISH-MATRIX-READY', flush=True)
     target = peer.data / 'global/pg_catalog.dat'
     selected = target.read_bytes()
     base = catalog['base_catalogs'][peer]
@@ -127,11 +155,8 @@ def matrix(peer, disposition):
         probe(peer, 'late-source-cf', late_source=True)
         probe(peer, 'late-source-cf-recovery')
     if '--crashes' in sys.argv or '--cuts' in sys.argv:
-        cases = []
-        if '--crashes' in sys.argv:
-            cases.extend((point, None) for point in CUTS)
-        if '--cuts' in sys.argv:
-            cases.extend((point, exit) for point in CUTS for exit in ('error', 'throw'))
+        cases = cut_cases(sys.argv[1:], os.environ.get('PG_LISP_TEST_CASE_SHARD'))
+        print('COLD-PUBLISH-CUT-INVENTORY '+json.dumps(cases), flush=True)
         for point, exit in cases:
             for name in children:
                 (peer.data / name).unlink(missing_ok=True)
@@ -163,6 +188,7 @@ CUTS = ('before-cold-control-create', 'after-cold-control-create',
 
 
 if __name__ == '__main__':
+    cut_cases(sys.argv[1:], os.environ.get('PG_LISP_TEST_CASE_SHARD'))
     OwnedLisp.start = catalog['start']
     standby['insert'] = catalog['insert']
     globals_for_run = api['run_healthy'].__globals__
