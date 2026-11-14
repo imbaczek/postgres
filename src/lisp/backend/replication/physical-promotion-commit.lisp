@@ -384,6 +384,16 @@ finish; a durable child is not yet a production-ready postmaster."
 
 (defun physical-promotion-stage-child-checkpoint
     (state plan prefix files history-p check sync-data &key context install-prefix)
+  ;; The caller must first bind STATE, PLAN, PREFIX, FILES and HISTORY-P by
+  ;; artifact validation, and hold the PGDATA context, exclusion and failure
+  ;; fence needed for mutation.  This stages history and WAL; it does not
+  ;; publish child control or install runtime globals.
+  ;;
+  ;; CHECK receives NIL before staging is complete and :STAGED after the
+  ;; frames are written.  SYNC-DATA must durably sync referenced data and
+  ;; catalog files before child control can be published.  A future cold caller
+  ;; must restore the restartpoint catalog with globals unopened and explicitly
+  ;; sync raw forks and CLOG; the live sync cannot do that with NIL globals.
   (let ((child (getf state :promotion-child))
         (directory-fd (when context
                         (cdr (assoc "pg_wal" (physical-image-context-children context) :test #'equal)))))
@@ -456,6 +466,7 @@ publication starts fences recovery; the ordinary path keeps its existing fence."
           (check)
           (unwind-protect
                (progn
+                 ;; Stage and sync referenced data before publishing control.
                  (physical-promotion-stage-child-checkpoint
                   state plan prefix files history-p #'check (lambda () (physical-promotion-sync-child-data context))
                   :context context :install-prefix (not (null owner)))
