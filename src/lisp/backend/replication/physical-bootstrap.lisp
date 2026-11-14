@@ -368,10 +368,10 @@ only declines the fast path and does not add a new cycle error."
 
 (defun physical-bootstrap-manifest-image (manifest)
   "Encode the canonical manifest text with its CRC envelope."
-  (let* ((text (physical-bootstrap-manifest-text manifest))
-         (bytes (string->bytes text))
-         (crc (wal-crc32 bytes)))
-    (string->bytes (format nil "PGPHYSICALBACKUP1 ~8,'0X~%~a~%" crc text))))
+  (let* ((payload (string->bytes (physical-bootstrap-manifest-text manifest)))
+         (crc (wal-crc32 payload))
+         (image (make-array (+ 28 (length payload)) :element-type '(unsigned-byte 8))))
+    (%physical-bootstrap-write-manifest-envelope payload crc image)))
 
 (declaim (ftype function physical-recovery-check-checkpoint-resources))
 
