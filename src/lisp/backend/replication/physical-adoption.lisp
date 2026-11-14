@@ -171,8 +171,9 @@ This context is invalid after its enclosing call exits."
 ;; also support a future private initial publisher.
 
 (defun call-with-physical-directory-root (owner function)
+  (declare (notinline sb-posix:close))
   (physical-directory-check-owner-common owner)
-  (let ((fd nil))
+  (let ((fd nil) (completed nil))
     (unwind-protect
          (progn
            (sb-sys:without-interrupts
@@ -184,8 +185,14 @@ This context is invalid after its enclosing call exits."
            (physical-directory-check-owner-common owner)
            (multiple-value-prog1
                (funcall function fd (physical-image-fd-path fd))
-             (physical-directory-check-owner-common owner)))
-      (when fd (sb-posix:close fd)))))
+             (physical-directory-check-owner-common owner)
+             (setf completed t)))
+      (when fd
+        (handler-case (sb-posix:close fd)
+          (error (condition)
+            (if completed (error condition)
+                (ignore-errors
+                 (report-query-temp-cleanup-failure "offline root descriptor" condition)))))))))
 
 (defun physical-directory-check-owner (owner)
   "Recheck the thread-bound owner, directory and lock inode, then its role.
