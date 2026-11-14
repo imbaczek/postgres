@@ -207,20 +207,33 @@ Return the verified plan; signal an error for contradictory artifacts."
       (error "child checkpoint staging lost its durable EOR"))
     plan))
 
-(defun physical-promotion-open-staging-file (path)
+(defun physical-promotion-open-staging-file (path &optional observer)
   "Open a regular child file for reading and writing, or create it exclusively.
 Return its stream and size. The caller closes the stream. Do not follow a
 symlink or replace an existing special file."
-  (if (wal-namespace-file-stat path t)
-      (physical-promotion-open-file path t)
-      (let ((fd (sb-posix:open (namestring path)
-                               (logior sb-posix:o-rdwr sb-posix:o-creat sb-posix:o-excl
-                                       sb-posix:o-nofollow +postmaster-o-cloexec+) #o600)))
-        (handler-case
-            (values (sb-sys:make-fd-stream fd :input t :output t :element-type '(unsigned-byte 8)) 0)
-          (error (condition) (sb-posix:close fd) (error condition))))))
+  (declare (notinline sb-posix:open sb-posix:close))
+  (let ((stream nil) (fd nil) (size 0) (complete nil))
+    (sb-sys:without-interrupts
+      (unwind-protect
+           (progn
+             (if (wal-namespace-file-stat path t)
+                 (progn
+                   (multiple-value-setq (stream size) (physical-promotion-open-file path t))
+                   (wal-staging-observe observer :opened-existing :frame path
+                                        (sb-sys:fd-stream-fd stream)))
+                 (progn
+                   (setf fd (sb-posix:open (namestring path)
+                                           (logior sb-posix:o-rdwr sb-posix:o-creat sb-posix:o-excl
+                                                   sb-posix:o-nofollow +postmaster-o-cloexec+) #o600))
+                   (wal-staging-observe observer :created :frame path fd)
+                   (setf stream (sb-sys:make-fd-stream fd :input t :output t :element-type '(unsigned-byte 8))
+                         fd nil)))
+             (setf complete t)
+             (values stream size))
+        (unless complete
+          (if stream (close stream) (when fd (sb-posix:close fd))))))))
 
-(defun physical-promotion-stage-frame (child frame)
+(defun physical-promotion-stage-frame (child frame &optional observer)
   "Write and sync one planned frame, preserving any exact existing bytes.
 Earlier preflight must have checked the file extent and all staged records.
 Never create a hole or rewrite an exact EOR beneath a later checkpoint.
@@ -228,29 +241,35 @@ Close the stream on every exit; the enclosing publisher fences failures."
   (destructuring-bind (start record) frame
     (let* ((path (wal-segment-path (floor start +wal-segment-size+) child :timeline))
            (offset (mod start +wal-segment-size+)))
-      (multiple-value-bind (stream size) (physical-promotion-open-staging-file path)
-        (unwind-protect
-             (let ((prior (make-array (min (length record) (max 0 (- size offset)))
-                                      :element-type '(unsigned-byte 8))))
-               (unless (<= offset size) (error "checkpoint staging would create an unexplained hole"))
-               (file-position stream offset)
-               (unless (= (length prior) (read-sequence prior stream)) (error "short checkpoint staging read"))
-               (unless (equalp prior record)
-                 (file-position stream offset)
-                 (write-sequence record stream))
-               (physical-promotion-test-point
-                (ecase (wal-u16 record 6)
-                  (13 :after-child-eor-write) (6 :after-child-batch-write)
-                  (17 :after-child-fpw-write) (18 :after-child-logical-write)
-                  (4 :after-child-checkpoint-write)))
-               (wal-sync-output-bytes stream t))
-          (close stream))))))
+      (sb-sys:without-interrupts
+        (multiple-value-bind (stream size) (physical-promotion-open-staging-file path observer)
+          (unwind-protect
+               (sb-sys:with-local-interrupts
+                 (let ((prior (make-array (min (length record) (max 0 (- size offset)))
+                                          :element-type '(unsigned-byte 8))))
+                   (unless (<= offset size) (error "checkpoint staging would create an unexplained hole"))
+                   (file-position stream offset)
+                   (unless (= (length prior) (read-sequence prior stream)) (error "short checkpoint staging read"))
+                   (unless (equalp prior record)
+                     (file-position stream offset)
+                     (write-sequence record stream))
+                   (physical-promotion-test-point
+                    (ecase (wal-u16 record 6)
+                      (13 :after-child-eor-write) (6 :after-child-batch-write)
+                      (17 :after-child-fpw-write) (18 :after-child-logical-write)
+                      (4 :after-child-checkpoint-write)))
+                   (sb-sys:without-interrupts
+                     (wal-sync-output-bytes stream t)
+                     (wal-staging-observe observer :written :frame path
+                                          (sb-sys:fd-stream-fd stream)))))
+            (close stream)))))))
 
-(defun physical-promotion-remove-child-orphans (state files)
+(defun physical-promotion-remove-child-orphans (state files &optional observer)
   "Remove abandoned selected-child segments outside FILES before history exists.
 Preflight all orphan names as regular files before unlinking any of them.
 Published history makes an unexpected segment an error, not disposable staging.
 Parent segments are never selected. Sync the WAL directory after removals."
+  (declare (notinline sb-posix:unlink))
   (let* ((child (getf state :promotion-child))
          (segments (wal-discover-segments child :timeline))
          (orphans (remove-if (lambda (segment) (assoc segment files)) segments)))
@@ -258,7 +277,11 @@ Parent segments are never selected. Sync the WAL directory after removals."
       (error "published child history has an unexplained WAL segment"))
     (dolist (segment orphans) (wal-namespace-file-stat (wal-segment-path segment child :timeline)))
     (dolist (segment orphans)
-      (sb-posix:unlink (namestring (wal-segment-path segment child :timeline)))
+      (let ((path (wal-segment-path segment child :timeline)))
+        (sb-sys:without-interrupts
+          (wal-staging-observe observer :before-unlink :orphan path nil)
+          (sb-posix:unlink (namestring path))
+          (wal-staging-observe observer :unlinked :orphan path nil)))
       (physical-promotion-test-point :after-child-orphan-unlink))
     (when orphans (fsync-directory (wal-directory)))))
 
@@ -383,7 +406,7 @@ finish; a durable child is not yet a production-ready postmaster."
                 logical-slot-copy-import-check-child-commit))
 
 (defun physical-promotion-stage-child-checkpoint
-    (state plan prefix files history-p check sync-data &key context install-prefix)
+    (state plan prefix files history-p check sync-data &key context install-prefix observer)
   ;; The caller must first bind STATE, PLAN, PREFIX, FILES and HISTORY-P by
   ;; artifact validation, and hold the PGDATA context, exclusion and failure
   ;; fence needed for mutation.  This stages history and WAL; it does not
@@ -397,25 +420,25 @@ finish; a durable child is not yet a production-ready postmaster."
   (let ((child (getf state :promotion-child))
         (directory-fd (when context
                         (cdr (assoc "pg_wal" (physical-image-context-children context) :test #'equal)))))
-    (physical-promotion-remove-child-orphans state files)
+    (physical-promotion-remove-child-orphans state files observer)
     (unless history-p
       (when install-prefix
         (funcall check nil)
         (wal-install-timeline-prefix (physical-recovery-replay-timeline state) child
                                      (getf plan :fork) prefix
-                                     (physical-promotion-parent-namespace state) directory-fd))
+                                     (physical-promotion-parent-namespace state) directory-fd observer))
       (dolist (entry (rest files))
         (funcall check nil)
         (wal-install-timeline-prefix (physical-recovery-replay-timeline state) child
                                      (* (first entry) +wal-segment-size+)
                                      (make-array 0 :element-type '(unsigned-byte 8))
-                                     (physical-promotion-parent-namespace state) directory-fd)))
+                                     (physical-promotion-parent-namespace state) directory-fd observer)))
     (funcall check nil)
-    (physical-promotion-sync-history state directory-fd)
+    (physical-promotion-sync-history state directory-fd observer)
     (physical-promotion-test-point :after-child-history-sync)
     (dolist (frame (getf plan :frames))
       (funcall check nil)
-      (physical-promotion-stage-frame child frame)
+      (physical-promotion-stage-frame child frame observer)
       (when (eq frame (first (getf plan :frames)))
         (physical-promotion-test-point :after-child-eor-flush)))
     (physical-promotion-test-point :after-child-checkpoint-flush)

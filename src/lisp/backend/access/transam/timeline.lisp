@@ -250,35 +250,51 @@ Native ancestry requires the parent history and a forward fork; no role is chang
   (if (= timeline 1) (timeline-parse-history 1 "")
       (timeline-parse-history timeline (bytes->string (timeline-history-bytes timeline directory)))))
 
-(defun timeline-publish-history-bytes (path bytes &key directory-fd)
+(defun timeline-publish-history-bytes (path bytes &key directory-fd observer)
   "Exclusively install a synced inode; never replace an existing pathname.
 DIRECTORY-FD, when supplied, is the caller-held history directory descriptor."
+  (declare (notinline open-exclusive-temporary-file sb-posix:link sb-posix:unlink))
   (let ((directory (uiop:pathname-directory-pathname path)))
     (wal-ensure-directory-durable directory directory-fd)
-    (multiple-value-bind (fd temporary)
-        (sb-posix:mkstemp (namestring (merge-pathnames ".history-XXXXXX" directory)))
-      (unwind-protect
-           (progn
-             (let ((stream (sb-sys:make-fd-stream fd :output t :element-type '(unsigned-byte 8))))
-               (setf fd nil)
-               (unwind-protect
-                    (progn
-                      (write-sequence bytes stream)
-                      (finish-output stream)
-                      (timeline-history-test-point :before-file-fsync)
-                      (fsync-stream stream)
-                      (timeline-history-test-point :after-file-fsync)
-                      (sb-posix:link temporary (namestring path))
-                      (timeline-history-test-point :after-install)
-                      ;; durable_rename fsyncs the installed inode, then its directory.
-                      (fsync-stream stream))
-                 (close stream)))
-             (sb-posix:unlink temporary)
-             (fsync-directory directory)
-             (timeline-history-test-point :after-directory-fsync)
-             path)
-        (when fd (sb-posix:close fd))
-        (ignore-errors (sb-posix:unlink temporary))))))
+    (let ((fd nil) (temporary nil))
+      (sb-sys:without-interrupts
+        (unwind-protect
+             (progn
+               (multiple-value-setq (fd temporary)
+                 (open-exclusive-temporary-file (merge-pathnames ".history-XXXXXX" directory)))
+               (wal-staging-observe observer :created :history temporary fd)
+               (let ((stream (sb-sys:make-fd-stream fd :output t :element-type '(unsigned-byte 8))))
+                 (setf fd nil)
+                 (unwind-protect
+                      (sb-sys:with-local-interrupts
+                        (write-sequence bytes stream)
+                        (finish-output stream)
+                        (timeline-history-test-point :before-file-fsync)
+                        (sb-sys:without-interrupts
+                          (fsync-stream stream)
+                          (wal-staging-observe observer :written :history temporary
+                                               (sb-sys:fd-stream-fd stream)))
+                        (timeline-history-test-point :after-file-fsync)
+                        (sb-sys:without-interrupts
+                          (wal-staging-observe observer :before-install :history temporary
+                                               (sb-sys:fd-stream-fd stream) path)
+                          (sb-posix:link (namestring temporary) (namestring path))
+                          (wal-staging-observe observer :installed :history temporary
+                                               (sb-sys:fd-stream-fd stream) path))
+                        (timeline-history-test-point :after-install)
+                        (fsync-stream stream))
+                   (close stream)))
+               (let ((removed temporary))
+                 (wal-staging-observe observer :before-unlink :history removed nil)
+                 (sb-posix:unlink (namestring temporary))
+                 (setf temporary nil)
+                 (wal-staging-observe observer :unlinked :history removed nil))
+               (sb-sys:with-local-interrupts
+                 (fsync-directory directory)
+                 (timeline-history-test-point :after-directory-fsync))
+               path)
+          (when fd (sb-posix:close fd))
+          (when temporary (ignore-errors (sb-posix:unlink (namestring temporary)))))))))
 
 (defun timeline-write-history (child parent switchpoint reason &optional (directory *pgdata*))
   "Durably publish immutable history without changing runtime timeline or role.

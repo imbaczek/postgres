@@ -577,6 +577,9 @@ short check alone cannot do so."
 (defun wal-directory ()
   (pgdata-resolve-path "pg_wal/" *pgdata*))
 
+(defun wal-staging-observe (observer event operation name fd &optional destination)
+  (when observer (funcall observer event operation name fd destination)))
+
 (defun wal-parent-directory (directory)
   (let* ((path (pathname directory))
          (parts (pathname-directory path))

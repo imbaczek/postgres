@@ -48,19 +48,28 @@ An absent legacy intent retains the historical level 2 bytes."
         (error "pending child contains a different complete record"))
       (equalp tail eor))))
 
-(defun physical-promotion-sync-history (state &optional directory-fd)
+(defun physical-promotion-sync-history (state &optional directory-fd observer)
   "History inode and directory must be durable even when retry finds matching bytes.
 DIRECTORY-FD is an optional caller-held WAL directory descriptor."
   (let ((path (timeline-history-path (getf state :promotion-child) *pgdata*))
         (expected (physical-promotion-history-image state)))
-    (unless (wal-namespace-file-stat path t) (timeline-publish-history-bytes path expected :directory-fd directory-fd))
-    (multiple-value-bind (stream size) (physical-promotion-open-file path t)
-      (unwind-protect
-           (let ((bytes (make-array size :element-type '(unsigned-byte 8))))
-             (unless (and (= size (read-sequence bytes stream)) (equalp bytes expected))
-               (error "pending history changed before durability"))
-             (fsync-stream stream))
-        (close stream)))
+    (unless (wal-namespace-file-stat path t)
+      (timeline-publish-history-bytes path expected :directory-fd directory-fd :observer observer))
+    (sb-sys:without-interrupts
+      (multiple-value-bind (stream size) (physical-promotion-open-file path t)
+        (unwind-protect
+             (progn
+               (wal-staging-observe observer :opened-existing :history path
+                                    (sb-sys:fd-stream-fd stream))
+               (sb-sys:with-local-interrupts
+                 (let ((bytes (make-array size :element-type '(unsigned-byte 8))))
+                   (unless (and (= size (read-sequence bytes stream)) (equalp bytes expected))
+                     (error "pending history changed before durability"))
+                   (sb-sys:without-interrupts
+                     (fsync-stream stream)
+                     (wal-staging-observe observer :written :history path
+                                          (sb-sys:fd-stream-fd stream))))))
+          (close stream))))
     (fsync-directory (wal-directory))))
 
 (defun physical-promotion-write-eor (path prefix eor)
