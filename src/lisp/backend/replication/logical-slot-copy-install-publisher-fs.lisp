@@ -3,7 +3,8 @@
 ;;; Hold and check publication descriptors until the scoped ledger is drained.
 (defun logical-slot-copy-install-publisher-open (publisher parent name kind &key missing (group (logical-slot-copy-install-publisher-root publisher)))
   "Open a child under a held parent and register its descriptor before checks.
-Require the current root mount group and retain file facts for rechecking."
+Use the current root mount group by default; pg_replslot may establish its own
+group.  Retain file facts for rechecking."
   (declare (notinline physical-image-openat sb-posix:close))
   (logical-slot-copy-install-check-publisher publisher)
   (unless (and (or (eq parent (logical-slot-copy-install-publisher-root publisher))
@@ -59,6 +60,8 @@ Require the current root mount group and retain file facts for rechecking."
   (logical-slot-copy-install-publisher-point publisher point))
 
 (defun logical-slot-copy-install-publisher-close (publisher node)
+  "Remove an owned leaf from the ledger and close it once with interrupts masked.
+On Linux, do not retry a failed close: the descriptor number may be reused."
   (declare (notinline sb-posix:close))
   (logical-slot-copy-install-check-publisher publisher)
   (unless (and (member node (logical-slot-copy-install-publisher-nodes publisher) :test #'eq)
@@ -110,7 +113,8 @@ Require the current root mount group and retain file facts for rechecking."
 
 (defun call-with-logical-slot-copy-install-publisher (owner context input function &key (constructor #'%make-logical-slot-copy-install-publisher))
   "Call FUNCTION with scoped publication authority backed by the retained input proof.
-Drain every owned descriptor with interrupts masked, then recheck its path facts.
+Drain every owned descriptor once with interrupts masked, then recheck its path
+facts.  CONSTRUCTOR selects the publisher role while reusing this scope.
 Preserve an original error if close also fails.  Failure, including a caught
 check failure or cleanup failure, revokes the input and fences the operation."
   (declare (notinline sb-posix:close))

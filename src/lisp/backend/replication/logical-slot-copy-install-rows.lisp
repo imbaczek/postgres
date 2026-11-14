@@ -1,6 +1,11 @@
 (in-package #:pg)
 
+;;; This bound covers the writer. Validation opens separate temporary read descriptors.
+
+;;; Resync installed rows and move the remaining pending rows in order.
+;;; Only one row and its state file are held open at a time.
 (defun logical-slot-copy-install-row-open (writer row expected installed)
+  "Reprove the source and open one row and state file by recorded identities."
   (logical-slot-copy-install-row-proof writer)
   (let* ((slot-root (logical-slot-copy-install-row-writer-slot-root writer))
          (parent (if installed slot-root (logical-slot-copy-install-row-writer-slots writer)))
@@ -15,6 +20,7 @@
     (values directory state)))
 
 (defun logical-slot-copy-install-row-rebind (writer directory state)
+  "Bind the held row and state identities to the canonical parent after rename."
   (let* ((next-directory (%make-logical-slot-copy-install-node
                           :fd (logical-slot-copy-install-node-fd directory)
                           :parent (logical-slot-copy-install-row-writer-slot-root writer)
@@ -30,6 +36,7 @@
     (values next-directory next-state)))
 
 (defun logical-slot-copy-install-row-rename (writer directory state)
+  "Reprove the source, then move one row with NOREPLACE and advance the prefix."
   (declare (notinline physical-adoption-renameat2))
   (let ((name (logical-slot-copy-install-node-name directory)))
     (logical-slot-copy-install-row-point writer :before-row-rename name)
@@ -48,11 +55,14 @@
     (values directory state)))
 
 (defun logical-slot-copy-install-row-sync (writer node point name)
+  "Sync one held inode with the row role checked around the primitive."
   (logical-slot-copy-install-check-row-writer writer)
   (logical-slot-copy-install-publisher-sync writer node :row-sync)
   (logical-slot-copy-install-row-point writer point name))
 
 (defun logical-slot-copy-install-row-finish (writer directory state)
+  "Sync state, row, target parent, then source parent and reprove the source.
+Save row facts and close its descriptors before processing the next row."
   (let ((name (logical-slot-copy-install-node-name directory)))
     (logical-slot-copy-install-row-sync writer state :after-row-state-sync name)
     (logical-slot-copy-install-row-sync writer directory :after-row-directory-sync name)
@@ -70,6 +80,10 @@
     (logical-slot-copy-install-row-point writer :after-row-close name)))
 
 (defun logical-slot-copy-install-rows (owner context input)
+  "Resync the visible pending prefix, then install remaining rows in order.
+Return the full pending prefix length.  This does not exchange the active
+certificate, activate the registry, grant admission, or run a coordinator;
+the fixed journal remains the startup fence."
   (let* ((record (logical-slot-copy-install-input-record owner context input))
          (image (logical-slot-copy-install-input-state-image record)))
     (call-with-logical-slot-copy-install-publisher
@@ -97,12 +111,14 @@
                            :prefix (logical-slot-copy-install-input-state-prefix record) arguments)))))
 
 (defun logical-slot-copy-install-fresh-rows ()
+  "Publish a fresh journal and install its pending rows."
   (call-with-logical-slot-copy-install-fresh-input
    (lambda (owner context input)
      (logical-slot-copy-install-publish-journal owner context input)
      (logical-slot-copy-install-rows owner context input))))
 
 (defun logical-slot-copy-install-resume-rows ()
+  "Resync a fixed cold journal and resume its pending rows."
   (call-with-logical-slot-copy-install-cold-input
    (lambda (owner context input)
      (logical-slot-copy-install-publish-journal owner context input)

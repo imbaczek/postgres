@@ -13,12 +13,14 @@
 (defvar *logical-slot-copy-install-publishers* nil)
 (defvar *logical-slot-copy-install-publication-test-hook* nil)
 
-(defgeneric logical-slot-copy-install-publisher-check-role (publisher))
+(defgeneric logical-slot-copy-install-publisher-check-role (publisher)
+  (:documentation "Check role-specific authority while descriptors are held."))
 
 (defmethod logical-slot-copy-install-publisher-check-role ((publisher logical-slot-copy-install-publisher))
   publisher)
 
-(defgeneric logical-slot-copy-install-publisher-check-closed-role (publisher))
+(defgeneric logical-slot-copy-install-publisher-check-closed-role (publisher)
+  (:documentation "Check role-specific observations after descriptor cleanup."))
 
 (defmethod logical-slot-copy-install-publisher-check-closed-role ((publisher logical-slot-copy-install-publisher))
   publisher)

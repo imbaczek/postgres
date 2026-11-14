@@ -1,14 +1,18 @@
 (in-package #:pg)
 
+;;; Row publication extends the publisher scope with pending-prefix checks.
+;;; The same constructor-based scope performs role checks before and after cleanup.
 (defstruct (logical-slot-copy-install-row-writer
             (:include logical-slot-copy-install-publisher)
             (:constructor %make-logical-slot-copy-install-row-writer)
             (:print-function physical-libpq-print-private-object))
+  "Publisher role holding the expected pending prefix and closed row facts."
   (value nil :read-only t) prefix slot-root slot-work slots closed)
 
 (defvar *logical-slot-copy-install-row-test-hook* nil)
 
 (defun logical-slot-copy-install-check-row-origin (writer)
+  "Require the actual spent fresh handoff or cold fixed-journal authority."
   (let* ((record (logical-slot-copy-install-publisher-record writer))
          (operation (logical-slot-copy-install-publisher-operation writer)))
     (ecase (logical-slot-copy-install-input-state-origin record)
@@ -30,6 +34,7 @@
          (error "logical installation rows require cold fixed-journal authority"))))))
 
 (defun logical-slot-copy-install-check-row-closed (writer)
+  "Reopen closed rows without following links through held parents and compare facts."
   (let ((closed (logical-slot-copy-install-row-writer-closed writer)))
     (when closed
       (logical-slot-copy-descriptor-list-count closed +logical-slot-copy-descriptor-maximum-slots+)
@@ -45,6 +50,7 @@
                       (error "logical installation closed row facts changed")))))))))
 
 (defmethod logical-slot-copy-install-publisher-check-role ((writer logical-slot-copy-install-row-writer))
+  "Require the origin, exact pending prefix, and closed row observations."
   (logical-slot-copy-install-check-row-origin writer)
   (let* ((layout (logical-slot-copy-install-read-layout
                   (logical-slot-copy-install-publisher-operation writer)
@@ -57,10 +63,12 @@
   writer)
 
 (defmethod logical-slot-copy-install-publisher-check-closed-role ((writer logical-slot-copy-install-row-writer))
+  "Recheck origin and closed rows after publisher descriptor cleanup."
   (logical-slot-copy-install-check-row-origin writer)
   (logical-slot-copy-install-check-row-closed writer))
 
 (defun logical-slot-copy-install-check-row-writer (writer)
+  "Check the typed row role and its registered publisher bindings."
   (unless (logical-slot-copy-install-row-writer-p writer)
     (error "logical installation requires a row writer"))
   (logical-slot-copy-install-check-publisher writer))
@@ -71,10 +79,13 @@
   (logical-slot-copy-install-check-row-writer writer))
 
 (defun logical-slot-copy-install-row-proof (writer)
+  "Recheck row authority and the complete retained source proof."
   (logical-slot-copy-install-check-row-writer writer)
   (logical-slot-copy-install-publisher-proof writer))
 
 (defun logical-slot-copy-install-row-bind (writer)
+  "Bind the recorded slot parents in their current filesystem group.
+The slot root may be on a different filesystem from the operation root."
   (let* ((value (logical-slot-copy-install-row-writer-value writer))
          (root (logical-slot-copy-install-publisher-root writer))
          (slot-root (logical-slot-copy-install-publisher-open writer root "pg_replslot" :slot-root :group nil))

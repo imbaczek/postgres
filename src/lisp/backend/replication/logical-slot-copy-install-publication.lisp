@@ -93,7 +93,7 @@ immediately before NOREPLACE, then rebind held identities to the new path."
     (logical-slot-copy-install-publisher-point publisher :after-journal-rename)))
 
 (defun logical-slot-copy-install-publisher-sync-journal (publisher)
-  "Sync journal, active file, container, source parent when present, and root."
+  "Sync journal, active file, container, root, then source parent when present."
   (logical-slot-copy-install-publisher-sync
    publisher (logical-slot-copy-install-publisher-journal publisher) :after-journal-file-sync)
   (logical-slot-copy-install-publisher-sync
