@@ -100,7 +100,8 @@
            (*pgdata* base) (*physical-recovery-state* nil))
       (unwind-protect
            (dolist (name '("logical-slot-copy.import" "logical-slot-copy.import.tmp"
-                           "logical-slot-copy.evidence" "logical-slot-copy.evidence.tmp"))
+                           "logical-slot-copy.evidence" "logical-slot-copy.evidence.tmp"
+                           "logical-slot-copy.source-proof" "logical-slot-copy.source-proof.tmp"))
              (let ((path (merge-pathnames name base)))
                (with-open-file (out path :direction :output :if-exists :error)
                  (write-char #\x out))
@@ -109,6 +110,25 @@
                (delete-file path)))
         (uiop:delete-directory-tree base :validate t :if-does-not-exist :ignore)))
   (rove:ok (rove:signals (logical-slot-copy-import-file-spec :active) 'error)))
+
+(rove:deftest logical-import-copy-id-alone-retains-promotion-fence
+    (let* ((base (uiop:ensure-directory-pathname
+                  (sb-posix:mkdtemp
+                   (namestring (merge-pathnames "import-identity-XXXXXX"
+                                                (uiop:temporary-directory))))))
+           (*pgdata* base) (*physical-recovery-state* nil))
+      (unwind-protect
+           (progn
+             (rove:ok (null (logical-slot-copy-check-promotion)))
+             (dolist (id '(nil "0123456789abcdef0123456789abcdef"))
+               (wal-atomic-write-bytes
+                (merge-pathnames "physical-backup.manifest" base)
+                (physical-bootstrap-manifest-image (list :logical-slot-copy-id id)))
+               (rove:ok (rove:signals (logical-slot-copy-check-promotion) 'error)))
+             (delete-file (merge-pathnames "physical-backup.manifest" base))
+             (let ((*physical-recovery-state* (list :logical-slot-copy-id "copy")))
+               (rove:ok (rove:signals (logical-slot-copy-check-promotion) 'error))))
+        (uiop:delete-directory-tree base :validate t :if-does-not-exist :ignore))))
 
 (rove:deftest logical-import-evidence-history-keeps-the-applied-parent-before-a-newer-selection
     (let* ((parent (timeline-encode-history 2 1 100 "first fork" nil))

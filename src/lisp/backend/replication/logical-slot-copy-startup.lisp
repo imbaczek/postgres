@@ -2,7 +2,8 @@
 
 (defun logical-slot-copy-preflight-startup ()
   (dolist (name '("logical-slot-copy.install" "logical-slot-copy.import" "logical-slot-copy.import.tmp"
-                  "logical-slot-copy.evidence" "logical-slot-copy.evidence.tmp"))
+                  "logical-slot-copy.evidence" "logical-slot-copy.evidence.tmp"
+                  "logical-slot-copy.source-proof" "logical-slot-copy.source-proof.tmp"))
     (when (slot-state-lstat (merge-pathnames name *pgdata*))
       (error "logical copy requires child-owner import before promotion; import artifacts require reconciliation")))
   (when (slot-state-lstat (merge-pathnames "logical-slot-copy.in-progress" *pgdata*))
@@ -120,7 +121,11 @@
   (dolist (name '("logical-slot-copy.install" "logical-slot-copy.in-progress" "logical-slot-copy.descriptor"
                   "logical-slot-copy.base-verified" "logical-slot-copy.base-verified.tmp" "logical_slot_wal"
                   "logical-slot-copy.import" "logical-slot-copy.import.tmp"
-                  "logical-slot-copy.evidence" "logical-slot-copy.evidence.tmp"))
+                  "logical-slot-copy.evidence" "logical-slot-copy.evidence.tmp"
+                  "logical-slot-copy.source-proof" "logical-slot-copy.source-proof.tmp"))
     (when (slot-state-lstat (merge-pathnames name *pgdata*))
+      (error "logical copy requires child-owner import before promotion")))
+  (when (slot-state-lstat (merge-pathnames "physical-backup.manifest" *pgdata*))
+    (when (get-properties (recovery-read-manifest *pgdata*) '(:logical-slot-copy-id))
       (error "logical copy requires child-owner import before promotion")))
   (values))

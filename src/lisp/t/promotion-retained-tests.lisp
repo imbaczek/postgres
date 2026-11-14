@@ -1680,6 +1680,44 @@
          (ok (equalp manifest (lineage-test-bytes
                                (merge-pathnames "physical-backup.manifest" root))))))))
 
+(deftest copied-import-stops-retirement-before-primary-registration
+    (handoff-test-committed
+     (lambda (root store reference)
+       (declare (ignore store))
+       (let* ((primary (pg::physical-promotion-retained-owner :primary))
+              (pending (pg::physical-promotion-retained-owner :pending))
+              (control (lineage-test-bytes (pg::physical-recovery-control-path)))
+              (manifest (lineage-test-bytes (merge-pathnames "physical-backup.manifest" root))))
+         (dolist (name '("logical-slot-copy.descriptor" "logical-slot-copy.base-verified"
+                         "logical-slot-copy.import" "logical-slot-copy.import.tmp"
+                         "logical-slot-copy.evidence" "logical-slot-copy.evidence.tmp"
+                         "logical-slot-copy.install" "logical-slot-copy.in-progress"
+                         "logical-slot-copy.base-verified.tmp" "logical_slot_wal"
+                         "logical-slot-copy.source-proof" "logical-slot-copy.source-proof.tmp"))
+           (let ((path (merge-pathnames name root)) (events nil))
+             (with-open-file (out path :direction :output :if-exists :error)
+               (declare (ignore out)))
+             (unwind-protect
+                  (call-with-current-promotion-owner
+                   (lambda ()
+                     (let ((pg::*physical-promotion-test-hook*
+                             (lambda (point) (push point events))))
+                       (ok (intake-fails-p
+                            (lambda ()
+                              (call-with-promotion-exclusion
+                               #'pg::physical-promotion-retire-recovery)))
+                           name)
+                       (ok (null events) name)
+                       (ok (null (pg::physical-retained-root-current primary)) name)
+                       (ok (eql (getf reference :root-id)
+                                (pg::physical-retained-root-current pending)) name)
+                       (ok (equalp control
+                                   (lineage-test-bytes (pg::physical-recovery-control-path))) name)
+                       (ok (equalp manifest
+                                   (lineage-test-bytes
+                                    (merge-pathnames "physical-backup.manifest" root))) name))))
+               (delete-file path))))))))
+
 (deftest committed-archive-cannot-retire-rootless-pending-control
     (handoff-test-committed
      (lambda (root store reference)
