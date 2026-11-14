@@ -69,30 +69,21 @@ Live mode captures the caller\'s pending state and receive store; cold mode capt
       (push (logical-slot-copy-file-row context name) observations))
     (logical-slot-copy-observe-pieces context descriptor observations index)))
 
-(defun logical-slot-copy-read-preserved-inputs (owner context proof-bytes certificate control-phase)
-  "Check preserved inputs against the caller-bound original pending certificate.
-CONTROL-PHASE selects exact parent control from the descriptor or exact child
-control from the evidence-checked plan.  Both require the same receipt, evidence,
-fences and input observations.  Parent control still requires the control
-temporary to be reconciled first.
-
-This read grants no authority and does not observe the canonical import file.
-The caller must bind the original pending certificate first; a journal caller
-must prove its exact certificate pair.  Recheck observations across the callback."
-  (unless (member control-phase '(:parent :child))
-    (error "unknown preserved import control phase"))
+(defun logical-slot-copy-check-preserved-reader (owner context proof-bytes certificate)
   (unless (logical-slot-copy-committed-owner-p owner)
     (error "committed import binding requires its sibling input owner"))
   (logical-slot-copy-check-input owner context)
   (unless proof-bytes (error "committed import lost its base receipt"))
   (unless (eq :pending (getf certificate :phase))
     (error "committed import binding requires its original pending certificate"))
+  (dolist (name '("logical-slot-copy.in-progress" "logical-slot-copy.base-verified.tmp"
+                  "logical-slot-copy.import.tmp" "logical-slot-copy.evidence.tmp"))
+    (when (slot-state-lstat (merge-pathnames name (physical-image-context-root-path context)))
+      (error "committed import has an unresolved temporary or copy fence"))))
+
+(defun logical-slot-copy-read-preserved-source-inputs (owner context proof-bytes certificate)
+  (logical-slot-copy-check-preserved-reader owner context proof-bytes certificate)
   (let ((bound-observations nil))
-    (dolist (name '("logical-slot-copy.in-progress" "logical-slot-copy.base-verified.tmp"
-                    "logical-slot-copy.import.tmp" "logical-slot-copy.evidence.tmp"
-                    "global/pg_wal_control.tmp"))
-      (when (slot-state-lstat (merge-pathnames name (physical-image-context-root-path context)))
-        (error "committed import has an unresolved temporary or copy fence")))
     (flet ((read-input (name maximum)
              (multiple-value-bind (bytes facts) (logical-slot-copy-read-file context name maximum)
                (push (list name (length bytes) (logical-slot-copy-import-digest bytes) facts)
@@ -125,19 +116,6 @@ must prove its exact certificate pair.  Recheck observations across the callback
                          (equalp (physical-recovery-marker-bytes)
                                  (read-input "recovery.required" 4096)))
               (error "committed import differs from preserved base or pending control"))
-            (let ((expected
-                    (ecase control-phase
-                      (:parent (logical-slot-copy-descriptor-base-control descriptor))
-                      (:child
-                       (let ((*physical-recovery-state* control))
-                         (physical-promotion-child-control-image
-                          plan (getf (getf plan :snapshot) :time)))))))
-              (unless (equalp expected
-                              (read-input "global/pg_wal_control"
-                                          (1+ +wal-control-maximum-bytes+)))
-                (error (if (eq control-phase :child)
-                           "committed import does not have its exact child control"
-                           "preserved import does not have its exact parent control"))))
             (multiple-value-bind (observations index)
                 (logical-slot-copy-committed-observations owner context manifest descriptor)
               (declare (ignore index))
@@ -148,6 +126,35 @@ must prove its exact certificate pair.  Recheck observations across the callback
                 (unless (equal row (logical-slot-copy-file-row context (first row)))
                   (error "committed import binding changed during verification")))
               (values certificate evidence descriptor manifest control plan status observations))))))))
+
+(defun logical-slot-copy-read-preserved-inputs (owner context proof-bytes certificate control-phase)
+  (unless (member control-phase '(:parent :child))
+    (error "unknown preserved import control phase"))
+  (logical-slot-copy-check-preserved-reader owner context proof-bytes certificate)
+  (when (slot-state-lstat (merge-pathnames "global/pg_wal_control.tmp"
+                                           (physical-image-context-root-path context)))
+    (error "committed import has an unresolved temporary or copy fence"))
+  (multiple-value-bind (bound evidence descriptor manifest control plan status observations)
+      (logical-slot-copy-read-preserved-source-inputs owner context proof-bytes certificate)
+    (let ((expected
+            (ecase control-phase
+              (:parent (logical-slot-copy-descriptor-base-control descriptor))
+              (:child
+               (let ((*physical-recovery-state* control))
+                 (physical-promotion-child-control-image plan (getf (getf plan :snapshot) :time)))))))
+      (multiple-value-bind (bytes facts)
+          (logical-slot-copy-read-file context "global/pg_wal_control" (1+ +wal-control-maximum-bytes+))
+        (unless (equalp expected bytes)
+          (error (if (eq control-phase :child)
+                     "committed import does not have its exact child control"
+                     "preserved import does not have its exact parent control")))
+        (push (list "global/pg_wal_control" (length bytes) (logical-slot-copy-import-digest bytes) facts)
+              observations)))
+    (logical-slot-copy-input-check-observations owner context observations)
+    (dolist (row observations)
+      (unless (equal row (logical-slot-copy-file-row context (first row)))
+        (error "committed import binding changed during verification")))
+    (values bound evidence descriptor manifest control plan status observations)))
 
 (defun logical-slot-copy-read-committed-inputs (owner context proof-bytes certificate)
   "Check preserved inputs against the exact committed child control.

@@ -107,10 +107,64 @@
                          :old-bytes old-bytes :old-facts old-facts)
                    global phase))))))))))
 
+(defun logical-slot-copy-catalog-call-with-bound-source
+    (owner context binding global phase store mark-started function)
+  (let ((attempt nil) (source-active t) (complete nil) (failed nil))
+    (setf (getf binding :source-proof)
+          (multiple-value-list
+           (logical-slot-copy-check-retained-source
+            (getf binding :certificate) (getf binding :evidence) (getf binding :descriptor)
+            (getf binding :manifest) (getf binding :control) (getf binding :plan)
+            (getf binding :state) (getf binding :metadata) (getf binding :prefix)
+            (getf binding :generation) store
+            (lambda () (logical-slot-copy-catalog-artifacts binding owner context)))))
+    (setf attempt
+          (%make-logical-slot-copy-catalog-attempt
+           :owner owner :context context :binding binding :global global
+           :root (physical-image-context-root-fd context) :mark-started mark-started
+           :file-operation (logical-slot-copy-catalog-file-operations (lambda () attempt))
+           :failure-operation
+           (lambda (operation subject)
+             (when (eq subject attempt)
+               (ecase operation
+                 (:failedp failed)
+                 (:revoke
+                  (setf failed t
+                        (logical-slot-copy-catalog-attempt-failed attempt) t
+                        (physical-adoption-owner-active-p owner) nil)))))
+           :phase phase :target-facts (getf binding :old-facts) :active t
+           :source-check
+           (lambda ()
+             (unless source-active
+               (logical-slot-copy-catalog-revoke attempt)
+               (error "catalog source checker expired"))
+             (logical-slot-copy-catalog-check-source attempt store))))
+    (setf (logical-slot-copy-catalog-attempt-seal attempt)
+          (logical-slot-copy-import-state-image (logical-slot-copy-catalog-image attempt)))
+    (logical-slot-copy-catalog-seal-operation attempt)
+    (let ((*logical-slot-copy-catalog-attempts*
+            (acons owner attempt *logical-slot-copy-catalog-attempts*)))
+      (unwind-protect
+           (progn
+             (logical-slot-copy-catalog-open-one attempt nil)
+             (when (eq phase :residue) (logical-slot-copy-catalog-open-one attempt t))
+             (logical-slot-copy-catalog-check attempt)
+             (multiple-value-prog1 (funcall function attempt)
+               (unless (and (member (logical-slot-copy-catalog-attempt-phase attempt) '(:installed :synced))
+                            (logical-slot-copy-catalog-attempt-file-synced attempt)
+                            (logical-slot-copy-catalog-attempt-directory-synced attempt))
+                 (error "catalog restoration did not complete durability"))
+               (logical-slot-copy-catalog-point :after-cold-catalog-execute attempt)
+               (logical-slot-copy-catalog-check attempt)
+               (setf source-active nil)
+               (logical-slot-copy-catalog-check attempt :source nil)
+               (setf complete t)))
+        (setf source-active nil
+              (logical-slot-copy-catalog-attempt-active attempt) nil)
+        (unless complete (logical-slot-copy-catalog-revoke attempt))
+        (logical-slot-copy-catalog-close attempt)))))
+
 (defun logical-slot-copy-catalog-call-with-source (owner context proof mark-started function)
-  ;; Hold the retained store and receive-root lease across the callback and
-  ;; its final checks.  The internal restore accepts this attempt so a future
-  ;; publisher can use it within an existing lease.
   (multiple-value-bind (binding global phase)
       (logical-slot-copy-catalog-read-binding owner context proof)
     (call-with-logical-slot-copy-committed-store
@@ -121,60 +175,8 @@
        (physical-follow-call-with-receive-root
         store
         (lambda ()
-          (let ((attempt nil) (source-active t) (complete nil) (failed nil))
-            (setf (getf binding :source-proof)
-                  (multiple-value-list
-                   (logical-slot-copy-check-retained-source
-                    (getf binding :certificate) (getf binding :evidence) (getf binding :descriptor)
-                    (getf binding :manifest) (getf binding :control) (getf binding :plan)
-                    (getf binding :state) (getf binding :metadata) (getf binding :prefix)
-                    (getf binding :generation) store
-                    (lambda () (logical-slot-copy-catalog-artifacts binding owner context)))))
-            (setf attempt
-                  (%make-logical-slot-copy-catalog-attempt
-                   :owner owner :context context :binding binding :global global
-                   :root (physical-image-context-root-fd context) :mark-started mark-started
-                   :file-operation (logical-slot-copy-catalog-file-operations (lambda () attempt))
-                   :failure-operation
-                   (lambda (operation subject)
-                     (when (eq subject attempt)
-                       (ecase operation
-                         (:failedp failed)
-                         (:revoke
-                          (setf failed t
-                                (logical-slot-copy-catalog-attempt-failed attempt) t
-                                (physical-adoption-owner-active-p owner) nil)))))
-                   :phase phase :target-facts (getf binding :old-facts) :active t
-                   :source-check
-                   (lambda ()
-                     (unless source-active
-                       (logical-slot-copy-catalog-revoke attempt)
-                       (error "catalog source checker expired"))
-                     (logical-slot-copy-catalog-check-source attempt store))))
-            (setf (logical-slot-copy-catalog-attempt-seal attempt)
-                  (logical-slot-copy-import-state-image (logical-slot-copy-catalog-image attempt)))
-            (logical-slot-copy-catalog-seal-operation attempt)
-            (let ((*logical-slot-copy-catalog-attempts*
-                    (acons owner attempt *logical-slot-copy-catalog-attempts*)))
-              (unwind-protect
-                   (progn
-                     (logical-slot-copy-catalog-open-one attempt nil)
-                     (when (eq phase :residue) (logical-slot-copy-catalog-open-one attempt t))
-                     (logical-slot-copy-catalog-check attempt)
-                     (multiple-value-prog1 (funcall function attempt)
-                       (unless (and (member (logical-slot-copy-catalog-attempt-phase attempt) '(:installed :synced))
-                                    (logical-slot-copy-catalog-attempt-file-synced attempt)
-                                    (logical-slot-copy-catalog-attempt-directory-synced attempt))
-                         (error "catalog restoration did not complete durability"))
-                       (logical-slot-copy-catalog-point :after-cold-catalog-execute attempt)
-                       (logical-slot-copy-catalog-check attempt)
-                       (setf source-active nil)
-                       (logical-slot-copy-catalog-check attempt :source nil)
-                       (setf complete t)))
-                (setf source-active nil
-                      (logical-slot-copy-catalog-attempt-active attempt) nil)
-                (unless complete (logical-slot-copy-catalog-revoke attempt))
-                (logical-slot-copy-catalog-close attempt))))))))))
+          (logical-slot-copy-catalog-call-with-bound-source
+           owner context binding global phase store mark-started function)))))))
 
 (defun logical-slot-copy-import-restore-parent-catalog ()
   ;; Restore only the selected parent catalog under cold exclusion.  This does
