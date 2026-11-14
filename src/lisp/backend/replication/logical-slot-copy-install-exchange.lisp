@@ -1,6 +1,9 @@
 (in-package #:pg)
 
+;;; Exchange the two certificate names or resync the already active cold state.
+;;; The fixed journal remains the startup fence.
 (defun logical-slot-copy-install-exchange-rebind (writer)
+  "Rebind both held certificate identities after exchange, allowing only ctime drift."
   (let* ((old-pending (logical-slot-copy-install-exchange-writer-pending writer))
          (old-active (logical-slot-copy-install-publisher-active writer))
          (pending (%make-logical-slot-copy-install-node
@@ -26,6 +29,7 @@
     (setf (logical-slot-copy-install-exchange-writer-expected-phase writer) :active)))
 
 (defun logical-slot-copy-install-consume-row-receipt (writer)
+  "Spend the current available receipt and arm the exchange writer."
   (let ((record (logical-slot-copy-install-publisher-record writer)))
     (unless (and (eq :available (logical-slot-copy-install-input-state-row-receipt-state record))
                  (eq (logical-slot-copy-install-exchange-writer-receipt writer)
@@ -35,6 +39,7 @@
           (logical-slot-copy-install-exchange-writer-armed writer) t)))
 
 (defun logical-slot-copy-install-exchange-rename (writer)
+  "Exchange certificates only from pending phase after spending the receipt."
   (declare (notinline physical-adoption-renameat2))
   (logical-slot-copy-install-check-exchange-writer writer)
   (unless (and (eq :pending (logical-slot-copy-install-exchange-writer-expected-phase writer))
@@ -56,6 +61,12 @@
   (logical-slot-copy-install-exchange-point writer :after-exchange))
 
 (defun logical-slot-copy-install-exchange-certificate (owner context input receipt)
+  "Exchange pending certificates or resync an already active cold layout.
+Sync both certificate files, root, and container, then reprove the input and
+receipt facts through cleanup while the source lease remains held.  Cold active
+resync never exchanges the files.  The immutable journal containing the original pending certificate remains
+the authority and startup fence; registry activation, admission, and retirement
+are not implemented here."
   (let ((record (logical-slot-copy-install-input-record owner context input)))
     (logical-slot-copy-install-check-row-receipt owner context input receipt)
     (call-with-logical-slot-copy-install-publisher
@@ -84,6 +95,7 @@
                            arguments)))))
 
 (defun logical-slot-copy-install-fresh-active ()
+  "Publish the journal and rows, then exchange the pending certificate."
   (call-with-logical-slot-copy-install-fresh-input
    (lambda (owner context input)
      (logical-slot-copy-install-publish-journal owner context input)
@@ -92,6 +104,7 @@
        (logical-slot-copy-install-exchange-certificate owner context input receipt)))))
 
 (defun logical-slot-copy-install-resume-active ()
+  "Resume a fixed cold layout through certificate exchange or active resync."
   (call-with-logical-slot-copy-install-cold-input
    (lambda (owner context input)
      (logical-slot-copy-install-publish-journal owner context input)

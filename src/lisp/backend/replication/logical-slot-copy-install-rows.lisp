@@ -80,6 +80,11 @@ Save row facts and close its descriptors before processing the next row."
     (logical-slot-copy-install-row-point writer :after-row-close name)))
 
 (defun logical-slot-copy-install-rows (owner context input &key (phase :pending))
+  "Resync the installed prefix, install remaining pending rows, and return the
+count and a scoped receipt.
+Pending is the default; cold active with a complete prefix only resyncs rows.
+Mint the receipt after publisher cleanup, a fresh input and source check, and
+rechecking full row and parent facts while the source lease is held."
   (let* ((record (logical-slot-copy-install-input-record owner context input))
          (image (logical-slot-copy-install-input-state-image record))
          (facts nil)

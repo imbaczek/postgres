@@ -6,7 +6,7 @@
             (:include logical-slot-copy-install-publisher)
             (:constructor %make-logical-slot-copy-install-row-writer)
             (:print-function physical-libpq-print-private-object))
-  "Publisher role holding the expected pending prefix and closed row facts."
+  "Publisher role holding the expected phase, prefix, and closed row facts."
   (value nil :read-only t) (expected-phase :pending :read-only t)
   prefix slot-root slot-work slots closed)
 
@@ -51,7 +51,7 @@
                       (error "logical installation closed row facts changed")))))))))
 
 (defmethod logical-slot-copy-install-publisher-check-role ((writer logical-slot-copy-install-row-writer))
-  "Require the origin, exact pending prefix, and closed row observations."
+  "Require the origin, exact phase and prefix, and closed row observations."
   (logical-slot-copy-install-check-fixed-origin writer)
   (let* ((layout (logical-slot-copy-install-read-layout
                   (logical-slot-copy-install-publisher-operation writer)

@@ -104,7 +104,8 @@
   (error "logical installation input does not authorize offline adoption"))
 
 (defun logical-slot-copy-install-input-record (owner context input)
-  "Require the exact registered owner, context, and input."
+  "Require the exact registered owner, context, and input.
+Reject a forged input before granting it authority over the registered scope."
   (let ((record (logical-slot-copy-install-input-owner-record owner)))
     (unless (and (logical-slot-copy-install-input-p input)
                  (eq input (logical-slot-copy-install-input-state-input record))

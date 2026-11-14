@@ -116,7 +116,9 @@ On Linux, do not retry a failed close: the descriptor number may be reused."
 Drain every owned descriptor once with interrupts masked, then recheck its path
 facts.  CONSTRUCTOR selects the publisher role while reusing this scope.
 Preserve an original error if close also fails.  Failure, including a caught
-check failure or cleanup failure, revokes the input and fences the operation."
+check failure or cleanup failure, revokes the input and fences the operation.
+A constructor failure after input authentication also revokes that input; a
+forged input is rejected before entering this failure envelope."
   (declare (notinline sb-posix:close))
   (let ((record (logical-slot-copy-install-input-record owner context input)))
     (when *logical-slot-copy-install-publishers*
