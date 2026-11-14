@@ -1,0 +1,93 @@
+(in-package #:pg)
+
+(defun logical-slot-copy-cold-control-global-image (context manifest)
+  (let* ((global (cdr (assoc "global" (physical-image-context-children context) :test #'equal)))
+         (catalog (slot-state-lstat (slot-state-fd-path global "pg_catalog.tmp")))
+         (control (slot-state-lstat (slot-state-fd-path global "pg_wal_control.tmp"))))
+    (when (and catalog control)
+      (error "cold publication has both catalog and control temporaries"))
+    (multiple-value-bind (held facts children present)
+        (logical-slot-copy-import-bound-global-image context manifest (if control :control :catalog))
+      (unless (eql (not (null present)) (not (null (or catalog control))))
+        (error "cold publication temporary namespace changed"))
+      (values held facts children (cond (catalog :catalog) (control :control) (t :absent))))))
+
+(defun logical-slot-copy-cold-control-read-temporary (context facts kind expected)
+  (let* ((name (ecase kind (:catalog "global/pg_catalog.tmp") (:control "global/pg_wal_control.tmp")))
+         (global (cdr (assoc "global" (physical-image-context-children context) :test #'equal)))
+         (before (physical-image-file-facts global (subseq name 7))))
+    (unless (logical-slot-copy-import-control-private-facts-p before facts)
+      (error "cold publication temporary is not private and bound"))
+    (multiple-value-bind (bytes actual) (logical-slot-copy-read-file context name (length expected))
+      (unless (and (equal before actual)
+                   (logical-slot-copy-import-control-prefix-p bytes expected))
+        (error "cold publication temporary differs from its selected image"))
+      (list name bytes actual))))
+
+(defun logical-slot-copy-cold-control-read-restartpoint (owner context manifest control descriptor)
+  (multiple-value-bind (restartpoints facts) (logical-slot-copy-catalog-open-restartpoints context)
+    (multiple-value-bind (state metadata prefix generation)
+        (logical-slot-copy-committed-state manifest control descriptor)
+      (multiple-value-bind (actual catalog actual-prefix actual-generation) (physical-restartpoint-read state)
+        (unless (and (equal metadata actual) (equalp prefix actual-prefix)
+                     (eql generation actual-generation) (plusp (length catalog)))
+          (error "cold publication selected restartpoint changed"))
+        (let ((observations
+                (list (logical-slot-copy-catalog-observe context "physical-restartpoint.control" 28)
+                      (logical-slot-copy-catalog-observe
+                       context (format nil "pg_physical_restartpoints/~16,'0X-~16,'0X.rp"
+                                       (getf metadata :lsn) generation) (* 1024 1024 1024)))))
+          (logical-slot-copy-check-input owner context)
+          (values state metadata prefix generation catalog restartpoints facts observations))))))
+
+(defun logical-slot-copy-cold-control-read-binding (owner context proof)
+  (let ((*pgdata* (physical-image-context-root-path context))
+        (*physical-image-context* nil))
+    (logical-slot-copy-import-control-fences context)
+    (let ((global (cdr (assoc "global" (physical-image-context-children context) :test #'equal))))
+      (unless (logical-slot-copy-import-control-private-facts-p
+               (physical-image-file-facts global "pg_catalog.dat") (physical-image-file-facts global))
+        (error "cold publication catalog target is not private and regular")))
+    (multiple-value-bind (certificate certificate-bytes certificate-facts)
+        (logical-slot-copy-import-read-artifact context :pending)
+      (unless (and certificate (eq :pending (getf certificate :phase)))
+        (error "cold publication requires its original pending certificate"))
+      (multiple-value-bind (bound evidence descriptor manifest control plan status observations)
+          (logical-slot-copy-read-preserved-source-inputs owner context proof certificate)
+        (declare (ignore bound status))
+        (multiple-value-bind (global global-facts global-children temporary)
+            (logical-slot-copy-cold-control-global-image context manifest)
+          (multiple-value-bind (state metadata prefix generation catalog restartpoints restartpoint-facts restartpoint-observations)
+              (logical-slot-copy-cold-control-read-restartpoint owner context manifest control descriptor)
+            (let* ((parent (logical-slot-copy-descriptor-base-control descriptor))
+                   (child (let ((*physical-recovery-state* control))
+                            (physical-promotion-child-control-image plan (getf (getf plan :snapshot) :time)))))
+              (multiple-value-bind (canonical canonical-facts)
+                  (logical-slot-copy-read-file context "global/pg_wal_control" (1+ +wal-control-maximum-bytes+))
+                (let ((phase (cond ((equalp canonical parent) :parent)
+                                   ((equalp canonical child) :child)
+                                   (t (error "cold publication has neither exact parent nor child control")))))
+                  (multiple-value-bind (old-catalog catalog-facts)
+                      (logical-slot-copy-read-file context "global/pg_catalog.dat" (* 1024 1024 1024))
+                    (unless (and (equal canonical-facts (second (assoc "pg_wal_control" global-children :test #'equal)))
+                                 (equal catalog-facts (second (assoc "pg_catalog.dat" global-children :test #'equal))))
+                      (error "cold publication global targets changed during observation"))
+                    (when (or (and (eq phase :child)
+                                   (or (not (eq temporary :absent)) (not (equalp catalog old-catalog))))
+                              (and (eq temporary :control) (not (equalp catalog old-catalog))))
+                      (error "cold publication control, catalog and temporary phases disagree"))
+                    (list :certificate certificate :evidence evidence :descriptor descriptor :manifest manifest
+                          :control control :plan plan :state state :metadata metadata :prefix prefix :generation generation
+                          :catalog catalog :parent-control parent :child-control child :control-phase phase
+                          :canonical-control canonical :canonical-control-facts canonical-facts
+                          :old-catalog old-catalog :old-catalog-facts catalog-facts
+                          :global global :global-facts global-facts :global-children global-children
+                          :temporary-kind temporary
+                          :temporary (unless (eq temporary :absent)
+                                       (logical-slot-copy-cold-control-read-temporary
+                                        context global-facts temporary (if (eq temporary :catalog) catalog child)))
+                          :inputs (cons (list "logical-slot-copy.import" (length certificate-bytes)
+                                              (logical-slot-copy-import-digest certificate-bytes) certificate-facts)
+                                        observations)
+                          :restartpoints restartpoints :restartpoint-directory-facts restartpoint-facts
+                          :restartpoint-observations restartpoint-observations)))))))))))
