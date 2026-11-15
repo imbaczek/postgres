@@ -19,12 +19,14 @@ string = base['string']
 
 
 def probe(peer, label, *args, failure=None, publication=None, cut='none', syscall=None,
-          mount=None, all_lost=False, empty_interval=False, **kwargs):
+          mount=None, all_lost=False, empty_interval=False, wal_removed=False, **kwargs):
     assert failure in (None, 'error', 'throw', 'mutation')
     assert publication in (None, 'run', 'reject', 'error', 'throw', 'crash')
-    assert sum(bool(x) for x in (failure, publication, syscall, mount, all_lost, empty_interval)) <= 1
+    assert sum(bool(x) for x in (failure, publication, syscall, mount, all_lost, empty_interval, wal_removed)) <= 1
     operation = (f'(logical-source-proof-test-preparation-failure :{failure})'
                  if failure else '(logical-source-proof-test-run)')
+    if wal_removed:
+        operation = '(logical-source-proof-test-wal-removed)'
     if empty_interval:
         operation = '(logical-source-proof-test-empty-interval)'
     if all_lost:
@@ -66,7 +68,8 @@ def probe(peer, label, *args, failure=None, publication=None, cut='none', syscal
         assert f'SOURCE-PROOF-PUBLICATION-KILL :{cut.upper()}' in text, log
         print(f'SOURCE-PROOF-KILLED {label} seconds={time.monotonic()-started:.6f}', flush=True)
         return
-    marker = ('SOURCE-PROOF-EMPTY-INTERVAL-PASS' if empty_interval else
+    marker = ('SOURCE-PROOF-WAL-REMOVED-PASS' if wal_removed else
+              'SOURCE-PROOF-EMPTY-INTERVAL-PASS' if empty_interval else
               'SOURCE-PROOF-ALL-LOST-PASS' if all_lost else
               'SOURCE-PROOF-MOUNT-PASS' if mount else
               'SOURCE-PROOF-SYSCALL-PASS' if syscall else
@@ -271,7 +274,7 @@ def run_all_lost():
     print('SOURCE-PROOF-ALL-LOST-WORKFLOW-PASS', flush=True)
 
 
-def run_empty_interval(optional):
+def run_empty_interval(optional, *, wal_removed=False):
     started = time.monotonic()
     source = OwnedLisp(parameters=(('wal_level', 'logical'),))
     child = OwnedLisp(parameters=(('wal_level', 'replica'),))
@@ -280,11 +283,15 @@ def run_empty_interval(optional):
         connection = standby['RawConnection'](source.port)
         try:
             connection.query('CREATE TABLE copy_rows (id integer, body text)')
-            for name in ('alpha', 'beta'):
+            for name in (('alpha',) if wal_removed else ('alpha', 'beta')):
                 connection.query(f"SELECT * FROM pg_create_logical_replication_slot('{name}', 'pgoutput')")
             connection.query("INSERT INTO copy_rows VALUES (1, 'empty interval base')")
         finally:
             connection.close()
+        if wal_removed:
+            source.control(f'(load {string(Path(__file__).with_name("logical-slot-copy-source-proof-native.lisp"))})')
+            reply = source.control('(logical-source-proof-test-invalidate-alpha)')
+            assert 'SOURCE-PROOF-SOURCE-WAL-REMOVED-PASS' in reply
         child.data.mkdir(mode=0o700)
         source.control(f'(logical-slot-base-copy {string(child.data)} "empty_interval_pin")', timeout=90)
         child.start()
@@ -295,16 +302,20 @@ def run_empty_interval(optional):
         child.control('(physical-follow-stop)')
         child.control('(physical-recovery-restartpoint)')
         environment['optional'] = optional
-        catalog['prepare'](child, pending=True, disposition='eligible')
+        catalog['prepare'](child, pending=True,
+                           disposition='wal-removed' if wal_removed else 'eligible')
         child.stop(immediate=True)
         source.stop(immediate=True)
         base['probe'](child, 'empty-interval-cf')
-        probe(child, 'empty-interval-baseline', empty_interval=True)
+        probe(child, 'empty-interval-baseline', empty_interval=not wal_removed,
+              wal_removed=wal_removed)
         before = catalog['image'](child.data)
         for retry in range(2):
-            probe(child, f'empty-interval-retry-{retry}', empty_interval=True)
+            probe(child, f'empty-interval-retry-{retry}', empty_interval=not wal_removed,
+                  wal_removed=wal_removed)
             assert before == catalog['image'](child.data), 'empty interval retry changed files'
-        print(f'SOURCE-PROOF-EMPTY-INTERVAL-WORKFLOW-PASS optional={optional} '
+        kind = 'WAL-REMOVED' if wal_removed else 'EMPTY-INTERVAL'
+        print(f'SOURCE-PROOF-{kind}-WORKFLOW-PASS optional={optional} '
               f'seconds={time.monotonic()-started:.6f}', flush=True)
     finally:
         child.stop(immediate=True)
@@ -317,18 +328,19 @@ if __name__ == '__main__':
     modes = parser.add_mutually_exclusive_group()
     modes.add_argument('--all-lost', action='store_true')
     modes.add_argument('--empty-interval', action='store_true')
+    modes.add_argument('--wal-removed', action='store_true')
     parser.add_argument('--publication-cuts', action='store_true')
     parser.add_argument('--publication-negative', action='store_true')
     parser.add_argument('--publication-syscalls', action='store_true')
     parser.add_argument('--publication-mounts', action='store_true')
     arguments = parser.parse_args()
-    if arguments.all_lost or arguments.empty_interval:
+    if arguments.all_lost or arguments.empty_interval or arguments.wal_removed:
         if any((arguments.publication_cuts, arguments.publication_negative,
                 arguments.publication_syscalls, arguments.publication_mounts)):
             parser.error('semantic modes cannot be combined with publication fault matrices')
-        if arguments.empty_interval:
+        if arguments.empty_interval or arguments.wal_removed:
             for optional in ((False,) if arguments.smoke else (False, True)):
-                run_empty_interval(optional)
+                run_empty_interval(optional, wal_removed=arguments.wal_removed)
         else:
             run_all_lost()
         raise SystemExit(0)
