@@ -1,6 +1,9 @@
 (in-package #:pg)
 
 (defun logical-slot-startup-prepare-known-candidates (candidates prepare-known)
+  "Preflight names, then prepare known candidates in snapshot order.
+The snapshot pairs each exact slot with its encoded image. Child-owned results
+must be that same candidate. Recheck list topology and images before cleanup."
   (let ((names (make-hash-table :test #'equal))
         (prepared (make-hash-table :test #'eq)))
     (dolist (slot candidates)
@@ -30,8 +33,9 @@
     prepared))
 
 (defun logical-slot-prepare-startup-inventory (candidates segments inactive-since &optional prepare-known)
-  ;; Prepare known logical candidates while the caller's source registry is visible.
-  ;; Build the private replacement only after those authority callbacks finish.
+  "Prepare derived state while the caller's source registry is visible.
+After the callbacks and checks, build a private replacement with duplicate,
+capacity, standby and progress checks. Publication is separate."
   (let ((prepared (logical-slot-startup-prepare-known-candidates candidates prepare-known))
         (restored (make-hash-table :test #'equal)))
     (let ((*wal-replication-slots* restored))
