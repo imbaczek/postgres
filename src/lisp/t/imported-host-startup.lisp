@@ -39,6 +39,47 @@
               (call-with-physical-image-owned-context
                root t (lambda (context) (funcall function owner context))))))))
 
+(defun native-host-origin-cursor-bridge (archive)
+  (let* ((base (getf (logical-wal-archive-reference archive) :base))
+         (fork (getf (logical-wal-archive-reference archive) :end))
+         (history (timeline-check-lineage
+                   (timeline-parse-history *wal-insert-timeline*
+                                           (bytes->string (timeline-history-bytes *wal-insert-timeline*)))))
+         (records 0))
+    (flet ((guard () (logical-wal-archive-check archive)))
+      (call-with-logical-wal-cursor
+       (logical-wal-archive-history archive) :timeline base fork
+       (timeline-at-point base (logical-wal-archive-history archive)) :prefix-end #'guard
+       (lambda (inner)
+         (call-with-logical-wal-record-provider
+          (lambda (position consume)
+            (sb-thread:with-mutex (*wal-lock*)
+              (logical-wal-cursor-check-scope inner)
+              (assert (= position (logical-wal-cursor-position inner))))
+            (multiple-value-bind (record raw owner carrier kind) (logical-wal-cursor-next inner)
+              (declare (ignore owner kind))
+              (assert record)
+              (funcall consume raw (wal-record-start record) carrier)
+              (sb-thread:with-mutex (*wal-lock*)
+                (logical-wal-cursor-check-scope inner)
+                (assert (= (wal-record-end record) (logical-wal-cursor-position inner))))))
+          #'guard
+          (lambda (provider)
+            (call-with-logical-wal-cursor
+             history :timeline base fork (timeline-at-point base history) :prefix-end #'guard
+             (lambda (outer)
+               (loop for record = (logical-wal-cursor-next outer) while record
+                     do (incf records)
+                        (assert (<= (wal-record-end record) fork)))
+               (assert (= fork (logical-wal-cursor-position outer)))
+               (assert (= fork (logical-wal-cursor-position inner)))
+               (assert (not (logical-wal-cursor-batch-open inner))))
+             :record-reader provider :batch-policy :logical-reader))))
+       :archive archive :archive-only t :batch-policy :logical-reader))
+    (when (< base fork) (assert (plusp records)))
+    (format t "~&NATIVE-ORIGIN archive-only parent cursor supplied ~d records to current-history provider cursor~%"
+            records)))
+
 (defun native-host-origin-read (gate ownership different-primary)
   (let ((saved nil) (record nil) (token nil) (origin-id nil)
                     (primary (physical-promotion-retained-owner :primary)))
@@ -90,6 +131,7 @@
                 (assert (handler-case
                             (progn (logical-wal-archive-copy-at archive fork *wal-durable-lsn* carrier) nil)
                           (error () t))))))
+          (native-host-origin-cursor-bridge archive)
           (format t "~&NATIVE-ORIGIN read original root=~d different-primary=~s~%" origin-id different-primary)))))
     (assert (null (logical-wal-archive-index saved)))
     (assert (null (logical-wal-archive-cache-bytes saved)))

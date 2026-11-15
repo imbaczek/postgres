@@ -13,6 +13,7 @@
 The guard is checked under the captured WAL mutex before each copy and advance."
   (history nil :read-only t) (namespace nil :read-only t)
   (end 0 :read-only t) (guard nil :read-only t) (archive nil :read-only t)
+  (archive-only nil :read-only t)
   (batch-policy :strict :read-only t) (segment-reader nil :read-only t)
   (thread sb-thread:*current-thread* :read-only t)
   (position 0) (batch-open nil) (record-reader nil :read-only t)
@@ -38,7 +39,7 @@ The guard is checked under the captured WAL mutex before each copy and advance."
                                       (logical-wal-cursor-history cursor)
                                       (logical-wal-cursor-namespace cursor))))
 
-(defun call-with-logical-wal-cursor (history namespace start end owner role guard function &key archive segment-reader record-reader (batch-policy :strict))
+(defun call-with-logical-wal-cursor (history namespace start end owner role guard function &key archive archive-only segment-reader record-reader (batch-policy :strict))
   "Call FUNCTION with a cursor over START through the frozen END.
 The caller must prove the source, start boundary and horizon and supply a guard that
 checks that proof under the WAL mutex.  A geometrically valid empty interval
@@ -52,6 +53,7 @@ both policies reject end-of-recovery inside an open batch."
   (timeline-check-lineage history)
   (unless (and (member batch-policy '(:strict :logical-reader))
                (functionp guard)
+               (typep archive-only 'boolean) (or (null archive-only) archive)
                (or (null segment-reader) (functionp segment-reader))
                (or (null record-reader) (logical-wal-record-provider-p record-reader))
                (<= (count-if #'identity (list archive segment-reader record-reader)) 1)
@@ -68,7 +70,7 @@ both policies reject end-of-recovery inside an open batch."
          (mutex *wal-lock*)
          (cursor (%make-logical-wal-cursor
                   :history (mapcar #'copy-timeline-history-entry history)
-                  :namespace namespace :position start :end end :archive archive
+                  :namespace namespace :position start :end end :archive archive :archive-only archive-only
                   :batch-policy batch-policy :segment-reader segment-reader :record-reader record-reader
                   :guard (lambda () (and active (eq mutex *wal-lock*) (funcall guard))))))
     (unwind-protect
@@ -136,6 +138,10 @@ both policies reject end-of-recovery inside an open batch."
   "Copy from the exact local carrier, or consult the archive on open ENOENT.
 Return bytes, size and ready; ready true with NIL bytes means EOF, while a
 false ready value requests preparation.  Other open failures remain errors."
+  (when (logical-wal-cursor-archive-only cursor)
+    (return-from logical-wal-cursor-copy-at
+      (logical-wal-archive-copy-at (logical-wal-cursor-archive cursor)
+                                   position (logical-wal-cursor-end cursor) carrier)))
   (when (logical-wal-cursor-segment-reader cursor)
     (return-from logical-wal-cursor-copy-at
       (logical-wal-cursor-copy-provided cursor position carrier)))
