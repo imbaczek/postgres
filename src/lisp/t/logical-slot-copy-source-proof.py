@@ -6,6 +6,7 @@ from pathlib import Path
 import runpy
 import re
 import signal
+import shutil
 import subprocess
 import time
 
@@ -21,12 +22,17 @@ string = base['string']
 
 def probe(peer, label, *args, failure=None, publication=None, cut='none', syscall=None,
           mount=None, all_lost=False, empty_interval=False, wal_removed=False, segment_boundary=False,
-          catalog_spelling=False, catalog_size=None, **kwargs):
+          catalog_spelling=False, catalog_size=None, binding=None, foreign_root=False, **kwargs):
     assert failure in (None, 'error', 'throw', 'mutation')
     assert publication in (None, 'run', 'reject', 'error', 'throw', 'crash')
-    assert sum(bool(x) for x in (failure, publication, syscall, mount, all_lost, empty_interval, wal_removed, segment_boundary, catalog_spelling)) <= 1
+    assert binding in (None, 'prefix', 'inventory', 'extent')
+    assert sum(bool(x) for x in (failure, publication, syscall, mount, all_lost, empty_interval, wal_removed, segment_boundary, catalog_spelling, binding, foreign_root)) <= 1
     operation = (f'(logical-source-proof-test-preparation-failure :{failure})'
                  if failure else '(logical-source-proof-test-run)')
+    if binding:
+        operation = f'(logical-source-proof-test-binding :{binding})'
+    if foreign_root:
+        operation = '(logical-source-proof-test-foreign-root)'
     if segment_boundary:
         assert isinstance(segment_boundary, int) and not isinstance(segment_boundary, bool)
         assert isinstance(catalog_size, int) and catalog_size > 0
@@ -56,6 +62,7 @@ def probe(peer, label, *args, failure=None, publication=None, cut='none', syscal
         '(asdf:load-system "pg")', '(in-package :pg)',
         f'(load {string(Path(__file__).with_name("logical-slot-copy-source-proof-native.lisp"))})',
         f'(load {string(Path(__file__).with_name("logical-slot-copy-source-proof-publication-faults.lisp"))})',
+        f'(load {string(Path(__file__).with_name("logical-slot-copy-source-proof-binding-faults.lisp"))})',
         f'(let ((*pgdata* (directory-pathname {string(peer.data)}))) '
         '(unwind-protect (postmaster-own-data-directory "127.0.0.1" 6543 '
         f':startup-reconcile (lambda () {operation})) '
@@ -78,7 +85,9 @@ def probe(peer, label, *args, failure=None, publication=None, cut='none', syscal
         assert f'SOURCE-PROOF-PUBLICATION-KILL :{cut.upper()}' in text, log
         print(f'SOURCE-PROOF-KILLED {label} seconds={time.monotonic()-started:.6f}', flush=True)
         return
-    marker = ('SOURCE-PROOF-CATALOG-SPELLING-PASS' if catalog_spelling else
+    marker = ('SOURCE-PROOF-READER-BINDING-PASS' if binding else
+              'SOURCE-PROOF-FOREIGN-ROOT-PASS' if foreign_root else
+              'SOURCE-PROOF-CATALOG-SPELLING-PASS' if catalog_spelling else
               'SOURCE-PROOF-SEGMENT-BOUNDARY-PASS' if segment_boundary else
               'SOURCE-PROOF-WAL-REMOVED-PASS' if wal_removed else
               'SOURCE-PROOF-EMPTY-INTERVAL-PASS' if empty_interval else
@@ -247,6 +256,27 @@ def publication_mount_matrix(peer):
     print('SOURCE-PROOF-MOUNT-MATRIX-PASS', flush=True)
 
 
+def reader_binding_matrix(peer):
+    for mode in ('prefix', 'inventory', 'extent'):
+        before = catalog['image'](peer.data)
+        probe(peer, 'binding-'+mode, binding=mode)
+        assert before == catalog['image'](peer.data), (mode, 'binding probe changed original files')
+    foreign = OwnedLisp()
+    try:
+        original = catalog['image'](peer.data)
+        shutil.copytree(peer.data, foreign.data, symlinks=True)
+        assert peer.data.stat().st_ino != foreign.data.stat().st_ino
+        before = catalog['image'](foreign.data)
+        probe(foreign, 'foreign-root', foreign_root=True)
+        assert before == catalog['image'](foreign.data), 'foreign-root probe changed copied files'
+        assert original == catalog['image'](peer.data), 'foreign-root probe changed source files'
+        probe(peer, 'foreign-root-original-retry')
+        assert original == catalog['image'](peer.data), 'original retry changed files'
+    finally:
+        foreign.stop(immediate=True)
+    print('SOURCE-PROOF-READER-BINDING-MATRIX-PASS cases=4', flush=True)
+
+
 def matrix(peer, disposition):
     assert disposition == 'eligible'
     assert peer.process is None
@@ -261,6 +291,8 @@ def matrix(peer, disposition):
         before = catalog['image'](peer.data)
         probe(peer, 'preparation-'+failure, failure=failure)
         assert before == catalog['image'](peer.data), 'preparation failure changed files'
+    if arguments.reader_bindings:
+        reader_binding_matrix(peer)
     if arguments.publication_cuts:
         publication_matrix(peer)
     if arguments.publication_negative:
@@ -378,6 +410,7 @@ if __name__ == '__main__':
     modes.add_argument('--wal-removed', action='store_true')
     modes.add_argument('--segment-boundary', action='store_true')
     modes.add_argument('--catalog-spelling', action='store_true')
+    parser.add_argument('--reader-bindings', action='store_true')
     parser.add_argument('--publication-cuts', action='store_true')
     parser.add_argument('--publication-negative', action='store_true')
     parser.add_argument('--publication-syscalls', action='store_true')
@@ -385,7 +418,7 @@ if __name__ == '__main__':
     arguments = parser.parse_args()
     if arguments.all_lost or arguments.empty_interval or arguments.wal_removed or arguments.segment_boundary or arguments.catalog_spelling:
         if any((arguments.publication_cuts, arguments.publication_negative,
-                arguments.publication_syscalls, arguments.publication_mounts)):
+                arguments.publication_syscalls, arguments.publication_mounts, arguments.reader_bindings)):
             parser.error('semantic modes cannot be combined with publication fault matrices')
         if arguments.empty_interval or arguments.wal_removed or arguments.segment_boundary or arguments.catalog_spelling:
             for optional in ((False,) if arguments.smoke else (False, True)):
