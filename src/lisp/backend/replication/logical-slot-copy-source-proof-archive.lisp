@@ -14,6 +14,9 @@
       history)))
 
 (defun logical-slot-copy-source-proof-archive-cursor (candidate function start fork history)
+  "Return visit and finish closures for replay from START to exact F.
+Check gaps against HISTORY and install EOR selection before visiting the record.
+This private cursor does not validate the archive or confer authority."
   (let ((cursor start))
     (values
      (lambda (record raw)
@@ -43,6 +46,7 @@
 
 (defun logical-slot-copy-source-proof-map-archive
     (facts directory reader candidate function start)
+  "Validate the retained archive while replaying its records through exact F."
   (let* ((certificate (getf facts :certificate))
          (reference (getf certificate :retained-reference))
          (history (getf facts :history))
