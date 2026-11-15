@@ -81,6 +81,31 @@
            (ok (null pg::*catalog*))
            (ok (= 1 pg::*logical-capture-live-slots*)))))))
 
+(deftest startup-slot-publisher-notifies-only-after-installing-mirrors
+    (pg::call-with-logical-slot-real-startup-test
+     (lambda ()
+       (pg::wal-report-logical-decoding-status t)
+       (let ((registry pg::*wal-replication-slots*)
+             (notify (symbol-function 'pg::notify-primary-wal-writer-under-lock))
+             (notifications 0))
+         (unwind-protect
+              (progn
+                (setf (symbol-function 'pg::notify-primary-wal-writer-under-lock)
+                      (lambda ()
+                        (incf notifications)
+                        (ok (sb-thread:holding-mutex-p pg::*wal-lock*))
+                        (ok (not (sb-thread:holding-mutex-p pg::*xid-lock*)))
+                        (ok (not (eq registry pg::*wal-replication-slots*)))
+                        (ok (zerop (hash-table-count pg::*wal-replication-slots*)))
+                        (ok (zerop pg::*logical-capture-live-slots*))
+                        (ok (pg::wal-logical-policy-pending-disable pg::*wal-logical-policy*))))
+                (pg::call-with-logical-slot-owned-startup-test
+                 (lambda (gate ownership)
+                   (pg::wal-load-replication-slots :gate-owner gate :ownership ownership)))
+                (ok (= 1 notifications)))
+           (setf (symbol-function 'pg::notify-primary-wal-writer-under-lock) notify))))
+     :wal-level :replica))
+
 (defun startup-slot-test-progress-record (type start &key xids (xid 0))
   (let* ((images (when (= type pg::+wal-record-pages+)
                    (list (pg::make-wal-page-image

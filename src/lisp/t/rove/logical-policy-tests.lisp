@@ -269,6 +269,43 @@
              (wal-process-pending-logical-disable-under-lock (lambda () nil)))
            (rove:ok (not (wal-logical-info-backend-enabled first))))))))
 
+(rove:deftest logical-startup-mirror-preparation-does-not-notify-writer
+    (call-with-logical-info-barrier-test
+     (lambda (first second)
+       (declare (ignore first second))
+       (let ((notify (symbol-function 'notify-primary-wal-writer-under-lock))
+             (notifications 0)
+             (restored (make-hash-table :test #'equal)))
+         (unwind-protect
+              (progn
+                (setf (symbol-function 'notify-primary-wal-writer-under-lock)
+                      (lambda ()
+                        (assert (sb-thread:holding-mutex-p *wal-lock*))
+                        (incf notifications)))
+                (sb-thread:with-mutex (*wal-lock*)
+                  (setf (gethash "valid" *wal-replication-slots*)
+                        (make-wal-replication-slot :name "valid" :kind :logical :restart-lsn 0))
+                  (wal-refresh-logical-capture-slot-mirror-under-wal-lock)
+                  (let ((registry *wal-replication-slots*)
+                        (policy *wal-logical-policy*))
+                    (multiple-value-bind (count prepared-policy disable)
+                        (logical-slot-startup-prepare-mirrors restored)
+                      (rove:ok (zerop count))
+                      (rove:ok (eq policy prepared-policy))
+                      (rove:ok disable))
+                    (rove:ok (eq registry *wal-replication-slots*))
+                    (rove:ok (= 1 *logical-capture-live-slots*))
+                    (rove:ok (eq policy *wal-logical-policy*))
+                    (rove:ok (not *wal-logical-info-disable-pending*))
+                    (rove:ok (zerop notifications)))
+                  ;; The runtime path still queues the same request and wakes its writer.
+                  (let ((*wal-replication-slots* restored))
+                    (wal-refresh-logical-capture-slot-mirror-under-wal-lock))
+                  (rove:ok *wal-logical-info-disable-pending*)
+                  (rove:ok (= 1 notifications))))
+           (setf (symbol-function 'notify-primary-wal-writer-under-lock) notify))))
+     :enabled t))
+
 (rove:deftest logical-info-clog-rebind-preserves-interest-but-not-old-writer-authority
     (call-with-logical-info-barrier-test
      (lambda (first second)

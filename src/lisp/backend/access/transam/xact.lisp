@@ -1424,12 +1424,12 @@ Pass BACKEND when releasing its virtual reader ID."
     (not (member (gethash xid *logical-capture-xid-modes* :capture)
                  '(:skip :skip-written)))))
 
-(defun wal-refresh-logical-capture-slot-mirror-under-wal-lock ()
+(defun wal-refresh-logical-capture-slot-mirror-under-wal-lock (&key (notify t))
   "Publish the live slot count under the established WAL-to-XID lock order."
   (let ((count (wal-logical-valid-slot-count-under-lock)))
     (sb-thread:with-mutex (*xid-lock*)
       (setf *logical-capture-live-slots* count))
-    (wal-note-logical-slot-count-under-lock count))
+    (wal-note-logical-slot-count-under-lock count :notify notify))
   (values))
 
 (defun logical-activation-relation-wait-p (old-xids &optional (backend *backend*))

@@ -164,7 +164,7 @@
             (funcall function)
          (end-backend-session))))))
 
-(defun call-with-logical-slot-real-startup-test (function)
+(defun call-with-logical-slot-real-startup-test (function &key (wal-level :logical))
   (call-with-queued-clog-test
    (lambda ()
      (let ((*wal-ready* nil) (*wal-dirty-resident-limit-pages* 512)
@@ -176,7 +176,7 @@
                              (*catalog* nil) (*catalog-identity-needs-persist-p* nil)
                              (*catalog-oldest-relfrozenxid* nil) (*catalog-durable-generation* 0)
                              (*catalog-logical-event-publication-p* nil)
-                             (*wal-level* :logical) (*backend* nil)
+                             (*wal-level* wal-level) (*backend* nil)
                              (*startup-installed-configuration* nil) (*physical-follow-desired* nil)
                              (*active-xids* nil) (*next-xid* 3) (*xid-batch-end* 3)
                              (*active-snapshots* 0) (*active-snapshot-set* (make-hash-table :test #'eq))
@@ -199,7 +199,7 @@
        (unwind-protect
             (progn
               (let ((settings (startup-default-settings (namestring *pgdata*))))
-                (setf (getf (gethash "wal_level" settings) :value) "logical"
+                (setf (getf (gethash "wal_level" settings) :value) (string-downcase (symbol-name wal-level))
                       *startup-installed-configuration*
                       (startup-prepare-installation settings (make-hash-table :test #'equal)
                                                     (make-hash-table :test #'equal) nil)))

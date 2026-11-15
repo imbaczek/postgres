@@ -431,7 +431,7 @@ Reject an unrecovered witness rather than treating it as an OFF state."
       (setf *wal-logical-policy* candidate)))
   (values))
 
-(defun wal-note-logical-slot-count-under-lock (count)
+(defun wal-note-logical-slot-count-under-lock (count &key (notify t))
   "Request a writer disable when replica mode loses its last valid slot."
   (assert (sb-thread:holding-mutex-p *wal-lock*))
   (when (and *wal-ready* (not *wal-poisoned*))
@@ -445,7 +445,7 @@ Reject an unrecovered witness rather than treating it as an OFF state."
                     (wal-logical-info-capture-under-xid-lock-p)))))
       (when policy (wal-logical-set-pending-under-lock policy (not (null pending))))
       (setf *wal-logical-info-disable-pending* (not (null info-pending)))
-      (when (or pending info-pending) (notify-primary-wal-writer-under-lock))))
+      (when (and notify (or pending info-pending)) (notify-primary-wal-writer-under-lock))))
   (values))
 
 (defun wal-request-logical-disable-after-arm ()

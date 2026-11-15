@@ -83,12 +83,12 @@ capacity, standby and progress checks. Publication is separate."
         (*logical-capture-live-slots* *logical-capture-live-slots*)
         (*wal-logical-policy* *wal-logical-policy*)
         (*wal-logical-info-disable-pending* *wal-logical-info-disable-pending*))
-    (wal-refresh-logical-capture-slot-mirror-under-wal-lock)
+    (wal-refresh-logical-capture-slot-mirror-under-wal-lock :notify nil)
     (values *logical-capture-live-slots* *wal-logical-policy* *wal-logical-info-disable-pending*)))
 
 (defun logical-slot-startup-publish (source restored &optional archive)
   ;; Finish all fallible preparation and checks before fixed publication under
-  ;; WAL then XID lock.  The archive lease, when present, still spans this step.
+  ;; WAL then XID lock. The archive lease, when present, still spans this step.
   (when (logical-slot-imported-startup-source-p source)
     (error "imported startup publication requires its one-shot publication owner"))
   (logical-slot-startup-check-inventory source)
@@ -97,7 +97,8 @@ capacity, standby and progress checks. Publication is separate."
     (unless (and (eq *wal-replication-slots* (logical-slot-startup-source-registry source))
                  (<= (hash-table-count restored) *max-replication-slots*))
       (error "logical slot startup publication context changed"))
-    (multiple-value-bind (count policy disable-pending) (logical-slot-startup-prepare-mirrors restored)
+    (multiple-value-bind (count policy disable-pending)
+        (logical-slot-startup-prepare-mirrors restored)
       (logical-slot-startup-check-source source)
       (when archive (logical-wal-archive-check archive))
       (sb-thread:with-mutex (*xid-lock*)
@@ -105,7 +106,10 @@ capacity, standby and progress checks. Publication is separate."
           (setf *wal-replication-slots* restored
                 *logical-capture-live-slots* count
                 *wal-logical-policy* policy
-                *wal-logical-info-disable-pending* disable-pending)))))
+                *wal-logical-info-disable-pending* disable-pending)))
+      (when (or disable-pending
+                (and policy (wal-logical-policy-pending-disable policy)))
+        (notify-primary-wal-writer-under-lock))))
   (values))
 
 (defun logical-slot-startup-restore (source segments inactive-since)
