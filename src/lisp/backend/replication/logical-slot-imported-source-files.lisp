@@ -39,6 +39,9 @@
     (sb-thread:with-mutex (*wal-lock*)
       (multiple-value-bind (slot system-id history end)
           (logical-slot-imported-owner-candidate-under-lock owner)
+        (logical-slot-imported-check-origin-history
+         (getf certificate :child-timeline) (getf certificate :parent-timeline)
+         (getf certificate :fork) (getf (getf facts :evidence) :child-history) history)
         (let ((row (find (wal-replication-slot-name slot) (getf certificate :slots)
                          :key #'first :test #'equal)))
           (unless (and (eql system-id (getf certificate :system-id)) row (fourth row))

@@ -406,6 +406,7 @@
                    (:file "../replication/logical-slot-copy-source-proof-archive")
                    (:file "../replication/logical-slot-copy-source-proof-reader-fs")
                    (:file "../replication/logical-slot-imported-source-owner")
+                   (:file "../replication/logical-slot-imported-origin-history")
                    (:file "../replication/logical-slot-imported-startup-owner")
                    (:file "../replication/logical-slot-imported-owner-protocol")
                    (:file "../replication/logical-slot-imported-source-files")
