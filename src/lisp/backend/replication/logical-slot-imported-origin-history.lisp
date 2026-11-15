@@ -1,6 +1,15 @@
 (in-package #:pg)
 
 (defun logical-slot-imported-check-origin-history (child parent fork original-bytes history)
+  ;; Check that the current history preserves the imported origin.
+  ;;
+  ;; The child's begin point, its parent, and all older intervals must match
+  ;; the certified history.  The child's end may now be set if a later
+  ;; timeline descended from it.
+  ;;
+  ;; This only observes history; it grants no admission or WAL retention
+  ;; authority.  Parsing is bounded, but this check is not intended for
+  ;; per-record guards.
   (unless (and (typep child '(integer 2 4294967295))
                (typep parent '(integer 1 4294967295)) (< parent child)
                (typep fork '(unsigned-byte 64))
