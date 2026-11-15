@@ -102,6 +102,8 @@ replay D through F, provide WAL records, publish a slot or establish readiness."
                      (require-scope)
                      (logical-slot-imported-owner-under-lock owner)
                      (logical-slot-imported-check-file-anchors root named-root root-facts held))))
+                ;; CHECK with T returns a copy of the exact proof image and
+                ;; the names and copied facts of its held FDs for binding.
                 (check (&optional binding)
                   (when (sb-thread:holding-mutex-p *wal-lock*)
                     (error "full imported proof check requires the WAL mutex to be released"))

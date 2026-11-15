@@ -1361,6 +1361,12 @@ PG_NATIVE_HOST_DISPOSABLE=1 PG_NATIVE_PROOF_DATA=/absolute/disposable-prepared-c
   --non-interactive --load t/imported-host-startup.lisp
 ```
 
+The test reselects and reads back a real primary root while independently
+leasing and pinning the original root. It checks that replay failure keeps
+that protection and that dropped slots stay absent. It also rejects requests
+for the child carrier and requests starting at F. This private restoration
+path does not establish production integration or admission.
+
 The unit suite contains 68 regressions migrated from the legacy runner, eight
 Properties and one Function Spec, all explicitly executed through Rove. Loading
 it alone does not run tests. `./t/run-unit-tests.sh` executes this ASDF suite and

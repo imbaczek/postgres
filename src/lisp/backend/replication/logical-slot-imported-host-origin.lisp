@@ -1,8 +1,17 @@
 (in-package #:pg)
 
+;; The protection described below starts only after successful root restoration.
+
+;; This registry records a retained root obligation independently of the
+;; temporary startup owner and the current primary root.  A retry must match
+;; the exact permanent-pair binding.  Protection remains after scope exit or
+;; failure; no retirement path is provided here.
+
 (defstruct (logical-slot-imported-host-origin
             (:constructor %make-logical-slot-imported-host-origin)
             (:print-function physical-libpq-print-private-object))
+  "Registry membership alone does not mean the root was restored.
+Once restored, protection persists after scope exit or failure."
   (state nil :read-only t))
 
 (defvar *logical-slot-imported-host-origins* (make-hash-table :test #'equal))

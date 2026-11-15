@@ -75,6 +75,10 @@ Keep the overlap descriptor as the value of its object key."
           using (hash-value descriptor)
         when (eq (car object) :overlap) return descriptor))
 
+;; READER is called under the archive mutex.  It must not acquire the WAL
+;; mutex or perform live owner checks.  It supplies bounded bytes for the
+;; requested object and must preserve content ID validation.
+
 (defun physical-retained-root-load-reference (directory identity id history &key (reader 'physical-retained-object-read))
   "Validate the complete selected root under the archive mutex and build its reference."
   (physical-retained-root-require-lock)
@@ -179,6 +183,8 @@ that reference on every exit. Reject an active or uncertain owner update."
 
 Read control outside the archive mutex, then recheck the captured owner state
 before validating and installing its reference."
+  ;; READER has the same archive-mutex and validation duties as in
+  ;; physical-retained-root-load-reference.
   (unless (and owner (functionp read-selected))
     (error "retained WAL reconciliation requires an owner and durable control reader"))
   (let ((directory (physical-retained-root-directory directory))

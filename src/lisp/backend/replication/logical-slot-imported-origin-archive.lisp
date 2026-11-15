@@ -1,5 +1,11 @@
 (in-package #:pg)
 
+;; Both archive histories are the frozen original parent history for [D,F).
+;; The record also keeps the original child history for descendant and seam
+;; checks.  Do not attach this parent archive to a child or current local-first
+;; cursor.  A future provider must read the origin archive alone and prove
+;; continuation separately.
+
 (defun call-with-logical-slot-imported-origin-archive
     (record facts check under-lock directory input reader anchors function)
   (multiple-value-bind (token reference identity parent-history)
@@ -48,6 +54,11 @@
           (sb-sys:without-interrupts
             (setf active nil (logical-wal-archive-index archive) nil)
             (logical-wal-archive-clear-cache archive)))))))
+
+;; Reconcile before allowing startup GC or readiness.  This is a private
+;; restoration path; production integration and admission are not yet present.
+;; Live checks bracket the pure D..F replay, whose simulated globals and raw FD
+;; reader must not invoke WAL or live owner checks inside replay.
 
 (defun call-with-logical-slot-imported-host-origin (owner context function)
   (unless (logical-slot-imported-host-startup-owner-p owner)

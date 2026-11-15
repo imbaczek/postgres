@@ -1,5 +1,9 @@
 (in-package #:pg)
 
+;; Open the named archive through the held directory.  The reader bounds each
+;; object and verifies its content ID; it performs no WAL or live owner checks,
+;; so retained-root validation can call it under the archive mutex.
+
 (defun call-with-logical-slot-imported-archive-input (context function)
   (let ((root (physical-image-context-root-fd context)))
     (call-with-logical-slot-imported-archive-directory

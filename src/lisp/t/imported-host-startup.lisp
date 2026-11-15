@@ -2,6 +2,10 @@
 ;; Drops canonical slot files, then checks that the permanent historical proof
 ;; can be observed without resurrecting slots.
 
+;; Reselect and read back a real primary root while the original root remains
+;; independently pinned.  Check replay failure retains that pin and reject a
+;; wrong child carrier or fork.
+
 (require :asdf)
 (let ((source (truename (merge-pathnames "../" (uiop:pathname-directory-pathname *load-truename*)))))
   (pushnew source asdf:*central-registry* :test #'equal)
@@ -161,6 +165,7 @@
     (format t "~&NATIVE-ORIGIN replay failure kept the original root protected and released its reader~%")))
 
 (defun native-host-origin-cycle (gate ownership)
+  "Exercise rejection of the child carrier and reads at F."
   (let* ((original (native-host-origin-read gate ownership nil))
          (current (progn (native-host-origin-failure-keeps-pin gate ownership original)
                          (native-host-republish-primary-root))))
