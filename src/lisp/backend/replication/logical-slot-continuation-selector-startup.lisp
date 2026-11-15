@@ -40,6 +40,15 @@
   t)
 
 (defun logical-slot-continuation-restore-empty-startup (gate ownership)
+  ;; Only an actually empty durable inventory can be restored here.  Active
+  ;; P7 rows, transfers, roots, runs and tails need proof, retention and a
+  ;; provider before they can be accepted.  No transition or control mutation
+  ;; or admission is performed here.
+  ;;
+  ;; Keep the actual origin proof and root-reader lease across publication and
+  ;; readback.  Check host system ID, history, sealed end and binding against
+  ;; the selected claims before and after sync.  Empty restoration does not
+  ;; open the GC fence.
   (declare (notinline sb-posix:fsync))
   (call-with-logical-slot-continuation-startup-storage
    gate ownership

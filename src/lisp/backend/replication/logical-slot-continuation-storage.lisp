@@ -62,13 +62,15 @@
     (owner context function)
   ;; Weak EQ identity dispatch and dynamic registration limit this capability
   ;; to its active thread and checked host, proof, context and named child.
-  ;; A failed check or nonlocal exit during a check makes failure sticky,
-  ;; including an interrupt.  Copied or foreign-thread objects are rejected
-  ;; before that state is changed.  Cleanup revokes registration and the source-proof
-  ;; scope closes the held FD.
+  ;; A failed operation or nonlocal exit during it, including an interrupt,
+  ;; makes failure sticky. :WITH-ORIGIN includes its callback in the operation.
+  ;; Copied objects and foreign-thread calls are rejected before that state
+  ;; changes. Cleanup revokes registration; the proof scope closes the held FD.
   ;;
   ;; :DIRECTORY returns a borrowed FD for this scope; :BINDING returns copied
-  ;; canonical proof bytes.
+  ;; canonical proof bytes.  :HOST returns a detached actual control image,
+  ;; system ID, history and end.  :WITH-ORIGIN runs its callback inside the
+  ;; actual origin proof and root-reader lease.
   (unless (logical-slot-imported-host-startup-owner-p owner)
     (error "continuation startup storage requires a typed host startup owner"))
   (call-with-logical-slot-imported-proof-files

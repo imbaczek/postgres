@@ -464,6 +464,8 @@ retains protection until readback reconciliation or durable retirement."
 
 Restore all durable references before deletion begins.  Do not acquire store or
 WAL locks while holding the archive mutex."
+  ;; The continuation guard assumes the fixed PGDATA/pg_physical_retained
+  ;; parent; an alias of the archive directory needs separate handling.
   (let ((directory (physical-retained-root-directory directory)))
     (sb-thread:with-mutex (*physical-retained-inventory-publish-lock*)
       (unless (or (physical-retained-root-protected-under-lock directory kind id)

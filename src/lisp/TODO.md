@@ -1,5 +1,13 @@
 # Development TODO
 
+- [ ] Bind retained-root deletion to checked archive and host identities before
+  permitting deletion after continuation restoration. The fence assumes the
+  fixed `PGDATA/pg_physical_retained/` parent. A separate bind-mount alias can
+  have another parent and miss that path check; generic root references also
+  use canonical directory paths. Qualify aliases with held descriptors and mount
+  identities before opening GC after continuation restoration. Current typed
+  archive inputs require the fixed child, and the imported-host fence stays closed.
+
 - [x] Allow detached index builds to overlap logical DDL on other tables.
   Capture schema-before and validate subscriber state at final catalog publication,
   after relation gates. Keep response collection separate from publication locks.

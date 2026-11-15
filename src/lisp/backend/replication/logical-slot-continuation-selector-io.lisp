@@ -10,6 +10,7 @@
   (logical-slot-continuation-storage-check storage))
 
 (defun logical-slot-continuation-selector-names (storage)
+  ;; Refuse unclassified entries and preserve them for investigation.
   (let* ((directory (logical-slot-continuation-storage-call storage :directory))
          (names (logical-slot-copy-import-control-names directory 3)))
     (unless (every (lambda (name) (member name '("selector" "selector.tmp") :test #'equal)) names)
@@ -28,6 +29,10 @@
     held))
 
 (defun logical-slot-continuation-selector-write-initial (storage image function)
+  ;; Raw selector I/O callers must hold the actual origin proof and its
+  ;; root-reader lease.  Resume only an exact temporary prefix.  A new file
+  ;; is opened exclusively, without following links, and its private named FD
+  ;; remains held through installation.
   (declare (notinline sb-posix:write sb-posix:fsync sb-posix:close))
   (let* ((directory (logical-slot-continuation-storage-call storage :directory))
          (limit (or *logical-slot-continuation-selector-write-limit* 65536))
@@ -94,6 +99,9 @@
                       (report-query-temp-cleanup-failure "continuation selector temporary" condition)))))))))))
 
 (defun call-with-logical-slot-continuation-selector (storage function)
+  ;; The selector is a self-contained canonical snapshot, not a pointer chain.
+  ;; The caller must keep the origin proof and root-reader lease through this
+  ;; read; decoding model claims alone does not prove the source.
   (let ((directory (logical-slot-continuation-storage-call storage :directory)))
     (call-with-logical-slot-copy-source-proof-fd
      directory "selector" nil
@@ -107,6 +115,9 @@
            (logical-slot-imported-check-held-file directory "selector" fd facts image)))))))
 
 (defun logical-slot-continuation-install-initial-selector (storage image)
+  ;; Publish with NOREPLACE, sync file and directory, and read back the exact
+  ;; selected image.  A canonical selector with a temporary is ambiguous and
+  ;; is refused without removing either file.
   (declare (notinline sb-posix:fsync))
   (let ((directory (logical-slot-continuation-storage-call storage :directory)))
     (logical-slot-continuation-selector-write-initial

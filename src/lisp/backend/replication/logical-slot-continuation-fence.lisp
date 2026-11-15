@@ -4,6 +4,9 @@
   (make-hash-table :test #'equal :synchronized t))
 
 (defun logical-slot-continuation-gc-fenced-p (directory)
+  ;; Once the feature is seen, the fence stays closed for this PGDATA
+  ;; device, inode and mount, including after empty restoration.  There is no
+  ;; opening path yet.
   (let ((root (uiop:ensure-directory-pathname directory)))
     (when (slot-state-lstat root)
       (let* ((facts (physical-image-file-facts -100 (namestring (truename root))))
