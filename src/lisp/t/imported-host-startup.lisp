@@ -578,6 +578,94 @@
     (assert rejected)
     (format t "~&NATIVE-ACTIVE-CANONICAL-BASELINE PASS caller-provided saved baseline cannot hide an inside-record restart~%")))
 
+(defun native-host-continuation-composed-cursors (gate ownership)
+  (let ((totals (list 0 0 0)) (slots 0))
+    (dolist (row (slot-state-map (wal-replication-slot-directory)
+                                 (lambda (bytes name) (list name bytes)) :local-workspace t))
+      (let ((slot (logical-slot-state-decode (second row) (first row))))
+        (when (eq :reserved (wal-replication-slot-wal-status slot))
+          (incf slots)
+          (call-with-logical-slot-continuation-startup-cursor
+           gate ownership (first row)
+           (lambda (cursor check seams)
+             (destructuring-bind (base fork end) seams
+               (let ((counts (list 0 0 0)))
+                 (loop
+                   (multiple-value-bind (record raw owner carrier kind) (logical-wal-cursor-next cursor)
+                     (declare (ignore raw owner carrier kind))
+                     (unless record (return))
+                     (incf (nth (cond ((< (wal-record-start record) base) 0)
+                                      ((< (wal-record-start record) fork) 1) (t 2)) counts))))
+                 (funcall check)
+                 (assert (= end (logical-wal-cursor-position cursor)))
+                 (setf totals (mapcar #'+ totals counts))
+                 (format t "~&NATIVE-COMPOSED-READER slot=~a sidecar=~d origin=~d child=~d seams=~s~%"
+                         (first row) (first counts) (second counts) (third counts) seams))))))))
+    (assert (plusp slots))
+    (assert (every #'plusp totals))
+    (format t "~&NATIVE-COMPOSED-READER PASS slots=~d lane-records=~s~%" slots totals)))
+
+(defun native-host-continuation-pending-candidates (gate ownership)
+  (let ((entries (logical-slot-startup-read-inventory :local-workspace t))
+        (total 0))
+    (call-with-logical-slot-imported-startup-source
+     gate ownership entries
+     (lambda (source)
+       (call-with-logical-slot-continuation-startup-readers
+        gate ownership
+        (lambda (read-slot check)
+          (dolist (entry entries)
+            (let ((slot (logical-slot-startup-entry-slot entry)))
+              (when (eq :reserved (wal-replication-slot-wal-status slot))
+                (funcall read-slot (wal-replication-slot-name slot)
+                         (lambda (cursor seams)
+                           (declare (ignore seams))
+                           (let* ((pending (logical-slot-startup-derive-pending-with-cursor source slot cursor))
+                                  (rows (loop for xid being the hash-keys of pending
+                                                using (hash-value positions)
+                                              collect (list xid (car positions) (cdr positions)))))
+                             (incf total (hash-table-count pending))
+                             (dolist (row rows)
+                               (assert (<= (wal-replication-slot-restart-lsn slot)
+                                           (second row) (third row) (logical-slot-startup-source-end source))))
+                             (format t "~&NATIVE-COMPOSED-PENDING slot=~a pending=~s~%"
+                                     (wal-replication-slot-name slot) (sort rows #'< :key #'first))))))))
+          (funcall check)))))
+    (assert (plusp total))
+    (format t "~&NATIVE-COMPOSED-PENDING PASS candidates=~d pending-xids=~d registry-unpublished~%"
+            (length entries) total)))
+
+(defun native-host-continuation-caught-reader-failure (gate ownership)
+  (let ((caught nil) (rejected nil)
+                     (name (first (find-if
+                                   (lambda (row)
+                                     (eq :reserved (wal-replication-slot-wal-status
+                                                    (logical-slot-state-decode (second row) (first row)))))
+                                   (slot-state-map (wal-replication-slot-directory)
+                                                   (lambda (bytes name) (list name bytes)) :local-workspace t)))))
+    (assert name)
+    (setf rejected
+          (handler-case
+              (progn
+                (call-with-logical-slot-continuation-startup-readers
+                 gate ownership
+                 (lambda (read-slot check)
+                   (declare (ignore check))
+                   (handler-case
+                       (funcall read-slot name
+                                (lambda (cursor seams)
+                                  (declare (ignore seams))
+                                  (logical-wal-cursor-next cursor)
+                                  (error "intentional composed slot callback failure")))
+                     (error (condition)
+                       (setf caught (search "intentional composed slot callback failure"
+                                            (princ-to-string condition)))))))
+                nil)
+            (error () t)))
+    (assert caught)
+    (assert rejected)
+    (format t "~&NATIVE-COMPOSED-CAUGHT-FAILURE PASS caught slot failure rejects entire reader scope~%")))
+
 (defun native-host-continuation-active-refusal (gate ownership)
   (let* ((entries (logical-slot-startup-read-inventory :local-workspace t))
          (registry *wal-replication-slots*)
@@ -621,6 +709,10 @@
                 (length rows) records (logical-slot-continuation-plan-tail-request plan) rejected)))
     (native-host-continuation-boundary-probes gate ownership)
     (native-host-continuation-reject-caller-baseline gate ownership)
+    (when (uiop:getenv "PG_NATIVE_COMPOSED_READER")
+      (native-host-continuation-composed-cursors gate ownership)
+      (native-host-continuation-pending-candidates gate ownership)
+      (native-host-continuation-caught-reader-failure gate ownership))
     (assert (equalp control (logical-slot-startup-control-image)))
     (assert (eq registry *wal-replication-slots*))
     (assert (zerop (hash-table-count registry)))

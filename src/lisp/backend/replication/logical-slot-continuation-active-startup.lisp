@@ -123,7 +123,7 @@
          records))
      :segment-reader reader :batch-policy :strict)))
 
-(defun call-with-logical-slot-continuation-local-tail (storage snapshot function &key boundaries)
+(defun call-with-logical-slot-continuation-local-tail-source (storage snapshot function &key boundaries)
   ;; Prove the locally present original-child WAL from F to the sealed end.
   ;; The first pass records exact frames and a segment ledger; the second
   ;; compares frames, segment facts and ordered visits.  Hold one segment FD
@@ -184,6 +184,7 @@
                            (guard))))
                      (prove ()
                        (check)
+                       (close-current)
                        (setf visits nil)
                        (let ((verify (logical-spool-sealed-p spool)) (complete nil))
                          (unwind-protect
@@ -204,13 +205,21 @@
                                 (setf complete t))
                            (unless complete (setf failed t))))))
               (unwind-protect
-                   (progn (check) (multiple-value-prog1 (funcall function #'prove #'check) (check)))
+                   (progn (check) (multiple-value-prog1 (funcall function #'prove #'check #'read-segment #'guard) (check)))
                 (sb-sys:without-interrupts
                   (setf active nil)
                   (when current
                     (let ((stream (second current)))
                       (setf current nil)
                       (close stream)))))))))))))
+
+(defun call-with-logical-slot-continuation-local-tail (storage snapshot function &key boundaries)
+  (call-with-logical-slot-continuation-local-tail-source
+   storage snapshot
+   (lambda (prove check reader guard)
+     (declare (ignore reader guard))
+     (funcall function prove check))
+   :boundaries boundaries))
 
 (defun logical-slot-continuation-restore-active-startup (gate ownership)
   ;; Hold the original origin proof and root lease through both passes,

@@ -58,6 +58,22 @@
               (if complete (error condition)
                   (report-query-temp-cleanup-failure "continuation root" condition)))))))))
 
+(defun call-with-logical-slot-continuation-wal-directory (root function)
+  (call-with-logical-slot-copy-source-proof-fd
+   root "pg_wal" t
+   (lambda (directory facts)
+     (let ((active t) (thread sb-thread:*current-thread*))
+       (flet ((check ()
+                (unless (and active (eq thread sb-thread:*current-thread*)
+                             (equal facts (physical-image-file-facts directory))
+                             (equal facts (physical-image-file-facts root "pg_wal")))
+                  (error "continuation WAL directory lost its live named binding"))))
+         (unwind-protect
+              (progn
+                (check)
+                (multiple-value-prog1 (funcall function directory #'check) (check)))
+           (sb-sys:without-interrupts (setf active nil))))))))
+
 (defun call-with-logical-slot-continuation-startup-storage-context
     (owner context function)
   ;; Weak EQ identity dispatch and dynamic registration limit this capability
@@ -115,25 +131,31 @@
                                         (:with-local-wal
                                             (unless (functionp argument)
                                               (error "continuation local WAL requires a callback"))
-                                          (call-with-logical-slot-copy-source-proof-fd
-                                           root "pg_wal" t
-                                           (lambda (wal-directory wal-facts)
-                                             (let ((live t) (prior-wal-check wal-check))
-                                               (labels ((check-directory ()
-                                                          (unless (and live (eq thread sb-thread:*current-thread*))
-                                                            (error "continuation WAL directory scope ended or changed thread"))
-                                                          (unless (and
-                                                                   (equal wal-facts (physical-image-file-facts wal-directory))
-                                                                   (equal wal-facts (physical-image-file-facts root "pg_wal")))
-                                                            (error "continuation WAL directory lost its named binding"))))
-                                                 (unwind-protect
-                                                      (progn
-                                                        (setf wal-check #'check-directory)
-                                                        (check-directory)
-                                                        (multiple-value-prog1
-                                                            (funcall argument wal-directory #'check-directory)
-                                                          (check-directory)))
-                                                   (sb-sys:without-interrupts (setf live nil wal-check prior-wal-check))))))))
+                                          (call-with-logical-slot-continuation-wal-directory
+                                           root
+                                           (lambda (directory directory-check)
+                                             (let ((prior wal-check))
+                                               (unwind-protect
+                                                    (progn
+                                                      (setf wal-check (lambda () (when prior (funcall prior))
+                                                                        (funcall directory-check)))
+                                                      (funcall argument directory directory-check))
+                                                 (sb-sys:without-interrupts (setf wal-check prior)))))))
+                                        (:with-sidecar
+                                            (unless (functionp argument)
+                                              (error "continuation sidecar requires a callback"))
+                                          (call-with-logical-slot-continuation-sidecar
+                                           owner context
+                                           (logical-slot-copy-check-source-proof (first (funcall check t)))
+                                           (lambda () (state storage :check-under-lock))
+                                           (lambda (reader directory-check file-check)
+                                             (let ((prior wal-check))
+                                               (unwind-protect
+                                                    (progn
+                                                      (setf wal-check (lambda () (when prior (funcall prior))
+                                                                        (funcall directory-check)))
+                                                      (funcall argument reader file-check))
+                                                 (sb-sys:without-interrupts (setf wal-check prior)))))))
                                         (:directory directory)
                                         (:binding (first (funcall check t)))
                                         (:facts (logical-slot-copy-check-source-proof (first (funcall check t))))

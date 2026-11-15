@@ -33,6 +33,7 @@
                (:file "t/rove/continuation-storage-tests")
                (:file "t/rove/continuation-selector-tests")
                (:file "t/rove/continuation-active-startup-tests")
+               (:file "t/rove/logical-wal-lane-provider-tests")
                (:file "t/rove/logical-slot-imported-startup-principal-tests")
                (:file "t/rove/logical-slot-imported-startup-owner-tests")
                (:file "t/rove/pglz-tests")
