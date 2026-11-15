@@ -40,6 +40,10 @@
                root t (lambda (context) (funcall function owner context))))))))
 
 (defun native-host-origin-cursor-bridge (archive)
+  ;; Test the original parent archive through an archive-only cursor and a
+  ;; record provider into a cursor using current child history.  The enclosing
+  ;; archive scope holds its lease; guards recheck the source.  This test bridge
+  ;; does not provide admission.
   (let* ((base (getf (logical-wal-archive-reference archive) :base))
          (fork (getf (logical-wal-archive-reference archive) :end))
          (history (timeline-check-lineage

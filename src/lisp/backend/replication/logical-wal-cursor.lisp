@@ -50,6 +50,10 @@ record-reader are mutually exclusive. Strict batch policy rejects
 nested starts and an open batch at the horizon. The logical-reader policy
 lets the consumer discard abandoned batches and hide an incomplete tail;
 both policies reject end-of-recovery inside an open batch."
+  ;; Archive-only requires an archive and reads it directly, with no local
+  ;; fallback even on error.  Normal mode tries the local carrier first and
+  ;; consults the archive on ENOENT.  Both retain the scope, carrier, gap,
+  ;; rotation, batch, and end checks.
   (timeline-check-lineage history)
   (unless (and (member batch-policy '(:strict :logical-reader))
                (functionp guard)
@@ -135,9 +139,10 @@ both policies reject end-of-recovery inside an open batch."
       (sb-sys:without-interrupts (setf active nil)))))
 
 (defun logical-wal-cursor-copy-at (cursor position carrier)
-  "Copy from the exact local carrier, or consult the archive on open ENOENT.
+  "Copy from the archive alone, or from the local carrier with archive fallback.
 Return bytes, size and ready; ready true with NIL bytes means EOF, while a
 false ready value requests preparation.  Other open failures remain errors."
+  ;; Choose the archive before opening any local carrier in archive-only mode.
   (when (logical-wal-cursor-archive-only cursor)
     (return-from logical-wal-cursor-copy-at
       (logical-wal-archive-copy-at (logical-wal-cursor-archive cursor)
