@@ -2,26 +2,16 @@
 
 (declaim (ftype function check-primary-storage-startup-context))
 
-(defstruct (logical-slot-startup-entry (:constructor %make-logical-slot-startup-entry))
-  ;; Keep both the decoded candidate and its disk image for later rechecks.
-  (slot nil :read-only t) (bytes nil :read-only t) (image nil :read-only t)
-  (profile nil :read-only t) (provenance nil :read-only t))
+(declaim (ftype function call-with-logical-slot-imported-startup-principal
+                logical-slot-imported-startup-principal-under-lock))
 
-(defstruct (logical-slot-startup-source (:constructor %make-logical-slot-startup-source))
-  ;; Freeze the post-replay source before catalog initialization: durable
-  ;; catalog system ID, control, history, durable end and slot candidates.
-  ;; The gate and postmaster ownership are separate, borrowed authority.
-  (gate-owner nil :read-only t) (ownership nil :read-only t)
-  (entries nil :read-only t) (system-id nil :read-only t)
-  (root nil :read-only t) (history nil :read-only t) (history-bytes nil :read-only t)
-  (control nil :read-only t) (timeline nil :read-only t) (namespace nil :read-only t)
-  (end nil :read-only t) (incarnation nil :read-only t) (wal-level nil :read-only t)
-  (registry nil :read-only t) (maximum nil :read-only t) (policy nil :read-only t)
-  (thread nil :read-only t) (mutex nil :read-only t) active-p)
+(declaim (ftype function call-with-logical-slot-imported-startup-capture
+                logical-slot-imported-startup-capture-p
+                logical-slot-imported-startup-capture-call
+                %make-logical-slot-imported-startup-source
+                logical-slot-copy-descriptor-list-count))
 
 (defvar *logical-slot-startup-sources* nil)
-
-(defvar *logical-slot-imported-startup-sources* nil)
 
 (defun logical-slot-startup-known-p (slot)
   (and (wal-logical-slot-p slot) (wal-replication-slot-logical-provenance slot)))
@@ -117,11 +107,13 @@ promotion may explicitly skip the local workspace; incoming images stay strict."
       (logical-slot-startup-check-live source)))
   t)
 
-(defun %call-with-logical-slot-startup-source (gate-owner ownership entries function)
+(defun %call-with-logical-slot-startup-source (gate-owner ownership entries function &optional capture)
   "Capture startup source facts after independently checking the context.
 Child-owned candidates require history even when all are lost. Capture alone
 publishes nothing and does not authorize imported use."
   (check-primary-storage-startup-context gate-owner ownership)
+  (when (and capture (not (logical-slot-imported-startup-capture-p capture)))
+    (error "startup capture requires its typed imported purpose"))
   (let* ((slots (mapcar #'logical-slot-startup-entry-slot entries))
          (system-id (logical-slot-check-startup-candidate-identities slots))
          (history-required
@@ -148,17 +140,20 @@ publishes nothing and does not authorize imported use."
                    (when (and (logical-slot-startup-known-p slot)
                               (eq :reserved (wal-replication-slot-wal-status slot)))
                      (logical-slot-check-primary-history slot history))))
-               (%make-logical-slot-startup-source
-                :gate-owner gate-owner :ownership ownership :entries (copy-list entries)
-                :system-id system-id :root (logical-wal-current-root-identity)
-                :history history :history-bytes bytes :control (logical-slot-startup-control-image)
-                :timeline timeline :namespace *wal-segment-namespace* :end *wal-durable-lsn*
-                :incarnation *wal-storage-incarnation* :wal-level *wal-level*
-                :registry *wal-replication-slots* :maximum *max-replication-slots* :policy *wal-logical-policy*
-                :thread sb-thread:*current-thread* :mutex *wal-lock* :active-p t)))))
+               (apply (if capture #'%make-logical-slot-imported-startup-source
+                          #'%make-logical-slot-startup-source)
+                      (append (when capture (list :capture capture))
+                              (list :gate-owner gate-owner :ownership ownership :entries (copy-list entries)
+                                    :system-id system-id :root (logical-wal-current-root-identity)
+                                    :history history :history-bytes bytes :control (logical-slot-startup-control-image)
+                                    :timeline timeline :namespace *wal-segment-namespace* :end *wal-durable-lsn*
+                                    :incarnation *wal-storage-incarnation* :wal-level *wal-level*
+                                    :registry *wal-replication-slots* :maximum *max-replication-slots* :policy *wal-logical-policy*
+                                    :thread sb-thread:*current-thread* :mutex *wal-lock* :active-p t)))))))
     (let ((*logical-slot-startup-sources* (cons source *logical-slot-startup-sources*)))
       (unwind-protect
            (progn
+             (when capture (logical-slot-imported-startup-capture-call source :bind))
              (logical-slot-startup-check-authority source)
              (sb-thread:with-mutex (*wal-lock*) (logical-slot-startup-check-source source))
              (funcall function source))
@@ -173,27 +168,26 @@ publishes nothing and does not authorize imported use."
 (defun logical-slot-imported-startup-check-under-lock (source)
   "Check imported purpose, lifetime and captured in-memory source and candidate
 facts under WAL exclusion. This does not recheck disk inventory bytes."
-  (assert (sb-thread:holding-mutex-p *wal-lock*))
-  (unless (member source *logical-slot-imported-startup-sources* :test #'eq)
-    (error "imported logical source requires its registered startup candidate scope"))
-  (logical-slot-startup-check-source source))
+  (logical-slot-imported-startup-principal-under-lock source)
+  t)
 
 (defun call-with-logical-slot-imported-startup-source (gate-owner ownership entries function)
   "Observe child-owned candidates in a registered imported startup scope.
 Check disk inventory at entry; later under-WAL checks cover captured in-memory
 source and candidate facts, not disk inventory bytes."
   (check-primary-storage-startup-context gate-owner ownership)
+  (logical-slot-copy-descriptor-list-count entries *max-replication-slots*)
   (unless (some (lambda (entry)
                   (wal-replication-slot-child-owner (logical-slot-startup-entry-slot entry)))
                 entries)
     (error "imported logical startup candidates require a child-owned slot"))
-  (%call-with-logical-slot-startup-source
-   gate-owner ownership entries
-   (lambda (source)
-     (logical-slot-startup-check-inventory source)
-     (let ((*logical-slot-imported-startup-sources*
-             (cons source *logical-slot-imported-startup-sources*)))
-       (funcall function source)))))
+  (call-with-logical-slot-imported-startup-capture
+   (lambda (capture)
+     (%call-with-logical-slot-startup-source
+      gate-owner ownership entries
+      (lambda (source)
+        (call-with-logical-slot-imported-startup-principal source function))
+      capture))))
 
 (defun logical-slot-startup-start-position (slot history)
   ;; A restart may name a record start at a fork or the end of a prefix.
