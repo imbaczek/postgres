@@ -1795,6 +1795,78 @@ WAL source or invalidating the retention pin, so it is not compared here."
                       (wal-retained-slot-scan-start scan)))
       (error "logical replication slot changed or lost retained WAL during scan"))))
 
+(defstruct (wal-retained-slot-scan-scope (:constructor %make-wal-retained-slot-scan-scope))
+  (scan nil :read-only t) (purpose nil :read-only t)
+  (thread nil :read-only t) (mutex nil :read-only t)
+  (dispatch nil :read-only t))
+
+(defvar *wal-retained-slot-scan-scopes* nil)
+
+(defun wal-retained-slot-scan-check-frozen-under-lock (scan snapshot)
+  (assert (sb-thread:holding-mutex-p *wal-lock*))
+  (unless (and
+           (equal (wal-retained-slot-scan-name scan) (wal-retained-slot-scan-name snapshot))
+           (eq (wal-retained-slot-scan-slot scan) (wal-retained-slot-scan-slot snapshot))
+           (eq (wal-retained-slot-scan-owner scan) (wal-retained-slot-scan-owner snapshot))
+           (eql (wal-retained-slot-scan-database scan) (wal-retained-slot-scan-database snapshot))
+           (equal (wal-retained-slot-scan-plugin scan) (wal-retained-slot-scan-plugin snapshot))
+           (eql (wal-retained-slot-scan-timeline scan) (wal-retained-slot-scan-timeline snapshot))
+           (eq (wal-retained-slot-scan-namespace scan) (wal-retained-slot-scan-namespace snapshot))
+           (eql (wal-retained-slot-scan-start scan) (wal-retained-slot-scan-start snapshot))
+           (eql (wal-retained-slot-scan-end scan) (wal-retained-slot-scan-end snapshot))
+           (eq (wal-retained-slot-scan-pin scan) (wal-retained-slot-scan-pin snapshot))
+           (eq (wal-retained-slot-scan-continuation scan)
+               (wal-retained-slot-scan-continuation snapshot)))
+    (error "logical retained scan changed its frozen principal"))
+  (wal-retained-slot-scan-validate-under-lock scan)
+  t)
+
+(defun wal-retained-slot-scan-capture-scope-under-lock (scan purpose)
+  (assert (sb-thread:holding-mutex-p *wal-lock*))
+  (let ((snapshot (copy-wal-retained-slot-scan scan))
+        (thread sb-thread:*current-thread*) (mutex *wal-lock*) (active t) (failed nil))
+    (setf (wal-retained-slot-scan-name snapshot) (copy-seq (wal-retained-slot-scan-name scan))
+          (wal-retained-slot-scan-plugin snapshot) (copy-seq (wal-retained-slot-scan-plugin scan)))
+    (%make-wal-retained-slot-scan-scope
+     :scan scan :purpose (ecase purpose (:stream :stream) (:terminal-check :terminal-check))
+     :thread thread :mutex mutex
+     :dispatch
+     (lambda (operation)
+       (unless (and (eq thread sb-thread:*current-thread*) (eq mutex *wal-lock*)
+                    (sb-thread:holding-mutex-p mutex))
+         (error "logical retained scan principal changed thread or WAL mutex"))
+       (ecase operation
+         (:check
+          (unless (and active (not failed))
+            (error "logical retained scan principal ended or failed"))
+          (sb-sys:without-interrupts
+            (let ((complete nil))
+              (unwind-protect
+                   (multiple-value-prog1
+                       (sb-sys:with-local-interrupts
+                         (wal-retained-slot-scan-check-frozen-under-lock scan snapshot))
+                     (setf complete t))
+                (unless complete (setf failed t))))))
+         (:release
+          (sb-sys:without-interrupts
+            (setf active nil)
+            (remhash (wal-retained-slot-scan-pin snapshot) *wal-snapshot-retention-pins*))))))))
+
+(defun wal-retained-slot-scan-check-scope-under-lock (scan)
+  (assert (sb-thread:holding-mutex-p *wal-lock*))
+  (let ((scope (find scan *wal-retained-slot-scan-scopes*
+                     :key #'wal-retained-slot-scan-scope-scan :test #'eq)))
+    (unless (and scope
+                 (eq sb-thread:*current-thread* (wal-retained-slot-scan-scope-thread scope))
+                 (eq *wal-lock* (wal-retained-slot-scan-scope-mutex scope)))
+      (error "logical retained scan has no live principal on this thread and WAL mutex"))
+    (funcall (wal-retained-slot-scan-scope-dispatch scope) :check)
+    scan))
+
+(defun wal-retained-slot-scan-release-scope-under-lock (scope)
+  (assert (sb-thread:holding-mutex-p *wal-lock*))
+  (funcall (wal-retained-slot-scan-scope-dispatch scope) :release))
+
 (declaim (ftype function logical-slot-check-primary-history logical-slot-primary-history-under-lock))
 
 (declaim (ftype function logical-wal-reusable-continuation logical-slot-wal-scan-start-position
@@ -1811,7 +1883,9 @@ other slots retain the one-argument callback. A matching, rechecked continuation
 may start at the requested position. Stale evidence at admission falls back to
 restart replay; a source change after pinning aborts the scan. The reader must
 independently prove the anchor's position role."
-  (let ((scan nil) (requested nil) (replay nil) (continuation nil))
+  (let ((scan nil) (requested nil) (replay nil) (continuation nil)
+                   (scope nil) (owned-pin nil)
+                   (*wal-retained-slot-scan-scopes* *wal-retained-slot-scan-scopes*))
     (unwind-protect
          (progn
            (sb-sys:without-interrupts
@@ -1852,14 +1926,19 @@ independently prove the anchor's position role."
                                :plugin (copy-seq (wal-replication-slot-plugin slot))
                                :timeline *wal-insert-timeline* :namespace *wal-segment-namespace*
                                :start start :end end :cursor start :pin pin :continuation continuation))
-                   (setf (gethash pin *wal-snapshot-retention-pins*) start)))))
+                   (setf owned-pin pin
+                         (gethash pin *wal-snapshot-retention-pins*) start
+                         scope (wal-retained-slot-scan-capture-scope-under-lock scan :stream))
+                   (push scope *wal-retained-slot-scan-scopes*)))))
            (if replay
                (funcall function scan requested)
                (funcall function scan)))
-      (when scan
+      (when owned-pin
         (sb-sys:without-interrupts
           (sb-thread:with-mutex (*wal-lock*)
-            (remhash (wal-retained-slot-scan-pin scan) *wal-snapshot-retention-pins*)))))))
+            (if scope
+                (wal-retained-slot-scan-release-scope-under-lock scope)
+                (remhash owned-pin *wal-snapshot-retention-pins*))))))))
 
 (defun wal-retained-slot-scan-next (scan)
   "Copy one retained durable record under the lock, then validate it outside."

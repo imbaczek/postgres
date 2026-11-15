@@ -23,6 +23,8 @@
                (:file "t/rove/logical-slot-copy-descriptor-tests")
                (:file "t/rove/logical-slot-copy-binding-tests")
                (:file "t/rove/logical-wal-cursor-tests")
+               (:file "t/rove/logical-slot-scan-scope-tests")
+               (:file "t/rove/logical-slot-imported-owner-tests")
                (:file "t/rove/pglz-tests")
                (:file "t/rove/numeric-storage-tests")
                (:file "t/rove/jsonb-storage-tests")

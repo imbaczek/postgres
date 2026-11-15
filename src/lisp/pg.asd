@@ -403,6 +403,7 @@
                    (:file "../replication/logical-slot-copy-source-proof-binding")
                    (:file "../replication/logical-slot-copy-source-proof-archive")
                    (:file "../replication/logical-slot-copy-source-proof-reader-fs")
+                   (:file "../replication/logical-slot-imported-source-owner")
                    (:file "../replication/logical-slot-copy-source-proof-reader-owner")
                    (:file "../replication/logical-slot-copy-source-proof-reader")
                    (:file "../replication/logical-slot-copy-source-proof-preparation")

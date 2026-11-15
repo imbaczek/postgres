@@ -706,7 +706,8 @@ captures the restart anchor and its role before scanning.  The WAL lock is
 not held across the entire scan; individual record reads still take it.
 WAL and pending transactions may grow during the scan; FINISH must recheck
 current slot state under the lock before acting on the proof."
-  (let ((scan nil) (source nil) (owner nil) (role nil))
+  (let ((scan nil) (source nil) (owner nil) (role nil) (scope nil) (owned-pin nil)
+                   (*wal-retained-slot-scan-scopes* *wal-retained-slot-scan-scopes*))
     (unwind-protect
          (progn
            (sb-thread:with-mutex (*wal-lock*)
@@ -732,12 +733,17 @@ current slot state under the lock before acting on the proof."
                                :plugin (copy-seq (wal-replication-slot-plugin slot))
                                :timeline *wal-insert-timeline* :namespace *wal-segment-namespace*
                                :start start :end end :cursor start :pin pin))
-                   (setf (gethash pin *wal-snapshot-retention-pins*) start))
+                   (setf owned-pin pin
+                         (gethash pin *wal-snapshot-retention-pins*) start
+                         scope (wal-retained-slot-scan-capture-scope-under-lock scan :terminal-check))
+                   (push scope *wal-retained-slot-scan-scopes*))
                  (setf source (logical-wal-capture-source scan :purpose :terminal-check))
                  (multiple-value-setq (owner role) (logical-slot-wal-scan-start-position scan))
                  (logical-wal-check-source source end))))
            (call-with-logical-terminal-cursor scan source owner role target finish))
-      (when scan
+      (when owned-pin
         (sb-sys:without-interrupts
           (sb-thread:with-mutex (*wal-lock*)
-            (remhash (wal-retained-slot-scan-pin scan) *wal-snapshot-retention-pins*)))))))
+            (if scope
+                (wal-retained-slot-scan-release-scope-under-lock scope)
+                (remhash owned-pin *wal-snapshot-retention-pins*))))))))
