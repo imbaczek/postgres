@@ -313,3 +313,37 @@
         (unit-continuation-boundary-records observe)
         (rove:ok (handler-case (progn (funcall finish) nil) (error () t))
                  "The child EOR never certifies a prefix-end restart"))))
+
+(cl-spec:defproperty startup-publication-image-detects-derived-state-mutation
+    ((xid (range integer 3 10000)) (start (range integer 32 128)) (span (range integer 1 128)))
+  (:about logical-slot-publication-check-registry)
+  (:trials (:normal 200))
+  (multiple-value-bind (certificate host rows) (unit-continuation-active-inputs)
+    (declare (ignore certificate host))
+    (let* ((slot (logical-slot-state-decode (second (find "alpha" rows :key #'first :test #'equal)) "alpha"))
+           (pending (wal-replication-slot-pending-xids slot))
+           (registry (make-hash-table :test #'equal)))
+      (setf (gethash xid pending) (cons start (+ start span))
+            (gethash "alpha" registry) slot)
+      (let ((image (logical-slot-publication-registry-image registry)))
+        (flet ((rejected ()
+                 (handler-case
+                     (progn (logical-slot-publication-check-registry registry image) nil)
+                   (error () t))))
+          (and (logical-slot-publication-check-registry registry image)
+               (progn (incf (cdr (gethash xid pending))) (rejected))
+               (progn (decf (cdr (gethash xid pending)))
+                      (logical-slot-publication-check-registry registry image))
+               (progn (setf (gethash "alpha" registry) (copy-wal-replication-slot slot)) (rejected))
+               (progn (setf (gethash "alpha" registry) slot
+                            (wal-replication-slot-state-uncertain-p slot) t)
+                      (rejected))))))))
+
+(rove:deftest startup-publication-image-generated-contract
+    (let ((result (cl-spec:result-data
+                   (cl-spec:run-property 'startup-publication-image-detects-derived-state-mutation
+                                         :seed 11502 :profile :normal))))
+      (format t "~&STARTUP-PUBLICATION-IMAGE status=~s trials=~s seed=11502 digest=~s~%"
+              (getf result :status) (getf result :trials) (getf result :definition-digest))
+      (rove:ok (eq :passed (getf result :status)) (format nil "~s" result))
+      (rove:ok (= 200 (getf result :trials)))))

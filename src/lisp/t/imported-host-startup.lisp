@@ -601,6 +601,14 @@
                  (setf totals (mapcar #'+ totals counts))
                  (format t "~&NATIVE-COMPOSED-READER slot=~a sidecar=~d origin=~d child=~d seams=~s~%"
                          (first row) (first counts) (second counts) (third counts) seams))))))))
+    (assert (equal '(:primary :secondary)
+                   (multiple-value-list
+                    (call-with-logical-slot-continuation-startup-readers
+                     gate ownership
+                     (lambda (read-slot check)
+                       (declare (ignore read-slot))
+                       (funcall check)
+                       (values :primary :secondary))))))
     (assert (plusp slots))
     (assert (every #'plusp totals))
     (format t "~&NATIVE-COMPOSED-READER PASS slots=~d lane-records=~s~%" slots totals)))
@@ -687,6 +695,172 @@
     (assert rejected)
     (format t "~&NATIVE-STARTUP-OBSERVATION-NO-PUBLISH PASS registry and mirrors unchanged~%")))
 
+(defun native-host-continuation-publication-failures (gate ownership)
+  (dolist (point '(:derived :prepared :before-commit :pending-tamper))
+    (let* ((mirrors (logical-slot-publication-mirrors))
+           (fds (length (directory #p"/proc/self/fd/*")))
+           (sentinel (make-condition 'simple-error :format-control "native startup publication cut"))
+           (injected nil) (caught nil)
+           (*logical-slot-startup-publication-test-hook*
+             (lambda (observed owner token restored)
+               (declare (ignore owner token))
+               (when (or (eq point observed)
+                         (and (eq point :pending-tamper) (eq observed :before-commit)))
+                 (setf injected t)
+                 (if (eq point :pending-tamper)
+                     (let* ((slot (loop for slot being the hash-values of restored return slot))
+                            (pending (wal-replication-slot-pending-xids slot))
+                            (xid (loop for xid being the hash-keys of pending return xid)))
+                       (incf (cdr (gethash xid pending))))
+                     (error sentinel))))))
+      (handler-case (logical-slot-continuation-publish-startup gate ownership)
+        (error (condition) (setf caught condition)))
+      (assert injected)
+      (assert (if (eq point :pending-tamper)
+                  (and caught (search "derived pending state changed" (princ-to-string caught)))
+                  (eq sentinel caught)))
+      (assert (equal mirrors (logical-slot-publication-mirrors)))
+      (assert (= fds (length (directory #p"/proc/self/fd/*"))))
+      (format t "~&NATIVE-STARTUP-PUBLICATION-PRECOMMIT PASS cut=~s registry-and-mirrors-unchanged~%" point)))
+  (let* ((registry *wal-replication-slots*)
+         (fds (length (directory #p"/proc/self/fd/*")))
+         (sentinel (make-condition 'simple-error :format-control "native startup publication postcommit cut"))
+         (caught nil)
+         (*logical-slot-startup-publication-test-hook*
+           (lambda (point owner token restored)
+             (declare (ignore owner token restored))
+             (when (eq point :after-commit) (error sentinel)))))
+    (handler-case (logical-slot-continuation-publish-startup gate ownership)
+      (error (condition) (setf caught condition)))
+    (assert (eq sentinel caught))
+    (assert (not (eq registry *wal-replication-slots*)))
+    (assert (= 2 (hash-table-count *wal-replication-slots*) *logical-capture-live-slots*))
+    (maphash
+     (lambda (name slot)
+       (assert (wal-replication-slot-state-uncertain-p slot))
+       (assert (handler-case (progn (wal-require-known-replication-slot name) nil) (error () t))))
+     *wal-replication-slots*)
+    (assert (= fds (length (directory #p"/proc/self/fd/*"))))
+    (assert (logical-slot-continuation-gc-fenced-p *pgdata*))
+    (format t "~&NATIVE-STARTUP-PUBLICATION-POSTCOMMIT PASS registry-installed slots-uncertain no-rollback~%")))
+
+(defun native-host-continuation-publication-notify-unwind (gate ownership)
+  (dolist (site '(:context :notify-entry))
+    (let* ((registry *wal-replication-slots*)
+           (fds (length (directory #p"/proc/self/fd/*")))
+           (saved-owner nil)
+           (tag (gensym "PUBLICATION-NOTIFY-CUT-"))
+           (target (ecase site
+                     (:context 'check-primary-storage-startup-context)
+                     (:notify-entry 'logical-slot-startup-publication-notify)))
+           (original (symbol-function target))
+           (result nil))
+      (let ((*logical-slot-startup-publication-test-hook*
+              (lambda (point owner token restored)
+                (declare (ignore token restored))
+                (when (eq point :after-commit) (setf saved-owner owner)))))
+        (unwind-protect
+             (progn
+               (setf (symbol-function target)
+                     (lambda (&rest arguments)
+                       (ecase site
+                         (:context
+                          (multiple-value-prog1 (apply original arguments)
+                            (when (and saved-owner (not (physical-adoption-owner-active-p saved-owner)))
+                              (throw tag :notify-cut))))
+                         (:notify-entry
+                          (assert saved-owner)
+                          (assert (not (physical-adoption-owner-active-p saved-owner)))
+                          (throw tag :notify-cut)))))
+               (setf result
+                     (catch tag
+                       (logical-slot-continuation-publish-startup gate ownership)
+                       :unexpected-return)))
+          (setf (symbol-function target) original)))
+      (assert (eq :notify-cut result))
+      (assert (not (eq registry *wal-replication-slots*)))
+      (assert (not (physical-adoption-owner-active-p saved-owner)))
+      (maphash (lambda (name slot)
+                 (declare (ignore name))
+                 (assert (wal-replication-slot-state-uncertain-p slot)))
+               *wal-replication-slots*)
+      (assert (= fds (length (directory #p"/proc/self/fd/*"))))
+      (format t "~&NATIVE-STARTUP-PUBLICATION-NOTIFY-UNWIND PASS site=~s original-throw-preserved registry-fenced~%" site))))
+
+(defun native-host-continuation-publication (gate ownership)
+  (let* ((entries (logical-slot-startup-read-inventory :local-workspace t))
+         (registry *wal-replication-slots*)
+         (expected (make-hash-table :test #'equal)))
+    (call-with-logical-slot-imported-startup-source
+     gate ownership entries
+     (lambda (source)
+       (call-with-logical-slot-continuation-startup-readers
+        gate ownership
+        (lambda (read-slot check)
+          (dolist (entry entries)
+            (let ((slot (logical-slot-startup-entry-slot entry)))
+              (when (eq :reserved (wal-replication-slot-wal-status slot))
+                (funcall read-slot (wal-replication-slot-name slot)
+                         (lambda (cursor seams)
+                           (declare (ignore seams))
+                           (setf (gethash (wal-replication-slot-name slot) expected)
+                                 (logical-slot-startup-derive-pending-with-cursor source slot cursor)))))))
+          (funcall check)))))
+    (when (uiop:getenv "PG_NATIVE_STARTUP_PUBLICATION_FAULTS")
+      (native-host-continuation-publication-failures gate ownership)
+      (native-host-continuation-publication-notify-unwind gate ownership))
+    (let* ((negative-checks 0) (saved-owner nil) (saved-token nil)
+                               (*logical-slot-startup-publication-test-hook*
+                                 (lambda (point owner token prepared)
+                                   (declare (ignore prepared))
+                                   (setf saved-owner owner saved-token token)
+                                   (case point
+                                     (:derived (assert (null *logical-slot-startup-sources*)))
+                                     (:prepared
+                                      (dolist (pair (list (list (copy-logical-slot-startup-publication-owner owner) token)
+                                                          (list owner (copy-logical-slot-startup-publication-token token))))
+                                        (assert (handler-case
+                                                    (progn (logical-slot-startup-publication-call
+                                                            (first pair) :prepare (second pair)) nil)
+                                                  (error () t)))
+                                        (incf negative-checks))
+                                      (let* ((registered *logical-slot-startup-publication-owners*)
+                                             (thread
+                                               (sb-thread:make-thread
+                                                (lambda ()
+                                                  (let ((*logical-slot-startup-publication-owners* registered))
+                                                    (handler-case
+                                                        (progn (logical-slot-startup-publication-call owner :prepare token) nil)
+                                                      (error () t)))))))
+                                        (assert (sb-thread:join-thread thread))
+                                        (incf negative-checks)))
+                                     (:after-commit
+                                      (assert (handler-case
+                                                  (progn (logical-slot-startup-publication-call owner :commit token) nil)
+                                                (error () t)))
+                                      (incf negative-checks)))))
+                               (restored (logical-slot-continuation-publish-startup gate ownership)))
+      (assert (= 4 negative-checks))
+      (assert (not (physical-adoption-owner-active-p saved-owner)))
+      (assert (handler-case
+                  (progn (logical-slot-startup-publication-call saved-owner :commit saved-token) nil)
+                (error () t)))
+      (assert (and (eq restored *wal-replication-slots*) (not (eq registry restored))))
+      (assert (= (length entries) (hash-table-count restored) *logical-capture-live-slots*))
+      (dolist (entry entries)
+        (let* ((old (logical-slot-startup-entry-slot entry))
+               (slot (gethash (wal-replication-slot-name old) restored))
+               (pending (gethash (wal-replication-slot-name old) expected)))
+          (assert (and slot (not (eq old slot))))
+          (assert (equalp (logical-slot-startup-candidate-image old)
+                          (logical-slot-startup-candidate-image slot)))
+          (assert (and (= 2 (hash-table-count pending))
+                       (equalp pending (wal-replication-slot-pending-xids slot))))
+          (assert (not (wal-replication-slot-state-uncertain-p slot)))))
+      (assert (logical-slot-continuation-gc-fenced-p *pgdata*))
+      (format t "~&NATIVE-STARTUP-PUBLICATION PASS slots=~d pending-per-slot=2 registry-and-mirrors-installed GC-fenced~%"
+              (hash-table-count restored)))))
+
 (defun native-host-continuation-active-refusal (gate ownership)
   (let* ((entries (logical-slot-startup-read-inventory :local-workspace t))
          (registry *wal-replication-slots*)
@@ -745,6 +919,11 @@
       (destructuring-bind (path facts bytes) row
         (assert (equal facts (physical-image-file-facts -100 (namestring path))))
         (assert (equalp bytes (read-bounded-regular-file path +slot-state-maximum-bytes+)))))
+    (when (uiop:getenv "PG_NATIVE_STARTUP_PUBLICATION")
+      (native-host-continuation-publication gate ownership)
+      (assert (equalp control (logical-slot-startup-control-image)))
+      (assert (= fds (length (directory #p"/proc/self/fd/*"))))
+      (assert (null *catalog*)))
     t))
 
 (defun native-imported-host-observation ()

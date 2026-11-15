@@ -51,7 +51,7 @@
                         :segment-reader reader :batch-policy :logical-reader)))))
         (open-lanes (nreverse specifications) nil)))))
 
-(defun call-with-logical-slot-continuation-startup-readers (gate ownership function)
+(defun call-with-logical-slot-continuation-storage-readers (storage facts function &optional finish)
   ;; Keep startup storage, canonical proof, selector FD, origin root lease,
   ;; local tail proof and sidecar live for the multislot callback.  The scope
   ;; checks guard, check and read-slot with a failure latch and postcheck.
@@ -59,82 +59,90 @@
   ;; does not sandbox them.  Current startup supports the original child only.
   ;; Runtime scan and ACK, atomic startup publication and admission remain
   ;; separate work; the GC fence remains closed.
+  (logical-slot-continuation-storage-call
+   storage :with-origin
+   (lambda (archive)
+     (unless (equal '("selector") (logical-slot-continuation-selector-names storage))
+       (error "composed startup reader requires an unambiguous stable selector"))
+     (call-with-logical-slot-continuation-selector
+      storage
+      (lambda (snapshot fd selector-facts)
+        (let ((image (logical-slot-continuation-encode snapshot))
+              (directory (logical-slot-continuation-storage-call storage :directory))
+              (source-facts (logical-slot-continuation-storage-call storage :facts)))
+          (logical-slot-continuation-check-active-startup storage facts snapshot)
+          (call-with-logical-slot-continuation-local-tail-source
+           storage snapshot
+           (lambda (prove check-tail local-reader local-guard)
+             (funcall prove)
+             (logical-slot-continuation-storage-call
+              storage :with-sidecar
+              (lambda (sidecar-reader check-files)
+                (let ((active t) (failed nil) (thread sb-thread:*current-thread*))
+                  (macrolet ((in-scope (&body body)
+                               (let ((complete (gensym "COMPLETE")))
+                                 `(progn
+                                    (unless (eq thread sb-thread:*current-thread*)
+                                      (error "composed startup reader changed thread"))
+                                    (unless (and active (not failed))
+                                      (error "composed startup reader ended or failed"))
+                                    (sb-sys:without-interrupts
+                                      (let ((,complete nil))
+                                        (unwind-protect
+                                             (multiple-value-prog1
+                                                 (sb-sys:with-local-interrupts (progn ,@body))
+                                               (setf ,complete t))
+                                          (unless ,complete (setf failed t)))))))))
+                    (labels ((guard ()
+                               (in-scope
+                                (logical-slot-continuation-storage-call storage :check-under-lock)
+                                (funcall local-guard)
+                                (unless (and (equal selector-facts (physical-image-file-facts fd))
+                                             (equal selector-facts (physical-image-file-facts directory "selector"))
+                                             (equal '("selector")
+                                                    (logical-slot-copy-import-control-names directory 3)))
+                                  (error "composed source lost its stable selected selector"))
+                                t))
+                             (check ()
+                               (in-scope
+                                (unless (equal '("selector") (logical-slot-continuation-selector-names storage))
+                                  (error "composed source has an ambiguous selector"))
+                                (logical-slot-continuation-check-active-startup storage nil snapshot)
+                                (logical-slot-imported-check-held-file directory "selector" fd selector-facts image)
+                                (funcall check-files)
+                                (funcall check-tail)))
+                             (read-slot (name callback)
+                               (in-scope
+                                (check)
+                                (let* ((row (find name (getf snapshot :slots) :key #'first :test #'equal))
+                                       (slot (and row (logical-slot-state-decode (second row) name))))
+                                  (unless (and slot (eq :reserved (wal-replication-slot-wal-status slot)))
+                                    (error "composed startup reader requires its saved reserved slot"))
+                                  (multiple-value-prog1
+                                      (call-with-logical-slot-continuation-lanes
+                                       source-facts snapshot slot archive sidecar-reader local-reader #'guard callback)
+                                    (check))))))
+                      (unwind-protect
+                           (progn
+                             (check)
+                             (let ((results (multiple-value-list (funcall function #'read-slot #'check))))
+                               (check)
+                               (funcall prove)
+                               (check)
+                               (multiple-value-prog1
+                                   (if finish
+                                       (funcall finish (first results) snapshot #'check #'guard)
+                                       (values-list results))
+                                 (check))))
+                        (sb-sys:without-interrupts (setf active nil)))))))))
+           :boundaries (lambda ()
+                         (logical-slot-continuation-active-boundaries storage nil snapshot archive)))))))))
+
+(defun call-with-logical-slot-continuation-startup-readers (gate ownership function)
   (call-with-logical-slot-continuation-startup-storage
    gate ownership
    (lambda (storage facts)
-     (logical-slot-continuation-storage-call
-      storage :with-origin
-      (lambda (archive)
-        (unless (equal '("selector") (logical-slot-continuation-selector-names storage))
-          (error "composed startup reader requires an unambiguous stable selector"))
-        (call-with-logical-slot-continuation-selector
-         storage
-         (lambda (snapshot fd selector-facts)
-           (let ((image (logical-slot-continuation-encode snapshot))
-                 (directory (logical-slot-continuation-storage-call storage :directory))
-                 (source-facts (logical-slot-continuation-storage-call storage :facts)))
-             (logical-slot-continuation-check-active-startup storage facts snapshot)
-             (call-with-logical-slot-continuation-local-tail-source
-              storage snapshot
-              (lambda (prove check-tail local-reader local-guard)
-                (funcall prove)
-                (logical-slot-continuation-storage-call
-                 storage :with-sidecar
-                 (lambda (sidecar-reader check-files)
-                   (let ((active t) (failed nil) (thread sb-thread:*current-thread*))
-                     (macrolet ((in-scope (&body body)
-                                  (let ((complete (gensym "COMPLETE")))
-                                    `(progn
-                                       (unless (eq thread sb-thread:*current-thread*)
-                                         (error "composed startup reader changed thread"))
-                                       (unless (and active (not failed))
-                                         (error "composed startup reader ended or failed"))
-                                       (sb-sys:without-interrupts
-                                         (let ((,complete nil))
-                                           (unwind-protect
-                                                (multiple-value-prog1
-                                                    (sb-sys:with-local-interrupts (progn ,@body))
-                                                  (setf ,complete t))
-                                             (unless ,complete (setf failed t)))))))))
-                       (labels ((guard ()
-                                  (in-scope
-                                   (logical-slot-continuation-storage-call storage :check-under-lock)
-                                   (funcall local-guard)
-                                   (unless (and (equal selector-facts (physical-image-file-facts fd))
-                                                (equal selector-facts (physical-image-file-facts directory "selector"))
-                                                (equal '("selector")
-                                                       (logical-slot-copy-import-control-names directory 3)))
-                                     (error "composed source lost its stable selected selector"))
-                                   t))
-                                (check ()
-                                  (in-scope
-                                   (unless (equal '("selector") (logical-slot-continuation-selector-names storage))
-                                     (error "composed source has an ambiguous selector"))
-                                   (logical-slot-continuation-check-active-startup storage nil snapshot)
-                                   (logical-slot-imported-check-held-file directory "selector" fd selector-facts image)
-                                   (funcall check-files)
-                                   (funcall check-tail)))
-                                (read-slot (name callback)
-                                  (in-scope
-                                   (check)
-                                   (let* ((row (find name (getf snapshot :slots) :key #'first :test #'equal))
-                                          (slot (and row (logical-slot-state-decode (second row) name))))
-                                     (unless (and slot (eq :reserved (wal-replication-slot-wal-status slot)))
-                                       (error "composed startup reader requires its saved reserved slot"))
-                                     (multiple-value-prog1
-                                         (call-with-logical-slot-continuation-lanes
-                                          source-facts snapshot slot archive sidecar-reader local-reader #'guard callback)
-                                       (check))))))
-                         (unwind-protect
-                              (progn
-                                (check)
-                                (multiple-value-prog1 (funcall function #'read-slot #'check)
-                                  (check)
-                                  (funcall prove)
-                                  (check)))
-                           (sb-sys:without-interrupts (setf active nil)))))))))
-              :boundaries (lambda ()
-                            (logical-slot-continuation-active-boundaries storage nil snapshot archive)))))))))))
+     (call-with-logical-slot-continuation-storage-readers storage facts function))))
 
 (defun call-with-logical-slot-continuation-startup-cursor (gate ownership name function)
   (call-with-logical-slot-continuation-startup-readers

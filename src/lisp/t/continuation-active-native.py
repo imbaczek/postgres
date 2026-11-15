@@ -85,7 +85,12 @@ def main():
                                 child=json.loads((logs / 'child.log').read_text())))
             campaign.write_json(logs / 'active-native-results.json', results)
             assert status == 0, str(log)
-            assert 'NATIVE-SELECTOR-ACTIVE-REFUSAL PASS' in log.read_text(errors='replace')
+            contents = log.read_text(errors='replace')
+            assert 'NATIVE-SELECTOR-ACTIVE-REFUSAL PASS' in contents
+            if os.environ.get('PG_NATIVE_STARTUP_PUBLICATION'):
+                assert 'NATIVE-STARTUP-PUBLICATION PASS' in contents
+            if os.environ.get('PG_NATIVE_STARTUP_PUBLICATION_FAULTS'):
+                assert 'NATIVE-STARTUP-PUBLICATION-POSTCOMMIT PASS' in contents
             assert identity == (data.stat().st_dev, data.stat().st_ino)
             assert before == fixture_image(data)
             image = file_image(selected)
@@ -94,7 +99,10 @@ def main():
             stable = image
         summary = dict(exit_code=0, source=frozen['image'], fixture=str(data),
                        fixture_identity=identity, preserved_files=before, selector=stable,
-                       runs=results, limits='Active initial selector proof; registry, admission and GC remain closed')
+                       runs=results,
+                       limits=('Startup registry publication under the owned gate; admission and GC remain closed'
+                               if os.environ.get('PG_NATIVE_STARTUP_PUBLICATION') else
+                               'Active initial selector proof; registry, admission and GC remain closed'))
         campaign.write_json(logs / 'active-native-summary.json', summary)
         print('CONTINUATION-ACTIVE-NATIVE PASS ' + json.dumps(summary), flush=True)
 
