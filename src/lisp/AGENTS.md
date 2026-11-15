@@ -619,6 +619,16 @@ Remove the trace and its temporary helper after the demo:
   `QUICKLISP-CLIENT` symbols in FASLs. Serialize batches that share a live image
   or write one cache. Existing process ownership, polling, and cleanup rules
   still apply.
+- For repeated strict unit or physical runs on unchanged source, use
+  `t/test-campaign.sh create`, `run CAMPAIGN unit|physical [head ...]`, and
+  `close CAMPAIGN` as described in the README. Each run has a fresh image and
+  strict compiler, private cache, and full identity and suite inventory gates.
+  Create a new campaign when the checkout revision, dirty source files or checked
+  runtime settings change. Jobs serialize within a campaign. The main test child retains
+  the run, campaign and RAM leases if its coordinator dies; the strict compiler
+  reacquires campaign and RAM leases. Preserve compact evidence and audit active
+  processes before deleting retained campaign files. Full unit runs have used
+  3.4–3.8 GiB; eight Lisp images is a ceiling, not a target.
 
 ## Tests
 

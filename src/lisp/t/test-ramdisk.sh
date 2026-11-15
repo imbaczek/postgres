@@ -12,6 +12,7 @@ source_name=pg-lisp-tests-$uid
 fail() { printf '%s\n' "$*" >&2; exit 1; }
 
 # Stable lock files live outside the mount so unmounting cannot replace a lease.
+# Campaign children retain the usage lease until they exit, including orphans.
 [[ ! -L $state ]] || fail "Refusing symlink $state"
 mkdir -p "$state"
 [[ $(stat -c %u:%a "$state") == "$uid:700" ]] || fail "Unsafe control directory $state"

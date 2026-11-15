@@ -1,4 +1,4 @@
-"""Fast filesystem contracts for the test campaign coordinator."""
+"""Filesystem, cache and inherited-lease contracts for the coordinator."""
 import importlib.util
 import os
 from pathlib import Path

@@ -85,6 +85,7 @@
         :features (sort (mapcar #'prin1-to-string *features*) #'string<)))
 
 (defun pg-test-record-manifest (actual output-variable expected-variable keys)
+  "Record or check campaign identity and inventory without reader evaluation."
   (let ((output (uiop:getenv output-variable))
         (expected (uiop:getenv expected-variable)))
     (when output

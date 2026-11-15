@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Freeze test source once and reuse completed FASLs in private job caches."""
+"""Run serialized strict jobs from frozen source with private reusable FASLs.
+
+Each job gates image identity and suite inventory before executing selected heads.
+"""
 import argparse
 import contextlib
 import fcntl
@@ -188,6 +191,7 @@ def publish_cache(private, shared):
 
 
 def wait_child(command, env, log, lease, run_lock, workspace):
+    """Keep all three leases in the child even if the coordinator disappears."""
     process = None
     def interrupted(signum, frame):
         raise InterruptedError('Campaign interrupted by signal ' + str(signum))

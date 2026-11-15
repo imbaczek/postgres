@@ -1290,6 +1290,30 @@ at the printed path. The strict compiler cache and log remain in the
 temporary work directory for archiving or explicit cleanup by their owner;
 the RAM-disk wrapper places that directory in the owned RAM root.
 
+For repeated strict ASDF runs against one unchanged checkout, create a campaign
+and use the path printed by `create` in subsequent commands:
+
+```sh
+./t/test-campaign.sh create
+./t/test-campaign.sh run /absolute/campaign/path unit
+./t/test-campaign.sh run /absolute/campaign/path physical head-name
+./t/test-campaign.sh close /absolute/campaign/path
+```
+
+Each run uses a fresh Lisp image and a fresh strict compiler, even when it
+reuses completed parent FASLs. `--cold` skips that cache. Jobs within a campaign
+are serialized, with private caches and a read-only frozen source. A different
+checkout revision, dirty source files or checked runtime setting requires a new
+campaign. Image identity and the full registered suite inventory are checked
+before selected heads execute.
+The main test child inherits the campaign, run and RAM workspace leases. The
+strict compiler reacquires campaign and workspace leases. Wait for all children
+before cleanup if the coordinator dies. Close retains files for
+audited cleanup. Archive compact logs and source deltas with the RAM-disk
+teardown, then delete disposable caches and data after checking for active jobs.
+Full unit runs have used roughly 3.4–3.8 GiB; the eight-image limit is a ceiling,
+not a concurrency target.
+
 Native cold-publish fault cases can be partitioned, for example:
 
 ```sh
