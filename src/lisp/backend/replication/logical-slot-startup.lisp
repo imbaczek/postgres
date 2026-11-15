@@ -1,9 +1,39 @@
 (in-package #:pg)
 
+(defun logical-slot-startup-prepare-known-candidates (candidates prepare-known)
+  (let ((names (make-hash-table :test #'equal))
+        (prepared (make-hash-table :test #'eq)))
+    (dolist (slot candidates)
+      (let ((name (wal-replication-slot-name slot)))
+        (when (gethash name names) (error "duplicate WAL replication slot ~a" name))
+        (setf (gethash name names) t)))
+    (let ((images (mapcar (lambda (slot)
+                            (cons slot (logical-slot-startup-candidate-image slot)))
+                          candidates)))
+      (loop for entry in images for slot = (car entry)
+            do (when (logical-slot-startup-known-p slot)
+                 (when (recovery-in-progress-p)
+                   (error "logical slot restoration during native recovery is unsupported"))
+                 (unless prepare-known (error "known logical slot startup requires an owned source"))
+                 (let ((result (funcall prepare-known slot)))
+                   (when (and (wal-replication-slot-child-owner slot) (not (eq slot result)))
+                     (error "imported startup preparation must return the exact captured candidate"))
+                   (setf (gethash slot prepared) result))))
+      (loop with remaining = candidates
+            for (slot . image) in images
+            do (unless (and (consp remaining) (eq slot (car remaining))
+                            (equalp image (logical-slot-startup-candidate-image slot)))
+                 (error "startup preparation changed a persistent candidate"))
+               (setf remaining (cdr remaining))
+            finally (unless (null remaining)
+                      (error "startup preparation changed the candidate list"))))
+    prepared))
+
 (defun logical-slot-prepare-startup-inventory (candidates segments inactive-since &optional prepare-known)
-  ;; Build a private registry.  Known logical slots need the caller's source
-  ;; preparation; legacy and physical slots retain their existing paths.
-  (let ((restored (make-hash-table :test #'equal)))
+  ;; Prepare known logical candidates while the caller's source registry is visible.
+  ;; Build the private replacement only after those authority callbacks finish.
+  (let ((prepared (logical-slot-startup-prepare-known-candidates candidates prepare-known))
+        (restored (make-hash-table :test #'equal)))
     (let ((*wal-replication-slots* restored))
       (dolist (slot candidates)
         (let ((name (wal-replication-slot-name slot)))
@@ -14,8 +44,7 @@
                       (when (recovery-in-progress-p)
                         (error "logical slot restoration during native recovery is unsupported"))
                       (if (logical-slot-startup-known-p slot)
-                          (if prepare-known (funcall prepare-known slot)
-                              (error "known logical slot startup requires an owned source"))
+                          (gethash slot prepared)
                           (wal-validate-replication-slot-wal slot segments))))
             (wal-check-replication-slot-capacity)
             (setf (gethash name restored) slot))))
