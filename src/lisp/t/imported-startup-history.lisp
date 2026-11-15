@@ -118,7 +118,8 @@
                        (sb-thread:with-mutex (*wal-lock*) (logical-wal-archive-check archive))
                        (assert (native-eq-table-image-p inside *physical-retained-root-references*))
                        (format t "~&NATIVE-HISTORY archive lease, D-through-F replay and both prefixes validated~%")
-                       (funcall function archive)))))
+                       (funcall function archive)))
+                   :input-directory input :reader #'read-object))
              (setf active nil))))))))
 
 (defun startup-proof-native-observation ()

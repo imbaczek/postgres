@@ -16,6 +16,7 @@ are private to the reader scope and must not be mutated by its callback."
   (reference nil :read-only t) (history nil :read-only t)
   (parent-history nil :read-only t) (guard nil :read-only t)
   (minimum-end 0 :read-only t)
+  (input nil :read-only t) (reader 'physical-retained-object-read :read-only t)
   (index nil) (cache-segment nil) (cache-bytes nil) (cache-start 0) (cache-end 0))
 
 (defun logical-wal-archive-clear-cache (archive)
@@ -189,14 +190,39 @@ The captured minimum end permits durable growth, but not regression."
           (error "logical WAL archive owner changed or has an unresolved update")))))
   t)
 
+(defun logical-wal-archive-read-object (archive selected kind id maximum)
+  (when (sb-thread:holding-mutex-p *wal-lock*)
+    (error "logical WAL archive object reads require WAL exclusion to be released"))
+  (unless (and (equal selected (logical-wal-archive-input archive))
+               (typep id '(unsigned-byte 64))
+               (eql maximum (ecase kind
+                              (:inventory +physical-retained-inventory-limit+)
+                              ((:extent :overlap) +physical-retained-image-limit+))))
+    (error "logical WAL archive object request escaped its fixed input"))
+  (sb-thread:with-mutex (*wal-lock*) (logical-wal-archive-check archive))
+  (let ((supplied (funcall (logical-wal-archive-reader archive) selected kind id maximum)))
+    (unless (typep supplied '(vector (unsigned-byte 8)))
+      (error "logical WAL archive reader returned an invalid byte vector"))
+    (let ((size (length supplied)))
+      (unless (<= size maximum)
+        (error "logical WAL archive reader exceeded its object bound"))
+      (let ((bytes (make-array size :element-type '(unsigned-byte 8))))
+        (replace bytes supplied :end2 size)
+        (unless (= id (physical-store-update-digest #xCBF29CE484222325 bytes))
+          (error "logical WAL archive object differs from its bounded content ID"))
+        (sb-thread:with-mutex (*wal-lock*) (logical-wal-archive-check archive))
+        bytes))))
+
 (defun logical-wal-archive-read-index (archive)
   "Read the selected index and check its identity, parent ancestry and chain.
 The required base overlap does not itself establish logical coverage."
   (let* ((reference (logical-wal-archive-reference archive))
          (history (logical-wal-archive-parent-history archive))
          (index (physical-retained-inventory-read-index
-                 (logical-wal-archive-directory archive) (getf reference :root-id)
-                 (logical-wal-archive-identity archive) history)))
+                 (logical-wal-archive-input archive) (getf reference :root-id)
+                 (logical-wal-archive-identity archive) history
+                 (lambda (selected kind id maximum)
+                   (logical-wal-archive-read-object archive selected kind id maximum)))))
     (unless (and (getf index :base-overlap)
                  (eql (getf index :history-target)
                       (timeline-history-entry-timeline (first history)))
@@ -209,7 +235,8 @@ The required base overlap does not itself establish logical coverage."
      (getf index :entries))
     index))
 
-(defun call-with-logical-wal-archive-core (system-id history namespace guard identity-function function)
+(defun call-with-logical-wal-archive-core (system-id history namespace guard identity-function function
+                                           &key (reader 'physical-retained-object-read) input-directory)
   "Call FUNCTION with a private archive selected from committed primary control.
 GUARD supplies the caller's source proof; this scope also checks persisted
 control, history and root.  It rechecks both under the captured WAL mutex on
@@ -218,7 +245,9 @@ index and cache are cleared on every exit, and the archive then expires."
   ;; Startup supplies a pre-catalog identity only after the retained root has
   ;; been restored in committed control.  The callback can publish while the
   ;; reader lease is held; the runtime wrapper supplies the live catalog ID.
-  (unless (and (functionp guard) (functionp identity-function) (functionp function) (eq namespace :timeline))
+  (unless (and (functionp guard) (functionp identity-function) (functionp function)
+               (or (functionp reader) (and (symbolp reader) (fboundp reader)))
+               (eq namespace :timeline))
     (error "logical WAL archive requires a timeline source scope"))
   (timeline-check-lineage history)
   (let ((archive nil) (owner nil) (active t)
@@ -228,6 +257,7 @@ index and cache are cleared on every exit, and the archive then expires."
       (unless (funcall guard) (error "logical WAL archive source is unavailable"))
       (let* ((fields (multiple-value-list (wal-read-control-fields)))
              (metadata (seventh fields))
+             (directory (physical-retained-root-directory (physical-recovery-retained-directory)))
              (reference (copy-tree (getf metadata :retained-reference)))
              (identity (physical-promotion-retained-identity system-id reference))
              (tip (timeline-history-entry-timeline (first history))))
@@ -243,7 +273,7 @@ index and cache are cleared on every exit, and the archive then expires."
           (setf owner (physical-promotion-retained-owner :primary)
                 archive
                 (%make-logical-wal-archive
-                 :directory (physical-retained-root-directory (physical-recovery-retained-directory))
+                 :directory directory :input (if input-directory (uiop:ensure-directory-pathname input-directory) directory) :reader reader
                  :identity identity :reference reference
                  :history (mapcar #'copy-timeline-history-entry history)
                  :parent-history projected :minimum-end (second fields)
@@ -311,7 +341,7 @@ The private cache retains the checked result for this reader scope."
         (return-from logical-wal-archive-prepare t))
       (setf entries (logical-wal-archive-segment-entries archive segment carrier))
       (logical-wal-archive-clear-cache archive))
-    (let* ((directory (logical-wal-archive-directory archive))
+    (let* ((directory (logical-wal-archive-input archive))
            (reference (logical-wal-archive-reference archive))
            (base (getf reference :base))
            (origin (* segment +wal-segment-size+))
@@ -319,13 +349,15 @@ The private cache retains the checked result for this reader scope."
            (end (if entries (min (getf reference :end) (getf (third (car (last entries))) :end)) base))
            (overlap (when (= segment (floor (1- base) +wal-segment-size+))
                       (physical-retained-inventory-read-overlap
-                       directory (logical-wal-archive-index archive))))
+                       directory (logical-wal-archive-index archive)
+                       (lambda (selected kind id maximum)
+                         (logical-wal-archive-read-object archive selected kind id maximum)))))
            (bytes (nth-value
                    1 (physical-retained-inventory-verify-entries
                       entries (logical-wal-archive-parent-history archive)
                       (lambda (id)
-                        (physical-retained-object-read directory :extent id
-                                                       +physical-retained-image-limit+))
+                        (logical-wal-archive-read-object archive directory :extent id
+                                                         +physical-retained-image-limit+))
                       overlap))))
       (sb-thread:with-mutex (*wal-lock*)
         (logical-wal-archive-check archive)

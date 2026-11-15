@@ -1165,6 +1165,101 @@
          (ok (= (+ (* 2 pg::+wal-segment-size+) 32) (getf fixture :fork)))))
      :cursor-records t))
 
+(deftest logical-wal-archive-custom-reader-covers-index-overlap-and-extents
+    (call-with-historical-segment-source
+     (lambda (fixture)
+       (let* ((pg::*wal-ready* t)
+              (fd (sb-posix:open (namestring (getf fixture :directory))
+                                 (logior sb-posix:o-rdonly sb-posix:o-directory)))
+              (input (pg::physical-image-fd-path fd)) (kinds nil) (saved nil))
+         (unwind-protect
+              (progn
+                (pg::call-with-logical-wal-archive-core
+                 (pg::catalog-system-identifier)
+                 (pg::timeline-parse-history 2 (pg::bytes->string (pg::timeline-history-bytes 2)))
+                 :timeline (lambda () t) #'pg::catalog-system-identifier
+                 (lambda (archive)
+                   (setf saved archive)
+                   (ok (equal input (pg::logical-wal-archive-input archive)))
+                   (ok (pg::logical-wal-archive-prepare archive 0 1))
+                   (ok (equalp (getf fixture :first) (pg::logical-wal-archive-cache-bytes archive)))
+                   (dolist (kind '(:inventory :overlap :extent)) (ok (member kind kinds)))
+                   (ok (= 2 (count :extent kinds)))
+                   (let ((before (length kinds)))
+                     (ok (signals
+                          (sb-thread:with-mutex (pg::*wal-lock*)
+                            (pg::logical-wal-archive-read-object
+                             archive input :inventory (getf (getf fixture :reference) :root-id)
+                             pg::+physical-retained-inventory-limit+)) 'error))
+                     (ok (= before (length kinds)))))
+                 :input-directory input
+                 :reader (lambda (selected kind id maximum)
+                           (ok (equal selected input))
+                           (push kind kinds)
+                           (pg::physical-retained-object-read selected kind id maximum)))
+                (let ((before (length kinds)))
+                  (ok (signals
+                       (pg::logical-wal-archive-read-object
+                        saved input :inventory (getf (getf fixture :reference) :root-id)
+                        pg::+physical-retained-inventory-limit+) 'error))
+                  (ok (= before (length kinds)))))
+           (sb-posix:close fd))))
+     :split-first t))
+
+(deftest logical-wal-archive-custom-reader-cannot-bypass-content-identity
+    (dolist (failure '(:inventory :overlap :extent))
+      (call-with-historical-segment-source
+       (lambda (fixture)
+         (let* ((pg::*wal-ready* t) (hit nil) (entered nil)
+                                    (owner (pg::physical-promotion-retained-owner :primary))
+                                    (reference (gethash owner pg::*physical-retained-root-references*))
+                                    (count (hash-table-count pg::*physical-retained-root-references*)))
+           (ok
+            (signals
+             (pg::call-with-logical-wal-archive-core
+              (pg::catalog-system-identifier)
+              (pg::timeline-parse-history 2 (pg::bytes->string (pg::timeline-history-bytes 2)))
+              :timeline (lambda () t) #'pg::catalog-system-identifier
+              (lambda (archive)
+                (setf entered t)
+                (pg::logical-wal-archive-prepare archive 0 1))
+              :reader (lambda (directory kind id maximum)
+                        (let ((bytes (pg::physical-retained-object-read directory kind id maximum)))
+                          (when (eq kind failure)
+                            (setf hit t (aref bytes 0) (logxor 1 (aref bytes 0))))
+                          bytes)))
+             'error))
+           (ok hit)
+           (ok (eq (not (eq failure :inventory)) entered))
+           (ok (= count (hash-table-count pg::*physical-retained-root-references*)))
+           (ok (eq reference (gethash owner pg::*physical-retained-root-references*))))))))
+
+(deftest logical-wal-archive-reader-cannot-change-accepted-bytes-through-an-alias
+    (call-with-historical-segment-source
+     (lambda (fixture)
+       (let ((pg::*wal-ready* t) (borrowed nil) (armed nil) (mutations 0) (finished nil))
+         (pg::call-with-logical-wal-archive-core
+          (pg::catalog-system-identifier)
+          (pg::timeline-parse-history 2 (pg::bytes->string (pg::timeline-history-bytes 2)))
+          :timeline
+          (lambda ()
+            (when armed
+              (setf (aref borrowed 0) (logxor 1 (aref borrowed 0)) armed nil)
+              (incf mutations))
+            t)
+          #'pg::catalog-system-identifier
+          (lambda (archive)
+            (ok (pg::logical-wal-archive-prepare archive 0 1))
+            (ok (equalp (getf fixture :first) (pg::logical-wal-archive-cache-bytes archive)))
+            (setf finished t))
+          :reader (lambda (directory kind id maximum)
+                    (setf borrowed (pg::physical-retained-object-read directory kind id maximum)
+                          armed t)
+                    borrowed))
+         (ok finished)
+         (ok (>= mutations 4))))
+     :split-first t))
+
 (deftest logical-wal-archive-checks-all-versions-of-a-segment
     (call-with-historical-segment-source
      (lambda (fixture)
