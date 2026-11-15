@@ -73,9 +73,30 @@
   (multiple-value-prog1 (logical-wal-cursor-next cursor)
     (logical-slot-startup-check-authority source)))
 
+(defun logical-slot-startup-derive-pending-with-cursor (source slot cursor)
+  (logical-slot-startup-check-authority source)
+  (unless (and (some (lambda (entry) (eq slot (logical-slot-startup-entry-slot entry)))
+                     (logical-slot-startup-source-entries source))
+               (logical-slot-startup-known-p slot)
+               (eq :reserved (wal-replication-slot-wal-status slot))
+               (= (logical-wal-cursor-position cursor) (wal-replication-slot-restart-lsn slot))
+               (= (logical-wal-cursor-end cursor) (logical-slot-startup-source-end source))
+               (eq (logical-wal-cursor-namespace cursor) (logical-slot-startup-source-namespace source))
+               (equalp (logical-wal-cursor-history cursor) (logical-slot-startup-source-history source)))
+    (error "startup pending reconstruction requires its captured candidate and exact cursor"))
+  (let ((progress (make-logical-slot-startup-progress (wal-replication-slot-confirmed-flush-lsn slot)))
+        (*wal-recovery-reservation-batch-clean-p* nil))
+    (loop
+      (multiple-value-bind (record bytes record-owner carrier kind)
+          (logical-slot-startup-next-record source cursor)
+        (declare (ignore bytes record-owner carrier))
+        (unless record (return))
+        (logical-slot-startup-accept-record progress record kind)))
+    (unless (= (logical-wal-cursor-position cursor) (logical-slot-startup-source-end source))
+      (error "startup pending reconstruction did not reach its captured horizon"))
+    (logical-slot-startup-progress-pending progress)))
+
 (defun logical-slot-startup-derive-pending (source slot &optional archive)
-  ;; Scan through the frozen durable end.  The logical reader checks record
-  ;; framing, carrier and CRC, and accepts an open tail of complete records.
   ;; An open or abandoned batch contributes no staged first positions.  This
   ;; scan does not claim full logical payload semantic validation.
   (logical-slot-startup-check-authority source)
@@ -84,23 +105,14 @@
                (logical-slot-startup-known-p slot)
                (eq :reserved (wal-replication-slot-wal-status slot)))
     (error "startup cursor requires its captured reserved logical candidate"))
-  (let ((history (logical-slot-startup-source-history source))
-        (progress (make-logical-slot-startup-progress (wal-replication-slot-confirmed-flush-lsn slot)))
-        (*wal-recovery-reservation-batch-clean-p* nil))
-    (multiple-value-bind (owner role) (logical-slot-startup-start-position slot history)
-      (call-with-logical-wal-cursor
-       history (logical-slot-startup-source-namespace source)
-       (wal-replication-slot-restart-lsn slot) (logical-slot-startup-source-end source)
-       owner role (lambda () (logical-slot-startup-check-source source))
-       (lambda (cursor)
-         (loop
-           (multiple-value-bind (record bytes record-owner carrier kind)
-               (logical-slot-startup-next-record source cursor)
-             (declare (ignore bytes record-owner carrier))
-             (unless record (return))
-             (logical-slot-startup-accept-record progress record kind))))
-       :archive archive :batch-policy :logical-reader))
-    (logical-slot-startup-progress-pending progress)))
+  (multiple-value-bind (owner role)
+      (logical-slot-startup-start-position slot (logical-slot-startup-source-history source))
+    (call-with-logical-wal-cursor
+     (logical-slot-startup-source-history source) (logical-slot-startup-source-namespace source)
+     (wal-replication-slot-restart-lsn slot) (logical-slot-startup-source-end source)
+     owner role (lambda () (logical-slot-startup-check-source source))
+     (lambda (cursor) (logical-slot-startup-derive-pending-with-cursor source slot cursor))
+     :archive archive :batch-policy :logical-reader)))
 
 (defun logical-slot-on-coverage
     (state history required owner role through through-owner)

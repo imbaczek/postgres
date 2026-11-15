@@ -112,13 +112,12 @@ leave its local workspace opaque.  Slot data must remain descriptor-only."
         (error "logical copy input changed after verification"))))
   t)
 
-(defun logical-slot-copy-input-segment-reader (owner context index)
+(defun logical-slot-copy-input-piece-reader (parent index guard)
   (lambda (segment carrier consume)
-    (logical-slot-copy-check-input owner context)
+    (unless (funcall guard) (error "logical copy selected piece lost its source scope"))
     (let* ((entry (gethash (list carrier segment) index))
            (piece (first entry))
            (observation (second entry))
-           (parent (cdr (assoc "logical_slot_wal" (physical-image-context-children context) :test #'equal)))
            (leaf (wal-segment-filename segment carrier :timeline)))
       (unless entry (error "logical copy is missing its selected WAL piece"))
       (call-with-physical-image-input-at
@@ -132,8 +131,13 @@ leave its local workspace opaque.  Slot data must remain descriptor-only."
              (unless (and (equal expected (physical-image-file-facts fd))
                           (equal expected (physical-image-file-facts parent leaf)))
                (error "logical copy selected WAL piece changed during reading"))
-             (logical-slot-copy-check-input owner context))))
+             (unless (funcall guard) (error "logical copy selected piece lost its source scope")))))
        :element-type '(unsigned-byte 8)))))
+
+(defun logical-slot-copy-input-segment-reader (owner context index)
+  (logical-slot-copy-input-piece-reader
+   (cdr (assoc "logical_slot_wal" (physical-image-context-children context) :test #'equal))
+   index (lambda () (logical-slot-copy-check-input owner context))))
 
 (defun logical-slot-copy-check-checkpoint-bytes (bytes manifest descriptor)
   "Check the D record against manifest coordinates and copied control.
