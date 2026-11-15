@@ -21,6 +21,10 @@
     binding))
 
 (defun logical-slot-startup-publication-make-state (gate ownership image baseline registry-image control receipt)
+  ;; CONTROL holds phase, active, failed, token, expected mirrors, registry
+  ;; image, and source binding receipt in slots 0 through 6, respectively.
+  ;; The new owner expects the old state before publication and the prepared
+  ;; state afterward; existing observers keep their original expectations.
   (let ((incarnation *wal-storage-incarnation*) (namespace *wal-segment-namespace*)
                                                 (maximum *max-replication-slots*) (level *wal-level*)
                                                 (thread sb-thread:*current-thread*) (mutex *wal-lock*) (owner nil))
@@ -95,6 +99,9 @@
                     (logical-slot-publication-check-registry registry rows)
                     (let* ((expected (svref control 4))
                            (count (second expected)) (policy (third expected)) (disable (fourth expected)))
+                      ;; WAL is already locked.  Take XID second, then perform
+                      ;; no allocation, callback, or I/O from the first assignment
+                      ;; through the phase change and completion receipt.
                       (sb-thread:with-mutex (*xid-lock*)
                         (sb-sys:without-interrupts
                           (setf *wal-replication-slots* registry
@@ -119,6 +126,9 @@
               owner operation token))))
 
 (defun call-with-logical-slot-startup-publication-owner (gate ownership function &optional (receipt (vector nil)))
+  ;; The one-element receipt records the committed registry; it grants no authority.
+  ;; It is filled during commit to cover the gap between owner return and
+  ;; notification.  An abnormal exit after commit fences the published slots.
   (when (sb-thread:holding-mutex-p *wal-lock*)
     (error "startup publication acquisition requires the WAL mutex to be released"))
   (unless (and (typep receipt '(simple-vector 1)) (null (svref receipt 0)))

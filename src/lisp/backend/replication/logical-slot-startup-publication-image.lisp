@@ -23,6 +23,9 @@
         (wal-replication-slot-inactive-since slot)))
 
 (defun logical-slot-publication-registry-image (registry)
+  ;; P7 candidate bytes omit pending XIDs and transient fields.  Save those
+  ;; separately, including object identities, so later checks cover both the
+  ;; saved contents and exact slot bindings.
   (unless (and (hash-table-p registry) (eq (hash-table-test registry) 'equal))
     (error "startup publication requires its EQUAL slot registry"))
   (sort
@@ -61,6 +64,8 @@
         *wal-logical-policy* *wal-logical-info-disable-pending*))
 
 (defun logical-slot-publication-fence (registry)
+  ;; Keep the installed registry, but block use of its slots until retry;
+  ;; publication is not rolled back after an abnormal exit.
   (flet ((fence ()
            (maphash (lambda (name slot)
                       (declare (ignore name))

@@ -8,6 +8,8 @@
       (funcall *logical-slot-startup-publication-test-hook* point owner token (svref binding 1)))))
 
 (defun logical-slot-startup-publication-derive (owner gate ownership read-slot check)
+  ;; Under the owned startup gate, prepare and prove the replacement before
+  ;; publishing it.  This library does not open admission.
   (multiple-value-bind (restored image)
       (call-with-logical-slot-imported-startup-source
        gate ownership (logical-slot-startup-read-inventory :local-workspace t)
@@ -28,6 +30,10 @@
            (funcall check)
            (logical-slot-startup-check-inventory source)
            (values restored (logical-slot-publication-registry-image restored)))))
+    ;; The source scope has exited before a token can be registered.  Its
+    ;; private EQ binding holds owner, registry, image and phase in slots 0
+    ;; through 3.  Slot 4 starts NIL and receives the selector and permanent
+    ;; proof binding after the final proof.
     (logical-slot-publication-check-registry restored image)
     (logical-slot-imported-host-startup-check-owner owner)
     (let ((token (%make-logical-slot-startup-publication-token)))
@@ -44,6 +50,8 @@
                 (logical-slot-continuation-storage-call storage :binding)))
     (logical-slot-startup-publication-call owner :prepare token)
     (logical-slot-startup-publication-test-point :prepared owner token)
+    ;; Recheck the source while its leases and file descriptors are held.
+    ;; The guard repeats the under-lock checks immediately before commit.
     (funcall check)
     (sb-thread:with-mutex (*wal-lock*)
       (logical-slot-startup-publication-test-point :before-commit owner token)
@@ -96,6 +104,7 @@
                                     (logical-slot-startup-publication-finish
                                      owner storage token snapshot check guard))))))
                             receipt)))
+                     ;; All source scopes have exited before notifying the writer.
                      (logical-slot-startup-publication-notify gate ownership restored)))
                (setf complete t))
           (unless complete

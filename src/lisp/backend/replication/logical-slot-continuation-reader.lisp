@@ -57,7 +57,8 @@
   ;; checks guard, check and read-slot with a failure latch and postcheck.
   ;; Callbacks are trusted internal code and can access raw data; this scope
   ;; does not sandbox them.  Current startup supports the original child only.
-  ;; Runtime scan and ACK, atomic startup publication and admission remain
+  ;; Atomic startup publication is available to the original-child startup
+  ;; library.  Automatic loading, admission, runtime scan and ACK remain
   ;; separate work; the GC fence remains closed.
   (logical-slot-continuation-storage-call
    storage :with-origin
