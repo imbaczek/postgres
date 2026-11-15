@@ -15,7 +15,8 @@ The guard is checked under the captured WAL mutex before each copy and advance."
   (end 0 :read-only t) (guard nil :read-only t) (archive nil :read-only t)
   (batch-policy :strict :read-only t) (segment-reader nil :read-only t)
   (thread sb-thread:*current-thread* :read-only t)
-  (position 0) (batch-open nil))
+  (position 0) (batch-open nil) (record-reader nil :read-only t)
+  (busy nil) (failed nil) (last-carrier 0))
 
 (defun logical-wal-segment-carrier (segment history)
   "Choose the timeline carrying the last byte of SEGMENT in the selected history."
@@ -26,15 +27,18 @@ The guard is checked under the captured WAL mutex before each copy and advance."
 (defun logical-wal-cursor-check-scope (cursor)
   "Require the owning thread and live source scope under the WAL mutex."
   (assert (sb-thread:holding-mutex-p *wal-lock*))
-  (unless (and (eq sb-thread:*current-thread* (logical-wal-cursor-thread cursor))
+  (unless (and (not (logical-wal-cursor-failed cursor))
+               (eq sb-thread:*current-thread* (logical-wal-cursor-thread cursor))
                (funcall (logical-wal-cursor-guard cursor)))
     (error "logical WAL cursor is outside its source scope"))
+  (when (logical-wal-cursor-record-reader cursor)
+    (logical-wal-record-provider-check (logical-wal-cursor-record-reader cursor)))
   (when (logical-wal-cursor-archive cursor)
     (logical-wal-archive-check-cursor (logical-wal-cursor-archive cursor)
                                       (logical-wal-cursor-history cursor)
                                       (logical-wal-cursor-namespace cursor))))
 
-(defun call-with-logical-wal-cursor (history namespace start end owner role guard function &key archive segment-reader (batch-policy :strict))
+(defun call-with-logical-wal-cursor (history namespace start end owner role guard function &key archive segment-reader record-reader (batch-policy :strict))
   "Call FUNCTION with a cursor over START through the frozen END.
 The caller must prove the source and start boundary and supply a guard that
 checks that proof under the WAL mutex.  A geometrically valid empty interval
@@ -47,7 +51,9 @@ both policies reject end-of-recovery inside an open batch."
   (timeline-check-lineage history)
   (unless (and (member batch-policy '(:strict :logical-reader))
                (functionp guard)
-               (or (null segment-reader) (and (functionp segment-reader) (null archive)))
+               (or (null segment-reader) (functionp segment-reader))
+               (or (null record-reader) (logical-wal-record-provider-p record-reader))
+               (<= (count-if #'identity (list archive segment-reader record-reader)) 1)
                (typep start '(unsigned-byte 64)) (typep end '(unsigned-byte 64))
                (<= start end) (member namespace '(:legacy :timeline))
                (or (eq namespace :timeline)
@@ -62,7 +68,7 @@ both policies reject end-of-recovery inside an open batch."
          (cursor (%make-logical-wal-cursor
                   :history (mapcar #'copy-timeline-history-entry history)
                   :namespace namespace :position start :end end :archive archive
-                  :batch-policy batch-policy :segment-reader segment-reader
+                  :batch-policy batch-policy :segment-reader segment-reader :record-reader record-reader
                   :guard (lambda () (and active (eq mutex *wal-lock*) (funcall guard))))))
     (unwind-protect
          (progn
@@ -159,11 +165,69 @@ false ready value requests preparation.  Other open failures remain errors."
                (values bytes observed-size ready))))
       (when stream (close stream)))))
 
+(defun logical-wal-cursor-read-provider (cursor)
+  (let ((provider (logical-wal-cursor-record-reader cursor))
+        (original nil) (bytes nil) (position nil) (carrier nil)
+        (active t) (called nil) (complete nil))
+    (sb-thread:with-mutex (*wal-lock*)
+      (logical-wal-cursor-check-scope cursor)
+      (setf original (logical-wal-cursor-position cursor))
+      (when (= original (logical-wal-cursor-end cursor))
+        (when (and (logical-wal-cursor-batch-open cursor)
+                   (eq :strict (logical-wal-cursor-batch-policy cursor)))
+          (error "logical WAL horizon ends inside a batch"))
+        (return-from logical-wal-cursor-read-provider nil)))
+    (labels ((reject (message)
+               (setf (logical-wal-cursor-failed cursor) t
+                     (logical-wal-record-provider-failed provider) t)
+               (error message))
+             (consume (raw start file-timeline)
+               (unless (and active (not called)
+                            (eq sb-thread:*current-thread* (logical-wal-cursor-thread cursor)))
+                 (reject "logical WAL record consumer is expired, foreign or already used"))
+               (setf called t)
+               (when (sb-thread:holding-mutex-p *wal-lock*)
+                 (reject "logical WAL record consumer requires WAL exclusion to be released"))
+               (sb-thread:with-mutex (*wal-lock*)
+                 (logical-wal-cursor-check-scope cursor)
+                 (unless (= original (logical-wal-cursor-position cursor))
+                   (reject "logical WAL cursor changed during provider reading")))
+               (unless (and (typep raw '(vector (unsigned-byte 8)))
+                            (<= +wal-header-size+ (length raw) +wal-segment-size+)
+                            (typep start '(unsigned-byte 64))
+                            (<= original start) (< start (logical-wal-cursor-end cursor))
+                            (typep file-timeline '(integer 1 4294967295)))
+                 (reject "logical WAL record provider supplied invalid record coordinates"))
+               (unless (= (length raw)
+                          (logical-wal-check-record-length
+                           raw 0 start (+ (mod start +wal-segment-size+) (length raw))
+                           (logical-wal-cursor-end cursor)))
+                 (reject "logical WAL record provider supplied an inexact frame"))
+               (setf bytes (copy-seq raw) position start carrier file-timeline)
+               (values)))
+      (unwind-protect
+           (progn
+             (funcall (logical-wal-record-provider-reader provider) original #'consume)
+             (unless called (reject "logical WAL record provider did not supply a record"))
+             (sb-thread:with-mutex (*wal-lock*)
+               (logical-wal-cursor-check-scope cursor)
+               (unless (= original (logical-wal-cursor-position cursor))
+                 (reject "logical WAL cursor changed during provider postcheck")))
+             (setf complete t)
+             (values bytes position carrier original))
+        (sb-sys:without-interrupts
+          (setf active nil)
+          (unless complete
+            (setf (logical-wal-cursor-failed cursor) t
+                  (logical-wal-record-provider-failed provider) t)))))))
+
 (defun logical-wal-cursor-read-next (cursor)
   "Prepare the archive segment outside WAL exclusion and retry the local open.
 Keep position, gap and original position private across retries.  At most two
 segments may be prepared; each retry checks the scope and original position.
 Return bytes, position, carrier and original position."
+  (when (logical-wal-cursor-record-reader cursor)
+    (return-from logical-wal-cursor-read-next (logical-wal-cursor-read-provider cursor)))
   (let ((original nil) (continuation nil) (prepared nil))
     (dotimes (attempt 3)
       (declare (ignorable attempt))
@@ -279,25 +343,69 @@ rejects nested batch starts; the logical reader applies its own batch rules."
             (error "nested logical WAL batch"))))
     (values owner (if eor :end-of-recovery :ordinary))))
 
-(defun logical-wal-cursor-next (cursor)
-  "Decode a fresh record copy outside WAL exclusion, then recheck the full
-scope and original position before advancing.  Return the record, bytes,
-record owner, carrier and kind; local progress is not slot acknowledgement."
+(defun logical-wal-cursor-check-provider-record (cursor record carrier original)
+  (let* ((history (logical-wal-cursor-history cursor))
+         (start (wal-record-start record))
+         (owner (timeline-at-point start history)))
+    (unless (and (member carrier
+                         (timeline-segment-candidates
+                          (floor start +wal-segment-size+) history
+                          (logical-wal-cursor-last-carrier cursor)))
+                 (>= carrier owner))
+      (error "logical WAL record provider supplied a foreign or regressing carrier"))
+    (when (> start original)
+      (wal-lineage-check-gap original record history))))
+
+(defun logical-wal-cursor-next-checked (cursor)
   (multiple-value-bind (bytes position carrier original)
       (logical-wal-cursor-read-next cursor)
-    (unless bytes (return-from logical-wal-cursor-next nil))
+    (unless bytes (return-from logical-wal-cursor-next-checked nil))
     (let ((record (wal-decode-record bytes position)))
       (multiple-value-bind (owner kind) (logical-wal-cursor-check-record cursor record)
+        (when (logical-wal-cursor-record-reader cursor)
+          (logical-wal-cursor-check-provider-record cursor record carrier original))
         (sb-thread:with-mutex (*wal-lock*)
           (logical-wal-cursor-check-scope cursor)
           (unless (= original (logical-wal-cursor-position cursor))
             (error "logical WAL cursor changed during record decode"))
+          (when (logical-wal-cursor-record-reader cursor)
+            (setf (logical-wal-cursor-last-carrier cursor) carrier))
           (setf (logical-wal-cursor-position cursor) (wal-record-end record))
           (cond ((= (wal-record-type record) +wal-record-batch-start+)
                  (setf (logical-wal-cursor-batch-open cursor) t))
                 ((wal-terminal-record-type-p (wal-record-type record))
                  (setf (logical-wal-cursor-batch-open cursor) nil))))
         (values record bytes owner carrier kind)))))
+
+(defun logical-wal-cursor-next (cursor)
+  "Decode a fresh record copy outside WAL exclusion, then recheck the full
+scope and original position before advancing. Return the record, bytes,
+record owner, carrier and kind; local progress is not slot acknowledgement."
+  (unless (logical-wal-cursor-record-reader cursor)
+    (return-from logical-wal-cursor-next (logical-wal-cursor-next-checked cursor)))
+  (let ((complete nil) (entered nil)
+                       (provider (logical-wal-cursor-record-reader cursor)))
+    (sb-sys:without-interrupts
+      (unwind-protect
+           (sb-sys:with-local-interrupts
+             (sb-thread:with-mutex (*wal-lock*)
+               (logical-wal-cursor-check-scope cursor)
+               (when (or (logical-wal-cursor-busy cursor)
+                         (logical-wal-record-provider-busy provider))
+                 (setf (logical-wal-cursor-failed cursor) t
+                       (logical-wal-record-provider-failed provider) t)
+                 (error "logical WAL record provider reentered its cursor"))
+               (sb-sys:without-interrupts
+                 (setf (logical-wal-cursor-busy cursor) t
+                       (logical-wal-record-provider-busy provider) t entered t)))
+             (multiple-value-prog1 (logical-wal-cursor-next-checked cursor)
+               (setf complete t)))
+        (when entered
+          (setf (logical-wal-cursor-busy cursor) nil
+                (logical-wal-record-provider-busy provider) nil)
+          (unless complete
+            (setf (logical-wal-cursor-failed cursor) t
+                  (logical-wal-record-provider-failed provider) t)))))))
 
 (declaim (ftype function physical-slot-startup-system-id))
 

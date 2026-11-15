@@ -157,6 +157,7 @@
                    (:file "../replication/physical-recovery-policy")
                    (:file "../storage/wal-namespace")
                    (:file "../storage/wal-lineage")
+                   (:file "../replication/logical-wal-record-provider")
                    (:file "../replication/logical-wal-cursor")
                    (:file "../storage/wal-timeline")
                    (:file "../replication/physical-history")
