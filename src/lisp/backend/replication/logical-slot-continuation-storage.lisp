@@ -20,6 +20,10 @@
   (logical-slot-continuation-storage-call storage :check))
 
 (defun logical-slot-continuation-prepare-startup-directory (gate ownership)
+  ;; Under the startup gate and postmaster ownership, create the fixed 0700
+  ;; child and sync it and PGDATA before capturing the host owner and proof
+  ;; binder.  Existing entries are checked and preserved; contents are not
+  ;; classified or removed here.
   (declare (notinline sb-posix:close))
   (check-primary-storage-startup-context gate ownership)
   (let ((root nil) (complete nil))
@@ -56,6 +60,15 @@
 
 (defun call-with-logical-slot-continuation-startup-storage-context
     (owner context function)
+  ;; Weak EQ identity dispatch and dynamic registration limit this capability
+  ;; to its active thread and checked host, proof, context and named child.
+  ;; A failed check or nonlocal exit during a check makes failure sticky,
+  ;; including an interrupt.  Copied or foreign-thread objects are rejected
+  ;; before that state is changed.  Cleanup revokes registration and the source-proof
+  ;; scope closes the held FD.
+  ;;
+  ;; :DIRECTORY returns a borrowed FD for this scope; :BINDING returns copied
+  ;; canonical proof bytes.
   (unless (logical-slot-imported-host-startup-owner-p owner)
     (error "continuation startup storage requires a typed host startup owner"))
   (call-with-logical-slot-imported-proof-files
@@ -112,6 +125,11 @@
         :mutable-directory t)))))
 
 (defun call-with-logical-slot-continuation-startup-storage (gate ownership function)
+  ;; This is a storage capability for future selector I/O.  It does not
+  ;; publish a snapshot, selector or control transition, lease or restore
+  ;; roots, reserve a tail, prove records, admit work, run GC, or establish
+  ;; readiness.  Current control is observed read-only; no offline adoption
+  ;; authority is granted.
   (logical-slot-continuation-prepare-startup-directory gate ownership)
   (call-with-logical-slot-imported-host-startup-owner
    gate ownership
