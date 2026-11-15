@@ -89,6 +89,8 @@ capacity, standby and progress checks. Publication is separate."
 (defun logical-slot-startup-publish (source restored &optional archive)
   ;; Finish all fallible preparation and checks before fixed publication under
   ;; WAL then XID lock.  The archive lease, when present, still spans this step.
+  (when (logical-slot-imported-startup-source-p source)
+    (error "imported startup publication requires its one-shot publication owner"))
   (logical-slot-startup-check-inventory source)
   (sb-thread:with-mutex (*wal-lock*)
     (logical-slot-startup-check-source source)

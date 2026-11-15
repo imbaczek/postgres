@@ -666,6 +666,27 @@
     (assert rejected)
     (format t "~&NATIVE-COMPOSED-CAUGHT-FAILURE PASS caught slot failure rejects entire reader scope~%")))
 
+(defun native-host-continuation-observer-cannot-publish (gate ownership)
+  (let ((registry *wal-replication-slots*)
+        (count *logical-capture-live-slots*)
+        (policy *wal-logical-policy*)
+        (disable *wal-logical-info-disable-pending*)
+        (rejected nil))
+    (call-with-logical-slot-imported-startup-source
+     gate ownership (logical-slot-startup-read-inventory :local-workspace t)
+     (lambda (source)
+       (handler-case
+           (logical-slot-startup-publish source (make-hash-table :test #'equal))
+         (error (condition)
+           (setf rejected (search "imported startup publication requires"
+                                  (princ-to-string condition)))))))
+    (assert (eq registry *wal-replication-slots*))
+    (assert (eql count *logical-capture-live-slots*))
+    (assert (eq policy *wal-logical-policy*))
+    (assert (eq disable *wal-logical-info-disable-pending*))
+    (assert rejected)
+    (format t "~&NATIVE-STARTUP-OBSERVATION-NO-PUBLISH PASS registry and mirrors unchanged~%")))
+
 (defun native-host-continuation-active-refusal (gate ownership)
   (let* ((entries (logical-slot-startup-read-inventory :local-workspace t))
          (registry *wal-replication-slots*)
@@ -712,7 +733,8 @@
     (when (uiop:getenv "PG_NATIVE_COMPOSED_READER")
       (native-host-continuation-composed-cursors gate ownership)
       (native-host-continuation-pending-candidates gate ownership)
-      (native-host-continuation-caught-reader-failure gate ownership))
+      (native-host-continuation-caught-reader-failure gate ownership)
+      (native-host-continuation-observer-cannot-publish gate ownership))
     (assert (equalp control (logical-slot-startup-control-image)))
     (assert (eq registry *wal-replication-slots*))
     (assert (zerop (hash-table-count registry)))
