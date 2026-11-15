@@ -105,14 +105,7 @@ or authority."
        (snapshot-wal-boundary-restart-timeline boundary)
        (snapshot-wal-boundary-timeline boundary)))))
 
-(defun logical-slot-check-startup-identities (slots)
-  "Check known logical slot identities against the durable catalog once.
-Return its system ID when needed, without initializing or repairing the catalog.
-This does not prove history, slot lifetime or import authority."
-  (when (some #'wal-replication-slot-child-owner slots)
-    (error "child-owned logical slots require active import reconciliation"))
-  ;; Include known lost slots: loss of WAL does not waive cluster identity.
-  ;; This read-only catalog parse may be repeated by later source checks.
+(defun logical-slot-check-startup-candidate-identities (slots)
   (let ((known (remove-if-not
                 (lambda (slot)
                   (and (wal-logical-slot-p slot) (wal-replication-slot-logical-provenance slot)))
@@ -128,6 +121,14 @@ This does not prove history, slot lifetime or import authority."
                      (logical-slot-provenance-system-id (wal-replication-slot-logical-provenance slot)))
             (error "logical slot ~a belongs to another cluster" (wal-replication-slot-name slot))))
         system-id))))
+
+(defun logical-slot-check-startup-identities (slots)
+  "Check known logical slot identities against the durable catalog once.
+Return its system ID when needed, without initializing or repairing the catalog.
+This does not prove history, slot lifetime or import authority."
+  (when (some #'wal-replication-slot-child-owner slots)
+    (error "child-owned logical slots require active import reconciliation"))
+  (logical-slot-check-startup-candidate-identities slots))
 
 (defun logical-slot-provenance-fields-equal-p (left right)
   "Compare immutable provenance fields for detached state observations."

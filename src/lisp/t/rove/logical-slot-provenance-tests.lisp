@@ -1367,6 +1367,22 @@
              (rove:ok (zerop reads)))
         (setf (symbol-function 'physical-slot-startup-system-id) reader))))
 
+(rove:deftest logical-slot-startup-candidate-identity-does-not-admit-imports
+    (call-with-logical-slot-real-startup-test
+     (lambda ()
+       (let* ((system-id (catalog-system-identifier))
+              (slot (unit-logical-provenance-slot :system-id system-id :child-owner 0))
+              (registry *wal-replication-slots*)
+              (count (hash-table-count registry)))
+         (rove:ok (eql system-id (logical-slot-check-startup-candidate-identities (list slot))))
+         (rove:ok (rove:signals (logical-slot-check-startup-identities (list slot)) 'error))
+         (let ((foreign (unit-logical-provenance-slot
+                         :system-id (logxor system-id 1) :child-owner 0)))
+           (rove:ok (rove:signals
+                     (logical-slot-check-startup-candidate-identities (list foreign)) 'error)))
+         (rove:ok (eq registry *wal-replication-slots*))
+         (rove:ok (= count (hash-table-count *wal-replication-slots*)))))))
+
 (rove:deftest logical-slot-child-owner-update-rejects-source-image-grafts
     (dolist (owner '(nil 2))
       (call-with-canonical-wal-slot-fixture
