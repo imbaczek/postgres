@@ -125,6 +125,7 @@ Do not repair the catalog or grant history, lifetime or import authority."
         system-id))))
 
 (defun logical-slot-check-startup-local-owners (slots)
+  "Reject child-owned slots on the ordinary local startup path."
   (when (some #'wal-replication-slot-child-owner slots)
     (error "child-owned logical slots require active import reconciliation"))
   slots)

@@ -118,6 +118,9 @@ promotion may explicitly skip the local workspace; incoming images stay strict."
   t)
 
 (defun %call-with-logical-slot-startup-source (gate-owner ownership entries function)
+  "Capture startup source facts after independently checking the context.
+Child-owned candidates require history even when all are lost. Capture alone
+publishes nothing and does not authorize imported use."
   (check-primary-storage-startup-context gate-owner ownership)
   (let* ((slots (mapcar #'logical-slot-startup-entry-slot entries))
          (system-id (logical-slot-check-startup-candidate-identities slots))
@@ -162,17 +165,23 @@ promotion may explicitly skip the local workspace; incoming images stay strict."
         (setf (logical-slot-startup-source-active-p source) nil)))))
 
 (defun call-with-logical-slot-startup-source (gate-owner ownership entries function)
+  "Capture ordinary startup facts after rejecting child-owned candidates."
   (check-primary-storage-startup-context gate-owner ownership)
   (logical-slot-check-startup-local-owners (mapcar #'logical-slot-startup-entry-slot entries))
   (%call-with-logical-slot-startup-source gate-owner ownership entries function))
 
 (defun logical-slot-imported-startup-check-under-lock (source)
+  "Check imported purpose, lifetime and captured in-memory source and candidate
+facts under WAL exclusion. This does not recheck disk inventory bytes."
   (assert (sb-thread:holding-mutex-p *wal-lock*))
   (unless (member source *logical-slot-imported-startup-sources* :test #'eq)
     (error "imported logical source requires its registered startup candidate scope"))
   (logical-slot-startup-check-source source))
 
 (defun call-with-logical-slot-imported-startup-source (gate-owner ownership entries function)
+  "Observe child-owned candidates in a registered imported startup scope.
+Check disk inventory at entry; later under-WAL checks cover captured in-memory
+source and candidate facts, not disk inventory bytes."
   (check-primary-storage-startup-context gate-owner ownership)
   (unless (some (lambda (entry)
                   (wal-replication-slot-child-owner (logical-slot-startup-entry-slot entry)))
