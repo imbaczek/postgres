@@ -1,5 +1,13 @@
 (in-package #:pg)
 
+;; Observe an imported host at primary startup, even when it has no slots.
+;; The private baseline is a coherent post-replay control image and its
+;; associated root, timeline, and durable end, captured under the WAL lock.
+;; Each check compares against that same image; history facts are copied.
+;; The startup gate and postmaster ownership must remain valid for the scope.
+;; A failed check is sticky, and release ends the owner's lifetime.
+;; This observation grants no adoption, admission, or retention authority.
+
 (defstruct (logical-slot-imported-host-startup-owner
             (:include physical-adoption-owner)
             (:constructor %make-logical-slot-imported-host-startup-owner)

@@ -1,3 +1,7 @@
+;; Destructive test for a disposable prepared child only.
+;; Drops canonical slot files, then checks that the permanent historical proof
+;; can be observed without resurrecting slots.
+
 (require :asdf)
 (let ((source (truename (merge-pathnames "../" (uiop:pathname-directory-pathname *load-truename*)))))
   (pushnew source asdf:*central-registry* :test #'equal)

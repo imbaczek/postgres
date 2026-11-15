@@ -42,6 +42,8 @@
                (logical-slot-startup-source-end source))))))
 
 (defun logical-slot-imported-owner-source-under-lock (owner)
+  ;; Only the typed host owner has no candidate slot.  The startup and scan
+  ;; owners supply their checked per-slot candidate and source facts.
   (assert (sb-thread:holding-mutex-p *wal-lock*))
   (etypecase owner
     (logical-slot-imported-host-startup-owner

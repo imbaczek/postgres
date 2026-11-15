@@ -1350,6 +1350,17 @@ unchanged mirrors.
 Startup replay changes control and recovery state; this is not a read-only file
 probe. It does not enable a writer, listener or admission.
 
+To check host observation with no slot files, use an original disposable
+prepared-child root with its permanent proof. The proof is bound to the
+directory inode, so do not copy the fixture. This test drops canonical slot
+files; do not use a preserved or non-disposable fixture. From `src/lisp`, run:
+
+```sh
+PG_NATIVE_HOST_DISPOSABLE=1 PG_NATIVE_PROOF_DATA=/absolute/disposable-prepared-child \
+  ./t/test-ramdisk.sh run "${SBCL:-sbcl}" --noinform --disable-debugger \
+  --non-interactive --load t/imported-host-startup.lisp
+```
+
 The unit suite contains 68 regressions migrated from the legacy runner, eight
 Properties and one Function Spec, all explicitly executed through Rove. Loading
 it alone does not run tests. `./t/run-unit-tests.sh` executes this ASDF suite and
