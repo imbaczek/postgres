@@ -489,6 +489,9 @@ the outer scope installs it after the owner has retired."
       (when (and requested-child (not (eql requested-child child)))
         (error "requested promotion child is not the next local timeline"))
       (multiple-value-bind (metadata catalog prefix generation) (physical-restartpoint-read state)
+        ;; R has already passed restartpoint validation.  Compare its complete
+        ;; decoded catalog with the live catalog, allowing serialization padding;
+        ;; generation and other durable byte bindings remain exact.
         (when (and *catalog* (not (physical-history-catalog-images-equal-p catalog (catalog-image-bytes))))
           (error "promotion retained catalog differs from its restartpoint"))
         (multiple-value-bind (fork next) (physical-promotion-check-progress state metadata prefix generation)

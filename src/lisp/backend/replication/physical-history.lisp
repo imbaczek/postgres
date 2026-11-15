@@ -53,6 +53,8 @@ Native readable array syntax remains accepted, including SBCL string arrays."
 (defun physical-history-catalog-form-equal-p (left right)
   "Compare finite decoded catalog forms, treating strings as case-sensitive text.
 Other arrays keep their shape and element type; scalars keep their types."
+  ;; Compare the whole tree without rebuilding a catalog: unknown entries,
+  ;; duplicates and their order remain part of the comparison.
   (cond
     ((stringp left) (and (stringp right) (string= left right)))
     ((consp left)
@@ -75,6 +77,8 @@ Other arrays keep their shape and element type; scalars keep their types."
 (defun physical-history-catalog-images-equal-p (left right)
   "Compare complete catalog forms while allowing reader whitespace and comments.
 This is an in-memory consistency check; raw images still bind WAL and R."
+  ;; Read the original forms directly so reader whitespace does not turn an
+  ;; otherwise identical catalog into a mismatch.
   (physical-history-catalog-form-equal-p
    (physical-history-read-catalog left) (physical-history-read-catalog right)))
 
