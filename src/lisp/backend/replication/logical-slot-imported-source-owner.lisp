@@ -72,6 +72,14 @@ A foreign or copied owner cannot fail the original owner's scope."
          (error "imported logical source differs from its registered scan"))
        (logical-wal-check-source source (wal-retained-slot-scan-end scan))))))
 
+(defun logical-slot-imported-scan-proof-horizon-under-lock (owner)
+  (assert (sb-thread:holding-mutex-p *wal-lock*))
+  (call-with-logical-slot-imported-scan-check
+   owner
+   (lambda ()
+     (logical-slot-imported-scan-check-under-lock owner)
+     (funcall (logical-slot-imported-scan-owner-state owner) :horizon owner))))
+
 (defmethod physical-adoption-check-owner-role ((owner logical-slot-imported-scan-owner))
   (call-with-logical-slot-imported-scan-check
    owner
@@ -97,11 +105,13 @@ This alone does not establish the permanent pair, F proof, lease, provider,
 startup or readiness required for imported source use."
   (when (sb-thread:holding-mutex-p *wal-lock*)
     (error "imported source acquisition must run outside the WAL mutex"))
-  (let ((principal
-          (sb-thread:with-mutex (*wal-lock*)
-            (wal-retained-slot-scan-check-scope-under-lock scan)
-            (find scan *wal-retained-slot-scan-scopes*
-                  :key #'wal-retained-slot-scan-scope-scan :test #'eq))))
+  (multiple-value-bind (principal horizon)
+      (sb-thread:with-mutex (*wal-lock*)
+        (wal-retained-slot-scan-check-scope-under-lock scan)
+        (logical-wal-check-source source *wal-durable-lsn*)
+        (values (find scan *wal-retained-slot-scan-scopes*
+                      :key #'wal-retained-slot-scan-scope-scan :test #'eq)
+                *wal-durable-lsn*))
     (call-with-postmaster-ownership
      (lambda (ownership)
        (let ((owner nil) (active t) (failed nil)
@@ -120,6 +130,11 @@ startup or readiness required for imported source use."
                     (:check (unless (and active (not failed)
                                          (logical-slot-imported-history-equal-p history (logical-wal-source-history source)))
                               (error "imported source owner ended or failed")))
+                    (:horizon
+                     (unless (and active (not failed))
+                       (error "imported source proof horizon ended or failed"))
+                     (logical-wal-check-source source horizon)
+                     horizon)
                     (:fail (setf failed t))
                     (:release (setf active nil)))))
            (setf owner (apply #'%make-logical-slot-imported-scan-owner

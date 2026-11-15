@@ -861,6 +861,430 @@
       (format t "~&NATIVE-STARTUP-PUBLICATION PASS slots=~d pending-per-slot=2 registry-and-mirrors-installed GC-fenced~%"
               (hash-table-count restored)))))
 
+(defun native-host-runtime-root-metadata-change (context)
+  (let* ((root (physical-image-context-root-fd context))
+         (leaf "pg-runtime-source-probe.tmp")
+         (path (slot-state-fd-path root leaf))
+         (fd (physical-image-openat root leaf
+                                    (logior sb-posix:o-wronly sb-posix:o-creat sb-posix:o-excl
+                                            sb-posix:o-nofollow +postmaster-o-cloexec+) #o600)))
+    (when (minusp fd) (error "cannot create native runtime root metadata probe"))
+    (unwind-protect
+         (values)
+      (sb-posix:close fd)
+      (sb-posix:unlink path))))
+
+(defun native-host-with-runtime-scan (name function &key upto)
+  (call-with-logical-replication-slot
+   name
+   (lambda (slot)
+     (call-with-wal-retained-slot-scan
+      name (wal-replication-slot-restart-lsn slot) (or upto *wal-durable-lsn*)
+      (lambda (scan)
+        (let ((source (sb-thread:with-mutex (*wal-lock*) (logical-wal-capture-source scan))))
+          (funcall function scan source)))))))
+
+(defun native-host-continuation-runtime-source-negative ()
+  (native-host-with-runtime-scan
+   "alpha"
+   (lambda (scan source)
+     (let ((rejected nil))
+       (handler-case
+           (call-with-logical-slot-imported-scan-owner
+            scan source
+            (lambda (owner)
+              (call-with-physical-directory-root
+               owner
+               (lambda (root path)
+                 (declare (ignore path))
+                 (call-with-physical-image-owned-context
+                  root t
+                  (lambda (context)
+                    (call-with-logical-slot-imported-proof-files
+                     owner context
+                     (lambda (facts check under-lock)
+                       (declare (ignore facts under-lock))
+                       (sb-thread:with-mutex (*wal-lock*)
+                         (wal-save-control-fields *wal-checkpoint-lsn* *wal-durable-lsn*))
+                       (native-host-runtime-root-metadata-change context)
+                       (funcall check)))))))))
+         (error (condition) (setf rejected (princ-to-string condition))))
+       (assert (and rejected (search "root descriptor changed" rejected)) ()
+               "strict proof control-replacement rejection was ~s" rejected))))
+  (let ((registry *logical-slot-imported-host-origins*)
+        (count (hash-table-count *logical-slot-imported-host-origins*)))
+    (native-host-with-runtime-scan
+     "alpha"
+     (lambda (scan source)
+       (let ((*logical-slot-imported-host-origins* (make-hash-table :test #'equal))
+             (rejected nil))
+         (handler-case
+             (call-with-logical-slot-imported-runtime-source
+              scan source (lambda (&rest arguments) (declare (ignore arguments))
+                            (error "unrestored runtime origin reached its callback")))
+           (error (condition) (setf rejected (princ-to-string condition))))
+         (assert (and rejected (search "has not been restored" rejected)))
+         (assert (zerop (hash-table-count *logical-slot-imported-host-origins*))))))
+    (assert (eq registry *logical-slot-imported-host-origins*))
+    (assert (= count (hash-table-count registry))))
+  (format t "~&NATIVE-RUNTIME-SOURCE-NEGATIVE PASS strict-default-rejects-root-metadata-change missing-origin-not-restored~%"))
+
+(defun native-host-with-runtime-tail-file (storage snapshot function)
+  (logical-slot-continuation-storage-call
+   storage :with-local-wal
+   (lambda (directory check-directory)
+     (let* ((fork (second (getf snapshot :origin)))
+            (child (first (getf snapshot :origin)))
+            (segment (floor fork +wal-segment-size+))
+            (name (wal-segment-filename segment child :timeline)))
+       (with-open-file (stream (slot-state-fd-path directory name)
+                               :direction :io :if-exists :overwrite
+                               :element-type '(unsigned-byte 8))
+         (let* ((fd (sb-sys:fd-stream-fd stream))
+                (size (sixth (physical-image-file-facts fd)))
+                (original (make-array size :element-type '(unsigned-byte 8))))
+           (assert (= size (read-sequence original stream)))
+           (unwind-protect
+                (funcall function stream original (logical-wal-eor-position fork))
+             (file-position stream 0)
+             (write-sequence original stream)
+             (finish-output stream)
+             (sb-posix:ftruncate fd size)
+             (file-position stream 0)
+             (let ((after (make-array size :element-type '(unsigned-byte 8))))
+               (assert (= size (read-sequence after stream)))
+               (assert (equalp original after)))
+             (funcall check-directory))))))))
+
+(defun native-host-runtime-tail-mutate (stream original start mode)
+  (let ((offset (mod start +wal-segment-size+)))
+    (ecase mode
+      (:append
+       (file-position stream (length original))
+       (write-sequence
+        (wal-encode-record +wal-record-batch-start+ 0
+                           (+ (- start offset) (length original))
+                           (make-array 0 :element-type '(unsigned-byte 8)))
+        stream))
+      (:rewrite
+       (let* ((raw (subseq original offset (+ offset +wal-end-of-recovery-record-size+)))
+              (record (wal-decode-record raw start))
+              (info (wal-end-of-recovery-record-info record))
+              (replacement
+                (wal-encode-end-of-recovery-record
+                 start (logxor 1 (getf info :end-time)) (getf info :timeline)
+                 (getf info :prev-timeline) (getf info :wal-level))))
+         (assert (not (equalp raw replacement)))
+         (wal-end-of-recovery-record-info (wal-decode-record replacement start))
+         (file-position stream offset)
+         (write-sequence replacement stream))))
+    (finish-output stream)))
+
+(defun native-host-continuation-runtime-tail-mutations (scan source)
+  (dolist (mode '(:append :rewrite))
+    (let ((entered nil) (returned nil) (failure nil) (seen-eor nil)
+                        (*wal-logical-slot-read-progress* 17) (*wal-logical-slot-read-continuation* nil))
+      (handler-case
+          (call-with-logical-slot-continuation-runtime-storage
+           scan source
+           (lambda (storage facts)
+             (declare (ignore facts))
+             (call-with-logical-slot-continuation-selector
+              storage
+              (lambda (snapshot fd selector-facts)
+                (declare (ignore fd selector-facts))
+                (native-host-with-runtime-tail-file
+                 storage snapshot
+                 (lambda (stream original start)
+                   (multiple-value-bind (owner role)
+                       (sb-thread:with-mutex (*wal-lock*) (logical-slot-wal-scan-start-position scan))
+                     (setf returned
+                           (call-with-logical-slot-wal-cursor-from-scan
+                            scan owner role
+                            (lambda (cursor selected-source)
+                              (setf entered t)
+                              (native-host-runtime-tail-mutate stream original start mode)
+                              (loop
+                                (multiple-value-bind (record raw record-owner carrier kind)
+                                    (logical-wal-cursor-next cursor)
+                                  (declare (ignore record-owner carrier))
+                                  (unless record (return))
+                                  (when (eq kind :end-of-recovery)
+                                    (setf seen-eor t)
+                                    (assert (equalp raw
+                                                    (subseq original (mod start +wal-segment-size+)
+                                                            (+ (mod start +wal-segment-size+) (length raw))))))))
+                              (sb-thread:with-mutex (*wal-lock*)
+                                (setf *wal-logical-slot-read-progress* (wal-retained-slot-scan-end scan)
+                                      *wal-logical-slot-read-continuation*
+                                      (logical-wal-certify-boundary
+                                       selected-source (wal-retained-slot-scan-end scan))))
+                              :returned))))))))))
+        (error (condition) (setf failure condition)))
+      (assert (and entered seen-eor))
+      (assert (null *wal-logical-slot-read-continuation*))
+      (if (eq mode :rewrite)
+          (progn
+            (assert (and failure (search "differs from its exact transcript" (princ-to-string failure))))
+            (assert (not returned))
+            (assert (= 17 *wal-logical-slot-read-progress*)))
+          (progn
+            (assert (null failure))
+            (assert (eq :returned returned))
+            (assert (= (wal-retained-slot-scan-end scan) *wal-logical-slot-read-progress*))))))
+  (format t "~&NATIVE-RUNTIME-TAIL-MUTATIONS PASS append-after-horizon-accepted valid-crc-rewrite-rejected private-replay-unchanged progress-staged~%"))
+
+(defun native-host-continuation-runtime-storage (scan source)
+  (let ((escaped nil))
+    (call-with-logical-slot-continuation-runtime-storage
+     scan source
+     (lambda (storage facts)
+       (setf escaped storage)
+       (call-with-logical-slot-continuation-selector
+        storage
+        (lambda (snapshot fd selector-facts)
+          (declare (ignore fd selector-facts))
+          (logical-slot-continuation-check-runtime-snapshot storage facts snapshot)
+          (let ((escaped-next nil) (frames 0))
+            (multiple-value-bind (first second)
+                (call-with-logical-slot-continuation-runtime-tail
+                 storage snapshot (wal-retained-slot-scan-end scan)
+                 (lambda (next check guard)
+                   (declare (ignore guard))
+                   (setf escaped-next next)
+                   (funcall check)
+                   (loop for frame = (funcall next) while frame do
+                     (assert (= (length frame) (+ 40 (wal-u32 frame 36))))
+                     (incf frames))
+                   (values :first :second)))
+              (assert (and (eq first :first) (eq second :second))))
+            (assert (plusp frames))
+            (assert (handler-case (progn (funcall escaped-next) nil) (error () t))))))
+       (assert (logical-slot-continuation-runtime-storage-p storage))
+       (assert (eql (wal-retained-slot-scan-end scan)
+                    (logical-slot-continuation-storage-call storage :end)))
+       (let ((entered nil))
+         (assert
+          (handler-case
+              (progn
+                (call-with-logical-slot-continuation-selector
+                 storage
+                 (lambda (snapshot fd selector-facts)
+                   (declare (ignore fd selector-facts))
+                   (call-with-logical-slot-continuation-runtime-tail
+                    storage snapshot (1+ (wal-retained-slot-scan-end scan))
+                    (lambda (&rest ignored) (declare (ignore ignored)) (setf entered t)))))
+                nil)
+            (error () t)))
+         (assert (not entered)))
+       (assert (equalp facts (logical-slot-continuation-storage-call storage :facts)))
+       (assert (<= (getf (getf facts :certificate) :fork)
+                   (logical-slot-continuation-storage-call storage :horizon)))
+       (logical-slot-continuation-storage-call
+        storage :with-local-wal
+        (lambda (directory check)
+          (declare (ignore directory))
+          (funcall check)
+          (logical-slot-continuation-storage-check storage)))
+       (logical-slot-continuation-storage-call
+        storage :with-origin
+        (lambda (archive)
+          (sb-thread:with-mutex (*wal-lock*)
+            (logical-wal-archive-check archive))))
+       (let ((rejected nil))
+         (sb-thread:join-thread
+          (sb-thread:make-thread
+           (lambda ()
+             (handler-case (logical-slot-continuation-storage-check storage)
+               (error () (setf rejected t))))))
+         (assert rejected))
+       (logical-slot-continuation-storage-check storage)))
+    (assert (handler-case
+                (progn (logical-slot-continuation-storage-check escaped) nil)
+              (error () t)))))
+
+(defun native-host-continuation-runtime-bounded-lanes (scan source)
+  (let ((records 0) (escaped nil))
+    (call-with-logical-slot-continuation-runtime-storage
+     scan source
+     (lambda (storage facts)
+       (call-with-logical-slot-continuation-selector
+        storage
+        (lambda (snapshot fd selector-facts)
+          (declare (ignore fd selector-facts))
+          (logical-slot-continuation-check-runtime-snapshot storage facts snapshot)
+          (logical-slot-continuation-storage-call
+           storage :with-origin
+           (lambda (archive)
+             (logical-slot-continuation-storage-call
+              storage :with-sidecar
+              (lambda (reader check)
+                (multiple-value-bind (owner role)
+                    (sb-thread:with-mutex (*wal-lock*)
+                      (logical-slot-wal-scan-start-position scan))
+                  (call-with-logical-slot-continuation-lanes
+                   facts snapshot (wal-retained-slot-scan-slot scan) archive reader nil
+                   (lambda () (logical-slot-continuation-storage-call storage :check-under-lock))
+                   (lambda (cursor bounds)
+                     (setf escaped cursor)
+                     (assert (= (wal-retained-slot-scan-end scan) (third bounds)))
+                     (loop while (logical-wal-cursor-next cursor) do (incf records))
+                     (assert (= (wal-retained-slot-scan-end scan)
+                                (logical-wal-cursor-position cursor))))
+                   :end (wal-retained-slot-scan-end scan)
+                   :position (list (wal-retained-slot-scan-start scan) owner role)))
+                (funcall check)))))))))
+    (assert (handler-case (progn (logical-wal-cursor-next escaped) nil)
+              (error () t)))
+    (assert (if (= (wal-retained-slot-scan-start scan) (wal-retained-slot-scan-end scan))
+                (zerop records) (plusp records)))
+    (format t "~&NATIVE-RUNTIME-BOUNDED-LANES PASS start=~d end=~d records=~d~%"
+            (wal-retained-slot-scan-start scan) (wal-retained-slot-scan-end scan) records)))
+
+(declaim (ftype function native-host-continuation-runtime-cursor))
+
+(defun native-host-continuation-runtime-bounded-source (ends)
+  (dolist (end ends)
+    (native-host-with-runtime-scan
+     "alpha"
+     (lambda (scan source)
+       (assert (= end (wal-retained-slot-scan-end scan)))
+       (native-host-continuation-runtime-storage scan source)
+       (native-host-continuation-runtime-bounded-lanes scan source)
+       (native-host-continuation-runtime-cursor scan source)
+       (call-with-logical-slot-imported-runtime-source
+        scan source
+        (lambda (owner context facts archive check under-lock)
+          (declare (ignore context archive))
+          (assert (< end (getf (getf facts :certificate) :fork)))
+          (funcall check)
+          (sb-thread:with-mutex (*wal-lock*)
+            (funcall under-lock)
+            (assert (<= (getf (getf facts :certificate) :fork)
+                        (logical-slot-imported-scan-proof-horizon-under-lock owner)))))))
+     :upto end))
+  (format t "~&NATIVE-RUNTIME-BOUNDED-SOURCE PASS pre-fork-and-empty-horizons=~s~%" ends))
+
+(defun native-host-continuation-runtime-ack-fenced (scan)
+  (let* ((slot (wal-retained-slot-scan-slot scan))
+         (name (wal-retained-slot-scan-name scan))
+         (confirmed (wal-replication-slot-confirmed-flush-lsn slot))
+         (before (logical-slot-state-encode slot))
+         (pending (wal-replication-slot-pending-xids slot))
+         (prepared nil))
+    (dolist (operation
+             (list
+              (lambda ()
+                (sb-thread:with-mutex (*wal-lock*)
+                  (wal-persist-replication-slot-ack-under-lock slot confirmed)))
+              (lambda () (wal-acknowledge-standard-replication-slot name confirmed confirmed confirmed))
+              (lambda () (wal-logical-slot-accept-resume-position name confirmed))
+              (lambda ()
+                (call-with-logical-slot-terminal-check
+                 name confirmed
+                 (lambda (candidate) (declare (ignore candidate)) (setf prepared t) (values t nil))
+                 (lambda (&rest arguments) (declare (ignore arguments)) (error "unexpected finish"))))))
+      (assert
+       (handler-case (progn (funcall operation) nil)
+         (error (condition)
+           (search "prepared continuation publication" (princ-to-string condition))))))
+    (assert (not prepared))
+    (assert (eq pending (wal-replication-slot-pending-xids slot)))
+    (assert (equalp before (logical-slot-state-encode slot)))
+    (assert (not (wal-replication-slot-state-uncertain-p slot)))
+    (format t "~&NATIVE-RUNTIME-ACK-FENCED PASS slot=~a persistence-standard-resume-prepare~%" name)))
+
+(defun native-host-continuation-runtime-cursor (scan source)
+  (native-host-continuation-runtime-ack-fenced scan)
+  (let ((records 0) (escaped nil))
+    (multiple-value-bind (owner role)
+        (sb-thread:with-mutex (*wal-lock*) (logical-slot-wal-scan-start-position scan))
+      (call-with-logical-slot-wal-cursor-from-scan
+       scan owner role
+       (lambda (cursor selected-source)
+         (assert (and (eq (logical-wal-source-slot source) (logical-wal-source-slot selected-source))
+                      (eq :stream (logical-wal-source-purpose selected-source))))
+         (setf escaped cursor)
+         (when (< (wal-retained-slot-scan-start scan) (wal-retained-slot-scan-end scan))
+           (assert (logical-wal-record-provider-p (logical-wal-cursor-record-reader cursor))))
+         (loop while (logical-wal-cursor-next cursor) do (incf records))
+         (assert (= (wal-retained-slot-scan-end scan) (logical-wal-cursor-position cursor))))))
+    (assert (handler-case (progn (logical-wal-cursor-next escaped) nil) (error () t)))
+    (format t "~&NATIVE-RUNTIME-CURSOR PASS slot=~a start=~d end=~d records=~d~%"
+            (wal-retained-slot-scan-name scan) (wal-retained-slot-scan-start scan)
+            (wal-retained-slot-scan-end scan) records)))
+
+(defun native-host-continuation-runtime-transactions (scan)
+  (let ((position (wal-retained-slot-scan-start scan))
+        (end (wal-retained-slot-scan-end scan))
+        (xids nil) (commits nil) (changes 0) (frontiers nil) (finished nil))
+    (call-with-logical-reader-spools
+     (lambda ()
+       (dotimes (attempt 16)
+         (declare (ignorable attempt))
+         (multiple-value-bind (transactions progress exhausted)
+             (wal-logical-slot-read-transactions
+              (wal-retained-slot-scan-name scan) :from-lsn position :upto-lsn end :max-transactions 1)
+           (assert (<= position progress end))
+           (assert (null *wal-logical-slot-read-continuation*))
+           (dolist (transaction transactions)
+             (assert (not (member (logical-transaction-commit-lsn transaction) commits)))
+             (push (logical-transaction-commit-lsn transaction) commits)
+             (when (plusp (logical-transaction-xid transaction))
+               (assert (not (member (logical-transaction-xid transaction) xids)))
+               (push (logical-transaction-xid transaction) xids))
+             (logical-transaction-map-changes
+              transaction (lambda (change) (declare (ignore change)) (incf changes))))
+           (push progress frontiers)
+           (setf position progress)
+           (when exhausted (setf finished t) (return))))))
+    (assert (and finished (= end position)))
+    (assert (equal '(3 4) (nreverse xids)))
+    (assert (<= 2 changes))
+    (format t "~&NATIVE-RUNTIME-TRANSACTIONS PASS slot=~a xids=(3 4) changes=~d frontiers=~s~%"
+            (wal-retained-slot-scan-name scan) changes (nreverse frontiers))))
+
+(defun native-host-continuation-runtime-source ()
+  (catalog-init)
+  (let ((fds (length (directory #p"/proc/self/fd/*")))
+        (records 0) (boundary nil))
+    (dolist (name '("alpha" "beta"))
+      (native-host-with-runtime-scan
+       name
+       (lambda (scan source)
+         (when (string= name "alpha")
+           (native-host-continuation-runtime-tail-mutations scan source))
+         (native-host-continuation-runtime-cursor scan source)
+         (native-host-continuation-runtime-transactions scan)
+         (call-with-logical-slot-imported-runtime-source
+          scan source
+          (lambda (owner context facts archive check under-lock)
+            (declare (ignore owner))
+            (setf boundary (getf (getf facts :manifest) :end))
+            (funcall check)
+            (sb-thread:with-mutex (*wal-lock*)
+              (funcall under-lock)
+              (wal-save-control-fields *wal-checkpoint-lsn* *wal-durable-lsn*))
+            (native-host-runtime-root-metadata-change context)
+            (funcall check)
+            (let* ((history (logical-slot-copy-source-proof-parent-history facts))
+                   (start (getf (getf facts :manifest) :end))
+                   (end (getf (getf facts :certificate) :fork)))
+              (call-with-logical-wal-cursor
+               history :timeline start end (timeline-at-point (1- start) history) :prefix-end
+               under-lock
+               (lambda (cursor)
+                 (loop while (logical-wal-cursor-next cursor) do (incf records)))
+               :archive archive :archive-only t :batch-policy :logical-reader))
+            (funcall check))))))
+    (native-host-continuation-runtime-bounded-source
+     (list (wal-replication-slot-restart-lsn (gethash "alpha" *wal-replication-slots*)) boundary))
+    (native-host-continuation-runtime-source-negative)
+    (assert (plusp records))
+    (assert (= fds (length (directory #p"/proc/self/fd/*"))))
+    (assert (logical-slot-continuation-gc-fenced-p *pgdata*))
+    (format t "~&NATIVE-RUNTIME-SOURCE PASS archive-records=~d control-replacement-accepted~%" records)))
+
 (defun native-host-continuation-active-refusal (gate ownership)
   (let* ((entries (logical-slot-startup-read-inventory :local-workspace t))
          (registry *wal-replication-slots*)
@@ -924,6 +1348,8 @@
       (assert (equalp control (logical-slot-startup-control-image)))
       (assert (= fds (length (directory #p"/proc/self/fd/*"))))
       (assert (null *catalog*)))
+    (when (uiop:getenv "PG_NATIVE_RUNTIME_SOURCE")
+      (native-host-continuation-runtime-source))
     t))
 
 (defun native-imported-host-observation ()

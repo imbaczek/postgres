@@ -536,6 +536,8 @@ Ordinary validation errors return NIL. FATAL errors and any error after WAL
 failure is latched propagate unchanged, as do cancellation and statement
 timeout (57014). A miss leaves the caller to validate anew."
   (assert (sb-thread:holding-mutex-p *wal-lock*))
+  (when (wal-replication-slot-child-owner slot)
+    (return-from logical-wal-reusable-continuation nil))
   (let ((certificate *wal-logical-slot-read-continuation*))
     (when (and certificate
                (eq :stream (logical-wal-source-purpose (logical-wal-continuation-source certificate)))
@@ -635,6 +637,10 @@ continuation nor its facts retain a pin, reader lease or cached WAL payload."
                      (wal-retained-slot-scan-slot scan) (wal-retained-slot-scan-start scan) owner role))
           (error "logical WAL start lacks a captured slot boundary"))
         (check-source))
+      (when (wal-replication-slot-child-owner (wal-retained-slot-scan-slot scan))
+        (return-from call-with-logical-slot-wal-cursor-from-scan
+          (call-with-logical-slot-imported-runtime-scan
+           scan source owner role function batch-policy)))
       (call-with-optional-logical-wal-archive
        (logical-wal-source-system-id source) (logical-wal-source-history source)
        (logical-wal-source-namespace source) #'check-source
@@ -724,6 +730,7 @@ current slot state under the lock before acting on the proof."
            (sb-thread:with-mutex (*wal-lock*)
              (wal-check-healthy)
              (let ((slot (wal-find-usable-replication-slot-under-lock name)))
+               (wal-check-slot-ack-publication-under-lock slot)
                (multiple-value-bind (done result) (funcall prepare slot)
                  (when done (return-from call-with-logical-slot-terminal-check result)))
                (unless (wal-replication-slot-logical-provenance slot)

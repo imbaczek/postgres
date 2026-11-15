@@ -89,7 +89,8 @@
   t)
 
 (defun logical-slot-continuation-scan-tail
-    (history fork child end guard reader spool observe finish)
+    (history fork child end guard reader spool observe finish
+     &key (batch-policy :strict) (require-closed t))
   (let ((verify (logical-spool-sealed-p spool)) (records 0)
                                                 (*wal-recovery-reservation-batch-clean-p* nil))
     (call-with-logical-wal-cursor
@@ -116,12 +117,12 @@
                (when (next nil) (error "continuation WAL exceeds its transcript")))
              (loop while (next nil)))
          (unless (and (= end (logical-wal-cursor-position cursor))
-                      (not (logical-wal-cursor-batch-open cursor)))
+                      (or (not require-closed) (not (logical-wal-cursor-batch-open cursor))))
            (error "continuation WAL did not reach its sealed completed end"))
          (when finish (funcall finish))
          (unless verify (logical-spool-seal spool))
          records))
-     :segment-reader reader :batch-policy :strict)))
+     :segment-reader reader :batch-policy batch-policy)))
 
 (defun call-with-logical-slot-continuation-local-tail-source (storage snapshot function &key boundaries)
   ;; Prove the locally present original-child WAL from F to the sealed end.

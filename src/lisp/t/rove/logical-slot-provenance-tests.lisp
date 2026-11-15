@@ -1467,14 +1467,18 @@
            (rove:ok (zerop writes))
            (rove:ok (not (wal-replication-slot-state-uncertain-p slot))))))))
 
-(rove:deftest logical-slot-child-owner-survives-ack-and-loss
+(rove:deftest logical-slot-child-owner-survives-progress-save-and-loss
     (call-with-canonical-wal-slot-fixture
      (lambda ()
        (let ((slot (unit-logical-provenance-slot :child-owner #xffffffffffffffffffffffffffffffff)))
          (wal-create-replication-slot-file slot)
          (setf (gethash "fixture" *wal-replication-slots*) slot)
          (sb-thread:with-mutex (*wal-lock*)
-           (wal-persist-replication-slot-ack-under-lock slot 90)
+           ;; Exercise P7 storage invariants below imported ACK admission.
+           (let ((candidate (wal-copy-replication-slot-with-profile slot)))
+             (setf (wal-replication-slot-restart-lsn candidate) 90
+                   (wal-replication-slot-confirmed-flush-lsn candidate) 90)
+             (logical-slot-save-update-under-lock slot candidate))
            (wal-invalidate-replication-slots-matching-under-lock (constantly t)))
          (let ((decoded (wal-read-replication-slot (wal-replication-slot-path "fixture"))))
            (rove:ok (eql (wal-replication-slot-child-owner slot)
@@ -1497,7 +1501,11 @@
                      (error "child-owned slot save fault")))))
            (rove:ok (rove:signals
                      (sb-thread:with-mutex (*wal-lock*)
-                       (wal-persist-replication-slot-ack-under-lock slot 90)) 'error)))
+                       ;; Exercise P7 storage invariants below imported ACK admission.
+                       (let ((candidate (wal-copy-replication-slot-with-profile slot)))
+                         (setf (wal-replication-slot-restart-lsn candidate) 90
+                               (wal-replication-slot-confirmed-flush-lsn candidate) 90)
+                         (logical-slot-save-update-under-lock slot candidate))) 'error)))
          (rove:ok fired)
          (rove:ok (wal-replication-slot-state-uncertain-p slot))
          (rove:ok (= 32 (wal-replication-slot-restart-lsn slot)))

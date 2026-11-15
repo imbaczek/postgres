@@ -467,3 +467,55 @@
                       (progn (call-with-logical-spool-reader spool (if (eq case :bound) 1 2) (lambda (next) (funcall next))) nil)
                     (error () t)))))
            (rove:ok (logical-spool-failed-p spool)))))))
+
+(cl-spec:defproperty continuation-runtime-tail-allows-open-and-abandoned-extension
+    ((count (range integer 0 12)))
+  (:about logical-slot-continuation-runtime-tail-observer)
+  (:trials (:normal 200))
+  (multiple-value-bind (fork eor-end batch-end sealed) (unit-continuation-boundary-positions)
+    (declare (ignore eor-end batch-end))
+    (multiple-value-bind (observe finish)
+        (logical-slot-continuation-runtime-tail-observer fork sealed)
+      (unit-continuation-boundary-records observe)
+      (let ((position sealed))
+        (dotimes (i count)
+          (declare (ignore i))
+          (let* ((raw (wal-encode-record +wal-record-batch-start+ 0 position
+                                         (make-array 0 :element-type '(unsigned-byte 8))))
+                 (record (wal-decode-record raw position)))
+            (funcall observe record raw 2 2 :ordinary position)
+            (setf position (wal-record-end record)))))
+      (funcall finish))))
+
+(rove:deftest continuation-runtime-tail-extension-generated-contract
+    (let ((result (cl-spec:result-data
+                   (cl-spec:run-property
+                    'continuation-runtime-tail-allows-open-and-abandoned-extension
+                    :seed 11504 :profile :normal))))
+      (format t "~&RUNTIME-TAIL-CONTRACT ~s~%" result)
+      (rove:ok (eq :passed (getf result :status)))
+      (rove:ok (= 200 (getf result :trials)))))
+
+(rove:deftest continuation-runtime-tail-keeps-the-historical-seal-strict
+    (multiple-value-bind (fork eor-end batch-end sealed) (unit-continuation-boundary-positions)
+      (declare (ignore eor-end))
+      (dolist (mode '(:unfinished-seal :missing-seal :orphan-extension))
+        (rove:ok
+         (handler-case
+             (progn
+               (multiple-value-bind (observe finish)
+                   (logical-slot-continuation-runtime-tail-observer
+                    fork (if (eq mode :unfinished-seal) batch-end sealed))
+                 (if (eq mode :missing-seal)
+                     (funcall finish)
+                     (progn
+                       (unit-continuation-boundary-records observe)
+                       (when (eq mode :orphan-extension)
+                         (let* ((raw (wal-encode-record +wal-record-commit+ 10 sealed
+                                                        (wal-encode-commit-timestamp 0)))
+                                (record (wal-decode-record raw sealed)))
+                           (funcall observe record raw 2 2 :ordinary sealed)))
+                       (funcall finish))))
+               nil)
+           (error () t))
+         (format nil "~s must be rejected" mode)))))

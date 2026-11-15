@@ -1678,6 +1678,7 @@ tracked by the bounded sender. SENT-LSN never includes an unfinished frame."
     (let ((slot (wal-find-usable-replication-slot-under-lock name)))
       (unless slot
         (ereport "42704" "replication slot ~s does not exist" name))
+      (wal-check-slot-ack-publication-under-lock slot)
       (unless (and *wal-logical-slot-owner*
                    (eq *wal-logical-slot-owner*
                        (wal-replication-slot-active-owner slot)))
@@ -2102,7 +2103,8 @@ baseline and end-of-recovery alone do not establish a continuation."
             :cursor cursor :output-start requested :allow-filter allow-filter)
          (sb-thread:with-mutex (*wal-lock*)
            (logical-wal-cursor-check-scope cursor)
-           (when (eql progress finished-terminal)
+           (when (and (not (wal-replication-slot-child-owner (wal-retained-slot-scan-slot scan)))
+                      (eql progress finished-terminal))
              (setf *wal-logical-slot-read-continuation*
                    (logical-wal-certify-boundary source progress)))
            (wal-logical-reader-return transactions progress exhausted))))

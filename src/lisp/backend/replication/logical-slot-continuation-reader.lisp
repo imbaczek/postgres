@@ -1,7 +1,8 @@
 (in-package #:pg)
 
 (defun call-with-logical-slot-continuation-lanes
-    (facts snapshot slot archive sidecar-reader local-reader guard function)
+    (facts snapshot slot archive sidecar-reader local-reader guard function
+     &key (end (first (getf snapshot :sealed-end))) position local-provider (batch-policy :logical-reader))
   ;; D is the manifest end (the checkpoint end), not the archive base or
   ;; checkpoint start.  Read before D from the sidecar, D through F from the
   ;; original parent archive only, and F through the sealed end from local
@@ -11,14 +12,17 @@
          (parent-history (logical-slot-copy-source-proof-parent-history facts))
          (base (getf (getf facts :manifest) :end))
          (fork (getf (getf facts :certificate) :fork))
-         (end (first (getf snapshot :sealed-end)))
-         (start (wal-replication-slot-restart-lsn slot))
+         (start (if position (first position) (wal-replication-slot-restart-lsn slot)))
          (specifications nil))
-    (unless (<= start end) (error "imported restart exceeds its sealed source"))
-    (multiple-value-bind (owner role) (logical-slot-startup-start-position slot history)
-      (flet ((add-lane (lineage begin stop start-owner start-role archive reader)
+    (unless (and (integerp start) (integerp end) (<= 0 start end))
+      (error "invalid imported reader interval"))
+    (multiple-value-bind (owner role) (if position
+                                          (progn (logical-slot-continuation-list position 3)
+                                                 (values (second position) (third position)))
+                                          (logical-slot-startup-start-position slot history))
+      (flet ((add-lane (lineage begin stop start-owner start-role archive reader &optional provider)
                (when (< begin stop)
-                 (push (list lineage begin stop start-owner start-role archive reader) specifications))))
+                 (push (list lineage begin stop start-owner start-role archive reader provider) specifications))))
         (add-lane parent-history start (min base end) owner role nil sidecar-reader)
         (let ((begin (max start base)) (stop (min fork end)))
           (add-lane parent-history begin stop
@@ -27,7 +31,7 @@
         (let ((begin (max start fork)))
           (add-lane history begin end
                     (if (= begin fork) (getf snapshot :history-target) owner)
-                    (if (= begin fork) :record-start role) nil local-reader)))
+                    (if (= begin fork) :record-start role) nil local-reader local-provider)))
       (labels ((open-lanes (remaining cursors)
                  (if (null remaining)
                      (if cursors
@@ -37,18 +41,18 @@
                             (call-with-logical-wal-cursor
                              history :timeline start end owner role guard
                              (lambda (cursor) (funcall function cursor (list base fork end)))
-                             :record-reader provider :batch-policy :logical-reader)))
+                             :record-reader provider :batch-policy batch-policy)))
                          (call-with-logical-wal-cursor
                           history :timeline start end owner role guard
                           (lambda (cursor) (funcall function cursor (list base fork end)))
-                          :segment-reader local-reader :batch-policy :logical-reader))
-                     (destructuring-bind (lineage begin stop start-owner start-role lane-archive reader)
+                          :segment-reader local-reader :batch-policy batch-policy))
+                     (destructuring-bind (lineage begin stop start-owner start-role lane-archive reader provider)
                          (first remaining)
                        (call-with-logical-wal-cursor
                         lineage :timeline begin stop start-owner start-role guard
                         (lambda (cursor) (open-lanes (rest remaining) (cons cursor cursors)))
                         :archive lane-archive :archive-only (not (null lane-archive))
-                        :segment-reader reader :batch-policy :logical-reader)))))
+                        :segment-reader reader :record-reader provider :batch-policy batch-policy)))))
         (open-lanes (nreverse specifications) nil)))))
 
 (defun call-with-logical-slot-continuation-storage-readers (storage facts function &optional finish)
