@@ -1,10 +1,13 @@
 (in-package #:pg)
 
 (defun logical-slot-copy-source-proof-directory-identity (facts)
+  "Select device, inode, full mode, owner and mount identity for a directory."
   (list (first facts) (second facts) (third facts) (fifth facts) (ninth facts)))
 
 (defun call-with-logical-slot-copy-source-proof-fd (parent name directory-p function &key mutable-directory)
   ;; Hold one private, named input for FUNCTION and recheck its identity.
+  ;; Full facts are required by default. Mutable directories may change size,
+  ;; link count and timestamps, but retain their private named identity.
   ;; Leave a reused descriptor open.  Close owned input once, without retrying
   ;; a reported close failure; preserve an original body failure during cleanup.
   (declare (notinline sb-posix:close))
@@ -64,5 +67,8 @@
                       (report-query-temp-cleanup-failure "source proof input" condition)))))))))))
 
 (defun call-with-logical-slot-imported-archive-directory (parent function)
+  "Hold the retained directory while its contents may change.
+Before reading selected objects, protect them with a retained-root lease and
+check their contents. This scope alone grants no logical authority."
   (call-with-logical-slot-copy-source-proof-fd
    parent "pg_physical_retained" t function :mutable-directory t))
