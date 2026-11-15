@@ -99,6 +99,12 @@ those permissions aborts startup.
 
 ## Agent runtime debugging
 
+Pure replay scanners bind simulated recovery state and store. Bracket an
+observational scan with live owner and startup authority checks in the real
+context; the reader inside checks only private FD, scope and content identity.
+Do not rebind saved live globals to make a guard pass. Runtime providers still
+need live per-record and terminal checks.
+
 When a task depends on live Lisp state, backend threads, or timing between SQL
 sessions, agents should prefer the control REPL on a local server instance they
 started for the task. Use it to inspect state, coordinate concurrent sessions,

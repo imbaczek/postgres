@@ -5,6 +5,10 @@
   (asdf:load-system "pg"))
 (in-package #:pg)
 
+;; Run against the original stopped prepared child: its permanent pair is
+;; inode-bound. Startup replay changes control and recovery state; this is not
+;; a read-only file probe.
+
 (defun native-imported-child-prefix (context facts)
   (let* ((certificate (getf facts :certificate))
          (fork (getf certificate :fork))
@@ -38,6 +42,7 @@
               image)))
 
 (defun native-imported-history-observation (owner context facts check under-lock references function)
+  "Replay D through F and check archive and child prefixes under a real lease."
   (let* ((source (logical-slot-imported-startup-owner-source owner))
          (root (physical-image-context-root-fd context))
          (certificate (getf facts :certificate)))
@@ -52,6 +57,10 @@
                     (assert (equal archive-facts (physical-image-file-facts archive-fd)))
                     (assert (equal archive-facts (physical-image-file-facts root "pg_physical_retained")))
                     t)
+                  ;; Historical replay binds simulated recovery globals. Live
+                  ;; owner, pair and archive checks bracket it outside the scan;
+                  ;; this reader checks only private scope, FDs and contents.
+                  ;; Directory facts assume a quiescent fixture, not a runtime provider.
                   (read-object (selected kind id maximum)
                     (anchors)
                     (assert (equal selected input))

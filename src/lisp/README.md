@@ -1330,6 +1330,26 @@ smoke single-fixture job needs one image; a full job with both certificate
 variants still needs three for later fixture preparation. Keep the combined
 owned limit at eight and do not start three preparation groups simultaneously.
 
+To check imported startup history, use the original stopped, prepared child
+PGDATA with its P7 permanent pair. Do not copy the fixture: its proof binds the
+directory inode. From `src/lisp`, run:
+
+```sh
+PG_NATIVE_PROOF_DATA=/absolute/prepared-child ./t/test-ramdisk.sh run \
+  "${SBCL:-sbcl}" --noinform --disable-debugger --non-interactive \
+  --load t/imported-startup-history.lisp
+```
+
+The test requires fork F to follow the base-copy end D by default; set
+`PG_NATIVE_PROOF_ALLOW_EMPTY=1` explicitly for an empty interval. It acquires
+real postmaster and startup gate ownership, performs startup replay and retained
+root restoration, and holds an archive lease while checking historical replay
+and the archive and child prefixes. It aborts before publication and checks
+reader, descriptor and scope cleanup, the empty registry and catalog, and
+unchanged mirrors.
+Startup replay changes control and recovery state; this is not a read-only file
+probe. It does not enable a writer, listener or admission.
+
 The unit suite contains 68 regressions migrated from the legacy runner, eight
 Properties and one Function Spec, all explicitly executed through Rove. Loading
 it alone does not run tests. `./t/run-unit-tests.sh` executes this ASDF suite and
