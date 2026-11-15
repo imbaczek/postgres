@@ -74,6 +74,9 @@ Once restored, protection persists after scope exit or failure."
     (list (namestring (physical-adoption-owner-directory owner))
           (first facts) (second facts) (ninth facts))))
 
+;; Runtime lookup never restores an origin.  It requires the already restored
+;; record and its matching binding and directory; use still takes a fresh lease.
+
 (defun logical-slot-imported-host-origin-lookup (owner context directory binding)
   (unless (logical-slot-imported-scan-owner-p owner)
     (error "runtime origin lookup requires its registered scan owner"))

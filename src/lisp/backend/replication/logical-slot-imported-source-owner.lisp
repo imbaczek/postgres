@@ -72,6 +72,9 @@ A foreign or copied owner cannot fail the original owner's scope."
          (error "imported logical source differs from its registered scan"))
        (logical-wal-check-source source (wal-retained-slot-scan-end scan))))))
 
+;; L is captured from durable WAL under the lock when the owner is acquired.
+;; Recheck the source against that private horizon instead of advancing it.
+
 (defun logical-slot-imported-scan-proof-horizon-under-lock (owner)
   (assert (sb-thread:holding-mutex-p *wal-lock*))
   (call-with-logical-slot-imported-scan-check

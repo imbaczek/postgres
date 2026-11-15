@@ -257,6 +257,8 @@ The caller must not mutate EVENT after passing it to this function."
          (unless complete (setf (logical-spool-failed-p spool) t))))))
   (values))
 
+;; Capture checksums and counts for the sealed in-memory frames before replay.
+
 (defun logical-spool-reader-memory (spool maximum)
   (let ((frames nil) (total 0) (remaining (logical-spool-events spool)))
     (dotimes (index (logical-spool-count spool))
@@ -270,6 +272,8 @@ The caller must not mutate EVENT after passing it to this function."
       (error "invalid logical spool memory contents"))
     frames))
 
+;; Bound each allocation by both the frame limit and the remaining spool bytes.
+
 (defun logical-spool-reader-file-frame (stream maximum remaining)
   (let ((size (logical-spool-read-u32 stream))
         (checksum (logical-spool-read-u32 stream)))
@@ -279,6 +283,10 @@ The caller must not mutate EVENT after passing it to this function."
       (unless (= size (read-sequence frame stream)) (error "truncated logical spool event"))
       (unless (= checksum (wal-crc32 frame)) (error "logical spool checksum mismatch"))
       frame)))
+
+;; NEXT belongs to this thread and callback only.  Reading through EOF checks
+;; the final count and extent.  A failed read or incomplete callback poisons
+;; the spool; cleanup revokes NEXT, including after partial consumption.
 
 (defun call-with-logical-spool-reader (spool maximum function)
   (unless (and (typep maximum '(integer 1 4294967295)) (functionp function))

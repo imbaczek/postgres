@@ -15,6 +15,10 @@
 (defvar *logical-slot-continuation-storage-identities*
   (make-hash-table :test #'eq :weakness :key :synchronized t))
 
+;; Storage is a scoped capability.  Its identity, registration, owner thread
+;; and held proof are checked on use; failure during an operation is sticky.
+;; The runtime subtype also carries the captured horizon and origin lease.
+
 (defun logical-slot-continuation-storage-call (storage operation &optional argument)
   (let ((state (and (logical-slot-continuation-startup-storage-p storage)
                     (gethash storage *logical-slot-continuation-storage-identities*))))
@@ -87,6 +91,10 @@
 
 (defun call-with-logical-slot-continuation-wal-directory (root function)
   (call-with-logical-slot-continuation-owned-wal-directory root function nil))
+
+;; Runtime pg_wal may grow, but its named and held directories must retain
+;; device, inode, full mode, owner and mount identity.  Startup remains strict
+;; about the full captured directory facts.
 
 (defun call-with-logical-slot-continuation-runtime-wal-directory (root function)
   (call-with-logical-slot-continuation-owned-wal-directory root function t))

@@ -1668,6 +1668,9 @@ captured horizon. An early limit returns false for exhaustion."
                progress-lsn)))
   (values transactions progress-lsn exhausted-p))
 
+;; Imported reads do not grant ACK publication.  Check that fence before
+;; persisting standard feedback, even if the reader has returned progress.
+
 (defun wal-acknowledge-standard-replication-slot
     (name acknowledged-lsn restart-floor sent-lsn)
   "Persist exact standard feedback while retaining an aligned decoding cursor.

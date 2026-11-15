@@ -62,8 +62,9 @@
   ;; Callbacks are trusted internal code and can access raw data; this scope
   ;; does not sandbox them.  Current startup supports the original child only.
   ;; Atomic startup publication is available to the original-child startup
-  ;; library.  Automatic loading, admission, runtime scan and ACK remain
-  ;; separate work; the GC fence remains closed.
+  ;; library, and the public runtime reader is observational.  Ordinary
+  ;; imported loading and admission, terminal ACK and persistence, and GC
+  ;; remain fenced.
   (logical-slot-continuation-storage-call
    storage :with-origin
    (lambda (archive)

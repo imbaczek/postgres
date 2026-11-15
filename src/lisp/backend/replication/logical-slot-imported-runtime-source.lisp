@@ -1,5 +1,11 @@
 (in-package #:pg)
 
+;; An imported runtime scan borrows the registered scan owner and the held
+;; permanent proof files.  Origin lookup only finds a previously restored
+;; record; the archive operation obtains a fresh root-reader lease.  These
+;; scopes are observational and cover the original child, generation 1 only.
+;; Callbacks are trusted internal code, not a sandbox for raw Lisp access.
+
 (defun call-with-logical-slot-imported-runtime-source (scan source function)
   (call-with-logical-slot-imported-scan-owner
    scan source
@@ -32,6 +38,10 @@
      (call-with-logical-slot-continuation-storage-context
       owner context facts check under-lock function archive))))
 
+;; Compare the selected snapshot with the historical host image at its seal S.
+;; Change only the detached host copy; neither S in the snapshot nor live host
+;; globals are rewritten to make the current durable end look historical.
+
 (defun logical-slot-continuation-check-runtime-snapshot (storage facts snapshot)
   (unless (logical-slot-continuation-runtime-storage-p storage)
     (error "runtime selector proof requires runtime storage"))
@@ -50,6 +60,10 @@
                       (logical-slot-continuation-encode snapshot))
         (error "selected continuation differs from its historical host and saved inventory"))))
   (logical-slot-continuation-storage-check storage))
+
+;; Prove the original strict boundary rules through S, then use ordinary
+;; reader batch rules for the suffix.  The suffix may end with an open or
+;; abandoned batch; a record may not cross the historical seal.
 
 (defun logical-slot-continuation-runtime-tail-observer (fork sealed &optional requests)
   (unless (and (typep fork '(unsigned-byte 64))
@@ -89,6 +103,9 @@
                  t))
         (values #'observe #'finish)))))
 
+;; Hold an independent pin at fork F throughout capture, replay, drain and
+;; reproof.  The consumer's own retention pin is not a substitute for it.
+
 (defun call-with-logical-slot-continuation-runtime-pin (storage fork function)
   (let ((table nil) (pin (gensym "CONTINUATION-TAIL-")) (active nil)
                     (thread sb-thread:*current-thread*))
@@ -117,6 +134,11 @@
        (= (fifth observed) (sb-posix:geteuid))
        (zerop (logand (third observed) #o077))
        (<= minimum (sixth observed) +wal-segment-size+)))
+
+;; Track named segment identities and minimum captured prefixes while reading
+;; the original child.  Each read uses the current descriptor size.  The
+;; ordered visits are checked again after replay.  Failure revokes the scope;
+;; release masks interrupts between detaching and closing the held stream.
 
 (defun call-with-logical-slot-continuation-runtime-segments
     (storage fork child horizon function)
@@ -199,6 +221,16 @@
                   (setf active nil)
                   (release)))))))))))
 
+;; E is the registered consumer end, L the private captured and checked
+;; durable proof horizon, and S the selected historical seal.  Prove through
+;; H = max(E, S), requiring H <= L, even when the consumer stops before S.
+;;
+;; Capture into a private bounded spool, replay and drain it, then reprove the
+;; same bytes and ordered segment visits.  Append after H is qualified here;
+;; committed durable growth and cold historical reconciliation are not yet
+;; qualified.  Without an independent digest this cannot detect consistent
+;; corruption predating capture, or a transient rewrite that is restored.
+
 (defun call-with-logical-slot-continuation-runtime-tail
     (storage snapshot end function)
   (unless (eql end (logical-slot-continuation-storage-call storage :end))
@@ -249,6 +281,9 @@
                      (prove)
                      (logical-slot-continuation-check-runtime-snapshot storage facts snapshot)))))))))))))
 
+;; Supply the captured transcript sequentially from the registered start.
+;; The first record may use the saved restart boundary's batch-start position.
+
 (defun call-with-logical-slot-continuation-runtime-tail-provider
     (storage snapshot scan function)
   (let* ((fork (second (getf snapshot :origin)))
@@ -285,6 +320,10 @@
             (multiple-value-prog1 (funcall function provider)
               (sb-thread:with-mutex (*wal-lock*)
                 (logical-wal-record-provider-check provider))))))))))
+
+;; Keep the exact selected file, sidecar, origin lease and local proof live
+;; across the cursor callback.  Checks before and after use bind the named
+;; selector to its held descriptor and bytes; an ambiguous selector fails.
 
 (defun call-with-logical-slot-imported-runtime-cursor (scan source owner role function &key (batch-policy :logical-reader))
   (unless (eq :stream (logical-wal-source-purpose source))
@@ -345,6 +384,13 @@
                           :position (list (wal-retained-slot-scan-start scan) owner role)
                           :local-provider local-provider :batch-policy batch-policy)
                        (check)))))))))))))))
+
+;; Dispatch the imported observational scan within the caller's registered
+;; scan scope.  Borrowed cursors and artifact capabilities stay within their
+;; callbacks; all artifact scopes end before progress is published.
+
+;; Stage progress privately until the cursor, drain and reproof all succeed;
+;; publish it only after rechecking the registered scan and source under WAL.
 
 (defun call-with-logical-slot-imported-runtime-scan
     (scan source owner role function batch-policy)

@@ -169,6 +169,10 @@ replay D through F, provide WAL records, publish a slot or establish readiness."
 (defun call-with-logical-slot-imported-proof-files (owner context function)
   (call-with-logical-slot-imported-proof-file-scope owner context function))
 
+;; Runtime permits mutable root directory metadata while preserving its
+;; device, inode, full mode, owner and mount identity.  The held permanent
+;; pair and installation files still require their exact facts and contents.
+
 (defun call-with-logical-slot-imported-runtime-proof-files (owner context function)
   (unless (logical-slot-imported-scan-owner-p owner)
     (error "runtime proof files require their registered scan owner"))
