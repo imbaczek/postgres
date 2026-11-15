@@ -46,21 +46,25 @@
   (let* ((source (logical-slot-imported-startup-owner-source owner))
          (root (physical-image-context-root-fd context))
          (certificate (getf facts :certificate)))
-    (call-with-logical-slot-copy-source-proof-fd
-     root "pg_physical_retained" t
+    (call-with-logical-slot-imported-archive-directory
+     root
      (lambda (archive-fd archive-facts)
        (let ((input (physical-image-fd-path archive-fd)) (active t)
                                                          (thread sb-thread:*current-thread*) (mutex *wal-lock*))
          (labels ((anchors ()
                     (assert (and active (eq thread sb-thread:*current-thread*) (eq mutex *wal-lock*)))
                     (physical-image-check-context context)
-                    (assert (equal archive-facts (physical-image-file-facts archive-fd)))
-                    (assert (equal archive-facts (physical-image-file-facts root "pg_physical_retained")))
+                    (assert (equal (logical-slot-copy-source-proof-directory-identity archive-facts)
+                                   (logical-slot-copy-source-proof-directory-identity
+                                    (physical-image-file-facts archive-fd))))
+                    (assert (equal (logical-slot-copy-source-proof-directory-identity archive-facts)
+                                   (logical-slot-copy-source-proof-directory-identity
+                                    (physical-image-file-facts root "pg_physical_retained"))))
                     t)
                   ;; Historical replay binds simulated recovery globals. Live
                   ;; owner, pair and archive checks bracket it outside the scan;
                   ;; this reader checks only private scope, FDs and contents.
-                  ;; Directory facts assume a quiescent fixture, not a runtime provider.
+                  ;; This observational reader is not a runtime record provider.
                   (read-object (selected kind id maximum)
                     (anchors)
                     (assert (equal selected input))
