@@ -148,6 +148,7 @@
                    (:file "../access/transam/timeline")
                    (:file "../access/transam/timeline.hot")
                    (:file "../replication/logical-slot-state")
+                   (:file "../replication/logical-slot-imported-state")
                    (:file "../replication/physical-fpw")
                    (:file "../replication/physical-logical-status")
                    (:file "../replication/physical-bootstrap.hot")

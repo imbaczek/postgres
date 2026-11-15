@@ -15,6 +15,7 @@
                (:file "t/rove/cold-wal-scratch-tests")
                (:file "t/rove/cold-wal-ledger-tests")
                (:file "t/rove/logical-slot-provenance-tests")
+               (:file "t/rove/logical-slot-imported-state-tests")
                (:file "t/rove/logical-slot-copy-import-tests")
                (:file "t/rove/logical-slot-copy-evidence-tests")
                (:file "t/rove/logical-slot-copy-install-tests")
