@@ -13,21 +13,9 @@
         (error "permanent source parent history differs from its certificate"))
       history)))
 
-(defun logical-slot-copy-source-proof-map-archive
-    (facts directory reader candidate function start)
-  ;; Feed validated archive records from START to exact F, rejecting crossings
-  ;; and gaps that do not follow the embedded history.
-  (let* ((certificate (getf facts :certificate))
-         (reference (getf certificate :retained-reference))
-         (history (getf facts :history))
-         (parent (getf certificate :parent-timeline))
-         (fork (getf certificate :fork))
-         (cursor start)
-         (archive-history (logical-slot-copy-source-proof-parent-history facts)))
-    (physical-promotion-check-retained-reference
-     (getf certificate :system-id) reference parent archive-history
-     :end fork :directory directory :reader reader
-     :on-record
+(defun logical-slot-copy-source-proof-archive-cursor (candidate function start fork history)
+  (let ((cursor start))
+    (values
      (lambda (record raw)
        (let ((begin (wal-record-start record)) (end (wal-record-end record)))
          (cond
@@ -48,9 +36,25 @@
                             :fork cursor :eor-bytes raw
                             :previous (physical-store-selection candidate)))))
             (funcall function record raw)
-            (setf cursor end))))))
-    (unless (= cursor fork) (error "permanent source archive did not reach exact F"))
-    nil))
+            (setf cursor end)))))
+     (lambda ()
+       (unless (= cursor fork) (error "permanent source archive did not reach exact F"))
+       nil))))
+
+(defun logical-slot-copy-source-proof-map-archive
+    (facts directory reader candidate function start)
+  (let* ((certificate (getf facts :certificate))
+         (reference (getf certificate :retained-reference))
+         (history (getf facts :history))
+         (parent (getf certificate :parent-timeline))
+         (fork (getf certificate :fork))
+         (archive-history (logical-slot-copy-source-proof-parent-history facts)))
+    (multiple-value-bind (visit finish)
+        (logical-slot-copy-source-proof-archive-cursor candidate function start fork history)
+      (physical-promotion-check-retained-reference
+       (getf certificate :system-id) reference parent archive-history
+       :end fork :directory directory :reader reader :on-record visit)
+      (funcall finish))))
 
 (defun logical-slot-copy-source-proof-scan-archive (facts directory reader)
   ;; Replay from the embedded D checkpoint seed to clean F and compare the

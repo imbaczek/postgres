@@ -428,6 +428,124 @@
             (rove:ok (equal control before))
             (rove:ok (equal fact fact-before)))))))
 
+(defun unit-source-proof-cursor-result (gap length)
+  (let* ((start +wal-segment-size+)
+         (raw (wal-encode-record
+               +wal-record-maintenance+ 0 start
+               (make-array (- length +wal-header-size+)
+                           :element-type '(unsigned-byte 8) :initial-element 0)))
+         (history (list (make-timeline-history-entry :timeline 1 :begin 0)))
+         (seen nil))
+    (handler-case
+        (multiple-value-bind (visit finish)
+            (logical-slot-copy-source-proof-archive-cursor
+             (%make-physical-store)
+             (lambda (record bytes)
+               (assert (equalp bytes raw))
+               (push (wal-record-start record) seen))
+             (- start gap) (+ start length) history)
+          (funcall visit (wal-decode-record raw start) raw)
+          (funcall finish)
+          (list :passed seen))
+      (error () (list :rejected seen)))))
+
+(cl-spec:defproperty permanent-source-cursor-requires-necessary-rotation
+    ((gap (range integer 1 256)) (length (range integer 32 256)))
+  (:about logical-slot-copy-source-proof-archive-cursor)
+  (:trials (:normal 200))
+  (equal (unit-source-proof-cursor-result gap length)
+         (if (< gap length)
+             (list :passed (list +wal-segment-size+))
+             (list :rejected nil))))
+
+(rove:deftest permanent-source-cursor-rotation-generated-contract
+    (let ((result (cl-spec:result-data
+                   (cl-spec:run-property 'permanent-source-cursor-requires-necessary-rotation
+                                         :seed 7522 :profile :normal))))
+      (rove:ok (eq :passed (getf result :status)) (format nil "~s" result))
+      (rove:ok (= 200 (getf result :trials)))))
+
+(rove:deftest permanent-source-cursor-rejects-inexact-f-and-impossible-gaps
+    (let* ((boundary +wal-segment-size+)
+           (start (- boundary 48))
+           (first-raw (wal-encode-record +wal-record-maintenance+ 0 start #()))
+           (next-raw (wal-encode-record +wal-record-batch-start+ 0 boundary #()))
+           (first (wal-decode-record first-raw start))
+           (next (wal-decode-record next-raw boundary))
+           (history (list (make-timeline-history-entry :timeline 1 :begin 0))))
+      (dolist (fork (list (- boundary 8) boundary (1+ boundary)))
+        (let ((seen nil))
+          (multiple-value-bind (visit finish)
+              (logical-slot-copy-source-proof-archive-cursor
+               (%make-physical-store)
+               (lambda (record raw) (declare (ignore raw)) (push (wal-record-start record) seen))
+               start fork history)
+            (funcall visit first first-raw)
+            (rove:ok
+             (handler-case
+                 (progn (funcall visit next next-raw) (funcall finish) nil)
+               (error (condition)
+                 (search (if (> fork boundary) "crosses F" "did not reach exact F")
+                         (princ-to-string condition)))))
+            (rove:ok (equal seen (list start)) "rejected successor never reaches the replay callback"))))
+      (multiple-value-bind (visit finish)
+          (logical-slot-copy-source-proof-archive-cursor
+           (%make-physical-store) (lambda (&rest args) (declare (ignore args)))
+           (1+ start) (+ boundary 32) history)
+        (declare (ignore finish))
+        (rove:ok (handler-case (progn (funcall visit first first-raw) nil)
+                   (error (condition) (search "crosses its replay cursor" (princ-to-string condition))))))
+      (rove:ok (equal (unit-source-proof-cursor-result 16 32)
+                      (list :passed (list boundary))))
+      (rove:ok (equal (unit-source-proof-cursor-result 32 32) (list :rejected nil)))
+      (rove:ok (equal (unit-source-proof-cursor-result 100 32) (list :rejected nil)))))
+
+(rove:deftest permanent-source-cursor-checks-eor-before-callback
+    (let* ((start +wal-segment-size+)
+           (fork (- start 16))
+           (raw (wal-encode-end-of-recovery-record start 0 2 1 2))
+           (record (wal-decode-record raw start))
+           (history (timeline-check-lineage
+                     (timeline-parse-history
+                      2 (bytes->string (timeline-encode-history 2 1 fork "rotation fork" nil)))))
+           (previous (list :saved-selection t))
+           (candidate (%make-physical-store :selection previous))
+           (seen 0))
+      (multiple-value-bind (visit finish)
+          (logical-slot-copy-source-proof-archive-cursor
+           candidate
+           (lambda (item bytes)
+             (rove:ok (eq record item))
+             (rove:ok (eq raw bytes))
+             (let ((selection (physical-store-selection candidate)))
+               (rove:ok (= 2 (getf selection :target)))
+               (rove:ok (= 1 (getf selection :parent)))
+               (rove:ok (= fork (getf selection :fork)))
+               (rove:ok (eq previous (getf selection :previous)))
+               (rove:ok (eq raw (getf selection :eor-bytes))))
+             (incf seen))
+           fork (wal-record-end record) history)
+        (funcall visit record raw)
+        (funcall finish)
+        (rove:ok (= 1 seen)))
+      (dolist (bad-history
+               (list (list (make-timeline-history-entry :timeline 1 :begin 0))
+                     (timeline-check-lineage
+                      (timeline-parse-history
+                       2 (bytes->string (timeline-encode-history
+                                         2 1 (1- fork) "wrong fork" nil))))))
+        (let ((called nil) (candidate (%make-physical-store :selection previous)))
+          (multiple-value-bind (visit finish)
+              (logical-slot-copy-source-proof-archive-cursor
+               candidate (lambda (&rest args) (declare (ignore args)) (setf called t))
+               fork (wal-record-end record) bad-history)
+            (declare (ignore finish))
+            (rove:ok (handler-case (progn (funcall visit record raw) nil)
+                       (error (condition)
+                         (search "EOR differs from embedded ancestry" (princ-to-string condition)))))
+            (rove:ok (null called))
+            (rove:ok (eq previous (physical-store-selection candidate))))))))
+
 (defun unit-source-proof-envelope (salt size)
   (loop for (key minimum maximum) in (logical-slot-copy-source-proof-sections)
         collect key
