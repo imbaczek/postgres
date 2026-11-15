@@ -106,6 +106,8 @@ or authority."
        (snapshot-wal-boundary-timeline boundary)))))
 
 (defun logical-slot-check-startup-candidate-identities (slots)
+  "Check known slots, including lost ones, against durable cluster identity.
+Do not repair the catalog or grant history, lifetime or import authority."
   (let ((known (remove-if-not
                 (lambda (slot)
                   (and (wal-logical-slot-p slot) (wal-replication-slot-logical-provenance slot)))
