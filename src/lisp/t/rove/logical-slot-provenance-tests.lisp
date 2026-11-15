@@ -1383,6 +1383,67 @@
          (rove:ok (eq registry *wal-replication-slots*))
          (rove:ok (= count (hash-table-count *wal-replication-slots*)))))))
 
+(rove:deftest logical-slot-imported-startup-candidates-remain-unpublished
+    (dolist (cause '(:none :wal-removed))
+      (call-with-logical-slot-real-startup-test
+       (lambda ()
+         (create-standard-logical-slot "import_candidate" :nothing)
+         (when (eq cause :none) (create-standard-logical-slot "local_candidate" :nothing))
+         (let* ((registry *wal-replication-slots*)
+                (original (gethash "import_candidate" registry))
+                (mirror *logical-capture-live-slots*)
+                (slot-image
+                  (logical-slot-copy-import-child-image
+                   original
+                   (if (zerop (logical-slot-provenance-generation
+                               (wal-replication-slot-logical-provenance original))) 1 0)
+                   cause))
+                (saved nil) (entered nil))
+           (call-with-logical-slot-owned-startup-test
+            (lambda (gate-owner ownership)
+              (dolist (entries (list nil (logical-slot-startup-read-inventory)))
+                (rove:ok (rove:signals
+                          (call-with-logical-slot-imported-startup-source
+                           gate-owner ownership entries
+                           (lambda (source) (declare (ignore source)) (setf entered t))) 'error))
+                (rove:ok (not entered)))
+              (call-with-logical-slot-startup-source
+               gate-owner ownership (logical-slot-startup-read-inventory)
+               (lambda (source)
+                 (sb-thread:with-mutex (*wal-lock*)
+                   (rove:ok (rove:signals
+                             (logical-slot-imported-startup-check-under-lock source) 'error))
+                   (rove:ok (logical-slot-startup-check-source source)))))))
+           (wal-atomic-write-bytes (wal-replication-slot-path "import_candidate") slot-image)
+           (call-with-logical-slot-owned-startup-test
+            (lambda (gate-owner ownership)
+              (let ((entries (logical-slot-startup-read-inventory)))
+                (rove:ok (rove:signals
+                          (call-with-logical-slot-startup-source
+                           gate-owner ownership entries
+                           (lambda (source) (declare (ignore source)) (setf entered t))) 'error))
+                (call-with-logical-slot-imported-startup-source
+                 gate-owner ownership entries
+                 (lambda (source)
+                   (setf saved source entered t)
+                   (rove:ok (logical-slot-startup-source-history source))
+                   (rove:ok (eql (catalog-system-identifier)
+                                 (logical-slot-startup-source-system-id source)))
+                   (sb-thread:with-mutex (*wal-lock*)
+                     (rove:ok (logical-slot-imported-startup-check-under-lock source))
+                     (rove:ok (rove:signals
+                               (logical-slot-imported-startup-check-under-lock
+                                (copy-logical-slot-startup-source source)) 'error))
+                     (rove:ok (logical-slot-imported-startup-check-under-lock source))))))))
+           (rove:ok entered)
+           (rove:ok (not (logical-slot-startup-source-active-p saved)))
+           (sb-thread:with-mutex (*wal-lock*)
+             (rove:ok (rove:signals (logical-slot-imported-startup-check-under-lock saved) 'error)))
+           (rove:ok (eq registry *wal-replication-slots*))
+           (rove:ok (eq original (gethash "import_candidate" *wal-replication-slots*)))
+           (rove:ok (null (wal-replication-slot-child-owner original)))
+           (rove:ok (= mirror *logical-capture-live-slots*)))))))
+
 (rove:deftest logical-slot-child-owner-update-rejects-source-image-grafts
     (dolist (owner '(nil 2))
       (call-with-canonical-wal-slot-fixture

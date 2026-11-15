@@ -124,12 +124,16 @@ Do not repair the catalog or grant history, lifetime or import authority."
             (error "logical slot ~a belongs to another cluster" (wal-replication-slot-name slot))))
         system-id))))
 
+(defun logical-slot-check-startup-local-owners (slots)
+  (when (some #'wal-replication-slot-child-owner slots)
+    (error "child-owned logical slots require active import reconciliation"))
+  slots)
+
 (defun logical-slot-check-startup-identities (slots)
   "Check known logical slot identities against the durable catalog once.
 Return its system ID when needed, without initializing or repairing the catalog.
 This does not prove history, slot lifetime or import authority."
-  (when (some #'wal-replication-slot-child-owner slots)
-    (error "child-owned logical slots require active import reconciliation"))
+  (logical-slot-check-startup-local-owners slots)
   (logical-slot-check-startup-candidate-identities slots))
 
 (defun logical-slot-provenance-fields-equal-p (left right)

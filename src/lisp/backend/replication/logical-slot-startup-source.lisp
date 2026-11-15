@@ -21,6 +21,8 @@
 
 (defvar *logical-slot-startup-sources* nil)
 
+(defvar *logical-slot-imported-startup-sources* nil)
+
 (defun logical-slot-startup-known-p (slot)
   (and (wal-logical-slot-p slot) (wal-replication-slot-logical-provenance slot)))
 
@@ -115,20 +117,22 @@ promotion may explicitly skip the local workspace; incoming images stay strict."
       (logical-slot-startup-check-live source)))
   t)
 
-(defun call-with-logical-slot-startup-source (gate-owner ownership entries function)
-  ;; Capture one thread-bound source under the real startup authority.  A
-  ;; failed ordinary source observation revokes it; every exit ends its scope.
+(defun %call-with-logical-slot-startup-source (gate-owner ownership entries function)
   (check-primary-storage-startup-context gate-owner ownership)
   (let* ((slots (mapcar #'logical-slot-startup-entry-slot entries))
-         (system-id (logical-slot-check-startup-identities slots))
-         (reserved (some (lambda (slot) (and (logical-slot-startup-known-p slot)
-                                             (eq :reserved (wal-replication-slot-wal-status slot)))) slots))
+         (system-id (logical-slot-check-startup-candidate-identities slots))
+         (history-required
+           (or (some #'wal-replication-slot-child-owner slots)
+               (some (lambda (slot)
+                       (and (logical-slot-startup-known-p slot)
+                            (eq :reserved (wal-replication-slot-wal-status slot))))
+                     slots)))
          (source
            (sb-thread:with-mutex (*wal-lock*)
              (let* ((fields (multiple-value-list (wal-read-control-fields)))
                     (timeline *wal-insert-timeline*)
-                    (bytes (when (and reserved (/= timeline 1)) (timeline-history-bytes timeline)))
-                    (history (when reserved
+                    (bytes (when (and history-required (/= timeline 1)) (timeline-history-bytes timeline)))
+                    (history (when history-required
                                (timeline-check-lineage
                                 (timeline-parse-history timeline (if bytes (bytes->string bytes) ""))))))
                (unless (and *wal-ready* (not (recovery-in-progress-p))
@@ -156,6 +160,31 @@ promotion may explicitly skip the local workspace; incoming images stay strict."
              (sb-thread:with-mutex (*wal-lock*) (logical-slot-startup-check-source source))
              (funcall function source))
         (setf (logical-slot-startup-source-active-p source) nil)))))
+
+(defun call-with-logical-slot-startup-source (gate-owner ownership entries function)
+  (check-primary-storage-startup-context gate-owner ownership)
+  (logical-slot-check-startup-local-owners (mapcar #'logical-slot-startup-entry-slot entries))
+  (%call-with-logical-slot-startup-source gate-owner ownership entries function))
+
+(defun logical-slot-imported-startup-check-under-lock (source)
+  (assert (sb-thread:holding-mutex-p *wal-lock*))
+  (unless (member source *logical-slot-imported-startup-sources* :test #'eq)
+    (error "imported logical source requires its registered startup candidate scope"))
+  (logical-slot-startup-check-source source))
+
+(defun call-with-logical-slot-imported-startup-source (gate-owner ownership entries function)
+  (check-primary-storage-startup-context gate-owner ownership)
+  (unless (some (lambda (entry)
+                  (wal-replication-slot-child-owner (logical-slot-startup-entry-slot entry)))
+                entries)
+    (error "imported logical startup candidates require a child-owned slot"))
+  (%call-with-logical-slot-startup-source
+   gate-owner ownership entries
+   (lambda (source)
+     (logical-slot-startup-check-inventory source)
+     (let ((*logical-slot-imported-startup-sources*
+             (cons source *logical-slot-imported-startup-sources*)))
+       (funcall function source)))))
 
 (defun logical-slot-startup-start-position (slot history)
   ;; A restart may name a record start at a fork or the end of a prefix.
