@@ -78,6 +78,8 @@ capacity, standby and progress checks. Publication is separate."
   t)
 
 (defun logical-slot-startup-prepare-mirrors (restored)
+  "Compute replacement mirrors in dynamic bindings without waking the writer.
+The caller publishes the results before waking the writer."
   (assert (sb-thread:holding-mutex-p *wal-lock*))
   (let ((*wal-replication-slots* restored)
         (*logical-capture-live-slots* *logical-capture-live-slots*)

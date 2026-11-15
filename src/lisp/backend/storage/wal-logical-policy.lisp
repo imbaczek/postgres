@@ -432,7 +432,9 @@ Reject an unrecovered witness rather than treating it as an OFF state."
   (values))
 
 (defun wal-note-logical-slot-count-under-lock (count &key (notify t))
-  "Request a writer disable when replica mode loses its last valid slot."
+  "Request a writer disable when replica mode loses its last valid slot.
+With NOTIFY NIL, retain the pending request without waking the writer;
+the caller must publish the result before waking it."
   (assert (sb-thread:holding-mutex-p *wal-lock*))
   (when (and *wal-ready* (not *wal-poisoned*))
     (let* ((policy (wal-checked-logical-policy-under-lock))
