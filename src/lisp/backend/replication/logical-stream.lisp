@@ -1796,6 +1796,7 @@ WAL source or invalidating the retention pin, so it is not compared here."
       (error "logical replication slot changed or lost retained WAL during scan"))))
 
 (defstruct (wal-retained-slot-scan-scope (:constructor %make-wal-retained-slot-scan-scope))
+  ;; The dispatch closes over the frozen principal and its revocation state.
   (scan nil :read-only t) (purpose nil :read-only t)
   (thread nil :read-only t) (mutex nil :read-only t)
   (dispatch nil :read-only t))
@@ -1803,6 +1804,7 @@ WAL source or invalidating the retention pin, so it is not compared here."
 (defvar *wal-retained-slot-scan-scopes* nil)
 
 (defun wal-retained-slot-scan-check-frozen-under-lock (scan snapshot)
+  "Check the frozen principal; only the scan cursor may change."
   (assert (sb-thread:holding-mutex-p *wal-lock*))
   (unless (and
            (equal (wal-retained-slot-scan-name scan) (wal-retained-slot-scan-name snapshot))
@@ -1822,6 +1824,8 @@ WAL source or invalidating the retention pin, so it is not compared here."
   t)
 
 (defun wal-retained-slot-scan-capture-scope-under-lock (scan purpose)
+  "Capture a private snapshot and revocable, purpose-bound scan scope.
+Release removes the original pin even if the scan was changed."
   (assert (sb-thread:holding-mutex-p *wal-lock*))
   (let ((snapshot (copy-wal-retained-slot-scan scan))
         (thread sb-thread:*current-thread*) (mutex *wal-lock*) (active t) (failed nil))
@@ -1853,6 +1857,8 @@ WAL source or invalidating the retention pin, so it is not compared here."
             (remhash (wal-retained-slot-scan-pin snapshot) *wal-snapshot-retention-pins*))))))))
 
 (defun wal-retained-slot-scan-check-scope-under-lock (scan)
+  "Check the registered scan on its owning thread and WAL mutex.
+A foreign or copied scan is rejected before checking the live scope."
   (assert (sb-thread:holding-mutex-p *wal-lock*))
   (let ((scope (find scan *wal-retained-slot-scan-scopes*
                      :key #'wal-retained-slot-scan-scope-scan :test #'eq)))
@@ -1864,6 +1870,7 @@ WAL source or invalidating the retention pin, so it is not compared here."
     scan))
 
 (defun wal-retained-slot-scan-release-scope-under-lock (scope)
+  "Revoke SCOPE and remove its captured retention pin."
   (assert (sb-thread:holding-mutex-p *wal-lock*))
   (funcall (wal-retained-slot-scan-scope-dispatch scope) :release))
 

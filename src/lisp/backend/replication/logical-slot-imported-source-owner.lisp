@@ -4,6 +4,7 @@
             (:include physical-adoption-owner)
             (:constructor %make-logical-slot-imported-scan-owner)
             (:print-function physical-libpq-print-private-object))
+  ;; An observational owner borrowing postmaster ownership, not adoption authority.
   (ownership nil :read-only t) (scan nil :read-only t)
   (source nil :read-only t) (principal nil :read-only t)
   (state nil :read-only t))
@@ -11,6 +12,7 @@
 (defvar *logical-slot-imported-scan-owners* nil)
 
 (defun logical-slot-imported-history-equal-p (expected observed)
+  "Compare the complete observed history with the bounded expected history."
   (loop with remaining = observed
         for original in expected
         always (and (consp remaining)
@@ -25,6 +27,8 @@
         finally (return (null remaining))))
 
 (defun call-with-logical-slot-imported-scan-check (owner function)
+  "Check identity before the sticky live-owner checks and FUNCTION.
+A foreign or copied owner cannot fail the original owner's scope."
   (unless (logical-slot-imported-scan-owner-p owner)
     (error "imported logical source requires its typed scan owner"))
   (let ((state (logical-slot-imported-scan-owner-state owner)))
@@ -45,6 +49,7 @@
             (setf (physical-adoption-owner-active-p owner) nil)))))))
 
 (defun logical-slot-imported-scan-check-under-lock (owner)
+  "Recheck scan, purpose and source against the registered principal under WAL."
   (assert (sb-thread:holding-mutex-p *wal-lock*))
   (call-with-logical-slot-imported-scan-check
    owner
@@ -79,6 +84,7 @@
      owner)))
 
 (defun logical-slot-imported-scan-check-owner (owner)
+  "Check the borrowed directory owner outside WAL and its scan under WAL."
   (call-with-logical-slot-imported-scan-check
    owner (lambda () (physical-directory-check-owner owner))))
 
@@ -86,6 +92,9 @@
   (error "imported logical source observation does not authorize offline adoption"))
 
 (defun call-with-logical-slot-imported-scan-owner (scan source function)
+  "Borrow postmaster ownership for a purpose-bound observational scan.
+This alone does not establish the permanent pair, F proof, lease, provider,
+startup or readiness required for imported source use."
   (when (sb-thread:holding-mutex-p *wal-lock*)
     (error "imported source acquisition must run outside the WAL mutex"))
   (let ((principal
