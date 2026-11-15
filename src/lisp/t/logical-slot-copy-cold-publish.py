@@ -18,7 +18,7 @@ string = catalog['string']
 
 
 def probe(peer, label, *args, kill=None, late_source=False, cut=None,
-          authority=None, syscall=None, **kwargs):
+          authority=None, syscall=None, timeout=90, **kwargs):
     forms = ['(require :asdf)',
              f'(push (uiop:ensure-directory-pathname {string(catalog["LISP"])}) asdf:*central-registry*)',
              '(asdf:load-system "pg")', '(in-package :pg)',
@@ -55,7 +55,7 @@ def probe(peer, label, *args, kill=None, late_source=False, cut=None,
     log = peer.root / f'cold-publish-{label}.log'
     started = time.monotonic()
     with log.open('w') as output:
-        status = subprocess.run(command, stdout=output, stderr=subprocess.STDOUT, timeout=90).returncode
+        status = subprocess.run(command, stdout=output, stderr=subprocess.STDOUT, timeout=timeout).returncode
     text = log.read_text()
     if kill:
         assert status == -signal.SIGKILL and f'COLD-PUBLISH-KILL {kill}' in text, (status, log)

@@ -11,17 +11,19 @@ OwnedLisp = standby['api']['OwnedLisp']
 lisp_string = standby['lisp_string']
 
 
-def probe(peer, pending=False, disposition='wal-level-insufficient', *, intent_failure=False):
+def probe(peer, pending=False, disposition='wal-level-insufficient', *, intent_failure=False,
+          timeout=None):
     peer.control(f'(load {lisp_string(Path(__file__).with_name("logical-slot-copy-import-input-native.lisp"))})')
     peer.control(f'(setf *logical-import-native-expected-disposition* :{disposition})')
     peer.control(f'(setf *logical-import-native-intent-failure* {"t" if intent_failure else "nil"})')
     names = '("alpha" "beta")' if disposition == 'eligible' else '("alpha")'
     peer.control(f"(setf *logical-import-native-expected-names* '{names})")
     peer.control('(logical-import-native-start t)' if pending else '(logical-import-native-start)')
-    deadline = time.monotonic() + 45
+    deadline = time.monotonic() + (45 if timeout is None else timeout)
     while time.monotonic() < deadline:
         assert peer.process.poll() is None, peer.root / 'server.log'
-        state = peer.control('*logical-import-native-result*')
+        state = peer.control('*logical-import-native-result*',
+                             timeout=15 if timeout is None else timeout)
         if ':PASSED' in state:
             peer.control('(assert (eq :passed (first *logical-import-native-result*)))')
             peer.control('(assert (not (eq :timeout (sb-thread:join-thread *logical-import-native-thread* :timeout 5 :default :timeout))))')

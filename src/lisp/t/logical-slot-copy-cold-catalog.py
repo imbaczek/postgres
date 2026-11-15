@@ -70,9 +70,10 @@ def prepare(peer, *args, **kwargs):
         peer.control(f'(load {string(Path(__file__).with_name("logical-slot-copy-import-commit-native.lisp"))})')
         peer.control(f'(load {string(Path(__file__).with_name("logical-slot-copy-cold-catalog-native.lisp"))})')
         peer.control('(logical-cold-catalog-prepare-optional)')
-        deadline = time.monotonic() + 60
+        deadline = time.monotonic() + (kwargs.get('timeout') or 60)
         while time.monotonic() < deadline:
-            result = peer.control('*logical-cold-catalog-optional-result*')
+            result = peer.control('*logical-cold-catalog-optional-result*',
+                                  timeout=kwargs.get('timeout') or 15)
             if ':PASSED' in result:
                 peer.control('(assert (not (eq :timeout (sb-thread:join-thread *logical-cold-catalog-optional-thread* :timeout 5 :default :timeout))))')
                 return
