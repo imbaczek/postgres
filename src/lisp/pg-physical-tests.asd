@@ -1,6 +1,7 @@
 (asdf:defsystem "pg-physical-tests"
   :description "Native physical WAL intake and recovery contracts"
-  :depends-on ("pg" "rove" "cl-spec/check-it" "pg/logical-slot-fixtures")
+  :depends-on ("pg" "rove" "cl-spec/check-it" "pg/logical-slot-fixtures" "pg/test-compilation")
+  :around-compile "pg-test-compilation:around-compile"
   :serial t
   :components ((:file "t/physical-tests")
                (:file "t/physical-child-command-tests")

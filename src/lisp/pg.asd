@@ -437,3 +437,20 @@
   :depends-on ("pg")
   :serial t
   :components ((:file "t/support/logical-slot-fixtures")))
+
+(asdf:defsystem "pg/test-compilation"
+  :description "Scoped compilation policies for isolated test images"
+  :depends-on ("uiop")
+  :components ((:file "test-compilation")))
+
+(asdf:defsystem "pg/test-compilation-tests"
+  :depends-on ("pg/test-compilation" "rove" "cl-spec/check-it")
+  :components ((:file "t/test-compilation-tests"))
+  :perform (asdf:test-op (operation component)
+                         (declare (ignore operation component))
+                         (unless (uiop:symbol-call
+                                  :rove/core/suite/package :suite-tests
+                                  (uiop:symbol-call :rove/core/suite/package :find-suite :pg-test-compilation-tests))
+                           (error "No test compilation contracts were registered"))
+                         (unless (uiop:symbol-call :rove :run-suite :pg-test-compilation-tests)
+                           (error "Test compilation contracts failed"))))

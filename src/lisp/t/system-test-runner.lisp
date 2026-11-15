@@ -182,6 +182,13 @@
     (pushnew source asdf:*central-registry* :test #'equal)
     (asdf:load-asd (merge-pathnames "pg.asd" source))
     (asdf:load-asd (merge-pathnames (format nil "~a.asd" system) source))
+    (asdf:load-system "pg/test-compilation")
+    (let ((profile (uiop:symbol-call :pg-test-compilation :profile)))
+      (when (and (eq profile :fast) (not (string= target "physical")))
+        (error "Fast test compilation is supported only for physical tests."))
+      (when (and (eq profile :fast) (not (uiop:getenv "PG_LISP_TEST_CAMPAIGN")))
+        (error "Fast test compilation requires an isolated test campaign."))
+      (format t "~&TEST-COMPILE-POLICY ~a~%" profile))
     (setf *print-circle* t *print-level* 6 *print-length* 12)
     ;; Start compilation alongside loading, but wait for it before executing heads.
     ;; Mask spawn and assignment so unwind cleanup always owns a returned child.
@@ -196,7 +203,14 @@
             :test-load
             (lambda ()
               (let ((*pg-test-system* system))
-                (load (merge-pathnames "t/test-dependencies.lisp" source)))))
+                (flet ((load-tests () (load (merge-pathnames "t/test-dependencies.lisp" source))))
+                  (if (uiop:getenv "PG_LISP_TEST_CAMPAIGN")
+                      (uiop:symbol-call
+                       :pg-test-compilation :call-with-cache
+                       (uiop:symbol-call :pg-test-compilation :profile)
+                       (uiop:ensure-directory-pathname (uiop:getenv "XDG_CACHE_HOME"))
+                       source #'load-tests)
+                      (load-tests))))))
            (let ((heads (pg-test-selected-heads suite names)))
              (when (uiop:getenv "PG_LISP_TEST_CAMPAIGN")
                (pg-test-record-suite-manifest suite heads))

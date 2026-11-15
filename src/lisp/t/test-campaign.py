@@ -23,7 +23,8 @@ import time
 RAM = Path('/dev/shm') / ('pg-lisp-tests-' + str(os.getuid()))
 GENERATED = {'.fasl', '.so', '.o', '.core', '.pyc'}
 ENVIRONMENT = ('SBCL', 'SBCL_HOME', 'CL_SOURCE_REGISTRY', 'ASDF_SOURCE_REGISTRY',
-               'ASDF_OUTPUT_TRANSLATIONS', 'QUICKLISP_HOME', 'PG_CONFIG', 'PG_LIBPQ_HELPER')
+               'ASDF_OUTPUT_TRANSLATIONS', 'QUICKLISP_HOME', 'PG_CONFIG', 'PG_LIBPQ_HELPER',
+               'PG_LISP_TEST_COMPILE_POLICY')
 
 
 def job_root(path=None):
