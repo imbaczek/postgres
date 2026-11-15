@@ -76,12 +76,11 @@
   (call-with-logical-slot-imported-proof-files
    owner context
    (lambda (facts check under-lock)
-     (declare (ignore under-lock))
      (let ((root (physical-image-context-root-fd context)))
        (call-with-logical-slot-copy-source-proof-fd
         root "pg_logical_continuation" t
         (lambda (directory directory-facts)
-          (let ((storage nil) (active t) (failed nil)
+          (let ((storage nil) (active t) (failed nil) (wal-check nil)
                               (thread sb-thread:*current-thread*)
                               (identity (logical-slot-copy-source-proof-directory-identity directory-facts)))
             (labels ((state (candidate operation &optional argument)
@@ -96,7 +95,9 @@
                                     (sb-sys:with-local-interrupts
                                       (unless (member storage *logical-slot-continuation-startup-storages* :test #'eq)
                                         (error "continuation startup publisher lost its registration"))
-                                      (funcall check)
+                                      (if (eq operation :check-under-lock)
+                                          (funcall under-lock)
+                                          (funcall check))
                                       (unless (and
                                                (equal identity
                                                       (logical-slot-copy-source-proof-directory-identity
@@ -105,10 +106,35 @@
                                                       (logical-slot-copy-source-proof-directory-identity
                                                        (physical-image-file-facts root "pg_logical_continuation"))))
                                         (error "continuation startup publisher lost its named directory"))
+                                      (when wal-check (funcall wal-check))
                                       (ecase operation
                                         (:check t)
+                                        (:check-under-lock t)
+                                        (:with-local-wal
+                                            (unless (functionp argument)
+                                              (error "continuation local WAL requires a callback"))
+                                          (call-with-logical-slot-copy-source-proof-fd
+                                           root "pg_wal" t
+                                           (lambda (wal-directory wal-facts)
+                                             (let ((live t) (prior-wal-check wal-check))
+                                               (labels ((check-directory ()
+                                                          (unless (and live (eq thread sb-thread:*current-thread*))
+                                                            (error "continuation WAL directory scope ended or changed thread"))
+                                                          (unless (and
+                                                                   (equal wal-facts (physical-image-file-facts wal-directory))
+                                                                   (equal wal-facts (physical-image-file-facts root "pg_wal")))
+                                                            (error "continuation WAL directory lost its named binding"))))
+                                                 (unwind-protect
+                                                      (progn
+                                                        (setf wal-check #'check-directory)
+                                                        (check-directory)
+                                                        (multiple-value-prog1
+                                                            (funcall argument wal-directory #'check-directory)
+                                                          (check-directory)))
+                                                   (sb-sys:without-interrupts (setf live nil wal-check prior-wal-check))))))))
                                         (:directory directory)
                                         (:binding (first (funcall check t)))
+                                        (:facts (logical-slot-copy-check-source-proof (first (funcall check t))))
                                         (:host
                                          (sb-thread:with-mutex (*wal-lock*)
                                            (logical-slot-continuation-copy

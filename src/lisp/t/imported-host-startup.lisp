@@ -365,7 +365,7 @@
         (delete-file path)
         (fsync-directory directory)))))
 
-(defun native-host-continuation-selector-reset (gate ownership)
+(defun native-host-continuation-selector-reset (gate ownership &optional (kind :empty))
   (call-with-logical-slot-continuation-startup-storage
    gate ownership
    (lambda (storage facts)
@@ -380,7 +380,9 @@
              storage
              (lambda (snapshot fd selected-facts)
                (declare (ignore fd selected-facts))
-               (logical-slot-continuation-check-empty-startup storage facts snapshot)))
+               (ecase kind
+                 (:empty (logical-slot-continuation-check-empty-startup storage facts snapshot))
+                 (:active (logical-slot-continuation-check-active-startup storage facts snapshot)))))
             (let* ((directory (logical-slot-continuation-storage-call storage :directory))
                    (path (slot-state-fd-path directory "selector")))
               (delete-file path)
@@ -488,9 +490,101 @@
       (native-host-continuation-selector-adversarial gate ownership))
     (format t "~&NATIVE-SELECTOR-RECOVER PASS actual startup hook, origin proof, empty registry, unchanged control; GC and admission still fenced~%")))
 
+(defun native-host-continuation-boundary-probes (gate ownership)
+  (call-with-logical-slot-continuation-startup-storage
+   gate ownership
+   (lambda (storage facts)
+     (logical-slot-continuation-storage-call
+      storage :with-origin
+      (lambda (archive)
+        (let* ((reference (logical-wal-archive-reference archive))
+               (history (logical-wal-archive-history archive))
+               (base (getf reference :base)) (fork (getf reference :end))
+               (first-start nil) (first-owner nil) (inside nil) (terminal nil) (terminal-owner nil))
+          (flet ((guard ()
+                   (logical-slot-continuation-storage-call storage :check-under-lock)
+                   (logical-wal-archive-check archive)))
+            (call-with-logical-wal-cursor
+             history :timeline base fork (timeline-at-point base history) :record-start #'guard
+             (lambda (cursor)
+               (loop
+                 (multiple-value-bind (record raw owner carrier kind) (logical-wal-cursor-next cursor)
+                   (declare (ignore raw carrier))
+                   (unless record (return))
+                   (unless first-start
+                     (setf first-start (wal-record-start record) first-owner owner
+                           inside (1+ (wal-record-start record))))
+                   (when (and (eq kind :ordinary) (wal-terminal-record-type-p (wal-record-type record)))
+                     (setf terminal (wal-record-end record) terminal-owner owner)))))
+             :archive archive :archive-only t :batch-policy :logical-reader))
+          (assert (and first-start terminal))
+          (assert
+           (null
+            (logical-slot-continuation-prove-parent-boundaries
+             storage facts archive (list (list :restart first-start first-owner :record-start)
+                                         (list :confirmed terminal terminal-owner :prefix-end)))))
+          (assert
+           (handler-case
+               (progn
+                 (logical-slot-continuation-prove-parent-boundaries
+                  storage facts archive (list (list :restart inside first-owner :prefix-end)))
+                 nil)
+             (error (condition) (search "record-boundary proof" (princ-to-string condition)))))
+          (logical-slot-continuation-storage-check storage)
+          (format t "~&NATIVE-ACTIVE-BOUNDARIES parent-start=~d parent-terminal=~d inside-record=~d rejected~%"
+                  first-start terminal inside)))))))
+
+(defun native-host-continuation-reject-caller-baseline (gate ownership)
+  (let ((rejected nil))
+    (setf rejected
+          (handler-case
+              (progn
+                (call-with-logical-slot-continuation-startup-storage
+                 gate ownership
+                 (lambda (storage facts)
+                   (logical-slot-continuation-storage-call
+                    storage :with-origin
+                    (lambda (archive)
+                      (let* ((snapshot (logical-slot-continuation-active-startup-image storage nil))
+                             (row (find-if
+                                   (lambda (candidate)
+                                     (eq :reserved
+                                         (wal-replication-slot-wal-status
+                                          (logical-slot-state-decode (second candidate) (first candidate)))))
+                                   (getf snapshot :slots)))
+                             (slot (and row (logical-slot-state-decode (second row) (first row))))
+                             (fake-facts (copy-list facts))
+                             (fake-certificate (copy-list (getf facts :certificate)))
+                             (fake-rows (mapcar #'copy-list (getf fake-certificate :slots))))
+                        (assert slot)
+                        (setf (wal-replication-slot-restart-lsn slot) (1+ (second (getf snapshot :origin)))
+                              (wal-replication-slot-restart-timeline slot) (getf snapshot :history-target)
+                              (wal-replication-slot-confirmed-flush-lsn slot) (first (getf snapshot :sealed-end))
+                              (wal-replication-slot-confirmed-timeline slot) (getf snapshot :history-target)
+                              (second row) (logical-slot-state-encode slot)
+                              (fourth (find (first row) fake-rows :key #'first :test #'equal))
+                              (bytes->string (second row))
+                              (getf fake-certificate :slots) fake-rows
+                              (getf fake-facts :certificate) fake-certificate)
+                        (logical-slot-continuation-check snapshot)
+                        (call-with-logical-slot-continuation-local-tail
+                         storage snapshot
+                         (lambda (prove check) (declare (ignore check)) (funcall prove))
+                         :boundaries (lambda ()
+                                       (logical-slot-continuation-active-boundaries
+                                        storage fake-facts snapshot archive))))))))
+                nil)
+            (error (condition) (search "record-boundary proof" (princ-to-string condition)))))
+    (assert rejected)
+    (format t "~&NATIVE-ACTIVE-CANONICAL-BASELINE PASS caller-provided saved baseline cannot hide an inside-record restart~%")))
+
 (defun native-host-continuation-active-refusal (gate ownership)
   (let* ((entries (logical-slot-startup-read-inventory :local-workspace t))
          (registry *wal-replication-slots*)
+         (*logical-capture-memory-bytes*
+           (if (equal "1" (uiop:getenv "PG_NATIVE_CONTINUATION_FORCE_SPILL")) 0 *logical-capture-memory-bytes*))
+         (fds (length (directory #p"/proc/self/fd/*")))
+         (control (logical-slot-startup-control-image))
          (before
            (loop for entry in entries
                  for slot = (logical-slot-startup-entry-slot entry)
@@ -501,23 +595,43 @@
     (assert entries)
     (assert (every (lambda (entry)
                      (wal-replication-slot-child-owner (logical-slot-startup-entry-slot entry))) entries))
-    (assert (not (probe-file (merge-pathnames "pg_logical_continuation/selector" *pgdata*))))
     (setf rejected
           (handler-case
               (progn (wal-load-replication-slots :gate-owner gate :ownership ownership) nil)
-            (error () t)))
-    (assert rejected)
+            (error (condition) (princ-to-string condition))))
+    (assert (and rejected (search "active import reconciliation" rejected)))
+    (multiple-value-bind (snapshot records)
+        (logical-slot-continuation-restore-active-startup gate ownership)
+      (let* ((plan (logical-slot-continuation-check snapshot))
+             (selector (merge-pathnames "pg_logical_continuation/selector" *pgdata*))
+             (identity (physical-image-file-facts -100 (namestring selector)))
+             (rows (sort (loop for entry in entries
+                               collect (list (wal-replication-slot-name (logical-slot-startup-entry-slot entry))
+                                             (logical-slot-startup-entry-bytes entry)))
+                         #'string< :key #'first)))
+        (assert (equalp rows (getf snapshot :slots)))
+        (assert (plusp records))
+        (assert (= (second (getf snapshot :origin)) (logical-slot-continuation-plan-floor plan)))
+        (assert (logical-slot-continuation-plan-tail-request plan))
+        (assert (null (getf snapshot :roots)))
+        (assert (null (getf snapshot :runs)))
+        (assert (equalp snapshot (logical-slot-continuation-restore-active-startup gate ownership)))
+        (assert (equal identity (physical-image-file-facts -100 (namestring selector))))
+        (format t "~&NATIVE-SELECTOR-ACTIVE-REFUSAL PASS slots=~d records=~d tail=~s; stable active selector verified; loader still refuses: ~a~%"
+                (length rows) records (logical-slot-continuation-plan-tail-request plan) rejected)))
+    (native-host-continuation-boundary-probes gate ownership)
+    (native-host-continuation-reject-caller-baseline gate ownership)
+    (assert (equalp control (logical-slot-startup-control-image)))
     (assert (eq registry *wal-replication-slots*))
     (assert (zerop (hash-table-count registry)))
+    (assert (= fds (length (directory #p"/proc/self/fd/*"))))
     (assert (logical-slot-continuation-gc-fenced-p *pgdata*))
-    (assert (not (probe-file (merge-pathnames "pg_logical_continuation/selector" *pgdata*))))
     (assert (not (probe-file (merge-pathnames "pg_logical_continuation/selector.tmp" *pgdata*))))
     (dolist (row before)
       (destructuring-bind (path facts bytes) row
         (assert (equal facts (physical-image-file-facts -100 (namestring path))))
         (assert (equalp bytes (read-bounded-regular-file path +slot-state-maximum-bytes+)))))
-    (format t "~&NATIVE-SELECTOR-ACTIVE-REFUSAL PASS slots=~d; files and registry unchanged; no selector publication~%"
-            (length entries))))
+    t))
 
 (defun native-imported-host-observation ()
   (unless (equal "1" (uiop:getenv "PG_NATIVE_HOST_DISPOSABLE"))
@@ -547,6 +661,9 @@
                  (note-primary-startup-replay)
                  (physical-promotion-restore-primary-retained)
                  (when (uiop:getenv "PG_NATIVE_SELECTOR_REQUIRE_ACTIVE")
+                   (when (equal "1" (uiop:getenv "PG_NATIVE_SELECTOR_ACTIVE_RESET"))
+                     (logical-slot-continuation-restore-active-startup gate ownership)
+                     (native-host-continuation-selector-reset gate ownership :active))
                    (native-host-continuation-active-refusal gate ownership)
                    (return-from native-imported-host-observation t))
                  (let ((registry *wal-replication-slots*)

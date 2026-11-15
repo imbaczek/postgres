@@ -6,6 +6,7 @@
   t)
 
 (defun logical-slot-continuation-empty-startup-snapshot (storage facts)
+  (setf facts (logical-slot-continuation-storage-call storage :facts))
   (logical-slot-continuation-require-empty-inventory)
   (let* ((host (logical-slot-continuation-storage-call storage :host))
          (certificate (getf facts :certificate)))
@@ -18,6 +19,7 @@
           :slots nil :transfers nil :roots nil :runs nil :tail nil)))
 
 (defun logical-slot-continuation-check-empty-startup (storage facts snapshot)
+  (setf facts (logical-slot-continuation-storage-call storage :facts))
   (logical-slot-continuation-check snapshot)
   (logical-slot-continuation-require-empty-inventory)
   (let* ((host (logical-slot-continuation-storage-call storage :host))

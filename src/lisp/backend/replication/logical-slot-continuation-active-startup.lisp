@@ -1,0 +1,246 @@
+(in-package #:pg)
+
+(defun logical-slot-continuation-active-snapshot (binding certificate host rows)
+  (logical-slot-copy-descriptor-list-count certificate 128)
+  (logical-slot-continuation-list host 6)
+  (logical-slot-copy-descriptor-blob-size binding 1 (logical-slot-copy-source-proof-maximum-bytes))
+  (logical-slot-copy-descriptor-blob-size (fourth host) 0 +physical-store-history-maximum-bytes+)
+  (logical-slot-copy-descriptor-list-count (getf certificate :slots)
+                                           +logical-slot-continuation-obligation-limit+)
+  (dolist (row (getf certificate :slots))
+    (unless (<= 4 (logical-slot-copy-descriptor-list-count row 16))
+      (error "invalid initial continuation certificate row"))
+    (logical-slot-continuation-ascii-size (first row) 63)
+    (when (fourth row) (logical-slot-continuation-ascii-size (fourth row) +slot-state-maximum-bytes+)))
+  (logical-slot-copy-descriptor-list-count rows +logical-slot-continuation-obligation-limit+)
+  (unless (and rows
+               (eql (first host) (getf certificate :system-id))
+               (eql (fifth host) (getf certificate :child-timeline)))
+    (error "initial active continuation requires its original child and saved inventory"))
+  (dolist (row rows)
+    (logical-slot-continuation-list row 2)
+    (logical-slot-continuation-ascii-size (first row) 63)
+    (logical-slot-copy-descriptor-blob-size (second row) 1 +slot-state-maximum-bytes+))
+  (let* ((history (logical-slot-continuation-history (fifth host) (fourth host)))
+         (saved (sort (logical-slot-continuation-copy rows) #'string< :key #'first))
+         (prior nil) (demand nil))
+    (dolist (row saved)
+      (logical-slot-continuation-list row 2)
+      (unless (or (null prior) (string< prior (first row)))
+        (error "initial active continuation has repeated saved slots"))
+      (setf prior (first row))
+      (let* ((current (logical-slot-state-decode (second row) (first row)))
+             (original (find (first row) (getf certificate :slots) :key #'first :test #'equal)))
+        (unless (and original (fourth original))
+          (error "saved continuation slot is absent from its permanent certificate"))
+        (logical-slot-imported-check-state
+         current (logical-slot-state-decode (string->bytes (fourth original)) (first row))
+         history (sixth host))
+        (when (eq :reserved (wal-replication-slot-wal-status current)) (setf demand t))))
+    (let* ((fork (getf certificate :fork)) (child (getf certificate :child-timeline))
+                                           (snapshot
+                                             (list :version 1 :binding (copy-seq binding) :generation 1 :system-id (first host)
+                                                   :origin (list child fork) :history-target (fifth host)
+                                                   :history (copy-seq (fourth host)) :sealed-end (list (sixth host) (fifth host) :prefix-end)
+                                                   :slots saved :transfers nil :roots nil :runs nil
+                                                   :tail (when demand (list (list fork child :record-start) child)))))
+      (logical-slot-continuation-check snapshot)
+      snapshot)))
+
+(defun logical-slot-continuation-read-saved-rows (storage)
+  (logical-slot-continuation-storage-check storage)
+  (let ((rows (loop for entry in (logical-slot-startup-read-inventory :local-workspace t)
+                    collect (list (wal-replication-slot-name (logical-slot-startup-entry-slot entry))
+                                  (copy-seq (logical-slot-startup-entry-bytes entry))))))
+    (logical-slot-continuation-storage-check storage)
+    (sort rows #'string< :key #'first)))
+
+(defun logical-slot-continuation-active-startup-image (storage facts)
+  (setf facts (logical-slot-continuation-storage-call storage :facts))
+  (logical-slot-continuation-active-snapshot
+   (logical-slot-continuation-storage-call storage :binding) (getf facts :certificate)
+   (logical-slot-continuation-storage-call storage :host)
+   (logical-slot-continuation-read-saved-rows storage)))
+
+(defun logical-slot-continuation-check-active-startup (storage facts snapshot)
+  (unless (equalp (logical-slot-continuation-encode snapshot)
+                  (logical-slot-continuation-encode
+                   (logical-slot-continuation-active-startup-image storage facts)))
+    (error "initial active continuation differs from its durable host or saved inventory"))
+  t)
+
+(defun logical-slot-continuation-check-tail-files (directory held)
+  (dolist (row held)
+    (destructuring-bind (name stream facts size) row
+      (declare (ignore size))
+      (unless (and (equal facts (physical-image-file-facts (sb-sys:fd-stream-fd stream)))
+                   (equal facts (physical-image-file-facts directory name)))
+        (error "continuation local WAL changed its held or named segment"))))
+  t)
+
+(defun logical-slot-continuation-check-tail-ledger (directory ledger)
+  (maphash (lambda (name row)
+             (unless (equal (first row) (physical-image-file-facts directory name))
+               (error "continuation WAL segment differs from its proof ledger")))
+           ledger)
+  t)
+
+(defun logical-slot-continuation-scan-tail
+    (history fork child end guard reader spool observe finish)
+  (let ((verify (logical-spool-sealed-p spool)) (records 0)
+                                                (*wal-recovery-reservation-batch-clean-p* nil))
+    (call-with-logical-wal-cursor
+     history :timeline fork end child :record-start guard
+     (lambda (cursor)
+       (labels ((next (expected)
+                  (let ((original (logical-wal-cursor-position cursor)))
+                    (multiple-value-bind (record raw owner carrier kind) (logical-wal-cursor-next cursor)
+                      (unless record
+                        (when expected (error "continuation WAL ended before its transcript"))
+                        (return-from next nil))
+                      (let ((frame (logical-slot-continuation-tail-frame
+                                    record raw owner carrier kind original)))
+                        (if verify
+                            (unless (and expected (equalp frame expected))
+                              (error "continuation WAL differs from its exact transcript"))
+                            (logical-spool-append spool frame)))
+                      (when observe (funcall observe record raw owner carrier kind original))
+                      (incf records)
+                      t))))
+         (if verify
+             (progn
+               (logical-spool-map-events spool #'next)
+               (when (next nil) (error "continuation WAL exceeds its transcript")))
+             (loop while (next nil)))
+         (unless (and (= end (logical-wal-cursor-position cursor))
+                      (not (logical-wal-cursor-batch-open cursor)))
+           (error "continuation WAL did not reach its sealed completed end"))
+         (when finish (funcall finish))
+         (unless verify (logical-spool-seal spool))
+         records))
+     :segment-reader reader :batch-policy :strict)))
+
+(defun call-with-logical-slot-continuation-local-tail (storage snapshot function &key boundaries)
+  (let* ((history (logical-slot-continuation-history
+                   (getf snapshot :history-target) (getf snapshot :history)))
+         (fork (second (getf snapshot :origin)))
+         (child (first (getf snapshot :origin)))
+         (end (first (getf snapshot :sealed-end))))
+    (logical-slot-continuation-storage-call
+     storage :with-local-wal
+     (lambda (directory check-directory)
+       (call-with-logical-slot-continuation-transcript
+        (lambda (spool)
+          (let ((current nil) (active t) (failed nil) (visits nil) (expected-visits nil)
+                              (ledger (make-hash-table :test #'equal)))
+            (labels ((guard ()
+                       (unless (and active (not failed)) (error "continuation local WAL proof ended or failed"))
+                       (logical-slot-continuation-storage-call storage :check-under-lock)
+                       (funcall check-directory)
+                       (logical-slot-continuation-check-tail-files directory (when current (list current))))
+                     (check ()
+                       (logical-slot-continuation-storage-check storage)
+                       (sb-thread:with-mutex (*wal-lock*) (guard))
+                       (logical-slot-continuation-check-tail-ledger directory ledger)
+                       (sb-thread:with-mutex (*wal-lock*) (guard)))
+                     (close-current ()
+                       (when current
+                         (if (sb-thread:holding-mutex-p *wal-lock*) (guard)
+                             (sb-thread:with-mutex (*wal-lock*) (guard)))
+                         (sb-sys:without-interrupts
+                           (let ((stream (second current)))
+                             (setf current nil)
+                             (close stream)))))
+                     (read-segment (segment carrier consume)
+                       (guard)
+                       (unless (eql child carrier)
+                         (error "initial continuation requires its original child's local carrier"))
+                       (let ((name (wal-segment-filename segment carrier :timeline)))
+                         (unless (and current (equal name (first current)))
+                           (close-current)
+                           (sb-sys:without-interrupts
+                             (multiple-value-bind (stream size)
+                                 (open-bounded-regular-file
+                                  (slot-state-fd-path directory name) +wal-segment-size+)
+                               (setf current (list name stream nil size))
+                               (setf (third current) (physical-image-file-facts (sb-sys:fd-stream-fd stream)))))
+                           (let ((prior (gethash name ledger))
+                                 (row (list (third current) (fourth current))))
+                             (if prior
+                                 (unless (equal prior row) (error "continuation segment changed between passes"))
+                                 (if (logical-spool-sealed-p spool)
+                                     (error "continuation reproof visited an unrecorded segment")
+                                     (setf (gethash name ledger) row))))
+                           (push name visits))
+                         (guard)
+                         (multiple-value-prog1 (funcall consume (second current) (fourth current))
+                           (guard))))
+                     (prove ()
+                       (check)
+                       (setf visits nil)
+                       (let ((verify (logical-spool-sealed-p spool)) (complete nil))
+                         (unwind-protect
+                              (multiple-value-prog1
+                                  (multiple-value-bind (observe finish)
+                                      (if boundaries (funcall boundaries) (values nil nil))
+                                    (let ((records
+                                            (unwind-protect
+                                                 (logical-slot-continuation-scan-tail
+                                                  history fork child end #'guard #'read-segment spool observe finish)
+                                              (close-current))))
+                                      (if verify
+                                          (unless (equal expected-visits (nreverse visits))
+                                            (error "continuation reproof changed its ordered segment visits"))
+                                          (setf expected-visits (nreverse visits)))
+                                      (check)
+                                      records))
+                                (setf complete t))
+                           (unless complete (setf failed t))))))
+              (unwind-protect
+                   (progn (check) (multiple-value-prog1 (funcall function #'prove #'check) (check)))
+                (sb-sys:without-interrupts
+                  (setf active nil)
+                  (when current
+                    (let ((stream (second current)))
+                      (setf current nil)
+                      (close stream)))))))))))))
+
+(defun logical-slot-continuation-restore-active-startup (gate ownership)
+  (declare (notinline sb-posix:fsync))
+  (call-with-logical-slot-continuation-startup-storage
+   gate ownership
+   (lambda (storage facts)
+     (logical-slot-continuation-storage-call
+      storage :with-origin
+      (lambda (archive)
+        (let ((snapshot (logical-slot-continuation-active-startup-image storage facts)))
+          (call-with-logical-slot-continuation-local-tail
+           storage snapshot
+           (lambda (prove check)
+             (let ((records (funcall prove)))
+               (logical-slot-continuation-selector-point storage :after-active-tail-proof)
+               (logical-slot-continuation-check-active-startup storage facts snapshot)
+               (unless (member "selector" (logical-slot-continuation-selector-names storage) :test #'equal)
+                 (logical-slot-continuation-install-initial-selector
+                  storage (logical-slot-continuation-encode snapshot)))
+               (unless (equal '("selector") (logical-slot-continuation-selector-names storage))
+                 (error "active continuation selector has an unresolved temporary"))
+               (call-with-logical-slot-continuation-selector
+                storage
+                (lambda (selected fd selected-facts)
+                  (declare (ignore selected-facts))
+                  (logical-slot-continuation-check-active-startup storage facts selected)
+                  (sb-posix:fsync fd)
+                  (sb-posix:fsync (logical-slot-continuation-storage-call storage :directory))
+                  (logical-slot-continuation-selector-point storage :after-selector-restoration-sync)
+                  (funcall prove)
+                  (logical-slot-continuation-check-active-startup storage facts selected)
+                  (funcall check)
+                  (values selected records)))))
+           :boundaries (lambda ()
+                         (logical-slot-continuation-active-boundaries storage facts snapshot archive)))))))))
+
+(defun logical-slot-continuation-restore-startup (gate ownership)
+  (if (logical-slot-startup-read-inventory :local-workspace t)
+      (logical-slot-continuation-restore-active-startup gate ownership)
+      (logical-slot-continuation-restore-empty-startup gate ownership)))

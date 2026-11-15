@@ -119,7 +119,7 @@ def main():
                "wall_seconds": time.monotonic() - start,
                "stable_sha256": stable_digest, "original_pgdata_identity": root_identity,
                "original_proof_identity": proof_identity,
-               "limits": "Empty selection only; GC and admission remain fenced."}
+                "limits": "Empty selector crash matrix; optional active selector proof retains all saved P7 rows. GC and admission remain fenced."}
     (logs / "selector-crash-summary.json").write_text(json.dumps(summary, indent=2) + "\n")
     print("CONTINUATION-SELECTOR-CRASH PASS " + json.dumps({k: v for k, v in summary.items() if k != "runs"}), flush=True)
 
