@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import runpy
+import re
 import signal
 import subprocess
 import time
@@ -19,12 +20,21 @@ string = base['string']
 
 
 def probe(peer, label, *args, failure=None, publication=None, cut='none', syscall=None,
-          mount=None, all_lost=False, empty_interval=False, wal_removed=False, **kwargs):
+          mount=None, all_lost=False, empty_interval=False, wal_removed=False, segment_boundary=False,
+          catalog_spelling=False, catalog_size=None, **kwargs):
     assert failure in (None, 'error', 'throw', 'mutation')
     assert publication in (None, 'run', 'reject', 'error', 'throw', 'crash')
-    assert sum(bool(x) for x in (failure, publication, syscall, mount, all_lost, empty_interval, wal_removed)) <= 1
+    assert sum(bool(x) for x in (failure, publication, syscall, mount, all_lost, empty_interval, wal_removed, segment_boundary, catalog_spelling)) <= 1
     operation = (f'(logical-source-proof-test-preparation-failure :{failure})'
                  if failure else '(logical-source-proof-test-run)')
+    if segment_boundary:
+        assert isinstance(segment_boundary, int) and not isinstance(segment_boundary, bool)
+        assert isinstance(catalog_size, int) and catalog_size > 0
+        operation = f'(logical-source-proof-test-segment-boundary {segment_boundary} {catalog_size})'
+    if catalog_spelling:
+        assert isinstance(catalog_spelling, int) and not isinstance(catalog_spelling, bool)
+        assert isinstance(catalog_size, int) and catalog_size > 0
+        operation = f'(logical-source-proof-test-catalog-spelling {catalog_spelling} {catalog_size})'
     if wal_removed:
         operation = '(logical-source-proof-test-wal-removed)'
     if empty_interval:
@@ -61,14 +71,16 @@ def probe(peer, label, *args, failure=None, publication=None, cut='none', syscal
     started = time.monotonic()
     with log.open('w') as output:
         result = subprocess.run(command, stdout=output, stderr=subprocess.STDOUT,
-                                timeout=120)
+                                timeout=600 if segment_boundary else 120)
     text = log.read_text()
     if publication == 'crash':
         assert result.returncode == -signal.SIGKILL, (result.returncode, log)
         assert f'SOURCE-PROOF-PUBLICATION-KILL :{cut.upper()}' in text, log
         print(f'SOURCE-PROOF-KILLED {label} seconds={time.monotonic()-started:.6f}', flush=True)
         return
-    marker = ('SOURCE-PROOF-WAL-REMOVED-PASS' if wal_removed else
+    marker = ('SOURCE-PROOF-CATALOG-SPELLING-PASS' if catalog_spelling else
+              'SOURCE-PROOF-SEGMENT-BOUNDARY-PASS' if segment_boundary else
+              'SOURCE-PROOF-WAL-REMOVED-PASS' if wal_removed else
               'SOURCE-PROOF-EMPTY-INTERVAL-PASS' if empty_interval else
               'SOURCE-PROOF-ALL-LOST-PASS' if all_lost else
               'SOURCE-PROOF-MOUNT-PASS' if mount else
@@ -274,7 +286,8 @@ def run_all_lost():
     print('SOURCE-PROOF-ALL-LOST-WORKFLOW-PASS', flush=True)
 
 
-def run_empty_interval(optional, *, wal_removed=False):
+def run_boundary_case(optional, *, wal_removed=False, segment_boundary=False, catalog_spelling=False):
+    assert sum(bool(x) for x in (wal_removed, segment_boundary, catalog_spelling)) <= 1
     started = time.monotonic()
     source = OwnedLisp(parameters=(('wal_level', 'logical'),))
     child = OwnedLisp(parameters=(('wal_level', 'replica'),))
@@ -296,25 +309,59 @@ def run_empty_interval(optional, *, wal_removed=False):
         source.control(f'(logical-slot-base-copy {string(child.data)} "empty_interval_pin")', timeout=90)
         child.start()
         standby['wait_rows'](child, [['1']])
-        # Initialize phase-2 receive storage without post-D source writes.
-        # The actual restartpoint must still prove F equals the copied D.
+        # Initialize genuine phase-2 receive storage. Only the segment-boundary
+        # and catalog-spelling cases add complete source batches after D.
         child.control(f'(physical-follow-start "127.0.0.1" {source.port} "empty_interval_pin")')
-        child.control('(physical-follow-stop)')
-        child.control('(physical-recovery-restartpoint)')
+        if segment_boundary or catalog_spelling:
+            source.control(f'(load {string(Path(__file__).with_name("logical-slot-copy-source-proof-native.lisp"))})')
+            reply = source.control(
+                f'(logical-source-proof-test-write-catalog-batches {"t" if segment_boundary else "nil"})',
+                timeout=120)
+            match = re.search(r'SOURCE-PROOF-SOURCE-CATALOG-PASS start=([0-9]+) terminal=([0-9]+) catalog-bytes=([0-9]+)', reply)
+            assert match, reply
+            terminal = int(match.group(2))
+            canonical_size = int(match.group(3))
+            deadline = time.monotonic() + 120
+            while time.monotonic() < deadline:
+                reply = child.control('(format t "SOURCE-PROOF-APPLIED ~d~%" *last-replay-lsn*)')
+                applied = int(re.search(r'SOURCE-PROOF-APPLIED ([0-9]+)', reply).group(1))
+                if applied == terminal:
+                    break
+                assert applied < terminal, (applied, terminal)
+                assert child.process.poll() is None
+                time.sleep(0.05)
+            else:
+                raise TimeoutError(('segment-boundary replay', child.root))
+            print(f'SOURCE-PROOF-BOUNDARY-REPLAY-PASS terminal={terminal}', flush=True)
+        phase_timeout = 600 if segment_boundary else 15
+        child.control('(physical-follow-stop)', timeout=phase_timeout)
+        child.control('(physical-recovery-restartpoint)', timeout=phase_timeout)
+        if catalog_spelling:
+            child.control(f'(load {string(Path(__file__).with_name("logical-slot-copy-source-proof-native.lisp"))})')
+            reply = child.control(f'(logical-source-proof-test-warm-catalog-spelling {canonical_size + 17})')
+            assert 'SOURCE-PROOF-WARM-CATALOG-SPELLING-PASS' in reply
         environment['optional'] = optional
         catalog['prepare'](child, pending=True,
-                           disposition='wal-removed' if wal_removed else 'eligible')
+                           disposition='wal-removed' if wal_removed else 'eligible',
+                           timeout=600 if segment_boundary else None)
         child.stop(immediate=True)
         source.stop(immediate=True)
-        base['probe'](child, 'empty-interval-cf')
-        probe(child, 'empty-interval-baseline', empty_interval=not wal_removed,
-              wal_removed=wal_removed)
+        label = ('segment-boundary' if segment_boundary else 'catalog-spelling' if catalog_spelling
+                 else 'wal-removed' if wal_removed else 'empty-interval')
+        base['probe'](child, label+'-cf', timeout=600 if segment_boundary else 90)
+        probe_options = dict(
+            empty_interval=not (wal_removed or segment_boundary or catalog_spelling),
+            wal_removed=wal_removed,
+            segment_boundary=terminal if segment_boundary else False,
+            catalog_spelling=terminal if catalog_spelling else False,
+            catalog_size=(canonical_size if segment_boundary else canonical_size + 17)
+            if segment_boundary or catalog_spelling else None)
+        probe(child, label+'-baseline', **probe_options)
         before = catalog['image'](child.data)
         for retry in range(2):
-            probe(child, f'empty-interval-retry-{retry}', empty_interval=not wal_removed,
-                  wal_removed=wal_removed)
-            assert before == catalog['image'](child.data), 'empty interval retry changed files'
-        kind = 'WAL-REMOVED' if wal_removed else 'EMPTY-INTERVAL'
+            probe(child, f'{label}-retry-{retry}', **probe_options)
+            assert before == catalog['image'](child.data), f'{label} retry changed files'
+        kind = label.upper()
         print(f'SOURCE-PROOF-{kind}-WORKFLOW-PASS optional={optional} '
               f'seconds={time.monotonic()-started:.6f}', flush=True)
     finally:
@@ -329,18 +376,22 @@ if __name__ == '__main__':
     modes.add_argument('--all-lost', action='store_true')
     modes.add_argument('--empty-interval', action='store_true')
     modes.add_argument('--wal-removed', action='store_true')
+    modes.add_argument('--segment-boundary', action='store_true')
+    modes.add_argument('--catalog-spelling', action='store_true')
     parser.add_argument('--publication-cuts', action='store_true')
     parser.add_argument('--publication-negative', action='store_true')
     parser.add_argument('--publication-syscalls', action='store_true')
     parser.add_argument('--publication-mounts', action='store_true')
     arguments = parser.parse_args()
-    if arguments.all_lost or arguments.empty_interval or arguments.wal_removed:
+    if arguments.all_lost or arguments.empty_interval or arguments.wal_removed or arguments.segment_boundary or arguments.catalog_spelling:
         if any((arguments.publication_cuts, arguments.publication_negative,
                 arguments.publication_syscalls, arguments.publication_mounts)):
             parser.error('semantic modes cannot be combined with publication fault matrices')
-        if arguments.empty_interval or arguments.wal_removed:
+        if arguments.empty_interval or arguments.wal_removed or arguments.segment_boundary or arguments.catalog_spelling:
             for optional in ((False,) if arguments.smoke else (False, True)):
-                run_empty_interval(optional, wal_removed=arguments.wal_removed)
+                run_boundary_case(optional, wal_removed=arguments.wal_removed,
+                                  segment_boundary=arguments.segment_boundary,
+                                  catalog_spelling=arguments.catalog_spelling)
         else:
             run_all_lost()
         raise SystemExit(0)
