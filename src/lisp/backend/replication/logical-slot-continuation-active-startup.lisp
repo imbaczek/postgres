@@ -128,6 +128,8 @@
   ;; The first pass records exact frames and a segment ledger; the second
   ;; compares frames, segment facts and ordered visits.  Hold one segment FD
   ;; at a time and keep the transcript in a private temporary directory.
+  ;; Close any current segment before a fresh proof so ordered visits can be
+  ;; compared with the first pass.
   (let* ((history (logical-slot-continuation-history
                    (getf snapshot :history-target) (getf snapshot :history)))
          (fork (second (getf snapshot :origin)))

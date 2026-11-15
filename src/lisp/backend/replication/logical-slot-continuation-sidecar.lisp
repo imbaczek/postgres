@@ -1,6 +1,8 @@
 (in-package #:pg)
 
 (defun call-with-logical-slot-continuation-sidecar (owner context facts guard function)
+  ;; Check the descriptor inventory and piece sizes and digests before use.
+  ;; Recheck the named directory and observed file facts through the callback.
   (logical-slot-copy-check-input owner context)
   (unless (assoc "logical_slot_wal" (physical-image-context-children context) :test #'equal)
     (logical-slot-copy-open-input-sidecar owner context))

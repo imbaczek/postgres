@@ -2,6 +2,10 @@
 
 (defun call-with-logical-slot-continuation-lanes
     (facts snapshot slot archive sidecar-reader local-reader guard function)
+  ;; D is the manifest end (the checkpoint end), not the archive base or
+  ;; checkpoint start.  Read before D from the sidecar, D through F from the
+  ;; original parent archive only, and F through the sealed end from local
+  ;; original-child WAL.  The archive lane has no local fallback.
   (let* ((history (logical-slot-continuation-history
                    (getf snapshot :history-target) (getf snapshot :history)))
          (parent-history (logical-slot-copy-source-proof-parent-history facts))
@@ -48,6 +52,13 @@
         (open-lanes (nreverse specifications) nil)))))
 
 (defun call-with-logical-slot-continuation-startup-readers (gate ownership function)
+  ;; Keep startup storage, canonical proof, selector FD, origin root lease,
+  ;; local tail proof and sidecar live for the multislot callback.  The scope
+  ;; checks guard, check and read-slot with a failure latch and postcheck.
+  ;; Callbacks are trusted internal code and can access raw data; this scope
+  ;; does not sandbox them.  Current startup supports the original child only.
+  ;; Runtime scan and ACK, atomic startup publication and admission remain
+  ;; separate work; the GC fence remains closed.
   (call-with-logical-slot-continuation-startup-storage
    gate ownership
    (lambda (storage facts)

@@ -4,7 +4,8 @@
     (request record owner kind original fork terminal)
   ;; A changed restart must be a batch or EOR start, or a completed terminal
   ;; end.  A changed acknowledgement must be a completed terminal end; the
-  ;; checkpoint is not an acknowledgement.
+  ;; checkpoint is not an acknowledgement.  P7 has no restart kind bit: a
+  ;; positive same-timeline prefix end may name a pending batch start.
   (and (eql owner (third request))
        (ecase (first request)
          (:confirmed

@@ -74,6 +74,8 @@
     (logical-slot-startup-check-authority source)))
 
 (defun logical-slot-startup-derive-pending-with-cursor (source slot cursor)
+  ;; Reuse the pending reconstruction for this exact captured source,
+  ;; candidate, history and horizon.  It does not publish a registry entry.
   (logical-slot-startup-check-authority source)
   (unless (and (some (lambda (entry) (eq slot (logical-slot-startup-entry-slot entry)))
                      (logical-slot-startup-source-entries source))

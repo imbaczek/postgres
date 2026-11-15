@@ -113,6 +113,8 @@ leave its local workspace opaque.  Slot data must remain descriptor-only."
   t)
 
 (defun logical-slot-copy-input-piece-reader (parent index guard)
+  ;; Recheck the caller's source and the held and named file facts around
+  ;; CONSUME.  Coverage and the frozen end come from the caller.
   (lambda (segment carrier consume)
     (unless (funcall guard) (error "logical copy selected piece lost its source scope"))
     (let* ((entry (gethash (list carrier segment) index))

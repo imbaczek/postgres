@@ -3,6 +3,10 @@
 (declaim (ftype function logical-slot-copy-descriptor-list-count))
 
 (defun call-with-logical-wal-lane-provider (cursors guard function)
+  ;; Stitch at most three contiguous live cursors, advancing only the requested
+  ;; lane and rejecting a batch that crosses a seam.  Callbacks are trusted
+  ;; internal code; source and publication proofs remain the caller's duty.
+  ;; A failed read remains failed even if its caller catches the error.
   (logical-slot-copy-descriptor-list-count cursors 3)
   (unless (and cursors (every #'logical-wal-cursor-p cursors)
                (functionp guard) (functionp function))
