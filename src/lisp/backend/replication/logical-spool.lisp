@@ -257,6 +257,98 @@ The caller must not mutate EVENT after passing it to this function."
          (unless complete (setf (logical-spool-failed-p spool) t))))))
   (values))
 
+(defun logical-spool-reader-memory (spool maximum)
+  (let ((frames nil) (total 0) (remaining (logical-spool-events spool)))
+    (dotimes (index (logical-spool-count spool))
+      (unless (consp remaining) (error "invalid logical spool memory event count"))
+      (let ((event (pop remaining)))
+        (unless (and (typep event '(vector (unsigned-byte 8))) (<= 1 (length event) maximum))
+          (error "invalid bounded logical spool event"))
+        (incf total (length event))
+        (push (vector event (wal-crc32 event)) frames)))
+    (unless (and (null remaining) (= total (logical-spool-bytes spool)))
+      (error "invalid logical spool memory contents"))
+    frames))
+
+(defun logical-spool-reader-file-frame (stream maximum remaining)
+  (let ((size (logical-spool-read-u32 stream))
+        (checksum (logical-spool-read-u32 stream)))
+    (unless (<= 1 size (min maximum remaining))
+      (error "logical spool frame exceeds its bounded reader"))
+    (let ((frame (make-array size :element-type '(unsigned-byte 8))))
+      (unless (= size (read-sequence frame stream)) (error "truncated logical spool event"))
+      (unless (= checksum (wal-crc32 frame)) (error "logical spool checksum mismatch"))
+      frame)))
+
+(defun call-with-logical-spool-reader (spool maximum function)
+  (unless (and (typep maximum '(integer 1 4294967295)) (functionp function))
+    (error "logical spool reader requires a bounded frame size and callback"))
+  (call-with-logical-spool-visit
+   spool
+   (lambda ()
+     (let ((active t) (busy nil) (failed nil) (complete nil)
+                      (thread sb-thread:*current-thread*)
+                      (owner (logical-spool-owner spool)) (stream (logical-spool-stream spool))
+                      (head (logical-spool-events spool)) (count (logical-spool-count spool))
+                      (bytes (logical-spool-bytes spool)) (frames nil)
+                      (index 0) (total 0) (position 0))
+       (labels ((check ()
+                  (unless (and (not failed) (not (logical-spool-failed-p spool))
+                               (logical-spool-sealed-p spool) (not (logical-spool-closed-p spool))
+                               (eq owner (logical-spool-owner spool)) (eq stream (logical-spool-stream spool))
+                               (eq head (logical-spool-events spool)) (= count (logical-spool-count spool))
+                               (= bytes (logical-spool-bytes spool))
+                               (or (null stream) (eql position (file-position stream))))
+                    (error "logical spool reader lost its sealed source")))
+                (next ()
+                  (unless (and active (eq thread sb-thread:*current-thread*))
+                    (error "logical spool reader ended or changed thread"))
+                  (when busy
+                    (setf failed t (logical-spool-failed-p spool) t)
+                    (error "logical spool reader is already reading"))
+                  (sb-sys:without-interrupts
+                    (let ((done nil))
+                      (setf busy t)
+                      (unwind-protect
+                           (multiple-value-prog1
+                               (sb-sys:with-local-interrupts
+                                 (check)
+                                 (let ((frame
+                                         (if (= index count)
+                                             (progn
+                                               (unless (and (= total bytes)
+                                                            (if stream (null (read-byte stream nil nil)) (null frames)))
+                                                 (error "invalid logical spool trailing contents"))
+                                               nil)
+                                             (if stream
+                                                 (logical-spool-reader-file-frame stream maximum (- bytes total))
+                                                 (let* ((row (pop frames)) (event (and row (svref row 0))))
+                                                   (unless (and row (= (svref row 1) (wal-crc32 event)))
+                                                     (error "logical spool memory checksum mismatch"))
+                                                   (copy-seq event))))))
+                                   (when frame (incf index) (incf total (length frame)))
+                                   (when stream (setf position (file-position stream)))
+                                   (check)
+                                   frame))
+                             (setf done t))
+                        (setf busy nil)
+                        (unless done (setf failed t (logical-spool-failed-p spool) t)))))))
+         (sb-sys:without-interrupts
+           (unwind-protect
+                (multiple-value-prog1
+                    (sb-sys:with-local-interrupts
+                      (unless (and (typep count '(integer 0 *)) (typep bytes '(integer 0 *))
+                                   (<= count bytes))
+                        (error "invalid logical spool reader metadata"))
+                      (when stream
+                        (unless (file-position stream 0) (error "cannot seek logical spool")))
+                      (check)
+                      (unless stream (setf frames (logical-spool-reader-memory spool maximum)))
+                      (multiple-value-prog1 (funcall function #'next) (check)))
+                  (setf complete t))
+             (setf active nil)
+             (unless complete (setf (logical-spool-failed-p spool) t)))))))))
+
 (defun logical-spool-map-event-cursors (spool function)
   "Visit CRC-verified bounded cursors; each cursor expires when FUNCTION returns."
   (call-with-logical-spool-visit

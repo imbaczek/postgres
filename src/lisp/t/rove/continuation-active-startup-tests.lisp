@@ -347,3 +347,123 @@
               (getf result :status) (getf result :trials) (getf result :definition-digest))
       (rove:ok (eq :passed (getf result :status)) (format nil "~s" result))
       (rove:ok (= 200 (getf result :trials)))))
+
+(cl-spec:defproperty continuation-spool-pull-preserves-owned-frames
+    ((size (range integer 1 128)) (count (range integer 0 12)) (spill (range integer 0 1)))
+  (:about call-with-logical-spool-reader)
+  (:trials (:normal 200))
+  (let* ((*logical-capture-memory-bytes* (if (zerop spill) 0 1048576))
+         (events (loop for index below count
+                       collect (make-array size :element-type '(unsigned-byte 8)
+                                                :initial-element (mod (+ size index) 256))))
+         (expected (mapcar #'copy-seq events)))
+    (call-with-logical-slot-continuation-transcript
+     (lambda (spool)
+       (dolist (event events) (logical-spool-append spool event))
+       (logical-spool-seal spool)
+       (let ((actual nil) (expired nil))
+         (call-with-logical-spool-reader
+          spool 128
+          (lambda (next)
+            (setf expired next)
+            (loop for frame = (funcall next) while frame
+                  do (push (copy-seq frame) actual)
+                     (setf (aref frame 0) (logxor 255 (aref frame 0))))))
+         (and (equalp expected (nreverse actual))
+              (equalp expected events)
+              (not (logical-spool-failed-p spool))
+              (handler-case (progn (funcall expired) nil) (error () t))
+              (equal '(:one :two)
+                     (multiple-value-list
+                      (call-with-logical-spool-reader
+                       spool 128 (lambda (next) (funcall next) (values :one :two)))))
+              (not (logical-spool-failed-p spool))
+              (let ((reread nil))
+                (logical-spool-map-events spool (lambda (event) (push (copy-seq event) reread)))
+                (equalp expected (nreverse reread)))))))))
+
+(rove:deftest continuation-spool-pull-generated-contract
+    (let ((result (cl-spec:result-data
+                   (cl-spec:run-property 'continuation-spool-pull-preserves-owned-frames
+                                         :seed 11503 :profile :normal))))
+      (format t "~&CONTINUATION-SPOOL-PULL status=~s trials=~s seed=11503 digest=~s~%"
+              (getf result :status) (getf result :trials) (getf result :definition-digest))
+      (rove:ok (eq :passed (getf result :status)) (format nil "~s" result))
+      (rove:ok (= 200 (getf result :trials)))))
+
+(rove:deftest continuation-spool-pull-rejects-bounds-and-corruption
+    (dolist (kind '(:bound :length :crc :trailing))
+      (let ((*logical-capture-memory-bytes* 0))
+        (call-with-logical-slot-continuation-transcript
+         (lambda (spool)
+           (logical-spool-append spool (make-array 32 :element-type '(unsigned-byte 8) :initial-element 7))
+           (logical-spool-seal spool)
+           (let ((stream (logical-spool-stream spool)) (caught nil) (returned nil) (completed nil))
+             (ecase kind
+               (:bound)
+               (:length
+                (file-position stream 0)
+                (dotimes (index 4) (write-byte 255 stream)))
+               (:crc (file-position stream 8) (write-byte 8 stream))
+               (:trailing (file-position stream :end) (write-byte 42 stream)))
+             (finish-output stream)
+             (handler-case
+                 (progn
+                   (call-with-logical-spool-reader
+                    spool (if (eq kind :bound) 16 64)
+                    (lambda (next)
+                      (handler-case (progn (funcall next) (funcall next))
+                        (error () (setf caught t)))
+                      (setf returned t)))
+                   (setf completed t))
+               (error () nil))
+             (rove:ok caught (format nil "~s fails inside NEXT" kind))
+             (rove:ok returned "The test caught the read failure inside its callback")
+             (rove:ok (not completed) "A caught read failure rejects the enclosing reader scope")
+             (rove:ok (logical-spool-failed-p spool))
+             (rove:ok (handler-case
+                          (progn (call-with-logical-spool-reader spool 64 (lambda (next) (funcall next))) nil)
+                        (error () t)))))))))
+
+(rove:deftest continuation-spool-pull-rejects-foreign-nested-and-expired-use
+    (dolist (limit '(0 1024))
+      (let ((*logical-capture-memory-bytes* limit) (retained nil))
+        (call-with-logical-slot-continuation-transcript
+         (lambda (spool)
+           (logical-spool-append spool (make-array 2 :element-type '(unsigned-byte 8) :initial-contents '(7 8)))
+           (logical-spool-seal spool)
+           (call-with-logical-spool-reader
+            spool 2
+            (lambda (next)
+              (setf retained next)
+              (rove:ok (sb-thread:join-thread
+                        (sb-thread:make-thread
+                         (lambda () (handler-case (progn (funcall next) nil) (error () t))))))
+              (rove:ok (handler-case (progn (logical-spool-map-events spool #'identity) nil) (error () t)))
+              (rove:ok (equalp #(7 8) (funcall next)))
+              (rove:ok (null (funcall next)))))
+           (rove:ok (not (logical-spool-failed-p spool)))
+           (rove:ok (handler-case (progn (funcall retained) nil) (error () t)))
+           (rove:ok (not (logical-spool-failed-p spool))))))))
+
+(rove:deftest continuation-spool-pull-unwind-and-memory-topology
+    (dolist (case '(:throw :cycle :bound))
+      (let ((*logical-capture-memory-bytes* 1024))
+        (call-with-logical-slot-continuation-transcript
+         (lambda (spool)
+           (logical-spool-append spool (make-array 2 :element-type '(unsigned-byte 8) :initial-contents '(7 8)))
+           (logical-spool-seal spool)
+           (if (eq case :throw)
+               (rove:ok
+                (eq :cut
+                    (catch 'continuation-reader-cut
+                      (call-with-logical-spool-reader
+                       spool 2 (lambda (next) (funcall next) (throw 'continuation-reader-cut :cut))))))
+               (progn
+                 (when (eq case :cycle)
+                   (setf (cdr (logical-spool-events spool)) (logical-spool-events spool)))
+                 (rove:ok
+                  (handler-case
+                      (progn (call-with-logical-spool-reader spool (if (eq case :bound) 1 2) (lambda (next) (funcall next))) nil)
+                    (error () t)))))
+           (rove:ok (logical-spool-failed-p spool)))))))
