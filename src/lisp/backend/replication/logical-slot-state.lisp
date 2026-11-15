@@ -130,6 +130,7 @@ This does not prove history, slot lifetime or import authority."
         system-id))))
 
 (defun logical-slot-provenance-fields-equal-p (left right)
+  "Compare immutable provenance fields for detached state observations."
   (or (eq left right)
       (and (logical-slot-provenance-p left) (logical-slot-provenance-p right)
            (eql (logical-slot-provenance-system-id left) (logical-slot-provenance-system-id right))
@@ -140,6 +141,8 @@ This does not prove history, slot lifetime or import authority."
                 (logical-slot-provenance-on-start-timeline right)))))
 
 (defun logical-slot-state-identity-equal-p (left right)
+  "Compare immutable slot identity independently of progress.
+Live updates still require the exact provenance object under the WAL lock."
   (and (wal-replication-slot-p left) (wal-replication-slot-p right)
        (eq (wal-replication-slot-kind left) (wal-replication-slot-kind right))
        (equal (wal-replication-slot-name left) (wal-replication-slot-name right))

@@ -1,6 +1,8 @@
 (in-package #:pg)
 
 (defun logical-slot-imported-check-progress (current baseline history)
+  "Check imported progress against the baseline and selected history.
+Preserve an existing terminal cause and its progress."
   (let* ((cause (logical-slot-effective-invalidation-cause baseline))
          (next-cause (logical-slot-effective-invalidation-cause current))
          (prior (wal-replication-slot-confirmed-flush-lsn baseline))
@@ -32,6 +34,8 @@
       (error "imported logical slot changed its original terminal cause or progress"))))
 
 (defun logical-slot-imported-check-state (current baseline history end)
+  "Compare detached imported state with its certified origin and frozen end.
+This observation does not grant storage or slot authority."
   (unless (and (logical-slot-state-valid-p current)
                (logical-slot-state-valid-p baseline)
                (wal-replication-slot-child-owner baseline)
