@@ -239,6 +239,56 @@
                     (member 103 *wal-pending-deletes*))
                "parent drop defers deletion of both owned TOAST relations")))
 
+(cl-spec:defproperty catalog-comparison-keeps-complete-reader-forms
+    ((salt (range integer 0 255)) (width (range integer 0 4)))
+  (:about physical-history-catalog-images-equal-p)
+  (:trials (:normal 100))
+  (let* ((matrix (make-array (list 2 width) :element-type '(unsigned-byte 8)))
+         (image (list :name "Case" :number salt :matrix matrix
+                      :vector #(1 "Case") :float 1.25d0 :character #\Q)))
+    (dotimes (i (array-total-size matrix))
+      (setf (row-major-aref matrix i) (mod (+ salt i) 256)))
+    (let* ((text (with-standard-io-syntax (prin1-to-string image)))
+           (bytes (string->bytes text))
+           (spaced (string->bytes (format nil "; leading~%~a~%#| trailing |#  " text))))
+      (and (physical-history-catalog-images-equal-p bytes spaced)
+           (physical-history-catalog-images-equal-p spaced bytes)))))
+
+(rove:deftest catalog-comparison-generated-reader-contract
+    (let ((data (cl-spec:result-data
+                 (cl-spec:run-property 'catalog-comparison-keeps-complete-reader-forms
+                                       :seed 7619 :profile :normal))))
+      (rove:ok (eq :passed (getf data :status)) (format nil "~s" data))
+      (rove:ok (= 100 (getf data :trials)))))
+
+(rove:deftest catalog-comparison-rejects-changed-complete-forms
+    (dolist (pair (list (list '(:name "Case") '(:name "case"))
+                        (list '(:number 1) '(:number 1.0))
+                        (list '(:number 1) '(:number 2))
+                        (list '(:name "Case") '(:name "Case" :unknown nil))
+                        (list '(:name "Case") '(:name "Case" :name "Case"))
+                        (list '(:a 1 :b 2) '(:b 2 :a 1))
+                        (list #2A((1 2) (3 4)) #2A((1 2 3 4)))
+                        (list #2A((1 2) (3 4)) #2A((1 2) (3 5)))
+                        (list (make-array 2 :element-type '(unsigned-byte 8)
+                                            :initial-contents '(1 2)) #(1 2))
+                        (list #\a #\A)))
+      (let ((left (string->bytes (with-standard-io-syntax (prin1-to-string (first pair)))))
+            (right (string->bytes (with-standard-io-syntax (prin1-to-string (second pair))))))
+        (rove:ok (not (physical-history-catalog-images-equal-p left right)))))
+  (let ((unsupported (make-hash-table)))
+    (rove:ok (not (physical-history-catalog-form-equal-p unsupported unsupported)))))
+
+(rove:deftest catalog-comparison-rejects-trailing-forms-and-reader-labels
+    (dolist (text '("(:name \"Case\") (:extra t)"
+                    "#1=(:name \"Case\")" "#1#"))
+      (rove:ok
+       (handler-case
+           (progn (physical-history-catalog-images-equal-p
+                   (string->bytes text) (string->bytes "(:name \"Case\")"))
+                  nil)
+         (error () t)))))
+
 (rove:deftest test-toast-catalog-physical-history
     (let* ((toast (make-pg-toast :oid 100 :relfilenode 101 :index-oid 102
                                  :index-relfilenode 103 :relfrozenxid 20))

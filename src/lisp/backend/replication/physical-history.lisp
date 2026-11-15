@@ -50,6 +50,34 @@ Native readable array syntax remains accepted, including SBCL string arrays."
             (error "catalog history has trailing forms"))
           image)))))
 
+(defun physical-history-catalog-form-equal-p (left right)
+  "Compare finite decoded catalog forms, treating strings as case-sensitive text.
+Other arrays keep their shape and element type; scalars keep their types."
+  (cond
+    ((stringp left) (and (stringp right) (string= left right)))
+    ((consp left)
+     (and (consp right)
+          (physical-history-catalog-form-equal-p (car left) (car right))
+          (physical-history-catalog-form-equal-p (cdr left) (cdr right))))
+    ((arrayp left)
+     (and (arrayp right) (not (stringp right))
+          (equal (array-dimensions left) (array-dimensions right))
+          (equal (array-element-type left) (array-element-type right))
+          (eql (array-has-fill-pointer-p left) (array-has-fill-pointer-p right))
+          (or (not (array-has-fill-pointer-p left))
+              (= (fill-pointer left) (fill-pointer right)))
+          (loop for i below (array-total-size left)
+                always (physical-history-catalog-form-equal-p
+                        (row-major-aref left i) (row-major-aref right i)))))
+    ((or (symbolp left) (numberp left) (characterp left)) (eql left right))
+    (t nil)))
+
+(defun physical-history-catalog-images-equal-p (left right)
+  "Compare complete catalog forms while allowing reader whitespace and comments.
+This is an in-memory consistency check; raw images still bind WAL and R."
+  (physical-history-catalog-form-equal-p
+   (physical-history-read-catalog left) (physical-history-read-catalog right)))
+
 (defun physical-history-catalog-relfilenodes (bytes identity)
   "Read exactly one source catalog and retain every serialized fork reference.
 Do not round-trip through catalog hash tables: duplicate names must not hide

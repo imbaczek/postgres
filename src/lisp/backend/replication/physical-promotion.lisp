@@ -489,7 +489,7 @@ the outer scope installs it after the owner has retired."
       (when (and requested-child (not (eql requested-child child)))
         (error "requested promotion child is not the next local timeline"))
       (multiple-value-bind (metadata catalog prefix generation) (physical-restartpoint-read state)
-        (when (and *catalog* (not (equalp catalog (catalog-image-bytes))))
+        (when (and *catalog* (not (physical-history-catalog-images-equal-p catalog (catalog-image-bytes))))
           (error "promotion retained catalog differs from its restartpoint"))
         (multiple-value-bind (fork next) (physical-promotion-check-progress state metadata prefix generation)
           (apply #'physical-promotion-preflight-runtime
