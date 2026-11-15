@@ -12,6 +12,7 @@
      (* 7 (+ 12 +logical-slot-copy-evidence-record-maximum+))))
 
 (defun logical-slot-copy-evidence-chain-size (chain)
+  "Bound the optional chain, including its count and length prefixes."
   (let ((count (logical-slot-copy-descriptor-list-count
                 chain +physical-store-history-chain-limit+))
         (size 4))
@@ -26,7 +27,7 @@
 
 (defun logical-slot-copy-import-evidence-parts (value)
   "Validate bounded raw evidence parts and the exact child frame plan.
-The roughly 48 MiB bound includes three large blobs without hex expansion."
+The roughly 64 MiB bound includes the optional receive-selection chain."
   (unless (and (member (logical-slot-copy-descriptor-list-count value 14) '(12 14))
                (equal (loop for key in value by #'cddr collect key)
                       (append '(:manifest :checkpoint :control :selected-history :child-history :plan)
@@ -54,7 +55,8 @@ The roughly 48 MiB bound includes three large blobs without hex expansion."
     (values blobs plan snapshot size)))
 
 (defun logical-slot-copy-import-evidence-encode (value)
-  "Encode observational evidence; CRC covers all bytes except its four-byte trailer."
+  "Encode observational evidence and an optional selection-chain trailer.
+The CRC covers all bytes except its four-byte trailer."
   (multiple-value-bind (blobs plan snapshot size) (logical-slot-copy-import-evidence-parts value)
     (let ((bytes (make-array size :element-type '(unsigned-byte 8) :initial-element 0))
           (position 20))

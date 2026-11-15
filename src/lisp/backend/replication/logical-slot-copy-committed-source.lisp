@@ -86,7 +86,8 @@
 
 (defun logical-slot-copy-check-retained-source
     (certificate evidence descriptor manifest control plan state metadata prefix generation store check-artifacts)
-  ;; Replay the retained source and require the caller's artifact check while
+  ;; The selection chain binds evidence to the retained receive selection, but
+  ;; does not replace replay of the retained source. Require the artifact check while
   ;; the store lease is held.  The committed wrapper checks complete child files;
   ;; parent catalog restoration supplies its own staged-artifact check.
   (logical-slot-copy-check-committed-progress state metadata prefix generation store)

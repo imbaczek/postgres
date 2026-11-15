@@ -109,6 +109,7 @@ Rewrites are rejected even when the bytes are unchanged."
 
 (defun logical-slot-copy-import-check-publication-plan (owner context attempt store tuple kind)
   "Recheck source and evidence binding, receive tuple and owner before publication.
+Compare the captured selection chain with the leased store before publication.
 Certificate writes also require the pinned evidence bytes and file facts."
   (logical-slot-copy-check-import-publication owner context)
   (logical-slot-copy-import-check-pending-plan owner context attempt)

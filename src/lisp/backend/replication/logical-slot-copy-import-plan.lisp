@@ -108,7 +108,8 @@ Encoded evidence is independent of the minted child owner."
     (owner context existing source descriptor observations control)
   "Build source-bound pending facts and a deterministic child plan.
 On retry, reuse the certificate owner only after checking source exclusions and
-requiring the reconstructed value to match."
+requiring the reconstructed value to match. The evidence retains the detached
+receive-selection chain for later binding and source rechecks."
   ;; Reconciliation uses this same source-bound plan to authenticate the
   ;; staged child and the expected control temporary.
   (let ((*pgdata* (physical-image-context-root-path context))

@@ -4,6 +4,9 @@
 (in-package #:pg)
 
 (defun logical-slot-copy-evidence-check-selection-chain (evidence certificate control)
+  "Bind complete selection digests and the tip to control and selected history.
+A history-text digest alone cannot bind the end-of-recovery bytes. This pure
+check grants no authority; retained WAL still requires replay."
   (let ((chain (getf evidence :selection-chain))
         (target (getf control :history-target))
         (digest (getf control :history-digest)))

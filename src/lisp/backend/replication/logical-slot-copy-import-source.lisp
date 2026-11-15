@@ -170,6 +170,8 @@ In phase 3, also check full checkpoint artifacts before the final source replay.
                       (logical-slot-copy-import-disposition slot fact history fork parent))))
 
 (defun logical-slot-copy-import-selection-chain (store control)
+  "Capture bounded encoded selections in oldest-first order.
+The caller holds the receive-store scope; these detached bytes confer no authority."
   (let ((selection (physical-recovery-check-history-reference
                     store (getf control :history-target) (getf control :history-digest)))
         (chain nil) (size 4) (count 0))
