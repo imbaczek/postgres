@@ -2,6 +2,28 @@
 (defpackage #:pg-physical-tests (:use #:cl #:rove))
 (in-package #:pg-physical-tests)
 
+(defvar *physical-test-plain-cache* nil)
+
+(defun physical-test-child-command (command)
+  (unless (and (consp command) (list-length command)
+               (every (lambda (argument)
+                        (and (stringp argument) (not (find (code-char 0) argument)))) command)
+               (plusp (length (first command))))
+    (error "physical test children require an argument list, not a shell command"))
+  (if *physical-test-plain-cache*
+      (let ((cache (uiop:ensure-directory-pathname *physical-test-plain-cache*)))
+        (unless (uiop:absolute-pathname-p cache) (error "physical child cache must be absolute"))
+        (let ((*print-length* nil) (*print-level* nil) (*print-readably* t)
+                                   (*package* (find-package :cl-user)))
+          (list* "env"
+                 (concatenate 'string "ASDF_OUTPUT_TRANSLATIONS="
+                              (write-to-string
+                               (list :output-translations (list t (namestring cache))
+                                     :ignore-inherited-configuration)))
+                 "PG_LISP_TEST_CHILD_CACHE_EXPECTED=1"
+                 command)))
+      command))
+
 (defun empty-octets ()
   (make-array 0 :element-type '(unsigned-byte 8)))
 

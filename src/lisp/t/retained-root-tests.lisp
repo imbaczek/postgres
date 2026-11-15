@@ -653,8 +653,9 @@
                   (pg::physical-store-flush store))
              (pg::physical-store-close store)))
          (let* ((script (namestring (asdf:system-relative-pathname "pg" "t/physical-store-rewind-crash-child.lisp")))
-                (command (list (or (uiop:getenv "SBCL") "sbcl") "--noinform" "--no-sysinit"
-                               "--no-userinit" "--script" script (namestring root))))
+                (command (physical-test-child-command
+                          (list (or (uiop:getenv "SBCL") "sbcl") "--noinform" "--no-sysinit"
+                                "--no-userinit" "--script" script (namestring root)))))
            (multiple-value-bind (output errors status)
                (uiop:run-program (append command (list (symbol-name point) "rooted"))
                                  :output :string :error-output :string :ignore-error-status t)

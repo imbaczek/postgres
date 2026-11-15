@@ -3,7 +3,22 @@
 (push (uiop:pathname-parent-directory-pathname
        (uiop:pathname-directory-pathname *load-truename*))
       asdf:*central-registry*)
-(asdf:load-system "pg")
+
+(defvar *physical-child-pg-compilations* 0)
+
+(defmethod asdf:perform :before ((operation asdf:compile-op) (component asdf:cl-source-file))
+  (declare (ignore operation component))
+  (incf *physical-child-pg-compilations*))
+
+(let ((start (get-internal-real-time)) (cpu (get-internal-run-time)))
+  (asdf:load-system "pg")
+  (format t "~&CHILD-PG-LOAD wall=~,6f cpu=~,6f compiles=~d~%"
+          (/ (- (get-internal-real-time) start) internal-time-units-per-second)
+          (/ (- (get-internal-run-time) cpu) internal-time-units-per-second)
+          *physical-child-pg-compilations*)
+  (finish-output)
+  (when (uiop:getenv "PG_LISP_TEST_CHILD_CACHE_EXPECTED")
+    (assert (zerop *physical-child-pg-compilations*))))
 
 (defun physical-store-rewind-crash-main ()
   (let* ((args (uiop:command-line-arguments))

@@ -211,10 +211,10 @@
                   (lambda ()
                     (let ((cache-symbol
                             (when (eq suite :pg-physical-tests)
-                              (find-symbol "*PROMOTION-TEST-PLAIN-CACHE*" :pg-physical-tests))))
+                              (find-symbol "*PHYSICAL-TEST-PLAIN-CACHE*" :pg-physical-tests))))
                       (when (and strict (eq suite :pg-physical-tests) (null cache-symbol))
                         (error "Physical child cache binding is unavailable"))
-                      ;; Promotion handoff children use the plain compiler cache,
+                      ;; Owned plain children use the strict compiler cache,
                       ;; separate from any Quicklisp-initialized parent FASLs.
                       (progv (when cache-symbol (list cache-symbol)) (when cache-symbol (list cache))
                         (pg-test-execute-heads heads)))))

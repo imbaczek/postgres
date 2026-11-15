@@ -3,6 +3,7 @@
   :depends-on ("pg" "rove" "cl-spec/check-it" "pg/logical-slot-fixtures")
   :serial t
   :components ((:file "t/physical-tests")
+               (:file "t/physical-child-command-tests")
                (:file "t/physical-store-tests")
                (:file "t/physical-pid-tests")
                (:file "t/physical-config-tests")
