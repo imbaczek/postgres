@@ -1,6 +1,9 @@
 (in-package #:pg)
 
 (defun logical-slot-continuation-active-snapshot (binding certificate host rows)
+  ;; The startup caller supplies the current canonical rows.  Each must belong to the
+  ;; historical certificate; a row absent from the current inventory stays
+  ;; dropped.  The present path requires the original child as current tip.
   (logical-slot-copy-descriptor-list-count certificate 128)
   (logical-slot-continuation-list host 6)
   (logical-slot-copy-descriptor-blob-size binding 1 (logical-slot-copy-source-proof-maximum-bytes))
@@ -121,6 +124,10 @@
      :segment-reader reader :batch-policy :strict)))
 
 (defun call-with-logical-slot-continuation-local-tail (storage snapshot function &key boundaries)
+  ;; Prove the locally present original-child WAL from F to the sealed end.
+  ;; The first pass records exact frames and a segment ledger; the second
+  ;; compares frames, segment facts and ordered visits.  Hold one segment FD
+  ;; at a time and keep the transcript in a private temporary directory.
   (let* ((history (logical-slot-continuation-history
                    (getf snapshot :history-target) (getf snapshot :history)))
          (fork (second (getf snapshot :origin)))
@@ -206,6 +213,9 @@
                       (close stream)))))))))))))
 
 (defun logical-slot-continuation-restore-active-startup (gate ownership)
+  ;; Hold the original origin proof and root lease through both passes,
+  ;; selector installation and readback.  This does not install a provider,
+  ;; admit consumers or open the GC fence.
   (declare (notinline sb-posix:fsync))
   (call-with-logical-slot-continuation-startup-storage
    gate ownership

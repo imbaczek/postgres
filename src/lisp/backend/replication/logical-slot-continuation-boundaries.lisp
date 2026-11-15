@@ -2,6 +2,9 @@
 
 (defun logical-slot-continuation-boundary-match-p
     (request record owner kind original fork terminal)
+  ;; A changed restart must be a batch or EOR start, or a completed terminal
+  ;; end.  A changed acknowledgement must be a completed terminal end; the
+  ;; checkpoint is not an acknowledgement.
   (and (eql owner (third request))
        (ecase (first request)
          (:confirmed
@@ -121,6 +124,9 @@
     (nreverse requests)))
 
 (defun logical-slot-continuation-prove-parent-boundaries (storage facts archive requests)
+  ;; Parent requests use the retained origin archive; child requests are
+  ;; returned for the local tail proof.  Requests before the archive base
+  ;; are rejected until a separate retained sidecar proof exists.
   (setf facts (logical-slot-continuation-storage-call storage :facts))
   (let* ((certificate (getf facts :certificate))
          (fork (getf certificate :fork)) (child (getf certificate :child-timeline))

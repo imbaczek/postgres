@@ -20,6 +20,10 @@
     frame))
 
 (defun call-with-logical-slot-continuation-transcript (function)
+  ;; Use a private child of the process temporary directory.  Attempt cleanup
+  ;; on normal or nonlocal exit; failed cleanup retains ownership for retry.
+  ;; Scratch grows with the WAL interval and uses the query temporary-file
+  ;; quota; an I/O failure leaves startup fenced.
   (let* ((*query-temp-directory* nil)
          (spool (make-logical-spool)))
     (sb-sys:without-interrupts

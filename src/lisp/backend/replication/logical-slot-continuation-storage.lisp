@@ -70,7 +70,9 @@
   ;; :DIRECTORY returns a borrowed FD for this scope; :BINDING returns copied
   ;; canonical proof bytes.  :HOST returns a detached actual control image,
   ;; system ID, history and end.  :WITH-ORIGIN runs its callback inside the
-  ;; actual origin proof and root-reader lease.
+  ;; actual origin proof and root-reader lease.  :FACTS rechecks and decodes
+  ;; the canonical proof.  :WITH-LOCAL-WAL holds the named pg_wal directory
+  ;; for its callback and supplies a directory binding check.
   (unless (logical-slot-imported-host-startup-owner-p owner)
     (error "continuation startup storage requires a typed host startup owner"))
   (call-with-logical-slot-imported-proof-files

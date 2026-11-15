@@ -19,6 +19,7 @@
           :slots nil :transfers nil :roots nil :runs nil :tail nil)))
 
 (defun logical-slot-continuation-check-empty-startup (storage facts snapshot)
+  ;; Refresh facts from the canonical proof before checking the empty image.
   (setf facts (logical-slot-continuation-storage-call storage :facts))
   (logical-slot-continuation-check snapshot)
   (logical-slot-continuation-require-empty-inventory)
@@ -42,10 +43,8 @@
   t)
 
 (defun logical-slot-continuation-restore-empty-startup (gate ownership)
-  ;; Only an actually empty durable inventory can be restored here.  Active
-  ;; P7 rows, transfers, roots, runs and tails need proof, retention and a
-  ;; provider before they can be accepted.  No transition or control mutation
-  ;; or admission is performed here.
+  ;; Only an actually empty durable inventory can be restored here.  This
+  ;; path performs no transition, control mutation or admission.
   ;;
   ;; Keep the actual origin proof and root-reader lease across publication and
   ;; readback.  Check host system ID, history, sealed end and binding against
