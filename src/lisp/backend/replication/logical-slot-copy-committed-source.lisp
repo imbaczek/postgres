@@ -90,7 +90,9 @@
   ;; the store lease is held.  The committed wrapper checks complete child files;
   ;; parent catalog restoration supplies its own staged-artifact check.
   (logical-slot-copy-check-committed-progress state metadata prefix generation store)
-  (unless (and (equalp (getf evidence :selected-history)
+  (unless (and (equalp (getf evidence :selection-chain)
+                       (logical-slot-copy-import-selection-chain store control))
+               (equalp (getf evidence :selected-history)
                        (logical-slot-copy-import-selected-history state))
                (equalp (getf evidence :child-history) (physical-promotion-history-image state))
                (logical-slot-copy-committed-image-equal-p plan (physical-promotion-current-checkpoint-plan state)))

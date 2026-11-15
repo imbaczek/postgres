@@ -6,23 +6,39 @@
 (defconstant +logical-slot-copy-evidence-snapshot-maximum+ 16384)
 
 (defconstant +logical-slot-copy-evidence-maximum-bytes+
-  (+ 24 20 (* 3 16 1024 1024)
+  (+ +physical-store-history-maximum-bytes+ 24 20 (* 3 16 1024 1024)
      +logical-slot-copy-evidence-record-maximum+ +physical-recovery-control-maximum-bytes+
      28 +logical-slot-copy-evidence-snapshot-maximum+
      (* 7 (+ 12 +logical-slot-copy-evidence-record-maximum+))))
 
+(defun logical-slot-copy-evidence-chain-size (chain)
+  (let ((count (logical-slot-copy-descriptor-list-count
+                chain +physical-store-history-chain-limit+))
+        (size 4))
+    (unless (and count (plusp count))
+      (error "invalid logical import receive history chain count"))
+    (dolist (bytes chain)
+      (incf size (+ 4 (logical-slot-copy-descriptor-blob-size
+                       bytes 16 +physical-store-history-maximum-bytes+)))
+      (when (> size +physical-store-history-maximum-bytes+)
+        (error "logical import receive history chain exceeds its byte bound")))
+    size))
+
 (defun logical-slot-copy-import-evidence-parts (value)
   "Validate bounded raw evidence parts and the exact child frame plan.
 The roughly 48 MiB bound includes three large blobs without hex expansion."
-  (unless (and (= 12 (logical-slot-copy-descriptor-list-count value 12))
+  (unless (and (member (logical-slot-copy-descriptor-list-count value 14) '(12 14))
                (equal (loop for key in value by #'cddr collect key)
-                      '(:manifest :checkpoint :control :selected-history :child-history :plan)))
+                      (append '(:manifest :checkpoint :control :selected-history :child-history :plan)
+                              (when (getf value :selection-chain) '(:selection-chain)))))
     (error "invalid logical import evidence fields"))
   (let* ((blobs (loop for key in '(:manifest :checkpoint :control :selected-history :child-history)
                       collect (getf value key)))
          (plan (logical-slot-copy-evidence-check-plan (getf value :plan)))
          (snapshot (string->bytes (physical-bootstrap-manifest-text (getf plan :snapshot))))
          (size (+ 24 20 28 (length snapshot)
+                  (if (getf value :selection-chain)
+                      (logical-slot-copy-evidence-chain-size (getf value :selection-chain)) 0)
                   (loop for bytes in blobs
                         for minimum in '(1 1 1 0 1)
                         for maximum in (list (* 16 1024 1024)
@@ -54,7 +70,10 @@ The roughly 48 MiB bound includes three large blobs without hex expansion."
         (blob snapshot)
         (u32 (length (getf plan :frames)))
         (dolist (frame (getf plan :frames))
-          (u64 (first frame)) (blob (second frame))))
+          (u64 (first frame)) (blob (second frame)))
+        (when (getf value :selection-chain)
+          (u32 (length (getf value :selection-chain)))
+          (dolist (selection (getf value :selection-chain)) (blob selection))))
       (unless (= position (- size 4)) (error "logical import evidence size changed"))
       (wal-set-u32 bytes position (wal-crc32 bytes 0 position))
       bytes)))
@@ -96,6 +115,19 @@ The roughly 48 MiB bound includes three large blobs without hex expansion."
                             :selected-history selected :child-history history
                             :plan (list :fork fork :child child :snapshot snapshot
                                         :end child-end :frames frames))))
+          (when (< position end)
+            (let ((chain-start position) (chain-count (u32)))
+              (unless (<= 1 chain-count +physical-store-history-chain-limit+)
+                (error "invalid logical import receive history chain count"))
+              (let ((chain
+                      (loop repeat chain-count
+                            collect (prog1 (blob 16 (min +physical-store-history-maximum-bytes+
+                                                         (- +physical-store-history-maximum-bytes+
+                                                            (- position chain-start) 4)))
+                                      (when (> (- position chain-start)
+                                               +physical-store-history-maximum-bytes+)
+                                        (error "logical import receive history chain exceeds its byte bound"))))))
+                (setf value (append value (list :selection-chain chain))))))
           (unless (= position end) (error "trailing logical import evidence data"))
           (unless (equalp bytes (logical-slot-copy-import-evidence-encode value))
             (error "noncanonical logical import evidence"))

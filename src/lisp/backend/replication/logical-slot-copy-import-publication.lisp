@@ -112,11 +112,17 @@ Rewrites are rejected even when the bytes are unchanged."
 Certificate writes also require the pinned evidence bytes and file facts."
   (logical-slot-copy-check-import-publication owner context)
   (logical-slot-copy-import-check-pending-plan owner context attempt)
-  (logical-slot-copy-import-evidence-check-certificate
-   (logical-slot-copy-import-evidence-decode (logical-slot-copy-import-pending-plan-evidence attempt))
-   (logical-slot-copy-import-pending-plan-value attempt)
-   (logical-slot-copy-import-pending-plan-descriptor attempt)
-   (logical-slot-copy-import-owner-existing-proof owner))
+  (let ((evidence (logical-slot-copy-import-evidence-decode
+                   (logical-slot-copy-import-pending-plan-evidence attempt))))
+    (unless (equalp (logical-slot-copy-import-selection-chain
+                     store (physical-recovery-decode-control
+                            (logical-slot-copy-import-pending-plan-control attempt)))
+                    (getf evidence :selection-chain))
+      (error "logical import receive selection changed before publication"))
+    (logical-slot-copy-import-evidence-check-certificate
+     evidence (logical-slot-copy-import-pending-plan-value attempt)
+     (logical-slot-copy-import-pending-plan-descriptor attempt)
+     (logical-slot-copy-import-owner-existing-proof owner)))
   (unless (equal tuple (physical-store-control-tuple store))
     (error "logical import receive tuple changed before publication"))
   (physical-store-read-retained-control store tuple)

@@ -169,6 +169,26 @@ In phase 3, also check full checkpoint artifacts before the final source replay.
                       (bytes->string bytes)
                       (logical-slot-copy-import-disposition slot fact history fork parent))))
 
+(defun logical-slot-copy-import-selection-chain (store control)
+  (let ((selection (physical-recovery-check-history-reference
+                    store (getf control :history-target) (getf control :history-digest)))
+        (chain nil) (size 4) (count 0))
+    (loop for item = selection then (getf item :previous) while item do
+      (when (> (incf count) +physical-store-history-chain-limit+)
+        (error "logical import receive history chain exceeds its bound"))
+      (let* ((bytes (read-bounded-regular-file
+                     (physical-store-history-path store (getf item :target) (getf item :digest))
+                     +physical-store-history-maximum-bytes+))
+             (payload (physical-store-history-payload bytes)))
+        (unless (and (= (physical-store-update-digest #xCBF29CE484222325 bytes)
+                        (getf item :digest))
+                     (equal payload (subseq item 0 18)))
+          (error "logical import receive selection changed"))
+        (when (> (incf size (+ 4 (length bytes))) +physical-store-history-maximum-bytes+)
+          (error "logical import receive history chain exceeds its byte bound"))
+        (push bytes chain)))
+    chain))
+
 (defun logical-slot-copy-read-import-source
     (owner context store descriptor observations manifest control state metadata prefix generation
      &key (emit-test-point t))
@@ -200,6 +220,7 @@ Recheck the selected plan, receive tuple, input observations, and sidecars."
                                              history)
                    :fork fork :parent-timeline parent :phase (getf control :phase)
                    :control-bytes control-bytes :logical-fact fact
+                   :selection-chain (logical-slot-copy-import-selection-chain store control)
                    :eligible-interest (not (null (find :eligible rows :key #'fifth)))
                    :slots rows)))
       (when (and (= 3 (getf control :phase)) (getf value :eligible-interest)

@@ -3,7 +3,7 @@
 ;;; Permanent import evidence checks describe recorded facts, not authority.
 (in-package #:pg)
 
-(defun logical-slot-copy-import-build-evidence (context descriptor state plan selected control)
+(defun logical-slot-copy-import-build-evidence (context descriptor state plan selected control &optional selection-chain)
   "Capture raw manifest, D checkpoint, pending C3 control, histories and frame plan.
 This does not capture full F metadata or catalog; D through F replay is separate."
   (let ((manifest-bytes (logical-slot-copy-read-file context "physical-backup.manifest"
@@ -12,7 +12,8 @@ This does not capture full F metadata or catalog; D through F replay is separate
       (unless (= digest (logical-slot-copy-descriptor-manifest-digest descriptor))
         (error "logical import evidence manifest changed"))
       (logical-slot-copy-import-evidence-encode
-       (list :manifest manifest-bytes
-             :checkpoint (logical-slot-copy-input-checkpoint context manifest descriptor)
-             :control control :selected-history selected
-             :child-history (physical-promotion-history-image state) :plan plan)))))
+       (append (list :manifest manifest-bytes
+                     :checkpoint (logical-slot-copy-input-checkpoint context manifest descriptor)
+                     :control control :selected-history selected
+                     :child-history (physical-promotion-history-image state) :plan plan)
+               (when selection-chain (list :selection-chain selection-chain)))))))

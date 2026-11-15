@@ -3,6 +3,33 @@
 ;;; Permanent import evidence checks describe recorded facts, not authority.
 (in-package #:pg)
 
+(defun logical-slot-copy-evidence-check-selection-chain (evidence certificate control)
+  (let ((chain (getf evidence :selection-chain))
+        (target (getf control :history-target))
+        (digest (getf control :history-digest)))
+    (if (or target digest)
+        (progn
+          (unless (and target digest chain)
+            (error "import evidence lacks its receive history selection"))
+          (logical-slot-copy-evidence-chain-size chain)
+          (let ((store (%make-physical-store
+                        :system-id (getf certificate :system-id)
+                        :timeline (getf certificate :base-timeline)
+                        :base-lsn (getf certificate :base-end)))
+                (previous nil))
+            (dolist (bytes chain)
+              (setf previous
+                    (physical-store-check-history-selection
+                     store (physical-store-history-payload bytes)
+                     (logical-slot-copy-import-digest bytes) previous)))
+            (unless (and (eql target (getf previous :target))
+                         (eql digest (getf previous :digest))
+                         (equalp (getf evidence :selected-history)
+                                 (string->bytes (getf previous :history-text))))
+              (error "import evidence receive selection differs from pending control or history"))))
+        (when chain (error "import evidence has an unreferenced receive history selection")))
+    t))
+
 (defun logical-slot-copy-evidence-check-history (evidence certificate descriptor control)
   "Bind selected and child history through the applied parent and fork.
 The selected tip may be newer than the applied parent."
@@ -28,10 +55,7 @@ The selected tip may be newer than the applied parent."
     (setf (timeline-history-entry-end (first prefix)) nil)
     (unless (physical-store-history-extends-p prefix child)
       (error "import evidence child history changes its parent prefix"))
-    (when (getf control :history-target)
-      (unless (= (getf control :history-digest)
-                 (logical-slot-copy-import-digest (getf evidence :selected-history)))
-        (error "import evidence selected history differs from pending control")))
+    (logical-slot-copy-evidence-check-selection-chain evidence certificate control)
     selected))
 
 (defun logical-slot-copy-evidence-check-rows (certificate descriptor control history)

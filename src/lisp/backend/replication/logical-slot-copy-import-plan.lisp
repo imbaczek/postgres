@@ -142,7 +142,8 @@ requiring the reconstructed value to match."
          :control (getf source :control-bytes) :child-plan plan
          :descriptor descriptor :observations observations :selected-history selected
          :evidence (logical-slot-copy-import-build-evidence
-                    context descriptor state plan selected (getf source :control-bytes)))))))
+                    context descriptor state plan selected (getf source :control-bytes)
+                    (getf source :selection-chain)))))))
 
 (defun logical-slot-copy-import-build-pending (owner context existing)
   "Build source-bound pending facts and a deterministic child plan.
@@ -182,7 +183,9 @@ requiring the reconstructed value to match."
                      context (logical-slot-copy-import-pending-plan-descriptor attempt)
                      state (logical-slot-copy-import-pending-plan-child-plan attempt)
                      (logical-slot-copy-import-pending-plan-selected-history attempt)
-                     (logical-slot-copy-import-pending-plan-control attempt)))
+                     (logical-slot-copy-import-pending-plan-control attempt)
+                     (getf (logical-slot-copy-import-evidence-decode
+                            (logical-slot-copy-import-pending-plan-evidence attempt)) :selection-chain)))
       (error "logical import evidence changed before publication"))
     (logical-slot-copy-input-check-observations owner context observations)
     (dolist (row observations)

@@ -37,6 +37,20 @@
             (list "Same" #(1 2) '(3 . 4))
             (list (copy-seq "Same") (vector 1 2) '(3 . 4)))))
 
+(defun unit-logical-import-selection-chain ()
+  (let* ((store (%make-physical-store :system-id 42 :timeline 1 :base-lsn 64))
+         (parent (timeline-encode-history 2 1 100 "first fork" nil))
+         (selected (timeline-encode-history 3 2 200 "received future" parent)))
+    (multiple-value-bind (first first-bytes)
+        (physical-store-history-candidate
+         store 2 (bytes->string parent) (wal-encode-end-of-recovery-record 100 0 2 1 2) 123)
+      (setf (physical-store-selection store) first)
+      (multiple-value-bind (second second-bytes)
+          (physical-store-history-candidate
+           store 3 (bytes->string selected) (wal-encode-end-of-recovery-record 200 0 3 2 2) 456)
+        (declare (ignore second))
+        (values (list first-bytes second-bytes) parent selected)))))
+
 (defun unit-logical-import-evidence (fork salt)
   (let* ((state (list :phase 3 :applied fork :timeline 1 :promotion-child 2
                       :next-xid 50 :state-time salt
@@ -58,7 +72,9 @@
     ((fork (range integer 256 50000000)) (salt (range integer 0 2147483647)))
   (:about logical-slot-copy-import-evidence-encode logical-slot-copy-import-evidence-decode)
   (:trials (:normal 200))
-  (let* ((value (unit-logical-import-evidence fork salt))
+  (let* ((value (append (unit-logical-import-evidence fork salt)
+                        (when (oddp salt)
+                          (list :selection-chain (unit-logical-import-selection-chain)))))
          (image (logical-slot-copy-import-evidence-encode value))
          (before (copy-seq image))
          (decoded (logical-slot-copy-import-evidence-decode image)))
@@ -131,34 +147,111 @@
         (uiop:delete-directory-tree base :validate t :if-does-not-exist :ignore))))
 
 (rove:deftest logical-import-evidence-history-keeps-the-applied-parent-before-a-newer-selection
-    (let* ((parent (timeline-encode-history 2 1 100 "first fork" nil))
-           (selected (timeline-encode-history 3 2 200 "received future" parent))
-           (descriptor (make-logical-slot-copy-descriptor
-                        :history (make-array 0 :element-type '(unsigned-byte 8))))
-           (control (list :timeline 1 :history-target 3
-                          :history-digest (logical-slot-copy-import-digest selected))))
-      (dolist (fork '(100 150 200))
-        (let* ((certificate (list :base-timeline 1 :parent-timeline 2 :child-timeline 4 :fork fork))
-               (evidence (list :selected-history selected
-                               :child-history (timeline-encode-history 4 2 fork
-                                                                       "pg-lisp promotion" parent)))
-               (history (logical-slot-copy-evidence-check-history
-                         evidence certificate descriptor control)))
-          (rove:ok (= 3 (timeline-history-entry-timeline (first history))))
-          (rove:ok (timeline-prefix-boundary-p 2 fork history))
-          (setf (getf evidence :child-history)
-                (timeline-encode-history 4 2 (1+ fork) "pg-lisp promotion" parent))
+    (multiple-value-bind (chain parent selected) (unit-logical-import-selection-chain)
+      (let* ((descriptor (make-logical-slot-copy-descriptor
+                          :history (make-array 0 :element-type '(unsigned-byte 8))))
+             (control (list :timeline 1 :history-target 3
+                            :history-digest (logical-slot-copy-import-digest (second chain)))))
+        (dolist (fork '(100 150 200))
+          (let* ((certificate (list :system-id 42 :base-end 64 :base-timeline 1
+                                    :parent-timeline 2 :child-timeline 4 :fork fork))
+                 (evidence (list :selected-history selected :selection-chain chain
+                                 :child-history (timeline-encode-history 4 2 fork
+                                                                         "pg-lisp promotion" parent)))
+                 (history (logical-slot-copy-evidence-check-history
+                           evidence certificate descriptor control)))
+            (rove:ok (= 3 (timeline-history-entry-timeline (first history))))
+            (rove:ok (timeline-prefix-boundary-p 2 fork history))
+            (setf (getf evidence :child-history)
+                  (timeline-encode-history 4 2 (1+ fork) "pg-lisp promotion" parent))
+            (rove:ok (rove:signals
+                      (logical-slot-copy-evidence-check-history
+                       evidence certificate descriptor control) 'error))))
+        (let* ((certificate (list :system-id 42 :base-end 64 :base-timeline 1
+                                  :parent-timeline 2 :child-timeline 4 :fork 150))
+               (changed-parent (timeline-encode-history 2 1 99 "changed ancestry" nil))
+               (evidence (list :selected-history selected :selection-chain chain
+                               :child-history (timeline-encode-history 4 2 150
+                                                                       "pg-lisp promotion" changed-parent))))
           (rove:ok (rove:signals
-                    (logical-slot-copy-evidence-check-history
-                     evidence certificate descriptor control) 'error))))
-      (let* ((certificate (list :base-timeline 1 :parent-timeline 2 :child-timeline 4 :fork 150))
-             (changed-parent (timeline-encode-history 2 1 99 "changed ancestry" nil))
-             (evidence (list :selected-history selected
-                             :child-history (timeline-encode-history 4 2 150
-                                                                     "pg-lisp promotion" changed-parent))))
-        (rove:ok (rove:signals
-                  (logical-slot-copy-evidence-check-history evidence certificate descriptor control)
-                  'error)))))
+                    (logical-slot-copy-evidence-check-history evidence certificate descriptor control)
+                    'error))))))
+
+(rove:deftest logical-import-evidence-selection-chain-rejects-substitution
+    (multiple-value-bind (chain parent selected) (unit-logical-import-selection-chain)
+      (declare (ignore parent))
+      (let* ((certificate (list :system-id 42 :base-timeline 1 :base-end 64))
+             (control (list :history-target 3
+                            :history-digest (logical-slot-copy-import-digest (second chain))))
+             (evidence (list :selected-history selected :selection-chain chain)))
+        (rove:ok (logical-slot-copy-evidence-check-selection-chain evidence certificate control))
+        (flet ((reject (changed-evidence changed-certificate changed-control)
+                 (rove:ok (rove:signals
+                           (logical-slot-copy-evidence-check-selection-chain
+                            changed-evidence changed-certificate changed-control) 'error))))
+          (reject (list :selected-history selected) certificate control)
+          (reject evidence certificate nil)
+          (reject evidence certificate (list :history-target 3))
+          (reject evidence certificate (list :history-digest (getf control :history-digest)))
+          (reject evidence (list :system-id 43 :base-timeline 1 :base-end 64) control)
+          (reject evidence (list :system-id 42 :base-timeline 1 :base-end 65) control)
+          (reject (list :selected-history selected :selection-chain (reverse chain)) certificate control)
+          (reject (list :selected-history selected :selection-chain (list (second chain)))
+                  certificate control)
+          (reject (list :selected-history (string->bytes "changed") :selection-chain chain)
+                  certificate control)
+          (reject evidence certificate
+                  (list :history-target 3 :history-digest (logical-slot-copy-import-digest selected)))
+          (let ((bad (copy-seq (second chain))))
+            (setf (aref bad 12) (logxor 1 (aref bad 12)))
+            (reject (list :selected-history selected :selection-chain (list (first chain) bad))
+                    certificate control))
+          (dolist (key '(:previous-digest :fork-digest :eor-octets))
+            (let ((payload (physical-store-history-payload (second chain))))
+              (setf (getf payload key)
+                    (if (eq key :eor-octets)
+                        (coerce (wal-encode-end-of-recovery-record 200 0 3 1 2) 'list)
+                        (1+ (getf payload key))))
+              (let ((bad (physical-store-history-image payload)))
+                (reject (list :selected-history selected :selection-chain (list (first chain) bad))
+                        certificate control))))))
+      (rove:ok (logical-slot-copy-evidence-check-selection-chain
+                (list :selected-history selected)
+                (list :system-id 42 :base-timeline 3 :base-end 256) (list :timeline 3)))
+      (let* ((value (unit-logical-import-evidence 512 2))
+             (legacy (logical-slot-copy-import-evidence-encode value)))
+        (rove:ok (null (getf (logical-slot-copy-import-evidence-decode legacy) :selection-chain)))
+        (rove:ok (equalp legacy (logical-slot-copy-import-evidence-encode
+                                 (logical-slot-copy-import-evidence-decode legacy)))))
+      (rove:ok (rove:signals (logical-slot-copy-evidence-chain-size
+                              (make-list (1+ +physical-store-history-chain-limit+)
+                                         :initial-element (first chain))) 'error))
+      (rove:ok (rove:signals (logical-slot-copy-evidence-chain-size
+                              (list (make-array +physical-store-history-maximum-bytes+
+                                                :element-type '(unsigned-byte 8)))) 'error))))
+
+(rove:deftest logical-import-evidence-rejects-selection-trailer-forgeries
+    (let* ((value (append (unit-logical-import-evidence 512 2)
+                          (list :selection-chain (unit-logical-import-selection-chain))))
+           (image (logical-slot-copy-import-evidence-encode value))
+           (start (- (length image) 4
+                     (logical-slot-copy-evidence-chain-size (getf value :selection-chain)))))
+      (rove:ok (equalp value (logical-slot-copy-import-evidence-decode image)))
+      (flet ((reject (bytes)
+               (wal-set-u32 bytes (- (length bytes) 4)
+                            (wal-crc32 bytes 0 (- (length bytes) 4)))
+               (rove:ok (rove:signals (logical-slot-copy-import-evidence-decode bytes) 'error))))
+        (dolist (count '(0 3 257 4294967295))
+          (let ((bad (copy-seq image)))
+            (wal-set-u32 bad start count)
+            (reject bad)))
+        (dolist (size '(0 15 16777216 4294967295))
+          (let ((bad (copy-seq image)))
+            (wal-set-u32 bad (+ start 4) size)
+            (reject bad)))
+        (let ((bad (subseq image 0 (1- (length image)))))
+          (wal-set-u32 bad 16 (- (length bad) 24))
+          (reject bad)))))
 
 (rove:deftest logical-import-evidence-retains-all-three-large-raw-blobs
     (let ((value (unit-logical-import-evidence 256 0))
