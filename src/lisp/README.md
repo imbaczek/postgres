@@ -1185,7 +1185,7 @@ PG_LISP_TEST_COMPILE_POLICY=fast ./t/test-campaign.sh run /path/to/campaign phys
 The fast policy is for physical campaigns; unit campaigns reject it. It keeps
 test FASLs in a policy-specific cache and leaves production and default
 compilation unchanged. On one 12-head comparison, cold elapsed time fell from
-67.55 to 55.30 seconds (test load 47.94 to 35.95); serial warm runs were 19.06
+69.29 to 60.61 seconds (test load 49.73 to 39.25); serial warm runs were 19.06
 and 19.29 seconds, respectively. These measurements do not cover the full suite.
 
 From `src/lisp`, run `python3 t/interop/hba-policy.py` and
