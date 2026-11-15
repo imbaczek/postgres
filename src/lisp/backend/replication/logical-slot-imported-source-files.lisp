@@ -38,17 +38,21 @@
       (error "imported logical source differs from the permanent certificate root"))
     (sb-thread:with-mutex (*wal-lock*)
       (multiple-value-bind (slot system-id history end)
-          (logical-slot-imported-owner-candidate-under-lock owner)
+          (logical-slot-imported-owner-source-under-lock owner)
+        (unless (and (eql system-id (getf certificate :system-id))
+                     (<= (getf certificate :fork) end))
+          (error "imported logical source differs from the permanent certificate identity"))
         (logical-slot-imported-check-origin-history
          (getf certificate :child-timeline) (getf certificate :parent-timeline)
          (getf certificate :fork) (getf (getf facts :evidence) :child-history) history)
-        (let ((row (find (wal-replication-slot-name slot) (getf certificate :slots)
-                         :key #'first :test #'equal)))
-          (unless (and (eql system-id (getf certificate :system-id)) row (fourth row))
-            (error "imported logical source differs from the permanent certificate"))
-          (logical-slot-imported-check-state
-           slot (logical-slot-state-decode (string->bytes (fourth row)) (first row))
-           history end))))
+        (when slot
+          (let ((row (find (wal-replication-slot-name slot) (getf certificate :slots)
+                           :key #'first :test #'equal)))
+            (unless (and row (fourth row))
+              (error "imported logical source differs from the permanent certificate"))
+            (logical-slot-imported-check-state
+             slot (logical-slot-state-decode (string->bytes (fourth row)) (first row))
+             history end)))))
     t))
 
 (defun call-with-logical-slot-imported-proof-files (owner context function)

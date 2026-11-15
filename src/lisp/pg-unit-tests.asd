@@ -28,6 +28,7 @@
                (:file "t/rove/logical-slot-imported-files-tests")
                (:file "t/rove/imported-archive-directory-tests")
                (:file "t/rove/imported-origin-history-tests")
+               (:file "t/rove/imported-host-startup-owner-tests")
                (:file "t/rove/logical-slot-imported-startup-principal-tests")
                (:file "t/rove/logical-slot-imported-startup-owner-tests")
                (:file "t/rove/pglz-tests")

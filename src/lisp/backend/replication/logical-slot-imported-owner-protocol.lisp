@@ -2,6 +2,8 @@
 
 (defun call-with-logical-slot-imported-owner-check (owner function)
   (etypecase owner
+    (logical-slot-imported-host-startup-owner
+     (call-with-logical-slot-imported-host-startup-check owner function))
     (logical-slot-imported-scan-owner
      (call-with-logical-slot-imported-scan-check owner function))
     (logical-slot-imported-startup-owner
@@ -10,11 +12,15 @@
 (defun logical-slot-imported-check-owner (owner)
   "Run the full owner check outside WAL exclusion."
   (etypecase owner
+    (logical-slot-imported-host-startup-owner
+     (logical-slot-imported-host-startup-check-owner owner))
     (logical-slot-imported-scan-owner (logical-slot-imported-scan-check-owner owner))
     (logical-slot-imported-startup-owner (logical-slot-imported-startup-check-owner owner))))
 
 (defun logical-slot-imported-owner-under-lock (owner)
   (etypecase owner
+    (logical-slot-imported-host-startup-owner
+     (logical-slot-imported-host-startup-under-lock owner))
     (logical-slot-imported-scan-owner (logical-slot-imported-scan-check-under-lock owner))
     (logical-slot-imported-startup-owner (logical-slot-imported-startup-owner-under-lock owner))))
 
@@ -34,3 +40,13 @@
                (logical-slot-startup-source-system-id source)
                (logical-slot-startup-source-history source)
                (logical-slot-startup-source-end source))))))
+
+(defun logical-slot-imported-owner-source-under-lock (owner)
+  (assert (sb-thread:holding-mutex-p *wal-lock*))
+  (etypecase owner
+    (logical-slot-imported-host-startup-owner
+     (multiple-value-bind (system-id history end)
+         (logical-slot-imported-host-startup-facts-under-lock owner)
+       (values nil system-id history end)))
+    ((or logical-slot-imported-startup-owner logical-slot-imported-scan-owner)
+     (logical-slot-imported-owner-candidate-under-lock owner))))
