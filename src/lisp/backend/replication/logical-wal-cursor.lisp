@@ -40,11 +40,12 @@ The guard is checked under the captured WAL mutex before each copy and advance."
 
 (defun call-with-logical-wal-cursor (history namespace start end owner role guard function &key archive segment-reader record-reader (batch-policy :strict))
   "Call FUNCTION with a cursor over START through the frozen END.
-The caller must prove the source and start boundary and supply a guard that
+The caller must prove the source, start boundary and horizon and supply a guard that
 checks that proof under the WAL mutex.  A geometrically valid empty interval
 alone does not verify record bytes or a record boundary.  The cursor is valid
 only in this call, on this thread, with the captured mutex.  An optional
-archive must also pass its own context check. Strict batch policy rejects
+archive must also pass its own context check. Archive, segment-reader and
+record-reader are mutually exclusive. Strict batch policy rejects
 nested starts and an open batch at the horizon. The logical-reader policy
 lets the consumer discard abandoned batches and hide an incomplete tail;
 both policies reject end-of-recovery inside an open batch."
@@ -166,6 +167,12 @@ false ready value requests preparation.  Other open failures remain errors."
       (when stream (close stream)))))
 
 (defun logical-wal-cursor-read-provider (cursor)
+  "Read one supplied record while the caller holds its source lease outside WAL
+exclusion.
+READER calls CONSUME once with raw bytes, actual start and carrier; CONSUME
+copies the bytes. READER must complete its source postcheck before returning;
+the cursor then rechecks provider scope before decode and advance. A reader
+that copies under WAL must release it before calling CONSUME."
   (let ((provider (logical-wal-cursor-record-reader cursor))
         (original nil) (bytes nil) (position nil) (carrier nil)
         (active t) (called nil) (complete nil))
@@ -344,6 +351,9 @@ rejects nested batch starts; the logical reader applies its own batch rules."
     (values owner (if eor :end-of-recovery :ordinary))))
 
 (defun logical-wal-cursor-check-provider-record (cursor record carrier original)
+  "Check carrier ancestry and nonregression, and any legal lineage gap.
+The record position determines its owner. The storage provider must bind the
+carrier to the exact source."
   (let* ((history (logical-wal-cursor-history cursor))
          (start (wal-record-start record))
          (owner (timeline-at-point start history)))
@@ -357,6 +367,7 @@ rejects nested batch starts; the logical reader applies its own batch rules."
       (wal-lineage-check-gap original record history))))
 
 (defun logical-wal-cursor-next-checked (cursor)
+  "Decode and check the private copy before advancing the cursor under WAL."
   (multiple-value-bind (bytes position carrier original)
       (logical-wal-cursor-read-next cursor)
     (unless bytes (return-from logical-wal-cursor-next-checked nil))
@@ -380,7 +391,9 @@ rejects nested batch starts; the logical reader applies its own batch rules."
 (defun logical-wal-cursor-next (cursor)
   "Decode a fresh record copy outside WAL exclusion, then recheck the full
 scope and original position before advancing. Return the record, bytes,
-record owner, carrier and kind; local progress is not slot acknowledgement."
+record owner, carrier and kind; local progress is not slot acknowledgement.
+Provider failure is sticky to this cursor and provider, not global WAL health.
+Busy state is cleared with interrupts deferred even on failure."
   (unless (logical-wal-cursor-record-reader cursor)
     (return-from logical-wal-cursor-next (logical-wal-cursor-next-checked cursor)))
   (let ((complete nil) (entered nil)

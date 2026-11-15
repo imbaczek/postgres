@@ -5,6 +5,7 @@
             (:print-function (lambda (object stream depth)
                                (declare (ignore object depth))
                                (write-string "#<LOGICAL-WAL-RECORD-PROVIDER>" stream))))
+  ;; Typed, EQ-registered scope state; it is not storage or slot authority.
   (reader nil :read-only t) (guard nil :read-only t)
   (thread sb-thread:*current-thread* :read-only t)
   (mutex *wal-lock* :read-only t) (active t) (failed nil) (busy nil))
@@ -12,6 +13,7 @@
 (defvar *logical-wal-record-providers* nil)
 
 (defun logical-wal-record-provider-check (provider)
+  "Check registration, thread, mutex and caller guard under WAL exclusion."
   (assert (sb-thread:holding-mutex-p *wal-lock*))
   (unless (and (logical-wal-record-provider-p provider)
                (eq sb-thread:*current-thread* (logical-wal-record-provider-thread provider))
@@ -30,6 +32,10 @@
   t)
 
 (defun call-with-logical-wal-record-provider (reader guard function)
+  "Scope READER to this thread and WAL mutex, with GUARD rechecked under WAL.
+The caller must establish the source, start and horizon; this grants no slot or
+storage authority. READER must call its consumer once while the caller holds
+the source lease."
   (unless (and (functionp reader) (functionp guard) (functionp function))
     (error "invalid logical WAL record provider scope"))
   (let* ((provider (%make-logical-wal-record-provider :reader reader :guard guard))
