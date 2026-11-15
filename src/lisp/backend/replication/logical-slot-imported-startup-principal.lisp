@@ -5,6 +5,7 @@
 (defvar *logical-slot-imported-startup-captures* nil)
 
 (defun call-with-logical-slot-imported-startup-capture (function)
+  "Register a one-use capture bound to one typed source and principal."
   (let ((capture nil) (source nil) (principal nil) (active t)
                       (thread sb-thread:*current-thread*) (mutex *wal-lock*))
     (flet ((state (operation candidate observed &optional installed)
@@ -37,6 +38,9 @@
           (setf active nil))))))
 
 (defun logical-slot-imported-startup-capture-call (source operation &optional principal)
+  "Retrieve the fixed principal even if registration was lost.
+Its protected check then detects the loss and latches failure; other operations
+require the registered capture."
   (unless (logical-slot-imported-startup-source-p source)
     (error "imported startup principal requires its typed capture source"))
   (let ((capture (logical-slot-imported-startup-source-capture source)))
@@ -66,11 +70,13 @@
         (logical-slot-startup-source-mutex source)))
 
 (defun logical-slot-imported-startup-bounded-entries (source)
+  "Bound the entry list before traversing or copying it."
   (let ((entries (logical-slot-startup-source-entries source)))
     (logical-slot-copy-descriptor-list-count entries (logical-slot-startup-source-maximum source))
     entries))
 
 (defun logical-slot-imported-startup-freeze-entries (source)
+  "Copy candidate evidence independently, excluding derived pending XIDs."
   (loop for entry in (logical-slot-imported-startup-bounded-entries source)
         for slot = (logical-slot-startup-entry-slot entry)
         collect (list entry slot
@@ -98,6 +104,7 @@
         finally (return (null remaining))))
 
 (defun logical-slot-imported-startup-freeze-source (source)
+  "Capture an independent source and candidate snapshot under WAL exclusion."
   (assert (sb-thread:holding-mutex-p *wal-lock*))
   (let* ((entries (logical-slot-imported-startup-freeze-entries source))
          (bytes (logical-slot-startup-source-history-bytes source))
@@ -125,6 +132,7 @@
         (getf snapshot :history) (logical-slot-startup-source-history source))))
 
 (defun call-with-logical-slot-imported-startup-principal-check (principal source function)
+  "Check identity before sticky failure handling, so copies cannot revoke the genuine source."
   (unless (logical-slot-imported-startup-principal-p principal)
     (error "imported startup source requires its typed principal"))
   (let ((state (logical-slot-imported-startup-principal-state principal)))
@@ -145,6 +153,9 @@
             (setf (logical-slot-startup-source-active-p source) nil)))))))
 
 (defun logical-slot-imported-startup-principal-under-lock (source)
+  "Check the private principal and current source under WAL exclusion.
+The source check reads current control, system identity and history as needed;
+it does not reread the slot inventory."
   (assert (sb-thread:holding-mutex-p *wal-lock*))
   (let ((principal (logical-slot-imported-startup-capture-call source :principal)))
     (unless principal
@@ -156,6 +167,8 @@
        principal))))
 
 (defun call-with-logical-slot-imported-startup-principal (source function)
+  "Bind a private snapshot to SOURCE and check actual inventory at entry and exit.
+This scope alone does not establish imported slot eligibility or readiness."
   (when (sb-thread:holding-mutex-p *wal-lock*)
     (error "imported startup principal acquisition requires the WAL mutex to be released"))
   (logical-slot-imported-startup-capture-call source :identity)

@@ -1,12 +1,14 @@
 (in-package #:pg)
 
+;; Define these layouts before predicates and callers compile.
+
 (defstruct (logical-slot-startup-entry (:constructor %make-logical-slot-startup-entry))
   ;; Keep both the decoded candidate and its disk image for later rechecks.
   (slot nil :read-only t) (bytes nil :read-only t) (image nil :read-only t)
   (profile nil :read-only t) (provenance nil :read-only t))
 
 (defstruct (logical-slot-startup-source (:constructor %make-logical-slot-startup-source))
-  ;; Freeze the post-replay source before catalog initialization: durable
+  ;; Capture post-replay facts before catalog initialization: durable
   ;; catalog system ID, control, history, durable end and slot candidates.
   ;; The gate and postmaster ownership are separate, borrowed authority.
   (gate-owner nil :read-only t) (ownership nil :read-only t)
@@ -22,6 +24,7 @@
             (:print-object
              (lambda (object stream)
                (print-unreadable-object (object stream :type t :identity t)))))
+  ;; One capture binds one exact source and its private principal.
   (state nil :read-only t))
 
 (defstruct (logical-slot-imported-startup-source
@@ -34,4 +37,5 @@
             (:print-object
              (lambda (object stream)
                (print-unreadable-object (object stream :type t :identity t)))))
+  ;; State closes over the independent snapshot and revocation status.
   (source nil :read-only t) (state nil :read-only t))

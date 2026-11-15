@@ -173,8 +173,8 @@ facts under WAL exclusion. This does not recheck disk inventory bytes."
 
 (defun call-with-logical-slot-imported-startup-source (gate-owner ownership entries function)
   "Observe child-owned candidates in a registered imported startup scope.
-Check disk inventory at entry; later under-WAL checks cover captured in-memory
-source and candidate facts, not disk inventory bytes."
+Check disk inventory at entry and normal exit. Under-WAL checks compare the
+private snapshot and current source, but do not reread slot inventory."
   (check-primary-storage-startup-context gate-owner ownership)
   (logical-slot-copy-descriptor-list-count entries *max-replication-slots*)
   (unless (some (lambda (entry)
