@@ -10,11 +10,11 @@
 (defvar *logical-slot-continuation-storage-identities*
   (make-hash-table :test #'eq :weakness :key :synchronized t))
 
-(defun logical-slot-continuation-storage-call (storage operation)
+(defun logical-slot-continuation-storage-call (storage operation &optional argument)
   (let ((state (and (logical-slot-continuation-startup-storage-p storage)
                     (gethash storage *logical-slot-continuation-storage-identities*))))
     (unless state (error "continuation storage has no registered startup publisher"))
-    (funcall state storage operation)))
+    (funcall state storage operation argument)))
 
 (defun logical-slot-continuation-storage-check (storage)
   (logical-slot-continuation-storage-call storage :check))
@@ -82,7 +82,7 @@
           (let ((storage nil) (active t) (failed nil)
                               (thread sb-thread:*current-thread*)
                               (identity (logical-slot-copy-source-proof-directory-identity directory-facts)))
-            (labels ((state (candidate operation)
+            (labels ((state (candidate operation &optional argument)
                        (unless (and (eq storage candidate) (eq thread sb-thread:*current-thread*))
                          (error "continuation startup publisher changed identity or thread"))
                        (unless (and active (not failed))
@@ -106,7 +106,16 @@
                                       (ecase operation
                                         (:check t)
                                         (:directory directory)
-                                        (:binding (first (funcall check t)))))
+                                        (:binding (first (funcall check t)))
+                                        (:host
+                                         (sb-thread:with-mutex (*wal-lock*)
+                                           (logical-slot-continuation-copy
+                                            (logical-slot-imported-host-startup-image))))
+                                        (:with-origin
+                                            (unless (functionp argument)
+                                              (error "continuation origin proof requires a callback"))
+                                          (call-with-logical-slot-imported-host-origin
+                                           owner context argument))))
                                   (setf complete t))
                              (unless complete (setf failed t)))))))
               (setf storage (%make-logical-slot-continuation-startup-storage :state #'state))
@@ -125,11 +134,9 @@
         :mutable-directory t)))))
 
 (defun call-with-logical-slot-continuation-startup-storage (gate ownership function)
-  ;; This is a storage capability for future selector I/O.  It does not
-  ;; publish a snapshot, selector or control transition, lease or restore
-  ;; roots, reserve a tail, prove records, admit work, run GC, or establish
-  ;; readiness.  Current control is observed read-only; no offline adoption
-  ;; authority is granted.
+  ;; Current control is observed read-only. The origin operation restores
+  ;; and holds the independent origin proof; continuation and admission
+  ;; still require their own checks.
   (logical-slot-continuation-prepare-startup-directory gate ownership)
   (call-with-logical-slot-imported-host-startup-owner
    gate ownership

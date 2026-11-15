@@ -466,7 +466,9 @@ Restore all durable references before deletion begins.  Do not acquire store or
 WAL locks while holding the archive mutex."
   (let ((directory (physical-retained-root-directory directory)))
     (sb-thread:with-mutex (*physical-retained-inventory-publish-lock*)
-      (unless (physical-retained-root-protected-under-lock directory kind id)
+      (unless (or (physical-retained-root-protected-under-lock directory kind id)
+                  (logical-slot-continuation-gc-fenced-p
+                   (uiop:pathname-parent-directory-pathname directory)))
         (let ((path (physical-retained-object-path directory kind id)))
           (when (wal-namespace-file-stat path t)
             (delete-file path)

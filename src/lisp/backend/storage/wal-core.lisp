@@ -8,6 +8,8 @@
 (defconstant +wal-control-maximum-bytes+ 1024
   "Maximum control line characters, excluding its terminating newline.")
 
+(declaim (ftype function logical-slot-continuation-gc-fenced-p))
+
 (defconstant +wal-max-page-images-per-record+ 512)
 (defconstant +wal-record-pages+ 1)
 (defconstant +wal-record-commit+ 2)
@@ -3983,6 +3985,8 @@ Active standard-policy owners defer removal in a process-local ticket; the calle
 retries outside locks after stopping them. Independent XID and snapshot floors
 also constrain removal. CURRENT freezes the endpoint across that retry, while
 each calculation captures the current retention settings."
+  (when (logical-slot-continuation-gc-fenced-p *pgdata*)
+    (return-from wal-remove-checkpointed-segments-under-wal-lock (values)))
   (when *wal-shutdown-defer-recycling*
     (return-from wal-remove-checkpointed-segments-under-wal-lock (values)))
   (wal-settle-page-publications-under-lock)

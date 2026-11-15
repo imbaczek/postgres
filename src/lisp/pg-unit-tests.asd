@@ -31,6 +31,7 @@
                (:file "t/rove/imported-host-startup-owner-tests")
                (:file "t/rove/continuation-snapshot-tests")
                (:file "t/rove/continuation-storage-tests")
+               (:file "t/rove/continuation-selector-tests")
                (:file "t/rove/logical-slot-imported-startup-principal-tests")
                (:file "t/rove/logical-slot-imported-startup-owner-tests")
                (:file "t/rove/pglz-tests")

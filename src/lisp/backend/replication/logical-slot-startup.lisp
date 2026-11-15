@@ -126,9 +126,13 @@ capacity, standby and progress checks. Publication is separate."
           (call-with-logical-slot-startup-archive source #'prepare)
           (prepare nil)))))
 
+(declaim (ftype function logical-slot-continuation-restore-empty-startup))
+
 (defun logical-slot-load-startup-inventory (gate-owner ownership)
   (when (or gate-owner ownership)
     (check-primary-storage-startup-context gate-owner ownership))
+  (when (and gate-owner ownership (logical-slot-continuation-gc-fenced-p *pgdata*))
+    (logical-slot-continuation-restore-empty-startup gate-owner ownership))
   (let* ((entries (logical-slot-startup-read-inventory :cleanup (and gate-owner ownership)
                                                        :local-workspace t))
          (candidates (mapcar #'logical-slot-startup-entry-slot entries))
