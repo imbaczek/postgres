@@ -100,6 +100,37 @@ class CampaignContracts(unittest.TestCase):
             with self.assertRaises(ValueError):
                 campaign.job_root()
 
+    def test_next_run_waits_for_surviving_compiler_lease(self):
+        script = """
+import importlib.util, pathlib, sys
+from unittest import mock
+spec = importlib.util.spec_from_file_location('campaign', sys.argv[1])
+c = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(c)
+root = pathlib.Path(sys.argv[2])
+def admitted(_):
+    print('admitted', flush=True)
+    raise SystemExit(0)
+with mock.patch.object(c, 'job_root', side_effect=[root, root / 'job']), \
+     mock.patch.object(c, 'read_campaign', side_effect=admitted):
+    print('ready', flush=True)
+    c.run(root, 'unit', [], False, -1)
+"""
+        with campaign.lock(self.root, 'lease.lock'):
+            process = subprocess.Popen([sys.executable, '-c', script, campaign.__file__, str(self.root)],
+                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            try:
+                self.assertEqual('ready\n', process.stdout.readline())
+                with self.assertRaises(subprocess.TimeoutExpired):
+                    process.wait(timeout=0.2)
+            except BaseException:
+                process.kill()
+                process.communicate()
+                raise
+        output, error = process.communicate(timeout=5)
+        self.assertEqual(0, process.returncode, error)
+        self.assertEqual('admitted\n', output)
+
     def test_exec_child_inherits_both_ownership_locks(self):
         with campaign.workspace_lease() as workspace, campaign.lock(self.root, 'run.lock', exclusive=True) as run_lock:
             with campaign.lock(self.root, 'lease.lock') as lease:

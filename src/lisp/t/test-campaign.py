@@ -223,7 +223,8 @@ def run(campaign, target, heads, cold, workspace):
     job = job_root()
     if root == job:
         raise ValueError('Each campaign job needs its own RAM workspace')
-    with lock(root, 'run.lock', exclusive=True) as run_lock, lock(root, 'lease.lock') as lease:
+    with lock(root, 'run.lock', exclusive=True) as run_lock, lock(root, 'lease.lock', exclusive=True) as lease:
+        fcntl.flock(lease, fcntl.LOCK_SH)
         data = read_campaign(root)
         source = Path(data['source'])
         if data['state'] != 'open' or data['environment'] != environment():
