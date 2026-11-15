@@ -1173,6 +1173,21 @@ durable target validation, sequence alignment and post-cutover writes.
 
 ## Testing
 
+For an opt-in fast-compilation physical campaign, set the same policy when
+creating and running it. With the RAM workspace set up, from `src/lisp` run:
+
+```sh
+PG_LISP_TEST_COMPILE_POLICY=fast ./t/test-campaign.sh create
+# Use the path printed after TEST-CAMPAIGN.
+PG_LISP_TEST_COMPILE_POLICY=fast ./t/test-campaign.sh run /path/to/campaign physical
+```
+
+The fast policy is for physical campaigns; unit campaigns reject it. It keeps
+test FASLs in a policy-specific cache and leaves production and default
+compilation unchanged. On one 12-head comparison, cold elapsed time fell from
+67.55 to 55.30 seconds (test load 47.94 to 35.95); serial warm runs were 19.06
+and 19.29 seconds, respectively. These measurements do not cover the full suite.
+
 From `src/lisp`, run `python3 t/interop/hba-policy.py` and
 `python3 t/interop/hba-backup.py` with psycopg2 installed to exercise policy
 admission, reload, backup and promotion using owned server processes.

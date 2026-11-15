@@ -4,6 +4,9 @@
 (in-package #:pg-test-compilation)
 
 (defun profile (&optional (value (uiop:getenv "PG_LISP_TEST_COMPILE_POLICY")))
+  ;; Fast is opt-in for physical campaigns; the unit campaign rejects it.
+  ;; The campaign marker is not identity authority.  The runner still checks
+  ;; source, runtime and suite, and requires the same policy at create and run.
   (cond ((or (null value) (equal value "default")) :default)
         ((equal value "fast") :fast)
         (t (error "Unknown test compilation policy: ~s" value))))
@@ -22,6 +25,8 @@
           :ignore-inherited-configuration)))
 
 (defun call-with-policy (profile thunk)
+  ;; Scope these qualities to test compilation.  Default and production
+  ;; compilation remain unchanged; DEBUG keeps its inherited value.
   (ecase profile
     (:default (funcall thunk))
     (:fast
@@ -32,6 +37,8 @@
 (defvar *test-cache-context* nil)
 
 (defun call-with-cache (profile cache source thunk)
+  ;; Explicitly isolate compilation with policy-tagged test FASLs.  The
+  ;; dynamic context and output translations unwind on errors or throws.
   (let* ((translations (cache-translations cache source profile))
          (*test-cache-context*
            (list profile (merge-pathnames "t/compile-policy-probe.fasl" source)
@@ -41,6 +48,8 @@
       (funcall thunk))))
 
 (defun around-compile (thunk &optional (profile (profile)))
+  ;; Require both the dynamic context and its actual output mapping.  In fast
+  ;; mode, warnings are fatal except for style warnings.
   (ecase profile
     (:default (funcall thunk))
     (:fast

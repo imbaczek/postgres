@@ -50,6 +50,11 @@ as errors. It uses `sbcl` from `PATH` by default and honors `SBCL` overrides.
 Pass only `.lisp` and `.asd` paths to it. It treats every input as Lisp; filter
 mixed source-file lists before invoking it.
 
+`PG_LISP_TEST_COMPILE_POLICY=fast` is an opt-in physical campaign policy. Set it
+at both campaign creation and execution; unit campaigns reject it. It does not
+replace the campaign's source, runtime and suite checks or the strict production
+compile.
+
 ## Work the Lisp way: reload, don't restart
 
 The server loads the `pg` system with ASDF and can recompile itself in place.
