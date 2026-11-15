@@ -92,6 +92,11 @@ teardown() {
         for job in "$root"/runs/run.*; do
             [[ -d $job/logs && ! -L $job && ! -L $job/logs ]] || continue
             cp -a -- "$job/logs" "$archive/$(basename "$job")"
+            for artifact in source-changes.patch source-additions frozen-source.json campaign.json; do
+                if [[ -e $job/$artifact && ! -L $job/$artifact ]]; then
+                    cp -a -- "$job/$artifact" "$archive/$(basename "$job")/"
+                fi
+            done
         done
         printf 'Archived logs to %s\n' "$archive"
     fi

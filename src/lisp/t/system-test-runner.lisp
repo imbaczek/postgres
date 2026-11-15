@@ -42,7 +42,9 @@
              (append '("--noinform" "--disable-debugger" "--no-sysinit" "--no-userinit"
                        "--non-interactive")
                      (loop for form in forms append (list "--eval" (write-to-string form)))))))
-    (sb-ext:run-program (namestring sb-ext:*runtime-pathname*) arguments
+    (sb-ext:run-program (or (and (uiop:getenv "PG_LISP_TEST_CAMPAIGN")
+                                 (uiop:getenv "PG_LISP_TEST_CAMPAIGN_SBCL"))
+                            (namestring sb-ext:*runtime-pathname*)) arguments
                         :wait nil :output log :error :output :if-output-exists :error)))
 
 (defun pg-test-finish-compiler (process log)
@@ -63,12 +65,63 @@
     (sb-ext:process-wait process)
     (sb-ext:process-close process)))
 
+(defun pg-test-configure-parent-cache (cache)
+  (asdf:initialize-output-translations
+   `(:output-translations
+     ("/" ,(namestring (merge-pathnames "common-lisp/" (uiop:ensure-directory-pathname cache))))
+     :ignore-inherited-configuration)))
+
+(defun pg-test-file-digest (path)
+  (subseq (uiop:run-program (list "sha256sum" (namestring path)) :output :string) 0 64))
+
+(defun pg-test-image-identity (source)
+  (list :format 1 :source (namestring source)
+        :implementation (lisp-implementation-version)
+        :runtime (namestring sb-ext:*runtime-pathname*)
+        :runtime-digest (pg-test-file-digest sb-ext:*runtime-pathname*)
+        :core (namestring sb-ext:*core-pathname*)
+        :core-digest (pg-test-file-digest sb-ext:*core-pathname*)
+        :asdf (asdf:asdf-version)
+        :features (sort (mapcar #'prin1-to-string *features*) #'string<)))
+
+(defun pg-test-record-manifest (actual output-variable expected-variable keys)
+  (let ((output (uiop:getenv output-variable))
+        (expected (uiop:getenv expected-variable)))
+    (when output
+      (with-open-file (stream output :direction :output :if-exists :error
+                                     :if-does-not-exist :create)
+        (with-standard-io-syntax
+          (let ((*print-circle* t)) (write actual :stream stream) (terpri stream)))))
+    (when expected
+      (let ((prior
+              (with-open-file (stream expected)
+                (with-standard-io-syntax
+                  (let* ((*read-eval* nil) (end (gensym)) (value (read stream nil end)))
+                    (unless (and (not (eq value end)) (eq end (read stream nil end)))
+                      (error "Invalid test campaign manifest ~a" expected))
+                    value)))))
+        (unless (equal (mapcar (lambda (key) (getf actual key)) keys)
+                       (mapcar (lambda (key) (getf prior key)) keys))
+          (error "Test campaign manifest differs: ~a" expected))))))
+
+(defun pg-test-suite-heads (suite)
+  (let ((package (find-package :rove/core/suite/package)))
+    (funcall (find-symbol "SUITE-TESTS" package)
+             (funcall (find-symbol "FIND-SUITE" package) suite))))
+
+(defun pg-test-record-suite-manifest (suite heads)
+  (flet ((name (head)
+           (format nil "~a::~a" (package-name (symbol-package head)) (symbol-name head))))
+    (pg-test-record-manifest
+     (list :format 1 :suite (symbol-name suite)
+           :registered (sort (mapcar #'name (pg-test-suite-heads suite)) #'string<)
+           :selected (mapcar #'name heads))
+     "PG_LISP_TEST_SUITE_OUT" "PG_LISP_TEST_SUITE_EXPECTED"
+     '(:format :suite :registered))))
+
 (defun pg-test-selected-heads (suite names)
   ;; Resolve unqualified names against this suite before running any head.
-  (let* ((package (find-package :rove/core/suite/package))
-         (registered
-           (funcall (find-symbol "SUITE-TESTS" package)
-                    (funcall (find-symbol "FIND-SUITE" package) suite)))
+  (let* ((registered (pg-test-suite-heads suite))
          (heads
            (if names
                (mapcar
@@ -118,6 +171,11 @@
          (cache (when work (merge-pathnames "plain-cache/" work)))
          (log (when work (merge-pathnames "strict-compile.log" work)))
          (compiler nil) (start (get-internal-real-time)))
+    (when (uiop:getenv "PG_LISP_TEST_CAMPAIGN")
+      (pg-test-record-manifest
+       (pg-test-image-identity source) "PG_LISP_TEST_IDENTITY_OUT" "PG_LISP_TEST_IDENTITY_EXPECTED"
+       '(:format :source :implementation :runtime :runtime-digest :core :core-digest :asdf :features))
+      (pg-test-configure-parent-cache (uiop:getenv "XDG_CACHE_HOME")))
     (when (member "pg" (asdf:already-loaded-systems) :test #'string=)
       (error "Run system tests in a fresh Lisp without preloaded pg"))
     (pushnew source asdf:*central-registry* :test #'equal)
@@ -139,6 +197,8 @@
               (let ((*pg-test-system* system))
                 (load (merge-pathnames "t/test-dependencies.lisp" source)))))
            (let ((heads (pg-test-selected-heads suite names)))
+             (when (uiop:getenv "PG_LISP_TEST_CAMPAIGN")
+               (pg-test-record-suite-manifest suite heads))
              (when compiler
                (pg-test-phase :strict-wait (lambda () (pg-test-finish-compiler compiler log)))
                (pg-test-close-compiler compiler)
