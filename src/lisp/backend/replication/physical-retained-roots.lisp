@@ -75,11 +75,11 @@ Keep the overlap descriptor as the value of its object key."
           using (hash-value descriptor)
         when (eq (car object) :overlap) return descriptor))
 
-(defun physical-retained-root-load-reference (directory identity id history)
+(defun physical-retained-root-load-reference (directory identity id history &key (reader 'physical-retained-object-read))
   "Validate the complete selected root under the archive mutex and build its reference."
   (physical-retained-root-require-lock)
   (when id
-    (let ((payload (physical-retained-inventory-load directory id identity history)))
+    (let ((payload (physical-retained-inventory-load directory id identity history :reader reader)))
       (physical-retained-root-make-reference directory identity id (getf payload :entries)
                                              (getf payload :base-overlap)))))
 
@@ -174,7 +174,7 @@ that reference on every exit. Reject an active or uncertain owner update."
                (or (null hold) (eq :uncertain (physical-retained-root-hold-state hold))))
     (error "retained WAL control owner changed during control readback")))
 
-(defun physical-retained-root-reconcile (owner directory identity history read-selected)
+(defun physical-retained-root-reconcile (owner directory identity history read-selected &key (reader 'physical-retained-object-read))
   "Reconcile an uncertain update with the root read from durable control.
 
 Read control outside the archive mutex, then recheck the captured owner state
@@ -196,7 +196,7 @@ before validating and installing its reference."
           (when (and (not hold) current
                      (not (eql id (physical-retained-root-reference-root-id current))))
             (error "retained WAL control changed without a reserved update"))
-          (let ((reference (physical-retained-root-load-reference directory identity id history)))
+          (let ((reference (physical-retained-root-load-reference directory identity id history :reader reader)))
             (sb-sys:without-interrupts
               (physical-retained-root-install owner reference)
               (when hold (physical-retained-root-drop-hold hold :reconciled))))

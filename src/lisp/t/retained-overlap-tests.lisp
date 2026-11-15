@@ -276,3 +276,62 @@
                   (ok (intake-fails-p (lambda () (pg::physical-retained-root-register
                                                   owner root selected identity history))))
                 (ok (null (pg::physical-retained-root-current owner)))))))))
+
+(deftest retained-root-reconciliation-uses-one-reader-for-every-object
+    (with-physical-store-directory (root)
+      (with-retained-root-registry
+          (let* ((prefix (overlap-test-bytes 96))
+                 (overlap-image (pg::physical-retained-overlap-encode
+                                 (overlap-test-metadata 96 prefix) prefix))
+                 (identity '(:system-id 123 :base-timeline 1 :base 96 :manifest-digest 77))
+                 (history (pg::timeline-parse-history 1 ""))
+                 (writer (gensym)) (owner (gensym)) (selected nil)
+                 (objects (make-hash-table :test #'equal)) (seen nil))
+            (pg::call-with-physical-retained-root-update
+             (lambda (initial hold)
+               (declare (ignore initial))
+               (let ((overlap (pg::physical-retained-root-stage-overlap hold 1 "" overlap-image))
+                     (extent (pg::physical-retained-root-stage-image hold 1 "" (overlap-test-extent prefix))))
+                 (setf selected (pg::physical-retained-root-publish-staged-entries
+                                 hold 1 "" (list extent) :base-overlap overlap))))
+             writer root identity 1 "" nil :read-selected (lambda () selected))
+            (let* ((payload (pg::physical-retained-inventory-load root selected identity history))
+                   (keys (list (cons :inventory selected)
+                               (cons :extent (first (first (getf payload :entries))))
+                               (cons :overlap (first (getf payload :base-overlap))))))
+              (dolist (key keys)
+                (setf (gethash key objects)
+                      (pg::physical-retained-object-read
+                       root (car key) (cdr key)
+                       (if (eq :inventory (car key)) pg::+physical-retained-inventory-limit+
+                           pg::+physical-retained-image-limit+)))
+                (delete-file (pg::physical-retained-object-path root (car key) (cdr key))))
+              (flet ((reader (directory kind id maximum)
+                       (assert (sb-thread:holding-mutex-p pg::*physical-retained-inventory-publish-lock*))
+                       (assert (equal directory (truename root)))
+                       (push (cons kind id) seen)
+                       (let ((bytes (or (gethash (cons kind id) objects) (error "unexpected object"))))
+                         (assert (<= (length bytes) maximum))
+                         (assert (= id (pg::physical-store-update-digest #xCBF29CE484222325 bytes)))
+                         (copy-seq bytes))))
+                (ok (eql selected
+                         (pg::physical-retained-root-reconcile
+                          owner root identity history
+                          (lambda ()
+                            (assert (not (sb-thread:holding-mutex-p pg::*physical-retained-inventory-publish-lock*)))
+                            selected)
+                          :reader #'reader)))
+                (ok (equal (sort (mapcar #'car seen) #'string<) '(:extent :inventory :overlap)))
+                (let ((reference (gethash owner pg::*physical-retained-root-references*)))
+                  (ok (equal (truename root) (pg::physical-retained-root-reference-directory reference)))
+                  (dolist (key keys)
+                    (ok (pg::physical-retained-root-protected-p root (car key) (cdr key))))
+                  (dolist (failure '(:inventory :extent :overlap))
+                    (ok (signals
+                         (pg::physical-retained-root-reconcile
+                          owner root identity history (lambda () selected)
+                          :reader (lambda (directory kind id maximum)
+                                    (when (eq failure kind) (error "injected object input failure"))
+                                    (reader directory kind id maximum)))
+                         'error))
+                    (ok (eq reference (gethash owner pg::*physical-retained-root-references*)))))))))))
