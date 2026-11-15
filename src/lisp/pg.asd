@@ -417,6 +417,7 @@
                    (:file "../replication/logical-slot-continuation-shape")
                    (:file "../replication/logical-slot-continuation-model")
                    (:file "../replication/logical-slot-continuation-codec")
+                   (:file "../replication/logical-slot-continuation-storage")
                    (:file "../replication/logical-slot-copy-source-proof-reader-owner")
                    (:file "../replication/logical-slot-copy-source-proof-reader")
                    (:file "../replication/logical-slot-copy-source-proof-preparation")

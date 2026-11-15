@@ -222,6 +222,132 @@
     (assert (null (logical-slot-startup-read-inventory :local-workspace t)))
     (format t "~&NATIVE-ORIGIN PASS independent original root survives owner exit and current primary reselection; zero slot files~%")))
 
+(defun native-host-continuation-check-unwind (storage &optional interrupt)
+  (let* ((directory (logical-slot-continuation-storage-call storage :directory))
+         (original (symbol-function 'physical-image-file-facts))
+         (target sb-thread:*current-thread*) (actor nil)
+         (blocked (sb-thread:make-semaphore :count 0))
+         (injected nil) (result nil))
+    (unwind-protect
+         (progn
+           (setf (symbol-function 'physical-image-file-facts)
+                 (lambda (descriptor &optional (name ""))
+                   (when (and (eql descriptor directory) (equal name ""))
+                     (if interrupt
+                         (progn
+                           (sb-sys:without-interrupts
+                             (setf actor
+                                   (sb-thread:make-thread
+                                    (lambda ()
+                                      (sb-thread:interrupt-thread
+                                       target
+                                       (lambda ()
+                                         (setf injected t)
+                                         (throw 'native-continuation-check :interrupted))))
+                                    :name "native continuation check interrupt")))
+                           (sb-thread:wait-on-semaphore blocked :timeout 5)
+                           (error "continuation check interrupt was not delivered"))
+                         (progn
+                           (setf injected t)
+                           (throw 'native-continuation-check :interrupted))))
+                   (funcall original descriptor name)))
+           (setf result
+                 (catch 'native-continuation-check
+                   (unwind-protect
+                        (progn (logical-slot-continuation-storage-check storage) :unexpected-return)
+                     (when actor (sb-thread:join-thread actor))))))
+      (setf (symbol-function 'physical-image-file-facts) original))
+    (and injected (eq result :interrupted))))
+
+(defun native-host-continuation-storage (gate ownership)
+  (let ((saved nil) (fds (length (directory #p"/proc/self/fd/*"))))
+    (call-with-logical-slot-continuation-startup-storage
+     gate ownership
+     (lambda (storage facts)
+       (setf saved storage)
+       (assert (plusp (length (getf (getf facts :certificate) :slots))))
+       (assert (null (logical-slot-startup-read-inventory :local-workspace t)))
+       (assert (handler-case
+                   (progn (logical-slot-continuation-storage-check
+                           (copy-logical-slot-continuation-startup-storage storage)) nil)
+                 (error () t)))
+       (assert
+        (eq :rejected
+            (sb-thread:join-thread
+             (sb-thread:make-thread
+              (lambda ()
+                (handler-case (logical-slot-continuation-storage-check storage)
+                  (error () :rejected)))))))
+       (let* ((directory (logical-slot-continuation-storage-call storage :directory))
+              (root-facts (physical-image-file-facts -100 (namestring *pgdata*)))
+              (path (merge-pathnames "native-storage-probe" (physical-image-fd-path directory)))
+              (binding (logical-slot-continuation-storage-call storage :binding)))
+         (assert (plusp (length binding)))
+         (setf (aref binding 0) (logxor 1 (aref binding 0)))
+         (assert (not (equalp binding (logical-slot-continuation-storage-call storage :binding))))
+         (unwind-protect
+              (progn
+                (with-open-file (stream path :direction :output :if-exists :error
+                                             :element-type '(unsigned-byte 8))
+                  (write-byte 42 stream)
+                  (finish-output stream)
+                  (sb-posix:fsync (sb-sys:fd-stream-fd stream)))
+                (sb-posix:fsync directory)
+                (assert (equal root-facts (physical-image-file-facts -100 (namestring *pgdata*))))
+                (assert (logical-slot-continuation-storage-check storage)))
+           (when (probe-file path) (delete-file path))
+           (sb-posix:fsync directory)))))
+    (assert (handler-case (progn (logical-slot-continuation-storage-check saved) nil) (error () t)))
+    (dolist (kind '(:root-entry :directory-mode :registration :nonlocal :interrupt))
+      (let ((entered nil) (rejected nil) (sticky nil) (scope-failed nil)
+                          (unexpected (merge-pathnames "native-continuation-root-mutation" *pgdata*))
+                          (child (merge-pathnames "pg_logical_continuation/" *pgdata*)))
+        (handler-case
+            (call-with-logical-slot-continuation-startup-storage
+             gate ownership
+             (lambda (storage facts)
+               (declare (ignore facts))
+               (setf entered t)
+               (unwind-protect
+                    (progn
+                      (ecase kind
+                        (:root-entry (sb-posix:mkdir (namestring unexpected) #o700))
+                        (:directory-mode (sb-posix:chmod (namestring child) #o755))
+                        ((:registration :nonlocal :interrupt) nil))
+                      (setf rejected
+                            (ecase kind
+                              ((:root-entry :directory-mode)
+                               (handler-case
+                                   (progn (logical-slot-continuation-storage-check storage) nil)
+                                 (error () t)))
+                              (:registration
+                               (let ((*logical-slot-continuation-startup-storages* nil))
+                                 (handler-case
+                                     (progn (logical-slot-continuation-storage-check storage) nil)
+                                   (error () t))))
+                              (:nonlocal (native-host-continuation-check-unwind storage))
+                              (:interrupt (native-host-continuation-check-unwind storage t)))))
+                 (ecase kind
+                   (:root-entry (when (probe-file unexpected) (sb-posix:rmdir (namestring unexpected))))
+                   (:directory-mode (sb-posix:chmod (namestring child) #o700))
+                   ((:registration :nonlocal :interrupt) nil)))
+               (setf sticky
+                     (handler-case
+                         (progn (logical-slot-continuation-storage-check storage) nil)
+                       (error () t)))))
+          (error () (setf scope-failed t)))
+        (assert entered)
+        (assert rejected)
+        (assert sticky)
+        (assert scope-failed)))
+    (call-with-logical-slot-continuation-startup-storage
+     gate ownership
+     (lambda (storage facts)
+       (declare (ignore facts))
+       (assert (logical-slot-continuation-storage-check storage))))
+    (assert (= fds (length (directory #p"/proc/self/fd/*"))))
+    (format t "~&NATIVE-CONTINUATION-STORAGE PASS private child writes preserve full root proof; copied, foreign-thread, expired and mutated scopes rejected; registration, throw and external interrupt failures sticky; zero slot files~%")))
+
 (defun native-imported-host-observation ()
   (unless (equal "1" (uiop:getenv "PG_NATIVE_HOST_DISPOSABLE"))
     (error "This test drops slot files; set PG_NATIVE_HOST_DISPOSABLE=1 only for its disposable fixture"))
@@ -285,6 +411,7 @@
                    (assert (not (physical-adoption-owner-active-p saved-owner)))
                    (assert (handler-case (progn (funcall saved-check) nil) (error () t)))
                    (native-host-origin-cycle gate ownership)
+                   (native-host-continuation-storage gate ownership)
                    (assert (eq registry *wal-replication-slots*))
                    (assert (zerop (hash-table-count registry)))
                    (assert (null (logical-slot-startup-read-inventory :local-workspace t)))
