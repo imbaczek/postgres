@@ -8,6 +8,7 @@
      (call-with-logical-slot-imported-startup-owner-check owner function))))
 
 (defun logical-slot-imported-check-owner (owner)
+  "Run the full owner check outside WAL exclusion."
   (etypecase owner
     (logical-slot-imported-scan-owner (logical-slot-imported-scan-check-owner owner))
     (logical-slot-imported-startup-owner (logical-slot-imported-startup-check-owner owner))))
@@ -18,6 +19,7 @@
     (logical-slot-imported-startup-owner (logical-slot-imported-startup-owner-under-lock owner))))
 
 (defun logical-slot-imported-owner-candidate-under-lock (owner)
+  "Return the checked candidate and its source facts under WAL exclusion."
   (assert (sb-thread:holding-mutex-p *wal-lock*))
   (logical-slot-imported-owner-under-lock owner)
   (etypecase owner

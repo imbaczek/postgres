@@ -13,6 +13,7 @@
   t)
 
 (defun logical-slot-imported-check-file-anchors (root named-root root-facts held &key canonical)
+  "Check held and named file anchors; CANONICAL also rereads exact bytes."
   (unless (and (equal root-facts (physical-image-file-facts root))
                (equal root-facts (physical-image-file-facts -100 named-root)))
     (error "imported logical source root descriptor changed"))
@@ -48,6 +49,12 @@
     t))
 
 (defun call-with-logical-slot-imported-proof-files (owner context function)
+  "Observe the canonical permanent pair through an explicit read-only context.
+Keep *PGDATA* and *PHYSICAL-IMAGE-CONTEXT* bindings intact for startup
+authority checks. The named PGDATA path must still bind to this held context.
+The private callback scope supplies a full check outside WAL and a lighter
+named-FD anchor check under WAL. It does not acquire a retained-root lease,
+replay D through F, provide WAL records, publish a slot or establish readiness."
   (call-with-logical-slot-imported-owner-check
    owner
    (lambda ()

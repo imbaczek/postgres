@@ -4,6 +4,7 @@
             (:include physical-adoption-owner)
             (:constructor %make-logical-slot-imported-startup-owner)
             (:print-function physical-libpq-print-private-object))
+  ;; Borrow the real postmaster owner for one unpublished child candidate.
   (ownership nil :read-only t) (source nil :read-only t)
   (entry nil :read-only t) (principal nil :read-only t)
   (state nil :read-only t))
@@ -11,6 +12,7 @@
 (defvar *logical-slot-imported-startup-owners* nil)
 
 (defun call-with-logical-slot-imported-startup-owner-check (owner function)
+  "Check identity before sticky failure handling; the owner expires with its scope."
   (unless (logical-slot-imported-startup-owner-p owner)
     (error "imported startup observation requires its typed owner"))
   (let ((state (logical-slot-imported-startup-owner-state owner)))
@@ -31,6 +33,7 @@
             (setf (physical-adoption-owner-active-p owner) nil)))))))
 
 (defun logical-slot-imported-startup-owner-under-lock (owner)
+  "Recheck the exact private principal and captured child entry under WAL."
   (assert (sb-thread:holding-mutex-p *wal-lock*))
   (call-with-logical-slot-imported-startup-owner-check
    owner
@@ -67,6 +70,8 @@
   (error "imported startup observation does not authorize offline adoption"))
 
 (defun call-with-logical-slot-imported-startup-owner (source entry function)
+  "Observe one captured child entry under borrowed postmaster ownership.
+The entry is not published by this scope."
   (when (sb-thread:holding-mutex-p *wal-lock*)
     (error "imported startup owner acquisition requires the WAL mutex to be released"))
   (let ((principal (sb-thread:with-mutex (*wal-lock*)
