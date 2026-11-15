@@ -1,0 +1,67 @@
+(in-package #:pg)
+
+(defstruct (logical-slot-imported-host-origin
+            (:constructor %make-logical-slot-imported-host-origin)
+            (:print-function physical-libpq-print-private-object))
+  (state nil :read-only t))
+
+(defvar *logical-slot-imported-host-origins* (make-hash-table :test #'equal))
+
+(defun logical-slot-imported-host-origin-call (record operation &optional observed)
+  (unless (logical-slot-imported-host-origin-p record)
+    (error "imported host origin requires its typed registry entry"))
+  (funcall (logical-slot-imported-host-origin-state record) operation record observed))
+
+(defun logical-slot-imported-make-host-origin (key binding directory)
+  (assert (sb-thread:holding-mutex-p *wal-lock*))
+  (let* ((private-key (logical-slot-copy-import-state-image key))
+         (private-binding (logical-slot-copy-import-state-image binding))
+         (facts (logical-slot-copy-check-source-proof (first private-binding)))
+         (certificate (getf facts :certificate))
+         (reference (copy-tree (getf certificate :retained-reference)))
+         (identity (physical-promotion-retained-identity (getf certificate :system-id) reference))
+         (parent-history (logical-slot-copy-source-proof-parent-history facts))
+         (history (timeline-check-lineage
+                   (timeline-parse-history (getf certificate :child-timeline)
+                                           (bytes->string (getf (getf facts :evidence) :child-history)))))
+         (token (gensym "IMPORTED-ORIGIN")) (record nil))
+    (flet ((state (operation candidate observed)
+             (assert (sb-thread:holding-mutex-p *wal-lock*))
+             (unless (and (eq candidate record)
+                          (eq record (gethash private-key *logical-slot-imported-host-origins*)))
+               (error "imported host origin is not its registered entry"))
+             (ecase operation
+               (:binding
+                (unless (logical-slot-copy-committed-image-equal-p private-binding observed)
+                  (error "imported host permanent pair differs from its retained obligation"))
+                t)
+               (:selection
+                (values token (copy-tree reference) (copy-tree identity)
+                        (mapcar #'copy-timeline-history-entry parent-history)
+                        (mapcar #'copy-timeline-history-entry history)))
+               (:check-root
+                (sb-thread:with-mutex (*physical-retained-inventory-publish-lock*)
+                  (let ((current (gethash token *physical-retained-root-references*)))
+                    (physical-retained-root-check-context current directory identity)
+                    (unless (and current
+                                 (eql (getf reference :root-id)
+                                      (physical-retained-root-reference-root-id current))
+                                 (not (gethash token *physical-retained-root-updates*)))
+                      (error "imported host origin has no certain protected root"))))
+                t))))
+      (setf record (%make-logical-slot-imported-host-origin :state #'state))
+      record)))
+
+(defun logical-slot-imported-host-origin-record (owner context directory binding)
+  (unless (logical-slot-imported-host-startup-owner-p owner)
+    (error "host origin restoration requires host startup observation"))
+  (let* ((facts (physical-image-file-facts (physical-image-context-root-fd context)))
+         (key (list (namestring (physical-adoption-owner-directory owner))
+                    (first facts) (second facts) (ninth facts))))
+    (sb-thread:with-mutex (*wal-lock*)
+      (logical-slot-imported-host-startup-under-lock owner)
+      (let ((record (or (gethash key *logical-slot-imported-host-origins*)
+                        (setf (gethash key *logical-slot-imported-host-origins*)
+                              (logical-slot-imported-make-host-origin key binding directory)))))
+        (logical-slot-imported-host-origin-call record :binding binding)
+        record))))

@@ -72,7 +72,7 @@ replay D through F, provide WAL records, publish a slot or establish readiness."
      (let* ((root (physical-image-context-root-fd context))
             (root-facts (physical-image-file-facts root))
             (named-root (namestring (physical-adoption-owner-directory owner)))
-            (held nil) (private-facts nil) (active nil)
+            (held nil) (private-facts nil) (private-image nil) (active nil)
             (thread sb-thread:*current-thread*))
        (unless (and (= (first root-facts) (physical-adoption-owner-device owner))
                     (= (second root-facts) (physical-adoption-owner-inode owner))
@@ -102,7 +102,7 @@ replay D through F, provide WAL records, publish a slot or establish readiness."
                      (require-scope)
                      (logical-slot-imported-owner-under-lock owner)
                      (logical-slot-imported-check-file-anchors root named-root root-facts held))))
-                (check ()
+                (check (&optional binding)
                   (when (sb-thread:holding-mutex-p *wal-lock*)
                     (error "full imported proof check requires the WAL mutex to be released"))
                   (call-with-logical-slot-imported-owner-check
@@ -114,7 +114,11 @@ replay D through F, provide WAL records, publish a slot or establish readiness."
                      (logical-slot-imported-check-file-anchors
                       root named-root root-facts held :canonical t)
                      (logical-slot-imported-check-certificate-source owner context private-facts)
-                     t))))
+                     (if binding
+                         (list (copy-seq private-image)
+                               (mapcar (lambda (entry)
+                                         (list (second entry) (copy-tree (fourth entry)))) held))
+                         t)))))
          (hold root "logical-slot-copy.source-proof" nil nil
                (lambda (proof-fd)
                  (let* ((image (logical-slot-copy-import-control-read-fd
@@ -126,7 +130,7 @@ replay D through F, provide WAL records, publish a slot or establish readiness."
                         (pending (getf (getf facts :journal) :certificate))
                         (active-image (logical-slot-copy-install-active-image certificate)))
                    (setf (fifth (first held)) (copy-seq image)
-                         private-facts facts)
+                         private-facts facts private-image (copy-seq image))
                    (logical-slot-imported-check-certificate-source owner context facts)
                    (hold root "logical-slot-copy.import" nil active-image
                          (lambda (active-fd)
