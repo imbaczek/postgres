@@ -57,6 +57,8 @@
   bytes)
 
 (defun logical-slot-continuation-decode (bytes)
+  ;; Check the fixed envelope, length and CRC, then bound table counts and
+  ;; require canonical re-encoding.  CRC detects corruption; it is not proof.
   (logical-slot-continuation-check-envelope bytes)
   (let ((position 20) (end (- (length bytes) 4)))
     (labels ((take (count)

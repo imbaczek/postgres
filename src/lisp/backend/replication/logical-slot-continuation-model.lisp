@@ -4,6 +4,8 @@
   (timeline-check-lineage (timeline-parse-history tip (bytes->string bytes))))
 
 (defun logical-slot-continuation-work-profile (snapshot history)
+  ;; Bound weighted history entry visits before geometry and cache parsed
+  ;; root histories for the checks that follow.
   (let* ((uses (make-hash-table :test #'eql))
          (parsed (make-hash-table :test #'eql))
          (work (* (length history)
@@ -34,6 +36,9 @@
     lsn))
 
 (defun logical-slot-continuation-slot-positions (snapshot history end)
+  ;; Slot rows retain the exact P7 byte image, including its 128-bit
+  ;; generation and child owner.  Transfers use canonical 32-character
+  ;; lowercase hex, checked by the existing generation parser.
   (let ((prior nil) (positions nil))
     (dolist (row (getf snapshot :slots))
       (unless (or (null prior) (string< prior (first row)))
@@ -109,6 +114,15 @@
       (t (error "continuation selection has an unclassified gap")))))
 
 (defun logical-slot-continuation-make-plan (snapshot history positions)
+  ;; The plan holds a detached full snapshot and proof requests; nested data
+  ;; is neither immutable nor independently verified.  The floor comes from
+  ;; supplied saved restart positions and transfers, not confirmed progress
+  ;; or an in-memory restart.  Prove the actual durably saved rows before
+  ;; publication or release.
+  ;;
+  ;; Each root carries its own system, base, reference and history.  A run's
+  ;; logical owner can differ from its physical carrier.  The current-tip
+  ;; tail is a local retention claim, not a claim about a future archive.
   (let* ((fork (second (getf snapshot :origin)))
          (floor (when positions (max fork (reduce #'min positions :key #'first))))
          (cursor floor) (carrier 0) (requests nil) (seams nil) (keys nil)
@@ -145,6 +159,10 @@
      :tail-request (and floor (logical-slot-continuation-copy tail)))))
 
 (defun logical-slot-continuation-check (snapshot)
+  ;; These are source-selection claims only.  A later held-FD proof must
+  ;; match the canonical host proof and independently read roots, records,
+  ;; and the local tail.  This check does no I/O, publication, GC, admission,
+  ;; or readiness update.
   (let* ((size (logical-slot-continuation-shape snapshot))
          (history (logical-slot-continuation-history (getf snapshot :history-target) (getf snapshot :history)))
          (parsed (logical-slot-continuation-work-profile snapshot history))
@@ -162,6 +180,10 @@
       (values (logical-slot-continuation-make-plan snapshot history positions) size))))
 
 (defun logical-slot-continuation-normalize (snapshot)
+  ;; Drop only whole runs ending strictly below the floor.  Keep intersecting
+  ;; and equality-boundary runs without clipping or coalescing, remove unused
+  ;; roots, and renumber local keys.  The origin binding remains even when no
+  ;; obligations remain.
   (let* ((plan (logical-slot-continuation-check snapshot))
          (floor (logical-slot-continuation-plan-floor plan))
          (copy (logical-slot-continuation-copy snapshot))

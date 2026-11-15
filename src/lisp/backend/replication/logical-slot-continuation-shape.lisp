@@ -18,6 +18,8 @@
   (+ (logical-slot-copy-source-proof-maximum-bytes) (* 64 1024 1024)))
 
 (defun logical-slot-continuation-copy (value)
+  ;; The caller supplies a validated fixed schema.  Walk list spines
+  ;; iteratively so a large table does not consume one stack frame per row.
   (typecase value
     (cons (loop for item in value collect (logical-slot-continuation-copy item)))
     (vector (copy-seq value))
@@ -72,6 +74,8 @@
   42)
 
 (defun logical-slot-continuation-shape (snapshot)
+  ;; Bound the bytes and table counts before copying or geometry checks.
+  ;; Binding is opaque here; it is not proof of the canonical host files.
   (logical-slot-continuation-plist
    snapshot '(:version :binding :generation :system-id :origin :history-target :history
               :sealed-end :slots :transfers :roots :runs :tail))
