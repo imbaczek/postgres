@@ -10,9 +10,12 @@
 (defvar *logical-import-native-expected-names* '("alpha"))
 
 (defun logical-import-native-rejects (function &optional message)
-  (assert (handler-case (progn (funcall function) nil)
-            (error (condition)
-              (or (null message) (search message (princ-to-string condition)))))))
+  (let ((observed nil))
+    (assert (handler-case (progn (funcall function) nil)
+              (error (condition)
+                (setf observed (princ-to-string condition))
+                (or (null message) (search message observed))))
+            () "Expected rejection ~S; observed ~S" message observed)))
 
 (defun logical-import-native-source-change (owner context)
   (let* ((path (merge-pathnames "logical-slot-copy.descriptor"

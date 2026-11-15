@@ -22,17 +22,21 @@ string = base['string']
 
 def probe(peer, label, *args, failure=None, publication=None, cut='none', syscall=None,
           mount=None, all_lost=False, empty_interval=False, wal_removed=False, segment_boundary=False,
-          catalog_spelling=False, catalog_size=None, binding=None, foreign_root=False, **kwargs):
+          catalog_spelling=False, catalog_size=None, binding=None, foreign_root=False,
+          eor=None, **kwargs):
     assert failure in (None, 'error', 'throw', 'mutation')
     assert publication in (None, 'run', 'reject', 'error', 'throw', 'crash')
     assert binding in (None, 'prefix', 'inventory', 'extent')
-    assert sum(bool(x) for x in (failure, publication, syscall, mount, all_lost, empty_interval, wal_removed, segment_boundary, catalog_spelling, binding, foreign_root)) <= 1
+    assert sum(bool(x) for x in (failure, publication, syscall, mount, all_lost, empty_interval, wal_removed, segment_boundary, catalog_spelling, binding, foreign_root, eor)) <= 1
     operation = (f'(logical-source-proof-test-preparation-failure :{failure})'
                  if failure else '(logical-source-proof-test-run)')
     if binding:
         operation = f'(logical-source-proof-test-binding :{binding})'
     if foreign_root:
         operation = '(logical-source-proof-test-foreign-root)'
+    if eor:
+        assert len(eor) == 2 and all(isinstance(x, int) and not isinstance(x, bool) for x in eor)
+        operation = f'(logical-source-proof-test-eor {eor[0]} {eor[1]})'
     if segment_boundary:
         assert isinstance(segment_boundary, int) and not isinstance(segment_boundary, bool)
         assert isinstance(catalog_size, int) and catalog_size > 0
@@ -63,6 +67,7 @@ def probe(peer, label, *args, failure=None, publication=None, cut='none', syscal
         f'(load {string(Path(__file__).with_name("logical-slot-copy-source-proof-native.lisp"))})',
         f'(load {string(Path(__file__).with_name("logical-slot-copy-source-proof-publication-faults.lisp"))})',
         f'(load {string(Path(__file__).with_name("logical-slot-copy-source-proof-binding-faults.lisp"))})',
+        f'(load {string(Path(__file__).with_name("logical-slot-copy-source-proof-eor-native.lisp"))})',
         f'(let ((*pgdata* (directory-pathname {string(peer.data)}))) '
         '(unwind-protect (postmaster-own-data-directory "127.0.0.1" 6543 '
         f':startup-reconcile (lambda () {operation})) '
@@ -85,7 +90,8 @@ def probe(peer, label, *args, failure=None, publication=None, cut='none', syscal
         assert f'SOURCE-PROOF-PUBLICATION-KILL :{cut.upper()}' in text, log
         print(f'SOURCE-PROOF-KILLED {label} seconds={time.monotonic()-started:.6f}', flush=True)
         return
-    marker = ('SOURCE-PROOF-READER-BINDING-PASS' if binding else
+    marker = ('SOURCE-PROOF-EOR-PASS' if eor else
+              'SOURCE-PROOF-READER-BINDING-PASS' if binding else
               'SOURCE-PROOF-FOREIGN-ROOT-PASS' if foreign_root else
               'SOURCE-PROOF-CATALOG-SPELLING-PASS' if catalog_spelling else
               'SOURCE-PROOF-SEGMENT-BOUNDARY-PASS' if segment_boundary else

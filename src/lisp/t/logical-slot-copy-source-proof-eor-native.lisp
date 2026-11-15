@@ -1,0 +1,52 @@
+(in-package #:pg)
+
+(defun logical-source-proof-test-source-eor (parent child fork)
+  (assert (= child *wal-insert-timeline*))
+  (assert (eq :timeline *wal-segment-namespace*))
+  (let* ((bytes (physical-promotion-read-file
+                 (wal-segment-path (floor fork +wal-segment-size+) child :timeline)))
+         (offset (mod fork +wal-segment-size+))
+         (record (wal-decode-record
+                  (subseq bytes offset (+ offset +wal-end-of-recovery-record-size+)) fork))
+         (info (wal-end-of-recovery-record-info record))
+         (checkpoint (wal-read-checkpoint-record (wal-checkpoint-record-start) *wal-checkpoint-lsn*))
+         (snapshot (wal-checkpoint-record-snapshot checkpoint)))
+    (assert (= child (getf info :timeline) (getf snapshot :timeline)))
+    (assert (= parent (getf info :prev-timeline) (getf snapshot :prev-timeline)))
+    (assert (= 2 (getf info :wal-level)))
+    (assert (>= (wal-record-start checkpoint) (wal-record-end record)))
+    (format t "~&SOURCE-PROOF-SOURCE-EOR-PASS parent=~d child=~d fork=~d checkpoint=~d~%"
+            parent child fork (wal-record-end checkpoint))
+    (finish-output)))
+
+(defun logical-source-proof-test-eor (expected-parent expected-end)
+  (logical-source-proof-test-run)
+  (let* ((facts (logical-slot-copy-read-source-proof))
+         (certificate (getf facts :certificate))
+         (history (getf facts :history))
+         (candidate (%make-physical-store))
+         (seen nil))
+    (assert (= expected-parent (getf certificate :parent-timeline)))
+    (assert (= 1 (getf certificate :base-timeline)))
+    (assert (= expected-end (getf certificate :fork)))
+    (assert (equal '("alpha" "beta") (mapcar #'first (getf certificate :slots))))
+    (assert (every (lambda (row) (eq :eligible (fifth row))) (getf certificate :slots)))
+    (logical-slot-copy-source-proof-map-archive
+     facts (physical-recovery-retained-directory) #'physical-retained-object-read candidate
+     (lambda (record raw)
+       (declare (ignore raw))
+       (when (= +wal-record-end-of-recovery+ (wal-record-type record))
+         (let* ((info (wal-end-of-recovery-record-info record))
+                (child (getf info :timeline))
+                (entry (find child history :key #'timeline-history-entry-timeline)))
+           (assert entry)
+           (assert (= (wal-record-start record) (timeline-history-entry-begin entry)))
+           (push (list child (getf info :prev-timeline)) seen))))
+     (getf certificate :base-end))
+    (setf seen (nreverse seen))
+    (assert (equal seen
+                   (loop for child from 2 to expected-parent collect (list child (1- child)))))
+    (assert (logical-source-proof-test-rejected-p #'logical-slot-copy-check-promotion))
+    (format t "~&SOURCE-PROOF-EOR-PASS parent=~d eor=~d F=~d~%"
+            expected-parent (length seen) expected-end)
+    (finish-output)))
