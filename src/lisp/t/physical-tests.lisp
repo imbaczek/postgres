@@ -2,9 +2,13 @@
 (defpackage #:pg-physical-tests (:use #:cl #:rove))
 (in-package #:pg-physical-tests)
 
-(defvar *physical-test-plain-cache* nil)
+(defvar *physical-test-plain-cache*
+  ;; Use only a cache from a completed successful plain strict production
+  ;; compile of the identical pinned source and runtime.
+  nil)
 
 (defun physical-test-child-command (command)
+  ;; Pass environment entries as literal arguments and retain a fresh child.
   (unless (and (consp command) (list-length command)
                (every (lambda (argument)
                         (and (stringp argument) (not (find (code-char 0) argument)))) command)

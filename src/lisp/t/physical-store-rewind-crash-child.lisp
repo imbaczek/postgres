@@ -7,6 +7,8 @@
 (defvar *physical-child-pg-compilations* 0)
 
 (defmethod asdf:perform :before ((operation asdf:compile-op) (component asdf:cl-source-file))
+  ;; Count every source compilation, including dependencies, so a zero count
+  ;; conservatively checks the expected cache in this fresh child.
   (declare (ignore operation component))
   (incf *physical-child-pg-compilations*))
 
