@@ -12,6 +12,7 @@ CACHE-BYTES holds a checked physical prefix; CACHE-START and CACHE-END bound
 logical record coverage.  Equal bounds can witness EOF at the base.  Accessors
 do not grant authority to produce or consume logical WAL. The index and cache
 are private to the reader scope and must not be mutated by its callback."
+  ;; DIRECTORY anchors the primary root and lease; INPUT is the fixed I/O namespace.
   (directory nil :read-only t) (identity nil :read-only t)
   (reference nil :read-only t) (history nil :read-only t)
   (parent-history nil :read-only t) (guard nil :read-only t)
@@ -191,6 +192,9 @@ The captured minimum end permits durable growth, but not regression."
   t)
 
 (defun logical-wal-archive-read-object (archive selected kind id maximum)
+  "Read a bounded object outside WAL, checking source scope before and after.
+Copy and hash the supplied bytes before returning them, so a reader cannot
+change verified parser input through an alias."
   (when (sb-thread:holding-mutex-p *wal-lock*)
     (error "logical WAL archive object reads require WAL exclusion to be released"))
   (unless (and (equal selected (logical-wal-archive-input archive))
@@ -215,7 +219,8 @@ The captured minimum end permits durable growth, but not regression."
 
 (defun logical-wal-archive-read-index (archive)
   "Read the selected index and check its identity, parent ancestry and chain.
-The required base overlap does not itself establish logical coverage."
+The inventory is read through the bounded object reader. The required base
+overlap does not itself establish logical coverage."
   (let* ((reference (logical-wal-archive-reference archive))
          (history (logical-wal-archive-parent-history archive))
          (index (physical-retained-inventory-read-index
@@ -241,7 +246,10 @@ The required base overlap does not itself establish logical coverage."
 GUARD supplies the caller's source proof; this scope also checks persisted
 control, history and root.  It rechecks both under the captured WAL mutex on
 the owning thread.  A retained-root reader lease spans the callback.  The
-index and cache are cleared on every exit, and the archive then expires."
+index and cache are cleared on every exit, and the archive then expires.
+INPUT-DIRECTORY may name a separate fixed I/O namespace such as a held FD alias;
+its provenance is the caller's responsibility. READER is transport only. The
+default symbol is resolved at each call, allowing reloads and fault injection."
   ;; Startup supplies a pre-catalog identity only after the retained root has
   ;; been restored in committed control.  The callback can publish while the
   ;; reader lease is held; the runtime wrapper supplies the live catalog ID.
