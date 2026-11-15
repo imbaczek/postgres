@@ -297,3 +297,19 @@
           (funcall observe record raw 1 1 :ordinary start)
           (rove:ok (handler-case (progn (funcall finish) nil) (error () t))
                    "An exact standalone checkpoint is traversal evidence, not a completed ACK batch")))))
+
+(rove:deftest continuation-boundary-keeps-persisted-pending-batch-start-role
+    (multiple-value-bind (fork eor-end batch-end commit-end) (unit-continuation-boundary-positions)
+      (declare (ignore batch-end commit-end))
+      (multiple-value-bind (observe finish)
+          (logical-slot-continuation-boundary-observer
+           (list (list :restart eor-end 2 :prefix-end)) :fork fork)
+        (unit-continuation-boundary-records observe)
+        (rove:ok (handler-case (funcall finish) (error () nil))
+                 "A persisted pending restart can use prefix-end geometry at an exact BATCH start"))
+      (multiple-value-bind (observe finish)
+          (logical-slot-continuation-boundary-observer
+           (list (list :restart fork 2 :prefix-end)) :fork fork)
+        (unit-continuation-boundary-records observe)
+        (rove:ok (handler-case (progn (funcall finish) nil) (error () t))
+                 "The child EOR never certifies a prefix-end restart"))))

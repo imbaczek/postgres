@@ -11,9 +11,8 @@
           (and terminal (eq :prefix-end (fourth request))
                (= (second request) (wal-record-end record))))
          (:restart
-          (or (and (eq :record-start (fourth request))
-                   (or (= (wal-record-type record) +wal-record-batch-start+)
-                       (eq kind :end-of-recovery))
+          (or (and (or (= (wal-record-type record) +wal-record-batch-start+)
+                       (and (eq :record-start (fourth request)) (eq kind :end-of-recovery)))
                    (= (second request) (wal-record-start record)))
               (and terminal (eq :prefix-end (fourth request))
                    (= (second request) (wal-record-end record)))
