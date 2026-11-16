@@ -36,6 +36,7 @@
                (:file "t/rove/continuation-inventory-tests")
                (:file "t/rove/continuation-native-proof-tests")
                (:file "t/rove/continuation-prepared-tests")
+               (:file "t/rove/continuation-cold-startup-tests")
                (:file "t/rove/logical-wal-lane-provider-tests")
                (:file "t/rove/logical-slot-imported-startup-principal-tests")
                (:file "t/rove/logical-slot-imported-startup-owner-tests")

@@ -270,11 +270,36 @@
     (format t "~&NATIVE-WRITER PASS case=~a attempted=~s published=~s fds-closed beta-preserved~%"
             (or fault-case case) (null before-intent) (not (null published)))))
 
+(defun native-host-writer-parent-before-d ()
+  (let* ((slot (gethash "alpha" *wal-replication-slots*))
+         (beta (wal-replication-slot-path "beta"))
+         (beta-facts (physical-image-file-facts -100 (namestring beta)))
+         (beta-image (read-bounded-regular-file beta +slot-state-maximum-bytes+))
+         (fds (native-host-writer-open-fds)))
+    (call-with-logical-replication-slot
+     "alpha" (lambda (owned)
+               (assert (eq owned slot))
+               (assert (eq slot (logical-slot-continuation-native-acknowledge
+                                 "alpha" 29061 *wal-logical-slot-owner*)))))
+    (assert (= 2 (getf (native-host-writer-selected) :generation)))
+    (assert (= 29061 (wal-replication-slot-confirmed-flush-lsn slot)
+               (wal-replication-slot-restart-lsn slot)))
+    (assert (= 1 (wal-replication-slot-confirmed-timeline slot)
+               (wal-replication-slot-restart-timeline slot)))
+    (assert (= 1 (hash-table-count (wal-replication-slot-pending-xids slot))))
+    (assert (equalp (logical-slot-state-encode slot)
+                    (read-bounded-regular-file (wal-replication-slot-path "alpha") +slot-state-maximum-bytes+)))
+    (assert (equal beta-facts (physical-image-file-facts -100 (namestring beta))))
+    (assert (equalp beta-image (read-bounded-regular-file beta +slot-state-maximum-bytes+)))
+    (assert (equal fds (native-host-writer-open-fds)))
+    (format t "~&NATIVE-WRITER PASS case=parent-before-D generation=2 confirmed=restart=29061 timeline=1 beta-preserved before-D-reader-still-unqualified~%")))
+
 (defun native-host-continuation-native-writer ()
   (handler-case
       (let ((case (uiop:getenv "PG_NATIVE_WRITER_CASE")))
         (cond
           ((equal case "happy") (native-host-writer-happy))
+          ((equal case "parent-before-D") (native-host-writer-parent-before-d))
           ((assoc case '(("prepared-close" . "prepared-durable")
                          ("p7-close" . "p7-durable") ("stable-close" . "stable-durable")
                          ("proof-close" . "after-callback")) :test #'equal)

@@ -63,7 +63,7 @@ def owned_fixture(data, identity):
 
 
 @contextmanager
-def working_namespaces(data, destination):
+def working_namespaces(data, destination, source=None):
     """Retain failed working images; restore original inodes after the child exits."""
     identity = (data.stat().st_dev, data.stat().st_ino)
     backup = destination / 'original'
@@ -82,7 +82,7 @@ def working_namespaces(data, destination):
                 before[name] = tree_image(data / name)
                 os.rename(data / name, backup / name)
                 moved.append(name)
-                original = backup / name
+                original = (source / name) if source is not None else (backup / name)
                 if original.is_symlink():
                     raise ValueError('Mutable fixture namespace is a symlink: ' + name)
                 if original.is_dir():

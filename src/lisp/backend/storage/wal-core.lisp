@@ -266,8 +266,11 @@ Logical updates guard identity, progress and the first terminal cause."
 (defvar *max-replication-slots* 10
   "Shared capacity for all public slot names, including temporary and lost slots.")
 
+(declaim (ftype function logical-slot-continuation-cold-check-admission))
+
 (defun wal-check-replication-slot-capacity ()
   "Check shared capacity under WAL, counting temporary and lost slots too."
+  (logical-slot-continuation-cold-check-admission)
   (when (zerop *max-replication-slots*)
     (ereport "55000" "replication slots require max_replication_slots greater than zero"))
   (when (>= (hash-table-count *wal-replication-slots*) *max-replication-slots*)

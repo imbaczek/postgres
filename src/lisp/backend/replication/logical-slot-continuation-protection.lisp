@@ -160,6 +160,7 @@
   ;; Check admission and mutation at the live registry boundary, independent of
   ;; the slot's current child-owner field.  Both root and registry maps prevent
   ;; a changed root, name or type from bypassing the group through a lookup miss.
+  (logical-slot-continuation-cold-check-admission)
   (let ((registered (gethash *wal-replication-slots* *logical-slot-continuation-protection-registries*)))
     (when (or registered (plusp (hash-table-count *logical-slot-continuation-protections*)))
       (let* ((facts (physical-image-file-facts
