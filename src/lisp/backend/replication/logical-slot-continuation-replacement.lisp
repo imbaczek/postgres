@@ -1,8 +1,14 @@
 (in-package #:pg)
 
+;; A scoped file replacement resource, following the temporary write, fsync,
+;; rename, file and directory sync order used by SaveSlotToPath in slot.c.
+;; The caller supplies the protocol and any additional outer-directory sync.
+
 (defstruct (logical-slot-continuation-replacement
             (:constructor %make-logical-slot-continuation-replacement)
             (:print-function physical-libpq-print-private-object))
+  ;; The parent directory is borrowed; the scope owns the old and new file
+  ;; descriptors. Images are detached copies.
   directory parent-facts name temporary old-image new-image guard
   old-fd old-facts new-fd new-identity
   (prefix 0) (temporary-present nil) (phase :old))
@@ -14,6 +20,8 @@
     (funcall *logical-slot-continuation-replacement-test-hook* point)))
 
 (defun logical-slot-continuation-replacement-open (resource new)
+  ;; Open and retain independent old and new descriptors, checking the named
+  ;; private inode against the held descriptor before accepting either one.
   (let* ((directory (logical-slot-continuation-replacement-directory resource))
          (name (if new (logical-slot-continuation-replacement-temporary resource)
                    (logical-slot-continuation-replacement-name resource)))
@@ -41,6 +49,9 @@
             (error "replacement input lost its private named inode")))))))
 
 (defun logical-slot-continuation-replacement-check (resource)
+  ;; Before rename the old file must retain its full named facts.  After rename
+  ;; its held, unlinked inode and bytes must remain stable.  The new file must
+  ;; retain its named identity and the exact written prefix in either phase.
   (funcall (logical-slot-continuation-replacement-guard resource))
   (let* ((directory (logical-slot-continuation-replacement-directory resource))
          (parent (physical-image-file-facts directory))
@@ -82,6 +93,7 @@
     (logical-slot-continuation-replacement-phase resource)))
 
 (defun logical-slot-continuation-replacement-open-temporary (resource)
+  ;; Resume only an existing temporary that is an exact prefix of the new bytes.
   (logical-slot-continuation-replacement-open resource t)
   (let* ((image (logical-slot-continuation-replacement-new-image resource))
          (prefix (logical-slot-copy-import-control-read-fd
@@ -92,6 +104,7 @@
           (logical-slot-continuation-replacement-temporary-present resource) t)))
 
 (defun logical-slot-continuation-replacement-prepare (resource)
+  ;; Complete the checked prefix and sync the temporary before selection.
   (declare (notinline sb-posix:write sb-posix:fsync))
   (unless (eq :old (logical-slot-continuation-replacement-phase resource))
     (error "replacement preparation requires the old selected file"))
@@ -116,6 +129,7 @@
     (setf (logical-slot-continuation-replacement-phase resource) :prepared)))
 
 (defun logical-slot-continuation-replacement-replace (resource)
+  ;; Rename and record selection without an interrupt between the two steps.
   (unless (eq :prepared (logical-slot-continuation-replacement-phase resource))
     (error "replacement requires a synchronized temporary"))
   (logical-slot-continuation-replacement-check resource)
@@ -129,6 +143,8 @@
   :selected)
 
 (defun logical-slot-continuation-replacement-sync (resource)
+  ;; Sync the selected file and its directory.  For slot state this does not
+  ;; sync the outer pg_replslot root; a writer must do that before declaring P7N.
   (declare (notinline sb-posix:fsync))
   (unless (eq :selected (logical-slot-continuation-replacement-phase resource))
     (error "replacement sync requires the new selected file"))
@@ -141,6 +157,8 @@
   (setf (logical-slot-continuation-replacement-phase resource) :synced))
 
 (defun logical-slot-continuation-replacement-close (resource complete)
+  ;; Close owned descriptors without unlinking staged files or rolling back.
+  ;; Report cleanup failures without hiding the original unsuccessful exit.
   (declare (notinline sb-posix:close))
   (let ((failure nil))
     (dolist (kind '(:new :old))
@@ -167,6 +185,15 @@
 
 (defun call-with-logical-slot-continuation-file-replacement
     (directory purpose old-image new-image guard function)
+  ;; Lend a thread-bound operation callback over bounded opaque images and the
+  ;; sealed selector or slot-state names.  Canonical form, protocol, complete
+  ;; inventory and authority are the caller's responsibility.  The guard must
+  ;; follow the actual authority across phases: an old runtime-snapshot guard
+  ;; is no longer valid after P7N.  This scope does not mint authority.
+  ;;
+  ;; A normal return requires :old (no mutation) or :synced.  A failed operation
+  ;; revokes the callback; interrupted partial stages remain for higher-level
+  ;; recovery and the callback expires on return.
   (multiple-value-bind (name temporary maximum)
       (ecase purpose
         (:selector (values "selector" "selector.tmp" (logical-slot-continuation-prepared-maximum-bytes)))
