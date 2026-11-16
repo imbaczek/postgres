@@ -119,6 +119,8 @@
 (defun logical-slot-continuation-native-proof-check-under-lock (proof)
   (call-with-logical-slot-continuation-native-proof-check proof (lambda () proof)))
 
+;; Partition under WAL exclusion using the proof's checked certificate and
+;; source metadata.  The proof check keeps those resources bound to this call.
 (defun logical-slot-continuation-native-proof-partition-under-lock (proof rows)
   (call-with-logical-slot-continuation-native-proof-check
    proof

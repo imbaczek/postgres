@@ -29,6 +29,8 @@
 ;; Retain the original candidate identities and freeze their registry image,
 ;; including reconstructed pending transactions, for later comparison.
 
+;; Build the complete candidate registry.  Restore physical slots with a
+;; startup inactivity time; child logical slots are reconstructed separately.
 (defun logical-slot-continuation-cold-prepare-registry (source)
   (logical-slot-startup-check-inventory source)
   (let ((candidates (mapcar #'logical-slot-startup-entry-slot
@@ -127,6 +129,8 @@
     (logical-slot-publication-check-registry (getf data :registry) (getf data :image)))
   t)
 
+;; A fresh preparation derives a new physical inactivity time.  Ignore that
+;; transient when comparing the two preparations, while checking the other state.
 (defun logical-slot-continuation-cold-preparation-semantic-image (image)
   (mapcar (lambda (row)
             (let ((transients (copy-list (eighth row))))

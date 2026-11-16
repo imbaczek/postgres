@@ -49,6 +49,8 @@
     (unless selector-resource (logical-slot-continuation-writer-check-selected context)))
   (logical-slot-continuation-writer-base-check context))
 
+;; Compare the child rows with the new selector and the full disk ledger with
+;; the expected replacement, including the ordinary physical slots.
 (defun logical-slot-continuation-writer-check-new-inventory (context)
   (with-continuation-writer-context (context proof slot-root record ledger name target-row)
     (multiple-value-bind (rows observed)

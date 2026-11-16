@@ -52,6 +52,8 @@
          (name (wal-retained-slot-scan-name scan))
          (target (logical-slot-continuation-native-proof-target-lsn proof))
          (old (logical-slot-continuation-native-preflight-selector proof)))
+    ;; Keep the ledger for all disk entries, but compare only child rows with
+    ;; the selector.  The registry check below still covers the full inventory.
     (multiple-value-bind (rows ledger)
         (logical-slot-continuation-read-slot-inventory
          (logical-slot-continuation-native-proof-slot-root proof)

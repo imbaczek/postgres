@@ -7,6 +7,8 @@
       (values :stable (logical-slot-continuation-decode bytes))
       (values :prepared (logical-slot-continuation-prepared-decode bytes))))
 
+;; Classify the selected generation against the child rows only.  Partitioning
+;; also validates the ordinary rows in the complete disk inventory.
 (defun logical-slot-continuation-cold-classify (kind model rows binding certificate host)
   (let ((children (logical-slot-continuation-partition-rows rows certificate host)))
     (ecase kind

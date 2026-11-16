@@ -1,5 +1,8 @@
 (in-package #:pg)
 
+;; Ordinary slots admitted alongside the continuation must be persistent
+;; physical slots. Validate their state and any reserved restart against the
+;; current history.
 (defun logical-slot-continuation-check-ordinary-slot (slot system-id history frontier)
   (unless (and (wal-replication-slot-p slot) (wal-physical-slot-p slot)
                (not (wal-replication-slot-temporary-p slot)))
@@ -20,6 +23,9 @@
    registry)
   t)
 
+;; Split the full saved inventory into certified child rows and ordinary
+;; physical rows, preserving their order.  Check names, child state and physical
+;; positions before returning either list.
 (defun logical-slot-continuation-partition-rows (rows certificate host)
   (logical-slot-copy-descriptor-list-count rows +logical-slot-continuation-obligation-limit+)
   (logical-slot-copy-descriptor-list-count
