@@ -65,6 +65,8 @@ class ColdPlanContracts(unittest.TestCase):
                     [{'case': 'happy', 'proof': 'prepare', 'cut': 'after-state-sync'}],
                     [{'case': 'happy', 'proof': 'reconcile', 'cut': 'unknown'}],
                     [{'case': 'happy', 'proof': 'reconcile', 'cut': False}],
+                    [{'case': 'happy', 'proof': 'publish', 'cut': 'after-state-sync'}],
+                    [{'case': 'happy', 'proof': 'reconcile', 'cut': 'after-commit'}],
                     [{'case': 'happy', 'label': '../outside'}],
                     [{'case': 'happy', 'label': ''}],
                     [{'case': 'happy', 'variant_root': 7}],
@@ -185,8 +187,11 @@ class ColdPlanContracts(unittest.TestCase):
         self.assertEqual(7, results[0]['exit_code'])
         self.assertFalse(results[0]['passed'])
 
-    def crash_children(self, *, first_exit=-9, changed_seal=False):
-        row = dict(case='happy', proof='reconcile', cut='slot-state-after-unlink')
+    def crash_children(self, *, first_exit=-9, changed_seal=False, proof='reconcile',
+                       spill=False, missing_spill=False):
+        row = dict(case='happy', proof=proof, spill=spill,
+                   cut='after-commit' if proof == 'publish' else 'slot-state-after-unlink')
+        prefix = native.PROOF_MARKERS[proof]
         env = dict(PG_NATIVE_COLD_RECONCILE_CUT=row['cut'], PG_NATIVE_COLD_APPEND='1')
         calls = []
 
@@ -194,11 +199,15 @@ class ColdPlanContracts(unittest.TestCase):
             self.assertEqual((12, 11, 10), (lease, run_lock, workspace))
             calls.append((command, dict(actual), log))
             seal = 'CCDD' if changed_seal and len(calls) == 2 else 'AABB'
-            text = 'NATIVE-COLD-RECONCILIATION-EXPECTED ' + seal + '\n'
+            text = prefix + '-EXPECTED ' + seal + '\n'
             if len(calls) == 1:
-                text += 'NATIVE-COLD-RECONCILIATION-SIGKILL ' + row['cut'] + '\n'
+                if spill and not missing_spill:
+                    text += 'NATIVE-COLD-SPILL-USED transcript threshold=0\n'
+                text += prefix + '-SIGKILL ' + row['cut'] + '\n'
             else:
-                text += 'NATIVE-COLD-RECONCILIATION PASS case=happy\n'
+                text += prefix + ' PASS case=happy\n'
+                if spill and not missing_spill:
+                    text += 'NATIVE-COLD-SPILL PASS transcripts=2 threshold=0 cleanup-complete\n'
             log.write_text(text)
             return first_exit if len(calls) == 1 else 0
 
@@ -231,6 +240,28 @@ class ColdPlanContracts(unittest.TestCase):
         self.assertNotEqual(0, status)
         self.assertFalse(crash['passed'])
         self.assertFalse(crash['restarts'][0]['passed'])
+
+    def test_publication_crashes_use_the_publication_seal_and_restart_markers(self):
+        calls, (status, _, crash) = self.crash_children(proof='publish', spill=True)
+        self.assertEqual(3, len(calls))
+        self.assertEqual(0, status)
+        self.assertTrue(crash['passed'])
+
+    def test_spill_crash_cannot_pass_without_actual_spill_use_before_death(self):
+        calls, (status, _, crash) = self.crash_children(proof='publish', spill=True,
+                                                      missing_spill=True)
+        self.assertEqual(1, len(calls))
+        self.assertNotEqual(0, status)
+        self.assertFalse(crash['passed'])
+
+    def test_spill_flag_requires_a_real_nonempty_spill_and_cleanup_marker(self):
+        row = dict(proof='publish', case='happy', spill=True)
+        passed = 'NATIVE-COLD-PUBLICATION PASS case=happy\n'
+        self.assertFalse(native.cold_pass_marker(row, passed))
+        self.assertFalse(native.cold_pass_marker(
+            row, passed + 'NATIVE-COLD-SPILL PASS transcripts=0 threshold=0 cleanup-complete\n'))
+        self.assertTrue(native.cold_pass_marker(
+            row, passed + 'NATIVE-COLD-SPILL PASS transcripts=2 threshold=0 cleanup-complete\n'))
 
 
 if __name__ == '__main__':

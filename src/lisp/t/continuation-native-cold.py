@@ -33,6 +33,18 @@ CASE_DEFINITIONS = {
 }
 CASE_DEFINITIONS.update({fault: DEFAULT_CASES[variant] for fault, variant in FAULTS.items()})
 PROOF_MARKERS = {
+    'publish': 'NATIVE-COLD-PUBLICATION',
+    'publish-after-group-pin': 'NATIVE-COLD-PUBLICATION-REFUSAL',
+    'publish-maps-ready': 'NATIVE-COLD-PUBLICATION-REFUSAL',
+    'publish-derived': 'NATIVE-COLD-PUBLICATION-REFUSAL',
+    'publish-prepared': 'NATIVE-COLD-PUBLICATION-REFUSAL',
+    'publish-before-commit': 'NATIVE-COLD-PUBLICATION-REFUSAL',
+    'publish-after-commit': 'NATIVE-COLD-PUBLICATION-REFUSAL',
+    'publish-owner-return': 'NATIVE-COLD-PUBLICATION-REFUSAL',
+    'publish-close': 'NATIVE-COLD-PUBLICATION-REFUSAL',
+    'publish-notify': 'NATIVE-COLD-PUBLICATION-REFUSAL',
+    'publish-before-retirement': 'NATIVE-COLD-PUBLICATION-REFUSAL',
+    'publish-lost-registration': 'NATIVE-COLD-PUBLICATION-REFUSAL',
     'reconcile': 'NATIVE-COLD-RECONCILIATION',
     'reconcile-reenter': 'NATIVE-COLD-RECONCILIATION-REFUSAL',
     'reconcile-after-unlink': 'NATIVE-COLD-RECONCILIATION-REFUSAL',
@@ -64,6 +76,11 @@ COLD_RECONCILIATION_CUTS = {
     'selector-after-directory-sync', 'selector-temporary-durable', 'stable-temporary',
     'stable-selected', 'replacement-after-selected-sync',
     'replacement-after-directory-sync', 'stable-durable',
+}
+COLD_PUBLICATION_CUTS = {
+    'completion-ready', 'before-group-pin', 'after-group-pin', 'maps-ready',
+    'derived', 'prepared', 'before-commit', 'after-commit', 'before-owner-return',
+    'before-old-pin-retirement', 'completed',
 }
 
 
@@ -103,9 +120,9 @@ def cold_plan(environment, campaign):
             raise ValueError('Unknown cold proof mode')
         if case in FAULTS and proof is not None:
             raise ValueError('Cold classification faults require the classification proof mode')
-        if cut is not None and (not isinstance(cut, str) or cut not in COLD_RECONCILIATION_CUTS
-                                or proof != 'reconcile'):
-            raise ValueError('Invalid cold reconciliation crash cut')
+        cuts = {'reconcile': COLD_RECONCILIATION_CUTS, 'publish': COLD_PUBLICATION_CUTS}.get(proof, set())
+        if cut is not None and (not isinstance(cut, str) or cut not in cuts):
+            raise ValueError('Invalid cold crash cut')
         if not isinstance(spill, bool) or not isinstance(root, str) or not root:
             raise ValueError('Invalid cold spill flag or variant root')
         label = entry.get('label', (proof or 'classification') + '-' + case
@@ -138,9 +155,21 @@ def child_environment(base, row):
     return env
 
 
+def cold_spill_required(row):
+    proof = row['proof'] or ''
+    return row.get('spill', False) and (proof in {'prepare', 'pending', 'policy', 'reconcile', 'publish'}
+                                      or proof.startswith(('publish-', 'reconcile-')))
+
+
+def cold_spill_marker(text):
+    return re.search(r'^NATIVE-COLD-SPILL PASS transcripts=[1-9][0-9]* threshold=0 cleanup-complete$',
+                     text, re.MULTILINE) is not None
+
+
 def cold_pass_marker(row, text):
     marker = PROOF_MARKERS[row['proof']] + ' PASS case=' + row['case']
-    return re.search('^' + re.escape(marker) + r'(?:\s|$)', text, re.MULTILINE) is not None
+    return (re.search('^' + re.escape(marker) + r'(?:\s|$)', text, re.MULTILINE) is not None
+            and (not cold_spill_required(row) or cold_spill_marker(text)))
 
 
 def run_cold_children(campaign, command, env, row, log, lease, run_lock, workspace):
@@ -148,10 +177,13 @@ def run_cold_children(campaign, command, env, row, log, lease, run_lock, workspa
     if not row.get('cut'):
         return status, log, None
     text = log.read_text(errors='replace')
-    expected = re.findall(r'^NATIVE-COLD-RECONCILIATION-EXPECTED ([0-9A-Fa-f]+)$', text, re.MULTILINE)
-    cut_marker = 'NATIVE-COLD-RECONCILIATION-SIGKILL ' + row['cut']
+    prefix = PROOF_MARKERS[row['proof']]
+    expected_pattern = '^' + re.escape(prefix) + r'-EXPECTED ([0-9A-Fa-f]+)$'
+    expected = re.findall(expected_pattern, text, re.MULTILINE)
+    cut_marker = prefix + '-SIGKILL ' + row['cut']
     crash = dict(exit_code=status, log=str(log), restarts=[], passed=False)
-    if status != -signal.SIGKILL or cut_marker not in text.splitlines() or len(expected) != 1:
+    if (status != -signal.SIGKILL or cut_marker not in text.splitlines() or len(expected) != 1
+            or (cold_spill_required(row) and 'NATIVE-COLD-SPILL-USED transcript threshold=0' not in text.splitlines())):
         return 1, log, crash
     recovery_env = dict(env)
     recovery_env.pop('PG_NATIVE_COLD_RECONCILE_CUT', None)
@@ -160,8 +192,7 @@ def run_cold_children(campaign, command, env, row, log, lease, run_lock, workspa
         recovered_log = log.with_name(log.stem + '-restart-' + str(attempt) + log.suffix)
         status = campaign.wait_child(command, recovery_env, recovered_log, lease, run_lock, workspace)
         recovered_text = recovered_log.read_text(errors='replace')
-        actual = re.findall(r'^NATIVE-COLD-RECONCILIATION-EXPECTED ([0-9A-Fa-f]+)$',
-                            recovered_text, re.MULTILINE)
+        actual = re.findall(expected_pattern, recovered_text, re.MULTILINE)
         passed = status == 0 and actual == expected and cold_pass_marker(row, recovered_text)
         crash['restarts'].append(dict(exit_code=status, log=str(recovered_log), passed=passed))
         if not passed:
@@ -218,11 +249,13 @@ def main():
                      '--non-interactive', '--eval', load],
                     child_env, row, log, lease, run_lock, workspace)
             assert before == writer.tree_image(variant), 'Preserved writer variant changed'
-            passed = status == 0 and cold_pass_marker(row, log.read_text(errors='replace'))
+            log_text = log.read_text(errors='replace')
+            passed = status == 0 and cold_pass_marker(row, log_text)
             results.append(dict(case=case, exit_code=status, wall_seconds=time.monotonic() - start,
                                 log=str(log), input_variant=str(variant), observed=str(observed),
                                 source=frozen['image'], proof_mode=row['proof'], label=label,
-                                spill=row['spill'], cut=row.get('cut'), crash=crash, passed=passed))
+                                spill=row['spill'], spill_exercised=cold_spill_marker(log_text),
+                                cut=row.get('cut'), crash=crash, passed=passed))
             campaign.write_json(logs / 'native-cold-results.json', results)
             if not passed:
                 raise RuntimeError('Cold case failed: ' + str(log))
