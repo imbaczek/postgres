@@ -17,6 +17,8 @@
   (make-hash-table :test #'eq :weakness :key :synchronized t))
 
 (defun logical-slot-startup-inventory-dispatch (inventory operation &optional source)
+  ;; Dispatch only the registered capability. Loss of registration must not
+  ;; fall back to the ordinary disk inventory path.
   (let ((state (and (logical-slot-startup-inventory-p inventory)
                     (gethash inventory *logical-slot-startup-inventories*))))
     (unless (and (functionp state) (eq state (logical-slot-startup-inventory-state inventory)))
@@ -139,6 +141,7 @@ promotion may explicitly skip the local workspace; incoming images stay strict."
   "Capture startup source facts after independently checking the context.
 Child-owned candidates require history even when all are lost. Capture alone
 publishes nothing and does not authorize imported use."
+  ;; Preflight before binding this one-use inventory to the imported source.
   (when inventory
     (unless capture (error "selected inventory requires an imported capture"))
     (logical-slot-startup-inventory-dispatch inventory :preflight))

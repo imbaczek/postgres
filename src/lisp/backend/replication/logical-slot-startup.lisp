@@ -62,8 +62,9 @@ capacity, standby and progress checks. Publication is separate."
     restored))
 
 (defun logical-slot-startup-check-inventory (source)
-  ;; Compare disk bytes with the captured inventory after allowed temporary
-  ;; physical slot cleanup, while retaining startup authority.
+  ;; A selected inventory observes its own captured rows; ordinary startup
+  ;; compares disk bytes after allowed temporary physical slot cleanup. Both
+  ;; retain startup authority throughout the check.
   (logical-slot-startup-check-authority source)
   (when (logical-slot-startup-source-inventory source)
     (logical-slot-startup-inventory-call source :observe)

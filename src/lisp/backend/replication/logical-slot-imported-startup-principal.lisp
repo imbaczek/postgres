@@ -54,6 +54,7 @@ require the registered capture."
 (defvar *logical-slot-imported-startup-principals* nil)
 
 (defun logical-slot-imported-startup-source-fields (source)
+  ;; Include capability identity in the principal's frozen source fields.
   (list (logical-slot-startup-source-inventory source)
         (logical-slot-imported-startup-source-capture source)
         (logical-slot-startup-source-gate-owner source)

@@ -16,6 +16,8 @@
 
 (defun call-with-logical-slot-continuation-cold-source
     (gate ownership storage reservation function)
+  ;; Turn the actual cold observation into a scoped imported source.  The
+  ;; caller retains startup ownership; the capability only checks inventory.
   (call-with-logical-slot-continuation-cold-observation
    storage reservation
    (lambda (observation actual recheck)
@@ -29,6 +31,8 @@
             (active t) (failed nil) (thread sb-thread:*current-thread*) (mutex *wal-lock*))
        (funcall recheck)
        (labels ((state (operation candidate source)
+                  ;; Reject copies and foreign callers before sticky failure can
+                  ;; revoke the genuine source. Expired checks do no disk I/O.
                   (unless (and (eq inventory candidate) (eq thread sb-thread:*current-thread*)
                                (eq mutex *wal-lock*))
                     (error "cold startup inventory changed identity, thread or WAL mutex"))
@@ -83,6 +87,10 @@
 
 (defun call-with-logical-slot-continuation-cold-source-readers
     (storage source observation archive check-source function)
+  ;; S is the selected sealed end and L the observed durable horizon (S <= L).
+  ;; Each reserved slot reads continuously from its start through L, carrying
+  ;; pending transactions across any D, F and S seams it crosses. Reprove
+  ;; before returning outward.
   (let* ((facts (logical-slot-continuation-storage-call storage :facts))
          (snapshot (logical-slot-continuation-copy (getf observation :snapshot)))
          (horizon (getf observation :horizon)))
@@ -147,6 +155,9 @@
        :boundaries #'boundaries :end horizon :batch-policy :logical-reader :require-closed nil))))
 
 (defun call-with-logical-slot-continuation-cold-reconstruction (gate ownership function)
+  ;; Reconstruct every saved reserved candidate privately through the actual
+  ;; durable horizon L before the callback. This scope alone grants no slot
+  ;; eligibility, publication or admission.
   (call-with-logical-slot-continuation-cold-context
    gate ownership
    (lambda (storage reservation archive)

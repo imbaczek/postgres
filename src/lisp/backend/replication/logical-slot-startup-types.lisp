@@ -10,6 +10,8 @@
 (defstruct (logical-slot-startup-inventory
             (:constructor %make-logical-slot-startup-inventory)
             (:print-function physical-libpq-print-private-object))
+  ;; Opaque, scoped observation capability; it grants no eligibility,
+  ;; readiness or publication authority.
   (state nil :read-only t))
 
 (defstruct (logical-slot-startup-source (:constructor %make-logical-slot-startup-source))
