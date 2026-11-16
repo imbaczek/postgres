@@ -88,6 +88,8 @@
     t))
 
 (defun logical-slot-continuation-read-saved-rows (storage)
+  ;; Runtime observes the held slot root; startup retains its existing inventory
+  ;; path.  Both return saved bytes for the later continuation checks.
   (logical-slot-continuation-storage-check storage)
   (let ((rows
           (if (logical-slot-continuation-runtime-storage-p storage)

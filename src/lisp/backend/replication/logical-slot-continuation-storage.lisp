@@ -69,6 +69,10 @@
 
 (defun call-with-logical-slot-continuation-directory-binding
     (root name function mutable-directory label)
+  ;; Borrow the parent and own the child descriptor for this thread and scope.
+  ;; Check held and named facts around the callback; mutable directories may
+  ;; change contents but must keep their identity.  The local check expires on
+  ;; return and is suitable under the WAL lock.  WAL and slot roots share it.
   (call-with-logical-slot-copy-source-proof-fd
    root name t
    (lambda (directory facts)
@@ -91,6 +95,8 @@
    :mutable-directory mutable-directory))
 
 (defun call-with-logical-slot-continuation-target-directory (root name guard function)
+  ;; Lend one named slot directory and combine its local binding check with
+  ;; the caller's guard.  The parent is borrowed and the child is scope-owned.
   (unless (and (slot-state-valid-name-p name) (functionp guard) (functionp function))
     (error "continuation target directory requires a slot name and callbacks"))
   (funcall guard)
