@@ -1,5 +1,10 @@
 (in-package #:pg)
 
+;; Retire an exact typed temporary under the caller's guard, which supplies
+;; the authority this module does not have.  The parent directory is borrowed;
+;; the temporary descriptor is owned for the scope.  Unlink is not rolled back
+;; on failure, and a receipt requires the directory sync to have completed.
+
 (defvar *logical-slot-continuation-retirement-test-hook* nil)
 
 (defun logical-slot-continuation-retirement-point (point purpose)
@@ -42,6 +47,9 @@
 
 (defun call-with-logical-slot-continuation-temporary-retirement
     (directory purpose expected guard function)
+  ;; Retire only the typed temporary whose held inode and bytes were observed.
+  ;; The guard remains live throughout; a receipt requires directory fsync.
+  ;; Failure poisons this scope, including after unlink but before sync.
   (declare (notinline logical-slot-copy-unlinkat sb-posix:fsync))
   (multiple-value-bind (name maximum)
       (ecase purpose

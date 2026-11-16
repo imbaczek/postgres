@@ -1,5 +1,10 @@
 (in-package #:pg)
 
+;; Reconcile the observed selected generation under the startup ownership scope.
+;; This context borrows descriptors and check callbacks and owns private copies
+;; of the expected ledgers.  Only the active row or resource may change during
+;; an effect; the context expires when its enclosing scope exits.
+
 (defstruct (logical-slot-continuation-cold-reconciliation
             (:constructor %make-logical-slot-continuation-cold-reconciliation)
             (:print-function physical-libpq-print-private-object))
@@ -144,6 +149,8 @@
 
 (defun logical-slot-continuation-cold-reconciliation-with-context
     (storage preparation observation registry image check-tail check-sidecar)
+  ;; The context owns the checked inventory only within this thread and scope.
+  ;; Recheck the selected bytes, WAL proof and empty registry around effects.
   (logical-slot-continuation-storage-call
    storage :with-cold-slot-root
    (lambda (directory check-directory)
@@ -199,6 +206,8 @@
     (logical-slot-continuation-copy (getf observation :snapshot))))
 
 (defun logical-slot-continuation-cold-reconcile (gate ownership)
+  ;; This entry reconciles disk only: it retains F and leaves the registry empty.
+  ;; Preparation expires on return, before any later publication integration.
   (call-with-logical-slot-startup-publication-owner
    gate ownership
    (lambda (owner)

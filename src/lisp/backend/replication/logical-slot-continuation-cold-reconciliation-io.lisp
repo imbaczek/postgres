@@ -1,5 +1,8 @@
 (in-package #:pg)
 
+;; Make the selected state durable, retire observed temporaries, then stabilize
+;; the selector.  File and directory syncs preserve that order across crashes.
+
 (defun logical-slot-continuation-cold-reconciliation-sync-row (context row)
   (declare (notinline sb-posix:fsync))
   (let ((root (logical-slot-continuation-cold-reconciliation-slot-root context))
@@ -94,6 +97,9 @@
     (logical-slot-continuation-cold-reconciliation-point context :stable-durable)))
 
 (defun logical-slot-continuation-cold-reconciliation-execute-io (context)
+  ;; As in slot.c RestoreSlotFromDisk and SaveSlotToPath, durable state needs
+  ;; file and directory syncs.  Here the selected generation and exact typed
+  ;; temporaries also determine what may be retired before stabilizing it.
   (declare (notinline sb-posix:fsync))
   (logical-slot-continuation-cold-reconciliation-point context :before-effects)
   (dolist (row (logical-slot-continuation-cold-reconciliation-ledger context))

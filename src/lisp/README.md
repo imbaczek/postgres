@@ -1341,6 +1341,13 @@ containing both writer variants:
 ]
 ```
 
+A row with `proof` set to `reconcile` may also specify `cut` for a
+whitelisted reconciliation SIGKILL boundary, such as `after-state-sync`.
+The first child must actually die from SIGKILL at that boundary; two fresh
+process restarts then compare the exact selected bytes. Normal reconciliation
+also tests twice in the same image; those checks are distinct from the fresh
+process crash restarts.
+
 The runner validates the plan and owned RAM roots before starting children. Each
 row gets a fresh SBCL image and working namespace, while the job's private cache
 is reused. Proof, fault, append and spill settings are reset for each row. The
