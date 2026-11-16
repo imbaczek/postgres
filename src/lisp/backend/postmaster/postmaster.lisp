@@ -188,6 +188,8 @@ Registry removal is conditional on exact ownership; repeated cleanup is safe."
   ;; admission. Remove its token here as a final guarantee that teardown cannot
   ;; retain the backend. Acquire the live-operation lock before the registry
   ;; lock, matching cancel-target lookup, but release it before taking the latter.
+  ;; Retire lifetime tokens under WAL exclusion first, then release that lock
+  ;; before taking the live-operation and registry locks during teardown.
   (sb-sys:without-interrupts
     (sb-thread:grab-mutex *wal-lock*)
     (unwind-protect (backend-lifetime-retire-under-wal-lock backend)
