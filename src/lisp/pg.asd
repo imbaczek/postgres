@@ -429,6 +429,7 @@
                    (:file "../replication/logical-slot-continuation-selector-startup")
                    (:file "../replication/logical-slot-continuation-transcript")
                    (:file "../replication/logical-slot-continuation-boundaries")
+                   (:file "../replication/logical-slot-continuation-partition")
                    (:file "../replication/logical-slot-continuation-active-startup")
                    (:file "../replication/logical-slot-continuation-reader")
                    (:file "../replication/logical-slot-startup-publication-image")
