@@ -19,6 +19,8 @@
   (let ((previous *wal-durable-lsn*) (end nil)
                                      (group (gethash *wal-replication-slots* *logical-slot-continuation-protection-registries*)))
     (with-wal-critical
+      (when (equal "happy-abandoned" (uiop:getenv "PG_NATIVE_WRITER_CASE"))
+        (wal-append-batch-start))
       (wal-append-batch-start)
       (setf end (wal-append-record +wal-record-maintenance+ 0
                                    (make-array 0 :element-type '(unsigned-byte 8))))
@@ -150,7 +152,8 @@
       (assert (equal opened (list output)))
       (format t "~&NATIVE-WRITER-FDS PASS sole-new-descriptor=~s target=~s~%"
               output (sb-posix:readlink (namestring output))))
-    (format t "~&NATIVE-WRITER PASS case=happy generations=2,3 child-wal noop beta-preserved no-fd-leak~%")))
+    (format t "~&NATIVE-WRITER PASS case=~a generations=2,3 child-wal noop beta-preserved no-fd-leak~%"
+            (uiop:getenv "PG_NATIVE_WRITER_CASE"))))
 
 (defun native-host-writer-with-io-fault (case inject function)
   (let ((close (symbol-function 'sb-posix:close))
@@ -298,7 +301,7 @@
   (handler-case
       (let ((case (uiop:getenv "PG_NATIVE_WRITER_CASE")))
         (cond
-          ((equal case "happy") (native-host-writer-happy))
+          ((member case '("happy" "happy-abandoned") :test #'equal) (native-host-writer-happy))
           ((equal case "parent-before-D") (native-host-writer-parent-before-d))
           ((assoc case '(("prepared-close" . "prepared-durable")
                          ("p7-close" . "p7-durable") ("stable-close" . "stable-durable")

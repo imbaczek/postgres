@@ -59,7 +59,7 @@
                              (recheck)))))
                   (sb-sys:without-interrupts (setf active nil))))))))))))
 
-(defun call-with-logical-slot-continuation-cold-state (gate ownership function)
+(defun call-with-logical-slot-continuation-cold-context (gate ownership function)
   ;; Hold the actual startup owner and restored origin around the reservation
   ;; and observation.  Failure, including late close, retains the fork pin;
   ;; this scope does not open automatic loading, ACK or WAL retirement.
@@ -76,14 +76,13 @@
                     (logical-slot-continuation-storage-call
                      storage :with-origin
                      (lambda (archive)
-                       (declare (ignore archive))
                        (let ((reservation (logical-slot-continuation-ensure-cold-reservation storage failure)))
                          (when *logical-slot-continuation-cold-test-hook*
                            (funcall *logical-slot-continuation-cold-test-hook* :reservation-returned reservation))
                          (when *logical-slot-continuation-cold-test-hook*
                            (funcall *logical-slot-continuation-cold-test-hook* :protected reservation))
                          (multiple-value-prog1
-                             (call-with-logical-slot-continuation-cold-observation storage reservation function)
+                             (funcall function storage reservation archive)
                            (when *logical-slot-continuation-cold-test-hook*
                              (funcall *logical-slot-continuation-cold-test-hook* :after-observation reservation)))))))))
              (progn
@@ -94,3 +93,11 @@
           (if (sb-thread:holding-mutex-p mutex)
               (funcall (car failure))
               (sb-thread:with-mutex (mutex) (funcall (car failure)))))))))
+
+(defun call-with-logical-slot-continuation-cold-state (gate ownership function)
+  (unless (functionp function) (error "cold continuation requires a callback"))
+  (call-with-logical-slot-continuation-cold-context
+   gate ownership
+   (lambda (storage reservation archive)
+     (declare (ignore archive))
+     (call-with-logical-slot-continuation-cold-observation storage reservation function))))

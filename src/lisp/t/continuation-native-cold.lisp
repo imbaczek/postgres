@@ -230,13 +230,87 @@
     (format t "~&NATIVE-COLD-CLASSIFICATION PASS case=~a refusal=~s persistent-F uncertain no-cleanup no-fd-leak~%"
             (uiop:getenv "PG_NATIVE_COLD_CASE") caught)))
 
+(defun native-host-cold-parent-boundaries (gate ownership)
+  (let ((files (native-host-cold-file-image)) (fds (native-host-writer-open-fds))
+                                              (proved nil))
+    (call-with-logical-slot-continuation-cold-context
+     gate ownership
+     (lambda (storage reservation archive)
+       (call-with-logical-slot-continuation-cold-observation
+        storage reservation
+        (lambda (observation actual check)
+          (assert (eq actual reservation))
+          (let* ((facts (logical-slot-continuation-storage-call storage :facts))
+                 (snapshot (getf observation :snapshot))
+                 (requests (logical-slot-continuation-saved-boundaries snapshot (getf facts :certificate))))
+            (assert (member '(:confirmed 29061 1 :prefix-end) requests :test #'equal))
+            (assert (member '(:restart 29061 1 :prefix-end) requests :test #'equal))
+            (assert (null (logical-slot-continuation-prove-parent-boundaries
+                           storage facts archive
+                           (cons '(:confirmed 29285 1 :prefix-end) requests))))
+            (funcall check)
+            (setf proved t))))))
+    (assert proved)
+    (assert (equalp files (native-host-cold-file-image)))
+    (assert (equal fds (native-host-writer-open-fds)))
+    (assert (zerop (hash-table-count *wal-replication-slots*)))
+    (format t "~&NATIVE-COLD-PARENT-BOUNDARIES PASS case=~a target=29061 D=29285 baseline=20430 no-admission no-cleanup~%"
+            (uiop:getenv "PG_NATIVE_COLD_CASE"))))
+
+(defun native-host-cold-selected-boundaries (gate ownership)
+  (let ((files (native-host-cold-file-image)) (fds (native-host-writer-open-fds))
+                                              (proved nil))
+    (call-with-logical-slot-continuation-cold-context
+     gate ownership
+     (lambda (storage reservation archive)
+       (call-with-logical-slot-continuation-cold-observation
+        storage reservation
+        (lambda (observation actual check)
+          (assert (eq actual reservation))
+          (let* ((facts (logical-slot-continuation-storage-call storage :facts))
+                 (snapshot (getf observation :snapshot))
+                 (horizon (getf observation :horizon))
+                 (sealed (first (getf snapshot :sealed-end))))
+            (flet ((boundaries ()
+                     (funcall check)
+                     (logical-slot-continuation-runtime-tail-observer
+                      (second (getf snapshot :origin)) sealed
+                      (logical-slot-continuation-prove-parent-boundaries
+                       storage facts archive
+                       (logical-slot-continuation-saved-boundaries snapshot (getf facts :certificate))
+                       :batch-policy :logical-reader)
+                      :logical-reader)))
+              (call-with-logical-slot-continuation-local-tail-source
+               storage snapshot
+               (lambda (prove check-tail reader guard)
+                 (declare (ignore reader guard))
+                 (funcall prove)
+                 (funcall check-tail)
+                 (funcall check)
+                 (funcall prove))
+               :boundaries #'boundaries :end horizon
+               :batch-policy :logical-reader :require-closed nil))
+            (funcall check)
+            (setf proved t))))))
+    (assert proved)
+    (assert (equalp files (native-host-cold-file-image)))
+    (assert (equal fds (native-host-writer-open-fds)))
+    (assert (zerop (hash-table-count *wal-replication-slots*)))
+    (format t "~&NATIVE-COLD-SELECTED-BOUNDARIES PASS case=~a historical-seal full-horizon reproof no-admission no-cleanup~%"
+            (uiop:getenv "PG_NATIVE_COLD_CASE"))))
+
 (defun native-host-continuation-cold-state (gate ownership)
   (handler-case
       (progn
         (when (uiop:getenv "PG_NATIVE_COLD_APPEND") (native-host-cold-append))
-        (if (uiop:getenv "PG_NATIVE_COLD_FAULT")
-            (native-host-cold-refusal gate ownership (uiop:getenv "PG_NATIVE_COLD_FAULT"))
-            (native-host-cold-classification gate ownership)))
+        (cond
+          ((equal "selected-boundaries" (uiop:getenv "PG_NATIVE_COLD_PROOF"))
+           (native-host-cold-selected-boundaries gate ownership))
+          ((equal "parent-boundaries" (uiop:getenv "PG_NATIVE_COLD_PROOF"))
+           (native-host-cold-parent-boundaries gate ownership))
+          ((uiop:getenv "PG_NATIVE_COLD_FAULT")
+           (native-host-cold-refusal gate ownership (uiop:getenv "PG_NATIVE_COLD_FAULT")))
+          (t (native-host-cold-classification gate ownership))))
     (error (condition)
       (setf *native-cold-test-failure* condition)
       (format t "~&NATIVE-COLD-CLASSIFICATION FAILURE ~a~%" condition)

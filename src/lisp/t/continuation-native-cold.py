@@ -37,6 +37,8 @@ def main():
         'stable-durable-extended': ('stable-durable', 2, 'STABLE', 'STABLE', True),
     }
     cases = os.environ.get('PG_NATIVE_COLD_CASES', ','.join(definitions)).split(',')
+    definitions['parent-before-D'] = ('parent-before-D', 2, 'STABLE', 'STABLE', False)
+    definitions['happy-abandoned'] = ('happy-abandoned', 3, 'STABLE', 'STABLE', False)
     faults = {'corrupt-selector': 'stable-durable', 'changed-beta': 'stable-durable',
               'stable-state-temp': 'stable-durable', 'unrelated-state-temp': 'prepared-durable',
               'wrong-prefix': 'p7-temporary', 'protected': 'stable-durable',
@@ -93,9 +95,12 @@ def main():
             assert before == writer.tree_image(variant), 'Preserved writer variant changed'
             results.append(dict(case=case, exit_code=status, wall_seconds=time.monotonic() - start,
                                 log=str(log), input_variant=str(variant), observed=str(observed),
-                                source=frozen['image']))
+                                source=frozen['image'], proof_mode=env.get('PG_NATIVE_COLD_PROOF')))
             campaign.write_json(logs / 'native-cold-results.json', results)
-            if status or 'NATIVE-COLD-CLASSIFICATION PASS case=' + case not in log.read_text(errors='replace'):
+            marker = {'parent-boundaries': 'NATIVE-COLD-PARENT-BOUNDARIES',
+                      'selected-boundaries': 'NATIVE-COLD-SELECTED-BOUNDARIES',
+                      None: 'NATIVE-COLD-CLASSIFICATION'}[env.get('PG_NATIVE_COLD_PROOF')] + ' PASS case=' + case
+            if status or marker not in log.read_text(errors='replace'):
                 raise RuntimeError('Cold case failed: ' + str(log))
         print('CONTINUATION-NATIVE-COLD PASS ' + json.dumps(results), flush=True)
 

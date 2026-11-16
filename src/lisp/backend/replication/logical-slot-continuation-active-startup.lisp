@@ -169,7 +169,8 @@
          records))
      :segment-reader reader :batch-policy batch-policy)))
 
-(defun call-with-logical-slot-continuation-local-tail-source (storage snapshot function &key boundaries)
+(defun call-with-logical-slot-continuation-local-tail-source (storage snapshot function &key boundaries
+                                                                                          (end (first (getf snapshot :sealed-end))) (batch-policy :strict) (require-closed t))
   ;; Prove the locally present original-child WAL from F to the sealed end.
   ;; The first pass records exact frames and a segment ledger; the second
   ;; compares frames, segment facts and ordered visits.  Hold one segment FD
@@ -179,8 +180,15 @@
   (let* ((history (logical-slot-continuation-history
                    (getf snapshot :history-target) (getf snapshot :history)))
          (fork (second (getf snapshot :origin)))
-         (child (first (getf snapshot :origin)))
-         (end (first (getf snapshot :sealed-end))))
+         (child (first (getf snapshot :origin))))
+    (unless (and (member batch-policy '(:strict :logical-reader))
+                 (typep require-closed 'boolean)
+                 (typep end '(unsigned-byte 64))
+                 (<= (first (getf snapshot :sealed-end)) end
+                     (if (logical-slot-continuation-runtime-storage-p storage)
+                         (logical-slot-continuation-storage-call storage :horizon)
+                         (sixth (logical-slot-continuation-storage-call storage :host)))))
+      (error "continuation local proof exceeds its captured horizon"))
     (logical-slot-continuation-storage-call
      storage :with-local-wal
      (lambda (directory check-directory)
@@ -242,7 +250,8 @@
                                     (let ((records
                                             (unwind-protect
                                                  (logical-slot-continuation-scan-tail
-                                                  history fork child end #'guard #'read-segment spool observe finish)
+                                                  history fork child end #'guard #'read-segment spool observe finish
+                                                  :batch-policy batch-policy :require-closed require-closed)
                                               (close-current))))
                                       (if verify
                                           (unless (equal expected-visits (nreverse visits))
