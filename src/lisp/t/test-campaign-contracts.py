@@ -99,6 +99,7 @@ class CampaignContracts(unittest.TestCase):
         self.assertEqual(['first', 'second'], args.heads)
 
     def test_job_root_is_claimed_once_even_without_a_cache(self):
+        # A failed or cache-free attempt still consumes its private job directory.
         campaign.claim_job(self.root)
         self.assertFalse((self.root / 'cache').exists())
         with self.assertRaises(FileExistsError):
@@ -119,6 +120,7 @@ class CampaignContracts(unittest.TestCase):
                 campaign.job_cache(self.root)
 
     def test_wrapper_preserves_inherited_descriptors_seven_and_nine(self):
+        # The shell wrapper must not replace descriptors held by its caller.
         script = """
 import importlib.util, os, pathlib, subprocess, sys
 spec = importlib.util.spec_from_file_location('campaign', sys.argv[1])
@@ -143,6 +145,7 @@ with c.workspace_lease() as workspace, c.lock(root, 'run.lock', exclusive=True) 
         self.assertEqual(0, result.returncode, result.stderr)
 
     def test_parallel_requires_existing_identity_and_target_inventory(self):
+        # Each target needs its own serially qualified inventory.
         manifests = self.root / 'manifests'
         manifests.mkdir()
         for name in ('image.log', 'unit.log'):
@@ -158,6 +161,7 @@ with c.workspace_lease() as workspace, c.lock(root, 'run.lock', exclusive=True) 
             campaign.require_parallel_manifests(self.root, 'unit')
 
     def test_parallel_run_can_enter_while_another_job_holds_shared_leases(self):
+        # Independent jobs can enter together while retaining shared leases.
         script = """
 import importlib.util, pathlib, sys
 from unittest import mock

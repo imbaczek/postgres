@@ -224,12 +224,14 @@ def wait_child(command, env, log, lease, run_lock, workspace):
 
 
 def claim_job(job):
+    # A job directory is single-use, including when the run never creates a cache.
     fd = os.open(job / 'campaign-job.claim',
                  os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
     os.close(fd)
 
 
 def require_parallel_manifests(root, target):
+    # Parallel jobs only consume manifests published by successful serial runs.
     for name in ('image', target):
         path = root / 'manifests' / (name + '.log')
         if path.is_symlink() or not path.is_file():
@@ -237,6 +239,7 @@ def require_parallel_manifests(root, target):
 
 
 def job_cache(job):
+    # The wrapper must supply this job's private cache, not a shared path.
     home = Path(os.environ.get('XDG_CACHE_HOME', ''))
     if home != job / 'cache' or home.is_symlink() or not home.is_dir():
         raise ValueError('Campaign cache must be the job private cache directory')
@@ -244,6 +247,8 @@ def job_cache(job):
 
 
 def campaign_wrapper(root, executable, inherited):
+    # POSIX shells such as dash need single-digit redirection descriptors.
+    # Leave inherited lease descriptors untouched when choosing two free ones.
     available = [fd for fd in range(3, 10) if fd not in inherited]
     if len(available) < 2:
         raise ValueError('Campaign wrapper has no free shell lock descriptors')
@@ -260,6 +265,7 @@ def run(campaign, target, heads, cold, workspace, parallel=False):
     if root == job:
         raise ValueError('Each campaign job needs its own RAM workspace')
     claim_job(job)
+    # Parallel jobs share read leases; serial jobs exclude them and each other.
     with lock(root, 'run.lock', exclusive=not parallel) as run_lock, \
          lock(root, 'lease.lock', exclusive=not parallel) as lease:
         if not parallel:
@@ -306,6 +312,7 @@ def run(campaign, target, heads, cold, workspace, parallel=False):
         if data['image'] != fingerprint(source):
             raise ValueError('Immutable campaign source changed during the job')
         published = 0
+        # Only a successful serial run may publish manifests or cache additions.
         if result == 0 and not parallel:
             with lock(root, 'cache.lock', exclusive=True):
                 for kind, name in (('image', 'image'), (target, 'suite')):

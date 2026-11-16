@@ -635,8 +635,14 @@ Remove the trace and its temporary helper after the demo:
   `close CAMPAIGN` as described in the README. Each run has a fresh image and
   strict compiler, private cache, and full identity and suite inventory gates.
   Create a new campaign when the checkout revision, dirty source files or checked
-  runtime settings change. Jobs serialize within a campaign. The main test child retains
-  the run, campaign and RAM leases if its coordinator dies; the strict compiler
+  runtime settings change. First qualify the image and each desired target with
+  successful serial runs. Independent jobs may then use `--parallel`, each in a
+  separate RAM wrapper invocation; serial campaign and native work must not overlap
+  them. Parallel jobs only read shared manifests and cache, and have private logs,
+  caches and single-use job directories. Ensure fixture and port independence and
+  count nested images against the eight-image ceiling. A selected physical run is
+  not full physical coverage. The main test child retains the run, campaign and
+  RAM leases if its coordinator dies; the strict compiler
   reacquires campaign and RAM leases. Preserve compact evidence and audit active
   processes before deleting retained campaign files. Full unit runs have used
   3.4–3.8 GiB; eight Lisp images is a ceiling, not a target.

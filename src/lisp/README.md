@@ -1316,11 +1316,38 @@ and use the path printed by `create` in subsequent commands:
 ```
 
 Each run uses a fresh Lisp image and a fresh strict compiler, even when it
-reuses completed parent FASLs. `--cold` skips that cache. Jobs within a campaign
-are serialized, with private caches and a read-only frozen source. A different
+reuses completed parent FASLs. `--cold` skips that cache. Jobs normally serialize,
+with private caches and a read-only frozen source. A different
 checkout revision, dirty source files or checked runtime setting requires a new
 campaign. Image identity and the full registered suite inventory are checked
 before selected heads execute.
+
+To overlap independent jobs, first complete successful serial runs that qualify
+the image and each target you plan to use. Then start each `--parallel` run in
+its own `test-campaign.sh` invocation, outside an existing RAM wrapper, so each
+gets a separate job directory:
+
+```sh
+./t/test-campaign.sh run /absolute/campaign/path unit
+./t/test-campaign.sh run /absolute/campaign/path physical head-name
+```
+
+Run these commands in separate terminals to overlap the jobs and see each
+exit status:
+
+```sh
+./t/test-campaign.sh run /absolute/campaign/path unit --parallel head-one
+./t/test-campaign.sh run /absolute/campaign/path physical --parallel head-two
+```
+
+Parallel jobs read the shared manifests and parent cache but publish neither.
+Each has its own logs and private cache, and claims its job directory once. Serial
+campaign work excludes parallel jobs. Keep native tests separate from campaign
+jobs, and overlap only fixtures with independent state and ports. Count all Lisp
+images, including nested servers and compiler children, against the eight-image
+ceiling; also check available RAM. A successful selected physical run qualifies
+its target inventory but does not mean the full physical suite ran.
+
 The main test child inherits the campaign, run and RAM workspace leases. The
 strict compiler reacquires campaign and workspace leases. Wait for all children
 before cleanup if the coordinator dies. Close retains files for
