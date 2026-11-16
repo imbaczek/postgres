@@ -129,6 +129,44 @@
             (handler-case (progn (backend-lifetime-test-capture backend) nil)
               (error () t)))))))
 
+(rove:deftest backend-lifetime-capture-rejects-another-backends-token
+    (call-with-backend-lifetime-test
+     (lambda ()
+       (let ((backend (backend-lifetime-test-backend))
+             (alias (make-backend :pid 0 :thread sb-thread:*current-thread*)))
+         (register-backend backend)
+         (let ((token (backend-lifetime-test-capture backend)))
+           (setf (gethash alias *backend-lifetimes*) token)
+           (unwind-protect
+                (progn
+                  (rove:ok
+                   (handler-case
+                       (progn (backend-lifetime-test-capture alias) nil)
+                     (error () t)))
+                  (rove:ok (eq token (backend-lifetime-test-check token)))
+                  (rove:ok (eq token (backend-lifetime-test-capture backend))))
+             (remhash alias *backend-lifetimes*)))))))
+
+(rove:deftest backend-lifetime-alias-cleanup-preserves-the-genuine-owner
+    (call-with-backend-lifetime-test
+     (lambda ()
+       (let ((backend (backend-lifetime-test-backend))
+             (alias (make-backend :pid 0 :thread sb-thread:*current-thread*)))
+         (register-backend backend)
+         (register-backend alias)
+         (let ((token (backend-lifetime-test-capture backend)))
+           (setf (gethash alias *backend-lifetimes*) token)
+           (unregister-backend alias)
+           (rove:ok (= 1 *n-backends*))
+           (rove:ok (null (gethash alias *backend-lifetimes*)))
+           (rove:ok (eq backend (gethash (backend-pid backend) *backend-registry*)))
+           (rove:ok
+            (handler-case (eq token (backend-lifetime-test-check token))
+              (error () nil)))
+           (rove:ok
+            (handler-case (eq token (backend-lifetime-test-capture backend))
+              (error () nil))))))))
+
 (rove:deftest backend-lifetime-rejects-fabricated-validator
     (call-with-backend-lifetime-test
      (lambda ()

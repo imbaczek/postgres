@@ -19,6 +19,10 @@
   (backend nil :read-only t)
   (state nil :read-only t))
 
+(defun backend-lifetime-names-backend-p (token backend)
+  (and (backend-lifetime-p token)
+       (eq backend (backend-lifetime-backend token))))
+
 ;; Enroll only the registered backend on its own thread and OS thread ID.
 ;; A DEFVAR reload does not replace an older unsynchronized registry, so refuse
 ;; enrollment in that case.  The closure retains the expected identity facts.
@@ -97,8 +101,10 @@
   (assert (sb-thread:holding-mutex-p *wal-lock*))
   (unless (eq (backend-thread backend) sb-thread:*current-thread*)
     (error "backend lifetime capture requires its owning thread"))
-  (backend-lifetime-check-under-wal-lock
-   (gethash backend *backend-lifetimes*)))
+  (let ((token (gethash backend *backend-lifetimes*)))
+    (unless (backend-lifetime-names-backend-p token backend)
+      (error "backend lifetime capture changed its registered owner"))
+    (backend-lifetime-check-under-wal-lock token)))
 
 ;; Revoke every token for this backend before removing its current binding.
 ;; Lock the seal table while scanning: enrollment writes it under the registry
@@ -108,12 +114,12 @@
   (sb-sys:without-interrupts
     (let ((tokens nil))
       (let ((current (gethash backend *backend-lifetimes*)))
-        (when current (push current tokens)))
+        (when (backend-lifetime-names-backend-p current backend)
+          (push current tokens)))
       (sb-ext:with-locked-hash-table (*backend-lifetime-seals*)
         (maphash (lambda (token state)
                    (declare (ignore state))
-                   (when (and (backend-lifetime-p token)
-                              (eq backend (backend-lifetime-backend token)))
+                   (when (backend-lifetime-names-backend-p token backend)
                      (pushnew token tokens :test #'eq)))
                  *backend-lifetime-seals*))
       (dolist (token tokens)
