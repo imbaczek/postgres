@@ -1,6 +1,8 @@
 (in-package #:pg)
 
 (defun logical-slot-continuation-origin-inputs (binding certificate host)
+  ;; Bound the certificate and host inputs and select the original child's
+  ;; history before using either in a continuation proof.
   (logical-slot-copy-descriptor-list-count certificate 128)
   (logical-slot-continuation-list host 6)
   (logical-slot-copy-descriptor-blob-size binding 1 (logical-slot-copy-source-proof-maximum-bytes))
@@ -19,6 +21,8 @@
   (logical-slot-continuation-history (fifth host) (fourth host)))
 
 (defun logical-slot-continuation-saved-origin-rows (certificate history end rows)
+  ;; Check each saved image against its permanent certificate, returning the
+  ;; ordered inventory and whether any reserved slot still demands WAL.
   (logical-slot-copy-descriptor-list-count rows +logical-slot-continuation-obligation-limit+)
   (unless rows (error "active continuation requires its saved inventory"))
   (dolist (row rows)
@@ -42,6 +46,8 @@
     (values saved demand)))
 
 (defun logical-slot-continuation-active-snapshot (binding certificate host rows)
+  ;; Construct a detached generation 1 bootstrap image.  Later selected
+  ;; generations are checked separately against the saved inventory and host.
   (let ((history (logical-slot-continuation-origin-inputs binding certificate host)))
     (multiple-value-bind (saved demand)
         (logical-slot-continuation-saved-origin-rows certificate history (sixth host) rows)
@@ -57,6 +63,9 @@
 
 (defun logical-slot-continuation-check-selected-snapshot
     (snapshot binding certificate host rows horizon)
+  ;; Support the original child and its local tail.  The selected historical
+  ;; seal may precede the captured durable horizon; compare the exact saved
+  ;; inventory and reject other roots, runs or transfers here.
   (logical-slot-continuation-check snapshot)
   (let* ((history (logical-slot-continuation-origin-inputs binding certificate host))
          (sealed (getf snapshot :sealed-end))

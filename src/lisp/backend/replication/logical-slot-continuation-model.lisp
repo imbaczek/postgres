@@ -4,6 +4,7 @@
   (timeline-check-lineage (timeline-parse-history tip (bytes->string bytes))))
 
 (defun logical-slot-continuation-slot-rows-equal-p (left right)
+  ;; Compare both bounded inventories in order, including exact image bytes.
   (and (= (logical-slot-copy-descriptor-list-count left +logical-slot-continuation-obligation-limit+)
           (logical-slot-copy-descriptor-list-count right +logical-slot-continuation-obligation-limit+))
        (every (lambda (a b) (and (string= (first a) (first b)) (equalp (second a) (second b))))

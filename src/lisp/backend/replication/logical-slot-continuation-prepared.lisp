@@ -1,9 +1,11 @@
 (in-package #:pg)
 
 (defun logical-slot-continuation-prepared-maximum-bytes ()
+  ;; Bound the envelope and its two continuation images before allocation.
   (min (+ 24 #xffffffff) (+ 139 (* 2 (logical-slot-continuation-maximum-bytes)))))
 
 (defun logical-slot-continuation-prepared-slot (bytes name)
+  ;; Require the exact canonical imported child slot image.
   (let ((slot (logical-slot-state-decode bytes name)))
     (unless (and (wal-replication-slot-child-owner slot)
                  (equalp bytes (logical-slot-state-encode slot)))
@@ -11,6 +13,7 @@
     slot))
 
 (defun logical-slot-continuation-prepared-rows (rows)
+  ;; Validate a bounded, ordered complete inventory of canonical slot images.
   (logical-slot-copy-descriptor-list-count rows +logical-slot-continuation-obligation-limit+)
   (let ((prior nil))
     (dolist (row rows)
@@ -24,6 +27,11 @@
   rows)
 
 (defun logical-slot-continuation-prepared-check (record)
+  ;; Check the proposed old-to-new transition; this is not authority to
+  ;; publish it.  The full inventory and topology stay fixed, the generation
+  ;; advances once, and only the named slot may change.  Native confirmation
+  ;; may begin at birth; standard confirmation requires pgoutput and may retain
+  ;; a zero restart floor.  All positions remain within the proof end.
   (logical-slot-continuation-plist
    record '(:version :kind :name :old :new :ack :restart-floor :proof-end))
   (unless (and (eql 1 (getf record :version))
@@ -92,6 +100,9 @@
     (values record size)))
 
 (defun logical-slot-continuation-prepared-classify (record observed)
+  ;; Classify the exact full inventory against the checked old and new rows.
+  ;; A blocked result includes malformed or mixed observations.  This pure
+  ;; comparison does not establish authority to install either image.
   (logical-slot-continuation-prepared-check record)
   (handler-case-noninterrupt
    (progn

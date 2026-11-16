@@ -1,6 +1,8 @@
 (in-package #:pg)
 
 (defun logical-slot-continuation-prepared-encode (record)
+  ;; Encode a checked transition in the bounded, checksummed envelope.
+  ;; Encoding is pure and does not publish or authorize the transition.
   (multiple-value-bind (checked size) (logical-slot-continuation-prepared-check record)
     (declare (ignore checked))
     (let ((bytes (make-array size :element-type '(unsigned-byte 8) :initial-element 0))
@@ -28,6 +30,7 @@
       bytes)))
 
 (defun logical-slot-continuation-prepared-check-envelope (bytes)
+  ;; Check the envelope bounds, framing and checksum before decoding fields.
   (unless (and (typep bytes '(vector (unsigned-byte 8)))
                (<= 24 (length bytes) (logical-slot-continuation-prepared-maximum-bytes))
                (equalp (subseq bytes 0 16) #(80 71 76 79 71 67 79 78 84 80 82 69 80 49 0 0))
@@ -37,6 +40,8 @@
   bytes)
 
 (defun logical-slot-continuation-prepared-decode (bytes)
+  ;; Decode bounded fields and require an exact canonical re-encoding.
+  ;; A valid record still needs the caller's live authority checks.
   (logical-slot-continuation-prepared-check-envelope bytes)
   (let ((position 20) (end (- (length bytes) 4)))
     (labels ((take (count)

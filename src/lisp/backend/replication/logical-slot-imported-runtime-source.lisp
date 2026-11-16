@@ -38,9 +38,9 @@
      (call-with-logical-slot-continuation-storage-context
       owner context facts check under-lock function archive))))
 
-;; Compare the selected snapshot with the historical host image at its seal S.
-;; Change only the detached host copy; neither S in the snapshot nor live host
-;; globals are rewritten to make the current durable end look historical.
+;; Check the selected historical seal S against the captured durable horizon L
+;; and the live original-child host and saved inventory.  S remains independent
+;; of L; storage checks bracket the validation.
 
 (defun logical-slot-continuation-check-runtime-snapshot (storage facts snapshot)
   (unless (logical-slot-continuation-runtime-storage-p storage)
