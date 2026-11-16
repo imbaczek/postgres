@@ -19,6 +19,8 @@
   (backend nil :read-only t)
   (state nil :read-only t))
 
+;; Test the token's immutable backend association.  This does not check that
+;; the lifetime is live or grants authority.
 (defun backend-lifetime-names-backend-p (token backend)
   (and (backend-lifetime-p token)
        (eq backend (backend-lifetime-backend token))))
@@ -113,6 +115,7 @@
   (assert (sb-thread:holding-mutex-p *wal-lock*))
   (sb-sys:without-interrupts
     (let ((tokens nil))
+      ;; Ignore a foreign alias; the seal scan also finds this backend's tokens.
       (let ((current (gethash backend *backend-lifetimes*)))
         (when (backend-lifetime-names-backend-p current backend)
           (push current tokens)))
