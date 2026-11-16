@@ -1,6 +1,9 @@
 (in-package #:pg)
 
 (defun logical-slot-continuation-writer-base-check (context)
+  ;; Keep the registry, mirrors and group's private selection cell stable.
+  ;; Before publication its car is the old selection and cdr is the writer;
+  ;; afterwards the car is the new image and the cdr is clear.
   (with-continuation-writer-context
       (context writer proof group registry before after mirrors cell old-selection new-image phase)
     (logical-slot-continuation-native-proof-check-under-lock proof)
@@ -28,6 +31,8 @@
          (error "continuation writer selected inode or bytes changed"))))))
 
 (defun logical-slot-continuation-writer-guard (context)
+  ;; Guard unchanged members and the selected inode through PREPARED and P7N.
+  ;; An active replacement checks its own named file and exact inode receipt.
   (logical-slot-continuation-writer-base-check context)
   (with-continuation-writer-context
       (context slot-root ledger name target-row slot-resource selector-resource)
@@ -55,6 +60,7 @@
         (error "continuation writer did not preserve its exact new inventory")))))
 
 (defun logical-slot-continuation-writer-recheck-before-intent (context operation)
+  ;; Recheck the fresh plan, pending state and exact selector inode before intent.
   (with-continuation-writer-context
       (context proof prepared-image candidate ledger selected-facts)
     (multiple-value-bind (fresh next observed facts)
@@ -70,6 +76,8 @@
         (error "continuation writer preflight changed before intent")))))
 
 (defun logical-slot-continuation-writer-replace-selector (context)
+  ;; Install PREPARED first and the stable new selector after P7N is durable.
+  ;; Each replacement scope closes before the next phase begins.
   (with-continuation-writer-context
       (context directory selector-resource selected-image selected-facts
                prepared-image new-image phase flags)
@@ -107,6 +115,7 @@
     (logical-slot-continuation-writer-point context phase)))
 
 (defun logical-slot-continuation-writer-replace-slot (context)
+  ;; Install and sync P7N, including the outer slot root, before advancing.
   (declare (notinline sb-posix:fsync))
   (with-continuation-writer-context
       (context target-directory slot-root slot-resource target-row name
@@ -142,6 +151,8 @@
     (logical-slot-continuation-writer-point context :p7-durable)))
 
 (defun logical-slot-continuation-writer-publish (context receipt)
+  ;; Publish live state only after all replacement scopes have closed and the
+  ;; new inventory and candidate have been checked again.
   (with-continuation-writer-context
       (context writer group slot candidate new-slot-image after cell new-image flags phase)
     (unless (and (eq phase :publication-ready)
@@ -172,6 +183,7 @@
     slot))
 
 (defun logical-slot-continuation-writer-run (context)
+  ;; Complete the three durable replacements in order before live publication.
   (with-continuation-writer-context (context writer receipt group phase slot)
     (unless (eq phase :registered) (error "continuation writer was already started"))
     (logical-slot-continuation-protection-call group :begin writer)

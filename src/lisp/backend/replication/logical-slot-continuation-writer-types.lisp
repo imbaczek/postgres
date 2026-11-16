@@ -5,15 +5,18 @@
 (defstruct (logical-slot-continuation-writer
             (:constructor %make-logical-slot-continuation-writer)
             (:print-function physical-libpq-print-private-object))
+  ;; Opaque, registered operation; its state checks thread and scope.
   (state nil :read-only t))
 
 (defstruct (logical-slot-continuation-writer-receipt
             (:constructor %make-logical-slot-continuation-writer-receipt)
             (:print-function physical-libpq-print-private-object))
+  ;; Private publication capability, valid only for its registered writer.
   (writer nil :read-only t))
 
 (defstruct (logical-slot-continuation-writer-control
             (:constructor %make-logical-slot-continuation-writer-control))
+  ;; Outer lifetime and failure capability, retained through source cleanup.
   (state nil :read-only t))
 
 (defvar *logical-slot-continuation-writer-controls* nil)
@@ -33,6 +36,7 @@
 
 (defstruct (logical-slot-continuation-writer-context
             (:constructor %make-logical-slot-continuation-writer-context))
+  ;; Private state shared by the checked phases; callers cannot substitute it.
   writer receipt proof group record candidate ledger target-row
   slot name directory slot-root target-directory old-slot-image new-slot-image
   old-image prepared-image new-image selected-image selected-facts

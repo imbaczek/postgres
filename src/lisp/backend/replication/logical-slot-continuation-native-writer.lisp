@@ -13,6 +13,7 @@
    before))
 
 (defun logical-slot-continuation-writer-make-context (proof group record candidate ledger facts flags)
+  ;; Capture the private images and live registry facts used by every phase.
   (let* ((slot (wal-retained-slot-scan-slot (logical-slot-continuation-native-proof-scan proof)))
          (name (getf record :name)) (before (logical-slot-publication-registry-image *wal-replication-slots*)))
     (%make-logical-slot-continuation-writer-context
@@ -32,6 +33,8 @@
      :mirrors (logical-slot-publication-mirrors) :flags flags)))
 
 (defun logical-slot-continuation-native-writer-from-proof (proof control)
+  ;; An unchanged confirmation returns without writing.  Before intent, a
+  ;; registered writer may cancel; after intent failure uses the outer control.
   (logical-slot-continuation-writer-control-call control :alive)
   (multiple-value-bind (group record candidate ledger added facts)
       (logical-slot-continuation-ensure-native-protection-under-lock proof)
@@ -110,6 +113,10 @@
                 (remhash writer *logical-slot-continuation-writer-identities*)))))))))
 
 (defun logical-slot-continuation-native-acknowledge (name target &optional expected-owner)
+  ;; Serialize the entire lifetime outside WAL, retaining failure cleanup through
+  ;; proof and source close even after live publication.  The persistent fork
+  ;; pin remains; this operation does not retire WAL or enable public ACK and
+  ;; automatic recovery paths.
   (unless (and (wal-valid-replication-slot-name-p name) (typep target '(unsigned-byte 64)))
     (ereport "22023" "invalid imported native acknowledgment"))
   (when (or (sb-thread:holding-mutex-p *wal-lock*)
