@@ -60,6 +60,9 @@ This private cursor does not validate the archive or confer authority."
        :end fork :directory directory :reader reader :on-record visit)
       (funcall finish))))
 
+;; The first value contains the replay boundary facts; the second carries the
+;; last completed logical fact and checkpoint for a continuation seed.
+
 (defun logical-slot-copy-source-proof-scan-archive (facts directory reader)
   ;; Replay from the embedded D checkpoint seed to clean F and compare the
   ;; resulting fact.  This is a historical observation, not promotion authority.

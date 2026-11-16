@@ -85,6 +85,9 @@
              (setf active nil)
              (remhash inventory *logical-slot-startup-inventories*))))))))
 
+;; The first child EOR can follow a legal segment gap.  Keep the original fork
+;; F as the selection boundary even when the EOR starts after it.
+
 (defun logical-slot-continuation-cold-select-child (candidate record raw fork parent child history)
   (unless (and (= (wal-record-start record) (logical-wal-eor-position fork))
                (= (wal-record-type record) +wal-record-end-of-recovery+))
@@ -92,6 +95,10 @@
   (setf (physical-store-selection candidate)
         (list :history history :target child :parent parent :fork fork
               :eor-bytes raw :previous (physical-store-selection candidate))))
+
+;; Replay the genuine archive from D through F to seed physical replay from F
+;; through L.  This checks child initialization and returns the completed policy
+;; for slot lifetime checks; it grants no admission or publication authority.
 
 (defun logical-slot-continuation-cold-policy (facts snapshot horizon archive map-records)
   (let* ((certificate (getf facts :certificate))
@@ -141,6 +148,9 @@
           (physical-logical-check-fact
            (getf final :logical-fact) history (getf result :terminal) child)
           (list :horizon horizon :result result :completed final))))))
+
+;; :POLICY requests the completed replay policy as an additional callback
+;; argument.  Reprove it and the live source before leaving this scope.
 
 (defun call-with-logical-slot-continuation-cold-source-readers
     (storage source observation archive check-source function &key policy)
@@ -221,10 +231,12 @@
                     (sb-sys:without-interrupts (setf active nil)))))))))
        :boundaries #'boundaries :end horizon :batch-policy :logical-reader :require-closed nil :transcript policy))))
 
+;; :POLICY also checks each saved slot's lifetime against the proved policy.
+
 (defun call-with-logical-slot-continuation-cold-reconstruction (gate ownership function &key policy)
   ;; Reconstruct every saved reserved candidate privately through the actual
-  ;; durable horizon L before the callback. This scope alone grants no slot
-  ;; eligibility, publication or admission.
+  ;; durable horizon L before the callback. This scope does not publish slots
+  ;; or grant admission.
   (call-with-logical-slot-continuation-cold-context
    gate ownership
    (lambda (storage reservation archive)

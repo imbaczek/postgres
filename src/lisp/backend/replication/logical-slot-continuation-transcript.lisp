@@ -19,6 +19,10 @@
     (replace frame raw :start1 40)
     frame))
 
+;; Map private transcript bytes only within the sealed interval, on the owning
+;; thread and during this scope.  Replay uses simulated state, so the mapper does
+;; not run live guards; callers perform live checks and reproof outside replay.
+
 (defun call-with-logical-slot-continuation-transcript-reader (spool start end function)
   (unless (and (typep start '(unsigned-byte 64)) (typep end '(unsigned-byte 64))
                (<= start end) (functionp function) (logical-spool-sealed-p spool))

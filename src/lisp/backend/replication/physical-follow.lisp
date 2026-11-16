@@ -526,12 +526,18 @@ Return nine values, including optional resource, FPW and logical facts."
               (physical-restartpoint-fpw-seed metadata base store start)
               (physical-restartpoint-logical-seed metadata base store start)))))
 
+;; Keep optional policy facts at the applied and required boundaries.
+
 (defun physical-follow-scan-policy-fields (applied-fpw required-fpw applied-logical required-logical)
   (append
    (when (or applied-fpw required-fpw)
      (list :applied-fpw-fact applied-fpw :required-fpw-fact required-fpw))
    (when (or applied-logical required-logical)
      (list :applied-logical-fact applied-logical :required-logical-fact required-logical))))
+
+;; The first value retains the applied and required boundary facts.  The second
+;; value holds the logical fact and checkpoint at the last completed boundary.
+;; With an open tail, terminal T can precede the fully consumed horizon L.
 
 ;; Shared read-only scan from a supplied seed and record mapper.  Callers must
 ;; establish the seed and durable-position authority appropriate to their use.

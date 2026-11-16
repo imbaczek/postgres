@@ -169,6 +169,9 @@
          records))
      :segment-reader reader :batch-policy batch-policy)))
 
+;; With :TRANSCRIPT T, prove and seal the tail first and pass a scoped mapper
+;; as the fifth callback argument.  Live checks and reproof remain outside it.
+
 (defun call-with-logical-slot-continuation-local-tail-source (storage snapshot function &key boundaries
                                                                                           (end (first (getf snapshot :sealed-end))) (batch-policy :strict) (require-closed t) transcript)
   ;; Prove locally present original-child WAL from F to END.  END defaults to
