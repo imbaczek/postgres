@@ -6,14 +6,6 @@
   (origin nil :read-only t) (root-identity nil :read-only t)
   (fork nil :read-only t) (names nil :read-only t) (state nil :read-only t))
 
-(defvar *logical-slot-continuation-protections* (make-hash-table :test #'equal :synchronized t))
-
-(defvar *logical-slot-continuation-protection-registries*
-  (make-hash-table :test #'eq :synchronized t))
-
-(defvar *logical-slot-continuation-protection-identities*
-  (make-hash-table :test #'eq :weakness :key :synchronized t))
-
 (defun logical-slot-continuation-protection-call (protection operation &optional value)
   ;; Dispatch a registered group under WAL exclusion.  :FAIL marks all
   ;; members uncertain and retains the persistent fork pin.
@@ -49,86 +41,125 @@
   (logical-slot-imported-host-origin-call origin :check-root)
   t)
 
+(defun logical-slot-continuation-build-protection-under-lock
+    (registry image binding root origin namespace &optional (phase :published))
+  (assert (sb-thread:holding-mutex-p *wal-lock*))
+  (unless (member phase '(:staged :published)) (error "invalid continuation group phase"))
+  (let* ((root (copy-list root)) (binding (copy-seq binding))
+                                 (saved (copy-seq image)) (selection (cons saved nil))
+                                 (snapshot (logical-slot-continuation-decode saved)) (rows (getf snapshot :slots))
+                                 (fork (second (getf snapshot :origin))) (child (first (getf snapshot :origin)))
+                                 (pins *wal-snapshot-retention-pins*) (incarnation *wal-storage-incarnation*)
+                                 (mutex *wal-lock*) (control (vector phase nil))
+                                 (members (mapcar (lambda (row) (cons (first row) (gethash (first row) registry))) rows))
+                                 (identities
+                                   (mapcar (lambda (row)
+                                             (cons (logical-slot-state-decode (second row) (first row))
+                                                   (wal-replication-slot-logical-provenance (gethash (first row) registry)))) rows))
+                                 (names (mapcar (lambda (entry) (copy-seq (car entry))) members))
+                                 (protection nil))
+    (unless (and (= (length members) (hash-table-count registry))
+                 (every (lambda (entry) (wal-replication-slot-p (cdr entry))) members))
+      (error "continuation group requires its complete candidate registry"))
+    (labels ((fail ()
+               (assert (sb-thread:holding-mutex-p mutex))
+               (sb-sys:without-interrupts
+                 (setf (svref control 1) t)
+                 (dolist (entry members)
+                   (setf (wal-replication-slot-state-uncertain-p (cdr entry)) t)
+                   (when (and (eq mutex *wal-lock*) (eq registry *wal-replication-slots*))
+                     (let ((current (gethash (car entry) registry)))
+                       (when (wal-replication-slot-p current)
+                         (setf (wal-replication-slot-state-uncertain-p current) t))))))
+               t)
+             (check-identity (object)
+               (assert (and (eq mutex *wal-lock*) (sb-thread:holding-mutex-p mutex)))
+               (unless (and (eq object protection)
+                            (equal root (logical-slot-continuation-protection-root-identity protection))
+                            (equal names (logical-slot-continuation-protection-names protection))
+                            (eql fork (logical-slot-continuation-protection-fork protection))
+                            (eq origin (logical-slot-continuation-protection-origin protection)))
+                 (error "continuation protection changed its identity")))
+             (ready ()
+               (when (svref control 1)
+                 (ereport "55000" "continuation group is uncertain; cold reconciliation required"))
+               (unless (eq :published (svref control 0))
+                 (ereport "55000" "continuation group is staged; publication required"))
+               (logical-slot-continuation-protection-check-bindings
+                protection pins registry incarnation namespace child members identities origin))
+             (staged ()
+               (check-identity protection)
+               (unless (and (eq :staged (svref control 0)) (not (svref control 1))
+                            (eq pins *wal-snapshot-retention-pins*)
+                            (eq incarnation *wal-storage-incarnation*)
+                            (eq namespace *wal-segment-namespace*) (eql child *wal-insert-timeline*)
+                            (eql fork (gethash protection pins))
+                            (= (length members) (hash-table-count registry))
+                            (every (lambda (entry expected)
+                                     (and (eq (cdr entry) (gethash (car entry) registry))
+                                          (logical-slot-state-identity-equal-p (cdr entry) (car expected))
+                                          (eq (wal-replication-slot-logical-provenance (cdr entry))
+                                              (cdr expected)))) members identities))
+                 (error "staged continuation protection changed its candidates or fork pin"))
+               (logical-slot-imported-host-origin-call origin :check-root)
+               t)
+             (state (operation object &optional value)
+               (check-identity object)
+               (ecase operation
+                 (:identity t)
+                 (:uncertain (svref control 1))
+                 (:fail (fail))
+                 (:failure-cleanup #'fail)
+                 (:check (ready))
+                 (:binding (copy-seq binding))
+                 (:image (copy-seq (car selection)))
+                 (:owns-cell
+                  (unless (eq :published (svref control 0)) (error "continuation group is staged"))
+                  (and (cdr selection) (consp value) (eq (car value) (cdr selection))
+                       (eq (cdr value) selection)))
+                 (:begin
+                  (ready)
+                  (logical-slot-continuation-writer-bind-check-under-lock value protection (car selection))
+                  (when (cdr selection) (error "continuation already has a writer"))
+                  (sb-sys:without-interrupts
+                    (let ((complete nil))
+                      (unwind-protect
+                           (progn
+                             (setf (cdr selection) value)
+                             (logical-slot-continuation-writer-bind-cell-under-lock value protection selection)
+                             (setf complete t))
+                        (unless complete
+                          (when (eq value (cdr selection)) (setf (cdr selection) nil)))))))
+                 (:cancel
+                  (unless (eq :published (svref control 0)) (error "continuation group is staged"))
+                  (logical-slot-continuation-writer-call value :cancel-ready protection)
+                  (cond ((eq value (cdr selection)) (setf (cdr selection) nil))
+                        ((null (cdr selection)) t)
+                        (t (error "continuation cancellation changed its writer")))))))
+      (setf protection (%make-logical-slot-continuation-protection
+                        :origin origin :root-identity (copy-list root)
+                        :fork fork :names (mapcar #'copy-seq names) :state #'state))
+      (values protection control #'fail #'staged))))
+
 (defun logical-slot-continuation-make-protection-under-lock (proof)
   (multiple-value-bind (record candidate ledger selected-facts)
       (logical-slot-continuation-native-preflight-under-lock proof)
-    (let* ((image (logical-slot-continuation-native-proof-old-image proof))
-           (root (copy-list (logical-slot-continuation-native-proof-root-identity proof)))
-           (binding (copy-seq (logical-slot-continuation-native-proof-binding proof)))
-           (saved (copy-seq image)) (selection (cons saved nil))
-           (snapshot (logical-slot-continuation-decode saved)) (rows (getf snapshot :slots))
-           (fork (second (getf snapshot :origin))) (child (first (getf snapshot :origin)))
-           (origin (logical-slot-continuation-native-proof-origin proof))
-           (namespace (logical-wal-source-namespace (logical-slot-continuation-native-proof-source proof)))
-           (pins *wal-snapshot-retention-pins*) (registry *wal-replication-slots*)
-           (incarnation *wal-storage-incarnation*) (mutex *wal-lock*)
-           (members (mapcar (lambda (row) (cons (first row) (gethash (first row) registry))) rows))
-           (identities
-             (mapcar (lambda (row)
-                       (cons (logical-slot-state-decode (second row) (first row))
-                             (wal-replication-slot-logical-provenance (gethash (first row) registry)))) rows))
-           (names (mapcar (lambda (entry) (copy-seq (car entry))) members))
-           (protection nil) (uncertain nil))
+    (let ((root (logical-slot-continuation-native-proof-root-identity proof))
+          (registry *wal-replication-slots*))
       (when (or (gethash root *logical-slot-continuation-protections*)
                 (gethash registry *logical-slot-continuation-protection-registries*))
         (error "continuation protection already has a registered group"))
-      (labels ((fail ()
-                 (assert (sb-thread:holding-mutex-p mutex))
-                 (sb-sys:without-interrupts
-                   (setf uncertain t)
-                   (dolist (entry members)
-                     (setf (wal-replication-slot-state-uncertain-p (cdr entry)) t)
-                     (when (and (eq mutex *wal-lock*) (eq registry *wal-replication-slots*))
-                       (let ((current (gethash (car entry) registry)))
-                         (when (wal-replication-slot-p current)
-                           (setf (wal-replication-slot-state-uncertain-p current) t))))))
-                 t)
-               (state (operation object &optional value)
-                 (assert (and (eq mutex *wal-lock*) (sb-thread:holding-mutex-p mutex)))
-                 (unless (and (eq object protection)
-                              (equal root (logical-slot-continuation-protection-root-identity protection))
-                              (equal names (logical-slot-continuation-protection-names protection))
-                              (eql fork (logical-slot-continuation-protection-fork protection))
-                              (eq origin (logical-slot-continuation-protection-origin protection)))
-                   (error "continuation protection changed its identity"))
-                 (ecase operation
-                   (:identity t)
-                   (:uncertain uncertain)
-                   (:fail (fail))
-                   (:failure-cleanup #'fail)
-                   (:check
-                    (when uncertain
-                      (ereport "55000" "continuation group is uncertain; cold reconciliation required"))
-                    (logical-slot-continuation-protection-check-bindings
-                     protection pins registry incarnation namespace child members identities origin))
-                   (:binding (copy-seq binding))
-                   (:image (copy-seq (car selection)))
-                   (:owns-cell
-                    (and (cdr selection) (consp value) (eq (car value) (cdr selection))
-                         (eq (cdr value) selection)))
-                   (:begin
-                    (logical-slot-continuation-writer-bind-check-under-lock value protection (car selection))
-                    (when (cdr selection) (error "continuation already has a writer"))
-                    (sb-sys:without-interrupts
-                      (let ((complete nil))
-                        (unwind-protect
-                             (progn
-                               (setf (cdr selection) value)
-                               (logical-slot-continuation-writer-bind-cell-under-lock value protection selection)
-                               (setf complete t))
-                          (unless complete
-                            (when (eq value (cdr selection)) (setf (cdr selection) nil)))))))
-                   (:cancel
-                    (logical-slot-continuation-writer-call value :cancel-ready protection)
-                    (cond ((eq value (cdr selection)) (setf (cdr selection) nil))
-                          ((null (cdr selection)) t)
-                          (t (error "continuation cancellation changed its writer")))))))
-        (setf protection (%make-logical-slot-continuation-protection
-                          :origin origin :root-identity (copy-list root)
-                          :fork fork :names (mapcar #'copy-seq names) :state #'state))
+      (let ((protection
+              (logical-slot-continuation-build-protection-under-lock
+               registry (logical-slot-continuation-native-proof-old-image proof)
+               (logical-slot-continuation-native-proof-binding proof) root
+               (logical-slot-continuation-native-proof-origin proof)
+               (logical-wal-source-namespace (logical-slot-continuation-native-proof-source proof)))))
         (sb-sys:without-interrupts
-          (setf (gethash protection pins) fork
-                (gethash protection *logical-slot-continuation-protection-identities*) #'state
+          (setf (gethash protection *wal-snapshot-retention-pins*)
+                (logical-slot-continuation-protection-fork protection)
+                (gethash protection *logical-slot-continuation-protection-identities*)
+                (logical-slot-continuation-protection-state protection)
                 (gethash (copy-list root) *logical-slot-continuation-protections*) protection
                 (gethash registry *logical-slot-continuation-protection-registries*) protection))
         (values protection record candidate ledger t selected-facts)))))

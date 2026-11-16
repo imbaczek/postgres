@@ -34,6 +34,7 @@
                (:file "t/rove/continuation-selector-tests")
                (:file "t/rove/continuation-active-startup-tests")
                (:file "t/rove/continuation-cold-reconciliation-tests")
+               (:file "t/rove/continuation-cold-publication-tests")
                (:file "t/rove/continuation-inventory-tests")
                (:file "t/rove/continuation-native-proof-tests")
                (:file "t/rove/continuation-prepared-tests")

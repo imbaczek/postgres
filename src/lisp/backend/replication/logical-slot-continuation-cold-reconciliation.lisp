@@ -114,7 +114,7 @@
     (logical-slot-continuation-cold-reconciliation-base-check context)
     t))
 
-(defun logical-slot-continuation-cold-reconciliation-with-tail (storage observation archive proof function)
+(defun logical-slot-continuation-cold-reconciliation-with-tail (storage observation archive proof function &key commit-guard)
   (let* ((snapshot (getf observation :snapshot))
          (horizon (getf observation :horizon))
          (facts (logical-slot-continuation-storage-call storage :facts)))
@@ -128,7 +128,7 @@
               :logical-reader)))
       (call-with-logical-slot-continuation-local-tail-source
        storage snapshot
-       (lambda (prove check-tail reader guard &optional map-records)
+       (lambda (prove check-tail reader guard &optional map-records check-commit)
          (declare (ignore reader guard))
          (labels ((reprove ()
                     (unless (equalp proof
@@ -141,11 +141,12 @@
             storage :with-sidecar
             (lambda (sidecar check-sidecar)
               (declare (ignore sidecar))
-              (multiple-value-prog1 (funcall function check-tail check-sidecar)
+              (multiple-value-prog1 (apply function check-tail check-sidecar
+                                           (when commit-guard (list check-commit)))
                 (funcall check-sidecar)
                 (reprove))))))
        :boundaries #'boundaries :end horizon :batch-policy :logical-reader
-       :require-closed nil :transcript t :witness t))))
+       :require-closed nil :transcript t :witness t :commit-guard commit-guard))))
 
 (defun logical-slot-continuation-cold-reconciliation-with-context
     (storage preparation observation registry image check-tail check-sidecar)
@@ -169,7 +170,20 @@
                 (sb-sys:with-local-interrupts
                   (logical-slot-continuation-cold-reconciliation-check context)
                   (logical-slot-continuation-cold-reconciliation-execute context)
-                  (logical-slot-continuation-cold-reconciliation-check context)))
+                  (logical-slot-continuation-cold-reconciliation-check context)
+                  (logical-slot-continuation-copy
+                   (list :kind :stable :choice :stable
+                         :snapshot (getf observation :snapshot)
+                         :selector (logical-slot-continuation-cold-reconciliation-selector context)
+                         :temporary nil
+                         :directory-facts
+                         (physical-image-file-facts
+                          (logical-slot-continuation-storage-call storage :directory))
+                         :slot-root-facts (physical-image-file-facts directory)
+                         :rows (mapcar (lambda (row) (list (first row) (fourth row)))
+                                       (logical-slot-continuation-cold-reconciliation-ledger context))
+                         :ledger (logical-slot-continuation-cold-reconciliation-ledger context)
+                         :horizon (getf observation :horizon)))))
            (setf (logical-slot-continuation-cold-reconciliation-active context) nil)
            (remhash context *logical-slot-continuation-cold-reconciliations*)))))))
 
@@ -195,23 +209,42 @@
   (let* ((observation (logical-slot-continuation-cold-preparation-call preparation :observation))
          (proof (logical-slot-continuation-cold-preparation-call preparation :proof))
          (registry (logical-slot-continuation-cold-preparation-call preparation :registry))
+         (reservation (logical-slot-continuation-cold-preparation-call preparation :reservation))
          (image (logical-slot-publication-registry-image registry)))
     (logical-slot-continuation-cold-preparation-call preparation :claim)
-    (call-with-logical-slot-startup-publication-storage
-     owner
-     (lambda (storage facts)
-       (declare (ignore facts))
-       (logical-slot-continuation-cold-reconcile-storage
-        storage preparation observation proof registry image)))
-    (logical-slot-continuation-copy (getf observation :snapshot))))
+    (let ((final
+            (call-with-logical-slot-startup-publication-storage
+             owner
+             (lambda (storage facts)
+               (declare (ignore facts))
+               (logical-slot-continuation-cold-reconcile-storage
+                storage preparation observation proof registry image)))))
+      (sb-thread:with-mutex (*wal-lock*)
+        (values
+         (logical-slot-continuation-copy (getf observation :snapshot))
+         (list :registry registry :image image :observation final :proof proof
+               :reservation reservation
+               :binding (logical-slot-continuation-cold-reservation-call reservation :binding)
+               :origin (logical-slot-continuation-cold-reservation-call reservation :origin)
+               :root (let ((facts (physical-image-file-facts
+                                   -100 (namestring (uiop:ensure-directory-pathname *pgdata*)))))
+                       (list (first facts) (second facts) (ninth facts)))
+               :host (logical-slot-imported-host-startup-image)
+               :mirrors (logical-slot-publication-mirrors)
+               :incarnation *wal-storage-incarnation* :namespace *wal-segment-namespace*
+               :maximum *max-replication-slots* :wal-level *wal-level*
+               :thread sb-thread:*current-thread* :mutex *wal-lock*))))))
 
 (defun logical-slot-continuation-cold-reconcile (gate ownership)
   ;; This entry reconciles disk only: it retains F and leaves the registry empty.
-  ;; Preparation expires on return, before any later publication integration.
+  ;; Preparation expires before the completed observation is exposed.
   (call-with-logical-slot-startup-publication-owner
    gate ownership
    (lambda (owner)
-     (call-with-logical-slot-continuation-cold-preparation
-      gate ownership
-      (lambda (preparation)
-        (logical-slot-continuation-cold-reconcile-prepared owner preparation))))))
+     (call-with-logical-slot-continuation-cold-completion
+      owner gate ownership
+      (lambda (completion)
+        (logical-slot-continuation-copy
+         (getf (getf (logical-slot-continuation-cold-completion-call completion :data)
+                     :observation)
+               :snapshot)))))))

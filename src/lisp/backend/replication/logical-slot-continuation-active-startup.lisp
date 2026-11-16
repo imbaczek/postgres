@@ -174,8 +174,26 @@
 
 ;; When :WITNESS is true, PROVE returns a tail witness as its second value.
 
+(defun logical-slot-continuation-check-local-tail-options
+    (storage snapshot end batch-policy require-closed transcript witness commit-guard)
+  (unless (and (member batch-policy '(:strict :logical-reader))
+               (every (lambda (value) (typep value 'boolean))
+                      (list require-closed transcript witness commit-guard))
+               (typep end '(unsigned-byte 64))
+               (<= (first (getf snapshot :sealed-end)) end
+                   (if (logical-slot-continuation-runtime-storage-p storage)
+                       (logical-slot-continuation-storage-call storage :horizon)
+                       (sixth (logical-slot-continuation-storage-call storage :host)))))
+    (error "continuation local proof exceeds its captured horizon")))
+
+(defun logical-slot-continuation-check-tail-commit (directory ledger guard)
+  (assert (sb-thread:holding-mutex-p *wal-lock*))
+  (funcall guard)
+  (logical-slot-continuation-check-tail-ledger directory ledger)
+  (funcall guard))
+
 (defun call-with-logical-slot-continuation-local-tail-source (storage snapshot function &key boundaries
-                                                                                          (end (first (getf snapshot :sealed-end))) (batch-policy :strict) (require-closed t) transcript witness)
+                                                                                          (end (first (getf snapshot :sealed-end))) (batch-policy :strict) (require-closed t) transcript witness commit-guard)
   ;; Prove locally present original-child WAL from F to END.  END defaults to
   ;; historical seal S and must satisfy S <= END <= captured horizon L.
   ;; Strict batch handling and a closed end remain the defaults.
@@ -188,14 +206,8 @@
                    (getf snapshot :history-target) (getf snapshot :history)))
          (fork (second (getf snapshot :origin)))
          (child (first (getf snapshot :origin))))
-    (unless (and (member batch-policy '(:strict :logical-reader))
-                 (typep require-closed 'boolean) (typep transcript 'boolean) (typep witness 'boolean)
-                 (typep end '(unsigned-byte 64))
-                 (<= (first (getf snapshot :sealed-end)) end
-                     (if (logical-slot-continuation-runtime-storage-p storage)
-                         (logical-slot-continuation-storage-call storage :horizon)
-                         (sixth (logical-slot-continuation-storage-call storage :host)))))
-      (error "continuation local proof exceeds its captured horizon"))
+    (logical-slot-continuation-check-local-tail-options
+     storage snapshot end batch-policy require-closed transcript witness commit-guard)
     (logical-slot-continuation-storage-call
      storage :with-local-wal
      (lambda (directory check-directory)
@@ -277,7 +289,12 @@
                      (flet ((invoke (&optional mapper)
                               (multiple-value-prog1
                                   (apply function #'prove #'check #'read-segment #'guard
-                                         (when transcript (list mapper)))
+                                         (append
+                                          (when (or transcript commit-guard) (list mapper))
+                                          (when commit-guard
+                                            (list (lambda ()
+                                                    (logical-slot-continuation-check-tail-commit
+                                                     directory ledger #'guard))))))
                                 (check))))
                        (if transcript
                            (progn (prove)

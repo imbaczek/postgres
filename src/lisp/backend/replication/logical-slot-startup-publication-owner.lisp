@@ -20,6 +20,45 @@
       (error "startup publication requires its unconsumed derived token"))
     binding))
 
+(defun logical-slot-startup-publication-cold-plan (binding)
+  (case (length binding)
+    (5 nil)
+    (6 (let ((plan (svref binding 5)))
+         (unless (logical-slot-continuation-cold-commit-p plan)
+           (error "startup publication has an invalid cold plan"))
+         plan))
+    (t (error "startup publication has an invalid binding shape"))))
+
+(defun logical-slot-startup-publication-install-under-lock (binding control receipt expected cold)
+  (assert (sb-thread:holding-mutex-p *wal-lock*))
+  (let* ((registry (first expected)) (count (second expected))
+                                     (policy (third expected)) (disable (fourth expected))
+                                     (maps (when cold (getf cold :new-maps)))
+                                     (group-control (when cold (getf cold :group-control)))
+                                     (completion-control (when cold (getf cold :completion-control)))
+                                     (reservation-control (when cold (getf cold :reservation-control)))
+                                     (group (when cold (getf cold :group))))
+    (sb-thread:with-mutex (*xid-lock*)
+      (sb-sys:without-interrupts
+        (when cold
+          (setf *logical-slot-continuation-protections* (svref maps 0)
+                *logical-slot-continuation-protection-registries* (svref maps 1)
+                *logical-slot-continuation-protection-identities* (svref maps 2)
+                *logical-slot-continuation-cold-reservations* (svref maps 3)
+                *logical-slot-continuation-cold-registries* (svref maps 4)))
+        (setf *wal-replication-slots* registry
+              *logical-capture-live-slots* count
+              *wal-logical-policy* policy
+              *wal-logical-info-disable-pending* disable)
+        (when cold
+          (setf (svref group-control 0) :published
+                (svref completion-control 0) :published
+                (svref completion-control 2) group
+                (svref reservation-control 0) :published))
+        (setf (svref binding 3) :published
+              (svref control 0) :published
+              (svref receipt 0) registry)))))
+
 (defun logical-slot-startup-publication-make-state (gate ownership image baseline registry-image control receipt)
   ;; CONTROL holds phase, active, failed, token, expected mirrors, registry
   ;; image, and source binding receipt in slots 0 through 6, respectively.
@@ -44,7 +83,10 @@
                               (equalp image (logical-slot-imported-host-startup-image))
                               (equal expected (logical-slot-publication-mirrors)))
                    (error "startup publication host or mirror state changed"))
-                 (logical-slot-publication-check-registry *wal-replication-slots* rows)))
+                 (progn
+                   (logical-slot-publication-check-registry *wal-replication-slots* rows)
+                   (when (and (eq :published (svref control 0)) (svref control 8))
+                     (logical-slot-continuation-cold-commit-postcheck (svref control 8))))))
              (state (operation candidate)
                (check-identity candidate)
                (ecase operation
@@ -70,7 +112,8 @@
                (check)
                (let* ((binding (logical-slot-startup-publication-token-binding owner token))
                       (registry (svref binding 1))
-                      (rows (svref binding 2)))
+                      (rows (svref binding 2))
+                      (cold (logical-slot-startup-publication-cold-plan binding)))
                  (ecase operation
                    (:prepare
                     (unless (eq :old (svref control 0))
@@ -89,28 +132,25 @@
                               (svref control 4) (list registry count policy disable)
                               (svref control 5) rows
                               (svref control 6) (logical-slot-continuation-copy (svref binding 4))
+                              (svref control 7) cold
+                              (svref control 8) (when cold
+                                                  (logical-slot-continuation-cold-commit-call
+                                                   cold :data owner))
                               (svref control 0) :prepared))))
                    (:commit
                     (assert (sb-thread:holding-mutex-p *wal-lock*))
                     (unless (and (eq :prepared (svref control 0)) (eq token (svref control 3))
+                                 (eq cold (svref control 7))
                                  (equalp (svref binding 4) (svref control 6)))
                       (error "startup publication token does not match its prepared owner"))
                     (under-lock)
                     (logical-slot-publication-check-registry registry rows)
-                    (let* ((expected (svref control 4))
-                           (count (second expected)) (policy (third expected)) (disable (fourth expected)))
-                      ;; WAL is already locked.  Take XID second, then perform
-                      ;; no allocation, callback, or I/O from the first assignment
-                      ;; through the phase change and completion receipt.
-                      (sb-thread:with-mutex (*xid-lock*)
-                        (sb-sys:without-interrupts
-                          (setf *wal-replication-slots* registry
-                                *logical-capture-live-slots* count
-                                *wal-logical-policy* policy
-                                *wal-logical-info-disable-pending* disable
-                                (svref binding 3) :published
-                                (svref control 0) :published
-                                (svref receipt 0) registry)))))
+                    (let ((cold-data (when cold
+                                       (logical-slot-continuation-cold-commit-call cold :data owner))))
+                      (unless (eq cold-data (svref control 8))
+                        (error "startup publication changed its cold commit binding"))
+                      (logical-slot-startup-publication-install-under-lock
+                       binding control receipt (svref control 4) cold-data)))
                    ))))
       (values #'state #'publish (lambda (candidate) (setf owner candidate))))))
 
@@ -134,7 +174,7 @@
   (unless (and (typep receipt '(simple-vector 1)) (null (svref receipt 0)))
     (error "startup publication requires a fresh completion receipt"))
   (check-primary-storage-startup-context gate ownership)
-  (let ((control (vector :old t nil nil nil nil nil)) (owner nil) (complete nil))
+  (let ((control (vector :old t nil nil nil nil nil nil nil)) (owner nil) (complete nil))
     (multiple-value-bind (state publish install)
         (sb-thread:with-mutex (*wal-lock*)
           (logical-slot-startup-publication-make-state
@@ -153,6 +193,9 @@
              (progn
                (logical-slot-imported-host-startup-check-owner owner)
                (multiple-value-prog1 (funcall function owner)
+                 (when (eq :published (svref control 0))
+                   (logical-slot-startup-publication-test-point
+                    :before-owner-return owner (svref control 3)))
                  (logical-slot-imported-host-startup-check-owner owner)
                  (setf complete t)))
           (sb-sys:without-interrupts
