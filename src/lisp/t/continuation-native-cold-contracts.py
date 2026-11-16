@@ -83,6 +83,23 @@ class ColdPlanContracts(unittest.TestCase):
         with self.assertRaises(ValueError):
             native.cold_plan(env, self.campaign())
 
+    def test_loader_modes_keep_crash_families_and_spill_requirements(self):
+        rows = self.plan([{'case': 'happy', 'proof': 'load', 'cut': 'after-commit'},
+                          {'case': 'happy', 'proof': 'load-close'},
+                          {'case': 'happy', 'proof': 'load-bootstrap-prefix'},
+                          {'case': 'happy', 'proof': 'load-empty'},
+                          {'case': 'happy', 'proof': 'load-empty-late'}])
+        self.assertEqual(5, len(rows))
+        self.assertTrue(native.cold_spill_required(dict(rows[0], spill=True)))
+        self.assertTrue(native.cold_spill_required(dict(rows[1], spill=True)))
+        self.assertTrue(native.cold_spill_required(dict(rows[2], spill=True)))
+        self.assertFalse(native.cold_spill_required(dict(rows[3], spill=True)))
+        self.assertFalse(native.cold_spill_required(dict(rows[4], spill=True)))
+        for proof, cut in [('load', 'after-state-sync'), ('load-close', 'after-commit'),
+                           ('load-empty', 'after-commit')]:
+            with self.subTest(proof=proof), self.assertRaises(ValueError):
+                self.plan([{'case': 'happy', 'proof': proof, 'cut': cut}])
+
     def test_optional_child_flags_do_not_leak_between_rows(self):
         rows = self.plan([{'case': 'prepared-durable', 'proof': 'prepare-pending', 'spill': True},
                           {'case': 'happy', 'proof': None, 'spill': False},
@@ -190,7 +207,7 @@ class ColdPlanContracts(unittest.TestCase):
     def crash_children(self, *, first_exit=-9, changed_seal=False, proof='reconcile',
                        spill=False, missing_spill=False):
         row = dict(case='happy', proof=proof, spill=spill,
-                   cut='after-commit' if proof == 'publish' else 'slot-state-after-unlink')
+                   cut='after-commit' if proof in ('publish', 'load') else 'slot-state-after-unlink')
         prefix = native.PROOF_MARKERS[proof]
         env = dict(PG_NATIVE_COLD_RECONCILE_CUT=row['cut'], PG_NATIVE_COLD_APPEND='1')
         calls = []
@@ -246,6 +263,17 @@ class ColdPlanContracts(unittest.TestCase):
         self.assertEqual(3, len(calls))
         self.assertEqual(0, status)
         self.assertTrue(crash['passed'])
+
+    def test_loader_crashes_require_two_fresh_restarts_and_real_spilling(self):
+        calls, (status, _, crash) = self.crash_children(proof='load', spill=True)
+        self.assertEqual(3, len(calls))
+        self.assertEqual(0, status)
+        self.assertTrue(crash['passed'])
+        calls, (status, _, crash) = self.crash_children(proof='load', spill=True,
+                                                      missing_spill=True)
+        self.assertEqual(1, len(calls))
+        self.assertNotEqual(0, status)
+        self.assertFalse(crash['passed'])
 
     def test_spill_crash_cannot_pass_without_actual_spill_use_before_death(self):
         calls, (status, _, crash) = self.crash_children(proof='publish', spill=True,

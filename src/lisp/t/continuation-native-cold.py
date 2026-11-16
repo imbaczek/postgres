@@ -33,6 +33,13 @@ CASE_DEFINITIONS = {
 }
 CASE_DEFINITIONS.update({fault: DEFAULT_CASES[variant] for fault, variant in FAULTS.items()})
 PROOF_MARKERS = {
+    'load': 'NATIVE-COLD-PUBLICATION',
+    'load-bootstrap': 'NATIVE-COLD-PUBLICATION',
+    'load-bootstrap-prefix': 'NATIVE-COLD-PUBLICATION',
+    'load-empty': 'NATIVE-COLD-EMPTY-LOADER',
+    'load-empty-late': 'NATIVE-COLD-EMPTY-LOADER-REFUSAL',
+    'load-mixed-refusal': 'NATIVE-COLD-LOADER-REFUSAL',
+    'load-mixed-staging-refusal': 'NATIVE-COLD-LOADER-REFUSAL',
     'publish': 'NATIVE-COLD-PUBLICATION',
     'publish-after-group-pin': 'NATIVE-COLD-PUBLICATION-REFUSAL',
     'publish-maps-ready': 'NATIVE-COLD-PUBLICATION-REFUSAL',
@@ -70,6 +77,9 @@ PROOF_MARKERS = {
     'pending-temp-swap': 'NATIVE-COLD-PENDING-REFUSAL',
     None: 'NATIVE-COLD-CLASSIFICATION',
 }
+PROOF_MARKERS.update({'load-' + proof.removeprefix('publish-'): marker
+                      for proof, marker in tuple(PROOF_MARKERS.items())
+                      if isinstance(proof, str) and proof.startswith('publish-')})
 COLD_RECONCILIATION_CUTS = {
     'before-state-sync', 'after-state-sync', 'slot-state-after-unlink',
     'slot-state-after-directory-sync', 'after-slot-root-sync', 'selector-after-unlink',
@@ -120,7 +130,8 @@ def cold_plan(environment, campaign):
             raise ValueError('Unknown cold proof mode')
         if case in FAULTS and proof is not None:
             raise ValueError('Cold classification faults require the classification proof mode')
-        cuts = {'reconcile': COLD_RECONCILIATION_CUTS, 'publish': COLD_PUBLICATION_CUTS}.get(proof, set())
+        cuts = {'reconcile': COLD_RECONCILIATION_CUTS, 'publish': COLD_PUBLICATION_CUTS,
+                'load': COLD_PUBLICATION_CUTS}.get(proof, set())
         if cut is not None and (not isinstance(cut, str) or cut not in cuts):
             raise ValueError('Invalid cold crash cut')
         if not isinstance(spill, bool) or not isinstance(root, str) or not root:
@@ -157,8 +168,10 @@ def child_environment(base, row):
 
 def cold_spill_required(row):
     proof = row['proof'] or ''
-    return row.get('spill', False) and (proof in {'prepare', 'pending', 'policy', 'reconcile', 'publish'}
-                                      or proof.startswith(('publish-', 'reconcile-')))
+    return row.get('spill', False) and (proof in {'prepare', 'pending', 'policy', 'reconcile', 'publish', 'load'}
+                                      or proof.startswith(('publish-', 'reconcile-'))
+                                      or (proof.startswith('load-') and proof not in
+                                          {'load-empty', 'load-empty-late'}))
 
 
 def cold_spill_marker(text):

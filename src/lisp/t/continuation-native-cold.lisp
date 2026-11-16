@@ -8,9 +8,11 @@
     `(let* ((,flag (not (null (uiop:getenv "PG_NATIVE_COLD_SPILL"))))
             (,mode (uiop:getenv "PG_NATIVE_COLD_PROOF"))
             (,required (and ,flag ,mode
-                            (or (member ,mode '("prepare" "pending" "policy" "reconcile" "publish")
+                            (or (member ,mode '("prepare" "pending" "policy" "reconcile" "publish" "load")
                                         :test #'equal)
                                 (eql 0 (search "publish-" ,mode))
+                                (and (eql 0 (search "load-" ,mode))
+                                     (not (member ,mode '("load-empty" "load-empty-late") :test #'equal)))
                                 (eql 0 (search "reconcile-" ,mode)))))
             (*logical-capture-memory-bytes* (if ,flag 0 *logical-capture-memory-bytes*))
             (,original (symbol-function 'logical-spool-ensure-file))
@@ -651,7 +653,22 @@
     (sb-posix:kill (sb-posix:getpid) sb-posix:sigkill)
     (error "cold publication SIGKILL returned")))
 
-(defun native-host-cold-publication (gate ownership)
+(defun native-host-cold-publish (gate ownership loader)
+  (if loader
+      (progn (wal-load-replication-slots :gate-owner gate :ownership ownership)
+             *wal-replication-slots*)
+      (uiop:symbol-call :pg :logical-slot-continuation-cold-publish-startup gate ownership)))
+
+(defun native-host-cold-bootstrap-selector (snapshot prefix)
+  (let ((selector (merge-pathnames "pg_logical_continuation/selector" *pgdata*)))
+    (sb-posix:unlink (namestring selector))
+    (when prefix
+      (with-open-file (stream (merge-pathnames "pg_logical_continuation/selector.tmp" *pgdata*)
+                              :direction :output :if-exists :error
+                              :element-type '(unsigned-byte 8))
+        (write-sequence (logical-slot-continuation-encode snapshot) stream :end 17)))))
+
+(defun native-host-cold-publication (gate ownership &optional loader)
   (let* ((before (native-host-cold-file-image))
          (fds (native-host-writer-open-fds))
          (old-registry *wal-replication-slots*)
@@ -722,8 +739,9 @@
               (loop for byte across (logical-slot-continuation-encode snapshot)
                     do (format stream "~2,'0x" byte))))
     (finish-output)
-    (let* ((restored (uiop:symbol-call :pg :logical-slot-continuation-cold-publish-startup
-                                       gate ownership))
+    (when (member loader '(:bootstrap :bootstrap-prefix))
+      (native-host-cold-bootstrap-selector snapshot (eq loader :bootstrap-prefix)))
+    (let* ((restored (native-host-cold-publish gate ownership loader))
            (group (gethash restored *logical-slot-continuation-protection-registries*)))
       (native-host-cold-publication-kill "completed")
       (assert (and (hash-table-p restored) (eq restored *wal-replication-slots*)
@@ -777,7 +795,7 @@
     (format t "~&NATIVE-COLD-PUBLICATION PASS case=~a exact-selected-generation-and-pending registry-and-mirrors group-F gapless-reservation-handoff no-fd-leak~%"
             (uiop:getenv "PG_NATIVE_COLD_CASE"))))
 
-(defun native-host-cold-publication-failure (gate ownership mode)
+(defun native-host-cold-publication-failure (gate ownership mode &optional loader)
   (let* ((files (native-host-cold-file-image)) (fds (native-host-writer-open-fds))
                                                (old-registry *wal-replication-slots*) (mirrors (logical-slot-publication-mirrors))
                                                (reservation nil) (snapshot nil) (group nil) (candidates nil)
@@ -851,7 +869,7 @@
            (setf refused
                  (handler-case
                      (progn
-                       (uiop:symbol-call :pg :logical-slot-continuation-cold-publish-startup gate ownership)
+                       (native-host-cold-publish gate ownership loader)
                        nil)
                    (error () t))))
       (setf (symbol-function 'sb-posix:close) close
@@ -883,7 +901,7 @@
                       (third (assoc "pg_logical_continuation/selector" after :test #'string=))))
       (assert (handler-case
                   (progn
-                    (uiop:symbol-call :pg :logical-slot-continuation-cold-publish-startup gate ownership)
+                    (native-host-cold-publish gate ownership loader)
                     nil)
                 (error () t)))
       (assert (= visits before-retry))
@@ -1124,6 +1142,124 @@
     (format t "~&NATIVE-COLD-PREPARATION-WAL-REFUSAL PASS case=~a valid-CRC same-policy same-pending changed-transcript~%"
             (uiop:getenv "PG_NATIVE_COLD_CASE"))))
 
+(defun native-host-cold-add-extra (staging)
+  (let ((image (wal-encode-replication-slot
+                (make-wal-replication-slot
+                 :name "extra" :kind :physical :system-id 5339102419085599071
+                 :database-oid nil :plugin nil :consistent-lsn nil
+                 :confirmed-flush-lsn nil :restart-lsn nil
+                 :restart-timeline nil :inactive-since 0 :wal-status :lost))))
+    (slot-state-create (wal-replication-slot-directory) "extra" image)
+    (when staging
+      (with-open-file (stream (merge-pathnames "pg_replslot/extra/state.tmp" *pgdata*)
+                              :direction :output :if-exists :error
+                              :element-type '(unsigned-byte 8))
+        (write-sequence image stream :end 1)))))
+
+(defun native-host-cold-extra-files ()
+  (append (native-host-cold-file-image)
+          (loop for name in '("pg_replslot/extra/state" "pg_replslot/extra/state.tmp")
+                for path = (merge-pathnames name *pgdata*)
+                when (slot-state-lstat path)
+                  collect (list name (physical-image-file-facts -100 (namestring path))
+                                (read-bounded-regular-file path +slot-state-maximum-bytes+)))))
+
+(defun native-host-cold-mixed-loader-refusal (gate ownership staging)
+  (let ((fds (native-host-writer-open-fds)) (registry *wal-replication-slots*)
+                                            (mirrors (logical-slot-publication-mirrors)) (reservation nil))
+    (call-with-logical-slot-continuation-cold-state
+     gate ownership
+     (lambda (observation actual check)
+       (declare (ignore observation))
+       (setf reservation actual)
+       (funcall check)))
+    (native-host-cold-add-extra staging)
+    (let ((before (native-host-cold-extra-files)))
+      (assert (handler-case
+                  (progn (wal-load-replication-slots :gate-owner gate :ownership ownership) nil)
+                (error () t)))
+      (assert (equalp before (native-host-cold-extra-files)))
+      (assert (eq registry *wal-replication-slots*))
+      (assert (zerop (hash-table-count registry)))
+      (assert (equal mirrors (logical-slot-publication-mirrors)))
+      (native-host-cold-with-wal
+       (lambda ()
+         (assert (= 41268 (gethash reservation *wal-snapshot-retention-pins*)))
+         (assert (logical-slot-continuation-cold-reservation-call reservation :uncertain)))))
+    (assert (equal fds (native-host-writer-open-fds)))
+    (assert (logical-slot-continuation-gc-fenced-p *pgdata*))
+    (format t "~&NATIVE-COLD-LOADER-REFUSAL PASS case=~a mixed-inventory-preserved staging=~s empty-registry retained-F no-fd-leak~%"
+            (uiop:getenv "PG_NATIVE_COLD_CASE") staging)))
+
+(defun native-host-cold-empty-late-loader (gate ownership)
+  (let ((fds (native-host-writer-open-fds)) (registry *wal-replication-slots*)
+                                            (mirrors (logical-slot-publication-mirrors)) (hit nil) (before nil) (refused nil)
+                                            (restore (symbol-function 'logical-slot-continuation-restore-startup)))
+    (unwind-protect
+         (progn
+           (setf (symbol-function 'logical-slot-continuation-restore-startup)
+                 (lambda (actual-gate actual-ownership)
+                   (let ((result (funcall restore actual-gate actual-ownership)))
+                     (assert (null result))
+                     (native-host-cold-add-extra t)
+                     (setf before (native-host-cold-extra-files) hit t)
+                     result)))
+           (setf refused
+                 (handler-case
+                     (progn (wal-load-replication-slots :gate-owner gate :ownership ownership) nil)
+                   (error () t))))
+      (setf (symbol-function 'logical-slot-continuation-restore-startup) restore))
+    (assert hit)
+    (assert refused)
+    (assert (equalp before (native-host-cold-extra-files)))
+    (assert (eq registry *wal-replication-slots*))
+    (assert (zerop (hash-table-count registry)))
+    (assert (equal mirrors (logical-slot-publication-mirrors)))
+    (assert (equal fds (native-host-writer-open-fds)))
+    (assert (logical-slot-continuation-gc-fenced-p *pgdata*))
+    (format t "~&NATIVE-COLD-EMPTY-LOADER-REFUSAL PASS case=~a late-physical-and-staging-preserved no-adoption no-fd-leak~%"
+            (uiop:getenv "PG_NATIVE_COLD_CASE"))))
+
+(defun native-host-cold-empty-loader (gate ownership &optional late)
+  (let ((fds (native-host-writer-open-fds)) (workspace-facts nil)
+                                            (selector (merge-pathnames "pg_logical_continuation/selector" *pgdata*))
+                                            (workspace (merge-pathnames "pg_replslot/.logical-slot-copy.work" *pgdata*))
+                                            (*logical-slot-continuation-cold-publication-test-hook*
+                                              (lambda (&rest ignored)
+                                                (declare (ignore ignored))
+                                                (error "empty loader entered cold publication"))))
+    (dolist (name '("alpha/" "beta/"))
+      (uiop:delete-directory-tree (merge-pathnames name (wal-replication-slot-directory))
+                                  :validate t :if-does-not-exist :error))
+    (sb-posix:unlink (namestring selector))
+    (unless (slot-state-lstat workspace)
+      (with-open-file (stream workspace :direction :output :if-exists :error)
+        (write-string "opaque local workspace" stream)))
+    (setf workspace-facts (physical-image-file-facts -100 (namestring workspace)))
+    (when late
+      (native-host-cold-empty-late-loader gate ownership)
+      (assert (equal workspace-facts (physical-image-file-facts -100 (namestring workspace))))
+      (return-from native-host-cold-empty-loader t))
+    (dotimes (iteration 2)
+      (let ((before (when (plusp iteration) (native-host-cold-file-image))))
+        (wal-load-replication-slots :gate-owner gate :ownership ownership)
+        (assert (zerop (hash-table-count *wal-replication-slots*)))
+        (assert (zerop *logical-capture-live-slots*))
+        (assert (null (gethash *wal-replication-slots*
+                               *logical-slot-continuation-protection-registries*)))
+        (assert (equal workspace-facts (physical-image-file-facts -100 (namestring workspace))))
+        (when before (assert (equalp before (native-host-cold-file-image))))
+        (let ((snapshot
+                (logical-slot-continuation-decode
+                 (read-bounded-regular-file
+                  selector (logical-slot-continuation-prepared-maximum-bytes)))))
+          (assert (= 1 (getf snapshot :generation)))
+          (assert (null (getf snapshot :slots))))))
+    (assert (equal fds (native-host-writer-open-fds)))
+    (assert (logical-slot-continuation-gc-fenced-p *pgdata*))
+    (format t "~&NATIVE-COLD-EMPTY-LOADER PASS case=~a bootstrap restart exact-empty-selector opaque-workspace no-cold-publication no-fd-leak~%"
+            (uiop:getenv "PG_NATIVE_COLD_CASE"))))
+
 (defun native-host-continuation-cold-state (gate ownership)
   (with-native-cold-spill-probe
       (handler-case
@@ -1135,6 +1271,24 @@
                          "publish-before-commit" "publish-after-commit" "publish-owner-return" "publish-close"
                          "publish-notify" "publish-before-retirement" "publish-lost-registration") :test #'equal)
                (native-host-cold-publication-failure gate ownership (uiop:getenv "PG_NATIVE_COLD_PROOF")))
+              ((member (uiop:getenv "PG_NATIVE_COLD_PROOF")
+                       '("load-mixed-refusal" "load-mixed-staging-refusal") :test #'equal)
+               (native-host-cold-mixed-loader-refusal
+                gate ownership (equal "load-mixed-staging-refusal" (uiop:getenv "PG_NATIVE_COLD_PROOF"))))
+              ((member (uiop:getenv "PG_NATIVE_COLD_PROOF") '("load-empty" "load-empty-late") :test #'equal)
+               (native-host-cold-empty-loader
+                gate ownership (equal "load-empty-late" (uiop:getenv "PG_NATIVE_COLD_PROOF"))))
+              ((member (uiop:getenv "PG_NATIVE_COLD_PROOF")
+                       '("load-bootstrap" "load-bootstrap-prefix") :test #'equal)
+               (native-host-cold-publication
+                gate ownership
+                (if (equal "load-bootstrap-prefix" (uiop:getenv "PG_NATIVE_COLD_PROOF"))
+                    :bootstrap-prefix :bootstrap)))
+              ((eql 0 (search "load-" (or (uiop:getenv "PG_NATIVE_COLD_PROOF") "")))
+               (native-host-cold-publication-failure
+                gate ownership (concatenate 'string "publish-" (subseq (uiop:getenv "PG_NATIVE_COLD_PROOF") 5)) t))
+              ((equal "load" (uiop:getenv "PG_NATIVE_COLD_PROOF"))
+               (native-host-cold-publication gate ownership t))
               ((equal "publish" (uiop:getenv "PG_NATIVE_COLD_PROOF"))
                (native-host-cold-publication gate ownership))
               ((member (uiop:getenv "PG_NATIVE_COLD_PROOF")
