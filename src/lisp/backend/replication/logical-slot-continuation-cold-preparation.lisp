@@ -33,17 +33,21 @@
   (logical-slot-startup-check-inventory source)
   (let ((candidates (mapcar #'logical-slot-startup-entry-slot
                             (logical-slot-startup-source-entries source)))
-        (registry (make-hash-table :test #'equal)))
+        (registry (make-hash-table :test #'equal))
+        (inactive-since (postgres-current-timestamp)))
     (unless (every (lambda (slot)
-                     (and (logical-slot-startup-known-p slot)
-                          (wal-replication-slot-child-owner slot)
-                          (not (wal-replication-slot-temporary-p slot))))
+                     (and (not (wal-replication-slot-temporary-p slot))
+                          (or (wal-physical-slot-p slot)
+                              (and (logical-slot-startup-known-p slot)
+                                   (wal-replication-slot-child-owner slot)))))
                    candidates)
-      (error "cold continuation preparation requires certified logical members"))
+      (error "cold continuation preparation has an unsupported candidate"))
     (logical-slot-startup-prepare-known-candidates candidates #'identity)
     (dolist (slot candidates)
       (when (some #'identity (subseq (logical-slot-publication-slot-transients slot) 0 6))
         (error "cold continuation candidate is active or uncertain"))
+      (when (wal-physical-slot-p slot)
+        (physical-slot-restore slot inactive-since))
       (wal-check-replication-slot-capacity-for-count
        (hash-table-count registry) (logical-slot-startup-source-maximum source))
       (setf (gethash (copy-seq (wal-replication-slot-name slot)) registry) slot))
@@ -125,7 +129,10 @@
 
 (defun logical-slot-continuation-cold-preparation-semantic-image (image)
   (mapcar (lambda (row)
-            (list (first row) (third row) (fourth row) (seventh row) (eighth row)))
+            (let ((transients (copy-list (eighth row))))
+              (when (wal-physical-slot-p (second row))
+                (setf (seventh transients) 0))
+              (list (first row) (third row) (fourth row) (seventh row) transients)))
           image))
 
 ;; A claim makes a fresh full proof in closed scopes and compares the host,

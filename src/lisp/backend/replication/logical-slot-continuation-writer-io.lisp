@@ -50,11 +50,15 @@
   (logical-slot-continuation-writer-base-check context))
 
 (defun logical-slot-continuation-writer-check-new-inventory (context)
-  (with-continuation-writer-context (context slot-root record ledger name target-row)
+  (with-continuation-writer-context (context proof slot-root record ledger name target-row)
     (multiple-value-bind (rows observed)
         (logical-slot-continuation-read-slot-inventory
          slot-root (lambda () (logical-slot-continuation-writer-base-check context)))
-      (unless (and (eq :new (logical-slot-continuation-prepared-classify record rows))
+      (unless (and (eq :new
+                       (logical-slot-continuation-prepared-classify
+                        record
+                        (logical-slot-continuation-native-proof-partition-under-lock
+                         proof rows)))
                    (equalp observed
                            (mapcar (lambda (row) (if (string= name (first row)) target-row row)) ledger)))
         (error "continuation writer did not preserve its exact new inventory")))))

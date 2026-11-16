@@ -1142,13 +1142,14 @@
     (format t "~&NATIVE-COLD-PREPARATION-WAL-REFUSAL PASS case=~a valid-CRC same-policy same-pending changed-transcript~%"
             (uiop:getenv "PG_NATIVE_COLD_CASE"))))
 
-(defun native-host-cold-add-extra (staging)
+(defun native-host-cold-add-extra (staging &optional reserved (system-id 5339102419085599071))
   (let ((image (wal-encode-replication-slot
                 (make-wal-replication-slot
-                 :name "extra" :kind :physical :system-id 5339102419085599071
+                 :name "extra" :kind :physical :system-id system-id
                  :database-oid nil :plugin nil :consistent-lsn nil
-                 :confirmed-flush-lsn nil :restart-lsn nil
-                 :restart-timeline nil :inactive-since 0 :wal-status :lost))))
+                 :confirmed-flush-lsn nil :restart-lsn (when reserved (1- *wal-durable-lsn*))
+                 :restart-timeline (when reserved *wal-insert-timeline*) :inactive-since 0
+                 :wal-status (if reserved :reserved :lost)))))
     (slot-state-create (wal-replication-slot-directory) "extra" image)
     (when staging
       (with-open-file (stream (merge-pathnames "pg_replslot/extra/state.tmp" *pgdata*)
@@ -1164,6 +1165,116 @@
                   collect (list name (physical-image-file-facts -100 (namestring path))
                                 (read-bounded-regular-file path +slot-state-maximum-bytes+)))))
 
+(defun native-host-cold-mixed-seal ()
+  (let ((selected (native-host-writer-selected))
+        (physical (read-bounded-regular-file
+                   (merge-pathnames "pg_replslot/extra/state" *pgdata*)
+                   +slot-state-maximum-bytes+)))
+    (format t "~&NATIVE-COLD-MIXED-PUBLICATION-EXPECTED ~a:~a~%"
+            (with-output-to-string (stream)
+              (loop for byte across (logical-slot-continuation-encode selected)
+                    do (format stream "~2,'0x" byte)))
+            (with-output-to-string (stream)
+              (loop for byte across physical do (format stream "~2,'0x" byte))))
+    (finish-output)))
+
+(defun native-host-cold-mixed-restart (gate ownership)
+  (let ((before (native-host-cold-extra-files))
+        (fds (native-host-writer-open-fds)))
+    (wal-load-replication-slots :gate-owner gate :ownership ownership)
+    (catalog-init)
+    (assert (= 3 (hash-table-count *wal-replication-slots*)))
+    (assert (= 2 *logical-capture-live-slots*))
+    (let* ((beta (gethash "beta" *wal-replication-slots*))
+           (physical (gethash "extra" *wal-replication-slots*))
+           (group (gethash *wal-replication-slots*
+                           *logical-slot-continuation-protection-registries*)))
+      (assert (= 37853 (wal-replication-slot-confirmed-flush-lsn beta)))
+      (assert (zerop (hash-table-count (wal-replication-slot-pending-xids beta))))
+      (assert (wal-physical-slot-p physical))
+      (assert (= *wal-durable-lsn* (wal-replication-slot-restart-lsn physical)))
+      (call-with-logical-replication-slot
+       "beta" (lambda (owned) (assert (eq beta owned))))
+      (native-host-cold-with-wal
+       (lambda () (assert (logical-slot-continuation-protection-call group :check)))))
+    (assert (equalp before (native-host-cold-extra-files)))
+    (assert (equal fds (native-host-writer-open-fds)))
+    (native-host-cold-mixed-seal)
+    (format t "~&NATIVE-COLD-MIXED-PUBLICATION PASS case=~a fresh-restart exact-saved-inventory~%"
+            (uiop:getenv "PG_NATIVE_COLD_CASE"))))
+
+(defun native-host-cold-mixed-publication (gate ownership)
+  (when (uiop:getenv "PG_NATIVE_COLD_MIXED_RESTART")
+    (return-from native-host-cold-mixed-publication
+      (native-host-cold-mixed-restart gate ownership)))
+  (native-host-cold-add-extra nil t)
+  (let* ((fds (native-host-writer-open-fds)) (snapshot nil) (reservation nil)
+                                             (candidates nil)
+                                             (*logical-slot-continuation-cold-publication-test-hook*
+                                               (lambda (point completion group registry)
+                                                 (declare (ignore completion group))
+                                                 (when (eq point :completion-ready)
+                                                   (setf candidates
+                                                         (loop for name being the hash-keys of registry using (hash-value slot)
+                                                               collect (list name slot (wal-replication-slot-pending-xids slot))))))))
+    (call-with-logical-slot-continuation-cold-state
+     gate ownership
+     (lambda (observation actual check)
+       (assert (= 3 (length (getf observation :rows))))
+       (setf snapshot (getf observation :snapshot) reservation actual)
+       (assert (= 2 (length (getf snapshot :slots))))
+       (funcall check)))
+    (let ((before (native-host-cold-extra-files)))
+      (wal-load-replication-slots :gate-owner gate :ownership ownership)
+      (catalog-init)
+      (let* ((registry *wal-replication-slots*)
+             (group (gethash registry *logical-slot-continuation-protection-registries*))
+             (physical (gethash "extra" registry))
+             (beta (gethash "beta" registry)))
+        (assert (= 3 (hash-table-count registry)))
+        (assert (= 2 *logical-capture-live-slots*))
+        (assert (and group (wal-physical-slot-p physical)))
+        (assert (plusp (wal-replication-slot-inactive-since physical)))
+        (dolist (row candidates)
+          (assert (eq (second row) (gethash (first row) registry)))
+          (assert (eq (third row) (wal-replication-slot-pending-xids (second row)))))
+        (assert (= 3 (length candidates)))
+        (native-host-cold-with-wal
+         (lambda ()
+           (assert (logical-slot-continuation-protection-call group :check))
+           (assert (eq physical (logical-slot-continuation-check-slot physical t)))
+           (assert (= 41268 (gethash group *wal-snapshot-retention-pins*)))
+           (assert (null (gethash reservation *wal-snapshot-retention-pins*)))))
+        (assert (= *wal-durable-lsn*
+                   (wal-advance-physical-replication-slot "extra" *wal-durable-lsn*)))
+        (let ((after (assoc "pg_replslot/extra/state" (native-host-cold-extra-files)
+                            :test #'string=)))
+          (assert (not (equalp after (assoc "pg_replslot/extra/state" before :test #'string=))))
+          (setf before (cons after (remove "pg_replslot/extra/state" before
+                                           :key #'first :test #'string=))))
+        (call-with-logical-replication-slot
+         "beta"
+         (lambda (owned)
+           (assert (eq beta owned))
+           (assert (< (wal-replication-slot-confirmed-flush-lsn owned) 37853))
+           (assert (eq beta (logical-slot-continuation-native-acknowledge
+                             "beta" 37853 *wal-logical-slot-owner*)))))
+        (assert (= 37853 (wal-replication-slot-confirmed-flush-lsn beta)))
+        (assert (zerop (hash-table-count (wal-replication-slot-pending-xids beta))))
+        (assert (eq physical (gethash "extra" registry)))
+        (assert (equalp (assoc "pg_replslot/extra/state" before :test #'string=)
+                        (assoc "pg_replslot/extra/state" (native-host-cold-extra-files)
+                               :test #'string=)))
+        (let ((selected (native-host-writer-selected)))
+          (assert (= (1+ (getf snapshot :generation)) (getf selected :generation)))
+          (assert (= 2 (length (getf selected :slots)))))
+        (native-host-cold-with-wal
+         (lambda () (assert (logical-slot-continuation-protection-call group :check))))))
+    (assert (equal fds (native-host-writer-open-fds)))
+    (native-host-cold-mixed-seal)
+    (format t "~&NATIVE-COLD-MIXED-PUBLICATION PASS case=~a complete-registry child-ack physical-preserved no-fd-leak~%"
+            (uiop:getenv "PG_NATIVE_COLD_CASE"))))
+
 (defun native-host-cold-mixed-loader-refusal (gate ownership staging)
   (let ((fds (native-host-writer-open-fds)) (registry *wal-replication-slots*)
                                             (mirrors (logical-slot-publication-mirrors)) (reservation nil))
@@ -1173,7 +1284,8 @@
        (declare (ignore observation))
        (setf reservation actual)
        (funcall check)))
-    (native-host-cold-add-extra staging)
+    (native-host-cold-add-extra staging nil
+                                (if staging 5339102419085599071 5339102419085599072))
     (let ((before (native-host-cold-extra-files)))
       (assert (handler-case
                   (progn (wal-load-replication-slots :gate-owner gate :ownership ownership) nil)
@@ -1271,6 +1383,8 @@
                          "publish-before-commit" "publish-after-commit" "publish-owner-return" "publish-close"
                          "publish-notify" "publish-before-retirement" "publish-lost-registration") :test #'equal)
                (native-host-cold-publication-failure gate ownership (uiop:getenv "PG_NATIVE_COLD_PROOF")))
+              ((equal "load-physical" (uiop:getenv "PG_NATIVE_COLD_PROOF"))
+               (native-host-cold-mixed-publication gate ownership))
               ((member (uiop:getenv "PG_NATIVE_COLD_PROOF")
                        '("load-mixed-refusal" "load-mixed-staging-refusal") :test #'equal)
                (native-host-cold-mixed-loader-refusal

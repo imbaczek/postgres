@@ -22,14 +22,18 @@
     (values (logical-slot-continuation-decode expected) selected-facts)))
 
 (defun logical-slot-continuation-native-preflight-registry (rows)
-  ;; Every saved row must match the current registry incarnation, and the
-  ;; registry must contain no additional slots.
   (unless (= (length rows) (hash-table-count *wal-replication-slots*))
     (error "native writer registry differs from its complete inventory"))
   (dolist (row rows)
     (let ((slot (wal-find-usable-replication-slot-under-lock (first row))))
-      (unless (and slot (wal-replication-slot-child-owner slot)
-                   (equalp (second row) (logical-slot-state-encode slot)))
+      (unless (and slot
+                   (if (wal-physical-slot-p slot)
+                       (equalp
+                        (logical-slot-startup-candidate-image slot)
+                        (logical-slot-startup-candidate-image
+                         (wal-decode-replication-slot-image (second row) (first row))))
+                       (and (wal-replication-slot-child-owner slot)
+                            (equalp (second row) (logical-slot-state-encode slot)))))
         (error "native writer live slot differs from its saved incarnation"))))
   t)
 
@@ -52,7 +56,9 @@
         (logical-slot-continuation-read-slot-inventory
          (logical-slot-continuation-native-proof-slot-root proof)
          (lambda () (logical-slot-continuation-native-proof-check-under-lock proof)))
-      (unless (logical-slot-continuation-slot-rows-equal-p rows (getf old :slots))
+      (unless (logical-slot-continuation-slot-rows-equal-p
+               (logical-slot-continuation-native-proof-partition-under-lock proof rows)
+               (getf old :slots))
         (error "native writer complete inventory differs from its selected image"))
       (logical-slot-continuation-native-preflight-registry rows)
       (unless (eq slot (gethash name *wal-replication-slots*))

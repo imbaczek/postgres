@@ -50,7 +50,9 @@
   ;; generations are checked separately against the saved inventory and host.
   (let ((history (logical-slot-continuation-origin-inputs binding certificate host)))
     (multiple-value-bind (saved demand)
-        (logical-slot-continuation-saved-origin-rows certificate history (sixth host) rows)
+        (logical-slot-continuation-saved-origin-rows
+         certificate history (sixth host)
+         (logical-slot-continuation-partition-rows rows certificate host))
       (let* ((fork (getf certificate :fork)) (child (getf certificate :child-timeline))
                                              (snapshot
                                                (list :version 1 :binding (copy-seq binding) :generation 1 :system-id (first host)

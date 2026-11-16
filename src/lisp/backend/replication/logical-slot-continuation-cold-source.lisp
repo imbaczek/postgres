@@ -207,8 +207,9 @@
                          (read-slot (slot callback)
                            (in-scope
                             (check)
-                            (unless (find slot (logical-slot-startup-source-entries source)
-                                          :key #'logical-slot-startup-entry-slot :test #'eq)
+                            (unless (and (find slot (logical-slot-startup-source-entries source)
+                                               :key #'logical-slot-startup-entry-slot :test #'eq)
+                                         (logical-slot-continuation-selected-child-p slot snapshot))
                               (error "cold reader requires its exact startup candidate"))
                             (multiple-value-prog1
                                 (call-with-logical-slot-continuation-lanes
@@ -254,7 +255,9 @@
          (lambda (read-slot check &optional proved-policy)
            (dolist (entry (logical-slot-startup-source-entries source))
              (let ((slot (logical-slot-startup-entry-slot entry)))
-               (when (eq :reserved (wal-replication-slot-wal-status slot))
+               (when (and (logical-slot-continuation-selected-child-p
+                           slot (getf observation :snapshot))
+                          (eq :reserved (wal-replication-slot-wal-status slot)))
                  (funcall read-slot slot
                           (lambda (cursor seams)
                             (declare (ignore seams))
@@ -268,8 +271,10 @@
                     (state (physical-logical-state-from-fact
                             (getf (getf proved-policy :completed) :logical-fact))))
                (dolist (entry (logical-slot-startup-source-entries source))
-                 (logical-slot-copy-check-slot-lifetime
-                  (logical-slot-startup-entry-slot entry) state history (getf observation :horizon)))))
+                 (when (logical-slot-continuation-selected-child-p
+                        (logical-slot-startup-entry-slot entry) snapshot)
+                   (logical-slot-copy-check-slot-lifetime
+                    (logical-slot-startup-entry-slot entry) state history (getf observation :horizon))))))
            (apply function source observation actual check
                   (when receipt (list (logical-slot-continuation-copy proved-policy)))))
          :policy policy :receipt receipt))))))

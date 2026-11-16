@@ -105,6 +105,7 @@ class ColdPlanContracts(unittest.TestCase):
                           {'case': 'happy', 'proof': None, 'spill': False},
                           {'case': 'happy-extended', 'proof': 'prepare'}])
         base = {'PG_NATIVE_COLD_APPEND': 'old', 'PG_NATIVE_COLD_FAULT': 'old',
+                'PG_NATIVE_COLD_MIXED_RESTART': 'old',
                 'PG_NATIVE_COLD_PLAN': 'input-only', 'UNCHANGED': 'yes'}
         first = native.child_environment(base, rows[0])
         second = native.child_environment(first, rows[1])
@@ -114,8 +115,10 @@ class ColdPlanContracts(unittest.TestCase):
         self.assertEqual('1', first['PG_NATIVE_COLD_GENERATION'])
         self.assertEqual('1', first['PG_NATIVE_COLD_SPILL'])
         for key in ('PG_NATIVE_COLD_PROOF', 'PG_NATIVE_COLD_SPILL', 'PG_NATIVE_COLD_APPEND',
-                    'PG_NATIVE_COLD_FAULT', 'PG_NATIVE_COLD_PLAN'):
+                      'PG_NATIVE_COLD_FAULT', 'PG_NATIVE_COLD_PLAN',
+                      'PG_NATIVE_COLD_MIXED_RESTART'):
             self.assertNotIn(key, second)
+        self.assertNotIn('PG_NATIVE_COLD_MIXED_RESTART', first)
         self.assertEqual('1', third['PG_NATIVE_COLD_APPEND'])
         self.assertEqual('yes', third['UNCHANGED'])
         self.assertEqual('old', base['PG_NATIVE_COLD_FAULT'])
@@ -231,6 +234,41 @@ class ColdPlanContracts(unittest.TestCase):
         result = native.run_cold_children(SimpleNamespace(wait_child=child), ['sbcl'], env,
                                           row, self.root / 'crash.log', 12, 11, 10)
         return calls, result
+
+    def mixed_children(self, *, changed_seal=False, failed_restart=False):
+        calls = []
+        row = dict(case='happy', proof='load-physical', spill=False)
+
+        def child(command, env, log, lease, run_lock, workspace):
+            calls.append((dict(env), log))
+            if len(calls) > 1:
+                self.assertEqual('1', env['PG_NATIVE_COLD_MIXED_RESTART'])
+                self.assertNotIn('PG_NATIVE_COLD_APPEND', env)
+            seal = 'CCDD' if changed_seal and len(calls) == 2 else 'AABB'
+            log.write_text('NATIVE-COLD-MIXED-PUBLICATION-EXPECTED 1122:' + seal + '\n'
+                           'NATIVE-COLD-MIXED-PUBLICATION PASS case=happy\n')
+            return 1 if failed_restart and len(calls) == 2 else 0
+
+        result = native.run_cold_children(SimpleNamespace(wait_child=child), ['sbcl'],
+                                         dict(PG_NATIVE_COLD_APPEND='1'), row,
+                                         self.root / 'mixed.log', 12, 11, 10)
+        return calls, result
+
+    def test_mixed_inventory_requires_two_clean_restarts_with_exact_physical_and_selector_bytes(self):
+        calls, (status, _, recovery) = self.mixed_children()
+        self.assertEqual(3, len(calls))
+        self.assertEqual(3, len({call[1] for call in calls}))
+        self.assertEqual(0, status)
+        self.assertEqual('clean', recovery['kind'])
+        self.assertTrue(recovery['passed'])
+
+    def test_mixed_restart_rejects_changed_physical_bytes_or_failed_child(self):
+        for options in (dict(changed_seal=True), dict(failed_restart=True)):
+            with self.subTest(options=options):
+                calls, (status, _, recovery) = self.mixed_children(**options)
+                self.assertEqual(2, len(calls))
+                self.assertNotEqual(0, status)
+                self.assertFalse(recovery['passed'])
 
     def test_crash_requires_sigkill_then_two_fresh_restarts_with_the_same_seal(self):
         calls, (status, log, crash) = self.crash_children()

@@ -38,6 +38,7 @@ PROOF_MARKERS = {
     'load-bootstrap-prefix': 'NATIVE-COLD-PUBLICATION',
     'load-empty': 'NATIVE-COLD-EMPTY-LOADER',
     'load-empty-late': 'NATIVE-COLD-EMPTY-LOADER-REFUSAL',
+    'load-physical': 'NATIVE-COLD-MIXED-PUBLICATION',
     'load-mixed-refusal': 'NATIVE-COLD-LOADER-REFUSAL',
     'load-mixed-staging-refusal': 'NATIVE-COLD-LOADER-REFUSAL',
     'publish': 'NATIVE-COLD-PUBLICATION',
@@ -153,6 +154,7 @@ def child_environment(base, row):
                PG_NATIVE_COLD_KIND=kind, PG_NATIVE_COLD_CHOICE=choice,
                PG_NATIVE_COLD_VARIANT_ROOT=row['variant_root'])
     env.pop('PG_NATIVE_COLD_PLAN', None)
+    env.pop('PG_NATIVE_COLD_MIXED_RESTART', None)
     # Do not let a previous or inherited mode leak into this row.
     for key, value in (('PG_NATIVE_COLD_PROOF', row['proof']),
                        ('PG_NATIVE_COLD_RECONCILE_CUT', row.get('cut')),
@@ -185,7 +187,33 @@ def cold_pass_marker(row, text):
             and (not cold_spill_required(row) or cold_spill_marker(text)))
 
 
+def run_mixed_restarts(campaign, command, env, row, log, lease, run_lock, workspace):
+    recovery = dict(kind='clean', restarts=[], passed=False)
+    expected = None
+    recovery_env = dict(env)
+    recovery_env.pop('PG_NATIVE_COLD_APPEND', None)
+    recovery_env['PG_NATIVE_COLD_MIXED_RESTART'] = '1'
+    pattern = r'^NATIVE-COLD-MIXED-PUBLICATION-EXPECTED ([0-9A-Fa-f]+:[0-9A-Fa-f]+)$'
+    for attempt in range(3):
+        current = log if attempt == 0 else log.with_name(log.stem + '-restart-' + str(attempt) + log.suffix)
+        status = campaign.wait_child(command, env if attempt == 0 else recovery_env,
+                                     current, lease, run_lock, workspace)
+        text = current.read_text(errors='replace')
+        seal = re.findall(pattern, text, re.MULTILINE)
+        if expected is None:
+            expected = seal
+        passed = status == 0 and len(seal) == 1 and seal == expected and cold_pass_marker(row, text)
+        recovery['restarts'].append(dict(attempt=attempt, exit_code=status,
+                                         log=str(current), passed=passed))
+        if not passed:
+            return status or 1, current, recovery
+    recovery['passed'] = True
+    return 0, current, recovery
+
+
 def run_cold_children(campaign, command, env, row, log, lease, run_lock, workspace):
+    if row['proof'] == 'load-physical':
+        return run_mixed_restarts(campaign, command, env, row, log, lease, run_lock, workspace)
     status = campaign.wait_child(command, env, log, lease, run_lock, workspace)
     if not row.get('cut'):
         return status, log, None
@@ -268,7 +296,10 @@ def main():
                                 log=str(log), input_variant=str(variant), observed=str(observed),
                                 source=frozen['image'], proof_mode=row['proof'], label=label,
                                 spill=row['spill'], spill_exercised=cold_spill_marker(log_text),
-                                cut=row.get('cut'), crash=crash, passed=passed))
+                                  cut=row.get('cut'),
+                                  crash=crash if row.get('cut') else None,
+                                  clean_restarts=crash if row['proof'] == 'load-physical' else None,
+                                  passed=passed))
             campaign.write_json(logs / 'native-cold-results.json', results)
             if not passed:
                 raise RuntimeError('Cold case failed: ' + str(log))

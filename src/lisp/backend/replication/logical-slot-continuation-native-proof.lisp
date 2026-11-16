@@ -119,6 +119,12 @@
 (defun logical-slot-continuation-native-proof-check-under-lock (proof)
   (call-with-logical-slot-continuation-native-proof-check proof (lambda () proof)))
 
+(defun logical-slot-continuation-native-proof-partition-under-lock (proof rows)
+  (call-with-logical-slot-continuation-native-proof-check
+   proof
+   (lambda ()
+     (funcall (logical-slot-continuation-native-proof-state proof) :partition proof rows))))
+
 (defun logical-slot-continuation-native-proof-claim-under-lock (proof)
   ;; Claim once; this does not grant writer authority or replace fresh preflight.
   (call-with-logical-slot-continuation-native-proof-check
@@ -157,7 +163,7 @@
           (unless (<= (first seal) (getf resources :horizon))
             (error "native terminal proof exceeds its captured durable horizon"))
           (logical-slot-continuation-native-proof-point :after-observation)
-          (labels ((state (operation candidate)
+          (labels ((state (operation candidate &optional rows)
                      (unless (and (eq candidate proof) (eq thread sb-thread:*current-thread*) (eq mutex *wal-lock*))
                        (error "native terminal proof changed identity, thread or WAL mutex"))
                      (ecase operation
@@ -177,6 +183,15 @@
                         (wal-retained-slot-scan-check-scope-under-lock scan)
                         (logical-wal-check-source source (wal-retained-slot-scan-end scan))
                         t)
+                       (:partition
+                        (state :check candidate)
+                        (logical-slot-continuation-partition-rows
+                         rows (getf (getf resources :facts) :certificate)
+                         (list (logical-wal-source-system-id source)
+                               nil nil
+                               (logical-wal-source-history-bytes source)
+                               (logical-wal-source-timeline source)
+                               *wal-durable-lsn*)))
                        (:claim
                         (unless (and active (not failed) (not claimed))
                           (error "native terminal proof was already claimed"))

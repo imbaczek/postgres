@@ -66,11 +66,13 @@
   (unless (logical-slot-continuation-runtime-storage-p storage)
     (error "runtime selector proof requires runtime storage"))
   (logical-slot-continuation-storage-check storage)
-  (logical-slot-continuation-check-selected-snapshot
-   snapshot (logical-slot-continuation-storage-call storage :binding) (getf facts :certificate)
-   (logical-slot-continuation-storage-call storage :host)
-   (logical-slot-continuation-read-saved-rows storage)
-   (logical-slot-continuation-storage-call storage :horizon))
+  (let* ((host (logical-slot-continuation-storage-call storage :host))
+         (children (logical-slot-continuation-partition-rows
+                    (logical-slot-continuation-read-saved-rows storage)
+                    (getf facts :certificate) host)))
+    (logical-slot-continuation-check-selected-snapshot
+     snapshot (logical-slot-continuation-storage-call storage :binding) (getf facts :certificate)
+     host children (logical-slot-continuation-storage-call storage :horizon)))
   (logical-slot-continuation-storage-check storage))
 
 ;; Prove the original strict boundary rules through S, then use ordinary

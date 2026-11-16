@@ -38,6 +38,7 @@
                (:file "t/rove/continuation-inventory-tests")
                (:file "t/rove/continuation-native-proof-tests")
                (:file "t/rove/continuation-prepared-tests")
+               (:file "t/rove/continuation-partition-tests")
                (:file "t/rove/continuation-cold-startup-tests")
                (:file "t/rove/continuation-selected-proof-tests")
                (:file "t/rove/continuation-cold-source-tests")

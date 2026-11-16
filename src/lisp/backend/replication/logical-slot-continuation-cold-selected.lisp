@@ -8,21 +8,21 @@
       (values :prepared (logical-slot-continuation-prepared-decode bytes))))
 
 (defun logical-slot-continuation-cold-classify (kind model rows binding certificate host)
-  ;; A stable image must match the full inventory; PREPARED must match exactly
-  ;; its old or new inventory.  Classification is not proof or publication.
-  (ecase kind
-    (:stable
-     (logical-slot-continuation-check-selected-snapshot model binding certificate host rows (sixth host))
-     (values model :stable))
-    (:prepared
-     (dolist (key '(:old :new))
-       (let ((snapshot (getf model key)))
-         (logical-slot-continuation-check-selected-snapshot
-          snapshot binding certificate host (getf snapshot :slots) (sixth host))))
-     (let ((selection (logical-slot-continuation-prepared-classify model rows)))
-       (when (eq selection :blocked)
-         (error "cold continuation complete inventory matches neither old nor new"))
-       (values (getf model selection) selection)))))
+  (let ((children (logical-slot-continuation-partition-rows rows certificate host)))
+    (ecase kind
+      (:stable
+       (logical-slot-continuation-check-selected-snapshot
+        model binding certificate host children (sixth host))
+       (values model :stable))
+      (:prepared
+       (dolist (key '(:old :new))
+         (let ((snapshot (getf model key)))
+           (logical-slot-continuation-check-selected-snapshot
+            snapshot binding certificate host (getf snapshot :slots) (sixth host))))
+       (let ((selection (logical-slot-continuation-prepared-classify model children)))
+         (when (eq selection :blocked)
+           (error "cold continuation complete inventory matches neither old nor new"))
+         (values (getf model selection) selection))))))
 
 (defun call-with-logical-slot-continuation-cold-selected-files (storage function)
   ;; Keep the selected inode and any unselected selector.tmp under checked
