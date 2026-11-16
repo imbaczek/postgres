@@ -172,6 +172,8 @@
 ;; With :TRANSCRIPT T, prove and seal the tail first and pass a scoped mapper
 ;; as the fifth callback argument.  Live checks and reproof remain outside it.
 
+;; When :WITNESS is true, PROVE returns a tail witness as its second value.
+
 (defun call-with-logical-slot-continuation-local-tail-source (storage snapshot function &key boundaries
                                                                                           (end (first (getf snapshot :sealed-end))) (batch-policy :strict) (require-closed t) transcript witness)
   ;; Prove locally present original-child WAL from F to END.  END defaults to

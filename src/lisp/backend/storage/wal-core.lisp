@@ -268,6 +268,8 @@ Logical updates guard identity, progress and the first terminal cause."
 
 (declaim (ftype function logical-slot-continuation-cold-check-admission))
 
+;; Check a supplied count and maximum, including the zero-capacity case.
+
 (defun wal-check-replication-slot-capacity-for-count (count maximum)
   (unless (and (typep count '(integer 0 *)) (typep maximum '(integer 0 *)))
     (error "replication slot capacity requires nonnegative counts"))
@@ -276,6 +278,8 @@ Logical updates guard identity, progress and the first terminal cause."
   (when (>= count maximum)
     (ereport "53400" "all replication slots are in use"))
   (values))
+
+;; Public slot creation checks cold admission before shared capacity.
 
 (defun wal-check-replication-slot-capacity ()
   "Check shared capacity under WAL, counting temporary and lost slots too."

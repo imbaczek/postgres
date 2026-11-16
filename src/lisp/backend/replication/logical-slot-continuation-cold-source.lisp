@@ -235,6 +235,9 @@
 
 ;; :POLICY also checks each saved slot's lifetime against the proved policy.
 
+;; :RECEIPT requires :POLICY and passes the proof as a fifth callback argument.
+;; Without :RECEIPT the callback keeps its four-argument interface.
+
 (defun call-with-logical-slot-continuation-cold-reconstruction (gate ownership function &key policy receipt)
   ;; Reconstruct every saved reserved candidate privately through the actual
   ;; durable horizon L before the callback. This scope does not publish slots

@@ -1,5 +1,9 @@
 (in-package #:pg)
 
+;; Prepare an imported slot registry without publishing it. A receipt survives
+;; the proof's closed descriptors, but later effects need a new protected check.
+;; Only the owned entry point registers a receipt; copying it grants no authority.
+
 (defstruct (logical-slot-continuation-cold-preparation
             (:constructor %make-logical-slot-continuation-cold-preparation)
             (:print-function physical-libpq-print-private-object))
@@ -21,6 +25,9 @@
         (when (functionp state) (funcall state :lost preparation))
         (error "cold preparation lost its registered receipt"))
       (sb-sys:with-local-interrupts (funcall state operation preparation)))))
+
+;; Retain the original candidate identities and freeze their registry image,
+;; including reconstructed pending transactions, for later comparison.
 
 (defun logical-slot-continuation-cold-prepare-registry (source)
   (logical-slot-startup-check-inventory source)
@@ -48,6 +55,10 @@
     (if (sb-thread:holding-mutex-p mutex)
         (funcall failure)
         (sb-thread:with-mutex (mutex) (funcall failure)))))
+
+;; Complete reconstruction and close its source scopes and descriptors before
+;; returning the saved data.  The failure cell carries cleanup across that close
+;; and receipt creation, so an uncertain failure is retained.
 
 (defun logical-slot-continuation-cold-prepare-data (gate ownership &optional failure-cell)
   (let ((data nil) (failure nil) (complete nil) (mutex *wal-lock*))
@@ -117,6 +128,9 @@
             (list (first row) (third row) (fourth row) (seventh row) (eighth row)))
           image))
 
+;; A claim makes a fresh full proof in closed scopes and compares the host,
+;; configuration, observation, source, semantic registry image and F..L witness.
+
 (defun logical-slot-continuation-cold-preparation-reprove (data gate ownership)
   (logical-slot-continuation-cold-preparation-check-data data gate ownership)
   (let ((current (logical-slot-continuation-cold-prepare-data gate ownership)))
@@ -133,6 +147,11 @@
                          (logical-slot-continuation-cold-preparation-semantic-image (getf current :image))))
       (error "cold preparation differs from its fresh closed-scope proof")))
   (logical-slot-continuation-cold-preparation-check-data data gate ownership))
+
+;; Register a receipt only after the source scopes have closed.  Identity and
+;; thread rejection precede the masked owner failure latch and cleanup.  A claim
+;; is not effect or publication authority: a later effect needs fresh protected
+;; descriptors and its own commit guard.
 
 (defun call-with-logical-slot-continuation-cold-preparation (gate ownership function)
   (unless (functionp function) (error "cold preparation requires a callback"))

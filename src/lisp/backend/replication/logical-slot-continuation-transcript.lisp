@@ -19,6 +19,10 @@
     (replace frame raw :start1 40)
     frame))
 
+;; Hash complete frames in order, including their coordinates, with the physical
+;; FNV digest.  Copy the visited segment facts for comparison on reproof.
+;; This witness is comparison data and grants no authority.
+
 (defun logical-slot-continuation-tail-witness (spool start end ledger visits)
   (let ((digest #xCBF29CE484222325) (count 0) (bytes 0))
     (call-with-logical-spool-reader
