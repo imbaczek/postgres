@@ -44,8 +44,8 @@
        slot system-id history frontier child-provenances))
   slot)
 
-(defun logical-slot-continuation-check-ordinary-registry
-    (registry members system-id history frontier)
+(defun logical-slot-continuation-check-ordinary-registry-with-validator
+    (registry members system-id history frontier validator)
   (unless (and (hash-table-p registry) (eq (hash-table-test registry) 'equal))
     (error "continuation registry requires an EQUAL table"))
   (let ((child-provenances
@@ -58,10 +58,48 @@
                     (string= name (wal-replication-slot-name slot)))
          (error "ordinary continuation slot changed its registry binding"))
        (unless (assoc name members :test #'string=)
-         (logical-slot-continuation-check-ordinary-slot
-          slot system-id history frontier child-provenances)))
+         (funcall validator slot system-id history frontier child-provenances)))
      registry))
   t)
+
+(defun logical-slot-continuation-check-runtime-ordinary-slot
+    (slot system-id history frontier &optional child-provenances permitted operation)
+  (unless (or (null permitted) (physical-slot-lifetime-p permitted))
+    (error "temporary physical operation requires a typed lifetime"))
+  (if (or (wal-replication-slot-temporary-p slot)
+          (wal-replication-slot-temporary-lifetime slot)
+          (gethash slot *physical-slot-lifetimes*))
+      (progn
+        (unless (and (wal-physical-slot-p slot)
+                     (physical-slot-lifetime-p (wal-replication-slot-temporary-lifetime slot)))
+          (error "runtime ordinary temporary slot requires a physical lifetime"))
+        (let* ((lifetime (wal-replication-slot-temporary-lifetime slot))
+               (mode (if (eq lifetime permitted)
+                         (ecase operation
+                           (:physical-create :creating)
+                           (:physical-drop :drop-check))
+                         :live)))
+          (physical-slot-lifetime-call-under-lock lifetime mode slot))
+        (physical-slot-check-position slot system-id history frontier))
+      (logical-slot-continuation-check-ordinary-slot
+       slot system-id history frontier child-provenances))
+  slot)
+
+(defun logical-slot-continuation-check-runtime-ordinary-registry
+    (registry members system-id history frontier &optional permitted operation)
+  (assert (sb-thread:holding-mutex-p *wal-lock*))
+  (physical-slot-check-names-under-lock)
+  (logical-slot-continuation-check-ordinary-registry-with-validator
+   registry members system-id history frontier
+   (lambda (slot sid chain end provenances)
+     (logical-slot-continuation-check-runtime-ordinary-slot
+      slot sid chain end provenances permitted operation))))
+
+(defun logical-slot-continuation-check-ordinary-registry
+    (registry members system-id history frontier)
+  (logical-slot-continuation-check-ordinary-registry-with-validator
+   registry members system-id history frontier
+   #'logical-slot-continuation-check-ordinary-slot))
 
 (defun logical-slot-continuation-check-ordinary-candidate
     (registry members value system-id history frontier)
@@ -78,10 +116,31 @@
       (logical-slot-check-update-under-lock live value))
     (logical-slot-continuation-check-ordinary-slot value system-id history frontier)))
 
-;; Split the full saved inventory into certified child rows and ordinary
-;; rows, preserving their order. Check child certificates separately from
-;; ordinary slot state; callers still retain the complete raw inventory.
-(defun logical-slot-continuation-partition-rows (rows certificate host)
+(defun logical-slot-continuation-check-runtime-ordinary-candidate
+    (registry members value system-id history frontier)
+  (unless (and (wal-replication-slot-p value)
+               (not (assoc (wal-replication-slot-name value) members :test #'string=)))
+    (error "ordinary slot is outside its live registry"))
+  (let ((live (gethash (wal-replication-slot-name value) registry)))
+    (unless (and (wal-replication-slot-p live)
+                 (eq (wal-physical-slot-p live) (wal-physical-slot-p value)))
+      (error "ordinary slot changed its live kind or registry binding"))
+    (if (or (wal-replication-slot-temporary-p live)
+            (wal-replication-slot-temporary-p value))
+        (progn
+          (unless (and (wal-physical-slot-p live)
+                       (wal-replication-slot-temporary-p live)
+                       (wal-replication-slot-temporary-p value))
+            (error "ordinary candidate changed temporary physical identity"))
+          (physical-slot-lifetime-check-under-lock live)
+          (physical-slot-check-temporary-candidate-under-lock value)
+          (physical-slot-check-position value system-id history frontier))
+        (logical-slot-continuation-check-ordinary-candidate
+         registry members value system-id history frontier)))
+  value)
+
+(defun logical-slot-continuation-partition-rows-with-validator
+    (rows certificate host validator frontier)
   (logical-slot-copy-descriptor-list-count rows +logical-slot-continuation-obligation-limit+)
   (logical-slot-copy-descriptor-list-count
    (getf certificate :slots) +logical-slot-continuation-obligation-limit+)
@@ -118,10 +177,48 @@
                history (sixth host))
               (push row children))
             (let ((slot (wal-decode-replication-slot-image bytes name)))
-              (logical-slot-continuation-check-ordinary-slot
-               slot (first host) history (sixth host) child-provenances)
+              (funcall validator slot (first host) history frontier child-provenances)
               (push row ordinary)))))
     (values (nreverse children) (nreverse ordinary))))
+
+(defun logical-slot-continuation-check-runtime-ordinary-image
+    (slot system-id history frontier child-provenances)
+  (assert (sb-thread:holding-mutex-p *wal-lock*))
+  (let ((live (gethash (wal-replication-slot-name slot) *wal-replication-slots*)))
+    (unless (and (wal-replication-slot-p live)
+                 (eq (wal-physical-slot-p slot) (wal-physical-slot-p live)))
+      (error "runtime ordinary image has no matching live slot"))
+    (if (wal-replication-slot-temporary-p slot)
+        (progn
+          (unless (and (wal-physical-slot-p slot)
+                       (wal-replication-slot-temporary-p live))
+            (error "runtime temporary image requires a physical live slot"))
+          (physical-slot-lifetime-check-under-lock live)
+          (physical-slot-check-position slot system-id history frontier))
+        (logical-slot-continuation-check-ordinary-slot
+         slot system-id history frontier child-provenances))
+    (unless (equalp (logical-slot-startup-candidate-image slot)
+                    (logical-slot-startup-candidate-image live))
+      (error "runtime ordinary disk image differs from its live durable state")))
+  slot)
+
+(declaim (ftype function logical-slot-continuation-native-preflight-registry))
+
+(defun logical-slot-continuation-partition-runtime-rows-under-lock (rows certificate host)
+  (assert (sb-thread:holding-mutex-p *wal-lock*))
+  (physical-slot-check-names-under-lock)
+  (unless (= (length rows) (hash-table-count *wal-replication-slots*))
+    (error "runtime continuation inventory differs from the full live registry"))
+  (logical-slot-continuation-partition-rows-with-validator
+   rows certificate host #'logical-slot-continuation-check-runtime-ordinary-image
+   *wal-durable-lsn*))
+
+;; Split the full saved inventory into certified child rows and ordinary
+;; rows, preserving their order. Check child certificates separately from
+;; ordinary slot state; callers still retain the complete raw inventory.
+(defun logical-slot-continuation-partition-rows (rows certificate host)
+  (logical-slot-continuation-partition-rows-with-validator
+   rows certificate host #'logical-slot-continuation-check-ordinary-slot (sixth host)))
 
 (defun logical-slot-continuation-selected-child-p (slot snapshot)
   (and (wal-logical-slot-p slot)

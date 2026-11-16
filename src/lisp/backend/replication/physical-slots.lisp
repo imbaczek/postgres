@@ -321,15 +321,19 @@ The returned slot has fresh process-local ownership and transaction state."
   "Check the shared slot namespace and capacity while holding the WAL lock."
   (unless (wal-valid-replication-slot-name-p name)
     (ereport "42602" "invalid replication slot name ~s" name))
+  (physical-slot-check-name-under-lock name)
   (when (gethash name *wal-replication-slots*)
     (ereport "42710" "replication slot ~s already exists" name))
   (wal-check-replication-slot-capacity))
 
 (defun physical-slot-owned-by-backend-p (slot backend)
   "Test whether BACKEND is the temporary physical slot's creator."
+  (when (wal-replication-slot-p slot)
+    (physical-slot-check-name-under-lock (wal-replication-slot-name slot)))
   (and backend (wal-physical-slot-p slot)
        (wal-replication-slot-temporary-p slot)
-       (eq backend (wal-replication-slot-temporary-owner slot))))
+       (eq backend (wal-replication-slot-temporary-owner slot))
+       (physical-slot-check-temporary-owner-under-lock slot backend)))
 
 (defun physical-slot-publish-create-under-lock (name restart timeline temporary)
   "Create and publish a slot while holding the WAL lock.
@@ -337,25 +341,32 @@ If creation may have published state but fails, retain its name and WAL floor
 and reject normal use until startup validates the state."
   (wal-check-healthy)
   (wal-check-physical-slot-create name)
-  ;; The receipt and completion flag let cleanup retain a possibly visible pin.
   (let ((publication-receipt (list :unpublished))
         (completed nil)
-        (slot (make-wal-replication-slot
-               :name name :kind :physical :system-id (catalog-system-identifier)
-               :restart-lsn restart :restart-timeline timeline
-               :consistent-lsn nil :confirmed-flush-lsn nil :plugin nil
-               :temporary-p temporary :temporary-owner (when temporary *backend*)
-               :active-owner (when temporary *backend*)
-               :active-owner-backend (when temporary *backend*)
-               :inactive-since (postgres-current-timestamp))))
-    (unwind-protect
-         (progn
-           (setf (gethash name *wal-replication-slots*) slot)
-           (wal-create-replication-slot-file slot publication-receipt)
-           (setf (wal-replication-slot-inactive-since slot) (postgres-current-timestamp)
-                 completed t))
-      (wal-finish-replication-slot-creation-under-lock slot publication-receipt completed))
-    slot))
+        (system-id (catalog-system-identifier)))
+    (multiple-value-bind (lifetime bind-lifetime finish-lifetime)
+        (when temporary (physical-slot-make-lifetime-under-lock name system-id publication-receipt))
+      (let ((slot (make-wal-replication-slot
+                   :name name :kind :physical :system-id system-id
+                   :restart-lsn restart :restart-timeline timeline
+                   :consistent-lsn nil :confirmed-flush-lsn nil :plugin nil
+                   :temporary-p temporary :temporary-owner (when temporary *backend*)
+                   :temporary-lifetime lifetime
+                   :active-owner (when temporary *backend*)
+                   :active-owner-backend (when temporary *backend*)
+                   :inactive-since (postgres-current-timestamp)))
+            (*physical-slot-lifetime-create* lifetime))
+        (when bind-lifetime (funcall bind-lifetime slot))
+        (unwind-protect
+             (progn
+               (setf (gethash name *wal-replication-slots*) slot)
+               (wal-create-replication-slot-file slot publication-receipt)
+               (when finish-lifetime (funcall finish-lifetime slot t))
+               (setf (wal-replication-slot-inactive-since slot) (postgres-current-timestamp)
+                     completed t))
+          (wal-finish-replication-slot-creation-under-lock slot publication-receipt completed)
+          (when finish-lifetime (funcall finish-lifetime slot completed)))
+        slot))))
 
 (defun physical-slot-primary-reserve-under-lock ()
   "Reserve the durable checkpoint redo position while holding the WAL lock."
@@ -430,6 +441,7 @@ verify the base floor before publishing under WAL."
   "Create a durable physical slot, optionally reserving WAL and a session owner."
   (when (and temporary (null *backend*))
     (error "temporary physical slot requires a backend owner"))
+  (when temporary (physical-slot-check-temporary-creation-admission))
   (sb-thread:with-mutex (*wal-lock*)
     (wal-check-physical-slot-create name))
   (when (and immediately-reserve (not (recovery-in-progress-p))
@@ -512,6 +524,7 @@ interior position on a standby."
   (when backend
     (let ((slots
             (sb-thread:with-mutex (*wal-lock*)
+              (physical-slot-check-names-under-lock)
               (loop for slot being the hash-values of *wal-replication-slots*
                     when (and (not (wal-replication-slot-creation-failed-p slot))
                               (physical-slot-owned-by-backend-p slot backend))

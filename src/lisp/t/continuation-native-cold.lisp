@@ -1404,6 +1404,32 @@
     (format t "~&NATIVE-COLD-LOGICAL PASS case=~a ordinary-state child-ack exact-full-inventory~%"
             (uiop:getenv "PG_NATIVE_COLD_CASE"))))
 
+(defun native-host-cold-with-temporary-physical (function)
+  (if (not (uiop:getenv "PG_NATIVE_COLD_TEMPORARY"))
+      (funcall function)
+      (let ((*backend* (make-backend
+                        :pid (sb-thread:thread-os-tid sb-thread:*current-thread*)
+                        :thread sb-thread:*current-thread*)))
+        (physical-slot-check-live-admission)
+        (register-backend *backend*)
+        (unwind-protect
+             (let* ((slot (wal-create-physical-replication-slot
+                           "native_temporary" :temporary t :immediately-reserve t))
+                    (capability (wal-replication-slot-temporary-lifetime slot)))
+               (assert (physical-slot-lifetime-p capability))
+               (wal-advance-physical-replication-slot "native_temporary" *wal-durable-lsn*)
+               (let ((image (physical-slot-encode slot)))
+                 (funcall function)
+                 (native-host-cold-with-wal
+                  (lambda ()
+                    (assert (eq slot (physical-slot-lifetime-check-under-lock slot)))
+                    (assert (eq capability (wal-replication-slot-temporary-lifetime slot)))
+                    (assert (equalp image (physical-slot-encode slot)))))
+                 (wal-drop-replication-slot "native_temporary" slot)
+                 (assert (null (gethash "native_temporary" *wal-replication-slots*)))
+                 (format t "~&NATIVE-COLD-TEMPORARY PASS issued-lifetime child-ack owner-drop~%")))
+          (unregister-backend *backend*)))))
+
 (defun native-host-cold-mixed-publication (gate ownership)
   (when (uiop:getenv "PG_NATIVE_COLD_MIXED_RESTART")
     (return-from native-host-cold-mixed-publication
@@ -1453,13 +1479,15 @@
           (assert (not (equalp after (assoc "pg_replslot/extra/state" before :test #'string=))))
           (setf before (cons after (remove "pg_replslot/extra/state" before
                                            :key #'first :test #'string=))))
-        (call-with-logical-replication-slot
-         "beta"
-         (lambda (owned)
-           (assert (eq beta owned))
-           (assert (< (wal-replication-slot-confirmed-flush-lsn owned) 37853))
-           (assert (eq beta (logical-slot-continuation-native-acknowledge
-                             "beta" 37853 *wal-logical-slot-owner*)))))
+        (native-host-cold-with-temporary-physical
+         (lambda ()
+           (call-with-logical-replication-slot
+            "beta"
+            (lambda (owned)
+              (assert (eq beta owned))
+              (assert (< (wal-replication-slot-confirmed-flush-lsn owned) 37853))
+              (assert (eq beta (logical-slot-continuation-native-acknowledge
+                                "beta" 37853 *wal-logical-slot-owner*)))))))
         (assert (= 37853 (wal-replication-slot-confirmed-flush-lsn beta)))
         (assert (zerop (hash-table-count (wal-replication-slot-pending-xids beta))))
         (assert (eq physical (gethash "extra" registry)))

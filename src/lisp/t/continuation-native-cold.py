@@ -213,6 +213,9 @@ def run_mixed_restarts(campaign, command, env, row, log, lease, run_lock, worksp
         if expected is None:
             expected = seal
         passed = status == 0 and len(seal) == 1 and seal == expected and cold_pass_marker(row, text)
+        if attempt == 0 and env.get('PG_NATIVE_COLD_TEMPORARY') is not None:
+            passed = passed and re.search(r'^NATIVE-COLD-TEMPORARY PASS(?:\s|$)',
+                                          text, re.MULTILINE) is not None
         recovery['restarts'].append(dict(attempt=attempt, exit_code=status,
                                          log=str(current), passed=passed))
         if not passed:

@@ -192,6 +192,16 @@
      (multiple-value-prog1 (funcall function directory directory-check) (funcall check)))
    t))
 
+(defun logical-slot-continuation-storage-host (operation archive)
+  (flet ((host ()
+           (logical-slot-continuation-copy (logical-slot-imported-host-startup-image))))
+    (ecase operation
+      (:host (sb-thread:with-mutex (*wal-lock*) (host)))
+      (:runtime-host-under-lock
+       (unless archive (error "locked runtime host requires runtime storage"))
+       (assert (sb-thread:holding-mutex-p *wal-lock*))
+       (host)))))
+
 (defun call-with-logical-slot-continuation-storage-context
     (owner context facts check under-lock function &optional archive)
   (unless (if archive (logical-slot-imported-scan-owner-p owner)
@@ -216,7 +226,7 @@
                                  (sb-sys:with-local-interrupts
                                    (unless (member storage *logical-slot-continuation-startup-storages* :test #'eq)
                                      (error "continuation startup publisher lost its registration"))
-                                   (if (eq operation :check-under-lock)
+                                   (if (member operation '(:check-under-lock :runtime-host-under-lock))
                                        (progn (funcall under-lock)
                                               (when archive (logical-wal-archive-check archive)))
                                        (progn (funcall check)
@@ -280,10 +290,8 @@
                                      (:with-cold-slot-root
                                          (call-with-logical-slot-continuation-cold-slot-root
                                           owner root argument (lambda () (state storage :check))))
-                                     (:host
-                                      (sb-thread:with-mutex (*wal-lock*)
-                                        (logical-slot-continuation-copy
-                                         (logical-slot-imported-host-startup-image))))
+                                     ((:host :runtime-host-under-lock)
+                                      (logical-slot-continuation-storage-host operation archive))
                                      (:with-origin
                                          (unless (functionp argument)
                                            (error "continuation origin proof requires a callback"))

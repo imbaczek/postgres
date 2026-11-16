@@ -187,7 +187,7 @@
                         t)
                        (:partition
                         (state :check candidate)
-                        (logical-slot-continuation-partition-rows
+                        (logical-slot-continuation-partition-runtime-rows-under-lock
                          rows (getf (getf resources :facts) :certificate)
                          (list (logical-wal-source-system-id source)
                                nil nil

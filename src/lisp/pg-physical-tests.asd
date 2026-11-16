@@ -167,6 +167,7 @@
                (:file "t/rove/checkpoint-commit-ts-replay-tests")
                (:file "t/physical-slot-standby-tests")
                (:file "t/physical-slot-api-tests")
+               (:file "t/physical-slot-lifetime-tests")
                (:file "t/selected-eor-replay-tests")
                (:file "t/scan-stage-tests")
                (:file "t/readiness-fpw-tests")

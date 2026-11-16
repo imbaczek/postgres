@@ -218,6 +218,7 @@ Active slots retain WAL until release and a recheck at the same endpoint."
 (defun wal-prepare-slot-recycling-under-lock (redo-segment &optional (current *wal-durable-lsn*))
   "Apply one captured policy and keep size under WAL, returning floor and requests.
 A removal retry captures current settings again at the same frozen endpoint."
+  (physical-slot-check-names-under-lock)
   (multiple-value-bind (policy keep-mb) (startup-retention-inputs)
     (let ((limit (wal-slot-retention-policy-limit policy)))
       (ecase (wal-slot-retention-mode policy)
@@ -305,6 +306,7 @@ Preserve FUNCTION's values; callers may choose a nonwaiting retry."
     (sb-thread:with-mutex (*exported-logical-snapshot-lock*)
       (sb-sys:without-interrupts
         (sb-thread:with-mutex (*wal-lock*)
+          (physical-slot-check-name-under-lock name)
           (let ((slot (gethash name *wal-replication-slots*)))
             (when (and expected-slot (not (eq expected-slot slot)))
               (return-from wal-drop-replication-slot (values)))
@@ -317,6 +319,7 @@ Preserve FUNCTION's values; callers may choose a nonwaiting retry."
             (wal-delete-replication-slot-file name)
             (setf removed-slot slot)
             (remhash name *wal-replication-slots*)
+            (physical-slot-finish-name-removal-under-lock slot)
             (wal-refresh-logical-capture-slot-mirror-under-wal-lock)))
         (when (and removed-slot (wal-logical-slot-p removed-slot))
 

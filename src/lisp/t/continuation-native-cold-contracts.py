@@ -240,7 +240,8 @@ class ColdPlanContracts(unittest.TestCase):
                                           row, self.root / 'crash.log', 12, 11, 10)
         return calls, result
 
-    def mixed_children(self, *, changed_seal=False, failed_restart=False):
+    def mixed_children(self, *, changed_seal=False, failed_restart=False,
+                       temporary=False, missing_temporary=False):
         calls = []
         row = dict(case='happy', proof='load-physical', spill=False)
 
@@ -251,11 +252,16 @@ class ColdPlanContracts(unittest.TestCase):
                 self.assertNotIn('PG_NATIVE_COLD_APPEND', env)
             seal = 'CCDD' if changed_seal and len(calls) == 2 else 'AABB'
             log.write_text('NATIVE-COLD-MIXED-PUBLICATION-EXPECTED 1122:' + seal + '\n'
-                           'NATIVE-COLD-MIXED-PUBLICATION PASS case=happy\n')
+                           'NATIVE-COLD-MIXED-PUBLICATION PASS case=happy\n'
+                           + ('NATIVE-COLD-TEMPORARY PASS issued-lifetime\n'
+                              if temporary and not missing_temporary and len(calls) == 1 else ''))
             return 1 if failed_restart and len(calls) == 2 else 0
 
+        environment = dict(PG_NATIVE_COLD_APPEND='1')
+        if temporary:
+            environment['PG_NATIVE_COLD_TEMPORARY'] = '1'
         result = native.run_cold_children(SimpleNamespace(wait_child=child), ['sbcl'],
-                                         dict(PG_NATIVE_COLD_APPEND='1'), row,
+                                         environment, row,
                                          self.root / 'mixed.log', 12, 11, 10)
         return calls, result
 
@@ -274,6 +280,16 @@ class ColdPlanContracts(unittest.TestCase):
                 self.assertEqual(2, len(calls))
                 self.assertNotEqual(0, status)
                 self.assertFalse(recovery['passed'])
+
+    def test_temporary_qualification_requires_its_initial_child_marker(self):
+        calls, (status, _, recovery) = self.mixed_children(temporary=True)
+        self.assertEqual(3, len(calls))
+        self.assertEqual(0, status)
+        self.assertTrue(recovery['passed'])
+        calls, (status, _, recovery) = self.mixed_children(temporary=True, missing_temporary=True)
+        self.assertEqual(1, len(calls))
+        self.assertNotEqual(0, status)
+        self.assertFalse(recovery['passed'])
 
     def logical_children(self, *, changed_pending=False, failed_seed=False):
         calls = []

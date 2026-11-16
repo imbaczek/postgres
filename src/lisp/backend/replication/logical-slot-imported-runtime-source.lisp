@@ -66,13 +66,29 @@
   (unless (logical-slot-continuation-runtime-storage-p storage)
     (error "runtime selector proof requires runtime storage"))
   (logical-slot-continuation-storage-check storage)
-  (let* ((host (logical-slot-continuation-storage-call storage :host))
-         (children (logical-slot-continuation-partition-rows
-                    (logical-slot-continuation-read-saved-rows storage)
-                    (getf facts :certificate) host)))
-    (logical-slot-continuation-check-selected-snapshot
-     snapshot (logical-slot-continuation-storage-call storage :binding) (getf facts :certificate)
-     host children (logical-slot-continuation-storage-call storage :horizon)))
+  (let ((binding (logical-slot-continuation-storage-call storage :binding))
+        (horizon (logical-slot-continuation-storage-call storage :horizon)))
+    (logical-slot-continuation-storage-call
+     storage :with-slot-root
+     (lambda (directory directory-check)
+       (sb-thread:with-mutex (*wal-lock*)
+         (let ((registry *wal-replication-slots*))
+           (labels ((check ()
+                      (logical-slot-continuation-storage-call storage :check-under-lock)
+                      (funcall directory-check)
+                      (unless (eq registry *wal-replication-slots*)
+                        (error "runtime inventory changed its live registry"))))
+             (check)
+             (let* ((host (logical-slot-continuation-storage-call
+                           storage :runtime-host-under-lock))
+                    (rows (sort (logical-slot-continuation-read-slot-inventory directory #'check)
+                                #'string< :key #'first))
+                    (children (logical-slot-continuation-partition-runtime-rows-under-lock
+                               rows (getf facts :certificate) host)))
+               (logical-slot-continuation-native-preflight-registry rows)
+               (logical-slot-continuation-check-selected-snapshot
+                snapshot binding (getf facts :certificate) host children horizon))
+             (check)))))))
   (logical-slot-continuation-storage-check storage))
 
 ;; Prove the original strict boundary rules through S, then use ordinary

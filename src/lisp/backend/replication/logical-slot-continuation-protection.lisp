@@ -24,7 +24,7 @@
 ;; The selected children are a subset of the registry. Check their saved
 ;; identities and validate every ordinary entry under its own slot contract.
 (defun logical-slot-continuation-protection-check-registry
-    (registry members identities system-id history frontier)
+    (registry members identities system-id history frontier &optional permitted operation)
   (unless (and (<= (length members) (hash-table-count registry))
                (= (length members) (length identities))
                (every (lambda (entry expected)
@@ -36,12 +36,13 @@
                       members identities))
     (error "continuation protection registry differs from its saved group"))
   ;; Other entries may be ordinary persistent logical or physical slots.
-  (logical-slot-continuation-check-ordinary-registry
-   registry members system-id history frontier)
+  (logical-slot-continuation-check-runtime-ordinary-registry
+   registry members system-id history frontier permitted operation)
   t)
 
 (defun logical-slot-continuation-protection-check-bindings
-    (protection pins registry incarnation namespace child members identities origin system-id history)
+    (protection pins registry incarnation namespace child members identities origin system-id history
+     &optional permitted operation)
   (unless (and (eq incarnation *wal-storage-incarnation*)
                (eq pins *wal-snapshot-retention-pins*)
                (eql (logical-slot-continuation-protection-fork protection) (gethash protection pins))
@@ -51,7 +52,7 @@
                (eq protection (gethash registry *logical-slot-continuation-protection-registries*)))
     (error "continuation protection lost its published registry"))
   (logical-slot-continuation-protection-check-registry
-   registry members identities system-id history *wal-durable-lsn*)
+   registry members identities system-id history *wal-durable-lsn* permitted operation)
   (logical-slot-imported-host-origin-call origin :check-root)
   t)
 
@@ -69,7 +70,8 @@
                                                                              (getf snapshot :history)))
                                  (fork (second (getf snapshot :origin))) (child (first (getf snapshot :origin)))
                                  (pins *wal-snapshot-retention-pins*) (incarnation *wal-storage-incarnation*)
-                                 (mutex *wal-lock*) (control (vector phase nil))
+                                 (mutex *wal-lock*) (name-index *physical-slot-lifetime-names*)
+                                 (control (vector phase nil))
                                  (members (mapcar (lambda (row) (cons (first row) (gethash (first row) registry))) rows))
                                  (identities
                                    (mapcar (lambda (row)
@@ -80,7 +82,7 @@
     (unless (and (<= (length members) (hash-table-count registry))
                  (every (lambda (entry) (wal-replication-slot-p (cdr entry))) members))
       (error "continuation group requires its complete candidate registry"))
-    (logical-slot-continuation-check-ordinary-registry
+    (logical-slot-continuation-check-runtime-ordinary-registry
      registry members system-id history *wal-durable-lsn*)
     (labels ((fail ()
                (assert (sb-thread:holding-mutex-p mutex))
@@ -95,19 +97,21 @@
                t)
              (check-identity (object)
                (assert (and (eq mutex *wal-lock*) (sb-thread:holding-mutex-p mutex)))
-               (unless (and (eq object protection)
+               (unless (and (eq name-index *physical-slot-lifetime-names*)
+                            (eq object protection)
                             (equal root (logical-slot-continuation-protection-root-identity protection))
                             (equal names (logical-slot-continuation-protection-names protection))
                             (eql fork (logical-slot-continuation-protection-fork protection))
                             (eq origin (logical-slot-continuation-protection-origin protection)))
                  (error "continuation protection changed its identity")))
-             (ready ()
+             (ready (&optional permitted operation)
                (when (svref control 1)
                  (ereport "55000" "continuation group is uncertain; cold reconciliation required"))
                (unless (eq :published (svref control 0))
                  (ereport "55000" "continuation group is staged; publication required"))
                (logical-slot-continuation-protection-check-bindings
-                protection pins registry incarnation namespace child members identities origin system-id history))
+                protection pins registry incarnation namespace child members identities origin system-id history
+                permitted operation))
              (staged ()
                (check-identity protection)
                (unless (and (eq :staged (svref control 0)) (not (svref control 1))
@@ -130,8 +134,16 @@
                  (:check (ready))
                  (:ordinary
                   (ready)
-                  (logical-slot-continuation-check-ordinary-candidate
+                  (logical-slot-continuation-check-runtime-ordinary-candidate
                    registry members value system-id history *wal-durable-lsn*))
+                 ((:physical-create :physical-drop)
+                  (unless (and (wal-replication-slot-p value)
+                               (wal-physical-slot-p value)
+                               (wal-replication-slot-temporary-p value)
+                               (eq value (gethash (wal-replication-slot-name value) registry))
+                               (not (member (wal-replication-slot-name value) names :test #'string=)))
+                    (error "temporary physical operation is outside its ordinary registry"))
+                  (ready (wal-replication-slot-temporary-lifetime value) operation))
                  (:binding (copy-seq binding))
                  (:image (copy-seq (car selection)))
                  (:owns-cell
@@ -221,10 +233,15 @@
                              (equal key (logical-slot-continuation-protection-root-identity registered)))))
           (error "protected continuation changed its PGDATA identity"))
         (when protection
-          (logical-slot-continuation-protection-call protection :check)
-          (if (member (wal-replication-slot-name slot)
-                      (logical-slot-continuation-protection-names protection) :test #'string=)
-              (when mutation
-                (ereport "55000" "protected imported slot mutation requires continuation publication"))
-              (logical-slot-continuation-protection-call protection :ordinary slot))))))
+          (cond
+            ((member (wal-replication-slot-name slot)
+                     (logical-slot-continuation-protection-names protection) :test #'string=)
+             (logical-slot-continuation-protection-call protection :check)
+             (when mutation
+               (ereport "55000" "protected imported slot mutation requires continuation publication")))
+            ((member mutation '(:physical-create :physical-drop))
+             (logical-slot-continuation-protection-call protection mutation slot))
+            (t
+             (logical-slot-continuation-protection-call protection :check)
+             (logical-slot-continuation-protection-call protection :ordinary slot)))))))
   slot)

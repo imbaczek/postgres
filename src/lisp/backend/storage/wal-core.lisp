@@ -150,6 +150,7 @@ Logical updates guard identity, progress and the first terminal cause."
   ;; PGSLOT1-3 were the private protocol even though the old wire name was pgoutput.
   (plugin "pg_lisp")
   (kind :logical) system-id restart-timeline (temporary-p nil) temporary-owner
+  (temporary-lifetime nil :read-only t)
   (inactive-since 0)
   (pending-xids (make-hash-table :test #'eql))
   (wal-status :reserved))
@@ -189,6 +190,11 @@ Logical updates guard identity, progress and the first terminal cause."
 
 (declaim (ftype function logical-slot-continuation-check-slot))
 
+(declaim (ftype function physical-slot-check-temporary-live-under-lock
+                physical-slot-check-temporary-candidate-under-lock
+                physical-slot-temporary-drop-under-lock
+                physical-slot-lifetime-call-under-lock))
+
 (defun wal-require-known-replication-slot (slot)
   "Reject failed creation or uncertain state until a cold load."
   ;; A failed publication may still be visible on disk and must retain its pin.
@@ -210,13 +216,20 @@ Logical updates guard identity, progress and the first terminal cause."
 
 (declaim (special *wal-lock*))
 
+(declaim (ftype function physical-slot-check-name-under-lock physical-slot-finish-name-removal-under-lock))
+
+(declaim (ftype function physical-slot-check-file-operation-name))
+
 (defun wal-find-usable-replication-slot-under-lock (name)
   ;; Look up and check the generation while the registry is locked.
   (assert (sb-thread:holding-mutex-p *wal-lock*))
   ;; Group admission follows the actual registry lookup, before callers use it.
+  (physical-slot-check-name-under-lock name)
   (let ((slot (gethash name *wal-replication-slots*)))
     (when slot
       (wal-require-usable-replication-slot slot)
+      (when (wal-physical-slot-p slot)
+        (physical-slot-check-temporary-live-under-lock slot))
       (logical-slot-continuation-check-slot slot))))
 
 (defun wal-require-logical-slot (slot)
@@ -3317,9 +3330,18 @@ wal_level_insufficient cause requires PGSLOT6, or PGSLOT7 with a child owner."
 
 (defun wal-create-replication-slot-file (slot &optional publication-receipt)
   ;; CREATE publishes a staged directory without replacing an existing name.
+  (unless (sb-thread:holding-mutex-p *wal-lock*)
+    (return-from wal-create-replication-slot-file
+      (sb-thread:with-mutex (*wal-lock*)
+        (wal-create-replication-slot-file slot publication-receipt))))
+  (physical-slot-check-name-under-lock (wal-replication-slot-name slot))
   (wal-require-usable-replication-slot slot)
+  (when (wal-replication-slot-temporary-lifetime slot)
+    (physical-slot-lifetime-call-under-lock
+     (wal-replication-slot-temporary-lifetime slot) :creating slot))
   ;; A protected group fences creation even if the candidate's type changed.
-  (logical-slot-continuation-check-slot slot t)
+  (logical-slot-continuation-check-slot
+   slot (if (wal-replication-slot-temporary-lifetime slot) :physical-create t))
   (slot-state-create (wal-replication-slot-directory)
                      (wal-replication-slot-name slot)
                      (wal-encode-replication-slot slot)
@@ -3328,7 +3350,14 @@ wal_level_insufficient cause requires PGSLOT6, or PGSLOT7 with a child owner."
 
 (defun wal-save-replication-slot (slot)
   ;; UPDATE requires an existing directory and cannot recreate a dropped slot.
+  (unless (sb-thread:holding-mutex-p *wal-lock*)
+    (return-from wal-save-replication-slot
+      (sb-thread:with-mutex (*wal-lock*)
+        (wal-save-replication-slot slot))))
+  (physical-slot-check-name-under-lock (wal-replication-slot-name slot))
   (wal-require-usable-replication-slot slot)
+  (when (wal-physical-slot-p slot)
+    (physical-slot-check-temporary-candidate-under-lock slot))
   ;; Check the live group before the file mutation.
   (logical-slot-continuation-check-slot slot t)
   (slot-state-update (wal-replication-slot-directory)
@@ -3338,19 +3367,27 @@ wal_level_insufficient cause requires PGSLOT6, or PGSLOT7 with a child owner."
 
 (defun wal-delete-replication-slot-file (name &optional expected-slot)
   (assert (sb-thread:holding-mutex-p *wal-lock*))
+  (physical-slot-check-name-under-lock name)
   (let ((slot (gethash name *wal-replication-slots*)))
     (unless (and slot (or (null expected-slot) (eq slot expected-slot)))
       (error "replication slot deletion requires its exact registered object"))
     (wal-require-known-replication-slot slot)
+    (when (wal-physical-slot-p slot)
+      (physical-slot-temporary-drop-under-lock slot :drop-check))
     ;; Check the live group before removing its registered member.
-    (logical-slot-continuation-check-slot slot t)
+    (logical-slot-continuation-check-slot
+     slot (if (wal-replication-slot-temporary-lifetime slot) :physical-drop t))
     ;; Save the numeric directory identities before removal. On failure the
     ;; claim and WAL pin remain, and only this generation may retry the drop.
     (unless (wal-replication-slot-drop-claim slot)
       (setf (wal-replication-slot-drop-claim slot)
             (slot-state-claim-drop (wal-replication-slot-directory) name)))
+    (when (wal-physical-slot-p slot)
+      (physical-slot-temporary-drop-under-lock slot :begin-drop))
     (slot-state-drop (wal-replication-slot-directory) name
-                     (wal-replication-slot-drop-claim slot)))
+                     (wal-replication-slot-drop-claim slot))
+    (when (wal-physical-slot-p slot)
+      (physical-slot-temporary-drop-under-lock slot :finish-drop)))
   (values))
 
 (defun wal-split-fields (line)

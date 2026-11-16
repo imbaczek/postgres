@@ -214,6 +214,7 @@
                    (:file "../replication/physical-promotion-retained")
                    (:file "../replication/logical-wal-archive")
                    (:file "../replication/physical-origin-proof")
+                   (:file "../replication/physical-slot-lifetime")
                    (:file "../replication/physical-slots")
                    (:file "../replication/physical-promotion-primary")
                    (:file "../utils/control-data")
