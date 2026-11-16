@@ -74,6 +74,7 @@ def cold_plan(environment, campaign):
                    for case in environment.get('PG_NATIVE_COLD_CASES', ','.join(DEFAULT_CASES)).split(',')]
     if not isinstance(entries, list) or not 1 <= len(entries) <= 128:
         raise ValueError('Expected between one and 128 cold plan entries')
+    # Validate every row and owned variant root before starting any child.
     result, labels, roots = [], set(), {}
     for entry in entries:
         if not isinstance(entry, dict) or set(entry) - {'case', 'proof', 'label', 'variant_root', 'spill'}:
@@ -106,6 +107,7 @@ def child_environment(base, row):
                PG_NATIVE_COLD_KIND=kind, PG_NATIVE_COLD_CHOICE=choice,
                PG_NATIVE_COLD_VARIANT_ROOT=row['variant_root'])
     env.pop('PG_NATIVE_COLD_PLAN', None)
+    # Do not let a previous or inherited mode leak into this row.
     for key, value in (('PG_NATIVE_COLD_PROOF', row['proof']),
                        ('PG_NATIVE_COLD_SPILL', '1' if row['spill'] else None),
                        ('PG_NATIVE_COLD_APPEND', '1' if append else None),
@@ -150,6 +152,7 @@ def main():
         load = '(handler-bind ((warning (lambda (c) (unless (typep c \'sb-kernel:redefinition-warning) (error c))))) (load ' + quoted + '))'
         campaign.write_json(logs / 'native-cold-plan.json', plan)
         results = []
+        # Each row gets a fresh image and working namespace; the job cache persists.
         for row in plan:
             case, label = row['case'], row['label']
             variant_case = CASE_DEFINITIONS[case][0]

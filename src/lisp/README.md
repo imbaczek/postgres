@@ -1322,6 +1322,38 @@ checkout revision, dirty source files or checked runtime setting requires a new
 campaign. Image identity and the full registered suite inventory are checked
 before selected heads execute.
 
+Native cold classification can also run a batch against an existing frozen
+campaign and existing owned retained writer variants. Set `PG_NATIVE_COLD_PLAN`
+to a JSON file containing a list of rows. Each row names a `case`; `proof` is
+optional, inherits `PG_NATIVE_COLD_PROOF` when omitted, and `null` selects
+classification. `variant_root` may be supplied per
+row or inherited from `PG_NATIVE_COLD_VARIANT_ROOT`; `spill` is a boolean and
+`label` identifies the output and must be unique when supplied. An omitted
+`spill` follows the presence of `PG_NATIVE_COLD_SPILL`, even when its value is
+`0`. An omitted `label` is derived from the proof, case and spill flag and must
+also be unique. For example, with the global variant root set to the owned root
+containing both writer variants:
+
+```json
+[
+  {"case": "happy", "proof": null, "spill": false, "label": "happy"},
+  {"case": "stable-durable", "proof": "prepare", "spill": true, "label": "stable-spill"}
+]
+```
+
+The runner validates the plan and owned RAM roots before starting children. Each
+row gets a fresh SBCL image and working namespace, while the job's private cache
+is reused. Proof, fault, append and spill settings are reset for each row. The
+batch stops on a failed exit or missing exact pass marker. Without a plan, the
+legacy `PG_NATIVE_COLD_CASES`, `PG_NATIVE_COLD_PROOF` and `PG_NATIVE_COLD_SPILL`
+settings still apply; with these unset, the default is nine classification
+cases. To check the Python
+contracts, run this from `src/lisp` inside the test RAM wrapper:
+
+```sh
+./t/test-ramdisk.sh run python3 t/continuation-native-cold-contracts.py
+```
+
 To overlap independent jobs, first complete successful serial runs that qualify
 the image and each target you plan to use. Then start each `--parallel` run in
 its own `test-campaign.sh` invocation, outside an existing RAM wrapper, so each
