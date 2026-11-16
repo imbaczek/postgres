@@ -95,6 +95,7 @@
                (:file "t/rove/wal-pressure-tests")
                (:file "t/rove/wal-writer-lifecycle-tests")
                (:file "t/rove/backend-lifecycle-tests")
+               (:file "t/rove/backend-lifetime-tests")
                (:file "t/rove/property-tests")
                (:file "t/rove/subquery-tests")
                (:file "t/rove/window-tests")

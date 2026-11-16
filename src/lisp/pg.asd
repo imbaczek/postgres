@@ -84,7 +84,7 @@
         :components ((:file "vacuumlazy")))))
      (:module "postmaster"
       :serial t
-      :components ((:file "postmaster") (:file "bgworker") (:file "walwriter")))
+      :components ((:file "backend-lifetime") (:file "postmaster") (:file "bgworker") (:file "walwriter")))
      (:file "replication/walsender-status")
      (:file "replication/syncrep")
      (:module "catalog"

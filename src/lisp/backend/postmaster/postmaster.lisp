@@ -73,7 +73,7 @@
   "Backend objects whose storage cleanup was deferred during fast shutdown.
 The registry lock protects this queue. MAIN retires it after all clients leave.")
 
-(defvar *backend-registry* (make-hash-table :test #'eql))
+(defvar *backend-registry* (make-hash-table :test #'eql :synchronized t))
 (defvar *backend-registry-lock*
   (sb-thread:make-mutex :name "pg backend registry lock"))
 (defvar *accept-lock* (sb-thread:make-mutex :name "pg accept lock"))
@@ -149,6 +149,7 @@ then XID exclusion."
       (sb-sys:without-interrupts
         (setf (gethash (backend-pid backend) *backend-registry*) backend)
         (incf *n-backends*)
+        (backend-lifetime-enroll-under-registry-lock backend)
         (unless *live-operation-admission-open*
           (pushnew backend *live-operation-cleanup-backends* :test #'eq)))))
   ;; Close the race where fast shutdown snapshots the registry just before
@@ -188,6 +189,9 @@ Registry removal is conditional on exact ownership; repeated cleanup is safe."
   ;; retain the backend. Acquire the live-operation lock before the registry
   ;; lock, matching cancel-target lookup, but release it before taking the latter.
   (sb-sys:without-interrupts
+    (sb-thread:grab-mutex *wal-lock*)
+    (unwind-protect (backend-lifetime-retire-under-wal-lock backend)
+      (sb-thread:release-mutex *wal-lock*))
     (sb-thread:grab-mutex *live-operation-lock*)
     (unwind-protect
          (progn
@@ -197,13 +201,15 @@ Registry removal is conditional on exact ownership; repeated cleanup is safe."
                  (backend-thread backend) nil)
            (remhash backend *live-operation-backend-query-tokens*)
            (sb-thread:condition-broadcast *live-operation-cv*))
-      (sb-thread:release-mutex *live-operation-lock*)))
-  (sb-thread:with-mutex (*backend-registry-lock*)
-    (sb-sys:without-interrupts
-      (remhash backend *backend-admission-classes*)
-      (when (eq (gethash (backend-pid backend) *backend-registry*) backend)
-        (remhash (backend-pid backend) *backend-registry*)
-        (decf *n-backends*))))
+      (sb-thread:release-mutex *live-operation-lock*))
+    (sb-thread:grab-mutex *backend-registry-lock*)
+    (unwind-protect
+         (progn
+           (remhash backend *backend-admission-classes*)
+           (when (eq (gethash (backend-pid backend) *backend-registry*) backend)
+             (remhash (backend-pid backend) *backend-registry*)
+             (decf *n-backends*)))
+      (sb-thread:release-mutex *backend-registry-lock*)))
   (values))
 
 (defun connection-started ()
