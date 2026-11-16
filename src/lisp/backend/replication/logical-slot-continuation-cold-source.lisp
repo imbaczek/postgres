@@ -85,8 +85,65 @@
              (setf active nil)
              (remhash inventory *logical-slot-startup-inventories*))))))))
 
+(defun logical-slot-continuation-cold-select-child (candidate record raw fork parent child history)
+  (unless (and (= (wal-record-start record) (logical-wal-eor-position fork))
+               (= (wal-record-type record) +wal-record-end-of-recovery+))
+    (error "cold continuation does not start with its selected child EOR"))
+  (setf (physical-store-selection candidate)
+        (list :history history :target child :parent parent :fork fork
+              :eor-bytes raw :previous (physical-store-selection candidate))))
+
+(defun logical-slot-continuation-cold-policy (facts snapshot horizon archive map-records)
+  (let* ((certificate (getf facts :certificate))
+         (fork (getf certificate :fork))
+         (parent (getf certificate :parent-timeline))
+         (child (first (getf snapshot :origin)))
+         (history (logical-slot-continuation-history
+                   (getf snapshot :history-target) (getf snapshot :history))))
+    (multiple-value-bind (prefix completed)
+        (logical-slot-copy-source-proof-scan-archive
+         facts (logical-wal-archive-input archive) (logical-wal-archive-reader archive))
+      (let* ((base (logical-slot-copy-import-base-state
+                    (getf facts :manifest) (getf facts :descriptor) (getf facts :control)
+                    :reservation (getf prefix :reservation)))
+             (next (getf prefix :next-xid))
+             (candidate (%make-physical-store
+                         :system-id (getf certificate :system-id) :timeline parent
+                         :base-lsn fork :floor-lsn fork :flushed-lsn horizon
+                         :selection (list :history (logical-slot-copy-source-proof-parent-history facts)
+                                          :target parent)))
+             (seed (list fork parent next (getf completed :source-checkpoint)
+                         (getf prefix :reservation) (getf prefix :source-xids)
+                         (getf prefix :applied-resource-fact) (getf prefix :applied-fpw-fact)
+                         (getf completed :logical-fact)))
+             (seen-eor nil))
+        (setf (getf base :required-resource-fact) (getf prefix :applied-resource-fact)
+              (getf base :required-fpw-fact) (getf prefix :applied-fpw-fact)
+              (getf base :required-logical-fact) (getf completed :logical-fact))
+        (multiple-value-bind (result final)
+            (physical-follow-scan-replay-from-seed-core
+             candidate base (list fork parent) (list fork parent) next seed
+             (lambda (visit start)
+               (funcall map-records
+                        (lambda (record raw)
+                          (unless seen-eor
+                            (logical-slot-continuation-cold-select-child
+                             candidate record raw fork parent child history)
+                            (setf seen-eor t))
+                          (funcall visit record raw))
+                        start))
+             t)
+          (unless (and seen-eor (null (getf result :disposition))
+                       (= child (getf result :timeline))
+                       (= child (getf (getf final :source-checkpoint) :timeline 0))
+                       (getf final :logical-fact))
+            (error "cold continuation lacks completed child initialization and logical policy"))
+          (physical-logical-check-fact
+           (getf final :logical-fact) history (getf result :terminal) child)
+          (list :horizon horizon :result result :completed final))))))
+
 (defun call-with-logical-slot-continuation-cold-source-readers
-    (storage source observation archive check-source function)
+    (storage source observation archive check-source function &key policy)
   ;; S is the selected sealed end and L the observed durable horizon (S <= L).
   ;; Each reserved slot reads continuously from its start through L, carrying
   ;; pending transactions across any D, F and S seams it crosses. Reprove
@@ -106,12 +163,15 @@
               :logical-reader)))
       (call-with-logical-slot-continuation-local-tail-source
        storage snapshot
-       (lambda (prove check-tail local-reader local-guard)
+       (lambda (prove check-tail local-reader local-guard &optional map-records)
          (funcall prove)
          (logical-slot-continuation-storage-call
           storage :with-sidecar
           (lambda (sidecar-reader check-files)
-            (let ((active t) (failed nil) (thread sb-thread:*current-thread*))
+            (let ((active t) (failed nil) (thread sb-thread:*current-thread*)
+                             (proved-policy (when policy
+                                              (logical-slot-continuation-cold-policy
+                                               facts snapshot horizon archive map-records))))
               (macrolet ((in-scope (&body body)
                            (let ((complete (gensym "COMPLETE")))
                              `(progn
@@ -147,14 +207,21 @@
                   (unwind-protect
                        (progn
                          (check)
-                         (multiple-value-prog1 (funcall function #'read-slot #'check)
+                         (multiple-value-prog1
+                             (apply function #'read-slot #'check
+                                    (when policy (list (logical-slot-continuation-copy proved-policy))))
                            (check)
                            (funcall prove)
+                           (when (and policy
+                                      (not (equal proved-policy
+                                                  (logical-slot-continuation-cold-policy
+                                                   facts snapshot horizon archive map-records))))
+                             (error "cold continuation policy changed during reconstruction"))
                            (check)))
                     (sb-sys:without-interrupts (setf active nil)))))))))
-       :boundaries #'boundaries :end horizon :batch-policy :logical-reader :require-closed nil))))
+       :boundaries #'boundaries :end horizon :batch-policy :logical-reader :require-closed nil :transcript policy))))
 
-(defun call-with-logical-slot-continuation-cold-reconstruction (gate ownership function)
+(defun call-with-logical-slot-continuation-cold-reconstruction (gate ownership function &key policy)
   ;; Reconstruct every saved reserved candidate privately through the actual
   ;; durable horizon L before the callback. This scope alone grants no slot
   ;; eligibility, publication or admission.
@@ -166,7 +233,7 @@
       (lambda (source observation actual check-source)
         (call-with-logical-slot-continuation-cold-source-readers
          storage source observation archive check-source
-         (lambda (read-slot check)
+         (lambda (read-slot check &optional proved-policy)
            (dolist (entry (logical-slot-startup-source-entries source))
              (let ((slot (logical-slot-startup-entry-slot entry)))
                (when (eq :reserved (wal-replication-slot-wal-status slot))
@@ -176,4 +243,14 @@
                             (setf (wal-replication-slot-pending-xids slot)
                                   (logical-slot-startup-derive-pending-with-cursor source slot cursor)))))))
            (funcall check)
-           (funcall function source observation actual check))))))))
+           (when policy
+             (let* ((snapshot (getf observation :snapshot))
+                    (history (logical-slot-continuation-history
+                              (getf snapshot :history-target) (getf snapshot :history)))
+                    (state (physical-logical-state-from-fact
+                            (getf (getf proved-policy :completed) :logical-fact))))
+               (dolist (entry (logical-slot-startup-source-entries source))
+                 (logical-slot-copy-check-slot-lifetime
+                  (logical-slot-startup-entry-slot entry) state history (getf observation :horizon)))))
+           (funcall function source observation actual check))
+         :policy policy))))))

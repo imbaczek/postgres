@@ -170,7 +170,7 @@
      :segment-reader reader :batch-policy batch-policy)))
 
 (defun call-with-logical-slot-continuation-local-tail-source (storage snapshot function &key boundaries
-                                                                                          (end (first (getf snapshot :sealed-end))) (batch-policy :strict) (require-closed t))
+                                                                                          (end (first (getf snapshot :sealed-end))) (batch-policy :strict) (require-closed t) transcript)
   ;; Prove locally present original-child WAL from F to END.  END defaults to
   ;; historical seal S and must satisfy S <= END <= captured horizon L.
   ;; Strict batch handling and a closed end remain the defaults.
@@ -184,7 +184,7 @@
          (fork (second (getf snapshot :origin)))
          (child (first (getf snapshot :origin))))
     (unless (and (member batch-policy '(:strict :logical-reader))
-                 (typep require-closed 'boolean)
+                 (typep require-closed 'boolean) (typep transcript 'boolean)
                  (typep end '(unsigned-byte 64))
                  (<= (first (getf snapshot :sealed-end)) end
                      (if (logical-slot-continuation-runtime-storage-p storage)
@@ -264,7 +264,18 @@
                                 (setf complete t))
                            (unless complete (setf failed t))))))
               (unwind-protect
-                   (progn (check) (multiple-value-prog1 (funcall function #'prove #'check #'read-segment #'guard) (check)))
+                   (progn
+                     (check)
+                     (flet ((invoke (&optional mapper)
+                              (multiple-value-prog1
+                                  (apply function #'prove #'check #'read-segment #'guard
+                                         (when transcript (list mapper)))
+                                (check))))
+                       (if transcript
+                           (progn (prove)
+                                  (call-with-logical-slot-continuation-transcript-reader
+                                   spool fork end #'invoke))
+                           (invoke))))
                 (sb-sys:without-interrupts
                   (setf active nil)
                   (when current

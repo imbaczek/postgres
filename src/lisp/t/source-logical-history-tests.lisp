@@ -97,6 +97,133 @@
            (ok (not (eq fact (getf result :applied-logical-fact))))
            (ok (equal before state)))))))
 
+(deftest source-logical-follow-exports-completed-policy-and-checkpoint
+    (dolist (mode '(:empty :complete :open))
+      (call-with-resource-restartpoint-fixture
+       (lambda (root store)
+         (declare (ignore root))
+         (let* ((snapshot (append-source-logical-test-checkpoint store t))
+                (start (getf snapshot :end))
+                (seed (pg::physical-logical-fact-from-checkpoint snapshot))
+                (latest snapshot) (off nil) (on nil)
+                (state pg::*physical-recovery-state*) (before (copy-tree state))
+                (base (copy-tree state)) (next (getf snapshot :next-xid)))
+           (unless (eq mode :empty)
+             (setf off (append-source-logical-test-status store nil)
+                   on (append-source-logical-test-status store t)
+                   latest (append-source-logical-test-checkpoint store t)))
+           (when (eq mode :open)
+             (let ((begin (pg::physical-store-flushed-lsn store)))
+               (pg::physical-store-input store begin (sample-physical-record begin))
+               (pg::physical-store-flush store)))
+           (remf base :required-resource-fact)
+           (multiple-value-bind (result completed)
+               (pg::physical-follow-scan-replay-from-seed-core
+                store base (list start 1) (list start 1) next
+                (list start 1 next snapshot nil nil
+                      (pg::wal-copy-control-resource-fields snapshot) nil seed)
+                (lambda (visit from)
+                  (pg::physical-store-map-durable-records store visit :start-lsn from))
+                (eq mode :open))
+             (ok completed)
+             (ok (= (getf latest :end) (getf result :terminal)))
+             (ok (equal seed (getf result :applied-logical-fact)))
+             (ok (equal seed (getf result :required-logical-fact)))
+             (ok (equal latest (getf completed :source-checkpoint)))
+             (ok (not (eq latest (getf completed :source-checkpoint))))
+             (let ((fact (getf completed :logical-fact)))
+               (ok (pg::physical-logical-fact-at-p fact (getf latest :end) 1))
+               (unless (eq mode :empty)
+                 (ok (= off (getf fact :last-disable-lsn)))
+                 (ok (= on (getf fact :last-enable-lsn)))))
+             (when (eq mode :open)
+               (ok (< (getf result :terminal) (pg::physical-store-flushed-lsn store))))
+             (ok (equal before state))
+             (ok (eq state pg::*physical-recovery-state*))))))))
+
+(deftest source-logical-transcript-reader-is-scoped-and-exact
+    (dolist (limit '(0 1048576))
+      (let* ((pg::*logical-capture-memory-bytes* limit)
+             (raw (sample-physical-record 100))
+             (record (pg::wal-decode-record raw 100))
+             (end (pg::wal-record-end record))
+             (escaped nil) (count 0))
+        (pg::call-with-logical-slot-continuation-transcript
+         (lambda (spool)
+           (pg::logical-spool-append
+            spool (pg::logical-slot-continuation-tail-frame record raw 1 1 :ordinary 100))
+           (pg::logical-spool-seal spool)
+           (pg::call-with-logical-slot-continuation-transcript-reader
+            spool 100 end
+            (lambda (map-records)
+              (setf escaped map-records)
+              (ok (signals (funcall map-records (lambda (&rest args) (declare (ignore args))) 99)))
+              (ok (sb-thread:join-thread
+                   (sb-thread:make-thread
+                    (lambda ()
+                      (handler-case (progn (funcall map-records #'error 100) nil)
+                        (error () t))))))
+              (loop repeat 2 do
+                (funcall map-records
+                         (lambda (seen bytes)
+                           (incf count)
+                           (ok (= 100 (pg::wal-record-start seen)))
+                           (ok (= end (pg::wal-record-end seen)))
+                           (ok (equalp raw bytes)))
+                         100))))))
+        (ok (= count 2))
+        (ok (signals (funcall escaped #'error 100))))))
+
+(deftest source-logical-transcript-reader-rejects-invalid-frames-and-latches-failure
+    (dolist (limit '(0 1048576))
+      (dolist (mode '(:short :coordinates :kind :reserved :crc :missing :visitor))
+        (let* ((pg::*logical-capture-memory-bytes* limit)
+               (raw (sample-physical-record 100))
+               (record (pg::wal-decode-record raw 100))
+               (end (pg::wal-record-end record)) (visits 0))
+          (pg::call-with-logical-slot-continuation-transcript
+           (lambda (spool)
+             (let ((frame (pg::logical-slot-continuation-tail-frame record raw 1 1 :ordinary 100)))
+               (case mode
+                 (:short (setf frame (subseq frame 0 39)))
+                 (:coordinates (pg::wal-set-u64 frame 0 99))
+                 (:kind (setf (aref frame 32) 1))
+                 (:reserved (setf (aref frame 33) 1))
+                 (:crc (setf (aref frame (1- (length frame)))
+                             (logxor 1 (aref frame (1- (length frame)))))))
+               (unless (eq mode :missing) (pg::logical-spool-append spool frame)))
+             (pg::logical-spool-seal spool)
+             (pg::call-with-logical-slot-continuation-transcript-reader
+              spool 100 end
+              (lambda (map-records)
+                (flet ((visit (&rest args)
+                         (declare (ignore args))
+                         (incf visits)
+                         (when (eq mode :visitor) (error "injected visitor failure"))))
+                  (ok (signals (funcall map-records #'visit 100)))
+                  (ok (signals (funcall map-records #'visit 100)))
+                  (ok (= visits (if (eq mode :visitor) 1 0))))))))))))
+
+(deftest source-logical-cold-child-selection-allows-eor-segment-padding
+    (dolist (fork (list 100 (- pg::+wal-segment-size+ 16)))
+      (let* ((start (pg::wal-record-start-after fork pg::+wal-end-of-recovery-record-size+))
+             (raw (pg::wal-encode-end-of-recovery-record start 42 2 1 1))
+             (record (pg::wal-decode-record raw start))
+             (prior (list :target 1))
+             (store (pg::%make-physical-store :selection prior))
+             (history (list :private-test-history)))
+        (pg::logical-slot-continuation-cold-select-child store record raw fork 1 2 history)
+        (ok (= fork (getf (pg::physical-store-selection store) :fork)))
+        (ok (eq prior (getf (pg::physical-store-selection store) :previous)))
+        (ok (eq history (getf (pg::physical-store-selection store) :history)))
+        (when (/= start fork)
+          (let* ((bad-raw (sample-physical-record start))
+                 (bad (pg::wal-decode-record bad-raw start))
+                 (before (pg::physical-store-selection store)))
+            (ok (signals (pg::logical-slot-continuation-cold-select-child
+                          store bad bad-raw fork 1 2 history)))
+            (ok (eq before (pg::physical-store-selection store))))))))
+
 (deftest source-logical-follow-binding-and-control-preserve-known-off-and-on
     (dolist (enabled '(nil t))
       (call-with-fpw-wal-fixture

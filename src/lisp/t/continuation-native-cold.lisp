@@ -330,7 +330,9 @@
 
 (defun native-host-cold-reconstruct-pending (gate ownership)
   (let ((files (native-host-cold-file-image)) (fds (native-host-writer-open-fds))
-                                              (saved-check nil) (saved-source nil) (count 0))
+                                              (saved-check nil) (saved-source nil) (count 0)
+                                              (*logical-capture-memory-bytes* (if (uiop:getenv "PG_NATIVE_COLD_SPILL")
+                                                                                  0 *logical-capture-memory-bytes*)))
     (funcall
      (symbol-function 'call-with-logical-slot-continuation-cold-reconstruction)
      gate ownership
@@ -367,7 +369,8 @@
        (funcall check)
        (sb-thread:with-mutex (*wal-lock*)
          (logical-slot-continuation-cold-reservation-call reservation :check))
-       (setf saved-check check saved-source source)))
+       (setf saved-check check saved-source source))
+     :policy (equal "policy" (uiop:getenv "PG_NATIVE_COLD_PROOF")))
     (assert (= count 2))
     (native-host-cold-recheck-refused-before-io saved-check)
     (native-host-cold-recheck-refused-before-io
@@ -448,15 +451,50 @@
     (format t "~&NATIVE-COLD-PENDING-REFUSAL PASS case=~a mode=~a sticky no-fallback persistent-F no-cleanup~%"
             (uiop:getenv "PG_NATIVE_COLD_CASE") mode)))
 
+(defun native-host-cold-policy-refusal (gate ownership mode)
+  (dolist (enabled (if (equal mode "policy-off-on") '(nil t) '(nil)))
+    (with-wal-critical
+      (wal-append-batch-start)
+      (wal-append-record +wal-record-logical-decoding-status-change+ 0
+                         (wal-encode-logical-decoding-status-change enabled))
+      (wal-flush-core)))
+  (sb-thread:with-mutex (*wal-lock*)
+    (wal-save-control-fields *wal-checkpoint-lsn* *wal-durable-lsn*))
+  (let ((files (native-host-cold-file-image)) (fds (native-host-writer-open-fds))
+                                              (entered nil) (caught nil))
+    (setf caught
+          (handler-case
+              (progn
+                (call-with-logical-slot-continuation-cold-reconstruction
+                 gate ownership
+                 (lambda (&rest args) (declare (ignore args)) (setf entered t))
+                 :policy t)
+                nil)
+            (error (condition) (princ-to-string condition))))
+    (assert (and caught (search "slot birth inside the current ON interval" caught)))
+    (assert (not entered))
+    (assert (zerop (hash-table-count *wal-replication-slots*)))
+    (assert (equalp files (native-host-cold-file-image)))
+    (assert (equal fds (native-host-writer-open-fds)))
+    (sb-thread:with-mutex (*wal-lock*)
+      (assert (= 1 (hash-table-count *logical-slot-continuation-cold-reservations*)))
+      (loop for reservation being the hash-values of *logical-slot-continuation-cold-reservations*
+            do (assert (logical-slot-continuation-cold-reservation-call reservation :uncertain))
+               (assert (= 41268 (gethash reservation *wal-snapshot-retention-pins*))))))
+  (format t "~&NATIVE-COLD-POLICY-REFUSAL PASS case=~a mode=~a preserved-F no-admission no-cleanup~%"
+          (uiop:getenv "PG_NATIVE_COLD_CASE") mode))
+
 (defun native-host-continuation-cold-state (gate ownership)
   (handler-case
       (progn
         (when (uiop:getenv "PG_NATIVE_COLD_APPEND") (native-host-cold-append))
         (cond
+          ((member (uiop:getenv "PG_NATIVE_COLD_PROOF") '("policy-off" "policy-off-on") :test #'equal)
+           (native-host-cold-policy-refusal gate ownership (uiop:getenv "PG_NATIVE_COLD_PROOF")))
           ((member (uiop:getenv "PG_NATIVE_COLD_PROOF")
                    '("pending-registration" "pending-candidate" "pending-temp-swap") :test #'equal)
            (native-host-cold-pending-refusal gate ownership (uiop:getenv "PG_NATIVE_COLD_PROOF")))
-          ((equal "pending" (uiop:getenv "PG_NATIVE_COLD_PROOF"))
+          ((member (uiop:getenv "PG_NATIVE_COLD_PROOF") '("pending" "policy") :test #'equal)
            (native-host-cold-reconstruct-pending gate ownership))
           ((equal "selected-boundaries" (uiop:getenv "PG_NATIVE_COLD_PROOF"))
            (native-host-cold-selected-boundaries gate ownership))
