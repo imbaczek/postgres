@@ -200,6 +200,137 @@
               nil)
           (error () t))))))
 
+(defun unit-continuation-partition-logical (name generation kind)
+  (let ((slot (unit-logical-provenance-slot
+               :generation generation :end 180 :timeline 2
+               :provenance (member kind '(:known :lost))
+               :cause (if (member kind '(:lost :legacy-lost)) :wal-removed :none))))
+    (setf (wal-replication-slot-name slot) name)
+    (list name (wal-encode-replication-slot slot))))
+
+(cl-spec:defproperty continuation-partition-admits-ordinary-logical-contracts
+    ((generation (range integer 0 340282366920938463463374607431768211455))
+     (index (range integer 0 3)))
+  (:about logical-slot-continuation-partition-rows)
+  (:trials (:normal 80))
+  (multiple-value-bind (certificate host children) (unit-continuation-active-inputs generation)
+    (let* ((extra (unit-continuation-partition-logical
+                   "ordinary" (logxor generation 2)
+                   (nth index '(:known :legacy :lost :legacy-lost))))
+           (rows (append children (list extra)))
+           (before (logical-slot-continuation-copy rows)))
+      (multiple-value-bind (selected ordinary)
+          (logical-slot-continuation-partition-rows rows certificate host)
+        (and (every #'eq selected children)
+             (= 1 (length ordinary))
+             (eq extra (first ordinary))
+             (equalp before rows))))))
+
+(cl-spec:defproperty continuation-partition-rejects-logical-identity-and-position-grafts
+    ((generation (range integer 0 340282366920938463463374607431768211455))
+     (mode (range integer 0 6)))
+  (:about logical-slot-continuation-partition-rows)
+  (:trials (:normal 80))
+  (multiple-value-bind (certificate host children) (unit-continuation-active-inputs generation)
+    (let* ((slot (unit-logical-provenance-slot
+                  :generation (if (= mode 4) generation (logxor generation 2))
+                  :system-id (if (member mode '(0 6)) 43 42)
+                  :end (if (= mode 1) 210 180)
+                  :timeline (if (= mode 2) 99 2)
+                  :cause (if (member mode '(4 6)) :wal-removed :none)
+                  :child-owner (when (= mode 3) 999)))
+           (name (if (= mode 5) "alpha" "ordinary")))
+      (setf (wal-replication-slot-name slot) name)
+      (let ((rows (append (if (= mode 5)
+                              (remove "alpha" children :key #'first :test #'string=)
+                              children)
+                          (list (list name (wal-encode-replication-slot slot))))))
+        (handler-case
+            (progn (logical-slot-continuation-partition-rows rows certificate host) nil)
+          (error () t))))))
+
+(cl-spec:defproperty continuation-ordinary-registry-keeps-child-generation-disjoint
+    ((generation (range integer 0 340282366920938463463374607431768211455)))
+  (:about logical-slot-continuation-check-ordinary-registry)
+  (:trials (:normal 80))
+  (multiple-value-bind (certificate host rows) (unit-continuation-active-inputs generation)
+    (declare (ignore certificate))
+    (let* ((registry (make-hash-table :test #'equal))
+           (members (mapcar (lambda (row)
+                              (cons (first row)
+                                    (wal-decode-replication-slot-image (second row) (first row))))
+                            rows))
+           (row (unit-continuation-partition-logical "ordinary" (logxor generation 2) :known))
+           (history (logical-slot-continuation-history (fifth host) (fourth host))))
+      (dolist (entry members) (setf (gethash (car entry) registry) (cdr entry)))
+      (setf (gethash "ordinary" registry)
+            (wal-decode-replication-slot-image (second row) "ordinary"))
+      (and (logical-slot-continuation-check-ordinary-registry registry members 42 history 192)
+           (progn
+             (setf (gethash "ordinary" registry)
+                   (let ((clone (unit-imported-state-with-origin (cdr (assoc "alpha" members :test #'string=))
+                                                                 :owner nil)))
+                     (setf (wal-replication-slot-name clone) "ordinary")
+                     clone))
+             (handler-case
+                 (progn (logical-slot-continuation-check-ordinary-registry
+                         registry members 42 history 192) nil)
+               (error () t)))))))
+
+(cl-spec:defproperty continuation-ordinary-candidates-preserve-live-identity
+    ((generation (range integer 0 340282366920938463463374607431768211455)))
+  (:about logical-slot-continuation-check-ordinary-candidate)
+  (:trials (:normal 80))
+  (multiple-value-bind (certificate host rows) (unit-continuation-active-inputs generation)
+    (declare (ignore certificate))
+    (let* ((registry (make-hash-table :test #'equal))
+           (members (mapcar (lambda (row)
+                              (cons (first row)
+                                    (wal-decode-replication-slot-image (second row) (first row))))
+                            rows))
+           (row (unit-continuation-partition-logical "ordinary" (logxor generation 2) :known))
+           (live (wal-decode-replication-slot-image (second row) "ordinary"))
+           (candidate (wal-copy-replication-slot-with-profile live))
+           (history (logical-slot-continuation-history (fifth host) (fourth host)))
+           (*wal-replication-slots* registry))
+      (dolist (entry members) (setf (gethash (car entry) registry) (cdr entry)))
+      (setf (gethash "ordinary" registry) live
+            (wal-replication-slot-confirmed-flush-lsn candidate) 181
+            (wal-replication-slot-restart-lsn candidate) 181)
+      (let ((forged (wal-decode-replication-slot-image (wal-encode-replication-slot candidate) "ordinary")))
+        (sb-thread:with-mutex (*wal-lock*)
+          (and
+           (eq live (logical-slot-continuation-check-ordinary-candidate
+                     registry members live 42 history 192))
+           (eq candidate (logical-slot-continuation-check-ordinary-candidate
+                          registry members candidate 42 history 192))
+           (handler-case
+               (progn (logical-slot-continuation-check-ordinary-candidate
+                       registry members forged 42 history 192) nil)
+             (error () t))
+           (handler-case
+               (progn (logical-slot-continuation-check-ordinary-candidate
+                       registry members (cdr (first members)) 42 history 192) nil)
+             (error () t))
+           (progn
+             (setf (gethash "ordinary" registry) forged)
+             (handler-case
+                 (progn (logical-slot-continuation-check-ordinary-candidate
+                         registry members candidate 42 history 192) nil)
+               (error () t)))))))))
+
+(rove:deftest continuation-ordinary-logical-partition-generated-contracts
+    (dolist (entry '((continuation-partition-admits-ordinary-logical-contracts 11701)
+                     (continuation-partition-rejects-logical-identity-and-position-grafts 11702)
+                     (continuation-ordinary-registry-keeps-child-generation-disjoint 11703)
+                     (continuation-ordinary-candidates-preserve-live-identity 11704)))
+      (let ((result (cl-spec:result-data
+                     (cl-spec:run-property (first entry) :seed (second entry) :profile :normal))))
+        (let ((*print-length* nil) (*print-level* nil))
+          (format t "~&CONTINUATION-ORDINARY-LOGICAL-CONTRACT ~s~%" result))
+        (rove:ok (eq :passed (getf result :status)))
+        (rove:ok (= 80 (getf result :trials))))))
+
 (rove:deftest continuation-mixed-partition-generated-contracts
     (dolist (entry '((continuation-partition-preserves-full-inventory-and-row-identities 11601)
                      (continuation-partition-rejects-unproved-ordinary-and-child-grafts 11602)
