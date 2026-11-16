@@ -243,3 +243,31 @@
            (rove:ok (zerop calls))
            (rove:ok (zerop reads)))
       (setf (symbol-function 'physical-image-file-facts) original))))
+
+(rove:deftest continuation-writer-forgeries-refuse-before-io
+    (let* ((calls 0) (reads 0) (original (symbol-function 'physical-image-file-facts))
+                     (writer (%make-logical-slot-continuation-writer
+                              :state (lambda (&rest ignored) (declare (ignore ignored)) (incf calls) t)))
+                     (receipt (%make-logical-slot-continuation-writer-receipt :writer writer))
+                     (context (%make-logical-slot-continuation-writer-context :writer writer))
+                     (control (%make-logical-slot-continuation-writer-control
+                               :state (lambda (&rest ignored) (declare (ignore ignored)) (incf calls) t)))
+                     (*logical-slot-continuation-writers* (list writer))
+                     (*logical-slot-continuation-writer-controls* (list control)))
+      (unwind-protect
+           (progn
+             (setf (symbol-function 'physical-image-file-facts)
+                   (lambda (&rest arguments) (incf reads) (apply original arguments)))
+             (sb-thread:with-mutex (*wal-lock*)
+               (dolist (action
+                        (list (lambda () (logical-slot-continuation-writer-call writer :run))
+                              (lambda () (logical-slot-continuation-writer-call
+                                          (copy-logical-slot-continuation-writer writer) :run))
+                              (lambda () (logical-slot-continuation-writer-publish-under-lock writer receipt))
+                              (lambda () (logical-slot-continuation-writer-guard context))
+                              (lambda () (logical-slot-continuation-native-writer-from-proof
+                                          (%make-logical-slot-continuation-native-proof) control))))
+                 (rove:ok (handler-case (progn (funcall action) nil) (error () t)))))
+             (rove:ok (zerop calls))
+             (rove:ok (zerop reads)))
+        (setf (symbol-function 'physical-image-file-facts) original))))

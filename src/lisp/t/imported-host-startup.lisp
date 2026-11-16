@@ -1802,6 +1802,11 @@
 
 (defun native-host-continuation-runtime-source ()
   (catalog-init)
+  (when (uiop:getenv "PG_NATIVE_WRITER_CASE")
+    (load (merge-pathnames "t/continuation-native-writer.lisp"
+                           (uiop:ensure-directory-pathname (uiop:getenv "PG_LISP_FROZEN_SOURCE"))))
+    (return-from native-host-continuation-runtime-source
+      (funcall (symbol-function 'native-host-continuation-native-writer))))
   (native-host-continuation-missing-origin nil)
   (let ((fds (length (directory #p"/proc/self/fd/*")))
         (records 0) (boundary nil))
@@ -1994,6 +1999,10 @@
                    (format t "~&NATIVE-HOST PASS canonical permanent proof checked independently of current slots; no imported-slot admission~%")))))))
       (postmaster-remove-pid-file)
       (when *postmaster-data-lock* (close *postmaster-data-lock*))
-      (setf sb-ext:*exit-hooks* exit-hooks))))
+      (setf sb-ext:*exit-hooks* exit-hooks)
+      (when (and (uiop:getenv "PG_NATIVE_WRITER_CASE")
+                 (boundp '*native-writer-test-failure*)
+                 (symbol-value '*native-writer-test-failure*))
+        (error "native writer case failed: ~a" (symbol-value '*native-writer-test-failure*))))))
 
 (native-imported-host-observation)

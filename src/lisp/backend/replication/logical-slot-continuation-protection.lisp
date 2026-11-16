@@ -14,7 +14,7 @@
 (defvar *logical-slot-continuation-protection-identities*
   (make-hash-table :test #'eq :weakness :key :synchronized t))
 
-(defun logical-slot-continuation-protection-call (protection operation)
+(defun logical-slot-continuation-protection-call (protection operation &optional value)
   ;; Dispatch a registered group under WAL exclusion.  :FAIL marks all
   ;; members uncertain and retains the persistent fork pin.
   (assert (sb-thread:holding-mutex-p *wal-lock*))
@@ -27,27 +27,41 @@
                                          *logical-slot-continuation-protections*)))
       (error "continuation protection has no registered identity"))
     (funcall state :identity protection)
-    (funcall state operation protection)))
+    (funcall state operation protection value)))
+
+(defun logical-slot-continuation-protection-check-bindings
+    (protection pins registry incarnation namespace child members identities origin)
+  (unless (and (eq incarnation *wal-storage-incarnation*)
+               (eq pins *wal-snapshot-retention-pins*)
+               (eql (logical-slot-continuation-protection-fork protection) (gethash protection pins))
+               (eq namespace *wal-segment-namespace*) (eql child *wal-insert-timeline*))
+    (error "continuation protection lost its fork reservation"))
+  (unless (and (eq registry *wal-replication-slots*)
+               (eq protection (gethash registry *logical-slot-continuation-protection-registries*))
+               (= (length members) (hash-table-count registry))
+               (every (lambda (entry identity)
+                        (let ((slot (cdr entry)))
+                          (and (eq slot (gethash (car entry) registry))
+                               (logical-slot-state-identity-equal-p slot (car identity))
+                               (eq (wal-replication-slot-logical-provenance slot) (cdr identity)))))
+                      members identities))
+    (error "continuation protection registry differs from its saved group"))
+  (logical-slot-imported-host-origin-call origin :check-root)
+  t)
 
 (defun logical-slot-continuation-make-protection-under-lock (proof)
-  ;; Bind the owned root, registry and exact member objects to their saved
-  ;; identities, provenance and origin.  Private binding and image copies keep
-  ;; those values immutable by representation.  The fork pin outlives the reader
-  ;; pin; no writer unwind or cold reconciliation is performed here.
-  (multiple-value-bind (record candidate ledger)
+  (multiple-value-bind (record candidate ledger selected-facts)
       (logical-slot-continuation-native-preflight-under-lock proof)
     (let* ((image (logical-slot-continuation-native-proof-old-image proof))
            (root (copy-list (logical-slot-continuation-native-proof-root-identity proof)))
            (binding (copy-seq (logical-slot-continuation-native-proof-binding proof)))
-           (saved (copy-seq image))
-           (snapshot (logical-slot-continuation-decode saved))
-           (rows (getf snapshot :slots))
-           (fork (second (getf snapshot :origin)))
-           (child (first (getf snapshot :origin)))
+           (saved (copy-seq image)) (selection (cons saved nil))
+           (snapshot (logical-slot-continuation-decode saved)) (rows (getf snapshot :slots))
+           (fork (second (getf snapshot :origin))) (child (first (getf snapshot :origin)))
            (origin (logical-slot-continuation-native-proof-origin proof))
            (namespace (logical-wal-source-namespace (logical-slot-continuation-native-proof-source proof)))
            (pins *wal-snapshot-retention-pins*) (registry *wal-replication-slots*)
-           (incarnation *wal-storage-incarnation*)
+           (incarnation *wal-storage-incarnation*) (mutex *wal-lock*)
            (members (mapcar (lambda (row) (cons (first row) (gethash (first row) registry))) rows))
            (identities
              (mapcar (lambda (row)
@@ -58,9 +72,20 @@
       (when (or (gethash root *logical-slot-continuation-protections*)
                 (gethash registry *logical-slot-continuation-protection-registries*))
         (error "continuation protection already has a registered group"))
-      (labels ((state (operation candidate)
-                 (assert (sb-thread:holding-mutex-p *wal-lock*))
-                 (unless (and (eq candidate protection)
+      (labels ((fail ()
+                 (assert (sb-thread:holding-mutex-p mutex))
+                 (sb-sys:without-interrupts
+                   (setf uncertain t)
+                   (dolist (entry members)
+                     (setf (wal-replication-slot-state-uncertain-p (cdr entry)) t)
+                     (when (and (eq mutex *wal-lock*) (eq registry *wal-replication-slots*))
+                       (let ((current (gethash (car entry) registry)))
+                         (when (wal-replication-slot-p current)
+                           (setf (wal-replication-slot-state-uncertain-p current) t))))))
+                 t)
+               (state (operation object &optional value)
+                 (assert (and (eq mutex *wal-lock*) (sb-thread:holding-mutex-p mutex)))
+                 (unless (and (eq object protection)
                               (equal root (logical-slot-continuation-protection-root-identity protection))
                               (equal names (logical-slot-continuation-protection-names protection))
                               (eql fork (logical-slot-continuation-protection-fork protection))
@@ -69,38 +94,35 @@
                  (ecase operation
                    (:identity t)
                    (:uncertain uncertain)
-                   (:fail
-                    (sb-sys:without-interrupts
-                      (setf uncertain t)
-                      (dolist (entry members)
-                        (setf (wal-replication-slot-state-uncertain-p (cdr entry)) t)
-                        (when (eq registry *wal-replication-slots*)
-                          (let ((current (gethash (car entry) registry)))
-                            (when current (setf (wal-replication-slot-state-uncertain-p current) t))))))
-                    t)
+                   (:fail (fail))
+                   (:failure-cleanup #'fail)
                    (:check
                     (when uncertain
                       (ereport "55000" "continuation group is uncertain; cold reconciliation required"))
-                    (unless (and (eq incarnation *wal-storage-incarnation*)
-                                 (eq pins *wal-snapshot-retention-pins*)
-                                 (eql fork (gethash protection pins))
-                                 (eq namespace *wal-segment-namespace*)
-                                 (eql child *wal-insert-timeline*))
-                      (error "continuation protection lost its fork reservation"))
-                    (unless (and (eq registry *wal-replication-slots*)
-                                 (eq protection (gethash registry *logical-slot-continuation-protection-registries*))
-                                 (= (length members) (hash-table-count registry))
-                                 (every (lambda (entry identity)
-                                          (let ((slot (cdr entry)))
-                                            (and (eq slot (gethash (car entry) registry))
-                                                 (logical-slot-state-identity-equal-p slot (car identity))
-                                                 (eq (wal-replication-slot-logical-provenance slot) (cdr identity)))))
-                                        members identities))
-                      (error "continuation protection registry differs from its saved group"))
-                    (logical-slot-imported-host-origin-call origin :check-root)
-                    t)
+                    (logical-slot-continuation-protection-check-bindings
+                     protection pins registry incarnation namespace child members identities origin))
                    (:binding (copy-seq binding))
-                   (:image (copy-seq saved)))))
+                   (:image (copy-seq (car selection)))
+                   (:owns-cell
+                    (and (cdr selection) (consp value) (eq (car value) (cdr selection))
+                         (eq (cdr value) selection)))
+                   (:begin
+                    (logical-slot-continuation-writer-bind-check-under-lock value protection (car selection))
+                    (when (cdr selection) (error "continuation already has a writer"))
+                    (sb-sys:without-interrupts
+                      (let ((complete nil))
+                        (unwind-protect
+                             (progn
+                               (setf (cdr selection) value)
+                               (logical-slot-continuation-writer-bind-cell-under-lock value protection selection)
+                               (setf complete t))
+                          (unless complete
+                            (when (eq value (cdr selection)) (setf (cdr selection) nil)))))))
+                   (:cancel
+                    (logical-slot-continuation-writer-call value :cancel-ready protection)
+                    (cond ((eq value (cdr selection)) (setf (cdr selection) nil))
+                          ((null (cdr selection)) t)
+                          (t (error "continuation cancellation changed its writer")))))))
         (setf protection (%make-logical-slot-continuation-protection
                           :origin origin :root-identity (copy-list root)
                           :fork fork :names (mapcar #'copy-seq names) :state #'state))
@@ -109,7 +131,7 @@
                 (gethash protection *logical-slot-continuation-protection-identities*) #'state
                 (gethash (copy-list root) *logical-slot-continuation-protections*) protection
                 (gethash registry *logical-slot-continuation-protection-registries*) protection))
-        (values protection record candidate ledger t)))))
+        (values protection record candidate ledger t selected-facts)))))
 
 (defun logical-slot-continuation-ensure-native-protection-under-lock (proof)
   ;; Reuse a group only for the exact saved image, binding and origin, including
@@ -119,11 +141,11 @@
   (let* ((key (logical-slot-continuation-native-proof-root-identity proof))
          (image (logical-slot-continuation-native-proof-old-image proof))
          (prior (gethash key *logical-slot-continuation-protections*)))
-    (multiple-value-bind (protection record candidate ledger added)
+    (multiple-value-bind (protection record candidate ledger added selected-facts)
         (if prior
-            (multiple-value-bind (record candidate ledger)
+            (multiple-value-bind (record candidate ledger selected-facts)
                 (logical-slot-continuation-native-preflight-under-lock proof)
-              (values prior record candidate ledger nil))
+              (values prior record candidate ledger nil selected-facts))
             (logical-slot-continuation-make-protection-under-lock proof))
       (logical-slot-continuation-protection-call protection :check)
       (unless (and (equalp image (logical-slot-continuation-protection-call protection :image))
@@ -132,7 +154,7 @@
                    (eq (logical-slot-continuation-native-proof-origin proof)
                        (logical-slot-continuation-protection-origin protection)))
         (error "continuation protection differs from its selected durable binding"))
-      (values protection record candidate ledger added))))
+      (values protection record candidate ledger added selected-facts))))
 
 (defun logical-slot-continuation-check-slot (slot &optional mutation)
   ;; Check admission and mutation at the live registry boundary, independent of

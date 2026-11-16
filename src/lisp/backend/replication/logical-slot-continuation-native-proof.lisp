@@ -202,6 +202,7 @@
                            (logical-slot-continuation-native-proof-check-under-lock proof))
                          (logical-slot-continuation-native-proof-point :receipt-registered proof)
                          (multiple-value-prog1 (funcall function proof)
+                           (logical-slot-continuation-native-proof-point :after-callback proof)
                            (logical-slot-continuation-storage-check storage)
                            (sb-thread:with-mutex (*wal-lock*)
                              (logical-slot-continuation-native-proof-check-under-lock proof)))))
