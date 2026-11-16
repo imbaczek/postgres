@@ -35,7 +35,8 @@
                                    (cdr expected)))))
                       members identities))
     (error "continuation protection registry differs from its saved group"))
-  ;; Other entries may be ordinary persistent logical or physical slots.
+  ;; Other entries may include live temporary physical slots as well as
+  ;; persistent ordinary slots.
   (logical-slot-continuation-check-runtime-ordinary-registry
    registry members system-id history frontier permitted operation)
   t)

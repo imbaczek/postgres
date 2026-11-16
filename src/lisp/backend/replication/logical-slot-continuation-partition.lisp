@@ -62,6 +62,9 @@
      registry))
   t)
 
+;; Runtime may also contain a temporary physical slot with a checked lifetime.
+;; The permitted capability identifies the one creation or drop in progress;
+;; other temporary slots must already be live.
 (defun logical-slot-continuation-check-runtime-ordinary-slot
     (slot system-id history frontier &optional child-provenances permitted operation)
   (unless (or (null permitted) (physical-slot-lifetime-p permitted))

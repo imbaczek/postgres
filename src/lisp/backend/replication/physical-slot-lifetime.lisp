@@ -1,14 +1,21 @@
 (in-package #:pg)
 
+;; Track temporary physical slots for their owning backend generation.  The
+;; weak tables bind slots to capabilities and capabilities to their state.
+;; Operations below run under WAL exclusion unless noted otherwise.
 (defvar *physical-slot-lifetimes*
   (make-hash-table :test #'eq :synchronized t :weakness :key))
 (defvar *physical-slot-lifetime-seals*
   (make-hash-table :test #'eq :synchronized t :weakness :key))
 (defvar *physical-slot-lifetime-create* nil)
 
+;; Callers carry this read-only capability; its sealed state checks the exact
+;; slot and context before allowing an operation.
 (defstruct (physical-slot-lifetime (:constructor %make-physical-slot-lifetime))
   (state nil :read-only t))
 
+;; Keep the backend, registry and storage identities captured at creation,
+;; together with the slot, phase and any outstanding drop claim.
 (defstruct (physical-slot-lifetime-context
             (:constructor %make-physical-slot-lifetime-context))
   (backend nil :read-only t) (backend-token nil :read-only t)
@@ -21,6 +28,8 @@
 (defvar *physical-slot-lifetime-names*
   (make-hash-table :test #'eq :synchronized t :weakness :key))
 
+;; Keep a name bound to its original context and capability until removal has
+;; finished, even if the registry entry is disturbed.
 (defstruct (physical-slot-lifetime-name (:constructor %make-physical-slot-lifetime-name))
   (context nil :read-only t) (capability nil :read-only t))
 
@@ -32,6 +41,8 @@
         (setf (gethash registry *physical-slot-lifetime-names*)
               (make-hash-table :test #'equal)))))
 
+;; Check the name anchor before using the registry entry.  A lost binding or
+;; failed context check makes the original slot uncertain.
 (defun physical-slot-check-name-under-lock (name)
   (assert (sb-thread:holding-mutex-p *wal-lock*))
   (sb-sys:without-interrupts
@@ -74,6 +85,7 @@
       (error "temporary physical retirement lost its name anchor"))
     (remhash name names)))
 
+;; Release the name only after retirement and removal from the registry.
 (defun physical-slot-finish-name-removal-under-lock (slot)
   (assert (sb-thread:holding-mutex-p *wal-lock*))
   (let* ((names (physical-slot-lifetime-name-table *wal-replication-slots*))
@@ -106,6 +118,8 @@
        (eq (physical-slot-lifetime-context-backend context)
            (wal-replication-slot-temporary-owner slot))))
 
+;; Recheck captured storage and backend identities and, once bound, the exact
+;; slot and name anchor.  The caller holds the original WAL mutex.
 (defun physical-slot-lifetime-check-context (context capability)
   (assert (and (eq *wal-lock* (physical-slot-lifetime-context-mutex context))
                (sb-thread:holding-mutex-p *wal-lock*)))
@@ -132,6 +146,7 @@
         (error "temporary physical slot lost its exact registered generation"))))
   t)
 
+;; Check that the creator is still registered on its owning thread.
 (defun physical-slot-lifetime-check-owner (context backend)
   (unless (eq backend (physical-slot-lifetime-context-backend context))
     (ereport "55006" "temporary physical slot belongs to another backend"))
@@ -139,6 +154,7 @@
               (backend-lifetime-capture-under-wal-lock backend))
     (error "temporary physical slot changed its backend registration")))
 
+;; Bind the new slot and reserve its name before publishing the slot state.
 (defun physical-slot-lifetime-bind (context capability slot)
   (unless (and (eq :unbound (physical-slot-lifetime-context-phase context))
                (null (physical-slot-lifetime-context-slot context))
@@ -157,6 +173,9 @@
           (%make-physical-slot-lifetime-name :context context :capability capability)))
   slot)
 
+;; The publication receipt distinguishes an unpublished failure from one that
+;; may have reached disk.  Only the former can release the name immediately;
+;; an uncertain publication remains fenced for recovery.
 (defun physical-slot-lifetime-finish-create (context capability slot receipt completed)
   (assert (and (eq *wal-lock* (physical-slot-lifetime-context-mutex context))
                (sb-thread:holding-mutex-p *wal-lock*)))
@@ -189,6 +208,9 @@
   (unless (physical-slot-lifetime-candidate-matches-p context capability candidate)
     (error "physical candidate did not retain its temporary lifetime")))
 
+;; Enforce the creation, live and retirement phases under WAL exclusion.
+;; Retirement holds the exact drop claim until completion; a failed context
+;; check marks the slot uncertain.
 (defun physical-slot-lifetime-dispatch (context capability operation slot value)
   (assert (and (eq *wal-lock* (physical-slot-lifetime-context-mutex context))
                (sb-thread:holding-mutex-p *wal-lock*)))
@@ -253,6 +275,9 @@
   (when (physical-slot-registered-creator-p *backend*)
     (physical-slot-check-live-admission)))
 
+;; Create a sealed capability and callbacks for a registered backend.  An
+;; unregistered creator gets no lifetime here, preserving the legacy fixture
+;; path. Strict runtime validation rejects temporary slots without a lifetime.
 (defun physical-slot-make-lifetime-under-lock (name system-id receipt)
   (assert (sb-thread:holding-mutex-p *wal-lock*))
   (let ((backend *backend*))
@@ -282,6 +307,8 @@
                   (sb-sys:without-interrupts
                     (physical-slot-lifetime-finish-create context capability slot receipt completed))))))))
 
+;; Check the independent seal before dispatch.  If the live slot lost its
+;; issued capability, mark it uncertain rather than allowing further use.
 (defun physical-slot-lifetime-call-under-lock (capability operation slot &optional value)
   (assert (sb-thread:holding-mutex-p *wal-lock*))
   (sb-sys:without-interrupts
@@ -305,6 +332,8 @@
     (physical-slot-lifetime-check-under-lock slot))
   slot)
 
+;; A copied candidate must carry the same lifetime as the registered slot;
+;; the capability then checks the candidate's temporary identity.
 (defun physical-slot-check-temporary-candidate-under-lock (candidate)
   (let ((slot (gethash (wal-replication-slot-name candidate) *wal-replication-slots*)))
     (when (or (wal-replication-slot-temporary-lifetime candidate)
