@@ -93,6 +93,98 @@ class CampaignContracts(unittest.TestCase):
         args = campaign.parse_args(['run', '/campaign', 'unit', 'first', '--cold', 'second'])
         self.assertEqual(['first', 'second'], args.heads)
 
+    def test_parallel_option_preserves_head_order(self):
+        args = campaign.parse_args(['run', '/campaign', 'unit', 'first', '--parallel', 'second'])
+        self.assertTrue(args.parallel)
+        self.assertEqual(['first', 'second'], args.heads)
+
+    def test_job_root_is_claimed_once_even_without_a_cache(self):
+        campaign.claim_job(self.root)
+        self.assertFalse((self.root / 'cache').exists())
+        with self.assertRaises(FileExistsError):
+            campaign.claim_job(self.root)
+
+    def test_parent_cache_must_belong_to_the_job(self):
+        cache = self.root / 'cache'
+        cache.mkdir()
+        with mock.patch.dict(os.environ, XDG_CACHE_HOME=str(cache)):
+            self.assertEqual(cache / 'common-lisp', campaign.job_cache(self.root))
+        with mock.patch.dict(os.environ, XDG_CACHE_HOME=str(self.root.parent / 'shared-cache')):
+            with self.assertRaises(ValueError):
+                campaign.job_cache(self.root)
+        cache.rmdir()
+        cache.symlink_to(self.root.parent, target_is_directory=True)
+        with mock.patch.dict(os.environ, XDG_CACHE_HOME=str(cache)):
+            with self.assertRaises(ValueError):
+                campaign.job_cache(self.root)
+
+    def test_wrapper_preserves_inherited_descriptors_seven_and_nine(self):
+        script = """
+import importlib.util, os, pathlib, subprocess, sys
+spec = importlib.util.spec_from_file_location('campaign', sys.argv[1])
+c = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(c)
+root = pathlib.Path(sys.argv[2])
+with c.workspace_lease() as workspace, c.lock(root, 'run.lock', exclusive=True) as run:
+    with c.lock(root, 'lease.lock') as lease:
+        os.dup2(lease, 7)
+        os.dup2(run, 9)
+        wrapper = root / 'wrapper'
+        wrapper.write_text(c.campaign_wrapper(root, sys.executable, (7, 9, workspace)))
+        wrapper.chmod(0o700)
+        command = [str(wrapper), '-c',
+                   'import os,sys; assert os.fstat(7).st_ino == int(sys.argv[1]); assert os.fstat(9).st_ino == int(sys.argv[2])',
+                   str(os.fstat(7).st_ino), str(os.fstat(9).st_ino)]
+        status = subprocess.call(command, pass_fds=(7, 9, workspace))
+        raise SystemExit(status)
+"""
+        result = subprocess.run([sys.executable, '-c', script, campaign.__file__, str(self.root)],
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=10)
+        self.assertEqual(0, result.returncode, result.stderr)
+
+    def test_parallel_requires_existing_identity_and_target_inventory(self):
+        manifests = self.root / 'manifests'
+        manifests.mkdir()
+        for name in ('image.log', 'unit.log'):
+            with self.assertRaises(ValueError):
+                campaign.require_parallel_manifests(self.root, 'unit')
+            (manifests / name).write_text('checked by the child reader')
+        campaign.require_parallel_manifests(self.root, 'unit')
+        with self.assertRaises(ValueError):
+            campaign.require_parallel_manifests(self.root, 'physical')
+        (manifests / 'unit.log').unlink()
+        (manifests / 'unit.log').symlink_to(manifests / 'image.log')
+        with self.assertRaises(ValueError):
+            campaign.require_parallel_manifests(self.root, 'unit')
+
+    def test_parallel_run_can_enter_while_another_job_holds_shared_leases(self):
+        script = """
+import importlib.util, pathlib, sys
+from unittest import mock
+spec = importlib.util.spec_from_file_location('campaign', sys.argv[1])
+c = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(c)
+root = pathlib.Path(sys.argv[2])
+def admitted(_):
+    print('admitted', flush=True)
+    raise SystemExit(0)
+with mock.patch.object(c, 'job_root', side_effect=[root, root / 'job']), \
+     mock.patch.object(c, 'read_campaign', side_effect=admitted):
+    c.run(root, 'unit', [], False, -1, parallel=True)
+"""
+        (self.root / 'job').mkdir()
+        with campaign.lock(self.root, 'run.lock'), campaign.lock(self.root, 'lease.lock'):
+            process = subprocess.Popen([sys.executable, '-c', script, campaign.__file__, str(self.root)],
+                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            try:
+                output, error = process.communicate(timeout=5)
+            except BaseException:
+                process.kill()
+                process.communicate()
+                raise
+        self.assertEqual(0, process.returncode, error)
+        self.assertEqual('admitted\n', output)
+
     def test_run_mount_redirection_is_rejected(self):
         root = os.environ['PG_LISP_TEST_RUN_DIR']
         with mock.patch.object(campaign.subprocess, 'check_output',
@@ -101,6 +193,7 @@ class CampaignContracts(unittest.TestCase):
                 campaign.job_root()
 
     def test_next_run_waits_for_surviving_compiler_lease(self):
+        (self.root / 'job').mkdir()
         script = """
 import importlib.util, pathlib, sys
 from unittest import mock

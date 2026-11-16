@@ -223,13 +223,47 @@ def wait_child(command, env, log, lease, run_lock, workspace):
             signal.signal(signum, handler)
 
 
-def run(campaign, target, heads, cold, workspace):
+def claim_job(job):
+    fd = os.open(job / 'campaign-job.claim',
+                 os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    os.close(fd)
+
+
+def require_parallel_manifests(root, target):
+    for name in ('image', target):
+        path = root / 'manifests' / (name + '.log')
+        if path.is_symlink() or not path.is_file():
+            raise ValueError('Parallel runs require a previously qualified image and target')
+
+
+def job_cache(job):
+    home = Path(os.environ.get('XDG_CACHE_HOME', ''))
+    if home != job / 'cache' or home.is_symlink() or not home.is_dir():
+        raise ValueError('Campaign cache must be the job private cache directory')
+    return home / 'common-lisp'
+
+
+def campaign_wrapper(root, executable, inherited):
+    available = [fd for fd in range(3, 10) if fd not in inherited]
+    if len(available) < 2:
+        raise ValueError('Campaign wrapper has no free shell lock descriptors')
+    lease_fd, workspace_fd = available[:2]
+    return ('#!/bin/sh\nset -eu\nexec ' + str(lease_fd) + '>>' + shlex.quote(str(root / 'lease.lock')) +
+            '\nflock -s ' + str(lease_fd) + '\nexec ' + str(workspace_fd) + '>>' +
+            shlex.quote(str(RAM.with_name(RAM.name + '-control') / 'usage.lock')) +
+            '\nflock -s ' + str(workspace_fd) + '\nexec ' + shlex.quote(executable) + ' "$@"\n')
+
+
+def run(campaign, target, heads, cold, workspace, parallel=False):
     root = job_root(campaign)
     job = job_root()
     if root == job:
         raise ValueError('Each campaign job needs its own RAM workspace')
-    with lock(root, 'run.lock', exclusive=True) as run_lock, lock(root, 'lease.lock', exclusive=True) as lease:
-        fcntl.flock(lease, fcntl.LOCK_SH)
+    claim_job(job)
+    with lock(root, 'run.lock', exclusive=not parallel) as run_lock, \
+         lock(root, 'lease.lock', exclusive=not parallel) as lease:
+        if not parallel:
+            fcntl.flock(lease, fcntl.LOCK_SH)
         data = read_campaign(root)
         source = Path(data['source'])
         if data['state'] != 'open' or data['environment'] != environment():
@@ -239,7 +273,9 @@ def run(campaign, target, heads, cold, workspace):
             raise ValueError('Campaign checkout revision or dirty state changed; freeze a new campaign')
         if data['image'] != fingerprint(source) or data['image'] != fingerprint(Path(data['checkout'])):
             raise ValueError('Campaign source differs from the current checkout; freeze a new campaign')
-        cache = Path(os.environ['XDG_CACHE_HOME']) / 'common-lisp'
+        if parallel:
+            require_parallel_manifests(root, target)
+        cache = job_cache(job)
         if cache.exists():
             raise ValueError('Campaign needs a fresh private parent cache')
         copied = time.monotonic()
@@ -248,9 +284,8 @@ def run(campaign, target, heads, cold, workspace):
                 shutil.copytree(root / 'parent-fasls', cache)
         copy_seconds = time.monotonic() - copied
         wrapper = job / 'campaign-sbcl'
-        wrapper.write_text('#!/bin/sh\nset -eu\nexec 7>>' + shlex.quote(str(root / 'lease.lock')) +
-                           '\nflock -s 7\nexec 9>>' + shlex.quote(str(RAM.with_name(RAM.name + '-control') / 'usage.lock')) +
-                           '\nflock -s 9\nexec ' + shlex.quote(data['environment']['executable']) + ' "$@"\n')
+        wrapper.write_text(campaign_wrapper(root, data['environment']['executable'],
+                                            (lease, run_lock, workspace)))
         wrapper.chmod(0o700)
         env = dict(os.environ, SBCL=str(wrapper), PG_LISP_TEST_CAMPAIGN=str(root),
                    PG_LISP_TEST_CAMPAIGN_SBCL=str(wrapper), PG_LISP_FROZEN_SOURCE=str(source),
@@ -271,7 +306,7 @@ def run(campaign, target, heads, cold, workspace):
         if data['image'] != fingerprint(source):
             raise ValueError('Immutable campaign source changed during the job')
         published = 0
-        if result == 0:
+        if result == 0 and not parallel:
             with lock(root, 'cache.lock', exclusive=True):
                 for kind, name in (('image', 'image'), (target, 'suite')):
                     reference = root / 'manifests' / (kind + '.log')
@@ -280,7 +315,7 @@ def run(campaign, target, heads, cold, workspace):
                 if not cold:
                     published = publish_cache(cache, root / 'parent-fasls')
         record = dict(format=1, campaign=str(root), source=data['image'], target=target,
-                      requested_heads=heads, strict=True, cold=cold, exit_code=result,
+                       requested_heads=heads, strict=True, cold=cold, parallel=parallel, exit_code=result,
                       wall_seconds=time.monotonic() - started, copy_seconds=copy_seconds,
                       cpu_seconds=after.ru_utime + after.ru_stime - cpu.ru_utime - cpu.ru_stime,
                       peak_rss_kib=after.ru_maxrss, published_fasls=published,
@@ -308,6 +343,8 @@ def parse_args(arguments=None):
     run_parser.add_argument('campaign')
     run_parser.add_argument('target', choices=('unit', 'physical'))
     run_parser.add_argument('--cold', action='store_true', help='Do not read or publish parent FASLs')
+    run_parser.add_argument('--parallel', action='store_true',
+                            help='Overlap independent jobs on a qualified campaign; never publish cache additions')
     run_parser.add_argument('heads', nargs='*')
     actions.add_parser('close').add_argument('campaign')
     args, extra = parser.parse_known_args(arguments)
@@ -325,7 +362,7 @@ def main():
         if args.action == 'create':
             create(args.source)
         elif args.action == 'run':
-            return run(args.campaign, args.target, args.heads, args.cold, workspace)
+            return run(args.campaign, args.target, args.heads, args.cold, workspace, args.parallel)
         else:
             close(args.campaign)
     return 0
