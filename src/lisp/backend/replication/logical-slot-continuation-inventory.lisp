@@ -39,12 +39,9 @@
               (list name (copy-list child-facts) (copy-list facts) bytes))))))
     (funcall check)))
 
-(defun logical-slot-continuation-read-slot-inventory (directory guard)
-  ;; Observe twice under the full root-facts guard.  Each row's descriptors
-  ;; close before the interpass hook; the second pass reopens and compares all
-  ;; facts and bytes with the ledger.  Returned row bytes are detached.  The
-  ;; ledger is an observation, not authority for admission or mutation.
-  (unless (functionp guard) (error "continuation slot inventory requires a directory guard"))
+(defun logical-slot-continuation-observe-slot-inventory (directory guard read-row)
+  (unless (and (functionp guard) (functionp read-row))
+    (error "continuation slot inventory requires a guard and row observer"))
   (funcall guard)
   (let ((root-facts (physical-image-file-facts directory)))
     (unless (and (sb-posix:s-isdir (third root-facts))
@@ -61,9 +58,7 @@
                  (unless (equal names (logical-slot-continuation-slot-inventory-names directory))
                    (error "continuation slot inventory names changed"))
                  (multiple-value-prog1
-                     (mapcar (lambda (name)
-                               (logical-slot-continuation-read-slot-inventory-row directory name #'check))
-                             names)
+                     (mapcar (lambda (name) (funcall read-row directory name #'check)) names)
                    (check))))
         (let ((ledger (read-pass)))
           (when *logical-slot-continuation-inventory-test-hook*
@@ -73,3 +68,9 @@
           (check)
           (values (mapcar (lambda (row) (list (first row) (copy-seq (fourth row)))) ledger)
                   ledger))))))
+
+(defun logical-slot-continuation-read-slot-inventory (directory guard)
+  ;; Stable observation still rejects all temporaries. The shared kernel checks
+  ;; full root facts, complete names and two independently opened row ledgers.
+  (logical-slot-continuation-observe-slot-inventory
+   directory guard #'logical-slot-continuation-read-slot-inventory-row))

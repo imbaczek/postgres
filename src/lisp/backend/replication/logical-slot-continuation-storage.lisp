@@ -160,6 +160,38 @@
 
 ;; :ROOT-IDENTITY returns the held PGDATA device, inode and mount.
 
+(defun logical-slot-continuation-storage-scan-limit (owner archive horizon)
+  (unless archive (error "scan limit requires runtime storage"))
+  (sb-thread:with-mutex (*wal-lock*)
+    (logical-slot-imported-scan-check-under-lock owner)
+    (if horizon
+        (logical-slot-imported-scan-proof-horizon-under-lock owner)
+        (wal-retained-slot-scan-end (logical-slot-imported-scan-owner-scan owner)))))
+
+(defun logical-slot-continuation-storage-startup-origin (owner context)
+  (unless (logical-slot-imported-host-startup-owner-p owner)
+    (error "cold origin lookup requires genuine startup storage"))
+  (logical-slot-imported-host-startup-check-owner owner)
+  (let ((key (logical-slot-imported-host-origin-key owner context)))
+    (sb-thread:with-mutex (*wal-lock*)
+      (logical-slot-imported-host-startup-under-lock owner)
+      (let ((origin (gethash key *logical-slot-imported-host-origins*)))
+        (unless origin (error "cold continuation origin has not been restored"))
+        (logical-slot-imported-host-origin-call origin :check-root)
+        origin))))
+
+(defun call-with-logical-slot-continuation-cold-slot-root (owner root function check)
+  (unless (and (logical-slot-imported-host-startup-owner-p owner)
+               (functionp function) (functionp check))
+    (error "cold slot directory requires startup storage and a callback"))
+  (logical-slot-imported-host-startup-check-owner owner)
+  (call-with-logical-slot-continuation-owned-directory
+   root :slots
+   (lambda (directory directory-check)
+     (funcall check)
+     (multiple-value-prog1 (funcall function directory directory-check) (funcall check)))
+   t))
+
 (defun call-with-logical-slot-continuation-storage-context
     (owner context facts check under-lock function &optional archive)
   (unless (if archive (logical-slot-imported-scan-owner-p owner)
@@ -241,16 +273,13 @@
                                      (:directory directory)
                                      (:binding (first (funcall check t)))
                                      (:facts (logical-slot-copy-check-source-proof (first (funcall check t))))
-                                     (:end
-                                      (unless archive (error "scan end requires runtime storage"))
-                                      (sb-thread:with-mutex (*wal-lock*)
-                                        (logical-slot-imported-scan-check-under-lock owner)
-                                        (wal-retained-slot-scan-end
-                                         (logical-slot-imported-scan-owner-scan owner))))
-                                     (:horizon
-                                      (unless archive (error "proof horizon requires runtime storage"))
-                                      (sb-thread:with-mutex (*wal-lock*)
-                                        (logical-slot-imported-scan-proof-horizon-under-lock owner)))
+                                     (:end (logical-slot-continuation-storage-scan-limit owner archive nil))
+                                     (:horizon (logical-slot-continuation-storage-scan-limit owner archive t))
+                                     (:startup-origin
+                                      (logical-slot-continuation-storage-startup-origin owner context))
+                                     (:with-cold-slot-root
+                                         (call-with-logical-slot-continuation-cold-slot-root
+                                          owner root argument (lambda () (state storage :check))))
                                      (:host
                                       (sb-thread:with-mutex (*wal-lock*)
                                         (logical-slot-continuation-copy
