@@ -268,14 +268,20 @@ Logical updates guard identity, progress and the first terminal cause."
 
 (declaim (ftype function logical-slot-continuation-cold-check-admission))
 
+(defun wal-check-replication-slot-capacity-for-count (count maximum)
+  (unless (and (typep count '(integer 0 *)) (typep maximum '(integer 0 *)))
+    (error "replication slot capacity requires nonnegative counts"))
+  (when (zerop maximum)
+    (ereport "55000" "replication slots require max_replication_slots greater than zero"))
+  (when (>= count maximum)
+    (ereport "53400" "all replication slots are in use"))
+  (values))
+
 (defun wal-check-replication-slot-capacity ()
   "Check shared capacity under WAL, counting temporary and lost slots too."
   (logical-slot-continuation-cold-check-admission)
-  (when (zerop *max-replication-slots*)
-    (ereport "55000" "replication slots require max_replication_slots greater than zero"))
-  (when (>= (hash-table-count *wal-replication-slots*) *max-replication-slots*)
-    (ereport "53400" "all replication slots are in use"))
-  (values))
+  (wal-check-replication-slot-capacity-for-count
+   (hash-table-count *wal-replication-slots*) *max-replication-slots*))
 
 (defvar *wal-logical-catalog-event-interests* (make-hash-table :test #'eq))
 (defvar *wal-logical-slot-owner* nil)

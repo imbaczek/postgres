@@ -16,6 +16,22 @@
                 (multiple-value-list (pg::logical-slot-startup-start-position slot history)))))
      '((1 . :prefix-end) (2 . :record-start)))))
 
+(cl-spec:defproperty startup-slot-capacity-count-preserves-boundaries
+    ((count (range integer 0 32)) (maximum (range integer 0 32)))
+  (:about pg::wal-check-replication-slot-capacity-for-count)
+  (:trials (:normal 200))
+  (let ((pg::*max-replication-slots* 0)
+        (pg::*wal-replication-slots* (make-hash-table :test #'equal)))
+    (equal (cond ((zerop maximum) "55000") ((>= count maximum) "53400") (t :available))
+           (handler-case
+               (progn (pg::wal-check-replication-slot-capacity-for-count count maximum) :available)
+             (pg::pg-error (condition) (pg::pg-error-sqlstate condition))))))
+
+(deftest startup-slot-private-capacity-uses-explicit-count-and-limit
+    (let ((data (cl-spec:result-data
+                 (cl-spec:run-property 'startup-slot-capacity-count-preserves-boundaries :seed 4213))))
+      (ok (eq :passed (getf data :status)) (format nil "~s" data))))
+
 (deftest startup-slot-start-role-has-no-pending-map-prerequisite
     (let ((data (cl-spec:result-data
                  (cl-spec:run-property 'startup-slot-fork-anchor-keeps-persisted-owner :seed 204))))
