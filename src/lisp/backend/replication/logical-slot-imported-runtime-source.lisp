@@ -6,7 +6,7 @@
 ;; scopes are observational and cover the original child, generation 1 only.
 ;; Callbacks are trusted internal code, not a sandbox for raw Lisp access.
 
-(defun call-with-logical-slot-imported-runtime-source (scan source function)
+(defun call-with-logical-slot-imported-runtime-origin (scan source function)
   (call-with-logical-slot-imported-scan-owner
    scan source
    (lambda (owner)
@@ -29,14 +29,30 @@
                    (call-with-logical-slot-imported-origin-archive
                     record facts check under-lock directory input reader anchors
                     (lambda (archive)
-                      (funcall function owner context facts archive check under-lock)))))))))))))))
+                      (funcall function owner context facts archive check under-lock record)))))))))))))))
+
+(defun call-with-logical-slot-imported-runtime-source (scan source function)
+  (call-with-logical-slot-imported-runtime-origin
+   scan source
+   (lambda (owner context facts archive check under-lock origin)
+     (declare (ignore origin))
+     (funcall function owner context facts archive check under-lock))))
+
+(defun call-with-logical-slot-continuation-runtime-origin-storage (scan source function)
+  (call-with-logical-slot-imported-runtime-origin
+   scan source
+   (lambda (owner context facts archive check under-lock origin)
+     (call-with-logical-slot-continuation-storage-context
+      owner context facts check under-lock
+      (lambda (storage observed) (funcall function storage observed origin))
+      archive))))
 
 (defun call-with-logical-slot-continuation-runtime-storage (scan source function)
-  (call-with-logical-slot-imported-runtime-source
+  (call-with-logical-slot-continuation-runtime-origin-storage
    scan source
-   (lambda (owner context facts archive check under-lock)
-     (call-with-logical-slot-continuation-storage-context
-      owner context facts check under-lock function archive))))
+   (lambda (storage facts origin)
+     (declare (ignore origin))
+     (funcall function storage facts))))
 
 ;; Check the selected historical seal S against the captured durable horizon L
 ;; and the live original-child host and saved inventory.  S remains independent

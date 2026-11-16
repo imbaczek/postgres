@@ -212,3 +212,34 @@
                   (error () t)))))
            (rove:ok (zerop reads)))
       (setf (symbol-function 'physical-image-file-facts) original))))
+
+(rove:deftest continuation-protection-rejects-forged-registration-before-io
+    (rove:ok (fboundp 'logical-slot-continuation-protection-call))
+  (rove:ok (fboundp 'logical-slot-continuation-make-protection-under-lock))
+  (let* ((reads 0) (calls 0)
+                   (original (symbol-function 'physical-image-file-facts))
+                   (root '(101 202 303))
+                   (fake (%make-logical-slot-continuation-protection
+                          :root-identity root
+                          :state (lambda (&rest ignored) (declare (ignore ignored)) (incf calls) t)))
+                   (*logical-slot-continuation-protections* (make-hash-table :test #'equal)))
+    (setf (gethash root *logical-slot-continuation-protections*) fake)
+    (unwind-protect
+         (progn
+           (setf (symbol-function 'physical-image-file-facts)
+                 (lambda (&rest arguments) (incf reads) (apply original arguments)))
+           (sb-thread:with-mutex (*wal-lock*)
+             (dolist (value (list nil fake (copy-logical-slot-continuation-protection fake)))
+               (rove:ok (handler-case
+                            (progn (logical-slot-continuation-protection-call value :fail) nil)
+                          (error () t))))
+             (rove:ok
+              (handler-case
+                  (progn
+                    (logical-slot-continuation-make-protection-under-lock
+                     (%make-logical-slot-continuation-native-proof :root-identity root))
+                    nil)
+                (error () t))))
+           (rove:ok (zerop calls))
+           (rove:ok (zerop reads)))
+      (setf (symbol-function 'physical-image-file-facts) original))))

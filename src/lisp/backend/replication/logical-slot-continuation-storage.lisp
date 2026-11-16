@@ -235,6 +235,7 @@
                                          (call-with-logical-slot-continuation-slot-root
                                           root archive argument (lambda () (state storage :check))))
                                      (:scan-source (logical-slot-continuation-storage-scan-source owner archive))
+                                     (:root-identity (let ((f (physical-image-file-facts root))) (list (first f) (second f) (ninth f))))
                                      (:directory directory)
                                      (:binding (first (funcall check t)))
                                      (:facts (logical-slot-copy-check-source-proof (first (funcall check t))))

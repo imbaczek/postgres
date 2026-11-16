@@ -187,6 +187,8 @@ Logical updates guard identity, progress and the first terminal cause."
   "Test the explicit slot kind; a nullable database alone does not identify it."
   (eq :logical (wal-replication-slot-kind slot)))
 
+(declaim (ftype function logical-slot-continuation-check-slot))
+
 (defun wal-require-known-replication-slot (slot)
   "Reject failed creation or uncertain state until a cold load."
   ;; A failed publication may still be visible on disk and must retain its pin.
@@ -212,7 +214,9 @@ Logical updates guard identity, progress and the first terminal cause."
   ;; Look up and check the generation while the registry is locked.
   (assert (sb-thread:holding-mutex-p *wal-lock*))
   (let ((slot (gethash name *wal-replication-slots*)))
-    (when slot (wal-require-usable-replication-slot slot))))
+    (when slot
+      (wal-require-usable-replication-slot slot)
+      (logical-slot-continuation-check-slot slot))))
 
 (defun wal-require-logical-slot (slot)
   "Reject physical slots before logical decoding or acknowledgment."
@@ -3300,6 +3304,7 @@ wal_level_insufficient cause requires PGSLOT6, or PGSLOT7 with a child owner."
 (defun wal-create-replication-slot-file (slot &optional publication-receipt)
   ;; CREATE publishes a staged directory without replacing an existing name.
   (wal-require-usable-replication-slot slot)
+  (logical-slot-continuation-check-slot slot t)
   (slot-state-create (wal-replication-slot-directory)
                      (wal-replication-slot-name slot)
                      (wal-encode-replication-slot slot)
@@ -3309,6 +3314,7 @@ wal_level_insufficient cause requires PGSLOT6, or PGSLOT7 with a child owner."
 (defun wal-save-replication-slot (slot)
   ;; UPDATE requires an existing directory and cannot recreate a dropped slot.
   (wal-require-usable-replication-slot slot)
+  (logical-slot-continuation-check-slot slot t)
   (slot-state-update (wal-replication-slot-directory)
                      (wal-replication-slot-name slot)
                      (wal-encode-replication-slot slot))
@@ -3320,6 +3326,7 @@ wal_level_insufficient cause requires PGSLOT6, or PGSLOT7 with a child owner."
     (unless (and slot (or (null expected-slot) (eq slot expected-slot)))
       (error "replication slot deletion requires its exact registered object"))
     (wal-require-known-replication-slot slot)
+    (logical-slot-continuation-check-slot slot t)
     ;; Save the numeric directory identities before removal. On failure the
     ;; claim and WAL pin remain, and only this generation may retry the drop.
     (unless (wal-replication-slot-drop-claim slot)

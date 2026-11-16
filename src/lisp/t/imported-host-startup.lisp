@@ -921,6 +921,30 @@
         (let ((source (sb-thread:with-mutex (*wal-lock*) (logical-wal-capture-source scan))))
           (funcall function scan source)))))))
 
+(defun native-host-continuation-missing-origin (protected)
+  (let ((registry *logical-slot-imported-host-origins*)
+        (count (hash-table-count *logical-slot-imported-host-origins*)))
+    (native-host-with-runtime-scan
+     "alpha"
+     (lambda (scan source)
+       (let ((*logical-slot-imported-host-origins* (make-hash-table :test #'equal))
+             (rejected nil) (entered nil))
+         (handler-case
+             (call-with-logical-slot-imported-runtime-source
+              scan source
+              (lambda (&rest arguments)
+                (declare (ignore arguments))
+                (setf entered t)
+                (error "unrestored runtime origin reached its callback")))
+           (error (condition) (setf rejected (princ-to-string condition))))
+         (assert (and rejected
+                      (search (if protected "not its registered entry" "has not been restored") rejected)))
+         (assert (not entered))
+         (assert (zerop (hash-table-count *logical-slot-imported-host-origins*))))))
+    (assert (eq registry *logical-slot-imported-host-origins*))
+    (assert (= count (hash-table-count registry))))
+  (format t "~&NATIVE-RUNTIME-MISSING-ORIGIN PASS protected=~s no-restore no-callback~%" protected))
+
 (defun native-host-continuation-runtime-source-negative ()
   (native-host-with-runtime-scan
    "alpha"
@@ -948,22 +972,7 @@
          (error (condition) (setf rejected (princ-to-string condition))))
        (assert (and rejected (search "root descriptor changed" rejected)) ()
                "strict proof control-replacement rejection was ~s" rejected))))
-  (let ((registry *logical-slot-imported-host-origins*)
-        (count (hash-table-count *logical-slot-imported-host-origins*)))
-    (native-host-with-runtime-scan
-     "alpha"
-     (lambda (scan source)
-       (let ((*logical-slot-imported-host-origins* (make-hash-table :test #'equal))
-             (rejected nil))
-         (handler-case
-             (call-with-logical-slot-imported-runtime-source
-              scan source (lambda (&rest arguments) (declare (ignore arguments))
-                            (error "unrestored runtime origin reached its callback")))
-           (error (condition) (setf rejected (princ-to-string condition))))
-         (assert (and rejected (search "has not been restored" rejected)))
-         (assert (zerop (hash-table-count *logical-slot-imported-host-origins*))))))
-    (assert (eq registry *logical-slot-imported-host-origins*))
-    (assert (= count (hash-table-count registry))))
+  (native-host-continuation-missing-origin t)
   (format t "~&NATIVE-RUNTIME-SOURCE-NEGATIVE PASS strict-default-rejects-root-metadata-change missing-origin-not-restored~%"))
 
 (defun native-host-with-runtime-tail-file (storage snapshot function)
@@ -1291,10 +1300,20 @@
 
 (defun native-host-continuation-native-preflight (proof slot kind)
   (let ((before (logical-slot-state-encode slot))
-        (pending (wal-replication-slot-pending-xids slot)))
-    (multiple-value-bind (record candidate ledger)
-        (logical-slot-continuation-native-preflight-under-lock proof)
+        (pending (wal-replication-slot-pending-xids slot))
+        (protection nil) (added nil))
+    (multiple-value-bind (group record candidate ledger new)
+        (logical-slot-continuation-ensure-native-protection-under-lock proof)
+      (setf protection group added new)
       (assert (= 2 (length ledger)))
+      (assert (= (logical-slot-continuation-protection-fork group)
+                 (gethash group *wal-snapshot-retention-pins*)))
+      (let ((pins (hash-table-count *wal-snapshot-retention-pins*)))
+        (multiple-value-bind (again ignored ignored-candidate ignored-ledger another)
+            (logical-slot-continuation-ensure-native-protection-under-lock proof)
+          (declare (ignore ignored ignored-candidate ignored-ledger))
+          (assert (and (eq again group) (not another))))
+        (assert (= pins (hash-table-count *wal-snapshot-retention-pins*))))
       (if (eq kind :unchanged)
           (assert (and (null record) (eq candidate slot)))
           (progn
@@ -1315,7 +1334,8 @@
     (assert (equalp before (logical-slot-state-encode slot)))
     (assert (eq pending (wal-replication-slot-pending-xids slot)))
     (format t "~&NATIVE-ACK-FRESH-PREFLIGHT PASS slot=~a kind=~a no-persistence~%"
-            (wal-replication-slot-name slot) kind)))
+            (wal-replication-slot-name slot) kind)
+    (values protection added)))
 
 (defun native-host-continuation-native-proof-positive (scan target kind)
   (let* ((slot (wal-retained-slot-scan-slot scan))
@@ -1324,7 +1344,7 @@
          (pending (wal-replication-slot-pending-xids slot))
          (pins (hash-table-count *wal-snapshot-retention-pins*))
          (fds (length (directory #p"/proc/self/fd/*")))
-         (escaped nil) (cursor nil)
+         (escaped nil) (cursor nil) (protection nil) (added-pin nil)
          (*logical-slot-continuation-native-proof-test-hook*
            (lambda (point value) (when (eq point :cursor-finished) (setf cursor value)))))
     (assert
@@ -1365,7 +1385,8 @@
                            (logical-slot-continuation-native-proof-check-under-lock proof)
                            (assert (plusp calls)))
                       (setf (symbol-function 'physical-image-file-facts) original)))
-                  (native-host-continuation-native-preflight proof slot kind)
+                  (multiple-value-setq (protection added-pin)
+                    (native-host-continuation-native-preflight proof slot kind))
                   (assert (eq :claimed (logical-slot-continuation-native-proof-claim-under-lock proof)))
                   (assert (logical-slot-continuation-native-proof-check-under-lock proof))
                   (assert
@@ -1379,7 +1400,11 @@
          (error () t))))
     (assert (eq pending (wal-replication-slot-pending-xids slot)))
     (assert (equalp before (logical-slot-state-encode slot)))
-    (assert (= pins (hash-table-count *wal-snapshot-retention-pins*)))
+    (assert (= (+ pins (if added-pin 1 0)) (hash-table-count *wal-snapshot-retention-pins*)))
+    (sb-thread:with-mutex (*wal-lock*)
+      (assert (logical-slot-continuation-protection-call protection :check))
+      (assert (= (logical-slot-continuation-protection-fork protection)
+                 (gethash protection *wal-snapshot-retention-pins*))))
     (assert (= fds (length (directory #p"/proc/self/fd/*"))))
     (format t "~&NATIVE-ACK-COMPLETED-PROOF PASS slot=~a kind=~a target=~d exact-principal closed-cursor one-claim no-persistence~%"
             name kind target)))
@@ -1454,45 +1479,48 @@
     (dolist (cut '(:selector :saved-row :registry))
       (let ((entered nil) (caught nil)
                           (pins (hash-table-count *wal-snapshot-retention-pins*))
-                          (fds (length (directory #p"/proc/self/fd/*"))))
-        (call-with-logical-slot-continuation-native-proof
-         name target
-         (lambda (proof)
-           (setf entered t)
-           (sb-thread:with-mutex (*wal-lock*)
-             (let* ((old-selector (logical-slot-continuation-native-proof-old-image proof))
-                    (changed-selector (logical-slot-continuation-decode old-selector))
-                    (old-row (logical-slot-state-encode other))
-                    (changed-row (wal-copy-replication-slot-with-profile other)))
-               (incf (getf changed-selector :generation))
-               (incf (wal-replication-slot-confirmed-flush-lsn changed-row))
-               (unwind-protect
-                    (progn
-                      (ecase cut
-                        (:selector
-                         (native-host-continuation-write-selector-image
-                          selector-path (logical-slot-continuation-encode changed-selector)))
-                        (:saved-row
-                         (native-host-continuation-write-selector-image
-                          other-path (logical-slot-state-encode changed-row)))
-                        (:registry (setf (gethash "unexpected" *wal-replication-slots*) other)))
-                      (handler-case
-                          (progn (logical-slot-continuation-native-preflight-under-lock proof)
-                                 (error "native preflight accepted changed evidence"))
-                        (error (condition)
-                          (let ((message (princ-to-string condition)))
-                            (assert (search
-                                     (ecase cut
-                                       (:selector "selector differs")
-                                       (:saved-row "complete inventory differs")
-                                       (:registry "registry differs"))
-                                     message))
-                            (setf caught t)))))
-                 (ecase cut
-                   (:selector
-                    (native-host-continuation-write-selector-image selector-path old-selector))
-                   (:saved-row (native-host-continuation-write-selector-image other-path old-row))
-                   (:registry (remhash "unexpected" *wal-replication-slots*))))))))
+                          (fds (length (directory #p"/proc/self/fd/*")))
+                          (tag (gensym "PREFLIGHT-CUT-")))
+        (assert (eq :refused (catch tag
+                               (call-with-logical-slot-continuation-native-proof
+                                name target
+                                (lambda (proof)
+                                  (setf entered t)
+                                  (sb-thread:with-mutex (*wal-lock*)
+                                    (let* ((old-selector (logical-slot-continuation-native-proof-old-image proof))
+                                           (changed-selector (logical-slot-continuation-decode old-selector))
+                                           (old-row (logical-slot-state-encode other))
+                                           (changed-row (wal-copy-replication-slot-with-profile other)))
+                                      (incf (getf changed-selector :generation))
+                                      (incf (wal-replication-slot-confirmed-flush-lsn changed-row))
+                                      (unwind-protect
+                                           (progn
+                                             (ecase cut
+                                               (:selector
+                                                (native-host-continuation-write-selector-image
+                                                 selector-path (logical-slot-continuation-encode changed-selector)))
+                                               (:saved-row
+                                                (native-host-continuation-write-selector-image
+                                                 other-path (logical-slot-state-encode changed-row)))
+                                               (:registry (setf (gethash "unexpected" *wal-replication-slots*) other)))
+                                             (handler-case
+                                                 (progn (logical-slot-continuation-native-preflight-under-lock proof)
+                                                        (error "native preflight accepted changed evidence"))
+                                               (error (condition)
+                                                 (let ((message (princ-to-string condition)))
+                                                   (assert (search
+                                                            (ecase cut
+                                                              (:selector "selector differs")
+                                                              (:saved-row "complete inventory differs")
+                                                              (:registry "registry differs"))
+                                                            message))
+                                                   (setf caught t)))))
+                                        (ecase cut
+                                          (:selector
+                                           (native-host-continuation-write-selector-image selector-path old-selector))
+                                          (:saved-row (native-host-continuation-write-selector-image other-path old-row))
+                                          (:registry (remhash "unexpected" *wal-replication-slots*))))))
+                                  (throw tag :refused))))))
         (assert (and entered caught))
         (assert (= pins (hash-table-count *wal-snapshot-retention-pins*)))
         (assert (= fds (length (directory #p"/proc/self/fd/*"))))))
@@ -1586,8 +1614,195 @@
     (format t "~&NATIVE-RUNTIME-TRANSACTIONS PASS slot=~a xids=(3 4) changes=~d frontiers=~s~%"
             (wal-retained-slot-scan-name scan) changes (nreverse frontiers))))
 
+(defun native-host-continuation-refused-actions (slot expected)
+  (let* ((name (wal-replication-slot-name slot)) (effects 0)
+                                                 (saved (mapcar (lambda (symbol) (cons symbol (symbol-function symbol)))
+                                                                '(slot-state-create slot-state-update slot-state-drop slot-state-claim-drop))))
+    (unwind-protect
+         (progn
+           (dolist (entry saved)
+             (setf (symbol-function (car entry))
+                   (lambda (&rest arguments) (declare (ignore arguments))
+                     (incf effects) (error "unexpected slot namespace effect"))))
+           (dolist (action
+                    (list (lambda () (wal-logical-slot-read-transactions name))
+                          (lambda () (wal-acknowledge-replication-slot
+                                      name (wal-replication-slot-confirmed-flush-lsn slot)))
+                          (lambda () (wal-drop-replication-slot name))
+                          (lambda () (sb-thread:with-mutex (*wal-lock*)
+                                       (wal-find-usable-replication-slot-under-lock name)))
+                          (lambda () (sb-thread:with-mutex (*wal-lock*) (wal-save-replication-slot slot)))
+                          (lambda () (sb-thread:with-mutex (*wal-lock*) (wal-delete-replication-slot-file name)))
+                          (lambda () (sb-thread:with-mutex (*wal-lock*) (wal-create-replication-slot-file slot)))
+                          (lambda () (sb-thread:with-mutex (*wal-lock*)
+                                       (logical-slot-save-update-under-lock
+                                        slot (wal-copy-replication-slot-with-profile slot))))))
+             (assert (handler-case (progn (funcall action) nil)
+                       (error (condition) (search expected (princ-to-string condition))))))
+           (assert (zerop effects)))
+      (dolist (entry saved) (setf (symbol-function (car entry)) (cdr entry))))))
+
+(defun native-host-continuation-downgraded-member (slot expected)
+  (let* ((name (wal-replication-slot-name slot))
+         (replacement (make-wal-replication-slot
+                       :name name :database-oid (wal-replication-slot-database-oid slot)
+                       :restart-lsn (wal-replication-slot-restart-lsn slot)
+                       :consistent-lsn (wal-replication-slot-consistent-lsn slot)
+                       :confirmed-flush-lsn (wal-replication-slot-confirmed-flush-lsn slot)
+                       :plugin (wal-replication-slot-plugin slot))))
+    (assert (null (wal-replication-slot-child-owner replacement)))
+    (assert (not (wal-replication-slot-state-uncertain-p replacement)))
+    (unwind-protect
+         (progn
+           (sb-thread:with-mutex (*wal-lock*)
+             (setf (gethash name *wal-replication-slots*) replacement))
+           (native-host-continuation-refused-actions replacement expected))
+      (sb-thread:with-mutex (*wal-lock*) (setf (gethash name *wal-replication-slots*) slot)))))
+
+(defun native-host-continuation-protection-root-checks (group slot)
+  (let ((original (symbol-function 'physical-image-file-facts))
+        (root (namestring (uiop:ensure-directory-pathname *pgdata*)))
+        (substituted 0))
+    (unwind-protect
+         (progn
+           (setf (symbol-function 'physical-image-file-facts)
+                 (lambda (fd &optional name)
+                   (let ((facts (if name (funcall original fd name) (funcall original fd))))
+                     (when (and (= fd -100) (equal name root))
+                       (incf substituted)
+                       (setf facts (copy-list facts))
+                       (incf (second facts)))
+                     facts)))
+           (native-host-continuation-refused-actions slot "changed its PGDATA identity")
+           (assert (plusp substituted)))
+      (setf (symbol-function 'physical-image-file-facts) original)))
+  (let ((key (logical-slot-continuation-protection-root-identity group)))
+    (unwind-protect
+         (progn
+           (sb-thread:with-mutex (*wal-lock*) (remhash key *logical-slot-continuation-protections*))
+           (native-host-continuation-refused-actions slot "changed its PGDATA identity"))
+      (sb-thread:with-mutex (*wal-lock*) (setf (gethash key *logical-slot-continuation-protections*) group))))
+  (let* ((real *pgdata*)
+         (alias (merge-pathnames (symbol-name (gensym "PROTECTION-ALIAS-")) (uiop:temporary-directory))))
+    (unwind-protect
+         (progn
+           (sb-posix:symlink (namestring real) (namestring alias))
+           (let ((*pgdata* alias))
+             (sb-thread:with-mutex (*wal-lock*)
+               (assert (eq slot (logical-slot-continuation-check-slot slot)))
+               (assert (handler-case (progn (wal-save-replication-slot slot) nil)
+                         (error (condition)
+                           (search "mutation requires continuation publication" (princ-to-string condition)))))
+               (assert (handler-case
+                           (progn (logical-slot-save-update-under-lock
+                                   slot (wal-copy-replication-slot-with-profile slot)) nil)
+                         (error (condition)
+                           (search "mutation requires continuation publication" (princ-to-string condition))))))
+             (assert (handler-case (progn (wal-drop-replication-slot (wal-replication-slot-name slot)) nil)
+                       (error (condition)
+                         (search "mutation requires continuation publication" (princ-to-string condition)))))))
+      (when (slot-state-lstat alias) (delete-file alias)))))
+
+(defun native-host-continuation-protection-bindings (group slot)
+  (sb-thread:with-mutex (*wal-lock*)
+    (let ((before (wal-replication-slot-database-oid slot)))
+      (unwind-protect
+           (progn
+             (setf (wal-replication-slot-database-oid slot) (1+ before))
+             (assert (handler-case
+                         (progn (wal-find-usable-replication-slot-under-lock
+                                 (wal-replication-slot-name slot)) nil)
+                       (error (condition) (search "registry differs" (princ-to-string condition))))))
+        (setf (wal-replication-slot-database-oid slot) before)))
+    (let ((fork (gethash group *wal-snapshot-retention-pins*)))
+      (dolist (wrong (list nil (1+ fork)))
+        (unwind-protect
+             (progn
+               (if wrong (setf (gethash group *wal-snapshot-retention-pins*) wrong)
+                   (remhash group *wal-snapshot-retention-pins*))
+               (assert (handler-case
+                           (progn (logical-slot-continuation-protection-call group :check) nil)
+                         (error (condition) (search "fork reservation" (princ-to-string condition))))))
+          (setf (gethash group *wal-snapshot-retention-pins*) fork))))
+    (multiple-value-bind (token)
+        (logical-slot-imported-host-origin-call
+         (logical-slot-continuation-protection-origin group) :selection)
+      (sb-thread:with-mutex (*physical-retained-inventory-publish-lock*)
+        (assert (null (gethash token *physical-retained-root-updates*))))
+      (unwind-protect
+           (progn
+             (sb-thread:with-mutex (*physical-retained-inventory-publish-lock*)
+               (setf (gethash token *physical-retained-root-updates*) t))
+             (assert (handler-case
+                         (progn (logical-slot-continuation-protection-call group :check) nil)
+                       (error (condition) (search "certain protected root" (princ-to-string condition))))))
+        (sb-thread:with-mutex (*physical-retained-inventory-publish-lock*)
+          (remhash token *physical-retained-root-updates*))))
+    (assert (logical-slot-continuation-protection-call group :check))))
+
+(defun native-host-continuation-protection ()
+  (let* ((groups (loop for group being the hash-values of *logical-slot-continuation-protections*
+                       collect group))
+         (group (first groups))
+         (pins *wal-snapshot-retention-pins*)
+         (alpha (gethash "alpha" *wal-replication-slots*))
+         (beta (gethash "beta" *wal-replication-slots*)))
+    (assert (= 1 (length groups)))
+    (assert (= (logical-slot-continuation-protection-fork group) (gethash group pins)))
+    (sb-thread:with-mutex (*wal-lock*)
+      (assert (logical-slot-continuation-protection-call group :check))
+      (dolist (operation '(:image :binding))
+        (let ((image (logical-slot-continuation-protection-call group operation)))
+          (setf (aref image 0) (logxor 1 (aref image 0)))
+          (assert (not (equalp image (logical-slot-continuation-protection-call group operation))))))
+      (dolist (action (list (lambda () (wal-save-replication-slot beta))
+                            (lambda () (logical-slot-save-update-under-lock
+                                        beta (wal-copy-replication-slot-with-profile beta)))))
+        (assert (handler-case (progn (funcall action) nil)
+                  (error (condition)
+                    (search "mutation requires continuation publication" (princ-to-string condition))))))
+      (assert (not (wal-replication-slot-state-uncertain-p alpha)))
+      (assert (not (wal-replication-slot-state-uncertain-p beta)))
+      (let ((*wal-snapshot-retention-pins* (make-hash-table :test #'eq)))
+        (assert (handler-case
+                    (progn (logical-slot-continuation-protection-call group :check) nil)
+                  (error (condition) (search "fork reservation" (princ-to-string condition))))))
+      (assert (logical-slot-continuation-protection-call group :check)))
+    (assert (handler-case (progn (wal-drop-replication-slot "beta") nil)
+              (error (condition)
+                (search "mutation requires continuation publication" (princ-to-string condition)))))
+    (native-host-continuation-downgraded-member beta "registry differs")
+    (native-host-continuation-protection-root-checks group beta)
+    (native-host-continuation-protection-bindings group beta)
+    (sb-thread:with-mutex (*wal-lock*)
+      (logical-slot-continuation-protection-call group :fail)
+      (assert (logical-slot-continuation-protection-call group :uncertain))
+      (assert (wal-replication-slot-state-uncertain-p alpha))
+      (assert (wal-replication-slot-state-uncertain-p beta))
+      (let ((replacement (wal-copy-replication-slot-with-profile beta)))
+        (setf (wal-replication-slot-state-uncertain-p replacement) nil)
+        (unwind-protect
+             (progn
+               (setf (gethash "beta" *wal-replication-slots*) replacement)
+               (assert (handler-case (progn (wal-find-usable-replication-slot-under-lock "beta") nil)
+                         (error (condition) (search "group is uncertain" (princ-to-string condition))))))
+          (setf (gethash "beta" *wal-replication-slots*) beta))))
+    (native-host-continuation-downgraded-member beta "uncertain")
+    (dolist (name '("alpha" "beta"))
+      (dolist (action
+               (list (lambda () (wal-logical-slot-read-transactions name))
+                     (lambda () (wal-acknowledge-replication-slot
+                                 name (wal-replication-slot-confirmed-flush-lsn
+                                       (gethash name *wal-replication-slots*))))
+                     (lambda () (wal-drop-replication-slot name))))
+        (assert (handler-case (progn (funcall action) nil)
+                  (error (condition) (search "uncertain" (princ-to-string condition)))))))
+    (assert (= (logical-slot-continuation-protection-fork group) (gethash group pins)))
+    (format t "~&NATIVE-CONTINUATION-PROTECTION PASS persistent-fork single-group detached-image reset-refused raw-mutation-fenced alpha-beta-uncertainty registry-replacement-refused~%")))
+
 (defun native-host-continuation-runtime-source ()
   (catalog-init)
+  (native-host-continuation-missing-origin nil)
   (let ((fds (length (directory #p"/proc/self/fd/*")))
         (records 0) (boundary nil))
     (dolist (name '("alpha" "beta"))
@@ -1625,6 +1840,7 @@
     (assert (plusp records))
     (assert (= fds (length (directory #p"/proc/self/fd/*"))))
     (assert (logical-slot-continuation-gc-fenced-p *pgdata*))
+    (native-host-continuation-protection)
     (format t "~&NATIVE-RUNTIME-SOURCE PASS archive-records=~d control-replacement-accepted~%" records)))
 
 (defun native-host-continuation-active-refusal (gate ownership)

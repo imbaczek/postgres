@@ -7,7 +7,7 @@
   ;; Its detached images and seal do not themselves authorize a slot write.
   (storage nil :read-only t) (scan nil :read-only t) (source nil :read-only t)
   (directory nil :read-only t) (slot-root nil :read-only t) (target-directory nil :read-only t)
-  (binding nil :read-only t) (old-image nil :read-only t) (seal nil :read-only t)
+  (origin nil :read-only t) (root-identity nil :read-only t) (binding nil :read-only t) (old-image nil :read-only t) (seal nil :read-only t)
   (horizon nil :read-only t) (target-lsn nil :read-only t) (kind nil :read-only t)
   (state nil :read-only t))
 
@@ -70,11 +70,12 @@
   ;; and independent fork pin throughout observation and receipt use.
   (unless (eq :terminal-check (logical-wal-source-purpose source))
     (error "native proof requires its terminal source"))
-  (call-with-logical-slot-continuation-runtime-storage
+  (call-with-logical-slot-continuation-runtime-origin-storage
    scan source
-   (lambda (storage facts)
+   (lambda (storage facts origin)
      (let ((directory (logical-slot-continuation-storage-call storage :directory))
            (binding (logical-slot-continuation-storage-call storage :binding))
+           (root-identity (logical-slot-continuation-storage-call storage :root-identity))
            (horizon (logical-slot-continuation-storage-call storage :horizon)))
        (logical-slot-continuation-storage-call
         storage :with-slot-root
@@ -86,7 +87,8 @@
               storage (getf (getf facts :certificate) :fork)
               (lambda (pin-check)
                 (funcall function
-                         (list :storage storage :facts facts :directory directory :binding binding :horizon horizon
+                         (list :storage storage :facts facts :origin origin :directory directory :root-identity root-identity
+                               :binding binding :horizon horizon
                                :slot-root root :root-check root-check :target-directory target
                                :target-check target-check :pin-check pin-check))))))))))))
 
@@ -142,10 +144,12 @@
       scan source
       (lambda (resources)
         (let* ((storage (getf resources :storage))
+               (origin (getf resources :origin))
                (draft (logical-slot-continuation-read-native-proof
                        storage (getf resources :facts) scan source owner role target))
                (image (getf draft :image)) (seal (getf draft :seal))
                (binding (copy-seq (getf resources :binding)))
+               (root-identity (copy-list (getf resources :root-identity)))
                (proof nil) (active t) (failed nil) (claimed nil)
                (thread sb-thread:*current-thread*) (mutex *wal-lock*))
           (unless (<= (first seal) (getf resources :horizon))
@@ -160,7 +164,9 @@
                         (unless (and active (not failed)
                                      (equalp image (logical-slot-continuation-native-proof-old-image proof))
                                      (equal seal (logical-slot-continuation-native-proof-seal proof))
-                                     (equalp binding (logical-slot-continuation-native-proof-binding proof)))
+                                     (equalp binding (logical-slot-continuation-native-proof-binding proof))
+                                     (equal root-identity (logical-slot-continuation-native-proof-root-identity proof))
+                                     (eq origin (logical-slot-continuation-native-proof-origin proof)))
                           (error "native terminal proof ended, changed or failed"))
                         (logical-slot-continuation-storage-call storage :check-under-lock)
                         (funcall (getf resources :pin-check))
@@ -179,7 +185,7 @@
                          :storage storage :scan scan :source source
                          :directory (getf resources :directory) :slot-root (getf resources :slot-root)
                          :target-directory (getf resources :target-directory)
-                         :binding (copy-seq binding) :old-image (copy-seq image) :seal (copy-list seal)
+                         :origin origin :root-identity (copy-list root-identity) :binding (copy-seq binding) :old-image (copy-seq image) :seal (copy-list seal)
                          :horizon (getf resources :horizon) :target-lsn target :kind (getf draft :kind)
                          :state #'state))
             (let ((*logical-slot-continuation-native-proofs*
