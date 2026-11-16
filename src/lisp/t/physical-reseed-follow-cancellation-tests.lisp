@@ -27,6 +27,55 @@
        (reseed-follow-with-retirement record (nth (- shape 16) groups))))
     (otherwise (error "unknown cancellation fixture shape"))))
 
+(cl-spec:defproperty reseed-follow-decode-keeps-idempotent-normalization
+    ((shape (range integer 0 19)) (selected boolean) (cancel boolean))
+  (:about pg::physical-reseed-follow-copy pg::physical-reseed-follow-decode)
+  (:trials (:normal 200))
+  (let* ((fixture (reseed-cancellation-codec-fixture shape selected))
+         (record (if cancel (pg::physical-reseed-follow-cancellation-begin-record fixture) fixture))
+         (saved (pg::physical-adoption-attempt-value-copy record))
+         (normalized (pg::physical-reseed-follow-copy record))
+         (again (pg::physical-reseed-follow-copy normalized))
+         (image (pg::physical-reseed-follow-image normalized))
+         (decoded (pg::physical-reseed-follow-decode image)))
+    (and (equal normalized again)
+         (equal normalized decoded)
+         (not (eq normalized again))
+         (equal saved record)
+         (equalp image (pg::physical-reseed-follow-image decoded)))))
+
+(deftest generated-reseed-follow-decode-normalization-contract
+    (let ((result (cl-spec:result-data
+                   (cl-spec:run-property 'reseed-follow-decode-keeps-idempotent-normalization
+                                         :seed 11507 :profile :normal))))
+      (ok (eq :passed (getf result :status)) (format nil "~s" result))
+      (ok (= 200 (getf result :trials)))))
+
+(deftest reseed-follow-decoder-preserves-capacity-refusal
+    (dolist (shape '(0 7 8 10 16))
+      (dolist (selected '(nil t))
+        (let* ((record (pg::physical-reseed-follow-copy
+                        (reseed-cancellation-codec-fixture shape selected)))
+               (image (pg::physical-reseed-follow-image record))
+               (original (symbol-function 'pg::physical-reseed-follow-check-image-capacity))
+               (calls 0))
+          (unwind-protect
+               (progn
+                 (setf (symbol-function 'pg::physical-reseed-follow-check-image-capacity)
+                       (lambda (actual length maximum)
+                         (incf calls)
+                         (ok (equal record actual))
+                         (ok (= (length image) length))
+                         (let* ((required
+                                  (if (eq :handoff-pending (getf (getf actual :settlement) :phase))
+                                      (max length (pg::physical-reseed-follow-settlement-terminal-size actual))
+                                      length))
+                                (bound (+ required (pg::physical-reseed-follow-capacity-reserve actual))))
+                           (funcall original actual length (min maximum (1- bound))))))
+                 (ok (signals (pg::physical-reseed-follow-decode image) 'error))
+                 (ok (= 1 calls)))
+            (setf (symbol-function 'pg::physical-reseed-follow-check-image-capacity) original))))))
+
 (cl-spec:defproperty reseed-cancellation-pending-preserves-all-installed-history
     ((shape (range integer 0 19)) (selected boolean))
   (:about pg::physical-reseed-follow-cancellation-begin-record

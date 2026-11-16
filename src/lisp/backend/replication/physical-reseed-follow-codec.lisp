@@ -223,5 +223,6 @@
   (let ((record (physical-backup-lease-decode-literal
                  "PGRESEEDFOLLOW1" bytes +physical-reseed-follow-maximum-bytes+
                  #'physical-reseed-follow-copy)))
-    (physical-reseed-follow-image record)
+    (physical-reseed-follow-check-image-capacity
+     record (length bytes) +physical-reseed-follow-maximum-bytes+)
     record))
