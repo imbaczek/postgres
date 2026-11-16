@@ -424,6 +424,7 @@
                    (:file "../replication/logical-slot-continuation-sidecar")
                    (:file "../replication/logical-slot-continuation-storage")
                    (:file "../replication/logical-slot-continuation-replacement")
+                   (:file "../replication/logical-slot-continuation-inventory")
                    (:file "../replication/logical-slot-continuation-selector-io")
                    (:file "../replication/logical-slot-continuation-selector-startup")
                    (:file "../replication/logical-slot-continuation-transcript")

@@ -1071,7 +1071,19 @@
             (assert (= (wal-retained-slot-scan-end scan) *wal-logical-slot-read-progress*))))))
   (format t "~&NATIVE-RUNTIME-TAIL-MUTATIONS PASS append-after-horizon-accepted valid-crc-rewrite-rejected private-replay-unchanged progress-staged~%"))
 
+(defun native-host-continuation-runtime-slot-inventory (storage)
+  (let ((passes 0) (fds (length (directory #p"/proc/self/fd/*"))))
+    (let ((*logical-slot-continuation-inventory-test-hook*
+            (lambda (point) (assert (eq point :between-passes)) (incf passes))))
+      (let ((rows (logical-slot-continuation-read-saved-rows storage)))
+        (assert (= passes 1))
+        (assert (equal '("alpha" "beta") (mapcar #'first rows)))
+        (logical-slot-continuation-prepared-rows rows)))
+    (assert (= fds (length (directory #p"/proc/self/fd/*"))))
+    (format t "~&NATIVE-RUNTIME-SLOT-INVENTORY PASS held-root two-passes exact-P7-rows no-FD-leak~%")))
+
 (defun native-host-continuation-runtime-slot-resources (storage)
+  (native-host-continuation-runtime-slot-inventory storage)
   (let ((escaped nil) (foreign-rejected nil))
     (multiple-value-bind (first second)
         (logical-slot-continuation-storage-call
@@ -1079,6 +1091,13 @@
          (lambda (directory check)
            (setf escaped check)
            (assert (physical-image-file-facts directory))
+           (call-with-logical-slot-continuation-target-directory
+            directory "alpha" check
+            (lambda (target target-check)
+              (assert (equal '("state") (logical-slot-copy-import-control-names target 3)))
+              (sb-thread:with-mutex (*wal-lock*)
+                (logical-slot-continuation-storage-call storage :check-under-lock)
+                (funcall target-check))))
            (funcall check)
            (sb-thread:join-thread
             (sb-thread:make-thread

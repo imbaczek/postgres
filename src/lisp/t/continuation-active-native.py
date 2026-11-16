@@ -107,6 +107,7 @@ def main():
                                'NATIVE-RUNTIME-BOUNDED-SOURCE PASS',
                                'NATIVE-RUNTIME-BOUNDED-LANES PASS',
                                'NATIVE-RUNTIME-SLOT-RESOURCES PASS',
+                               'NATIVE-RUNTIME-SLOT-INVENTORY PASS',
                                'NATIVE-STARTUP-SLOT-RESOURCES-REFUSED PASS',
                                'NATIVE-RUNTIME-TAIL-MUTATIONS PASS',
                                'NATIVE-RUNTIME-ACK-FENCED PASS',

@@ -89,9 +89,15 @@
 
 (defun logical-slot-continuation-read-saved-rows (storage)
   (logical-slot-continuation-storage-check storage)
-  (let ((rows (loop for entry in (logical-slot-startup-read-inventory :local-workspace t)
+  (let ((rows
+          (if (logical-slot-continuation-runtime-storage-p storage)
+              (logical-slot-continuation-storage-call
+               storage :with-slot-root
+               (lambda (directory check)
+                 (logical-slot-continuation-read-slot-inventory directory check)))
+              (loop for entry in (logical-slot-startup-read-inventory :local-workspace t)
                     collect (list (wal-replication-slot-name (logical-slot-startup-entry-slot entry))
-                                  (copy-seq (logical-slot-startup-entry-bytes entry))))))
+                                  (copy-seq (logical-slot-startup-entry-bytes entry)))))))
     (logical-slot-continuation-storage-check storage)
     (sort rows #'string< :key #'first)))
 

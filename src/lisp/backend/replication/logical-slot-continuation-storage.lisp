@@ -67,32 +67,49 @@
               (if complete (error condition)
                   (report-query-temp-cleanup-failure "continuation root" condition)))))))))
 
+(defun call-with-logical-slot-continuation-directory-binding
+    (root name function mutable-directory label)
+  (call-with-logical-slot-copy-source-proof-fd
+   root name t
+   (lambda (directory facts)
+     (let ((active t) (thread sb-thread:*current-thread*)
+                      (expected (if mutable-directory
+                                    (logical-slot-copy-source-proof-directory-identity facts) facts)))
+       (labels ((matches (observed)
+                  (equal expected (if mutable-directory
+                                      (logical-slot-copy-source-proof-directory-identity observed) observed)))
+                (check ()
+                  (unless (and active (eq thread sb-thread:*current-thread*)
+                               (matches (physical-image-file-facts directory))
+                               (matches (physical-image-file-facts root name)))
+                    (error "continuation ~a directory lost its live named binding" label))))
+         (unwind-protect
+              (progn
+                (check)
+                (multiple-value-prog1 (funcall function directory #'check) (check)))
+           (sb-sys:without-interrupts (setf active nil))))))
+   :mutable-directory mutable-directory))
+
+(defun call-with-logical-slot-continuation-target-directory (root name guard function)
+  (unless (and (slot-state-valid-name-p name) (functionp guard) (functionp function))
+    (error "continuation target directory requires a slot name and callbacks"))
+  (funcall guard)
+  (call-with-logical-slot-continuation-directory-binding
+   root name
+   (lambda (directory directory-check)
+     (labels ((check () (funcall directory-check) (funcall guard)))
+       (check)
+       (multiple-value-prog1 (funcall function directory #'check)
+         (check))))
+   t name))
+
 (defun call-with-logical-slot-continuation-owned-directory (root purpose function mutable-directory)
   ;; Lend the named directory and its check only to this callback and thread.
-  ;; Check both held and named facts before and after use.  Mutable directories
+  ;; Check both held and named facts before and after use. Mutable directories
   ;; may change contents and other facts, but must keep their captured identity.
   ;; Lost bindings or use after the callback signal an error.
-  (let ((name (ecase purpose (:wal "pg_wal") (:slots "pg_replslot"))))
-    (call-with-logical-slot-copy-source-proof-fd
-     root name t
-     (lambda (directory facts)
-       (let ((active t) (thread sb-thread:*current-thread*)
-                        (expected (if mutable-directory
-                                      (logical-slot-copy-source-proof-directory-identity facts) facts)))
-         (labels ((matches (observed)
-                    (equal expected (if mutable-directory
-                                        (logical-slot-copy-source-proof-directory-identity observed) observed)))
-                  (check ()
-                    (unless (and active (eq thread sb-thread:*current-thread*)
-                                 (matches (physical-image-file-facts directory))
-                                 (matches (physical-image-file-facts root name)))
-                      (error "continuation ~a directory lost its live named binding" purpose))))
-           (unwind-protect
-                (progn
-                  (check)
-                  (multiple-value-prog1 (funcall function directory #'check) (check)))
-             (sb-sys:without-interrupts (setf active nil))))))
-     :mutable-directory mutable-directory)))
+  (call-with-logical-slot-continuation-directory-binding
+   root (ecase purpose (:wal "pg_wal") (:slots "pg_replslot")) function mutable-directory purpose))
 
 (defun call-with-logical-slot-continuation-owned-wal-directory (root function mutable-directory)
   ;; Keep the WAL-specific entry point while sharing the directory checks.
