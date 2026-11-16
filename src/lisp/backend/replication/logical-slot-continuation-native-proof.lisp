@@ -5,6 +5,7 @@
             (:print-function physical-libpq-print-private-object))
   ;; A completed, scoped observation, bound to its thread and live resources.
   ;; Its detached images and seal do not themselves authorize a slot write.
+  ;; The receipt also retains the actual origin and owned root identity.
   (storage nil :read-only t) (scan nil :read-only t) (source nil :read-only t)
   (directory nil :read-only t) (slot-root nil :read-only t) (target-directory nil :read-only t)
   (origin nil :read-only t) (root-identity nil :read-only t) (binding nil :read-only t) (old-image nil :read-only t) (seal nil :read-only t)
@@ -67,7 +68,8 @@
 
 (defun call-with-logical-slot-continuation-native-resources (scan source function)
   ;; Hold the real terminal source, origin, storage, slot root, target directory
-  ;; and independent fork pin throughout observation and receipt use.
+  ;; and independent reader fork pin throughout observation and receipt use.
+  ;; A persistent protection, when installed, owns a separate fork pin.
   (unless (eq :terminal-check (logical-wal-source-purpose source))
     (error "native proof requires its terminal source"))
   (call-with-logical-slot-continuation-runtime-origin-storage

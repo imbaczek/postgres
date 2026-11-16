@@ -204,6 +204,7 @@ cause and durable progress positions cannot change."
 Interrupts are deferred across save and publication. Any incomplete save or
 publication marks the live SLOT uncertain and retains its old pin; a cold load
 is required before acknowledgment, saving or scanning can resume."
+  ;; Fence the live group at the mutation boundary, not in detached validators.
   (logical-slot-continuation-check-slot slot t)
   (logical-slot-check-update-under-lock slot candidate)
   (sb-sys:without-interrupts

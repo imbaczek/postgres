@@ -15,6 +15,8 @@
   (make-hash-table :test #'eq :weakness :key :synchronized t))
 
 (defun logical-slot-continuation-protection-call (protection operation)
+  ;; Dispatch a registered group under WAL exclusion.  :FAIL marks all
+  ;; members uncertain and retains the persistent fork pin.
   (assert (sb-thread:holding-mutex-p *wal-lock*))
   (unless (logical-slot-continuation-protection-p protection)
     (error "continuation protection requires its registered record"))
@@ -28,6 +30,10 @@
     (funcall state operation protection)))
 
 (defun logical-slot-continuation-make-protection-under-lock (proof)
+  ;; Bind the owned root, registry and exact member objects to their saved
+  ;; identities, provenance and origin.  Private binding and image copies keep
+  ;; those values immutable by representation.  The fork pin outlives the reader
+  ;; pin; no writer unwind or cold reconciliation is performed here.
   (multiple-value-bind (record candidate ledger)
       (logical-slot-continuation-native-preflight-under-lock proof)
     (let* ((image (logical-slot-continuation-native-proof-old-image proof))
@@ -106,6 +112,9 @@
         (values protection record candidate ledger t)))))
 
 (defun logical-slot-continuation-ensure-native-protection-under-lock (proof)
+  ;; Reuse a group only for the exact saved image, binding and origin, including
+  ;; a no-op preflight.  The returned plan is not an ACK, cold dispatcher,
+  ;; writer authority or permission to release retained WAL.
   (logical-slot-continuation-native-proof-check-under-lock proof)
   (let* ((key (logical-slot-continuation-native-proof-root-identity proof))
          (image (logical-slot-continuation-native-proof-old-image proof))
@@ -126,6 +135,9 @@
       (values protection record candidate ledger added))))
 
 (defun logical-slot-continuation-check-slot (slot &optional mutation)
+  ;; Check admission and mutation at the live registry boundary, independent of
+  ;; the slot's current child-owner field.  Both root and registry maps prevent
+  ;; a changed root, name or type from bypassing the group through a lookup miss.
   (let ((registered (gethash *wal-replication-slots* *logical-slot-continuation-protection-registries*)))
     (when (or registered (plusp (hash-table-count *logical-slot-continuation-protections*)))
       (let* ((facts (physical-image-file-facts

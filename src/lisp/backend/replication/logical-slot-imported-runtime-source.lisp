@@ -7,6 +7,7 @@
 ;; Callbacks are trusted internal code, not a sandbox for raw Lisp access.
 
 (defun call-with-logical-slot-imported-runtime-origin (scan source function)
+  ;; Retain the actual origin record along with the scoped scan and archive.
   (call-with-logical-slot-imported-scan-owner
    scan source
    (lambda (owner)
@@ -32,6 +33,7 @@
                       (funcall function owner context facts archive check under-lock record)))))))))))))))
 
 (defun call-with-logical-slot-imported-runtime-source (scan source function)
+  ;; Preserve the existing six-argument callback interface.
   (call-with-logical-slot-imported-runtime-origin
    scan source
    (lambda (owner context facts archive check under-lock origin)
@@ -39,6 +41,7 @@
      (funcall function owner context facts archive check under-lock))))
 
 (defun call-with-logical-slot-continuation-runtime-origin-storage (scan source function)
+  ;; Pass the same origin through the runtime storage scope.
   (call-with-logical-slot-imported-runtime-origin
    scan source
    (lambda (owner context facts archive check under-lock origin)
@@ -48,6 +51,7 @@
       archive))))
 
 (defun call-with-logical-slot-continuation-runtime-storage (scan source function)
+  ;; Preserve the existing two-argument storage callback interface.
   (call-with-logical-slot-continuation-runtime-origin-storage
    scan source
    (lambda (storage facts origin)

@@ -213,6 +213,7 @@ Logical updates guard identity, progress and the first terminal cause."
 (defun wal-find-usable-replication-slot-under-lock (name)
   ;; Look up and check the generation while the registry is locked.
   (assert (sb-thread:holding-mutex-p *wal-lock*))
+  ;; Group admission follows the actual registry lookup, before callers use it.
   (let ((slot (gethash name *wal-replication-slots*)))
     (when slot
       (wal-require-usable-replication-slot slot)
@@ -3304,6 +3305,7 @@ wal_level_insufficient cause requires PGSLOT6, or PGSLOT7 with a child owner."
 (defun wal-create-replication-slot-file (slot &optional publication-receipt)
   ;; CREATE publishes a staged directory without replacing an existing name.
   (wal-require-usable-replication-slot slot)
+  ;; A protected group fences creation even if the candidate's type changed.
   (logical-slot-continuation-check-slot slot t)
   (slot-state-create (wal-replication-slot-directory)
                      (wal-replication-slot-name slot)
@@ -3314,6 +3316,7 @@ wal_level_insufficient cause requires PGSLOT6, or PGSLOT7 with a child owner."
 (defun wal-save-replication-slot (slot)
   ;; UPDATE requires an existing directory and cannot recreate a dropped slot.
   (wal-require-usable-replication-slot slot)
+  ;; Check the live group before the file mutation.
   (logical-slot-continuation-check-slot slot t)
   (slot-state-update (wal-replication-slot-directory)
                      (wal-replication-slot-name slot)
@@ -3326,6 +3329,7 @@ wal_level_insufficient cause requires PGSLOT6, or PGSLOT7 with a child owner."
     (unless (and slot (or (null expected-slot) (eq slot expected-slot)))
       (error "replication slot deletion requires its exact registered object"))
     (wal-require-known-replication-slot slot)
+    ;; Check the live group before removing its registered member.
     (logical-slot-continuation-check-slot slot t)
     ;; Save the numeric directory identities before removal. On failure the
     ;; claim and WAL pin remain, and only this generation may retry the drop.

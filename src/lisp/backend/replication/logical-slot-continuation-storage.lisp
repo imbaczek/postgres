@@ -158,6 +158,8 @@
   (values (logical-slot-imported-scan-owner-scan owner)
           (logical-slot-imported-scan-owner-source owner)))
 
+;; :ROOT-IDENTITY returns the held PGDATA device, inode and mount.
+
 (defun call-with-logical-slot-continuation-storage-context
     (owner context facts check under-lock function &optional archive)
   (unless (if archive (logical-slot-imported-scan-owner-p owner)

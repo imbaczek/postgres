@@ -110,6 +110,10 @@ context; the reader inside checks only private FD, scope and content identity.
 Do not rebind saved live globals to make a guard pass. Runtime providers still
 need live per-record and terminal checks.
 
+Detached slot-image validators also run without the WAL lock. Keep live
+registry and group admission checks at registry lookup and mutation
+boundaries.
+
 When a task depends on live Lisp state, backend threads, or timing between SQL
 sessions, agents should prefer the control REPL on a local server instance they
 started for the task. Use it to inspect state, coordinate concurrent sessions,
