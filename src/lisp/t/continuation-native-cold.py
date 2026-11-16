@@ -103,6 +103,10 @@ def main():
             campaign.write_json(logs / 'native-cold-results.json', results)
             marker = {'parent-boundaries': 'NATIVE-COLD-PARENT-BOUNDARIES',
                       'selected-boundaries': 'NATIVE-COLD-SELECTED-BOUNDARIES',
+                      'pending': 'NATIVE-COLD-PENDING',
+                      'pending-registration': 'NATIVE-COLD-PENDING-REFUSAL',
+                      'pending-candidate': 'NATIVE-COLD-PENDING-REFUSAL',
+                      'pending-temp-swap': 'NATIVE-COLD-PENDING-REFUSAL',
                       None: 'NATIVE-COLD-CLASSIFICATION'}[env.get('PG_NATIVE_COLD_PROOF')] + ' PASS case=' + case
             if status or marker not in log.read_text(errors='replace'):
                 raise RuntimeError('Cold case failed: ' + str(log))

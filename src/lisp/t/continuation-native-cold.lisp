@@ -299,11 +299,165 @@
     (format t "~&NATIVE-COLD-SELECTED-BOUNDARIES PASS case=~a historical-seal full-horizon reproof no-admission no-cleanup~%"
             (uiop:getenv "PG_NATIVE_COLD_CASE"))))
 
+(defun native-host-cold-source-probes (source check)
+  (let* ((inventory (logical-slot-startup-source-inventory source))
+         (copied (copy-logical-slot-startup-inventory inventory))
+         (state (logical-slot-startup-inventory-state inventory)))
+    (native-host-cold-recheck-refused-before-io
+     (lambda () (logical-slot-startup-inventory-call
+                 (copy-logical-slot-imported-startup-source source) :observe)))
+    (native-host-cold-recheck-refused-before-io
+     (lambda () (logical-slot-startup-inventory-dispatch copied :observe source)))
+    (unwind-protect
+         (progn
+           (setf (gethash copied *logical-slot-startup-inventories*) state)
+           (native-host-cold-recheck-refused-before-io
+            (lambda () (logical-slot-startup-inventory-dispatch copied :observe source))))
+      (remhash copied *logical-slot-startup-inventories*))
+    (native-host-cold-recheck-refused-before-io
+     (lambda () (logical-slot-startup-inventory-dispatch inventory :preflight)))
+    (let ((refused nil))
+      (sb-thread:join-thread
+       (sb-thread:make-thread
+        (lambda ()
+          (native-host-cold-recheck-refused-before-io
+           (lambda () (logical-slot-startup-inventory-call source :observe)))
+          (setf refused t))
+        :name "foreign-cold-inventory-probe"))
+      (assert refused))
+    (assert (logical-slot-startup-inventory-call source :check))
+    (funcall check)))
+
+(defun native-host-cold-reconstruct-pending (gate ownership)
+  (let ((files (native-host-cold-file-image)) (fds (native-host-writer-open-fds))
+                                              (saved-check nil) (saved-source nil) (count 0))
+    (funcall
+     (symbol-function 'call-with-logical-slot-continuation-cold-reconstruction)
+     gate ownership
+     (lambda (source observation reservation check)
+       (assert (logical-slot-imported-startup-source-p source))
+       (native-host-cold-source-probes source check)
+       (when (probe-file (merge-pathnames "pg_replslot/alpha/state.tmp" *pgdata*))
+         (let ((entered nil))
+           (assert (handler-case
+                       (progn
+                         (call-with-logical-slot-imported-startup-source
+                          gate ownership (logical-slot-startup-source-entries source)
+                          (lambda (ordinary) (declare (ignore ordinary)) (setf entered t)))
+                         nil)
+                     (error (condition)
+                       (format t "~&NATIVE-COLD-ORDINARY-REFUSAL ~a~%" condition)
+                       (search "unfinished replication slot state update" (princ-to-string condition)))))
+           (assert (not entered))))
+       (assert (= (logical-slot-startup-source-end source) (getf observation :horizon)))
+       (dolist (entry (logical-slot-startup-source-entries source))
+         (let* ((slot (logical-slot-startup-entry-slot entry))
+                (confirmed (wal-replication-slot-confirmed-flush-lsn slot))
+                (pending (wal-replication-slot-pending-xids slot))
+                (expected (remove-if-not
+                           (lambda (row) (> (third row) confirmed))
+                           '((3 20598 29061) (4 29381 37853)))))
+           (assert (member (wal-replication-slot-name slot) '("alpha" "beta") :test #'equal))
+           (assert (= (length expected) (hash-table-count pending)))
+           (dolist (row expected)
+             (assert (equal (cons (second row) (third row)) (gethash (first row) pending))))
+           (incf count)))
+       (assert (= count 2))
+       (assert (zerop (hash-table-count *wal-replication-slots*)))
+       (funcall check)
+       (sb-thread:with-mutex (*wal-lock*)
+         (logical-slot-continuation-cold-reservation-call reservation :check))
+       (setf saved-check check saved-source source)))
+    (assert (= count 2))
+    (native-host-cold-recheck-refused-before-io saved-check)
+    (native-host-cold-recheck-refused-before-io
+     (lambda () (logical-slot-startup-inventory-call saved-source :observe)))
+    (assert (equalp files (native-host-cold-file-image)))
+    (assert (equal fds (native-host-writer-open-fds)))
+    (assert (zerop (hash-table-count *wal-replication-slots*)))
+    (format t "~&NATIVE-COLD-PENDING PASS case=~a both-members through-L exact-pending no-admission no-cleanup~%"
+            (uiop:getenv "PG_NATIVE_COLD_CASE"))))
+
+(defun native-host-cold-pending-refusal (gate ownership mode)
+  (let ((fds (native-host-writer-open-fds)) (files (native-host-cold-file-image))
+                                            (reached nil) (saved-source nil) (caught nil))
+    (setf caught
+          (handler-case
+              (progn
+                (call-with-logical-slot-continuation-cold-reconstruction
+                 gate ownership
+                 (lambda (source observation reservation check)
+                   (declare (ignore observation reservation))
+                   (setf reached t saved-source source)
+                   (cond
+                     ((equal mode "pending-registration")
+                      (let* ((inventory (logical-slot-startup-source-inventory source))
+                             (state (gethash inventory *logical-slot-startup-inventories*)))
+                        (unwind-protect
+                             (progn
+                               (remhash inventory *logical-slot-startup-inventories*)
+                               (let ((sources *logical-slot-startup-sources*) (refused nil))
+                                 (sb-thread:join-thread
+                                  (sb-thread:make-thread
+                                   (lambda ()
+                                     (let ((*logical-slot-startup-sources* sources))
+                                       (native-host-cold-recheck-refused-before-io
+                                        (lambda () (logical-slot-startup-inventory-call source :check)))
+                                       (setf refused t)))
+                                   :name "missing-cold-inventory-foreign-probe"))
+                                 (assert refused)
+                                 (assert (logical-slot-startup-source-active-p source)))
+                               (native-host-cold-recheck-refused-before-io check)
+                               (assert (not (logical-slot-startup-source-active-p source))))
+                          (setf (gethash inventory *logical-slot-startup-inventories*) state))))
+                     ((equal mode "pending-candidate")
+                      (let* ((slot (logical-slot-startup-entry-slot
+                                    (first (logical-slot-startup-source-entries source))))
+                             (confirmed (wal-replication-slot-confirmed-flush-lsn slot)))
+                        (unwind-protect
+                             (progn
+                               (incf (wal-replication-slot-confirmed-flush-lsn slot))
+                               (native-host-cold-recheck-refused-before-io check))
+                          (setf (wal-replication-slot-confirmed-flush-lsn slot) confirmed))))
+                     ((equal mode "pending-temp-swap")
+                      (let* ((path (merge-pathnames "pg_replslot/alpha/state.tmp" *pgdata*))
+                             (replacement (merge-pathnames "pg_replslot/alpha/state.replacement" *pgdata*))
+                             (bytes (read-bounded-regular-file path +slot-state-maximum-bytes+)))
+                        (with-open-file (stream replacement :direction :output :if-exists :error
+                                                            :element-type '(unsigned-byte 8))
+                          (write-sequence bytes stream))
+                        (sb-posix:chmod (namestring replacement) #o600)
+                        (sb-posix:rename (namestring replacement) (namestring path))
+                        (setf files (native-host-cold-file-image))
+                        (assert (handler-case (progn (funcall check) nil) (error () t)))))
+                     (t (error "unknown cold pending refusal ~s" mode)))
+                   (native-host-cold-recheck-refused-before-io check)))
+                nil)
+            (error (condition) (princ-to-string condition))))
+    (assert (and reached caught))
+    (native-host-cold-recheck-refused-before-io
+     (lambda () (logical-slot-startup-inventory-call saved-source :observe)))
+    (assert (zerop (hash-table-count *wal-replication-slots*)))
+    (sb-thread:with-mutex (*wal-lock*)
+      (loop for reservation being the hash-values of *logical-slot-continuation-cold-reservations*
+            do (assert (logical-slot-continuation-cold-reservation-call reservation :uncertain))
+               (assert (= 41268 (gethash reservation *wal-snapshot-retention-pins*)))))
+    (assert (= 1 (hash-table-count *logical-slot-continuation-cold-reservations*)))
+    (assert (equal fds (native-host-writer-open-fds)))
+    (assert (equalp files (native-host-cold-file-image)))
+    (format t "~&NATIVE-COLD-PENDING-REFUSAL PASS case=~a mode=~a sticky no-fallback persistent-F no-cleanup~%"
+            (uiop:getenv "PG_NATIVE_COLD_CASE") mode)))
+
 (defun native-host-continuation-cold-state (gate ownership)
   (handler-case
       (progn
         (when (uiop:getenv "PG_NATIVE_COLD_APPEND") (native-host-cold-append))
         (cond
+          ((member (uiop:getenv "PG_NATIVE_COLD_PROOF")
+                   '("pending-registration" "pending-candidate" "pending-temp-swap") :test #'equal)
+           (native-host-cold-pending-refusal gate ownership (uiop:getenv "PG_NATIVE_COLD_PROOF")))
+          ((equal "pending" (uiop:getenv "PG_NATIVE_COLD_PROOF"))
+           (native-host-cold-reconstruct-pending gate ownership))
           ((equal "selected-boundaries" (uiop:getenv "PG_NATIVE_COLD_PROOF"))
            (native-host-cold-selected-boundaries gate ownership))
           ((equal "parent-boundaries" (uiop:getenv "PG_NATIVE_COLD_PROOF"))
