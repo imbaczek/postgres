@@ -3,6 +3,12 @@
 (defun logical-slot-continuation-history (tip bytes)
   (timeline-check-lineage (timeline-parse-history tip (bytes->string bytes))))
 
+(defun logical-slot-continuation-slot-rows-equal-p (left right)
+  (and (= (logical-slot-copy-descriptor-list-count left +logical-slot-continuation-obligation-limit+)
+          (logical-slot-copy-descriptor-list-count right +logical-slot-continuation-obligation-limit+))
+       (every (lambda (a b) (and (string= (first a) (first b)) (equalp (second a) (second b))))
+              left right)))
+
 (defun logical-slot-continuation-work-profile (snapshot history)
   ;; Bound weighted history entry visits before geometry and cache parsed
   ;; root histories for the checks that follow.

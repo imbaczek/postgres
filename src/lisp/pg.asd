@@ -419,6 +419,8 @@
                    (:file "../replication/logical-slot-continuation-shape")
                    (:file "../replication/logical-slot-continuation-model")
                    (:file "../replication/logical-slot-continuation-codec")
+                   (:file "../replication/logical-slot-continuation-prepared")
+                   (:file "../replication/logical-slot-continuation-prepared-codec")
                    (:file "../replication/logical-slot-continuation-sidecar")
                    (:file "../replication/logical-slot-continuation-storage")
                    (:file "../replication/logical-slot-continuation-selector-io")
