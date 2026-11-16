@@ -68,6 +68,10 @@
                   (report-query-temp-cleanup-failure "continuation root" condition)))))))))
 
 (defun call-with-logical-slot-continuation-owned-directory (root purpose function mutable-directory)
+  ;; Lend the named directory and its check only to this callback and thread.
+  ;; Check both held and named facts before and after use.  Mutable directories
+  ;; may change contents and other facts, but must keep their captured identity.
+  ;; Lost bindings or use after the callback signal an error.
   (let ((name (ecase purpose (:wal "pg_wal") (:slots "pg_replslot"))))
     (call-with-logical-slot-copy-source-proof-fd
      root name t
@@ -91,6 +95,7 @@
      :mutable-directory mutable-directory)))
 
 (defun call-with-logical-slot-continuation-owned-wal-directory (root function mutable-directory)
+  ;; Keep the WAL-specific entry point while sharing the directory checks.
   (call-with-logical-slot-continuation-owned-directory root :wal function mutable-directory))
 
 (defun call-with-logical-slot-continuation-wal-directory (root function)
@@ -104,6 +109,10 @@
   (call-with-logical-slot-continuation-owned-wal-directory root function t))
 
 (defun call-with-logical-slot-continuation-slot-root (root archive function check)
+  ;; Runtime storage lends the original slot root for the callback only.
+  ;; Full storage checks bracket it outside the WAL lock; the supplied directory
+  ;; check is local and can be used under that lock.  This resource grants no
+  ;; authority to mutate slots or publish an image.
   (unless (and archive (functionp function) (functionp check))
     (error "slot directory resources require runtime storage and a callback"))
   (call-with-logical-slot-continuation-owned-directory
@@ -113,6 +122,12 @@
      (multiple-value-prog1 (funcall function directory directory-check)
        (funcall check)))
    t))
+
+;; The runtime :WITH-SLOT-ROOT operation lends the checked slot directory;
+;; startup storage cannot use it.  The capability and its callbacks remain
+;; bound to this thread and scope.  A failed operation revokes the capability.
+;; Full checks run outside the WAL lock; :CHECK-UNDER-LOCK uses the local guard.
+;; This is a directory resource, not a slot writer or mutation authority.
 
 (defun call-with-logical-slot-continuation-storage-context
     (owner context facts check under-lock function &optional archive)
