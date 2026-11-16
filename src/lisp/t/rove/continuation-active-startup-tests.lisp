@@ -15,6 +15,146 @@
               (list 42 nil nil history 2 192)
               (list (list "beta" lost) (list "alpha" (logical-slot-state-encode alpha)))))))
 
+(defun unit-continuation-directory-fixture (function)
+  (let* ((root (uiop:ensure-directory-pathname
+                (sb-posix:mkdtemp
+                 (namestring (merge-pathnames "continuation-directories.XXXXXX"
+                                              (uiop:temporary-directory))))))
+         (fd nil))
+    (unwind-protect
+         (progn
+           (dolist (name '("pg_wal/" "pg_replslot/"))
+             (sb-posix:mkdir (namestring (merge-pathnames name root)) #o700))
+           (setf fd (sb-posix:open (namestring root)
+                                   (logior sb-posix:o-rdonly sb-posix:o-directory
+                                           sb-posix:o-nofollow +postmaster-o-cloexec+)))
+           (funcall function fd root))
+      (when fd (sb-posix:close fd))
+      (uiop:delete-directory-tree root :validate t :if-does-not-exist :ignore))))
+
+(rove:deftest continuation-owned-directory-checks-thread-and-expiry
+    (dolist (purpose '(:wal :slots))
+      (unit-continuation-directory-fixture
+       (lambda (parent root)
+         (declare (ignore root))
+         (let ((stale nil) (calls 0)
+                           (original (symbol-function 'physical-image-file-facts)))
+           (unwind-protect
+                (progn
+                  (setf (symbol-function 'physical-image-file-facts)
+                        (lambda (&rest arguments)
+                          (incf calls)
+                          (apply original arguments)))
+                  (rove:ok
+                   (equal (list 37 purpose)
+                          (multiple-value-list
+                           (call-with-logical-slot-continuation-owned-directory
+                            parent purpose
+                            (lambda (directory check)
+                              (declare (ignore directory))
+                              (setf stale check calls 0)
+                              (funcall check)
+                              (rove:ok (plusp calls))
+                              (setf calls 0)
+                              (rove:ok
+                               (sb-thread:join-thread
+                                (sb-thread:make-thread
+                                 (lambda ()
+                                   (handler-case (progn (funcall check) nil)
+                                     (error () t))))))
+                              (rove:ok (zerop calls))
+                              (funcall check)
+                              (values 37 purpose))
+                            t))))
+                  (setf calls 0)
+                  (rove:ok (handler-case (progn (funcall stale) nil) (error () t)))
+                  (rove:ok (zerop calls)))
+             (setf (symbol-function 'physical-image-file-facts) original)))))))
+
+(rove:deftest continuation-owned-directory-distinguishes-strict-and-mutable-facts
+    (dolist (purpose '(:wal :slots))
+      (dolist (mutable '(nil t))
+        (unit-continuation-directory-fixture
+         (lambda (parent root)
+           (declare (ignore root))
+           (let ((entered nil) (result nil) (failed nil))
+             (handler-case
+                 (setf result
+                       (call-with-logical-slot-continuation-owned-directory
+                        parent purpose
+                        (lambda (directory check)
+                          (funcall check)
+                          (setf entered t)
+                          (with-open-file (stream (merge-pathnames "probe" (physical-image-fd-path directory))
+                                                  :direction :output :if-does-not-exist :create
+                                                  :if-exists :error :element-type '(unsigned-byte 8))
+                            (write-byte 7 stream))
+                          (sb-posix:utime (namestring (physical-image-fd-path directory)) 0 0)
+                          :finished)
+                        mutable))
+               (error () (setf failed t)))
+             (rove:ok entered)
+             (rove:ok (if mutable (and (not failed) (eq :finished result)) failed))))))))
+
+(rove:deftest continuation-owned-directory-rejects-named-replacement
+    (dolist (purpose '(:wal :slots))
+      (unit-continuation-directory-fixture
+       (lambda (parent root)
+         (let* ((name (ecase purpose (:wal "pg_wal/") (:slots "pg_replslot/")))
+                (named (merge-pathnames name root))
+                (saved (merge-pathnames "saved/" root))
+                (entered nil))
+           (rove:ok
+            (handler-case
+                (progn
+                  (call-with-logical-slot-continuation-owned-directory
+                   parent purpose
+                   (lambda (directory check)
+                     (declare (ignore directory check))
+                     (setf entered t)
+                     (sb-posix:rename (namestring named) (namestring saved))
+                     (sb-posix:mkdir (namestring named) #o700)
+                     :ignored)
+                   t)
+                  nil)
+              (error () t)))
+           (rove:ok entered))))))
+
+(rove:deftest continuation-owned-directory-rejects-unknown-purpose-before-io
+    (let ((calls 0) (original (symbol-function 'physical-image-file-facts)))
+      (unwind-protect
+           (progn
+             (setf (symbol-function 'physical-image-file-facts)
+                   (lambda (&rest arguments) (incf calls) (apply original arguments)))
+             (rove:ok
+              (handler-case
+                  (progn (call-with-logical-slot-continuation-owned-directory
+                          -1 :unrecognized (lambda (&rest arguments) (declare (ignore arguments))) t)
+                         nil)
+                (error () t)))
+             (rove:ok (zerop calls)))
+        (setf (symbol-function 'physical-image-file-facts) original))))
+
+(rove:deftest continuation-slot-root-rejects-invalid-purpose-before-io
+    (let ((calls 0) (opens 0)
+                    (original (symbol-function 'call-with-logical-slot-continuation-owned-directory)))
+      (unwind-protect
+           (progn
+             (setf (symbol-function 'call-with-logical-slot-continuation-owned-directory)
+                   (lambda (&rest arguments)
+                     (incf opens)
+                     (apply original arguments)))
+             (dolist (arguments
+                      (list (list nil (lambda (&rest ignored) (declare (ignore ignored))) (lambda () (incf calls)))
+                            (list t nil (lambda () (incf calls)))
+                            (list t (lambda (&rest ignored) (declare (ignore ignored))) nil)))
+               (rove:ok (handler-case
+                            (progn (apply #'call-with-logical-slot-continuation-slot-root -1 arguments) nil)
+                          (error () t))))
+             (rove:ok (zerop calls))
+             (rove:ok (zerop opens)))
+        (setf (symbol-function 'call-with-logical-slot-continuation-owned-directory) original))))
+
 (cl-spec:defproperty continuation-initial-active-keeps-exact-saved-obligations
     ((generation (range integer 0 340282366920938463463374607431768211455))
      (restart (range integer 32 64)))

@@ -106,6 +106,8 @@ def main():
                 for marker in ('NATIVE-RUNTIME-SOURCE PASS',
                                'NATIVE-RUNTIME-BOUNDED-SOURCE PASS',
                                'NATIVE-RUNTIME-BOUNDED-LANES PASS',
+                               'NATIVE-RUNTIME-SLOT-RESOURCES PASS',
+                               'NATIVE-STARTUP-SLOT-RESOURCES-REFUSED PASS',
                                'NATIVE-RUNTIME-TAIL-MUTATIONS PASS',
                                'NATIVE-RUNTIME-ACK-FENCED PASS',
                                'NATIVE-RUNTIME-TRANSACTIONS PASS slot=alpha',

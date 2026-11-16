@@ -259,7 +259,44 @@
       (setf (symbol-function 'physical-image-file-facts) original))
     (and injected (eq result :interrupted))))
 
+(defun native-host-continuation-startup-reject-slot-resources (gate ownership)
+  (let ((original (symbol-function 'call-with-logical-slot-continuation-owned-directory))
+        (opens 0) (callbacks 0) (entered nil) (rejected nil) (sticky nil) (scope-failed nil))
+    (unwind-protect
+         (progn
+           (setf (symbol-function 'call-with-logical-slot-continuation-owned-directory)
+                 (lambda (&rest arguments)
+                   (incf opens)
+                   (apply original arguments)))
+           (handler-case
+               (call-with-logical-slot-continuation-startup-storage
+                gate ownership
+                (lambda (storage facts)
+                  (declare (ignore facts))
+                  (setf entered t)
+                  (setf rejected
+                        (handler-case
+                            (progn
+                              (logical-slot-continuation-storage-call
+                               storage :with-slot-root
+                               (lambda (&rest ignored)
+                                 (declare (ignore ignored))
+                                 (incf callbacks)))
+                              nil)
+                          (error (condition)
+                            (search "slot directory resources require runtime storage"
+                                    (princ-to-string condition)))))
+                  (setf sticky
+                        (handler-case
+                            (progn (logical-slot-continuation-storage-check storage) nil)
+                          (error () t)))))
+             (error () (setf scope-failed t))))
+      (setf (symbol-function 'call-with-logical-slot-continuation-owned-directory) original))
+    (assert (and entered rejected sticky scope-failed (zerop opens) (zerop callbacks)))
+    (format t "~&NATIVE-STARTUP-SLOT-RESOURCES-REFUSED PASS no-open no-callback sticky-owner~%")))
+
 (defun native-host-continuation-storage (gate ownership)
+  (native-host-continuation-startup-reject-slot-resources gate ownership)
   (let ((saved nil) (fds (length (directory #p"/proc/self/fd/*"))))
     (call-with-logical-slot-continuation-startup-storage
      gate ownership
@@ -1034,12 +1071,36 @@
             (assert (= (wal-retained-slot-scan-end scan) *wal-logical-slot-read-progress*))))))
   (format t "~&NATIVE-RUNTIME-TAIL-MUTATIONS PASS append-after-horizon-accepted valid-crc-rewrite-rejected private-replay-unchanged progress-staged~%"))
 
+(defun native-host-continuation-runtime-slot-resources (storage)
+  (let ((escaped nil) (foreign-rejected nil))
+    (multiple-value-bind (first second)
+        (logical-slot-continuation-storage-call
+         storage :with-slot-root
+         (lambda (directory check)
+           (setf escaped check)
+           (assert (physical-image-file-facts directory))
+           (funcall check)
+           (sb-thread:join-thread
+            (sb-thread:make-thread
+             (lambda ()
+               (handler-case (funcall check)
+                 (error () (setf foreign-rejected t))))))
+           (assert foreign-rejected)
+           (funcall check)
+           (logical-slot-continuation-storage-check storage)
+           (values :slot-root :checked)))
+      (assert (and (eq first :slot-root) (eq second :checked))))
+    (assert (handler-case (progn (funcall escaped) nil) (error () t)))
+    (logical-slot-continuation-storage-check storage)
+    (format t "~&NATIVE-RUNTIME-SLOT-RESOURCES PASS thread expiry multiple-values owner-healthy~%")))
+
 (defun native-host-continuation-runtime-storage (scan source)
   (let ((escaped nil))
     (call-with-logical-slot-continuation-runtime-storage
      scan source
      (lambda (storage facts)
        (setf escaped storage)
+       (native-host-continuation-runtime-slot-resources storage)
        (call-with-logical-slot-continuation-selector
         storage
         (lambda (snapshot fd selector-facts)
@@ -1326,6 +1387,7 @@
         (assert (equal identity (physical-image-file-facts -100 (namestring selector))))
         (format t "~&NATIVE-SELECTOR-ACTIVE-REFUSAL PASS slots=~d records=~d tail=~s; stable active selector verified; loader still refuses: ~a~%"
                 (length rows) records (logical-slot-continuation-plan-tail-request plan) rejected)))
+    (native-host-continuation-startup-reject-slot-resources gate ownership)
     (native-host-continuation-boundary-probes gate ownership)
     (native-host-continuation-reject-caller-baseline gate ownership)
     (when (uiop:getenv "PG_NATIVE_COMPOSED_READER")

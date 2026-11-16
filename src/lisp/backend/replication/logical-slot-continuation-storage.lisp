@@ -67,27 +67,31 @@
               (if complete (error condition)
                   (report-query-temp-cleanup-failure "continuation root" condition)))))))))
 
+(defun call-with-logical-slot-continuation-owned-directory (root purpose function mutable-directory)
+  (let ((name (ecase purpose (:wal "pg_wal") (:slots "pg_replslot"))))
+    (call-with-logical-slot-copy-source-proof-fd
+     root name t
+     (lambda (directory facts)
+       (let ((active t) (thread sb-thread:*current-thread*)
+                        (expected (if mutable-directory
+                                      (logical-slot-copy-source-proof-directory-identity facts) facts)))
+         (labels ((matches (observed)
+                    (equal expected (if mutable-directory
+                                        (logical-slot-copy-source-proof-directory-identity observed) observed)))
+                  (check ()
+                    (unless (and active (eq thread sb-thread:*current-thread*)
+                                 (matches (physical-image-file-facts directory))
+                                 (matches (physical-image-file-facts root name)))
+                      (error "continuation ~a directory lost its live named binding" purpose))))
+           (unwind-protect
+                (progn
+                  (check)
+                  (multiple-value-prog1 (funcall function directory #'check) (check)))
+             (sb-sys:without-interrupts (setf active nil))))))
+     :mutable-directory mutable-directory)))
+
 (defun call-with-logical-slot-continuation-owned-wal-directory (root function mutable-directory)
-  (call-with-logical-slot-copy-source-proof-fd
-   root "pg_wal" t
-   (lambda (directory facts)
-     (let ((active t) (thread sb-thread:*current-thread*)
-                      (expected (if mutable-directory
-                                    (logical-slot-copy-source-proof-directory-identity facts) facts)))
-       (labels ((matches (observed)
-                  (equal expected (if mutable-directory
-                                      (logical-slot-copy-source-proof-directory-identity observed) observed)))
-                (check ()
-                  (unless (and active (eq thread sb-thread:*current-thread*)
-                               (matches (physical-image-file-facts directory))
-                               (matches (physical-image-file-facts root "pg_wal")))
-                    (error "continuation WAL directory lost its live named binding"))))
-         (unwind-protect
-              (progn
-                (check)
-                (multiple-value-prog1 (funcall function directory #'check) (check)))
-           (sb-sys:without-interrupts (setf active nil))))))
-   :mutable-directory mutable-directory))
+  (call-with-logical-slot-continuation-owned-directory root :wal function mutable-directory))
 
 (defun call-with-logical-slot-continuation-wal-directory (root function)
   (call-with-logical-slot-continuation-owned-wal-directory root function nil))
@@ -98,6 +102,17 @@
 
 (defun call-with-logical-slot-continuation-runtime-wal-directory (root function)
   (call-with-logical-slot-continuation-owned-wal-directory root function t))
+
+(defun call-with-logical-slot-continuation-slot-root (root archive function check)
+  (unless (and archive (functionp function) (functionp check))
+    (error "slot directory resources require runtime storage and a callback"))
+  (call-with-logical-slot-continuation-owned-directory
+   root :slots
+   (lambda (directory directory-check)
+     (funcall check)
+     (multiple-value-prog1 (funcall function directory directory-check)
+       (funcall check)))
+   t))
 
 (defun call-with-logical-slot-continuation-storage-context
     (owner context facts check under-lock function &optional archive)
@@ -172,6 +187,9 @@
                                                                      (funcall directory-check)))
                                                    (funcall argument reader file-check))
                                               (sb-sys:without-interrupts (setf wal-check prior)))))))
+                                     (:with-slot-root
+                                         (call-with-logical-slot-continuation-slot-root
+                                          root archive argument (lambda () (state storage :check))))
                                      (:directory directory)
                                      (:binding (first (funcall check t)))
                                      (:facts (logical-slot-copy-check-source-proof (first (funcall check t))))
