@@ -1274,9 +1274,177 @@
     (assert (not (wal-replication-slot-state-uncertain-p slot)))
     (format t "~&NATIVE-RUNTIME-ACK-FENCED PASS slot=~a persistence-standard-resume-prepare~%" name)))
 
+(defun native-host-continuation-native-proof-refusal (scan target)
+  (let ((entered nil) (pins (hash-table-count *wal-snapshot-retention-pins*))
+                      (fds (length (directory #p"/proc/self/fd/*"))))
+    (assert
+     (handler-case
+         (progn
+           (call-with-logical-slot-continuation-native-proof
+            (wal-retained-slot-scan-name scan) target
+            (lambda (proof) (declare (ignore proof)) (setf entered t)))
+           nil)
+       (error () t)))
+    (assert (not entered))
+    (assert (= pins (hash-table-count *wal-snapshot-retention-pins*)))
+    (assert (= fds (length (directory #p"/proc/self/fd/*"))))))
+
+(defun native-host-continuation-native-proof-positive (scan target kind)
+  (let* ((slot (wal-retained-slot-scan-slot scan))
+         (name (wal-retained-slot-scan-name scan))
+         (before (logical-slot-state-encode slot))
+         (pending (wal-replication-slot-pending-xids slot))
+         (pins (hash-table-count *wal-snapshot-retention-pins*))
+         (fds (length (directory #p"/proc/self/fd/*")))
+         (escaped nil) (cursor nil)
+         (*logical-slot-continuation-native-proof-test-hook*
+           (lambda (point value) (when (eq point :cursor-finished) (setf cursor value)))))
+    (assert
+     (equal '(:proof 73)
+            (multiple-value-list
+             (call-with-logical-slot-continuation-native-proof
+              name target
+              (lambda (proof)
+                (setf escaped proof)
+                (assert (eq kind (logical-slot-continuation-native-proof-kind proof)))
+                (assert (eq :terminal-check (logical-wal-source-purpose
+                                             (logical-slot-continuation-native-proof-source proof))))
+                (assert (= target (wal-retained-slot-scan-end
+                                   (logical-slot-continuation-native-proof-scan proof))))
+                (assert (<= target (first (logical-slot-continuation-native-proof-seal proof))
+                            (logical-slot-continuation-native-proof-horizon proof)))
+                (sb-thread:with-mutex (*wal-lock*)
+                  (assert (logical-slot-continuation-native-proof-check-under-lock proof))
+                  (assert (handler-case (progn (logical-wal-cursor-check-scope cursor) nil) (error () t)))
+                  (assert
+                   (handler-case
+                       (progn (logical-wal-certify-boundary
+                               (logical-slot-continuation-native-proof-source proof) target) nil)
+                     (error () t)))
+                  (let ((calls 0) (original (symbol-function 'physical-image-file-facts)))
+                    (unwind-protect
+                         (progn
+                           (setf (symbol-function 'physical-image-file-facts)
+                                 (lambda (&rest arguments) (incf calls) (apply original arguments)))
+                           (assert
+                            (handler-case
+                                (progn
+                                  (logical-slot-continuation-native-proof-check-under-lock
+                                   (copy-logical-slot-continuation-native-proof proof))
+                                  nil)
+                              (error () t)))
+                           (assert (zerop calls))
+                           (logical-slot-continuation-native-proof-check-under-lock proof)
+                           (assert (plusp calls)))
+                      (setf (symbol-function 'physical-image-file-facts) original)))
+                  (assert (eq :claimed (logical-slot-continuation-native-proof-claim-under-lock proof)))
+                  (assert (logical-slot-continuation-native-proof-check-under-lock proof))
+                  (assert
+                   (handler-case
+                       (progn (wal-persist-replication-slot-ack-under-lock slot target) nil)
+                     (error (condition) (search "prepared continuation publication" (princ-to-string condition))))))
+                (values :proof 73))))))
+    (sb-thread:with-mutex (*wal-lock*)
+      (assert
+       (handler-case (progn (logical-slot-continuation-native-proof-check-under-lock escaped) nil)
+         (error () t))))
+    (assert (eq pending (wal-replication-slot-pending-xids slot)))
+    (assert (equalp before (logical-slot-state-encode slot)))
+    (assert (= pins (hash-table-count *wal-snapshot-retention-pins*)))
+    (assert (= fds (length (directory #p"/proc/self/fd/*"))))
+    (format t "~&NATIVE-ACK-COMPLETED-PROOF PASS slot=~a kind=~a target=~d exact-principal closed-cursor one-claim no-persistence~%"
+            name kind target)))
+
+(defun native-host-continuation-native-proof-cuts (scan target)
+  (let* ((slot (wal-retained-slot-scan-slot scan))
+         (name (wal-retained-slot-scan-name scan))
+         (before (logical-slot-state-encode slot))
+         (pending (wal-replication-slot-pending-xids slot)))
+    (dolist (cut '(:cursor-finished :after-observation :late-selector :double-claim))
+      (let* ((tag (gensym "NATIVE-PROOF-CUT")) (entered nil) (injected nil) (armed nil)
+                                               (fds (length (directory #p"/proc/self/fd/*")))
+                                               (pins (hash-table-count *wal-snapshot-retention-pins*))
+                                               (original (symbol-function 'logical-slot-imported-check-held-file))
+                                               (*logical-slot-continuation-native-proof-test-hook*
+                                                 (lambda (point value)
+                                                   (declare (ignore value))
+                                                   (when (eq point :cursor-finished)
+                                                     (when (eq cut :late-selector) (setf armed t)))
+                                                   (when (eq point cut)
+                                                     (setf injected t)
+                                                     (throw tag :injected)))))
+        (unwind-protect
+             (progn
+               (setf (symbol-function 'logical-slot-imported-check-held-file)
+                     (lambda (parent child fd facts bytes)
+                       (when (and armed (equal child "selector"))
+                         (setf injected t)
+                         (throw tag :injected))
+                       (funcall original parent child fd facts bytes)))
+               (if (eq cut :double-claim)
+                   (assert
+                    (handler-case
+                        (progn
+                          (call-with-logical-slot-continuation-native-proof
+                           name target
+                           (lambda (proof)
+                             (setf entered t)
+                             (sb-thread:with-mutex (*wal-lock*)
+                               (logical-slot-continuation-native-proof-claim-under-lock proof)
+                               (assert
+                                (handler-case
+                                    (progn (logical-slot-continuation-native-proof-claim-under-lock proof) nil)
+                                  (error () t)))
+                               (assert
+                                (handler-case
+                                    (progn (logical-slot-continuation-native-proof-check-under-lock proof) nil)
+                                  (error () t))))))
+                          nil)
+                      (error () t)))
+                   (assert
+                    (eq :injected
+                        (catch tag
+                          (call-with-logical-slot-continuation-native-proof
+                           name target
+                           (lambda (proof) (declare (ignore proof)) (setf entered t))))))))
+          (setf (symbol-function 'logical-slot-imported-check-held-file) original))
+        (if (eq cut :double-claim) (assert entered) (assert (and injected (not entered))))
+        (assert (= pins (hash-table-count *wal-snapshot-retention-pins*)))
+        (assert (= fds (length (directory #p"/proc/self/fd/*"))))
+        (assert (eq pending (wal-replication-slot-pending-xids slot)))
+        (assert (equalp before (logical-slot-state-encode slot)))
+        (assert (not (wal-replication-slot-state-uncertain-p slot)))))
+    (format t "~&NATIVE-ACK-PROOF-CUTS PASS slot=~a before-mint late-selector-postcheck sticky-double-claim no-effects~%" name)))
+
+(defun native-host-continuation-native-proofs (scan source)
+  (let* ((slot (wal-retained-slot-scan-slot scan))
+         (fork (timeline-history-entry-begin
+                (find (logical-wal-source-timeline source) (logical-wal-source-history source)
+                      :key #'timeline-history-entry-timeline)))
+         (confirmed (wal-replication-slot-confirmed-flush-lsn slot))
+         (target (loop for entry being the hash-values of (wal-replication-slot-pending-xids slot)
+                       maximize (or (cdr entry) 0))))
+    (assert (< confirmed target fork))
+    (native-host-continuation-native-proof-positive scan confirmed :unchanged)
+    (native-host-continuation-native-proof-positive scan target :advance)
+    (native-host-continuation-native-proof-cuts scan target)
+    (let ((entered nil) (pins (hash-table-count *wal-snapshot-retention-pins*))
+                        (fds (length (directory #p"/proc/self/fd/*"))))
+      (assert
+       (handler-case
+           (progn
+             (call-with-logical-slot-continuation-native-proof
+              (wal-retained-slot-scan-name scan) (1+ confirmed)
+              (lambda (proof) (declare (ignore proof)) (setf entered t)))
+             nil)
+         (error () t)))
+      (assert (not entered))
+      (assert (= pins (hash-table-count *wal-snapshot-retention-pins*)))
+      (assert (= fds (length (directory #p"/proc/self/fd/*")))))))
+
 (defun native-host-continuation-runtime-cursor (scan source)
   (native-host-continuation-runtime-ack-fenced scan)
-  (let ((records 0) (escaped nil))
+  (let ((records 0) (escaped nil) (eor nil))
     (multiple-value-bind (owner role)
         (sb-thread:with-mutex (*wal-lock*) (logical-slot-wal-scan-start-position scan))
       (call-with-logical-slot-wal-cursor-from-scan
@@ -1287,9 +1455,20 @@
          (setf escaped cursor)
          (when (< (wal-retained-slot-scan-start scan) (wal-retained-slot-scan-end scan))
            (assert (logical-wal-record-provider-p (logical-wal-cursor-record-reader cursor))))
-         (loop while (logical-wal-cursor-next cursor) do (incf records))
+         (loop
+           (multiple-value-bind (record bytes record-owner carrier kind) (logical-wal-cursor-next cursor)
+             (declare (ignore bytes record-owner carrier))
+             (unless record (return))
+             (incf records)
+             (when (eq kind :end-of-recovery) (setf eor (wal-record-end record)))))
          (assert (= (wal-retained-slot-scan-end scan) (logical-wal-cursor-position cursor))))))
     (assert (handler-case (progn (logical-wal-cursor-next escaped) nil) (error () t)))
+    (when eor
+      (native-host-continuation-native-proofs scan source)
+      (native-host-continuation-native-proof-positive scan (wal-retained-slot-scan-end scan) :advance)
+      (native-host-continuation-native-proof-refusal scan eor)
+      (format t "~&NATIVE-ACK-PROOF-EOR-REFUSED PASS slot=~a eor=~d~%"
+              (wal-retained-slot-scan-name scan) eor))
     (format t "~&NATIVE-RUNTIME-CURSOR PASS slot=~a start=~d end=~d records=~d~%"
             (wal-retained-slot-scan-name scan) (wal-retained-slot-scan-start scan)
             (wal-retained-slot-scan-end scan) records)))

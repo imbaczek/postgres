@@ -152,6 +152,11 @@
 ;; Full checks run outside the WAL lock; :CHECK-UNDER-LOCK uses the local guard.
 ;; This is a directory resource, not a slot writer or mutation authority.
 
+(defun logical-slot-continuation-storage-scan-source (owner archive)
+  (unless archive (error "scan source requires runtime storage"))
+  (values (logical-slot-imported-scan-owner-scan owner)
+          (logical-slot-imported-scan-owner-source owner)))
+
 (defun call-with-logical-slot-continuation-storage-context
     (owner context facts check under-lock function &optional archive)
   (unless (if archive (logical-slot-imported-scan-owner-p owner)
@@ -228,6 +233,7 @@
                                      (:with-slot-root
                                          (call-with-logical-slot-continuation-slot-root
                                           root archive argument (lambda () (state storage :check))))
+                                     (:scan-source (logical-slot-continuation-storage-scan-source owner archive))
                                      (:directory directory)
                                      (:binding (first (funcall check t)))
                                      (:facts (logical-slot-copy-check-source-proof (first (funcall check t))))

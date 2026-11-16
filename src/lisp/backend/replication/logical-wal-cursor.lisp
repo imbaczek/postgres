@@ -714,15 +714,7 @@ validation and FINISH, including any slot save performed there."
               (funcall finish (wal-retained-slot-scan-slot scan) found))))
         :archive archive :batch-policy :logical-reader)))))
 
-(defun call-with-logical-slot-terminal-check (name target prepare finish)
-  "Check TARGET against a retained durable prefix before calling FINISH.
-PREPARE runs under the WAL lock and returns DONE and RESULT; when DONE is true,
-return RESULT.  Legacy slots use their existing check, and an exact owned
-continuation can supply proof.  A fresh proof for a slot with known provenance
-captures the restart anchor and its role before scanning.  The WAL lock is
-not held across the entire scan; individual record reads still take it.
-WAL and pending transactions may grow during the scan; FINISH must recheck
-current slot state under the lock before acting on the proof."
+(defun call-with-logical-slot-terminal-scan (name target prepare function &key end)
   (let ((scan nil) (source nil) (owner nil) (role nil) (scope nil) (owned-pin nil)
                    (*wal-retained-slot-scan-scopes* *wal-retained-slot-scan-scopes*))
     (unwind-protect
@@ -730,19 +722,15 @@ current slot state under the lock before acting on the proof."
            (sb-thread:with-mutex (*wal-lock*)
              (wal-check-healthy)
              (let ((slot (wal-find-usable-replication-slot-under-lock name)))
-               (wal-check-slot-ack-publication-under-lock slot)
                (multiple-value-bind (done result) (funcall prepare slot)
-                 (when done (return-from call-with-logical-slot-terminal-check result)))
-               (unless (wal-replication-slot-logical-provenance slot)
-                 (return-from call-with-logical-slot-terminal-check
-                   (funcall finish slot (wal-slot-terminal-ack-p slot target))))
-               (when (logical-wal-reusable-continuation slot target target)
-                 (return-from call-with-logical-slot-terminal-check (funcall finish slot t)))
+                 (when done (return-from call-with-logical-slot-terminal-scan result)))
                (let ((start (wal-replication-slot-restart-lsn slot))
-                     (end *wal-durable-lsn*)
+                     (frozen-end (or end *wal-durable-lsn*))
                      (pin (gensym "LOGICAL-TERMINAL-PIN-")))
                  (unless (and (typep start '(unsigned-byte 64))
-                              (typep target '(unsigned-byte 64)) (<= start target end))
+                              (typep target '(unsigned-byte 64))
+                              (typep frozen-end '(unsigned-byte 64))
+                              (<= start target frozen-end *wal-durable-lsn*))
                    (error "logical terminal target is outside retained durable WAL"))
                  (sb-sys:without-interrupts
                    (setf scan (make-wal-retained-slot-scan
@@ -750,18 +738,42 @@ current slot state under the lock before acting on the proof."
                                :database (wal-replication-slot-database-oid slot)
                                :plugin (copy-seq (wal-replication-slot-plugin slot))
                                :timeline *wal-insert-timeline* :namespace *wal-segment-namespace*
-                               :start start :end end :cursor start :pin pin))
+                               :start start :end frozen-end :cursor start :pin pin))
                    (setf owned-pin pin
                          (gethash pin *wal-snapshot-retention-pins*) start
                          scope (wal-retained-slot-scan-capture-scope-under-lock scan :terminal-check))
                    (push scope *wal-retained-slot-scan-scopes*))
                  (setf source (logical-wal-capture-source scan :purpose :terminal-check))
                  (multiple-value-setq (owner role) (logical-slot-wal-scan-start-position scan))
-                 (logical-wal-check-source source end))))
-           (call-with-logical-terminal-cursor scan source owner role target finish))
+                 (logical-wal-check-source source frozen-end))))
+           (funcall function scan source owner role))
       (when owned-pin
         (sb-sys:without-interrupts
           (sb-thread:with-mutex (*wal-lock*)
             (if scope
                 (wal-retained-slot-scan-release-scope-under-lock scope)
                 (remhash owned-pin *wal-snapshot-retention-pins*))))))))
+
+(defun call-with-logical-slot-terminal-check (name target prepare finish)
+  "Check TARGET against a retained durable prefix before calling FINISH.
+PREPARE runs under the WAL lock and returns DONE and RESULT; when DONE is true,
+return RESULT. Legacy slots use their existing check, and an exact owned
+continuation can supply proof. A fresh proof for a slot with known provenance
+captures the restart anchor and its role before scanning. The WAL lock is
+not held across the entire scan; individual record reads still take it.
+WAL and pending transactions may grow during the scan; FINISH must recheck
+current slot state under the lock before acting on the proof."
+  (call-with-logical-slot-terminal-scan
+   name target
+   (lambda (slot)
+     (wal-check-slot-ack-publication-under-lock slot)
+     (multiple-value-bind (done result) (funcall prepare slot)
+       (cond (done (values t result))
+             ((not (wal-replication-slot-logical-provenance slot))
+              (return-from call-with-logical-slot-terminal-check
+                (funcall finish slot (wal-slot-terminal-ack-p slot target))))
+             ((logical-wal-reusable-continuation slot target target)
+              (return-from call-with-logical-slot-terminal-check (funcall finish slot t)))
+             (t (values nil nil)))))
+   (lambda (scan source owner role)
+     (call-with-logical-terminal-cursor scan source owner role target finish))))

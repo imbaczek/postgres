@@ -317,7 +317,64 @@
 ;; across the cursor callback.  Checks before and after use bind the named
 ;; selector to its held descriptor and bytes; an ambiguous selector fails.
 
-(defun call-with-logical-slot-imported-runtime-cursor (scan source owner role function &key (batch-policy :logical-reader))
+(defun call-with-logical-slot-continuation-runtime-observation
+    (storage facts scan source owner role function &key (batch-policy :logical-reader))
+  (unless (and (logical-slot-continuation-runtime-storage-p storage)
+               (member (logical-wal-source-purpose source) '(:stream :terminal-check)))
+    (error "runtime observation requires its registered source purpose"))
+  (multiple-value-bind (actual-scan actual-source)
+      (logical-slot-continuation-storage-call storage :scan-source)
+    (unless (and (eq scan actual-scan) (eq source actual-source))
+      (error "runtime observation differs from its storage scan source")))
+  (unless (equal '("selector") (logical-slot-continuation-selector-names storage))
+    (error "runtime reader requires an unambiguous stable selector"))
+  (call-with-logical-slot-continuation-selector
+   storage
+   (lambda (snapshot fd selector-facts)
+     (let ((directory (logical-slot-continuation-storage-call storage :directory))
+           (image (logical-slot-continuation-encode snapshot)))
+       (logical-slot-continuation-check-runtime-snapshot storage facts snapshot)
+       (call-with-logical-slot-continuation-runtime-tail-provider
+        storage snapshot scan
+        (lambda (local-provider)
+          (logical-slot-continuation-storage-call
+           storage :with-origin
+           (lambda (archive)
+             (logical-slot-continuation-storage-call
+              storage :with-sidecar
+              (lambda (sidecar-reader check-files)
+                (labels ((guard ()
+                           (logical-slot-continuation-storage-call storage :check-under-lock)
+                           (logical-wal-record-provider-check local-provider)
+                           (unless (and
+                                    (equal selector-facts (physical-image-file-facts fd))
+                                    (equal selector-facts (physical-image-file-facts directory "selector"))
+                                    (equal '("selector")
+                                           (logical-slot-copy-import-control-names directory 3)))
+                             (error "runtime reader lost its stable selector"))
+                           t)
+                         (check ()
+                           (logical-slot-continuation-check-runtime-snapshot storage facts snapshot)
+                           (logical-slot-imported-check-held-file directory "selector" fd selector-facts image)
+                           (funcall check-files)
+                           (sb-thread:with-mutex (*wal-lock*) (guard))))
+                  (check)
+                  (multiple-value-prog1
+                      (call-with-logical-slot-continuation-lanes
+                       facts snapshot (wal-retained-slot-scan-slot scan) archive
+                       sidecar-reader nil #'guard
+                       (lambda (cursor bounds)
+                         (declare (ignore bounds))
+                         (multiple-value-prog1 (funcall function cursor source snapshot image)
+                           (sb-thread:with-mutex (*wal-lock*)
+                             (logical-wal-cursor-check-scope cursor))))
+                       :end (wal-retained-slot-scan-end scan)
+                       :position (list (wal-retained-slot-scan-start scan) owner role)
+                       :local-provider local-provider :batch-policy batch-policy)
+                    (check)))))))))))))
+
+(defun call-with-logical-slot-imported-runtime-cursor
+    (scan source owner role function &key (batch-policy :logical-reader))
   (unless (eq :stream (logical-wal-source-purpose source))
     (error "terminal evidence cannot open an imported stream cursor"))
   (sb-thread:with-mutex (*wal-lock*)
@@ -329,53 +386,12 @@
   (call-with-logical-slot-continuation-runtime-storage
    scan source
    (lambda (storage facts)
-     (unless (equal '("selector") (logical-slot-continuation-selector-names storage))
-       (error "runtime reader requires an unambiguous stable selector"))
-     (call-with-logical-slot-continuation-selector
-      storage
-      (lambda (snapshot fd selector-facts)
-        (let ((directory (logical-slot-continuation-storage-call storage :directory))
-              (image (logical-slot-continuation-encode snapshot)))
-          (logical-slot-continuation-check-runtime-snapshot storage facts snapshot)
-          (call-with-logical-slot-continuation-runtime-tail-provider
-           storage snapshot scan
-           (lambda (local-provider)
-             (logical-slot-continuation-storage-call
-              storage :with-origin
-              (lambda (archive)
-                (logical-slot-continuation-storage-call
-                 storage :with-sidecar
-                 (lambda (sidecar-reader check-files)
-                   (labels ((guard ()
-                              (logical-slot-continuation-storage-call storage :check-under-lock)
-                              (logical-wal-record-provider-check local-provider)
-                              (unless (and
-                                       (equal selector-facts (physical-image-file-facts fd))
-                                       (equal selector-facts (physical-image-file-facts directory "selector"))
-                                       (equal '("selector")
-                                              (logical-slot-copy-import-control-names directory 3)))
-                                (error "runtime reader lost its stable selector"))
-                              t)
-                            (check ()
-                              (logical-slot-continuation-check-runtime-snapshot storage facts snapshot)
-                              (logical-slot-imported-check-held-file
-                               directory "selector" fd selector-facts image)
-                              (funcall check-files)
-                              (sb-thread:with-mutex (*wal-lock*) (guard))))
-                     (check)
-                     (multiple-value-prog1
-                         (call-with-logical-slot-continuation-lanes
-                          facts snapshot (wal-retained-slot-scan-slot scan) archive
-                          sidecar-reader nil #'guard
-                          (lambda (cursor bounds)
-                            (declare (ignore bounds))
-                            (multiple-value-prog1 (funcall function cursor source)
-                              (sb-thread:with-mutex (*wal-lock*)
-                                (logical-wal-cursor-check-scope cursor))))
-                          :end (wal-retained-slot-scan-end scan)
-                          :position (list (wal-retained-slot-scan-start scan) owner role)
-                          :local-provider local-provider :batch-policy batch-policy)
-                       (check)))))))))))))))
+     (call-with-logical-slot-continuation-runtime-observation
+      storage facts scan source owner role
+      (lambda (cursor actual-source snapshot image)
+        (declare (ignore snapshot image))
+        (funcall function cursor actual-source))
+      :batch-policy batch-policy))))
 
 ;; Dispatch the imported observational scan within the caller's registered
 ;; scan scope.  Borrowed cursors and artifact capabilities stay within their
