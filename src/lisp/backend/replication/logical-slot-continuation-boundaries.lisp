@@ -21,7 +21,9 @@
                    (eq :record-start (fourth request)) (eq kind :end-of-recovery)
                    (= (wal-record-start record) (logical-wal-eor-position fork))))))))
 
-(defun logical-slot-continuation-boundary-observer (requests &key fork checkpoint)
+(defun logical-slot-continuation-boundary-observer (requests &key fork checkpoint (batch-policy :strict))
+  (unless (member batch-policy '(:strict :logical-reader))
+    (error "unsupported continuation boundary batch policy"))
   (logical-slot-copy-descriptor-list-count requests (* 2 +logical-slot-continuation-obligation-limit+))
   (when fork (unless (typep fork '(unsigned-byte 64)) (error "invalid continuation fork")))
   (when checkpoint
@@ -56,7 +58,7 @@
                              (wal-note-recovery-batch-record record)
                              (cond
                                ((= type +wal-record-batch-start+)
-                                (when batch-open (error "nested continuation batch"))
+                                (when (and batch-open (eq batch-policy :strict)) (error "nested continuation batch"))
                                 (setf batch-open t))
                                ((and (not batch-open) (not seen) checkpoint
                                      (= type +wal-record-checkpoint+)
@@ -123,10 +125,77 @@
               (pushnew (list :confirmed confirmed confirmed-owner :prefix-end) requests :test #'equal))))))
     (nreverse requests)))
 
-(defun logical-slot-continuation-prove-parent-boundaries (storage facts archive requests)
-  ;; Parent requests use the retained origin archive; child requests are
-  ;; returned for the local tail proof.  Requests before the archive base
-  ;; are rejected until a separate retained sidecar proof exists.
+(defun logical-slot-continuation-parent-proof-start (certificate history requests base)
+  (let ((limit (reduce #'min requests :key #'second))
+        (position nil))
+    (logical-slot-copy-descriptor-list-count
+     (getf certificate :slots) +logical-slot-continuation-obligation-limit+)
+    (dolist (row (getf certificate :slots))
+      (when (fourth row)
+        (let* ((slot (logical-slot-state-decode (string->bytes (fourth row)) (first row)))
+               (restart (wal-replication-slot-restart-lsn slot)))
+          (when (and (eq :reserved (wal-replication-slot-wal-status slot))
+                     (< restart base) (< restart limit)
+                     (or (null position) (< restart (first position))))
+            (multiple-value-bind (owner role) (logical-slot-startup-start-position slot history)
+              (setf position (list restart owner role)))))))
+    (or position (error "saved parent position has no earlier certified sidecar anchor"))))
+
+(defun logical-slot-continuation-observe-boundary-cursor (cursor observe end)
+  (loop for original = (logical-wal-cursor-position cursor)
+        do (multiple-value-bind (record raw owner carrier kind) (logical-wal-cursor-next cursor)
+             (unless record (return))
+             (funcall observe record raw owner carrier kind original)))
+  (unless (and (= end (logical-wal-cursor-position cursor))
+               (not (logical-wal-cursor-batch-open cursor)))
+    (error "continuation parent boundary proof did not reach a closed exact lane end")))
+
+(defun logical-slot-continuation-prove-parent-prefix
+    (storage facts archive requests batch-policy)
+  (let* ((certificate (getf facts :certificate))
+         (fork (getf certificate :fork))
+         (base (getf (logical-wal-archive-reference archive) :base))
+         (history (logical-wal-archive-history archive))
+         (sidecar-p (some (lambda (request)
+                            (or (< (second request) base)
+                                (and (= (second request) base)
+                                     (eq :prefix-end (fourth request)))))
+                          requests)))
+    (multiple-value-bind (observe finish)
+        (logical-slot-continuation-boundary-observer
+         requests :batch-policy batch-policy
+         :checkpoint (list (physical-manifest-checkpoint-start (getf facts :manifest))
+                           (getf (getf facts :evidence) :checkpoint)))
+      (labels ((guard ()
+                 (logical-slot-continuation-storage-call storage :check-under-lock)
+                 (logical-wal-archive-check archive))
+               (archive-proof (left-proof-p)
+                 (call-with-logical-wal-cursor
+                  history :timeline base fork
+                  (timeline-at-point (if left-proof-p (1- base) base) history)
+                  (if left-proof-p :prefix-end :record-start) #'guard
+                  (lambda (cursor)
+                    (logical-slot-continuation-observe-boundary-cursor cursor observe fork))
+                  :archive archive :archive-only t :batch-policy :logical-reader)))
+        (if sidecar-p
+            (destructuring-bind (start owner role)
+                (logical-slot-continuation-parent-proof-start certificate history requests base)
+              (logical-slot-continuation-storage-call
+               storage :with-sidecar
+               (lambda (reader check-files)
+                 (funcall check-files)
+                 (call-with-logical-wal-cursor
+                  history :timeline start base owner role #'guard
+                  (lambda (cursor)
+                    (logical-slot-continuation-observe-boundary-cursor cursor observe base))
+                  :segment-reader reader :batch-policy :logical-reader)
+                 (archive-proof t)
+                 (funcall check-files))))
+            (archive-proof nil))
+        (funcall finish)))))
+
+(defun logical-slot-continuation-prove-parent-boundaries
+    (storage facts archive requests &key (batch-policy :strict))
   (setf facts (logical-slot-continuation-storage-call storage :facts))
   (let* ((certificate (getf facts :certificate))
          (fork (getf certificate :fork)) (child (getf certificate :child-timeline))
@@ -137,29 +206,8 @@
           (push request parent-requests)
           (push request child-requests)))
     (when parent-requests
-      (let* ((base (getf (logical-wal-archive-reference archive) :base))
-             (history (logical-wal-archive-history archive)))
-        (when (some (lambda (request) (< (second request) base)) parent-requests)
-          (error "advanced saved continuation position requires its retained sidecar proof"))
-        (multiple-value-bind (observe finish)
-            (logical-slot-continuation-boundary-observer
-             parent-requests
-             :checkpoint (list (physical-manifest-checkpoint-start (getf facts :manifest))
-                               (getf (getf facts :evidence) :checkpoint)))
-          (flet ((guard ()
-                   (logical-slot-continuation-storage-call storage :check-under-lock)
-                   (logical-wal-archive-check archive)))
-            (call-with-logical-wal-cursor
-             history :timeline base fork (timeline-at-point base history) :record-start #'guard
-             (lambda (cursor)
-               (loop for original = (logical-wal-cursor-position cursor)
-                     do (multiple-value-bind (record raw owner carrier kind) (logical-wal-cursor-next cursor)
-                          (unless record (return))
-                          (funcall observe record raw owner carrier kind original)))
-               (unless (= fork (logical-wal-cursor-position cursor))
-                 (error "continuation parent boundary proof did not reach exact F"))
-               (funcall finish))
-             :archive archive :archive-only t :batch-policy :logical-reader)))))
+      (logical-slot-continuation-prove-parent-prefix
+       storage facts archive parent-requests batch-policy))
     (nreverse child-requests)))
 
 (defun logical-slot-continuation-active-boundaries (storage facts snapshot archive)

@@ -77,12 +77,12 @@
 ;; reader batch rules for the suffix.  The suffix may end with an open or
 ;; abandoned batch; a record may not cross the historical seal.
 
-(defun logical-slot-continuation-runtime-tail-observer (fork sealed &optional requests)
+(defun logical-slot-continuation-runtime-tail-observer (fork sealed &optional requests (batch-policy :strict))
   (unless (and (typep fork '(unsigned-byte 64))
                (typep sealed '(unsigned-byte 64)) (<= fork sealed))
     (error "invalid historical continuation seal"))
   (multiple-value-bind (strict-observe strict-finish)
-      (logical-slot-continuation-boundary-observer requests :fork fork)
+      (logical-slot-continuation-boundary-observer requests :fork fork :batch-policy batch-policy)
     (let ((position fork) (sealed-p (= fork sealed)) (active t) (failed nil)
                           (progress (make-logical-slot-startup-progress nil)) (clean nil))
       (when sealed-p (funcall strict-finish))
@@ -262,7 +262,8 @@
      (lambda (archive)
        (let ((requests (logical-slot-continuation-prove-parent-boundaries
                         storage facts archive
-                        (logical-slot-continuation-saved-boundaries snapshot (getf facts :certificate)))))
+                        (logical-slot-continuation-saved-boundaries snapshot (getf facts :certificate))
+                        :batch-policy :logical-reader)))
          (call-with-logical-slot-continuation-runtime-segments
           storage fork child horizon
           (lambda (reader guard check finish-pass)
@@ -272,7 +273,7 @@
                  (labels ((prove ()
                             (funcall check)
                             (multiple-value-bind (observe finish)
-                                (logical-slot-continuation-runtime-tail-observer fork sealed requests)
+                                (logical-slot-continuation-runtime-tail-observer fork sealed requests :logical-reader)
                               (let* ((verify (logical-spool-sealed-p spool))
                                      (records (logical-slot-continuation-scan-tail
                                                history fork child horizon guard reader spool observe finish
