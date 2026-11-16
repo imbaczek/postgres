@@ -129,13 +129,8 @@
                  (:check (ready))
                  (:ordinary
                   (ready)
-                  (unless (and (wal-replication-slot-p value)
-                               (not (assoc (wal-replication-slot-name value) members :test #'string=))
-                               (wal-physical-slot-p
-                                (gethash (wal-replication-slot-name value) registry)))
-                    (error "ordinary slot is outside its live registry"))
-                  (logical-slot-continuation-check-ordinary-slot
-                   value system-id history *wal-durable-lsn*))
+                  (logical-slot-continuation-check-ordinary-candidate
+                   registry members value system-id history *wal-durable-lsn*))
                  (:binding (copy-seq binding))
                  (:image (copy-seq (car selection)))
                  (:owns-cell

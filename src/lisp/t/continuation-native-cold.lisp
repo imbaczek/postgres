@@ -1203,6 +1203,207 @@
     (format t "~&NATIVE-COLD-MIXED-PUBLICATION PASS case=~a fresh-restart exact-saved-inventory~%"
             (uiop:getenv "PG_NATIVE_COLD_CASE"))))
 
+(defun native-host-cold-logical-hex (bytes)
+  (with-output-to-string (stream)
+    (loop for byte across bytes do (format stream "~2,'0x" byte))))
+
+(defun native-host-cold-logical-pending (slot)
+  (with-output-to-string (stream)
+    (dolist (xid (sort (loop for xid being the hash-keys of
+                                                         (wal-replication-slot-pending-xids slot) collect xid) #'<))
+      (let ((entry (gethash xid (wal-replication-slot-pending-xids slot))))
+        (format stream "~d/~d/~d;" xid (car entry) (cdr entry))))))
+
+(defun native-host-cold-logical-compatibility (empty)
+  (let* ((old (gethash "ordinary" *wal-replication-slots*))
+         (unbound (member (uiop:getenv "PG_NATIVE_COLD_PROOF")
+                          '("load-unbound-logical" "load-legacy-v2") :test #'equal))
+         (slot (make-wal-replication-slot
+                :name "ordinary" :kind :logical
+                :database-oid (unless unbound (wal-replication-slot-database-oid old))
+                :plugin (if unbound "pg_lisp" (wal-replication-slot-plugin old))
+                :restart-lsn (if empty *wal-durable-lsn* (wal-replication-slot-restart-lsn old))
+                :consistent-lsn (wal-replication-slot-consistent-lsn old)
+                :confirmed-flush-lsn (unless unbound
+                                       (if empty *wal-durable-lsn*
+                                           (wal-replication-slot-confirmed-flush-lsn old)))
+                :invalidation-cause :none :wal-status :reserved)))
+    (slot-state-update
+     (wal-replication-slot-directory) "ordinary"
+     (if (equal "load-legacy-v2" (uiop:getenv "PG_NATIVE_COLD_PROOF"))
+         (let ((prefix (format nil "PGSLOT2 ordinary ~d ~d - reserved"
+                               (wal-replication-slot-restart-lsn slot)
+                               (wal-replication-slot-consistent-lsn slot))))
+           (string->bytes (format nil "~a ~8,'0X~%" prefix (wal-crc32 (string->bytes prefix)))))
+         (wal-encode-replication-slot slot)))
+    (setf (gethash "ordinary" *wal-replication-slots*) slot)
+    (format t "~&NATIVE-COLD-LOGICAL-COMPATIBILITY provenance-free-codec-fixture mode=~a empty=~s~%"
+            (uiop:getenv "PG_NATIVE_COLD_PROOF") empty)))
+
+(defun native-host-cold-logical-seed (gate ownership)
+  (wal-load-replication-slots :gate-owner gate :ownership ownership)
+  (catalog-init)
+  (let ((*backend* (make-backend)))
+    (register-backend *backend*)
+    (unwind-protect
+         (progn
+           (uiop:with-temporary-file (:stream output :direction :io :element-type '(unsigned-byte 8))
+             (assert (nth-value 1 (exec-simple-query output "CREATE TABLE continuation_ordinary (id int)"))))
+           (create-standard-logical-slot "ordinary" :nothing)
+           (when (member (uiop:getenv "PG_NATIVE_COLD_PROOF")
+                         '("load-legacy-logical" "load-unbound-logical" "load-legacy-v2") :test #'equal)
+             (native-host-cold-logical-compatibility nil))
+           (uiop:with-temporary-file (:stream output :direction :io :element-type '(unsigned-byte 8))
+             (assert (nth-value 1 (exec-simple-query output "INSERT INTO continuation_ordinary VALUES (117)"))))
+           (when (equal "load-legacy-empty" (uiop:getenv "PG_NATIVE_COLD_PROOF"))
+             (native-host-cold-logical-compatibility t))
+           (let ((slot (gethash "ordinary" *wal-replication-slots*)))
+             (assert (eq (equal "load-logical" (uiop:getenv "PG_NATIVE_COLD_PROOF"))
+                         (not (null (logical-slot-startup-known-p slot)))))
+             (assert (null (wal-replication-slot-child-owner slot)))
+             (assert (= (if (equal "load-legacy-empty" (uiop:getenv "PG_NATIVE_COLD_PROOF")) 0 1)
+                        (hash-table-count (wal-replication-slot-pending-xids slot))))
+             (format t "~&NATIVE-COLD-LOGICAL-SEED-EXPECTED ~a ~a~%"
+                     (native-host-cold-logical-hex (wal-encode-replication-slot slot))
+                     (native-host-cold-logical-pending slot))))
+      (unwind-protect (end-backend-session) (unregister-backend *backend*))))
+  (format t "~&NATIVE-COLD-LOGICAL-SEED PASS case=~a real-creation real-insert~%"
+          (uiop:getenv "PG_NATIVE_COLD_CASE")))
+
+(defun native-host-cold-logical-proof-probes (name target)
+  (let ((saved nil) (rows nil))
+    (call-with-logical-slot-continuation-native-proof
+     name target
+     (lambda (proof)
+       (setf saved proof)
+       (sb-thread:with-mutex (*wal-lock*)
+         (setf rows
+               (logical-slot-continuation-read-slot-inventory
+                (logical-slot-continuation-native-proof-slot-root proof)
+                (lambda () (logical-slot-continuation-native-proof-check-under-lock proof))))
+         (assert (= 3 (length rows)))
+         (assert (= 2 (length (logical-slot-continuation-native-proof-partition-under-lock proof rows))))
+         (assert (handler-case
+                     (progn
+                       (logical-slot-continuation-native-proof-partition-under-lock
+                        (copy-logical-slot-continuation-native-proof proof) rows)
+                       nil)
+                   (error () t)))
+         (assert (eq proof (logical-slot-continuation-native-proof-check-under-lock proof))))))
+    (native-host-cold-recheck-refused-before-io
+     (lambda ()
+       (sb-thread:with-mutex (*wal-lock*)
+         (logical-slot-continuation-native-proof-partition-under-lock saved rows))))))
+
+(defun native-host-cold-logical-noop-preflight (beta)
+  (let* ((path (wal-replication-slot-path "ordinary"))
+         (facts (physical-image-file-facts -100 (namestring path)))
+         (bytes (read-bounded-regular-file path +slot-state-maximum-bytes+))
+         (selected (native-host-cold-file-image)))
+    (when (equal "load-legacy-v2" (uiop:getenv "PG_NATIVE_COLD_PROOF"))
+      (assert (string= "PGSLOT2" (bytes->string (subseq bytes 0 7))))
+      (assert (not (equalp bytes
+                           (wal-encode-replication-slot (gethash "ordinary" *wal-replication-slots*))))))
+    (call-with-logical-slot-continuation-native-proof
+     "beta" (wal-replication-slot-confirmed-flush-lsn beta)
+     (lambda (proof)
+       (sb-thread:with-mutex (*wal-lock*)
+         (multiple-value-bind (record candidate ledger)
+             (logical-slot-continuation-native-preflight-under-lock proof)
+           (assert (null record))
+           (assert (eq beta candidate))
+           (assert (= 3 (length ledger)))))))
+    (assert (equalp selected (native-host-cold-file-image)))
+    (assert (equal facts (physical-image-file-facts -100 (namestring path))))
+    (assert (equalp bytes (read-bounded-regular-file path +slot-state-maximum-bytes+)))))
+
+(defun native-host-cold-logical-ordinary-operation (ordinary)
+  (if (wal-replication-slot-database-oid ordinary)
+      (call-with-logical-replication-slot
+       "ordinary"
+       (lambda (owned)
+         (assert (eq ordinary owned))
+         (unless (wal-replication-slot-confirmed-flush-lsn ordinary)
+           (wal-finalize-replication-slot-copy
+            "ordinary" (wal-replication-slot-consistent-lsn ordinary) *wal-logical-slot-owner*))
+         (assert (eq ordinary
+                     (wal-acknowledge-replication-slot
+                      "ordinary" *wal-durable-lsn* *wal-logical-slot-owner*))))
+       :allow-initial-copy t)
+      (assert (handler-case
+                  (progn (call-with-logical-replication-slot "ordinary" (lambda (slot)
+                                                                          (declare (ignore slot)))) nil)
+                (pg-error (condition)
+                  (assert (string= "55000" (pg-error-sqlstate condition)))
+                  t)))))
+
+(defun native-host-cold-logical-advance (ordinary beta)
+  (assert (string= (uiop:getenv "PG_NATIVE_COLD_LOGICAL_SEED_IMAGE")
+                   (native-host-cold-logical-hex (wal-encode-replication-slot ordinary))))
+  (assert (string= (uiop:getenv "PG_NATIVE_COLD_LOGICAL_SEED_PENDING")
+                   (native-host-cold-logical-pending ordinary)))
+  (assert (= (if (equal "load-legacy-empty" (uiop:getenv "PG_NATIVE_COLD_PROOF")) 0 1)
+             (hash-table-count (wal-replication-slot-pending-xids ordinary))))
+  (native-host-cold-logical-noop-preflight beta)
+  (let ((before (native-host-cold-file-image)))
+    (native-host-cold-logical-ordinary-operation ordinary)
+    (assert (equalp before (native-host-cold-file-image))))
+  (native-host-cold-logical-proof-probes "beta" 37853)
+  (let* ((path (wal-replication-slot-path "ordinary"))
+         (before (physical-image-file-facts -100 (namestring path)))
+         (bytes (read-bounded-regular-file path +slot-state-maximum-bytes+))
+         (generation (getf (native-host-writer-selected) :generation)))
+    (call-with-logical-replication-slot
+     "beta"
+     (lambda (owned)
+       (assert (eq beta owned))
+       (logical-slot-continuation-native-acknowledge "beta" 37853 *wal-logical-slot-owner*)))
+    (assert (equal before (physical-image-file-facts -100 (namestring path))))
+    (assert (equalp bytes (read-bounded-regular-file path +slot-state-maximum-bytes+)))
+    (assert (= (1+ generation) (getf (native-host-writer-selected) :generation)))))
+
+(defun native-host-cold-logical-publication (gate ownership)
+  (when (equal "seed" (uiop:getenv "PG_NATIVE_COLD_LOGICAL_PHASE"))
+    (return-from native-host-cold-logical-publication
+      (native-host-cold-logical-seed gate ownership)))
+  (let ((fds (native-host-writer-open-fds)))
+    (wal-load-replication-slots :gate-owner gate :ownership ownership)
+    (catalog-init)
+    (assert (= 3 (hash-table-count *wal-replication-slots*)))
+    (assert (= 3 *logical-capture-live-slots*))
+    (let* ((ordinary (gethash "ordinary" *wal-replication-slots*))
+           (beta (gethash "beta" *wal-replication-slots*))
+           (group (gethash *wal-replication-slots*
+                           *logical-slot-continuation-protection-registries*)))
+      (assert group)
+      (assert (eq (equal "load-logical" (uiop:getenv "PG_NATIVE_COLD_PROOF"))
+                  (not (null (logical-slot-startup-known-p ordinary)))))
+      (assert (null (wal-replication-slot-child-owner ordinary)))
+      (when (equal "advance" (uiop:getenv "PG_NATIVE_COLD_LOGICAL_PHASE"))
+        (native-host-cold-logical-advance ordinary beta))
+      (if (wal-replication-slot-database-oid ordinary)
+          (progn
+            (assert (= *wal-durable-lsn* (wal-replication-slot-confirmed-flush-lsn ordinary)))
+            (assert (zerop (hash-table-count (wal-replication-slot-pending-xids ordinary)))))
+          (progn
+            (assert (null (wal-replication-slot-confirmed-flush-lsn ordinary)))
+            (assert (= 1 (hash-table-count (wal-replication-slot-pending-xids ordinary))))))
+      (assert (= 37853 (wal-replication-slot-confirmed-flush-lsn beta)))
+      (native-host-cold-with-wal
+       (lambda () (assert (logical-slot-continuation-protection-call group :check))))
+      (assert (eq ordinary (gethash "ordinary" *wal-replication-slots*)))
+      (format t "~&NATIVE-COLD-LOGICAL-EXPECTED ~a:~a:~a:~a~%"
+              (native-host-cold-logical-hex
+               (logical-slot-continuation-encode (native-host-writer-selected)))
+              (native-host-cold-logical-hex
+               (read-bounded-regular-file (wal-replication-slot-path "ordinary")
+                                          +slot-state-maximum-bytes+))
+              (native-host-cold-logical-pending beta)
+              (native-host-cold-logical-pending ordinary)))
+    (assert (equal fds (native-host-writer-open-fds)))
+    (format t "~&NATIVE-COLD-LOGICAL PASS case=~a ordinary-state child-ack exact-full-inventory~%"
+            (uiop:getenv "PG_NATIVE_COLD_CASE"))))
+
 (defun native-host-cold-mixed-publication (gate ownership)
   (when (uiop:getenv "PG_NATIVE_COLD_MIXED_RESTART")
     (return-from native-host-cold-mixed-publication
@@ -1383,6 +1584,10 @@
                          "publish-before-commit" "publish-after-commit" "publish-owner-return" "publish-close"
                          "publish-notify" "publish-before-retirement" "publish-lost-registration") :test #'equal)
                (native-host-cold-publication-failure gate ownership (uiop:getenv "PG_NATIVE_COLD_PROOF")))
+              ((member (uiop:getenv "PG_NATIVE_COLD_PROOF")
+                       '("load-logical" "load-legacy-logical" "load-unbound-logical" "load-legacy-empty" "load-legacy-v2")
+                       :test #'equal)
+               (native-host-cold-logical-publication gate ownership))
               ((equal "load-physical" (uiop:getenv "PG_NATIVE_COLD_PROOF"))
                (native-host-cold-mixed-publication gate ownership))
               ((member (uiop:getenv "PG_NATIVE_COLD_PROOF")

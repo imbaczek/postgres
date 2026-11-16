@@ -63,7 +63,7 @@ def owned_fixture(data, identity):
 
 
 @contextmanager
-def working_namespaces(data, destination, source=None):
+def working_namespaces(data, destination, source=None, *, include_base=False):
     """Retain failed working images; restore original inodes after the child exits."""
     identity = (data.stat().st_dev, data.stat().st_ino)
     backup = destination / 'original'
@@ -73,16 +73,17 @@ def working_namespaces(data, destination, source=None):
     marker = data.parent / 'continuation-writer-owner.json'
     moved = []
     before = {}
+    names = NAMES + (('base',) if include_base else ())
     with owned_fixture(data, identity):
         with marker.open('x') as stream:
             json.dump(dict(pid=os.getpid(), root=str(data), identity=identity,
                            backup=str(backup), variant=str(variant)), stream)
         try:
-            for name in NAMES:
+            for name in names:
                 before[name] = tree_image(data / name)
                 os.rename(data / name, backup / name)
                 moved.append(name)
-                original = (source / name) if source is not None else (backup / name)
+                original = (source / name) if source is not None and name in NAMES else (backup / name)
                 if original.is_symlink():
                     raise ValueError('Mutable fixture namespace is a symlink: ' + name)
                 if original.is_dir():
@@ -102,10 +103,10 @@ def working_namespaces(data, destination, source=None):
         # wait_child returns only after its process group is reaped on interruption.
         # A foreign owner prevents restoration and leaves marker/backups for recovery.
         with owned_fixture(data, identity):
-            for name in NAMES:
+            for name in names:
                 os.rename(data / name, variant / name)
                 os.rename(backup / name, data / name)
-            after = {name: tree_image(data / name) for name in NAMES}
+            after = {name: tree_image(data / name) for name in names}
             if before != after:
                 raise ValueError('Original fixture was not restored exactly')
             (destination / 'preservation.json').write_text(json.dumps(

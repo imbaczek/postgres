@@ -27,13 +27,12 @@
   (dolist (row rows)
     (let ((slot (wal-find-usable-replication-slot-under-lock (first row))))
       (unless (and slot
-                   (if (wal-physical-slot-p slot)
+                   (if (wal-replication-slot-child-owner slot)
+                       (equalp (second row) (logical-slot-state-encode slot))
                        (equalp
                         (logical-slot-startup-candidate-image slot)
                         (logical-slot-startup-candidate-image
-                         (wal-decode-replication-slot-image (second row) (first row))))
-                       (and (wal-replication-slot-child-owner slot)
-                            (equalp (second row) (logical-slot-state-encode slot)))))
+                         (wal-decode-replication-slot-image (second row) (first row))))))
         (error "native writer live slot differs from its saved incarnation"))))
   t)
 

@@ -239,6 +239,19 @@
 ;; :RECEIPT requires :POLICY and passes the proof as a fifth callback argument.
 ;; Without :RECEIPT the callback keeps its four-argument interface.
 
+(defun logical-slot-continuation-cold-reconstruct-ordinary (source slot)
+  (when (and (wal-logical-slot-p slot)
+             (eq :reserved (wal-replication-slot-wal-status slot)))
+    (when (wal-replication-slot-child-owner slot)
+      (error "ordinary reconstruction cannot use a child-owned candidate"))
+    (setf (wal-replication-slot-pending-xids slot)
+          (if (logical-slot-startup-known-p slot)
+              (progn
+                (logical-slot-startup-check-eligibility source slot)
+                (logical-slot-startup-derive-pending source slot))
+              (logical-slot-startup-derive-legacy-pending source slot))))
+  slot)
+
 (defun call-with-logical-slot-continuation-cold-reconstruction (gate ownership function &key policy receipt)
   ;; Reconstruct every saved reserved candidate privately through the actual
   ;; durable horizon L before the callback. This scope does not publish slots
@@ -255,14 +268,15 @@
          (lambda (read-slot check &optional proved-policy)
            (dolist (entry (logical-slot-startup-source-entries source))
              (let ((slot (logical-slot-startup-entry-slot entry)))
-               (when (and (logical-slot-continuation-selected-child-p
-                           slot (getf observation :snapshot))
-                          (eq :reserved (wal-replication-slot-wal-status slot)))
-                 (funcall read-slot slot
-                          (lambda (cursor seams)
-                            (declare (ignore seams))
-                            (setf (wal-replication-slot-pending-xids slot)
-                                  (logical-slot-startup-derive-pending-with-cursor source slot cursor)))))))
+               (if (logical-slot-continuation-selected-child-p
+                    slot (getf observation :snapshot))
+                   (when (eq :reserved (wal-replication-slot-wal-status slot))
+                     (funcall read-slot slot
+                              (lambda (cursor seams)
+                                (declare (ignore seams))
+                                (setf (wal-replication-slot-pending-xids slot)
+                                      (logical-slot-startup-derive-pending-with-cursor source slot cursor)))))
+                   (logical-slot-continuation-cold-reconstruct-ordinary source slot))))
            (funcall check)
            (when policy
              (let* ((snapshot (getf observation :snapshot))

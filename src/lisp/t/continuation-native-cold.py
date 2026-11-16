@@ -39,6 +39,11 @@ PROOF_MARKERS = {
     'load-empty': 'NATIVE-COLD-EMPTY-LOADER',
     'load-empty-late': 'NATIVE-COLD-EMPTY-LOADER-REFUSAL',
     'load-physical': 'NATIVE-COLD-MIXED-PUBLICATION',
+    'load-logical': 'NATIVE-COLD-LOGICAL',
+    'load-legacy-logical': 'NATIVE-COLD-LOGICAL',
+    'load-unbound-logical': 'NATIVE-COLD-LOGICAL',
+    'load-legacy-empty': 'NATIVE-COLD-LOGICAL',
+    'load-legacy-v2': 'NATIVE-COLD-LOGICAL',
     'load-mixed-refusal': 'NATIVE-COLD-LOADER-REFUSAL',
     'load-mixed-staging-refusal': 'NATIVE-COLD-LOADER-REFUSAL',
     'publish': 'NATIVE-COLD-PUBLICATION',
@@ -88,6 +93,8 @@ COLD_RECONCILIATION_CUTS = {
     'stable-selected', 'replacement-after-selected-sync',
     'replacement-after-directory-sync', 'stable-durable',
 }
+LOGICAL_PROOFS = {'load-logical', 'load-legacy-logical', 'load-unbound-logical',
+                  'load-legacy-empty', 'load-legacy-v2'}
 COLD_PUBLICATION_CUTS = {
     'completion-ready', 'before-group-pin', 'after-group-pin', 'maps-ready',
     'derived', 'prepared', 'before-commit', 'after-commit', 'before-owner-return',
@@ -155,6 +162,9 @@ def child_environment(base, row):
                PG_NATIVE_COLD_VARIANT_ROOT=row['variant_root'])
     env.pop('PG_NATIVE_COLD_PLAN', None)
     env.pop('PG_NATIVE_COLD_MIXED_RESTART', None)
+    for key in ('PG_NATIVE_COLD_LOGICAL_PHASE', 'PG_NATIVE_COLD_LOGICAL_SEED_IMAGE',
+                'PG_NATIVE_COLD_LOGICAL_SEED_PENDING'):
+        env.pop(key, None)
     # Do not let a previous or inherited mode leak into this row.
     for key, value in (('PG_NATIVE_COLD_PROOF', row['proof']),
                        ('PG_NATIVE_COLD_RECONCILE_CUT', row.get('cut')),
@@ -211,7 +221,42 @@ def run_mixed_restarts(campaign, command, env, row, log, lease, run_lock, worksp
     return 0, current, recovery
 
 
+def run_logical_restarts(campaign, command, env, row, log, lease, run_lock, workspace):
+    seed_env = dict(env, PG_NATIVE_COLD_LOGICAL_PHASE='seed')
+    status = campaign.wait_child(command, seed_env, log, lease, run_lock, workspace)
+    text = log.read_text(errors='replace')
+    seed = re.findall(r'^NATIVE-COLD-LOGICAL-SEED-EXPECTED ([0-9A-Fa-f]+) ([0-9/;]*)$',
+                      text, re.MULTILINE)
+    recovery = dict(kind='clean', seed=dict(exit_code=status, log=str(log)), restarts=[], passed=False)
+    if (status != 0 or len(seed) != 1 or
+            re.search('^NATIVE-COLD-LOGICAL-SEED PASS case=' + re.escape(row['case']) + r'(?:\s|$)',
+                      text, re.MULTILINE) is None or
+            (cold_spill_required(row) and not cold_spill_marker(text))):
+        return status or 1, log, recovery
+    recovery_env = dict(env, PG_NATIVE_COLD_LOGICAL_SEED_IMAGE=seed[0][0],
+                        PG_NATIVE_COLD_LOGICAL_SEED_PENDING=seed[0][1])
+    recovery_env.pop('PG_NATIVE_COLD_APPEND', None)
+    expected = None
+    for phase in ('advance', 'restart-1', 'restart-2'):
+        current = log.with_name(log.stem + '-' + phase + log.suffix)
+        recovery_env['PG_NATIVE_COLD_LOGICAL_PHASE'] = phase
+        status = campaign.wait_child(command, recovery_env, current, lease, run_lock, workspace)
+        text = current.read_text(errors='replace')
+        seal = re.findall(r'^NATIVE-COLD-LOGICAL-EXPECTED ([0-9A-Fa-f]+:[0-9A-Fa-f]+:[0-9/;]*:[0-9/;]*)$',
+                          text, re.MULTILINE)
+        if expected is None:
+            expected = seal
+        passed = status == 0 and len(seal) == 1 and seal == expected and cold_pass_marker(row, text)
+        recovery['restarts'].append(dict(phase=phase, exit_code=status, log=str(current), passed=passed))
+        if not passed:
+            return status or 1, current, recovery
+    recovery['passed'] = True
+    return 0, current, recovery
+
+
 def run_cold_children(campaign, command, env, row, log, lease, run_lock, workspace):
+    if row['proof'] in LOGICAL_PROOFS:
+        return run_logical_restarts(campaign, command, env, row, log, lease, run_lock, workspace)
     if row['proof'] == 'load-physical':
         return run_mixed_restarts(campaign, command, env, row, log, lease, run_lock, workspace)
     status = campaign.wait_child(command, env, log, lease, run_lock, workspace)
@@ -284,7 +329,8 @@ def main():
             log = logs / ('cold-' + label + '.log')
             child_env = child_environment(env, row)
             start = time.monotonic()
-            with writer.working_namespaces(data, job / ('cold-' + label), source=variant) as observed:
+            isolation = dict(include_base=True) if row['proof'] in LOGICAL_PROOFS else {}
+            with writer.working_namespaces(data, job / ('cold-' + label), source=variant, **isolation) as observed:
                 status, log, crash = run_cold_children(campaign,
                     [env.get('SBCL', 'sbcl'), '--noinform', '--no-sysinit', '--no-userinit',
                      '--non-interactive', '--eval', load],
@@ -298,7 +344,7 @@ def main():
                                 spill=row['spill'], spill_exercised=cold_spill_marker(log_text),
                                   cut=row.get('cut'),
                                   crash=crash if row.get('cut') else None,
-                                  clean_restarts=crash if row['proof'] == 'load-physical' else None,
+                                  clean_restarts=crash if row['proof'] == 'load-physical' or row['proof'] in LOGICAL_PROOFS else None,
                                   passed=passed))
             campaign.write_json(logs / 'native-cold-results.json', results)
             if not passed:

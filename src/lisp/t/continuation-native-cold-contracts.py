@@ -106,6 +106,9 @@ class ColdPlanContracts(unittest.TestCase):
                           {'case': 'happy-extended', 'proof': 'prepare'}])
         base = {'PG_NATIVE_COLD_APPEND': 'old', 'PG_NATIVE_COLD_FAULT': 'old',
                 'PG_NATIVE_COLD_MIXED_RESTART': 'old',
+                'PG_NATIVE_COLD_LOGICAL_PHASE': 'old',
+                'PG_NATIVE_COLD_LOGICAL_SEED_IMAGE': 'old',
+                'PG_NATIVE_COLD_LOGICAL_SEED_PENDING': 'old',
                 'PG_NATIVE_COLD_PLAN': 'input-only', 'UNCHANGED': 'yes'}
         first = native.child_environment(base, rows[0])
         second = native.child_environment(first, rows[1])
@@ -116,9 +119,11 @@ class ColdPlanContracts(unittest.TestCase):
         self.assertEqual('1', first['PG_NATIVE_COLD_SPILL'])
         for key in ('PG_NATIVE_COLD_PROOF', 'PG_NATIVE_COLD_SPILL', 'PG_NATIVE_COLD_APPEND',
                       'PG_NATIVE_COLD_FAULT', 'PG_NATIVE_COLD_PLAN',
-                      'PG_NATIVE_COLD_MIXED_RESTART'):
+                      'PG_NATIVE_COLD_MIXED_RESTART', 'PG_NATIVE_COLD_LOGICAL_PHASE',
+                      'PG_NATIVE_COLD_LOGICAL_SEED_IMAGE', 'PG_NATIVE_COLD_LOGICAL_SEED_PENDING'):
             self.assertNotIn(key, second)
         self.assertNotIn('PG_NATIVE_COLD_MIXED_RESTART', first)
+        self.assertNotIn('PG_NATIVE_COLD_LOGICAL_PHASE', first)
         self.assertEqual('1', third['PG_NATIVE_COLD_APPEND'])
         self.assertEqual('yes', third['UNCHANGED'])
         self.assertEqual('old', base['PG_NATIVE_COLD_FAULT'])
@@ -267,6 +272,44 @@ class ColdPlanContracts(unittest.TestCase):
             with self.subTest(options=options):
                 calls, (status, _, recovery) = self.mixed_children(**options)
                 self.assertEqual(2, len(calls))
+                self.assertNotEqual(0, status)
+                self.assertFalse(recovery['passed'])
+
+    def logical_children(self, *, changed_pending=False, failed_seed=False):
+        calls = []
+        row = dict(case='happy', proof='load-logical', spill=False)
+
+        def child(command, env, log, lease, run_lock, workspace):
+            calls.append(dict(env))
+            if len(calls) == 1:
+                log.write_text('NATIVE-COLD-LOGICAL-SEED-EXPECTED AABB 7/101/121;\n'
+                               'NATIVE-COLD-LOGICAL-SEED PASS case=happy\n')
+                return 1 if failed_seed else 0
+            self.assertNotIn('PG_NATIVE_COLD_APPEND', env)
+            self.assertEqual('AABB', env['PG_NATIVE_COLD_LOGICAL_SEED_IMAGE'])
+            self.assertEqual('7/101/121;', env['PG_NATIVE_COLD_LOGICAL_SEED_PENDING'])
+            pending = '7/101/122;' if changed_pending and len(calls) == 3 else '7/101/121;'
+            log.write_text('NATIVE-COLD-LOGICAL-EXPECTED 1122:AABB:' + pending + ':\n'
+                           'NATIVE-COLD-LOGICAL PASS case=happy\n')
+            return 0
+
+        result = native.run_cold_children(SimpleNamespace(wait_child=child), ['sbcl'],
+                                         dict(PG_NATIVE_COLD_APPEND='1'), row,
+                                         self.root / 'logical.log', 12, 11, 10)
+        return calls, result
+
+    def test_logical_seed_precedes_real_ack_and_two_exact_pending_restarts(self):
+        calls, (status, _, recovery) = self.logical_children()
+        self.assertEqual(['seed', 'advance', 'restart-1', 'restart-2'],
+                         [env['PG_NATIVE_COLD_LOGICAL_PHASE'] for env in calls])
+        self.assertEqual(0, status)
+        self.assertTrue(recovery['passed'])
+
+    def test_logical_seed_failure_and_changed_reconstructed_pending_are_rejected(self):
+        for options, count in ((dict(failed_seed=True), 1), (dict(changed_pending=True), 3)):
+            with self.subTest(options=options):
+                calls, (status, _, recovery) = self.logical_children(**options)
+                self.assertEqual(count, len(calls))
                 self.assertNotEqual(0, status)
                 self.assertFalse(recovery['passed'])
 
