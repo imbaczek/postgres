@@ -484,11 +484,232 @@
   (format t "~&NATIVE-COLD-POLICY-REFUSAL PASS case=~a mode=~a preserved-F no-admission no-cleanup~%"
           (uiop:getenv "PG_NATIVE_COLD_CASE") mode))
 
+(defun native-host-cold-preparation (gate ownership)
+  (let ((files (native-host-cold-file-image)) (fds (native-host-writer-open-fds))
+                                              (saved nil) (count 0)
+                                              (*logical-capture-memory-bytes* (if (uiop:getenv "PG_NATIVE_COLD_SPILL")
+                                                                                  0 *logical-capture-memory-bytes*)))
+    (flet ((call (token operation)
+             (uiop:symbol-call :pg :logical-slot-continuation-cold-preparation-call token operation)))
+      (funcall
+       (symbol-function 'call-with-logical-slot-continuation-cold-preparation)
+       gate ownership
+       (lambda (token)
+         (assert (null *logical-slot-startup-sources*))
+         (assert (zerop (hash-table-count *logical-slot-startup-inventories*)))
+         (assert (zerop (hash-table-count *wal-replication-slots*)))
+         (assert (call token :check))
+         (native-host-cold-recheck-refused-before-io
+          (lambda () (call (copy-structure token) :check)))
+         (let ((refused nil))
+           (sb-thread:join-thread
+            (sb-thread:make-thread
+             (lambda ()
+               (native-host-cold-recheck-refused-before-io (lambda () (call token :check)))
+               (setf refused t))))
+           (assert refused))
+         (let ((registry (call token :registry)))
+           (assert (not (eq registry *wal-replication-slots*)))
+           (assert (= 2 (hash-table-count registry)))
+           (maphash
+            (lambda (name slot)
+              (assert (equal name (wal-replication-slot-name slot)))
+              (let* ((confirmed (wal-replication-slot-confirmed-flush-lsn slot))
+                     (pending (wal-replication-slot-pending-xids slot))
+                     (expected (remove-if-not (lambda (row) (> (third row) confirmed))
+                                              '((3 20598 29061) (4 29381 37853)))))
+                (assert (= (length expected) (hash-table-count pending)))
+                (dolist (row expected)
+                  (assert (equal (cons (second row) (third row)) (gethash (first row) pending)))))
+              (incf count))
+            registry))
+         (sb-thread:with-mutex (*wal-lock*)
+           (let ((*max-replication-slots* 0))
+             (assert (handler-case (progn (wal-check-replication-slot-capacity) nil)
+                       (pg-error (condition)
+                         (search "has not published its group" (princ-to-string condition)))))))
+         (assert (call token :claim))
+         (setf saved token)))
+      (assert (= count 2))
+      (native-host-cold-recheck-refused-before-io (lambda () (call saved :check)))
+      (assert (equalp files (native-host-cold-file-image)))
+      (assert (equal fds (native-host-writer-open-fds)))
+      (assert (zerop (hash-table-count *wal-replication-slots*)))
+      (format t "~&NATIVE-COLD-PREPARATION PASS case=~a private-pending closed-source-scopes typed-one-shot no-admission~%"
+              (uiop:getenv "PG_NATIVE_COLD_CASE")))))
+
+(defun native-host-cold-preparation-refusal (gate ownership mode)
+  (let ((files (native-host-cold-file-image)) (fds (native-host-writer-open-fds))
+                                              (saved nil) (entered nil) (caught nil) (reentered nil))
+    (flet ((call (token operation)
+             (logical-slot-continuation-cold-preparation-call token operation)))
+      (setf caught
+            (handler-case
+                (let ((*max-replication-slots* (if (equal mode "prepare-capacity") 1 *max-replication-slots*))
+                      (*logical-slot-continuation-cold-test-hook*
+                        (when (equal mode "prepare-after-close")
+                          (lambda (point value)
+                            (declare (ignore value))
+                            (when (eq point :after-proof-return) (error "injected closed-scope failure"))))))
+                  (call-with-logical-slot-continuation-cold-preparation
+                   gate ownership
+                   (lambda (token)
+                     (setf saved token entered t)
+                     (cond
+                       ((equal mode "prepare-registration")
+                        (let ((state (gethash token *logical-slot-continuation-cold-preparations*))
+                              (scopes *logical-slot-continuation-cold-preparation-scopes*))
+                          (remhash token *logical-slot-continuation-cold-preparations*)
+                          (let ((refused nil))
+                            (sb-thread:join-thread
+                             (sb-thread:make-thread
+                              (lambda ()
+                                (let ((*logical-slot-continuation-cold-preparation-scopes* scopes))
+                                  (native-host-cold-recheck-refused-before-io (lambda () (call token :check)))
+                                  (setf refused t)))))
+                            (assert refused))
+                          (setf (gethash token *logical-slot-continuation-cold-preparations*) state)
+                          (assert (call token :check))
+                          (unwind-protect
+                               (progn
+                                 (remhash token *logical-slot-continuation-cold-preparations*)
+                                 (native-host-cold-recheck-refused-before-io (lambda () (call token :check))))
+                            (setf (gethash token *logical-slot-continuation-cold-preparations*) state))))
+                       ((member mode '("prepare-pending" "prepare-pending-swap") :test #'equal)
+                        (let* ((slot (gethash "beta" (call token :registry)))
+                               (pending (wal-replication-slot-pending-xids slot))
+                               (positions (gethash 3 pending)))
+                          (unwind-protect
+                               (progn
+                                 (if (equal mode "prepare-pending-swap")
+                                     (setf (wal-replication-slot-pending-xids slot) (let ((copy (make-hash-table :test #'eql)))
+                                                                                      (maphash (lambda (xid pair) (setf (gethash xid copy) pair)) pending)
+                                                                                      copy))
+                                     (setf (gethash 3 pending) (cons (1+ (car positions)) (cdr positions))))
+                                 (assert (handler-case (progn (call token :check) nil) (error () t))))
+                            (setf (wal-replication-slot-pending-xids slot) pending
+                                  (gethash 3 pending) positions))))
+                       ((equal mode "prepare-reuse")
+                        (assert (call token :claim))
+                        (native-host-cold-recheck-refused-before-io (lambda () (call token :claim))))
+                       ((equal mode "prepare-reenter")
+                        (let ((*logical-slot-continuation-cold-test-hook*
+                                (lambda (point value)
+                                  (declare (ignore value))
+                                  (when (eq point :after-proof-return)
+                                    (let ((masked nil))
+                                      (native-host-cold-recheck-refused-before-io
+                                       (lambda ()
+                                         (handler-bind ((error (lambda (condition)
+                                                                 (declare (ignore condition))
+                                                                 (setf masked (not sb-sys:*interrupts-enabled*)))))
+                                           (call token :registry))))
+                                      (assert masked))
+                                    (setf reentered t)))))
+                          (assert (handler-case (progn (call token :claim) nil) (error () t)))
+                          (assert reentered)))
+                       (t (error "unexpected preparation refusal callback ~s" mode)))
+                     (native-host-cold-recheck-refused-before-io (lambda () (call token :check)))))
+                  nil)
+              (error (condition) (princ-to-string condition))))
+      (assert caught)
+      (assert (eq (not (null entered))
+                  (not (member mode '("prepare-capacity" "prepare-after-close") :test #'equal))))
+      (when saved
+        (native-host-cold-recheck-refused-before-io (lambda () (call saved :check))))
+      (assert (zerop (hash-table-count *logical-slot-continuation-cold-preparations*)))
+      (assert (zerop (hash-table-count *wal-replication-slots*)))
+      (sb-thread:with-mutex (*wal-lock*)
+        (assert (= 1 (hash-table-count *logical-slot-continuation-cold-reservations*)))
+        (loop for reservation being the hash-values of *logical-slot-continuation-cold-reservations*
+              do (assert (logical-slot-continuation-cold-reservation-call reservation :uncertain))
+                 (assert (= 41268 (gethash reservation *wal-snapshot-retention-pins*)))))
+      (assert (equalp files (native-host-cold-file-image)))
+      (assert (equal fds (native-host-writer-open-fds)))
+      (format t "~&NATIVE-COLD-PREPARATION-REFUSAL PASS case=~a mode=~a sticky persistent-F no-admission~%"
+              (uiop:getenv "PG_NATIVE_COLD_CASE") mode))))
+
+(defun native-host-cold-preparation-wal-change (gate ownership)
+  (let ((files (native-host-cold-file-image)) (fds (native-host-writer-open-fds))
+                                              (entered nil) (proved nil) (refusal nil) (caught nil))
+    (setf caught
+          (handler-case
+              (progn
+                (call-with-logical-slot-continuation-cold-preparation
+                 gate ownership
+                 (lambda (token)
+                   (setf entered t)
+                   (let* ((observation (logical-slot-continuation-cold-preparation-call token :observation))
+                          (proof (logical-slot-continuation-cold-preparation-call token :proof))
+                          (registry (logical-slot-continuation-cold-preparation-call token :registry))
+                          (image (logical-slot-continuation-cold-preparation-semantic-image
+                                  (logical-slot-publication-registry-image registry)))
+                          (start (first (getf (getf observation :snapshot) :sealed-end)))
+                          (header (make-array +wal-header-size+ :element-type '(unsigned-byte 8))))
+                     (assert (< start (getf observation :horizon)))
+                     (with-open-file (stream (wal-segment-path (floor start +wal-segment-size+))
+                                             :direction :io :if-exists :overwrite :if-does-not-exist :error
+                                             :element-type '(unsigned-byte 8))
+                       (file-position stream (mod start +wal-segment-size+))
+                       (assert (= +wal-header-size+ (read-sequence header stream)))
+                       (assert (= +wal-record-batch-start+ (wal-record-type (wal-decode-record header start))))
+                       (wal-set-u16 header 4 +wal-version-v7+)
+                       (wal-set-u32 header 28 (wal-record-crc32 header))
+                       (assert (= +wal-version-v7+ (wal-record-version (wal-decode-record header start))))
+                       (file-position stream (mod start +wal-segment-size+))
+                       (write-sequence header stream)
+                       (fsync-stream stream))
+                     (call-with-logical-slot-continuation-cold-reconstruction
+                      gate ownership
+                      (lambda (source observed reservation check current)
+                        (declare (ignore reservation))
+                        (assert (equalp observation observed))
+                        (multiple-value-bind (restored frozen)
+                            (logical-slot-continuation-cold-prepare-registry source)
+                          (declare (ignore restored))
+                          (assert (equalp image (logical-slot-continuation-cold-preparation-semantic-image frozen))))
+                        (let ((before (logical-slot-continuation-copy proof))
+                              (after (logical-slot-continuation-copy current)))
+                          (remf before :tail) (remf after :tail)
+                          (assert (equalp before after)))
+                        (assert (/= (getf (getf proof :tail) :digest) (getf (getf current :tail) :digest)))
+                        (funcall check)
+                        (setf proved t))
+                      :policy t :receipt t)
+                     (setf refusal
+                           (handler-case
+                               (progn (logical-slot-continuation-cold-preparation-call token :claim) nil)
+                             (error (condition) (princ-to-string condition))))
+                     (assert (and proved refusal
+                                  (search "differs from its fresh closed-scope proof" refusal)))
+                     (native-host-cold-recheck-refused-before-io
+                      (lambda () (logical-slot-continuation-cold-preparation-call token :check))))))
+                nil)
+            (error (condition) (princ-to-string condition))))
+    (assert (and entered proved refusal caught))
+    (assert (equalp files (native-host-cold-file-image)))
+    (assert (equal fds (native-host-writer-open-fds)))
+    (assert (zerop (hash-table-count *wal-replication-slots*)))
+    (sb-thread:with-mutex (*wal-lock*)
+      (loop for reservation being the hash-values of *logical-slot-continuation-cold-reservations*
+            do (assert (logical-slot-continuation-cold-reservation-call reservation :uncertain))
+               (assert (= 41268 (gethash reservation *wal-snapshot-retention-pins*)))))
+    (format t "~&NATIVE-COLD-PREPARATION-WAL-REFUSAL PASS case=~a valid-CRC same-policy same-pending changed-transcript~%"
+            (uiop:getenv "PG_NATIVE_COLD_CASE"))))
+
 (defun native-host-continuation-cold-state (gate ownership)
   (handler-case
       (progn
         (when (uiop:getenv "PG_NATIVE_COLD_APPEND") (native-host-cold-append))
         (cond
+          ((equal "prepare-wal" (uiop:getenv "PG_NATIVE_COLD_PROOF"))
+           (native-host-cold-preparation-wal-change gate ownership))
+          ((member (uiop:getenv "PG_NATIVE_COLD_PROOF")
+                   '("prepare-registration" "prepare-pending" "prepare-pending-swap" "prepare-reuse"
+                     "prepare-reenter" "prepare-capacity" "prepare-after-close") :test #'equal)
+           (native-host-cold-preparation-refusal gate ownership (uiop:getenv "PG_NATIVE_COLD_PROOF")))
+          ((equal "prepare" (uiop:getenv "PG_NATIVE_COLD_PROOF"))
+           (native-host-cold-preparation gate ownership))
           ((member (uiop:getenv "PG_NATIVE_COLD_PROOF") '("policy-off" "policy-off-on") :test #'equal)
            (native-host-cold-policy-refusal gate ownership (uiop:getenv "PG_NATIVE_COLD_PROOF")))
           ((member (uiop:getenv "PG_NATIVE_COLD_PROOF")

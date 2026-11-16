@@ -19,6 +19,19 @@
     (replace frame raw :start1 40)
     frame))
 
+(defun logical-slot-continuation-tail-witness (spool start end ledger visits)
+  (let ((digest #xCBF29CE484222325) (count 0) (bytes 0))
+    (call-with-logical-spool-reader
+     spool (+ 40 +wal-segment-size+)
+     (lambda (next)
+       (loop for frame = (funcall next) while frame
+             do (setf digest (physical-store-update-digest digest frame))
+                (incf count)
+                (incf bytes (length frame)))))
+    (list :start start :end end :count count :bytes bytes :digest digest
+          :segments (mapcar (lambda (name) (list (copy-seq name) (copy-tree (gethash name ledger))))
+                            visits))))
+
 ;; Map private transcript bytes only within the sealed interval, on the owning
 ;; thread and during this scope.  Replay uses simulated state, so the mapper does
 ;; not run live guards; callers perform live checks and reproof outside replay.

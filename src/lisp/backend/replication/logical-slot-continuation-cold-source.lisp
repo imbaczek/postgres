@@ -153,14 +153,14 @@
 ;; argument.  Reprove it and the live source before leaving this scope.
 
 (defun call-with-logical-slot-continuation-cold-source-readers
-    (storage source observation archive check-source function &key policy)
+    (storage source observation archive check-source function &key policy receipt)
   ;; S is the selected sealed end and L the observed durable horizon (S <= L).
   ;; Each reserved slot reads continuously from its start through L, carrying
   ;; pending transactions across any D, F and S seams it crosses. Reprove
   ;; before returning outward.
   (let* ((facts (logical-slot-continuation-storage-call storage :facts))
          (snapshot (logical-slot-continuation-copy (getf observation :snapshot)))
-         (horizon (getf observation :horizon)))
+         (horizon (getf observation :horizon)) (tail-witness nil))
     (flet ((boundaries ()
              (logical-slot-startup-check-live source)
              (funcall check-source)
@@ -174,14 +174,15 @@
       (call-with-logical-slot-continuation-local-tail-source
        storage snapshot
        (lambda (prove check-tail local-reader local-guard &optional map-records)
-         (funcall prove)
+         (setf tail-witness (nth-value 1 (funcall prove)))
          (logical-slot-continuation-storage-call
           storage :with-sidecar
           (lambda (sidecar-reader check-files)
             (let ((active t) (failed nil) (thread sb-thread:*current-thread*)
                              (proved-policy (when policy
-                                              (logical-slot-continuation-cold-policy
-                                               facts snapshot horizon archive map-records))))
+                                              (list* :tail tail-witness
+                                                     (logical-slot-continuation-cold-policy
+                                                      facts snapshot horizon archive map-records)))))
               (macrolet ((in-scope (&body body)
                            (let ((complete (gensym "COMPLETE")))
                              `(progn
@@ -221,22 +222,24 @@
                              (apply function #'read-slot #'check
                                     (when policy (list (logical-slot-continuation-copy proved-policy))))
                            (check)
-                           (funcall prove)
+                           (setf tail-witness (nth-value 1 (funcall prove)))
                            (when (and policy
                                       (not (equal proved-policy
-                                                  (logical-slot-continuation-cold-policy
-                                                   facts snapshot horizon archive map-records))))
+                                                  (list* :tail tail-witness
+                                                         (logical-slot-continuation-cold-policy
+                                                          facts snapshot horizon archive map-records)))))
                              (error "cold continuation policy changed during reconstruction"))
                            (check)))
                     (sb-sys:without-interrupts (setf active nil)))))))))
-       :boundaries #'boundaries :end horizon :batch-policy :logical-reader :require-closed nil :transcript policy))))
+       :boundaries #'boundaries :end horizon :batch-policy :logical-reader :require-closed nil :transcript policy :witness receipt))))
 
 ;; :POLICY also checks each saved slot's lifetime against the proved policy.
 
-(defun call-with-logical-slot-continuation-cold-reconstruction (gate ownership function &key policy)
+(defun call-with-logical-slot-continuation-cold-reconstruction (gate ownership function &key policy receipt)
   ;; Reconstruct every saved reserved candidate privately through the actual
   ;; durable horizon L before the callback. This scope does not publish slots
   ;; or grant admission.
+  (when (and receipt (not policy)) (error "cold reconstruction receipt requires its policy proof"))
   (call-with-logical-slot-continuation-cold-context
    gate ownership
    (lambda (storage reservation archive)
@@ -264,5 +267,6 @@
                (dolist (entry (logical-slot-startup-source-entries source))
                  (logical-slot-copy-check-slot-lifetime
                   (logical-slot-startup-entry-slot entry) state history (getf observation :horizon)))))
-           (funcall function source observation actual check))
-         :policy policy))))))
+           (apply function source observation actual check
+                  (when receipt (list (logical-slot-continuation-copy proved-policy)))))
+         :policy policy :receipt receipt))))))
