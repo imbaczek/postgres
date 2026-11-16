@@ -356,6 +356,8 @@
 
 (declaim (ftype function logical-slot-continuation-cold-publish-startup))
 
+;; Probe only to choose the startup path.  This scope grants no publication
+;; authority and performs no cleanup; it closes before publication begins.
 (defun logical-slot-continuation-startup-layout (gate ownership)
   (call-with-logical-slot-continuation-startup-storage
    gate ownership
@@ -372,6 +374,10 @@
             ((member "selector" (logical-slot-continuation-selector-names storage)
                      :test #'string=) :selected)
             (t :bootstrap))))))))
+
+;; Recover the generation named by an existing selector instead of creating a
+;; bootstrap selector.  Empty recovery returns NIL for the caller to publish
+;; an empty inventory; the other paths publish here and return true.
 
 (defun logical-slot-continuation-restore-startup (gate ownership)
   (ecase (logical-slot-continuation-startup-layout gate ownership)

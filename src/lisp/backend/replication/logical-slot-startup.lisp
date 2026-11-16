@@ -144,6 +144,9 @@ The caller publishes the results before waking the writer."
 (defun logical-slot-load-startup-inventory (gate-owner ownership)
   (when (or gate-owner ownership)
     (check-primary-storage-startup-context gate-owner ownership))
+  ;; Fenced startup returns before generic inventory cleanup.  An empty restore
+  ;; returns NIL so the source captures NIL entries and the normal publication
+  ;; path still checks the inventory against that snapshot.
   (when (and gate-owner ownership (logical-slot-continuation-gc-fenced-p *pgdata*))
     (unless (logical-slot-continuation-restore-startup gate-owner ownership)
       (call-with-logical-slot-startup-source
