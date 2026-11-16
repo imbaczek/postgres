@@ -354,7 +354,34 @@
            :boundaries (lambda ()
                          (logical-slot-continuation-active-boundaries storage facts snapshot archive)))))))))
 
+(declaim (ftype function logical-slot-continuation-cold-publish-startup))
+
+(defun logical-slot-continuation-startup-layout (gate ownership)
+  (call-with-logical-slot-continuation-startup-storage
+   gate ownership
+   (lambda (storage facts)
+     (declare (ignore facts))
+     (logical-slot-continuation-storage-call
+      storage :with-cold-slot-root
+      (lambda (directory check)
+        (let ((names (logical-slot-copy-import-control-names
+                      directory (1+ +logical-slot-continuation-obligation-limit+))))
+          (funcall check)
+          (cond
+            ((null (remove ".logical-slot-copy.work" names :test #'string=)) :empty)
+            ((member "selector" (logical-slot-continuation-selector-names storage)
+                     :test #'string=) :selected)
+            (t :bootstrap))))))))
+
 (defun logical-slot-continuation-restore-startup (gate ownership)
-  (if (logical-slot-startup-read-inventory :local-workspace t)
-      (logical-slot-continuation-restore-active-startup gate ownership)
-      (logical-slot-continuation-restore-empty-startup gate ownership)))
+  (ecase (logical-slot-continuation-startup-layout gate ownership)
+    (:empty
+     (logical-slot-continuation-restore-empty-startup gate ownership)
+     nil)
+    (:selected
+     (logical-slot-continuation-cold-publish-startup gate ownership)
+     t)
+    (:bootstrap
+     (logical-slot-continuation-restore-active-startup gate ownership)
+     (logical-slot-continuation-cold-publish-startup gate ownership)
+     t)))

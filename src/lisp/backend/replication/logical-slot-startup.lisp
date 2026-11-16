@@ -145,7 +145,13 @@ The caller publishes the results before waking the writer."
   (when (or gate-owner ownership)
     (check-primary-storage-startup-context gate-owner ownership))
   (when (and gate-owner ownership (logical-slot-continuation-gc-fenced-p *pgdata*))
-    (logical-slot-continuation-restore-startup gate-owner ownership))
+    (unless (logical-slot-continuation-restore-startup gate-owner ownership)
+      (call-with-logical-slot-startup-source
+       gate-owner ownership nil
+       (lambda (source)
+         (logical-slot-startup-restore source (wal-discover-segments)
+                                       (postgres-current-timestamp)))))
+    (return-from logical-slot-load-startup-inventory (values)))
   (let* ((entries (logical-slot-startup-read-inventory :cleanup (and gate-owner ownership)
                                                        :local-workspace t))
          (candidates (mapcar #'logical-slot-startup-entry-slot entries))
