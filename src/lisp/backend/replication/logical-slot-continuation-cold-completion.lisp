@@ -51,6 +51,9 @@
     (if (sb-thread:holding-mutex-p *wal-lock*) (check)
         (sb-thread:with-mutex (*wal-lock*) (check)))))
 
+;; Reconciliation produces a scoped receipt for the candidate registry.  The
+;; receipt can be claimed once by publication, and is invalid after the callback.
+;; On failure, leave the reservation in its failure state.
 (defun call-with-logical-slot-continuation-cold-completion
     (owner gate ownership function &optional failure-cell)
   (unless (and (logical-slot-startup-publication-owner-p owner) (functionp function)

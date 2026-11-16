@@ -12,6 +12,9 @@
       (error "cold reservation lost its original PGDATA root")))
   (logical-slot-imported-host-origin-call origin :check-root))
 
+;; Keep the original fork pin until the replacement group has been published
+;; and startup notification has completed.  The reservation and group overlap
+;; during the handoff so either can be marked uncertain on failure.
 (defun logical-slot-continuation-build-cold-reservation-under-lock
     (root binding origin fork child)
   (assert (sb-thread:holding-mutex-p *wal-lock*))

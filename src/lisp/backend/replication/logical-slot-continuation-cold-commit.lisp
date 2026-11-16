@@ -42,6 +42,8 @@
     (maphash (lambda (key value) (setf (gethash key copy) value)) table)
     copy))
 
+;; Prepare replacement authority maps without changing the live maps.  Save
+;; images of both sets so the commit can check them before and after publication.
 (defun logical-slot-continuation-cold-commit-prepare-maps (data)
   (let* ((original (logical-slot-continuation-cold-authority-maps))
          (copies (map 'vector #'logical-slot-continuation-cold-copy-map original))
@@ -134,6 +136,9 @@
         (funcall (getf data :guard))
         (logical-slot-continuation-cold-reservation-call (getf data :reservation) :check))))
 
+;; Claim the completion and stage the group before installing its authority.
+;; Add the group fork pin while the reservation still holds its own pin, and
+;; arrange for both to be marked uncertain if the handoff fails.
 (defun call-with-logical-slot-continuation-cold-commit
     (owner completion guard function failure-cell)
   (unless (and (functionp guard) (functionp function) (consp failure-cell)

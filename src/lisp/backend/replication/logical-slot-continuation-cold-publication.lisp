@@ -60,6 +60,8 @@
               owner storage completion check-sidecar check-commit failure-cell))
            :commit-guard t)))))))
 
+;; Publish the reconciled registry, then notify startup before retiring the
+;; reservation's old fork pin.  Failure cleanup remains available throughout.
 (defun logical-slot-continuation-cold-publish-startup (gate ownership)
   (let ((failure (cons nil nil)) (receipt (vector nil))
                                  (reservation nil) (restored nil) (complete nil))

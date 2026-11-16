@@ -29,6 +29,8 @@
          plan))
     (t (error "startup publication has an invalid binding shape"))))
 
+;; Install the prepared maps, registry, and publication phases together while
+;; holding WAL and xid exclusion, with interrupts deferred during the updates.
 (defun logical-slot-startup-publication-install-under-lock (binding control receipt expected cold)
   (assert (sb-thread:holding-mutex-p *wal-lock*))
   (let* ((registry (first expected)) (count (second expected))

@@ -13,6 +13,8 @@
 
 (defvar *logical-slot-continuation-cold-publication-test-hook* nil)
 
+;; The completion is a scoped receipt for reconciliation; the commit is the
+;; corresponding plan for installing its candidate registry and protection.
 (defstruct (logical-slot-continuation-cold-completion
             (:constructor %make-logical-slot-continuation-cold-completion)
             (:print-function physical-libpq-print-private-object))

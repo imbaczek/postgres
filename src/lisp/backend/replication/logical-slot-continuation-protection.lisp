@@ -41,6 +41,8 @@
   (logical-slot-imported-host-origin-call origin :check-root)
   t)
 
+;; A staged group holds candidate identities for cold publication but cannot
+;; serve as the published protection until the installer changes its phase.
 (defun logical-slot-continuation-build-protection-under-lock
     (registry image binding root origin namespace &optional (phase :published))
   (assert (sb-thread:holding-mutex-p *wal-lock*))

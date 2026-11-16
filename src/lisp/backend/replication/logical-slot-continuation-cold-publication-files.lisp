@@ -25,6 +25,9 @@
         (logical-slot-imported-check-held-file parent name fd facts image))
     t))
 
+;; Hold the selector, slot directories, and state files through publication.
+;; Recheck their names, contents, and inventory under the WAL lock; close all
+;; held descriptors when the callback ends, including on failure.
 (defun call-with-logical-slot-continuation-cold-publication-files (storage completion function)
   (unless (functionp function) (error "cold publication final files require a callback"))
   (let* ((data (logical-slot-continuation-cold-completion-call completion :data))
