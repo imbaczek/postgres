@@ -1,6 +1,7 @@
 (in-package #:pg)
 
 (defun logical-slot-continuation-cold-read-temporary (directory name image)
+  ;; A target state.tmp is acceptable only as an exact prefix of new state.
   (call-with-logical-slot-copy-source-proof-fd
    directory name nil
    (lambda (fd facts)
@@ -11,6 +12,8 @@
        (list (copy-list facts) bytes)))))
 
 (defun logical-slot-continuation-cold-read-row (directory name check target new-image)
+  ;; Only the target may have state.tmp; all other extra entries are rejected.
+  ;; Read and close each held row before the next independent inventory pass.
   (funcall check)
   (multiple-value-prog1
       (call-with-logical-slot-copy-source-proof-fd
@@ -35,6 +38,8 @@
     (funcall check)))
 
 (defun logical-slot-continuation-cold-read-inventory (directory guard record)
+  ;; Return two-pass rows and inode ledgers, with target staging allowed only
+  ;; for a checked PREPARED record.  The observation grants no authority.
   (when record (logical-slot-continuation-prepared-check record))
   (let* ((target (when record (getf record :name)))
          (image (when record

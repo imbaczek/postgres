@@ -1,12 +1,15 @@
 (in-package #:pg)
 
 (defun logical-slot-continuation-cold-decode-selected (bytes)
+  ;; Decode the selected bytes as either a stable snapshot or PREPARED record.
   (if (and (<= 16 (length bytes))
            (equalp (subseq bytes 0 16) #(80 71 76 79 71 67 79 78 84 83 78 65 80 49 0 0)))
       (values :stable (logical-slot-continuation-decode bytes))
       (values :prepared (logical-slot-continuation-prepared-decode bytes))))
 
 (defun logical-slot-continuation-cold-classify (kind model rows binding certificate host)
+  ;; A stable image must match the full inventory; PREPARED must match exactly
+  ;; its old or new inventory.  Classification is not proof or publication.
   (ecase kind
     (:stable
      (logical-slot-continuation-check-selected-snapshot model binding certificate host rows (sixth host))
@@ -22,6 +25,8 @@
        (values (getf model selection) selection)))))
 
 (defun call-with-logical-slot-continuation-cold-selected-files (storage function)
+  ;; Keep the selected inode and any unselected selector.tmp under checked
+  ;; descriptors during the callback; a temporary is not itself selected.
   (let* ((directory (logical-slot-continuation-storage-call storage :directory))
          (names (logical-slot-continuation-selector-names storage))
          (root-facts (physical-image-file-facts directory)))

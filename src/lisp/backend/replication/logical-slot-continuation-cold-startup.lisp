@@ -1,6 +1,9 @@
 (in-package #:pg)
 
 (defun call-with-logical-slot-continuation-cold-observation (storage reservation function)
+  ;; Lend a read-only classification and recheck callback within this thread.
+  ;; Scope and sticky failure checks precede I/O, so an expired callback does
+  ;; no I/O.  The closed-row ledgers are reobserved before the scope ends.
   (let ((facts (logical-slot-continuation-storage-call storage :facts))
         (binding (logical-slot-continuation-storage-call storage :binding))
         (host (logical-slot-continuation-storage-call storage :host)))
@@ -57,6 +60,9 @@
                   (sb-sys:without-interrupts (setf active nil))))))))))))
 
 (defun call-with-logical-slot-continuation-cold-state (gate ownership function)
+  ;; Hold the actual startup owner and restored origin around the reservation
+  ;; and observation.  Failure, including late close, retains the fork pin;
+  ;; this scope does not open automatic loading, ACK or WAL retirement.
   (unless (functionp function) (error "cold continuation requires a callback"))
   (let ((failure (list nil)) (complete nil) (mutex *wal-lock*))
     (sb-sys:without-interrupts

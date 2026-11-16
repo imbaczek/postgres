@@ -1,6 +1,13 @@
 (in-package #:pg)
 
 (defun logical-slot-continuation-ensure-cold-reservation (storage &optional failure-cell)
+  ;; Require actual original-child startup, its restored origin and an empty
+  ;; registry.  Install a persistent fork pin and root/registry anchors; no
+  ;; slot admission follows from this reservation.  A prior reservation is
+  ;; reusable only with the same binding and origin.
+  ;;
+  ;; Populate the private failure cell before installing the pin and maps, so
+  ;; later failure or close can mark the reservation uncertain and retain F.
   (when (and failure-cell
              (not (and (consp failure-cell) (null (car failure-cell)) (null (cdr failure-cell)))))
     (error "cold reservation requires an empty private failure receipt"))
