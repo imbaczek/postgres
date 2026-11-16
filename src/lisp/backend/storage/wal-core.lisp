@@ -3571,6 +3571,9 @@ durability before saving the slot."
 
 (defun wal-replication-slot-ack-candidate-under-lock
     (slot acknowledged-lsn &optional (restart-floor acknowledged-lsn))
+  ;; Derive a fresh candidate from current pending transactions without
+  ;; changing or saving the slot.  The ordinary persistence path still
+  ;; checks its publication fence before calling this helper.
   (assert (sb-thread:holding-mutex-p *wal-lock*))
   (wal-require-logical-slot slot)
   (let* ((pending (wal-slot-pending-after-ack slot acknowledged-lsn))

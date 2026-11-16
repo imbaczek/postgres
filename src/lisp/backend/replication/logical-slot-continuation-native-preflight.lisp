@@ -1,6 +1,8 @@
 (in-package #:pg)
 
 (defun logical-slot-continuation-native-preflight-selector (proof)
+  ;; Reopen the sole selector and compare its exact bytes with the receipt,
+  ;; then recheck the live proof before decoding the observed image.
   (let ((directory (logical-slot-continuation-native-proof-directory proof))
         (expected (logical-slot-continuation-native-proof-old-image proof)))
     (unless (equal '("selector") (logical-slot-copy-import-control-names directory 3))
@@ -19,6 +21,8 @@
     (logical-slot-continuation-decode expected)))
 
 (defun logical-slot-continuation-native-preflight-registry (rows)
+  ;; Every saved row must match the current registry incarnation, and the
+  ;; registry must contain no additional slots.
   (unless (= (length rows) (hash-table-count *wal-replication-slots*))
     (error "native writer registry differs from its complete inventory"))
   (dolist (row rows)
@@ -29,6 +33,14 @@
   t)
 
 (defun logical-slot-continuation-native-preflight-under-lock (proof)
+  ;; Recheck the selector, complete saved inventory, registry, exact target
+  ;; object and current ACK permission.  Derive the candidate from current
+  ;; pending transactions.  A no-op leaves the generation alone; an advance
+  ;; builds and validates a PREPARED transition.
+  ;;
+  ;; The returned record, candidate and closed inventory ledger do not grant
+  ;; write authority.  A later writer must recheck resources and inodes and
+  ;; protect both old and new retention obligations before publishing.
   (logical-slot-continuation-native-proof-check-under-lock proof)
   (let* ((scan (logical-slot-continuation-native-proof-scan proof))
          (slot (wal-retained-slot-scan-slot scan))
