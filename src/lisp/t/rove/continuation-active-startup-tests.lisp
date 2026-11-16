@@ -155,6 +155,303 @@
              (rove:ok (zerop opens)))
         (setf (symbol-function 'call-with-logical-slot-continuation-owned-directory) original))))
 
+(defun unit-continuation-replacement-fixture (purpose function &optional prefix)
+  (unit-continuation-directory-fixture
+   (lambda (parent root)
+     (declare (ignore root))
+     (call-with-logical-slot-continuation-owned-directory
+      parent :slots
+      (lambda (directory check)
+        (let ((name (ecase purpose (:selector "selector") (:slot-state "state")))
+              (old (string->bytes "old image")) (new (string->bytes "new image")))
+          (labels ((write-image (name image)
+                     (with-open-file (stream (merge-pathnames name (physical-image-fd-path directory))
+                                             :direction :output :if-exists :error
+                                             :element-type '(unsigned-byte 8))
+                       (write-sequence image stream))
+                     (sb-posix:chmod
+                      (namestring (merge-pathnames name (physical-image-fd-path directory))) #o600)))
+            (write-image name old)
+            (when prefix (write-image (concatenate 'string name ".tmp") (subseq new 0 prefix)))
+            (funcall function directory check name old new))))
+      t))))
+
+(rove:deftest continuation-replacement-owns-phases-and-expires
+    (dolist (purpose '(:selector :slot-state))
+      (dolist (prefix '(nil 0 4 9))
+        (unit-continuation-replacement-fixture
+         purpose
+         (lambda (directory check name old new)
+           (let ((escaped nil))
+             (rove:ok
+              (equal '(17 :finished)
+                     (multiple-value-list
+                      (call-with-logical-slot-continuation-file-replacement
+                       directory purpose old new check
+                       (lambda (operation)
+                         (setf escaped operation)
+                         (rove:ok (eq :old (funcall operation :check)))
+                         (rove:ok (eq :prepared (funcall operation :prepare)))
+                         (rove:ok (eq :selected (funcall operation :replace)))
+                         (rove:ok (eq :synced (funcall operation :sync)))
+                         (rove:ok (equalp new (read-bounded-regular-file (merge-pathnames name (physical-image-fd-path directory)) 2048)))
+                         (values 17 :finished))))))
+             (rove:ok (handler-case (progn (funcall escaped :check) nil) (error () t)))))
+         prefix))))
+
+(rove:deftest continuation-replacement-failed-operation-stays-failed
+    (unit-continuation-replacement-fixture
+     :selector
+     (lambda (directory check name old new)
+       (declare (ignore name))
+       (let ((entered nil) (refused nil) (sticky nil))
+         (rove:ok
+          (handler-case
+              (progn
+                (call-with-logical-slot-continuation-file-replacement
+                 directory :selector old new check
+                 (lambda (operation)
+                   (setf entered t)
+                   (setf refused (handler-case (progn (funcall operation :replace) nil) (error () t)))
+                   (setf sticky (handler-case (progn (funcall operation :check) nil) (error () t)))))
+                nil)
+            (error () t)))
+         (rove:ok (and entered refused sticky))))))
+
+(rove:deftest continuation-replacement-rejects-foreign-operation
+    (unit-continuation-replacement-fixture
+     :slot-state
+     (lambda (directory check name old new)
+       (declare (ignore name))
+       (call-with-logical-slot-continuation-file-replacement
+        directory :slot-state old new check
+        (lambda (operation)
+          (rove:ok
+           (sb-thread:join-thread
+            (sb-thread:make-thread
+             (lambda () (handler-case (progn (funcall operation :prepare) nil) (error () t))))))
+          (rove:ok (eq :old (funcall operation :check))))))))
+
+(rove:deftest continuation-replacement-preserves-files-at-every-cut
+    (dolist (purpose '(:selector :slot-state))
+      (dolist (cut '(:after-write :after-temporary-sync :after-replace :after-selected-sync :after-directory-sync))
+        (unit-continuation-replacement-fixture
+         purpose
+         (lambda (directory check name old new)
+           (let* ((fds (length (directory #p"/proc/self/fd/*")))
+                  (tag (gensym "REPLACEMENT-CUT")) (hits 0)
+                  (*logical-slot-continuation-replacement-test-hook*
+                    (lambda (point)
+                      (when (eq point cut) (incf hits) (throw tag :injected))))
+                  (result
+                    (catch tag
+                      (call-with-logical-slot-continuation-file-replacement
+                       directory purpose old new check
+                       (lambda (operation)
+                         (funcall operation :prepare)
+                         (funcall operation :replace)
+                         (funcall operation :sync)
+                         :unexpected)))))
+             (rove:ok (and (eq result :injected) (= hits 1)))
+             (rove:ok (= fds (length (directory #p"/proc/self/fd/*"))))
+             (rove:ok
+              (equalp (if (member cut '(:after-write :after-temporary-sync)) old new)
+                      (read-bounded-regular-file (merge-pathnames name (physical-image-fd-path directory)) 2048)))
+             (rove:ok
+              (eq (not (null (member cut '(:after-write :after-temporary-sync))))
+                  (not (null (probe-file
+                              (merge-pathnames (concatenate 'string name ".tmp") (physical-image-fd-path directory)))))))
+             (funcall check)))))))
+
+(rove:deftest continuation-replacement-rejects-changed-temporary
+    (dolist (purpose '(:selector :slot-state))
+      (unit-continuation-replacement-fixture
+       purpose
+       (lambda (directory check name old new)
+         (let* ((path (merge-pathnames (concatenate 'string name ".tmp") (physical-image-fd-path directory)))
+                (entered nil) (fds (length (directory #p"/proc/self/fd/*"))))
+           (with-open-file (stream path :direction :output :if-exists :overwrite :element-type '(unsigned-byte 8))
+             (write-byte 255 stream))
+           (rove:ok
+            (handler-case
+                (progn
+                  (call-with-logical-slot-continuation-file-replacement
+                   directory purpose old new check (lambda (operation) (declare (ignore operation)) (setf entered t)))
+                  nil)
+              (error () t)))
+           (rove:ok (not entered))
+           (rove:ok (= fds (length (directory #p"/proc/self/fd/*"))))
+           (rove:ok (= 255 (aref (read-bounded-regular-file path 2048) 0)))))
+       4)))
+
+(rove:deftest continuation-replacement-rejects-selected-output-swap
+    (dolist (purpose '(:selector :slot-state))
+      (unit-continuation-replacement-fixture
+       purpose
+       (lambda (directory check name old new)
+         (let* ((selected (merge-pathnames name (physical-image-fd-path directory)))
+                (saved (merge-pathnames "../foreign-saved" (physical-image-fd-path directory)))
+                (entered nil) (refused nil) (sticky nil)
+                (fds (length (directory #p"/proc/self/fd/*")))
+                (*logical-slot-continuation-replacement-test-hook*
+                  (lambda (point)
+                    (when (eq point :after-replace)
+                      (setf entered t)
+                      (sb-posix:rename (namestring selected) (namestring saved))
+                      (with-open-file (stream selected :direction :output :if-exists :error
+                                                       :element-type '(unsigned-byte 8))
+                        (write-sequence new stream))
+                      (sb-posix:chmod (namestring selected) #o600)))))
+           (rove:ok
+            (handler-case
+                (progn
+                  (call-with-logical-slot-continuation-file-replacement
+                   directory purpose old new check
+                   (lambda (operation)
+                     (funcall operation :prepare)
+                     (setf refused (handler-case (progn (funcall operation :replace) nil) (error () t)))
+                     (setf sticky (handler-case (progn (funcall operation :sync) nil) (error () t)))))
+                  nil)
+              (error () t)))
+           (rove:ok (and entered refused sticky))
+           (rove:ok (= fds (length (directory #p"/proc/self/fd/*"))))
+           (rove:ok (probe-file saved))
+           (rove:ok (equalp new (read-bounded-regular-file selected 2048))))))))
+
+(cl-spec:defproperty continuation-replacement-resumes-exact-generated-prefixes
+    ((size (range integer 1 131089)) (seed (range integer 0 255)) (part (range integer 0 131089)))
+  (:about call-with-logical-slot-continuation-file-replacement)
+  (:trials (:normal 200))
+  (let* ((purpose (if (oddp seed) :slot-state :selector))
+         (size (if (eq purpose :slot-state) (1+ (mod size 2048)) size))
+         (prefix (mod part (1+ size)))
+         (image (make-array size :element-type '(unsigned-byte 8))))
+    (dotimes (i size) (setf (aref image i) (mod (+ seed (* 17 i)) 256)))
+    (unit-continuation-replacement-fixture
+     purpose
+     (lambda (directory check name old ignored)
+       (declare (ignore ignored))
+       (let ((path (merge-pathnames (concatenate 'string name ".tmp") (physical-image-fd-path directory))))
+         (with-open-file (stream path :direction :output :if-exists :error :element-type '(unsigned-byte 8))
+           (write-sequence image stream :end prefix))
+         (sb-posix:chmod (namestring path) #o600))
+       (and
+        (eq :synced
+            (call-with-logical-slot-continuation-file-replacement
+             directory purpose old image check
+             (lambda (operation)
+               (funcall operation :prepare)
+               (funcall operation :replace)
+               (funcall operation :sync))))
+        (equalp image
+                (read-bounded-regular-file
+                 (merge-pathnames name (physical-image-fd-path directory)) 131089)))))))
+
+(rove:deftest continuation-replacement-generated-prefix-contract
+    (let ((result (cl-spec:result-data
+                   (cl-spec:run-property
+                    'continuation-replacement-resumes-exact-generated-prefixes :seed 11508 :profile :normal))))
+      (format t "~&REPLACEMENT-PREFIX-CONTRACT ~s~%" result)
+      (rove:ok (eq :passed (getf result :status)))
+      (rove:ok (= 200 (getf result :trials)))))
+
+(rove:deftest continuation-replacement-closes-owned-inodes-after-mode-change
+    (dolist (purpose '(:selector :slot-state))
+      (dolist (kind '(:old :temporary :selected))
+        (unit-continuation-replacement-fixture
+         purpose
+         (lambda (directory check name old new)
+           (let ((fds (length (directory #p"/proc/self/fd/*")))
+                 (entered nil))
+             (rove:ok
+              (handler-case
+                  (progn
+                    (call-with-logical-slot-continuation-file-replacement
+                     directory purpose old new check
+                     (lambda (operation)
+                       (unless (eq kind :old) (funcall operation :prepare))
+                       (when (eq kind :selected) (funcall operation :replace))
+                       (setf entered t)
+                       (sb-posix:chmod
+                        (namestring
+                         (merge-pathnames (if (eq kind :temporary) (concatenate 'string name ".tmp") name)
+                                          (physical-image-fd-path directory)))
+                        #o640)))
+                    nil)
+                (error () t)))
+             (rove:ok entered)
+             (rove:ok (= fds (length (directory #p"/proc/self/fd/*"))))))))))
+
+(rove:deftest continuation-replacement-leaves-a-reused-descriptor-open
+    (dolist (kind '(:old :temporary :selected))
+      (unit-continuation-replacement-fixture
+       :selector
+       (lambda (directory check name old new)
+         (let ((foreign nil) (entered nil) (refused nil)
+                             (fds (length (directory #p"/proc/self/fd/*")))
+                             (path (merge-pathnames "../replacement-foreign" (physical-image-fd-path directory))))
+           (unwind-protect
+                (progn
+                  (rove:ok
+                   (handler-case
+                       (progn
+                         (call-with-logical-slot-continuation-file-replacement
+                          directory :selector old new check
+                          (lambda (operation)
+                            (unless (eq kind :old) (funcall operation :prepare))
+                            (when (eq kind :selected) (funcall operation :replace))
+                            (let* ((target (physical-image-file-facts
+                                            directory (if (eq kind :temporary) "selector.tmp" name)))
+                                   (matches
+                                     (loop for entry in (directory-entry-names #p"/proc/self/fd/" :follow-symlinks t)
+                                           for fd = (parse-integer entry)
+                                           for facts = (handler-case (physical-image-file-facts fd) (error () nil))
+                                           when (and facts
+                                                     (equal (logical-slot-copy-install-file-identity target)
+                                                            (logical-slot-copy-install-file-identity facts)))
+                                             collect fd)))
+                              (assert (= 1 (length matches)))
+                              (sb-posix:close (first matches))
+                              (setf foreign (sb-posix:open (namestring path)
+                                                           (logior sb-posix:o-rdwr sb-posix:o-creat sb-posix:o-excl
+                                                                   +postmaster-o-cloexec+) #o600))
+                              (assert (= foreign (first matches)))
+                              (setf entered t)
+                              (setf refused
+                                    (handler-case (progn (funcall operation :check) nil) (error () t))))))
+                         nil)
+                     (error () t)))
+                  (rove:ok (and entered refused))
+                  (rove:ok (equal (logical-slot-copy-install-file-identity (physical-image-file-facts foreign))
+                                  (logical-slot-copy-install-file-identity
+                                   (physical-image-file-facts -100 (namestring path))))))
+             (when foreign (sb-posix:close foreign)))
+           (rove:ok (= fds (length (directory #p"/proc/self/fd/*")))))))))
+
+(rove:deftest continuation-replacement-rejects-normal-partial-return
+    (dolist (phase '(:prepared :selected))
+      (unit-continuation-replacement-fixture
+       :selector
+       (lambda (directory check name old new)
+         (let ((fds (length (directory #p"/proc/self/fd/*"))) (entered nil))
+           (rove:ok
+            (handler-case
+                (progn
+                  (call-with-logical-slot-continuation-file-replacement
+                   directory :selector old new check
+                   (lambda (operation)
+                     (funcall operation :prepare)
+                     (when (eq phase :selected) (funcall operation :replace))
+                     (setf entered t)
+                     :partial))
+                  nil)
+              (error (condition) (search "returned before synchronization" (princ-to-string condition)))))
+           (rove:ok entered)
+           (rove:ok (= fds (length (directory #p"/proc/self/fd/*"))))
+           (rove:ok
+            (equalp (if (eq phase :selected) new old)
+                    (read-bounded-regular-file (merge-pathnames name (physical-image-fd-path directory)) 2048))))))))
+
 (cl-spec:defproperty continuation-initial-active-keeps-exact-saved-obligations
     ((generation (range integer 0 340282366920938463463374607431768211455))
      (restart (range integer 32 64)))
