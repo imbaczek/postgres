@@ -1289,6 +1289,34 @@
     (assert (= pins (hash-table-count *wal-snapshot-retention-pins*)))
     (assert (= fds (length (directory #p"/proc/self/fd/*"))))))
 
+(defun native-host-continuation-native-preflight (proof slot kind)
+  (let ((before (logical-slot-state-encode slot))
+        (pending (wal-replication-slot-pending-xids slot)))
+    (multiple-value-bind (record candidate ledger)
+        (logical-slot-continuation-native-preflight-under-lock proof)
+      (assert (= 2 (length ledger)))
+      (if (eq kind :unchanged)
+          (assert (and (null record) (eq candidate slot)))
+          (progn
+            (assert (not (eq slot candidate)))
+            (assert (eq :native-ack (getf record :kind)))
+            (assert (= (1+ (getf (getf record :old) :generation))
+                       (getf (getf record :new) :generation)))
+            (assert (equalp (logical-slot-continuation-native-proof-old-image proof)
+                            (logical-slot-continuation-encode (getf record :old))))
+            (assert (eq :old (logical-slot-continuation-prepared-classify
+                              record (getf (getf record :old) :slots))))
+            (assert (eq :new (logical-slot-continuation-prepared-classify
+                              record (getf (getf record :new) :slots))))
+            (assert (= (logical-slot-continuation-native-proof-target-lsn proof)
+                       (wal-replication-slot-confirmed-flush-lsn candidate)))
+            (assert (equal (logical-slot-continuation-native-proof-seal proof)
+                           (getf (getf record :new) :sealed-end))))))
+    (assert (equalp before (logical-slot-state-encode slot)))
+    (assert (eq pending (wal-replication-slot-pending-xids slot)))
+    (format t "~&NATIVE-ACK-FRESH-PREFLIGHT PASS slot=~a kind=~a no-persistence~%"
+            (wal-replication-slot-name slot) kind)))
+
 (defun native-host-continuation-native-proof-positive (scan target kind)
   (let* ((slot (wal-retained-slot-scan-slot scan))
          (name (wal-retained-slot-scan-name scan))
@@ -1337,6 +1365,7 @@
                            (logical-slot-continuation-native-proof-check-under-lock proof)
                            (assert (plusp calls)))
                       (setf (symbol-function 'physical-image-file-facts) original)))
+                  (native-host-continuation-native-preflight proof slot kind)
                   (assert (eq :claimed (logical-slot-continuation-native-proof-claim-under-lock proof)))
                   (assert (logical-slot-continuation-native-proof-check-under-lock proof))
                   (assert
@@ -1416,6 +1445,59 @@
         (assert (not (wal-replication-slot-state-uncertain-p slot)))))
     (format t "~&NATIVE-ACK-PROOF-CUTS PASS slot=~a before-mint late-selector-postcheck sticky-double-claim no-effects~%" name)))
 
+(defun native-host-continuation-native-preflight-cuts (scan target)
+  (let* ((name (wal-retained-slot-scan-name scan))
+         (other-name (if (string= name "alpha") "beta" "alpha"))
+         (other (gethash other-name *wal-replication-slots*))
+         (selector-path (merge-pathnames "pg_logical_continuation/selector" *pgdata*))
+         (other-path (merge-pathnames (format nil "pg_replslot/~a/state" other-name) *pgdata*)))
+    (dolist (cut '(:selector :saved-row :registry))
+      (let ((entered nil) (caught nil)
+                          (pins (hash-table-count *wal-snapshot-retention-pins*))
+                          (fds (length (directory #p"/proc/self/fd/*"))))
+        (call-with-logical-slot-continuation-native-proof
+         name target
+         (lambda (proof)
+           (setf entered t)
+           (sb-thread:with-mutex (*wal-lock*)
+             (let* ((old-selector (logical-slot-continuation-native-proof-old-image proof))
+                    (changed-selector (logical-slot-continuation-decode old-selector))
+                    (old-row (logical-slot-state-encode other))
+                    (changed-row (wal-copy-replication-slot-with-profile other)))
+               (incf (getf changed-selector :generation))
+               (incf (wal-replication-slot-confirmed-flush-lsn changed-row))
+               (unwind-protect
+                    (progn
+                      (ecase cut
+                        (:selector
+                         (native-host-continuation-write-selector-image
+                          selector-path (logical-slot-continuation-encode changed-selector)))
+                        (:saved-row
+                         (native-host-continuation-write-selector-image
+                          other-path (logical-slot-state-encode changed-row)))
+                        (:registry (setf (gethash "unexpected" *wal-replication-slots*) other)))
+                      (handler-case
+                          (progn (logical-slot-continuation-native-preflight-under-lock proof)
+                                 (error "native preflight accepted changed evidence"))
+                        (error (condition)
+                          (let ((message (princ-to-string condition)))
+                            (assert (search
+                                     (ecase cut
+                                       (:selector "selector differs")
+                                       (:saved-row "complete inventory differs")
+                                       (:registry "registry differs"))
+                                     message))
+                            (setf caught t)))))
+                 (ecase cut
+                   (:selector
+                    (native-host-continuation-write-selector-image selector-path old-selector))
+                   (:saved-row (native-host-continuation-write-selector-image other-path old-row))
+                   (:registry (remhash "unexpected" *wal-replication-slots*))))))))
+        (assert (and entered caught))
+        (assert (= pins (hash-table-count *wal-snapshot-retention-pins*)))
+        (assert (= fds (length (directory #p"/proc/self/fd/*"))))))
+    (format t "~&NATIVE-ACK-PREFLIGHT-CUTS PASS slot=~a changed-selector saved-row registry no-publication~%" name)))
+
 (defun native-host-continuation-native-proofs (scan source)
   (let* ((slot (wal-retained-slot-scan-slot scan))
          (fork (timeline-history-entry-begin
@@ -1428,6 +1510,7 @@
     (native-host-continuation-native-proof-positive scan confirmed :unchanged)
     (native-host-continuation-native-proof-positive scan target :advance)
     (native-host-continuation-native-proof-cuts scan target)
+    (native-host-continuation-native-preflight-cuts scan target)
     (let ((entered nil) (pins (hash-table-count *wal-snapshot-retention-pins*))
                         (fds (length (directory #p"/proc/self/fd/*"))))
       (assert

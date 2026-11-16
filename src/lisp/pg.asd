@@ -436,6 +436,7 @@
                    (:file "../replication/logical-slot-startup-publication")
                    (:file "../replication/logical-slot-imported-runtime-source")
                    (:file "../replication/logical-slot-continuation-native-proof")
+                   (:file "../replication/logical-slot-continuation-native-preflight")
                    (:file "../replication/logical-slot-copy-source-proof-reader-owner")
                    (:file "../replication/logical-slot-copy-source-proof-reader")
                    (:file "../replication/logical-slot-copy-source-proof-preparation")

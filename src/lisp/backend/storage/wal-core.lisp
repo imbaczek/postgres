@@ -3569,14 +3569,9 @@ durability before saving the slot."
     (ereport "55000" "imported slot acknowledgment requires a prepared continuation publication"))
   t)
 
-(defun wal-persist-replication-slot-ack-under-lock (slot acknowledged-lsn
-                                                    &optional (restart-floor acknowledged-lsn))
-  "Persist an already-validated acknowledgment while *WAL-LOCK* is held.
-Known provenance selects timeline owners from primary history; slots with
-unknown provenance retain the LSN-only path. The guarded update saves before publishing progress
-to the live slot. Startup and scan admission also check history, since no-op
-acknowledgments and resume paths can return before this helper."
-  (wal-check-slot-ack-publication-under-lock slot)
+(defun wal-replication-slot-ack-candidate-under-lock
+    (slot acknowledged-lsn &optional (restart-floor acknowledged-lsn))
+  (assert (sb-thread:holding-mutex-p *wal-lock*))
   (wal-require-logical-slot slot)
   (let* ((pending (wal-slot-pending-after-ack slot acknowledged-lsn))
          (candidate (wal-copy-replication-slot-with-profile slot)))
@@ -3591,7 +3586,18 @@ acknowledgments and resume paths can return before this helper."
                 (wal-replication-slot-confirmed-timeline candidate) confirmed-timeline))
         (setf (wal-replication-slot-restart-lsn candidate)
               (wal-slot-restart-for-ack restart-floor pending)))
-    (logical-slot-save-update-under-lock slot candidate)))
+    candidate))
+
+(defun wal-persist-replication-slot-ack-under-lock (slot acknowledged-lsn
+                                                    &optional (restart-floor acknowledged-lsn))
+  "Persist an already-validated acknowledgment while *WAL-LOCK* is held.
+Known provenance selects timeline owners from primary history; slots with
+unknown provenance retain the LSN-only path. The guarded update saves before publishing progress
+to the live slot. Startup and scan admission also check history, since no-op
+acknowledgments and resume paths can return before this helper."
+  (wal-check-slot-ack-publication-under-lock slot)
+  (logical-slot-save-update-under-lock
+   slot (wal-replication-slot-ack-candidate-under-lock slot acknowledged-lsn restart-floor)))
 
 (declaim (ftype function call-with-logical-slot-terminal-check))
 

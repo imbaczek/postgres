@@ -160,3 +160,55 @@
                (sb-thread:with-mutex (*wal-lock*)
                  (setf (gethash "cursor_source" *wal-replication-slots*) slot)
                  (wal-save-replication-slot slot)))))))))
+
+(rove:deftest continuation-native-ack-candidate-is-fresh-and-does-not-publish
+    (call-with-owned-cursor-test
+     (lambda (slot start middle end)
+       (let ((pending (wal-replication-slot-pending-xids slot))
+             (before (wal-encode-replication-slot slot))
+             (writes 0)
+             (original (symbol-function 'wal-save-replication-slot)))
+         (unwind-protect
+              (progn
+                (setf (symbol-function 'wal-save-replication-slot)
+                      (lambda (&rest ignored)
+                        (declare (ignore ignored))
+                        (incf writes)
+                        (error "candidate derivation attempted persistence")))
+                (sb-thread:with-mutex (*wal-lock*)
+                  (let ((first (wal-replication-slot-ack-candidate-under-lock slot middle)))
+                    (rove:ok (= middle (wal-replication-slot-restart-lsn first)))
+                    (setf (gethash 71 pending) (cons start end))
+                    (let ((second (wal-replication-slot-ack-candidate-under-lock slot middle)))
+                      (rove:ok (= start (wal-replication-slot-restart-lsn second)))
+                      (rove:ok (= middle (wal-replication-slot-confirmed-flush-lsn second)))
+                      (rove:ok (not (eq pending (wal-replication-slot-pending-xids second))))
+                      (rove:ok (equal (cons start end)
+                                      (gethash 71 (wal-replication-slot-pending-xids second))))
+                      (rove:ok (null (gethash 71 (wal-replication-slot-pending-xids first))))
+                      (rove:ok (eq (wal-replication-slot-logical-provenance slot)
+                                   (wal-replication-slot-logical-provenance second))))))
+                (rove:ok (zerop writes))
+                (rove:ok (eq pending (wal-replication-slot-pending-xids slot)))
+                (rove:ok (equalp before (wal-encode-replication-slot slot)))
+                (rove:ok (not (wal-replication-slot-state-uncertain-p slot))))
+           (setf (symbol-function 'wal-save-replication-slot) original))))))
+
+(rove:deftest continuation-native-preflight-rejects-unregistered-receipts-before-io
+    (rove:ok (fboundp 'logical-slot-continuation-native-preflight-under-lock))
+  (let ((reads 0) (original (symbol-function 'physical-image-file-facts)))
+    (unwind-protect
+         (progn
+           (setf (symbol-function 'physical-image-file-facts)
+                 (lambda (&rest arguments) (incf reads) (apply original arguments)))
+           (sb-thread:with-mutex (*wal-lock*)
+             (dolist (value (list nil (%make-logical-slot-continuation-native-proof
+                                       :state (lambda (&rest ignored)
+                                                (declare (ignore ignored))
+                                                (error "unregistered state must not run")))))
+               (rove:ok
+                (handler-case
+                    (progn (logical-slot-continuation-native-preflight-under-lock value) nil)
+                  (error () t)))))
+           (rove:ok (zerop reads)))
+      (setf (symbol-function 'physical-image-file-facts) original))))
