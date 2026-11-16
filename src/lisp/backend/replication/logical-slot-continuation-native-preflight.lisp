@@ -4,21 +4,22 @@
   ;; Reopen the sole selector and compare its exact bytes with the receipt,
   ;; then recheck the live proof before decoding the observed image.
   (let ((directory (logical-slot-continuation-native-proof-directory proof))
-        (expected (logical-slot-continuation-native-proof-old-image proof)))
+        (expected (logical-slot-continuation-native-proof-old-image proof))
+        (selected-facts nil))
     (unless (equal '("selector") (logical-slot-copy-import-control-names directory 3))
       (error "native writer requires one stable selector"))
     (call-with-logical-slot-copy-source-proof-fd
      directory "selector" nil
      (lambda (fd facts)
-       (declare (ignore facts))
        (unless (equalp expected
                        (logical-slot-copy-import-control-read-fd
                         fd (logical-slot-continuation-maximum-bytes)))
-         (error "native writer selector differs from its completed observation"))))
+         (error "native writer selector differs from its completed observation"))
+       (setf selected-facts (copy-list facts))))
     (unless (equal '("selector") (logical-slot-copy-import-control-names directory 3))
       (error "native writer selector directory changed"))
     (logical-slot-continuation-native-proof-check-under-lock proof)
-    (logical-slot-continuation-decode expected)))
+    (values (logical-slot-continuation-decode expected) selected-facts)))
 
 (defun logical-slot-continuation-native-preflight-registry (rows)
   ;; Every saved row must match the current registry incarnation, and the
@@ -59,9 +60,11 @@
       (let ((confirmed (wal-check-replication-slot-ack-under-lock
                         slot name target (wal-retained-slot-scan-owner scan))))
         (when (= target confirmed)
-          (logical-slot-continuation-native-preflight-selector proof)
-          (return-from logical-slot-continuation-native-preflight-under-lock
-            (values nil slot ledger))))
+          (multiple-value-bind (ignored selected-facts)
+              (logical-slot-continuation-native-preflight-selector proof)
+            (declare (ignore ignored))
+            (return-from logical-slot-continuation-native-preflight-under-lock
+              (values nil slot ledger selected-facts)))))
       (let* ((candidate (wal-replication-slot-ack-candidate-under-lock slot target))
              (new (logical-slot-continuation-copy old))
              (seal (copy-list (logical-slot-continuation-native-proof-seal proof)))
@@ -76,5 +79,7 @@
         (let ((record (list :version 1 :kind :native-ack :name name :old old :new new
                             :ack ack :restart-floor (copy-list ack) :proof-end (copy-list seal))))
           (logical-slot-continuation-prepared-check record)
-          (logical-slot-continuation-native-preflight-selector proof)
-          (values record candidate ledger))))))
+          (multiple-value-bind (ignored selected-facts)
+              (logical-slot-continuation-native-preflight-selector proof)
+            (declare (ignore ignored))
+            (values record candidate ledger selected-facts)))))))

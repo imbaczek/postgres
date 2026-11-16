@@ -183,6 +183,13 @@
       (if complete (error failure)
           (report-query-temp-cleanup-failure "continuation replacement" failure)))))
 
+(defun logical-slot-continuation-replacement-receipt (resource)
+  (copy-list
+   (physical-image-file-facts
+    (ecase (logical-slot-continuation-replacement-phase resource)
+      (:old (logical-slot-continuation-replacement-old-fd resource))
+      (:synced (logical-slot-continuation-replacement-new-fd resource))))))
+
 (defun call-with-logical-slot-continuation-file-replacement
     (directory purpose old-image new-image guard function)
   ;; Lend a thread-bound operation callback over bounded opaque images and the
@@ -223,12 +230,15 @@
                           (multiple-value-prog1
                               (sb-sys:with-local-interrupts
                                 (logical-slot-continuation-replacement-check resource)
-                                (ecase operation
-                                  (:check nil)
-                                  (:prepare (logical-slot-continuation-replacement-prepare resource))
-                                  (:replace (logical-slot-continuation-replacement-replace resource))
-                                  (:sync (logical-slot-continuation-replacement-sync resource)))
-                                (logical-slot-continuation-replacement-check resource))
+                                (let ((result
+                                        (ecase operation
+                                          (:check nil)
+                                          (:prepare (logical-slot-continuation-replacement-prepare resource))
+                                          (:replace (logical-slot-continuation-replacement-replace resource))
+                                          (:sync (logical-slot-continuation-replacement-sync resource))
+                                          (:receipt (logical-slot-continuation-replacement-receipt resource)))))
+                                  (let ((phase (logical-slot-continuation-replacement-check resource)))
+                                    (if (eq operation :receipt) result phase))))
                             (setf finished t))
                        (unless finished (setf failed t)))))))
         (sb-sys:without-interrupts

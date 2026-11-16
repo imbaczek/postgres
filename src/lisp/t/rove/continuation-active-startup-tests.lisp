@@ -199,6 +199,49 @@
              (rove:ok (handler-case (progn (funcall escaped :check) nil) (error () t)))))
          prefix))))
 
+(rove:deftest continuation-replacement-receipts-bind-selected-inodes
+    (dolist (purpose '(:selector :slot-state))
+      (unit-continuation-replacement-fixture
+       purpose
+       (lambda (directory check name old new)
+         (call-with-logical-slot-continuation-file-replacement
+          directory purpose old new check
+          (lambda (operation)
+            (let ((before (funcall operation :receipt)))
+              (rove:ok (equal before (physical-image-file-facts directory name)))
+              (setf (second before) -1)
+              (rove:ok (not (equal before (funcall operation :receipt)))))
+            (funcall operation :prepare)
+            (funcall operation :replace)
+            (funcall operation :sync)
+            (rove:ok (equal (funcall operation :receipt)
+                            (physical-image-file-facts directory name)))))))))
+
+(rove:deftest continuation-replacement-receipts-refuse-partial-phases
+    (dolist (purpose '(:selector :slot-state))
+      (dolist (phase '(:prepared :replaced))
+        (unit-continuation-replacement-fixture
+         purpose
+         (lambda (directory check name old new)
+           (declare (ignore name))
+           (let ((refused nil) (sticky nil))
+             (rove:ok
+              (handler-case
+                  (progn
+                    (call-with-logical-slot-continuation-file-replacement
+                     directory purpose old new check
+                     (lambda (operation)
+                       (funcall operation :prepare)
+                       (when (eq phase :replaced) (funcall operation :replace))
+                       (setf refused
+                             (handler-case (progn (funcall operation :receipt) nil) (error () t)))
+                       (setf sticky
+                             (handler-case (progn (funcall operation :check) nil) (error () t)))))
+                    nil)
+                (error () t)))
+             (rove:ok refused)
+             (rove:ok sticky)))))))
+
 (rove:deftest continuation-replacement-failed-operation-stays-failed
     (unit-continuation-replacement-fixture
      :selector
