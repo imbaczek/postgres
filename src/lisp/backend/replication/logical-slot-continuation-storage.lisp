@@ -153,6 +153,7 @@
 ;; This is a directory resource, not a slot writer or mutation authority.
 
 (defun logical-slot-continuation-storage-scan-source (owner archive)
+  ;; Return the registered scan and source only within runtime storage scope.
   (unless archive (error "scan source requires runtime storage"))
   (values (logical-slot-imported-scan-owner-scan owner)
           (logical-slot-imported-scan-owner-source owner)))

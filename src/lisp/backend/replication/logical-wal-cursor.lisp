@@ -715,6 +715,9 @@ validation and FINISH, including any slot save performed there."
         :archive archive :batch-policy :logical-reader)))))
 
 (defun call-with-logical-slot-terminal-scan (name target prepare function &key end)
+  ;; Prepare under WAL exclusion, then lend a pinned terminal scan and its
+  ;; captured source to the callback.  END, when supplied, bounds the frozen
+  ;; interval; the scope and pin are released even on a nonlocal exit.
   (let ((scan nil) (source nil) (owner nil) (role nil) (scope nil) (owned-pin nil)
                    (*wal-retained-slot-scan-scopes* *wal-retained-slot-scan-scopes*))
     (unwind-protect

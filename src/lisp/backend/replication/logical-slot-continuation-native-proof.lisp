@@ -3,6 +3,8 @@
 (defstruct (logical-slot-continuation-native-proof
             (:constructor %make-logical-slot-continuation-native-proof)
             (:print-function physical-libpq-print-private-object))
+  ;; A completed, scoped observation, bound to its thread and live resources.
+  ;; Its detached images and seal do not themselves authorize a slot write.
   (storage nil :read-only t) (scan nil :read-only t) (source nil :read-only t)
   (directory nil :read-only t) (slot-root nil :read-only t) (target-directory nil :read-only t)
   (binding nil :read-only t) (old-image nil :read-only t) (seal nil :read-only t)
@@ -19,6 +21,9 @@
     (funcall *logical-slot-continuation-native-proof-test-hook* point value)))
 
 (defun logical-slot-continuation-native-proof-result (snapshot name target found)
+  ;; Require an established saved confirmation.  An unchanged target needs no
+  ;; rediscovery; an advance must be a terminal batch found by the scan.
+  ;; The proof seal is H = max(S, target), later bounded by captured horizon L.
   (logical-slot-continuation-check snapshot)
   (let* ((row (find name (getf snapshot :slots) :key #'first :test #'string=))
          (slot (and row (logical-slot-continuation-prepared-slot (second row) name)))
@@ -41,6 +46,8 @@
 
 (defun logical-slot-continuation-read-native-proof
     (storage facts scan source owner role target)
+  ;; The callback builds a draft after draining and checking its cursor.
+  ;; The observation wrapper finishes all postchecks before returning it.
   (call-with-logical-slot-continuation-runtime-observation
    storage facts scan source owner role
    (lambda (cursor actual-source snapshot image)
@@ -59,6 +66,8 @@
    :batch-policy :logical-reader))
 
 (defun call-with-logical-slot-continuation-native-resources (scan source function)
+  ;; Hold the real terminal source, origin, storage, slot root, target directory
+  ;; and independent fork pin throughout observation and receipt use.
   (unless (eq :terminal-check (logical-wal-source-purpose source))
     (error "native proof requires its terminal source"))
   (call-with-logical-slot-continuation-runtime-storage
@@ -82,6 +91,8 @@
                                :target-check target-check :pin-check pin-check))))))))))))
 
 (defun call-with-logical-slot-continuation-native-proof-check (proof function)
+  ;; Recheck the registered receipt and its live resources under WAL exclusion.
+  ;; A nonlocal exit from its checked operation poisons the registered receipt.
   (assert (sb-thread:holding-mutex-p *wal-lock*))
   (unless (logical-slot-continuation-native-proof-p proof)
     (error "native terminal proof requires its completed receipt"))
@@ -105,10 +116,14 @@
   (call-with-logical-slot-continuation-native-proof-check proof (lambda () proof)))
 
 (defun logical-slot-continuation-native-proof-claim-under-lock (proof)
+  ;; Claim once; this does not grant writer authority or replace fresh preflight.
   (call-with-logical-slot-continuation-native-proof-check
    proof (lambda () (funcall (logical-slot-continuation-native-proof-state proof) :claim proof))))
 
 (defun call-with-logical-slot-continuation-native-proof (name target function &optional expected-owner)
+  ;; Mint a point-in-time receipt only after the inner observation and all its
+  ;; postchecks finish, while the outer resources remain live.  This does not
+  ;; bypass ACK, admission or GC fences; a writer still needs fresh preflight.
   (unless (and (typep target '(unsigned-byte 64)) (functionp function))
     (error "native terminal proof requires a target and a callback"))
   (call-with-logical-slot-terminal-scan

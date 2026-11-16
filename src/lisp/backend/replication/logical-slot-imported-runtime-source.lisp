@@ -319,6 +319,9 @@
 
 (defun call-with-logical-slot-continuation-runtime-observation
     (storage facts scan source owner role function &key (batch-policy :logical-reader))
+  ;; Share the checked observation for stream and terminal sources, requiring
+  ;; the exact scan and source held by storage.  The callback result escapes
+  ;; only after the cursor, selector, sidecar and tail checks finish.
   (unless (and (logical-slot-continuation-runtime-storage-p storage)
                (member (logical-wal-source-purpose source) '(:stream :terminal-check)))
     (error "runtime observation requires its registered source purpose"))
