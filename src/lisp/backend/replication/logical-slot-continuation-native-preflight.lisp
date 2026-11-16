@@ -21,6 +21,9 @@
     (logical-slot-continuation-native-proof-check-under-lock proof)
     (values (logical-slot-continuation-decode expected) selected-facts)))
 
+;; Compare ordinary slots as decoded candidates so compatible disk encodings
+;; compare by state.  Child slots still require their exact encoded image; the
+;; separate inventory ledger retains the raw bytes for every slot.
 (defun logical-slot-continuation-native-preflight-registry (rows)
   (unless (= (length rows) (hash-table-count *wal-replication-slots*))
     (error "native writer registry differs from its complete inventory"))

@@ -155,7 +155,7 @@
 (defun call-with-logical-slot-continuation-cold-source-readers
     (storage source observation archive check-source function &key policy receipt)
   ;; S is the selected sealed end and L the observed durable horizon (S <= L).
-  ;; Each reserved slot reads continuously from its start through L, carrying
+  ;; Each reserved selected child reads continuously from its start through L, carrying
   ;; pending transactions across any D, F and S seams it crosses. Reprove
   ;; before returning outward.
   (let* ((facts (logical-slot-continuation-storage-call storage :facts))
@@ -234,11 +234,8 @@
                     (sb-sys:without-interrupts (setf active nil)))))))))
        :boundaries #'boundaries :end horizon :batch-policy :logical-reader :require-closed nil :transcript policy :witness receipt))))
 
-;; :POLICY also checks each saved slot's lifetime against the proved policy.
-
-;; :RECEIPT requires :POLICY and passes the proof as a fifth callback argument.
-;; Without :RECEIPT the callback keeps its four-argument interface.
-
+;; Known ordinary slots use their own eligibility check and local startup scan.
+;; Legacy slots use the bounded local scan without asserting missing provenance.
 (defun logical-slot-continuation-cold-reconstruct-ordinary (source slot)
   (when (and (wal-logical-slot-p slot)
              (eq :reserved (wal-replication-slot-wal-status slot)))
@@ -255,7 +252,9 @@
 (defun call-with-logical-slot-continuation-cold-reconstruction (gate ownership function &key policy receipt)
   ;; Reconstruct every saved reserved candidate privately through the actual
   ;; durable horizon L before the callback. This scope does not publish slots
-  ;; or grant admission.
+  ;; or grant admission. :POLICY checks the selected children's lifetimes.
+  ;; :RECEIPT requires :POLICY and adds its proof as a fifth callback argument;
+  ;; without it, the callback keeps its four-argument interface.
   (when (and receipt (not policy)) (error "cold reconstruction receipt requires its policy proof"))
   (call-with-logical-slot-continuation-cold-context
    gate ownership

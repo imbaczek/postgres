@@ -21,8 +21,8 @@
     (funcall state :identity protection)
     (funcall state operation protection value)))
 
-;; The selected children are a subset of the registry.  Check their identities
-;; and require every other entry to be an admissible persistent physical slot.
+;; The selected children are a subset of the registry. Check their saved
+;; identities and validate every ordinary entry under its own slot contract.
 (defun logical-slot-continuation-protection-check-registry
     (registry members identities system-id history frontier)
   (unless (and (<= (length members) (hash-table-count registry))
@@ -35,6 +35,7 @@
                                    (cdr expected)))))
                       members identities))
     (error "continuation protection registry differs from its saved group"))
+  ;; Other entries may be ordinary persistent logical or physical slots.
   (logical-slot-continuation-check-ordinary-registry
    registry members system-id history frontier)
   t)

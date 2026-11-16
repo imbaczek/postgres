@@ -74,6 +74,7 @@
     (logical-slot-startup-check-authority source)))
 
 (defun logical-slot-startup-scan-pending (source slot cursor)
+  ;; The caller establishes candidate and cursor authority before this scan.
   (let ((progress (make-logical-slot-startup-progress (wal-replication-slot-confirmed-flush-lsn slot)))
         (*wal-recovery-reservation-batch-clean-p* nil))
     (loop
@@ -132,6 +133,9 @@
     (unless (eql last (logical-slot-startup-source-end source))
       (error "empty legacy restart lacks its checked durable record boundary"))))
 
+;; Legacy slots have no provenance to prove a parent origin.  Scan only the
+;; bounded local child interval with a cursor, avoiding WAL scan tail truncation.
+;; An empty interval needs a separate proof of the durable record boundary.
 (defun logical-slot-startup-derive-legacy-pending (source slot)
   (logical-slot-startup-check-authority source)
   (unless (and (logical-slot-imported-startup-source-p source)

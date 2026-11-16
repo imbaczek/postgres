@@ -1,5 +1,8 @@
 (in-package #:pg)
 
+;; Known ordinary slots must belong to this system and have a generation
+;; distinct from certified children.  Legacy slots lack that identity: for a
+;; reserved slot, require a restart on the local child without claiming origin.
 (defun logical-slot-continuation-check-ordinary-logical
     (slot system-id history frontier child-provenances)
   (unless (and (logical-slot-state-valid-p slot)
@@ -28,9 +31,8 @@
           (error "legacy ordinary slot requires a local child restart"))))
   slot)
 
-;; Ordinary slots admitted alongside the continuation must be persistent
-;; physical slots. Validate their state and any reserved restart against the
-;; current history.
+;; Check persistent ordinary slots beside the certified children. Physical
+;; and logical slots keep their own state and position checks.
 (defun logical-slot-continuation-check-ordinary-slot
     (slot system-id history frontier &optional child-provenances)
   (unless (and (wal-replication-slot-p slot)
@@ -66,6 +68,8 @@
   (unless (and (wal-replication-slot-p value)
                (not (assoc (wal-replication-slot-name value) members :test #'string=)))
     (error "ordinary slot is outside its live registry"))
+  ;; A copied logical candidate must retain its immutable identity and match
+  ;; the kind of the live entry bound to this name.
   (let ((live (gethash (wal-replication-slot-name value) registry)))
     (unless (and (wal-replication-slot-p live)
                  (eq (wal-physical-slot-p live) (wal-physical-slot-p value)))
@@ -75,8 +79,8 @@
     (logical-slot-continuation-check-ordinary-slot value system-id history frontier)))
 
 ;; Split the full saved inventory into certified child rows and ordinary
-;; physical rows, preserving their order.  Check names, child state and physical
-;; positions before returning either list.
+;; rows, preserving their order. Check child certificates separately from
+;; ordinary slot state; callers still retain the complete raw inventory.
 (defun logical-slot-continuation-partition-rows (rows certificate host)
   (logical-slot-copy-descriptor-list-count rows +logical-slot-continuation-obligation-limit+)
   (logical-slot-copy-descriptor-list-count

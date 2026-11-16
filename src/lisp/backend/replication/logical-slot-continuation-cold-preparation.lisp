@@ -29,8 +29,8 @@
 ;; Retain the original candidate identities and freeze their registry image,
 ;; including reconstructed pending transactions, for later comparison.
 
-;; Build the complete candidate registry.  Restore physical slots with a
-;; startup inactivity time; child logical slots are reconstructed separately.
+;; Build the complete candidate registry. Restore physical slots with a
+;; startup inactivity time; logical pending state is ready before this step.
 (defun logical-slot-continuation-cold-prepare-registry (source)
   (logical-slot-startup-check-inventory source)
   (let ((candidates (mapcar #'logical-slot-startup-entry-slot
@@ -42,6 +42,7 @@
                           (or (wal-physical-slot-p slot) (wal-logical-slot-p slot))))
                    candidates)
       (error "cold continuation preparation has an unsupported candidate"))
+    ;; Check known candidates before assembling the mixed registry.
     (logical-slot-startup-prepare-known-candidates candidates #'identity)
     (dolist (slot candidates)
       (when (some #'identity (subseq (logical-slot-publication-slot-transients slot) 0 6))
