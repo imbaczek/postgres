@@ -87,20 +87,23 @@ This private cursor does not validate the archive or confer authority."
                      (getf base :source-checkpoint) (getf base :source-reservation) nil
                      (getf base :base-source-resource-fact)
                      (getf base :base-source-fpw-fact) (getf base :base-source-logical-fact)))
-         (result
-           (physical-follow-scan-replay-from-seed-core
-            candidate base (list fork parent) (list fork parent) (getf control :next-xid) seed
-            (lambda (function start)
-              (logical-slot-copy-source-proof-map-archive
-               facts directory reader candidate function start))
-            nil)))
+         (scan
+           (multiple-value-list
+            (physical-follow-scan-replay-from-seed-core
+             candidate base (list fork parent) (list fork parent) (getf control :next-xid) seed
+             (lambda (function start)
+               (logical-slot-copy-source-proof-map-archive
+                facts directory reader candidate function start))
+             nil)))
+         (result (first scan))
+         (completed (second scan)))
     (unless (and (null (getf result :disposition))
                  (= fork (getf result :terminal))
                  (= parent (getf result :timeline))
                  (= (getf control :next-xid) (getf result :next-xid))
                  (equal (getf facts :fact) (getf result :applied-logical-fact)))
       (error "permanent source archive replay differs from its recorded F fact"))
-    result))
+    (values result completed)))
 
 (defun logical-slot-copy-source-proof-check-archive-prefix (facts directory reader)
   ;; Match the saved F prefix against the selected archived segment.

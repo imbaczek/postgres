@@ -526,6 +526,13 @@ Return nine values, including optional resource, FPW and logical facts."
               (physical-restartpoint-fpw-seed metadata base store start)
               (physical-restartpoint-logical-seed metadata base store start)))))
 
+(defun physical-follow-scan-policy-fields (applied-fpw required-fpw applied-logical required-logical)
+  (append
+   (when (or applied-fpw required-fpw)
+     (list :applied-fpw-fact applied-fpw :required-fpw-fact required-fpw))
+   (when (or applied-logical required-logical)
+     (list :applied-logical-fact applied-logical :required-logical-fact required-logical))))
+
 ;; Shared read-only scan from a supplied seed and record mapper.  Callers must
 ;; establish the seed and durable-position authority appropriate to their use.
 (defun physical-follow-scan-replay-from-seed-core
@@ -546,6 +553,7 @@ A policy fence must leave a clean batch boundary; an allowed open tail may remai
            (applied-resource-fact nil) (required-resource-fact nil)
            (fpw-fact (physical-fpw-copy-fact fpw-fact))
            (logical-fact (physical-logical-copy-fact logical-fact))
+           (completed-checkpoint snapshot)
            (applied-logical-fact nil) (required-logical-fact nil)
            (applied-fpw-fact nil) (required-fpw-fact nil)
            (history (lambda () (physical-recovery-resource-history candidate *physical-recovery-state*)))
@@ -627,7 +635,8 @@ A policy fence must leave a clean batch boundary; an allowed open tail may remai
                                         candidate *physical-recovery-state*)))
                            fpw-fact (physical-replay-fpw-fact-next fpw-fact record timeline history)
                            logical-fact (physical-replay-logical-fact-next logical-fact record timeline history)
-                           terminal (wal-record-end record))
+                           terminal (wal-record-end record)
+                           completed-checkpoint (getf *physical-recovery-state* :source-checkpoint))
                      (note-boundary)))
                  start))
           (unless (and applied-seen required-seen witness-seen
@@ -637,14 +646,15 @@ A policy fence must leave a clean batch boundary; an allowed open tail may remai
                                (and (not *wal-recovery-group-active*)
                                     (= terminal (physical-store-flushed-lsn candidate))))))
             (error "follow replay does not reach clean recovery boundaries"))))
-      (append (list :disposition disposition :start start :terminal terminal :timeline timeline :next-xid next
-                    :required-next-xid required-next
-                    :applied-resource-fact applied-resource-fact :required-resource-fact required-resource-fact
-                    :reservation reservation :source-xids source-xids)
-              (when (or applied-fpw-fact required-fpw-fact)
-                (list :applied-fpw-fact applied-fpw-fact :required-fpw-fact required-fpw-fact))
-              (when (or applied-logical-fact required-logical-fact)
-                (list :applied-logical-fact applied-logical-fact :required-logical-fact required-logical-fact))))))
+      (values
+       (append (list :disposition disposition :start start :terminal terminal :timeline timeline :next-xid next
+                     :required-next-xid required-next
+                     :applied-resource-fact applied-resource-fact :required-resource-fact required-resource-fact
+                     :reservation reservation :source-xids source-xids)
+               (physical-follow-scan-policy-fields
+                applied-fpw-fact required-fpw-fact applied-logical-fact required-logical-fact))
+       (list :logical-fact (physical-logical-copy-fact logical-fact)
+             :source-checkpoint (copy-tree completed-checkpoint))))))
 
 ;; The ordinary replay path retains its durable required-position checks and
 
