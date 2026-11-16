@@ -171,7 +171,9 @@
 
 (defun call-with-logical-slot-continuation-local-tail-source (storage snapshot function &key boundaries
                                                                                           (end (first (getf snapshot :sealed-end))) (batch-policy :strict) (require-closed t))
-  ;; Prove the locally present original-child WAL from F to the sealed end.
+  ;; Prove locally present original-child WAL from F to END.  END defaults to
+  ;; historical seal S and must satisfy S <= END <= captured horizon L.
+  ;; Strict batch handling and a closed end remain the defaults.
   ;; The first pass records exact frames and a segment ledger; the second
   ;; compares frames, segment facts and ordered visits.  Hold one segment FD
   ;; at a time and keep the transcript in a private temporary directory.

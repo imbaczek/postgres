@@ -36,6 +36,10 @@ def main():
         'stable-durable': ('stable-durable', 2, 'STABLE', 'STABLE', False),
         'stable-durable-extended': ('stable-durable', 2, 'STABLE', 'STABLE', True),
     }
+    # Opt in with matching variant roots: parent-before-D uses
+    # PG_NATIVE_COLD_PROOF=parent-boundaries; happy-abandoned uses
+    # PG_NATIVE_COLD_PROOF=selected-boundaries. Older retained roots may lack
+    # these variants, so defaults keep the original nine classification cases.
     cases = os.environ.get('PG_NATIVE_COLD_CASES', ','.join(definitions)).split(',')
     definitions['parent-before-D'] = ('parent-before-D', 2, 'STABLE', 'STABLE', False)
     definitions['happy-abandoned'] = ('happy-abandoned', 3, 'STABLE', 'STABLE', False)

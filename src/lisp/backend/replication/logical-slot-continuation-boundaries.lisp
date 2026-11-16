@@ -22,6 +22,11 @@
                    (= (wal-record-start record) (logical-wal-eor-position fork))))))))
 
 (defun logical-slot-continuation-boundary-observer (requests &key fork checkpoint (batch-policy :strict))
+  ;; Strict is the default; logical-reader accepts the reader's batch-start
+  ;; policy when the caller has selected it.  Both policies require completed
+  ;; obligations and a closed batch at finish.  A standalone checkpoint is
+  ;; allowed only as the first observed record, at the exact certified position
+  ;; and with the certified bytes.  It cannot certify a saved ACK.
   (unless (member batch-policy '(:strict :logical-reader))
     (error "unsupported continuation boundary batch policy"))
   (logical-slot-copy-descriptor-list-count requests (* 2 +logical-slot-continuation-obligation-limit+))
@@ -126,6 +131,8 @@
     (nreverse requests)))
 
 (defun logical-slot-continuation-parent-proof-start (certificate history requests base)
+  ;; A request before the archive base needs an earlier certified reserved
+  ;; restart as its sidecar anchor.  Without one the prefix cannot be proved.
   (let ((limit (reduce #'min requests :key #'second))
         (position nil))
     (logical-slot-copy-descriptor-list-count
@@ -152,6 +159,8 @@
 
 (defun logical-slot-continuation-prove-parent-prefix
     (storage facts archive requests batch-policy)
+  ;; Carry one observer from the sidecar through the archive to the fork.
+  ;; This checks obligations and batch closure across the D seam as well as F.
   (let* ((certificate (getf facts :certificate))
          (fork (getf certificate :fork))
          (base (getf (logical-wal-archive-reference archive) :base))

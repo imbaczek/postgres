@@ -95,6 +95,8 @@
               (sb-thread:with-mutex (mutex) (funcall (car failure)))))))))
 
 (defun call-with-logical-slot-continuation-cold-state (gate ownership function)
+  ;; Keep the public state callback inside the same owner, origin and
+  ;; reservation lifetime as the cold context and its observation.
   (unless (functionp function) (error "cold continuation requires a callback"))
   (call-with-logical-slot-continuation-cold-context
    gate ownership
