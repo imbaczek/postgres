@@ -73,6 +73,19 @@
   (multiple-value-prog1 (logical-wal-cursor-next cursor)
     (logical-slot-startup-check-authority source)))
 
+(defun logical-slot-startup-scan-pending (source slot cursor)
+  (let ((progress (make-logical-slot-startup-progress (wal-replication-slot-confirmed-flush-lsn slot)))
+        (*wal-recovery-reservation-batch-clean-p* nil))
+    (loop
+      (multiple-value-bind (record bytes record-owner carrier kind)
+          (logical-slot-startup-next-record source cursor)
+        (declare (ignore bytes record-owner carrier))
+        (unless record (return))
+        (logical-slot-startup-accept-record progress record kind)))
+    (unless (= (logical-wal-cursor-position cursor) (logical-slot-startup-source-end source))
+      (error "startup pending reconstruction did not reach its captured horizon"))
+    (logical-slot-startup-progress-pending progress)))
+
 (defun logical-slot-startup-derive-pending-with-cursor (source slot cursor)
   ;; Reuse the pending reconstruction for this exact captured source,
   ;; candidate, history and horizon.  It does not publish a registry entry.
@@ -86,17 +99,7 @@
                (eq (logical-wal-cursor-namespace cursor) (logical-slot-startup-source-namespace source))
                (equalp (logical-wal-cursor-history cursor) (logical-slot-startup-source-history source)))
     (error "startup pending reconstruction requires its captured candidate and exact cursor"))
-  (let ((progress (make-logical-slot-startup-progress (wal-replication-slot-confirmed-flush-lsn slot)))
-        (*wal-recovery-reservation-batch-clean-p* nil))
-    (loop
-      (multiple-value-bind (record bytes record-owner carrier kind)
-          (logical-slot-startup-next-record source cursor)
-        (declare (ignore bytes record-owner carrier))
-        (unless record (return))
-        (logical-slot-startup-accept-record progress record kind)))
-    (unless (= (logical-wal-cursor-position cursor) (logical-slot-startup-source-end source))
-      (error "startup pending reconstruction did not reach its captured horizon"))
-    (logical-slot-startup-progress-pending progress)))
+  (logical-slot-startup-scan-pending source slot cursor))
 
 (defun logical-slot-startup-derive-pending (source slot &optional archive)
   ;; An open or abandoned batch contributes no staged first positions.  This
@@ -115,6 +118,54 @@
      owner role (lambda () (logical-slot-startup-check-source source))
      (lambda (cursor) (logical-slot-startup-derive-pending-with-cursor source slot cursor))
      :archive archive :batch-policy :logical-reader)))
+
+(defun logical-slot-startup-check-legacy-empty-boundary (source begin tip)
+  (let ((last nil))
+    (call-with-logical-wal-cursor
+     (logical-slot-startup-source-history source) (logical-slot-startup-source-namespace source)
+     begin (logical-slot-startup-source-end source) tip :record-start
+     (lambda () (logical-slot-startup-check-source source))
+     (lambda (cursor)
+       (loop for record = (logical-slot-startup-next-record source cursor)
+             while record do (setf last (wal-record-end record))))
+     :batch-policy :logical-reader)
+    (unless (eql last (logical-slot-startup-source-end source))
+      (error "empty legacy restart lacks its checked durable record boundary"))))
+
+(defun logical-slot-startup-derive-legacy-pending (source slot)
+  (logical-slot-startup-check-authority source)
+  (unless (and (logical-slot-imported-startup-source-p source)
+               (find slot (logical-slot-startup-source-entries source)
+                     :key #'logical-slot-startup-entry-slot :test #'eq)
+               (wal-logical-slot-p slot) (logical-slot-state-valid-p slot)
+               (null (wal-replication-slot-logical-provenance slot))
+               (null (wal-replication-slot-child-owner slot))
+               (eq :reserved (wal-replication-slot-wal-status slot)))
+    (error "legacy startup requires its captured ordinary logical candidate"))
+  (logical-slot-startup-inventory-call source :observe)
+  (let* ((history (logical-slot-startup-source-history source))
+         (tip (timeline-history-entry-timeline (first history)))
+         (begin (timeline-history-entry-begin (first history)))
+         (start (wal-replication-slot-restart-lsn slot))
+         (end (logical-slot-startup-source-end source))
+         (confirmed (wal-replication-slot-confirmed-flush-lsn slot)))
+    (unless (and (<= begin start end)
+                 (<= (wal-replication-slot-consistent-lsn slot) end)
+                 (or (null confirmed) (<= confirmed end)))
+      (error "legacy startup requires a bounded local child interval"))
+    (multiple-value-prog1
+        (if (= start end)
+            (progn
+              (logical-slot-startup-check-legacy-empty-boundary source begin tip)
+              (make-hash-table :test #'eql))
+            (call-with-logical-wal-cursor
+             history (logical-slot-startup-source-namespace source) start end
+             tip (if (= start begin) :record-start :prefix-end)
+             (lambda () (logical-slot-startup-check-source source))
+             (lambda (cursor) (logical-slot-startup-scan-pending source slot cursor))
+             :batch-policy :logical-reader))
+      (logical-slot-startup-inventory-call source :observe)
+      (logical-slot-startup-check-authority source))))
 
 (defun logical-slot-on-coverage
     (state history required owner role through through-owner)
