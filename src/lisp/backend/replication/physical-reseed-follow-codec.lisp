@@ -223,6 +223,10 @@
   (let ((record (physical-backup-lease-decode-literal
                  "PGRESEEDFOLLOW1" bytes +physical-reseed-follow-maximum-bytes+
                  #'physical-reseed-follow-copy)))
+    ;; The literal decoder has normalized the record and required an exact
+    ;; canonical re-encoding.  Its input length therefore checks capacity and
+    ;; reserve without copying and rendering the record again.  This does not
+    ;; establish authority to use the decoded record.
     (physical-reseed-follow-check-image-capacity
      record (length bytes) +physical-reseed-follow-maximum-bytes+)
     record))
