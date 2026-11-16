@@ -62,6 +62,9 @@ class ColdPlanContracts(unittest.TestCase):
                     [{'case': 'happy', 'proof': False}],
                     [{'case': 'corrupt-selector', 'proof': 'prepare'}],
                     [{'case': 'happy', 'spill': 'yes'}],
+                    [{'case': 'happy', 'proof': 'prepare', 'cut': 'after-state-sync'}],
+                    [{'case': 'happy', 'proof': 'reconcile', 'cut': 'unknown'}],
+                    [{'case': 'happy', 'proof': 'reconcile', 'cut': False}],
                     [{'case': 'happy', 'label': '../outside'}],
                     [{'case': 'happy', 'label': ''}],
                     [{'case': 'happy', 'variant_root': 7}],
@@ -181,6 +184,53 @@ class ColdPlanContracts(unittest.TestCase):
         self.assertEqual(1, len(children))
         self.assertEqual(7, results[0]['exit_code'])
         self.assertFalse(results[0]['passed'])
+
+    def crash_children(self, *, first_exit=-9, changed_seal=False):
+        row = dict(case='happy', proof='reconcile', cut='slot-state-after-unlink')
+        env = dict(PG_NATIVE_COLD_RECONCILE_CUT=row['cut'], PG_NATIVE_COLD_APPEND='1')
+        calls = []
+
+        def child(command, actual, log, lease, run_lock, workspace):
+            self.assertEqual((12, 11, 10), (lease, run_lock, workspace))
+            calls.append((command, dict(actual), log))
+            seal = 'CCDD' if changed_seal and len(calls) == 2 else 'AABB'
+            text = 'NATIVE-COLD-RECONCILIATION-EXPECTED ' + seal + '\n'
+            if len(calls) == 1:
+                text += 'NATIVE-COLD-RECONCILIATION-SIGKILL ' + row['cut'] + '\n'
+            else:
+                text += 'NATIVE-COLD-RECONCILIATION PASS case=happy\n'
+            log.write_text(text)
+            return first_exit if len(calls) == 1 else 0
+
+        result = native.run_cold_children(SimpleNamespace(wait_child=child), ['sbcl'], env,
+                                          row, self.root / 'crash.log', 12, 11, 10)
+        return calls, result
+
+    def test_crash_requires_sigkill_then_two_fresh_restarts_with_the_same_seal(self):
+        calls, (status, log, crash) = self.crash_children()
+        self.assertEqual(3, len(calls))
+        self.assertEqual(3, len({call[2] for call in calls}))
+        self.assertEqual(0, status)
+        self.assertEqual(calls[-1][2], log)
+        self.assertTrue(crash['passed'])
+        self.assertEqual(-9, crash['exit_code'])
+        self.assertEqual(2, len(crash['restarts']))
+        for _, env, _ in calls[1:]:
+            self.assertNotIn('PG_NATIVE_COLD_RECONCILE_CUT', env)
+            self.assertNotIn('PG_NATIVE_COLD_APPEND', env)
+
+    def test_a_claimed_cut_without_sigkill_cannot_count_as_crash_coverage(self):
+        calls, (status, _, crash) = self.crash_children(first_exit=0)
+        self.assertEqual(1, len(calls))
+        self.assertNotEqual(0, status)
+        self.assertFalse(crash['passed'])
+
+    def test_changed_selected_bytes_on_restart_stop_before_a_second_restart(self):
+        calls, (status, _, crash) = self.crash_children(changed_seal=True)
+        self.assertEqual(2, len(calls))
+        self.assertNotEqual(0, status)
+        self.assertFalse(crash['passed'])
+        self.assertFalse(crash['restarts'][0]['passed'])
 
 
 if __name__ == '__main__':

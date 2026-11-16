@@ -447,6 +447,8 @@
                    (:file "../replication/logical-slot-continuation-cold-source")
                    (:file "../replication/logical-slot-continuation-cold-preparation")
                    (:file "../replication/logical-slot-continuation-temporary-retirement")
+                   (:file "../replication/logical-slot-continuation-cold-reconciliation")
+                   (:file "../replication/logical-slot-continuation-cold-reconciliation-io")
                    (:file "../replication/logical-slot-continuation-writer-io")
                    (:file "../replication/logical-slot-continuation-native-writer")
                    (:file "../replication/logical-slot-copy-source-proof-reader-owner")

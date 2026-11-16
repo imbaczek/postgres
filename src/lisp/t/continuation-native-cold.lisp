@@ -538,6 +538,143 @@
       (format t "~&NATIVE-COLD-PREPARATION PASS case=~a private-pending closed-source-scopes typed-one-shot no-admission~%"
               (uiop:getenv "PG_NATIVE_COLD_CASE")))))
 
+(defun native-host-cold-reconcile-kill (point)
+  (when (equal point (uiop:getenv "PG_NATIVE_COLD_RECONCILE_CUT"))
+    (format t "~&NATIVE-COLD-RECONCILIATION-SIGKILL ~a~%" point)
+    (finish-output)
+    (sb-posix:kill (sb-posix:getpid) sb-posix:sigkill)
+    (error "reconciliation SIGKILL returned")))
+
+(defun native-host-cold-reconcile (gate ownership)
+  (let ((before (native-host-cold-file-image))
+        (fds (native-host-writer-open-fds))
+        (registry *wal-replication-slots*)
+        (mirrors (logical-slot-publication-mirrors))
+        (snapshot nil) (reservation nil)
+        (*logical-slot-continuation-cold-reconciliation-test-hook*
+          (lambda (point) (native-host-cold-reconcile-kill (string-downcase point))))
+        (*logical-slot-continuation-retirement-test-hook*
+          (lambda (point purpose)
+            (native-host-cold-reconcile-kill
+             (format nil "~(~a~)-~(~a~)" purpose point))))
+        (*logical-slot-continuation-replacement-test-hook*
+          (lambda (point)
+            (native-host-cold-reconcile-kill (format nil "replacement-~(~a~)" point)))))
+    (call-with-logical-slot-continuation-cold-state
+     gate ownership
+     (lambda (observation actual check)
+       (setf snapshot (getf observation :snapshot) reservation actual)
+       (funcall check)))
+    (assert (= (getf snapshot :generation)
+               (parse-integer (uiop:getenv "PG_NATIVE_COLD_GENERATION"))))
+    (format t "~&NATIVE-COLD-RECONCILIATION-EXPECTED ~a~%"
+            (with-output-to-string (stream)
+              (loop for byte across (logical-slot-continuation-encode snapshot)
+                    do (format stream "~2,'0x" byte))))
+    (finish-output)
+    (assert (equalp snapshot
+                    (uiop:symbol-call :pg :logical-slot-continuation-cold-reconcile gate ownership)))
+    (let* ((after (native-host-cold-file-image))
+           (selector (assoc "pg_logical_continuation/selector" after :test #'string=)))
+      (assert (equalp (third selector) (logical-slot-continuation-encode snapshot)))
+      (dolist (row after)
+        (assert (not (search ".tmp" (first row))))
+        (unless (string= (first row) "pg_logical_continuation/selector")
+          (assert (equalp row (assoc (first row) before :test #'string=)))))
+      (dolist (row (getf snapshot :slots))
+        (assert (equalp (second row)
+                        (third (assoc (format nil "pg_replslot/~a/state" (first row))
+                                      after :test #'string=)))))
+      (when (string= (uiop:getenv "PG_NATIVE_COLD_KIND") "STABLE")
+        (assert (equalp selector
+                        (assoc "pg_logical_continuation/selector" before :test #'string=))))
+      (assert (equalp snapshot
+                      (uiop:symbol-call :pg :logical-slot-continuation-cold-reconcile gate ownership)))
+      (assert (equalp after (native-host-cold-file-image))))
+    (assert (eq registry *wal-replication-slots*))
+    (assert (zerop (hash-table-count registry)))
+    (assert (equal mirrors (logical-slot-publication-mirrors)))
+    (assert (equal fds (native-host-writer-open-fds)))
+    (assert (logical-slot-continuation-gc-fenced-p *pgdata*))
+    (sb-thread:with-mutex (*wal-lock*)
+      (assert (logical-slot-continuation-cold-reservation-call reservation :check))
+      (assert (= 41268 (gethash reservation *wal-snapshot-retention-pins*))))
+    (format t "~&NATIVE-COLD-RECONCILIATION PASS case=~a exact-selected-generation-and-seal stable-state-inodes repeat-idempotent retained-F no-admission~%"
+            (uiop:getenv "PG_NATIVE_COLD_CASE"))))
+
+(defun native-host-cold-reconcile-reenter (gate ownership)
+  (let* ((files (native-host-cold-file-image))
+         (fds (native-host-writer-open-fds))
+         (armed t) (refused nil) (caught nil)
+         (*logical-slot-continuation-cold-reconciliation-test-hook*
+           (lambda (point)
+             (when (and armed (eq point :before-effects))
+               (setf armed nil)
+               (let ((context (loop for key being the hash-keys
+                                      of *logical-slot-continuation-cold-reconciliations*
+                                    return key)))
+                 (assert context)
+                 (setf caught
+                       (handler-case
+                           (progn (logical-slot-continuation-cold-reconciliation-execute context) nil)
+                         (error () t))))))))
+    (setf refused
+          (handler-case
+              (progn (uiop:symbol-call :pg :logical-slot-continuation-cold-reconcile gate ownership) nil)
+            (error () t)))
+    (assert (and (not armed) caught refused))
+    (assert (equalp files (native-host-cold-file-image)))
+    (assert (equal fds (native-host-writer-open-fds)))
+    (assert (zerop (hash-table-count *wal-replication-slots*)))
+    (assert (logical-slot-continuation-gc-fenced-p *pgdata*))
+    (format t "~&NATIVE-COLD-RECONCILIATION-REFUSAL PASS case=~a caught-reentry-sticky no-effects retained-F~%"
+            (uiop:getenv "PG_NATIVE_COLD_CASE"))))
+
+(defun native-host-cold-reconcile-failure (gate ownership mode)
+  (let* ((before (native-host-cold-file-image))
+         (fds (native-host-writer-open-fds))
+         (reservation nil) (snapshot nil) (hit nil)
+         (point (cond ((equal mode "reconcile-after-unlink") :after-slot-root-sync)
+                      ((equal mode "reconcile-after-rename") :stable-selected)
+                      ((equal mode "reconcile-after-close") :stable-durable)
+                      (t (error "unknown reconciliation failure mode"))))
+         (*logical-slot-continuation-cold-reconciliation-test-hook*
+           (lambda (actual)
+             (when (eq point actual) (setf hit t) (error "reconciliation effect cut")))))
+    (call-with-logical-slot-continuation-cold-state
+     gate ownership
+     (lambda (observation actual check)
+       (setf reservation actual snapshot (getf observation :snapshot))
+       (funcall check)))
+    (assert (handler-case
+                (progn (uiop:symbol-call :pg :logical-slot-continuation-cold-reconcile gate ownership) nil)
+              (error () t)))
+    (assert hit)
+    (let ((after (native-host-cold-file-image)))
+      (assert (not (equalp before after)))
+      (dolist (row after)
+        (unless (search "selector" (first row))
+          (assert (not (search ".tmp" (first row))))
+          (assert (equalp row (assoc (first row) before :test #'string=)))))
+      (unless (eq point :after-slot-root-sync)
+        (assert (equalp (logical-slot-continuation-encode snapshot)
+                        (third (assoc "pg_logical_continuation/selector" after :test #'string=)))))
+      (assert (handler-case
+                  (progn (uiop:symbol-call :pg :logical-slot-continuation-cold-reconcile gate ownership) nil)
+                (error () t)))
+      (assert (equalp after (native-host-cold-file-image))))
+    (sb-thread:with-mutex (*wal-lock*)
+      (assert (logical-slot-continuation-cold-reservation-call reservation :uncertain))
+      (assert (= 41268 (gethash reservation *wal-snapshot-retention-pins*)))
+      (assert (handler-case
+                  (progn (logical-slot-continuation-cold-reservation-call reservation :check) nil)
+                (error () t))))
+    (assert (equal fds (native-host-writer-open-fds)))
+    (assert (zerop (hash-table-count *wal-replication-slots*)))
+    (assert (logical-slot-continuation-gc-fenced-p *pgdata*))
+    (format t "~&NATIVE-COLD-RECONCILIATION-REFUSAL PASS case=~a mode=~a actual-effects uncertain-F retry-fenced no-fd-leak~%"
+            (uiop:getenv "PG_NATIVE_COLD_CASE") mode)))
+
 (defun native-host-cold-preparation-refusal (gate ownership mode)
   (let ((files (native-host-cold-file-image)) (fds (native-host-writer-open-fds))
                                               (saved nil) (entered nil) (caught nil) (reentered nil))
@@ -702,6 +839,13 @@
       (progn
         (when (uiop:getenv "PG_NATIVE_COLD_APPEND") (native-host-cold-append))
         (cond
+          ((member (uiop:getenv "PG_NATIVE_COLD_PROOF")
+                   '("reconcile-after-unlink" "reconcile-after-rename" "reconcile-after-close") :test #'equal)
+           (native-host-cold-reconcile-failure gate ownership (uiop:getenv "PG_NATIVE_COLD_PROOF")))
+          ((equal "reconcile-reenter" (uiop:getenv "PG_NATIVE_COLD_PROOF"))
+           (native-host-cold-reconcile-reenter gate ownership))
+          ((equal "reconcile" (uiop:getenv "PG_NATIVE_COLD_PROOF"))
+           (native-host-cold-reconcile gate ownership))
           ((equal "prepare-wal" (uiop:getenv "PG_NATIVE_COLD_PROOF"))
            (native-host-cold-preparation-wal-change gate ownership))
           ((member (uiop:getenv "PG_NATIVE_COLD_PROOF")

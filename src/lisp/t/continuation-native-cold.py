@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import re
+import signal
 import time
 
 
@@ -32,6 +33,11 @@ CASE_DEFINITIONS = {
 }
 CASE_DEFINITIONS.update({fault: DEFAULT_CASES[variant] for fault, variant in FAULTS.items()})
 PROOF_MARKERS = {
+    'reconcile': 'NATIVE-COLD-RECONCILIATION',
+    'reconcile-reenter': 'NATIVE-COLD-RECONCILIATION-REFUSAL',
+    'reconcile-after-unlink': 'NATIVE-COLD-RECONCILIATION-REFUSAL',
+    'reconcile-after-rename': 'NATIVE-COLD-RECONCILIATION-REFUSAL',
+    'reconcile-after-close': 'NATIVE-COLD-RECONCILIATION-REFUSAL',
     'parent-boundaries': 'NATIVE-COLD-PARENT-BOUNDARIES',
     'selected-boundaries': 'NATIVE-COLD-SELECTED-BOUNDARIES',
     'pending': 'NATIVE-COLD-PENDING',
@@ -51,6 +57,13 @@ PROOF_MARKERS = {
     'pending-candidate': 'NATIVE-COLD-PENDING-REFUSAL',
     'pending-temp-swap': 'NATIVE-COLD-PENDING-REFUSAL',
     None: 'NATIVE-COLD-CLASSIFICATION',
+}
+COLD_RECONCILIATION_CUTS = {
+    'before-state-sync', 'after-state-sync', 'slot-state-after-unlink',
+    'slot-state-after-directory-sync', 'after-slot-root-sync', 'selector-after-unlink',
+    'selector-after-directory-sync', 'selector-temporary-durable', 'stable-temporary',
+    'stable-selected', 'replacement-after-selected-sync',
+    'replacement-after-directory-sync', 'stable-durable',
 }
 
 
@@ -77,27 +90,32 @@ def cold_plan(environment, campaign):
     # Validate every row and owned variant root before starting any child.
     result, labels, roots = [], set(), {}
     for entry in entries:
-        if not isinstance(entry, dict) or set(entry) - {'case', 'proof', 'label', 'variant_root', 'spill'}:
+        if not isinstance(entry, dict) or set(entry) - {'case', 'proof', 'label', 'variant_root', 'spill', 'cut'}:
             raise ValueError('Invalid cold plan entry fields')
         case = entry.get('case')
         proof = entry.get('proof', environment.get('PG_NATIVE_COLD_PROOF'))
         spill = entry.get('spill', 'PG_NATIVE_COLD_SPILL' in environment)
         root = entry.get('variant_root', environment.get('PG_NATIVE_COLD_VARIANT_ROOT'))
+        cut = entry.get('cut')
         if not isinstance(case, str) or case not in CASE_DEFINITIONS:
             raise ValueError('Unknown cold case')
         if (proof is not None and not isinstance(proof, str)) or proof not in PROOF_MARKERS:
             raise ValueError('Unknown cold proof mode')
         if case in FAULTS and proof is not None:
             raise ValueError('Cold classification faults require the classification proof mode')
+        if cut is not None and (not isinstance(cut, str) or cut not in COLD_RECONCILIATION_CUTS
+                                or proof != 'reconcile'):
+            raise ValueError('Invalid cold reconciliation crash cut')
         if not isinstance(spill, bool) or not isinstance(root, str) or not root:
             raise ValueError('Invalid cold spill flag or variant root')
-        label = entry.get('label', (proof or 'classification') + '-' + case + ('-spill' if spill else ''))
+        label = entry.get('label', (proof or 'classification') + '-' + case
+                          + ('-spill' if spill else '') + ('-' + cut if cut else ''))
         if not isinstance(label, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9-]{0,79}', label) or label in labels:
             raise ValueError('Invalid or duplicate cold output label')
         labels.add(label)
         if root not in roots:
             roots[root] = str(campaign.job_root(root))
-        result.append(dict(case=case, proof=proof, label=label, variant_root=roots[root], spill=spill))
+        result.append(dict(case=case, proof=proof, label=label, variant_root=roots[root], spill=spill, cut=cut))
     return result
 
 
@@ -109,6 +127,7 @@ def child_environment(base, row):
     env.pop('PG_NATIVE_COLD_PLAN', None)
     # Do not let a previous or inherited mode leak into this row.
     for key, value in (('PG_NATIVE_COLD_PROOF', row['proof']),
+                       ('PG_NATIVE_COLD_RECONCILE_CUT', row.get('cut')),
                        ('PG_NATIVE_COLD_SPILL', '1' if row['spill'] else None),
                        ('PG_NATIVE_COLD_APPEND', '1' if append else None),
                        ('PG_NATIVE_COLD_FAULT', row['case'] if row['case'] in FAULTS else None)):
@@ -117,6 +136,38 @@ def child_environment(base, row):
         else:
             env[key] = value
     return env
+
+
+def cold_pass_marker(row, text):
+    marker = PROOF_MARKERS[row['proof']] + ' PASS case=' + row['case']
+    return re.search('^' + re.escape(marker) + r'(?:\s|$)', text, re.MULTILINE) is not None
+
+
+def run_cold_children(campaign, command, env, row, log, lease, run_lock, workspace):
+    status = campaign.wait_child(command, env, log, lease, run_lock, workspace)
+    if not row.get('cut'):
+        return status, log, None
+    text = log.read_text(errors='replace')
+    expected = re.findall(r'^NATIVE-COLD-RECONCILIATION-EXPECTED ([0-9A-Fa-f]+)$', text, re.MULTILINE)
+    cut_marker = 'NATIVE-COLD-RECONCILIATION-SIGKILL ' + row['cut']
+    crash = dict(exit_code=status, log=str(log), restarts=[], passed=False)
+    if status != -signal.SIGKILL or cut_marker not in text.splitlines() or len(expected) != 1:
+        return 1, log, crash
+    recovery_env = dict(env)
+    recovery_env.pop('PG_NATIVE_COLD_RECONCILE_CUT', None)
+    recovery_env.pop('PG_NATIVE_COLD_APPEND', None)
+    for attempt in range(1, 3):
+        recovered_log = log.with_name(log.stem + '-restart-' + str(attempt) + log.suffix)
+        status = campaign.wait_child(command, recovery_env, recovered_log, lease, run_lock, workspace)
+        recovered_text = recovered_log.read_text(errors='replace')
+        actual = re.findall(r'^NATIVE-COLD-RECONCILIATION-EXPECTED ([0-9A-Fa-f]+)$',
+                            recovered_text, re.MULTILINE)
+        passed = status == 0 and actual == expected and cold_pass_marker(row, recovered_text)
+        crash['restarts'].append(dict(exit_code=status, log=str(recovered_log), passed=passed))
+        if not passed:
+            return status or 1, recovered_log, crash
+    crash['passed'] = True
+    return status, recovered_log, crash
 
 
 def main():
@@ -162,18 +213,16 @@ def main():
             child_env = child_environment(env, row)
             start = time.monotonic()
             with writer.working_namespaces(data, job / ('cold-' + label), source=variant) as observed:
-                status = campaign.wait_child(
+                status, log, crash = run_cold_children(campaign,
                     [env.get('SBCL', 'sbcl'), '--noinform', '--no-sysinit', '--no-userinit',
                      '--non-interactive', '--eval', load],
-                    child_env, log, lease, run_lock, workspace)
+                    child_env, row, log, lease, run_lock, workspace)
             assert before == writer.tree_image(variant), 'Preserved writer variant changed'
-            marker = PROOF_MARKERS[row['proof']] + ' PASS case=' + case
-            passed = status == 0 and re.search(
-                '^' + re.escape(marker) + r'(?:\s|$)', log.read_text(errors='replace'), re.MULTILINE) is not None
+            passed = status == 0 and cold_pass_marker(row, log.read_text(errors='replace'))
             results.append(dict(case=case, exit_code=status, wall_seconds=time.monotonic() - start,
                                 log=str(log), input_variant=str(variant), observed=str(observed),
                                 source=frozen['image'], proof_mode=row['proof'], label=label,
-                                spill=row['spill'], passed=passed))
+                                spill=row['spill'], cut=row.get('cut'), crash=crash, passed=passed))
             campaign.write_json(logs / 'native-cold-results.json', results)
             if not passed:
                 raise RuntimeError('Cold case failed: ' + str(log))
