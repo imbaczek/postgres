@@ -334,6 +334,64 @@
                (ok (equal (append expected (list (list 1000 first end))) pending))
                (ok (not (assoc 999 pending))))))))))
 
+(deftest startup-slot-pending-keeps-first-contributions-across-a-historical-seal
+    (pg::call-with-logical-slot-real-startup-test
+     (lambda ()
+       (startup-slot-test-sql "CREATE TABLE startup_seal (id int)")
+       (pg::create-standard-logical-slot "seal_restore" :nothing)
+       (let ((first nil) (sealed nil) (commit nil) (horizon nil))
+         (flet ((append-pages (xid)
+                  (pg::wal-append-record
+                   pg::+wal-record-pages+ 0
+                   (pg::wal-record-payload
+                    (startup-slot-test-progress-record pg::+wal-record-pages+
+                                                       pg::*wal-end-lsn* :xids (list xid))))))
+           (sb-thread:with-mutex (pg::*wal-lock*)
+             (setf first pg::*wal-end-lsn*)
+             (pg::wal-append-batch-start)
+             (append-pages 9000)
+             (pg::wal-append-record pg::+wal-record-maintenance+ 0
+                                    (make-array 0 :element-type '(unsigned-byte 8)))
+             (pg::wal-flush-core)
+             (setf sealed pg::*wal-durable-lsn*)
+             (pg::wal-append-batch-start)
+             (append-pages 9001)
+             (pg::wal-append-batch-start)
+             (setf commit (pg::wal-append-record pg::+wal-record-commit+ 9000
+                                                 (pg::wal-encode-commit-timestamp 1)))
+             (pg::wal-append-batch-start)
+             (append-pages 9002)
+             (pg::wal-flush-core)
+             (setf horizon pg::*wal-durable-lsn*)))
+         (pg::call-with-logical-slot-owned-startup-test
+          (lambda (gate ownership)
+            (pg::call-with-logical-slot-startup-source
+             gate ownership (pg::logical-slot-startup-read-inventory :local-workspace t)
+             (lambda (source)
+               (ok (= horizon (pg::logical-slot-startup-source-end source)))
+               (let* ((slot (pg::logical-slot-startup-entry-slot
+                             (first (pg::logical-slot-startup-source-entries source))))
+                      (pending (pg::logical-slot-startup-derive-pending source slot)))
+                 (ok (= 1 (hash-table-count pending)))
+                 (ok (equal (cons first commit) (gethash 9000 pending)))
+                 (ok (null (gethash 9001 pending)))
+                 (ok (null (gethash 9002 pending))))
+               (multiple-value-bind (observe finish)
+                   (pg::logical-slot-continuation-runtime-tail-observer first sealed nil :logical-reader)
+                 (pg::call-with-logical-wal-cursor
+                  (pg::logical-slot-startup-source-history source)
+                  (pg::logical-slot-startup-source-namespace source)
+                  first horizon 1 :record-start
+                  (lambda () (pg::logical-slot-startup-check-source source))
+                  (lambda (cursor)
+                    (loop for original = (pg::logical-wal-cursor-position cursor)
+                          do (multiple-value-bind (record raw owner carrier kind)
+                                 (pg::logical-wal-cursor-next cursor)
+                               (unless record (return))
+                               (funcall observe record raw owner carrier kind original)))
+                    (ok (funcall finish)))
+                  :batch-policy :logical-reader))))))))))
+
 (deftest startup-slot-private-archive-lease-does-not-authorize-ancestral-publication
     (call-with-historical-segment-source
      (lambda (fixture)

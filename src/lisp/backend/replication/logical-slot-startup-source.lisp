@@ -13,6 +13,29 @@
 
 (defvar *logical-slot-startup-sources* nil)
 
+(defvar *logical-slot-startup-inventories*
+  (make-hash-table :test #'eq :weakness :key :synchronized t))
+
+(defun logical-slot-startup-inventory-dispatch (inventory operation &optional source)
+  (let ((state (and (logical-slot-startup-inventory-p inventory)
+                    (gethash inventory *logical-slot-startup-inventories*))))
+    (unless (and (functionp state) (eq state (logical-slot-startup-inventory-state inventory)))
+      (when (and (logical-slot-startup-inventory-p inventory)
+                 (logical-slot-startup-source-p source)
+                 (eq inventory (logical-slot-startup-source-inventory source))
+                 (eq (logical-slot-startup-source-thread source) sb-thread:*current-thread*)
+                 (eq (logical-slot-startup-source-mutex source) *wal-lock*)
+                 (member source *logical-slot-startup-sources* :test #'eq))
+        (setf (logical-slot-startup-source-active-p source) nil))
+      (error "startup inventory requires its registered capability"))
+    (funcall state operation inventory source)))
+
+(defun logical-slot-startup-inventory-call (source operation)
+  (unless (logical-slot-imported-startup-source-p source)
+    (error "selected inventory requires its typed imported startup source"))
+  (logical-slot-startup-inventory-dispatch
+   (logical-slot-startup-source-inventory source) operation source))
+
 (defun logical-slot-startup-known-p (slot)
   (and (wal-logical-slot-p slot) (wal-replication-slot-logical-provenance slot)))
 
@@ -23,18 +46,21 @@
         (wal-encode-replication-slot copy))
       (wal-encode-replication-slot slot)))
 
+(defun logical-slot-startup-entry-from-image (bytes name)
+  (let ((slot (wal-decode-replication-slot bytes name)))
+    (%make-logical-slot-startup-entry
+     :slot slot :bytes (copy-seq bytes) :image (logical-slot-startup-candidate-image slot)
+     :profile (wal-slot-profile slot) :provenance (wal-replication-slot-logical-provenance slot))))
+
 (defun logical-slot-startup-read-inventory (&key cleanup root parent-fd local-workspace)
   "Read canonical slot state into startup entries.
 Inventory is strict by default.  Local startup, capture, recovery and
 promotion may explicitly skip the local workspace; incoming images stay strict."
   (apply #'slot-state-map
          (or root (wal-replication-slot-directory))
-         (lambda (bytes name)
-           (let ((slot (wal-decode-replication-slot bytes name)))
-             (%make-logical-slot-startup-entry
-              :slot slot :bytes (copy-seq bytes) :image (logical-slot-startup-candidate-image slot)
-              :profile (wal-slot-profile slot) :provenance (wal-replication-slot-logical-provenance slot))))
-         :cleanup cleanup :local-workspace local-workspace (when parent-fd (list :parent-fd parent-fd))))
+         #'logical-slot-startup-entry-from-image
+         :cleanup cleanup :local-workspace local-workspace
+         (when parent-fd (list :parent-fd parent-fd))))
 
 (defun logical-slot-startup-control-image ()
   (read-bounded-regular-file (wal-control-path) (1+ +wal-control-maximum-bytes+) :minimum 1))
@@ -46,6 +72,8 @@ promotion may explicitly skip the local workspace; incoming images stay strict."
                (eq (logical-slot-startup-source-mutex source) *wal-lock*)
                (member source *logical-slot-startup-sources* :test #'eq))
     (error "logical slot startup source scope ended or changed thread"))
+  (when (logical-slot-startup-source-inventory source)
+    (logical-slot-startup-inventory-call source :check))
   source)
 
 (defun logical-slot-startup-check-authority (source)
@@ -107,10 +135,13 @@ promotion may explicitly skip the local workspace; incoming images stay strict."
       (logical-slot-startup-check-live source)))
   t)
 
-(defun %call-with-logical-slot-startup-source (gate-owner ownership entries function &optional capture)
+(defun %call-with-logical-slot-startup-source (gate-owner ownership entries function &optional capture inventory)
   "Capture startup source facts after independently checking the context.
 Child-owned candidates require history even when all are lost. Capture alone
 publishes nothing and does not authorize imported use."
+  (when inventory
+    (unless capture (error "selected inventory requires an imported capture"))
+    (logical-slot-startup-inventory-dispatch inventory :preflight))
   (check-primary-storage-startup-context gate-owner ownership)
   (when (and capture (not (logical-slot-imported-startup-capture-p capture)))
     (error "startup capture requires its typed imported purpose"))
@@ -143,7 +174,7 @@ publishes nothing and does not authorize imported use."
                (apply (if capture #'%make-logical-slot-imported-startup-source
                           #'%make-logical-slot-startup-source)
                       (append (when capture (list :capture capture))
-                              (list :gate-owner gate-owner :ownership ownership :entries (copy-list entries)
+                              (list :gate-owner gate-owner :ownership ownership :entries (copy-list entries) :inventory inventory
                                     :system-id system-id :root (logical-wal-current-root-identity)
                                     :history history :history-bytes bytes :control (logical-slot-startup-control-image)
                                     :timeline timeline :namespace *wal-segment-namespace* :end *wal-durable-lsn*
@@ -154,6 +185,7 @@ publishes nothing and does not authorize imported use."
       (unwind-protect
            (progn
              (when capture (logical-slot-imported-startup-capture-call source :bind))
+             (when inventory (logical-slot-startup-inventory-call source :bind))
              (logical-slot-startup-check-authority source)
              (sb-thread:with-mutex (*wal-lock*) (logical-slot-startup-check-source source))
              (funcall function source))

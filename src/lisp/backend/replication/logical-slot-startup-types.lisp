@@ -7,12 +7,18 @@
   (slot nil :read-only t) (bytes nil :read-only t) (image nil :read-only t)
   (profile nil :read-only t) (provenance nil :read-only t))
 
+(defstruct (logical-slot-startup-inventory
+            (:constructor %make-logical-slot-startup-inventory)
+            (:print-function physical-libpq-print-private-object))
+  (state nil :read-only t))
+
 (defstruct (logical-slot-startup-source (:constructor %make-logical-slot-startup-source))
   ;; Capture post-replay facts before catalog initialization: durable
   ;; catalog system ID, control, history, durable end and slot candidates.
   ;; The gate and postmaster ownership are separate, borrowed authority.
   (gate-owner nil :read-only t) (ownership nil :read-only t)
   (entries nil :read-only t) (system-id nil :read-only t)
+  (inventory nil :read-only t)
   (root nil :read-only t) (history nil :read-only t) (history-bytes nil :read-only t)
   (control nil :read-only t) (timeline nil :read-only t) (namespace nil :read-only t)
   (end nil :read-only t) (incarnation nil :read-only t) (wal-level nil :read-only t)

@@ -54,7 +54,8 @@ require the registered capture."
 (defvar *logical-slot-imported-startup-principals* nil)
 
 (defun logical-slot-imported-startup-source-fields (source)
-  (list (logical-slot-imported-startup-source-capture source)
+  (list (logical-slot-startup-source-inventory source)
+        (logical-slot-imported-startup-source-capture source)
         (logical-slot-startup-source-gate-owner source)
         (logical-slot-startup-source-ownership source)
         (logical-slot-startup-source-system-id source)

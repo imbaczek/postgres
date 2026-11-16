@@ -65,6 +65,10 @@ capacity, standby and progress checks. Publication is separate."
   ;; Compare disk bytes with the captured inventory after allowed temporary
   ;; physical slot cleanup, while retaining startup authority.
   (logical-slot-startup-check-authority source)
+  (when (logical-slot-startup-source-inventory source)
+    (logical-slot-startup-inventory-call source :observe)
+    (logical-slot-startup-check-authority source)
+    (return-from logical-slot-startup-check-inventory t))
   (let ((expected
           (loop for entry in (logical-slot-startup-source-entries source)
                 for slot = (logical-slot-startup-entry-slot entry)
