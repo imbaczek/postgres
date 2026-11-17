@@ -774,6 +774,8 @@ this mode.
   changes. Compare the Lisp behavior with those references and explain any
   deliberate differences.
 - Project workflow: review each milestone with a subagent.
+  Use `gpt-6.2-sol` for all Sol subagent work and `gpt-6.2-astra` for all
+  Astra subagent work. Reuse review threads that already run the required model.
 - After implementation, tests and code reviews are complete, give the affected
   modules, functions and structures a separate source documentation pass. Use
   the original C source as the style reference: readable, straightforward prose
