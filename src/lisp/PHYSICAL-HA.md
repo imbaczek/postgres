@@ -3,18 +3,31 @@
 Open development audits, including cold-image/load-order correctness, are tracked
 in [TODO.md](TODO.md).
 
-Status, 2026-10-30: native intake/bootstrap/recovery, continuous receipt/reconnect,
-advancing source retention, explicit/automatic local restartpoints, PGDATA/PID
-ownership, a startup/reload configuration subset, client application-name settings
-and online promotion are implemented. Fresh backups from a promoted child can follow
-that same timeline. Pinned Patroni's full promotion method passes through native
-pg_ctl and pg_controldata, including its production-state wait. Locally selected
-ancestor-spool fork replay and later promotion now pass manual crash tests.
-Configured native follow now reconciles source settings through reload and cold
-restart. Complete Patroni writer/follow acceptance, rewind/rejoin, synchronous
-durability and remaining Patroni interfaces are unfinished. C physical WAL/disk
-compatibility remains future work. Coordination is excluded. The repository's
-original C source is the behavior oracle.
+## Scope check after capture-resume qualification
+
+Three manual writer switchovers have passed: Lisp-to-Lisp, Lisp-to-C, and
+C-to-Lisp. The mixed-engine tests use logical replication. Native physical
+streaming, promotion, and rewind use the Lisp storage and WAL formats.
+
+Pinned Patroni 4.1.5 has exercised real writer probes, follow and promote
+methods, and scheduled offline recovery of a dirty former primary with a
+leader supplied by the test. The recovered primary was rewound and rejoined as
+a standby. Native `pg_rewind --resume` has recovered from process crashes
+before the first capture, after a complete capture, and during install, follow
+configuration, and retirement.
+
+A transfer interrupted after the source records READY can still leave an
+incomplete target image. Resuming that case requires the source to retain and
+serve the exact image. Other remaining checks include retrieving missing target
+WAL from an archive and covering the remaining stock Patroni rewind queries.
+C `pg_rewind` uses the target WAL to identify changed pages. Native rewind
+reuses whole matching relation files. C physical WAL and disk interoperability
+are outside the verified behavior.
+
+The goal covers backend behavior against the original C implementation and
+pinned Patroni. Coordinated leader election, automatic failover, and blue-green
+orchestration remain separate work. The milestone tests establish the backend
+paths used by those workflows under the tested conditions.
 
 ## Physical sender shutdown
 
