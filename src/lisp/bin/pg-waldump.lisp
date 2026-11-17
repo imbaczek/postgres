@@ -10,6 +10,11 @@
 (in-package #:pg)
 
 (defun native-waldump-checkpoint (directory timeline start)
+  "Probe the clean shutdown checkpoint on a stopped primary under directory ownership.
+The checkpoint must start at the requested location and end at the durable WAL
+endpoint. Check up to one header of available bytes there for zeros. The next
+segment may be absent at a segment boundary. Print one checkpoint line and an
+end-of-WAL diagnostic, then return status 1."
   (call-with-physical-adoption-owner
    directory
    (lambda (owner)
@@ -44,6 +49,7 @@
          1)))))
 
 (defun native-waldump-main (arguments)
+  "Accept the PGDATA checkpoint probe -t TIMELINE -s LSN -n 2."
   (handler-case
       (destructuring-bind (timeline-option timeline start-option start limit-option limit) arguments
         (unless (and (string= timeline-option "-t")

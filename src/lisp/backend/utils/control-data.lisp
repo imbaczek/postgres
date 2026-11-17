@@ -348,6 +348,9 @@ the base files are still checked against the manifest read from disk."
     (error "native control files changed throughout inspection")))
 
 (defun native-control-verified-checksum-fork (relfilenode fork end)
+  "Read every page of a relation fork and verify its location-bound checksum.
+Require complete pages with nonzero LSNs at or before END.
+An absent visibility fork is empty."
   (let ((path (relation-file-path relfilenode fork)))
     (when (and (eq fork :visibility) (not (physical-adoption-path-present-p path)))
       (return-from native-control-verified-checksum-fork 0))
@@ -366,6 +369,9 @@ the base files are still checked against the manifest read from disk."
         (close stream)))))
 
 (defun native-control-verify-page-checksums (directory facts)
+  "Verify catalog relation main and visibility pages in a clean stopped primary.
+Hold the directory owner and recheck control after scanning. This reads every
+such page and returns true only when at least one page was verified."
   (declare (notinline physical-adoption-owner-directory))
   (call-with-physical-adoption-owner
    directory
@@ -386,6 +392,9 @@ the base files are still checked against the manifest read from disk."
          (plusp pages))))))
 
 (defun native-control-read-for-utility (directory)
+  "Read control facts and report the native checksum version when verified.
+Omit the version when the stopped-primary scan cannot establish it, including
+when no pages are available."
   (let ((facts (native-control-read directory)))
     (when (and (eql +db-shutdowned+ (getf facts :db-state))
                (handler-case (native-control-verify-page-checksums directory facts)

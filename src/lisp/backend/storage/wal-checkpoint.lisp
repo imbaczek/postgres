@@ -308,6 +308,8 @@ Boolean fact is false."
       record)))
 
 (defun wal-checkpoint-record-start (&optional (end *wal-checkpoint-lsn*))
+  "Return zero for END zero. Use the recorded start when the snapshot matches END.
+Otherwise subtract the legacy checkpoint header size from END."
   (cond ((zerop end) 0)
         ((and *wal-checkpoint-snapshot* (= end (getf *wal-checkpoint-snapshot* :end)))
          (getf *wal-checkpoint-snapshot* :start))
