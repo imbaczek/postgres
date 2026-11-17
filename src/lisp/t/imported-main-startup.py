@@ -34,9 +34,9 @@ def free_port():
         return sock.getsockname()[1]
 
 
-def inspect_control(path, pid):
+def inspect_control(path, pid, form=None, marker=':IMPORTED-MAIN-CONTROL-OK'):
     """Inspect this server's typed protection and absent follow workers."""
-    form = """(let ((*print-circle* t) (*print-level* 4) (*print-length* 12))
+    form = form or """(let ((*print-circle* t) (*print-level* 4) (*print-length* 12))
       (sb-thread:with-mutex (pg::*wal-lock*)
         (assert (not (pg::recovery-in-progress-p)))
         (assert (not pg::*physical-follow-runtime*))
@@ -64,7 +64,7 @@ def inspect_control(path, pid):
             if sum(map(len, chunks)) > 65536:
                 raise ValueError('Unexpectedly large control response')
     response = b''.join(chunks).decode()
-    if ':IMPORTED-MAIN-CONTROL-OK' not in response or 'error:' in response:
+    if marker not in response or 'error:' in response:
         raise RuntimeError('Imported main control check failed: ' + response)
     return response
 
@@ -104,6 +104,9 @@ def main():
         case = os.environ.get('PG_NATIVE_MAIN_CASE', 'happy')
         if case not in ('happy', 'managed', 'promote', 'malformed-proof', 'proof-loss', 'cancel-spawn'):
             raise ValueError('Unknown main startup case')
+        wire = os.environ.get('PG_NATIVE_MAIN_WIRE')
+        if wire not in (None, '1') or (wire and case != 'happy'):
+            raise ValueError('Wire qualification requires happy case and explicit value 1')
         restart = os.environ.get('PG_NATIVE_MAIN_RESTART')
         if restart not in (None, '1') or (restart and case != 'happy'):
             raise ValueError('Restart qualification requires happy case and explicit value 1')
@@ -298,6 +301,12 @@ def main():
                                                   sql_stderr=query.stderr)
                                     if query.returncode or query.stdout.splitlines() != expected_sql:
                                         raise RuntimeError('Imported main SQL check failed: ' + repr(query))
+                                    if wire and boot == 0:
+                                        wire_tests = module('imported_main_wire', directory / 'imported-main-wire.py')
+                                        result['wire'] = wire_tests.exercise(
+                                            port, data, job, expected_names,
+                                            lambda form, marker: inspect_control(
+                                                control / 'pg.sock', process.pid, form, marker))
                                     process.send_signal(signal.SIGTERM)
                                     result['exit_code'] = process.wait(timeout=30)
                                     if result['exit_code']:
