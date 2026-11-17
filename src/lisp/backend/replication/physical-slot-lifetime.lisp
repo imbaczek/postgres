@@ -9,6 +9,44 @@
   (make-hash-table :test #'eq :synchronized t :weakness :key))
 (defvar *physical-slot-lifetime-create* nil)
 
+(define-condition physical-slot-cold-cleanup-refusal (pg-error) ()
+  (:default-initargs
+   :sqlstate "55000"
+   :message "continuation group is uncertain; cold reconciliation required"))
+
+(defvar *physical-slot-cold-cleanup-refusals*
+  (make-hash-table :test #'eq :synchronized t :weakness :key))
+
+(declaim (ftype function physical-slot-lifetime-check-under-lock
+                physical-slot-check-temporary-owner-under-lock))
+
+(defun physical-slot-refuse-cold-cleanup-under-lock (slot check-group)
+  (assert (sb-thread:holding-mutex-p *wal-lock*))
+  (physical-slot-lifetime-check-under-lock slot)
+  (physical-slot-check-temporary-owner-under-lock slot *backend*)
+  (funcall check-group)
+  (let ((condition (make-condition 'physical-slot-cold-cleanup-refusal))
+        (backend *backend*)
+        (capability (wal-replication-slot-temporary-lifetime slot)))
+    (setf (gethash condition *physical-slot-cold-cleanup-refusals*)
+          (lambda (candidate creator)
+            (unless (and (eq candidate slot) (eq creator backend)
+                         (eq capability (wal-replication-slot-temporary-lifetime slot)))
+              (error "cold cleanup refusal changed its slot or creator"))
+            (physical-slot-lifetime-check-under-lock slot)
+            (physical-slot-check-temporary-owner-under-lock slot creator)
+            (funcall check-group)
+            t))
+    (error condition)))
+
+(defun physical-slot-cold-cleanup-refusal-check-under-lock (condition slot backend)
+  (assert (sb-thread:holding-mutex-p *wal-lock*))
+  (let ((check (and (typep condition 'physical-slot-cold-cleanup-refusal)
+                    (gethash condition *physical-slot-cold-cleanup-refusals*))))
+    (unless check
+      (error "unissued temporary physical cleanup refusal"))
+    (funcall check slot backend)))
+
 ;; Callers carry this read-only capability; its sealed state checks the exact
 ;; slot and context before allowing an operation.
 (defstruct (physical-slot-lifetime (:constructor %make-physical-slot-lifetime))
@@ -58,7 +96,11 @@
                              (eq (physical-slot-lifetime-state capability)
                                  (gethash capability *physical-slot-lifetime-seals*)))
                   (error "temporary physical name lost its original generation"))
-                (physical-slot-lifetime-check-context context capability))
+                (if (eq (physical-slot-lifetime-context-phase context) :cold-cleanup-required)
+                    (progn
+                      (physical-slot-lifetime-check-storage context)
+                      (physical-slot-lifetime-check-registration context capability))
+                    (physical-slot-lifetime-check-context context capability)))
             (error (condition)
               (setf (physical-slot-lifetime-context-phase context) :uncertain
                     (wal-replication-slot-state-uncertain-p slot) t)
@@ -118,9 +160,7 @@
        (eq (physical-slot-lifetime-context-backend context)
            (wal-replication-slot-temporary-owner slot))))
 
-;; Recheck captured storage and backend identities and, once bound, the exact
-;; slot and name anchor.  The caller holds the original WAL mutex.
-(defun physical-slot-lifetime-check-context (context capability)
+(defun physical-slot-lifetime-check-storage (context)
   (assert (and (eq *wal-lock* (physical-slot-lifetime-context-mutex context))
                (sb-thread:holding-mutex-p *wal-lock*)))
   (unless (and (eq *wal-replication-slots* (physical-slot-lifetime-context-registry context))
@@ -128,8 +168,9 @@
                (eq *physical-slot-lifetime-names* (physical-slot-lifetime-context-name-index context))
                (eq *wal-storage-incarnation* (physical-slot-lifetime-context-incarnation context))
                (equal (physical-slot-lifetime-root) (physical-slot-lifetime-context-root context)))
-    (error "temporary physical slot changed its storage context"))
-  (backend-lifetime-check-under-wal-lock (physical-slot-lifetime-context-backend-token context))
+    (error "temporary physical slot changed its storage context")))
+
+(defun physical-slot-lifetime-check-registration (context capability)
   (let ((slot (physical-slot-lifetime-context-slot context)))
     (when slot
       (let* ((names (physical-slot-lifetime-name-table *wal-replication-slots*))
@@ -145,6 +186,13 @@
                    (physical-slot-lifetime-candidate-matches-p context capability slot))
         (error "temporary physical slot lost its exact registered generation"))))
   t)
+
+;; Recheck captured storage and backend identities and, once bound, the exact
+;; slot and name anchor.  The caller holds the original WAL mutex.
+(defun physical-slot-lifetime-check-context (context capability)
+  (physical-slot-lifetime-check-storage context)
+  (backend-lifetime-check-under-wal-lock (physical-slot-lifetime-context-backend-token context))
+  (physical-slot-lifetime-check-registration context capability))
 
 ;; Check that the creator is still registered on its owning thread.
 (defun physical-slot-lifetime-check-owner (context backend)
@@ -217,6 +265,18 @@
   (unless (eq slot (physical-slot-lifetime-context-slot context))
     (error "copied slot cannot use a temporary physical lifetime"))
   (let ((phase (physical-slot-lifetime-context-phase context)))
+    (when (eq operation :cold-cleanup-retained-p)
+      (return-from physical-slot-lifetime-dispatch (eq phase :cold-cleanup-required)))
+    (when (eq operation :adopt-cold-cleanup)
+      (unless (and (eq phase :live) (null (wal-replication-slot-drop-claim slot)))
+        (error "cold cleanup requires a live temporary slot without a drop claim"))
+      (physical-slot-cold-cleanup-refusal-check-under-lock value slot *backend*)
+      (sb-sys:without-interrupts
+        (request-primary-wal-writer-shutdown)
+        (setf (physical-slot-lifetime-context-phase context) :cold-cleanup-required)
+        (unless *physical-slot-cold-cleanup-owner*
+          (setf *physical-slot-cold-cleanup-owner* *backend*)))
+      (return-from physical-slot-lifetime-dispatch slot))
     (ecase operation
       ((:live :candidate)
        (unless (and (eq phase :live) (null (wal-replication-slot-drop-claim slot)))

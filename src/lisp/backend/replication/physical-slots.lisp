@@ -519,6 +519,11 @@ interior position on a standby."
         (setf (wal-replication-slot-inactive-since slot) (postgres-current-timestamp))
         target))))
 
+(defun physical-slot-retained-for-cold-cleanup-p (slot)
+  (let ((capability (wal-replication-slot-temporary-lifetime slot)))
+    (and capability
+         (physical-slot-lifetime-call-under-lock capability :cold-cleanup-retained-p slot))))
+
 (defun wal-cleanup-backend-physical-slots (backend)
   "Drop temporary slots owned by BACKEND, checking each captured generation."
   (when backend
@@ -527,10 +532,18 @@ interior position on a standby."
               (physical-slot-check-names-under-lock)
               (loop for slot being the hash-values of *wal-replication-slots*
                     when (and (not (wal-replication-slot-creation-failed-p slot))
+                              (not (physical-slot-retained-for-cold-cleanup-p slot))
                               (physical-slot-owned-by-backend-p slot backend))
                       collect slot)))
           (*backend* backend))
-      ;; Failed creations remain fenced for startup, even when temporary.
       (dolist (slot slots)
-        (wal-drop-replication-slot (wal-replication-slot-name slot) slot))))
+        (handler-case
+            (wal-drop-replication-slot (wal-replication-slot-name slot) slot)
+          (physical-slot-cold-cleanup-refusal (condition)
+            (sb-thread:with-mutex (*wal-lock*)
+              (physical-slot-lifetime-call-under-lock
+               (wal-replication-slot-temporary-lifetime slot)
+               :adopt-cold-cleanup slot condition))
+            (call-with-live-operation-lock-if-needed
+             (lambda () (sb-thread:condition-broadcast *live-operation-cv*))))))))
   (values))

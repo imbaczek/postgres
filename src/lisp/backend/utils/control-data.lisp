@@ -41,6 +41,10 @@ production."
   (native-control-test-point :after-primary-startup-dirty)
   (values))
 
+(define-condition primary-clean-publication-fenced (wal-input-validation-error) ()
+  (:default-initargs :format-control
+   "cold temporary slot reconciliation prevents clean shutdown publication"))
+
 (defun wal-set-primary-state (state)
   "Publish STATE with the initialized catalog's system identifier.
 Hold WAL across publication and require debt already empty; the caller must drain
@@ -52,7 +56,11 @@ an existing identity must match the catalog."
     (when (and *wal-control-metadata*
                (/= system-id (getf *wal-control-metadata* :system-id)))
       (error "primary control and catalog system identifiers differ"))
+    (when (= state +db-shutdowned+)
+      (native-control-test-point :before-primary-shutdown-clean))
     (with-wal-critical
+      (when (and (= state +db-shutdowned+) *physical-slot-cold-cleanup-owner*)
+        (error 'primary-clean-publication-fenced))
       (wal-require-no-pending-storage)
       (let ((*wal-control-metadata* (if *wal-control-metadata*
                                         (wal-refresh-control-metadata *wal-control-metadata* state)

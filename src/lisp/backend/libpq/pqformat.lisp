@@ -26,11 +26,16 @@
     (payload-push-u32 p pid)
     (payload-push-u32 p secret)))
 
+(declaim (special *physical-slot-cold-cleanup-owner*))
+
 (defun send-ready-for-query (stream status)
   "Report changed session parameters before sending the ready status."
-  (session-report-parameters stream)
-  (with-backend-message (stream #\Z p)
-    (payload-push-byte p (char-code status))))
+  (if *physical-slot-cold-cleanup-owner*
+      (finish-output stream)
+      (progn
+        (session-report-parameters stream)
+        (with-backend-message (stream #\Z p)
+          (payload-push-byte p (char-code status))))))
 
 (defun send-empty-query-response (stream)
   (write-message stream #\I (make-payload)))

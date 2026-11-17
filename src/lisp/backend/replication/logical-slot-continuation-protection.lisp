@@ -57,6 +57,38 @@
   (logical-slot-imported-host-origin-call origin :check-root)
   t)
 
+(defun logical-slot-continuation-check-physical-operation
+    (operation slot protection registry control incarnation pins check-identity)
+  (unless (and (wal-replication-slot-p slot)
+               (wal-physical-slot-p slot)
+               (wal-replication-slot-temporary-p slot)
+               (eq slot (gethash (wal-replication-slot-name slot) registry))
+               (not (member (wal-replication-slot-name slot)
+                            (logical-slot-continuation-protection-names protection)
+                            :test #'string=)))
+    (error "temporary physical operation is outside its ordinary registry"))
+  (when (and (eq operation :physical-drop) (svref control 1)
+             (eq :published (svref control 0)))
+    (physical-slot-refuse-cold-cleanup-under-lock
+     slot
+     (lambda ()
+       (funcall check-identity protection)
+       (unless (and (svref control 1)
+                    (eq :published (svref control 0))
+                    (eq registry *wal-replication-slots*)
+                    (eq protection
+                        (gethash registry *logical-slot-continuation-protection-registries*))
+                    (eq protection
+                        (gethash (logical-slot-continuation-protection-root-identity protection)
+                                 *logical-slot-continuation-protections*))
+                    (eq incarnation *wal-storage-incarnation*)
+                    (eq pins *wal-snapshot-retention-pins*)
+                    (eql (logical-slot-continuation-protection-fork protection)
+                         (gethash protection pins)))
+         (error "cold cleanup refusal lost its uncertain group"))
+       (logical-slot-imported-host-origin-call
+        (logical-slot-continuation-protection-origin protection) :check-root)))))
+
 ;; A staged group holds candidate identities for cold publication but cannot
 ;; serve as the published protection until the installer changes its phase.
 (defun logical-slot-continuation-build-protection-under-lock
@@ -138,12 +170,8 @@
                   (logical-slot-continuation-check-runtime-ordinary-candidate
                    registry members value system-id history *wal-durable-lsn*))
                  ((:physical-create :physical-drop)
-                  (unless (and (wal-replication-slot-p value)
-                               (wal-physical-slot-p value)
-                               (wal-replication-slot-temporary-p value)
-                               (eq value (gethash (wal-replication-slot-name value) registry))
-                               (not (member (wal-replication-slot-name value) names :test #'string=)))
-                    (error "temporary physical operation is outside its ordinary registry"))
+                  (logical-slot-continuation-check-physical-operation
+                   operation value protection registry control incarnation pins #'check-identity)
                   (ready (wal-replication-slot-temporary-lifetime value) operation))
                  (:binding (copy-seq binding))
                  (:image (copy-seq (car selection)))

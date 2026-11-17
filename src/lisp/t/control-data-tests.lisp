@@ -123,6 +123,30 @@
                (lambda () (pg::native-control-facts (pg::native-control-capture)))))
           (ok (equalp before (pg::read-bounded-regular-file (pg::wal-control-path) 513)))))))
 
+(defun call-with-cold-cleanup-racing-clean-publication (function)
+  (let* ((at-boundary (sb-thread:make-semaphore))
+         (fenced (sb-thread:make-semaphore))
+         (owner (pg::make-backend))
+         (previous pg::*physical-slot-cold-cleanup-owner*)
+         (wal-lock pg::*wal-lock*)
+         (publisher (sb-thread:make-thread
+                     (lambda ()
+                       (when (sb-thread:wait-on-semaphore at-boundary :timeout 5)
+                         (sb-thread:with-mutex (wal-lock)
+                           (setf pg::*physical-slot-cold-cleanup-owner* owner))
+                         (sb-thread:signal-semaphore fenced))))))
+    (unwind-protect
+         (let ((pg::*native-control-test-hook*
+                 (lambda (point)
+                   (when (eq point :before-primary-shutdown-clean)
+                     (sb-thread:signal-semaphore at-boundary)
+                     (assert (sb-thread:wait-on-semaphore fenced :timeout 5))))))
+           (funcall function))
+      (when (sb-thread:thread-alive-p publisher)
+        (sb-thread:terminate-thread publisher))
+      (sb-thread:join-thread publisher :default nil)
+      (setf pg::*physical-slot-cold-cleanup-owner* previous))))
+
 (deftest wal-control-state-writer-retains-reference
     (with-physical-store-directory (root)
       (let* ((pg::*pgdata* root)
@@ -145,7 +169,15 @@
         (pg::wal-set-primary-state 4)
         (let ((loaded (nth-value 6 (pg::wal-read-control-fields))))
           (ok (= 4 (getf loaded :db-state)))
-          (ok (equal reference (getf loaded :retained-reference)))))))
+          (ok (equal reference (getf loaded :retained-reference)))
+          (call-with-cold-cleanup-racing-clean-publication
+           (lambda ()
+             (ok (handler-case
+                     (progn (pg::wal-set-primary-state pg::+db-shutdowned+) nil)
+                   (pg::primary-clean-publication-fenced () t)))
+             (ok (not pg::*wal-poisoned*))
+             (ok (equal loaded pg::*wal-control-metadata*))
+             (ok (equal loaded (nth-value 6 (pg::wal-read-control-fields))))))))))
 
 (deftest wal-control-reference-validation-survives-recomputed-crc
     (let* ((reference '(:root-id 0 :base-timeline 1 :base 32 :manifest-digest 7 :end 96 :end-digest 8))
@@ -288,3 +320,45 @@
       (ok pg::*live-operation-terminal-shutdown*)
       (ok (not pg::*live-operation-admission-open*))
       (ok (not (pg::live-operation-admitted-p t)))))
+
+(deftest cold-cleanup-fence-closes-work-admission-but-allows-backend-teardown
+    (let* ((backend (pg::make-backend))
+           (pg::*physical-slot-cold-cleanup-owner* backend)
+           (pg::*live-operation-terminal-shutdown* nil)
+           (pg::*live-operation-admission-open* t)
+           (pg::*live-operation-drain-open* t)
+           (pg::*live-operation-shutdown-drain-open* t)
+           (pg::*live-operation-shutdown-drain-check* (constantly t))
+           (pg::*live-operation-depth* 0)
+           (pg::*live-operation-count* 0))
+      (ok (not (pg::try-enter-live-operation t)))
+      (ok (pg::with-live-operation-backend-shutdown-cleanup (backend)
+            (eq pg::*backend* backend)))
+      (ok (pg::with-live-operation-query-state-cleanup t))
+      (ok (zerop pg::*live-operation-count*))))
+
+(deftest cold-cleanup-wakes-an-already-waiting-teardown
+    (let* ((waiting (sb-thread:make-semaphore))
+           (backend (pg::make-backend))
+           (worker
+             (sb-thread:make-thread
+              (lambda ()
+                (let ((pg::*physical-slot-cold-cleanup-owner* nil)
+                      (pg::*live-operation-admission-open* nil)
+                      (pg::*live-operation-depth* 0)
+                      (pg::*live-operation-admission-wait-hook*
+                        (lambda ()
+                          (setf pg::*physical-slot-cold-cleanup-owner* backend)
+                          (sb-thread:signal-semaphore waiting))))
+                  (pg::with-live-operation-cold-cleanup-fallback
+                      ((not (sb-thread:holding-mutex-p pg::*live-operation-lock*)))
+                    (pg::with-live-operation-internal (nil) :wrong-lane)))))))
+      (unwind-protect
+           (progn
+             (ok (sb-thread:wait-on-semaphore waiting :timeout 5))
+             (pg::call-with-live-operation-lock
+              (lambda () (sb-thread:condition-broadcast pg::*live-operation-cv*)))
+             (ok (eq t (sb-thread:join-thread worker :timeout 5 :default :timeout))))
+        (when (sb-thread:thread-alive-p worker)
+          (sb-thread:terminate-thread worker)
+          (sb-thread:join-thread worker :default nil)))))

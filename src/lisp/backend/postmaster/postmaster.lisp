@@ -298,7 +298,8 @@ command (idle) is ignored; the connection and its transaction state survive."
   ;; A backend can still hold live-operation admission here. Never join recovery
   ;; workers, close admission, or exit from this cleanup stack.
   (sb-thread:with-mutex (*accept-lock*)
-    (when (and (<= +smart-shutdown+ (shutdown-mode) +fast-shutdown+)
+    (when (and (not *physical-slot-cold-cleanup-owner*)
+               (<= +smart-shutdown+ (shutdown-mode) +fast-shutdown+)
                (if (wal-sender-shutdown-requested-p)
                    (wal-sender-shutdown-clients-drained-p)
                    (sb-thread:with-mutex (*backend-registry-lock*)
@@ -412,12 +413,12 @@ are killed abruptly."
 (defun act-on-shutdown (mode)
   (when (or (= mode +smart-shutdown+) (= mode +fast-shutdown+))
     (managed-worker-request-shutdown))
-  (case mode
-    (#.+smart-shutdown+
+  (cond
+    ((eql mode +smart-shutdown+)
      (admin-log "received smart shutdown request")
      ;; New connections are now rejected; existing clients may finish.
      (maybe-finish-shutdown))
-    (#.+fast-shutdown+
+    ((eql mode +fast-shutdown+)
      (admin-log "received fast shutdown request")
      (admin-log "aborting any active transactions")
      (if (and *wal-ready* (not (recovery-in-progress-p)))
@@ -426,7 +427,7 @@ are killed abruptly."
            (wal-sender-shutdown-terminate-nonparticipants))
          (terminate-all-backends))
      (maybe-finish-shutdown))
-    (#.+immediate-shutdown+
+    ((eql mode +immediate-shutdown+)
      (admin-log "received immediate shutdown request")
      (immediate-shutdown))))
 
@@ -467,15 +468,28 @@ are killed abruptly."
   (declare (ignore signal-info))
   (request-shutdown +immediate-shutdown+))
 
+(defvar *physical-slot-cold-cleanup-exit-ready* nil)
+
+(defun request-cold-slot-reconciliation-exit (backend)
+  (when (and backend (eq backend *physical-slot-cold-cleanup-owner*))
+    (setf *physical-slot-cold-cleanup-exit-ready* t))
+  (values))
+
 (defun postmaster-worker-loop ()
   (loop
+    (when *physical-slot-cold-cleanup-exit-ready*
+      (admin-log "cold temporary slot reconciliation required; exiting without clean shutdown")
+      (sb-ext:exit :code 1 :timeout 0))
     (let ((target *pm-requested-mode*))
-      (when (> target *pm-processed-mode*)
+      (when (and (> target *pm-processed-mode*)
+                 (or (not *physical-slot-cold-cleanup-owner*)
+                     (= target +immediate-shutdown+)))
         (setf *pm-processed-mode* target)
         (handler-case (process-shutdown-request target)
           (error (e)
             (admin-log "shutdown processing failed: ~a" e)))))
-    (when (<= +smart-shutdown+ (shutdown-mode) +fast-shutdown+)
+    (when (and (not *physical-slot-cold-cleanup-owner*)
+               (<= +smart-shutdown+ (shutdown-mode) +fast-shutdown+))
       (handler-case (maybe-finish-shutdown)
         (error (condition) (admin-log "shutdown drain failed: ~a" condition))))
     (sleep 0.05)))

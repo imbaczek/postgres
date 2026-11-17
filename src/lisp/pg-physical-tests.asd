@@ -168,6 +168,7 @@
                (:file "t/physical-slot-standby-tests")
                (:file "t/physical-slot-api-tests")
                (:file "t/physical-slot-lifetime-tests")
+               (:file "t/physical-slot-cleanup-refusal-tests")
                (:file "t/selected-eor-replay-tests")
                (:file "t/scan-stage-tests")
                (:file "t/readiness-fpw-tests")

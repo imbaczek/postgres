@@ -504,10 +504,14 @@ HANDLE-SIMPLE-QUERY-FRAME so decoding occurs after admission."
                                 (and (= type-byte (char-code #\E))
                                      (not *extended-execute-suspended-p*)))
                       (backend-statement-deadline *backend*))))
-          (pg-error (condition)
+          (error (condition)
             (when (fatal-error-p condition) (error condition))
             (let ((implicit (extended-query-state-implicit-p state)))
               (note-query-error)
+              (when *physical-slot-cold-cleanup-owner*
+                (send-error-response stream condition)
+                (finish-output stream)
+                (return-from handle-extended-query-frame :terminate))
               (setf (extended-query-state-statement-deadline state) nil
                     (extended-query-state-executed-in-cycle-p state) nil)
               (let ((*preserve-failed-extended-portals* (eq (backend-state *backend*) :aborted)))
@@ -518,25 +522,6 @@ HANDLE-SIMPLE-QUERY-FRAME so decoding occurs after admission."
               (setf (extended-query-state-implicit-p state) nil
                     (extended-query-state-ignore-until-sync state) t)
               (send-error-response stream condition)
-              (when (= type-byte (char-code #\S))
-                (setf (extended-query-state-ignore-until-sync state) nil
-                      (extended-query-state-in-cycle-p state) nil)
-                (send-ready-for-query stream (transaction-status-char)))))
-          (error (condition)
-            (when (fatal-error-p condition) (error condition))
-            (let ((implicit (extended-query-state-implicit-p state)))
-              (note-query-error)
-              (setf (extended-query-state-statement-deadline state) nil
-                    (extended-query-state-executed-in-cycle-p state) nil)
-              (let ((*preserve-failed-extended-portals* (eq (backend-state *backend*) :aborted)))
-                (extended-clear-portals-for-backend *backend*))
-              (when implicit
-                (unless (eq (backend-state *backend*) :idle) (abort-transaction))
-                (restore-session-settings stream))
-              (setf (extended-query-state-implicit-p state) nil
-                    (extended-query-state-ignore-until-sync state) t)
-              (send-error-response stream (make-condition 'pg-error :sqlstate "XX000"
-                                                                    :message (princ-to-string condition)))
               (when (= type-byte (char-code #\S))
                 (setf (extended-query-state-ignore-until-sync state) nil
                       (extended-query-state-in-cycle-p state) nil)
@@ -692,6 +677,7 @@ Preserve all dispatch values, including secondary values, for the caller."
 (defun backend-loop (stream)
   "Process frontend messages until termination or suppressed output closes the session."
   (loop
+    (when *physical-slot-cold-cleanup-owner* (return))
     (when (wal-sender-backend-stopping-p *backend*)
       (ereport-fatal "57P01" "WAL sender is stopping"))
     (check-backend-frontend-output)
@@ -778,10 +764,14 @@ finish outer connection accounting after unregistering."
                    (when (and *backend*
                               (or (backend-xid *backend*)
                                   (not (eq (backend-state *backend*) :idle))))
-                     (if (>= (shutdown-mode) +fast-shutdown+)
-                         (postmaster-remember-abandoned-backend *backend*)
-                         (with-live-operation-transaction-drain
-                           (end-backend-session)))))))
+                     (cond
+                       (*physical-slot-cold-cleanup-owner* nil)
+                       ((>= (shutdown-mode) +fast-shutdown+)
+                        (postmaster-remember-abandoned-backend *backend*))
+                       (t
+                        (with-live-operation-cold-cleanup-fallback ()
+                          (with-live-operation-transaction-drain
+                            (end-backend-session)))))))))
            (pg-error (e)
              (with-live-operation-backend-shutdown-cleanup (backend)
                (when stream (ignore-errors (send-error-response stream e)))))
@@ -796,7 +786,9 @@ finish outer connection accounting after unregistering."
       ;; Send the final error and close the socket *before* unregistering:
       ;; during a fast shutdown the last connection's CONNECTION-FINISHED exits
       ;; the process, and the client must still receive its FATAL.
-      (finish-backend-connection backend sock stream))))
+      (unwind-protect
+           (finish-backend-connection backend sock stream)
+        (request-cold-slot-reconciliation-exit backend)))))
 
 ;;; ---- server main ----
 
@@ -877,7 +869,7 @@ CL's RENAME-FILE merges a relative target with the source's directory."
         ;; lock that shutdown uses to stop the listener.  Counting the socket
         ;; in this critical section closes the accept/accounting race.
         (sb-thread:with-mutex (*accept-lock*)
-          (setf stop *accept-stop-requested*)
+          (setf stop (or *accept-stop-requested* *physical-slot-cold-cleanup-owner*))
           (when (and ready (not stop))
             (handler-case
                 (setf sock (accept-connection listener))
@@ -1054,6 +1046,11 @@ Then check the cached handles and workers under startup exclusion."
         (format t "pg-lisp: listening on ~a:~a~%" host port)
         (finish-output)
         (serve host port)
-        (prepare-postmaster-shutdown)
+        (unless *physical-slot-cold-cleanup-owner*
+          (handler-case (prepare-postmaster-shutdown)
+            (primary-clean-publication-fenced ()
+              (assert *physical-slot-cold-cleanup-owner*))))
+        (when *physical-slot-cold-cleanup-owner*
+          (loop (sleep 1)))
         (admin-log "database system is shut down")
         (sb-ext:exit :code 0)))))

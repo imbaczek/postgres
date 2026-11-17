@@ -221,7 +221,7 @@ Concurrent requests remain pending for their consumers."
 The shutdown lane admits only a checked sender or its cleanup while normal
 admission remains closed; the terminal fence closes every lane."
   (cond
-    (*live-operation-terminal-shutdown* nil)
+    ((or *live-operation-terminal-shutdown* *physical-slot-cold-cleanup-owner*) nil)
     (*live-operation-admission-open* :normal)
     ((and *live-operation-shutdown-drain-open*
           *live-operation-shutdown-drain-check*
@@ -232,13 +232,28 @@ admission remains closed; the terminal fence closes every lane."
      :drain)
     (t nil)))
 
+(defvar *live-operation-cold-cleanup-escape* nil)
+
+(defmacro with-live-operation-cold-cleanup-fallback ((&body fallback) &body body)
+  (let ((done (gensym "CLEANUP-DONE-"))
+        (wait (gensym "CLEANUP-WAIT-")))
+    `(block ,done
+       (block ,wait
+         (flet ((escape () (return-from ,wait)))
+           (when *physical-slot-cold-cleanup-owner* (escape))
+           (let ((*live-operation-cold-cleanup-escape* #'escape))
+             (return-from ,done (progn ,@body)))))
+       ,@fallback)))
+
 (defun wait-for-live-operation-admission (drain-p &optional backend)
   (when *live-operation-parked-p*
     (error "parked callbacks cannot enter live operations"))
   (call-with-live-operation-lock
    (lambda ()
      ;; Cleanup admission disables these checks so resource retirement can finish.
-     (loop do (when (and *live-operation-check-cancel-p*
+     (loop do (when (and *live-operation-cold-cleanup-escape* *physical-slot-cold-cleanup-owner*)
+                (funcall *live-operation-cold-cleanup-escape*))
+              (when (and *live-operation-check-cancel-p*
                          backend
                          (or (backend-termination-pending backend)
                              (backend-cancel-pending backend)))
@@ -678,7 +693,8 @@ The primary finalizer separately holds reload exclusion."
                           (sb-sys:allow-with-interrupts
                             (let ((*live-operation-depth* (1+ *live-operation-depth*))
                                   (*live-operation-current-lane* ,admitted)
-                                  (*live-operation-current-token* ,token))
+                                  (*live-operation-current-token* ,token)
+                                  (*live-operation-cold-cleanup-escape* nil))
                               (progn ,@body)))
                        (leave-live-operation ,backend ,token)))))))
            (let ((*live-operation-depth* (1+ *live-operation-depth*)))
@@ -698,8 +714,9 @@ operation and its lane, including a drain lane."
 
 Use only for sending a fatal response and releasing connection resources; this
 lane must not run query or storage work."
-  `(if (and (fboundp 'shutdown-terminates-backends-p)
-            (shutdown-terminates-backends-p))
+  `(if (or *physical-slot-cold-cleanup-owner*
+           (and (fboundp 'shutdown-terminates-backends-p)
+                (shutdown-terminates-backends-p)))
        (progn ,@body)
        (with-live-operation-captured-backend-cleanup ,@body)))
 
@@ -763,22 +780,18 @@ lane must not run query or storage work."
 
 (defmacro with-live-operation-backend-shutdown-cleanup ((backend) &body body)
   "Bind BACKEND while admitting its shutdown and teardown cleanup."
-  (let ((backend-value (gensym "BACKEND-")))
-    `(let* ((,backend-value ,backend)
-            (*backend* ,backend-value)
-            (*live-operation-shutdown-drain-check*
-              (and (fboundp 'wal-sender-shutdown-cleanup-check)
-                   (wal-sender-shutdown-cleanup-check ,backend-value))))
-       (if *live-operation-shutdown-drain-check*
-           (with-live-operation-internal (nil) ,@body)
-           (with-live-operation-shutdown-cleanup ,@body)))))
+  `(let ((*backend* ,backend))
+     (with-live-operation-cold-cleanup-fallback ((progn ,@body))
+       (let ((*live-operation-shutdown-drain-check*
+               (and (fboundp 'wal-sender-shutdown-cleanup-check)
+                    (wal-sender-shutdown-cleanup-check *backend*))))
+         (if *live-operation-shutdown-drain-check*
+             (with-live-operation-internal (nil) ,@body)
+             (with-live-operation-shutdown-cleanup ,@body))))))
 
 (defmacro with-live-operation-query-state-cleanup (&body body)
   "Clear query admission state without waiting during backend-terminating shutdown."
-  `(if (and (fboundp 'shutdown-terminates-backends-p)
-            (shutdown-terminates-backends-p))
-       (progn ,@body)
-       (with-live-operation-captured-backend-cleanup ,@body)))
+  `(with-live-operation-shutdown-cleanup ,@body))
 
 (defmacro with-live-operation-query-dispatch (drain-command-p &body body)
   "Admit transaction-ending commands from captured transactions during drain."

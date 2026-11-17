@@ -1400,6 +1400,10 @@ Re-signal CONDITION after requesting shutdown."
     (ignore-errors (funcall (symbol-function 'request-fast-shutdown))))
   (error condition))
 
+(defvar *physical-slot-cold-cleanup-owner* nil
+  "First backend requiring cold slot reconciliation. Set under the WAL mutex
+and observed by admission without taking the WAL mutex.")
+
 (defun wal-check-healthy ()
   (when *wal-poisoned*
     (error "WAL I/O previously failed; refusing further WAL operations"))

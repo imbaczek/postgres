@@ -208,7 +208,8 @@ count; an XID alone, shared cache pages and an empty context do not."
   ;; A queued helper becomes a no-op if a cooperative check delivered it first.
   ;; A failed backend keeps its original WAL error; other backends still terminate.
   (when (and backend (backend-termination-pending backend)
-             (not (backend-wal-failure backend)))
+             (not (backend-wal-failure backend))
+             (not (eq backend *physical-slot-cold-cleanup-owner*)))
     (setf (backend-termination-pending backend) nil
           (backend-cancel-pending backend) nil)
     (ereport-fatal "57P01" "terminating connection due to administrator command"))
@@ -217,7 +218,8 @@ count; an XID alone, shared cache pages and an empty context do not."
 (defun check-for-interrupts ()
   "Deliver pending termination before checking statement timeout or cancel.
 After a WAL failure, leave pending interrupts alone so they cannot replace it."
-  (when (current-backend-wal-failed-p)
+  (when (or (current-backend-wal-failed-p)
+            (and *backend* (eq *backend* *physical-slot-cold-cleanup-owner*)))
     (return-from check-for-interrupts (values)))
   (check-backend-frontend-output)
   (deliver-backend-termination *backend*)
