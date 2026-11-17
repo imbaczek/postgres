@@ -11,9 +11,11 @@ import socket
 import stat
 import time
 
-from patroni.dcs import Member
+from patroni.dcs import Leader, Member
 from patroni.postgresql import Postgresql
+from patroni.postgresql.misc import PostgresqlRole
 from patroni.postgresql.mpp import Null
+from patroni.postgresql.rewind import Rewind
 import psutil
 from patroni.async_executor import CriticalTask
 from psycopg2.extras import PhysicalReplicationConnection
@@ -220,6 +222,36 @@ class FormerPrimaryAcceptance(Acceptance):
     def verify_promotion(self, port):
         pass
 
+    def check_divergence_policy(self, target, original_port, source_port, fork):
+        config = follow.configuration(target, original_port, target.parent)
+        config.update(name="former_primary", use_pg_rewind=True)
+        leader = Leader(0, None, Member(0, "replacement_source", None, {
+            "conn_url": f"postgres://127.0.0.1:{source_port}/postgres",
+            "role": PostgresqlRole.PRIMARY}))
+        before = preserved_tree(target)
+        node = Postgresql(config, Null())
+        control = node.controldata()
+        assert control["Database cluster state"] == "shut down", control
+        assert control["Latest checkpoint's TimeLineID"] == "1", control
+        checkpoint = lsn_number(control["Latest checkpoint location"])
+        assert checkpoint >= fork, control
+        rewind = Rewind(node)
+        assert rewind.enabled and not rewind.can_rewind
+        assert not rewind.can_rewind_or_reinitialize_allowed
+        rewind.trigger_check_diverged_lsn()
+        assert not rewind.rewind_or_reinitialize_needed_and_possible(leader)
+
+        config["remove_data_directory_on_diverged_timelines"] = True
+        rewind = Rewind(Postgresql(config, Null()))
+        assert rewind.can_rewind_or_reinitialize_allowed
+        rewind.trigger_check_diverged_lsn()
+        assert rewind.rewind_or_reinitialize_needed_and_possible(leader)
+        assert preserved_tree(target) == before
+        self.result["former_primary"]["patroni_divergence_policy"] = {
+            "native_rewind_available": False,
+            "divergence_detected_with_removal_opt_in": True,
+            "offline_checkpoint": checkpoint}
+
     def initialize_target(self, target):
         started = time.monotonic()
         # Leave room for target.sock under the AF_UNIX path length limit.
@@ -263,11 +295,14 @@ class FormerPrimaryAcceptance(Acceptance):
                                               "divergent": divergent, "fork_lsn": fork}
         finally:
             self.stop_target(node)
+        original_port = self.server.port
         self.server.data.rename(target)
         self.server.data = data
         self.server.port = port
         self.start()
         assert identity(port)["timeline"] == 2
+        if type(self) is FormerPrimaryAcceptance:
+            self.check_divergence_policy(target, original_port, port, fork)
         if not follow.query(port, "SELECT slot_name FROM pg_replication_slots WHERE slot_name='follow_one'"):
             follow.query(port, "SELECT pg_create_physical_replication_slot('follow_one',true)")
         (target / "opaque-old-data").write_bytes(b"original data\x00\xff")
