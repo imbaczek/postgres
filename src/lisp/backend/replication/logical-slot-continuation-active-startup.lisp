@@ -45,23 +45,31 @@
         (when (eq :reserved (wal-replication-slot-wal-status current)) (setf demand t))))
     (values saved demand)))
 
-(defun logical-slot-continuation-active-snapshot (binding certificate host rows)
-  ;; Construct a detached generation 1 bootstrap image.  Later selected
-  ;; generations are checked separately against the saved inventory and host.
+(defun logical-slot-continuation-active-snapshot-from-checked-rows
+    (binding certificate host history rows)
+  (multiple-value-bind (saved demand)
+      (logical-slot-continuation-saved-origin-rows certificate history (sixth host) rows)
+    (let* ((fork (getf certificate :fork)) (child (getf certificate :child-timeline))
+                                           (snapshot
+                                             (list :version 1 :binding (copy-seq binding) :generation 1 :system-id (first host)
+                                                   :origin (list child fork) :history-target (fifth host)
+                                                   :history (copy-seq (fourth host))
+                                                   :sealed-end (list (sixth host) (fifth host) :prefix-end)
+                                                   :slots saved :transfers nil :roots nil :runs nil
+                                                   :tail (when demand (list (list fork child :record-start) child)))))
+      (logical-slot-continuation-check snapshot)
+      snapshot)))
+
+(defun logical-slot-continuation-active-child-snapshot (binding certificate host rows)
   (let ((history (logical-slot-continuation-origin-inputs binding certificate host)))
-    (multiple-value-bind (saved demand)
-        (logical-slot-continuation-saved-origin-rows
-         certificate history (sixth host)
-         (logical-slot-continuation-partition-rows rows certificate host))
-      (let* ((fork (getf certificate :fork)) (child (getf certificate :child-timeline))
-                                             (snapshot
-                                               (list :version 1 :binding (copy-seq binding) :generation 1 :system-id (first host)
-                                                     :origin (list child fork) :history-target (fifth host)
-                                                     :history (copy-seq (fourth host)) :sealed-end (list (sixth host) (fifth host) :prefix-end)
-                                                     :slots saved :transfers nil :roots nil :runs nil
-                                                     :tail (when demand (list (list fork child :record-start) child)))))
-        (logical-slot-continuation-check snapshot)
-        snapshot))))
+    (logical-slot-continuation-active-snapshot-from-checked-rows
+     binding certificate host history rows)))
+
+(defun logical-slot-continuation-active-snapshot (binding certificate host rows)
+  (let ((history (logical-slot-continuation-origin-inputs binding certificate host)))
+    (logical-slot-continuation-active-snapshot-from-checked-rows
+     binding certificate host history
+     (logical-slot-continuation-partition-rows rows certificate host))))
 
 (defun logical-slot-continuation-check-selected-snapshot
     (snapshot binding certificate host rows horizon)
