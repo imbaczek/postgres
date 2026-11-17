@@ -446,6 +446,7 @@
                    (:file "../replication/logical-slot-continuation-cold-handoff")
                    (:file "../replication/logical-slot-continuation-cold-reservation")
                    (:file "../replication/logical-slot-continuation-cold-inventory")
+                   (:file "../replication/logical-slot-continuation-cold-cleanup-inventory")
                    (:file "../replication/logical-slot-continuation-cold-selected")
                    (:file "../replication/logical-slot-continuation-cold-startup")
                    (:file "../replication/logical-slot-continuation-cold-source")

@@ -40,6 +40,7 @@
                (:file "t/rove/continuation-prepared-tests")
                (:file "t/rove/continuation-partition-tests")
                (:file "t/rove/continuation-cold-startup-tests")
+               (:file "t/rove/continuation-cold-cleanup-inventory-tests")
                (:file "t/rove/continuation-selected-proof-tests")
                (:file "t/rove/continuation-cold-source-tests")
                (:file "t/rove/logical-wal-lane-provider-tests")
