@@ -961,6 +961,9 @@ Then check the cached handles and workers under startup exclusion."
   (values))
 
 (defun offline-primary-recovery-options (arguments)
+  "Parse the supported single-user recovery arguments and settings.
+Require -D DATADIR and template1. Pass supported -c NAME=VALUE settings through.
+Consume the archive_mode=on and archive_command=false overrides."
   (unless (and (cddr arguments)
                (equal (first arguments) "-D")
                (plusp (length (second arguments)))
@@ -981,6 +984,8 @@ Then check the cached handles and workers under startup exclusion."
     options))
 
 (defun offline-primary-recovery-check-before-pid ()
+  "Under the directory lock, admit only an initialized ordinary primary.
+Check recovery control, recovery signals and startup fences before changing PID metadata."
   (when (or (physical-recovery-read-signal-mode)
             (physical-adoption-path-present-p (physical-recovery-control-path)))
     (error "offline primary recovery requires no standby or promotion recovery state"))
@@ -992,6 +997,10 @@ Then check the cached handles and workers under startup exclusion."
       (error "offline recovery requires an initialized ordinary primary"))))
 
 (defun run-offline-primary-recovery (arguments)
+  "Recover an existing primary offline with empty standard input.
+Own PGDATA before storage startup and redo, then load the export origin and
+publish a durable clean shutdown. Suppress checkpoint-driven WAL recycling
+throughout replay and shutdown."
   (unless (eq (read-char *standard-input* nil :eof) :eof)
     (error "offline primary recovery requires empty input"))
   (multiple-value-bind (host port pgdata control-port control-socket

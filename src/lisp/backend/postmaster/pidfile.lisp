@@ -273,7 +273,8 @@ leaves the separate data ownership lock to its owner."
     (fsync-directory *postmaster-pid-directory*)))
 
 (defun postmaster-check-data-directory (&key existing-only)
-  "Create only a missing native PGDATA; existing permissions must already be valid."
+  "Check PGDATA ownership and permissions, creating it only when allowed.
+EXISTING-ONLY requires the directory to be present."
   (unless (probe-file *pgdata*)
     (when existing-only (error "offline recovery requires an existing data directory"))
     (ensure-directories-exist
@@ -291,7 +292,8 @@ leaves the separate data ownership lock to its owner."
   (truename *pgdata*))
 
 (defun postmaster-open-data-lock (&key existing-only)
-  "Open only a dedicated regular ownership inode, never a link or special file."
+  "Open a dedicated regular ownership inode without following links.
+EXISTING-ONLY requires an existing private lock and leaves its mode unchanged."
   (let* ((fd (sb-posix:open (namestring (postmaster-data-path ".pg_lisp.lock"))
                             (logior sb-posix:o-rdwr (if existing-only 0 sb-posix:o-creat)
                                     sb-posix:o-nonblock sb-posix:o-nofollow +postmaster-o-cloexec+) #o600))
@@ -313,6 +315,7 @@ leaves the separate data ownership lock to its owner."
 
 (defun postmaster-own-data-directory (host port &key startup-before-pid startup-check startup-reconcile startup-observer existing-only)
   "Own PGDATA before any database storage initialization or recovery mutation.
+EXISTING-ONLY requires an existing directory and private ownership lock.
 Call read-only STARTUP-BEFORE-PID with the flock held before the startup
 timestamp or PID metadata changes.  A failure leaves stale PID evidence intact.
 Call STARTUP-CHECK synchronously with the local flock held and owned PID created,
