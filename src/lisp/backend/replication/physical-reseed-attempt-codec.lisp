@@ -12,7 +12,7 @@
 
 ;; These fields bind all phases to the same original attempt and source.
 
-(defparameter *physical-reseed-attempt-identity-keys* '(:version :local :request :source :stage))
+(defparameter *physical-reseed-attempt-identity-keys* '(:version :local :request :source :stage :rewind-origin))
 
 (defparameter *physical-reseed-local-keys* '(:directory :device :inode :lock-device :lock-inode :pid))
 
@@ -66,23 +66,40 @@
   (list :directory (copy-seq (getf stage :directory))
         :device (getf stage :device) :inode (getf stage :inode)))
 
+(defun physical-reseed-attempt-rewind-origin-copy (origin request local stage)
+  (unless (and stage (null (getf local :pid))
+               (listp origin) (= 4 (length origin))
+               (every (lambda (value) (typep value '(unsigned-byte 64))) origin)
+               (= (first origin) (getf request :system-id))
+               (< 0 (second origin) (getf request :timeline)))
+    (error "invalid saved native rewind origin"))
+  (copy-list origin))
+
 (defun physical-reseed-attempt-copy (record)
-  (let ((stage-p (loop for key in record by #'cddr thereis (eq key :stage))))
+  (let* ((keys (loop for key in record by #'cddr collect key))
+         (stage-p (member :stage keys))
+         (rewind-p (member :rewind-origin keys)))
     (physical-follow-check-plist record
-                                 (if stage-p (append *physical-reseed-attempt-keys* '(:stage))
-                                     *physical-reseed-attempt-keys*))
+                                 (append *physical-reseed-attempt-keys*
+                                         (when stage-p '(:stage))
+                                         (when rewind-p '(:rewind-origin))))
     (unless (and (eql 1 (getf record :version))
                  (member (getf record :phase) '(:premanifest :aborting :aborted)))
       (error "invalid reseed attempt version or phase"))
-    (let ((source (physical-follow-source-copy (getf record :source)))
-          (local (physical-reseed-attempt-local-copy (getf record :local))))
+    (let* ((source (physical-follow-source-copy (getf record :source)))
+           (local (physical-reseed-attempt-local-copy (getf record :local)))
+           (request (physical-backup-lease-request-copy (getf record :request)))
+           (stage (when stage-p (physical-reseed-attempt-stage-copy (getf record :stage) local))))
       (unless (eq :physical
                   (physical-libpq-frozen-profile-mode (nth-value 1 (physical-follow-source-profile source))))
         (error "reseed requires a saved physical replication connection"))
       (append
-       (list :version 1 :phase (getf record :phase) :local local
-             :request (physical-backup-lease-request-copy (getf record :request)) :source source)
-       (when stage-p (list :stage (physical-reseed-attempt-stage-copy (getf record :stage) local)))))))
+       (list :version 1 :phase (getf record :phase) :local local :request request :source source)
+       (when stage-p (list :stage stage))
+       (when rewind-p
+         (list :rewind-origin
+               (physical-reseed-attempt-rewind-origin-copy (getf record :rewind-origin)
+                                                           request local stage)))))))
 
 (defun physical-reseed-attempt-image (record)
   (let* ((text (physical-bootstrap-manifest-text (physical-reseed-attempt-copy record)))

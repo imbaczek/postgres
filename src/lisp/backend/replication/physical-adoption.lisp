@@ -254,13 +254,13 @@ The caller must keep inspected files immutable throughout the operation."
        (error "offline adoption requires a stopped primary without a PID file"))
      (funcall function owner))))
 
-(defun physical-adoption-inspect-primary (owner)
+(defun physical-inspect-clean-primary (owner check-owner)
   "Inspect a stopped primary without creating, repairing, or replaying files.
 Require DB_SHUTDOWNED and checkpoint = durable endpoint E, then verify the
 checkpoint record, resources, catalog identity and allocator capacity. Return
 actual next XID separately from the allocator's next value. Mutable facts must
 be revalidated before any future installation."
-  (physical-adoption-check-owner owner)
+  (funcall check-owner owner)
   (let* ((*pgdata* (physical-adoption-owner-directory owner))
          (*physical-recovery-state* nil)
          (*physical-recovery-failed-p* nil)
@@ -302,7 +302,7 @@ be revalidated before any future installation."
           (error "offline adoption checkpoint bytes or allocator capacity differ from control"))
         (physical-recovery-check-checkpoint-resources snapshot metadata)
         (native-control-facts capture)
-        (physical-adoption-check-owner owner)
+        (funcall check-owner owner)
         (unless (equalp capture (native-control-capture))
           (error "offline adoption primary control changed during inspection"))
         (list :owner owner :system-id (catalog-system-identifier)
@@ -311,6 +311,9 @@ be revalidated before any future installation."
               :checkpoint-start (getf snapshot :start) :snapshot snapshot :metadata metadata
               :next-xid (getf snapshot :next-xid) :allocation-next-xid allocation
               :history history :capture capture :catalog *catalog*)))))
+
+(defun physical-adoption-inspect-primary (owner)
+  (physical-inspect-clean-primary owner #'physical-adoption-check-owner))
 
 (defun physical-adoption-hash-origin-suffix (origin end history &key (namespace :timeline))
   "Extend the origin digest through END using the caller's immutable WAL files.
@@ -336,14 +339,14 @@ durability nor authority of ORIGIN. The caller must verify both independently."
         (error "adoption origin suffix did not reach the exact endpoint"))
       digest)))
 
-(defun physical-adoption-prove-primary-origin (state identity)
+(defun physical-prove-clean-primary-origin (state identity check-owner)
   "Read the source's durable origin and hash its WAL suffix to clean endpoint E.
 Reinspect the primary, require the same system and original timeline, and recheck
 control and origin after hashing. This evidence grants no installation or writer
 authority; mutable facts need revalidation before a future installation."
   (let* ((owner (getf state :owner))
-         (*pgdata* (physical-adoption-owner-directory (physical-adoption-check-owner owner)))
-         (fresh (physical-adoption-inspect-primary owner)))
+         (*pgdata* (physical-adoption-owner-directory (funcall check-owner owner)))
+         (fresh (physical-inspect-clean-primary owner check-owner)))
     (unless (and (equalp (getf state :capture) (getf fresh :capture))
                  (= (getf state :system-id) (getf fresh :system-id))
                  (= (getf state :allocation-next-xid) (getf fresh :allocation-next-xid)))
@@ -361,7 +364,7 @@ authority; mutable facts need revalidation before a future installation."
           (error "offline adoption origin belongs to another primary or exceeds its clean endpoint"))
         (let ((digest (physical-adoption-hash-origin-suffix
                        origin end (getf fresh :history) :namespace (getf fresh :namespace))))
-          (physical-adoption-check-owner owner)
+          (funcall check-owner owner)
           (unless (and (equalp (getf fresh :capture) (native-control-capture))
                        (equalp origin (physical-export-origin-read path)))
             (error "offline adoption origin or primary control changed during proof"))
@@ -369,3 +372,6 @@ authority; mutable facts need revalidation before a future installation."
                 :proven-lsn (physical-export-origin-proven-lsn origin)
                 :prefix-digest (physical-export-origin-prefix-digest origin)
                 :end end :end-digest digest))))))
+
+(defun physical-adoption-prove-primary-origin (state identity)
+  (physical-prove-clean-primary-origin state identity #'physical-adoption-check-owner))

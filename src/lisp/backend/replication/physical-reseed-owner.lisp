@@ -148,3 +148,15 @@ Keep the original PID file and dirty data intact; this does not perform reseed."
    :initial-arguments (lambda (root)
                         (physical-reseed-check-no-install root)
                         (list :old-pid (physical-reseed-read-pid root)))))
+
+(defun physical-rewind-check-reader (owner)
+  (if (eq (type-of owner) 'physical-reseed-owner)
+      (progn
+        (physical-reseed-check-owner owner)
+        (when (physical-reseed-owner-old-pid owner)
+          (error "native rewind requires clean shutdown and no PID file"))
+        owner)
+      (physical-adoption-check-owner owner)))
+
+(defun physical-rewind-inspect-primary (owner)
+  (physical-inspect-clean-primary owner #'physical-rewind-check-reader))

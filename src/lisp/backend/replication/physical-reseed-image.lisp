@@ -127,9 +127,9 @@ digest. Establish the source's ancestry before the export base separately."
   (unless (and source-image *physical-image-context*)
     (error "native rewind requires a previously verified source image and its descriptor scope"))
   (let* ((target (let ((*physical-image-context* nil))
-                   (physical-adoption-inspect-primary owner)))
+                   (physical-rewind-inspect-primary owner)))
          (origin (let ((*physical-image-context* nil))
-                   (physical-adoption-prove-primary-origin target origin-identity)))
+                   (physical-prove-clean-primary-origin target origin-identity #'physical-rewind-check-reader)))
          (manifest (getf (physical-reseed-image-check source-root source-image) :manifest))
          (source-timeline (getf manifest :timeline))
          (start (third (getf origin :identity)))
@@ -151,7 +151,7 @@ digest. Establish the source's ancestry before the export base separately."
         (wal-check-shared-lineage-prefix
          (getf target :history) source-root source-history start fork
          :left-namespace (getf target :namespace) :right-namespace source-namespace)
-        (physical-adoption-check-owner owner)
+        (physical-rewind-check-reader owner)
         (unless (and (equalp (getf target :capture) (native-control-capture))
                      (equalp (getf target :history) (timeline-read-history (getf target :timeline))))
           (error "native rewind target changed during shared WAL inspection")))
@@ -177,7 +177,7 @@ Installation requires separate checks."
          (digest #xCBF29CE484222325))
     (let* ((*pgdata* (physical-adoption-owner-directory owner))
            (*physical-image-context* nil)
-           (target (physical-adoption-inspect-primary owner))
+           (target (physical-rewind-inspect-primary owner))
            (capture (getf target :capture)))
       (unless (= (getf target :end) (getf proof :target-end))
         (error "rewind target changed before hashing shared WAL"))
@@ -192,7 +192,7 @@ Installation requires separate checks."
         (declare (ignore files))
         (unless (and complete (= cursor fork))
           (error "rewind target did not reach the shared fork")))
-      (physical-adoption-check-owner owner)
+      (physical-rewind-check-reader owner)
       (unless (equalp capture (native-control-capture))
         (error "rewind target changed while hashing shared WAL")))
     (let ((root
@@ -202,7 +202,7 @@ Installation requires separate checks."
                    :base-timeline (getf proof :common-timeline) :base (getf proof :start)
                    :manifest-digest (fourth origin-identity) :end fork)
              history-text digest)))
-      (physical-adoption-check-owner owner)
+      (physical-rewind-check-reader owner)
       (physical-reseed-image-check source-root source-image)
       (append proof (list :root-id root :fork-digest digest)))))
 
@@ -232,7 +232,7 @@ Hold a read descriptor for the target and a receive descriptor for the image.
 Reuse files only when the offered name, size and digest match. Verify the
 complete image and READY source lease, then recheck the target.
 Return the manifest, lease record and reused entries."
-  (let* ((target (physical-adoption-inspect-primary owner))
+  (let* ((target (physical-rewind-inspect-primary owner))
          (reused nil))
     (call-with-physical-directory-root
      owner
@@ -264,7 +264,7 @@ Return the manifest, lease record and reused entries."
                                 (physical-image-copy-file source-context *physical-image-context*
                                                           name size digest)
                                 (push entry reused))))))
-              (physical-adoption-check-owner owner)
+              (physical-rewind-check-reader owner)
               (let ((*pgdata* (physical-adoption-owner-directory owner))
                     (*physical-image-context* nil))
                 (unless (equalp (getf target :capture) (native-control-capture))
@@ -276,6 +276,13 @@ Return the manifest, lease record and reused entries."
 ;; journal, both images, and workspace identities.  The returned facts are
 ;; observations only: no install journal, moves, handoff, or startup retirement
 ;; are performed here.  Failed copies retain their partial incoming contents.
+
+(defun physical-reseed-image-check-rewind-origin (owner client record source-root image)
+  (let ((origin (getf record :rewind-origin)))
+    (when origin
+      (physical-reseed-require-journal owner record)
+      (physical-rewind-prove-leased-origin owner source-root image origin client (getf record :request))
+      (physical-reseed-require-journal owner record))))
 
 (defun physical-reseed-prepare-image (owner incoming &key helper)
   (unless (eq (type-of owner) 'physical-reseed-owner)
@@ -302,6 +309,7 @@ Return the manifest, lease record and reused entries."
                 (let ((source-context *physical-image-context*)
                       (image (physical-reseed-image-check source-root)))
                   (physical-reseed-image-check-source client record image)
+                  (physical-reseed-image-check-rewind-origin owner client record source-root image)
                   (physical-reseed-image-test-point :before-clone incoming)
                   (physical-reseed-require-journal owner record)
                   (physical-reseed-stage-facts owner stage stage-fd :expected stage-facts)

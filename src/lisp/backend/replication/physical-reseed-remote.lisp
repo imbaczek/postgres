@@ -101,7 +101,7 @@
            (funcall function client))
       (when client (physical-client-close client)))))
 
-(defun %physical-reseed-start-remote (owner directory request profile &key helper stage-check)
+(defun %physical-reseed-start-remote (owner directory request profile &key helper stage-check rewind-origin)
   ;; The optional check adds caller-specific observations at each stage check.
   ;; Publish the ordinary attempt journal before CAPTURE so a reopened attempt
   ;; can use status or cancellation without issuing CAPTURE again.
@@ -121,9 +121,10 @@
            (physical-reseed-remote-test-point :after-discovery)
            (check-stage t)
            (let ((record (physical-reseed-attempt-publish
-                          owner (list :version 1 :phase :premanifest
-                                      :local (physical-reseed-attempt-local-facts owner)
-                                      :request request :source source :stage facts))))
+                          owner (append (list :version 1 :phase :premanifest
+                                              :local (physical-reseed-attempt-local-facts owner)
+                                              :request request :source source :stage facts)
+                                        (when rewind-origin (list :rewind-origin rewind-origin))))))
              (physical-reseed-remote-test-point :after-journal)
              (call-with-physical-reseed-client
               owner record
@@ -132,8 +133,10 @@
                 (physical-reseed-require-journal owner record)
                 (check-stage t)
                 (multiple-value-prog1
-                    (physical-backup-lease-capture-remote stage client (getf record :request)
-                                                          :directory-fd fd)
+                    (if (getf record :rewind-origin)
+                        (physical-rewind-capture-image owner stage fd client (getf record :request))
+                        (physical-backup-lease-capture-remote stage client (getf record :request)
+                                                              :directory-fd fd))
                   (physical-reseed-remote-test-point :after-capture)
                   (physical-reseed-require-journal owner record)
                   (check-stage nil)))
@@ -142,6 +145,15 @@
 (defun physical-reseed-start-remote (owner directory request profile &key helper)
   ;; Start capture with the ordinary stage validation and durable journal.
   (%physical-reseed-start-remote owner directory request profile :helper helper))
+
+(declaim (ftype function physical-rewind-capture-image))
+
+(defun physical-rewind-start-remote (owner directory request profile origin &key helper)
+  (physical-reseed-check-owner owner)
+  (unless origin (error "native rewind requires its historical export identity"))
+  (physical-rewind-inspect-primary owner)
+  (%physical-reseed-start-remote
+   owner directory request profile :helper helper :rewind-origin origin))
 
 (defun physical-reseed-source-result (record source)
   (let ((source (when source (physical-backup-lease-copy source))))

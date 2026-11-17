@@ -20,6 +20,25 @@
                         :owner (pg::physical-libpq-frozen-profile-datum
                                 (pg::make-physical-libpq-frozen-profile info))))))
 
+(deftest rewind-attempt-preserves-origin-through-serialization-and-transitions
+    (let* ((record (reseed-attempt-test-record))
+           (request (getf record :request))
+           (origin (list (getf request :system-id) 1 192 456)))
+      (setf (getf request :timeline) 2
+            (getf record :stage) '(:directory "/tmp/rewind-stage/" :device 1 :inode 75)
+            (getf record :rewind-origin) origin)
+      (let* ((decoded (pg::physical-reseed-attempt-decode (pg::physical-reseed-attempt-image record)))
+             (changed (copy-tree decoded)))
+        (ok (equal origin (getf decoded :rewind-origin)))
+        (setf (fourth origin) 789)
+        (ok (= 456 (fourth (getf decoded :rewind-origin))))
+        (setf (getf changed :phase) :aborting)
+        (ok (pg::physical-reseed-attempt-check-transition decoded changed))
+        (setf (fourth (getf changed :rewind-origin)) 789)
+        (ok (signals (pg::physical-reseed-attempt-check-transition decoded changed) 'error))
+        (remf changed :rewind-origin)
+        (ok (signals (pg::physical-reseed-attempt-check-transition decoded changed) 'error)))))
+
 (cl-spec:defproperty reseed-attempt-storage-shapes-preserve-owned-unicode-intent
     ((shape (member :simple :adjustable :fill-pointer :displaced))
      (unicode (member nil t)) (phase (range integer 0 2)))

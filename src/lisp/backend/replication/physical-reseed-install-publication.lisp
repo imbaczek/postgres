@@ -103,6 +103,7 @@
                 (lambda (source-root)
                   (let ((image (physical-reseed-image-check source-root)))
                     (physical-reseed-image-check-source client record image)
+                    (physical-reseed-image-check-rewind-origin owner client record source-root image)
                     (physical-reseed-install-publish-workspaces
                      owner root-fd record client image *physical-image-context* source-root stage-check
                      incoming quarantine)))))
