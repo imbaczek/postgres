@@ -7,6 +7,17 @@
       (error "imported startup proof belongs to a different PGDATA root")))
   t)
 
+(defun logical-slot-imported-startup-pair-file-facts (held)
+  ;; Expose detached relative names and full facts, never held descriptors.
+  (logical-slot-copy-clone-facts
+   (mapcar (lambda (row)
+             (let ((name (second row)))
+               (list (if (member name '("journal" "active") :test #'equal)
+                         (concatenate 'string "logical-slot-copy.install/" name)
+                         name)
+                     (fourth row))))
+           (reverse held))))
+
 (defun call-with-logical-slot-imported-startup-pair (root root-check function)
   ;; Read the permanent pair before WAL opens. ROOT-CHECK retains real ownership.
   ;; The callback receives copies and a scoped check, never startup permission.
@@ -41,7 +52,7 @@
                                  (logical-slot-imported-check-held-file parent name fd facts bytes))
                                (funcall next fd)))
                         (when (eq record (first held)) (pop held))))))))
-             (check ()
+             (check (&optional projection)
                (unless (and active (eq thread sb-thread:*current-thread*))
                  (error "imported startup observation ended or changed thread"))
                (when failed (error "imported startup observation already failed"))
@@ -51,7 +62,9 @@
                      (logical-slot-imported-check-file-anchors
                       root named-root root-facts held :canonical t)
                      (logical-slot-imported-startup-check-certificate-root private-facts root-facts)
-                     t)
+                     (ecase projection
+                       ((nil) t)
+                       (:file-facts (logical-slot-imported-startup-pair-file-facts held))))
                  (error (condition)
                    (setf failed t)
                    (error condition)))))

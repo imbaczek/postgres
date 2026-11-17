@@ -272,6 +272,70 @@
     (rove:ok (= inode (sb-posix:stat-ino (sb-posix:lstat path))))
     (rove:ok (equalp bytes (read-bounded-regular-file path (1+ +wal-control-maximum-bytes+))))))
 
+(defun native-imported-main-pair-projection-error-contract (root root-check)
+  (rove:ok
+   (rove:signals
+    (call-with-logical-slot-imported-startup-pair
+     root root-check
+     (lambda (image facts check)
+       (declare (ignore image facts))
+       (rove:ok (rove:signals (funcall check :unsupported-projection) 'error))
+       (rove:ok (rove:signals (funcall check) 'error))
+       (rove:ok (rove:signals (funcall check :file-facts) 'error))))
+    'error)))
+
+(defun native-imported-main-pair-replacement-contract (root root-check)
+  ;; Reopen each byte-identical replacement in a fresh scope. Compare the detached
+  ;; evidence across scopes; both scopes must independently accept canonical data.
+  (dolist (name '("logical-slot-copy.source-proof" "logical-slot-copy.import"
+                  "logical-slot-copy.install/journal" "logical-slot-copy.install/active"
+                  "logical-slot-copy.install"))
+    (let* ((path (merge-pathnames name *pgdata*))
+           (directory-p (equal name "logical-slot-copy.install"))
+           (temporary (merge-pathnames (format nil "pair-replacement-~d-~d/"
+                                               (sb-posix:getpid) (random 1000000000))
+                                       (uiop:temporary-directory)))
+           (saved (merge-pathnames "original" temporary))
+           (copy (merge-pathnames "replacement" temporary))
+           (moved nil) (installed nil) (before nil) (after nil))
+      (labels ((copy-file (source target)
+                 (with-open-file (out target :direction :output :if-exists :error
+                                             :element-type '(unsigned-byte 8))
+                   (sb-posix:fchmod (sb-sys:fd-stream-fd out) #o600)
+                   (write-sequence (read-bounded-regular-file source
+                                                              (logical-slot-copy-source-proof-maximum-bytes)) out)))
+               (observe ()
+                 (call-with-logical-slot-imported-startup-pair
+                  root root-check
+                  (lambda (image facts check)
+                    (declare (ignore facts))
+                    (list image (funcall check :file-facts))))))
+        (sb-posix:mkdir temporary #o700)
+        (unwind-protect
+             (progn
+               (if directory-p
+                   (progn
+                     (ensure-directories-exist (merge-pathnames "replacement/" temporary))
+                     (sb-posix:chmod copy #o700)
+                     (dolist (leaf '("journal" "active"))
+                       (copy-file (merge-pathnames leaf (uiop:ensure-directory-pathname path))
+                                  (merge-pathnames leaf (uiop:ensure-directory-pathname copy)))))
+                   (copy-file path copy))
+               (setf before (observe))
+               (sb-sys:without-interrupts
+                 (sb-posix:rename path saved) (setf moved t)
+                 (sb-posix:rename copy path) (setf installed t))
+               (setf after (observe))
+               (rove:ok (equalp (first before) (first after)))
+               (rove:ok (not (equal (second before) (second after))))
+               (let ((old (assoc name (second before) :test #'equal))
+                     (new (assoc name (second after) :test #'equal)))
+                 (rove:ok (and old new (/= (second (second old)) (second (second new)))))))
+          (sb-sys:without-interrupts
+            (when installed (sb-posix:rename path copy) (setf installed nil))
+            (when moved (sb-posix:rename saved path) (setf moved nil)))
+          (uiop:delete-directory-tree temporary :validate t :if-does-not-exist :ignore))))))
+
 (defun native-imported-main-history-contract (root root-check)
   (let ((saved-check nil)
         (expected (or (uiop:getenv "PG_NATIVE_IMPORTED_HISTORY_PROFILE") "original")))
@@ -489,8 +553,10 @@
          (native-imported-main-history-contract root root-check)
          (native-imported-main-sidecar-contract root root-check)
          (native-imported-main-checkpoint-contract root root-check)
+         (native-imported-main-pair-projection-error-contract root root-check)
          (when (equal (uiop:getenv "PG_NATIVE_IMPORTED_CHECKPOINT_REPLACE") "1")
-           (native-imported-main-checkpoint-replacement-contract root root-check))
+           (native-imported-main-checkpoint-replacement-contract root root-check)
+           (native-imported-main-pair-replacement-contract root root-check))
          (rove:ok
           (equal
            '(:observed 17)
@@ -509,15 +575,28 @@
                (setf (getf (getf facts :certificate) :inode) 0
                      (aref image 0) (logxor #xff (aref image 0)))
                (rove:ok (funcall check))
+               (rove:ok (eq t (funcall check nil)))
+               (let* ((projection (funcall check :file-facts))
+                      (before (logical-slot-copy-clone-facts projection)))
+                 (rove:ok (equal (mapcar #'first projection)
+                                 '("logical-slot-copy.source-proof" "logical-slot-copy.import"
+                                   "logical-slot-copy.install" "logical-slot-copy.install/journal"
+                                   "logical-slot-copy.install/active")))
+                 (rove:ok (every (lambda (row) (and (= 2 (length row))
+                                                    (= 9 (length (second row))))) projection))
+                 (setf (aref (first (first projection)) 0) #\X
+                       (first (second (first projection))) -1)
+                 (rove:ok (equal before (funcall check :file-facts))))
                (let ((rejected nil))
                  (sb-thread:join-thread
                   (sb-thread:make-thread
                    (lambda ()
                      (setf rejected
-                           (handler-case (progn (funcall check) nil) (error () t))))))
+                           (handler-case (progn (funcall check :file-facts) nil) (error () t))))))
                  (rove:ok rejected))
                (values :observed 17))))))
          (rove:ok (rove:signals (funcall saved-check) 'error))
+         (rove:ok (rove:signals (funcall saved-check :file-facts) 'error))
          (rove:ok
           (rove:signals
            (call-with-logical-slot-imported-startup-pair
@@ -541,9 +620,9 @@
                 (declare (ignore image facts))
                 (incf called)
                 (setf reject t)
-                (rove:ok (rove:signals (funcall check) 'error))
+                (rove:ok (rove:signals (funcall check :file-facts) 'error))
                 (setf reject nil)
-                (rove:ok (rove:signals (funcall check) 'error))))
+                (rove:ok (rove:signals (funcall check :file-facts) 'error))))
              'error)))
          (let ((directory *pgdata*))
            (rove:ok
