@@ -160,7 +160,11 @@ This is not yet an operational recovery path and grants no writer authority."
 (defun wal-check-shared-lineage-prefix
     (left-history right-directory right-history start end
      &key (left-namespace :timeline) (right-namespace :timeline))
-  "Verify a nonempty shared WAL interval against two immutable segment sets."
+  "Verify that two immutable WAL segment sets share the nonempty interval [START, END).
+LEFT-HISTORY describes the current PGDATA. RIGHT-HISTORY describes RIGHT-DIRECTORY.
+The caller must verify cluster identity, both histories, and the START cursor
+and keep the segment sets stable. Compare original record bytes and their
+owning timelines. Return T on success or signal an error on a failed check."
   (unless (< start end) (error "shared lineage WAL interval is empty"))
   (let* ((remaining 0)
          (right-files
