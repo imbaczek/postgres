@@ -1086,6 +1086,9 @@
               (physical-reseed-follow-activation-publish context candidate check))))))))
 
 (defun physical-reseed-follow-configure-and-activate (target workspace time &key helper)
+  "Resume configuration, settlement, and activation under the configuration owner.
+Recover a complete next publication according to settlement, then advance phases
+to active. Fail if the phase is unsupported or the bounded loop cannot finish."
   (let ((*pgdata* target))
     (call-with-physical-reseed-follow-configuration-owner
      target

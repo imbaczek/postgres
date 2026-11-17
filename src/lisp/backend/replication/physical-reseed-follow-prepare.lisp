@@ -145,7 +145,8 @@
          (physical-reseed-follow-write-intent owner root-fd candidate bytes previous check))))))
 
 (defun physical-rewind-select-installed-follow (target name)
-  "Publish or recover the preparing successor for a journaled rewind install."
+  "Publish or recover the successor for a journaled rewind install.
+Recover a complete next intent. Accept at most one preparing or proved generation."
   (unless (wal-valid-replication-slot-name-p name)
     (error "invalid native rewind successor name"))
   (let ((*pgdata* target))

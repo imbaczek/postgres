@@ -82,7 +82,9 @@ Remove any owned PID file and release the data directory lock on exit."
         (when *postmaster-data-lock* (close *postmaster-data-lock*))))))
 
 (defun physical-reseed-follow-retire-offline (target port &key rewind-only)
-  "Own the stopped target and archive the install and attempt journals in order."
+  "Own the stopped target and resume retirement in journal order.
+With REWIND-ONLY, require a rewind origin before creating PID metadata.
+Archive the install and attempt journals before publishing terminal retirement."
   (call-with-physical-reseed-offline-startup
    target
    (lambda ()

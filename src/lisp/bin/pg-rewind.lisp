@@ -5,7 +5,7 @@
 (in-package #:pg)
 
 (defun native-rewind-options (arguments)
-  "Parse the supported target, source, and offline finish options."
+  "Parse the target and exactly one of source, resume, or finish."
   (let ((target nil) (source nil) (offline-mode nil))
     (labels ((accept (key value)
                (unless (and value (plusp (length value)))
@@ -42,6 +42,8 @@
     (uiop:ensure-directory-pathname directory)))
 
 (defun native-rewind-workspace-from-plan (target plan)
+  "Derive the CLI workspace from an owner-validated install plan.
+Require a rewind origin and the expected sibling workspace paths."
   (let* ((attempt (getf plan :attempt))
          (incoming (pathname (getf (getf plan :incoming) :directory)))
          (workspace (uiop:pathname-parent-directory-pathname incoming)))
@@ -58,6 +60,8 @@
     workspace))
 
 (defun native-rewind-complete-install (target helper)
+  "Resume installation from the validated owner's current step to its terminal step.
+Require each advance to publish the next step and return the plan's workspace."
   (call-with-physical-reseed-install-owner
    target
    (lambda (owner)
@@ -96,6 +100,7 @@ Publish the install journal before advancing the installation steps."
     workspace))
 
 (defun native-rewind-proved-follow-p (target)
+  "Check the follow journal under configuration ownership for a proved successor."
   (call-with-physical-reseed-follow-configuration-owner
    target
    (lambda (owner)
@@ -107,6 +112,8 @@ Publish the install journal before advancing the installation steps."
           (eq :proved (getf (first (getf record :generations)) :phase))))))))
 
 (defun native-rewind-follow (target workspace helper)
+  "Prepare a successor unless already proved, then resume configuration and activation.
+Retire the journals and finalize the installed standby."
   (unless (native-rewind-proved-follow-p target)
     (let ((name (string-downcase (format nil "rewind_~32,'0x" (logical-slot-new-generation)))))
       (physical-rewind-select-installed-follow target name))
@@ -123,6 +130,8 @@ Publish the install journal before advancing the installation steps."
   (physical-reseed-follow-finalize-offline target 5432))
 
 (defun native-rewind-resume-workspace (target helper)
+  "Use the validated install plan when follow state exists.
+Otherwise complete the published installation and return its workspace."
   (if (or (physical-adoption-path-present-p (merge-pathnames "physical-reseed.follow" target))
           (physical-adoption-path-present-p (merge-pathnames "physical-reseed.follow.tmp" target)))
       (call-with-physical-reseed-follow-configuration-owner
@@ -132,6 +141,8 @@ Publish the install journal before advancing the installation steps."
       (native-rewind-complete-install target helper)))
 
 (defun native-rewind-retirement-present-p (target)
+  "Route a named retired receipt or active follow record to the retirement owner.
+That owner checks authority before any update."
   (or (physical-adoption-path-present-p (merge-pathnames "physical-reseed.retired" target))
       (let ((fd (physical-backup-open-directory target)))
         (unwind-protect
@@ -142,7 +153,8 @@ Publish the install journal before advancing the installation steps."
           (sb-posix:close fd)))))
 
 (defun native-rewind-main (arguments)
-  "Run native rewind or finish configuration handoff after terminal retirement."
+  "Run a new rewind or resume a published install or follow phase.
+Use --finish for offline configuration handback, including after receipt consumption."
   (handler-case
       (multiple-value-bind (target conninfo offline-mode) (native-rewind-options arguments)
         (ecase offline-mode
