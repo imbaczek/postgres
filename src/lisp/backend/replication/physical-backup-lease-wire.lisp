@@ -344,12 +344,18 @@ Each unique entry contains a relation name, size and digest."
           (call-with-native-backup-copy-out
            stream tag
            (lambda (stage begin-copy)
-             (multiple-value-bind (manifest claimed)
-                 (physical-backup-lease-capture stage (physical-backup-lease-command-request command)
-                                                :on-start begin-copy)
-               (unless claimed
-                 (ereport "55000" "backup lease already exists; use BACKUP_LEASE_STATUS or BACKUP_LEASE_ABORT"))
-               manifest))
+             (let ((entries nil))
+               (multiple-value-bind (manifest claimed)
+                   (physical-backup-lease-capture
+                    stage (physical-backup-lease-command-request command)
+                    :on-start begin-copy
+                    :before-ready (when (eq kind :physical-lease-capture-rewind)
+                                    (lambda (directory verified digest)
+                                      (setf entries (physical-backup-bundle-entries
+                                                     directory verified :manifest-digest digest)))))
+                 (unless claimed
+                   (ereport "55000" "backup lease already exists; use BACKUP_LEASE_STATUS or BACKUP_LEASE_ABORT"))
+                 (values manifest entries))))
            :reuse (when offers
                     (lambda (entry)
                       (equal entry (gethash (first entry) offers)))))))

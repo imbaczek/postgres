@@ -168,13 +168,13 @@ Only explicit proof_kind retained_timeline selects the retained proof."
                                (setf copy-mode t)
                                (copy-write-frame stream #\H response)
                                (finish-output stream))))
-                      (let ((manifest (funcall producer stage #'begin-copy)))
+                      (multiple-value-bind (manifest expected-entries) (funcall producer stage #'begin-copy)
                         (unless copy-mode (error "native backup producer did not start COPY"))
                         (physical-bootstrap-test-point :before-stream stage)
                         (physical-backup-send-bundle
                          stage manifest
                          (lambda (payload) (copy-write-frame stream #\d payload) (finish-output stream))
-                         :reuse reuse))))
+                         :reuse reuse :expected-entries expected-entries))))
                (when stage (physical-backup-delete-stage stage)))
              (copy-write-frame stream #\c (make-payload))
              (send-command-complete stream tag)
@@ -212,7 +212,7 @@ A verified origin may outlive a failed or cancelled stream for later inspection.
      (funcall begin-copy)
      (let ((name (string-downcase (format nil "pg_basebackup_~d_~36r" (backend-pid *backend*)
                                           (random (ash 1 64))))))
-       (physical-export-base-backup stage name)))))
+       (values (physical-export-base-backup stage name))))))
 
 (defun parse-native-physical-prepare (words)
   "Parse PREPARE_FOLLOW and require the native format and each receiver field once.

@@ -50,7 +50,7 @@
 ;; owns DIRECTORY and any partial contents; this driver does not delete them.
 ;; ON-START runs only for a new claim, after CAPTURING is durable and before
 ;; the long copy, allowing a wire caller to begin COPY within its deadline.
-(defun physical-backup-lease-capture (directory request &key on-start)
+(defun physical-backup-lease-capture (directory request &key on-start before-ready)
   (let ((request (physical-backup-lease-request-copy request)))
     (when (plusp *live-operation-depth*)
       (error "backup lease capture must start outside a live operation"))
@@ -75,5 +75,6 @@
                      (physical-export-origin-verify-backup target manifest reservation)
                    (physical-backup-lease-test-point :after-capture-verification
                                                      (physical-backup-lease-status request))
+                   (when before-ready (funcall before-ready target actual digest))
                    (physical-backup-lease-publish-capture owner reservation origin actual digest))
                  manifest))))))))))

@@ -33,6 +33,32 @@
       (setf (getf new :version) 2)
       (ok (signals (pg::recovery-check-manifest-schema new)))))
 
+(deftest rewind-backup-stream-rejects-changed-authentication-metadata
+    (with-physical-store-directory (root)
+      (let* ((manifest (authentication-test-manifest))
+             (hba (merge-pathnames "pg_hba.conf" root))
+             (frames nil))
+        (write-recovery-manifest-text root (pg::physical-bootstrap-manifest-text manifest))
+        (dolist (name '("recovery.required" "physical-recovery.control"
+                        "pg_ident.conf" "authentication.initialized"))
+          (write-startup-config (merge-pathnames name root) "metadata"))
+        (write-startup-config hba "host all all all reject")
+        (let ((entries (pg::physical-backup-bundle-entries root manifest)))
+          (write-startup-config hba "host all all all trust")
+          (ok (equal manifest (pg::recovery-read-manifest root)))
+          (ok (signals (pg::physical-backup-send-bundle
+                        root manifest (lambda (frame) (push frame frames))
+                        :expected-entries entries)
+                       'error))
+          (ok (null frames)))
+        (let ((digest (nth-value 1 (pg::recovery-read-manifest root))))
+          (ok (pg::physical-backup-bundle-entries root manifest :manifest-digest digest))
+          (write-recovery-manifest-text
+           root (concatenate 'string (pg::physical-bootstrap-manifest-text manifest) " "))
+          (ok (equal manifest (pg::recovery-read-manifest root)))
+          (ok (signals (pg::physical-backup-bundle-entries root manifest :manifest-digest digest)
+                       'error))))))
+
 (deftest authentication-required-backup-never-bootstraps-missing-adjuncts
     (call-with-pid-owner
      (lambda (root)

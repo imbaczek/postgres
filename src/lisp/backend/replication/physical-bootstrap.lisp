@@ -595,25 +595,31 @@ Check the file length and digest before sending the end frame."
     ("pg_ident.conf" 1048576)
     ("authentication.initialized" 1024)))
 
-(defun physical-backup-bundle-entries (directory manifest)
+(defun physical-backup-bundle-entries (directory manifest &key manifest-digest)
   (recovery-check-manifest-schema manifest)
   (when (get-properties manifest '(:logical-slot-copy-id))
     (error "ordinary native backup bundles cannot carry logical slot copy adjuncts"))
-  (unless (equal manifest (recovery-read-manifest directory))
-    (error "native backup bundle manifest changed"))
   (append
-   (loop for (name maximum) in
-                            (physical-backup-metadata-bounds)
+   (loop for (name maximum) in (physical-backup-metadata-bounds)
          for bytes = (read-bounded-regular-file (merge-pathnames name directory) maximum)
-         collect (list name (length bytes) (physical-store-update-digest #xCBF29CE484222325 bytes)))
+         for digest = (if (equal name "physical-backup.manifest")
+                          (multiple-value-bind (actual hash) (recovery-decode-manifest bytes)
+                            (unless (and (equal manifest actual)
+                                         (or (null manifest-digest) (= manifest-digest hash)))
+                              (error "native backup bundle manifest changed"))
+                            hash)
+                          (physical-store-update-digest #xCBF29CE484222325 bytes))
+         collect (list name (length bytes) digest))
    (getf manifest :files)))
 
 ;; Send B (bundle header), F/D/E (file header, data and end), then Z
 ;; (count and checksum).  The checksum covers all preceding payloads, including
 ;; file checksums; it detects corruption and is not an authentication mechanism.
-(defun physical-backup-send-bundle (directory manifest emit &key reuse)
+(defun physical-backup-send-bundle (directory manifest emit &key reuse expected-entries)
   (let* ((entries (physical-backup-bundle-entries directory manifest))
          (digest #xCBF29CE484222325))
+    (when (and expected-entries (not (equal expected-entries entries)))
+      (error "native backup bundle changed after capture verification"))
     (flet ((send (payload)
              (setf digest (physical-store-update-digest digest payload))
              (funcall emit payload)))
