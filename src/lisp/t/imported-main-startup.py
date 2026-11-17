@@ -3,8 +3,10 @@
 PG_NATIVE_MAIN_RESTART=1 runs three fresh servers in the same disposable view,
 with clean SIGTERM shutdowns. Each boot checks its own control socket and SQL;
 instrumented runs also check typed C or ZERO-C restoration before catalog entry.
-Witness rows 41 and 42 persist across the clean restarts. This does not test
-crash or commit-ack durability, or advancement of slot feedback.
+Witness rows 41 and 42 persist across the clean restarts. The restart check
+does not test crash or commit-ack durability, or advancement of logical slot feedback.
+PG_NATIVE_MAIN_WIRE=1 runs the separate wire exercise; when combined with
+restart, it runs on the first boot only.
 """
 
 import importlib.util
@@ -35,7 +37,7 @@ def free_port():
 
 
 def inspect_control(path, pid, form=None, marker=':IMPORTED-MAIN-CONTROL-OK'):
-    """Inspect this server's typed protection and absent follow workers."""
+    """Check the server's control peer and run its protection or supplied check."""
     form = form or """(let ((*print-circle* t) (*print-level* 4) (*print-length* 12))
       (sb-thread:with-mutex (pg::*wal-lock*)
         (assert (not (pg::recovery-in-progress-p)))

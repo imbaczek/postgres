@@ -1,4 +1,9 @@
-"""Exercise native physical slot lifetimes beside imported logical protection."""
+"""Exercise native physical slot lifetimes beside imported logical protection.
+
+The server creates a local checkpoint and private source proof through a real
+base backup. A separate public temporary physical slot belongs to its creator;
+neither it nor the private proof replaces the imported logical protections.
+"""
 
 import os
 import re
@@ -30,6 +35,7 @@ def query(client, text):
 
 
 def feedback(client, written, flushed, applied):
+    """Report separate write, flush and apply positions to the sender."""
     send(client, b'd', b'r' + struct.pack('!QQQqB', written, flushed, applied, 0, 0))
 
 
@@ -82,6 +88,7 @@ def frame(client):
 
 
 def finish(client):
+    """End COPY and consume the sender's completion through ReadyForQuery."""
     send(client, b'c')
     kinds = []
     while True:
@@ -104,6 +111,7 @@ def finish(client):
 
 
 def check_protections(control):
+    """Check that the saved imported protections remain installed and valid."""
     control('(sb-thread:with-mutex (pg::*wal-lock*) '
             '(assert (= (length pg::*imported-wire-protections*) '
             '(hash-table-count pg::*logical-slot-continuation-protections*))) '
@@ -114,6 +122,7 @@ def check_protections(control):
 
 
 def exercise(port, data, job, imported, control):
+    """Check streaming, feedback and temporary-slot cleanup on this server."""
     began = time.monotonic()
     control('(progn (defparameter pg::*imported-wire-protections* nil) '
             '(sb-thread:with-mutex (pg::*wal-lock*) '
@@ -166,7 +175,8 @@ def exercise(port, data, job, imported, control):
         witness.query("INSERT INTO imported_wire_rows VALUES (1,'" + payload + "')")
         target = integer(witness.query('SELECT pg_current_wal_flush_lsn()')[0][0])
         feedback(owner, cursor, cursor, base)
-        # Sync only complete records; write feedback deliberately leads flush.
+        # Write feedback deliberately leads flush. Compare every fragment with
+        # local WAL and report flush only at complete record boundaries after fsync.
         pending = bytearray()
         received = completed = cursor
         first_end = None
@@ -237,7 +247,7 @@ def exercise(port, data, job, imported, control):
                         assert last_flush_sent == completed
                         assert largest_record > max_frame_bytes
                         assert write_only_checked and flush_checked
-                        break  # Previous report was processed before this frame.
+                        break  # Wait for another frame, then verify the applied floor below.
                     feedback(owner, received, completed, base)
                     last_flush_sent = completed
                     phase = 3
