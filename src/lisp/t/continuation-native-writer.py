@@ -63,8 +63,11 @@ def owned_fixture(data, identity):
 
 
 @contextmanager
-def working_namespaces(data, destination, source=None, *, include_base=False, extra_names=()):
+def working_namespaces(data, destination, source=None, *, include_base=False, extra_names=(),
+                       full_source=False):
     """Retain failed working images; restore original inodes after the child exits."""
+    if full_source and source is None:
+        raise ValueError('Complete variant copying requires an explicit source')
     identity = (data.stat().st_dev, data.stat().st_ino)
     backup = destination / 'original'
     variant = destination / 'variant'
@@ -79,6 +82,12 @@ def working_namespaces(data, destination, source=None, *, include_base=False, ex
                 or Path(name).name != name or name in names):
             raise ValueError('Invalid extra fixture namespace')
         names += (name,)
+    if full_source:
+        if source.is_symlink() or not source.is_dir():
+            raise ValueError('Complete fixture source must be a directory, not a link')
+        unselected = set(os.listdir(source)) - set(names) - {'.pg_lisp.lock'}
+        if unselected:
+            raise ValueError('Complete fixture source has unselected entries: ' + repr(sorted(unselected)))
     with owned_fixture(data, identity):
         with marker.open('x') as stream:
             json.dump(dict(pid=os.getpid(), root=str(data), identity=identity,
@@ -88,7 +97,10 @@ def working_namespaces(data, destination, source=None, *, include_base=False, ex
                 before[name] = tree_image(data / name)
                 os.rename(data / name, backup / name)
                 moved.append(name)
-                original = (source / name) if source is not None and name in NAMES else (backup / name)
+                original = ((source / name) if source is not None and (full_source or name in NAMES)
+                            else (backup / name))
+                if full_source and not os.path.lexists(original):
+                    continue
                 if original.is_symlink():
                     raise ValueError('Mutable fixture namespace is a symlink: ' + name)
                 if original.is_dir():
