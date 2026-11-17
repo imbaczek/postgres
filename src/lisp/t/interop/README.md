@@ -252,6 +252,23 @@ files and nested directory identities survive in quarantine along with the exact
 auxiliary guard, and that the standby can cold restart, restart with the source
 offline and reconnect. It also checks a table created only on the child timeline.
 
+Run the manual failover rehearsal with the same pinned Patroni 4.1.5 environment
+and dependencies, using a fresh output directory under the RAM job's temporary
+directory:
+
+```sh
+./t/test-ramdisk.sh setup 4G
+PATH="/path/to/c/bin:$PATH" PG_CONFIG=/path/to/c/bin/pg_config ./t/test-ramdisk.sh run \
+  sh -c 'exec "$1" t/interop/patroni-reseed.py --case manual-failover --output "$TMPDIR/manual-failover"' \
+  sh "$PATRONI_PYTHON"
+```
+
+The rehearsal drives native peers through Patroni's PostgreSQL control layer.
+The ledger compares client acknowledgements, a SQL rejection, and an unread
+COMMIT response with the promoted standby. The run verified asynchronous
+loss and reseeding the former primary. It took 268.36 seconds, including
+160.99 seconds for activation and retirement.
+
 Run the Patroni bootstrap cancellation oracle from `src/lisp` with the same
 pinned Patroni 4.1.5 environment and build dependencies. Choose a new output
 directory. The test uses an initially empty disposable destination.

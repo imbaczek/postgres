@@ -326,6 +326,8 @@ class ManualFailoverAcceptance(FormerPrimaryAcceptance):
         received, replayed = map(lsn_number, self.standby_frontier)
         assert received >= replayed > 0
         assert node.is_running() == standby
+        # Stop this exact standby before making source-only commits.  Restart it
+        # only after the source is dead, so it cannot receive those commits.
         stopped = self.stop_target(node)
         assert stopped and stopped["pid"] == standby.pid and stopped["exit"] == 0
         follow.query(self.server.port, "INSERT INTO failover_witness VALUES(2)")

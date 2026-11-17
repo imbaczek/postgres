@@ -15,6 +15,8 @@ class CommitLedger:
         self.outcomes[witness] = outcome
 
     def compare(self, rows):
+        # An ACK records a client observation, not a synchronous durability
+        # guarantee. Unknown means that client never observed a COMMIT response.
         observed = set(rows)
         if len(observed) != len(rows):
             raise AssertionError("promoted server contains duplicate witnesses")

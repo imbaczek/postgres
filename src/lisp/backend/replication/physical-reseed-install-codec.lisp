@@ -24,6 +24,7 @@
 ;; Bound the work and allocation needed to inspect an untrusted plan.  Shared
 ;; lists are allowed, but cycles and values outside the literal format are not.
 (defun physical-reseed-install-check-literal (value &key allow-true)
+  ;; ALLOW-TRUE is for checked in-memory bindings, not the journal grammar.
   (let ((todo (list (cons :enter value))) (active (make-hash-table :test #'eq))
                                           (cells 0) (weight 0))
     (loop while todo

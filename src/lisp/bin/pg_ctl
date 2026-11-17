@@ -46,9 +46,10 @@ def read_regular(path, limit):
 def recovery_phase(root):
     """Read bounded native recovery control and return its checked phase.
 
-    Strip the bit-30 logical fact first. The remaining length modulo four
-    identifies the two optional pending promotion intents. All sections share
-    one CRC. The backend still checks source ancestry before promoting.
+    Bit 30 marks a logical fact immediately before the CRC. Its final size field
+    identifies the optional ON interval. Strip that fact first; the length modulo
+    four identifies the two optional pending promotion intents. All sections
+    share one CRC. The backend still checks source ancestry before promoting.
     """
     data = read_regular(root / "physical-recovery.control", 407)
     if len(data) < 72:

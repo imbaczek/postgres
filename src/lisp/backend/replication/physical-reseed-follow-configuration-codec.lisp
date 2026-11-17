@@ -16,7 +16,8 @@
     ((equal name "receive.selected") (= 80 size))
     ((member name '("recovery.initial" "recovery.selected") :test #'equal)
      ;; These are ordinary control images. They may carry resource and FPW
-     ;; facts, and a logical fact with or without its ON interval.
+     ;; facts, and a logical fact with or without its ON interval.  This is a
+     ;; size check only; decoding must still validate the image contents.
      (let ((base (if (equal name "recovery.initial") 72 88)))
        (loop for logical-size in (list 0 +physical-logical-fact-size+
                                        +physical-logical-interval-fact-size+)
