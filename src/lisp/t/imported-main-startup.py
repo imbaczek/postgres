@@ -1,4 +1,11 @@
-"""Start the real launcher in a disposable view of an inode-bound import."""
+"""Start the real launcher in a disposable view of an inode-bound import.
+
+PG_NATIVE_MAIN_RESTART=1 runs three fresh servers in the same disposable view,
+with clean SIGTERM shutdowns. Each boot checks its own control socket and SQL;
+instrumented runs also check typed C or ZERO-C restoration before catalog entry.
+Witness rows 41 and 42 persist across the clean restarts. This does not test
+crash or commit-ack durability, or advancement of slot feedback.
+"""
 
 import importlib.util
 import json
