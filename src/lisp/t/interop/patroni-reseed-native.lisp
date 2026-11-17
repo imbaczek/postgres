@@ -61,3 +61,23 @@
           (close *postmaster-data-lock*)
           (setf *postmaster-data-lock* nil)))))
   (values))
+
+(defun native-patroni-rewind-shared-history (target origin-directory source-directory expected-fork)
+  (multiple-value-bind (manifest digest) (recovery-read-manifest origin-directory)
+    (let ((identity (list (getf manifest :system-id) (getf manifest :timeline)
+                          (getf manifest :end) digest))
+          (source-fd (physical-backup-open-directory source-directory)))
+      (unwind-protect
+           (call-with-physical-adoption-owner
+            target
+            (lambda (owner)
+              (call-with-physical-backup-image-directory
+               source-fd
+               (lambda (source-root)
+                 (let* ((image (physical-reseed-image-check source-root))
+                        (proof (physical-rewind-prove-shared-history owner source-root image identity)))
+                   (assert (= (getf proof :fork) expected-fork))
+                   (assert (< (getf proof :start) expected-fork
+                              (min (getf proof :target-end) (getf proof :source-end))))
+                   (format t "~&REWIND-SHARED-HISTORY PASS ~s~%" proof))))))
+        (sb-posix:close source-fd)))))

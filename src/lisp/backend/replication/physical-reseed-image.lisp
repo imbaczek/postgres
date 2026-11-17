@@ -118,6 +118,45 @@
    (getf image :manifest) (getf image :manifest-digest) (getf record :request)
    (pg-client-native-backup-lease-status client (getf record :request))))
 
+(defun physical-rewind-prove-shared-history (owner source-root source-image origin-identity)
+  (unless (and source-image *physical-image-context*)
+    (error "native rewind requires a previously verified source image and its descriptor scope"))
+  (let* ((target (let ((*physical-image-context* nil))
+                   (physical-adoption-inspect-primary owner)))
+         (origin (let ((*physical-image-context* nil))
+                   (physical-adoption-prove-primary-origin target origin-identity)))
+         (manifest (getf (physical-reseed-image-check source-root source-image) :manifest))
+         (source-timeline (getf manifest :timeline))
+         (start (third (getf origin :identity)))
+         (source-history (timeline-read-history source-timeline source-root))
+         (source-namespace
+           (let ((*pgdata* source-root))
+             (nth-value 5 (wal-read-control-fields)))))
+    (unless (and (= (getf target :system-id) (getf manifest :system-id))
+                 (equalp (getf target :cluster-identity) (getf manifest :cluster-identity))
+                 (/= (getf target :timeline) source-timeline))
+      (error "native rewind requires matching cluster identities on different timelines"))
+    (multiple-value-bind (common-timeline fork)
+        (timeline-common-ancestor (getf target :history) source-history)
+      (unless (and (= common-timeline (getf target :timeline))
+                   fork (< start fork (getf target :end)) (< fork (getf manifest :end)))
+        (error "native rewind requires retained shared WAL and complete divergent endpoints"))
+      (let ((*pgdata* (physical-adoption-owner-directory owner))
+            (*physical-image-context* nil))
+        (wal-check-shared-lineage-prefix
+         (getf target :history) source-root source-history start fork
+         :left-namespace (getf target :namespace) :right-namespace source-namespace)
+        (physical-adoption-check-owner owner)
+        (unless (and (equalp (getf target :capture) (native-control-capture))
+                     (equalp (getf target :history) (timeline-read-history (getf target :timeline))))
+          (error "native rewind target changed during shared WAL inspection")))
+      (physical-reseed-image-check source-root source-image)
+      (list :system-id (getf target :system-id)
+            :cluster-identity (getf target :cluster-identity)
+            :common-timeline common-timeline :start start :fork fork
+            :target-end (getf target :end) :source-end (getf manifest :end)
+            :source-manifest-digest (getf source-image :manifest-digest)))))
+
 ;; Copy a verified received stage into a separate empty incoming directory.
 ;; Check the original source is READY before and after the copy, and recheck the
 ;; journal, both images, and workspace identities.  The returned facts are

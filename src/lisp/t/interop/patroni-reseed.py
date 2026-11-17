@@ -5,6 +5,7 @@ import hashlib
 import importlib.metadata
 import importlib.util
 import json
+import os
 from pathlib import Path
 import signal
 import socket
@@ -39,12 +40,15 @@ CommitLedger = load_driver("manual_failover_ledger", "failover-ledger.py").Commi
 class Acceptance(cancellation.Acceptance):
     label = "patroni-reseed"
 
-    def prepare_active(self, target, workspace, port):
+    def native_arguments(self):
         registry = "(asdf:initialize-source-registry '(:source-registry (:tree " + cancellation.lisp_string(str(cancellation.LISP) + "/") + ") :inherit-configuration))"
         cache = "(asdf:initialize-output-translations '(:output-translations (t " + cancellation.lisp_string(str(self.output / "cache") + "/") + ") :ignore-inherited-configuration))"
-        arguments = [self.sbcl, "--noinform", "--no-sysinit", "--no-userinit", "--non-interactive",
-                     "--eval", "(require :asdf)", "--eval", registry, "--eval", cache,
-                     "--eval", '(asdf:load-system "pg")', "--load", str(HERE / "patroni-reseed-native.lisp")]
+        return [self.sbcl, "--noinform", "--no-sysinit", "--no-userinit", "--non-interactive",
+                "--eval", "(require :asdf)", "--eval", registry, "--eval", cache,
+                "--eval", '(asdf:load-system "pg")', "--load", str(HERE / "patroni-reseed-native.lisp")]
+
+    def prepare_active(self, target, workspace, port):
+        arguments = self.native_arguments()
         prefix = arguments.copy()
         form = "(pg::native-patroni-reseed-activate #P" + cancellation.lisp_string(str(target) + "/")
         form += " #P" + cancellation.lisp_string(str(workspace) + "/")
@@ -335,6 +339,38 @@ class FormerPrimaryAcceptance(Acceptance):
         assert follow.query(port, "SELECT id FROM patroni_reseed_child_only") == [(42,)]
 
 
+class RewindSharedHistoryAcceptance(FormerPrimaryAcceptance):
+    label = "rewind-shared-history"
+
+    def capture(self, label):
+        path = self.server.root / label
+        conninfo = f"host=127.0.0.1 port={self.server.port} user=postgres dbname=postgres"
+        self.process(label, [str(cancellation.LISP / "bin/pg_basebackup"),
+                             "-D", str(path), "-X", "stream", "-d", conninfo],
+                     env=dict(os.environ, PG_LIBPQ_HELPER=self.helper))
+        return path
+
+    def configured(self):
+        follow.query(self.server.port, "CREATE TABLE patroni_reseed_probe(id integer)")
+        follow.query(self.server.port, "INSERT INTO patroni_reseed_probe VALUES(1)")
+        origin = self.capture("rewind-origin")
+        target = self.server.root / "rewind-target"
+        self.initialize_target(target)
+        source = self.capture("rewind-source")
+        config = source / "postgresql.conf"
+        assert config.read_bytes() == b""
+        config.unlink()
+        before = {path: preserved_tree(path) for path in (target, source, origin)}
+        arguments = " ".join("#P" + cancellation.lisp_string(str(path) + "/")
+                             for path in (target, origin, source))
+        fork = self.result["former_primary"]["fork_lsn"]
+        _, output = self.process(self.label, self.native_arguments() + [
+            "--eval", f"(pg::native-patroni-rewind-shared-history {arguments} {fork})"])
+        assert b"REWIND-SHARED-HISTORY PASS" in output
+        assert all(preserved_tree(path) == inventory for path, inventory in before.items())
+        self.result["checks"].append(self.label)
+
+
 class ManualFailoverAcceptance(FormerPrimaryAcceptance):
     label = "manual-physical-failover"
 
@@ -427,6 +463,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
     cases = {"synthetic": Acceptance, "former-primary": FormerPrimaryAcceptance,
+             "rewind-shared-history": RewindSharedHistoryAcceptance,
              "manual-failover": ManualFailoverAcceptance}
     parser.add_argument("--case", choices=cases, default="synthetic")
     arguments = parser.parse_args()

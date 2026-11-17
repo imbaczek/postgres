@@ -7,6 +7,14 @@
               :checkpoint-start 32 :end 152)
         :manifest-digest 991 :files nil))
 
+(deftest rewind-shared-history-requires-source-image-descriptor
+    (let* ((pg::*physical-image-context* nil)
+           (message
+             (handler-case
+                 (pg::physical-rewind-prove-shared-history nil nil '(:manifest ()) nil)
+               (error (condition) (princ-to-string condition)))))
+      (ok (and (stringp message) (search "descriptor scope" message)))))
+
 (deftest reseed-image-preparation-requires-ordinary-stopped-ownership
     (call-with-reseed-owner-directory
      (lambda (root)
