@@ -58,7 +58,10 @@ def run(root, expected_state=None):
     if expected_state:
         assert rows["Database cluster state"] == expected_state, rows
     assert rows["Bytes per WAL segment"] == "16777216" and rows["Database block size"] == "8192"
-    assert "Data page checksum version" not in rows and "wal_log_hints setting" not in rows
+    assert "wal_log_hints setting" not in rows
+    if "Data page checksum version" in rows:
+        assert rows["Database cluster state"] == "shut down"
+        assert rows["Data page checksum version"] == "1"
     assert native_node(root).controldata() == rows, "Patroni parsed different control facts"
     print(f'control-data-inspect: {rows["Database cluster state"]} checkpoint={rows["Latest checkpoint location"]} PASS')
     return rows

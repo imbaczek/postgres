@@ -347,6 +347,53 @@ the base files are still checked against the manifest read from disk."
              (sleep 0.01))
     (error "native control files changed throughout inspection")))
 
+(defun native-control-verified-checksum-fork (relfilenode fork end)
+  (let ((path (relation-file-path relfilenode fork)))
+    (when (and (eq fork :visibility) (not (physical-adoption-path-present-p path)))
+      (return-from native-control-verified-checksum-fork 0))
+    (multiple-value-bind (stream size)
+        (open-bounded-regular-file path (* (ash 1 32) +blcksz+))
+      (unwind-protect
+           (multiple-value-bind (blocks extra) (floor size +blcksz+)
+             (unless (zerop extra) (error "incomplete relation page"))
+             (let ((page (make-array +blcksz+ :element-type '(unsigned-byte 8))))
+               (dotimes (block blocks)
+                 (unless (and (= (read-sequence page stream) +blcksz+)
+                              (<= 1 (page-u64 page +pd-lsn-off+) end)
+                              (wal-verify-page page relfilenode block fork))
+                   (error "native data page lacks a verified checksum"))))
+             blocks)
+        (close stream)))))
+
+(defun native-control-verify-page-checksums (directory facts)
+  (declare (notinline physical-adoption-owner-directory))
+  (call-with-physical-adoption-owner
+   directory
+   (lambda (owner)
+     (let* ((*pgdata* (physical-adoption-owner-directory owner))
+            (state (physical-adoption-inspect-primary owner))
+            (*catalog* (getf state :catalog))
+            (capture (getf state :capture))
+            (end (getf state :end)))
+       (unless (equalp facts (native-control-facts capture))
+         (error "control changed before checksum inspection"))
+       (let ((pages (loop for relfilenode in (remove-duplicates (catalog-physical-relfilenodes))
+                          sum (+ (native-control-verified-checksum-fork relfilenode :main end)
+                                 (native-control-verified-checksum-fork relfilenode :visibility end)))))
+         (physical-adoption-check-owner owner)
+         (unless (equalp capture (native-control-capture))
+           (error "control changed during checksum inspection"))
+         (plusp pages))))))
+
+(defun native-control-read-for-utility (directory)
+  (let ((facts (native-control-read directory)))
+    (when (and (eql +db-shutdowned+ (getf facts :db-state))
+               (handler-case (native-control-verify-page-checksums directory facts)
+                 (error () nil)))
+      ;; The native location-bound page CRC scheme has its own version.
+      (setf (getf facts :page-checksum-version) 1))
+    facts))
+
 (defun native-control-checkpoint-record (facts)
   "Build the checkpoint SQL record from validated, captured control facts.
 Fields without persisted native facts are SQL NULL. Legacy snapshots can leave
@@ -402,8 +449,9 @@ timeline select the filename."
 
 (defun native-control-data-rows (facts)
   "Return supported native facts under C pg_controldata's field names.
-Omit fields the native format does not establish, including rewind settings
-and checksum versions. A legacy primary's unknown lifecycle stays unknown.
+Omit unknown fields. Include a native page checksum version when the utility
+verified it under a stopped-primary lock. A legacy primary's unknown lifecycle
+stays unknown.
 Print all five persisted resource values together when known; omit them when unknown.
 Omit an absent commit timestamp XID pair, which was not recorded for that
 checkpoint; a present 0/0 pair is known and is printed. Print a recorded
@@ -452,6 +500,8 @@ full-page-writes value as on or off; omit it when unknown."
                             "max_locks_per_xact setting")
               for value in (resource-parameters-values (getf facts :resource-parameters))
               do (add name value)))
+      (when (getf facts :page-checksum-version)
+        (add "Data page checksum version" (getf facts :page-checksum-version)))
       (add "Database block size" +blcksz+)
       (add "Bytes per WAL segment" +wal-segment-size+))
     (nreverse rows)))
@@ -492,7 +542,7 @@ Inspection must not initialize or repair the cluster."
          0)
         (t
          (let ((rows (native-control-data-rows
-                      (native-control-read (native-controldata-directory arguments)))))
+                      (native-control-read-for-utility (native-controldata-directory arguments)))))
            (dolist (row rows) (format output "~a:~vt~a~%" (car row) 38 (cdr row))))
          0))
     (error (condition)

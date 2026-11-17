@@ -532,12 +532,33 @@ class RewindCliAcceptance(RewindInstallAcceptance):
 class RewindPatroniAcceptance(RewindInstallAcceptance):
     label = "rewind-patroni"
 
+    def check_checksum_rejection(self, target, node):
+        path = next(path for path in sorted((target / "base").iterdir())
+                    if path.name.isdecimal() and path.stat().st_size >= 8192)
+        with path.open("r+b", buffering=0) as stream:
+            header = stream.read(10)
+            assert len(header) == 10 and any(header[:8])
+            invalid_headers = (bytes(10), header[:8] + bytes([header[8] ^ 1, header[9]]))
+            try:
+                for invalid in invalid_headers:
+                    stream.seek(0)
+                    stream.write(invalid)
+                    facts = node.controldata()
+                    assert facts["Database cluster state"] == "shut down"
+                    assert "Data page checksum version" not in facts
+            finally:
+                stream.seek(0)
+                stream.write(header)
+
     def configured(self):
         target = self.create_rewind_target()
         with socket.socket() as reservation:
             reservation.bind(("127.0.0.1", 0))
             port = reservation.getsockname()[1]
-        node = Postgresql(follow.configuration(target, port, self.server.root), Null())
+        config = follow.configuration(target, port, self.server.root)
+        config.update(use_pg_rewind=True, remove_data_directory_on_diverged_timelines=False,
+                      remove_data_directory_on_rewind_failure=False)
+        node = Postgresql(config, Null())
         rewind = Rewind(node)
         follow.query(self.server.port, "CHECKPOINT")
         leader = Leader(0, None, Member(0, "source", None, {
@@ -550,6 +571,10 @@ class RewindPatroniAcceptance(RewindInstallAcceptance):
             logger.setLevel(logging.INFO)
             try:
                 with patch.dict(os.environ, SBCL=self.sbcl, PG_LIBPQ_HELPER=self.helper):
+                    assert rewind.can_rewind, node.controldata()
+                    self.check_checksum_rejection(target, node)
+                    rewind.trigger_check_diverged_lsn()
+                    assert rewind.rewind_or_reinitialize_needed_and_possible(leader)
                     rewind.execute(leader)
             finally:
                 logger.setLevel(level)
