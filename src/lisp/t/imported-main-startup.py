@@ -3,10 +3,12 @@
 PG_NATIVE_MAIN_RESTART=1 runs three fresh servers in the same disposable view,
 with clean SIGTERM shutdowns. Each boot checks its own control socket and SQL;
 instrumented runs also check typed C or ZERO-C restoration before catalog entry.
-Witness rows 41 and 42 persist across the clean restarts. The restart check
-does not test crash or commit-ack durability, or advancement of logical slot feedback.
+Witness rows 41 and 42 persist across the clean restarts. These clean restarts
+do not test crash or commit-ack durability.
 PG_NATIVE_MAIN_WIRE=1 runs the separate wire exercise; when combined with
 restart, it runs on the first boot only.
+PG_NATIVE_MAIN_CHILD_ACK=1 adds successful typed child ACKs on that boot and
+requires wire mode and both clean restarts to check the resulting slot state.
 """
 
 import importlib.util

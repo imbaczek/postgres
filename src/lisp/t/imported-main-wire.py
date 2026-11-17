@@ -277,8 +277,8 @@ def exercise(port, data, job, imported, control, source=None):
                 nonlocal packet_count
                 packets = 0
                 while True:
-                    # The preceding frame is waiting for this report. New WAL
-                    # receives no additional durability credit.
+                    # Keep reporting the old fsynced flush while ACKs run. New
+                    # WAL receives no additional durability credit from this peer.
                     feedback(owner, completed, completed, base)
                     frame(owner)
                     packets += 1

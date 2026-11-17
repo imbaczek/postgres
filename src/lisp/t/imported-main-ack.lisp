@@ -21,6 +21,8 @@
              (sleep 0.005))))
 
 (defun imported-main-ack-run (name target directory point)
+  ;; Claim the real typed slot and ACK under the worker's live admission.
+  ;; Check alpha's new generation, beta's unchanged state and the retained fork.
   (destructuring-bind (slot group generation beta beta-bytes beta-file-bytes beta-facts fork)
       (sb-thread:with-mutex (*wal-lock*)
         (let* ((slot (gethash name *wal-replication-slots*))
@@ -138,6 +140,8 @@
               (imported-main-ack-sql-marker arguments before)
               (multiple-value-prog1 (apply original arguments)
                 (imported-main-ack-sql-marker arguments after))))))
+  ;; This marker records query arrival, before dispatch; it does not prove that
+  ;; the slot function has entered.  The other markers surround that function.
   (let ((original (symbol-function '%dispatch-frontend-frame)))
     (push (cons '%dispatch-frontend-frame original) *imported-main-ack-sql-functions*)
     (setf (symbol-function '%dispatch-frontend-frame)

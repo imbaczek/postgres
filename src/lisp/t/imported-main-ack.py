@@ -1,4 +1,7 @@
-"""Schedule real typed child ACKs against SQL temporary slot lifetimes."""
+"""Schedule real typed child ACKs against SQL temporary slot lifetimes.
+
+This covers successful publication; post-intent fault composition is separate.
+"""
 
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -70,6 +73,8 @@ def exercise(connection, control, job, source, peer_progress):
     create = "SELECT slot_name FROM pg_create_physical_replication_slot('ack_barrier',true,true)"
     drop = "SELECT pg_drop_replication_slot('ack_barrier')"
     try:
+        # This barrier precedes fresh proof, so each completed slot change is
+        # included in the proof used by the ACK.
         target = start('lifetime-acquired')
         assert connection.query(create) == [['ack_barrier']]
         assert (instruments / 'created').exists()
@@ -85,11 +90,13 @@ def exercise(connection, control, job, source, peer_progress):
                 (drop, 'drop-query', 'retired', 'temporary retirement waits behind child ACK publication')]:
             for name in ('creating','created','retiring','retired','create-query','drop-query'):
                 (instruments / name).unlink(missing_ok=True)
+            # Here the writer holds the WAL lock before intent publication.
+            # The query marker records arrival, not entry to the slot function.
             target = start('before-intent')
             sql = executor.submit(connection.query, operation)
             wait_file(instruments / before)
             assert not (instruments / after).exists() and not sql.done()
-            # No SQL/control inspection while the writer holds the WAL lock.
+            # Release externally before SQL or control inspection or joining.
             (active / 'release').touch(mode=0o600)
             sql.result(timeout=15)
             sql = None
