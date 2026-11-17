@@ -1,8 +1,10 @@
 (in-package #:pg)
 
 (defun logical-slot-imported-startup-inputs (root root-check &optional expected)
-  ;; All observers remain nested until the detached snapshot is complete.
-  ;; Their terminal checks run before this function returns any evidence.
+  ;; Keep the pair, history, sidecar and checkpoint scopes nested while copying
+  ;; the inputs and comparing EXPECTED.  Their terminal checks run as the scopes
+  ;; close, before the detached evidence is returned.  ROOT-CHECK must reject loss
+  ;; of the caller's root and PID authority; the copied evidence carries none.
   (unless (logical-slot-copy-imported-startup-candidate-p)
     (error "imported startup requires the complete committed input names"))
   (call-with-logical-slot-imported-startup-pair
@@ -33,9 +35,12 @@
                   inputs)))))))))))
 
 (defun logical-slot-imported-startup-observation (lock phase &optional expected)
-  ;; Compare independent observations across the real PID publication boundary.
-  ;; Root directory size and timestamps may change there; file facts may not.
-  ;; This returns evidence only and never initializes WAL or admits a backend.
+  ;; Observe under the held root and the requested PID scope.  The owned-PID
+  ;; observation must match the copied before-PID evidence across publication.
+  ;; Compare the root by directory identity because its size and timestamps can
+  ;; change at publication; compare the other facts in full.  Return evidence
+  ;; only after the checks and scope cleanup, without initializing WAL or admitting
+  ;; a backend.  The returned copy is not continuing authority over the inputs.
   (ecase phase
     (:before-pid
      (when expected (error "initial imported startup cannot reuse boundary evidence")))

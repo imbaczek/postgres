@@ -2,6 +2,8 @@
 
 (defun call-with-logical-slot-imported-startup-sidecar (root image root-check function)
   ;; Check the original immutable sidecar without opening WAL or minting a source.
+  ;; The callback's check closure accepts :DIRECTORY-FACTS to return a copy of
+  ;; the directory facts after the same checks; it is valid only in this scope.
   (physical-adoption-check-startup-quiescence)
   (funcall root-check)
   (let* ((facts (logical-slot-copy-check-source-proof (copy-seq image)))
