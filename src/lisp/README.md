@@ -1311,16 +1311,30 @@ and use the path printed by `create` in subsequent commands:
 ```sh
 ./t/test-campaign.sh create
 ./t/test-campaign.sh run /absolute/campaign/path unit
-./t/test-campaign.sh run /absolute/campaign/path physical head-name
+./t/test-campaign.sh run /absolute/campaign/path physical --reuse-strict-compile head-name
 ./t/test-campaign.sh close /absolute/campaign/path
 ```
 
-Each run uses a fresh Lisp image and a fresh strict compiler, even when it
-reuses completed parent FASLs. `--cold` skips that cache. Jobs normally serialize,
-with private caches and a read-only frozen source. A different
-checkout revision, dirty source files or checked runtime setting requires a new
-campaign. Image identity and the full registered suite inventory are checked
-before selected heads execute.
+Invoke these commands outside an existing RAM wrapper. Every run uses a fresh
+Lisp image. By default it also runs a fresh no-init compiler, with warnings
+fatal, even when it reuses completed parent FASLs. `--cold` skips the parent
+cache and cannot be combined with `--reuse-strict-compile`.
+
+The explicit reuse option requires a prior successful serial run with a fresh
+strict compiler in the same campaign, as in the example above. Missing, stale
+or changed qualification causes the run to fail. The parent owns a sealed
+memory file recording the compiler's FASL inventory before test heads run.
+Only listed, unchanged FASLs can be published; FASLs added by tests do not
+qualify. A private copy is verified before loading `pg` and again before heads
+run. The log reports `TEST-STRICT-COMPILE-REUSED` when reuse succeeds.
+
+Jobs normally serialize, with private caches and a read-only frozen source.
+Qualification binds the absolute source path and content, compile profile,
+checkout state, runtime, core, ASDF, features and selected environment values;
+it is not an attestation of the entire host. A different checkout revision,
+dirty source files or checked runtime setting requires a new campaign. Image
+identity and the full registered suite inventory are checked before selected
+heads execute.
 
 Native cold classification can also run a batch against an existing frozen
 campaign and existing owned retained writer variants. Set `PG_NATIVE_COLD_PLAN`

@@ -1,3 +1,7 @@
+# Qualification belongs to one frozen campaign and compile profile.  A fresh
+# compiler records its log and FASL inventory in a parent-owned sealed checkpoint
+# before tests run.  A successful serial job may publish only those unchanged
+# files; reuse copies and verifies them in a private job cache.
 import argparse
 import contextlib
 import fcntl
@@ -186,6 +190,7 @@ def owned_path(path, root):
             directory(root / parent)
 
 
+# Capture the successful compiler output before any test head can add files.
 def capture(campaign, job, cache, log, image, profile, output, checkpoint_path):
     directory(job)
     for path, root in ((cache, job / 'tmp'), (log, job / 'tmp'),
@@ -214,6 +219,8 @@ def copy_files(cache, rows, destination):
     verify_files(cache, rows, exact=False)
 
 
+# Compare the receipt with the sealed pre-test checkpoint and publish once.
+# Extra files made by tests are excluded from the qualified inventory.
 def publish(campaign, job, receipt, checkpoint_fd=None):
     if not receipt.exists():
         return 0
@@ -264,6 +271,7 @@ def publish(campaign, job, receipt, checkpoint_fd=None):
     return len(value['files'])
 
 
+# Verify the shared qualification and make a private copy for this job.
 def prepare(campaign, job, profile):
     value = read_published(campaign, profile, campaign / 'manifests/image.log')
     shared = campaign / 'plain-strict-cache'
@@ -275,6 +283,7 @@ def prepare(campaign, job, profile):
     return cache, receipt
 
 
+# Recheck the private copy and its campaign and image binding before use.
 def verify_job(campaign, job, receipt, cache, profile, image):
     value = read_json(receipt)
     expected = read_published(campaign, profile, image)
