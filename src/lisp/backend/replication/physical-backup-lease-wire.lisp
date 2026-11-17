@@ -21,9 +21,16 @@
 ;; coordinates.  The lease source timeline is the capture timeline; the
 ;; follow source timeline identifies the chosen writer and can differ.
 
+(defparameter *physical-rewind-origin-wire-input*
+  '("checkpoint_start" "checkpoint_end" "checkpoint_manifest_digest"
+    "base_timeline" "base_lsn" "base_manifest_digest" "fork_lsn"))
+
+(declaim (ftype function physical-rewind-origin-proof))
+
 (defun physical-backup-lease-wire-option-keys (kind)
   (append '("native_format" "lease_name" "lease_token" "cluster_identity" "system_id" "source_timeline")
           (case kind
+            (:physical-lease-prove-rewind *physical-rewind-origin-wire-input*)
             ((:physical-lease-handoff :physical-lease-cleanup-selected)
              '("successor_name" "successor_anchor_digest"))
             ((:physical-lease-prepare-follow :physical-lease-cancel-follow)
@@ -40,6 +47,16 @@
         (make-logical-replication-command :options options)
         "follow_")
        :live))))
+
+(defun physical-rewind-origin-wire-lsn (text)
+  (let ((slash (position #\/ text)))
+    (unless (and slash (<= 1 slash 8) (<= 1 (- (length text) slash 1) 8)
+                 (every (lambda (character) (digit-char-p character 16))
+                        (subseq text 0 slash))
+                 (every (lambda (character) (digit-char-p character 16))
+                        (subseq text (1+ slash))))
+      (wal-invalid-input "invalid native rewind location"))
+    (parse-replication-lsn text)))
 
 ;; Require each verb's options exactly once as quoted literals. Allocated follow
 ;; commands also accept an optional follow_proof_kind.
@@ -79,7 +96,15 @@
              :type kind :slot-name (getf request :name)
              :options (append (list (cons "request" request))
                               (when successor (list (cons "successor" successor)))
-                              (when allocation (list (cons "allocation" allocation))))))))
+                              (when allocation (list (cons "allocation" allocation)))
+                              (when (eq kind :physical-lease-prove-rewind)
+                                (loop for key in *physical-rewind-origin-wire-input*
+                                      for text = (value key)
+                                      do (if (member key '("checkpoint_start" "checkpoint_end" "base_lsn" "fork_lsn")
+                                                     :test #'equal)
+                                             (physical-rewind-origin-wire-lsn text)
+                                             (physical-stream-u64 text))
+                                      collect (cons key text))))))))
     (pg-error (condition) (ereport (pg-error-sqlstate condition) "invalid native backup lease request"))
     (error () (ereport "22023" "invalid native backup lease request"))))
 
@@ -119,6 +144,9 @@
        (prevent-recovery-primary-operation "leased native backup")
        (when *swank-listener-enabled-p*
          (ereport "55000" "leased native backup requires Swank to be off"))
+       (with-wal-critical (wal-check-healthy)))
+      (:physical-lease-prove-rewind
+       (prevent-recovery-primary-operation "rewind origin proof")
        (with-wal-critical (wal-check-healthy)))
       ((:physical-lease-handoff :physical-lease-prepare-follow)
        (prevent-recovery-primary-operation "backup lease handoff")
@@ -203,6 +231,40 @@
                           (list (format nil "~d" generation) name))
            *physical-backup-lease-follow-cancel-schema* "BACKUP_LEASE_CANCEL_FOLLOW")))))
 
+(defparameter *physical-rewind-origin-wire-result*
+  (mapcar (lambda (name) (list name 25))
+          (append '("lease_name" "system_id") *physical-rewind-origin-wire-input*
+                  '("end_digest" "root_id" "source_timeline" "history"))))
+
+(defun execute-native-backup-lease-rewind-proof (stream command)
+  (let* ((lease (physical-backup-lease-command-request command))
+         (options (logical-replication-command-options command)))
+    (flet ((lsn (key) (parse-replication-lsn (cdr (assoc key options :test #'equal))))
+           (number (key) (physical-stream-u64 (cdr (assoc key options :test #'equal)))))
+      (let* ((capture (list (lsn "checkpoint_start") (lsn "checkpoint_end")
+                            (number "checkpoint_manifest_digest")))
+             (historical (list :system-id (getf lease :system-id)
+                               :base-timeline (number "base_timeline")
+                               :base (lsn "base_lsn")
+                               :manifest-digest (number "base_manifest_digest")
+                               :end (lsn "fork_lsn")))
+             (proof (physical-rewind-origin-proof lease capture historical)))
+        (send-native-backup-lease-row
+         stream
+         (list (getf proof :lease-name)
+               (format nil "~d" (getf proof :system-id))
+               (wal-format-lsn (first capture)) (wal-format-lsn (second capture))
+               (format nil "~d" (third capture))
+               (format nil "~d" (getf proof :base-timeline))
+               (wal-format-lsn (getf proof :base))
+               (format nil "~d" (getf proof :manifest-digest))
+               (wal-format-lsn (getf proof :end))
+               (format nil "~d" (getf proof :end-digest))
+               (format nil "~d" (getf proof :root-id))
+               (format nil "~d" (getf proof :source-timeline))
+               (getf proof :history-text))
+         *physical-rewind-origin-wire-result* "BACKUP_LEASE_PROVE_REWIND")))))
+
 ;; A successful HANDOFF row reports the source's durable CLOSED outcome and
 ;; successor. A lost reply leaves the caller to recover the outcome with STATUS
 ;; or an exact retry on the original route.
@@ -210,6 +272,9 @@
   (handler-case
       (progn
         (physical-backup-lease-wire-preflight command)
+        (when (eq (logical-replication-command-type command) :physical-lease-prove-rewind)
+          (return-from execute-native-backup-lease-command
+            (execute-native-backup-lease-rewind-proof stream command)))
         (when (member (logical-replication-command-type command)
                       '(:physical-lease-prepare-follow :physical-lease-cancel-follow))
           (return-from execute-native-backup-lease-command

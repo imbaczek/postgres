@@ -216,7 +216,8 @@
     ("BACKUP_LEASE_HANDOFF" . :physical-lease-handoff)
     ("BACKUP_LEASE_CLEANUP_SELECTED" . :physical-lease-cleanup-selected)
     ("BACKUP_LEASE_PREPARE_FOLLOW" . :physical-lease-prepare-follow)
-    ("BACKUP_LEASE_CANCEL_FOLLOW" . :physical-lease-cancel-follow)))
+    ("BACKUP_LEASE_CANCEL_FOLLOW" . :physical-lease-cancel-follow)
+    ("BACKUP_LEASE_PROVE_REWIND" . :physical-lease-prove-rewind)))
 
 (defun parse-replication-command (query)
   (let* ((words (replication-command-words query))
@@ -1078,7 +1079,8 @@ The caller releases the slot before sending shutdown completion."
   (when (and (member (logical-replication-command-type command) '(:start :physical-start :physical-backup :physical-prepare :physical-prove :physical-release :physical-bootstrap-release :timeline-history
                                                                   :physical-lease-capture :physical-lease-status :physical-lease-abort :physical-lease-handoff
                                                                   :physical-lease-cleanup-selected
-                                                                  :physical-lease-prepare-follow :physical-lease-cancel-follow))
+                                                                  :physical-lease-prepare-follow :physical-lease-cancel-follow
+                                                                  :physical-lease-prove-rewind))
              (backend-explicit *backend*))
     (ereport "25001" "~a cannot run inside a transaction block"
              (case (logical-replication-command-type command)
@@ -1091,6 +1093,7 @@ The caller releases the slot before sending shutdown completion."
                (:physical-lease-cleanup-selected "BACKUP_LEASE_CLEANUP_SELECTED")
                (:physical-lease-prepare-follow "BACKUP_LEASE_PREPARE_FOLLOW")
                (:physical-lease-cancel-follow "BACKUP_LEASE_CANCEL_FOLLOW")
+               (:physical-lease-prove-rewind "BACKUP_LEASE_PROVE_REWIND")
                (:physical-prepare "PREPARE_FOLLOW")
                (:physical-prove "PROVE_RETAINED")
                (:physical-release "RELEASE_FOLLOW")
@@ -1133,7 +1136,7 @@ The caller releases the slot before sending shutdown completion."
             (:physical-lease-capture (start-native-backup-lease-capture stream command))
             ((:physical-lease-status :physical-lease-abort :physical-lease-handoff
                                      :physical-lease-cleanup-selected
-              :physical-lease-prepare-follow :physical-lease-cancel-follow)
+              :physical-lease-prepare-follow :physical-lease-cancel-follow :physical-lease-prove-rewind)
              (execute-native-backup-lease-command stream command))
             (:physical-prepare (prepare-native-physical-follow stream command))
             (:physical-prove (prove-native-physical-retained stream command))

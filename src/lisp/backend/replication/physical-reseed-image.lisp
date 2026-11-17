@@ -162,6 +162,44 @@ digest. Establish the source's ancestry before the export base separately."
             :target-end (getf target :end) :source-end (getf manifest :end)
             :source-manifest-digest (getf source-image :manifest-digest)))))
 
+(defun physical-rewind-prove-leased-origin
+    (owner source-root source-image origin-identity client request)
+  (let* ((proof (physical-rewind-prove-shared-history owner source-root source-image origin-identity))
+         (manifest (getf source-image :manifest))
+         (fork (getf proof :fork))
+         (history-text (bytes->string (timeline-history-bytes (getf manifest :timeline) source-root)))
+         (digest #xCBF29CE484222325))
+    (let* ((*pgdata* (physical-adoption-owner-directory owner))
+           (*physical-image-context* nil)
+           (target (physical-adoption-inspect-primary owner))
+           (capture (getf target :capture)))
+      (unless (= (getf target :end) (getf proof :target-end))
+        (error "rewind target changed before hashing shared WAL"))
+      (multiple-value-bind (cursor files complete)
+          (wal-scan-lineage
+           (lambda (record timeline carrier bytes)
+             (declare (ignore record timeline carrier))
+             (setf digest (physical-store-update-digest digest bytes))
+             nil)
+           (getf target :history) (getf proof :start) fork
+           :namespace (getf target :namespace) :include-raw t)
+        (declare (ignore files))
+        (unless (and complete (= cursor fork))
+          (error "rewind target did not reach the shared fork")))
+      (physical-adoption-check-owner owner)
+      (unless (equalp capture (native-control-capture))
+        (error "rewind target changed while hashing shared WAL")))
+    (let ((root
+            (pg-client-native-backup-lease-rewind-proof
+             client request manifest (getf source-image :manifest-digest)
+             (list :system-id (getf proof :system-id)
+                   :base-timeline (getf proof :common-timeline) :base (getf proof :start)
+                   :manifest-digest (fourth origin-identity) :end fork)
+             history-text digest)))
+      (physical-adoption-check-owner owner)
+      (physical-reseed-image-check source-root source-image)
+      (append proof (list :root-id root :fork-digest digest)))))
+
 ;; Copy a verified received stage into a separate empty incoming directory.
 ;; Check the original source is READY before and after the copy, and recheck the
 ;; journal, both images, and workspace identities.  The returned facts are

@@ -23,6 +23,27 @@
     (assert position)
     (concatenate 'string (subseq text 0 position) after (subseq text (+ position (length before))))))
 
+(deftest rewind-proof-wire-requires-capture-and-historical-coordinates
+    (let* ((request (backup-lease-wire-request))
+           (proof '(("checkpoint_start" . "0/90") ("checkpoint_end" . "0/B0")
+                    ("checkpoint_manifest_digest" . "91") ("base_timeline" . "1")
+                    ("base_lsn" . "0/20") ("base_manifest_digest" . "73")
+                    ("fork_lsn" . "0/80")))
+           (query (pg::pg-client-native-backup-lease-option-query
+                   "BACKUP_LEASE_PROVE_REWIND"
+                   (append (pg::pg-client-native-backup-lease-options request) proof)))
+           (command (pg::parse-replication-command query)))
+      (ok (pg::replication-query-payload-p (pg::string->bytes query)))
+      (ok (eq :physical-lease-prove-rewind (pg::logical-replication-command-type command)))
+      (ok (equal request (pg::physical-backup-lease-command-request command)))
+      (ok (equal proof (rest (pg::logical-replication-command-options command))))
+      (ok (signals (pg::parse-replication-command
+                    (backup-lease-wire-replace query "fork_lsn" "unknown_fork"))
+                   'pg::pg-error))
+      (ok (signals (pg::parse-replication-command
+                    (backup-lease-wire-replace query "0/80" "000000000/80"))
+                   'pg::pg-error))))
+
 (cl-spec:defproperty backup-lease-wire-preserves-the-original-request-and-state
     ((kind (range integer 0 7)) (identity-choice (range integer 0 5)) (verb-choice (range integer 0 2)))
   (:about pg::parse-native-backup-lease-command pg::pg-client-native-backup-lease-record)

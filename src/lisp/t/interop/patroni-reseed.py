@@ -402,6 +402,16 @@ class RewindSharedHistoryAcceptance(FormerPrimaryAcceptance):
         _, output = self.process(self.label, self.native_arguments() + [
             "--eval", f"(pg::native-patroni-rewind-shared-history {arguments} {fork})"])
         assert b"REWIND-SHARED-HISTORY PASS" in output
+        leased = self.server.root / "rewind-leased"
+        leased.mkdir(mode=0o700)
+        arguments = " ".join("#P" + cancellation.lisp_string(str(path) + "/")
+                             for path in (target, self.origin, leased))
+        digest = self.result["former_primary"]["retained_origin"]["fork_digest"]
+        helper = cancellation.lisp_string(self.helper)
+        _, output = self.process("rewind-leased-origin", self.native_arguments() + [
+            "--eval", f"(pg::native-patroni-rewind-leased-origin {arguments} "
+                      f"{self.server.port} {helper} {fork} {digest})"])
+        assert b"REWIND-LEASED-ORIGIN PASS" in output
         assert all(preserved_tree(path) == inventory for path, inventory in before.items())
         self.result["checks"].append(self.label)
 

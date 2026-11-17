@@ -203,6 +203,44 @@
       (pg-client-native-reject "native backup lease differs from the received image")))
   (physical-backup-lease-copy record))
 
+(declaim (ftype function physical-origin-proof-check-request))
+
+(defun pg-client-native-backup-lease-rewind-proof
+    (client request manifest manifest-digest historical expected-history expected-digest)
+  (let* ((request (physical-backup-lease-request-copy request))
+         (historical (physical-origin-proof-check-request historical))
+         (history (copy-seq expected-history))
+         (coordinates
+           (list (wal-format-lsn (physical-manifest-checkpoint-start manifest))
+                 (wal-format-lsn (getf manifest :end))
+                 (format nil "~d" manifest-digest)
+                 (format nil "~d" (getf historical :base-timeline))
+                 (wal-format-lsn (getf historical :base))
+                 (format nil "~d" (getf historical :manifest-digest))
+                 (wal-format-lsn (getf historical :end))))
+         (verb "BACKUP_LEASE_PROVE_REWIND"))
+    (unless (= (getf request :system-id) (getf historical :system-id))
+      (pg-client-native-reject "rewind proof uses a different cluster identity"))
+    (physical-backup-lease-check-received-status
+     manifest manifest-digest request (pg-client-native-backup-lease-status client request))
+    (let* ((query (pg-client-native-backup-lease-option-query
+                   verb (append (pg-client-native-backup-lease-options request)
+                                (mapcar #'cons *physical-rewind-origin-wire-input* coordinates))))
+           (row (physical-client-query client query *physical-rewind-origin-wire-result* verb
+                                       :maximum +physical-client-proof-frame-maximum+))
+           (root (pg-client-native-u64 (aref row 10))))
+      (unless (and (equal (getf request :name) (aref row 0))
+                   (equal (format nil "~d" (getf request :system-id)) (aref row 1))
+                   (equal coordinates (coerce (subseq row 2 9) 'list))
+                   (equal (format nil "~d" expected-digest) (aref row 9))
+                   (equal (format nil "~d" root) (aref row 10))
+                   (equal (format nil "~d" (getf request :timeline)) (aref row 11))
+                   (equal history (aref row 12)))
+        (pg-client-native-reject "rewind proof differs from the requested backup capture or shared history"))
+      (physical-backup-lease-check-received-status
+       manifest manifest-digest request (pg-client-native-backup-lease-status client request))
+      root)))
+
 ;; Finish the stream, reread the manifest, and bind it to a READY status for
 ;; the original request before accepting the received inventory.
 
