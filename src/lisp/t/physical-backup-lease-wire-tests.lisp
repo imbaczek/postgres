@@ -44,6 +44,23 @@
                     (backup-lease-wire-replace query "0/80" "000000000/80"))
                    'pg::pg-error))))
 
+(deftest rewind-capture-wire-checks-bounded-relation-offers
+    (let* ((request (backup-lease-wire-request))
+           (offers '(("base/16384" 8192 45) ("base/16385.vm" 8192 123)))
+           (query (pg::pg-client-native-rewind-capture-query request offers))
+           (command (pg::parse-replication-command query))
+           (decoded (cdr (assoc "relation_offers" (pg::logical-replication-command-options command)
+                                :test #'equal))))
+      (ok (pg::replication-query-payload-p (pg::string->bytes query)))
+      (ok (eq :physical-lease-capture-rewind (pg::logical-replication-command-type command)))
+      (ok (equal request (pg::physical-backup-lease-command-request command)))
+      (dolist (entry offers)
+        (ok (equal entry (gethash (first entry) decoded))))
+      (ok (signals (pg::pg-client-native-rewind-capture-query request (append offers offers)) 'error))
+      (ok (signals (pg::parse-replication-command
+                    (backup-lease-wire-replace query "base/16384" "global/pg_control"))
+                   'pg::pg-error))))
+
 (cl-spec:defproperty backup-lease-wire-preserves-the-original-request-and-state
     ((kind (range integer 0 7)) (identity-choice (range integer 0 5)) (verb-choice (range integer 0 2)))
   (:about pg::parse-native-backup-lease-command pg::pg-client-native-backup-lease-record)

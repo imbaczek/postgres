@@ -82,6 +82,26 @@
                    (format t "~&REWIND-SHARED-HISTORY PASS ~s~%" proof))))))
         (sb-posix:close source-fd)))))
 
+(defun native-patroni-rewind-check-reuse (owner manifest reused)
+  (let* ((target (physical-adoption-inspect-primary owner))
+         (database (gethash "postgres" (catalog-databases (getf target :catalog))))
+         (tables (database-tables database))
+         (stable (gethash "rewind_reuse_payload" tables))
+         (changed (gethash "patroni_reseed_probe" tables))
+         (toast (pg-class-toast stable))
+         (stable-files
+           (mapcar (lambda (node) (format nil "base/~d" node))
+                   (cons (pg-class-relfilenode stable)
+                         (when toast (list (pg-toast-relfilenode toast)
+                                           (pg-toast-index-relfilenode toast))))))
+         (changed-file (format nil "base/~d" (pg-class-relfilenode changed))))
+    (assert (>= (loop for (name size) in reused
+                      when (member name stable-files :test #'equal) sum size)
+                65536))
+    (assert (assoc changed-file (getf manifest :files) :test #'equal))
+    (assert (probe-file (merge-pathnames changed-file (physical-adoption-owner-directory owner))))
+    (assert (not (assoc changed-file reused :test #'equal)))))
+
 (defun native-patroni-rewind-leased-origin (target origin-directory source-directory port helper fork digest)
   (multiple-value-bind (manifest manifest-digest) (recovery-read-manifest origin-directory)
     (let* ((identity (list (getf manifest :system-id) (getf manifest :timeline)
@@ -101,11 +121,14 @@
            (progn
              (setf fd (physical-backup-open-directory source-directory)
                    attempted t)
-             (let ((*pgdata* target))
-               (physical-backup-lease-capture-remote source-directory client request :directory-fd fd))
              (call-with-physical-adoption-owner
               target
               (lambda (owner)
+                (multiple-value-bind (capture record reused)
+                    (physical-rewind-capture-image owner source-directory fd client request)
+                  (declare (ignore record))
+                  (native-patroni-rewind-check-reuse owner capture reused)
+                  (format t "~&REWIND-REUSED ~s~%" reused))
                 (call-with-physical-backup-image-directory
                  fd
                  (lambda (source-root)

@@ -244,18 +244,39 @@
 ;; Finish the stream, reread the manifest, and bind it to a READY status for
 ;; the original request before accepting the received inventory.
 
-(defun physical-backup-lease-receive-remote (target channel request)
-  (physical-libpq-start-copy-out channel
-                                 (pg-client-native-backup-lease-query "CAPTURE_BACKUP_NATIVE" request))
-  (let ((manifest (physical-backup-receive-bundle
-                   target (lambda () (physical-backup-next-copy-frame channel "CAPTURE_BACKUP_NATIVE")))))
-    (physical-backup-finish-copy channel "CAPTURE_BACKUP_NATIVE")
-    (multiple-value-bind (actual digest) (recovery-read-manifest target)
-      (unless (equal manifest actual) (pg-client-native-reject "received backup manifest changed"))
-      (let ((record (physical-backup-lease-check-received-status
-                     actual digest request (pg-client-native-backup-lease-status channel request))))
-        (physical-backup-check-received-inventory target manifest)
-        (values manifest record)))))
+(defun pg-client-native-rewind-capture-query (request offers)
+  (unless (<= 1 (length offers) +native-rewind-offer-limit+)
+    (error "invalid native rewind relation offer count"))
+  (let ((text
+          (format nil "~{~a~^,~}"
+                  (loop for (name size digest) in offers
+                        do (unless (and (physical-backup-reuse-path-p name)
+                                        (<= (length name) 32)
+                                        (typep size '(unsigned-byte 64))
+                                        (typep digest '(unsigned-byte 64)))
+                             (error "invalid native rewind relation offer"))
+                        collect (format nil "~a:~d:~d" name size digest)))))
+    (physical-rewind-decode-offers text)
+    (pg-client-native-backup-lease-option-query
+     "CAPTURE_REWIND_NATIVE"
+     (append (pg-client-native-backup-lease-options request)
+             (list (cons "relation_offers" text))))))
+
+(defun physical-backup-lease-receive-remote (target channel request &key offers reuse)
+  (let ((tag (if offers "CAPTURE_REWIND_NATIVE" "CAPTURE_BACKUP_NATIVE")))
+    (physical-libpq-start-copy-out
+     channel (if offers
+                 (pg-client-native-rewind-capture-query request offers)
+                 (pg-client-native-backup-lease-query tag request)))
+    (let ((manifest (physical-backup-receive-bundle
+                     target (lambda () (physical-backup-next-copy-frame channel tag)) :reuse reuse)))
+      (physical-backup-finish-copy channel tag)
+      (multiple-value-bind (actual digest) (recovery-read-manifest target)
+        (unless (equal manifest actual) (pg-client-native-reject "received backup manifest changed"))
+        (let ((record (physical-backup-lease-check-received-status
+                       actual digest request (pg-client-native-backup-lease-status channel request))))
+          (physical-backup-check-received-inventory target manifest)
+          (values manifest record))))))
 
 ;; A supplied descriptor selects scoped descriptor-relative receipt.  Without
 ;; it, preserve the existing pathname-based receiver.
@@ -263,12 +284,14 @@
 ;; Receive into the caller's empty directory, verify the manifest, then check
 ;; STATUS against the received image.  READY describes source retention at
 ;; that check, not a permanent guarantee; follow or handoff must revalidate.
-(defun physical-backup-lease-capture-remote (directory channel request &key directory-fd)
+(defun physical-backup-lease-capture-remote (directory channel request &key directory-fd offers reuse)
+  (when (and (or offers reuse) (not (and offers reuse directory-fd)))
+    (error "native rewind capture requires offers and a descriptor-scoped receiver"))
   (let ((request (physical-backup-lease-request-copy request))
         (target (physical-bootstrap-target directory)))
     (if directory-fd
         (progn
           (physical-image-check-target target directory-fd)
           (call-with-physical-backup-receive-directory
-           directory-fd (lambda (anchored) (physical-backup-lease-receive-remote anchored channel request))))
+           directory-fd (lambda (anchored) (physical-backup-lease-receive-remote anchored channel request :offers offers :reuse reuse))))
         (physical-backup-lease-receive-remote target channel request))))

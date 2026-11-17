@@ -13,6 +13,35 @@
                                                   :element-type '(unsigned-byte 8))
         (funcall function root)))))
 
+(deftest physical-backup-reuse-marker-requires-a-matching-relation-and-owned-target
+    (with-physical-store-directory (root)
+      (let* ((entry '("base/16384" 32 123))
+             (header (pg::physical-backup-file-header-image entry #\R))
+             (seen nil)
+             (next (lambda () header))
+             (reuse (lambda (item) (setf seen item)))
+             (fd (pg::physical-backup-open-directory root)))
+        (unwind-protect
+             (progn
+               (ok (signals (pg::physical-backup-receive-file root (first entry) 32 next
+                                                              :expected entry :reuse reuse)
+                            'error))
+               (pg::call-with-physical-backup-receive-directory
+                fd
+                (lambda (directory)
+                  (ok (signals (pg::physical-backup-receive-file directory (first entry) 32 next
+                                                                 :expected entry)
+                               'error))
+                  (ok (signals (pg::physical-backup-receive-file directory (first entry) 32 next
+                                                                 :expected '("base/16384" 32 321)
+                                                                 :reuse reuse)
+                               'error))
+                  (ok (null seen))
+                  (ok (equal entry (pg::physical-backup-receive-file directory (first entry) 32 next
+                                                                     :expected entry :reuse reuse)))
+                  (ok (eq seen entry)))))
+          (sb-posix:close fd)))))
+
 (deftest physical-backup-stages-sweep-only-owned-names-without-following-links
     (call-with-backup-stage-fixture
      (lambda (root)
@@ -141,8 +170,9 @@
                         (lambda (function &key kind) (declare (ignore kind)) (funcall function))
                         (symbol-function 'pg::physical-backup-create-stage) (lambda () root)
                         (symbol-function 'pg::physical-backup-send-bundle)
-                        (lambda (stage manifest emit)
+                        (lambda (stage manifest emit &key reuse)
                           (declare (ignore stage manifest))
+                          (assert (null reuse))
                           (funcall emit (make-array 1 :element-type '(unsigned-byte 8) :initial-element 42)))
                         (symbol-function 'pg::physical-backup-delete-stage)
                         (lambda (stage)

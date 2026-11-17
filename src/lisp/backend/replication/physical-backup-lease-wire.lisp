@@ -27,10 +27,33 @@
 
 (declaim (ftype function physical-rewind-origin-proof))
 
+(defconstant +native-rewind-offer-limit+ 1024)
+
+(defun physical-rewind-decode-offers (text)
+  (unless (<= 1 (length text) 65536)
+    (wal-invalid-input "native rewind offer list exceeds its size bound"))
+  (let ((fields (uiop:split-string text :separator '(#\,)))
+        (offers (make-hash-table :test #'equal)))
+    (unless (<= (length fields) +native-rewind-offer-limit+)
+      (wal-invalid-input "native rewind has too many relation offers"))
+    (dolist (field fields)
+      (let ((parts (uiop:split-string field :separator '(#\:))))
+        (unless (and (= (length parts) 3)
+                     (<= (length (first parts)) 32)
+                     (physical-backup-reuse-path-p (first parts)))
+          (wal-invalid-input "invalid native rewind relation offer"))
+        (destructuring-bind (name size digest) parts
+          (when (gethash name offers)
+            (wal-invalid-input "duplicate native rewind relation offer"))
+          (setf (gethash name offers)
+                (list name (physical-stream-u64 size) (physical-stream-u64 digest))))))
+    offers))
+
 (defun physical-backup-lease-wire-option-keys (kind)
   (append '("native_format" "lease_name" "lease_token" "cluster_identity" "system_id" "source_timeline")
           (case kind
             (:physical-lease-prove-rewind *physical-rewind-origin-wire-input*)
+            (:physical-lease-capture-rewind '("relation_offers"))
             ((:physical-lease-handoff :physical-lease-cleanup-selected)
              '("successor_name" "successor_anchor_digest"))
             ((:physical-lease-prepare-follow :physical-lease-cancel-follow)
@@ -97,6 +120,9 @@
              :options (append (list (cons "request" request))
                               (when successor (list (cons "successor" successor)))
                               (when allocation (list (cons "allocation" allocation)))
+                              (when (eq kind :physical-lease-capture-rewind)
+                                (list (cons "relation_offers"
+                                            (physical-rewind-decode-offers (value "relation_offers")))))
                               (when (eq kind :physical-lease-prove-rewind)
                                 (loop for key in *physical-rewind-origin-wire-input*
                                       for text = (value key)
@@ -140,7 +166,7 @@
       (ereport "25P02" "current transaction is aborted"))
     (check-recovery-available)
     (case (logical-replication-command-type command)
-      (:physical-lease-capture
+      ((:physical-lease-capture :physical-lease-capture-rewind)
        (prevent-recovery-primary-operation "leased native backup")
        (when *swank-listener-enabled-p*
          (ereport "55000" "leased native backup requires Swank to be off"))
@@ -307,15 +333,22 @@
   (handler-case
       (progn
         (physical-backup-lease-wire-preflight command)
-        (call-with-native-backup-copy-out
-         stream "CAPTURE_BACKUP_NATIVE"
-         (lambda (stage begin-copy)
-           (multiple-value-bind (manifest claimed)
-               (physical-backup-lease-capture stage (physical-backup-lease-command-request command)
-                                              :on-start begin-copy)
-             (unless claimed
-               (ereport "55000" "backup lease already exists; use BACKUP_LEASE_STATUS or BACKUP_LEASE_ABORT"))
-             manifest))))
+        (let* ((kind (logical-replication-command-type command))
+               (tag (car (rassoc kind *physical-backup-lease-wire-verbs*)))
+               (offers (cdr (assoc "relation_offers" (logical-replication-command-options command)
+                                   :test #'equal))))
+          (call-with-native-backup-copy-out
+           stream tag
+           (lambda (stage begin-copy)
+             (multiple-value-bind (manifest claimed)
+                 (physical-backup-lease-capture stage (physical-backup-lease-command-request command)
+                                                :on-start begin-copy)
+               (unless claimed
+                 (ereport "55000" "backup lease already exists; use BACKUP_LEASE_STATUS or BACKUP_LEASE_ABORT"))
+               manifest))
+           :reuse (when offers
+                    (lambda (entry)
+                      (equal entry (gethash (first entry) offers)))))))
     (wal-input-validation-error () (ereport "55000" "backup lease capture is not valid for this source"))
     (pg-error (condition) (error condition))
     (error () (ereport "XX000" "leased native backup failed"))))

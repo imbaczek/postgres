@@ -386,10 +386,16 @@ class RewindSharedHistoryAcceptance(FormerPrimaryAcceptance):
         follow.query(self.server.port, "CREATE TABLE patroni_reseed_probe(id integer)")
         follow.query(self.server.port, "INSERT INTO patroni_reseed_probe VALUES(1)")
         follow.query(self.server.port, "CREATE TABLE rewind_shared_marker(id integer)")
+        follow.query(self.server.port, "CREATE TABLE rewind_reuse_payload(id integer, payload text)")
+        for i in range(48):
+            payload = hashlib.shake_256(str(i).encode()).hexdigest(3000)
+            follow.query(self.server.port,
+                         f"INSERT INTO rewind_reuse_payload VALUES({i},'{payload}')")
         follow.query(self.server.port, "SELECT pg_create_physical_replication_slot('replacement_source',true)")
         self.origin = self.capture("rewind-origin")
         target = self.server.root / "rewind-target"
         self.initialize_target(target)
+        follow.query(self.server.port, "INSERT INTO patroni_reseed_probe VALUES(2001)")
         source = self.capture("rewind-source")
         config = source / "postgresql.conf"
         assert config.read_bytes() == b""

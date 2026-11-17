@@ -266,14 +266,17 @@ Validate the selected lineage before constructing the inventory."
                   collect (concatenate 'string "pg_wal/" (timeline-history-filename ancestor)))
           #'string<)))
 
+(defun physical-bootstrap-relation-inventory ()
+  (loop for relfilenode in (remove-duplicates (catalog-physical-relfilenodes))
+        collect (format nil "base/~d" relfilenode)
+        when (probe-file (relation-file-path relfilenode :visibility))
+          collect (format nil "base/~d.vm" relfilenode)))
+
 (defun physical-bootstrap-inventory (&optional (checkpoint-start (wal-checkpoint-record-start)))
   "Return only durable cluster state and catalog-referenced relation forks."
-  (let ((files (list "PG_VERSION" "pg_xact" "global/pg_control"
-                     "global/pg_catalog.dat" "global/pg_wal_control")))
-    (dolist (relfilenode (remove-duplicates (catalog-physical-relfilenodes)))
-      (push (format nil "base/~d" relfilenode) files)
-      (when (probe-file (relation-file-path relfilenode :visibility))
-        (push (format nil "base/~d.vm" relfilenode) files)))
+  (let ((files (append (physical-bootstrap-relation-inventory)
+                       (list "PG_VERSION" "pg_xact" "global/pg_control"
+                             "global/pg_catalog.dat" "global/pg_wal_control"))))
     (let* ((restart checkpoint-start)
            (last (and (plusp *wal-durable-lsn*) (floor (1- *wal-durable-lsn*) +wal-segment-size+))))
       (when last
@@ -535,6 +538,22 @@ The slot is dropped on every exit; a verified origin remains after cancellation.
                      "pg_hba.conf" "pg_ident.conf" "authentication.initialized") :test #'equal)
       (recovery-manifest-path-p name timeline)))
 
+(defun physical-backup-reuse-path-p (name)
+  (and (stringp name) (uiop:string-prefix-p "base/" name)
+       (recovery-manifest-path-p name)))
+
+(defun physical-backup-file-header-image (entry tag)
+  (destructuring-bind (name size digest) entry
+    (let ((path (string->bytes name))
+          (header (make-payload)))
+      (unless (<= 1 (length path) 512) (error "native backup bundle path exceeds its bound"))
+      (payload-push-byte header (char-code tag))
+      (payload-push-u32 header (length path))
+      (loop for byte across path do (payload-push-byte header byte))
+      (replication-push-u64 header size)
+      (replication-push-u64 header digest)
+      header)))
+
 (defun physical-backup-send-file (directory entry timeline emit)
   "Send a checked bundle file as a header, data frames and an end frame.
 Each data frame owns a fresh payload; hash the same bytes copied into it.
@@ -544,22 +563,15 @@ Check the file length and digest before sending the end frame."
                  (typep size '(unsigned-byte 64))
                  (typep expected-digest '(unsigned-byte 64)))
       (error "invalid native backup bundle file"))
-    (let ((path (string->bytes name))
+    (let ((header (physical-backup-file-header-image entry #\F))
           (digest #xCBF29CE484222325)
           (buffer (make-array 65535 :element-type '(unsigned-byte 8))))
-      (unless (<= 1 (length path) 512) (error "native backup bundle path exceeds its bound"))
       (multiple-value-bind (input actual-size)
           (open-bounded-regular-file (merge-pathnames name directory) size)
         (unwind-protect
              (progn
                (unless (= size actual-size) (error "native backup bundle file length changed"))
-               (let ((header (make-payload)))
-                 (payload-push-byte header (char-code #\F))
-                 (payload-push-u32 header (length path))
-                 (loop for byte across path do (payload-push-byte header byte))
-                 (replication-push-u64 header size)
-                 (replication-push-u64 header expected-digest)
-                 (funcall emit header))
+               (funcall emit header)
                (loop with remaining = size
                      while (plusp remaining)
                      for count = (read-sequence buffer input :end (min remaining (length buffer)))
@@ -602,7 +614,7 @@ Check the file length and digest before sending the end frame."
 ;; Send B (bundle header), F/D/E (file header, data and end), then Z
 ;; (count and checksum).  The checksum covers all preceding payloads, including
 ;; file checksums; it detects corruption and is not an authentication mechanism.
-(defun physical-backup-send-bundle (directory manifest emit)
+(defun physical-backup-send-bundle (directory manifest emit &key reuse)
   (let* ((entries (physical-backup-bundle-entries directory manifest))
          (digest #xCBF29CE484222325))
     (flet ((send (payload)
@@ -614,7 +626,9 @@ Check the file length and digest before sending the end frame."
         (payload-push-u32 header (length entries))
         (send header))
       (dolist (entry entries)
-        (physical-backup-send-file directory entry (getf manifest :timeline) #'send)))
+        (if (and reuse (physical-backup-reuse-path-p (first entry)) (funcall reuse entry))
+            (send (physical-backup-file-header-image entry #\R))
+            (physical-backup-send-file directory entry (getf manifest :timeline) #'send))))
     (let ((end (make-payload)))
       (payload-push-byte end (char-code #\Z))
       (payload-push-u32 end (length entries))
@@ -627,8 +641,8 @@ Check the file length and digest before sending the end frame."
       (error "invalid or truncated native backup bundle frame"))
     frame))
 
-(defun physical-backup-file-header (header name maximum &optional expected)
-  (unless (and (>= (length header) 21) (= (aref header 0) (char-code #\F)))
+(defun physical-backup-file-header (header name maximum &optional expected (tag #\F))
+  (unless (and (>= (length header) 21) (= (aref header 0) (char-code tag)))
     (error "native backup bundle lacks its expected file"))
   (let ((length (bytes-to-u32 header 1)))
     (unless (and (<= 1 length 512) (= (length header) (+ 21 length))
@@ -667,28 +681,36 @@ The caller checks the file header and owns the output."
 ;; Descriptor-scoped receipt creates relative to held directories; the legacy
 ;; path retains its existing pathname-based file creation and sync behavior.
 
-(defun physical-backup-receive-file (directory name maximum next &key expected (timeline 1))
+(defun physical-backup-receive-file (directory name maximum next &key expected (timeline 1) reuse)
   (unless (physical-backup-bundle-path-p name timeline)
     (error "invalid native backup destination path"))
-  (multiple-value-bind (size expected-digest)
-      (physical-backup-file-header (physical-backup-read-frame next) name maximum expected)
-    (let ((digest
-            (if *physical-image-context*
-                (call-with-physical-image-output
-                 directory name
-                 (lambda (output)
-                   (physical-backup-receive-file-content size expected-digest next output)))
-                (let* ((path (merge-pathnames name directory))
-                       (parent (uiop:pathname-directory-pathname path))
-                       (digest nil))
-                  (wal-ensure-directory-durable parent)
-                  (with-open-file (output path :direction :output :if-exists :error
-                                               :if-does-not-exist :create :element-type '(unsigned-byte 8))
-                    (setf digest (physical-backup-receive-file-content size expected-digest next output))
-                    (fsync-stream output))
-                  (fsync-directory parent)
-                  digest))))
-      (list name size digest))))
+  (let ((header (physical-backup-read-frame next)))
+    (when (= (aref header 0) (char-code #\R))
+      (unless (and reuse expected (physical-backup-reuse-path-p name))
+        (error "unexpected native backup relation reuse"))
+      (physical-image-require-output-context directory)
+      (physical-backup-file-header header name maximum expected #\R)
+      (funcall reuse expected)
+      (return-from physical-backup-receive-file expected))
+    (multiple-value-bind (size expected-digest)
+        (physical-backup-file-header header name maximum expected)
+      (let ((digest
+              (if *physical-image-context*
+                  (call-with-physical-image-output
+                   directory name
+                   (lambda (output)
+                     (physical-backup-receive-file-content size expected-digest next output)))
+                  (let* ((path (merge-pathnames name directory))
+                         (parent (uiop:pathname-directory-pathname path))
+                         (digest nil))
+                    (wal-ensure-directory-durable parent)
+                    (with-open-file (output path :direction :output :if-exists :error
+                                                 :if-does-not-exist :create :element-type '(unsigned-byte 8))
+                      (setf digest (physical-backup-receive-file-content size expected-digest next output))
+                      (fsync-stream output))
+                    (fsync-directory parent)
+                    digest))))
+        (list name size digest)))))
 
 ;; The descriptor route checks all received names, including metadata, against
 ;; the manifest.  This snapshot is not a substitute for an installation check.
@@ -710,7 +732,7 @@ The caller checks the file header and owns the output."
 ;; Bound the file count and metadata sizes before receiving the manifest and
 ;; its inventory.  Check order, paths, sizes and checksums, then verify the
 ;; immutable recovery image and copied authentication policy before publication.
-(defun physical-backup-receive-bundle (directory next)
+(defun physical-backup-receive-bundle (directory next &key reuse)
   (let ((digest #xCBF29CE484222325)
         (magic (string->bytes "PGNATIVEBACKUP1")))
     (flet ((receive-frame ()
@@ -736,7 +758,7 @@ The caller checks the file header and owns the output."
               (physical-backup-receive-file directory (first entry) (second entry) #'receive-frame))
             (dolist (entry (getf manifest :files))
               (physical-backup-receive-file directory (first entry) (second entry) #'receive-frame
-                                            :expected entry :timeline (getf manifest :timeline)))
+                                            :expected entry :timeline (getf manifest :timeline) :reuse reuse))
             (let ((end (physical-backup-read-frame next)))
               (unless (and (= 13 (length end)) (= (aref end 0) (char-code #\Z))
                            (= count (bytes-to-u32 end 1)) (= digest (replication-read-u64 end 5)))

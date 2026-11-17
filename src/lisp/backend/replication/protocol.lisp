@@ -217,7 +217,8 @@
     ("BACKUP_LEASE_CLEANUP_SELECTED" . :physical-lease-cleanup-selected)
     ("BACKUP_LEASE_PREPARE_FOLLOW" . :physical-lease-prepare-follow)
     ("BACKUP_LEASE_CANCEL_FOLLOW" . :physical-lease-cancel-follow)
-    ("BACKUP_LEASE_PROVE_REWIND" . :physical-lease-prove-rewind)))
+    ("BACKUP_LEASE_PROVE_REWIND" . :physical-lease-prove-rewind)
+    ("CAPTURE_REWIND_NATIVE" . :physical-lease-capture-rewind)))
 
 (defun parse-replication-command (query)
   (let* ((words (replication-command-words query))
@@ -1080,13 +1081,14 @@ The caller releases the slot before sending shutdown completion."
                                                                   :physical-lease-capture :physical-lease-status :physical-lease-abort :physical-lease-handoff
                                                                   :physical-lease-cleanup-selected
                                                                   :physical-lease-prepare-follow :physical-lease-cancel-follow
-                                                                  :physical-lease-prove-rewind))
+                                                                  :physical-lease-prove-rewind :physical-lease-capture-rewind))
              (backend-explicit *backend*))
     (ereport "25001" "~a cannot run inside a transaction block"
              (case (logical-replication-command-type command)
                (:timeline-history "TIMELINE_HISTORY")
                (:physical-backup "BASE_BACKUP_NATIVE")
                (:physical-lease-capture "CAPTURE_BACKUP_NATIVE")
+               (:physical-lease-capture-rewind "CAPTURE_REWIND_NATIVE")
                (:physical-lease-status "BACKUP_LEASE_STATUS")
                (:physical-lease-abort "BACKUP_LEASE_ABORT")
                (:physical-lease-handoff "BACKUP_LEASE_HANDOFF")
@@ -1133,7 +1135,8 @@ The caller releases the slot before sending shutdown completion."
             (:drop (drop-replication-slot-command stream command))
             (:physical-start (start-native-physical-replication stream command))
             (:physical-backup (start-native-physical-backup stream command))
-            (:physical-lease-capture (start-native-backup-lease-capture stream command))
+            ((:physical-lease-capture :physical-lease-capture-rewind)
+             (start-native-backup-lease-capture stream command))
             ((:physical-lease-status :physical-lease-abort :physical-lease-handoff
                                      :physical-lease-cleanup-selected
               :physical-lease-prepare-follow :physical-lease-cancel-follow :physical-lease-prove-rewind)

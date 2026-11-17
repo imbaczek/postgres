@@ -206,6 +206,66 @@ Installation requires separate checks."
       (physical-reseed-image-check source-root source-image)
       (append proof (list :root-id root :fork-digest digest)))))
 
+(defun physical-rewind-relation-offer (directory name)
+  (let ((path (pgdata-resolve-path name directory)))
+    (with-physical-image-input (stream path :element-type '(unsigned-byte 8))
+      (let* ((fd (sb-sys:fd-stream-fd stream))
+             (before (physical-image-file-facts fd))
+             (size (sixth before))
+             (buffer (make-array 65536 :element-type '(unsigned-byte 8)))
+             (digest #xCBF29CE484222325))
+        (loop with remaining = size
+              while (plusp remaining)
+              for count = (read-sequence buffer stream :end (min remaining (length buffer)))
+              do (when (zerop count) (error "native rewind offer file was truncated"))
+                 (setf digest (physical-store-update-digest-span digest buffer 0 count))
+                 (decf remaining count))
+        (unless (and (eq :eof (read-byte stream nil :eof))
+                     (equal before (physical-image-file-facts fd))
+                     (equal before (physical-image-file-facts -100 (namestring path))))
+          (error "native rewind offer file changed"))
+        (list name size digest)))))
+
+(defun physical-rewind-capture-image (owner destination destination-fd client request)
+  (let* ((target (physical-adoption-inspect-primary owner))
+         (reused nil))
+    (call-with-physical-directory-root
+     owner
+     (lambda (root-fd anchored)
+       (declare (ignore anchored))
+       (call-with-physical-backup-image-directory
+        root-fd
+        (lambda (source-root)
+          (let* ((source-context *physical-image-context*)
+                 (*pgdata* source-root)
+                 (*catalog* (getf target :catalog))
+                 (offers
+                   (loop for name in (sort (physical-bootstrap-relation-inventory) #'string<)
+                         repeat +native-rewind-offer-limit+
+                         collect (physical-rewind-relation-offer source-root name)))
+                 (offered (make-hash-table :test #'equal)))
+            (dolist (entry offers)
+              (setf (gethash (first entry) offered) entry))
+            (multiple-value-bind (manifest record)
+                (let ((*pgdata* (physical-adoption-owner-directory owner))
+                      (*physical-image-context* nil))
+                  (physical-backup-lease-capture-remote
+                   destination client request :directory-fd destination-fd :offers offers
+                   :reuse (when offers
+                            (lambda (entry)
+                              (destructuring-bind (name size digest) entry
+                                (unless (equal entry (gethash name offered))
+                                  (error "native rewind source requested an unoffered relation"))
+                                (physical-image-copy-file source-context *physical-image-context*
+                                                          name size digest)
+                                (push entry reused))))))
+              (physical-adoption-check-owner owner)
+              (let ((*pgdata* (physical-adoption-owner-directory owner))
+                    (*physical-image-context* nil))
+                (unless (equalp (getf target :capture) (native-control-capture))
+                  (error "native rewind target changed during capture")))
+              (values manifest record (nreverse reused))))))))))
+
 ;; Copy a verified received stage into a separate empty incoming directory.
 ;; Check the original source is READY before and after the copy, and recheck the
 ;; journal, both images, and workspace identities.  The returned facts are

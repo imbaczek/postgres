@@ -279,11 +279,15 @@
 ;; Create a private 0600 file exclusively relative to a held directory, without
 ;; following symlinks.  Sync the file and parent before reporting success.
 
-(defun call-with-physical-image-output (directory name function)
+(defun physical-image-require-output-context (directory)
   (let ((context *physical-image-context*))
     (unless (and context (not (physical-image-read-context-p context))
                  (equal (pathname directory) (physical-image-context-root-path context)))
       (error "physical image output requires its descriptor scope"))
+    context))
+
+(defun call-with-physical-image-output (directory name function)
+  (let ((context (physical-image-require-output-context directory)))
     (multiple-value-bind (parent leaf) (physical-image-parent context name)
       (let ((fd nil) (stream nil))
         (sb-sys:without-interrupts
