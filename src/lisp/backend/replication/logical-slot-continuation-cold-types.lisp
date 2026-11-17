@@ -11,6 +11,21 @@
 
 (defvar *logical-slot-continuation-cold-test-hook* nil)
 
+(defmacro with-logical-slot-continuation-observation-check
+    ((active failed thread label) &body body)
+  (unless (stringp label) (error "observation check requires a literal label"))
+  (let ((complete (gensym "COMPLETE")))
+    `(sb-sys:without-interrupts
+       (unless (and ,active (eq ,thread sb-thread:*current-thread*))
+         (error ,(concatenate 'string label " expired or changed thread")))
+       (when ,failed (error ,(concatenate 'string label " failed")))
+       (let ((,complete nil))
+         (unwind-protect
+              (multiple-value-prog1
+                  (sb-sys:with-local-interrupts (progn ,@body))
+                (setf ,complete t))
+           (unless ,complete (setf ,failed t)))))))
+
 (defun logical-slot-continuation-cold-reservation-call (reservation operation &optional (value nil supplied-p))
   ;; Check the registered reservation under WAL exclusion before dispatch.
   (assert (sb-thread:holding-mutex-p *wal-lock*))

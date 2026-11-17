@@ -15,18 +15,8 @@
         (lambda (directory check-directory)
           (let ((active t) (failed nil) (thread sb-thread:*current-thread*))
             (macrolet ((in-scope (&body body)
-                         (let ((complete (gensym "COMPLETE")))
-                           `(progn
-                              (unless (and active (eq thread sb-thread:*current-thread*))
-                                (error "cold continuation observation expired or changed thread"))
-                              (when failed (error "cold continuation observation failed"))
-                              (sb-sys:without-interrupts
-                                (let ((,complete nil))
-                                  (unwind-protect
-                                       (multiple-value-prog1
-                                           (sb-sys:with-local-interrupts (progn ,@body))
-                                         (setf ,complete t))
-                                    (unless ,complete (setf failed t)))))))))
+                         `(with-logical-slot-continuation-observation-check
+                              (active failed thread "cold continuation observation") ,@body)))
               (labels ((check ()
                          (in-scope
                           (funcall check-directory)

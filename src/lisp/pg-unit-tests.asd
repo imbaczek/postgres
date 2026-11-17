@@ -44,6 +44,7 @@
                (:file "t/rove/continuation-cold-cleanup-proof-tests")
                (:file "t/rove/continuation-cold-cleanup-domain-tests")
                (:file "t/rove/continuation-cold-selector-observation-tests")
+               (:file "t/rove/continuation-cold-cleanup-plan-tests")
                (:file "t/rove/continuation-selected-proof-tests")
                (:file "t/rove/continuation-cold-source-tests")
                (:file "t/rove/logical-wal-lane-provider-tests")

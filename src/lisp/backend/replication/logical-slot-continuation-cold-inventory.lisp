@@ -1,14 +1,20 @@
 (in-package #:pg)
 
+(defun logical-slot-continuation-cold-check-prefix (bytes image)
+  (logical-slot-copy-descriptor-blob-size
+   image 1 (logical-slot-continuation-prepared-maximum-bytes))
+  (logical-slot-copy-descriptor-blob-size bytes 0 (length image))
+  (when (mismatch bytes image :end2 (length bytes))
+    (error "cold continuation temporary is not an exact new-state prefix"))
+  t)
+
 (defun logical-slot-continuation-cold-read-temporary (directory name image)
   ;; A target state.tmp is acceptable only as an exact prefix of new state.
   (call-with-logical-slot-copy-source-proof-fd
    directory name nil
    (lambda (fd facts)
      (let ((bytes (logical-slot-copy-import-control-read-fd fd (length image))))
-       (unless (and (<= (length bytes) (length image))
-                    (null (mismatch bytes image :end2 (length bytes))))
-         (error "cold continuation temporary is not an exact new-state prefix"))
+       (logical-slot-continuation-cold-check-prefix bytes image)
        (list (copy-list facts) bytes)))))
 
 (defun logical-slot-continuation-cold-read-row (directory name check target new-image)

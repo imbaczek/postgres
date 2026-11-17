@@ -33,6 +33,12 @@ CASE_DEFINITIONS = {
 }
 CASE_DEFINITIONS.update({fault: DEFAULT_CASES[variant] for fault, variant in FAULTS.items()})
 PROOF_MARKERS = {
+    'plan': 'NATIVE-COLD-CLEANUP-PLAN',
+    'plan-bootstrap-prefix': 'NATIVE-COLD-CLEANUP-PLAN',
+    'plan-empty': 'NATIVE-COLD-CLEANUP-PLAN',
+    'plan-replaced': 'NATIVE-COLD-CLEANUP-PLAN',
+    'plan-caught': 'NATIVE-COLD-CLEANUP-PLAN',
+    'plan-close': 'NATIVE-COLD-CLEANUP-PLAN',
     'load': 'NATIVE-COLD-PUBLICATION',
     'load-bootstrap': 'NATIVE-COLD-PUBLICATION',
     'load-bootstrap-prefix': 'NATIVE-COLD-PUBLICATION',

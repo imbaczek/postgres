@@ -47,6 +47,17 @@ class ColdPlanContracts(unittest.TestCase):
         self.assertEqual(['prepare', 'prepare'], [row['proof'] for row in rows])
         self.assertTrue(all(row['spill'] for row in rows))
 
+    def test_cleanup_plan_modes_do_not_claim_crash_coverage(self):
+        for proof in ('plan', 'plan-bootstrap-prefix', 'plan-empty',
+                      'plan-replaced', 'plan-caught', 'plan-close'):
+            with self.subTest(proof=proof):
+                row = self.plan([dict(case='stable-durable', proof=proof)])[0]
+                self.assertIsNone(row['cut'])
+                self.assertFalse(native.cold_spill_required(row))
+                self.assertEqual('NATIVE-COLD-CLEANUP-PLAN', native.PROOF_MARKERS[proof])
+                with self.assertRaises(ValueError):
+                    self.plan([dict(case='stable-durable', proof=proof, cut='after-state-sync')])
+
     def test_same_case_in_different_proof_modes_has_distinct_outputs(self):
         other = self.root / 'other-variants'
         rows = self.plan([{'case': 'happy', 'proof': 'prepare'},

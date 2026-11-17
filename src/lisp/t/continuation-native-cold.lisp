@@ -1601,12 +1601,207 @@
     (format t "~&NATIVE-COLD-EMPTY-LOADER PASS case=~a bootstrap restart exact-empty-selector opaque-workspace no-cold-publication no-fd-leak~%"
             (uiop:getenv "PG_NATIVE_COLD_CASE"))))
 
+(defun native-host-cold-cleanup-file-image ()
+  (let ((directory (sb-posix:open (namestring (wal-replication-slot-directory))
+                                  (logior sb-posix:o-rdonly sb-posix:o-directory
+                                          sb-posix:o-nofollow +postmaster-o-cloexec+))))
+    (unwind-protect
+         (list (physical-image-file-facts directory)
+               (logical-slot-continuation-cold-read-raw-inventory directory (lambda () t))
+               (physical-image-file-facts -100 (namestring (merge-pathnames "pg_logical_continuation/" *pgdata*)))
+               (native-host-cold-file-image))
+      (sb-posix:close directory))))
+
+(defun native-host-cold-cleanup-fixtures (gate ownership mode)
+  (when (equal mode "plan-empty")
+    (dolist (name '("alpha/" "beta/"))
+      (uiop:delete-directory-tree (merge-pathnames name (wal-replication-slot-directory))
+                                  :validate t :if-does-not-exist :error)))
+  (when (member mode '("plan-bootstrap-prefix" "plan-empty") :test #'equal)
+    (let ((snapshot nil))
+      (call-with-logical-slot-continuation-cold-context
+       gate ownership
+       (lambda (storage reservation archive)
+         (declare (ignore reservation archive))
+         (let ((facts (logical-slot-continuation-storage-call storage :facts)))
+           (setf snapshot
+                 (if (equal mode "plan-empty")
+                     (logical-slot-continuation-empty-snapshot
+                      (logical-slot-continuation-storage-call storage :binding)
+                      (getf facts :certificate)
+                      (logical-slot-continuation-storage-call storage :host))
+                     (logical-slot-continuation-active-startup-image storage facts))))))
+      (native-host-cold-bootstrap-selector snapshot t)))
+  (native-host-cold-add-extra t nil 998)
+  (slot-state-create
+   (wal-replication-slot-directory) "coldtemp"
+   (physical-slot-encode
+    (make-wal-replication-slot :name "coldtemp" :kind :physical :system-id 999
+                               :database-oid nil :plugin nil :consistent-lsn nil
+                               :restart-lsn nil :restart-timeline nil :inactive-since 0
+                               :wal-status :lost :temporary-p t)))
+  (let ((staging (merge-pathnames "orphan.tmp/" (wal-replication-slot-directory))))
+    (sb-posix:mkdir (namestring staging) #o700)
+    (with-open-file (stream (merge-pathnames "state.tmp" staging) :direction :output :if-exists :error
+                                                                  :element-type '(unsigned-byte 8))
+      (write-sequence #(1 2 3) stream))))
+
+(defun native-host-cold-cleanup-plan (gate ownership)
+  (let* ((mode (uiop:getenv "PG_NATIVE_COLD_PROOF"))
+         (registry *wal-replication-slots*) (mirrors (logical-slot-publication-mirrors))
+         (pins (hash-table-count *wal-snapshot-retention-pins*))
+         (lifetimes (hash-table-count *physical-slot-lifetimes*))
+         (fds (native-host-writer-open-fds)) (reservation nil) (escaped nil)
+         (files nil) (first-plan nil) (visits 0))
+    (native-host-cold-cleanup-fixtures gate ownership mode)
+    (setf files (native-host-cold-cleanup-file-image))
+    (dotimes (attempt 2)
+      (call-with-logical-slot-continuation-cold-cleanup-plan
+       gate ownership
+       (lambda (plan actual check)
+         (incf visits)
+         (setf escaped check)
+         (if first-plan (assert (equalp first-plan plan))
+             (setf first-plan (logical-slot-continuation-copy plan)))
+         (assert (equal '(:remove-staging :remove-scratch :retire-temporary)
+                        (mapcar (lambda (action) (getf action :operation)) (getf plan :actions))))
+         (assert (equal '("orphan.tmp" "extra" "coldtemp")
+                        (mapcar (lambda (action) (getf action :name)) (getf plan :actions))))
+         (assert (equal '("alpha" "beta") (getf plan :protected)))
+         (if (member mode '("plan-bootstrap-prefix" "plan-empty") :test #'equal)
+             (progn (assert (eq :absent (getf plan :kind)))
+                    (assert (eq :bootstrap (getf plan :choice)))
+                    (assert (= 1 (getf (getf plan :snapshot) :generation))))
+             (progn
+               (assert (eq (intern (uiop:getenv "PG_NATIVE_COLD_KIND") :keyword) (getf plan :kind)))
+               (assert (eq (intern (uiop:getenv "PG_NATIVE_COLD_CHOICE") :keyword) (getf plan :choice)))))
+         (if (equal mode "plan-empty")
+             (assert (equal '("extra") (mapcar #'first (getf plan :retained))))
+             (assert (equal '("alpha" "beta" "extra") (mapcar #'first (getf plan :retained)))))
+         (assert
+          (eq :passed
+              (sb-thread:join-thread
+               (sb-thread:make-thread
+                (lambda ()
+                  (handler-case
+                      (progn (native-host-cold-recheck-refused-before-io check) :passed)
+                    (error (condition) condition)))))))
+         (when reservation (assert (eq reservation actual)))
+         (setf reservation actual)
+         (sb-thread:with-mutex (*wal-lock*)
+           (assert (logical-slot-continuation-cold-reservation-call actual :check))
+           (assert (= 41268 (gethash actual *wal-snapshot-retention-pins*))))
+         (incf (getf (getf plan :snapshot) :generation))
+         (setf (getf (first (getf plan :ledger)) :name) "changed-copy")
+         (funcall check)))
+      (native-host-cold-recheck-refused-before-io escaped)
+      (assert (eq registry *wal-replication-slots*))
+      (assert (zerop (hash-table-count registry)))
+      (assert (equal mirrors (logical-slot-publication-mirrors)))
+      (assert (null (gethash registry *logical-slot-continuation-protection-registries*)))
+      (assert (equalp files (native-host-cold-cleanup-file-image))))
+    (assert (= 2 visits))
+    (assert (= (1+ pins) (hash-table-count *wal-snapshot-retention-pins*)))
+    (assert (= lifetimes (hash-table-count *physical-slot-lifetimes*)))
+
+    (assert (logical-slot-continuation-gc-fenced-p *pgdata*))
+
+    (assert (equal fds (native-host-writer-open-fds)))
+
+    (format t "~&NATIVE-COLD-CLEANUP-PLAN PASS case=~a mode=~a complete-ledger no-effects persistent-F no-admission repeat-idempotent no-fd-leak~%"
+            (uiop:getenv "PG_NATIVE_COLD_CASE") mode)))
+
+(defun native-host-cold-cleanup-corrupt-scratch ()
+  (with-open-file (stream (merge-pathnames "pg_replslot/extra/state.tmp" *pgdata*)
+                          :direction :output :if-exists :overwrite :element-type '(unsigned-byte 8))
+    (write-byte 0 stream)))
+
+(defun native-host-cold-cleanup-without-scratch (image)
+  (let* ((copy (logical-slot-continuation-copy image))
+         (extra (find "extra" (second copy) :key (lambda (row) (getf row :name)) :test #'string=)))
+    (setf (getf extra :files) (remove "state.tmp" (getf extra :files) :key #'first :test #'string=))
+    copy))
+
+(defun native-host-cold-cleanup-plan-refusal (gate ownership mode)
+  (let ((close (symbol-function 'sb-posix:close))
+        (registry *wal-replication-slots*) (mirrors (logical-slot-publication-mirrors))
+        (fds (native-host-writer-open-fds)) (reservation nil) (escaped nil)
+        (changed nil) (injected nil) (visits 0) (caught nil) (files nil))
+    (native-host-cold-cleanup-fixtures gate ownership mode)
+    (setf files (native-host-cold-cleanup-file-image))
+    (let ((*logical-slot-continuation-cold-test-hook*
+            (lambda (point actual)
+              (when (eq point :protected) (setf reservation actual))
+              (when (and (equal mode "plan-close") (eq point :after-observation))
+                (setf (symbol-function 'sb-posix:close)
+                      (lambda (fd)
+                        (funcall close fd)
+                        (setf (symbol-function 'sb-posix:close) close
+                              injected t)
+                        (error "native cleanup close failure"))))))
+          (*logical-slot-continuation-inventory-test-hook*
+            (lambda (point)
+              (when (and (equal mode "plan-replaced") (eq point :between-passes) (not changed))
+                (native-host-cold-cleanup-corrupt-scratch)
+                (setf changed t)))))
+      (unwind-protect
+           (setf caught
+                 (handler-case
+                     (progn
+                       (call-with-logical-slot-continuation-cold-cleanup-plan
+                        gate ownership
+                        (lambda (plan actual check)
+                          (declare (ignore plan))
+                          (incf visits)
+                          (setf reservation actual escaped check)
+                          (funcall check)
+                          (when (equal mode "plan-caught")
+                            (native-host-cold-cleanup-corrupt-scratch)
+                            (setf changed t)
+                            (assert (handler-case (progn (funcall check) nil) (error () t)))
+                            (native-host-cold-recheck-refused-before-io check))))
+                       nil)
+                   (error (condition) (princ-to-string condition))))
+        (setf (symbol-function 'sb-posix:close) close)))
+    (assert caught)
+    (cond
+      ((equal mode "plan-replaced") (assert (and changed (zerop visits))))
+      ((equal mode "plan-caught")
+       (assert (and changed (= 1 visits) (search "cold cleanup plan failed" caught))))
+      ((equal mode "plan-close")
+       (assert (and injected (= 1 visits) (search "native cleanup close failure" caught)))))
+    (when escaped (native-host-cold-recheck-refused-before-io escaped))
+    (assert (eq registry *wal-replication-slots*))
+    (assert (zerop (hash-table-count registry)))
+    (assert (equal mirrors (logical-slot-publication-mirrors)))
+    (assert (null (gethash registry *logical-slot-continuation-protection-registries*)))
+    (assert (logical-slot-continuation-gc-fenced-p *pgdata*))
+    (assert reservation)
+    (sb-thread:with-mutex (*wal-lock*)
+      (assert (logical-slot-continuation-cold-reservation-call reservation :uncertain))
+      (assert (= 41268 (gethash reservation *wal-snapshot-retention-pins*)))
+      (assert (handler-case
+                  (progn (logical-slot-continuation-cold-reservation-call reservation :check) nil)
+                (error () t))))
+    (assert (equal fds (native-host-writer-open-fds)))
+    (let ((after (native-host-cold-cleanup-file-image)))
+      (assert (equalp (if changed (native-host-cold-cleanup-without-scratch files) files)
+                      (if changed (native-host-cold-cleanup-without-scratch after) after))))
+    (format t "~&NATIVE-COLD-CLEANUP-PLAN PASS case=~a refusal=~a persistent-F uncertain empty-registry no-fd-leak~%"
+            (uiop:getenv "PG_NATIVE_COLD_CASE") mode)))
+
 (defun native-host-continuation-cold-state (gate ownership)
   (with-native-cold-spill-probe
       (handler-case
           (progn
             (when (uiop:getenv "PG_NATIVE_COLD_APPEND") (native-host-cold-append))
             (cond
+              ((member (uiop:getenv "PG_NATIVE_COLD_PROOF")
+                       '("plan-replaced" "plan-caught" "plan-close") :test #'equal)
+               (native-host-cold-cleanup-plan-refusal gate ownership (uiop:getenv "PG_NATIVE_COLD_PROOF")))
+              ((member (uiop:getenv "PG_NATIVE_COLD_PROOF")
+                       '("plan" "plan-bootstrap-prefix" "plan-empty") :test #'equal)
+               (native-host-cold-cleanup-plan gate ownership))
               ((member (uiop:getenv "PG_NATIVE_COLD_PROOF")
                        '("publish-after-group-pin" "publish-maps-ready" "publish-derived" "publish-prepared"
                          "publish-before-commit" "publish-after-commit" "publish-owner-return" "publish-close"

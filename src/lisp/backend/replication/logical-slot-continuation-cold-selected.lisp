@@ -79,24 +79,15 @@
              (invoke (kind model fd selected temp-fd temporary)
                (let ((active t) (failed nil) (thread sb-thread:*current-thread*))
                  (labels ((check ()
-                            (unless (and active (eq thread sb-thread:*current-thread*))
-                              (error "cold selector observation expired or changed thread"))
-                            (when failed (error "cold selector observation failed"))
-                            (sb-sys:without-interrupts
-                              (let ((complete nil))
-                                (unwind-protect
-                                     (multiple-value-prog1
-                                         (sb-sys:with-local-interrupts
-                                           (check-directory)
-                                           (dolist (entry (list (list fd selected)
-                                                                (list temp-fd temporary)))
-                                             (when (second entry)
-                                               (logical-slot-imported-check-held-file
-                                                directory (first (second entry)) (first entry)
-                                                (second (second entry)) (third (second entry)))))
-                                           t)
-                                       (setf complete t))
-                                  (unless complete (setf failed t)))))))
+                            (with-logical-slot-continuation-observation-check
+                                (active failed thread "cold selector observation")
+                              (check-directory)
+                              (dolist (entry (list (list fd selected) (list temp-fd temporary)))
+                                (when (second entry)
+                                  (logical-slot-imported-check-held-file
+                                   directory (first (second entry)) (first entry)
+                                   (second (second entry)) (third (second entry)))))
+                              t)))
                    (unwind-protect
                         (progn
                           (check)
