@@ -7,6 +7,7 @@ import argparse
 import contextlib
 import fcntl
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -24,7 +25,18 @@ RAM = Path('/dev/shm') / ('pg-lisp-tests-' + str(os.getuid()))
 GENERATED = {'.fasl', '.so', '.o', '.core', '.pyc'}
 ENVIRONMENT = ('SBCL', 'SBCL_HOME', 'CL_SOURCE_REGISTRY', 'ASDF_SOURCE_REGISTRY',
                'ASDF_OUTPUT_TRANSLATIONS', 'QUICKLISP_HOME', 'PG_CONFIG', 'PG_LIBPQ_HELPER',
-               'PG_LISP_TEST_COMPILE_POLICY')
+                 'PG_LISP_TEST_COMPILE_POLICY', 'PATH', 'LANG', 'LANGUAGE', 'LC_ALL', 'LC_CTYPE', 'TZ',
+                 'LD_LIBRARY_PATH', 'LD_PRELOAD')
+
+
+def compile_cache_module():
+    spec = importlib.util.spec_from_file_location('pg_compile_cache', Path(__file__).with_name('test_compile_cache.py'))
+    result = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(result)
+    return result
+
+
+COMPILE_CACHE = compile_cache_module()
 
 
 def job_root(path=None):
@@ -88,7 +100,8 @@ def environment():
     executable = shutil.which(os.environ.get('SBCL', 'sbcl'))
     if not executable:
         raise ValueError('SBCL executable was not found')
-    return dict(values={key: os.environ.get(key) for key in ENVIRONMENT},
+    keys = sorted(set(ENVIRONMENT) | {key for key in os.environ if key.startswith('LC_')})
+    return dict(values={key: os.environ.get(key) for key in keys},
                 executable=executable, launcher_sha256=hashlib.sha256(Path(executable).read_bytes()).hexdigest())
 
 
@@ -120,6 +133,13 @@ def write_json(path, value):
     temporary = path.with_suffix(path.suffix + '.tmp')
     temporary.write_text(json.dumps(value, indent=2) + '\n')
     os.replace(temporary, path)
+
+
+def publish_manifest(source, destination):
+    COMPILE_CACHE.directory(destination.parent)
+    contents = COMPILE_CACHE.private_file(source, contents=True)[1]
+    with destination.open('xb') as stream:
+        stream.write(contents)
 
 
 def create(source):
@@ -259,7 +279,9 @@ def campaign_wrapper(root, executable, inherited):
             '\nflock -s ' + str(workspace_fd) + '\nexec ' + shlex.quote(executable) + ' "$@"\n')
 
 
-def run(campaign, target, heads, cold, workspace, parallel=False):
+def run(campaign, target, heads, cold, workspace, parallel=False, reuse_strict_compile=False):
+    if cold and reuse_strict_compile:
+        raise ValueError('Cold runs cannot reuse strict compilation')
     root = job_root(campaign)
     job = job_root()
     if root == job:
@@ -267,7 +289,8 @@ def run(campaign, target, heads, cold, workspace, parallel=False):
     claim_job(job)
     # Parallel jobs share read leases; serial jobs exclude them and each other.
     with lock(root, 'run.lock', exclusive=not parallel) as run_lock, \
-         lock(root, 'lease.lock', exclusive=not parallel) as lease:
+         lock(root, 'lease.lock', exclusive=not parallel) as lease, \
+         COMPILE_CACHE.checkpoint() as checkpoint_fd:
         if not parallel:
             fcntl.flock(lease, fcntl.LOCK_SH)
         data = read_campaign(root)
@@ -288,6 +311,8 @@ def run(campaign, target, heads, cold, workspace, parallel=False):
         with lock(root, 'cache.lock', exclusive=True):
             if not cold:
                 shutil.copytree(root / 'parent-fasls', cache)
+            reused = (COMPILE_CACHE.prepare(root, job, os.environ.get('PG_LISP_TEST_COMPILE_POLICY') or 'default')
+                      if reuse_strict_compile else None)
         copy_seconds = time.monotonic() - copied
         wrapper = job / 'campaign-sbcl'
         wrapper.write_text(campaign_wrapper(root, data['environment']['executable'],
@@ -296,7 +321,14 @@ def run(campaign, target, heads, cold, workspace, parallel=False):
         env = dict(os.environ, SBCL=str(wrapper), PG_LISP_TEST_CAMPAIGN=str(root),
                    PG_LISP_TEST_CAMPAIGN_SBCL=str(wrapper), PG_LISP_FROZEN_SOURCE=str(source),
                    PG_LISP_TEST_IDENTITY_OUT=str(job / 'logs/image.log'),
-                   PG_LISP_TEST_SUITE_OUT=str(job / 'logs/suite.log'))
+                    PG_LISP_TEST_SUITE_OUT=str(job / 'logs/suite.log'),
+                     PG_LISP_TEST_STRICT_REPORT_OUT=str(job / 'logs/strict-compile.json'),
+                     PG_LISP_TEST_STRICT_CHECKPOINT='/proc/' + str(os.getpid()) + '/fd/' + str(checkpoint_fd))
+        for key in ('PG_LISP_TEST_REUSED_PLAIN_CACHE', 'PG_LISP_TEST_STRICT_REUSE_RECEIPT'):
+            env.pop(key, None)
+        if reused:
+            env.update(PG_LISP_TEST_REUSED_PLAIN_CACHE=str(reused[0]),
+                       PG_LISP_TEST_STRICT_REUSE_RECEIPT=str(reused[1]))
         for kind, key in (('image', 'PG_LISP_TEST_IDENTITY_EXPECTED'),
                           (target, 'PG_LISP_TEST_SUITE_EXPECTED')):
             reference = root / 'manifests' / (kind + '.log')
@@ -311,21 +343,26 @@ def run(campaign, target, heads, cold, workspace, parallel=False):
         after = resource.getrusage(resource.RUSAGE_CHILDREN)
         if data['image'] != fingerprint(source):
             raise ValueError('Immutable campaign source changed during the job')
-        published = 0
+        published = published_strict = 0
         # Only a successful serial run may publish manifests or cache additions.
         if result == 0 and not parallel:
             with lock(root, 'cache.lock', exclusive=True):
+                COMPILE_CACHE.directory(root / 'manifests')
                 for kind, name in (('image', 'image'), (target, 'suite')):
                     reference = root / 'manifests' / (kind + '.log')
                     if not reference.exists():
-                        shutil.copy2(job / 'logs' / (name + '.log'), reference)
+                        publish_manifest(job / 'logs' / (name + '.log'), reference)
                 if not cold:
                     published = publish_cache(cache, root / 'parent-fasls')
+                if not reuse_strict_compile:
+                    published_strict = COMPILE_CACHE.publish(root, job, job / 'logs/strict-compile.json', checkpoint_fd)
         record = dict(format=1, campaign=str(root), source=data['image'], target=target,
                        requested_heads=heads, strict=True, cold=cold, parallel=parallel, exit_code=result,
                       wall_seconds=time.monotonic() - started, copy_seconds=copy_seconds,
                       cpu_seconds=after.ru_utime + after.ru_stime - cpu.ru_utime - cpu.ru_stime,
-                      peak_rss_kib=after.ru_maxrss, published_fasls=published,
+                        peak_rss_kib=after.ru_maxrss, published_fasls=published,
+                        strict_compile='reused' if reuse_strict_compile else 'fresh',
+                        published_strict_fasls=published_strict,
                       log=str(job / 'logs/test.log'))
         write_json(job / 'logs/campaign-result.json', record)
         print('TEST-CAMPAIGN-RESULT ' + json.dumps(record), flush=True)
@@ -352,6 +389,8 @@ def parse_args(arguments=None):
     run_parser.add_argument('--cold', action='store_true', help='Do not read or publish parent FASLs')
     run_parser.add_argument('--parallel', action='store_true',
                             help='Overlap independent jobs on a qualified campaign; never publish cache additions')
+    run_parser.add_argument('--reuse-strict-compile', action='store_true',
+                            help='Require an intact fresh serial compiler qualification from this exact campaign')
     run_parser.add_argument('heads', nargs='*')
     actions.add_parser('close').add_argument('campaign')
     args, extra = parser.parse_known_args(arguments)
@@ -369,7 +408,8 @@ def main():
         if args.action == 'create':
             create(args.source)
         elif args.action == 'run':
-            return run(args.campaign, args.target, args.heads, args.cold, workspace, args.parallel)
+            return run(args.campaign, args.target, args.heads, args.cold, workspace,
+                       args.parallel, args.reuse_strict_compile)
         else:
             close(args.campaign)
     return 0

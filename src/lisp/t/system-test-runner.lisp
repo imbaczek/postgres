@@ -65,6 +65,19 @@
     (sb-ext:process-wait process)
     (sb-ext:process-close process)))
 
+(defun pg-test-compiler-cache-action (source action cache &optional log)
+  (unless (and (uiop:getenv "PG_LISP_TEST_CAMPAIGN")
+               (uiop:getenv "PG_LISP_TEST_IDENTITY_OUT"))
+    (error "Compiler qualification requires a checked campaign image"))
+  (uiop:run-program
+   (append
+    (list "python3" (namestring (merge-pathnames "t/test_compile_cache.py" source))
+          action (namestring cache)
+          (string-downcase (symbol-name (uiop:symbol-call :pg-test-compilation :profile))))
+    (when log (list "--log" (namestring log))))
+   :output *standard-output* :error-output *error-output*)
+  t)
+
 (defun pg-test-configure-parent-cache (cache)
   (asdf:initialize-output-translations
    `(:output-translations
@@ -165,11 +178,13 @@
          (suite (if (string= target "unit") :pg :pg-physical-tests))
          (strict (member "--strict" (rest arguments) :test #'string=))
          (names (remove "--strict" (rest arguments) :test #'string=))
+         (reused (uiop:getenv "PG_LISP_TEST_REUSED_PLAIN_CACHE"))
          (work (when strict
                  (uiop:ensure-directory-pathname
                   (sb-posix:mkdtemp
                    (namestring (merge-pathnames "pg-system-test.XXXXXX" (uiop:temporary-directory)))))))
-         (cache (when work (merge-pathnames "plain-cache/" work)))
+         (cache (when work (if reused (uiop:ensure-directory-pathname reused)
+                               (merge-pathnames "plain-cache/" work))))
          (log (when work (merge-pathnames "strict-compile.log" work)))
          (compiler nil) (start (get-internal-real-time)))
     (when (uiop:getenv "PG_LISP_TEST_CAMPAIGN")
@@ -177,6 +192,10 @@
        (pg-test-image-identity source) "PG_LISP_TEST_IDENTITY_OUT" "PG_LISP_TEST_IDENTITY_EXPECTED"
        '(:format :source :implementation :runtime :runtime-digest :core :core-digest :asdf :features))
       (pg-test-configure-parent-cache (uiop:getenv "XDG_CACHE_HOME")))
+    (when (or reused (uiop:getenv "PG_LISP_TEST_STRICT_REUSE_RECEIPT"))
+      (unless (and strict reused (uiop:getenv "PG_LISP_TEST_CAMPAIGN")
+                   (uiop:getenv "PG_LISP_TEST_STRICT_REUSE_RECEIPT"))
+        (error "Strict compiler reuse requires its complete campaign receipt")))
     (when (member "pg" (asdf:already-loaded-systems) :test #'string=)
       (error "Run system tests in a fresh Lisp without preloaded pg"))
     (pushnew source asdf:*central-registry* :test #'equal)
@@ -189,12 +208,15 @@
       (when (and (eq profile :fast) (not (uiop:getenv "PG_LISP_TEST_CAMPAIGN")))
         (error "Fast test compilation requires an isolated test campaign."))
       (format t "~&TEST-COMPILE-POLICY ~a~%" profile))
+    (when reused
+      (pg-test-phase :strict-cache-check
+                     (lambda () (pg-test-compiler-cache-action source "verify" cache))))
     (setf *print-circle* t *print-level* 6 *print-length* 12)
     ;; Start compilation alongside loading, but wait for it before executing heads.
     ;; Mask spawn and assignment so unwind cleanup always owns a returned child.
     (unwind-protect
          (progn
-           (when strict
+           (when (and strict (not reused))
              (ensure-directories-exist (merge-pathnames "placeholder" cache))
              (sb-sys:without-interrupts
                (setf compiler (pg-test-start-compiler source cache log))))
@@ -217,7 +239,14 @@
              (when compiler
                (pg-test-phase :strict-wait (lambda () (pg-test-finish-compiler compiler log)))
                (pg-test-close-compiler compiler)
-               (setf compiler nil))
+               (setf compiler nil)
+               (when (uiop:getenv "PG_LISP_TEST_STRICT_REPORT_OUT")
+                 (pg-test-phase :strict-capture
+                                (lambda () (pg-test-compiler-cache-action source "capture" cache log)))))
+             (when reused
+               (pg-test-phase :strict-reuse
+                              (lambda () (pg-test-compiler-cache-action source "verify" cache)))
+               (format t "~&TEST-STRICT-COMPILE-REUSED~%"))
              (pg-test-apply-seed (uiop:getenv "PG_LISP_TEST_SEED"))
              (multiple-value-prog1
                  (pg-test-phase

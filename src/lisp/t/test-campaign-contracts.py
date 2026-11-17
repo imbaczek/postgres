@@ -21,6 +21,26 @@ class CampaignContracts(unittest.TestCase):
     def tearDown(self):
         self.temporary.cleanup()
 
+    def test_native_loader_environment_is_part_of_campaign_identity(self):
+        for name in ('LD_LIBRARY_PATH', 'LD_PRELOAD'):
+            with self.subTest(name=name), mock.patch.dict(os.environ, {name: 'first'}):
+                first = campaign.environment()
+                os.environ[name] = 'changed'
+                second = campaign.environment()
+                self.assertEqual('first', first['values'][name])
+                self.assertNotEqual(first, second)
+
+    def test_manifest_publication_refuses_dangling_destination_link(self):
+        source = self.root / 'source.log'
+        source.write_bytes(b'qualified manifest')
+        outside = self.root / 'outside.log'
+        destination = self.root / 'manifest.log'
+        destination.symlink_to(outside)
+        self.assertFalse(destination.exists())
+        with self.assertRaises(FileExistsError):
+            campaign.publish_manifest(source, destination)
+        self.assertFalse(outside.exists())
+
     def test_checkout_records_paths_from_repository_root(self):
         source = self.root / 'src/lisp'
         source.mkdir(parents=True)
@@ -92,6 +112,13 @@ class CampaignContracts(unittest.TestCase):
         self.assertEqual(['first', 'second'], args.heads)
         args = campaign.parse_args(['run', '/campaign', 'unit', 'first', '--cold', 'second'])
         self.assertEqual(['first', 'second'], args.heads)
+
+    def test_strict_compile_reuse_is_explicit_and_preserves_head_order(self):
+        args = campaign.parse_args(['run', '/campaign', 'physical', 'first',
+                                    '--reuse-strict-compile', 'second'])
+        self.assertTrue(args.reuse_strict_compile)
+        self.assertEqual(['first', 'second'], args.heads)
+        self.assertFalse(campaign.parse_args(['run', '/campaign', 'physical']).reuse_strict_compile)
 
     def test_parallel_option_preserves_head_order(self):
         args = campaign.parse_args(['run', '/campaign', 'unit', 'first', '--parallel', 'second'])
