@@ -227,6 +227,11 @@ Installation requires separate checks."
         (list name size digest)))))
 
 (defun physical-rewind-capture-image (owner destination destination-fd client request)
+  "Receive a source image using relation offers from the locked target.
+Hold a read descriptor for the target and a receive descriptor for the image.
+Reuse files only when the offered name, size and digest match. Verify the
+complete image and READY source lease, then recheck the target.
+Return the manifest, lease record and reused entries."
   (let* ((target (physical-adoption-inspect-primary owner))
          (reused nil))
     (call-with-physical-directory-root

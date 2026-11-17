@@ -30,6 +30,8 @@
 (defconstant +native-rewind-offer-limit+ 1024)
 
 (defun physical-rewind-decode-offers (text)
+  "Decode bounded relation offers into a table keyed by name.
+Each unique entry contains a relation name, size and digest."
   (unless (<= 1 (length text) 65536)
     (wal-invalid-input "native rewind offer list exceeds its size bound"))
   (let ((fields (uiop:split-string text :separator '(#\,)))
