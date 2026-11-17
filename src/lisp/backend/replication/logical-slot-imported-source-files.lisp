@@ -61,6 +61,39 @@
                history proof-end))))))
     t))
 
+(defun call-with-logical-slot-imported-canonical-files (root hold-file observe-proof function)
+  ;; HOLD-FILE owns descriptors and checks their names and expected bytes.
+  ;; Reading this pair supplies evidence, never an owner or startup authority.
+  (funcall
+   hold-file root "logical-slot-copy.source-proof" nil nil
+   (lambda (proof-fd)
+     (let* ((image (logical-slot-copy-import-control-read-fd
+                    proof-fd (logical-slot-copy-source-proof-maximum-bytes)))
+            (parts (logical-slot-copy-source-proof-decode image))
+            (facts (logical-slot-copy-check-source-proof image))
+            (certificate (getf facts :certificate))
+            (journal (getf parts :installation))
+            (pending (getf (getf facts :journal) :certificate))
+            (active-image (logical-slot-copy-install-active-image certificate)))
+       (funcall observe-proof facts image)
+       (funcall
+        hold-file root "logical-slot-copy.import" nil active-image
+        (lambda (active-fd)
+          (declare (ignore active-fd))
+          (funcall
+           hold-file root "logical-slot-copy.install" t nil
+           (lambda (installation)
+             (logical-slot-imported-check-install-directory installation)
+             (funcall
+              hold-file installation "journal" nil journal
+              (lambda (journal-fd)
+                (declare (ignore journal-fd))
+                (funcall
+                 hold-file installation "active" nil pending
+                 (lambda (pending-fd)
+                   (declare (ignore pending-fd))
+                   (funcall function)))))))))))))
+
 (defun call-with-logical-slot-imported-proof-file-scope (owner context function &key runtime)
   "Observe the canonical permanent pair through an explicit read-only context.
 Keep *PGDATA* and *PHYSICAL-IMAGE-CONTEXT* bindings intact for startup
@@ -130,41 +163,23 @@ replay D through F, provide WAL records, publish a slot or establish readiness."
                                (mapcar (lambda (entry)
                                          (list (second entry) (copy-tree (fourth entry)))) held))
                          t)))))
-         (hold root "logical-slot-copy.source-proof" nil nil
-               (lambda (proof-fd)
-                 (let* ((image (logical-slot-copy-import-control-read-fd
-                                proof-fd (logical-slot-copy-source-proof-maximum-bytes)))
-                        (parts (logical-slot-copy-source-proof-decode image))
-                        (facts (logical-slot-copy-check-source-proof image))
-                        (certificate (getf facts :certificate))
-                        (journal (getf parts :installation))
-                        (pending (getf (getf facts :journal) :certificate))
-                        (active-image (logical-slot-copy-install-active-image certificate)))
-                   (setf (fifth (first held)) (copy-seq image)
-                         private-facts facts private-image (copy-seq image))
-                   (logical-slot-imported-check-certificate-source owner context facts :runtime runtime)
-                   (hold root "logical-slot-copy.import" nil active-image
-                         (lambda (active-fd)
-                           (declare (ignore active-fd))
-                           (hold root "logical-slot-copy.install" t nil
-                                 (lambda (installation)
-                                   (logical-slot-imported-check-install-directory installation)
-                                   (hold installation "journal" nil journal
-                                         (lambda (journal-fd)
-                                           (declare (ignore journal-fd))
-                                           (hold installation "active" nil pending
-                                                 (lambda (pending-fd)
-                                                   (declare (ignore pending-fd))
-                                                   (unwind-protect
-                                                        (progn
-                                                          (setf active t)
-                                                          (check)
-                                                          (multiple-value-prog1
-                                                              (funcall function
-                                                                       (logical-slot-copy-check-source-proof (copy-seq image))
-                                                                       #'check #'check-anchors-under-lock)
-                                                            (check)))
-                                                     (setf active nil))))))))))))))))))
+         (call-with-logical-slot-imported-canonical-files
+          root #'hold
+          (lambda (facts image)
+            (setf (fifth (first held)) (copy-seq image)
+                  private-facts facts private-image (copy-seq image))
+            (logical-slot-imported-check-certificate-source owner context facts :runtime runtime))
+          (lambda ()
+            (unwind-protect
+                 (progn
+                   (setf active t)
+                   (check)
+                   (multiple-value-prog1
+                       (funcall function
+                                (logical-slot-copy-check-source-proof (copy-seq private-image))
+                                #'check #'check-anchors-under-lock)
+                     (check)))
+              (setf active nil)))))))))
 
 (defun call-with-logical-slot-imported-proof-files (owner context function)
   (call-with-logical-slot-imported-proof-file-scope owner context function))
