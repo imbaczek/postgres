@@ -903,17 +903,14 @@
   in `/home/imbaczek/proj/pg-ha-artifacts/export-origins/`.
   This supplies historical evidence; it does not yet implement offline adoption.
 
-- [ ] Implement offline former-primary adoption using genuine source history
-  commitments and an independently validated descendant retained root. Require
-  stable PGDATA ownership and exact clean endpoint validation before staging
-  a canonical recovery image. Journal installation before changing files; every
-  interrupted startup must resume the exact installation or refuse writer startup.
-  Prepare normal follow at E/Mnew with the empty-prefix seed and independently
-  compare the source `PROVE_RETAINED` claim with local evidence. Save the exact
-  attempt before PREPARE, and keep existing cleanup debts separate from the new
-  base's provenance.
-  Then add native divergent rewind or explicit reseed fallback. Do not add
-  coordination, elections or DCS management in this backend work.
+- [ ] Extend former-primary rejoin beyond the verified native paths. A clean
+  former primary has already passed prefix-proved offline adoption, real
+  startup fence retirement, catch-up and cold restart (adoption startup evidence
+  above). A divergent former primary now also passes journaled reseed after
+  deliberate source SIGKILL and manual promotion (`1d19cf6a2d5`). That path
+  preserves the old tree and rejoins through pinned Patroni's follow method.
+  Native divergent rewind and integration of offline adoption with the pinned
+  Patroni control path remain open. Coordination stays outside this backend work.
 
 - [x] Keep ready native physical senders through the primary shutdown checkpoint.
   Frozen stream capabilities drain to the validated flush target under a narrow
