@@ -6,7 +6,7 @@
 
 (defun native-rewind-options (arguments)
   "Parse the supported target, source, and offline finish options."
-  (let ((target nil) (source nil) (finish nil))
+  (let ((target nil) (source nil) (offline-mode nil))
     (labels ((accept (key value)
                (unless (and value (plusp (length value)))
                  (error "pg_rewind option requires a value"))
@@ -22,9 +22,9 @@
             do (cond
                  ((member argument '("-D" "--target-pgdata") :test #'equal)
                   (accept :target (pop arguments)))
-                 ((equal argument "--finish")
-                  (when finish (error "duplicate pg_rewind finish option"))
-                  (setf finish t))
+                 ((member argument '("--finish" "--resume") :test #'equal)
+                  (when offline-mode (error "multiple pg_rewind offline modes"))
+                  (setf offline-mode (if (equal argument "--finish") :finish :resume)))
                  ((equal argument "--source-server")
                   (accept :source (pop arguments)))
                  ((uiop:string-prefix-p "--target-pgdata=" argument)
@@ -32,14 +32,43 @@
                  ((uiop:string-prefix-p "--source-server=" argument)
                   (accept :source (subseq argument (length "--source-server="))))
                  (t (error "unsupported native pg_rewind option")))))
-    (unless (and target (if finish (null source) source))
-      (error "pg_rewind requires -D and either --source-server or --finish"))
-    (values (truename (uiop:ensure-directory-pathname target)) source finish)))
+    (unless (and target (if offline-mode (null source) source))
+      (error "pg_rewind requires -D and exactly one of --source-server, --resume, or --finish"))
+    (values (truename (uiop:ensure-directory-pathname target)) source offline-mode)))
 
 (defun native-rewind-workspace (target)
   (let* ((parent (uiop:pathname-parent-directory-pathname target))
          (directory (sb-posix:mkdtemp (namestring (merge-pathnames ".pg-rewind.XXXXXX" parent)))))
     (uiop:ensure-directory-pathname directory)))
+
+(defun native-rewind-workspace-from-plan (target plan)
+  (let* ((attempt (getf plan :attempt))
+         (incoming (pathname (getf (getf plan :incoming) :directory)))
+         (workspace (uiop:pathname-parent-directory-pathname incoming)))
+    (unless (and (getf attempt :rewind-origin)
+                 (equal (uiop:pathname-parent-directory-pathname workspace)
+                        (uiop:pathname-parent-directory-pathname target))
+                 (uiop:string-prefix-p ".pg-rewind." (car (last (pathname-directory workspace))))
+                 (equal incoming (merge-pathnames "incoming/" workspace))
+                 (equal (getf (getf plan :quarantine) :directory)
+                        (namestring (merge-pathnames "quarantine/" workspace)))
+                 (equal (getf (getf attempt :stage) :directory)
+                        (namestring (merge-pathnames "stage/" workspace))))
+      (error "installation is not a native rewind CLI workspace"))
+    workspace))
+
+(defun native-rewind-complete-install (target helper)
+  (call-with-physical-reseed-install-owner
+   target
+   (lambda (owner)
+     (let* ((plan (physical-reseed-install-owner-plan owner))
+            (terminal (physical-reseed-install-last-step plan))
+            (workspace (native-rewind-workspace-from-plan target plan)))
+       (loop for step from (physical-reseed-install-owner-step owner) below terminal
+             do (let ((progress (physical-reseed-install-advance owner :helper helper)))
+                  (unless (= (getf progress :step) (1+ step))
+                    (error "rewind installation did not publish its next step"))))
+       workspace))))
 
 (defun native-rewind-install (target profile helper)
   "Capture and install a source image while holding the required target owners.
@@ -63,43 +92,75 @@ Publish the install journal before advancing the installation steps."
          (physical-rewind-start-discovered-remote owner stage profile :helper helper)
          (physical-reseed-prepare-image owner incoming :helper helper)
          (physical-reseed-publish-install owner incoming quarantine :helper helper))))
-    (let ((plan (getf (physical-reseed-install-initial-arguments target) :plan)))
-      (call-with-physical-reseed-install-owner
-       target
-       (lambda (owner)
-         (loop repeat (physical-reseed-install-last-step plan)
-               do (physical-reseed-install-advance owner :helper helper)))))
+    (native-rewind-complete-install target helper)
     workspace))
 
+(defun native-rewind-proved-follow-p (target)
+  (call-with-physical-reseed-follow-configuration-owner
+   target
+   (lambda (owner)
+     (call-with-physical-directory-root
+      owner
+      (lambda (fd directory)
+        (declare (ignore directory))
+        (let ((record (getf (physical-reseed-follow-snapshot-at fd) :record)))
+          (eq :proved (getf (first (getf record :generations)) :phase))))))))
+
 (defun native-rewind-follow (target workspace helper)
-  "Select and prove a successor, activate it, and archive the install and attempt journals.
-Finalize the stopped streaming standby after retirement."
-  (let ((name (string-downcase (format nil "rewind_~32,'0x" (logical-slot-new-generation)))))
-    (physical-rewind-select-installed-follow target name)
+  (unless (native-rewind-proved-follow-p target)
+    (let ((name (string-downcase (format nil "rewind_~32,'0x" (logical-slot-new-generation)))))
+      (physical-rewind-select-installed-follow target name))
     (let ((*pgdata* target))
       (call-with-physical-reseed-follow-owner
        target
        (lambda (owner)
          (let ((record (physical-reseed-follow-prepare owner :helper helper)))
            (unless (eq :proved (getf (first (getf record :generations)) :phase))
-             (error "native pg_rewind successor did not reach its proved state"))))))
-    (physical-reseed-follow-configure-and-activate
-     target (merge-pathnames "follow/" workspace) (postgres-current-timestamp) :helper helper)
-    ;; The port is used only while holding offline PID-file ownership.
-    (physical-reseed-follow-retire-offline target 5432)
-    (physical-reseed-follow-finalize-offline target 5432)))
+             (error "native pg_rewind successor did not reach its proved state")))))))
+  (physical-reseed-follow-configure-and-activate
+   target (merge-pathnames "follow/" workspace) (postgres-current-timestamp) :helper helper)
+  (physical-reseed-follow-retire-offline target 5432)
+  (physical-reseed-follow-finalize-offline target 5432))
+
+(defun native-rewind-resume-workspace (target helper)
+  (if (or (physical-adoption-path-present-p (merge-pathnames "physical-reseed.follow" target))
+          (physical-adoption-path-present-p (merge-pathnames "physical-reseed.follow.tmp" target)))
+      (call-with-physical-reseed-follow-configuration-owner
+       target
+       (lambda (owner)
+         (native-rewind-workspace-from-plan target (physical-reseed-install-owner-plan owner))))
+      (native-rewind-complete-install target helper)))
+
+(defun native-rewind-retirement-present-p (target)
+  (or (physical-adoption-path-present-p (merge-pathnames "physical-reseed.retired" target))
+      (let ((fd (physical-backup-open-directory target)))
+        (unwind-protect
+             (when (physical-reseed-follow-entry fd "physical-reseed.follow")
+               (let ((record (physical-reseed-follow-read-at fd "physical-reseed.follow")))
+                 (or (getf record :retirement)
+                     (eq :active (getf (getf record :activation) :phase)))))
+          (sb-posix:close fd)))))
 
 (defun native-rewind-main (arguments)
   "Run native rewind or finish configuration handoff after terminal retirement."
   (handler-case
-      (multiple-value-bind (target conninfo finish) (native-rewind-options arguments)
-        (if finish
-            (physical-reseed-follow-finalize-offline target 5432)
-            (let* ((helper (physical-libpq-helper-path))
-                   (profile (make-physical-libpq-profile conninfo :mode :physical
-                                                                  :fallback "native-rewind"))
-                   (workspace (native-rewind-install target profile helper)))
-              (native-rewind-follow target workspace helper)))
+      (multiple-value-bind (target conninfo offline-mode) (native-rewind-options arguments)
+        (ecase offline-mode
+          (:finish (physical-reseed-follow-finalize-offline target 5432))
+          (:resume
+           (if (native-rewind-retirement-present-p target)
+               (progn
+                 (physical-reseed-follow-retire-offline target 5432 :rewind-only t)
+                 (physical-reseed-follow-finalize-offline target 5432))
+               (let* ((helper (physical-libpq-helper-path))
+                      (workspace (native-rewind-resume-workspace target helper)))
+                 (native-rewind-follow target workspace helper))))
+          ((nil)
+           (let* ((helper (physical-libpq-helper-path))
+                  (profile (make-physical-libpq-profile conninfo :mode :physical
+                                                                 :fallback "native-rewind"))
+                  (workspace (native-rewind-install target profile helper)))
+             (native-rewind-follow target workspace helper))))
         (write-line "pg_rewind: target is ready to follow the source")
         0)
     (error (condition)

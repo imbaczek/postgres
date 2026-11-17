@@ -145,36 +145,45 @@
          (physical-reseed-follow-write-intent owner root-fd candidate bytes previous check))))))
 
 (defun physical-rewind-select-installed-follow (target name)
-  "Publish a preparing successor for a journaled rewind install.
-Hold the follow owner while recording the installed base and overlap."
+  "Publish or recover the preparing successor for a journaled rewind install."
   (unless (wal-valid-replication-slot-name-p name)
     (error "invalid native rewind successor name"))
   (let ((*pgdata* target))
     (call-with-physical-reseed-follow-owner
      target
      (lambda (owner)
-       (let* ((initial (physical-reseed-follow-initial-record owner))
-              (attempt (getf initial :attempt))
-              (base (physical-recovery-verify-base-state))
-              (timeline (getf base :timeline))
-              (end (getf base :end)))
-         (unless (getf attempt :rewind-origin)
-           (error "native rewind follow selection requires a journaled rewind install"))
-         (physical-reseed-follow-publish-intent owner initial)
-         (multiple-value-bind (bytes entry)
-             (physical-recovery-read-base-overlap base target)
-           (let ((record (physical-reseed-follow-copy initial)))
-             (setf (getf record :generations)
-                   (list (list :generation 1 :name name
-                               :coordinates
-                               (list :version 1 :system-id (getf base :system-id)
-                                     :base-timeline timeline :base end
-                                     :manifest-digest (getf base :manifest-digest)
-                                     :source-timeline (getf (getf attempt :request) :timeline)
-                                     :receive-timeline timeline :receive-lsn end
-                                     :receive-digest #xCBF29CE484222325
-                                     :overlap-start (- end (length bytes))
-                                     :overlap-digest (third entry))
-                               :source-history (bytes->string (timeline-history-bytes timeline target))
-                               :phase :preparing :anchor nil)))
-             (physical-reseed-follow-publish-intent owner record :previous initial))))))))
+       (unless (getf (physical-reseed-cleanup-owner-attempt owner) :rewind-origin)
+         (error "native rewind follow selection requires a journaled rewind install"))
+       (when (physical-adoption-path-present-p (merge-pathnames "physical-reseed.follow.tmp" target))
+         (physical-reseed-follow-recover-intent owner))
+       (let* ((saved (physical-reseed-follow-read owner))
+              (generations (getf saved :generations)))
+         (if generations
+             (progn
+               (unless (and (= (length generations) 1)
+                            (member (getf (first generations) :phase) '(:preparing :proved)))
+                 (error "native rewind follow journal has an unsupported successor"))
+               saved)
+             (let* ((initial (or saved (physical-reseed-follow-initial-record owner)))
+                    (attempt (getf initial :attempt))
+                    (base (physical-recovery-verify-base-state))
+                    (timeline (getf base :timeline))
+                    (end (getf base :end)))
+               (unless saved (physical-reseed-follow-publish-intent owner initial))
+               (multiple-value-bind (bytes entry)
+                   (physical-recovery-read-base-overlap base target)
+                 (let ((record (physical-reseed-follow-copy initial)))
+                   (setf (getf record :generations)
+                         (list (list :generation 1 :name name
+                                     :coordinates
+                                     (list :version 1 :system-id (getf base :system-id)
+                                           :base-timeline timeline :base end
+                                           :manifest-digest (getf base :manifest-digest)
+                                           :source-timeline (getf (getf attempt :request) :timeline)
+                                           :receive-timeline timeline :receive-lsn end
+                                           :receive-digest #xCBF29CE484222325
+                                           :overlap-start (- end (length bytes))
+                                           :overlap-digest (third entry))
+                                     :source-history (bytes->string (timeline-history-bytes timeline target))
+                                     :phase :preparing :anchor nil)))
+                   (physical-reseed-follow-publish-intent owner record :previous initial))))))))))

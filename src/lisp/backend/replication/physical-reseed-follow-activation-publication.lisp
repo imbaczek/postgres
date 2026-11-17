@@ -1086,25 +1086,36 @@
               (physical-reseed-follow-activation-publish context candidate check))))))))
 
 (defun physical-reseed-follow-configure-and-activate (target workspace time &key helper)
-  "Configure and activate a proved follow selection under the configuration owner.
-Settle the source handoff before publishing activation."
   (let ((*pgdata* target))
     (call-with-physical-reseed-follow-configuration-owner
      target
      (lambda (owner)
-       (physical-reseed-follow-begin-configuration owner workspace time)
-       (physical-reseed-follow-stage-configuration owner)
-       (loop repeat 8
-             for record = (physical-reseed-follow-advance-configuration owner)
-             when (eq :inert (getf (getf record :configuration) :phase))
-               return record
-             finally (error "native follow configuration did not reach its inert state"))
-       (physical-reseed-follow-settle owner :helper helper)
-       (physical-reseed-follow-begin-activation owner)
-       (physical-reseed-follow-stage-activation owner)
-       (physical-reseed-follow-start-activation owner :helper helper)
-       (loop repeat 4
-             for record = (physical-reseed-follow-advance-activation owner)
-             when (eq :active (getf (getf record :activation) :phase))
-               return record
-             finally (error "native follow activation did not reach its active state"))))))
+       (loop repeat 16
+             do (multiple-value-bind (record temporary)
+                    (call-with-physical-directory-root
+                     owner
+                     (lambda (fd directory)
+                       (declare (ignore directory))
+                       (values (physical-reseed-follow-read-at fd "physical-reseed.follow")
+                               (physical-reseed-follow-entry fd "physical-reseed.follow.tmp" t))))
+                  (let ((configuration (getf (getf record :configuration) :phase))
+                        (settlement (getf (getf record :settlement) :phase))
+                        (activation (getf (getf record :activation) :phase)))
+                    (cond
+                      (temporary
+                       (if (eq settlement :handed-off)
+                           (physical-reseed-follow-recover-activation owner :helper helper)
+                           (physical-reseed-follow-recover-configuration owner)))
+                      ((eq activation :active) (return record))
+                      ((eq activation :activating) (physical-reseed-follow-advance-activation owner))
+                      ((eq activation :staged) (physical-reseed-follow-start-activation owner :helper helper))
+                      ((eq activation :building) (physical-reseed-follow-stage-activation owner))
+                      ((eq settlement :handed-off) (physical-reseed-follow-begin-activation owner))
+                      ((eq configuration :inert) (physical-reseed-follow-settle owner :helper helper))
+                      ((member configuration '(:staged :installing))
+                       (physical-reseed-follow-advance-configuration owner))
+                      ((eq configuration :building) (physical-reseed-follow-stage-configuration owner))
+                      ((null configuration)
+                       (physical-reseed-follow-begin-configuration owner workspace time))
+                      (t (error "native follow journal has an unsupported configuration phase")))))
+             finally (error "native follow did not reach its active state"))))))

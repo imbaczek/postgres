@@ -81,7 +81,7 @@ Remove any owned PID file and release the data directory lock on exit."
            (when *postmaster-pid-stream* (postmaster-remove-pid-file))
         (when *postmaster-data-lock* (close *postmaster-data-lock*))))))
 
-(defun physical-reseed-follow-retire-offline (target port)
+(defun physical-reseed-follow-retire-offline (target port &key rewind-only)
   "Own the stopped target and archive the install and attempt journals in order."
   (call-with-physical-reseed-offline-startup
    target
@@ -92,17 +92,29 @@ Remove any owned PID file and release the data directory lock on exit."
         :startup-observer
         (lambda (lock phase)
           (ecase phase
-            (:before-pid (setf before (physical-reseed-follow-startup-observation lock phase)))
+            (:before-pid
+             (setf before (physical-reseed-follow-startup-observation lock phase))
+             (when rewind-only
+               (unless (getf (getf (getf (getf (getf before :evidence) :snapshot)
+                                         :record) :attempt) :rewind-origin)
+                 (error "retirement does not belong to a native rewind"))))
             (:owned-pid (setf after (physical-reseed-follow-startup-observation lock phase before)))))
         :startup-reconcile
         (lambda ()
           (call-with-physical-reseed-follow-retirement-startup-owner
            after
            (lambda (owner)
-             (physical-reseed-follow-retirement-publish-initial owner)
-             (physical-reseed-follow-retirement-archive-install owner)
-             (physical-reseed-follow-retirement-archive-attempt owner)
-             (physical-reseed-follow-retirement-publish-terminal owner)))))))))
+             (let* ((record (getf (getf (retirement-startup-evidence owner) :snapshot) :record))
+                    (retirement (getf record :retirement))
+                    (step (getf retirement :step 0)))
+               (unless retirement
+                 (physical-reseed-follow-retirement-publish-initial owner))
+               (unless (eq :retired (getf retirement :phase))
+                 (when (zerop step)
+                   (physical-reseed-follow-retirement-archive-install owner))
+                 (when (<= step 1)
+                   (physical-reseed-follow-retirement-archive-attempt owner))
+                 (physical-reseed-follow-retirement-publish-terminal owner)))))))))))
 
 (defun physical-reseed-follow-check-offline-finalization (&key before-pid)
   "Check that ordinary startup and an active installed streaming standby are allowed.
