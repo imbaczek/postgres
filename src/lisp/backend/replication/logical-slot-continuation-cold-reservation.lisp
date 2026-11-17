@@ -16,13 +16,18 @@
          (host (logical-slot-continuation-storage-call storage :host))
          (origin (logical-slot-continuation-storage-call storage :startup-origin))
          (fork (getf (getf facts :certificate) :fork))
-         (child (getf (getf facts :certificate) :child-timeline)))
+         (child (getf (getf facts :certificate) :child-timeline))
+         (host-timeline (fifth host)))
+    (logical-slot-continuation-origin-input-shape binding (getf facts :certificate) host)
+    (logical-slot-continuation-check-empty-snapshot
+     (logical-slot-continuation-empty-snapshot binding (getf facts :certificate) host)
+     binding (getf facts :certificate) host)
     (sb-thread:with-mutex (*wal-lock*)
       (logical-slot-continuation-storage-call storage :check-under-lock)
       (unless (and (zerop (hash-table-count *wal-replication-slots*))
-                   (eql child (fifth host)) (eql child *wal-insert-timeline*)
+                   (eql host-timeline *wal-insert-timeline*)
                    (eq :timeline *wal-segment-namespace*))
-        (error "cold reservation requires unpublished original-child startup"))
+        (error "cold reservation requires unpublished imported-host startup"))
       (when (gethash root *logical-slot-continuation-protections*)
         (error "cold reservation cannot replace an existing runtime group"))
       (let ((prior (gethash root *logical-slot-continuation-cold-reservations*)))
@@ -39,7 +44,8 @@
       (when (gethash *wal-replication-slots* *logical-slot-continuation-cold-registries*)
         (error "cold reservation lost its registered root"))
       (multiple-value-bind (reservation failure)
-          (logical-slot-continuation-build-cold-reservation-under-lock root binding origin fork child)
+          (logical-slot-continuation-build-cold-reservation-under-lock
+           root binding origin fork child host-timeline)
         (sb-sys:without-interrupts
           (when failure-cell (setf (car failure-cell) failure))
           (setf (gethash reservation *wal-snapshot-retention-pins*) fork

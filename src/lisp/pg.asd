@@ -455,6 +455,8 @@
                    (:file "../replication/logical-slot-continuation-cold-cleanup-effects")
                    (:file "../replication/logical-slot-continuation-cold-startup")
                    (:file "../replication/logical-slot-continuation-cold-cleanup-scope")
+                   (:file "../replication/logical-slot-continuation-cold-empty-handoff")
+                   (:file "../replication/logical-slot-continuation-cold-empty-startup")
                    (:file "../replication/logical-slot-continuation-cold-source")
                    (:file "../replication/logical-slot-continuation-cold-preparation")
                    (:file "../replication/logical-slot-continuation-temporary-retirement")

@@ -409,13 +409,22 @@
 ;; bootstrap selector.  Empty recovery returns NIL for the caller to publish
 ;; an empty inventory; the other paths publish here and return true.
 
+(declaim (ftype function logical-slot-continuation-cold-cleanup-startup))
+
+(declaim (ftype function logical-slot-continuation-restore-empty-publication))
+
+(declaim (ftype function logical-slot-continuation-cold-zero-child-startup-p))
+
 (defun logical-slot-continuation-restore-startup (gate ownership)
+  (logical-slot-continuation-cold-cleanup-startup gate ownership)
   (ecase (logical-slot-continuation-startup-layout gate ownership)
     (:empty
-     (logical-slot-continuation-restore-empty-startup gate ownership)
-     nil)
+     (logical-slot-continuation-restore-empty-publication gate ownership)
+     t)
     (:selected
-     (logical-slot-continuation-cold-publish-startup gate ownership)
+     (if (logical-slot-continuation-cold-zero-child-startup-p gate ownership)
+         (logical-slot-continuation-restore-empty-publication gate ownership t)
+         (logical-slot-continuation-cold-publish-startup gate ownership))
      t)
     (:bootstrap
      (logical-slot-continuation-restore-active-startup gate ownership)

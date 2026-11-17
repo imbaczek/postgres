@@ -32,7 +32,8 @@ must be that same candidate. Recheck list topology and images before cleanup."
                       (error "startup preparation changed the candidate list"))))
     prepared))
 
-(defun logical-slot-prepare-startup-inventory (candidates segments inactive-since &optional prepare-known)
+(defun logical-slot-prepare-startup-inventory (candidates segments inactive-since &optional prepare-known
+                                                                                    (check-capacity #'wal-check-replication-slot-capacity))
   "Prepare derived state while the caller's source registry is visible.
 After the callbacks and checks, build a private replacement with duplicate,
 capacity, standby and progress checks. Publication is separate."
@@ -50,7 +51,7 @@ capacity, standby and progress checks. Publication is separate."
                       (if (logical-slot-startup-known-p slot)
                           (gethash slot prepared)
                           (wal-validate-replication-slot-wal slot segments))))
-            (wal-check-replication-slot-capacity)
+            (funcall check-capacity)
             (setf (gethash name restored) slot))))
       (when (and (recovery-in-progress-p) (plusp (hash-table-count restored)))
         (physical-slot-check-standby-slots
@@ -93,9 +94,11 @@ The caller publishes the results before waking the writer."
     (wal-refresh-logical-capture-slot-mirror-under-wal-lock :notify nil)
     (values *logical-capture-live-slots* *wal-logical-policy* *wal-logical-info-disable-pending*)))
 
-(defun logical-slot-startup-publish (source restored &optional archive)
-  ;; Finish all fallible preparation and checks before fixed publication under
-  ;; WAL then XID lock. The archive lease, when present, still spans this step.
+(declaim (ftype function logical-slot-continuation-cold-empty-call))
+
+(defun logical-slot-startup-publish (source restored &optional archive empty-handoff)
+  ;; Finish preparation before fixed publication under WAL then XID exclusion.
+  ;; The archive lease, when present, still spans the publication.
   (when (logical-slot-imported-startup-source-p source)
     (error "imported startup publication requires its one-shot publication owner"))
   (logical-slot-startup-check-inventory source)
@@ -106,35 +109,56 @@ The caller publishes the results before waking the writer."
       (error "logical slot startup publication context changed"))
     (multiple-value-bind (count policy disable-pending)
         (logical-slot-startup-prepare-mirrors restored)
-      (logical-slot-startup-check-source source)
-      (when archive (logical-wal-archive-check archive))
-      (sb-thread:with-mutex (*xid-lock*)
-        (sb-sys:without-interrupts
-          (setf *wal-replication-slots* restored
-                *logical-capture-live-slots* count
-                *wal-logical-policy* policy
-                *wal-logical-info-disable-pending* disable-pending)))
-      (when (or disable-pending
-                (and policy (wal-logical-policy-pending-disable policy)))
-        (notify-primary-wal-writer-under-lock))))
+      (let ((commit (when empty-handoff
+                      (logical-slot-continuation-cold-empty-call
+                       empty-handoff :prepare (list source restored)))))
+        (flet ((install ()
+                 (logical-slot-startup-check-source source)
+                 (when archive (logical-wal-archive-check archive))
+                 (sb-thread:with-mutex (*xid-lock*)
+                   (sb-sys:without-interrupts
+                     (when commit (funcall commit))
+                     (setf *wal-replication-slots* restored
+                           *logical-capture-live-slots* count
+                           *wal-logical-policy* policy
+                           *wal-logical-info-disable-pending* disable-pending)))))
+          (if empty-handoff
+              (sb-sys:without-interrupts
+                (logical-slot-continuation-cold-empty-call empty-handoff :before-commit)
+                (install))
+              (install)))
+        (when empty-handoff
+          (logical-slot-continuation-cold-empty-call empty-handoff :after-commit))
+        (when (or disable-pending
+                  (and policy (wal-logical-policy-pending-disable policy)))
+          (notify-primary-wal-writer-under-lock)))))
   (values))
 
-(defun logical-slot-startup-restore (source segments inactive-since)
-  ;; Known lost slots still undergo identity checks in the source scope, but
-  ;; only reserved slots need eligibility checks and pending-XID reconstruction.
+(defun logical-slot-startup-restore (source segments inactive-since &optional empty-handoff)
+  (when empty-handoff
+    (sb-thread:with-mutex (*wal-lock*)
+      (logical-slot-continuation-cold-empty-call empty-handoff :authorize-source source)))
   (let ((candidates (mapcar #'logical-slot-startup-entry-slot
                             (logical-slot-startup-source-entries source))))
     (flet ((prepare (archive)
              (let ((restored
-                     (logical-slot-prepare-startup-inventory
+                     (apply
+                      #'logical-slot-prepare-startup-inventory
                       candidates segments inactive-since
                       (lambda (slot)
                         (when (eq :reserved (wal-replication-slot-wal-status slot))
                           (logical-slot-startup-check-eligibility source slot)
                           (let ((pending (logical-slot-startup-derive-pending source slot archive)))
                             (setf (wal-replication-slot-pending-xids slot) pending)))
-                        slot))))
-               (logical-slot-startup-publish source restored archive))))
+                        slot)
+                      (when empty-handoff
+                        (list (lambda ()
+                                (wal-check-replication-slot-capacity-for-count
+                                 (hash-table-count *wal-replication-slots*)
+                                 (logical-slot-startup-source-maximum source))))))))
+               (if empty-handoff
+                   (logical-slot-startup-publish source restored archive empty-handoff)
+                   (logical-slot-startup-publish source restored archive)))))
       (if (logical-slot-startup-source-history source)
           (call-with-logical-slot-startup-archive source #'prepare)
           (prepare nil)))))
@@ -144,16 +168,9 @@ The caller publishes the results before waking the writer."
 (defun logical-slot-load-startup-inventory (gate-owner ownership)
   (when (or gate-owner ownership)
     (check-primary-storage-startup-context gate-owner ownership))
-  ;; Fenced startup returns before generic inventory cleanup.  An empty restore
-  ;; returns NIL so the source captures NIL entries and the normal publication
-  ;; path still checks the inventory against that snapshot.
+  ;; Fenced startup owns cleanup and publication, including an empty inventory.
   (when (and gate-owner ownership (logical-slot-continuation-gc-fenced-p *pgdata*))
-    (unless (logical-slot-continuation-restore-startup gate-owner ownership)
-      (call-with-logical-slot-startup-source
-       gate-owner ownership nil
-       (lambda (source)
-         (logical-slot-startup-restore source (wal-discover-segments)
-                                       (postgres-current-timestamp)))))
+    (logical-slot-continuation-restore-startup gate-owner ownership)
     (return-from logical-slot-load-startup-inventory (values)))
   (let* ((entries (logical-slot-startup-read-inventory :cleanup (and gate-owner ownership)
                                                        :local-workspace t))

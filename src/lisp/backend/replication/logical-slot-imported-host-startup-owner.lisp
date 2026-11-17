@@ -90,6 +90,8 @@
 (defmethod physical-adoption-check-owner ((owner logical-slot-imported-host-startup-owner))
   (error "imported host startup observation does not authorize offline adoption"))
 
+(declaim (ftype function logical-slot-continuation-cold-empty-call))
+
 (defun call-with-logical-slot-imported-host-startup-owner (gate ownership function)
   (when (sb-thread:holding-mutex-p *wal-lock*)
     (error "imported host startup acquisition requires the WAL mutex to be released"))
@@ -99,33 +101,43 @@
         (values (logical-slot-imported-host-startup-image) *wal-storage-incarnation*
                 *wal-segment-namespace* *wal-replication-slots* sb-thread:*current-thread* *wal-lock*))
     (let ((owner nil) (active t) (failed nil))
-      (flet ((state (operation candidate)
-               (unless (and (eq candidate owner) (eq thread sb-thread:*current-thread*) (eq mutex *wal-lock*))
-                 (error "imported host startup owner changed identity, thread or WAL mutex"))
-               (ecase operation
-                 (:identity t)
-                 (:check
-                  (unless (and active (not failed)
-                               (eq ownership (logical-slot-imported-host-startup-owner-ownership owner)))
-                    (error "imported host startup owner ended or failed")))
-                 (:authority
-                  (check-primary-storage-startup-context gate ownership)
-                  (logical-slot-copy-check-postmaster-owner owner ownership))
-                 (:under-lock
-                  (assert (sb-thread:holding-mutex-p *wal-lock*))
-                  (unless (and (eq incarnation *wal-storage-incarnation*)
-                               (eq namespace *wal-segment-namespace*)
-                               (eq registry *wal-replication-slots*)
-                               (equalp image (logical-slot-imported-host-startup-image)))
-                    (error "imported host startup source changed")))
-                 (:facts
-                  (values (first image)
-                          (timeline-check-lineage
-                           (timeline-parse-history
-                            (fifth image) (if (fourth image) (bytes->string (fourth image)) "")))
-                          (sixth image)))
-                 (:fail (setf failed t))
-                 (:release (setf active nil)))))
+      (labels ((state (operation candidate &optional value)
+                 (unless (and (eq candidate owner) (eq thread sb-thread:*current-thread*) (eq mutex *wal-lock*))
+                   (error "imported host startup owner changed identity, thread or WAL mutex"))
+                 (ecase operation
+                   (:identity t)
+                   (:check
+                    (unless (and active (not failed)
+                                 (eq ownership (logical-slot-imported-host-startup-owner-ownership owner)))
+                      (error "imported host startup owner ended or failed")))
+                   (:authority
+                    (check-primary-storage-startup-context gate ownership)
+                    (logical-slot-copy-check-postmaster-owner owner ownership))
+                   (:under-lock
+                    (assert (sb-thread:holding-mutex-p *wal-lock*))
+                    (unless (and (eq incarnation *wal-storage-incarnation*)
+                                 (eq namespace *wal-segment-namespace*)
+                                 (eq registry *wal-replication-slots*)
+                                 (equalp image (logical-slot-imported-host-startup-image)))
+                      (error "imported host startup source changed")))
+                   (:prepare-empty-registry
+                    (state :check owner)
+                    (state :under-lock owner)
+                    (unless (and (physical-adoption-owner-active-p owner)
+                                 (member owner *logical-slot-imported-host-startup-owners* :test #'eq))
+                      (error "empty handoff requires its active imported host observer"))
+                    (let ((replacement
+                            (logical-slot-continuation-cold-empty-call
+                             value :owner-registry (list owner gate ownership registry))))
+                      (lambda () (setf registry replacement))))
+                   (:facts
+                    (values (first image)
+                            (timeline-check-lineage
+                             (timeline-parse-history
+                              (fifth image) (if (fourth image) (bytes->string (fourth image)) "")))
+                            (sixth image)))
+                   (:fail (setf failed t))
+                   (:release (setf active nil)))))
         (setf owner (apply #'%make-logical-slot-imported-host-startup-owner
                            :state #'state (logical-slot-copy-owner-arguments ownership)))
         (let ((*logical-slot-imported-host-startup-owners*
