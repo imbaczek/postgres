@@ -1258,7 +1258,8 @@
            (when (equal "load-legacy-empty" (uiop:getenv "PG_NATIVE_COLD_PROOF"))
              (native-host-cold-logical-compatibility t))
            (let ((slot (gethash "ordinary" *wal-replication-slots*)))
-             (assert (eq (equal "load-logical" (uiop:getenv "PG_NATIVE_COLD_PROOF"))
+             (assert (eq (not (null (member (uiop:getenv "PG_NATIVE_COLD_PROOF")
+                                            '("load-logical" "load-empty-logical") :test #'equal)))
                          (not (null (logical-slot-startup-known-p slot)))))
              (assert (null (wal-replication-slot-child-owner slot)))
              (assert (= (if (equal "load-legacy-empty" (uiop:getenv "PG_NATIVE_COLD_PROOF")) 0 1)
@@ -1535,13 +1536,14 @@
 (defun native-host-cold-empty-late-loader (gate ownership)
   (let ((fds (native-host-writer-open-fds)) (registry *wal-replication-slots*)
                                             (mirrors (logical-slot-publication-mirrors)) (hit nil) (before nil) (refused nil)
-                                            (restore (symbol-function 'logical-slot-continuation-restore-startup)))
+                                            (restore (symbol-function 'logical-slot-continuation-restore-empty-startup)))
     (unwind-protect
          (progn
-           (setf (symbol-function 'logical-slot-continuation-restore-startup)
+           (setf (symbol-function 'logical-slot-continuation-restore-empty-startup)
                  (lambda (actual-gate actual-ownership)
                    (let ((result (funcall restore actual-gate actual-ownership)))
-                     (assert (null result))
+                     (assert (= 1 (getf result :generation)))
+                     (assert (null (getf result :slots)))
                      (native-host-cold-add-extra t)
                      (setf before (native-host-cold-extra-files) hit t)
                      result)))
@@ -1549,7 +1551,7 @@
                  (handler-case
                      (progn (wal-load-replication-slots :gate-owner gate :ownership ownership) nil)
                    (error () t))))
-      (setf (symbol-function 'logical-slot-continuation-restore-startup) restore))
+      (setf (symbol-function 'logical-slot-continuation-restore-empty-startup) restore))
     (assert hit)
     (assert refused)
     (assert (equalp before (native-host-cold-extra-files)))
@@ -1561,14 +1563,76 @@
     (format t "~&NATIVE-COLD-EMPTY-LOADER-REFUSAL PASS case=~a late-physical-and-staging-preserved no-adoption no-fd-leak~%"
             (uiop:getenv "PG_NATIVE_COLD_CASE"))))
 
-(defun native-host-cold-empty-loader (gate ownership &optional late)
-  (let ((fds (native-host-writer-open-fds)) (workspace-facts nil)
-                                            (selector (merge-pathnames "pg_logical_continuation/selector" *pgdata*))
-                                            (workspace (merge-pathnames "pg_replslot/.logical-slot-copy.work" *pgdata*))
-                                            (*logical-slot-continuation-cold-publication-test-hook*
-                                              (lambda (&rest ignored)
-                                                (declare (ignore ignored))
-                                                (error "empty loader entered cold publication"))))
+(defun native-host-cold-empty-token-probes (token)
+  (assert (functionp (logical-slot-continuation-cold-empty-handoff-state token)))
+  (assert (>= (length *logical-slot-imported-host-startup-owners*) 2))
+  (let ((invoked nil))
+    (native-host-cold-recheck-refused-before-io
+     (lambda ()
+       (logical-slot-continuation-cold-empty-call
+        (%make-logical-slot-continuation-cold-empty-handoff
+         :state (lambda (&rest arguments) (declare (ignore arguments)) (setf invoked t)))
+        :check)))
+    (assert (not invoked)))
+  (sb-thread:with-mutex (*wal-lock*)
+    (native-host-cold-recheck-refused-before-io
+     (lambda ()
+       (logical-slot-continuation-cold-empty-call
+        (copy-logical-slot-continuation-cold-empty-handoff token) :check)))
+    (let ((copy (copy-logical-slot-continuation-cold-empty-handoff token)))
+      (native-host-cold-recheck-refused-before-io
+       (lambda ()
+         (funcall (logical-slot-continuation-cold-empty-handoff-state copy) :check copy nil)))))
+  (assert
+   (eq :passed
+       (sb-thread:join-thread
+        (sb-thread:make-thread
+         (lambda ()
+           (sb-thread:with-mutex (*wal-lock*)
+             (native-host-cold-recheck-refused-before-io
+              (lambda () (logical-slot-continuation-cold-empty-call token :check)))
+             :passed))))))
+  (sb-thread:with-mutex (*wal-lock*)
+    (assert (logical-slot-continuation-cold-empty-call token :check)))
+  t)
+
+(defun native-host-cold-empty-ordinary-slot (&optional keep)
+  (catalog-init)
+  (let ((*backend* (make-backend :pid (sb-thread:thread-os-tid sb-thread:*current-thread*)
+                                 :thread sb-thread:*current-thread*)))
+    (physical-slot-check-live-admission)
+    (register-backend *backend*)
+    (unwind-protect
+         (let ((slot (wal-create-physical-replication-slot "empty_ordinary" :immediately-reserve t)))
+           (assert (eq slot (gethash "empty_ordinary" *wal-replication-slots*)))
+           (assert (slot-state-lstat
+                    (merge-pathnames "empty_ordinary/state" (wal-replication-slot-directory))))
+           (wal-advance-physical-replication-slot "empty_ordinary" *wal-durable-lsn*)
+           (unless keep
+             (wal-drop-replication-slot "empty_ordinary" slot)
+             (assert (zerop (hash-table-count *wal-replication-slots*)))))
+      (unregister-backend *backend*)))
+  (format t "~&NATIVE-COLD-EMPTY-ADMISSION PASS ordinary-slot-created ~a~%"
+          (if keep "kept-for-restart" "and-dropped")))
+
+(defun native-host-cold-empty-loader (gate ownership &optional late keep)
+  (let* ((fds (native-host-writer-open-fds)) (workspace-facts nil)
+                                             (selector (merge-pathnames "pg_logical_continuation/selector" *pgdata*))
+                                             (workspace (merge-pathnames "pg_replslot/.logical-slot-copy.work" *pgdata*))
+                                             (tokens nil)
+                                             (outer-hook *logical-slot-continuation-cold-empty-test-hook*)
+                                             (*logical-slot-continuation-cold-empty-test-hook*
+                                               (lambda (point token reservation)
+                                                 (format t "~&NATIVE-COLD-EMPTY-HANDOFF point=~s~%" point)
+                                                 (finish-output)
+                                                 (when (eq point :minted)
+                                                   (push (cons token reservation) tokens)
+                                                   (native-host-cold-empty-token-probes token))
+                                                 (when outer-hook (funcall outer-hook point token reservation))))
+                                             (*logical-slot-continuation-cold-publication-test-hook*
+                                               (lambda (&rest ignored)
+                                                 (declare (ignore ignored))
+                                                 (error "empty loader entered cold publication"))))
     (dolist (name '("alpha/" "beta/"))
       (uiop:delete-directory-tree (merge-pathnames name (wal-replication-slot-directory))
                                   :validate t :if-does-not-exist :error))
@@ -1583,7 +1647,19 @@
       (return-from native-host-cold-empty-loader t))
     (dotimes (iteration 2)
       (let ((before (when (plusp iteration) (native-host-cold-file-image))))
-        (wal-load-replication-slots :gate-owner gate :ownership ownership)
+        (let ((pins (hash-table-count *wal-snapshot-retention-pins*)))
+          (wal-load-replication-slots :gate-owner gate :ownership ownership)
+          (assert (= pins (hash-table-count *wal-snapshot-retention-pins*))))
+        (sb-thread:with-mutex (*wal-lock*)
+          (assert (logical-slot-continuation-cold-check-admission))
+          (assert (zerop (hash-table-count *logical-slot-continuation-cold-reservations*)))
+          (assert (zerop (hash-table-count *logical-slot-continuation-cold-registries*)))
+          (wal-check-replication-slot-capacity)
+          (dolist (binding tokens)
+            (native-host-cold-recheck-refused-before-io
+             (lambda () (logical-slot-continuation-cold-empty-call (car binding) :check)))
+            (native-host-cold-recheck-refused-before-io
+             (lambda () (logical-slot-continuation-cold-reservation-call (cdr binding) :check)))))
         (assert (zerop (hash-table-count *wal-replication-slots*)))
         (assert (zerop *logical-capture-live-slots*))
         (assert (null (gethash *wal-replication-slots*
@@ -1596,10 +1672,309 @@
                   selector (logical-slot-continuation-prepared-maximum-bytes)))))
           (assert (= 1 (getf snapshot :generation)))
           (assert (null (getf snapshot :slots))))))
+    (native-host-cold-empty-ordinary-slot keep)
     (assert (equal fds (native-host-writer-open-fds)))
     (assert (logical-slot-continuation-gc-fenced-p *pgdata*))
     (format t "~&NATIVE-COLD-EMPTY-LOADER PASS case=~a bootstrap restart exact-empty-selector opaque-workspace no-cold-publication no-fd-leak~%"
             (uiop:getenv "PG_NATIVE_COLD_CASE"))))
+
+(defun native-host-cold-empty-ordinary-restart (gate ownership)
+  (let ((fds (native-host-writer-open-fds))
+        (pins (hash-table-count *wal-snapshot-retention-pins*)))
+    (if (uiop:getenv "PG_NATIVE_COLD_EMPTY_RESTART")
+        (wal-load-replication-slots :gate-owner gate :ownership ownership)
+        (native-host-cold-empty-loader gate ownership nil t))
+    (assert (= pins (hash-table-count *wal-snapshot-retention-pins*)))
+    (assert (= 1 (hash-table-count *wal-replication-slots*)))
+    (let ((slot (gethash "empty_ordinary" *wal-replication-slots*)))
+      (assert slot)
+      (assert (null (wal-replication-slot-database-oid slot)))
+      (assert (null (wal-replication-slot-child-owner slot)))
+      (let* ((bytes (read-bounded-regular-file
+                     (wal-replication-slot-path "empty_ordinary") +slot-state-maximum-bytes+))
+             (saved (physical-slot-decode bytes "empty_ordinary"))
+             (copy (copy-wal-replication-slot slot)))
+        (assert (plusp (wal-replication-slot-inactive-since slot)))
+        (setf (wal-replication-slot-inactive-since copy)
+              (wal-replication-slot-inactive-since saved))
+        (assert (equalp bytes (physical-slot-encode copy)))
+        (format t "~&NATIVE-COLD-EMPTY-ORDINARY-EXPECTED ~a~%"
+                (native-host-cold-logical-hex bytes))))
+    (native-host-cold-with-wal
+     (lambda () (assert (logical-slot-continuation-cold-check-admission))))
+    (assert (equal fds (native-host-writer-open-fds)))
+    (assert (logical-slot-continuation-gc-fenced-p *pgdata*))
+    (format t "~&NATIVE-COLD-EMPTY-ORDINARY PASS case=~a persistent-slot no-cold-group no-fd-leak~%"
+            (uiop:getenv "PG_NATIVE_COLD_CASE"))))
+
+(defun native-host-cold-empty-logical-restart (gate ownership)
+  (when (equal "seed" (uiop:getenv "PG_NATIVE_COLD_LOGICAL_PHASE"))
+    (native-host-cold-empty-loader gate ownership)
+    (return-from native-host-cold-empty-logical-restart
+      (native-host-cold-logical-seed gate ownership)))
+  (let ((fds (native-host-writer-open-fds))
+        (pins (hash-table-count *wal-snapshot-retention-pins*)))
+    (wal-load-replication-slots :gate-owner gate :ownership ownership)
+    (catalog-init)
+    (assert (= 1 (hash-table-count *wal-replication-slots*)))
+    (assert (= 1 *logical-capture-live-slots*))
+    (assert (= pins (hash-table-count *wal-snapshot-retention-pins*)))
+    (let ((ordinary (gethash "ordinary" *wal-replication-slots*)))
+      (assert (logical-slot-startup-known-p ordinary))
+      (assert (null (wal-replication-slot-child-owner ordinary)))
+      (when (equal "advance" (uiop:getenv "PG_NATIVE_COLD_LOGICAL_PHASE"))
+        (assert (string= (uiop:getenv "PG_NATIVE_COLD_LOGICAL_SEED_IMAGE")
+                         (native-host-cold-logical-hex (wal-encode-replication-slot ordinary))))
+        (assert (string= (uiop:getenv "PG_NATIVE_COLD_LOGICAL_SEED_PENDING")
+                         (native-host-cold-logical-pending ordinary)))
+        (assert (= 1 (hash-table-count (wal-replication-slot-pending-xids ordinary))))
+        (native-host-cold-logical-ordinary-operation ordinary))
+      (assert (= *wal-durable-lsn* (wal-replication-slot-confirmed-flush-lsn ordinary)))
+      (assert (zerop (hash-table-count (wal-replication-slot-pending-xids ordinary))))
+      (assert (null (gethash *wal-replication-slots*
+                             *logical-slot-continuation-protection-registries*)))
+      (native-host-cold-with-wal
+       (lambda () (assert (logical-slot-continuation-cold-check-admission))))
+      (let* ((selector-path (merge-pathnames "pg_logical_continuation/selector" *pgdata*))
+             (selector (read-bounded-regular-file
+                        selector-path (logical-slot-continuation-prepared-maximum-bytes))))
+        (assert (null (getf (logical-slot-continuation-decode selector) :slots)))
+        (format t "~&NATIVE-COLD-LOGICAL-EXPECTED ~a:~a::~a~%"
+                (native-host-cold-logical-hex selector)
+                (native-host-cold-logical-hex
+                 (read-bounded-regular-file
+                  (wal-replication-slot-path "ordinary") +slot-state-maximum-bytes+))
+                (native-host-cold-logical-pending ordinary))))
+    (assert (equal fds (native-host-writer-open-fds)))
+    (assert (logical-slot-continuation-gc-fenced-p *pgdata*))
+    (format t "~&NATIVE-COLD-LOGICAL PASS case=~a ordinary-only reconstructed-pending acknowledged no-cold-group no-fd-leak~%"
+            (uiop:getenv "PG_NATIVE_COLD_CASE"))))
+
+(defun native-host-cold-descendant-empty (gate ownership)
+  (let ((fds (native-host-writer-open-fds))
+        (pins (hash-table-count *wal-snapshot-retention-pins*))
+        (selector (merge-pathnames "pg_logical_continuation/selector" *pgdata*)))
+    (assert (= 3 *wal-insert-timeline*))
+    (dotimes (iteration 2)
+      (let ((before (when (probe-file selector)
+                      (read-bounded-regular-file
+                       selector (logical-slot-continuation-prepared-maximum-bytes)))))
+        (wal-load-replication-slots :gate-owner gate :ownership ownership)
+        (assert (zerop (hash-table-count *wal-replication-slots*)))
+        (assert (zerop *logical-capture-live-slots*))
+        (assert (= pins (hash-table-count *wal-snapshot-retention-pins*)))
+        (assert (zerop (hash-table-count *logical-slot-continuation-cold-reservations*)))
+        (assert (zerop (hash-table-count *logical-slot-continuation-cold-registries*)))
+        (let* ((after (read-bounded-regular-file
+                       selector (logical-slot-continuation-prepared-maximum-bytes)))
+               (snapshot (logical-slot-continuation-decode after)))
+          (when before (assert (equalp before after)))
+          (assert (null (getf snapshot :slots)))
+          (assert (= 2 (first (getf snapshot :origin)))))))
+    (native-host-cold-with-wal
+     (lambda () (assert (logical-slot-continuation-cold-check-admission))))
+    (assert (logical-slot-continuation-gc-fenced-p *pgdata*))
+    (assert (equal fds (native-host-writer-open-fds)))
+    (format t "~&NATIVE-COLD-DESCENDANT PASS case=~a timeline=3 origin=2 empty-repeated F-released no-fd-leak~%"
+            (uiop:getenv "PG_NATIVE_COLD_CASE"))))
+
+(defun native-host-cold-descendant-refusal (gate ownership mode)
+  (let* ((fds (native-host-writer-open-fds))
+         (files (native-host-cold-file-image))
+         (registry *wal-replication-slots*)
+         (hit nil) (condition nil)
+         (*logical-slot-continuation-cold-empty-test-hook*
+           (lambda (point token reservation)
+             (declare (ignore token))
+             (when (and (eq point :minted) (equal mode "load-descendant-timeline"))
+               (let ((timeline *wal-insert-timeline*) (rejected nil))
+                 (unwind-protect
+                      (progn
+                        (setf *wal-insert-timeline* 4)
+                        (native-host-cold-with-wal
+                         (lambda ()
+                           (setf rejected
+                                 (handler-case
+                                     (progn
+                                       (logical-slot-continuation-cold-reservation-call reservation :check)
+                                       nil)
+                                   (error () t))))))
+                   (setf *wal-insert-timeline* timeline))
+                 (assert rejected)
+                 (setf hit t)
+                 (error "descendant timeline changed after its actual reservation"))))))
+    (assert (= 3 *wal-insert-timeline*))
+    (handler-case
+        (wal-load-replication-slots :gate-owner gate :ownership ownership)
+      (error (caught) (setf condition caught)))
+    (assert condition)
+    (if (equal mode "load-descendant-timeline")
+        (assert hit)
+        (assert (search "original child host" (princ-to-string condition))))
+    (assert (= 3 *wal-insert-timeline*))
+    (assert (eq registry *wal-replication-slots*))
+    (assert (zerop (hash-table-count registry)))
+    (native-host-cold-with-wal
+     (lambda ()
+       (let ((reservations (loop for reservation being the hash-values of
+                                 *logical-slot-continuation-cold-reservations*
+                                 collect reservation)))
+         (assert (= 1 (length reservations)))
+         (let ((reservation (first reservations)))
+           (assert (= 41268 (gethash reservation *wal-snapshot-retention-pins*)))
+           (assert (logical-slot-continuation-cold-reservation-call reservation :uncertain))))
+       (assert (handler-case
+                   (progn (logical-slot-continuation-cold-check-admission) nil)
+                 (pg-error (caught)
+                   (assert (string= "55000" (pg-error-sqlstate caught)))
+                   t)))))
+    (assert (equalp files (native-host-cold-file-image)))
+    (assert (equal fds (native-host-writer-open-fds)))
+    (assert (logical-slot-continuation-gc-fenced-p *pgdata*))
+    (format t "~&NATIVE-COLD-DESCENDANT-REFUSAL PASS mode=~a F-pinned admission-closed files-preserved no-fd-leak~%"
+            mode)))
+
+(defun native-host-cold-empty-registration-loss (token mode)
+  (let* ((table *logical-slot-continuation-cold-empty-handoffs*)
+         (state (gethash token table))
+         (replacement (make-hash-table :test #'eq)))
+    (assert state)
+    (maphash (lambda (key value) (setf (gethash key replacement) value)) table)
+    (unwind-protect
+         (progn
+           (if (equal mode "empty-registration-map")
+               (setf *logical-slot-continuation-cold-empty-handoffs* replacement)
+               (remhash token table))
+           (native-host-cold-recheck-refused-before-io
+            (lambda ()
+              (if (equal mode "empty-registration-raw")
+                  (funcall (logical-slot-continuation-cold-empty-handoff-state token)
+                           :check token nil)
+                  (logical-slot-continuation-cold-empty-call token :check)))))
+      (setf *logical-slot-continuation-cold-empty-handoffs* table
+            (gethash token table) state))
+    (native-host-cold-recheck-refused-before-io
+     (lambda () (logical-slot-continuation-cold-empty-call token :check)))
+    t))
+
+(defun native-host-cold-empty-failure (gate ownership mode &optional ordinary)
+  (let* ((fds (native-host-writer-open-fds))
+         (old-registry *wal-replication-slots*)
+         (mirrors (logical-slot-publication-mirrors))
+         (token nil) (reservation nil) (hit nil) (post nil) (armed nil)
+         (visits 0) (refused nil) (prospective nil)
+         (close (symbol-function 'sb-posix:close))
+         (notify (symbol-function 'logical-slot-startup-publication-notify))
+         (publish (symbol-function 'logical-slot-startup-publish))
+         (scoped (symbol-function 'logical-slot-continuation-cold-empty-publish-scoped))
+         (target (cdr (assoc mode
+                             '(("empty-minted" . :minted)
+                               ("empty-prepared" . :prepared)
+                               ("empty-before-commit" . :before-commit)
+                               ("empty-after-commit" . :after-commit)
+                               ("empty-before-retirement" . :before-retirement))
+                             :test #'equal)))
+         (*logical-slot-continuation-cold-empty-test-hook*
+           (lambda (point actual owner)
+             (incf visits)
+             (setf token actual reservation owner)
+             (when (eq point :after-commit)
+               (setf post t)
+               (when (equal mode "empty-close") (setf armed t)))
+             (when (and (eq point :minted)
+                        (member mode '("empty-registration-map" "empty-registration-restore"
+                                       "empty-registration-raw") :test #'equal))
+               (native-host-cold-with-wal
+                (lambda () (native-host-cold-empty-registration-loss actual mode)))
+               (setf hit t)
+               (error "empty handoff observed registration loss ~a" mode))
+             (when (and (eq point :before-commit) (equal mode "empty-owner-change"))
+               (push (first *logical-slot-imported-host-startup-owners*)
+                     *logical-slot-imported-host-startup-owners*)
+               (setf hit t))
+             (when (and (eq point :before-commit) (equal mode "empty-table-change"))
+               (assert prospective)
+               (setf (gethash "intruder" prospective) nil hit t))
+             (when (eq point target)
+               (setf hit t)
+               (error "empty handoff cut ~a" mode)))))
+    (assert (or target (member mode '("empty-close" "empty-notify" "empty-registration-map"
+                                      "empty-registration-restore" "empty-registration-raw"
+                                      "empty-premature-close" "empty-owner-change"
+                                      "empty-table-change") :test #'equal)))
+    (unwind-protect
+         (progn
+           (when (equal mode "empty-table-change")
+             (setf (symbol-function 'logical-slot-startup-publish)
+                   (lambda (source restored &optional archive handoff)
+                     (setf prospective restored)
+                     (funcall publish source restored archive handoff))))
+           (when (equal mode "empty-premature-close")
+             (setf (symbol-function 'logical-slot-continuation-cold-empty-publish-scoped)
+                   (lambda (actual-gate actual-ownership actual-reservation)
+                     (let* ((results (multiple-value-list
+                                      (funcall scoped actual-gate actual-ownership actual-reservation)))
+                            (closed (third results))
+                            (rejected (handler-case (progn (funcall closed) nil) (error () t))))
+                       (assert rejected)
+                       (setf hit t)
+                       (error "empty publication cannot record closed scopes while an owner is live")))))
+           (when (equal mode "empty-close")
+             (setf (symbol-function 'sb-posix:close)
+                   (lambda (fd)
+                     (let ((result (funcall close fd)))
+                       (when (and armed (not hit))
+                         (setf hit t armed nil)
+                         (error "empty close reported failure after closing its FD"))
+                       result))))
+           (when (equal mode "empty-notify")
+             (setf (symbol-function 'logical-slot-startup-publication-notify)
+                   (lambda (actual-gate actual-ownership restored)
+                     (funcall notify actual-gate actual-ownership restored)
+                     (setf hit t)
+                     (error "empty notification cut"))))
+           (setf refused
+                 (handler-case
+                     (progn
+                       (if ordinary
+                           (wal-load-replication-slots :gate-owner gate :ownership ownership)
+                           (native-host-cold-empty-loader gate ownership))
+                       nil)
+                   (error () t))))
+      (setf (symbol-function 'sb-posix:close) close
+            (symbol-function 'logical-slot-startup-publication-notify) notify
+            (symbol-function 'logical-slot-startup-publish) publish
+            (symbol-function 'logical-slot-continuation-cold-empty-publish-scoped) scoped))
+    (assert (and hit refused token reservation))
+    (assert (= (if (and ordinary post) 1 0) (hash-table-count *wal-replication-slots*)))
+    (assert (null (gethash *wal-replication-slots*
+                           *logical-slot-continuation-protection-registries*)))
+    (if post
+        (assert (not (eq old-registry *wal-replication-slots*)))
+        (progn
+          (assert (eq old-registry *wal-replication-slots*))
+          (assert (equal mirrors (logical-slot-publication-mirrors)))))
+    (native-host-cold-with-wal
+     (lambda ()
+       (assert (= 41268 (gethash reservation *wal-snapshot-retention-pins*)))
+       (assert (logical-slot-continuation-cold-reservation-call reservation :uncertain))
+       (native-host-cold-recheck-refused-before-io
+        (lambda () (logical-slot-continuation-cold-empty-call token :check)))
+       (assert (handler-case
+                   (progn (logical-slot-continuation-cold-check-admission) nil)
+                 (pg-error (condition)
+                   (assert (string= "55000" (pg-error-sqlstate condition)))
+                   t)))))
+    (let ((files (native-host-cold-file-image)) (before visits))
+      (assert (handler-case
+                  (progn (wal-load-replication-slots :gate-owner gate :ownership ownership) nil)
+                (error () t)))
+      (assert (= before visits))
+      (assert (equalp files (native-host-cold-file-image))))
+    (assert (equal fds (native-host-writer-open-fds)))
+    (assert (logical-slot-continuation-gc-fenced-p *pgdata*))
+    (format t "~&NATIVE-COLD-EMPTY-REFUSAL PASS case=~a mode=~a published=~s F-pinned admission-closed retry-fenced no-fd-leak~%"
+            (uiop:getenv "PG_NATIVE_COLD_CASE") mode post)))
 
 (defun native-host-cold-cleanup-file-image ()
   (let ((directory (sb-posix:open (namestring (wal-replication-slot-directory))
@@ -1722,6 +2097,76 @@
     (setf (getf extra :files) (remove "state.tmp" (getf extra :files) :key #'first :test #'string=))
     copy))
 
+(defun native-host-cold-cleanup-step-cut (phase step index)
+  (let ((cut (format nil "~(~a~)-~2,'0d-~(~a~)" phase index (first step))))
+    (when (equal cut (uiop:getenv "PG_NATIVE_COLD_RECONCILE_CUT"))
+      (format t "~&NATIVE-COLD-CLEANUP-EFFECTS-SIGKILL ~a~%" cut)
+      (finish-output)
+      (sb-posix:kill (sb-posix:getpid) sb-posix:sigkill))))
+
+(defun native-host-cold-cleanup-expected (files extra)
+  (native-host-cold-logical-hex
+   (string->bytes
+    (with-standard-io-syntax
+      (write-to-string (list files extra) :readably t :length nil :level nil)))))
+
+(defun native-host-cold-cleanup-effects (gate ownership)
+  (let* ((registry *wal-replication-slots*) (mirrors (logical-slot-publication-mirrors))
+                                            (pin-table *wal-snapshot-retention-pins*)
+                                            (pins (loop for key being the hash-keys of pin-table using (hash-value value)
+                                                        collect (cons key value)))
+                                            (lifetimes (hash-table-count *physical-slot-lifetimes*))
+                                            (fds (native-host-writer-open-fds)) (reservation nil)
+                                            (files nil) (extra nil) (steps 0)
+                                            (restart (uiop:getenv "PG_NATIVE_COLD_CLEANUP_RESTART"))
+                                            (*logical-slot-continuation-cold-cleanup-test-hook*
+                                              (lambda (phase step)
+                                                (native-host-cold-cleanup-step-cut phase step steps)
+                                                (when (eq phase :after) (incf steps))))
+                                            (*logical-slot-continuation-cold-test-hook*
+                                              (lambda (point actual)
+                                                (when (eq point :protected)
+                                                  (when reservation (assert (eq reservation actual)))
+                                                  (setf reservation actual)))))
+    (unless restart
+      (native-host-cold-cleanup-fixtures gate ownership "plan")
+      (with-open-file (stream (merge-pathnames "pg_replslot/coldtemp/state.tmp" *pgdata*)
+                              :direction :output :if-exists :error :element-type '(unsigned-byte 8))
+        (write-sequence #(7 8) stream)))
+    (setf files (native-host-cold-file-image)
+          extra (let ((path (merge-pathnames "pg_replslot/extra/state" *pgdata*)))
+                  (list (physical-image-file-facts -100 (namestring path))
+                        (read-bounded-regular-file path +slot-state-maximum-bytes+))))
+    (format t "~&NATIVE-COLD-CLEANUP-EFFECTS-EXPECTED ~a~%"
+            (native-host-cold-cleanup-expected files extra))
+    (finish-output)
+    (let ((actions (logical-slot-continuation-cold-cleanup-startup gate ownership)))
+      (if restart (assert (<= 0 actions 3)) (assert (= 3 actions))))
+    (assert (zerop (logical-slot-continuation-cold-cleanup-startup gate ownership)))
+    (assert (eq registry *wal-replication-slots*))
+    (assert (zerop (hash-table-count registry)))
+    (assert (equal mirrors (logical-slot-publication-mirrors)))
+    (assert (equalp files (native-host-cold-file-image)))
+    (let* ((image (native-host-cold-cleanup-file-image))
+           (rows (second image))
+           (ordinary (find "extra" rows :key (lambda (row) (getf row :name)) :test #'equal)))
+      (assert (equal '("alpha" "beta" "extra")
+                     (mapcar (lambda (row) (getf row :name)) rows)))
+      (assert (equal '("state") (mapcar #'first (getf ordinary :files))))
+      (assert (equalp extra (rest (first (getf ordinary :files))))))
+    (assert (eq pin-table *wal-snapshot-retention-pins*))
+    (assert (= (1+ (length pins)) (hash-table-count pin-table)))
+    (dolist (entry pins) (assert (equal (cdr entry) (gethash (car entry) pin-table))))
+    (assert (= lifetimes (hash-table-count *physical-slot-lifetimes*)))
+    (assert (logical-slot-continuation-gc-fenced-p *pgdata*))
+    (assert reservation)
+    (sb-thread:with-mutex (*wal-lock*)
+      (assert (logical-slot-continuation-cold-reservation-call reservation :check))
+      (assert (= 41268 (gethash reservation pin-table))))
+    (assert (equal fds (native-host-writer-open-fds)))
+    (format t "~&NATIVE-COLD-CLEANUP-EFFECTS PASS case=~a stages scratch temporary-retirement exact-retained-inodes persistent-F empty-registry no-fd-leak~%"
+            (uiop:getenv "PG_NATIVE_COLD_CASE"))))
+
 (defun native-host-cold-cleanup-plan-refusal (gate ownership mode)
   (let ((close (symbol-function 'sb-posix:close))
         (registry *wal-replication-slots*) (mirrors (logical-slot-publication-mirrors))
@@ -1797,6 +2242,14 @@
             (when (uiop:getenv "PG_NATIVE_COLD_APPEND") (native-host-cold-append))
             (cond
               ((member (uiop:getenv "PG_NATIVE_COLD_PROOF")
+                       '("empty-minted" "empty-prepared" "empty-before-commit" "empty-after-commit"
+                         "empty-before-retirement" "empty-close" "empty-notify"
+                         "empty-registration-map" "empty-registration-restore" "empty-registration-raw"
+                         "empty-premature-close" "empty-owner-change" "empty-table-change") :test #'equal)
+               (native-host-cold-empty-failure gate ownership (uiop:getenv "PG_NATIVE_COLD_PROOF")))
+              ((equal "cleanup" (uiop:getenv "PG_NATIVE_COLD_PROOF"))
+               (native-host-cold-cleanup-effects gate ownership))
+              ((member (uiop:getenv "PG_NATIVE_COLD_PROOF")
                        '("plan-replaced" "plan-caught" "plan-close") :test #'equal)
                (native-host-cold-cleanup-plan-refusal gate ownership (uiop:getenv "PG_NATIVE_COLD_PROOF")))
               ((member (uiop:getenv "PG_NATIVE_COLD_PROOF")
@@ -1817,6 +2270,22 @@
                        '("load-mixed-refusal" "load-mixed-staging-refusal") :test #'equal)
                (native-host-cold-mixed-loader-refusal
                 gate ownership (equal "load-mixed-staging-refusal" (uiop:getenv "PG_NATIVE_COLD_PROOF"))))
+              ((eql 0 (search "empty-ordinary-" (or (uiop:getenv "PG_NATIVE_COLD_PROOF") "")))
+               (native-host-cold-empty-failure
+                gate ownership
+                (concatenate 'string "empty-" (subseq (uiop:getenv "PG_NATIVE_COLD_PROOF")
+                                                      (length "empty-ordinary-")))
+                t))
+              ((member (uiop:getenv "PG_NATIVE_COLD_PROOF")
+                       '("load-descendant-prepared" "load-descendant-child" "load-descendant-timeline")
+                       :test #'equal)
+               (native-host-cold-descendant-refusal gate ownership (uiop:getenv "PG_NATIVE_COLD_PROOF")))
+              ((equal "load-descendant-empty" (uiop:getenv "PG_NATIVE_COLD_PROOF"))
+               (native-host-cold-descendant-empty gate ownership))
+              ((equal "load-empty-logical" (uiop:getenv "PG_NATIVE_COLD_PROOF"))
+               (native-host-cold-empty-logical-restart gate ownership))
+              ((equal "load-empty-ordinary" (uiop:getenv "PG_NATIVE_COLD_PROOF"))
+               (native-host-cold-empty-ordinary-restart gate ownership))
               ((member (uiop:getenv "PG_NATIVE_COLD_PROOF") '("load-empty" "load-empty-late") :test #'equal)
                (native-host-cold-empty-loader
                 gate ownership (equal "load-empty-late" (uiop:getenv "PG_NATIVE_COLD_PROOF"))))

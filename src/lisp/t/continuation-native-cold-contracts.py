@@ -58,6 +58,156 @@ class ColdPlanContracts(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     self.plan([dict(case='stable-durable', proof=proof, cut='after-state-sync')])
 
+    def test_empty_ordinary_slot_survives_two_independent_restarts(self):
+        row = self.plan([dict(case='stable-durable', proof='load-empty-ordinary')])[0]
+        calls = []
+
+        def child(command, environment, log, *owners):
+            calls.append(dict(environment))
+            log.write_text('NATIVE-COLD-EMPTY-ORDINARY-EXPECTED AABB\n'
+                           'NATIVE-COLD-EMPTY-ORDINARY PASS case=stable-durable\n')
+            return 0
+
+        campaign = SimpleNamespace(wait_child=child)
+        status, _, recovery = native.run_cold_children(
+            campaign, ['sbcl'], {'PG_NATIVE_COLD_EMPTY_RESTART': 'stale',
+                                 'PG_NATIVE_COLD_APPEND': '1'}, row,
+            self.root / 'ordinary.log', None, None, None)
+        self.assertEqual(0, status)
+        self.assertTrue(recovery['passed'])
+        self.assertEqual(3, len(calls))
+        self.assertNotIn('PG_NATIVE_COLD_EMPTY_RESTART', calls[0])
+        for environment in calls[1:]:
+            self.assertEqual('1', environment['PG_NATIVE_COLD_EMPTY_RESTART'])
+            self.assertNotIn('PG_NATIVE_COLD_APPEND', environment)
+
+    def test_empty_ordinary_restart_rejects_changed_slot_image(self):
+        row = self.plan([dict(case='stable-durable', proof='load-empty-ordinary')])[0]
+        calls = []
+
+        def child(command, environment, log, *owners):
+            calls.append(environment)
+            image = 'AABB' if len(calls) == 1 else 'CCDD'
+            log.write_text('NATIVE-COLD-EMPTY-ORDINARY-EXPECTED ' + image + '\n'
+                           'NATIVE-COLD-EMPTY-ORDINARY PASS case=stable-durable\n')
+            return 0
+
+        status, _, recovery = native.run_cold_children(
+            SimpleNamespace(wait_child=child), ['sbcl'], {}, row,
+            self.root / 'ordinary-changed.log', None, None, None)
+        self.assertNotEqual(0, status)
+        self.assertFalse(recovery['passed'])
+        self.assertEqual(2, len(calls))
+
+    def test_extra_fixture_archives_restore_original_inodes_after_failure(self):
+        writer = native.module('writer_contract', Path(native.__file__).with_name('continuation-native-writer.py'))
+        data = self.root / 'certified'
+        data.mkdir()
+        (data / '.pg_lisp.lock').touch(mode=0o600)
+        for name in writer.NAMES:
+            (data / name).mkdir()
+        retained = data / 'pg_physical_retained'
+        retained.mkdir()
+        (retained / 'old-root').mkdir()
+        (retained / 'old-root' / 'extent').write_bytes(b'certified archive')
+        proof = data / 'logical-slot-copy.source-proof'
+        proof.write_bytes(b'permanent proof')
+        original = writer.tree_image(data)
+        destination = self.root / 'promotion-work'
+        with self.assertRaisesRegex(RuntimeError, 'promotion fault'):
+            with writer.working_namespaces(
+                    data, destination,
+                    extra_names=('pg_physical_retained', 'logical-slot-copy.source-proof')):
+                self.assertNotEqual(original['pg_physical_retained'],
+                                    writer.tree_image(data)['pg_physical_retained'])
+                (retained / 'old-root' / 'extent').unlink()
+                (retained / 'new-root').mkdir()
+                proof.unlink()
+                raise RuntimeError('promotion fault')
+        self.assertEqual(original, writer.tree_image(data))
+        self.assertFalse((destination / 'variant/pg_physical_retained/old-root/extent').exists())
+        self.assertTrue((destination / 'variant/pg_physical_retained/new-root').is_dir())
+
+    def test_descendant_archive_union_preserves_promoted_objects_and_rejects_conflicts(self):
+        descendant = native.module('descendant_contract',
+                                   Path(native.__file__).with_name('continuation-native-descendant.py'))
+        original, working = self.root / 'original-archive', self.root / 'promoted-archive'
+        original.mkdir()
+        working.mkdir()
+        name = 'extent-0123456789ABCDEF.wal'
+        (original / name).write_bytes(b'certified extent')
+        promoted = working / 'inventory-FEDCBA9876543210.index'
+        promoted.write_bytes(b'new promoted inventory')
+        identity = promoted.stat().st_ino
+        descendant.merge_certified_archive(original, working)
+        self.assertEqual(b'certified extent', (working / name).read_bytes())
+        self.assertEqual(identity, promoted.stat().st_ino)
+        self.assertEqual(b'new promoted inventory', promoted.read_bytes())
+        (working / name).write_bytes(b'conflicting promoted extent')
+        with self.assertRaisesRegex(ValueError, 'conflicts'):
+            descendant.merge_certified_archive(original, working)
+        self.assertEqual(b'conflicting promoted extent', (working / name).read_bytes())
+
+    def test_descendant_archive_union_refuses_linked_objects(self):
+        descendant = native.module('descendant_link_contract',
+                                   Path(native.__file__).with_name('continuation-native-descendant.py'))
+        original, working = self.root / 'old-archive', self.root / 'new-archive'
+        original.mkdir()
+        working.mkdir()
+        outside = self.root / 'outside-extent'
+        outside.write_bytes(b'outside')
+        name = 'extent-0123456789ABCDEF.wal'
+        (original / name).write_bytes(b'certified')
+        (working / name).symlink_to(outside)
+        with self.assertRaisesRegex(ValueError, 'conflicts'):
+            descendant.merge_certified_archive(original, working)
+        self.assertEqual(b'outside', outside.read_bytes())
+
+    def test_descendant_cleanup_never_authorizes_a_substituted_root(self):
+        descendant = native.module('descendant_cleanup_contract',
+                                   Path(native.__file__).with_name('continuation-native-descendant.py'))
+        writer = native.module('descendant_cleanup_writer',
+                               Path(native.__file__).with_name('continuation-native-writer.py'))
+        data = self.root / 'certified-root'
+        data.mkdir()
+        (data / '.pg_lisp.lock').touch(mode=0o600)
+        info = data.stat()
+        identity = (info.st_dev, info.st_ino)
+        data.rename(self.root / 'original-root')
+        data.mkdir()
+        (data / '.pg_lisp.lock').touch(mode=0o600)
+        (data / 'foreign-file').write_bytes(b'leave untouched')
+        foreign = writer.tree_image(data)
+        with self.assertRaisesRegex(ValueError, 'root changed'):
+            descendant.retire_new_root_entries(
+                data, {'.pg_lisp.lock'}, self.root / 'cleanup-output', writer, identity)
+        self.assertEqual(foreign, writer.tree_image(data))
+        self.assertEqual([], list((self.root / 'cleanup-output').iterdir()))
+
+    def test_cleanup_crashes_cover_each_owned_operation(self):
+        self.assertEqual(56, len(native.COLD_CLEANUP_CUTS))
+        rows = self.plan([{'case': 'stable-durable', 'proof': 'cleanup',
+                           'cut': cut, 'label': 'cleanup-' + str(index)}
+                          for index, cut in enumerate(sorted(native.COLD_CLEANUP_CUTS))])
+        self.assertEqual(56, len(rows))
+        self.assertIn('before-00-open-directory', native.COLD_CLEANUP_CUTS)
+        self.assertIn('after-27-close-directory', native.COLD_CLEANUP_CUTS)
+        self.assertFalse(native.cold_spill_required(dict(rows[0], spill=True)))
+        with self.assertRaises(ValueError):
+            self.plan([{'case': 'stable-durable', 'proof': 'cleanup', 'cut': 'after-commit'}])
+
+    def test_cleanup_restarts_skip_seeding_and_compare_retained_images(self):
+        calls, (status, _, crash) = self.crash_children(proof='cleanup')
+        self.assertEqual(0, status)
+        self.assertTrue(crash['passed'])
+        self.assertEqual(3, len(calls))
+        self.assertNotIn('PG_NATIVE_COLD_CLEANUP_RESTART', calls[0][1])
+        for _, environment, _ in calls[1:]:
+            self.assertEqual('1', environment['PG_NATIVE_COLD_CLEANUP_RESTART'])
+        _, (status, _, crash) = self.crash_children(proof='cleanup', changed_seal=True)
+        self.assertNotEqual(0, status)
+        self.assertFalse(crash['passed'])
+
     def test_same_case_in_different_proof_modes_has_distinct_outputs(self):
         other = self.root / 'other-variants'
         rows = self.plan([{'case': 'happy', 'proof': 'prepare'},
@@ -116,6 +266,7 @@ class ColdPlanContracts(unittest.TestCase):
                           {'case': 'happy', 'proof': None, 'spill': False},
                           {'case': 'happy-extended', 'proof': 'prepare'}])
         base = {'PG_NATIVE_COLD_APPEND': 'old', 'PG_NATIVE_COLD_FAULT': 'old',
+                'PG_NATIVE_COLD_CLEANUP_RESTART': 'old',
                 'PG_NATIVE_COLD_MIXED_RESTART': 'old',
                 'PG_NATIVE_COLD_LOGICAL_PHASE': 'old',
                 'PG_NATIVE_COLD_LOGICAL_SEED_IMAGE': 'old',
@@ -130,6 +281,7 @@ class ColdPlanContracts(unittest.TestCase):
         self.assertEqual('1', first['PG_NATIVE_COLD_SPILL'])
         for key in ('PG_NATIVE_COLD_PROOF', 'PG_NATIVE_COLD_SPILL', 'PG_NATIVE_COLD_APPEND',
                       'PG_NATIVE_COLD_FAULT', 'PG_NATIVE_COLD_PLAN',
+                        'PG_NATIVE_COLD_CLEANUP_RESTART',
                       'PG_NATIVE_COLD_MIXED_RESTART', 'PG_NATIVE_COLD_LOGICAL_PHASE',
                       'PG_NATIVE_COLD_LOGICAL_SEED_IMAGE', 'PG_NATIVE_COLD_LOGICAL_SEED_PENDING'):
             self.assertNotIn(key, second)
@@ -226,7 +378,8 @@ class ColdPlanContracts(unittest.TestCase):
     def crash_children(self, *, first_exit=-9, changed_seal=False, proof='reconcile',
                        spill=False, missing_spill=False):
         row = dict(case='happy', proof=proof, spill=spill,
-                   cut='after-commit' if proof in ('publish', 'load') else 'slot-state-after-unlink')
+                    cut=('before-00-open-directory' if proof == 'cleanup' else
+                         'after-commit' if proof in ('publish', 'load') else 'slot-state-after-unlink'))
         prefix = native.PROOF_MARKERS[proof]
         env = dict(PG_NATIVE_COLD_RECONCILE_CUT=row['cut'], PG_NATIVE_COLD_APPEND='1')
         calls = []

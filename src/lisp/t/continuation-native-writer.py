@@ -63,7 +63,7 @@ def owned_fixture(data, identity):
 
 
 @contextmanager
-def working_namespaces(data, destination, source=None, *, include_base=False):
+def working_namespaces(data, destination, source=None, *, include_base=False, extra_names=()):
     """Retain failed working images; restore original inodes after the child exits."""
     identity = (data.stat().st_dev, data.stat().st_ino)
     backup = destination / 'original'
@@ -74,6 +74,11 @@ def working_namespaces(data, destination, source=None, *, include_base=False):
     moved = []
     before = {}
     names = NAMES + (('base',) if include_base else ())
+    for name in extra_names:
+        if (not isinstance(name, str) or not name or name in ('.', '..')
+                or Path(name).name != name or name in names):
+            raise ValueError('Invalid extra fixture namespace')
+        names += (name,)
     with owned_fixture(data, identity):
         with marker.open('x') as stream:
             json.dump(dict(pid=os.getpid(), root=str(data), identity=identity,
@@ -92,7 +97,7 @@ def working_namespaces(data, destination, source=None, *, include_base=False):
                     shutil.copy2(original, data / name, follow_symlinks=False)
         except BaseException:
             for name in reversed(moved):
-                if (data / name).exists():
+                if os.path.lexists(data / name):
                     os.rename(data / name, variant / name)
                 os.rename(backup / name, data / name)
             marker.unlink()
@@ -104,7 +109,8 @@ def working_namespaces(data, destination, source=None, *, include_base=False):
         # A foreign owner prevents restoration and leaves marker/backups for recovery.
         with owned_fixture(data, identity):
             for name in names:
-                os.rename(data / name, variant / name)
+                if os.path.lexists(data / name):
+                    os.rename(data / name, variant / name)
                 os.rename(backup / name, data / name)
             after = {name: tree_image(data / name) for name in names}
             if before != after:

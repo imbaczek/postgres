@@ -1917,6 +1917,8 @@
     t))
 
 (defun native-imported-host-observation ()
+  (when (equal "1" (uiop:getenv "PG_NATIVE_HOST_LIBRARY_ONLY"))
+    (return-from native-imported-host-observation nil))
   (unless (equal "1" (uiop:getenv "PG_NATIVE_HOST_DISPOSABLE"))
     (error "This test drops slot files; set PG_NATIVE_HOST_DISPOSABLE=1 only for its disposable fixture"))
   (let* ((*pgdata* (uiop:ensure-directory-pathname

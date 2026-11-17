@@ -32,7 +32,36 @@ CASE_DEFINITIONS = {
     'happy-abandoned': ('happy-abandoned', 3, 'STABLE', 'STABLE', False),
 }
 CASE_DEFINITIONS.update({fault: DEFAULT_CASES[variant] for fault, variant in FAULTS.items()})
+COLD_CLEANUP_OPERATIONS = (
+    'open-directory', 'open-file', 'unlink', 'close-file', 'sync-directory',
+    'rmdir', 'sync-root', 'close-directory',
+    'open-directory', 'open-file', 'unlink', 'close-file', 'sync-directory', 'close-directory',
+    'open-directory', 'rename', 'sync-directory', 'sync-root',
+    'open-file', 'unlink', 'close-file', 'open-file', 'unlink', 'close-file',
+    'sync-directory', 'rmdir', 'sync-root', 'close-directory',
+)
+COLD_CLEANUP_CUTS = {f'{phase}-{index:02d}-{operation}'
+                     for phase in ('before', 'after')
+                     for index, operation in enumerate(COLD_CLEANUP_OPERATIONS)}
 PROOF_MARKERS = {
+    'empty-ordinary-before-commit': 'NATIVE-COLD-EMPTY-REFUSAL',
+    'empty-ordinary-after-commit': 'NATIVE-COLD-EMPTY-REFUSAL',
+    'empty-ordinary-close': 'NATIVE-COLD-EMPTY-REFUSAL',
+    'empty-ordinary-notify': 'NATIVE-COLD-EMPTY-REFUSAL',
+    'empty-minted': 'NATIVE-COLD-EMPTY-REFUSAL',
+    'empty-prepared': 'NATIVE-COLD-EMPTY-REFUSAL',
+    'empty-before-commit': 'NATIVE-COLD-EMPTY-REFUSAL',
+    'empty-after-commit': 'NATIVE-COLD-EMPTY-REFUSAL',
+    'empty-before-retirement': 'NATIVE-COLD-EMPTY-REFUSAL',
+    'empty-close': 'NATIVE-COLD-EMPTY-REFUSAL',
+    'empty-notify': 'NATIVE-COLD-EMPTY-REFUSAL',
+    'empty-registration-map': 'NATIVE-COLD-EMPTY-REFUSAL',
+    'empty-registration-restore': 'NATIVE-COLD-EMPTY-REFUSAL',
+    'empty-registration-raw': 'NATIVE-COLD-EMPTY-REFUSAL',
+    'empty-premature-close': 'NATIVE-COLD-EMPTY-REFUSAL',
+    'empty-owner-change': 'NATIVE-COLD-EMPTY-REFUSAL',
+    'empty-table-change': 'NATIVE-COLD-EMPTY-REFUSAL',
+    'cleanup': 'NATIVE-COLD-CLEANUP-EFFECTS',
     'plan': 'NATIVE-COLD-CLEANUP-PLAN',
     'plan-bootstrap-prefix': 'NATIVE-COLD-CLEANUP-PLAN',
     'plan-empty': 'NATIVE-COLD-CLEANUP-PLAN',
@@ -44,6 +73,8 @@ PROOF_MARKERS = {
     'load-bootstrap-prefix': 'NATIVE-COLD-PUBLICATION',
     'load-empty': 'NATIVE-COLD-EMPTY-LOADER',
     'load-empty-late': 'NATIVE-COLD-EMPTY-LOADER-REFUSAL',
+    'load-empty-ordinary': 'NATIVE-COLD-EMPTY-ORDINARY',
+    'load-empty-logical': 'NATIVE-COLD-LOGICAL',
     'load-physical': 'NATIVE-COLD-MIXED-PUBLICATION',
     'load-logical': 'NATIVE-COLD-LOGICAL',
     'load-legacy-logical': 'NATIVE-COLD-LOGICAL',
@@ -99,7 +130,7 @@ COLD_RECONCILIATION_CUTS = {
     'stable-selected', 'replacement-after-selected-sync',
     'replacement-after-directory-sync', 'stable-durable',
 }
-LOGICAL_PROOFS = {'load-logical', 'load-legacy-logical', 'load-unbound-logical',
+LOGICAL_PROOFS = {'load-empty-logical', 'load-logical', 'load-legacy-logical', 'load-unbound-logical',
                   'load-legacy-empty', 'load-legacy-v2'}
 COLD_PUBLICATION_CUTS = {
     'completion-ready', 'before-group-pin', 'after-group-pin', 'maps-ready',
@@ -144,7 +175,8 @@ def cold_plan(environment, campaign):
             raise ValueError('Unknown cold proof mode')
         if case in FAULTS and proof is not None:
             raise ValueError('Cold classification faults require the classification proof mode')
-        cuts = {'reconcile': COLD_RECONCILIATION_CUTS, 'publish': COLD_PUBLICATION_CUTS,
+        cuts = {'cleanup': COLD_CLEANUP_CUTS,
+                'reconcile': COLD_RECONCILIATION_CUTS, 'publish': COLD_PUBLICATION_CUTS,
                 'load': COLD_PUBLICATION_CUTS}.get(proof, set())
         if cut is not None and (not isinstance(cut, str) or cut not in cuts):
             raise ValueError('Invalid cold crash cut')
@@ -168,6 +200,8 @@ def child_environment(base, row):
                PG_NATIVE_COLD_VARIANT_ROOT=row['variant_root'])
     env.pop('PG_NATIVE_COLD_PLAN', None)
     env.pop('PG_NATIVE_COLD_MIXED_RESTART', None)
+    env.pop('PG_NATIVE_COLD_CLEANUP_RESTART', None)
+    env.pop('PG_NATIVE_COLD_EMPTY_RESTART', None)
     for key in ('PG_NATIVE_COLD_LOGICAL_PHASE', 'PG_NATIVE_COLD_LOGICAL_SEED_IMAGE',
                 'PG_NATIVE_COLD_LOGICAL_SEED_PENDING'):
         env.pop(key, None)
@@ -263,7 +297,69 @@ def run_logical_restarts(campaign, command, env, row, log, lease, run_lock, work
     return 0, current, recovery
 
 
+def run_empty_ordinary_restarts(campaign, command, env, row, log, lease, run_lock, workspace):
+    recovery = dict(kind='clean', restarts=[], passed=False)
+    expected = None
+    for attempt in range(3):
+        current = log if attempt == 0 else log.with_name(log.stem + '-restart-' + str(attempt) + log.suffix)
+        child_env = dict(env)
+        child_env.pop('PG_NATIVE_COLD_EMPTY_RESTART', None)
+        if attempt:
+            child_env['PG_NATIVE_COLD_EMPTY_RESTART'] = '1'
+            child_env.pop('PG_NATIVE_COLD_APPEND', None)
+        status = campaign.wait_child(command, child_env, current, lease, run_lock, workspace)
+        text = current.read_text(errors='replace')
+        seal = re.findall(r'^NATIVE-COLD-EMPTY-ORDINARY-EXPECTED ([0-9A-Fa-f]+)$', text, re.MULTILINE)
+        if expected is None:
+            expected = seal
+        passed = status == 0 and len(seal) == 1 and seal == expected and cold_pass_marker(row, text)
+        recovery['restarts'].append(dict(exit_code=status, log=str(current), passed=passed))
+        if not passed:
+            return status or 1, current, recovery
+    recovery['passed'] = True
+    return 0, current, recovery
+
+
+def run_empty_ordinary_failure(campaign, command, env, row, log, lease, run_lock, workspace):
+    recovery = dict(kind='clean', restarts=[], passed=False)
+    ordinary = dict(row, proof='load-empty-ordinary')
+    expected = None
+    for phase in ('seed', 'failure', 'restart-1', 'restart-2'):
+        current = log.with_name(log.stem + '-' + phase + log.suffix)
+        child_env = dict(env)
+        child_env.pop('PG_NATIVE_COLD_EMPTY_RESTART', None)
+        if phase == 'failure':
+            child_row = row
+        else:
+            child_row = ordinary
+            child_env['PG_NATIVE_COLD_PROOF'] = ordinary['proof']
+            if phase != 'seed':
+                child_env['PG_NATIVE_COLD_EMPTY_RESTART'] = '1'
+        if phase != 'seed':
+            child_env.pop('PG_NATIVE_COLD_APPEND', None)
+        status = campaign.wait_child(command, child_env, current, lease, run_lock, workspace)
+        text = current.read_text(errors='replace')
+        passed = status == 0 and cold_pass_marker(child_row, text)
+        if phase != 'failure':
+            seal = re.findall(r'^NATIVE-COLD-EMPTY-ORDINARY-EXPECTED ([0-9A-Fa-f]+)$', text, re.MULTILINE)
+            if expected is None:
+                expected = seal
+            passed = passed and len(seal) == 1 and seal == expected
+        recovery['restarts'].append(dict(phase=phase, exit_code=status, log=str(current), passed=passed))
+        if not passed:
+            return status or 1, current, recovery
+    recovery['passed'] = True
+    # The overall row proves the fault and its recovery; retain the fault marker
+    # as the final report log, while recording both clean restarts above.
+    fault_log = log.with_name(log.stem + '-failure' + log.suffix)
+    return 0, fault_log, recovery
+
+
 def run_cold_children(campaign, command, env, row, log, lease, run_lock, workspace):
+    if (row['proof'] or '').startswith('empty-ordinary-'):
+        return run_empty_ordinary_failure(campaign, command, env, row, log, lease, run_lock, workspace)
+    if row['proof'] == 'load-empty-ordinary':
+        return run_empty_ordinary_restarts(campaign, command, env, row, log, lease, run_lock, workspace)
     if row['proof'] in LOGICAL_PROOFS:
         return run_logical_restarts(campaign, command, env, row, log, lease, run_lock, workspace)
     if row['proof'] == 'load-physical':
@@ -283,6 +379,8 @@ def run_cold_children(campaign, command, env, row, log, lease, run_lock, workspa
     recovery_env = dict(env)
     recovery_env.pop('PG_NATIVE_COLD_RECONCILE_CUT', None)
     recovery_env.pop('PG_NATIVE_COLD_APPEND', None)
+    if row['proof'] == 'cleanup':
+        recovery_env['PG_NATIVE_COLD_CLEANUP_RESTART'] = '1'
     for attempt in range(1, 3):
         recovered_log = log.with_name(log.stem + '-restart-' + str(attempt) + log.suffix)
         status = campaign.wait_child(command, recovery_env, recovered_log, lease, run_lock, workspace)
@@ -353,7 +451,7 @@ def main():
                                 spill=row['spill'], spill_exercised=cold_spill_marker(log_text),
                                   cut=row.get('cut'),
                                   crash=crash if row.get('cut') else None,
-                                  clean_restarts=crash if row['proof'] == 'load-physical' or row['proof'] in LOGICAL_PROOFS else None,
+                                    clean_restarts=crash if row['proof'] in ('load-physical', 'load-empty-ordinary') or row['proof'] in LOGICAL_PROOFS or (row['proof'] or '').startswith('empty-ordinary-') else None,
                                   passed=passed))
             campaign.write_json(logs / 'native-cold-results.json', results)
             if not passed:
