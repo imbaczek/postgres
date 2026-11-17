@@ -131,6 +131,27 @@
            (native-patroni-rewind-check-reuse owner capture reused))))
       (write-line "REWIND-JOURNALED-CAPTURE PASS"))))
 
+(defun native-patroni-rewind-crash-after-install-step ()
+  (setf *physical-reseed-install-test-hook*
+        (lambda (point directory)
+          (declare (ignore directory))
+          (when (eq point :after-install-step-fsync)
+            (sb-posix:kill (sb-posix:getpid) sb-posix:sigkill)))))
+
+(defun native-patroni-rewind-crash-after-configuration-step ()
+  (setf *physical-reseed-follow-test-hook*
+        (lambda (point path)
+          (declare (ignore path))
+          (when (eq point :after-configuration-install-progress)
+            (sb-posix:kill (sb-posix:getpid) sb-posix:sigkill)))))
+
+(defun native-patroni-rewind-crash-after-retirement-move ()
+  (setf *physical-reseed-follow-test-hook*
+        (lambda (point path)
+          (declare (ignore path))
+          (when (eq point :after-retirement-archive-unlink)
+            (sb-posix:kill (sb-posix:getpid) sb-posix:sigkill)))))
+
 (defun native-patroni-rewind-install (target incoming quarantine helper)
   (call-with-physical-reseed-owner
    target

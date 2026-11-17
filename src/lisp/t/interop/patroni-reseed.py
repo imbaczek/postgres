@@ -506,12 +506,16 @@ class RewindInstallAcceptance(RewindSharedHistoryAcceptance):
 class RewindCliAcceptance(RewindInstallAcceptance):
     label = "rewind-cli"
 
-    def configured(self):
-        target = self.create_rewind_target()
-        conninfo = f"host=127.0.0.1 port={self.server.port} user=postgres dbname=postgres"
+    def execute_rewind(self, target, conninfo):
         _, output = self.process(self.label, [
             str(cancellation.LISP / "bin/pg_rewind"), "-D", str(target), "--source-server", conninfo],
             timeout=900, env=dict(os.environ, SBCL=self.sbcl, PG_LIBPQ_HELPER=self.helper))
+        return output
+
+    def configured(self):
+        target = self.create_rewind_target()
+        conninfo = f"host=127.0.0.1 port={self.server.port} user=postgres dbname=postgres"
+        output = self.execute_rewind(target, conninfo)
         assert b"target is ready to follow the source" in output
         workspace = Path(re.search(rb"^pg_rewind workspace: (.+)$", output, re.M)[1].decode())
         assert workspace.parent == target.parent and workspace.name.startswith(".pg-rewind.")
@@ -531,6 +535,38 @@ class RewindCliAcceptance(RewindInstallAcceptance):
             reservation.bind(("127.0.0.1", 0))
             port = reservation.getsockname()[1]
         self.check_rejoined(target, port)
+
+
+class RewindResumeCliAcceptance(RewindCliAcceptance):
+    label = "rewind-cli-resume"
+
+    def execute_rewind(self, target, conninfo):
+        env = dict(os.environ, SBCL=self.sbcl, PG_LIBPQ_HELPER=self.helper)
+        _, interrupted = self.process("rewind-install-crash", self.native_arguments() + [
+            "--eval", "(pg::native-patroni-rewind-crash-after-install-step)",
+            "--load", str(cancellation.LISP / "bin/pg-rewind.lisp"), "--end-toplevel-options",
+            "-D", str(target), "--source-server", conninfo],
+            timeout=240, env=env, expected=-signal.SIGKILL)
+        journal = (target / "physical-reseed.install").read_bytes()
+        assert re.search(rb"^STEP 1 [0-9A-F]{8}$", journal, re.M)
+        assert not re.search(rb"^STEP 2 ", journal, re.M)
+        self.process("rewind-configuration-crash", self.native_arguments() + [
+            "--eval", "(pg::native-patroni-rewind-crash-after-configuration-step)",
+            "--load", str(cancellation.LISP / "bin/pg-rewind.lisp"), "--end-toplevel-options",
+            "-D", str(target), "--resume"],
+            timeout=900, env=env, expected=-signal.SIGKILL)
+        assert (target / "physical-reseed.follow").is_file()
+        self.process("rewind-retirement-crash", self.native_arguments() + [
+            "--eval", "(pg::native-patroni-rewind-crash-after-retirement-move)",
+            "--load", str(cancellation.LISP / "bin/pg-rewind.lisp"), "--end-toplevel-options",
+            "-D", str(target), "--resume"],
+            timeout=900, env=env, expected=-signal.SIGKILL)
+        assert not (target / "physical-reseed.install").exists()
+        assert (target / "physical-reseed.attempt").is_file()
+        _, resumed = self.process("rewind-install-resume", [
+            str(cancellation.LISP / "bin/pg_rewind"), "-D", str(target), "--resume"],
+            timeout=900, env=env)
+        return interrupted + resumed
 
 
 class RewindPatroniAcceptance(RewindInstallAcceptance):
@@ -769,6 +805,7 @@ def main():
              "rewind-shared-history": RewindSharedHistoryAcceptance,
              "rewind-install": RewindInstallAcceptance,
              "rewind-cli": RewindCliAcceptance,
+             "rewind-cli-resume": RewindResumeCliAcceptance,
              "rewind-patroni": RewindPatroniAcceptance,
              "rewind-patroni-dirty": RewindDirtyPatroniAcceptance,
              "manual-failover": ManualFailoverAcceptance}
