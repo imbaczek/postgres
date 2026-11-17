@@ -133,6 +133,121 @@
                 'error))
               (rove:ok (= 1 (funcall injected)))))))))))
 
+(defun native-imported-main-sidecar-contract (root root-check)
+  (call-with-logical-slot-copy-source-proof-fd
+   root "logical_slot_wal" t
+   (lambda (sidecar facts)
+     (call-with-physical-image-owned-context
+      root t
+      (lambda (context)
+        (rove:ok (/= sidecar (physical-image-duplicate-child context "logical_slot_wal" sidecar)))
+        (let ((fds (length (directory #p"/proc/self/fd/*"))))
+          (rove:ok (rove:signals
+                    (physical-image-duplicate-child context "logical_slot_wal" sidecar)
+                    'error))
+          (rove:ok (equal facts (physical-image-file-facts sidecar)))
+          (rove:ok (= fds (length (directory #p"/proc/self/fd/*")))))))))
+  (call-with-logical-slot-imported-startup-pair
+   root root-check
+   (lambda (image facts pair-check)
+     (let ((saved-check nil)
+           (pieces (logical-slot-copy-descriptor-wal-pieces (getf facts :descriptor))))
+       (call-with-logical-slot-imported-startup-history
+        root image pair-check
+        (lambda (profile history history-check)
+          (declare (ignore profile history))
+          (rove:ok
+           (eq :sidecar
+               (call-with-logical-slot-imported-startup-sidecar
+                root image history-check
+                (lambda (snapshot check)
+                  (setf saved-check check)
+                  (rove:ok (= (length pieces) (length snapshot)))
+                  (rove:ok
+                   (equal (mapcar (lambda (piece)
+                                    (logical-slot-copy-piece-path (first piece) (second piece)))
+                                  pieces)
+                          (mapcar #'first snapshot)))
+                  (let ((row (first snapshot)))
+                    (rove:ok row)
+                    (setf (char (first row) 0) #\x
+                          (second row) 0 (third row) 0 (first (fourth row)) 0))
+                  (rove:ok (funcall check))
+                  (let ((rejected nil))
+                    (sb-thread:join-thread
+                     (sb-thread:make-thread
+                      (lambda ()
+                        (setf rejected
+                              (handler-case (progn (funcall check) nil) (error () t))))))
+                    (rove:ok rejected))
+                  :sidecar))))
+          (rove:ok (rove:signals (funcall saved-check) 'error))
+          (rove:ok
+           (rove:signals
+            (call-with-logical-slot-imported-startup-sidecar
+             root image history-check
+             (lambda (snapshot check)
+               (declare (ignore snapshot))
+               (setf saved-check check)
+               (error "deliberate sidecar callback failure")))
+            'error))
+          (rove:ok (rove:signals (funcall saved-check) 'error))
+          (let ((original (symbol-function 'physical-image-file-facts))
+                (names (mapcar (lambda (piece)
+                                 (wal-segment-filename (second piece) (first piece) :timeline))
+                               pieces))
+                (injected 0) (called nil))
+            (unwind-protect
+                 (progn
+                   (setf (symbol-function 'physical-image-file-facts)
+                         (lambda (fd &optional (name ""))
+                           (let* ((facts (funcall original fd name))
+                                  (leaf (file-namestring
+                                         (if (plusp (length name)) name
+                                             (sb-posix:readlink (format nil "/proc/self/fd/~d" fd))))))
+                             (when (member leaf names :test #'equal)
+                               (incf injected)
+                               (incf (ninth facts) 1000000))
+                             facts)))
+                   (rove:ok
+                    (rove:signals
+                     (call-with-logical-slot-imported-startup-sidecar
+                      root image history-check
+                      (lambda (&rest arguments)
+                        (declare (ignore arguments))
+                        (setf called t)))
+                     'error))
+                   (rove:ok (not called))
+                   (rove:ok (plusp injected)))
+              (setf (symbol-function 'physical-image-file-facts) original)))
+          (dolist (kind '(:size :digest :identity :mount))
+            (let ((original (symbol-function 'logical-slot-copy-file-row))
+                  (injected 0) (called nil))
+              (unwind-protect
+                   (progn
+                     (setf (symbol-function 'logical-slot-copy-file-row)
+                           (lambda (context relative &optional limit)
+                             (let ((row (funcall original context relative limit)))
+                               (when (and (zerop injected) (eql 0 (search "logical_slot_wal/" relative)))
+                                 (incf injected)
+                                 (ecase kind
+                                   (:size (incf (second row)))
+                                   (:digest (setf (third row) (logxor 1 (third row))))
+                                   (:identity (setf (first (fourth row)) 0))
+                                   (:mount (setf (ninth (fourth row)) 0))))
+                               row)))
+                     (rove:ok
+                      (rove:signals
+                       (call-with-logical-slot-imported-startup-sidecar
+                        root image history-check
+                        (lambda (&rest arguments)
+                          (declare (ignore arguments))
+                          (setf called t)))
+                       'error))
+                     (rove:ok (not called))
+                     (rove:ok (= 1 injected)))
+                (setf (symbol-function 'logical-slot-copy-file-row) original))))))))))
+
 (rove:deftest imported-main-pair-observer-is-read-only-and-scoped-before-wal
     (let* ((started (get-internal-real-time))
            (*pgdata* (uiop:ensure-directory-pathname
@@ -150,6 +265,7 @@
       (native-imported-main-with-root
        (lambda (root root-check)
          (native-imported-main-history-contract root root-check)
+         (native-imported-main-sidecar-contract root root-check)
          (rove:ok
           (equal
            '(:observed 17)

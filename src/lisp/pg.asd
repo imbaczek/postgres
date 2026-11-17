@@ -416,6 +416,7 @@
                    (:file "../replication/logical-slot-imported-source-files")
                    (:file "../replication/logical-slot-imported-main-pair")
                    (:file "../replication/logical-slot-imported-main-history")
+                   (:file "../replication/logical-slot-imported-main-sidecar")
                    (:file "../replication/logical-slot-imported-archive-input")
                    (:file "../replication/logical-slot-imported-host-origin")
                    (:file "../replication/logical-slot-imported-origin-archive")

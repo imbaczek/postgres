@@ -136,6 +136,18 @@
   (sb-sys:without-interrupts
     (funcall (cdr (assoc context *physical-image-owners* :test #'eq)) :register name fd)))
 
+(defun physical-image-duplicate-child (context name borrowed-fd)
+  ;; Duplicate an already checked input; the context owns only the new descriptor.
+  (physical-image-check-context context)
+  (let ((duplicate nil))
+    (sb-sys:without-interrupts
+      (unwind-protect
+           (progn
+             (setf duplicate (sb-posix:fcntl borrowed-fd 1030 0))
+             (prog1 (physical-image-register-child context name duplicate)
+               (setf duplicate nil)))
+        (when duplicate (sb-posix:close duplicate))))))
+
 (defun physical-image-check-context (context)
   ;; Reject copied or expired contexts, changed inventories, and wrong-thread use.
   (unless (and (physical-image-context-active context)
