@@ -532,6 +532,9 @@ class RewindCliAcceptance(RewindInstallAcceptance):
 class RewindPatroniAcceptance(RewindInstallAcceptance):
     label = "rewind-patroni"
 
+    def recover_target(self, target, node, rewind):
+        pass
+
     def check_checksum_rejection(self, target, node):
         path = next(path for path in sorted((target / "base").iterdir())
                     if path.name.isdecimal() and path.stat().st_size >= 8192)
@@ -571,6 +574,7 @@ class RewindPatroniAcceptance(RewindInstallAcceptance):
             logger.setLevel(logging.INFO)
             try:
                 with patch.dict(os.environ, SBCL=self.sbcl, PG_LIBPQ_HELPER=self.helper):
+                    self.recover_target(target, node, rewind)
                     assert rewind.can_rewind, node.controldata()
                     self.check_checksum_rejection(target, node)
                     rewind.trigger_check_diverged_lsn()
@@ -586,6 +590,54 @@ class RewindPatroniAcceptance(RewindInstallAcceptance):
         self.check_quarantine(workspace / "quarantine")
         assert not (target / "postmaster.pid").exists()
         self.check_rejoined(target, port)
+
+
+class RewindDirtyPatroniAcceptance(RewindPatroniAcceptance):
+    label = "rewind-patroni-dirty"
+    segment_size = 16 * 1024 * 1024
+
+    def prove_divergence(self):
+        self.start()
+        follow.query(self.server.port, "INSERT INTO patroni_reseed_probe VALUES(999)")
+        follow.query(self.server.port, "SELECT pg_drop_replication_slot('replacement_source')")
+        follow.query(self.server.port, "CREATE TABLE rewind_dirty_payload(payload text)")
+        start = lsn_number(identity(self.server.port)["position"])
+        connection = follow.psycopg2.connect(host="127.0.0.1", port=self.server.port,
+                                             user="postgres", dbname="postgres")
+        with closing(connection), connection.cursor() as cursor:
+            connection.autocommit = True
+            for index in range(1000):
+                payload = hashlib.shake_256(str(index).encode()).hexdigest(65536)
+                cursor.execute("INSERT INTO rewind_dirty_payload VALUES (%s)", (payload,))
+                cursor.execute("SELECT pg_current_wal_flush_lsn()")
+                if lsn_number(cursor.fetchone()[0]) >= start + self.segment_size:
+                    break
+            else:
+                raise AssertionError("dirty target did not cross a WAL segment")
+        divergent = identity(self.server.port)
+        process = self.server.process
+        self.server.stop(immediate=True)
+        assert process.returncode == -signal.SIGKILL
+        self.result["processes"].append(
+            {"kind": "source-crash", "pid": process.pid, "exit": process.returncode,
+             "expected_exit": -signal.SIGKILL})
+        return divergent
+
+    def recover_target(self, target, node, rewind):
+        assert (target / "postmaster.pid").is_file()
+        assert node.controldata()["Database cluster state"] == "in production"
+        (target / "postgresql.conf").write_text("")
+        (target / "pg_wal/archive_status").mkdir(exist_ok=True)
+        assert rewind.ensure_clean_shutdown() is True
+        assert not (target / "postmaster.pid").exists()
+        facts = node.controldata()
+        assert facts["Database cluster state"] == "shut down"
+        fork = self.result["former_primary"]["fork_lsn"]
+        assert lsn_number(facts["Latest checkpoint location"]) // self.segment_size > fork // self.segment_size
+        self.check_retained_origin(target, fork)
+        self.old_tree = preserved_tree(target)
+        (self.output / "former-primary-inventory.json").write_text(json.dumps(self.old_tree, indent=2) + "\n")
+        self.result["former_primary"]["offline_recovery"] = "patroni"
 
 
 class ManualFailoverAcceptance(FormerPrimaryAcceptance):
@@ -684,6 +736,7 @@ def main():
              "rewind-install": RewindInstallAcceptance,
              "rewind-cli": RewindCliAcceptance,
              "rewind-patroni": RewindPatroniAcceptance,
+             "rewind-patroni-dirty": RewindDirtyPatroniAcceptance,
              "manual-failover": ManualFailoverAcceptance}
     parser.add_argument("--case", choices=cases, default="synthetic")
     arguments = parser.parse_args()

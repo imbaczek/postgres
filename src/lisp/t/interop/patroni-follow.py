@@ -72,7 +72,7 @@ def configuration(data, port, root):
     executable = root / 'postgres'
     native = shlex.quote(str(BASE / 'pg-lisp.sh'))
     executable.write_text('#!/bin/sh\ncase "$1" in\n'
-                          '--version|-V|--describe-config) exec ' + native + ' "$@";;\nesac\n'
+                          '--version|-V|--describe-config|--single) exec ' + native + ' "$@";;\nesac\n'
                           'exec ' + native
                           + ' "$@" --control-socket '
                           + shlex.quote(str(root / 'target.sock')) + '\n')
