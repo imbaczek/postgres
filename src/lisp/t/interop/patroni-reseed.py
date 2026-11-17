@@ -31,6 +31,7 @@ def load_driver(name, filename):
 
 cancellation = load_driver("patroni_reseed_cancellation", "reseed-cancellation.py")
 follow = load_driver("patroni_reseed_follow", "patroni-follow.py")
+CommitLedger = load_driver("manual_failover_ledger", "failover-ledger.py").CommitLedger
 
 
 class Acceptance(cancellation.Acceptance):
@@ -93,6 +94,7 @@ class Acceptance(cancellation.Acceptance):
                     except psutil.NoSuchProcess:
                         pass
                     record["exit"] = process.wait(timeout=10)
+        return record
 
     def check_standby(self, port, expected):
         assert follow.query(port, "SELECT pg_is_in_recovery()") == [(True,)]
@@ -196,12 +198,32 @@ def preserved_tree(root):
             for path in sorted(root.rglob("*")) if path != root / ".pg_lisp.lock"}
 
 
+def lsn_number(value):
+    high, low = value.split("/")
+    return (int(high, 16) << 32) | int(low, 16)
+
+
 class FormerPrimaryAcceptance(Acceptance):
     label = "patroni-reseed-former-primary"
 
+    def fence_original(self, node, port):
+        self.stop()
+
+    def prove_divergence(self):
+        self.start()
+        follow.query(self.server.port, "INSERT INTO patroni_reseed_probe VALUES(999)")
+        assert follow.query(self.server.port, "SELECT id FROM patroni_reseed_probe ORDER BY id") == [(1,), (999,)]
+        divergent = identity(self.server.port)
+        self.stop()
+        return divergent
+
+    def verify_promotion(self, port):
+        pass
+
     def initialize_target(self, target):
         started = time.monotonic()
-        root = self.server.root / "replacement-source"
+        # Leave room for target.sock under the AF_UNIX path length limit.
+        root = self.server.root / "child"
         data = root / "data"
         data.mkdir(mode=0o700, parents=True)
         follow.query(self.server.port, "SELECT pg_create_physical_replication_slot('replacement_source',true)")
@@ -220,7 +242,7 @@ class FormerPrimaryAcceptance(Acceptance):
             assert node.follow(member, timeout=90) is True
             follow.wait_for(lambda: follow.query(port, "SELECT id FROM patroni_reseed_probe") == [(1,)])
             original = identity(self.server.port)
-            self.stop()
+            self.fence_original(node, port)
             assert node.promote(30, CriticalTask()) is True
             assert follow.query(port, "SELECT pg_is_in_recovery()") == [(False,)]
             follow.query(port, "CREATE TABLE patroni_reseed_child_only(id integer)")
@@ -231,19 +253,14 @@ class FormerPrimaryAcceptance(Acceptance):
             history = [line.split() for line in promoted["history"].splitlines()
                        if line and not line.startswith("#")]
             assert len(history) == 1 and history[0][0] == "1", history
-            high, low = history[0][1].split("/")
-            fork = int(high, 16) * 2**32 + int(low, 16)
-            self.start()
-            follow.query(self.server.port, "INSERT INTO patroni_reseed_probe VALUES(999)")
-            assert follow.query(self.server.port, "SELECT id FROM patroni_reseed_probe ORDER BY id") == [(1,), (999,)]
-            divergent = identity(self.server.port)
-            position = divergent["position"].split("/")
-            assert int(position[0], 16) * 2**32 + int(position[1], 16) > fork
+            fork = lsn_number(history[0][1])
+            divergent = self.prove_divergence()
+            assert lsn_number(divergent["position"]) > fork
             assert divergent["system"] == promoted["system"] and divergent["timeline"] == 1
             assert follow.query(port, "SELECT id FROM patroni_reseed_probe ORDER BY id") == [(1,)]
+            self.verify_promotion(port)
             self.result["former_primary"] = {"original": original, "source": promoted,
                                               "divergent": divergent, "fork_lsn": fork}
-            self.stop()
         finally:
             self.stop_target(node)
         self.server.data.rename(target)
@@ -256,7 +273,6 @@ class FormerPrimaryAcceptance(Acceptance):
         (target / "opaque-old-data").write_bytes(b"original data\x00\xff")
         self.old_tree = preserved_tree(target)
         (self.output / "former-primary-inventory.json").write_text(json.dumps(self.old_tree, indent=2) + "\n")
-        assert not (target / "postmaster.pid").exists()
         self.result.setdefault("timings", []).append(
             {"case": "former-primary-construction", "elapsed_seconds": time.monotonic() - started,
              "outcome": "pass"})
@@ -284,15 +300,100 @@ class FormerPrimaryAcceptance(Acceptance):
         assert follow.query(port, "SELECT id FROM patroni_reseed_child_only") == [(42,)]
 
 
+class ManualFailoverAcceptance(FormerPrimaryAcceptance):
+    label = "manual-physical-failover"
+
+    def initialize_target(self, target):
+        self.ledger = CommitLedger()
+        follow.query(self.server.port, "CREATE TABLE failover_witness(id integer PRIMARY KEY CHECK (id <> 3))")
+        follow.query(self.server.port, "INSERT INTO failover_witness VALUES(1)")
+        self.ledger.record(1, "acknowledged")
+        super().initialize_target(target)
+
+    def witnesses(self, port):
+        return [row[0] for row in follow.query(port, "SELECT id FROM failover_witness ORDER BY id")]
+
+    def fence_original(self, node, port):
+        standby = node.is_running()
+        assert standby
+        predecessor = (standby.pid, standby.create_time())
+        follow.query(self.server.port, "INSERT INTO failover_witness VALUES(5)")
+        self.ledger.record(5, "acknowledged")
+        follow.wait_for(lambda: self.witnesses(port) == [1, 5])
+        self.standby_frontier = follow.query(
+            port, "SELECT pg_last_wal_receive_lsn(), pg_last_wal_replay_lsn()")[0]
+        assert all(self.standby_frontier)
+        received, replayed = map(lsn_number, self.standby_frontier)
+        assert received >= replayed > 0
+        assert node.is_running() == standby
+        stopped = self.stop_target(node)
+        assert stopped and stopped["pid"] == standby.pid and stopped["exit"] == 0
+        follow.query(self.server.port, "INSERT INTO failover_witness VALUES(2)")
+        self.ledger.record(2, "acknowledged")
+        try:
+            follow.query(self.server.port, "INSERT INTO failover_witness VALUES(3)")
+        except follow.psycopg2.Error as error:
+            assert error.pgcode == "23514", error
+            self.ledger.record(3, "rejected")
+        else:
+            raise AssertionError("source accepted the rejected witness")
+        source = cancellation.wire.Connection(self.server.port)
+        try:
+            source.query("BEGIN")
+            source.query("INSERT INTO failover_witness VALUES(4)")
+            # This client sends COMMIT but never reads its response. A second
+            # connection independently witnesses the old primary's outcome.
+            source.send(b"Q", b"COMMIT\0")
+            self.ledger.record(4, "unknown")
+            follow.wait_for(lambda: self.witnesses(self.server.port) == [1, 2, 4, 5])
+            self.crashed_identity = identity(self.server.port)
+            process = self.server.process
+            self.server.stop(immediate=True)
+            self.result["processes"].append(
+                {"kind": "source-crash", "pid": process.pid,
+                 "exit": process.returncode, "expected_exit": -signal.SIGKILL})
+            assert process.returncode == -signal.SIGKILL
+        finally:
+            source.close()
+        with socket.socket() as probe:
+            probe.settimeout(2)
+            assert probe.connect_ex(("127.0.0.1", self.server.port)) != 0
+        assert node.start(timeout=90) is True
+        restarted = node.is_running()
+        assert restarted and (restarted.pid, restarted.create_time()) != predecessor
+        assert self.witnesses(port) == [1, 5]
+
+    def prove_divergence(self):
+        assert self.server.process is None
+        return self.crashed_identity
+
+    def verify_promotion(self, port):
+        observed = self.ledger.compare(self.witnesses(port))
+        assert observed["acknowledged"] == {"present": [1, 5], "absent": [2]}
+        assert observed["rejected"] == {"present": [], "absent": [3]}
+        assert observed["unknown"] == {"present": [], "absent": [4]}
+        self.result["client_ledger"] = observed
+        self.result["standby_receive_replay_before_cut"] = self.standby_frontier
+        # Use a fixed ID outside the source workload's range, independent of
+        # the old primary's sequence state.
+        follow.query(port, "INSERT INTO failover_witness VALUES(1000)")
+        assert self.witnesses(port) == [1, 5, 1000]
+
+    def check_standby(self, port, expected):
+        super().check_standby(port, expected)
+        assert self.witnesses(port) == [1, 5, 1000]
+
+
 def main():
     assert importlib.metadata.version("patroni") == "4.1.5"
     assert ctypes.CDLL(None, use_errno=True).prctl(36, 1, 0, 0, 0) == 0
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--case", choices=("synthetic", "former-primary"), default="synthetic")
+    cases = {"synthetic": Acceptance, "former-primary": FormerPrimaryAcceptance,
+             "manual-failover": ManualFailoverAcceptance}
+    parser.add_argument("--case", choices=cases, default="synthetic")
     arguments = parser.parse_args()
-    acceptance = FormerPrimaryAcceptance if arguments.case == "former-primary" else Acceptance
-    acceptance(arguments.output).execute(["configured"])
+    cases[arguments.case](arguments.output).execute(["configured"])
 
 
 if __name__ == "__main__":
