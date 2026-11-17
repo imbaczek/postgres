@@ -19,6 +19,26 @@
           (unless (eq logical-intent :absent) (list :promotion-logical-decoding-enabled logical-intent
                                                     :promotion-wal-level (if logical-intent :logical :replica))))))
 
+(rove:deftest reseed-journal-accepts-recovery-control-with-source-facts
+    (dolist (selected '(nil t))
+      (dolist (interval '(nil t))
+        (let* ((fact (unit-source-logical-fact :enabled t))
+               (name (if selected "recovery.selected" "recovery.initial")))
+          (setf (getf fact :through) 80)
+          (when interval
+            (setf fact (append fact '(:logical-on-start-lsn 65 :logical-on-start-timeline 1))))
+          (let* ((bytes (unit-source-logical-control fact :selected selected :resources t :fpw t))
+                 (size (length bytes)))
+            (rove:ok (physical-reseed-follow-configuration-image-size-p name size))
+            (rove:ok (not (physical-reseed-follow-configuration-image-size-p name (1+ size)))))))))
+
+(rove:deftest reseed-literal-check-keeps-boolean-permission-local
+    (let ((fact (unit-source-logical-fact :enabled t)))
+      (rove:ok (unit-commit-ts-error-p (lambda () (physical-reseed-install-check-literal fact))))
+      (rove:ok (physical-reseed-install-check-literal fact :allow-true t))
+      (rove:ok (unit-commit-ts-error-p
+                (lambda () (physical-reseed-install-check-literal (list 'foo) :allow-true t))))))
+
 (rove:deftest source-logical-control-roundtrips-all-existing-extension-combinations
     (dolist (pending '(nil t))
       (dolist (selected '(nil t))

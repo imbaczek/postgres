@@ -23,7 +23,7 @@
 
 ;; Bound the work and allocation needed to inspect an untrusted plan.  Shared
 ;; lists are allowed, but cycles and values outside the literal format are not.
-(defun physical-reseed-install-check-literal (value)
+(defun physical-reseed-install-check-literal (value &key allow-true)
   (let ((todo (list (cons :enter value))) (active (make-hash-table :test #'eq))
                                           (cells 0) (weight 0))
     (loop while todo
@@ -44,7 +44,7 @@
                         (error "oversized reseed install string"))
                       (incf weight (+ 2 (* 2 (length (string->bytes node))))))
                      ((integerp node) (incf weight (+ 2 (max 1 (ceiling (integer-length node) 3)))))
-                     ((null node) (incf weight 3))
+                     ((or (null node) (and allow-true (eq node t))) (incf weight 3))
                      ((keywordp node) (incf weight (+ 1 (length (symbol-name node)))))
                      (t (error "unsupported reseed install literal")))))
              (when (or (> cells 4000000) (> weight (* 2 +physical-reseed-install-body-maximum+)))

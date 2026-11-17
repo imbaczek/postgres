@@ -3,7 +3,10 @@
 (defun physical-reseed-follow-activation-config (value binding)
   ;; Derive the active configuration from the settled inert handoff.  This
   ;; constructs and checks a value; it does not publish or start follow.
-  (physical-reseed-install-check-literal (list value binding))
+  (physical-reseed-install-check-literal value)
+  ;; The in-memory binding carries boolean source facts. The install
+  ;; journal's literal alphabet stays unchanged.
+  (physical-reseed-install-check-literal binding :allow-true t)
   (multiple-value-bind (record selected)
       (physical-reseed-follow-configuration-plan-record value binding)
     (declare (ignore selected))

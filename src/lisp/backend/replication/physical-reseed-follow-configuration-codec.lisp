@@ -14,8 +14,17 @@
     ((equal name "receive.lock") (zerop size))
     ((equal name "receive.initial") (= 68 size))
     ((equal name "receive.selected") (= 80 size))
-    ((equal name "recovery.initial") (member size '(72 120)))
-    ((equal name "recovery.selected") (member size '(88 136)))
+    ((member name '("recovery.initial" "recovery.selected") :test #'equal)
+     ;; These are ordinary control images. They may carry resource and FPW
+     ;; facts, and a logical fact with or without its ON interval.
+     (let ((base (if (equal name "recovery.initial") 72 88)))
+       (loop for logical-size in (list 0 +physical-logical-fact-size+
+                                       +physical-logical-interval-fact-size+)
+             for remaining = (- size base logical-size)
+               thereis (or (= remaining 0)
+                           (= remaining +wal-resource-fact-size+)
+                           (= remaining +physical-fpw-fact-size+)
+                           (= remaining (+ +wal-resource-fact-size+ +physical-fpw-fact-size+))))))
     ((equal name "history.receive") (<= 16 size +physical-store-history-maximum-bytes+))
     ((equal name "history.wal") (<= 1 size +physical-store-history-maximum-bytes+))))
 
