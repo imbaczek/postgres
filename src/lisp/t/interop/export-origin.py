@@ -14,12 +14,14 @@ import socket
 import struct
 import subprocess
 from crc32c_reference import crc32c
+from patroni_native_node import native_node
 
 from patroni.dcs import Member
 from patroni.postgresql import Postgresql
 from patroni.postgresql.misc import PostgresqlRole
 from patroni.async_executor import CriticalTask
 from patroni.postgresql.mpp import Null
+from patroni.postgresql.rewind import Rewind
 
 
 BASE = Path(__file__).resolve().parents[2]
@@ -254,6 +256,13 @@ def check(binary, adopt=False):
             assert process.returncode == 0
             checkpoint, final_end, state = control(source.data)
             assert checkpoint == final_end and state == 1
+            stopped_node = native_node(source.data)
+            facts = stopped_node.controldata()
+            checkpoint_timeline = int(facts["Latest checkpoint's TimeLineID"])
+            checkpoint_start = facts['Latest checkpoint location']
+            assert Rewind(stopped_node)._get_checkpoint_end(checkpoint_timeline, lsn(checkpoint_start)) == final_end
+            out, err = stopped_node.waldump(checkpoint_timeline + 1, checkpoint_start, 2)
+            assert out == b'' and b'do not select the clean shutdown checkpoint' in err
             digest = hash_history(source.data, resumed, final_end, digest)
             assert origin(source.data, identity) == (final_end, digest)
             assert not old_segment.exists()
