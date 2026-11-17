@@ -913,7 +913,21 @@
   pinned Patroni 4.1.5, switches it to Patroni-managed follow, and verifies a
   restart with the source offline and replay after reconnect. The fixture uses
   a separate Patroni config directory and explicit HBA and ident file paths.
-  Native divergent rewind remains open. Coordination stays outside this backend work.
+  Pinned Patroni's policy check also detects a clean former primary past the
+  fork when directory removal is enabled, despite native rewind being
+  unavailable. The probe preserves the stopped target, then the test rejoins
+  through journaled reseed (`e6c2000d8dd`).
+  Native divergent rewind remains open. Start with a read-only plan under the
+  stopped-target lock. Verify cluster identity, ancestry, shared WAL bytes and
+  complete endpoints before comparing the target to a fixed source checkpoint.
+  C pg_rewind copies pages changed on the target and replays source WAL for the
+  remaining changes. A native candidate built directly at a source checkpoint
+  must account for changes on both branches, plus relation resets and reuse of
+  file identifiers. Fetch only the needed source data and verify the complete
+  candidate against the source manifest before journaled publication. The
+  acceptance should include target-only and source-only changes in one
+  relation and show that a sizeable unchanged relation was reused locally.
+  Coordination stays outside this backend work.
 
 - [x] Keep ready native physical senders through the primary shutdown checkpoint.
   Frozen stream capabilities drain to the validated flush target under a narrow
