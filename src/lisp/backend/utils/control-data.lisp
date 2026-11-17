@@ -371,6 +371,9 @@ An absent visibility fork is empty."
      :if-does-not-exist (if (eq fork :visibility) nil :error))))
 
 (defun call-with-native-control-checksum-image (directory function)
+  "Scan catalog relation pages in a clean stopped primary under directory ownership.
+Use a checked descriptor scope and recheck ownership, children, and control before
+calling FUNCTION with the captured state and verified page count."
   (declare (notinline physical-adoption-owner-directory physical-adoption-owner-device
                       physical-adoption-owner-inode))
   (call-with-physical-adoption-owner
@@ -413,6 +416,8 @@ such page and returns true only when at least one page was verified."
      (plusp pages))))
 
 (defun native-control-enable-page-checksums (directory)
+  "Verify existing catalog main and visibility pages and publish the mode if absent.
+Require at least one verified page and retain the owner through publication."
   (call-with-native-control-checksum-image
    directory
    (lambda (state pages)
@@ -430,9 +435,9 @@ such page and returns true only when at least one page was verified."
      t)))
 
 (defun native-control-read-for-utility (directory)
-  "Read control facts and report the native checksum version when verified.
-Omit the version when the stopped-primary scan cannot establish it, including
-when no pages are available."
+  "Report durable native checksum mode without rescanning relation pages.
+For a clean stopped primary without it, scan pages to establish a transient value.
+Omit the version when the scan fails or finds no pages."
   (let ((facts (native-control-read directory)))
     (when (and (null (getf facts :page-checksum-version))
                (eql +db-shutdowned+ (getf facts :db-state))
@@ -497,8 +502,8 @@ timeline select the filename."
 
 (defun native-control-data-rows (facts)
   "Return supported native facts under C pg_controldata's field names.
-Omit unknown fields. Include a native page checksum version when the utility
-verified it under a stopped-primary lock. A legacy primary's unknown lifecycle
+Omit unknown fields. Include a durable or freshly verified native checksum version.
+A legacy primary's unknown lifecycle
 stays unknown.
 Print all five persisted resource values together when known; omit them when unknown.
 Omit an absent commit timestamp XID pair, which was not recorded for that

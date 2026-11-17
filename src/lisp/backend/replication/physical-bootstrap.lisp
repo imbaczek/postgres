@@ -301,13 +301,11 @@ Validate the selected lineage before constructing the inventory."
                 (list checkpoint durable snapshot insertion checkpoint-timeline namespace copied))))))
 
 (defun physical-bootstrap-derived-wal-control (target)
-  "Derive target control when the source has a historical archive reference.
-Validate child control and require a checkpoint beyond the old fork.  Remove only
-the old reference from the target, preserving positions, snapshot, timelines,
-namespace and other metadata.  Atomically write and read back the complete tuple,
-then hash the actual target bytes.  Leave source control unchanged.  With no
-reference, return NIL so the ordinary copy preserves source bytes exactly.
-The new base receives its own archive; the old primary archive is not copied."
+  "Derive target control when source control contains local-only metadata.
+Validate an archive reference against the checkpoint, then remove it and the
+checksum qualification from the copied control. Preserve the other control facts,
+write and read back the tuple, and hash the target bytes. Return NIL when no
+derivation is needed. The source control remains unchanged."
   (multiple-value-bind (bytes expected) (physical-bootstrap-derived-wal-image)
     (when bytes
       (let ((path (merge-pathnames "global/pg_wal_control" target)))

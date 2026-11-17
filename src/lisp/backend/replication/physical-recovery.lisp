@@ -711,7 +711,8 @@ A nonpending standby cannot fall back to primary startup when validation fails."
 Return the reconstructed state and durable control; do not install runtime state.
 Derive immutable base facts from the checkpoint and any validated logical anchor.
 Keep them separate from control's later required facts.
-Retain a copy of the base checkpoint for later prefix scans."
+Retain a copy of the base checkpoint for later prefix scans. Reject local primary
+checksum qualification in a copied recovery base."
   ;; Pending control must never fall through the ordinary phase rewrite/redo path.
   ;; A later milestone will verify and reconcile this exact generation before SQL.
   (when (= 3 (getf control :phase))

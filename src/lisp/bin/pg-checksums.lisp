@@ -10,6 +10,8 @@
 (in-package #:pg)
 
 (defun native-checksums-main (arguments)
+  "Run the supported --enable operation on a clean stopped native primary.
+Verify existing catalog main and visibility pages and publish the mode if absent."
   (handler-case
       (progn
         (unless (equal (first arguments) "--enable")

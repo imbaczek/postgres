@@ -848,6 +848,8 @@ other inputs and modified tables use the scalar recurrence. BYTES is read only."
         (= checksum (wal-page-checksum page relfilenode block fork)))))
 
 (defun wal-check-read-page (page relfilenode block)
+  "Reject an unstamped page read from disk when durable checksum mode is enabled.
+Return PAGE for the remaining read checks."
   (when (and page (getf *wal-control-metadata* :page-checksum-version)
              (zerop (page-u64 page +pd-lsn-off+)))
     (ereport "XX001" "unstamped page in qualified relation ~a block ~a"
@@ -855,6 +857,8 @@ other inputs and modified tables use the scalar recurrence. BYTES is read only."
   page)
 
 (defun wal-check-persisted-page (stream relfilenode block page fork)
+  "In checksum mode, require a complete stamped page with a valid location checksum.
+Permit overwrite or append without leaving a storage gap."
   (when (getf *wal-control-metadata* :page-checksum-version)
     (unless (and (typep block '(unsigned-byte 32))
                  (<= block (relation-nblocks stream))

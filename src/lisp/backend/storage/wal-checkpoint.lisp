@@ -443,6 +443,8 @@ five integers as a list so EQUAL compares metadata without case-folding strings.
             (list :page-checksum-version (getf metadata :page-checksum-version)))))
 
 (defun wal-control-base-metadata (metadata)
+  "Remove the local retained reference and checksum qualification from copied control.
+Return the copied metadata and whether either field was removed."
   (let* ((copy (copy-list metadata))
          (removed-reference (remf copy :retained-reference))
          (removed-checksum (remf copy :page-checksum-version)))
@@ -456,7 +458,8 @@ five integers as a list so EQUAL compares metadata without case-folding strings.
 PGWAL6 has eight fields without metadata and eleven with lifecycle metadata.
 A retained reference adds six fields; resource metadata adds R, tuple hex, LSN
 and timeline, giving 15 fields alone or 21 with a reference. Reference values
-follow the fixed key order. The CRC covers every supplied field."
+follow the fixed key order. Optional C1 adds one field for native checksum mode.
+The CRC covers all fields before the CRC itself."
   (unless (and (typep checkpoint '(unsigned-byte 64))
                (typep durable '(unsigned-byte 64)) (<= checkpoint durable)
                (typep timeline '(integer 1 4294967295))
@@ -496,7 +499,8 @@ follow the fixed key order. The CRC covers every supplied field."
     (string->bytes (format nil "~a ~8,'0X~%" prefix crc))))
 
 (defun wal-decode-control-line (line)
-  "Decode a CRC-bound control image, retaining unknown legacy resource facts."
+  "Decode a CRC-bound control image, including the optional native C1 mode.
+The control CRC does not verify relation pages. Legacy resource facts may be unknown."
   (let* ((fields (and line (wal-split-fields line)))
          (version (first fields))
          (v6 (equal version "PGWAL6"))
