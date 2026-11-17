@@ -278,6 +278,8 @@ Return the manifest, lease record and reused entries."
 ;; are performed here.  Failed copies retain their partial incoming contents.
 
 (defun physical-reseed-image-check-rewind-origin (owner client record source-root image)
+  "Reprove any journaled rewind origin against the source image and lease.
+Check the attempt journal before and after the proof."
   (let ((origin (getf record :rewind-origin)))
     (when origin
       (physical-reseed-require-journal owner record)

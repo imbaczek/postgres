@@ -149,6 +149,9 @@
 (declaim (ftype function physical-rewind-capture-image))
 
 (defun physical-rewind-start-remote (owner directory request profile origin &key helper)
+  "Start a remote rewind capture for a clean stopped target.
+Record ORIGIN in the attempt journal before capture. Preparation and install
+publication verify that historical export identity against the source."
   (physical-reseed-check-owner owner)
   (unless origin (error "native rewind requires its historical export identity"))
   (physical-rewind-inspect-primary owner)

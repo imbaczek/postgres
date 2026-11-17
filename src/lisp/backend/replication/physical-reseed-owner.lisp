@@ -150,6 +150,8 @@ Keep the original PID file and dirty data intact; this does not perform reseed."
                         (list :old-pid (physical-reseed-read-pid root)))))
 
 (defun physical-rewind-check-reader (owner)
+  "Check OWNER before reading a rewind target and return the checked owner.
+A reseed owner must hold a stopped target with no PID file."
   (if (eq (type-of owner) 'physical-reseed-owner)
       (progn
         (physical-reseed-check-owner owner)
