@@ -143,3 +143,36 @@
          (funcall check)
          (physical-reseed-follow-check-network-snapshot-at root-fd snapshot)
          (physical-reseed-follow-write-intent owner root-fd candidate bytes previous check))))))
+
+(defun physical-rewind-select-installed-follow (target name)
+  (unless (wal-valid-replication-slot-name-p name)
+    (error "invalid native rewind successor name"))
+  (let ((*pgdata* target))
+    (call-with-physical-reseed-follow-owner
+     target
+     (lambda (owner)
+       (let* ((initial (physical-reseed-follow-initial-record owner))
+              (attempt (getf initial :attempt))
+              (base (physical-recovery-verify-base-state))
+              (timeline (getf base :timeline))
+              (end (getf base :end)))
+         (unless (getf attempt :rewind-origin)
+           (error "native rewind follow selection requires a journaled rewind install"))
+         (physical-reseed-follow-publish-intent owner initial)
+         (multiple-value-bind (bytes entry)
+             (physical-recovery-read-base-overlap base target)
+           (let ((record (physical-reseed-follow-copy initial)))
+             (setf (getf record :generations)
+                   (list (list :generation 1 :name name
+                               :coordinates
+                               (list :version 1 :system-id (getf base :system-id)
+                                     :base-timeline timeline :base end
+                                     :manifest-digest (getf base :manifest-digest)
+                                     :source-timeline (getf (getf attempt :request) :timeline)
+                                     :receive-timeline timeline :receive-lsn end
+                                     :receive-digest #xCBF29CE484222325
+                                     :overlap-start (- end (length bytes))
+                                     :overlap-digest (third entry))
+                               :source-history (bytes->string (timeline-history-bytes timeline target))
+                               :phase :preparing :anchor nil)))
+             (physical-reseed-follow-publish-intent owner record :previous initial))))))))

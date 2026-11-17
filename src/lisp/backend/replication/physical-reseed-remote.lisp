@@ -66,19 +66,24 @@
 ;; Identify the source and capture timeline before freezing its connection
 ;; facts, as base backup identifies its source before starting the backup.
 
-(defun physical-reseed-discover-source (request profile helper)
+(defun call-with-physical-reseed-discovery (profile helper function)
   (unless (eq :physical (physical-libpq-profile-mode profile))
     (error "reseed requires a physical replication profile"))
-  (let ((client nil) (resolved nil))
+  (let ((client nil))
     (unwind-protect
-         (progn
-           (setf resolved (or helper (physical-libpq-helper-path
-                                      :on-spawn (lambda (actor) (setf client actor))))
-                 client (physical-libpq-connect resolved profile
+         (let ((resolved (or helper (physical-libpq-helper-path
+                                     :on-spawn (lambda (actor) (setf client actor))))))
+           (setf client (physical-libpq-connect resolved profile
                                                 :on-spawn (lambda (actor) (setf client actor))))
-           (physical-reseed-source-identity client request :current-timeline t)
-           (values (physical-adoption-attempt-accepted-source client profile) resolved))
+           (funcall function client resolved))
       (when client (physical-client-close client)))))
+
+(defun physical-reseed-discover-source (request profile helper)
+  (call-with-physical-reseed-discovery
+   profile helper
+   (lambda (client resolved)
+     (physical-reseed-source-identity client request :current-timeline t)
+     (values (physical-adoption-attempt-accepted-source client profile) resolved))))
 
 ;; Reconnect using the saved route and credential owner, then recheck the
 ;; journal and source before the callback.  Track the helper as soon as it is
@@ -101,7 +106,7 @@
            (funcall function client))
       (when client (physical-client-close client)))))
 
-(defun %physical-reseed-start-remote (owner directory request profile &key helper stage-check rewind-origin)
+(defun %physical-reseed-start-remote (owner directory request profile &key helper stage-check rewind-origin accepted-source)
   ;; The optional check adds caller-specific observations at each stage check.
   ;; Publish the ordinary attempt journal before CAPTURE so a reopened attempt
   ;; can use status or cancellation without issuing CAPTURE again.
@@ -117,7 +122,9 @@
                 (physical-reseed-stage-facts owner stage fd :empty empty :expected facts)
                 (when stage-check (funcall stage-check stage fd))))
          (check-stage t)
-         (multiple-value-bind (source resolved) (physical-reseed-discover-source request profile helper)
+         (multiple-value-bind (source resolved) (if accepted-source
+                                                    (values accepted-source helper)
+                                                    (physical-reseed-discover-source request profile helper))
            (physical-reseed-remote-test-point :after-discovery)
            (check-stage t)
            (let ((record (physical-reseed-attempt-publish
@@ -148,6 +155,28 @@
 
 (declaim (ftype function physical-rewind-capture-image))
 
+(defun physical-rewind-discover-history (owner client)
+  (let* ((target (physical-rewind-inspect-primary owner))
+         (system (getf target :system-id))
+         (timeline (getf target :timeline)))
+    (multiple-value-bind (origin fork child) (pg-client-native-rewind-origin client)
+      (unless (and (= system (first origin)) (= timeline (second origin))
+                   (< (third origin) fork (getf target :end)))
+        (error "source rewind origin does not match the divergent target"))
+      (let* ((history (pg-client-native-history client child))
+             (child-history (timeline-parse-history child (bytes->string history))))
+        (multiple-value-bind (common shared-end)
+            (timeline-common-ancestor (getf target :history) child-history)
+          (unless (and (= common timeline) (eql shared-end fork)
+                       (= (timeline-history-entry-begin (first child-history)) fork)
+                       (second child-history)
+                       (= (timeline-history-entry-timeline (second child-history)) timeline))
+            (error "source rewind origin does not match its timeline history"))))
+      (physical-prove-clean-primary-origin target origin #'physical-rewind-check-reader)
+      (physical-reseed-source-identity client (list :system-id system :timeline child)
+                                       :current-timeline t)
+      (values origin fork child))))
+
 (defun physical-rewind-start-remote (owner directory request profile origin &key helper)
   "Start a remote rewind capture for a clean stopped target.
 Record ORIGIN in the attempt journal before capture. Preparation and install
@@ -157,6 +186,28 @@ publication verify that historical export identity against the source."
   (physical-rewind-inspect-primary owner)
   (%physical-reseed-start-remote
    owner directory request profile :helper helper :rewind-origin origin))
+
+(defun physical-rewind-start-discovered-remote (owner directory profile &key helper)
+  (physical-reseed-check-owner owner)
+  (multiple-value-bind (origin request source resolved)
+      (call-with-physical-reseed-discovery
+       profile helper
+       (lambda (client resolved)
+         (multiple-value-bind (origin fork child) (physical-rewind-discover-history owner client)
+           (declare (ignore fork))
+           (let* ((target (physical-rewind-inspect-primary owner))
+                  (request
+                    (list :version 1
+                          :name (string-downcase (format nil "reseed_~32,'0x" (logical-slot-new-generation)))
+                          :token (string-downcase
+                                  (format nil "~32,'0x~32,'0x" (logical-slot-new-generation)
+                                          (logical-slot-new-generation)))
+                          :system-id (getf target :system-id)
+                          :cluster-identity (getf target :cluster-identity)
+                          :timeline child)))
+             (values origin request (physical-adoption-attempt-accepted-source client profile) resolved)))))
+    (%physical-reseed-start-remote
+     owner directory request profile :helper resolved :rewind-origin origin :accepted-source source)))
 
 (defun physical-reseed-source-result (record source)
   (let ((source (when source (physical-backup-lease-copy source))))
