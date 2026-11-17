@@ -99,11 +99,10 @@
 ;; Publish bounded bytes through an exclusive private temporary file. Sync the
 ;; file before rename, sync the directory and check the published readback.
 ;; Cleanup removes a temporary only while it still names the created inode.
-(defun physical-backup-lease-write-bytes
-    (path temporary bytes &key (directory (physical-backup-lease-directory))
+(defun physical-backup-write-private-bytes
+    (path temporary bytes &key directory
                             (maximum +physical-backup-lease-maximum-bytes+)
                             check-readback (test-point (constantly nil)))
-  (physical-backup-lease-require-locks)
   (unless (and (functionp check-readback) (functionp test-point))
     (wal-invalid-input "backup lease publication requires valid callbacks"))
   (unless (and (typep bytes '(vector (unsigned-byte 8))) (<= (length bytes) maximum))
@@ -125,6 +124,11 @@
            (funcall test-point :after-write)
            (fsync-stream stream)
            (funcall test-point :after-file-fsync)
+           (unless (equal (physical-backup-lease-file-identity
+                           (sb-posix:fstat (sb-sys:fd-stream-fd stream)) t maximum)
+                          (physical-backup-lease-file-identity
+                           (sb-posix:lstat (namestring temporary)) t maximum))
+             (error "backup metadata temporary changed before publication"))
            (close stream)
            (setf stream nil)
            (sb-posix:rename (namestring temporary) (namestring path))
@@ -145,6 +149,15 @@
                   (error "backup lease temporary inode changed"))
                 (sb-posix:unlink (namestring temporary)))))))))
   (values))
+
+(defun physical-backup-lease-write-bytes
+    (path temporary bytes &key (directory (physical-backup-lease-directory))
+                            (maximum +physical-backup-lease-maximum-bytes+)
+                            check-readback (test-point (constantly nil)))
+  (physical-backup-lease-require-locks)
+  (physical-backup-write-private-bytes
+   path temporary bytes :directory directory :maximum maximum
+   :check-readback check-readback :test-point test-point))
 
 ;; Caller owns write and WAL exclusion and an active publication fence.  This
 ;; low-level writer checks the locks but does not establish the fence itself.

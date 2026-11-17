@@ -4,6 +4,65 @@
 ;;; image and its retained source position; it does not prove delivery to a
 ;;; receiver.  Target installation and handoff are outside this driver.
 
+(defun physical-backup-lease-captured-base (manifest digest)
+  (list :checkpoint-start (physical-manifest-checkpoint-start manifest)
+        :base (getf manifest :end) :manifest-digest digest))
+
+(defun physical-rewind-stage-seal-copy (seal)
+  (physical-follow-check-plist seal '(:request :base :metadata))
+  (let* ((request (physical-backup-lease-request-copy (getf seal :request)))
+         (base (physical-backup-lease-base-copy (getf seal :base)))
+         (metadata (getf seal :metadata))
+         (bounds (physical-backup-metadata-bounds)))
+    (unless (and (= (length metadata) (length bounds))
+                 (every (lambda (entry bound)
+                          (destructuring-bind (name size digest) entry
+                            (and (equal name (first bound))
+                                 (typep size '(unsigned-byte 64))
+                                 (<= size (second bound))
+                                 (typep digest '(unsigned-byte 64)))))
+                        metadata bounds)
+                 (= (third (first metadata)) (getf base :manifest-digest)))
+      (error "invalid rewind stage metadata"))
+    (list :request request :base base :metadata (copy-tree metadata))))
+
+(defun physical-rewind-read-stage-seal (path)
+  (multiple-value-bind (stream size)
+      (open-bounded-regular-file path +physical-backup-lease-maximum-bytes+)
+    (unwind-protect
+         (let* ((bytes (make-array size :element-type '(unsigned-byte 8)))
+                (fd (sb-sys:fd-stream-fd stream))
+                (identity (physical-backup-lease-file-identity (sb-posix:fstat fd))))
+           (unless (and (= size (sixth identity) (read-sequence bytes stream))
+                        (eq :eof (read-byte stream nil :eof))
+                        (equal identity (physical-backup-lease-file-identity (sb-posix:fstat fd)))
+                        (equal identity (physical-backup-lease-file-identity
+                                         (sb-posix:lstat (namestring path)))))
+             (error "rewind stage seal changed while reading"))
+           (physical-backup-lease-decode-literal
+            "PGREWINDSTAGE1" bytes +physical-backup-lease-maximum-bytes+
+            #'physical-rewind-stage-seal-copy))
+      (close stream))))
+
+(defun physical-rewind-write-stage-seal (directory request base entries)
+  (let* ((seal (physical-rewind-stage-seal-copy
+                (list :request request :base base
+                      :metadata (subseq entries 0 (length (physical-backup-metadata-bounds))))))
+         (path (merge-pathnames "rewind.seal" directory))
+         (bytes (physical-backup-lease-encode-literal
+                 "PGREWINDSTAGE1" seal +physical-backup-lease-maximum-bytes+)))
+    (physical-backup-write-private-bytes
+     path (merge-pathnames "rewind.tmp" directory) bytes :directory directory
+     :check-readback (lambda ()
+                       (unless (equal seal (physical-rewind-read-stage-seal path))
+                         (error "rewind stage seal differs from publication"))))))
+
+(defun physical-rewind-stage-sealed-entries (directory request base manifest)
+  (let ((seal (physical-rewind-read-stage-seal (merge-pathnames "rewind.seal" directory))))
+    (unless (and (equal request (getf seal :request)) (equal base (getf seal :base)))
+      (error "rewind stage seal differs from the lease"))
+    (append (getf seal :metadata) (getf manifest :files))))
+
 (defun physical-backup-lease-capture-active (owner)
   (with-live-operation
     (with-write-lock
@@ -32,8 +91,7 @@
                (request (getf record :request))
                (next (copy-list record)))
           (setf (getf next :phase) :ready
-                (getf next :base) (list :checkpoint-start (physical-manifest-checkpoint-start manifest)
-                                        :base (getf manifest :end) :manifest-digest digest)
+                (getf next :base) (physical-backup-lease-captured-base manifest digest)
                 next (physical-backup-lease-transition record next))
           (multiple-value-bind (pin disk) (physical-source-retirement-pins (getf request :name))
             (declare (ignore disk))
