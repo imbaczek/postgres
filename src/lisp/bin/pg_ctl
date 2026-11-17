@@ -46,18 +46,29 @@ def read_regular(path, limit):
 def recovery_phase(root):
     """Read bounded native recovery control and return its checked phase.
 
-    The 285-byte bound includes the optional pending-only 17-byte promotion
-    intent after any optional source FPW fact and before the CRC. Length modulo
-    four distinguishes it from earlier layouts. Check its magic, value byte and
-    reserved bytes; this does not establish source ancestry or carry out promotion.
+    Strip the bit-30 logical fact first. The remaining length modulo four
+    identifies the two optional pending promotion intents. All sections share
+    one CRC. The backend still checks source ancestry before promoting.
     """
-    data = read_regular(root / "physical-recovery.control", 285)
+    data = read_regular(root / "physical-recovery.control", 407)
+    if len(data) < 72:
+        raise ValueError("invalid native recovery control length")
     ordinary = data[:8] == b"PGRSTAT3"
     pending = data[:8] == b"PGRSTAT4"
-    intent = len(data) % 4 == 1
-    if len(data) % 4 not in (0, 1) or (intent and not pending):
+    raw_phase = struct.unpack_from("<I", data, 8)[0]
+    logical_size = 0
+    if raw_phase & (1 << 30):
+        suffix_size = struct.unpack_from("<I", data, len(data) - 8)[0]
+        if suffix_size not in (0, 16):
+            raise ValueError("invalid native recovery logical fact length")
+        logical_size = 88 + suffix_size
+    logical_end = len(data) - 4 - logical_size
+    residue = (logical_end + 4) % 4
+    intent, logical_intent = bool(residue & 1), bool(residue & 2)
+    phase = raw_phase & 0x3fffffff
+    if (intent or logical_intent) and not (pending and phase == 3):
         raise ValueError("invalid native recovery control length")
-    core_size = len(data) - (17 if intent else 0)
+    core_size = logical_end + 4 - (17 if intent else 0) - (18 if logical_intent else 0)
     fpw = ((ordinary and core_size in (144, 160, 192, 208))
            or (pending and core_size in (160, 176, 204, 208, 220, 224, 252, 268)))
     resource_end = core_size - 4 - (72 if fpw else 0)
@@ -81,13 +92,47 @@ def recovery_phase(root):
             raise ValueError("invalid native recovery resource fact")
     if fpw:
         validate_fpw_fact(data[core_size - 76:core_size - 4], applied, applied_timeline)
-    phase = struct.unpack_from("<I", data, 8)[0] & 0x7FFFFFFF
     if intent:
-        policy = data[-21:-4]
-        if not (phase == 3 and policy[:8] == b"PGFPWPI1" and policy[8] in (0, 1)
-                and not any(policy[9:])):
+        policy = data[core_size - 4:core_size + 13]
+        if not (policy[:8] == b"PGFPWPI1" and policy[8] in (0, 1) and not any(policy[9:])):
             raise ValueError("invalid native promotion FPW intent")
+    if logical_intent:
+        policy = data[logical_end - 18:logical_end]
+        if not (policy[:8] == b"PGLOGPI1" and tuple(policy[8:10]) in ((0, 1), (1, 1), (1, 2))
+                and not any(policy[10:])):
+            raise ValueError("invalid native promotion logical intent")
+    if logical_size:
+        validate_logical_fact(data[logical_end:-4], applied, applied_timeline)
     return phase
+
+
+def validate_logical_fact(data, applied, applied_timeline):
+    """Check the logical fact's encoding and its binding to applied WAL."""
+    interval = len(data) == 104
+    if len(data) not in (88, 104) or data[:8] != b"PGLOGFC1":
+        raise ValueError("invalid native recovery logical encoding")
+    flags, reserved, start, end, timeline, coverage_timeline, coverage, through, through_timeline = (
+        struct.unpack_from("<IIQQIIQQI", data, 8))
+    off_timeline, off, on, on_timeline, tail_reserved = struct.unpack_from("<IQQII", data, 60)
+    if (flags > 31 or interval != bool(flags & 16) or reserved or tail_reserved
+            or not coverage <= start < end <= through == applied
+            or not 1 <= coverage_timeline <= timeline <= through_timeline == applied_timeline):
+        raise ValueError("invalid native recovery logical fact")
+    for present, lsn, tli in ((flags & 4, off, off_timeline), (flags & 8, on, on_timeline)):
+        if (present and not (33 <= lsn <= end and 1 <= tli <= timeline)
+                or not present and (lsn or tli)):
+            raise ValueError("invalid native recovery logical boundary")
+    enabled, checkpoint = bool(flags & 1), bool(flags & 2)
+    if (enabled and off and on <= off or not enabled and on and off <= on
+            or not checkpoint and (end - start != 33 or
+                                   (end, timeline) != ((on, on_timeline) if enabled else (off, off_timeline)))):
+        raise ValueError("invalid native recovery logical transition")
+    if interval:
+        interval_start, interval_timeline, suffix_size = struct.unpack_from("<QII", data, 88)
+        if not (enabled and max(33, off + 1) <= interval_start <= end
+                and (not on or interval_start <= on) and (not checkpoint or interval_start <= start)
+                and 1 <= interval_timeline <= timeline and suffix_size == 16):
+            raise ValueError("invalid native recovery logical interval")
 
 
 def validate_fpw_fact(data, applied, applied_timeline):
