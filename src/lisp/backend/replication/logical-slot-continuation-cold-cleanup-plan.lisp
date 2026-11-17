@@ -19,6 +19,9 @@
     (error "cold cleanup resource is not private on its observed root"))
   (list (first facts) (second facts) (ninth facts)))
 
+;; Check the complete captured inventory before classifying it.  Require private
+;; resources on the observed root, distinct identities, bounded namespaces and
+;; exact file sizes; a name or inode must not be claimed twice.
 (defun logical-slot-continuation-cold-check-plan-ledger (rows root selector temporary)
   (logical-slot-continuation-list root 9)
   (logical-slot-copy-descriptor-list-count rows (* 2 +logical-slot-continuation-obligation-limit+))
@@ -61,6 +64,8 @@
         (error "cold cleanup inventory exceeds its independent namespace bounds"))))
   t)
 
+;; Bind the decoded selection back to the captured selector bytes and validate
+;; its child state before using it to classify the inventory.
 (defun logical-slot-continuation-cold-check-plan-selection (kind model selector binding certificate host)
   (ecase kind
     (:absent (when (or model selector) (error "absent selector carries a selected image")))
@@ -75,6 +80,8 @@
         kind model (getf snapshot :slots) binding certificate host))))
   t)
 
+;; Certificate names remain protected even when absent.  A present child needs
+;; canonical state; only the PREPARED target may have an exact new-state prefix.
 (defun logical-slot-continuation-cold-plan-children (rows domain kind model)
   (let ((children nil))
     (dolist (row rows)
@@ -93,6 +100,8 @@
           (push (list name (third state)) children))))
     (nreverse children)))
 
+;; An ordinary or staged name cannot hide a child image or reuse its logical
+;; provenance, even when its pathname is outside the certified domain.
 (defun logical-slot-continuation-cold-plan-reject-child-alias (bytes domain)
   (when (logical-slot-state-image-p bytes)
     (let ((slot (handler-case-noninterrupt
@@ -122,6 +131,13 @@
                          :files (list retained))
                    :absent)))
 
+;; Validate a temporary physical image before retirement, without requiring
+;; local system ID, history or WAL eligibility, as in RestoreSlotFromDisk.
+
+;; Plan staging removal, scratch removal and temporary physical slot retirement
+;; in that order.  Keep the complete state of other ordinary slots.  PostgreSQL
+;; slot.c startup removes staging directories and RestoreSlotFromDisk removes
+;; state.tmp; this planner records actions and does not perform those operations.
 (defun logical-slot-continuation-cold-plan-ordinary (rows domain)
   (let ((staging nil) (scratch nil) (temporary nil) (retained nil))
     (dolist (row (sort (copy-list rows) #'string< :key (lambda (row) (getf row :name))))
@@ -145,6 +161,9 @@
                         (push (logical-slot-continuation-cold-plan-action :remove-scratch row state) scratch)))))))))
     (values (append (nreverse staging) (nreverse scratch) (nreverse temporary)) (nreverse retained))))
 
+;; Construct a copied plan only after the selector, certificate and complete
+;; inventory agree.  An absent selector's temporary must prefix the derived
+;; bootstrap image.  The plan itself grants no cleanup or publication authority.
 (defun logical-slot-continuation-cold-build-cleanup-plan
     (kind model selector temporary rows root binding certificate host)
   (let ((domain (logical-slot-continuation-cold-certified-domain binding certificate host)))

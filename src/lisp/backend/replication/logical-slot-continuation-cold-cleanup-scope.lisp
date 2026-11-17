@@ -1,5 +1,9 @@
 (in-package #:pg)
 
+;; Keep the reservation, selector and slot root checked while building the plan
+;; and while its callback runs.  Re-read the complete inventory and root before
+;; and after the callback; pass a plan copy and a scoped recheck function.  The
+;; scope expires on exit, and observation alone does not perform cleanup.
 (defun call-with-logical-slot-continuation-cold-cleanup-plan (gate ownership function)
   (unless (functionp function) (error "cold cleanup plan requires a callback"))
   (call-with-logical-slot-continuation-cold-context

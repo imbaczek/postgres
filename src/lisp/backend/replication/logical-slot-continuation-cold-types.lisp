@@ -11,6 +11,11 @@
 
 (defvar *logical-slot-continuation-cold-test-hook* nil)
 
+;; The latch applies after entry: a foreign-thread or expired-scope rejection
+;; does not poison the owner.  Masked entry and unwind close the interrupt window.
+
+;; Check scope and owner thread before the body can do I/O.  Any unsuccessful
+;; exit makes failure sticky, including an interrupt during the body.
 (defmacro with-logical-slot-continuation-observation-check
     ((active failed thread label) &body body)
   (unless (stringp label) (error "observation check requires a literal label"))

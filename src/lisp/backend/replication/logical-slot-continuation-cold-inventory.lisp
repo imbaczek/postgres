@@ -1,5 +1,7 @@
 (in-package #:pg)
 
+;; Accept only a bounded exact prefix of the intended complete image, including
+;; an empty prefix.  This pure check neither reads nor changes the temporary.
 (defun logical-slot-continuation-cold-check-prefix (bytes image)
   (logical-slot-copy-descriptor-blob-size
    image 1 (logical-slot-continuation-prepared-maximum-bytes))
