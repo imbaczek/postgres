@@ -550,8 +550,9 @@
      t t))
 
 (defun selected-cleanup-recovery-operation (pin absent)
-  (format nil
-          "(let* ((request (getf parent :request))
+  (with-standard-io-syntax
+    (format nil
+            "(let* ((request (getf parent :request))
                   (successor (getf parent :successor))
                   (name (getf successor :name))
                   (expected (pg::physical-backup-lease-copy parent))
@@ -578,9 +579,27 @@
                          (progn (pg::physical-source-follow-prepare name coordinates) nil)
                        (pg::wal-input-validation-error () t)))
              (assert (not pg::*wal-poisoned*)))"
-          absent
-          (unless absent (coerce (pg::physical-source-pin-encode pin) 'list))
-          (if absent :absent :released)))
+            absent
+            (unless absent (coerce (pg::physical-source-pin-encode pin) 'list))
+            (if absent :absent :released))))
+
+(deftest selected-cleanup-recovery-operation-ignores-diagnostic-print-limits
+    (call-with-backup-lease-selected-observation-fixture
+     (lambda (root parent pin row)
+       (declare (ignore root parent row))
+       (dolist (absent '(nil t))
+         (let* ((expected (with-standard-io-syntax
+                            (selected-cleanup-recovery-operation pin absent)))
+                (actual (let ((*print-length* 3) (*print-level* 1) (*print-pretty* t)
+                                                 (*print-readably* nil) (*print-base* 16) (*print-radix* t))
+                          (selected-cleanup-recovery-operation pin absent))))
+           (ok (string= expected actual))
+           (ok (handler-case
+                   (let ((*read-eval* nil))
+                     (multiple-value-bind (form end) (read-from-string actual)
+                       (and (consp form) (= end (length actual)))))
+                 (error () nil))))))
+     nil t))
 
 (deftest selected-cleanup-recovers-real-kills-before-and-after-terminal-publication
     (with-physical-store-directory (cache-root)
