@@ -111,6 +111,17 @@ def main():
         wire = os.environ.get('PG_NATIVE_MAIN_WIRE')
         if wire not in (None, '1') or (wire and case != 'happy'):
             raise ValueError('Wire qualification requires happy case and explicit value 1')
+        ack_fault = os.environ.get('PG_NATIVE_MAIN_ACK_FAULT')
+        fault_sql = os.environ.get('PG_NATIVE_MAIN_ACK_SQL', 'create')
+        fault_restart = os.environ.get('PG_NATIVE_MAIN_ACK_COLD_RESTART')
+        if (ack_fault not in (None, 'prepared-durable', 'published')
+                or fault_sql not in ('create', 'retire')
+                or (ack_fault and (not wire or os.environ.get('PG_NATIVE_MAIN_RESTART')
+                                   or os.environ.get('PG_NATIVE_MAIN_CHILD_ACK')))
+                or (not ack_fault and 'PG_NATIVE_MAIN_ACK_SQL' in os.environ)):
+            raise ValueError('ACK fault cases require wire mode without restart or happy child ACK')
+        if fault_restart not in (None, '1') or (fault_restart and (not ack_fault or fault_sql != 'retire')):
+            raise ValueError('ACK cold restart requires a terminal retirement fault')
         child_ack = os.environ.get('PG_NATIVE_MAIN_CHILD_ACK')
         if child_ack not in (None, '1') or (child_ack and (not wire or os.environ.get('PG_NATIVE_MAIN_RESTART') != '1')):
             raise ValueError('Child ACK composition requires wire/restart modes and explicit value 1')
@@ -165,7 +176,7 @@ def main():
                     follow_before = writer.tree_image(follow) if follow.exists() else None
                     expected_names = sorted(path.name for path in (data / 'pg_replslot').iterdir()
                                             if path.is_dir() and not path.name.startswith('.'))
-                    if child_ack and expected_names != ['alpha', 'beta']:
+                    if (child_ack or ack_fault) and expected_names != ['alpha', 'beta']:
                         raise ValueError('Child ACK composition requires the actual two-slot fixture')
                     result['expected_slots'] = expected_names
                     process = None
@@ -203,11 +214,11 @@ def main():
                         command = [str(source / 'pg-lisp.sh'), '-D', str(data), '-p', str(port),
                                    '-c', 'wal_level=logical', '--control-socket', str(control / 'pg.sock')]
                         result['command'] = command
-                        for boot in range(3 if restart else 1):
+                        for boot in range(3 if restart else 2 if fault_restart else 1):
                             result['ready'] = False
                             boot_started = time.monotonic()
                             log = job / ('logs/imported-main-startup-' + str(boot) + '.log'
-                                         if restart else 'logs/imported-main-startup.log')
+                                           if restart or fault_restart else 'logs/imported-main-startup.log')
                             with log.open('w') as output:
                                 def spawn():
                                     child = subprocess.Popen(command, cwd=source, env=environment,
@@ -305,6 +316,12 @@ def main():
                                         ack = result['wire']['child_ack']
                                         sql += " SELECT confirmed_flush_lsn FROM pg_replication_slots WHERE slot_name='alpha'; SELECT n FROM imported_ack_rows ORDER BY n;"
                                         expected_sql += [ack['confirmed_lsn'], *map(str, ack['rows'])]
+                                    if fault_restart and boot == 1:
+                                        snapshot = result['ack_fault']['snapshot']
+                                        confirmed = int(re.search(r' confirmed=(\d+) ', snapshot)[1])
+                                        sql += " SELECT confirmed_flush_lsn FROM pg_replication_slots WHERE slot_name='alpha';"
+                                        sql += " SELECT n FROM imported_fault_rows;"
+                                        expected_sql += [f'{confirmed >> 32:X}/{confirmed & 0xffffffff:08X}', '1']
                                     query = subprocess.run([str(psql), '-X', '-q', '-A', '-t', '-h', '127.0.0.1',
                                                             '-p', str(port), '-U', 'postgres', '-d', 'postgres',
                                                             '-v', 'ON_ERROR_STOP=1', '-c', sql],
@@ -320,10 +337,27 @@ def main():
                                             port, data, job, expected_names,
                                             lambda form, marker: inspect_control(
                                                 control / 'pg.sock', process.pid, form, marker), source=source)
-                                    process.send_signal(signal.SIGTERM)
+                                    if ack_fault and boot == 0:
+                                        fault_tests = module('imported_main_ack_fault', directory / 'imported-main-ack-fault.py')
+                                        result['ack_fault'] = fault_tests.exercise(
+                                            port, job, source, ack_fault, fault_sql,
+                                            lambda form, marker: inspect_control(
+                                                control / 'pg.sock', process.pid, form, marker))
+                                        if not result['ack_fault']['passed']:
+                                            raise RuntimeError('Post-intent invariants were not established')
+                                        if fault_sql != 'retire':
+                                            process.kill()
+                                    else:
+                                        process.send_signal(signal.SIGTERM)
                                     result['exit_code'] = process.wait(timeout=30)
-                                    if result['exit_code']:
-                                        raise RuntimeError('Imported main shutdown failed')
+                                    expected_exit = (1 if fault_sql == 'retire' else -signal.SIGKILL) if ack_fault and boot == 0 else 0
+                                    if result['exit_code'] != expected_exit:
+                                        raise RuntimeError('Imported main termination failed')
+                                    if ack_fault and boot == 0 and fault_sql == 'retire':
+                                        shutdown_log = log.read_text()
+                                        assert 'cold temporary slot reconciliation required; exiting without clean shutdown' in shutdown_log
+                                        assert 'database system is shut down' not in shutdown_log
+                                        assert 'unhandled condition' not in shutdown_log.lower()
                                     result['follow_preserved'] = follow_before == (writer.tree_image(follow)
                                                                                   if follow.exists() else None)
                                     if not result['follow_preserved']:
@@ -377,7 +411,7 @@ def main():
                 raise RuntimeError('Main startup experiment changed preserved inputs')
         result['harness_passed'] = True
         campaign.write_json(job / 'logs/imported-main-startup-result.json', result)
-        marker = ('IMPORTED-MAIN-CANCEL' if case == 'cancel-spawn'
+        marker = ('IMPORTED-MAIN-ACK-FAULT' if ack_fault else 'IMPORTED-MAIN-CANCEL' if case == 'cancel-spawn'
                   else 'IMPORTED-MAIN-REFUSAL' if case != 'happy' else 'IMPORTED-MAIN-STARTUP')
         print(marker
               + ' PASS ' + json.dumps(result), flush=True)

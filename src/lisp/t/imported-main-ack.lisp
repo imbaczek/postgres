@@ -120,16 +120,20 @@
 
 (defvar *imported-main-ack-sql-directory* nil)
 
+(defvar *imported-main-ack-sql-repeat-markers* nil)
+
 (defun imported-main-ack-sql-marker (arguments name)
   (when (and *imported-main-ack-sql-directory*
              (equal (first arguments) "ack_barrier"))
     (with-open-file (stream (merge-pathnames name *imported-main-ack-sql-directory*)
-                            :direction :output :if-exists :error)
+                            :direction :output :if-exists (if *imported-main-ack-sql-repeat-markers* :append :error)
+                            :if-does-not-exist :create)
       (write-line name stream))))
 
-(defun imported-main-ack-instrument-sql (directory)
+(defun imported-main-ack-instrument-sql (directory &key repeat-markers)
   (when *imported-main-ack-sql-functions* (error "ACK SQL instrumentation already installed"))
-  (setf *imported-main-ack-sql-directory* (pathname directory))
+  (setf *imported-main-ack-sql-directory* (pathname directory)
+        *imported-main-ack-sql-repeat-markers* repeat-markers)
   (dolist (entry '((wal-create-physical-replication-slot "creating" "created")
                    (wal-drop-replication-slot "retiring" "retired")))
     (let* ((symbol (first entry)) (before (second entry)) (after (third entry))
@@ -161,5 +165,6 @@
 (defun imported-main-ack-restore-sql ()
   (dolist (entry *imported-main-ack-sql-functions*)
     (setf (symbol-function (car entry)) (cdr entry)))
-  (setf *imported-main-ack-sql-functions* nil *imported-main-ack-sql-directory* nil)
+  (setf *imported-main-ack-sql-functions* nil *imported-main-ack-sql-directory* nil
+        *imported-main-ack-sql-repeat-markers* nil)
   :ack-sql-restored)
