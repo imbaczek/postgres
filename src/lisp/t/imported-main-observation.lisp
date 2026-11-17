@@ -309,6 +309,45 @@
           (when moved (sb-posix:rename saved path) (setf moved nil)))
         (uiop:delete-directory-tree temporary :validate t :if-does-not-exist :ignore)))))
 
+(defun native-imported-main-owned-startup-contract ()
+  (let ((fds (length (directory #p"/proc/self/fd/*"))))
+    (unwind-protect
+         (let ((observation (logical-slot-imported-own-startup "127.0.0.1" 54321)))
+           (rove:ok (eq :owned-pid (getf observation :phase)))
+           (rove:ok (postmaster-pid-owned-p))
+           (rove:ok (logical-slot-continuation-gc-fenced-p *pgdata*))
+           (rove:ok (logical-slot-copy-committed-image-equal-p
+                     (getf observation :inputs)
+                     (logical-slot-imported-startup-check-owned observation))))
+      (unwind-protect
+           (when *postmaster-pid-stream* (postmaster-remove-pid-file))
+        (when *postmaster-data-lock* (close *postmaster-data-lock*))
+        (setf *postmaster-data-lock* nil *postmaster-start-timestamp* nil)))
+    (rove:ok (= fds (length (directory #p"/proc/self/fd/*"))))
+    (rove:ok (not *wal-ready*))
+    (dolist (name '("promote" "standby.signal" "recovery.signal" "physical-follow-managed.control"
+                    "physical-reseed.attempt" "physical-adoption.attempt"))
+      (let ((path (merge-pathnames name *pgdata*)) (created nil) (message nil))
+        (when (slot-state-lstat path) (error "startup conflict fixture already exists"))
+        (unwind-protect
+             (progn
+               (with-open-file (out path :direction :output :if-exists :error)
+                 (setf created t)
+                 (sb-posix:fchmod (sb-sys:fd-stream-fd out) #o600)
+                 (write-string "startup conflict" out))
+               (handler-case (logical-slot-imported-own-startup "127.0.0.1" 54321)
+                 (error (condition) (setf message (princ-to-string condition))))
+               (rove:ok message)
+               (rove:ok (not (slot-state-lstat (merge-pathnames "postmaster.pid" *pgdata*))))
+               (rove:ok (string= "startup conflict" (uiop:read-file-string path)))
+               (rove:ok (null *postmaster-data-lock*))
+               (rove:ok (not *wal-ready*)))
+          (when created (delete-file path)))))
+    (let ((*physical-promotion-requested-p* t))
+      (rove:ok (rove:signals (logical-slot-imported-own-startup "127.0.0.1" 54321) 'error))
+      (rove:ok *physical-promotion-requested-p*))
+    (rove:ok (= fds (length (directory #p"/proc/self/fd/*"))))))
+
 (defun native-imported-main-pid-boundary-contract ()
   ;; Exercise real flock/PID publication and refuse changed bytes or identities.
   (rove:ok (null *postmaster-data-lock*))
@@ -722,7 +761,8 @@
       (when (equal (uiop:getenv "PG_NATIVE_IMPORTED_CHECKPOINT_REPLACE") "1")
         (handler-bind ((error (lambda (condition)
                                 (format *error-output* "~&IMPORTED-PID-BOUNDARY-ERROR ~a~%" condition))))
-          (native-imported-main-pid-boundary-contract)))
+          (native-imported-main-pid-boundary-contract)
+          (native-imported-main-owned-startup-contract)))
       (rove:ok (= called 4))
       (rove:ok (not *wal-ready*))
       (rove:ok (zerop (hash-table-count *wal-replication-slots*)))

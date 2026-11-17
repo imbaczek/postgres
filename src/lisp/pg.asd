@@ -480,6 +480,7 @@
                    (:file "../replication/logical-slot-copy-source-proof-publication-fs")
                    (:file "../replication/logical-slot-copy-source-proof-publication")
                    (:file "../replication/logical-slot-copy-startup")
+                   (:file "../replication/logical-slot-imported-main-startup")
                    (:file "postgres")))
      (:file "replication/logical-retention")
      (:file "replication/logical-shutdown")))))

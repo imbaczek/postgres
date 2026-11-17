@@ -314,13 +314,16 @@ command (idle) is ignored; the connection and its transaction state survive."
 
 (declaim (ftype function physical-follow-desired-start-worker))
 
-(defun start-postmaster-recovery-workers ()
+(defun start-postmaster-recovery-workers (&key imported-primary)
   "Start admitted recovery services and cleanup, tolerating concurrent shutdown."
   (handler-case
       (progn
-        (physical-follow-autostart)
-        (physical-follow-controller-start-worker)
-        (physical-follow-desired-start-worker)
+        (when (and imported-primary (recovery-in-progress-p))
+          (error "imported primary worker startup cannot enter recovery"))
+        (unless imported-primary
+          (physical-follow-autostart)
+          (physical-follow-controller-start-worker)
+          (physical-follow-desired-start-worker))
         (physical-restartpoint-start-worker)
         (physical-promotion-start-worker))
     (physical-recovery-worker-shutdown (condition)

@@ -242,6 +242,31 @@
         (when root (sb-posix:close root))
         (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))
 
+(cl-spec:defproperty imported-primary-follow-policy-keeps-metadata-inert
+    ((unattached boolean) (enabled boolean) (preparing boolean)
+                          (cleanup boolean) (source boolean) (public-slot boolean))
+  (:about logical-slot-imported-startup-inert-follow-p)
+  (:trials (:normal 100))
+  (let* ((config (list 1 nil nil nil nil
+                       (list :mode (when unattached :standby-unattached) :enabled enabled
+                             :preparing preparing :cleanup cleanup :source source
+                             :public-slot public-slot)))
+         (before (logical-slot-copy-clone-facts config)))
+    (and (eql (not (null (logical-slot-imported-startup-inert-follow-p config)))
+              (and (or (not unattached) (not enabled))
+                   (not preparing) (not cleanup) (not source) (not public-slot)))
+         (equal before config))))
+
+(rove:deftest imported-primary-follow-policy-generated-inertness
+    (let ((data (cl-spec:result-data
+                 (cl-spec:run-property 'imported-primary-follow-policy-keeps-metadata-inert
+                                       :seed 418 :profile :normal))))
+      (rove:ok (eq :passed (getf data :status))))
+  (rove:ok (not (logical-slot-imported-startup-inert-follow-p
+                 '(1 "endpoint" "slot" nil))))
+  (rove:ok (not (logical-slot-imported-startup-inert-follow-p
+                 '(1 nil nil nil (:binding) (:enabled nil))))))
+
 (cl-spec:defproperty imported-startup-child-binding-keeps-identity-and-floor
     ((same-id boolean) (delta (range integer -2 2)))
   (:about logical-slot-imported-startup-check-child-binding)

@@ -925,7 +925,7 @@ CL's RENAME-FILE merges a relative target with the source's directory."
   (startup-check-retired-storage)
   (values))
 
-(defun initialize-primary-storage ()
+(defun initialize-primary-storage (&key imported-startup)
   "Initialize a cold or promoted primary from its durable WAL/control checkpoint.
 Hold the drained admission gate and borrow the real postmaster ownership."
   (call-with-live-operation-startup-quiescence
@@ -934,6 +934,8 @@ Hold the drained admission gate and borrow the real postmaster ownership."
       (lambda (ownership)
         ;; Check before the first storage mutation.
         (check-primary-storage-startup-context gate-owner ownership)
+        (when imported-startup
+          (logical-slot-imported-startup-check-owned imported-startup))
         (wal-mark-primary-startup)
         (wal-init)
         (xact-init)
@@ -976,61 +978,81 @@ Then check the cached handles and workers under startup exclusion."
           *query-temp-file-limit-bytes* temp-file-limit-bytes
           *query-sort-arena-limit-bytes* sort-arena-limit-bytes
           *max-slot-wal-keep-bytes* max-slot-wal-keep-bytes)
-    (logical-slot-copy-preflight-startup)
-    (authentication-preflight-startup startup-settings)
-    (startup-install-initial-settings startup-settings startup-native startup-overrides)
-    (startup-install-resource-capacity startup-settings)
-    (sb-sys:enable-interrupt sb-unix:sigusr1 #'request-physical-promotion)
-    ;; Observe before PID repair and consume terminal retirement under ownership
-    ;; before mutable bootstrap or storage initialization begins.
-    (physical-reseed-follow-own-startup host port)
-    (logical-slot-copy-owned-startup)
-    (physical-backup-cleanup-stages)
-    ;; Complete authentication using the captured inputs after PGDATA ownership.
-    ;; Do not reread configuration files or reinstall startup resource capacity.
-    (startup-complete-authentication)
-    (physical-promotion-initialize-requests)
-    (physical-promotion-test-point :after-promotion-request-initialization)
-    ;; Reject an unsupported SBCL before pending reconstruction can open storage.
-    (call-with-query-sort-arena (lambda (arena) (declare (ignore arena))))
-    ;; Historical retirement authority is gone.  Continue with ordinary local
-    ;; startup checks before bootstrap and storage initialization.
-    (physical-reseed-follow-check-ordinary-startup)
-    (let ((primary-ready (eq :primary-ready (physical-bootstrap-check-startup))))
-      (initialize-query-temp-storage)
-      (capture-server-streams)
-      (unless primary-ready
-        (physical-reseed-follow-check-ordinary-startup)
+    (let ((imported (logical-slot-copy-imported-startup-candidate-p))
+          (imported-startup nil))
+      (unless imported (logical-slot-copy-preflight-startup))
+      (authentication-preflight-startup startup-settings)
+      (startup-install-initial-settings startup-settings startup-native startup-overrides)
+      (startup-install-resource-capacity startup-settings)
+      (sb-sys:enable-interrupt sb-unix:sigusr1 #'request-physical-promotion)
+      ;; Observe before PID repair and consume terminal retirement under ownership
+      ;; before mutable bootstrap or storage initialization begins.
+      (if imported
+          (setf imported-startup (logical-slot-imported-own-startup host port))
+          (physical-reseed-follow-own-startup host port))
+      (unless imported
+        (logical-slot-copy-owned-startup)
+        (physical-backup-cleanup-stages))
+      ;; Complete authentication using the captured inputs after PGDATA ownership.
+      ;; Do not reread configuration files or reinstall startup resource capacity.
+      (startup-complete-authentication)
+      (if imported
+          (logical-slot-imported-startup-check-policy)
+          (physical-promotion-initialize-requests))
+      (physical-promotion-test-point :after-promotion-request-initialization)
+      ;; Reject an unsupported SBCL before pending reconstruction can open storage.
+      (call-with-query-sort-arena (lambda (arena) (declare (ignore arena))))
+      ;; Historical retirement authority is gone.  Continue with ordinary local
+      ;; startup checks before bootstrap and storage initialization.
+      (if imported
+          (logical-slot-imported-startup-check-policy)
+          (physical-reseed-follow-check-ordinary-startup))
+      (let ((primary-ready (and (not imported)
+                                (eq :primary-ready (physical-bootstrap-check-startup)))))
+        (initialize-query-temp-storage)
+        (capture-server-streams)
+        (unless primary-ready
+          (if imported
+              (logical-slot-imported-startup-check-policy)
+              (physical-reseed-follow-check-ordinary-startup))
+          (if imported
+              (progn
+                (initialize-primary-storage :imported-startup imported-startup)
+                (physical-backup-cleanup-stages))
+              (if (recovery-in-progress-p)
+                  (physical-recovery-open-storage)
+                  (initialize-primary-storage))))
+        (when (recovery-in-progress-p)
+          (physical-backup-lease-load-records)
+          (physical-backup-lease-load-standby-pins))
+        (physical-export-origin-load)
+        (physical-backup-lease-reconcile-startup)
+        (if imported
+            (logical-slot-imported-startup-check-policy)
+            (physical-follow-prepare-managed-startup))
         (if (recovery-in-progress-p)
-            (physical-recovery-open-storage)
-            (initialize-primary-storage)))
-      (when (recovery-in-progress-p)
-        (physical-backup-lease-load-records)
-        (physical-backup-lease-load-standby-pins))
-      (physical-export-origin-load)
-      (physical-backup-lease-reconcile-startup)
-      (physical-follow-prepare-managed-startup)
-      (if (recovery-in-progress-p)
-          (physical-recovery-check-resource-readiness)
-          (progn
-            (wal-report-installed-resource-capacity)
-            (wal-note-primary-ready)))
-      (if primary-ready
-          ;; Cold promotion already installed the source identity.
-          (assert (nth-value 0 (sync-replication-configuration-state)))
-          (with-live-operation-quiescence
-            (sync-replication-new-source-incarnation)))
-      (unless (recovery-in-progress-p) (start-primary-wal-writer))
-      (enable-reload)
-      (enable-shutdown-handlers)
-      (start-swank-listener swank-port swank-bind-address)
-      (start-control-plane :port control-port :socket-path control-socket)
-      (start-postmaster-recovery-workers)
-      (format t "~&pg-lisp: minimal PostgreSQL-compatible server~%")
-      (format t "pg-lisp: data directory ~a~%" *pgdata*)
-      (format t "pg-lisp: listening on ~a:~a~%" host port)
-      (finish-output)
-      (serve host port)
-      (prepare-postmaster-shutdown)
-      (admin-log "database system is shut down")
-      (sb-ext:exit :code 0))))
+            (physical-recovery-check-resource-readiness)
+            (progn
+              (wal-report-installed-resource-capacity)
+              (wal-note-primary-ready)))
+        (if primary-ready
+            ;; Cold promotion already installed the source identity.
+            (assert (nth-value 0 (sync-replication-configuration-state)))
+            (with-live-operation-quiescence
+              (sync-replication-new-source-incarnation)))
+        (unless (recovery-in-progress-p) (start-primary-wal-writer))
+        (enable-reload)
+        (enable-shutdown-handlers)
+        (start-swank-listener swank-port swank-bind-address)
+        (start-control-plane :port control-port :socket-path control-socket)
+        (if imported
+            (start-postmaster-recovery-workers :imported-primary t)
+            (start-postmaster-recovery-workers))
+        (format t "~&pg-lisp: minimal PostgreSQL-compatible server~%")
+        (format t "pg-lisp: data directory ~a~%" *pgdata*)
+        (format t "pg-lisp: listening on ~a:~a~%" host port)
+        (finish-output)
+        (serve host port)
+        (prepare-postmaster-shutdown)
+        (admin-log "database system is shut down")
+        (sb-ext:exit :code 0)))))

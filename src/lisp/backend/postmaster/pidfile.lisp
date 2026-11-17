@@ -301,7 +301,8 @@ leaves the separate data ownership lock to its owner."
                         (= (sb-posix:stat-uid stat) (sb-posix:geteuid))
                         (= (sb-posix:stat-nlink stat) 1))
              (error "data ownership lock is not a dedicated regular file"))
-           (sb-posix:fchmod fd #o600)
+           (unless (= #o600 (logand #o7777 (sb-posix:stat-mode stat)))
+             (sb-posix:fchmod fd #o600))
            (prog1 (sb-sys:make-fd-stream fd :input t :output t
                                             :element-type '(unsigned-byte 8) :auto-close t)
              (setf success t)))
