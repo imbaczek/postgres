@@ -233,6 +233,34 @@ Bind capture to the accepted source observed during discovery."
         record (pg-client-native-backup-lease-status client (getf record :request))))
      :helper helper)))
 
+(defun physical-rewind-resume-capture (owner record &key helper)
+  (physical-reseed-require-journal owner record)
+  (let ((status (physical-reseed-status owner :helper helper)))
+    (when (eq :ready (getf status :phase))
+      (return-from physical-rewind-resume-capture status))
+    (when status (error "native rewind source capture is not ready"))
+    (let ((request (getf record :request)) (stage (getf record :stage)))
+      (call-with-physical-reseed-stage
+       owner (pathname (getf stage :directory))
+       (lambda (directory facts fd)
+         (declare (ignore facts))
+         (call-with-physical-reseed-client
+          owner record
+          (lambda (client)
+            (unless (null (physical-reseed-source-result
+                           record (pg-client-native-backup-lease-status client request)))
+              (error "native rewind source claim appeared during resume"))
+            (multiple-value-bind (origin fork timeline) (physical-rewind-discover-history owner client)
+              (declare (ignore fork))
+              (unless (and (equal origin (getf record :rewind-origin))
+                           (= timeline (getf request :timeline)))
+                (error "native rewind source changed before capture resume")))
+            (physical-reseed-require-journal owner record)
+            (physical-reseed-stage-facts owner directory fd :empty t :expected stage)
+            (physical-rewind-capture-image owner directory fd client request))
+          :helper helper :capture t))
+       :expected stage))))
+
 ;; Persist abort intent before contacting the source.  Remote cancellation does
 ;; not need a healthy stage or the current timeline, but checks the same system
 ;; identifier.  An already-aborted attempt returns locally.  Neither path

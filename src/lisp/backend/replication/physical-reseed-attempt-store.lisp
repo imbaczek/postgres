@@ -242,14 +242,17 @@
 ;; or malformed files remain fences; do not recapture facts, choose a new ID,
 ;; or unlink them through this interface.
 
-(defun physical-reseed-attempt-recover (owner)
+(defun physical-reseed-attempt-recover (owner &key check-record)
   (physical-reseed-check-attempt-authority owner)
   (physical-reseed-check-owner owner)
   (let* ((directory (physical-adoption-owner-directory owner))
          (path (physical-reseed-attempt-path directory))
          (temporary (physical-reseed-attempt-temporary-path directory)))
     (unless (physical-adoption-path-present-p temporary)
-      (return-from physical-reseed-attempt-recover (physical-reseed-attempt-read owner)))
+      (return-from physical-reseed-attempt-recover
+        (let ((record (physical-reseed-attempt-read owner)))
+          (when check-record (funcall check-record record))
+          record)))
     (let* ((candidate (physical-reseed-attempt-read-file owner temporary))
            (temporary-identity (physical-reseed-attempt-file-identity (sb-posix:lstat (namestring temporary))))
            (previous (when (physical-adoption-path-present-p path)
@@ -260,4 +263,15 @@
           (physical-reseed-attempt-check-transition previous candidate)
           (unless (eq :premanifest (getf candidate :phase))
             (error "temporary reseed intent has no predecessor")))
+      (when check-record (funcall check-record candidate))
       (physical-reseed-attempt-promote-temporary owner candidate temporary-identity previous previous-identity))))
+
+(defun physical-rewind-recover-attempt (owner check-workspace)
+  (physical-reseed-attempt-recover
+   owner
+   :check-record
+   (lambda (record)
+     (unless (and (eq :premanifest (getf record :phase))
+                  (getf record :rewind-origin))
+       (error "pre-install resume requires an active native rewind attempt"))
+     (funcall check-workspace record))))

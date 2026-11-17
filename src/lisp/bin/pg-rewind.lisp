@@ -41,21 +41,31 @@
          (directory (sb-posix:mkdtemp (namestring (merge-pathnames ".pg-rewind.XXXXXX" parent)))))
     (uiop:ensure-directory-pathname directory)))
 
+(defun native-rewind-workspace-p (target workspace)
+  (and (equal (uiop:pathname-parent-directory-pathname workspace)
+              (uiop:pathname-parent-directory-pathname target))
+       (stringp (car (last (pathname-directory workspace))))
+       (uiop:string-prefix-p ".pg-rewind." (car (last (pathname-directory workspace))))))
+
+(defun native-rewind-stage-workspace (target attempt)
+  (let* ((stage (pathname (getf (getf attempt :stage) :directory)))
+         (workspace (uiop:pathname-parent-directory-pathname stage)))
+    (unless (and (getf attempt :rewind-origin)
+                 (native-rewind-workspace-p target workspace)
+                 (equal stage (merge-pathnames "stage/" workspace)))
+      (error "attempt is not a native rewind CLI capture"))
+    workspace))
+
 (defun native-rewind-workspace-from-plan (target plan)
-  "Derive the CLI workspace from an owner-validated install plan.
-Require a rewind origin and the expected sibling workspace paths."
+  "Derive the CLI workspace from the validated install plan."
   (let* ((attempt (getf plan :attempt))
          (incoming (pathname (getf (getf plan :incoming) :directory)))
          (workspace (uiop:pathname-parent-directory-pathname incoming)))
-    (unless (and (getf attempt :rewind-origin)
-                 (equal (uiop:pathname-parent-directory-pathname workspace)
-                        (uiop:pathname-parent-directory-pathname target))
-                 (uiop:string-prefix-p ".pg-rewind." (car (last (pathname-directory workspace))))
+    (native-rewind-stage-workspace target attempt)
+    (unless (and (native-rewind-workspace-p target workspace)
                  (equal incoming (merge-pathnames "incoming/" workspace))
                  (equal (getf (getf plan :quarantine) :directory)
-                        (namestring (merge-pathnames "quarantine/" workspace)))
-                 (equal (getf (getf attempt :stage) :directory)
-                        (namestring (merge-pathnames "stage/" workspace))))
+                        (namestring (merge-pathnames "quarantine/" workspace))))
       (error "installation is not a native rewind CLI workspace"))
     workspace))
 
@@ -129,6 +139,24 @@ Retire the journals and finalize the installed standby."
   (physical-reseed-follow-retire-offline target 5432)
   (physical-reseed-follow-finalize-offline target 5432))
 
+(defun native-rewind-resume-before-install (target helper)
+  (call-with-physical-reseed-owner
+   target
+   (lambda (owner)
+     (let ((attempt (physical-rewind-recover-attempt
+                     owner (lambda (record) (native-rewind-stage-workspace target record)))))
+       (physical-rewind-resume-capture owner attempt :helper helper)
+       (let* ((workspace (native-rewind-workspace target))
+              (incoming (merge-pathnames "incoming/" workspace))
+              (quarantine (merge-pathnames "quarantine/" workspace)))
+         (format t "~&pg_rewind workspace: ~a~%" workspace)
+         (finish-output)
+         (dolist (path (list incoming quarantine (merge-pathnames "follow/" workspace)))
+           (sb-posix:mkdir (string-right-trim "/" (namestring path)) #o700))
+         (physical-reseed-prepare-image owner incoming :helper helper)
+         (physical-reseed-publish-install owner incoming quarantine :helper helper)))))
+  (native-rewind-complete-install target helper))
+
 (defun native-rewind-resume-workspace (target helper)
   "Use the validated install plan when follow state exists.
 Otherwise complete the published installation and return its workspace."
@@ -138,7 +166,9 @@ Otherwise complete the published installation and return its workspace."
        target
        (lambda (owner)
          (native-rewind-workspace-from-plan target (physical-reseed-install-owner-plan owner))))
-      (native-rewind-complete-install target helper)))
+      (if (physical-adoption-path-present-p (merge-pathnames "physical-reseed.install" target))
+          (native-rewind-complete-install target helper)
+          (native-rewind-resume-before-install target helper))))
 
 (defun native-rewind-retirement-present-p (target)
   "Route a named retired receipt or active follow record to the retirement owner.
