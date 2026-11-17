@@ -23,7 +23,7 @@
                context descriptor nil (make-hash-table :test #'equal))
             (declare (ignore index))
             (setf observations (nreverse observations))
-            (labels ((check ()
+            (labels ((check (&optional projection)
                        (unless (and active (eq thread sb-thread:*current-thread*))
                          (error "imported sidecar observation ended or changed thread"))
                        (when failed (error "imported sidecar observation already failed"))
@@ -52,7 +52,9 @@
                                                      (physical-image-file-facts parent leaf)))
                                    (error
                                     "imported sidecar piece changed after digest verification"))))
-                             t)
+                             (ecase projection
+                               ((nil) t)
+                               (:directory-facts (logical-slot-copy-clone-facts sidecar-facts))))
                          (error (condition) (setf failed t) (error condition)))))
               (unwind-protect
                    (progn

@@ -272,6 +272,99 @@
     (rove:ok (= inode (sb-posix:stat-ino (sb-posix:lstat path))))
     (rove:ok (equalp bytes (read-bounded-regular-file path (1+ +wal-control-maximum-bytes+))))))
 
+(defun native-imported-main-with-pair-replacement (name function)
+  ;; Own an exclusive scratch directory, restore originals before deleting copies.
+  (let* ((path (merge-pathnames name *pgdata*))
+         (directory-p (equal name "logical-slot-copy.install"))
+         (temporary (merge-pathnames (format nil "pair-replacement-~d-~d/"
+                                             (sb-posix:getpid) (random 1000000000))
+                                     (uiop:temporary-directory)))
+         (saved (merge-pathnames "original" temporary))
+         (copy (merge-pathnames "replacement" temporary))
+         (moved nil) (installed nil))
+    (labels ((copy-file (source target)
+               (with-open-file (out target :direction :output :if-exists :error
+                                           :element-type '(unsigned-byte 8))
+                 (sb-posix:fchmod (sb-sys:fd-stream-fd out) #o600)
+                 (write-sequence (read-bounded-regular-file source
+                                                            (logical-slot-copy-source-proof-maximum-bytes)) out)))
+             (install ()
+               (when (or moved installed) (error "replacement already installed"))
+               (sb-sys:without-interrupts
+                 (sb-posix:rename path saved) (setf moved t)
+                 (sb-posix:rename copy path) (setf installed t))))
+      (sb-posix:mkdir temporary #o700)
+      (unwind-protect
+           (progn
+             (if directory-p
+                 (progn
+                   (sb-posix:mkdir copy #o700)
+                   (dolist (leaf '("journal" "active"))
+                     (copy-file (merge-pathnames leaf (uiop:ensure-directory-pathname path))
+                                (merge-pathnames leaf (uiop:ensure-directory-pathname copy)))))
+                 (copy-file path copy))
+             (funcall function #'install))
+        (sb-sys:without-interrupts
+          (when installed (sb-posix:rename path copy) (setf installed nil))
+          (when moved (sb-posix:rename saved path) (setf moved nil)))
+        (uiop:delete-directory-tree temporary :validate t :if-does-not-exist :ignore)))))
+
+(defun native-imported-main-pid-boundary-contract ()
+  ;; Exercise real flock/PID publication and refuse changed bytes or identities.
+  (rove:ok (null *postmaster-data-lock*))
+  (rove:ok (null *postmaster-pid-stream*))
+  (unless (null (slot-state-lstat (merge-pathnames "postmaster.pid" *pgdata*)))
+    (error "PID-boundary fixture must initially have no PID file"))
+  (let ((fds (length (directory #p"/proc/self/fd/*"))))
+    (dolist (fault '(nil :proof :file :root
+                     "logical-slot-copy.source-proof" "logical-slot-copy.import"
+                     "logical-slot-copy.install/journal" "logical-slot-copy.install/active"
+                     "logical-slot-copy.install"))
+      (flet ((run (install)
+               (let ((before nil) (after nil) (phases nil) (message nil))
+                 (unwind-protect
+                      (handler-case
+                          (postmaster-own-data-directory
+                           "127.0.0.1" 54321
+                           :startup-observer
+                           (lambda (lock phase)
+                             (push phase phases)
+                             (ecase phase
+                               (:before-pid
+                                (setf before (logical-slot-imported-startup-observation lock phase))
+                                (let ((inputs (getf before :inputs)))
+                                  (case fault
+                                    (:proof (setf (aref (getf inputs :proof) 0)
+                                                  (logxor #xff (aref (getf inputs :proof) 0))))
+                                    (:file (setf (second (second (first (getf inputs :pair)))) -1))
+                                    (:root (setf (second (getf inputs :root)) -1))))
+                                (when install (funcall install)))
+                               (:owned-pid
+                                (setf after
+                                      (logical-slot-imported-startup-observation lock phase before))))))
+                        (error (condition) (setf message (princ-to-string condition))))
+                   (unwind-protect
+                        (when *postmaster-pid-stream* (postmaster-remove-pid-file))
+                     (when *postmaster-data-lock* (close *postmaster-data-lock*))
+                     (setf *postmaster-data-lock* nil *postmaster-start-timestamp* nil)))
+                 (rove:ok (equal '(:owned-pid :before-pid) phases))
+                 (if fault
+                     (progn
+                       (rove:ok (and message (search "changed across PID publication" message)))
+                       (rove:ok (null after)))
+                     (progn
+                       (rove:ok (null message))
+                       (rove:ok (and after (eq :owned-pid (getf after :phase))))
+                       (rove:ok (logical-slot-copy-committed-image-equal-p
+                                 (getf before :inputs) (getf after :inputs)))))
+                 (rove:ok (null (slot-state-lstat (postmaster-data-path "postmaster.pid"))))
+                 (rove:ok (null *postmaster-data-lock*))
+                 (rove:ok (not *wal-ready*))
+                 (rove:ok (= fds (length (directory #p"/proc/self/fd/*")))))))
+        (if (stringp fault)
+            (native-imported-main-with-pair-replacement fault #'run)
+            (run nil))))))
+
 (defun native-imported-main-pair-projection-error-contract (root root-check)
   (rove:ok
    (rove:signals
@@ -285,56 +378,27 @@
     'error)))
 
 (defun native-imported-main-pair-replacement-contract (root root-check)
-  ;; Reopen each byte-identical replacement in a fresh scope. Compare the detached
-  ;; evidence across scopes; both scopes must independently accept canonical data.
+  ;; Both fresh scopes accept canonical bytes, but their inode evidence differs.
   (dolist (name '("logical-slot-copy.source-proof" "logical-slot-copy.import"
                   "logical-slot-copy.install/journal" "logical-slot-copy.install/active"
                   "logical-slot-copy.install"))
-    (let* ((path (merge-pathnames name *pgdata*))
-           (directory-p (equal name "logical-slot-copy.install"))
-           (temporary (merge-pathnames (format nil "pair-replacement-~d-~d/"
-                                               (sb-posix:getpid) (random 1000000000))
-                                       (uiop:temporary-directory)))
-           (saved (merge-pathnames "original" temporary))
-           (copy (merge-pathnames "replacement" temporary))
-           (moved nil) (installed nil) (before nil) (after nil))
-      (labels ((copy-file (source target)
-                 (with-open-file (out target :direction :output :if-exists :error
-                                             :element-type '(unsigned-byte 8))
-                   (sb-posix:fchmod (sb-sys:fd-stream-fd out) #o600)
-                   (write-sequence (read-bounded-regular-file source
-                                                              (logical-slot-copy-source-proof-maximum-bytes)) out)))
-               (observe ()
-                 (call-with-logical-slot-imported-startup-pair
-                  root root-check
-                  (lambda (image facts check)
-                    (declare (ignore facts))
-                    (list image (funcall check :file-facts))))))
-        (sb-posix:mkdir temporary #o700)
-        (unwind-protect
-             (progn
-               (if directory-p
-                   (progn
-                     (ensure-directories-exist (merge-pathnames "replacement/" temporary))
-                     (sb-posix:chmod copy #o700)
-                     (dolist (leaf '("journal" "active"))
-                       (copy-file (merge-pathnames leaf (uiop:ensure-directory-pathname path))
-                                  (merge-pathnames leaf (uiop:ensure-directory-pathname copy)))))
-                   (copy-file path copy))
-               (setf before (observe))
-               (sb-sys:without-interrupts
-                 (sb-posix:rename path saved) (setf moved t)
-                 (sb-posix:rename copy path) (setf installed t))
-               (setf after (observe))
-               (rove:ok (equalp (first before) (first after)))
-               (rove:ok (not (equal (second before) (second after))))
-               (let ((old (assoc name (second before) :test #'equal))
-                     (new (assoc name (second after) :test #'equal)))
-                 (rove:ok (and old new (/= (second (second old)) (second (second new)))))))
-          (sb-sys:without-interrupts
-            (when installed (sb-posix:rename path copy) (setf installed nil))
-            (when moved (sb-posix:rename saved path) (setf moved nil)))
-          (uiop:delete-directory-tree temporary :validate t :if-does-not-exist :ignore))))))
+    (native-imported-main-with-pair-replacement
+     name
+     (lambda (install)
+       (flet ((observe ()
+                (call-with-logical-slot-imported-startup-pair
+                 root root-check
+                 (lambda (image facts check)
+                   (declare (ignore facts))
+                   (list image (funcall check :file-facts))))))
+         (let ((before (observe)))
+           (funcall install)
+           (let* ((after (observe))
+                  (old (assoc name (second before) :test #'equal))
+                  (new (assoc name (second after) :test #'equal)))
+             (rove:ok (equalp (first before) (first after)))
+             (rove:ok (not (equal (second before) (second after))))
+             (rove:ok (and old new (/= (second (second old)) (second (second new))))))))))))
 
 (defun native-imported-main-history-contract (root root-check)
   (let ((saved-check nil)
@@ -459,14 +523,22 @@
                     (setf (char (first row) 0) #\x
                           (second row) 0 (third row) 0 (first (fourth row)) 0))
                   (rove:ok (funcall check))
+                  (rove:ok (eq t (funcall check nil)))
+                  (let* ((directory (funcall check :directory-facts))
+                         (before (copy-list directory)))
+                    (rove:ok (= 9 (length directory)))
+                    (rove:ok (equal directory (physical-image-file-facts root "logical_slot_wal")))
+                    (setf (first directory) -1)
+                    (rove:ok (equal before (funcall check :directory-facts))))
                   (let ((rejected nil))
                     (sb-thread:join-thread
                      (sb-thread:make-thread
                       (lambda ()
                         (setf rejected
-                              (handler-case (progn (funcall check) nil) (error () t))))))
+                              (handler-case (progn (funcall check :directory-facts) nil) (error () t))))))
                     (rove:ok rejected))
                   :sidecar))))
+          (rove:ok (rove:signals (funcall saved-check :directory-facts) 'error))
           (rove:ok (rove:signals (funcall saved-check) 'error))
           (rove:ok
            (rove:signals
@@ -478,6 +550,16 @@
                (error "deliberate sidecar callback failure")))
             'error))
           (rove:ok (rove:signals (funcall saved-check) 'error))
+          (rove:ok
+           (rove:signals
+            (call-with-logical-slot-imported-startup-sidecar
+             root image history-check
+             (lambda (snapshot check)
+               (declare (ignore snapshot))
+               (rove:ok (rove:signals (funcall check :unsupported) 'error))
+               (rove:ok (rove:signals (funcall check) 'error))
+               (rove:ok (rove:signals (funcall check :directory-facts) 'error))))
+            'error))
           (let ((original (symbol-function 'physical-image-file-facts))
                 (names (mapcar (lambda (piece)
                                  (wal-segment-filename (second piece) (first piece) :timeline))
@@ -637,6 +719,10 @@
                   (rove:ok (rove:signals (funcall check) 'error)))
                 (rove:ok (rove:signals (funcall check) 'error))))
              'error)))))
+      (when (equal (uiop:getenv "PG_NATIVE_IMPORTED_CHECKPOINT_REPLACE") "1")
+        (handler-bind ((error (lambda (condition)
+                                (format *error-output* "~&IMPORTED-PID-BOUNDARY-ERROR ~a~%" condition))))
+          (native-imported-main-pid-boundary-contract)))
       (rove:ok (= called 4))
       (rove:ok (not *wal-ready*))
       (rove:ok (zerop (hash-table-count *wal-replication-slots*)))
