@@ -272,9 +272,10 @@ leaves the separate data ownership lock to its owner."
     (postmaster-update-pid-status "starting")
     (fsync-directory *postmaster-pid-directory*)))
 
-(defun postmaster-check-data-directory ()
+(defun postmaster-check-data-directory (&key existing-only)
   "Create only a missing native PGDATA; existing permissions must already be valid."
   (unless (probe-file *pgdata*)
+    (when existing-only (error "offline recovery requires an existing data directory"))
     (ensure-directories-exist
      (merge-pathnames "parent" (uiop:pathname-parent-directory-pathname *pgdata*)))
     (handler-case
@@ -289,10 +290,10 @@ leaves the separate data ownership lock to its owner."
       (error "data directory has wrong type, ownership or permissions; require 0700 or 0750")))
   (truename *pgdata*))
 
-(defun postmaster-open-data-lock ()
+(defun postmaster-open-data-lock (&key existing-only)
   "Open only a dedicated regular ownership inode, never a link or special file."
   (let* ((fd (sb-posix:open (namestring (postmaster-data-path ".pg_lisp.lock"))
-                            (logior sb-posix:o-rdwr sb-posix:o-creat
+                            (logior sb-posix:o-rdwr (if existing-only 0 sb-posix:o-creat)
                                     sb-posix:o-nonblock sb-posix:o-nofollow +postmaster-o-cloexec+) #o600))
          (success nil))
     (unwind-protect
@@ -303,13 +304,14 @@ leaves the separate data ownership lock to its owner."
              (error "data ownership lock is not a dedicated regular file"))
            ;; Keep an already-private lock's metadata unchanged on a failed startup.
            (unless (= #o600 (logand #o7777 (sb-posix:stat-mode stat)))
+             (when existing-only (error "offline recovery requires a private data lock"))
              (sb-posix:fchmod fd #o600))
            (prog1 (sb-sys:make-fd-stream fd :input t :output t
                                             :element-type '(unsigned-byte 8) :auto-close t)
              (setf success t)))
       (unless success (sb-posix:close fd)))))
 
-(defun postmaster-own-data-directory (host port &key startup-before-pid startup-check startup-reconcile startup-observer)
+(defun postmaster-own-data-directory (host port &key startup-before-pid startup-check startup-reconcile startup-observer existing-only)
   "Own PGDATA before any database storage initialization or recovery mutation.
 Call read-only STARTUP-BEFORE-PID with the flock held before the startup
 timestamp or PID metadata changes.  A failure leaves stale PID evidence intact.
@@ -326,14 +328,14 @@ remove the owned PID, and close the lock even if PID cleanup fails."
   (when *postmaster-data-lock* (error "this process already owns a data directory"))
   (when (and startup-observer (or startup-before-pid startup-check))
     (error "startup observer cannot be combined with legacy PID checks"))
-  (postmaster-check-data-directory)
+  (postmaster-check-data-directory :existing-only existing-only)
   (let ((lock nil) (success nil))
     (unwind-protect
          (progn
            (setf *postmaster-pid-directory* (truename *pgdata*)
                  *postmaster-pid-host* "" *postmaster-pid-port* port
                  *postmaster-start-time* (postmaster-process-start-time)
-                 lock (postmaster-open-data-lock))
+                 lock (postmaster-open-data-lock :existing-only existing-only))
            (unless (zerop (physical-store-flock (sb-sys:fd-stream-fd lock) 6))
              (error "data directory is already owned by another pg-lisp process"))
            (if startup-observer

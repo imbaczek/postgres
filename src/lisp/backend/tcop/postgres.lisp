@@ -960,10 +960,68 @@ Then check the cached handles and workers under startup exclusion."
     (error "startup configuration requires storage and workers to remain uninitialized"))
   (values))
 
+(defun offline-primary-recovery-options (arguments)
+  (unless (and (cddr arguments)
+               (equal (first arguments) "-D")
+               (plusp (length (second arguments)))
+               (equal (car (last arguments)) "template1"))
+    (error "offline recovery expects --single -D DATADIR [OPTIONS] template1"))
+  (let ((options (list "-D" (second arguments))))
+    (loop for (flag setting) on (butlast (cddr arguments)) by #'cddr
+          do (unless (and (equal flag "-c") setting)
+               (error "offline recovery options must use -c NAME=VALUE"))
+             (cond
+               ((uiop:string-prefix-p "archive_mode=" setting)
+                (unless (equal setting "archive_mode=on")
+                  (error "offline recovery requires archive_mode=on")))
+               ((uiop:string-prefix-p "archive_command=" setting)
+                (unless (equal setting "archive_command=false")
+                  (error "offline recovery requires archive_command=false")))
+               (t (setf options (nconc options (list flag setting))))))
+    options))
+
+(defun offline-primary-recovery-check-before-pid ()
+  (when (or (physical-recovery-read-signal-mode)
+            (physical-adoption-path-present-p (physical-recovery-control-path)))
+    (error "offline primary recovery requires no standby or promotion recovery state"))
+  (logical-slot-copy-preflight-startup)
+  (physical-reseed-follow-check-ordinary-startup)
+  (let ((state (getf (native-control-read *pgdata*) :db-state)))
+    (unless (member state (list +db-shutdowned+ +db-shutdowning+
+                                +db-in-crash-recovery+ +db-in-production+))
+      (error "offline recovery requires an initialized ordinary primary"))))
+
+(defun run-offline-primary-recovery (arguments)
+  (unless (eq (read-char *standard-input* nil :eof) :eof)
+    (error "offline primary recovery requires empty input"))
+  (multiple-value-bind (host port pgdata control-port control-socket
+                        swank-port swank-bind-address temp-file-limit-bytes
+                        sort-arena-limit-bytes max-slot-wal-keep-bytes startup-settings startup-native startup-overrides)
+      (parse-args (offline-primary-recovery-options arguments))
+    (declare (ignore control-port control-socket swank-port swank-bind-address
+                     temp-file-limit-bytes sort-arena-limit-bytes))
+    (let ((*max-slot-wal-keep-bytes* max-slot-wal-keep-bytes)
+          (*wal-shutdown-defer-recycling* t)
+          (*shutdown-finalizing-p* t))
+      (startup-install-initial-settings startup-settings startup-native startup-overrides)
+      (startup-install-resource-capacity startup-settings)
+      (call-with-physical-reseed-offline-startup
+       (directory-pathname pgdata)
+       (lambda ()
+         (postmaster-own-data-directory
+          host port :existing-only t :startup-before-pid #'offline-primary-recovery-check-before-pid)
+         (initialize-primary-storage)
+         (physical-export-origin-load)
+         (prepare-primary-shutdown)))))
+  (sb-ext:exit :code 0))
+
 (defun main ()
   ;; Preflight policy before ownership, then initialize it after owning PGDATA.
   ;; Install resource limits before recovery, and check or report them before listen.
-  (startup-handle-meta-request (cdr sb-ext:*posix-argv*))
+  (let ((arguments (cdr sb-ext:*posix-argv*)))
+    (when (equal (first arguments) "--single")
+      (run-offline-primary-recovery (rest arguments)))
+    (startup-handle-meta-request arguments))
   (multiple-value-bind (host port pgdata control-port control-socket
                         swank-port swank-bind-address temp-file-limit-bytes
                         sort-arena-limit-bytes max-slot-wal-keep-bytes startup-settings startup-native startup-overrides)

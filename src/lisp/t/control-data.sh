@@ -6,7 +6,7 @@ SBCL=${SBCL:-sbcl}
 PSQL=${PSQL:-psql}
 PATRONI_PYTHON=${PATRONI_PYTHON:-/tmp/pg-patroni-4.1.5-venv/bin/python3}
 PORT=${PORT:-6586}
-TMP=$(mktemp -d "${TMPDIR:-/tmp}/pg-control-data.XXXXXX")
+TMP=$(mktemp -d "${TMPDIR:-/tmp}/pgcd.XXXXXX")
 SERVER= CLIENTS=
 cleanup() {
     status=$?
@@ -35,6 +35,10 @@ ready() { test_wait_owned_sql_server "$SERVER" "$PORT" "$PSQL"; }
 stop() { kill -"$1" "$SERVER"; wait "$SERVER"; SERVER=; }
 crash() { kill -KILL "$SERVER"; wait "$SERVER" 2>/dev/null || :; SERVER=; }
 inspect() { "$PATRONI_PYTHON" "$BASE/t/interop/control-data-inspect.py" "$CASE/data" "$1"; }
+recover() {
+    "$BASE/pg-lisp.sh" --single -D "$1" -c archive_mode=on \
+        -c archive_command=false template1 </dev/null
+}
 clone() {
     CASE=$TMP/$1
     mkdir -m 700 "$CASE"
@@ -73,12 +77,37 @@ for mode in TERM INT QUIT KILL; do
     if [ "$mode" != TERM ]; then clients; fi
     sql 'INSERT INTO lifecycle VALUES (4)'
     sql CHECKPOINT
+    if [ "$mode" = KILL ]; then
+        cp "$CASE/data/postmaster.pid" "$CASE/live.pid"
+        if recover "$CASE/data" >"$CASE/live-offline-recovery.log" 2>&1; then
+            echo 'control-data: offline recovery accepted a live target' >&2
+            exit 1
+        fi
+        cmp "$CASE/live.pid" "$CASE/data/postmaster.pid"
+        test "$(sql 'SELECT count(*) FROM lifecycle')" = 3
+    fi
     if [ "$mode" = KILL ]; then crash; else stop "$mode"; fi
     if [ -n "$CLIENTS" ]; then end_clients; fi
     case "$mode" in
         TERM|INT) inspect 'shut down' ;;
         *) inspect 'in production' ;;
     esac
+    if [ "$mode" = KILL ]; then
+        test -f "$CASE/data/postmaster.pid"
+        if recover "$CASE/missing/data" >"$CASE/missing-offline-recovery.log" 2>&1; then exit 1; fi
+        test ! -e "$CASE/missing"
+        mkdir -m 700 "$CASE/uninitialized"
+        if recover "$CASE/uninitialized" >"$CASE/uninitialized-offline-recovery.log" 2>&1; then exit 1; fi
+        test ! -e "$CASE/uninitialized/.pg_lisp.lock"
+        printf 'unfinished recovery\n' >"$CASE/data/physical-recovery.control"
+        if recover "$CASE/data" >"$CASE/pending-offline-recovery.log" 2>&1; then exit 1; fi
+        cmp "$CASE/live.pid" "$CASE/data/postmaster.pid"
+        rm "$CASE/data/physical-recovery.control"
+        recover "$CASE/data" >"$CASE/offline-recovery.log" 2>&1
+        test ! -e "$CASE/data/postmaster.pid"
+        inspect 'shut down'
+        echo 'control-data: offline primary crash recovery PASS'
+    fi
     start; ready
     test "$(sql 'SELECT count(*) FROM lifecycle')" = 3
     test "$(sql 'SELECT count(*) FROM lifecycle WHERE id=2')" = 0
