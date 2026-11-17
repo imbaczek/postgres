@@ -156,6 +156,8 @@
 (declaim (ftype function physical-rewind-capture-image))
 
 (defun physical-rewind-discover-history (owner client)
+  "Check the source origin and child history against the held clean target.
+Return the origin, fork, and current source timeline."
   (let* ((target (physical-rewind-inspect-primary owner))
          (system (getf target :system-id))
          (timeline (getf target :timeline)))
@@ -188,6 +190,8 @@ publication verify that historical export identity against the source."
    owner directory request profile :helper helper :rewind-origin origin))
 
 (defun physical-rewind-start-discovered-remote (owner directory profile &key helper)
+  "Discover the source origin and start a journaled remote rewind capture.
+Bind capture to the accepted source observed during discovery."
   (physical-reseed-check-owner owner)
   (multiple-value-bind (origin request source resolved)
       (call-with-physical-reseed-discovery

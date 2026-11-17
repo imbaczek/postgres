@@ -5,6 +5,7 @@
 (in-package #:pg)
 
 (defun native-rewind-options (arguments)
+  "Parse the supported target, source, and offline finish options."
   (let ((target nil) (source nil) (finish nil))
     (labels ((accept (key value)
                (unless (and value (plusp (length value)))
@@ -41,6 +42,8 @@
     (uiop:ensure-directory-pathname directory)))
 
 (defun native-rewind-install (target profile helper)
+  "Capture and install a source image while holding the required target owners.
+Publish the install journal before advancing the installation steps."
   (let ((workspace nil))
     (call-with-physical-reseed-owner
      target
@@ -69,6 +72,8 @@
     workspace))
 
 (defun native-rewind-follow (target workspace helper)
+  "Select and prove a successor, activate it, and archive the install and attempt journals.
+Finalize the stopped streaming standby after retirement."
   (let ((name (string-downcase (format nil "rewind_~32,'0x" (logical-slot-new-generation)))))
     (physical-rewind-select-installed-follow target name)
     (let ((*pgdata* target))
@@ -85,6 +90,7 @@
     (physical-reseed-follow-finalize-offline target 5432)))
 
 (defun native-rewind-main (arguments)
+  "Run native rewind or finish configuration handoff after terminal retirement."
   (handler-case
       (multiple-value-bind (target conninfo finish) (native-rewind-options arguments)
         (if finish

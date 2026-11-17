@@ -1086,6 +1086,8 @@
               (physical-reseed-follow-activation-publish context candidate check))))))))
 
 (defun physical-reseed-follow-configure-and-activate (target workspace time &key helper)
+  "Configure and activate a proved follow selection under the configuration owner.
+Settle the source handoff before publishing activation."
   (let ((*pgdata* target))
     (call-with-physical-reseed-follow-configuration-owner
      target

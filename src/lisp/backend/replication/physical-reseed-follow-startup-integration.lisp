@@ -63,6 +63,8 @@
        (physical-reseed-follow-check-ordinary-startup)))))
 
 (defun call-with-physical-reseed-offline-startup (target function)
+  "Call FUNCTION with fresh startup ownership state for TARGET.
+Remove any owned PID file and release the data directory lock on exit."
   (when (or *postmaster-data-lock* *postmaster-pid-stream*)
     (error "offline reseed startup requires an unowned process"))
   (let ((*pgdata* target)
@@ -80,6 +82,7 @@
         (when *postmaster-data-lock* (close *postmaster-data-lock*))))))
 
 (defun physical-reseed-follow-retire-offline (target port)
+  "Own the stopped target and archive the install and attempt journals in order."
   (call-with-physical-reseed-offline-startup
    target
    (lambda ()
@@ -102,6 +105,8 @@
              (physical-reseed-follow-retirement-publish-terminal owner)))))))))
 
 (defun physical-reseed-follow-check-offline-finalization (&key before-pid)
+  "Check that ordinary startup and an active installed streaming standby are allowed.
+After PID ownership also check the local follow store and startup admission."
   (physical-reseed-follow-check-ordinary-startup)
   (multiple-value-bind (base control) (physical-recovery-verify-base-state)
     (let ((*wal-segment-namespace* (getf base :wal-namespace))
@@ -128,6 +133,8 @@
           (physical-follow-managed-marker-p base))))))
 
 (defun physical-reseed-follow-finalize-offline (target port)
+  "Check the installed streaming standby under startup ownership.
+Ensure postgresql.conf exists and sync the target directory."
   (call-with-physical-reseed-offline-startup
    target
    (lambda ()
