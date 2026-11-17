@@ -83,7 +83,7 @@
         (sb-posix:close source-fd)))))
 
 (defun native-patroni-rewind-check-reuse (owner manifest reused)
-  (let* ((target (physical-adoption-inspect-primary owner))
+  (let* ((target (physical-rewind-inspect-primary owner))
          (database (gethash "postgres" (catalog-databases (getf target :catalog))))
          (tables (database-tables database))
          (stable (gethash "rewind_reuse_payload" tables))
@@ -157,3 +157,45 @@
                 (if complete
                     (error condition)
                     (format *error-output* "~&Rewind fixture lease cleanup failed: ~a~%" condition))))))))))
+
+(declaim (ftype function native-cancellation-publish-selection))
+
+(defun native-patroni-rewind-capture (target origin stage port helper)
+  (multiple-value-bind (manifest digest) (recovery-read-manifest origin)
+    (let ((identity (list (getf manifest :system-id) (getf manifest :timeline)
+                          (getf manifest :end) digest))
+          (request (list :version 1 :name "reseed_20202020202020202020202020202020"
+                         :token (make-string 64 :initial-element #\b)
+                         :system-id (getf manifest :system-id)
+                         :cluster-identity (getf manifest :cluster-identity) :timeline 2))
+          (profile (make-physical-libpq-profile
+                    (format nil "host=127.0.0.1 port=~d user=postgres dbname=postgres" port)
+                    :mode :physical :fallback "native-target-follow")))
+      (call-with-physical-reseed-owner
+       target
+       (lambda (owner)
+         (multiple-value-bind (capture record reused)
+             (physical-rewind-start-remote owner stage request profile identity :helper helper)
+           (declare (ignore record))
+           (native-patroni-rewind-check-reuse owner capture reused))))
+      (write-line "REWIND-JOURNALED-CAPTURE PASS"))))
+
+(defun native-patroni-rewind-install (target incoming quarantine helper)
+  (call-with-physical-reseed-owner
+   target
+   (lambda (owner)
+     (assert (getf (physical-reseed-attempt-recover owner) :rewind-origin))
+     (physical-reseed-prepare-image owner incoming :helper helper)
+     (physical-reseed-publish-install owner incoming quarantine :helper helper)))
+  (let ((plan (getf (physical-reseed-install-initial-arguments target) :plan)))
+    (call-with-physical-reseed-install-owner
+     target
+     (lambda (owner)
+       (loop repeat (physical-reseed-install-last-step plan)
+             do (physical-reseed-install-advance owner :helper helper)))))
+  (call-with-physical-reseed-follow-owner
+   target
+   (lambda (owner)
+     (physical-reseed-follow-publish-intent owner (physical-reseed-follow-initial-record owner))))
+  (native-cancellation-publish-selection target "native_target_follow_rewind")
+  (write-line "REWIND-JOURNALED-INSTALL PASS"))

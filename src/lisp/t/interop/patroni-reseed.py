@@ -382,7 +382,7 @@ class RewindSharedHistoryAcceptance(FormerPrimaryAcceptance):
         self.result["former_primary"]["retained_origin"] = dict(
             base=base, fork=fork, manifest_digest=manifest_digest, fork_digest=digest)
 
-    def configured(self):
+    def create_rewind_target(self):
         follow.query(self.server.port, "CREATE TABLE patroni_reseed_probe(id integer)")
         follow.query(self.server.port, "INSERT INTO patroni_reseed_probe VALUES(1)")
         follow.query(self.server.port, "CREATE TABLE rewind_shared_marker(id integer)")
@@ -396,6 +396,10 @@ class RewindSharedHistoryAcceptance(FormerPrimaryAcceptance):
         target = self.server.root / "rewind-target"
         self.initialize_target(target)
         follow.query(self.server.port, "INSERT INTO patroni_reseed_probe VALUES(2001)")
+        return target
+
+    def configured(self):
+        target = self.create_rewind_target()
         source = self.capture("rewind-source")
         config = source / "postgresql.conf"
         assert config.read_bytes() == b""
@@ -419,6 +423,55 @@ class RewindSharedHistoryAcceptance(FormerPrimaryAcceptance):
                       f"{self.server.port} {helper} {fork} {digest})"])
         assert b"REWIND-LEASED-ORIGIN PASS" in output
         assert all(preserved_tree(path) == inventory for path, inventory in before.items())
+        self.result["checks"].append(self.label)
+
+
+class RewindInstallAcceptance(RewindSharedHistoryAcceptance):
+    label = "rewind-install"
+
+    def configured(self):
+        target = self.create_rewind_target()
+        stage, incoming, quarantine, workspace = [
+            self.server.root / name for name in ("rw-stage", "rw-incoming", "rw-old", "rw-follow")]
+        for directory in (stage, incoming, quarantine, workspace):
+            directory.mkdir(mode=0o700)
+        capture_paths = " ".join("#P" + cancellation.lisp_string(str(path) + "/")
+                                 for path in (target, self.origin, stage))
+        install_paths = " ".join("#P" + cancellation.lisp_string(str(path) + "/")
+                                 for path in (target, incoming, quarantine))
+        helper = cancellation.lisp_string(self.helper)
+        _, output = self.process("rewind-capture", self.native_arguments() + [
+            "--eval", f"(pg::native-patroni-rewind-capture {capture_paths} {self.server.port} {helper})"])
+        assert b"REWIND-JOURNALED-CAPTURE PASS" in output
+        _, output = self.process("rewind-install", self.native_arguments() + [
+            "--load", str(HERE / "reseed-cancellation-native.lisp"),
+            "--eval", f"(pg::native-patroni-rewind-install {install_paths} {helper})"],
+            timeout=600)
+        assert b"REWIND-JOURNALED-INSTALL PASS" in output
+        old = preserved_tree(quarantine)
+        assert (quarantine / "physical-reseed.install").read_bytes() == b"offline reseed auxiliary directory"
+        del old["physical-reseed.install"]
+        assert old == self.old_tree
+        self.run("prove", target)
+        with socket.socket() as reservation:
+            reservation.bind(("127.0.0.1", 0))
+            port = reservation.getsockname()[1]
+        self.prepare_active(target, workspace, port)
+        node = Postgresql(follow.configuration(target, port, self.server.root), Null())
+        member = Member(0, "source", None,
+                        {"conn_url": f"postgres://127.0.0.1:{self.server.port}/postgres"})
+        try:
+            assert node.follow(member, timeout=90) is True
+            self.check_standby(port, [(1,), (2001,)])
+            follow.query(self.server.port, "INSERT INTO patroni_reseed_probe VALUES(2002)")
+            follow.wait_for(lambda: follow.query(port, "SELECT id FROM patroni_reseed_probe ORDER BY id")
+                            == [(1,), (2001,), (2002,)])
+            before = node.is_running().pid
+            assert node.restart(timeout=90) is True
+            assert node.is_running().pid != before
+            self.check_standby(port, [(1,), (2001,), (2002,)])
+        finally:
+            self.stop_target(node)
         self.result["checks"].append(self.label)
 
 
@@ -515,6 +568,7 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     cases = {"synthetic": Acceptance, "former-primary": FormerPrimaryAcceptance,
              "rewind-shared-history": RewindSharedHistoryAcceptance,
+             "rewind-install": RewindInstallAcceptance,
              "manual-failover": ManualFailoverAcceptance}
     parser.add_argument("--case", choices=cases, default="synthetic")
     arguments = parser.parse_args()
