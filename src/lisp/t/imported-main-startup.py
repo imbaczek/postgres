@@ -109,6 +109,9 @@ def main():
         wire = os.environ.get('PG_NATIVE_MAIN_WIRE')
         if wire not in (None, '1') or (wire and case != 'happy'):
             raise ValueError('Wire qualification requires happy case and explicit value 1')
+        child_ack = os.environ.get('PG_NATIVE_MAIN_CHILD_ACK')
+        if child_ack not in (None, '1') or (child_ack and (not wire or os.environ.get('PG_NATIVE_MAIN_RESTART') != '1')):
+            raise ValueError('Child ACK composition requires wire/restart modes and explicit value 1')
         restart = os.environ.get('PG_NATIVE_MAIN_RESTART')
         if restart not in (None, '1') or (restart and case != 'happy'):
             raise ValueError('Restart qualification requires happy case and explicit value 1')
@@ -160,6 +163,8 @@ def main():
                     follow_before = writer.tree_image(follow) if follow.exists() else None
                     expected_names = sorted(path.name for path in (data / 'pg_replslot').iterdir()
                                             if path.is_dir() and not path.name.startswith('.'))
+                    if child_ack and expected_names != ['alpha', 'beta']:
+                        raise ValueError('Child ACK composition requires the actual two-slot fixture')
                     result['expected_slots'] = expected_names
                     process = None
                     previous = {}
@@ -294,6 +299,10 @@ def main():
                                         expected_sql += ['41'] + (['42'] if boot == 2 else [])
                                         if boot == 1:
                                             sql += ' INSERT INTO imported_restart_witness VALUES (42);'
+                                    if child_ack and boot > 0:
+                                        ack = result['wire']['child_ack']
+                                        sql += " SELECT confirmed_flush_lsn FROM pg_replication_slots WHERE slot_name='alpha'; SELECT n FROM imported_ack_rows ORDER BY n;"
+                                        expected_sql += [ack['confirmed_lsn'], *map(str, ack['rows'])]
                                     query = subprocess.run([str(psql), '-X', '-q', '-A', '-t', '-h', '127.0.0.1',
                                                             '-p', str(port), '-U', 'postgres', '-d', 'postgres',
                                                             '-v', 'ON_ERROR_STOP=1', '-c', sql],
@@ -308,7 +317,7 @@ def main():
                                         result['wire'] = wire_tests.exercise(
                                             port, data, job, expected_names,
                                             lambda form, marker: inspect_control(
-                                                control / 'pg.sock', process.pid, form, marker))
+                                                control / 'pg.sock', process.pid, form, marker), source=source)
                                     process.send_signal(signal.SIGTERM)
                                     result['exit_code'] = process.wait(timeout=30)
                                     if result['exit_code']:

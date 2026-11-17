@@ -10,6 +10,8 @@ import re
 import random
 import struct
 import time
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 from interop.parking_wire import RawConnection, WireError
 
@@ -121,7 +123,7 @@ def check_protections(control):
             ':wire-protection-ok)\n(quit)\n', ':WIRE-PROTECTION-OK')
 
 
-def exercise(port, data, job, imported, control):
+def exercise(port, data, job, imported, control, source=None):
     """Check streaming, feedback and temporary-slot cleanup on this server."""
     began = time.monotonic()
     control('(progn (defparameter pg::*imported-wire-protections* nil) '
@@ -204,9 +206,9 @@ def exercise(port, data, job, imported, control):
                     assert start_lsn == received and received + len(raw) <= durable
                     segment, offset = divmod(received, SIZE)
                     path = data / 'pg_wal' / f'{timeline:08X}{segment // 256:08X}{segment % 256:08X}.wal'
-                    with path.open('rb') as source:
-                        source.seek(offset)
-                        assert source.read(len(raw)) == raw
+                    with path.open('rb') as source_stream:
+                        source_stream.seek(offset)
+                        assert source_stream.read(len(raw)) == raw
                     assert raw and len(raw) <= 65536
                     sink.write(raw)
                     pending.extend(raw)
@@ -255,6 +257,48 @@ def exercise(port, data, job, imported, control):
             final_row = slot('wire_temp')
             assert final_row == [['t', 't', pid, lsn(completed)]], final_row
             events.append('fragmented committed transaction synced and acknowledged at complete-record boundaries')
+        child_ack = None
+        if os.environ.get('PG_NATIVE_MAIN_CHILD_ACK') == '1':
+            if imported != ['alpha', 'beta']:
+                raise ValueError('Child ACK composition requires the actual two-slot fixture')
+            import importlib.util
+            path = source / 't/imported-main-ack.py'
+            spec = importlib.util.spec_from_file_location('imported_main_ack', path)
+            helper = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(helper)
+            stopped = threading.Event()
+            peer_started = threading.Event()
+            peer_lock = threading.Lock()
+            packet_count = 0
+            def peer_progress():
+                with peer_lock:
+                    return packet_count
+            def keep_peer_alive():
+                nonlocal packet_count
+                packets = 0
+                while True:
+                    # The preceding frame is waiting for this report. New WAL
+                    # receives no additional durability credit.
+                    feedback(owner, completed, completed, base)
+                    frame(owner)
+                    packets += 1
+                    with peer_lock:
+                        packet_count = packets
+                    peer_started.set()
+                    if stopped.is_set():
+                        return packets
+            with ThreadPoolExecutor(max_workers=1) as peers:
+                peer = peers.submit(keep_peer_alive)
+                try:
+                    if not peer_started.wait(15):
+                        raise TimeoutError('Physical peer did not produce its first frame')
+                    child_ack = helper.exercise(witness, control, job, source, peer_progress)
+                finally:
+                    stopped.set()
+                    child_packets = peer.result(timeout=15)
+            assert child_packets > 1
+            child_ack['physical_peer_packets'] = child_packets
+
         finish(owner)
         check_protections(control)
         assert owner.query('SELECT 1') == [['1']]
@@ -293,7 +337,7 @@ def exercise(port, data, job, imported, control):
         events.append('checked bootstrap release succeeds after all sender claims end')
         assert witness.query("SELECT slot_name FROM pg_replication_slots WHERE slot_type='logical' ORDER BY slot_name") == [[name] for name in imported]
         control('(sb-thread:with-mutex (pg::*wal-lock*)\n          (assert (zerop (hash-table-count pg::*physical-source-senders*)))\n          (assert (not (gethash \"wire_proof\" pg::*physical-source-pins*)))\n          (assert (not (pg::slot-state-lstat (pg::physical-source-pin-path \"wire_proof\"))))\n          (maphash (lambda (key group) (declare (ignore key))\n                     (assert (pg::logical-slot-continuation-protection-call group :check)))\n                   pg::*logical-slot-continuation-protections*)\n          :wire-owners-clean)\n          (quit)\n', ':WIRE-OWNERS-CLEAN')
-        return dict(events=events,wall_seconds=time.monotonic()-began,
+        return dict(child_ack=child_ack,events=events,wall_seconds=time.monotonic()-began,
                     received_bytes=received-cursor,flushed_lsn=lsn(completed),
                     target_lsn=lsn(target),records=records,fragmented_frames=fragments,large_records=large_records,
                     largest_record_bytes=largest_record,max_frame_bytes=max_frame_bytes,
