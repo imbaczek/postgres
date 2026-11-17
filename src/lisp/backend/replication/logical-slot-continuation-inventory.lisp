@@ -39,6 +39,9 @@
               (list name (copy-list child-facts) (copy-list facts) bytes))))))
     (funcall check)))
 
+;; Read the complete inventory twice through independently opened rows and
+;; require the names, root facts and resulting ledgers to agree.  The supplied
+;; readers determine which entries and file contents are acceptable.
 (defun logical-slot-continuation-observe-inventory (directory guard read-names read-row)
   (unless (and (functionp guard) (functionp read-names) (functionp read-row))
     (error "continuation inventory requires a guard and observers"))
@@ -68,6 +71,8 @@
           (check)
           ledger)))))
 
+;; Adapt the shared observation to slot rows and retain the full raw ledger.
+;; The standard reader below still requires one decoded stable state per slot.
 (defun logical-slot-continuation-observe-slot-inventory (directory guard read-row)
   (let ((ledger (logical-slot-continuation-observe-inventory
                  directory guard #'logical-slot-continuation-slot-inventory-names read-row)))
