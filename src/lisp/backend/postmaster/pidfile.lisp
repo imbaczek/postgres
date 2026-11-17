@@ -301,6 +301,7 @@ leaves the separate data ownership lock to its owner."
                         (= (sb-posix:stat-uid stat) (sb-posix:geteuid))
                         (= (sb-posix:stat-nlink stat) 1))
              (error "data ownership lock is not a dedicated regular file"))
+           ;; Keep an already-private lock's metadata unchanged on a failed startup.
            (unless (= #o600 (logand #o7777 (sb-posix:stat-mode stat)))
              (sb-posix:fchmod fd #o600))
            (prog1 (sb-sys:make-fd-stream fd :input t :output t

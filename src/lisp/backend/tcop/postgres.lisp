@@ -932,7 +932,8 @@ Hold the drained admission gate and borrow the real postmaster ownership."
    (lambda (gate-owner)
      (call-with-postmaster-ownership
       (lambda (ownership)
-        ;; Check before the first storage mutation.
+        ;; Recheck imported evidence under ownership immediately before WAL
+        ;; mutation.  The normal typed slot loader runs before catalog startup.
         (check-primary-storage-startup-context gate-owner ownership)
         (when imported-startup
           (logical-slot-imported-startup-check-owned imported-startup))
@@ -1002,8 +1003,8 @@ Then check the cached handles and workers under startup exclusion."
       (physical-promotion-test-point :after-promotion-request-initialization)
       ;; Reject an unsupported SBCL before pending reconstruction can open storage.
       (call-with-query-sort-arena (lambda (arena) (declare (ignore arena))))
-      ;; Historical retirement authority is gone.  Continue with ordinary local
-      ;; startup checks before bootstrap and storage initialization.
+      ;; Check the selected startup policy again before bootstrap and storage.
+      ;; Imported startup uses its local evidence; ordinary startup checks retirement.
       (if imported
           (logical-slot-imported-startup-check-policy)
           (physical-reseed-follow-check-ordinary-startup))

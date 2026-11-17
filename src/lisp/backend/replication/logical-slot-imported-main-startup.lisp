@@ -1,8 +1,9 @@
 (in-package #:pg)
 
 (defun logical-slot-imported-startup-inert-follow-p (config)
-  ;; A checked, source-free config may remain as inert local metadata. It does
-  ;; not authorize following or remote cleanup on the imported primary.
+  ;; Parsed, source-free follow metadata may remain inert on this primary.
+  ;; It is not historically certified and authorizes no follow or remote cleanup.
+  ;; Leave passive unowned bootstrap debt in place without contacting its source.
   (let ((state (sixth config)))
     (and (physical-follow-no-source-p config)
          (or (physical-follow-cleanup-only-p config)
@@ -27,8 +28,8 @@
   t)
 
 (defun logical-slot-imported-startup-check-owned (expected)
-  ;; Reobserve under published ownership before any storage mutation. The sticky
-  ;; continuation fence prevents a later missing proof from selecting empty load.
+  ;; Reobserve under published ownership before storage mutation.  The sticky
+  ;; continuation fence prevents missing proof from selecting ordinary slot loading.
   (unless (and (eq :owned-pid (getf expected :phase)) (getf expected :inputs))
     (error "imported owned startup requires checked PID-boundary evidence"))
   (let ((expected (logical-slot-copy-clone-facts (getf expected :inputs))))
@@ -65,6 +66,8 @@
                    inputs)))))))))))
 
 (defun logical-slot-imported-own-startup (host port)
+  ;; Compare observations across real PID publication, then reconcile again
+  ;; under published ownership.  Return evidence for the pre-WAL recheck.
   (let ((before nil) (after nil))
     (logical-slot-imported-startup-check-policy)
     (postmaster-own-data-directory

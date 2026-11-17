@@ -320,6 +320,8 @@ command (idle) is ignored; the connection and its transaction state survive."
       (progn
         (when (and imported-primary (recovery-in-progress-p))
           (error "imported primary worker startup cannot enter recovery"))
+        ;; Imported primaries leave follow metadata passive.  Keep the ordinary
+        ;; default; the other starters retain their normal primary checks.
         (unless imported-primary
           (physical-follow-autostart)
           (physical-follow-controller-start-worker)
