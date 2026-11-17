@@ -18,6 +18,43 @@
                           :outcome :handed-off :successor successor)))
       (values record (list :phase :handoff-pending :successor successor :receipt nil) receipt))))
 
+(cl-spec:defproperty reseed-follow-settlement-successor-retains-checked-binding
+    ((selected boolean))
+  (:about pg::physical-reseed-follow-settlement-successor)
+  (:trials (:normal 80))
+  (multiple-value-bind (record pending receipt) (reseed-follow-settlement-fixture selected)
+    (declare (ignore receipt))
+    (let* ((before (pg::physical-adoption-attempt-value-copy record))
+           (expected (getf pending :successor))
+           (actual (pg::physical-reseed-follow-settlement-successor record)))
+      (and (equal actual expected)
+           (progn
+             (setf (char (getf actual :name) 0)
+                   (if (char= (char (getf actual :name) 0) #\x) #\y #\x))
+             (not (equal actual expected)))
+           (equal before record)))))
+
+(deftest generated-reseed-follow-settlement-successor-binding
+    (let ((data (cl-spec:result-data
+                 (cl-spec:run-property 'reseed-follow-settlement-successor-retains-checked-binding
+                                       :seed 142 :profile :normal))))
+      (ok (eq :passed (getf data :status)))))
+
+(deftest reseed-follow-settlement-public-boundaries-reject-malformed-core
+    (dolist (selected '(nil t))
+      (multiple-value-bind (record pending receipt) (reseed-follow-settlement-fixture selected)
+        (declare (ignore receipt))
+        (dolist (fault '(:version :generations :phase))
+          (let ((bad (pg::physical-adoption-attempt-value-copy record)))
+            (ecase fault
+              (:version (setf (getf bad :version) 0))
+              (:generations (setf (getf bad :generations) nil))
+              (:phase (setf (getf (first (getf bad :generations)) :phase) :preparing)))
+            (ok (signals (pg::physical-reseed-follow-settlement-successor bad) 'error))
+            (ok (signals (pg::physical-reseed-follow-settlement-copy pending bad) 'error))
+            (ok (signals (pg::physical-reseed-follow-copy
+                          (append bad (list :settlement pending))) 'error)))))))
+
 (deftest reseed-follow-settlement-validates-exact-terminal-receipts
     (dolist (selected '(nil t))
       (multiple-value-bind (record pending receipt) (reseed-follow-settlement-fixture selected)

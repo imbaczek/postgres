@@ -3,11 +3,10 @@
 ;;; Settlement journal validation and capacity checks for the target follow
 ;;; record.  This is a private format, not a PostgreSQL wire or disk format.
 
-;; Derive the successor from the only proved generation and its anchor digest.
-(defun physical-reseed-follow-settlement-successor (record)
-  (let* ((core (physical-reseed-follow-core-copy
-                (physical-reseed-follow-core-projection record)))
-         (generation (car (last (getf core :generations)))))
+;; CORE was copied and validated by this call's public boundary.  Reuse it
+;; only within that call; these structural facts grant no filesystem authority.
+(defun %physical-reseed-follow-settlement-successor (core)
+  (let ((generation (car (last (getf core :generations)))))
     (unless (and (= 1 (length (getf core :generations)))
                  (eq :proved (getf generation :phase)))
       (error "settlement requires one proved generation"))
@@ -16,6 +15,12 @@
            :anchor-digest (physical-follow-anchor-digest
                            (physical-reseed-follow-generation-anchor generation)))
      (getf (getf core :attempt) :request))))
+
+;; Derive the successor from the only proved generation and its anchor digest.
+(defun physical-reseed-follow-settlement-successor (record)
+  (%physical-reseed-follow-settlement-successor
+   (physical-reseed-follow-core-copy
+    (physical-reseed-follow-core-projection record))))
 
 ;; Reconstruct the base bound to a closed source receipt.
 (defun physical-reseed-follow-settlement-base (record)
@@ -29,12 +34,12 @@
 (defun %physical-reseed-follow-settlement-copy (value record)
   ;; RECORD is a locally validated canonical predecessor through configuration.
   ;; This avoids repeating the public wrapper's full-prefix validation.
-  ;; Successor derivation still rechecks the canonical core.
+  ;; Successor derivation uses the same freshly checked core.
   (physical-follow-check-plist value '(:phase :successor :receipt))
   (let* ((core (physical-reseed-follow-core-projection record))
          (configuration (getf record :configuration))
          (phase (getf value :phase))
-         (successor (physical-reseed-follow-settlement-successor core))
+         (successor (%physical-reseed-follow-settlement-successor core))
          (submitted (physical-backup-lease-successor-copy
                      (getf value :successor) (getf (getf core :attempt) :request)))
          (receipt (when (getf value :receipt)
