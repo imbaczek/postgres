@@ -39,9 +39,10 @@
                         (equal identity (physical-backup-lease-file-identity
                                          (sb-posix:lstat (namestring path)))))
              (error "rewind stage seal changed while reading"))
-           (physical-backup-lease-decode-literal
-            "PGREWINDSTAGE1" bytes +physical-backup-lease-maximum-bytes+
-            #'physical-rewind-stage-seal-copy))
+           (values (physical-backup-lease-decode-literal
+                    "PGREWINDSTAGE1" bytes +physical-backup-lease-maximum-bytes+
+                    #'physical-rewind-stage-seal-copy)
+                   (physical-store-update-digest #xCBF29CE484222325 bytes)))
       (close stream))))
 
 (defun physical-rewind-write-stage-seal (directory request base entries)
@@ -55,11 +56,14 @@
      path (merge-pathnames "rewind.tmp" directory) bytes :directory directory
      :check-readback (lambda ()
                        (unless (equal seal (physical-rewind-read-stage-seal path))
-                         (error "rewind stage seal differs from publication"))))))
+                         (error "rewind stage seal differs from publication"))))
+    (physical-store-update-digest #xCBF29CE484222325 bytes)))
 
-(defun physical-rewind-stage-sealed-entries (directory request base manifest)
-  (let ((seal (physical-rewind-read-stage-seal (merge-pathnames "rewind.seal" directory))))
-    (unless (and (equal request (getf seal :request)) (equal base (getf seal :base)))
+(defun physical-rewind-stage-sealed-entries (directory request base manifest seal-digest)
+  (multiple-value-bind (seal actual)
+      (physical-rewind-read-stage-seal (merge-pathnames "rewind.seal" directory))
+    (unless (and (eql seal-digest actual)
+                 (equal request (getf seal :request)) (equal base (getf seal :base)))
       (error "rewind stage seal differs from the lease"))
     (append (getf seal :metadata) (getf manifest :files))))
 
@@ -83,7 +87,7 @@
 ;; Recheck the owner, source context, and exact retained pin under write and WAL
 ;; exclusion.  Install the verified origin and publish READY under the same
 ;; WAL publication fence, so failure cannot expose an unsafe memory state.
-(defun physical-backup-lease-publish-capture (owner reservation origin manifest digest)
+(defun physical-backup-lease-publish-capture (owner reservation origin manifest digest seal-digest)
   (with-live-operation
     (with-write-lock
       (with-wal-publication-fence (begin-publication)
@@ -91,8 +95,9 @@
                (request (getf record :request))
                (next (copy-list record)))
           (setf (getf next :phase) :ready
-                (getf next :base) (physical-backup-lease-captured-base manifest digest)
-                next (physical-backup-lease-transition record next))
+                (getf next :base) (physical-backup-lease-captured-base manifest digest))
+          (when seal-digest (setf (getf next :rewind-seal-digest) seal-digest))
+          (setf next (physical-backup-lease-transition record next))
           (multiple-value-bind (pin disk) (physical-source-retirement-pins (getf request :name))
             (declare (ignore disk))
             (unless (and pin (not (physical-source-pin-lost-p pin)))
@@ -133,6 +138,7 @@
                      (physical-export-origin-verify-backup target manifest reservation)
                    (physical-backup-lease-test-point :after-capture-verification
                                                      (physical-backup-lease-status request))
-                   (when before-ready (funcall before-ready target actual digest))
-                   (physical-backup-lease-publish-capture owner reservation origin actual digest))
+                   (let ((seal-digest (when before-ready (funcall before-ready target actual digest))))
+                     (physical-backup-lease-publish-capture owner reservation origin actual digest
+                                                            seal-digest)))
                  manifest))))))))))

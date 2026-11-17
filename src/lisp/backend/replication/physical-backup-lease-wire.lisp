@@ -359,10 +359,14 @@ Each unique entry contains a relation name, size and digest."
                                       (physical-rewind-write-stage-seal directory request base entries))))
                  (unless claimed
                    (ereport "55000" "backup lease already exists; use BACKUP_LEASE_STATUS or BACKUP_LEASE_ABORT"))
-                 (when (and base
-                            (not (equal entries (physical-rewind-stage-sealed-entries
-                                                 stage request base manifest))))
-                   (error "rewind stage seal differs from the verified capture"))
+                 (when base
+                   (let ((ready (physical-backup-lease-status request)))
+                     (unless (and (eq :ready (getf ready :phase))
+                                  (equal base (getf ready :base))
+                                  (equal entries (physical-rewind-stage-sealed-entries
+                                                  stage request base manifest
+                                                  (getf ready :rewind-seal-digest))))
+                       (error "rewind stage seal differs from the verified capture"))))
                  (values manifest entries))))
            :reuse (when offers
                     (lambda (entry)

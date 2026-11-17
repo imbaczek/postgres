@@ -14,6 +14,22 @@
                 (list :checkpoint-start 32 :base 152 :manifest-digest 991))
         :outcome nil :successor nil))
 
+(deftest backup-lease-rewind-seal-digest-is-published-once
+    (let* ((capturing (backup-lease-test-record :capturing))
+           (legacy (backup-lease-test-record :ready))
+           (ready (append legacy '(:rewind-seal-digest 1234)))
+           (interrupted (copy-list ready)))
+      (ok (equal legacy (pg::physical-backup-lease-decode (pg::physical-backup-lease-image legacy))))
+      (ok (equal ready (pg::physical-backup-lease-transition capturing ready)))
+      (ok (equal ready (pg::physical-backup-lease-decode (pg::physical-backup-lease-image ready))))
+      (setf (getf interrupted :phase) :interrupted)
+      (ok (equal interrupted (pg::physical-backup-lease-transition ready interrupted)))
+      (ok (signals (pg::physical-backup-lease-transition legacy interrupted) 'error))
+      (incf (getf interrupted :rewind-seal-digest))
+      (ok (signals (pg::physical-backup-lease-transition ready interrupted) 'error))
+      (remf interrupted :rewind-seal-digest)
+      (ok (signals (pg::physical-backup-lease-transition ready interrupted) 'error))))
+
 (cl-spec:defproperty backup-lease-envelope-preserves-base-and-token
     ((digest (range integer 0 18446744073709551615))
      (nibble (range integer 0 15)))
