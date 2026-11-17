@@ -55,6 +55,10 @@
             (:include physical-image-context)
             (:constructor %make-physical-image-read-context)))
 
+(defstruct (physical-image-primary-read-context
+            (:include physical-image-read-context)
+            (:constructor %make-physical-image-primary-read-context)))
+
 (defvar *physical-image-context* nil)
 
 (defvar *physical-image-test-hook* nil)
@@ -85,7 +89,9 @@
   ;; Duplicate the borrowed root and bind a private owner to this exact context.
   ;; On exit drain its descriptors once.  Report the first ordinary close error
   ;; only after a normal body return; preserve ordinary body errors and throws.
-  (let ((context (if read-only (%make-physical-image-read-context) (%make-physical-image-context)))
+  (let ((context (cond ((eq read-only :primary) (%make-physical-image-primary-read-context))
+                       (read-only (%make-physical-image-read-context))
+                       (t (%make-physical-image-context))))
         (root nil) (path nil) (children nil) (active t) (complete nil))
     (labels ((check ()
                (unless (and active
@@ -161,11 +167,12 @@
 (defun physical-image-fd-path (fd)
   (pathname (format nil "/proc/self/fd/~d/" fd)))
 
-(defun physical-image-check-directory (fd &optional device)
+(defun physical-image-check-directory (fd &optional device primary-permissions)
   (let ((stat (sb-posix:fstat fd)))
     (unless (and (sb-posix:s-isdir (sb-posix:stat-mode stat))
                  (= (sb-posix:geteuid) (sb-posix:stat-uid stat))
-                 (= #o700 (logand #o7777 (sb-posix:stat-mode stat)))
+                 (member (logand #o7777 (sb-posix:stat-mode stat))
+                         (if primary-permissions '(#o700 #o750 #o755) '(#o700)))
                  (or (null device) (= device (sb-posix:stat-dev stat))))
       (error "physical image directory is not private and owned"))
     stat))
@@ -195,7 +202,8 @@
                        (logior sb-posix:o-rdonly sb-posix:o-directory
                                sb-posix:o-nofollow +postmaster-o-cloexec+) 0))
              (when (minusp fd) (setf fd nil) (error "cannot open physical image child directory"))
-             (physical-image-check-directory fd (sb-posix:stat-dev (sb-posix:fstat root)))
+             (physical-image-check-directory fd (sb-posix:stat-dev (sb-posix:fstat root))
+                                             (physical-image-primary-read-context-p context))
              (unless (or existing (null (directory-entry-names (physical-image-fd-path fd) :follow-symlinks t)))
                (error "new physical image child directory is not empty"))
              (physical-image-register-child context name fd)
@@ -240,7 +248,8 @@
   (let ((root (physical-image-context-root-fd context)))
     (physical-image-check-directory root)
     (dolist (entry (physical-image-context-children context))
-      (let* ((held (physical-image-check-directory (cdr entry)))
+      (let* ((held (physical-image-check-directory
+                    (cdr entry) nil (physical-image-primary-read-context-p context)))
              (path (merge-pathnames (car entry) (physical-image-fd-path root)))
              (named (sb-posix:lstat (namestring path))))
         (unless (and (sb-posix:s-isdir (sb-posix:stat-mode named))
@@ -329,7 +338,8 @@
 ;; The stream and descriptor belong to this call and close on every exit.
 (defun call-with-physical-image-input-at (parent leaf function
                                           &key (element-type 'character)
-                                            (if-does-not-exist :error) (external-format :default))
+                                            (if-does-not-exist :error) (external-format :default)
+                                            primary-permissions)
   (unless (and (stringp leaf) (plusp (length leaf))
                (not (find #\/ leaf)) (not (find (code-char 0) leaf))
                (not (member leaf '("." "..") :test #'equal)))
@@ -350,7 +360,8 @@
                (unless (and (sb-posix:s-isreg (sb-posix:stat-mode stat))
                             (= 1 (sb-posix:stat-nlink stat))
                             (= (sb-posix:geteuid) (sb-posix:stat-uid stat))
-                            (= #o600 (logand #o7777 (sb-posix:stat-mode stat))))
+                            (member (logand #o7777 (sb-posix:stat-mode stat))
+                                    (if primary-permissions '(#o600 #o640 #o644) '(#o600))))
                  (error "physical image input is not a private regular file")))
              (setf stream (sb-sys:make-fd-stream fd :input t :element-type element-type
                                                     :external-format external-format))
@@ -364,7 +375,10 @@
   (unless (eq direction :input) (error "physical image reader requires input direction"))
   (multiple-value-bind (parent leaf) (physical-image-input-parent *physical-image-context* path)
     (call-with-physical-image-input-at parent leaf function :element-type element-type
-                                                            :if-does-not-exist if-does-not-exist :external-format external-format)))
+                                                            :if-does-not-exist if-does-not-exist :external-format external-format
+                                                            :primary-permissions
+                                                            (physical-image-primary-read-context-p
+                                                             *physical-image-context*))))
 
 ;; Outside an image scope, retain ordinary pathname-based input behavior.
 

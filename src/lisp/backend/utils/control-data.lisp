@@ -327,6 +327,7 @@ and then the verified selected checkpoint for a standby. Never use local setting
                             (max 0 (- checkpoint +wal-header-size+)))
             :checkpoint-timeline (if snapshot (getf snapshot :timeline) checkpoint-id) :snapshot snapshot
             :resource-parameters resources
+            :page-checksum-version (unless control (getf metadata :page-checksum-version))
             :recovery-lsn recovery-lsn :recovery-timeline recovery-timeline))))
 
 (defun native-control-read (directory)
@@ -352,51 +353,89 @@ the base files are still checked against the manifest read from disk."
 Require complete pages with nonzero LSNs at or before END.
 An absent visibility fork is empty."
   (let ((path (relation-file-path relfilenode fork)))
-    (when (and (eq fork :visibility) (not (physical-adoption-path-present-p path)))
-      (return-from native-control-verified-checksum-fork 0))
-    (multiple-value-bind (stream size)
-        (open-bounded-regular-file path (* (ash 1 32) +blcksz+))
-      (unwind-protect
-           (multiple-value-bind (blocks extra) (floor size +blcksz+)
-             (unless (zerop extra) (error "incomplete relation page"))
-             (let ((page (make-array +blcksz+ :element-type '(unsigned-byte 8))))
-               (dotimes (block blocks)
-                 (unless (and (= (read-sequence page stream) +blcksz+)
-                              (<= 1 (page-u64 page +pd-lsn-off+) end)
-                              (wal-verify-page page relfilenode block fork))
-                   (error "native data page lacks a verified checksum"))))
-             blocks)
-        (close stream)))))
+    (call-with-physical-image-input
+     path
+     (lambda (stream)
+       (unless stream (return-from native-control-verified-checksum-fork 0))
+       (multiple-value-bind (blocks extra) (floor (physical-image-stream-length stream) +blcksz+)
+         (unless (and (zerop extra) (<= 0 blocks (ash 1 32)))
+           (error "invalid relation fork length"))
+         (let ((page (make-array +blcksz+ :element-type '(unsigned-byte 8))))
+           (dotimes (block blocks)
+             (unless (and (= (read-sequence page stream) +blcksz+)
+                          (<= 1 (page-u64 page +pd-lsn-off+) end)
+                          (wal-verify-page page relfilenode block fork))
+               (error "native data page lacks a verified checksum"))))
+         blocks))
+     :element-type '(unsigned-byte 8)
+     :if-does-not-exist (if (eq fork :visibility) nil :error))))
+
+(defun call-with-native-control-checksum-image (directory function)
+  (declare (notinline physical-adoption-owner-directory physical-adoption-owner-device
+                      physical-adoption-owner-inode))
+  (call-with-physical-adoption-owner
+   directory
+   (lambda (owner)
+     (let ((fd (physical-backup-open-directory (physical-adoption-owner-directory owner))))
+       (unwind-protect
+            (let ((root (sb-posix:fstat fd)))
+              (unless (and (= (physical-adoption-owner-device owner) (sb-posix:stat-dev root))
+                           (= (physical-adoption-owner-inode owner) (sb-posix:stat-ino root)))
+                (error "checksum scan opened a different data directory"))
+              (call-with-physical-image-directory
+               fd
+               (lambda (path)
+                 (let* ((*pgdata* path)
+                        (state (physical-inspect-clean-primary
+                                owner #'physical-adoption-check-owner :directory path))
+                        (*catalog* (getf state :catalog))
+                        (end (getf state :end))
+                        (pages (loop for relfilenode in (remove-duplicates (catalog-physical-relfilenodes))
+                                     sum (+ (native-control-verified-checksum-fork relfilenode :main end)
+                                            (native-control-verified-checksum-fork relfilenode :visibility end)))))
+                   (physical-adoption-check-owner owner)
+                   (physical-image-check-children *physical-image-context*)
+                   (unless (equalp (getf state :capture) (native-control-capture))
+                     (error "control changed during checksum inspection"))
+                   (funcall function state pages)))
+               :primary))
+         (sb-posix:close fd))))))
 
 (defun native-control-verify-page-checksums (directory facts)
   "Verify catalog relation main and visibility pages in a clean stopped primary.
 Hold the directory owner and recheck control after scanning. This reads every
 such page and returns true only when at least one page was verified."
-  (declare (notinline physical-adoption-owner-directory))
-  (call-with-physical-adoption-owner
+  (call-with-native-control-checksum-image
    directory
-   (lambda (owner)
-     (let* ((*pgdata* (physical-adoption-owner-directory owner))
-            (state (physical-adoption-inspect-primary owner))
-            (*catalog* (getf state :catalog))
-            (capture (getf state :capture))
-            (end (getf state :end)))
-       (unless (equalp facts (native-control-facts capture))
-         (error "control changed before checksum inspection"))
-       (let ((pages (loop for relfilenode in (remove-duplicates (catalog-physical-relfilenodes))
-                          sum (+ (native-control-verified-checksum-fork relfilenode :main end)
-                                 (native-control-verified-checksum-fork relfilenode :visibility end)))))
-         (physical-adoption-check-owner owner)
-         (unless (equalp capture (native-control-capture))
-           (error "control changed during checksum inspection"))
-         (plusp pages))))))
+   (lambda (state pages)
+     (unless (equalp facts (native-control-facts (getf state :capture)))
+       (error "control changed before checksum inspection"))
+     (plusp pages))))
+
+(defun native-control-enable-page-checksums (directory)
+  (call-with-native-control-checksum-image
+   directory
+   (lambda (state pages)
+     (unless (plusp pages)
+       (error "checksum qualification requires at least one verified relation page"))
+     (multiple-value-bind (checkpoint durable snapshot insertion checkpoint-timeline namespace metadata)
+         (wal-decode-control-line (bytes->string (first (getf state :capture))))
+       (unless (getf metadata :page-checksum-version)
+         (wal-atomic-write-bytes
+          (wal-control-path)
+          (wal-encode-control-image
+           checkpoint durable snapshot :timeline insertion :checkpoint-timeline checkpoint-timeline
+           :namespace namespace :metadata (append metadata (list :page-checksum-version 1))))))
+     (physical-adoption-check-owner (getf state :owner))
+     t)))
 
 (defun native-control-read-for-utility (directory)
   "Read control facts and report the native checksum version when verified.
 Omit the version when the stopped-primary scan cannot establish it, including
 when no pages are available."
   (let ((facts (native-control-read directory)))
-    (when (and (eql +db-shutdowned+ (getf facts :db-state))
+    (when (and (null (getf facts :page-checksum-version))
+               (eql +db-shutdowned+ (getf facts :db-state))
                (handler-case (native-control-verify-page-checksums directory facts)
                  (error () nil)))
       ;; The native location-bound page CRC scheme has its own version.

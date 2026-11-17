@@ -1,0 +1,7 @@
+#!/bin/sh
+set -eu
+case "${1-}" in
+    --help|-\?) printf '%s\n' 'usage: pg_checksums --enable -D DIR'; exit 0 ;;
+esac
+UTILITY_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+exec "${SBCL:-sbcl}" --script "$UTILITY_DIR/pg-checksums.lisp" "$@"

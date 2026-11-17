@@ -254,14 +254,14 @@ The caller must keep inspected files immutable throughout the operation."
        (error "offline adoption requires a stopped primary without a PID file"))
      (funcall function owner))))
 
-(defun physical-inspect-clean-primary (owner check-owner)
+(defun physical-inspect-clean-primary (owner check-owner &key directory)
   "Inspect a stopped primary without creating, repairing, or replaying files.
 Require DB_SHUTDOWNED and checkpoint = durable endpoint E, then verify the
 checkpoint record, resources, catalog identity and allocator capacity. Return
 actual next XID separately from the allocator's next value. Mutable facts must
 be revalidated before any future installation."
   (funcall check-owner owner)
-  (let* ((*pgdata* (physical-adoption-owner-directory owner))
+  (let* ((*pgdata* (or directory (physical-adoption-owner-directory owner)))
          (*physical-recovery-state* nil)
          (*physical-recovery-failed-p* nil)
          (*catalog-identity-needs-persist-p* nil)
