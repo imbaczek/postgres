@@ -233,10 +233,16 @@ def primary_committed(root):
     requires lifecycle metadata. Promote also verifies the PGDATA owner.
     """
     fields = read_regular(root / "global/pg_wal_control", 1025).split()
-    if len(fields) not in (8, 11, 15, 17, 21) or fields[0] != b"PGWAL6":
+    checksum_format = len(fields) in (12, 16, 18, 22)
+    if ((not checksum_format and len(fields) not in (8, 11, 15, 17, 21))
+            or fields[0] != b"PGWAL6"):
         raise ValueError("invalid native WAL control")
     if crc32c(b" ".join(fields[:-1])) != int(fields[-1], 16):
         raise ValueError("native WAL control checksum mismatch")
+    if checksum_format:
+        if fields[-2] != b"C1":
+            raise ValueError("unsupported native page checksum format")
+        fields.pop(-2)
     validate_resource_fields(fields)
     return (int(fields[3]) > 1 and fields[3] == fields[4] and fields[5] == b"timeline"
             and len(fields) in (11, 15, 17, 21) and fields[8] == b"6"

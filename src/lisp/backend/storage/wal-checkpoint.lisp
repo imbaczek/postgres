@@ -409,12 +409,15 @@ five integers as a list so EQUAL compares metadata without case-folding strings.
       metadata)))
 
 (defun wal-control-metadata-valid-p (metadata)
-  (and (listp metadata) (member (length metadata) '(6 8 12 14))
+  (and (listp metadata) (member (length metadata) '(6 8 10 12 14 16))
        (let ((keys (loop for (key value) on metadata by #'cddr collect key)))
          (and (= (/ (length metadata) 2) (length (remove-duplicates keys)))
               (null (set-difference '(:system-id :db-state :state-time) keys))
               (null (set-difference keys '(:system-id :db-state :state-time :retained-reference
-                                           :resource-parameters :resource-lsn :resource-timeline)))
+                                           :resource-parameters :resource-lsn :resource-timeline
+                                           :page-checksum-version)))
+              (or (not (member :page-checksum-version keys))
+                  (eql 1 (getf metadata :page-checksum-version)))
               (or (not (member :retained-reference keys))
                   (wal-retained-reference-valid-p (getf metadata :retained-reference)))))
        (typep (getf metadata :system-id) '(unsigned-byte 64))
@@ -435,7 +438,15 @@ five integers as a list so EQUAL compares metadata without case-folding strings.
   (append (make-wal-control-metadata (getf metadata :system-id) state time)
           (when (getf metadata :retained-reference)
             (list :retained-reference (copy-list (getf metadata :retained-reference))))
-          (wal-copy-control-resource-fields metadata)))
+          (wal-copy-control-resource-fields metadata)
+          (when (getf metadata :page-checksum-version)
+            (list :page-checksum-version (getf metadata :page-checksum-version)))))
+
+(defun wal-control-base-metadata (metadata)
+  (let* ((copy (copy-list metadata))
+         (removed-reference (remf copy :retained-reference))
+         (removed-checksum (remf copy :page-checksum-version)))
+    (values copy (or removed-reference removed-checksum))))
 
 (defun wal-encode-control-image (checkpoint durable snapshot
                                  &key (timeline 1) (namespace :legacy) metadata
@@ -478,6 +489,9 @@ follow the fixed key order. The CRC covers every supplied field."
                      (format nil "~a R ~a ~d ~d" prefix (wal-resource-parameters-hex parameters)
                              (getf metadata :resource-lsn) (getf metadata :resource-timeline))
                      prefix))
+         (prefix (if (getf metadata :page-checksum-version)
+                     (format nil "~a C1" prefix)
+                     prefix))
          (crc (wal-crc32 (string->bytes prefix))))
     (string->bytes (format nil "~a ~8,'0X~%" prefix crc))))
 
@@ -486,6 +500,7 @@ follow the fixed key order. The CRC covers every supplied field."
   (let* ((fields (and line (wal-split-fields line)))
          (version (first fields))
          (v6 (equal version "PGWAL6"))
+         (checksum-p (and v6 (member (length fields) '(12 16 18 22))))
          (identities (member version '("PGWAL5" "PGWAL6") :test #'equal))
          (v4 (equal version "PGWAL4"))
          (checkpoint (handler-case-noninterrupt (parse-integer (second fields)) (condition nil)))
@@ -496,7 +511,9 @@ follow the fixed key order. The CRC covers every supplied field."
                                  ((equal (sixth fields) "timeline") :timeline))
                         :legacy))
          (crc (handler-case-noninterrupt (parse-integer (car (last fields)) :radix 16) (condition nil))))
-    (unless (and (cond (v6 (member (length fields) '(8 11 15 17 21)))
+    (unless (and (cond (v6 (if checksum-p
+                               (equal "C1" (first (last fields 2)))
+                               (member (length fields) '(8 11 15 17 21))))
                        (identities (= (length fields) 7))
                        (v4 (= (length fields) 5))
                        (t (and (= (length fields) 4)
@@ -516,7 +533,12 @@ follow the fixed key order. The CRC covers every supplied field."
       (when (and snapshot (or (/= checkpoint (getf snapshot :end))
                               (/= checkpoint-timeline (getf snapshot :timeline))))
         (error "checkpoint control copy names another record or timeline"))
-      (let ((metadata (when v6 (wal-decode-control-metadata fields))))
+      (let ((metadata
+              (when v6
+                (wal-decode-control-metadata
+                 (if checksum-p (append (butlast fields 2) (last fields)) fields)))))
+        (when checksum-p
+          (setf metadata (append metadata (list :page-checksum-version 1))))
         (unless (wal-control-resource-position-valid-p metadata durable timeline)
           (error "resource facts exceed durable control coordinates"))
         (values checkpoint durable snapshot timeline checkpoint-timeline namespace metadata)))))

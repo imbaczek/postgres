@@ -162,7 +162,7 @@ target which cannot be retried as an empty stage."
               for name = (first entry)
               for copied = (physical-bootstrap-copy-file name target :limit (getf (rest entry) :limit))
               do (unless (or (and (equal name "global/pg_wal_control")
-                                  (getf *wal-control-metadata* :retained-reference))
+                                  (nth-value 1 (wal-control-base-metadata *wal-control-metadata*)))
                              (equal copied (subseq expected 0 3)))
                    (error "adoption copied file differs from its checked source: ~a" name))
                  (when (member name names :test #'equal) (push copied files))

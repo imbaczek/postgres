@@ -285,21 +285,20 @@ Validate the selected lineage before constructing the inventory."
     (sort (append files (physical-bootstrap-history-inventory *wal-insert-timeline*)) #'string<)))
 
 (defun physical-bootstrap-derived-wal-image ()
-  "Return derived control bytes and their decoded tuple when a retained reference exists.
-Remove only that superseded reference. Return NIL otherwise; do not change the source."
+  "Return a control image and decoded tuple when the base must drop local metadata."
   (multiple-value-bind (checkpoint durable snapshot insertion checkpoint-timeline namespace metadata)
       (wal-read-control-fields)
     (let ((reference (getf metadata :retained-reference)))
       (when reference
         (wal-require-supported-timelines insertion checkpoint-timeline)
         (unless (and snapshot (> checkpoint (getf reference :end)))
-          (error "base backup checkpoint does not supersede its historical archive"))
-        (let ((copied (copy-list metadata)))
-          (remf copied :retained-reference)
-          (values (wal-encode-control-image
-                   checkpoint durable snapshot :timeline insertion
-                   :checkpoint-timeline checkpoint-timeline :namespace namespace :metadata copied)
-                  (list checkpoint durable snapshot insertion checkpoint-timeline namespace copied)))))))
+          (error "base backup checkpoint does not supersede its historical archive"))))
+    (multiple-value-bind (copied derived-p) (wal-control-base-metadata metadata)
+      (when derived-p
+        (values (wal-encode-control-image
+                 checkpoint durable snapshot :timeline insertion
+                 :checkpoint-timeline checkpoint-timeline :namespace namespace :metadata copied)
+                (list checkpoint durable snapshot insertion checkpoint-timeline namespace copied))))))
 
 (defun physical-bootstrap-derived-wal-control (target)
   "Derive target control when the source has a historical archive reference.

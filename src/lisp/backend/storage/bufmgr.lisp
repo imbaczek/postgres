@@ -89,9 +89,12 @@
 The descriptors remain valid across the durable commit callback, which may
 release the private replacements. Discarding cached pages costs work in the
 staged cache, but does not scan the old physical relation."
+  (declare (special *wal-control-metadata*))
   (let ((replacements (gethash backend *transaction-relation-replacements*))
         (resets nil))
     (when replacements
+      (when (and direct-p (getf *wal-control-metadata* :page-checksum-version))
+        (error "qualified relation replacement requires WAL"))
       (let ((nodes nil))
         (maphash (lambda (key replacement)
                    (declare (ignore key))

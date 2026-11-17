@@ -43,17 +43,25 @@ REDO permits an existing file and never truncates it, matching smgrcreate redo."
             (t (relation-nblocks (smgr-open-locked relfilenode fork)))))))
 
 (defun smgr-read (relfilenode block &optional (fork :main))
+  (declare (ftype function wal-check-read-page))
   (sb-thread:with-mutex (*smgr-lock*)
-    (let ((stream (gethash (list relfilenode fork) *relation-streams*)))
-      (cond (stream (read-page stream block))
-            ((and (eq fork :visibility)
-                  (not (probe-file (relation-file-path relfilenode fork))))
-             nil)
-            (t (read-page (smgr-open-locked relfilenode fork) block))))))
+    (let* ((stream (gethash (list relfilenode fork) *relation-streams*))
+           (page (cond (stream (read-page stream block))
+                       ((and (eq fork :visibility)
+                             (not (probe-file (relation-file-path relfilenode fork))))
+                        nil)
+                       (t (read-page (smgr-open-locked relfilenode fork) block)))))
+      (wal-check-read-page page relfilenode block))))
+
+(declaim (ftype function wal-check-persisted-page))
+
+(defun smgr-write-page-locked (stream relfilenode block page fork)
+  (wal-check-persisted-page stream relfilenode block page fork)
+  (write-page stream block page))
 
 (defun smgr-write (relfilenode block page &optional (fork :main))
   (sb-thread:with-mutex (*smgr-lock*)
-    (write-page (smgr-open-locked relfilenode fork) block page))
+    (smgr-write-page-locked (smgr-open-locked relfilenode fork) relfilenode block page fork))
   (values))
 
 (defun smgr-extend (relfilenode page &optional (fork :main))
@@ -61,7 +69,7 @@ REDO permits an existing file and never truncates it, matching smgrcreate redo."
   (sb-thread:with-mutex (*smgr-lock*)
     (let* ((stream (smgr-open-locked relfilenode fork))
            (block (relation-nblocks stream)))
-      (write-page stream block page)
+      (smgr-write-page-locked stream relfilenode block page fork)
       block)))
 
 (defun smgr-reset-fork (relfilenode fork)

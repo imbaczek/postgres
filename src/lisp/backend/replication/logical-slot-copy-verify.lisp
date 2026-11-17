@@ -13,11 +13,10 @@
          (base (logical-slot-copy-control-fields (logical-slot-copy-descriptor-base-control descriptor)))
          (recovery (physical-recovery-decode-control
                     (logical-slot-copy-descriptor-recovery-control descriptor)))
-         (metadata (copy-list (seventh source)))
-         (reference (getf metadata :retained-reference))
+         (metadata (wal-control-base-metadata (seventh source)))
+         (derived-p (not (equal metadata (seventh source))))
          (base-bytes (logical-slot-copy-descriptor-base-control descriptor))
          (base-entry (find "global/pg_wal_control" (getf manifest :files) :key #'first :test #'equal)))
-    (remf metadata :retained-reference)
     (unless (and base-entry (= (second base-entry) (length base-bytes))
                  (= (third base-entry) (physical-store-update-digest #xCBF29CE484222325 base-bytes))
                  (= (first source) (second source) (getf manifest :end))
@@ -26,7 +25,7 @@
                  (= (physical-manifest-checkpoint-start manifest) (getf (third source) :start))
                  (equalp base (append (subseq source 0 6) (list metadata)))
                  (equalp (logical-slot-copy-descriptor-base-control descriptor)
-                         (if reference
+                         (if derived-p
                              (wal-encode-control-image
                               (first source) (second source) (third source) :timeline (fourth source)
                                                                             :checkpoint-timeline (fifth source) :namespace (sixth source) :metadata metadata)

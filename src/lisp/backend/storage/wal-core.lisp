@@ -847,6 +847,22 @@ other inputs and modified tables use the scalar recurrence. BYTES is read only."
         (zerop checksum)
         (= checksum (wal-page-checksum page relfilenode block fork)))))
 
+(defun wal-check-read-page (page relfilenode block)
+  (when (and page (getf *wal-control-metadata* :page-checksum-version)
+             (zerop (page-u64 page +pd-lsn-off+)))
+    (ereport "XX001" "unstamped page in qualified relation ~a block ~a"
+             relfilenode block))
+  page)
+
+(defun wal-check-persisted-page (stream relfilenode block page fork)
+  (when (getf *wal-control-metadata* :page-checksum-version)
+    (unless (and (typep block '(unsigned-byte 32))
+                 (<= block (relation-nblocks stream))
+                 (= (length page) +blcksz+)
+                 (plusp (page-u64 page +pd-lsn-off+))
+                 (wal-verify-page page relfilenode block fork))
+      (error "qualified relation write requires a complete, stamped page without a storage gap"))))
+
 (defun wal-page-key (relfilenode block &optional (fork :main))
   (list relfilenode fork block))
 

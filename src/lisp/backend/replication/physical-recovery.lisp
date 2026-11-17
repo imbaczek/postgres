@@ -738,6 +738,8 @@ Retain a copy of the base checkpoint for later prefix scans."
     (multiple-value-bind (checkpoint durable snapshot insertion checkpoint-timeline namespace metadata)
         (wal-read-control-fields)
       (declare (ignore namespace))
+      (when (getf metadata :page-checksum-version)
+        (error "recovery base carries local primary checksum qualification"))
       (wal-require-supported-timelines insertion checkpoint-timeline)
       (unless (and (= insertion checkpoint-timeline (getf manifest :timeline))
                    (eql checkpoint (getf manifest :checkpoint))

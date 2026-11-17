@@ -1759,6 +1759,74 @@ Each entry in SEGMENTS contains a segment number followed by its byte vectors."
     (rove:ok (not (wal-verify-page page 123 4))
              "WAL page checksum detects page damage")))
 
+(rove:deftest test-qualified-page-checksum-control-format
+    (let* ((legacy (make-wal-control-metadata 811 +db-shutdowned+ 22))
+           (qualified (append legacy (list :page-checksum-version 1)))
+           (prefix "PGWAL6 0 0 1 1 legacy - 811 1 22 C9")
+           (unsupported (format nil "~a ~8,'0X~%" prefix (wal-crc32 (string->bytes prefix)))))
+      (flet ((round-trip (metadata)
+               (nth-value 6 (wal-decode-control-line
+                             (bytes->string (wal-encode-control-image 0 0 nil :metadata metadata))))))
+        (rove:ok (equal legacy (round-trip legacy)))
+        (rove:ok (equal qualified (round-trip qualified))))
+      (rove:ok (eql 1 (getf (wal-refresh-control-metadata qualified +db-in-production+)
+                            :page-checksum-version)))
+      (multiple-value-bind (copied changed) (wal-control-base-metadata qualified)
+        (rove:ok (and changed (equal copied legacy)))
+        (rove:ok (eql 1 (getf qualified :page-checksum-version))))
+      (rove:ok (handler-case (progn (wal-decode-control-line unsupported) nil)
+                 (error () t))
+               "an unsupported format is rejected even with a valid control CRC")))
+
+(rove:deftest test-qualified-page-checksum-base-copy
+    (call-with-wal-scan-test-files
+     nil 0
+     (lambda ()
+       (let* ((metadata (append (make-wal-control-metadata 811 +db-shutdowned+ 22)
+                                (list :page-checksum-version 1)))
+              (source (wal-encode-control-image 0 0 nil :metadata metadata))
+              (target (merge-pathnames "copy/" *pgdata*))
+              (control (merge-pathnames "global/pg_wal_control" target)))
+         (ensure-directories-exist (wal-control-path))
+         (ensure-directories-exist control)
+         (wal-atomic-write-bytes (wal-control-path) source)
+         (physical-bootstrap-copy-file "global/pg_wal_control" target)
+         (let ((copied (read-bounded-regular-file control +wal-control-maximum-bytes+)))
+           (rove:ok (equal (wal-control-base-metadata metadata)
+                           (nth-value 6 (wal-decode-control-line (bytes->string copied)))))
+           (rove:ok (equalp source (read-bounded-regular-file (wal-control-path)
+                                                              +wal-control-maximum-bytes+))))))))
+
+(rove:deftest test-qualified-relation-page-writes
+    (call-with-wal-scan-test-files
+     nil 0
+     (lambda ()
+       (let ((*wal-control-metadata* '(:page-checksum-version 1))
+             (*relation-streams* (make-hash-table :test #'equal))
+             (page (page-init (make-page))))
+         (ensure-directories-exist (relation-file-path 123))
+         (unwind-protect
+              (progn
+                (rove:ok (handler-case (progn (smgr-write 123 0 page) nil)
+                           (error () t))
+                         "a legacy unstamped page cannot reach qualified storage")
+                (rove:ok (= 0 (smgr-extend 123 (wal-stamp-page page 99 123 0))))
+                (rove:ok (handler-case (progn (smgr-write 123 2 (wal-stamp-page page 99 123 2)) nil)
+                           (error () t))
+                         "a correctly stamped sparse write still creates an invalid gap")
+                (rove:ok (handler-case (progn (smgr-write 123 1 page) nil)
+                           (error () t))
+                         "a stamped page cannot be reused at another block")
+                (smgr-write 123 1 (wal-stamp-page page 99 123 1))
+                (rove:ok (= 2 (smgr-nblocks 123)))
+                (let ((*wal-control-metadata* nil))
+                  (smgr-write 123 0 (page-init (make-page)))
+                  (rove:ok (smgr-read 123 0)))
+                (rove:ok (handler-case (progn (smgr-read 123 0) nil)
+                           (error () t))
+                         "qualified reads reject unstamped disk pages"))
+           (smgr-close-all))))))
+
 (rove:deftest test-wal-record-codec
     (let* ((payload (make-array 0 :element-type '(unsigned-byte 8)))
            (record (wal-encode-record +wal-record-commit+ 42 64 payload))
