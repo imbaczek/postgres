@@ -216,6 +216,16 @@
                 (let ((pg::*physical-reseed-attempt-test-hook* nil)
                       (pg::*pgdata* root))
                   (ok (intake-fails-p #'pg::physical-reseed-check-before-pid))
+                  (when (eq point :after-file-fsync)
+                    (ok (intake-fails-p
+                         (lambda ()
+                           (pg::physical-reseed-attempt-recover
+                            owner :check-record
+                            (lambda (candidate)
+                              (ok (equal candidate record))
+                              (error "refuse candidate workspace"))))))
+                    (ok (not (probe-file (pg::physical-reseed-attempt-path root))))
+                    (ok (probe-file (pg::physical-reseed-attempt-temporary-path root))))
                   (if (eq point :after-create)
                       (progn
                         (ok (intake-fails-p (lambda () (pg::physical-reseed-attempt-recover owner))))

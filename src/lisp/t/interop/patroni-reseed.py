@@ -537,6 +537,30 @@ class RewindCliAcceptance(RewindInstallAcceptance):
         self.check_rejoined(target, port)
 
 
+class RewindCaptureResumeCliAcceptance(RewindCliAcceptance):
+    label = "rewind-cli-capture-resume"
+    capture_hook = "native-patroni-rewind-crash-after-capture"
+
+    def execute_rewind(self, target, conninfo):
+        env = dict(os.environ, SBCL=self.sbcl, PG_LIBPQ_HELPER=self.helper)
+        self.process("rewind-capture-crash", self.native_arguments() + [
+            "--eval", f"(pg::{self.capture_hook})",
+            "--load", str(cancellation.LISP / "bin/pg-rewind.lisp"), "--end-toplevel-options",
+            "-D", str(target), "--source-server", conninfo],
+            timeout=240, env=env, expected=-signal.SIGKILL)
+        assert (target / "physical-reseed.attempt").is_file()
+        assert not (target / "physical-reseed.install").exists()
+        _, resumed = self.process("rewind-capture-resume", [
+            str(cancellation.LISP / "bin/pg_rewind"), "-D", str(target), "--resume"],
+            timeout=900, env=env)
+        return resumed
+
+
+class RewindFirstCaptureCliAcceptance(RewindCaptureResumeCliAcceptance):
+    label = "rewind-cli-first-capture"
+    capture_hook = "native-patroni-rewind-crash-before-capture"
+
+
 class RewindResumeCliAcceptance(RewindCliAcceptance):
     label = "rewind-cli-resume"
 
@@ -805,6 +829,8 @@ def main():
              "rewind-shared-history": RewindSharedHistoryAcceptance,
              "rewind-install": RewindInstallAcceptance,
              "rewind-cli": RewindCliAcceptance,
+             "rewind-cli-capture-resume": RewindCaptureResumeCliAcceptance,
+             "rewind-cli-first-capture": RewindFirstCaptureCliAcceptance,
              "rewind-cli-resume": RewindResumeCliAcceptance,
              "rewind-patroni": RewindPatroniAcceptance,
              "rewind-patroni-dirty": RewindDirtyPatroniAcceptance,

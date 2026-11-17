@@ -131,6 +131,18 @@
            (native-patroni-rewind-check-reuse owner capture reused))))
       (write-line "REWIND-JOURNALED-CAPTURE PASS"))))
 
+(defun native-patroni-rewind-crash-after-capture ()
+  (setf *physical-reseed-remote-test-hook*
+        (lambda (point)
+          (when (eq point :after-capture)
+            (sb-posix:kill (sb-posix:getpid) sb-posix:sigkill)))))
+
+(defun native-patroni-rewind-crash-before-capture ()
+  (setf *physical-reseed-remote-test-hook*
+        (lambda (point)
+          (when (eq point :before-capture)
+            (sb-posix:kill (sb-posix:getpid) sb-posix:sigkill)))))
+
 (defun native-patroni-rewind-crash-after-install-step ()
   (setf *physical-reseed-install-test-hook*
         (lambda (point directory)
