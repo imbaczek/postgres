@@ -909,8 +909,11 @@
   above). A divergent former primary now also passes journaled reseed after
   deliberate source SIGKILL and manual promotion (`1d19cf6a2d5`). That path
   preserves the old tree and rejoins through pinned Patroni's follow method.
-  Native divergent rewind and integration of offline adoption with the pinned
-  Patroni control path remain open. Coordination stays outside this backend work.
+  The clean-adoption interop test starts the installed former primary with
+  pinned Patroni 4.1.5, switches it to Patroni-managed follow, and verifies a
+  restart with the source offline and replay after reconnect. The fixture uses
+  a separate Patroni config directory and explicit HBA and ident file paths.
+  Native divergent rewind remains open. Coordination stays outside this backend work.
 
 - [x] Keep ready native physical senders through the primary shutdown checkpoint.
   Frozen stream capabilities drain to the validated flush target under a narrow
@@ -1455,9 +1458,9 @@
   rejection and explicit local reseeding (`53b16b79f49`); the oracle has no DCS
   or coordination. Authenticated native export and installation now support the
   default remote Patroni bootstrap clone, with staged publication and cancellation
-  cleanup. Even a nondivergent former primary lacks
-  verified recovery provenance; safe offline prefix-proved adoption remains open.
-  Native rewind and divergent rewind are unimplemented, and C tools are incompatible.
+  cleanup. Prefix-proved offline adoption supplies recovery provenance for
+  the clean former primary covered above. Native rewind remains unimplemented,
+  and C physical tooling is incompatible with the native format.
   The complete unchanged Patroni writer oracle now passes, including `hba_file`
   and `ident_file`. These settings accept only disabled or unset values:
   `max_prepared_transactions`,
