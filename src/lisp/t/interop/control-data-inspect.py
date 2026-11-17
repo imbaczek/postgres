@@ -39,8 +39,11 @@ def run(root, expected_state=None):
     rows = dict(line.split(":", 1) for line in result.stdout.splitlines())
     rows = {key: value.strip() for key, value in rows.items()}
     fields = (root / "global/pg_wal_control").read_bytes().split()
-    assert fields[0] == b"PGWAL6" and len(fields) in (8, 11, 15, 17, 21)
     assert crc32c(b" ".join(fields[:-1])) == int(fields[-1], 16)
+    qualified = len(fields) in (12, 16, 18, 22)
+    if qualified:
+        assert fields.pop(-2) == b"C1"
+    assert fields[0] == b"PGWAL6" and len(fields) in (8, 11, 15, 17, 21)
     CHECK_OPTIONAL_CONTROL(fields[:-1])
     if len(fields) in (11, 15, 17, 21) and not (root / "physical-recovery.control").exists():
         assert rows["Database system identifier"] == fields[7].decode()
@@ -60,7 +63,7 @@ def run(root, expected_state=None):
     assert rows["Bytes per WAL segment"] == "16777216" and rows["Database block size"] == "8192"
     assert "wal_log_hints setting" not in rows
     if "Data page checksum version" in rows:
-        assert rows["Database cluster state"] == "shut down"
+        assert qualified or rows["Database cluster state"] == "shut down"
         assert rows["Data page checksum version"] == "1"
     assert native_node(root).controldata() == rows, "Patroni parsed different control facts"
     print(f'control-data-inspect: {rows["Database cluster state"]} checkpoint={rows["Latest checkpoint location"]} PASS')

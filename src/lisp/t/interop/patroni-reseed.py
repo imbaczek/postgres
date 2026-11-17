@@ -14,16 +14,20 @@ import shutil
 import signal
 import socket
 import stat
+from threading import Event
 import time
 from unittest.mock import patch
+from patroni_native_node import native_node
 
-from patroni.dcs import Leader, Member
+from patroni import thread_pool
+from patroni.dcs import Cluster, Leader, Member
+from patroni.ha import Ha
 from patroni.postgresql import Postgresql
 from patroni.postgresql.misc import PostgresqlRole
 from patroni.postgresql.mpp import Null
-from patroni.postgresql.rewind import Rewind
+from patroni.postgresql.rewind import REWIND_STATUS, Rewind
 import psutil
-from patroni.async_executor import CriticalTask
+from patroni.async_executor import AsyncExecutor, CriticalTask
 from psycopg2.extras import PhysicalReplicationConnection
 
 
@@ -531,8 +535,9 @@ class RewindCliAcceptance(RewindInstallAcceptance):
 
 class RewindPatroniAcceptance(RewindInstallAcceptance):
     label = "rewind-patroni"
+    checksum_version_on_invalid_page = None
 
-    def recover_target(self, target, node, rewind):
+    def recover_target(self, target, node, rewind, leader):
         pass
 
     def check_checksum_rejection(self, target, node):
@@ -548,7 +553,7 @@ class RewindPatroniAcceptance(RewindInstallAcceptance):
                     stream.write(invalid)
                     facts = node.controldata()
                     assert facts["Database cluster state"] == "shut down"
-                    assert "Data page checksum version" not in facts
+                    assert facts.get("Data page checksum version") == self.checksum_version_on_invalid_page
             finally:
                 stream.seek(0)
                 stream.write(header)
@@ -574,7 +579,7 @@ class RewindPatroniAcceptance(RewindInstallAcceptance):
             logger.setLevel(logging.INFO)
             try:
                 with patch.dict(os.environ, SBCL=self.sbcl, PG_LIBPQ_HELPER=self.helper):
-                    self.recover_target(target, node, rewind)
+                    self.recover_target(target, node, rewind, leader)
                     assert rewind.can_rewind, node.controldata()
                     self.check_checksum_rejection(target, node)
                     rewind.trigger_check_diverged_lsn()
@@ -595,9 +600,18 @@ class RewindPatroniAcceptance(RewindInstallAcceptance):
 class RewindDirtyPatroniAcceptance(RewindPatroniAcceptance):
     label = "rewind-patroni-dirty"
     segment_size = 16 * 1024 * 1024
+    checksum_version_on_invalid_page = "1"
 
     def prove_divergence(self):
+        self.process("enable-checksums", [str(cancellation.LISP / "bin/pg_checksums"),
+                                          "--enable", "-D", str(self.server.data)])
         self.start()
+        node = native_node(self.server.data)
+        node.config["use_pg_rewind"] = True
+        rewind = Rewind(node)
+        assert rewind.can_rewind, node.controldata()
+        rewind.trigger_check_diverged_lsn()
+        assert rewind._state is REWIND_STATUS.CHECK
         follow.query(self.server.port, "INSERT INTO patroni_reseed_probe VALUES(999)")
         follow.query(self.server.port, "SELECT pg_drop_replication_slot('replacement_source')")
         follow.query(self.server.port, "CREATE TABLE rewind_dirty_payload(payload text)")
@@ -623,21 +637,41 @@ class RewindDirtyPatroniAcceptance(RewindPatroniAcceptance):
              "expected_exit": -signal.SIGKILL})
         return divergent
 
-    def recover_target(self, target, node, rewind):
+    def recover_target(self, target, node, rewind, leader):
         assert (target / "postmaster.pid").is_file()
         assert node.controldata()["Database cluster state"] == "in production"
+        assert rewind.can_rewind, node.controldata()
         (target / "postgresql.conf").write_text("")
         (target / "pg_wal/archive_status").mkdir(exist_ok=True)
-        assert rewind.ensure_clean_shutdown() is True
+        finished = Event()
+        thread_pool.configure_global_pool(1)
+        ha = Ha.__new__(Ha)
+        empty = Cluster.empty()
+        ha.cluster = Cluster(None, None, leader, empty.status, [], None, empty.sync, None, None)
+        assert not ha.cluster.is_unlocked()
+        ha._crash_recovery_started = 0
+        ha._rewind = rewind
+        ha._async_executor = AsyncExecutor(node.cancellable, finished.set)
+        try:
+            assert ha._handle_crash_recovery() == "doing crash recovery in a single user mode"
+            assert finished.wait(90), "Patroni crash recovery did not finish"
+        finally:
+            if ha._async_executor.busy:
+                ha._async_executor.cancel()
         assert not (target / "postmaster.pid").exists()
         facts = node.controldata()
         assert facts["Database cluster state"] == "shut down"
+        assert (target / "global/pg_wal_control").read_bytes().split()[-2] == b"C1"
         fork = self.result["former_primary"]["fork_lsn"]
         assert lsn_number(facts["Latest checkpoint location"]) // self.segment_size > fork // self.segment_size
         self.check_retained_origin(target, fork)
         self.old_tree = preserved_tree(target)
         (self.output / "former-primary-inventory.json").write_text(json.dumps(self.old_tree, indent=2) + "\n")
         self.result["former_primary"]["offline_recovery"] = "patroni"
+
+    def check_rejoined(self, target, port):
+        assert (target / "global/pg_wal_control").read_bytes().split()[-2] != b"C1"
+        super().check_rejoined(target, port)
 
 
 class ManualFailoverAcceptance(FormerPrimaryAcceptance):
