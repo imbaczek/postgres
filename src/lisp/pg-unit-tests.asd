@@ -42,6 +42,7 @@
                (:file "t/rove/continuation-cold-startup-tests")
                (:file "t/rove/continuation-cold-cleanup-inventory-tests")
                (:file "t/rove/continuation-cold-cleanup-proof-tests")
+               (:file "t/rove/continuation-cold-cleanup-domain-tests")
                (:file "t/rove/continuation-selected-proof-tests")
                (:file "t/rove/continuation-cold-source-tests")
                (:file "t/rove/logical-wal-lane-provider-tests")

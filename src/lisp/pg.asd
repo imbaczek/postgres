@@ -448,6 +448,7 @@
                    (:file "../replication/logical-slot-continuation-cold-inventory")
                    (:file "../replication/logical-slot-continuation-cold-cleanup-inventory")
                    (:file "../replication/logical-slot-continuation-cold-selected")
+                   (:file "../replication/logical-slot-continuation-cold-cleanup-domain")
                    (:file "../replication/logical-slot-continuation-cold-startup")
                    (:file "../replication/logical-slot-continuation-cold-source")
                    (:file "../replication/logical-slot-continuation-cold-preparation")
