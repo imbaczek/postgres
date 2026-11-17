@@ -1,10 +1,12 @@
 """Exercise pinned Patroni follow/start after journaled native reseed."""
 import argparse
+from contextlib import closing
 import ctypes
 import hashlib
 import importlib.metadata
 import importlib.util
 import json
+import logging
 import os
 from pathlib import Path
 import re
@@ -13,6 +15,7 @@ import signal
 import socket
 import stat
 import time
+from unittest.mock import patch
 
 from patroni.dcs import Leader, Member
 from patroni.postgresql import Postgresql
@@ -463,15 +466,21 @@ class RewindInstallAcceptance(RewindSharedHistoryAcceptance):
             "--eval", f"(pg::native-patroni-rewind-install {install_paths} {helper})"],
             timeout=600)
         assert b"REWIND-JOURNALED-INSTALL PASS" in output
-        old = preserved_tree(quarantine)
-        assert (quarantine / "physical-reseed.install").read_bytes() == b"offline reseed auxiliary directory"
-        del old["physical-reseed.install"]
-        assert old == self.old_tree
+        self.check_quarantine(quarantine)
         self.run("prove", target)
         with socket.socket() as reservation:
             reservation.bind(("127.0.0.1", 0))
             port = reservation.getsockname()[1]
         self.prepare_active(target, workspace, port)
+        self.check_rejoined(target, port)
+
+    def check_quarantine(self, quarantine):
+        old = preserved_tree(quarantine)
+        assert (quarantine / "physical-reseed.install").read_bytes() == b"offline reseed auxiliary directory"
+        del old["physical-reseed.install"]
+        assert old == self.old_tree
+
+    def check_rejoined(self, target, port):
         node = Postgresql(follow.configuration(target, port, self.server.root), Null())
         member = Member(0, "source", None,
                         {"conn_url": f"postgres://127.0.0.1:{self.server.port}/postgres"})
@@ -488,6 +497,70 @@ class RewindInstallAcceptance(RewindSharedHistoryAcceptance):
         finally:
             self.stop_target(node)
         self.result["checks"].append(self.label)
+
+
+class RewindCliAcceptance(RewindInstallAcceptance):
+    label = "rewind-cli"
+
+    def configured(self):
+        target = self.create_rewind_target()
+        conninfo = f"host=127.0.0.1 port={self.server.port} user=postgres dbname=postgres"
+        _, output = self.process(self.label, [
+            str(cancellation.LISP / "bin/pg_rewind"), "-D", str(target), "--source-server", conninfo],
+            timeout=900, env=dict(os.environ, SBCL=self.sbcl, PG_LIBPQ_HELPER=self.helper))
+        assert b"target is ready to follow the source" in output
+        workspace = Path(re.search(rb"^pg_rewind workspace: (.+)$", output, re.M)[1].decode())
+        assert workspace.parent == target.parent and workspace.name.startswith(".pg-rewind.")
+        assert stat.S_IMODE(workspace.stat().st_mode) == 0o700
+        self.check_quarantine(workspace / "quarantine")
+        assert not (target / "postmaster.pid").exists()
+        config = target / "postgresql.conf"
+        assert config.read_bytes() == b""
+        config.unlink()
+        _, finished = self.process("rewind-finish", [
+            str(cancellation.LISP / "bin/pg_rewind"), "-D", str(target), "--finish"],
+            timeout=90, env=dict(os.environ, SBCL=self.sbcl))
+        assert b"target is ready to follow the source" in finished
+        assert config.read_bytes() == b""
+        assert not (target / "postmaster.pid").exists()
+        with socket.socket() as reservation:
+            reservation.bind(("127.0.0.1", 0))
+            port = reservation.getsockname()[1]
+        self.check_rejoined(target, port)
+
+
+class RewindPatroniAcceptance(RewindInstallAcceptance):
+    label = "rewind-patroni"
+
+    def configured(self):
+        target = self.create_rewind_target()
+        with socket.socket() as reservation:
+            reservation.bind(("127.0.0.1", 0))
+            port = reservation.getsockname()[1]
+        node = Postgresql(follow.configuration(target, port, self.server.root), Null())
+        rewind = Rewind(node)
+        follow.query(self.server.port, "CHECKPOINT")
+        leader = Leader(0, None, Member(0, "source", None, {
+            "conn_url": f"postgres://127.0.0.1:{self.server.port}/postgres",
+            "role": PostgresqlRole.PRIMARY, "checkpoint_after_promote": True}))
+        logger = logging.getLogger("patroni.postgresql.rewind")
+        level = logger.level
+        with closing(logging.FileHandler(self.output / "patroni-rewind.log", mode="x")) as handler:
+            logger.addHandler(handler)
+            logger.setLevel(logging.INFO)
+            try:
+                with patch.dict(os.environ, SBCL=self.sbcl, PG_LIBPQ_HELPER=self.helper):
+                    rewind.execute(leader)
+            finally:
+                logger.setLevel(level)
+                logger.removeHandler(handler)
+                node.connection_pool.close()
+        assert rewind.executed and not rewind.failed
+        assert "pg_rewind exit code=0" in (self.output / "patroni-rewind.log").read_text()
+        workspace, = target.parent.glob(".pg-rewind.*")
+        self.check_quarantine(workspace / "quarantine")
+        assert not (target / "postmaster.pid").exists()
+        self.check_rejoined(target, port)
 
 
 class ManualFailoverAcceptance(FormerPrimaryAcceptance):
@@ -584,6 +657,8 @@ def main():
     cases = {"synthetic": Acceptance, "former-primary": FormerPrimaryAcceptance,
              "rewind-shared-history": RewindSharedHistoryAcceptance,
              "rewind-install": RewindInstallAcceptance,
+             "rewind-cli": RewindCliAcceptance,
+             "rewind-patroni": RewindPatroniAcceptance,
              "manual-failover": ManualFailoverAcceptance}
     parser.add_argument("--case", choices=cases, default="synthetic")
     arguments = parser.parse_args()

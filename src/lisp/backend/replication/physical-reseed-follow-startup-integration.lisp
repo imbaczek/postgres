@@ -31,7 +31,7 @@
   (physical-reseed-check-before-pid)
   (physical-adoption-check-startup))
 
-(defun physical-reseed-follow-own-startup (host port)
+(defun physical-reseed-follow-own-startup (host port &key check-ordinary-before-pid)
   ;; Save the before-PID observation and compare it with owned-PID evidence.
   ;; Ordinary startup keeps the existing adoption reconciliation path.
   (let ((before nil) (after nil))
@@ -43,7 +43,9 @@
          (:before-pid
           (setf before
                 (physical-reseed-follow-check-terminal-startup
-                 (physical-reseed-follow-startup-observation lock phase))))
+                 (physical-reseed-follow-startup-observation lock phase)))
+          (when (and check-ordinary-before-pid (eq :ordinary (getf before :branch)))
+            (funcall check-ordinary-before-pid)))
          (:owned-pid
           (setf after (physical-reseed-follow-startup-observation lock phase before)))))
      :startup-reconcile
@@ -59,3 +61,85 @@
        ;; Any retirement owner and its resources have closed.  Check the strict
        ;; namespace while still inside postmaster reconciliation.
        (physical-reseed-follow-check-ordinary-startup)))))
+
+(defun call-with-physical-reseed-offline-startup (target function)
+  (when (or *postmaster-data-lock* *postmaster-pid-stream*)
+    (error "offline reseed startup requires an unowned process"))
+  (let ((*pgdata* target)
+        (*postmaster-start-timestamp* nil)
+        (*postmaster-start-time* nil)
+        (*postmaster-pid-directory* nil)
+        (*postmaster-pid-host* nil)
+        (*postmaster-pid-port* nil)
+        (*postmaster-pid-stream* nil)
+        (*postmaster-data-lock* nil))
+    (unwind-protect
+         (funcall function)
+      (unwind-protect
+           (when *postmaster-pid-stream* (postmaster-remove-pid-file))
+        (when *postmaster-data-lock* (close *postmaster-data-lock*))))))
+
+(defun physical-reseed-follow-retire-offline (target port)
+  (call-with-physical-reseed-offline-startup
+   target
+   (lambda ()
+     (let ((before nil) (after nil))
+       (postmaster-own-data-directory
+        "127.0.0.1" port
+        :startup-observer
+        (lambda (lock phase)
+          (ecase phase
+            (:before-pid (setf before (physical-reseed-follow-startup-observation lock phase)))
+            (:owned-pid (setf after (physical-reseed-follow-startup-observation lock phase before)))))
+        :startup-reconcile
+        (lambda ()
+          (call-with-physical-reseed-follow-retirement-startup-owner
+           after
+           (lambda (owner)
+             (physical-reseed-follow-retirement-publish-initial owner)
+             (physical-reseed-follow-retirement-archive-install owner)
+             (physical-reseed-follow-retirement-archive-attempt owner)
+             (physical-reseed-follow-retirement-publish-terminal owner)))))))))
+
+(defun physical-reseed-follow-check-offline-finalization (&key before-pid)
+  (physical-reseed-follow-check-ordinary-startup)
+  (multiple-value-bind (base control) (physical-recovery-verify-base-state)
+    (let ((*wal-segment-namespace* (getf base :wal-namespace))
+          (*wal-insert-timeline* (getf base :timeline))
+          (*wal-checkpoint-timeline* (getf base :timeline)))
+      (let ((config (if before-pid
+                        (physical-follow-read-config)
+                        (physical-follow-startup-owner-check))))
+        (unless (and (= 2 (getf control :phase))
+                     (eq :active (getf (fifth config) :phase))
+                     (not (physical-follow-cleanup-only-p config)))
+          (error "offline follow finalization requires an installed streaming standby"))
+        (physical-follow-check-unowned-bootstrap-base config base)
+        (unless before-pid
+          (setf (getf base :follow-startup-config) config)
+          (physical-follow-check-startup-admission base)
+          (physical-follow-call-with-offline-store
+           base
+           (lambda (store)
+             (let* ((metadata (physical-restartpoint-read base))
+                    (policy (physical-recovery-resolve-timeline-policy
+                             base store metadata (startup-recovery-timeline-goal))))
+               (physical-follow-check-active-state store base config :policy policy))))
+          (physical-follow-managed-marker-p base))))))
+
+(defun physical-reseed-follow-finalize-offline (target port)
+  (call-with-physical-reseed-offline-startup
+   target
+   (lambda ()
+     (physical-reseed-follow-own-startup
+      "127.0.0.1" port
+      :check-ordinary-before-pid
+      (lambda () (physical-reseed-follow-check-offline-finalization :before-pid t)))
+     (physical-reseed-follow-check-offline-finalization)
+     (let ((path (merge-pathnames "postgresql.conf" target)))
+       (if (physical-adoption-path-present-p path)
+           (multiple-value-bind (input size) (open-bounded-regular-file path 16777216)
+             (declare (ignore size))
+             (close input))
+           (wal-atomic-write-bytes path (make-array 0 :element-type '(unsigned-byte 8))))
+       (fsync-directory target)))))

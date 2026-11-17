@@ -1,66 +1,15 @@
 (in-package #:pg)
 
 (defun native-patroni-reseed-activate (target workspace port helper)
-  (let ((*pgdata* target))
-    (call-with-physical-reseed-follow-configuration-owner
-     target
-     (lambda (owner)
-       (physical-reseed-follow-begin-configuration owner workspace port)
-       (physical-reseed-follow-stage-configuration owner)
-       (loop repeat 8
-             for record = (physical-reseed-follow-advance-configuration owner)
-             until (eq :inert (getf (getf record :configuration) :phase))
-             finally (assert (eq :inert (getf (getf record :configuration) :phase))))
-       (physical-reseed-follow-settle owner :helper helper)
-       (physical-reseed-follow-begin-activation owner)
-       (physical-reseed-follow-stage-activation owner)
-       (physical-reseed-follow-start-activation owner :helper helper)
-       (loop repeat 4
-             for record = (physical-reseed-follow-advance-activation owner)
-             until (eq :active (getf (getf record :activation) :phase))
-             finally (assert (eq :active (getf (getf record :activation) :phase))))))))
+  (declare (ignore port))
+  (physical-reseed-follow-configure-and-activate
+   target workspace (postgres-current-timestamp) :helper helper))
 
 (defun native-patroni-reseed-retire (target port)
-  (let ((*pgdata* target)
-        (before nil)
-        (after nil))
-    (unwind-protect
-         (postmaster-own-data-directory
-          "127.0.0.1" port
-          :startup-observer
-          (lambda (lock phase)
-            (if (eq phase :before-pid)
-                (setf before (physical-reseed-follow-startup-observation lock phase))
-                (setf after (physical-reseed-follow-startup-observation lock phase before))))
-          :startup-reconcile
-          (lambda ()
-            (call-with-physical-reseed-follow-retirement-startup-owner
-             after
-             (lambda (owner)
-               (physical-reseed-follow-retirement-publish-initial owner)
-               (physical-reseed-follow-retirement-archive-install owner)
-               (physical-reseed-follow-retirement-archive-attempt owner)
-               (physical-reseed-follow-retirement-publish-terminal owner)))))
-      (when *postmaster-pid-stream* (postmaster-remove-pid-file))))
-  (values))
+  (physical-reseed-follow-retire-offline target port))
 
 (defun native-patroni-reseed-finalize (target port)
-  (let ((*pgdata* target))
-    (unwind-protect
-         (progn
-           ;; Consume the receipt before creating ordinary configuration under the data lock.
-           (physical-reseed-follow-own-startup "127.0.0.1" port)
-           (physical-reseed-follow-check-ordinary-startup)
-           (let ((path (merge-pathnames "postgresql.conf" target)))
-             (assert (not (probe-file path)))
-             (wal-atomic-write-bytes path (make-array 0 :element-type '(unsigned-byte 8)))
-             (fsync-directory target)))
-      (unwind-protect
-           (when *postmaster-pid-stream* (postmaster-remove-pid-file))
-        (when *postmaster-data-lock*
-          (close *postmaster-data-lock*)
-          (setf *postmaster-data-lock* nil)))))
-  (values))
+  (physical-reseed-follow-finalize-offline target port))
 
 (defun native-patroni-rewind-shared-history (target origin-directory source-directory expected-fork)
   (multiple-value-bind (manifest digest) (recovery-read-manifest origin-directory)
@@ -119,16 +68,16 @@
            (complete nil))
       (unwind-protect
            (progn
-             (multiple-value-bind (discovered discovered-fork timeline)
-                 (pg-client-native-rewind-origin client)
-               (assert (equal identity discovered))
-               (assert (= fork discovered-fork))
-               (assert (= (getf request :timeline) timeline)))
              (setf fd (physical-backup-open-directory source-directory)
                    attempted t)
              (call-with-physical-adoption-owner
               target
               (lambda (owner)
+                (multiple-value-bind (discovered discovered-fork timeline)
+                    (physical-rewind-discover-history owner client)
+                  (assert (equal identity discovered))
+                  (assert (= fork discovered-fork))
+                  (assert (= (getf request :timeline) timeline)))
                 (multiple-value-bind (capture record reused)
                     (physical-rewind-capture-image owner source-directory fd client request)
                   (declare (ignore record))
@@ -169,10 +118,6 @@
   (multiple-value-bind (manifest digest) (recovery-read-manifest origin)
     (let ((identity (list (getf manifest :system-id) (getf manifest :timeline)
                           (getf manifest :end) digest))
-          (request (list :version 1 :name "reseed_20202020202020202020202020202020"
-                         :token (make-string 64 :initial-element #\b)
-                         :system-id (getf manifest :system-id)
-                         :cluster-identity (getf manifest :cluster-identity) :timeline 2))
           (profile (make-physical-libpq-profile
                     (format nil "host=127.0.0.1 port=~d user=postgres dbname=postgres" port)
                     :mode :physical :fallback "native-target-follow")))
@@ -180,8 +125,9 @@
        target
        (lambda (owner)
          (multiple-value-bind (capture record reused)
-             (physical-rewind-start-remote owner stage request profile identity :helper helper)
+             (physical-rewind-start-discovered-remote owner stage profile :helper helper)
            (declare (ignore record))
+           (assert (equal identity (getf (physical-reseed-attempt-recover owner) :rewind-origin)))
            (native-patroni-rewind-check-reuse owner capture reused))))
       (write-line "REWIND-JOURNALED-CAPTURE PASS"))))
 
@@ -198,9 +144,5 @@
      (lambda (owner)
        (loop repeat (physical-reseed-install-last-step plan)
              do (physical-reseed-install-advance owner :helper helper)))))
-  (call-with-physical-reseed-follow-owner
-   target
-   (lambda (owner)
-     (physical-reseed-follow-publish-intent owner (physical-reseed-follow-initial-record owner))))
-  (native-cancellation-publish-selection target "native_target_follow_rewind")
+  (physical-rewind-select-installed-follow target "native_target_follow_rewind")
   (write-line "REWIND-JOURNALED-INSTALL PASS"))

@@ -1,0 +1,8 @@
+#!/bin/sh
+set -eu
+case "${1:-}" in
+    --version|-V) echo 'pg_rewind (PostgreSQL) 20devel'; exit 0 ;;
+    --help|'-?') printf '%s\n' 'usage: pg_rewind -D DIR --source-server CONNINFO' '       pg_rewind -D DIR --finish'; exit 0 ;;
+esac
+UTILITY_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+exec "${SBCL:-sbcl}" --script "$UTILITY_DIR/pg-rewind.lisp" "$@"
