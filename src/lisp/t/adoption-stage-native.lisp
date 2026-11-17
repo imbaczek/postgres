@@ -4,6 +4,19 @@
 
 (in-package #:pg)
 
+(defun adoption-native-publish-fenced-follow (owner handoff follow)
+  (unless (and handoff follow) (error "adoption follow requires both private workspaces"))
+  (multiple-value-bind (intent phase)
+      (physical-adoption-handoff-start owner (uiop:ensure-directory-pathname handoff))
+    (declare (ignore intent))
+    (assert (eq phase :ready)))
+  (multiple-value-bind (journal phase)
+      (physical-adoption-follow-start owner (uiop:ensure-directory-pathname follow))
+    (assert (eq phase :active-fenced))
+    (assert (= (getf journal :step)
+               (physical-adoption-follow-validate owner journal)))
+    (format t "~&adoption-follow: fenced handoff prepared; real postmaster owns retirement PASS~%")))
+
 (defun adoption-install-native-check (state stage proved expected-root)
   (let* ((owner (getf state :owner))
          (root (physical-adoption-owner-directory owner))
@@ -39,6 +52,10 @@
                (assert (equal (getf proved :source-history) (getf remote :history-text))))
           (physical-client-close client))))
     (format t "~&adoption-install: E/Mnew installed, originals quarantined, stable ownership and source pin retained PASS~%")
+    (let ((handoff (uiop:getenv "PG_ADOPTION_HANDOFF_WORKSPACE"))
+          (follow (uiop:getenv "PG_ADOPTION_FOLLOW_WORKSPACE")))
+      (when (or handoff follow)
+        (adoption-native-publish-fenced-follow owner handoff follow)))
     installed))
 
 (defun adoption-stage-native-prove (stage state proof port expected-root)

@@ -1,6 +1,7 @@
 """Verify source-owned export history through recycling and a manual handoff."""
 import argparse
 from contextlib import ExitStack
+import ctypes
 import hashlib
 import importlib.metadata
 import os
@@ -16,6 +17,7 @@ from crc32c_reference import crc32c
 
 from patroni.dcs import Member
 from patroni.postgresql import Postgresql
+from patroni.postgresql.misc import PostgresqlRole
 from patroni.async_executor import CriticalTask
 from patroni.postgresql.mpp import Null
 
@@ -95,8 +97,77 @@ def snapshot_bytes(data):
             for path in data.rglob('*') if path.is_file()}
 
 
-def check(binary):
+def start_adopted_with_patroni(former, promoted_node, source_port, count, cleanup):
+    data = former.data
+    fences = [data / f'physical-adoption.{name}'
+              for name in ('attempt', 'install', 'handoff', 'follow')]
+    assert all(path.is_file() for path in fences)
+    identity = [path.stat().st_ino for path in (data, data / '.pg_lisp.lock')]
+    quarantine = former.root / 'install' / 'quarantine'
+    saved = snapshot_bytes(quarantine)
+    assert saved
+    root = former.root / 'adopt'
+    root.mkdir(mode=0o700)
+    config = follow['configuration'](data, former.port, root)
+    # Patroni can write its configuration outside the fenced data directory.
+    # Keep the installed HBA and ident files until the postmaster retires it.
+    config.update(name='clean_adopted', config_dir=str(root))
+    (root / 'postgresql.conf').touch()
+    config['parameters'].update(hba_file=str(data / 'pg_hba.conf'),
+                                ident_file=str(data / 'pg_ident.conf'))
+    node = Postgresql(config, Null())
+    cleanup.callback(api['stop_follower'], node)
+    assert node.start(timeout=90, role=PostgresqlRole.REPLICA) is True
+    assert node.query('SELECT pg_is_in_recovery()') == [(True,)]
+    assert all(not path.exists() for path in fences)
+    member = Member(0, 'promoted', None, {'conn_url': f'postgres://127.0.0.1:{source_port}/postgres'})
+    follow['query'](source_port, "SELECT pg_create_physical_replication_slot('clean_adopted',true)")
+    assert node.follow(member, timeout=90) is True
+    assert node.query('SELECT pg_is_in_recovery()') == [(True,)]
+    assert all(not path.exists() for path in fences)
+    follow['wait_for'](lambda: node.query(
+        'SELECT status,slot_name,received_tli FROM pg_stat_get_wal_receiver()')
+        == [('streaming', 'clean_adopted', 2)])
+    assert follow['query'](source_port, "SELECT active FROM pg_replication_slots "
+                          "WHERE slot_name='clean_adopted'") == [(True,)]
+    assert node.query('SELECT count(*) FROM public.origin_rows') == [(count + 1,)]
+    try:
+        follow['query'](former.port, "INSERT INTO origin_rows VALUES (-1,'read-only check')")
+    except follow['psycopg2'].Error as error:
+        assert error.pgcode == '25006', error
+    else:
+        raise AssertionError('adopted standby accepted a write')
+    follow['query'](source_port, f"INSERT INTO origin_rows VALUES ({count + 1},'after adoption')")
+    follow['wait_for'](lambda: node.query('SELECT max(id) FROM public.origin_rows') == [(count + 1,)])
+    predecessor = node.is_running()
+    assert predecessor
+    assert node.restart(timeout=90) is True
+    restarted = node.is_running()
+    assert restarted and restarted.pid != predecessor.pid
+    assert node.query('SELECT pg_is_in_recovery()') == [(True,)]
+    follow['query'](source_port, f"INSERT INTO origin_rows VALUES ({count + 2},'after restart')")
+    follow['wait_for'](lambda: node.query('SELECT max(id) FROM public.origin_rows') == [(count + 2,)])
+    old_source = promoted_node.is_running()
+    assert old_source
+    assert promoted_node.stop(mode='fast', checkpoint=False, stop_timeout=30)
+    assert not promoted_node.is_running()
+    assert node.restart(timeout=90) is True
+    assert node.query('SELECT pg_is_in_recovery()') == [(True,)]
+    assert node.query('SELECT max(id) FROM public.origin_rows') == [(count + 2,)]
+    assert promoted_node.start(timeout=90, role=PostgresqlRole.PRIMARY) is True
+    assert promoted_node.is_running().pid != old_source.pid
+    assert promoted_node.query('SELECT pg_is_in_recovery()') == [(False,)]
+    follow['query'](source_port, f"INSERT INTO origin_rows VALUES ({count + 3},'after source restart')")
+    follow['wait_for'](lambda: node.query('SELECT max(id) FROM public.origin_rows') == [(count + 3,)])
+    assert identity == [path.stat().st_ino for path in (data, data / '.pg_lisp.lock')]
+    assert snapshot_bytes(quarantine) == saved
+    print('export-origin: pinned Patroni clean adoption, source-offline restart and reconnect PASS', flush=True)
+
+
+def check(binary, adopt=False):
     assert importlib.metadata.version('patroni') == '4.1.5'
+    if adopt:
+        assert ctypes.CDLL(None, use_errno=True).prctl(36, 1, 0, 0, 0) == 0
     os.environ['PG_CONFIG'] = str(binary / 'pg_config')
     os.environ['PATH'] = str(binary) + os.pathsep + os.environ['PATH']
     source = api['peers']['OwnedLisp']()
@@ -221,13 +292,24 @@ def check(binary):
             assert snapshot_bytes(source.data) == before, 'proof cuts changed former-primary files'
             stage = source.root / 'adoption-stage'
             stage.mkdir(mode=0o700)
+            environment = os.environ.copy()
+            if adopt:
+                environment['PG_ADOPTION_INSTALL_TEST'] = '1'
+                for phase in ('install', 'handoff', 'follow'):
+                    workspace = source.root / phase
+                    workspace.mkdir(mode=0o700)
+                    environment[f'PG_ADOPTION_{phase.upper()}_WORKSPACE'] = str(workspace)
             result = subprocess.run(
                 [os.environ.get('SBCL', 'sbcl'), '--noinform', '--disable-debugger', '--script',
                  str(BASE / 't/adoption-stage-native.lisp'), str(source.data), str(stage), str(port),
                  *map(str, (*identity, final_end, digest, selected[5]))],
-                capture_output=True, text=True, timeout=240)
+                capture_output=True, text=True, timeout=600 if adopt else 240, env=environment)
             (source.root / 'adoption-stage-native.log').write_text(result.stdout + result.stderr)
             assert result.returncode == 0, result.stdout + result.stderr
+            if adopt:
+                assert 'fenced handoff prepared' in result.stdout
+                start_adopted_with_patroni(source, node, port, count, cleanup)
+                return
             assert snapshot_bytes(source.data) == before, 'canonical staging changed former-primary files'
             print('export-origin: verified canonical image and remote proof agree without installing it PASS', flush=True)
             result = subprocess.run(
@@ -249,4 +331,6 @@ def check(binary):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--reference-bin', type=Path, required=True)
-    check(parser.parse_args().reference_bin.resolve())
+    parser.add_argument('--patroni-adoption', action='store_true')
+    args = parser.parse_args()
+    check(args.reference_bin.resolve(), adopt=args.patroni_adoption)
