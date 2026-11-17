@@ -135,12 +135,20 @@ The descriptor is valid only during the callback and must not escape it."
   (from-fd sb-alien:int) (from sb-alien:c-string)
   (to-fd sb-alien:int) (to sb-alien:c-string) (flags sb-alien:unsigned-int))
 
+(defun slot-state-rename-no-replace (from-fd from to-fd to)
+  (unless (zerop (slot-state-renameat2 from-fd from to-fd to 1))
+    (error 'sb-posix:syscall-error :name 'renameat :errno (sb-alien:get-errno))))
+
+(defun slot-state-unlink-exact (fd name &optional directory-p)
+  (unless (zerop (port-unlinkat fd name (if directory-p #x200 0)))
+    (error 'sb-posix:syscall-error :name 'unlinkat :errno (sb-alien:get-errno))))
+
 (defun slot-state-rename (from-fd from to-fd to &optional no-replace)
   (slot-state-check-scope)
-  (unless (zerop (if no-replace
-                     (slot-state-renameat2 from-fd from to-fd to 1)
-                     (port-renameat from-fd from to-fd to)))
-    (error 'sb-posix:syscall-error :name 'renameat :errno (sb-alien:get-errno))))
+  (if no-replace
+      (slot-state-rename-no-replace from-fd from to-fd to)
+      (unless (zerop (port-renameat from-fd from to-fd to))
+        (error 'sb-posix:syscall-error :name 'renameat :errno (sb-alien:get-errno)))))
 
 (defun slot-state-check-bytes (bytes)
   (unless (and (typep bytes '(vector (unsigned-byte 8)))
