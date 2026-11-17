@@ -119,6 +119,11 @@
    (pg-client-native-backup-lease-status client (getf record :request))))
 
 (defun physical-rewind-prove-shared-history (owner source-root source-image origin-identity)
+  "Compare shared WAL from the target's export base up to the fork.
+Hold the stopped target's lock and the verified source image's descriptor scope.
+Require matching cluster identities and a source timeline descended from the
+target timeline. Return the verified interval, endpoints and source manifest
+digest. Establish the source's ancestry before the export base separately."
   (unless (and source-image *physical-image-context*)
     (error "native rewind requires a previously verified source image and its descriptor scope"))
   (let* ((target (let ((*physical-image-context* nil))
