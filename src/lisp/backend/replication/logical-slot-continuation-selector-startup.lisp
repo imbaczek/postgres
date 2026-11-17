@@ -5,6 +5,8 @@
     (error "continuation restoration requires saved-slot proof before enabling active obligations"))
   t)
 
+;; These helpers operate on supplied metadata only.  They do not establish
+;; that the disk inventory is empty or grant a startup capability.
 (defun logical-slot-continuation-empty-inputs (binding certificate host)
   (logical-slot-continuation-list host 6)
   (logical-slot-copy-descriptor-list-count certificate 128)
@@ -22,6 +24,8 @@
           :sealed-end (list (sixth host) (fifth host) :prefix-end)
           :slots nil :transfers nil :roots nil :runs nil :tail nil)))
 
+;; Check empty selection metadata against the host, including a history that
+;; may descend from the selected history.
 (defun logical-slot-continuation-check-empty-snapshot (snapshot binding certificate host)
   (logical-slot-continuation-check snapshot)
   (let* ((bytes (logical-slot-continuation-empty-inputs binding certificate host))
@@ -40,6 +44,8 @@
     (logical-slot-continuation-position (getf snapshot :sealed-end) history (sixth host)))
   t)
 
+;; The startup wrappers obtain fresh storage facts and check the actual empty
+;; inventory.  Restoration repeats these checks around selector I/O and sync.
 (defun logical-slot-continuation-empty-startup-snapshot (storage facts)
   (setf facts (logical-slot-continuation-storage-call storage :facts))
   (logical-slot-continuation-require-empty-inventory)

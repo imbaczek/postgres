@@ -45,6 +45,8 @@
         (when (eq :reserved (wal-replication-slot-wal-status current)) (setf demand t))))
     (values saved demand)))
 
+;; Assemble generation 1 from child rows, checking each against the permanent
+;; certificate and deriving whether the original tail is needed.
 (defun logical-slot-continuation-active-snapshot-from-checked-rows
     (binding certificate host history rows)
   (multiple-value-bind (saved demand)
@@ -60,11 +62,15 @@
       (logical-slot-continuation-check snapshot)
       snapshot)))
 
+;; Validate a nonempty set of child rows.  This does not inspect or validate
+;; the ordinary entries in a complete inventory.
 (defun logical-slot-continuation-active-child-snapshot (binding certificate host rows)
   (let ((history (logical-slot-continuation-origin-inputs binding certificate host)))
     (logical-slot-continuation-active-snapshot-from-checked-rows
      binding certificate host history rows)))
 
+;; Bound origin inputs before partitioning the full inventory, including its
+;; ordinary entries, and assembling the child snapshot.
 (defun logical-slot-continuation-active-snapshot (binding certificate host rows)
   (let ((history (logical-slot-continuation-origin-inputs binding certificate host)))
     (logical-slot-continuation-active-snapshot-from-checked-rows
