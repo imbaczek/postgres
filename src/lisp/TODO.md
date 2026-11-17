@@ -932,8 +932,11 @@
    former primary when all catalog relation pages have verified native CRCs.
    The check scans those pages under the data directory lock. Patroni can
    arm its divergence check before demoting a running primary, so a
-   stopped-only scan cannot qualify that path. Add durable checksum
-   capability evidence and qualify crash recovery for dirty former primaries.
+   stopped-only scan cannot qualify that path. Stock Patroni's
+   `Rewind.ensure_clean_shutdown` can now recover a dirty former primary
+   offline, publish a shutdown checkpoint, and preserve the common WAL for
+   rewind. Add durable checksum capability evidence before enabling eligibility
+   on running or dirty targets.
    Rewind continuation before terminal handoff and retrieval of missing
    target WAL from an archive remain open. C pg_rewind
    builds a changed-page map from target WAL. Native rewind reuses whole
@@ -1487,8 +1490,10 @@
    the clean former primary covered above. The native rewind executable passes
    Patroni eligibility, divergence detection and rejoin on a clean stopped
    former primary. Native `pg_waldump` handles Patroni's two-record checkpoint
-   probe on that state. Pre-stop eligibility, dirty-target recovery, and
-   other Patroni WAL dump queries remain open.
+   probe on that state. The offline primary recovery command supports
+   Patroni's single-user invocation with empty input. Stock HA scheduling
+   before stop and after a crash, and other Patroni WAL dump queries, remain
+   open.
    C physical tooling is incompatible with the native format.
   The complete unchanged Patroni writer oracle now passes, including `hba_file`
   and `ident_file`. These settings accept only disabled or unset values:
