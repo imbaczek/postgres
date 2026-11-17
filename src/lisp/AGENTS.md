@@ -636,8 +636,9 @@ Remove the trace and its temporary helper after the demo:
   still apply.
 - For repeated strict unit or physical runs on unchanged source, use
   `t/test-campaign.sh create`, `run CAMPAIGN unit|physical [head ...]`, and
-  `close CAMPAIGN` as described in the README. Each run has a fresh image and
-  strict compiler, private cache, and full identity and suite inventory gates.
+  `close CAMPAIGN` as described in the README. Each run has a fresh Lisp image,
+  private cache, and full identity and suite inventory gates. Strict compilation
+  is fresh unless a verified same-campaign qualification is explicitly reused.
   Create a new campaign when the checkout revision, dirty source files or checked
   runtime settings change. First qualify the image and each desired target with
   successful serial runs. Independent jobs may then use `--parallel`, each in a
@@ -650,6 +651,25 @@ Remove the trace and its temporary helper after the demo:
   reacquires campaign and RAM leases. Preserve compact evidence and audit active
   processes before deleting retained campaign files. Full unit runs have used
   3.4–3.8 GiB; eight Lisp images is a ceiling, not a target.
+- On unchanged source, keep the frozen campaign open and reuse its qualified
+  parent FASLs. `--reuse-strict-compile` requires a successful fresh strict
+  serial qualification for the same campaign, source, runtime, dependencies,
+  and feature gates; every run still uses a fresh Lisp image.
+- A measured pilot qualified the mocked-transport reseed heads
+  `RESEED-ACTIVATION-LOCAL-MOVE-0-RECONCILES-EVERY-SYNC-CUT` and
+  `RESEED-ACTIVATION-ADVANCES-OFFLINE-TO-ACTIVE-IN-EVERY-GEOMETRY` to overlap
+  in private RAM jobs. Their fixtures use private TMPDIR/PID/GENSYM filesystem
+  roots and process-local mock transport, without Lisp children or SQL listeners.
+  Do not infer independence for other heads, suites, or shards from this result.
+- When measuring scheduling gains, establish a serial baseline for each head
+  with the same source, runtime, cache policy, and selection. Use one fresh image
+  per head in both schedules. Check both per-head campaign receipts for the exact
+  source and head, exit 0, strict reuse, and zero parent and strict-compiler FASL
+  publications. Stagger launches at `TEST-STRICT-COMPILE-REUSED` (`STRICT-CAPTURE`
+  marks only a fresh compiler). Reserve capacity for existing full-run, server,
+  and control children within the eight-image ceiling. Budget private caches,
+  fixture data, and logs against both tmpfs free space and host RAM, as well as
+  checking available cores.
 
 ## Tests
 
