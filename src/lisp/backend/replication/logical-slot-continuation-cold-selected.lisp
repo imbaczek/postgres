@@ -7,6 +7,8 @@
       (values :stable (logical-slot-continuation-decode bytes))
       (values :prepared (logical-slot-continuation-prepared-decode bytes))))
 
+;; Classify selected child rows against stable or prepared snapshots.  This
+;; helper does not partition or validate the ordinary rows of a full inventory.
 (defun logical-slot-continuation-cold-classify-child-rows
     (kind model children binding certificate host)
   (ecase kind

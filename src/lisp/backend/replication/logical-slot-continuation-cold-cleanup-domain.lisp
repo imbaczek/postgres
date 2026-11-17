@@ -1,5 +1,10 @@
 (in-package #:pg)
 
+;; Validate the actual certificate child and fork with the pure empty-snapshot
+;; metadata check; this does not assert that the filesystem is empty.  Build
+;; the domain from canonical non-NIL fourth fields, including historical slots
+;; now missing from disk.  A NIL fourth field is deferred, not a child slot.
+;; Each image's logical system ID comes from its provenance.
 (defun logical-slot-continuation-cold-certified-domain (binding certificate host)
   (let ((history (logical-slot-continuation-origin-input-shape binding certificate host))
         (domain nil))
@@ -18,6 +23,10 @@
           (push (list (copy-seq name) slot) domain))))
     (values (sort domain #'string< :key #'first) history)))
 
+;; Classify only certified child rows, excluding ordinary and temporary slot
+;; eligibility.  Nonempty proofs require the original child; empty descendant
+;; history is allowed.  This pure check does no I/O and grants no effects,
+;; source or publication authority.
 (defun logical-slot-continuation-cold-check-child-selection
     (kind model rows binding certificate host)
   (let ((domain (logical-slot-continuation-cold-certified-domain binding certificate host)))

@@ -1,5 +1,8 @@
 (in-package #:pg)
 
+;; Bound the binding, certificate and host inputs before using them.  Certificate
+;; slot names must be valid and unique.  Check the shared host identity and
+;; history here so callers can also validate a descendant host.
 (defun logical-slot-continuation-origin-input-shape (binding certificate host)
   (logical-slot-copy-descriptor-list-count certificate 128)
   (logical-slot-continuation-list host 6)
@@ -23,6 +26,8 @@
     (error "continuation certificate differs from its actual host"))
   (logical-slot-continuation-history (fifth host) (fourth host)))
 
+;; Active nonempty proofs require the certificate's original child host.
+;; The shared shape check alone permits descendant history for empty snapshots.
 (defun logical-slot-continuation-origin-inputs (binding certificate host)
   (let ((history (logical-slot-continuation-origin-input-shape binding certificate host)))
     (unless (eql (fifth host) (getf certificate :child-timeline))
