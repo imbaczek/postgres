@@ -12,6 +12,53 @@
 
 (in-package #:pg)
 
+(defun call-with-physical-promotion-child-checkpoint-record (path snapshot function)
+  ;; Keep the record stream open through decoding and snapshot comparison.
+  (multiple-value-bind (stream size) (physical-promotion-open-file path)
+    (unwind-protect
+         (let ((bytes (make-array (wal-checkpoint-record-size snapshot)
+                                  :element-type '(unsigned-byte 8)))
+               (offset (mod (getf snapshot :start) +wal-segment-size+)))
+           (unless (<= (+ offset (length bytes)) size)
+             (error "child checkpoint is truncated"))
+           (file-position stream offset)
+           (unless (= (length bytes) (read-sequence bytes stream))
+             (error "child checkpoint differs from durable control"))
+           (funcall function bytes))
+      (close stream))))
+
+(defun %physical-promotion-check-child-checkpoint
+    (insertion checkpoint-timeline read-control with-history with-record function)
+  ;; Readers may retain named descriptors through FUNCTION. This validates their
+  ;; supplied images; ownership and retained-archive proof remain the caller's job.
+  (multiple-value-bind (checkpoint durable snapshot timeline checkpoint-id namespace metadata)
+      (funcall read-control)
+    (unless (and (typep insertion '(integer 2 4294967295))
+                 (= insertion checkpoint-timeline timeline checkpoint-id)
+                 (eq namespace :timeline) snapshot (wal-checkpoint-snapshot-valid-p snapshot)
+                 (= checkpoint (getf snapshot :end)) (<= checkpoint durable)
+                 (= insertion (getf snapshot :timeline)))
+      (error "child WAL control does not name a complete child checkpoint"))
+    (funcall
+     with-history (timeline-history-path insertion *pgdata*)
+     (lambda (history-bytes)
+       (let* ((history (timeline-check-lineage
+                        (timeline-parse-history insertion (bytes->string history-bytes))))
+              (parent (second history)) (start (getf snapshot :start))
+              (path (wal-segment-path (floor start +wal-segment-size+) insertion :timeline)))
+         (unless (and parent
+                      (= (getf snapshot :prev-timeline) (timeline-history-entry-timeline parent))
+                      (= insertion (timeline-at-point start history)))
+           (error "child checkpoint differs from its history"))
+         (timeline-check-resource-origin snapshot history)
+         (funcall
+          with-record path snapshot
+          (lambda (bytes)
+            (unless (equal snapshot
+                           (wal-checkpoint-record-snapshot (wal-decode-record bytes start)))
+              (error "child checkpoint differs from durable control"))
+            (funcall function snapshot history metadata))))))))
+
 (defun physical-promotion-check-child-checkpoint (insertion checkpoint-timeline)
   "Verify child checkpoint control, its WAL record and history without writes.
 Return the checkpoint snapshot, parsed history and metadata. This check must
@@ -21,34 +68,10 @@ separately validate any selected retained archive before using it as proof or
 granting writer authority. This lets a caller validate the root under its lease.
 Read the checkpoint's actual encoded size and check any resource origin against
 that history before accepting the control copy."
-  (multiple-value-bind (checkpoint durable snapshot timeline checkpoint-id namespace metadata) (wal-read-control-fields)
-    (unless (and (typep insertion '(integer 2 4294967295))
-                 (= insertion checkpoint-timeline timeline checkpoint-id)
-                 (eq namespace :timeline) snapshot (wal-checkpoint-snapshot-valid-p snapshot)
-                 (= checkpoint (getf snapshot :end)) (<= checkpoint durable)
-                 (= insertion (getf snapshot :timeline)))
-      (error "child WAL control does not name a complete child checkpoint"))
-    (let* ((history (timeline-check-lineage
-                     (timeline-parse-history
-                      insertion (bytes->string (physical-promotion-read-file
-                                                (timeline-history-path insertion *pgdata*))))))
-           (parent (second history)) (start (getf snapshot :start))
-           (path (wal-segment-path (floor start +wal-segment-size+) insertion :timeline)))
-      (unless (and parent (= (getf snapshot :prev-timeline) (timeline-history-entry-timeline parent))
-                   (= insertion (timeline-at-point start history)))
-        (error "child checkpoint differs from its history"))
-      (timeline-check-resource-origin snapshot history)
-      (multiple-value-bind (stream size) (physical-promotion-open-file path)
-        (unwind-protect
-             (let ((bytes (make-array (wal-checkpoint-record-size snapshot) :element-type '(unsigned-byte 8)))
-                   (offset (mod start +wal-segment-size+)))
-               (unless (<= (+ offset (length bytes)) size) (error "child checkpoint is truncated"))
-               (file-position stream offset)
-               (unless (and (= (length bytes) (read-sequence bytes stream))
-                            (equal snapshot (wal-checkpoint-record-snapshot (wal-decode-record bytes start))))
-                 (error "child checkpoint differs from durable control")))
-          (close stream)))
-      (values snapshot history metadata))))
+  (%physical-promotion-check-child-checkpoint
+   insertion checkpoint-timeline #'wal-read-control-fields
+   (lambda (path function) (funcall function (physical-promotion-read-file path)))
+   #'call-with-physical-promotion-child-checkpoint-record #'values))
 
 (defun physical-promotion-check-child-control (insertion checkpoint-timeline)
   (multiple-value-bind (snapshot history metadata)

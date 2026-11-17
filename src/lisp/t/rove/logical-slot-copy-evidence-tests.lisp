@@ -242,6 +242,58 @@
         (when root (sb-posix:close root))
         (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))
 
+(cl-spec:defproperty imported-startup-child-binding-keeps-identity-and-floor
+    ((same-id boolean) (delta (range integer -2 2)))
+  (:about logical-slot-imported-startup-check-child-binding)
+  (:trials (:normal 100))
+  (let* ((original (timeline-encode-history 2 1 200 "binding test" nil))
+         (facts (list :certificate
+                      (list :system-id 42 :child-timeline 2 :parent-timeline 1
+                            :fork 200 :child-end 400)
+                      :evidence (list :child-history original)))
+         (fields (list nil (+ 400 delta) nil nil nil nil
+                       (list :system-id (if same-id 42 43))))
+         (history (timeline-parse-history 2 (bytes->string original)))
+         (before (logical-slot-copy-clone-facts (list facts fields)))
+         (accepted (handler-case
+                       (logical-slot-imported-startup-check-child-binding facts fields history)
+                     (error () nil))))
+    (and (eql (not (null accepted)) (and same-id (not (minusp delta))))
+         (equalp before (list facts fields)))))
+
+(rove:deftest imported-startup-child-binding-generated-identity-and-floor
+    (let ((data (cl-spec:result-data
+                 (cl-spec:run-property
+                  'imported-startup-child-binding-keeps-identity-and-floor
+                  :seed 417 :profile :normal))))
+      (rove:ok (eq :passed (getf data :status)))))
+
+(rove:deftest imported-startup-child-binding-preserves-descendant-origin
+    (let* ((original (timeline-encode-history 2 1 200 "binding test" nil))
+           (facts (list :certificate
+                        (list :system-id 42 :child-timeline 2 :parent-timeline 1
+                              :fork 200 :child-end 400)
+                        :evidence (list :child-history original)))
+           (fields (list nil 700 nil nil nil nil (list :system-id 42)))
+           (descendant (timeline-encode-history 3 2 600 "later child" original)))
+      (rove:ok (logical-slot-imported-startup-check-child-binding
+                facts fields (timeline-parse-history 3 (bytes->string descendant))))
+      (dolist (fork '(300 399 400 401))
+        (let ((history (timeline-parse-history
+                        3 (bytes->string (timeline-encode-history 3 2 fork "boundary child" original)))))
+          (if (< fork 400)
+              (rove:ok (rove:signals
+                        (logical-slot-imported-startup-check-child-binding facts fields history)
+                        'error))
+              (rove:ok (logical-slot-imported-startup-check-child-binding facts fields history)))))
+      (rove:ok
+       (rove:signals
+        (logical-slot-imported-startup-check-child-binding
+         facts fields
+         (timeline-parse-history
+          3 (bytes->string (timeline-encode-history 3 1 600 "unrelated child" nil))))
+        'error))))
+
 (rove:deftest logical-import-artifacts-retain-startup-and-promotion-fences
     (let* ((base (uiop:ensure-directory-pathname
                   (sb-posix:mkdtemp

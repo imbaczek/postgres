@@ -50,6 +50,228 @@
            (funcall function (lambda () injected)))
       (setf (symbol-function 'logical-slot-copy-import-control-read-fd) original))))
 
+(defun native-imported-main-with-checkpoint-read-fault (name offset function)
+  (let ((original (symbol-function 'logical-slot-copy-import-control-read-fd))
+        (injected 0))
+    (unwind-protect
+         (progn
+           (setf (symbol-function 'logical-slot-copy-import-control-read-fd)
+                 (lambda (fd maximum)
+                   (multiple-value-bind (bytes facts) (funcall original fd maximum)
+                     (when (equal name
+                                  (file-namestring
+                                   (sb-posix:readlink (format nil "/proc/self/fd/~d" fd))))
+                       (setf bytes (copy-seq bytes))
+                       (incf injected)
+                       (setf (aref bytes offset) (logxor #xff (aref bytes offset))))
+                     (values bytes facts))))
+           (funcall function (lambda () injected)))
+      (setf (symbol-function 'logical-slot-copy-import-control-read-fd) original))))
+
+(defun native-imported-main-checkpoint-contract (root root-check)
+  (call-with-logical-slot-imported-startup-pair
+   root root-check
+   (lambda (image facts pair-check)
+     (declare (ignore facts))
+     (let* ((fields (multiple-value-list (wal-read-control-fields)))
+            (fds (length (directory #p"/proc/self/fd/*")))
+            (saved-check nil) (called nil))
+       (rove:ok
+        (equal '(:observed 17)
+               (multiple-value-list
+                (call-with-logical-slot-imported-startup-checkpoint
+                 root image pair-check
+                 (lambda (view check)
+                   (setf saved-check check called t)
+                   (rove:ok (= (getf (seventh fields) :system-id) (getf view :system-id)))
+                   (rove:ok (= (fourth fields) (getf view :timeline)))
+                   (rove:ok (= (second fields) (getf view :durable)))
+                   (rove:ok (= 5 (length (getf view :inputs))))
+                   (rove:ok (= (+ fds 5) (length (directory #p"/proc/self/fd/*"))))
+                   (dolist (key '(:control :history :checkpoint))
+                     (setf (aref (getf view key) 0)
+                           (logxor #xff (aref (getf view key) 0))))
+                   (setf (getf view :system-id) 0 (getf view :durable) 0)
+                   (setf (char (first (first (getf view :inputs))) 0) #\x)
+                   (incf (second (second (first (getf view :inputs)))))
+                   (incf (second (getf view :root-facts)))
+                   (rove:ok (funcall check))
+                   (let ((rejected nil))
+                     (sb-thread:join-thread
+                      (sb-thread:make-thread
+                       (lambda ()
+                         (setf rejected
+                               (handler-case (progn (funcall check) nil) (error () t))))))
+                     (rove:ok rejected))
+                   (rove:ok (funcall check))
+                   (values :observed 17))))))
+       (rove:ok called)
+       (rove:ok (rove:signals (funcall saved-check) 'error))
+       (rove:ok (= fds (length (directory #p"/proc/self/fd/*"))))
+       (rove:ok
+        (rove:signals
+         (call-with-logical-slot-imported-startup-checkpoint
+          root image pair-check
+          (lambda (view check)
+            (declare (ignore view))
+            (setf saved-check check)
+            (error "deliberate checkpoint callback failure")))
+         'error))
+       (rove:ok (rove:signals (funcall saved-check) 'error))
+       (let ((reject nil))
+         (rove:ok
+          (rove:signals
+           (call-with-logical-slot-imported-startup-checkpoint
+            root image
+            (lambda ()
+              (funcall pair-check)
+              (when reject (error "deliberate checkpoint root-check failure")))
+            (lambda (view check)
+              (declare (ignore view))
+              (setf reject t)
+              (rove:ok (rove:signals (funcall check) 'error))
+              (setf reject nil)
+              (rove:ok (rove:signals (funcall check) 'error))))
+           'error)))
+       (let* ((names '(wal-read-control-fields physical-promotion-read-file physical-promotion-open-file))
+              (originals (mapcar #'symbol-function names)))
+         (unwind-protect
+              (progn
+                (dolist (name names)
+                  (setf (symbol-function name)
+                        (lambda (&rest arguments)
+                          (declare (ignore arguments))
+                          (error "checkpoint observer attempted pathname-based I/O"))))
+                (rove:ok
+                 (eq :held
+                     (call-with-logical-slot-imported-startup-checkpoint
+                      root image pair-check
+                      (lambda (view check)
+                        (declare (ignore view))
+                        (rove:ok (funcall check))
+                        :held)))))
+           (loop for name in names for original in originals
+                 do (setf (symbol-function name) original))))
+       (let ((history-calls 0) (record-calls 0))
+         (rove:ok
+          (rove:signals
+           (%physical-promotion-check-child-checkpoint
+            (fourth fields) (1+ (fifth fields)) (lambda () (values-list fields))
+            (lambda (&rest arguments)
+              (declare (ignore arguments)) (incf history-calls))
+            (lambda (&rest arguments)
+              (declare (ignore arguments)) (incf record-calls))
+            #'values)
+           'error))
+         (rove:ok (zerop history-calls))
+         (rove:ok (zerop record-calls))
+         (rove:ok
+          (rove:signals
+           (%physical-promotion-check-child-checkpoint
+            (fourth fields) (fifth fields) (lambda () (values-list fields))
+            (lambda (path consume)
+              (declare (ignore path))
+              (incf history-calls)
+              (funcall consume (make-array 0 :element-type '(unsigned-byte 8))))
+            (lambda (&rest arguments)
+              (declare (ignore arguments)) (incf record-calls))
+            #'values)
+           'error))
+         (rove:ok (= history-calls 1))
+         (rove:ok (zerop record-calls)))
+       (let ((original (symbol-function 'physical-promotion-open-file)) (opened nil))
+         (unwind-protect
+              (progn
+                (setf (symbol-function 'physical-promotion-open-file)
+                      (lambda (&rest arguments)
+                        (multiple-value-bind (stream size) (apply original arguments)
+                          (setf opened stream)
+                          (values stream size))))
+                (rove:ok
+                 (rove:signals
+                  (call-with-physical-promotion-child-checkpoint-record
+                   (wal-segment-path (floor (getf (third fields) :start) +wal-segment-size+)
+                                     (fourth fields) :timeline)
+                   (third fields)
+                   (lambda (bytes)
+                     (rove:ok (open-stream-p opened))
+                     (rove:ok (= (length bytes) (wal-checkpoint-record-size (third fields))))
+                     (error "deliberate checkpoint consumer failure")))
+                  'error))
+                (rove:ok (not (open-stream-p opened))))
+           (setf (symbol-function 'physical-promotion-open-file) original)))
+       (dolist (case
+                   (list (list "pg_wal_control" 0)
+                         (list (timeline-history-filename (fourth fields)) 0)
+                         (list (wal-segment-filename
+                                (floor (getf (third fields) :start) +wal-segment-size+)
+                                (fourth fields) :timeline)
+                               (mod (getf (third fields) :start) +wal-segment-size+))))
+         (native-imported-main-with-checkpoint-read-fault
+          (first case) (second case)
+          (lambda (injected)
+            (let ((entered nil))
+              (rove:ok
+               (rove:signals
+                (call-with-logical-slot-imported-startup-checkpoint
+                 root image pair-check
+                 (lambda (view check)
+                   (declare (ignore view check)) (setf entered t)))
+                'error))
+              (rove:ok (not entered))
+              (rove:ok (plusp (funcall injected)))))))
+       (rove:ok (= fds (length (directory #p"/proc/self/fd/*"))))))))
+
+(defun native-imported-main-checkpoint-replacement-contract (root root-check)
+  ;; This explicit destructive mode restores inode, bytes and permissions.
+  ;; Rename changes timestamps; the driver records that narrower preservation.
+  (let* ((path (merge-pathnames "global/pg_wal_control" *pgdata*))
+         (saved (merge-pathnames
+                 (format nil "global/.checkpoint-probe-original-~d" (sb-posix:getpid)) *pgdata*))
+         (copy (merge-pathnames
+                (format nil "global/.checkpoint-probe-copy-~d" (sb-posix:getpid)) *pgdata*))
+         (bytes (read-bounded-regular-file path (1+ +wal-control-maximum-bytes+)))
+         (inode (sb-posix:stat-ino (sb-posix:lstat path)))
+         (moved nil) (installed nil) (entered nil) (saved-check nil))
+    (when (or (wal-namespace-file-stat saved t) (wal-namespace-file-stat copy t))
+      (error "checkpoint replacement probe names already exist"))
+    (unwind-protect
+         (progn
+           (with-open-file (out copy :direction :output :if-exists :error
+                                     :element-type '(unsigned-byte 8))
+             (sb-posix:fchmod (sb-sys:fd-stream-fd out) #o600)
+             (write-sequence bytes out))
+           (call-with-logical-slot-imported-startup-pair
+            root root-check
+            (lambda (image facts check)
+              (declare (ignore facts))
+              (rove:ok
+               (rove:signals
+                (call-with-logical-slot-imported-startup-checkpoint
+                 root image check
+                 (lambda (view current-check)
+                   (declare (ignore view))
+                   (setf entered t saved-check current-check)
+                   (sb-sys:without-interrupts
+                     (sb-posix:rename path saved)
+                     (setf moved t)
+                     (sb-posix:rename copy path)
+                     (setf installed t))
+                   (rove:ok (rove:signals (funcall current-check) 'error))))
+                'error))))
+           (rove:ok entered)
+           (rove:ok (rove:signals (funcall saved-check) 'error)))
+      (sb-sys:without-interrupts
+        (when installed
+          (sb-posix:rename path copy)
+          (setf installed nil))
+        (when moved
+          (sb-posix:rename saved path)
+          (setf moved nil))
+        (when (wal-namespace-file-stat copy t) (delete-file copy))))
+    (rove:ok (= inode (sb-posix:stat-ino (sb-posix:lstat path))))
+    (rove:ok (equalp bytes (read-bounded-regular-file path (1+ +wal-control-maximum-bytes+))))))
+
 (defun native-imported-main-history-contract (root root-check)
   (let ((saved-check nil)
         (expected (or (uiop:getenv "PG_NATIVE_IMPORTED_HISTORY_PROFILE") "original")))
@@ -266,6 +488,9 @@
        (lambda (root root-check)
          (native-imported-main-history-contract root root-check)
          (native-imported-main-sidecar-contract root root-check)
+         (native-imported-main-checkpoint-contract root root-check)
+         (when (equal (uiop:getenv "PG_NATIVE_IMPORTED_CHECKPOINT_REPLACE") "1")
+           (native-imported-main-checkpoint-replacement-contract root root-check))
          (rove:ok
           (equal
            '(:observed 17)

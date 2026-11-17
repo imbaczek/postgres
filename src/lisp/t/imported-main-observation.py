@@ -1,4 +1,4 @@
-"""Check pre-WAL imported proof observations without modifying the certified root."""
+"""Check pre-WAL observations, with an explicit reversible replacement probe."""
 
 import hashlib
 import importlib.util
@@ -20,12 +20,13 @@ def lisp_string(value):
     return '"' + str(value).replace('\\', '\\\\').replace('"', '\\"') + '"'
 
 
-def fixture_image(data, writer):
+def fixture_image(data, writer, *, timestamps=True):
     image = writer.tree_image(data)
     for relative, row in image.items():
         facts = (data / relative).lstat()
-        row.extend((facts.st_uid, facts.st_gid, facts.st_nlink,
-                    facts.st_mtime_ns, facts.st_ctime_ns))
+        row.extend((facts.st_uid, facts.st_gid, facts.st_nlink))
+        if timestamps:
+            row.extend((facts.st_mtime_ns, facts.st_ctime_ns))
     return image
 
 
@@ -36,6 +37,9 @@ def main():
     root = campaign.job_root(os.environ['PG_LISP_TEST_CAMPAIGN'])
     job = campaign.job_root()
     data = Path(os.environ['PG_NATIVE_ACTIVE_PROOF_DATA']).resolve(strict=True)
+    replace = os.environ.get('PG_NATIVE_IMPORTED_CHECKPOINT_REPLACE')
+    if replace not in (None, '1'):
+        raise ValueError('Checkpoint replacement probe requires explicit value 1')
     # The certificate binds this earlier fixture's inode; a new job cannot clone it.
     campaign.job_root(data.parents[2])
     identity = (data.stat().st_dev, data.stat().st_ino)
@@ -51,7 +55,7 @@ def main():
                 or frozen['image'] != campaign.fingerprint(Path(frozen['checkout']))):
             raise ValueError('Imported observation source or runtime changed')
         with writer.owned_fixture(data, identity):
-            before = fixture_image(data, writer)
+            before = fixture_image(data, writer, timestamps=not replace)
         campaign.write_json(job / 'logs/original-before.json', before)
         dependencies = lisp_string(source / 't/test-dependencies.lisp')
         setup = ('(let ((cl-user::*pg-test-system* "rove")) '
@@ -71,7 +75,7 @@ def main():
              '--eval', '(require :asdf)', '--eval', setup, '--eval', load],
             environment, log, lease, run_lock, workspace)
         with writer.owned_fixture(data, identity):
-            after = fixture_image(data, writer)
+            after = fixture_image(data, writer, timestamps=not replace)
         campaign.write_json(job / 'logs/original-after.json', after)
         preserved = before == after
         source_preserved = frozen['image'] == campaign.fingerprint(source)
@@ -80,6 +84,9 @@ def main():
                             text, re.MULTILINE)
         result = dict(exit_code=status, wall_seconds=time.monotonic() - started,
                       source=frozen['image'], original_preserved=preserved,
+                      checkpoint_replacement=bool(replace),
+                      preservation=('inode/content/mode/owner/links; timestamps may change'
+                                    if replace else 'full facts except access time'),
                       source_preserved=source_preserved,
                       phases={name: float(value) for name, value in phases},
                       original_sha256=hashlib.sha256(
