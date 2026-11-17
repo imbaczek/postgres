@@ -917,16 +917,15 @@
   fork when directory removal is enabled, despite native rewind being
   unavailable. The probe preserves the stopped target, then the test rejoins
   through journaled reseed (`e6c2000d8dd`).
-  Native divergent rewind remains open. Start with a read-only plan under the
-  stopped-target lock. Verify cluster identity, ancestry, shared WAL bytes and
-  complete endpoints before comparing the target to a fixed source checkpoint.
-  C pg_rewind copies pages changed on the target and replays source WAL for the
-  remaining changes. A native candidate built directly at a source checkpoint
-  must account for changes on both branches, plus relation resets and reuse of
-  file identifiers. Fetch only the needed source data and verify the complete
-  candidate against the source manifest before journaled publication. The
-  acceptance should include target-only and source-only changes in one
-  relation and show that a sizeable unchanged relation was reused locally.
+  Native rewind now verifies common retained WAL and the fork against an exact
+  READY source checkpoint. It reuses complete matching relation files and
+  fetches changed files, then verifies the entire image before publication.
+  The fixture reopens the persisted capture in a fresh process, installs the
+  image, and rejoins through pinned Patroni follow and restart (`c7fc921a907`).
+  It covers a clean stopped former primary and its immediate child timeline,
+  with writes on both branches and local reuse of an unchanged large relation.
+  The production `pg_rewind` executable and Patroni rewind invocation remain
+  open. C pg_rewind can copy changed pages rather than whole relation files.
   Coordination stays outside this backend work.
 
 - [x] Keep ready native physical senders through the primary shutdown checkpoint.
@@ -1473,7 +1472,8 @@
   or coordination. Authenticated native export and installation now support the
   default remote Patroni bootstrap clone, with staged publication and cancellation
   cleanup. Prefix-proved offline adoption supplies recovery provenance for
-  the clean former primary covered above. Native rewind remains unimplemented,
+  the clean former primary covered above. The native rewind backend now passes
+  the journaled fixture above. The production rewind executable remains open,
   and C physical tooling is incompatible with the native format.
   The complete unchanged Patroni writer oracle now passes, including `hba_file`
   and `ident_file`. These settings accept only disabled or unset values:
