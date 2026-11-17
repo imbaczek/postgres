@@ -928,8 +928,14 @@
    installation and standby handoff. Direct tests cover config repair with
    `--finish`. Pinned Patroni 4.1.5 invokes the executable through an explicit
    `Rewind.execute` call and follows and restarts the installed standby.
-   Automatic eligibility, rewind continuation before terminal handoff and
-   retrieval of missing target WAL from an archive remain open. C pg_rewind
+   Stock eligibility and divergence detection now work on a clean stopped
+   former primary when all catalog relation pages have verified native CRCs.
+   The check scans those pages under the data directory lock. Patroni can
+   arm its divergence check before demoting a running primary, so a
+   stopped-only scan cannot qualify that path. Add durable checksum
+   capability evidence and qualify crash recovery for dirty former primaries.
+   Rewind continuation before terminal handoff and retrieval of missing
+   target WAL from an archive remain open. C pg_rewind
    builds a changed-page map from target WAL. Native rewind reuses whole
    matching relation files.
   Coordination stays outside this backend work.
@@ -1479,8 +1485,10 @@
   default remote Patroni bootstrap clone, with staged publication and cancellation
   cleanup. Prefix-proved offline adoption supplies recovery provenance for
    the clean former primary covered above. The native rewind executable passes
-   explicit Patroni execution and rejoin. Exercise stock eligibility and timeline
-   divergence detection using verified native control and checkpoint evidence.
+   Patroni eligibility, divergence detection and rejoin on a clean stopped
+   former primary. Native `pg_waldump` handles Patroni's two-record checkpoint
+   probe on that state. Pre-stop eligibility, dirty-target recovery, and
+   other Patroni WAL dump queries remain open.
    C physical tooling is incompatible with the native format.
   The complete unchanged Patroni writer oracle now passes, including `hba_file`
   and `ident_file`. These settings accept only disabled or unset values:
