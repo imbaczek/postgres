@@ -164,6 +164,12 @@ digest. Establish the source's ancestry before the export base separately."
 
 (defun physical-rewind-prove-leased-origin
     (owner source-root source-image origin-identity client request)
+  "Prove shared WAL for the locked target and a verified source image.
+Hold the image's descriptor scope and use the admitted source connection.
+Bind the image to the source's READY lease and match the shared interval and
+digest against the retained root. Recheck the target owner and source image.
+Return the interval proof with the retained root ID and fork digest.
+Installation requires separate checks."
   (let* ((proof (physical-rewind-prove-shared-history owner source-root source-image origin-identity))
          (manifest (getf source-image :manifest))
          (fork (getf proof :fork))

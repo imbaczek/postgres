@@ -289,6 +289,10 @@ WAL or archive mutex. Recheck the captured context before and after the scan."
       (wal-invalid-input "rewind origin proof changed while reading retained WAL"))))
 
 (defun physical-rewind-origin-proof (lease capture historical)
+  "Hash retained WAL through the fork for an exact READY backup capture.
+Hold a retained-root reader while hashing and recheck the lease and source
+state before and after the read. Return the capture, historical identity,
+digest, retained root ID and source history after releasing the reader."
   (let ((lease (physical-backup-lease-request-copy lease))
         (capture (copy-list capture))
         (historical (physical-origin-proof-check-request historical)))
