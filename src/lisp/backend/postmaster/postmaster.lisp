@@ -471,6 +471,8 @@ are killed abruptly."
 (defvar *physical-slot-cold-cleanup-exit-ready* nil)
 
 (defun request-cold-slot-reconciliation-exit (backend)
+  ;; Only the owner can hand off the exit, after any pending error response
+  ;; and connection teardown have had a chance to finish.
   (when (and backend (eq backend *physical-slot-cold-cleanup-owner*))
     (setf *physical-slot-cold-cleanup-exit-ready* t))
   (values))

@@ -67,6 +67,8 @@
                             (logical-slot-continuation-protection-names protection)
                             :test #'string=)))
     (error "temporary physical operation is outside its ordinary registry"))
+  ;; Only a published, uncertain imported group can issue this refusal.  Its
+  ;; identity and retention pin must still match when the refusal is adopted.
   (when (and (eq operation :physical-drop) (svref control 1)
              (eq :published (svref control 0)))
     (physical-slot-refuse-cold-cleanup-under-lock

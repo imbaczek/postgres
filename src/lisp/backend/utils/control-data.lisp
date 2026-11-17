@@ -59,6 +59,8 @@ an existing identity must match the catalog."
     (when (= state +db-shutdowned+)
       (native-control-test-point :before-primary-shutdown-clean))
     (with-wal-critical
+      ;; Adoption and this check share WAL exclusion.  A refused slot must be
+      ;; reconciled at startup, so control must not advertise a clean shutdown.
       (when (and (= state +db-shutdowned+) *physical-slot-cold-cleanup-owner*)
         (error 'primary-clean-publication-fenced))
       (wal-require-no-pending-storage)

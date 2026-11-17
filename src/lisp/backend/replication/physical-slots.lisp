@@ -544,6 +544,7 @@ interior position on a standby."
               (physical-slot-lifetime-call-under-lock
                (wal-replication-slot-temporary-lifetime slot)
                :adopt-cold-cleanup slot condition))
+            ;; Release WAL before taking the admission mutex to wake waiters.
             (call-with-live-operation-lock-if-needed
              (lambda () (sb-thread:condition-broadcast *live-operation-cv*))))))))
   (values))

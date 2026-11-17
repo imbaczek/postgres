@@ -207,6 +207,7 @@ count; an XID alone, shared cache pages and an empty context do not."
   ;; Consume only at delivery, and let termination supersede query cancel.
   ;; A queued helper becomes a no-op if a cooperative check delivered it first.
   ;; A failed backend keeps its original WAL error; other backends still terminate.
+  ;; Likewise, let the cold-cleanup owner deliver its error before process exit.
   (when (and backend (backend-termination-pending backend)
              (not (backend-wal-failure backend))
              (not (eq backend *physical-slot-cold-cleanup-owner*)))

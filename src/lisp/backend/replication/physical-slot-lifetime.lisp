@@ -21,6 +21,8 @@
                 physical-slot-check-temporary-owner-under-lock))
 
 (defun physical-slot-refuse-cold-cleanup-under-lock (slot check-group)
+  ;; The condition is authority only through this issued check.  Recheck the
+  ;; exact slot, creator, lifetime and protected group when cleanup adopts it.
   (assert (sb-thread:holding-mutex-p *wal-lock*))
   (physical-slot-lifetime-check-under-lock slot)
   (physical-slot-check-temporary-owner-under-lock slot *backend*)
@@ -96,6 +98,8 @@
                              (eq (physical-slot-lifetime-state capability)
                                  (gethash capability *physical-slot-lifetime-seals*)))
                   (error "temporary physical name lost its original generation"))
+                ;; Unregister retires the creator token even when cold cleanup
+                ;; must keep the name, storage context and exact generation.
                 (if (eq (physical-slot-lifetime-context-phase context) :cold-cleanup-required)
                     (progn
                       (physical-slot-lifetime-check-storage context)
@@ -267,6 +271,8 @@
   (let ((phase (physical-slot-lifetime-context-phase context)))
     (when (eq operation :cold-cleanup-retained-p)
       (return-from physical-slot-lifetime-dispatch (eq phase :cold-cleanup-required)))
+    ;; Adoption keeps the slot and its name reserved for startup. Ordinary
+    ;; live and drop operations must reject this phase.
     (when (eq operation :adopt-cold-cleanup)
       (unless (and (eq phase :live) (null (wal-replication-slot-drop-claim slot)))
         (error "cold cleanup requires a live temporary slot without a drop claim"))
