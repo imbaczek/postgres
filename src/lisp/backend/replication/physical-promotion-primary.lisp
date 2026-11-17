@@ -13,7 +13,8 @@
 (in-package #:pg)
 
 (defun call-with-physical-promotion-child-checkpoint-record (path snapshot function)
-  ;; Keep the record stream open through decoding and snapshot comparison.
+  ;; Read the checkpoint record at SNAPSHOT's segment offset.  Keep the stream
+  ;; open through FUNCTION; reject a short file or read.
   (multiple-value-bind (stream size) (physical-promotion-open-file path)
     (unwind-protect
          (let ((bytes (make-array (wal-checkpoint-record-size snapshot)
@@ -29,8 +30,11 @@
 
 (defun %physical-promotion-check-child-checkpoint
     (insertion checkpoint-timeline read-control with-history with-record function)
-  ;; Readers may retain named descriptors through FUNCTION. This validates their
-  ;; supplied images; ownership and retained-archive proof remain the caller's job.
+  ;; Validate control, history and checkpoint record images supplied by the
+  ;; readers, then call FUNCTION with the snapshot, parsed history and metadata.
+  ;; Readers keep the supplied images valid through their callbacks.  The caller
+  ;; must enforce ownership and input stability for that scope.
+  ;; A valid lineage position does not prove that earlier WAL remains retained.
   (multiple-value-bind (checkpoint durable snapshot timeline checkpoint-id namespace metadata)
       (funcall read-control)
     (unless (and (typep insertion '(integer 2 4294967295))

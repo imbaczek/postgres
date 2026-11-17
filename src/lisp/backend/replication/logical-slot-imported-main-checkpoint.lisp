@@ -1,8 +1,8 @@
 (in-package #:pg)
 
 (defun logical-slot-imported-startup-check-child-binding (facts fields history)
-  ;; The checkpoint validator has checked these fields and actual WAL bytes.
-  ;; Bind that same control and history to the permanent imported origin.
+  ;; Bind the validated child checkpoint and history to the imported origin.
+  ;; The position in this lineage is not proof that all earlier WAL is retained.
   (let ((certificate (getf facts :certificate)))
     (unless (and (eql (getf certificate :system-id)
                       (getf (seventh fields) :system-id))
@@ -26,8 +26,13 @@
   t)
 
 (defun call-with-logical-slot-imported-startup-checkpoint (root image root-check function)
-  ;; Observe current primary control before WAL opens. Keep all named inputs
-  ;; held through the callback; this supplies evidence, never startup permission.
+  ;; Observe current primary control before WAL opens, under startup quiescence.
+  ;; ROOT and ROOT-CHECK identify the held PGDATA root; ROOT-CHECK must reject
+  ;; lost authority.  Keep the named inputs open through FUNCTION, which receives
+  ;; copied checkpoint facts and a check closure.  The closure is valid only on
+  ;; this thread during the callback and latches failures.  Checks before and after
+  ;; the callback reject changed inputs or authority.  This observation grants no
+  ;; startup admission and does not prove a complete retained WAL archive.
   (physical-adoption-check-startup-quiescence)
   (funcall root-check)
   (let* ((facts (logical-slot-copy-check-source-proof (copy-seq image)))
