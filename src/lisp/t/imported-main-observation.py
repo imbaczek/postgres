@@ -74,16 +74,19 @@ def main():
             after = fixture_image(data, writer)
         campaign.write_json(job / 'logs/original-after.json', after)
         preserved = before == after
+        source_preserved = frozen['image'] == campaign.fingerprint(source)
         text = log.read_text()
         phases = re.findall(r'^IMPORTED-MAIN-OBSERVATION-PHASE (setup|execution) wall=([0-9]+\.[0-9]+)$',
                             text, re.MULTILINE)
         result = dict(exit_code=status, wall_seconds=time.monotonic() - started,
                       source=frozen['image'], original_preserved=preserved,
+                      source_preserved=source_preserved,
                       phases={name: float(value) for name, value in phases},
                       original_sha256=hashlib.sha256(
                           json.dumps(before, sort_keys=True).encode()).hexdigest(), log=str(log))
         campaign.write_json(job / 'logs/imported-main-observation-result.json', result)
-        if (status or not preserved or 'IMPORTED-MAIN-OBSERVATION PASS' not in text
+        if (status or not preserved or not source_preserved
+                or 'IMPORTED-MAIN-OBSERVATION PASS' not in text
                 or len(phases) != 2 or set(result['phases']) != {'setup', 'execution'}):
             raise RuntimeError('Imported observation failed: ' + str(result))
         print('IMPORTED-MAIN-OBSERVATION-RESULT ' + json.dumps(result), flush=True)

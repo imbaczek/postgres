@@ -203,6 +203,45 @@
                (rove:ok (logical-slot-copy-imported-startup-candidate-p)))
           (uiop:delete-directory-tree root :validate t :if-does-not-exist :ignore)))))
 
+(rove:deftest imported-startup-recovery-profile-rejects-partial-trios
+    (let* ((directory (uiop:ensure-directory-pathname
+                       (sb-posix:mkdtemp
+                        (namestring (merge-pathnames "import-recovery-profile-XXXXXX"
+                                                     (uiop:temporary-directory))))))
+           (root nil)
+           (names '("physical-recovery.control" "physical-backup.manifest" "recovery.required")))
+      (unwind-protect
+           (progn
+             (setf root (physical-backup-open-directory directory))
+             (dotimes (mask 8)
+               (loop for name in names for bit from 0 when (logbitp bit mask)
+                     do (with-open-file (out (merge-pathnames name directory)
+                                             :direction :output :if-exists :error)
+                          (write-char #\x out)))
+               (case mask
+                 (0 (rove:ok (eq :retired (logical-slot-imported-startup-recovery-profile root))))
+                 (7 (rove:ok (eq :original (logical-slot-imported-startup-recovery-profile root))))
+                 (otherwise
+                  (rove:ok (rove:signals (logical-slot-imported-startup-recovery-profile root) 'error))))
+               (loop for name in names for bit from 0 when (logbitp bit mask)
+                     do (delete-file (merge-pathnames name directory))))
+             (dolist (name names)
+               (with-open-file (out (merge-pathnames name directory) :direction :output :if-exists :error)
+                 (write-char #\x out)))
+             (dolist (name names)
+               (let ((path (merge-pathnames name directory)))
+                 (delete-file path)
+                 (sb-posix:symlink "missing-recovery-input" (namestring path))
+                 (rove:ok (rove:signals (logical-slot-imported-startup-recovery-profile root) 'error))
+                 (delete-file path)
+                 (sb-posix:mkdir (namestring path) #o700)
+                 (rove:ok (rove:signals (logical-slot-imported-startup-recovery-profile root) 'error))
+                 (sb-posix:rmdir (namestring path))
+                 (with-open-file (out path :direction :output :if-exists :error)
+                   (write-char #\x out)))))
+        (when root (sb-posix:close root))
+        (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))
+
 (rove:deftest logical-import-artifacts-retain-startup-and-promotion-fences
     (let* ((base (uiop:ensure-directory-pathname
                   (sb-posix:mkdtemp

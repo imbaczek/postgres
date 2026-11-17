@@ -30,6 +30,109 @@
             (multiple-value-prog1 (funcall function root #'check)
               (check)))))))))
 
+(defun native-imported-main-with-history-read-fault (name enabled function)
+  (let ((original (symbol-function 'logical-slot-copy-import-control-read-fd))
+        (injected 0))
+    (unwind-protect
+         (progn
+           (setf (symbol-function 'logical-slot-copy-import-control-read-fd)
+                 (lambda (fd maximum)
+                   (let ((bytes (funcall original fd maximum)))
+                     (if (and (funcall enabled)
+                              (equal name
+                                     (file-namestring
+                                      (sb-posix:readlink (format nil "/proc/self/fd/~d" fd)))))
+                         (let ((changed (copy-seq bytes)))
+                           (incf injected)
+                           (setf (aref changed 0) (logxor #xff (aref changed 0)))
+                           changed)
+                         bytes))))
+           (funcall function (lambda () injected)))
+      (setf (symbol-function 'logical-slot-copy-import-control-read-fd) original))))
+
+(defun native-imported-main-history-contract (root root-check)
+  (let ((saved-check nil)
+        (expected (or (uiop:getenv "PG_NATIVE_IMPORTED_HISTORY_PROFILE") "original")))
+    (unless (member expected '("original" "retired") :test #'equal)
+      (error "unknown native imported history profile"))
+    (call-with-logical-slot-imported-startup-pair
+     root root-check
+     (lambda (image facts pair-check)
+       (declare (ignore facts))
+       (let ((names
+               (append '("logical-slot-copy.descriptor" "logical-slot-copy.base-verified"
+                         "logical-slot-copy.evidence")
+                       (when (equal expected "original")
+                         '("physical-backup.manifest" "physical-recovery.control" "recovery.required")))))
+         (rove:ok
+          (eq :history
+              (call-with-logical-slot-imported-startup-history
+               root image pair-check
+               (lambda (profile snapshot check)
+                 (rove:ok (eq profile (if (equal expected "original") :original :retired)))
+                 (rove:ok (equal names (mapcar #'first snapshot)))
+                 (setf saved-check check)
+                 (let* ((name (caar snapshot)) (initial (char name 0)))
+                   (unwind-protect
+                        (progn
+                          (setf (char name 0) #\x)
+                          (rove:ok (funcall check)))
+                     (setf (char name 0) initial)))
+                 (setf (first (second (first snapshot))) 0
+                       (aref (third (first snapshot)) 0)
+                       (logxor #xff (aref (third (first snapshot)) 0)))
+                 (rove:ok (funcall check))
+                 (let ((rejected nil))
+                   (sb-thread:join-thread
+                    (sb-thread:make-thread
+                     (lambda ()
+                       (setf rejected
+                             (handler-case (progn (funcall check) nil) (error () t))))))
+                   (rove:ok rejected))
+                 :history))))
+         (rove:ok (rove:signals (funcall saved-check) 'error))
+         (rove:ok
+          (rove:signals
+           (call-with-logical-slot-imported-startup-history
+            root image pair-check
+            (lambda (profile snapshot check)
+              (declare (ignore profile snapshot))
+              (setf saved-check check)
+              (error "deliberate historical observation callback failure")))
+           'error))
+         (rove:ok (rove:signals (funcall saved-check) 'error))
+         (dolist (name names)
+           (native-imported-main-with-history-read-fault
+            name (constantly t)
+            (lambda (injected)
+              (let ((called nil))
+                (rove:ok
+                 (rove:signals
+                  (call-with-logical-slot-imported-startup-history
+                   root image pair-check
+                   (lambda (&rest arguments)
+                     (declare (ignore arguments))
+                     (setf called t)))
+                  'error))
+                (rove:ok (not called))
+                (rove:ok (= 1 (funcall injected)))))))
+         (let ((enabled nil))
+           (native-imported-main-with-history-read-fault
+            (first names) (lambda () enabled)
+            (lambda (injected)
+              (rove:ok
+               (rove:signals
+                (call-with-logical-slot-imported-startup-history
+                 root image pair-check
+                 (lambda (profile snapshot check)
+                   (declare (ignore profile snapshot))
+                   (setf enabled t)
+                   (rove:ok (rove:signals (funcall check) 'error))
+                   (setf enabled nil)
+                   (rove:ok (rove:signals (funcall check) 'error))))
+                'error))
+              (rove:ok (= 1 (funcall injected)))))))))))
+
 (rove:deftest imported-main-pair-observer-is-read-only-and-scoped-before-wal
     (let* ((started (get-internal-real-time))
            (*pgdata* (uiop:ensure-directory-pathname
@@ -46,6 +149,7 @@
       (rove:ok (zerop (hash-table-count *wal-replication-slots*)))
       (native-imported-main-with-root
        (lambda (root root-check)
+         (native-imported-main-history-contract root root-check)
          (rove:ok
           (equal
            '(:observed 17)

@@ -78,15 +78,23 @@ def main():
         env['PG_NATIVE_DESCENDANT_BACKUP'] = str(backup)
         results = []
 
-        def child(phase, script, environment, marker):
+        def child(phase, script, environment, marker, *, rove=False):
             log = logs / ('descendant-' + phase + '.log')
             quoted = json.dumps(str(source / 't' / script))
             load = ('(handler-bind ((warning (lambda (c) (unless '
                     '(typep c \'sb-kernel:redefinition-warning) (error c))))) (load ' + quoted + '))')
             start = time.monotonic()
-            status = campaign.wait_child(
-                [env.get('SBCL', 'sbcl'), '--noinform', '--no-sysinit', '--no-userinit',
-                 '--non-interactive', '--eval', load], environment, log, lease, run_lock, workspace)
+            command = [env.get('SBCL', 'sbcl'), '--noinform', '--no-sysinit', '--no-userinit',
+                       '--non-interactive']
+            if rove:
+                dependencies = json.dumps(str(source / 't/test-dependencies.lisp'))
+                setup = ('(let ((cl-user::*pg-test-system* "rove")) '
+                         '(declare (special cl-user::*pg-test-system*)) (load ' + dependencies + '))')
+                command += ['--eval',
+                            '(defparameter *native-imported-main-bootstrap-start* (get-internal-real-time))',
+                            '--eval', '(require :asdf)', '--eval', setup]
+            command += ['--eval', load]
+            status = campaign.wait_child(command, environment, log, lease, run_lock, workspace)
             passed = status == 0 and marker in log.read_text(errors='replace')
             results.append(dict(phase=phase, exit_code=status, passed=passed,
                                 wall_seconds=time.monotonic() - start, log=str(log)))
@@ -140,6 +148,12 @@ def main():
                         if os.path.lexists(target):
                             raise ValueError('Promotion replaced a stashed proof name')
                         os.rename(item, target)
+                    observation_cache = job / 'cache/rove-observation'
+                    observation_cache.mkdir(mode=0o700)
+                    child('observe-retired-history', 'imported-main-observation.lisp',
+                          dict(env, PG_NATIVE_IMPORTED_HISTORY_PROFILE='retired',
+                               XDG_CACHE_HOME=str(observation_cache)),
+                          'IMPORTED-MAIN-OBSERVATION PASS', rove=True)
                     for phase in ('stable-empty', 'absent-empty'):
                         if phase == 'absent-empty':
                             (data / 'pg_logical_continuation/selector').unlink()
@@ -183,6 +197,12 @@ def main():
                 raise ValueError('Descendant experiment did not restore the original fixture')
             if writer.tree_image(variant) != variant_before:
                 raise ValueError('Preserved writer variant changed')
+        observed_source = campaign.fingerprint(source)
+        campaign.write_json(logs / 'native-descendant-source-preservation.json',
+                            dict(expected=frozen['image'], observed=observed_source,
+                                 preserved=observed_source == frozen['image']))
+        if observed_source != frozen['image']:
+            raise ValueError('Descendant frozen source changed during execution')
         print('CONTINUATION-NATIVE-DESCENDANT PASS ' + json.dumps(results), flush=True)
 
 
