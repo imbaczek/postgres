@@ -119,6 +119,11 @@
            (complete nil))
       (unwind-protect
            (progn
+             (multiple-value-bind (discovered discovered-fork timeline)
+                 (pg-client-native-rewind-origin client)
+               (assert (equal identity discovered))
+               (assert (= fork discovered-fork))
+               (assert (= (getf request :timeline) timeline)))
              (setf fd (physical-backup-open-directory source-directory)
                    attempted t)
              (call-with-physical-adoption-owner

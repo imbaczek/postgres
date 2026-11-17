@@ -238,6 +238,9 @@
        (parse-native-backup-lease-command words))
       ((equal verb "PREPARE_FOLLOW") (parse-native-physical-prepare words))
       ((equal verb "PROVE_RETAINED") (parse-native-physical-prove-retained words))
+      ((equal verb "IDENTIFY_REWIND_ORIGIN")
+       (unless (= (length words) 1) (ereport "42601" "IDENTIFY_REWIND_ORIGIN does not accept options"))
+       (make-logical-replication-command :type :physical-identify-rewind-origin))
       ((equal verb "RELEASE_FOLLOW") (parse-native-physical-release words))
       ((equal verb "RELEASE_BOOTSTRAP") (parse-native-physical-bootstrap-release words))
       ((equal verb "CREATE_REPLICATION_SLOT") (parse-create-replication-slot words))
@@ -1081,7 +1084,8 @@ The caller releases the slot before sending shutdown completion."
                                                                   :physical-lease-capture :physical-lease-status :physical-lease-abort :physical-lease-handoff
                                                                   :physical-lease-cleanup-selected
                                                                   :physical-lease-prepare-follow :physical-lease-cancel-follow
-                                                                  :physical-lease-prove-rewind :physical-lease-capture-rewind))
+                                                                  :physical-lease-prove-rewind :physical-lease-capture-rewind
+                                                                  :physical-identify-rewind-origin))
              (backend-explicit *backend*))
     (ereport "25001" "~a cannot run inside a transaction block"
              (case (logical-replication-command-type command)
@@ -1098,9 +1102,12 @@ The caller releases the slot before sending shutdown completion."
                (:physical-lease-prove-rewind "BACKUP_LEASE_PROVE_REWIND")
                (:physical-prepare "PREPARE_FOLLOW")
                (:physical-prove "PROVE_RETAINED")
+               (:physical-identify-rewind-origin "IDENTIFY_REWIND_ORIGIN")
                (:physical-release "RELEASE_FOLLOW")
                (:physical-bootstrap-release "RELEASE_BOOTSTRAP")
                (otherwise "START_REPLICATION")))))
+
+(declaim (ftype function identify-native-rewind-origin))
 
 (defun handle-replication-query-frame (stream type-byte length-bytes payload)
   (with-backend-query-execution (:backend *backend* :cleanup :query-state)
@@ -1143,6 +1150,7 @@ The caller releases the slot before sending shutdown completion."
              (execute-native-backup-lease-command stream command))
             (:physical-prepare (prepare-native-physical-follow stream command))
             (:physical-prove (prove-native-physical-retained stream command))
+            (:physical-identify-rewind-origin (identify-native-rewind-origin stream))
             (:physical-release (release-native-physical-follow stream command))
             (:physical-bootstrap-release (release-native-physical-bootstrap stream command))
             (:start

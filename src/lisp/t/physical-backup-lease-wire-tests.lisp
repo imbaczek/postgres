@@ -61,6 +61,16 @@
                     (backup-lease-wire-replace query "base/16384" "global/pg_control"))
                    'pg::pg-error))))
 
+(deftest rewind-origin-discovery-wire-requires-an-admitted-physical-sender
+    (let* ((query "IDENTIFY_REWIND_ORIGIN")
+           (command (pg::parse-replication-command query))
+           (pg::*backend* nil))
+      (ok (pg::replication-query-payload-p (pg::string->bytes query)))
+      (ok (eq :physical-identify-rewind-origin (pg::logical-replication-command-type command)))
+      (ok (signals (pg::parse-replication-command (concatenate 'string query " extra"))
+                   'pg::pg-error))
+      (ok (signals (pg::physical-rewind-origin-discovery-row) 'pg::pg-error))))
+
 (cl-spec:defproperty backup-lease-wire-preserves-the-original-request-and-state
     ((kind (range integer 0 7)) (identity-choice (range integer 0 5)) (verb-choice (range integer 0 2)))
   (:about pg::parse-native-backup-lease-command pg::pg-client-native-backup-lease-record)

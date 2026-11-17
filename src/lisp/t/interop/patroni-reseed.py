@@ -399,6 +399,21 @@ class RewindSharedHistoryAcceptance(FormerPrimaryAcceptance):
         return target
 
     def configured(self):
+        connection = follow.psycopg2.connect(
+            host="127.0.0.1", port=self.server.port, user="postgres", dbname="postgres",
+            connection_factory=PhysicalReplicationConnection, connect_timeout=2)
+        try:
+            with connection.cursor() as cursor:
+                try:
+                    cursor.execute("IDENTIFY_REWIND_ORIGIN")
+                except follow.psycopg2.Error as error:
+                    assert error.pgcode == "55000", error
+                else:
+                    raise AssertionError("initial primary advertised a retained rewind origin")
+                cursor.execute("IDENTIFY_SYSTEM")
+                assert int(cursor.fetchone()[1]) == 1
+        finally:
+            connection.close()
         target = self.create_rewind_target()
         source = self.capture("rewind-source")
         config = source / "postgresql.conf"

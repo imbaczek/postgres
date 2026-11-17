@@ -390,3 +390,63 @@ an image, authorize adoption, or grant writer authority."
     (wal-input-validation-error (condition) (ereport "55000" "~a" condition))
     (pg-error (condition) (error condition))
     (error (condition) (ereport "XX000" "retained origin proof failed: ~a" condition))))
+
+(defparameter *physical-rewind-origin-discovery-schema*
+  '(("system_id" 25) ("base_timeline" 25) ("base_lsn" 25)
+    ("base_manifest_digest" 25) ("fork_lsn" 25) ("source_timeline" 25)))
+
+(defun physical-rewind-origin-discovery-row ()
+  (with-live-operation
+    (unless (and *backend* (eq :physical (backend-replication-mode *backend*))
+                 (wal-sender-for-backend))
+      (ereport "55000" "rewind origin discovery requires an admitted physical sender"))
+    (prevent-recovery-primary-operation "rewind origin discovery")
+    (with-write-lock
+      (sb-thread:with-mutex (*wal-lock*)
+        (wal-check-healthy)
+        (unless (> *wal-insert-timeline* 1)
+          (wal-invalid-input "rewind origin discovery requires a child timeline"))
+        (multiple-value-bind (snapshot history metadata)
+            (physical-promotion-check-child-checkpoint *wal-insert-timeline* *wal-checkpoint-timeline*)
+          (declare (ignore snapshot))
+          (let* ((reference (getf metadata :retained-reference))
+                 (parent (second history))
+                 (fork (timeline-history-entry-begin (first history)))
+                 (system (catalog-system-identifier)))
+            (unless (and reference parent
+                         (= system (getf metadata :system-id))
+                         (= fork (getf reference :end))
+                         (= (timeline-history-entry-timeline parent)
+                            (getf reference :base-timeline))
+                         (<= (getf reference :base) fork))
+              (wal-invalid-input "rewind source has no retained origin for its current fork"))
+            (list (format nil "~d" system)
+                  (format nil "~d" (getf reference :base-timeline))
+                  (wal-format-lsn (getf reference :base))
+                  (format nil "~d" (getf reference :manifest-digest))
+                  (wal-format-lsn fork)
+                  (format nil "~d" *wal-insert-timeline*))))))))
+
+(defun identify-native-rewind-origin (stream)
+  (handler-case
+      (send-native-backup-lease-row
+       stream (physical-rewind-origin-discovery-row)
+       *physical-rewind-origin-discovery-schema* "IDENTIFY_REWIND_ORIGIN")
+    (wal-input-validation-error () (ereport "55000" "source has no discoverable rewind origin"))
+    (pg-error (condition) (error condition))
+    (error () (ereport "XX000" "could not inspect source rewind origin"))))
+
+(defun pg-client-native-rewind-origin (client)
+  (let* ((row (physical-client-query client "IDENTIFY_REWIND_ORIGIN"
+                                     *physical-rewind-origin-discovery-schema*
+                                     "IDENTIFY_REWIND_ORIGIN" :maximum 4096))
+         (historical-timeline (pg-client-native-u64 (aref row 1)))
+         (base (pg-client-native-lsn (aref row 2)))
+         (fork (pg-client-native-lsn (aref row 4)))
+         (source-timeline (pg-client-native-u64 (aref row 5))))
+    (unless (and (<= 1 historical-timeline) (< historical-timeline source-timeline (ash 1 32))
+                 (<= base fork))
+      (pg-client-native-reject "invalid rewind origin coordinates"))
+    (values (list (pg-client-native-u64 (aref row 0)) historical-timeline base
+                  (pg-client-native-u64 (aref row 3)))
+            fork source-timeline)))
