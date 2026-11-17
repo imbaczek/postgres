@@ -7,6 +7,8 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import re
+import shutil
 import signal
 import socket
 import stat
@@ -256,15 +258,18 @@ class FormerPrimaryAcceptance(Acceptance):
             "divergence_detected_with_removal_opt_in": True,
             "offline_checkpoint": checkpoint}
 
+    def seed_child(self, data):
+        data.mkdir(mode=0o700, parents=True)
+        follow.query(self.server.port, "SELECT pg_create_physical_replication_slot('replacement_source',true)")
+        self.control("(pg::physical-base-backup " +
+                     cancellation.lisp_string(str(data) + "/") + " \"former_primary_seed\")")
+
     def initialize_target(self, target):
         started = time.monotonic()
         # Leave room for target.sock under the AF_UNIX path length limit.
         root = self.server.root / "child"
         data = root / "data"
-        data.mkdir(mode=0o700, parents=True)
-        follow.query(self.server.port, "SELECT pg_create_physical_replication_slot('replacement_source',true)")
-        self.control("(pg::physical-base-backup " +
-                     cancellation.lisp_string(str(data) + "/") + " \"former_primary_seed\")")
+        self.seed_child(data)
         (data / "postgresql.conf").write_text("# Native replacement source.\n")
         with socket.socket() as reservation:
             reservation.bind(("127.0.0.1", 0))
@@ -350,20 +355,50 @@ class RewindSharedHistoryAcceptance(FormerPrimaryAcceptance):
                      env=dict(os.environ, PG_LIBPQ_HELPER=self.helper))
         return path
 
+    def seed_child(self, data):
+        data.parent.mkdir(mode=0o700)
+        shutil.copytree(self.origin, data)
+
+    def fence_original(self, node, port):
+        follow.query(self.server.port, "INSERT INTO rewind_shared_marker VALUES(71)")
+        follow.wait_for(lambda: follow.query(port, "SELECT id FROM rewind_shared_marker") == [(71,)])
+        super().fence_original(node, port)
+
+    def check_retained_origin(self, target, fork):
+        reference = load_driver("rewind_export_origin", "export-origin.py")
+        manifest = (self.origin / "physical-backup.manifest").read_bytes()
+        system = int(re.search(rb":SYSTEM-ID\s+(\d+)", manifest)[1])
+        base = int(re.search(rb":END\s+(\d+)", manifest)[1])
+        manifest_digest = reference.fnv(manifest)
+        digest = reference.hash_history(target, base, fork)
+        output = self.control(
+            "(let* ((fields (multiple-value-list (wal-read-control-fields))) "
+            "(history (timeline-read-history (fourth fields))) "
+            f"(request (list :system-id {system} :base-timeline 1 :base {base} "
+            f":manifest-digest {manifest_digest} :end {fork}))) "
+            f"(assert (= {digest} (physical-origin-proof-hash-root fields history request))) "
+            '(write-line "REWIND-SHARED-ORIGIN PASS"))')
+        assert "REWIND-SHARED-ORIGIN PASS" in output
+        self.result["former_primary"]["retained_origin"] = dict(
+            base=base, fork=fork, manifest_digest=manifest_digest, fork_digest=digest)
+
     def configured(self):
         follow.query(self.server.port, "CREATE TABLE patroni_reseed_probe(id integer)")
         follow.query(self.server.port, "INSERT INTO patroni_reseed_probe VALUES(1)")
-        origin = self.capture("rewind-origin")
+        follow.query(self.server.port, "CREATE TABLE rewind_shared_marker(id integer)")
+        follow.query(self.server.port, "SELECT pg_create_physical_replication_slot('replacement_source',true)")
+        self.origin = self.capture("rewind-origin")
         target = self.server.root / "rewind-target"
         self.initialize_target(target)
         source = self.capture("rewind-source")
         config = source / "postgresql.conf"
         assert config.read_bytes() == b""
         config.unlink()
-        before = {path: preserved_tree(path) for path in (target, source, origin)}
-        arguments = " ".join("#P" + cancellation.lisp_string(str(path) + "/")
-                             for path in (target, origin, source))
         fork = self.result["former_primary"]["fork_lsn"]
+        self.check_retained_origin(target, fork)
+        before = {path: preserved_tree(path) for path in (target, source, self.origin)}
+        arguments = " ".join("#P" + cancellation.lisp_string(str(path) + "/")
+                             for path in (target, self.origin, source))
         _, output = self.process(self.label, self.native_arguments() + [
             "--eval", f"(pg::native-patroni-rewind-shared-history {arguments} {fork})"])
         assert b"REWIND-SHARED-HISTORY PASS" in output
