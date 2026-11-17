@@ -97,12 +97,17 @@ def main():
         case = os.environ.get('PG_NATIVE_MAIN_CASE', 'happy')
         if case not in ('happy', 'managed', 'promote', 'malformed-proof', 'proof-loss', 'cancel-spawn'):
             raise ValueError('Unknown main startup case')
+        restart = os.environ.get('PG_NATIVE_MAIN_RESTART')
+        if restart not in (None, '1') or (restart and case != 'happy'):
+            raise ValueError('Restart qualification requires happy case and explicit value 1')
         control = job / 'tmp/main-control'
         control.mkdir(mode=0o700)
         port = free_port()
         log = job / 'logs/imported-main-startup.log'
         result = dict(source=frozen['image'], port=port, ready=False, profile=profile, case=case,
                       variant=str(variant) if variant else None)
+        result['restart_qualification'] = bool(restart)
+        result['boots'] = []
         started = time.monotonic()
         try:
             with writer.working_namespaces(data, job / 'main-working',
@@ -179,108 +184,125 @@ def main():
                         command = [str(source / 'pg-lisp.sh'), '-D', str(data), '-p', str(port),
                                    '-c', 'wal_level=logical', '--control-socket', str(control / 'pg.sock')]
                         result['command'] = command
-                        with log.open('w') as output:
-                            def spawn():
-                                child = subprocess.Popen(command, cwd=source, env=environment,
-                                                         stdout=output, stderr=subprocess.STDOUT,
-                                                         pass_fds=(lease, run_lock, workspace),
-                                                         start_new_session=True)
-                                if case == 'cancel-spawn':
-                                    os.kill(os.getpid(), signal.SIGTERM)
-                                return child
+                        for boot in range(3 if restart else 1):
+                            result['ready'] = False
+                            boot_started = time.monotonic()
+                            log = job / ('logs/imported-main-startup-' + str(boot) + '.log'
+                                         if restart else 'logs/imported-main-startup.log')
+                            with log.open('w') as output:
+                                def spawn():
+                                    child = subprocess.Popen(command, cwd=source, env=environment,
+                                                             stdout=output, stderr=subprocess.STDOUT,
+                                                             pass_fds=(lease, run_lock, workspace),
+                                                             start_new_session=True)
+                                    if case == 'cancel-spawn':
+                                        os.kill(os.getpid(), signal.SIGTERM)
+                                    return child
 
-                            child_transition = True
-                            try:
-                                process = spawn()
-                            finally:
-                                child_transition = False
-                            if pending_signal is not None:
-                                deferred = pending_signal
-                                pending_signal = None
-                                result['deferred_spawn_signal'] = deferred
-                                raise InterruptedError('Deferred startup signal ' + str(deferred))
-                            ticks = Path('/proc', str(process.pid), 'stat').read_text().rpartition(')')[2].split()[19]
-                            result.update(pid=process.pid, start_ticks=ticks)
-                            campaign.write_json(job / 'logs/main-child.json', result)
-                            deadline = time.monotonic() + 180
-                            marker = 'pg-lisp: listening on '
-                            while process.poll() is None and time.monotonic() < deadline:
-                                if marker in log.read_text(errors='replace'):
-                                    result['ready'] = True
-                                    break
-                                time.sleep(0.05)
-                            if case != 'happy':
-                                if result['ready']:
-                                    raise RuntimeError('Conflicting startup unexpectedly became ready')
-                                result['exit_code'] = process.wait(timeout=30)
-                                text = log.read_text()
-                                expected_error = {'managed': 'request physical-follow-managed.control',
-                                                  'promote': 'request promote',
-                                                  'malformed-proof': 'source proof',
-                                                  'proof-loss': 'requires the complete committed input names'}[case]
-                                if case == 'proof-loss':
-                                    counts = re.findall(r'^IMPORTED-MAIN-COUNTS slots=(\d+) catalogs=(\d+) bootstraps=(\d+) owned=(\d+) wal-ready=(NIL|T) fence=(NIL|T)$',
-                                                        text, re.MULTILINE)
-                                    if counts != [('0', '0', '0', '2', 'NIL', 'T')]:
-                                        raise RuntimeError('Proof loss bypassed the guarded initializer: ' + str(counts))
-                                    result['proof_loss_counts'] = counts[0]
-                                    observed_after = {name: observation.fixture_image(data / name, writer)
-                                                      for name in storage_names}
-                                    observed_before = storage_before
+                                child_transition = True
+                                try:
+                                    process = spawn()
+                                finally:
+                                    child_transition = False
+                                if pending_signal is not None:
+                                    deferred = pending_signal
+                                    pending_signal = None
+                                    result['deferred_spawn_signal'] = deferred
+                                    raise InterruptedError('Deferred startup signal ' + str(deferred))
+                                ticks = Path('/proc', str(process.pid), 'stat').read_text().rpartition(')')[2].split()[19]
+                                result.update(pid=process.pid, start_ticks=ticks)
+                                campaign.write_json(job / 'logs/main-child.json', result)
+                                deadline = time.monotonic() + 180
+                                marker = 'pg-lisp: listening on '
+                                while process.poll() is None and time.monotonic() < deadline:
+                                    if marker in log.read_text(errors='replace'):
+                                        result['ready'] = True
+                                        break
+                                    time.sleep(0.05)
+                                if case != 'happy':
+                                    if result['ready']:
+                                        raise RuntimeError('Conflicting startup unexpectedly became ready')
+                                    result['exit_code'] = process.wait(timeout=30)
+                                    text = log.read_text()
+                                    expected_error = {'managed': 'request physical-follow-managed.control',
+                                                      'promote': 'request promote',
+                                                      'malformed-proof': 'source proof',
+                                                      'proof-loss': 'requires the complete committed input names'}[case]
+                                    if case == 'proof-loss':
+                                        counts = re.findall(r'^IMPORTED-MAIN-COUNTS slots=(\d+) catalogs=(\d+) bootstraps=(\d+) owned=(\d+) wal-ready=(NIL|T) fence=(NIL|T)$',
+                                                            text, re.MULTILINE)
+                                        if counts != [('0', '0', '0', '2', 'NIL', 'T')]:
+                                            raise RuntimeError('Proof loss bypassed the guarded initializer: ' + str(counts))
+                                        result['proof_loss_counts'] = counts[0]
+                                        observed_after = {name: observation.fixture_image(data / name, writer)
+                                                          for name in storage_names}
+                                        observed_before = storage_before
+                                    else:
+                                        observed_before = refusal_before
+                                        observed_after = observation.fixture_image(data, writer)
+                                    result['refusal_inputs_preserved'] = observed_before == observed_after
+                                    if not result['refusal_inputs_preserved']:
+                                        campaign.write_json(job / 'logs/refusal-before.json', observed_before)
+                                        campaign.write_json(job / 'logs/refusal-after.json', observed_after)
+                                    if (result['ready'] or result['exit_code'] == 0
+                                            or expected_error not in text
+                                            or not result['refusal_inputs_preserved']
+                                            or (control / 'pg.sock').exists()):
+                                        raise RuntimeError('Main refusal did not preserve pre-startup inputs: ' + str(log))
+                                    result['refused'] = True
                                 else:
-                                    observed_before = refusal_before
-                                    observed_after = observation.fixture_image(data, writer)
-                                result['refusal_inputs_preserved'] = observed_before == observed_after
-                                if not result['refusal_inputs_preserved']:
-                                    campaign.write_json(job / 'logs/refusal-before.json', observed_before)
-                                    campaign.write_json(job / 'logs/refusal-after.json', observed_after)
-                                if (result['ready'] or result['exit_code'] == 0
-                                        or expected_error not in text
-                                        or not result['refusal_inputs_preserved']
-                                        or (control / 'pg.sock').exists()):
-                                    raise RuntimeError('Main refusal did not preserve pre-startup inputs: ' + str(log))
-                                result['refused'] = True
-                            else:
-                                if not result['ready']:
-                                    raise RuntimeError('Real imported main did not become ready: ' + str(log))
-                                pid = int((data / 'postmaster.pid').read_text().splitlines()[0])
-                                if pid != process.pid:
-                                    raise ValueError('Ready server does not own the expected PID')
-                                result['startup_seconds'] = time.monotonic() - started
-                                if instrumented:
-                                    observations = re.findall(r'^IMPORTED-MAIN-BEFORE-CATALOG slots=(\d+) groups=(\d+) outcome=(C|ZERO-C)$',
-                                                              log.read_text(), re.MULTILINE)
-                                    if len(observations) != 1:
-                                        raise RuntimeError('Missing unique before-catalog observation')
-                                    slots, groups, outcome = observations[0]
-                                    if (int(slots) != len(expected_names)
-                                            or (expected_names and (int(groups) < 1 or outcome != 'C'))
-                                            or (not expected_names and (int(groups) or outcome != 'ZERO-C'))):
-                                        raise RuntimeError('Wrong typed restoration at catalog entry')
-                                    result['before_catalog'] = dict(slots=int(slots), groups=int(groups), outcome=outcome)
-                                result['control_response'] = inspect_control(control / 'pg.sock', process.pid)
-                                psql = os.environ.get('PSQL') or shutil.which('psql')
-                                if not psql:
-                                    raise RuntimeError('Set PSQL to an installed PostgreSQL client')
-                                result['psql_version'] = subprocess.check_output([psql, '--version'], text=True).strip()
-                                sql = 'SELECT pg_is_in_recovery(); SELECT slot_name FROM pg_replication_slots ORDER BY slot_name;'
-                                query = subprocess.run([str(psql), '-X', '-A', '-t', '-h', '127.0.0.1',
-                                                        '-p', str(port), '-U', 'postgres', '-d', 'postgres',
-                                                        '-v', 'ON_ERROR_STOP=1', '-c', sql],
-                                                       env=dict(environment, PGCONNECT_TIMEOUT='5'),
-                                                       text=True, capture_output=True, timeout=30)
-                                result.update(query_exit=query.returncode, sql_stdout=query.stdout,
-                                              sql_stderr=query.stderr)
-                                if query.returncode or query.stdout.splitlines() != ['f', *expected_names]:
-                                    raise RuntimeError('Imported main SQL check failed: ' + repr(query))
-                                process.send_signal(signal.SIGTERM)
-                                result['exit_code'] = process.wait(timeout=30)
-                                if result['exit_code']:
-                                    raise RuntimeError('Imported main shutdown failed')
-                                result['follow_preserved'] = follow_before == (writer.tree_image(follow)
-                                                                              if follow.exists() else None)
-                                if not result['follow_preserved']:
-                                    raise ValueError('Inert follow configuration changed')
+                                    if not result['ready']:
+                                        raise RuntimeError('Real imported main did not become ready: ' + str(log))
+                                    pid = int((data / 'postmaster.pid').read_text().splitlines()[0])
+                                    if pid != process.pid:
+                                        raise ValueError('Ready server does not own the expected PID')
+                                    result['startup_seconds'] = time.monotonic() - boot_started
+                                    if instrumented:
+                                        observations = re.findall(r'^IMPORTED-MAIN-BEFORE-CATALOG slots=(\d+) groups=(\d+) outcome=(C|ZERO-C)$',
+                                                                  log.read_text(), re.MULTILINE)
+                                        if len(observations) != 1:
+                                            raise RuntimeError('Missing unique before-catalog observation')
+                                        slots, groups, outcome = observations[0]
+                                        if (int(slots) != len(expected_names)
+                                                or (expected_names and (int(groups) < 1 or outcome != 'C'))
+                                                or (not expected_names and (int(groups) or outcome != 'ZERO-C'))):
+                                            raise RuntimeError('Wrong typed restoration at catalog entry')
+                                        result['before_catalog'] = dict(slots=int(slots), groups=int(groups), outcome=outcome)
+                                    result['control_response'] = inspect_control(control / 'pg.sock', process.pid)
+                                    psql = os.environ.get('PSQL') or shutil.which('psql')
+                                    if not psql:
+                                        raise RuntimeError('Set PSQL to an installed PostgreSQL client')
+                                    result['psql_version'] = subprocess.check_output([psql, '--version'], text=True).strip()
+                                    sql = 'SELECT pg_is_in_recovery(); SELECT slot_name FROM pg_replication_slots ORDER BY slot_name;'
+                                    expected_sql = ['f', *expected_names]
+                                    if restart:
+                                        if boot == 0:
+                                            sql += ' CREATE TABLE imported_restart_witness (n integer); INSERT INTO imported_restart_witness VALUES (41);'
+                                        sql += ' SELECT n FROM imported_restart_witness ORDER BY n;'
+                                        expected_sql += ['41'] + (['42'] if boot == 2 else [])
+                                        if boot == 1:
+                                            sql += ' INSERT INTO imported_restart_witness VALUES (42);'
+                                    query = subprocess.run([str(psql), '-X', '-q', '-A', '-t', '-h', '127.0.0.1',
+                                                            '-p', str(port), '-U', 'postgres', '-d', 'postgres',
+                                                            '-v', 'ON_ERROR_STOP=1', '-c', sql],
+                                                           env=dict(environment, PGCONNECT_TIMEOUT='5'),
+                                                           text=True, capture_output=True, timeout=30)
+                                    result.update(query_exit=query.returncode, sql_stdout=query.stdout,
+                                                  sql_stderr=query.stderr)
+                                    if query.returncode or query.stdout.splitlines() != expected_sql:
+                                        raise RuntimeError('Imported main SQL check failed: ' + repr(query))
+                                    process.send_signal(signal.SIGTERM)
+                                    result['exit_code'] = process.wait(timeout=30)
+                                    if result['exit_code']:
+                                        raise RuntimeError('Imported main shutdown failed')
+                                    result['follow_preserved'] = follow_before == (writer.tree_image(follow)
+                                                                                  if follow.exists() else None)
+                                    if not result['follow_preserved']:
+                                        raise ValueError('Inert follow configuration changed')
+                            result['boots'].append({key: result[key] for key in
+                                ('pid', 'start_ticks', 'ready', 'exit_code', 'sql_stdout', 'before_catalog',
+                                 'startup_seconds', 'control_response', 'follow_preserved')
+                                if key in result})
                     finally:
                         child_transition = True
                         try:
