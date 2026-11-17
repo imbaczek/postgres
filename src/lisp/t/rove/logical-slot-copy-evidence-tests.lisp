@@ -109,6 +109,100 @@
 (rove:deftest recovery-manifest-byte-decoder-generated-contract
     (unit-check-property 'recovery-manifest-byte-decoder-preserves-envelope))
 
+(rove:deftest imported-startup-candidate-requires-canonical-complete-names
+    (let* ((root (uiop:ensure-directory-pathname
+                  (sb-posix:mkdtemp
+                   (namestring (merge-pathnames "import-candidate-XXXXXX"
+                                                (uiop:temporary-directory))))))
+           (*pgdata* root)
+           (names '("logical-slot-copy.source-proof" "logical-slot-copy.import"
+                    "logical-slot-copy.install")))
+      (labels ((put (name &optional directory-p)
+                 (let ((path (merge-pathnames name root)))
+                   (if directory-p
+                       (sb-posix:mkdir (namestring path) #o700)
+                       (with-open-file (out path :direction :output :if-exists :error)
+                         (write-char #\x out)))))
+               (remove-name (name &optional directory-p)
+                 (if directory-p
+                     (sb-posix:rmdir (namestring (merge-pathnames name root)))
+                     (delete-file (merge-pathnames name root)))))
+        (unwind-protect
+             (progn
+               (dotimes (mask 8)
+                 (loop for name in names for bit from 0
+                       when (logbitp bit mask) do (put name (= bit 2)))
+                 (rove:ok (eql (= mask 7)
+                               (logical-slot-copy-imported-startup-candidate-p)))
+                 (loop for name in names for bit from 0
+                       when (logbitp bit mask) do (remove-name name (= bit 2))))
+               (dolist (name names) (put name (equal name "logical-slot-copy.install")))
+               (dolist (name '("logical-slot-copy.import.tmp"
+                               "logical-slot-copy.source-proof.tmp"
+                               "logical-slot-copy.evidence.tmp"
+                               "logical-slot-copy.base-verified.tmp"
+                               "logical-slot-copy.in-progress"))
+                 (put name)
+                 (rove:ok (null (logical-slot-copy-imported-startup-candidate-p)))
+                 (remove-name name))
+               (put "logical-slot-copy.descriptor")
+               (put "logical-slot-copy.base-verified")
+               (put "logical-slot-copy.evidence")
+               (put "logical_slot_wal" t)
+               (rove:ok (logical-slot-copy-imported-startup-candidate-p))
+               (remove-name "logical-slot-copy.source-proof")
+               (sb-posix:symlink "logical-slot-copy.import"
+                                 (namestring (merge-pathnames "logical-slot-copy.source-proof" root)))
+               (rove:ok (null (logical-slot-copy-imported-startup-candidate-p)))
+               (remove-name "logical-slot-copy.source-proof")
+               (put "logical-slot-copy.source-proof" t)
+               (rove:ok (null (logical-slot-copy-imported-startup-candidate-p))))
+          (uiop:delete-directory-tree root :validate t :if-does-not-exist :ignore)))))
+
+(rove:deftest imported-startup-candidate-rejects-wrong-kinds-and-dangling-markers
+    (let* ((root (uiop:ensure-directory-pathname
+                  (sb-posix:mkdtemp
+                   (namestring (merge-pathnames "import-candidate-kinds-XXXXXX"
+                                                (uiop:temporary-directory))))))
+           (*pgdata* root)
+           (names '("logical-slot-copy.source-proof" "logical-slot-copy.import"
+                    "logical-slot-copy.install")))
+      (labels ((put (name directory-p)
+                 (let ((path (merge-pathnames name root)))
+                   (if directory-p
+                       (sb-posix:mkdir (namestring path) #o700)
+                       (with-open-file (out path :direction :output :if-exists :error)
+                         (write-char #\x out)))))
+               (remove-name (name directory-p)
+                 (if directory-p
+                     (sb-posix:rmdir (namestring (merge-pathnames name root)))
+                     (delete-file (merge-pathnames name root)))))
+        (unwind-protect
+             (progn
+               (dolist (name names) (put name (equal name "logical-slot-copy.install")))
+               (dolist (name names)
+                 (let ((directory-p (equal name "logical-slot-copy.install")))
+                   (remove-name name directory-p)
+                   (put name (not directory-p))
+                   (rove:ok (null (logical-slot-copy-imported-startup-candidate-p)))
+                   (remove-name name (not directory-p))
+                   (sb-posix:symlink "missing-candidate-target"
+                                     (namestring (merge-pathnames name root)))
+                   (rove:ok (null (logical-slot-copy-imported-startup-candidate-p)))
+                   (delete-file (merge-pathnames name root))
+                   (put name directory-p)))
+               (dolist (name '("logical-slot-copy.import.tmp"
+                               "logical-slot-copy.source-proof.tmp"
+                               "logical-slot-copy.evidence.tmp"
+                               "logical-slot-copy.base-verified.tmp"
+                               "logical-slot-copy.in-progress"))
+                 (sb-posix:symlink "missing-candidate-target"
+                                   (namestring (merge-pathnames name root)))
+                 (rove:ok (null (logical-slot-copy-imported-startup-candidate-p)))
+                 (delete-file (merge-pathnames name root)))
+               (rove:ok (logical-slot-copy-imported-startup-candidate-p)))
+          (uiop:delete-directory-tree root :validate t :if-does-not-exist :ignore)))))
+
 (rove:deftest logical-import-artifacts-retain-startup-and-promotion-fences
     (let* ((base (uiop:ensure-directory-pathname
                   (sb-posix:mkdtemp

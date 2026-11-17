@@ -1,5 +1,23 @@
 (in-package #:pg)
 
+(defun logical-slot-copy-imported-startup-candidate-p ()
+  ;; This names-only observation grants no startup or source authority.
+  ;; Historical copy evidence is checked later under real PGDATA ownership.
+  (and
+   (every (lambda (name)
+            (null (slot-state-lstat (merge-pathnames name *pgdata*))))
+          '("logical-slot-copy.import.tmp" "logical-slot-copy.source-proof.tmp"
+            "logical-slot-copy.evidence.tmp" "logical-slot-copy.base-verified.tmp"
+            "logical-slot-copy.in-progress"))
+   (loop for (name directory) in '(("logical-slot-copy.source-proof" nil)
+                                   ("logical-slot-copy.import" nil)
+                                   ("logical-slot-copy.install" t))
+         for facts = (slot-state-lstat (merge-pathnames name *pgdata*))
+         always (and facts
+                     (if directory
+                         (sb-posix:s-isdir (sb-posix:stat-mode facts))
+                         (sb-posix:s-isreg (sb-posix:stat-mode facts)))))))
+
 (defun logical-slot-copy-preflight-startup ()
   ;; Neither a source proof nor its temporary file grants startup.  Import
   ;; artifacts must be reconciled by the child owner first.
