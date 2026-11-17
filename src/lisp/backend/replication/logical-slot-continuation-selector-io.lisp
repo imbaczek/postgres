@@ -9,6 +9,8 @@
     (funcall *logical-slot-continuation-selector-test-hook* point storage))
   (logical-slot-continuation-storage-check storage))
 
+;; Validate the names under a held selector directory for both direct and
+;; storage-backed observers.  The storage wrapper supplies its directory.
 (defun logical-slot-continuation-selector-file-names (directory)
   (let ((names (logical-slot-copy-import-control-names directory 3)))
     (unless (every (lambda (name) (member name '("selector" "selector.tmp") :test #'equal)) names)

@@ -33,6 +33,15 @@
    kind model (logical-slot-continuation-partition-rows rows certificate host)
    binding certificate host))
 
+;; Observe exact selector presence or absence under a held private root.  A
+;; selector is decoded as a canonical stable or PREPARED image.  A held
+;; selector.tmp is unselected evidence, not bootstrap proof; prefix
+;; authorization is a later step.
+;; Keep original ledgers private and give the callback copies.  Its check
+;; enforces owner thread, expiry and sticky failure before I/O.  The scope
+;; expires before descriptor close; the owned source-proof FD primitive closes
+;; and validates its return, including late close failure.  This observation
+;; grants no plan, cleanup, publication or source authority.
 (defun call-with-logical-slot-continuation-cold-selector-files
     (directory guard function &key require-selected)
   (unless (and (functionp guard) (functionp function) (typep require-selected 'boolean))
@@ -107,6 +116,7 @@
               (lambda (temp-fd temporary)
                 (invoke kind model fd selected temp-fd temporary)))))))))
 
+;; Supply the storage directory and its guard to the direct observer.
 (defun call-with-logical-slot-continuation-cold-selector-observation
     (storage function &key require-selected)
   (call-with-logical-slot-continuation-cold-selector-files
@@ -114,6 +124,7 @@
    (lambda () (logical-slot-continuation-storage-check storage))
    function :require-selected require-selected))
 
+;; Preserve the existing selected-only interface: absence is an error.
 (defun call-with-logical-slot-continuation-cold-selected-files (storage function)
   (call-with-logical-slot-continuation-cold-selector-observation
    storage function :require-selected t))
