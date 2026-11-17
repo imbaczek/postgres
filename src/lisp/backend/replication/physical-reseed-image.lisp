@@ -255,7 +255,7 @@ Return the manifest, lease record and reused entries."
                 (let ((*pgdata* (physical-adoption-owner-directory owner))
                       (*physical-image-context* nil))
                   (physical-backup-lease-capture-remote
-                   destination client request :directory-fd destination-fd :offers offers
+                   destination client request :directory-fd destination-fd :rewind t :offers offers
                    :reuse (when offers
                             (lambda (entry)
                               (destructuring-bind (name size digest) entry

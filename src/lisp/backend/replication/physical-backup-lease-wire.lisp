@@ -55,7 +55,6 @@ Each unique entry contains a relation name, size and digest."
   (append '("native_format" "lease_name" "lease_token" "cluster_identity" "system_id" "source_timeline")
           (case kind
             (:physical-lease-prove-rewind *physical-rewind-origin-wire-input*)
-            (:physical-lease-capture-rewind '("relation_offers"))
             ((:physical-lease-handoff :physical-lease-cleanup-selected)
              '("successor_name" "successor_anchor_digest"))
             ((:physical-lease-prepare-follow :physical-lease-cancel-follow)
@@ -91,8 +90,10 @@ Each unique entry contains a relation name, size and digest."
                                :test #'equal)))
              (options (parse-replication-generic-options (rest words)))
              (keys (physical-backup-lease-wire-option-keys kind))
-             (optional (when (member kind '(:physical-lease-prepare-follow :physical-lease-cancel-follow))
-                         '("follow_proof_kind"))))
+             (optional (case kind
+                         (:physical-lease-capture-rewind '("relation_offers"))
+                         ((:physical-lease-prepare-follow :physical-lease-cancel-follow)
+                          '("follow_proof_kind")))))
         (unless (and kind
                      (every (lambda (key) (= 1 (count key options :key #'car :test #'equal))) keys)
                      (every (lambda (option)
@@ -122,7 +123,8 @@ Each unique entry contains a relation name, size and digest."
              :options (append (list (cons "request" request))
                               (when successor (list (cons "successor" successor)))
                               (when allocation (list (cons "allocation" allocation)))
-                              (when (eq kind :physical-lease-capture-rewind)
+                              (when (and (eq kind :physical-lease-capture-rewind)
+                                         (assoc "relation_offers" options :test #'equal))
                                 (list (cons "relation_offers"
                                             (physical-rewind-decode-offers (value "relation_offers")))))
                               (when (eq kind :physical-lease-prove-rewind)

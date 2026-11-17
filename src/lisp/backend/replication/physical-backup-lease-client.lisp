@@ -245,27 +245,27 @@
 ;; the original request before accepting the received inventory.
 
 (defun pg-client-native-rewind-capture-query (request offers)
-  (unless (<= 1 (length offers) +native-rewind-offer-limit+)
+  (unless (<= (length offers) +native-rewind-offer-limit+)
     (error "invalid native rewind relation offer count"))
-  (let ((text
-          (format nil "~{~a~^,~}"
-                  (loop for (name size digest) in offers
-                        do (unless (and (physical-backup-reuse-path-p name)
-                                        (<= (length name) 32)
-                                        (typep size '(unsigned-byte 64))
-                                        (typep digest '(unsigned-byte 64)))
-                             (error "invalid native rewind relation offer"))
-                        collect (format nil "~a:~d:~d" name size digest)))))
-    (physical-rewind-decode-offers text)
-    (pg-client-native-backup-lease-option-query
-     "CAPTURE_REWIND_NATIVE"
-     (append (pg-client-native-backup-lease-options request)
-             (list (cons "relation_offers" text))))))
+  (let ((options (pg-client-native-backup-lease-options request)))
+    (when offers
+      (let ((text
+              (format nil "~{~a~^,~}"
+                      (loop for (name size digest) in offers
+                            do (unless (and (physical-backup-reuse-path-p name)
+                                            (<= (length name) 32)
+                                            (typep size '(unsigned-byte 64))
+                                            (typep digest '(unsigned-byte 64)))
+                                 (error "invalid native rewind relation offer"))
+                            collect (format nil "~a:~d:~d" name size digest)))))
+        (physical-rewind-decode-offers text)
+        (setf options (append options (list (cons "relation_offers" text))))))
+    (pg-client-native-backup-lease-option-query "CAPTURE_REWIND_NATIVE" options)))
 
-(defun physical-backup-lease-receive-remote (target channel request &key offers reuse)
-  (let ((tag (if offers "CAPTURE_REWIND_NATIVE" "CAPTURE_BACKUP_NATIVE")))
+(defun physical-backup-lease-receive-remote (target channel request &key rewind offers reuse)
+  (let ((tag (if rewind "CAPTURE_REWIND_NATIVE" "CAPTURE_BACKUP_NATIVE")))
     (physical-libpq-start-copy-out
-     channel (if offers
+     channel (if rewind
                  (pg-client-native-rewind-capture-query request offers)
                  (pg-client-native-backup-lease-query tag request)))
     (let ((manifest (physical-backup-receive-bundle
@@ -284,14 +284,19 @@
 ;; Receive into the caller's empty directory, verify the manifest, then check
 ;; STATUS against the received image.  READY describes source retention at
 ;; that check, not a permanent guarantee; follow or handoff must revalidate.
-(defun physical-backup-lease-capture-remote (directory channel request &key directory-fd offers reuse)
-  (when (and (or offers reuse) (not (and offers reuse directory-fd)))
-    (error "native rewind capture requires offers and a descriptor-scoped receiver"))
+(defun physical-backup-lease-capture-remote (directory channel request &key directory-fd rewind offers reuse)
+  (unless (and (eq (null offers) (null reuse))
+               (or (null offers) rewind)
+               (or (null rewind) directory-fd))
+    (error "native rewind capture requires a descriptor and a receiver for any offers"))
   (let ((request (physical-backup-lease-request-copy request))
         (target (physical-bootstrap-target directory)))
     (if directory-fd
         (progn
           (physical-image-check-target target directory-fd)
           (call-with-physical-backup-receive-directory
-           directory-fd (lambda (anchored) (physical-backup-lease-receive-remote anchored channel request :offers offers :reuse reuse))))
+           directory-fd
+           (lambda (anchored)
+             (physical-backup-lease-receive-remote
+              anchored channel request :rewind rewind :offers offers :reuse reuse))))
         (physical-backup-lease-receive-remote target channel request))))

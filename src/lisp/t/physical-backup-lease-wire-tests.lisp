@@ -61,6 +61,23 @@
                     (backup-lease-wire-replace query "base/16384" "global/pg_control"))
                    'pg::pg-error))))
 
+(deftest rewind-capture-wire-allows-no-relation-offers
+    (let* ((request (backup-lease-wire-request))
+           (query (pg::pg-client-native-rewind-capture-query request nil))
+           (command (pg::parse-replication-command query))
+           (backup (pg::pg-client-native-backup-lease-query "CAPTURE_BACKUP_NATIVE" request))
+           (offered (pg::pg-client-native-rewind-capture-query request '(("base/16384" 8192 45)))))
+      (ok (pg::replication-query-payload-p (pg::string->bytes query)))
+      (ok (eq :physical-lease-capture-rewind (pg::logical-replication-command-type command)))
+      (ok (equal request (pg::physical-backup-lease-command-request command)))
+      (ok (null (assoc "relation_offers" (pg::logical-replication-command-options command)
+                       :test #'equal)))
+      (ok (eq :physical-lease-capture
+              (pg::logical-replication-command-type (pg::parse-replication-command backup))))
+      (ok (signals (pg::parse-replication-command
+                    (backup-lease-wire-replace offered "CAPTURE_REWIND_NATIVE" "CAPTURE_BACKUP_NATIVE"))
+                   'pg::pg-error))))
+
 (deftest rewind-origin-discovery-wire-requires-an-admitted-physical-sender
     (let* ((query "IDENTIFY_REWIND_ORIGIN")
            (command (pg::parse-replication-command query))
