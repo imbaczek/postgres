@@ -924,8 +924,14 @@
   image, and rejoins through pinned Patroni follow and restart (`c7fc921a907`).
   It covers a clean stopped former primary and its immediate child timeline,
   with writes on both branches and local reuse of an unchanged large relation.
-  The production `pg_rewind` executable and Patroni rewind invocation remain
-  open. C pg_rewind can copy changed pages rather than whole relation files.
+   Native `pg_rewind` now discovers this case over replication and completes
+   installation and standby handoff. Direct tests cover config repair with
+   `--finish`. Pinned Patroni 4.1.5 invokes the executable through an explicit
+   `Rewind.execute` call and follows and restarts the installed standby.
+   Automatic eligibility, rewind continuation before terminal handoff and
+   retrieval of missing target WAL from an archive remain open. C pg_rewind
+   builds a changed-page map from target WAL. Native rewind reuses whole
+   matching relation files.
   Coordination stays outside this backend work.
 
 - [x] Keep ready native physical senders through the primary shutdown checkpoint.
@@ -1472,9 +1478,10 @@
   or coordination. Authenticated native export and installation now support the
   default remote Patroni bootstrap clone, with staged publication and cancellation
   cleanup. Prefix-proved offline adoption supplies recovery provenance for
-  the clean former primary covered above. The native rewind backend now passes
-  the journaled fixture above. The production rewind executable remains open,
-  and C physical tooling is incompatible with the native format.
+   the clean former primary covered above. The native rewind executable passes
+   explicit Patroni execution and rejoin. Exercise stock eligibility and timeline
+   divergence detection using verified native control and checkpoint evidence.
+   C physical tooling is incompatible with the native format.
   The complete unchanged Patroni writer oracle now passes, including `hba_file`
   and `ident_file`. These settings accept only disabled or unset values:
   `max_prepared_transactions`,
@@ -1490,7 +1497,7 @@
   unsupported. Replica uses dynamic logical capture for live or arming slots,
   while logical captures even without slots. Each XID keeps its capture choice.
   `wal_log_hints` accepts on and off; supported native paths have no persistent
-  hint-bit writers. Full C hint full-page-image behavior and rewind remain open.
+   hint-bit writers. Full C hint full-page-image behavior remains open.
   Source effective WAL level and activation status, including WAL/checkpoint
   propagation, remain unimplemented; logical decoding on a standby is unsupported.
   Internal checks now derive shared
