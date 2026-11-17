@@ -33,41 +33,87 @@
    kind model (logical-slot-continuation-partition-rows rows certificate host)
    binding certificate host))
 
-(defun call-with-logical-slot-continuation-cold-selected-files (storage function)
-  ;; Keep the selected inode and any unselected selector.tmp under checked
-  ;; descriptors during the callback; a temporary is not itself selected.
-  (let* ((directory (logical-slot-continuation-storage-call storage :directory))
-         (names (logical-slot-continuation-selector-names storage))
-         (root-facts (physical-image-file-facts directory)))
-    (unless (member "selector" names :test #'string=)
+(defun call-with-logical-slot-continuation-cold-selector-files
+    (directory guard function &key require-selected)
+  (unless (and (functionp guard) (functionp function) (typep require-selected 'boolean))
+    (error "cold selector observation requires a guard, callback and selection policy"))
+  (funcall guard)
+  (let ((root-facts (physical-image-file-facts directory))
+        (names nil))
+    (unless (and (sb-posix:s-isdir (third root-facts))
+                 (= #o700 (logand #o7777 (third root-facts)))
+                 (= (fifth root-facts) (sb-posix:geteuid)))
+      (error "cold selector observation requires a private directory"))
+    (setf names (logical-slot-continuation-selector-file-names directory))
+    (when (and require-selected (not (member "selector" names :test #'string=)))
       (error "cold continuation has no canonical selected selector"))
-    (call-with-logical-slot-copy-source-proof-fd
-     directory "selector" nil
-     (lambda (fd facts)
-       (let* ((image (logical-slot-copy-import-control-read-fd
-                      fd (logical-slot-continuation-prepared-maximum-bytes)))
-              (ledger (list "selector" (copy-list facts) image)))
-         (multiple-value-bind (kind model) (logical-slot-continuation-cold-decode-selected image)
-           (labels ((with-temporary (temporary temp-fd)
-                      (flet ((check ()
-                               (logical-slot-continuation-storage-check storage)
-                               (unless (and (equal names (logical-slot-continuation-selector-names storage))
-                                            (equal root-facts (physical-image-file-facts directory)))
-                                 (error "cold continuation selected directory changed"))
-                               (logical-slot-imported-check-held-file directory "selector" fd facts image)
-                               (when temporary
-                                 (logical-slot-imported-check-held-file
-                                  directory "selector.tmp" temp-fd (second temporary) (third temporary)))))
-                        (check)
-                        (multiple-value-prog1 (funcall function kind model ledger temporary #'check)
-                          (check)))))
-             (if (member "selector.tmp" names :test #'string=)
-                 (call-with-logical-slot-copy-source-proof-fd
-                  directory "selector.tmp" nil
-                  (lambda (temp-fd temp-facts)
-                    (with-temporary
-                        (list "selector.tmp" (copy-list temp-facts)
-                              (logical-slot-copy-import-control-read-fd
-                               temp-fd (logical-slot-continuation-prepared-maximum-bytes)))
-                      temp-fd)))
-                 (with-temporary nil nil)))))))))
+    (labels ((check-directory ()
+               (funcall guard)
+               (unless (and (equal root-facts (physical-image-file-facts directory))
+                            (equal names (logical-slot-continuation-selector-file-names directory)))
+                 (error "cold continuation selected directory changed")))
+             (with-file (name consume)
+               (check-directory)
+               (multiple-value-prog1
+                   (if (member name names :test #'string=)
+                       (call-with-logical-slot-copy-source-proof-fd
+                        directory name nil
+                        (lambda (fd facts)
+                          (let ((ledger
+                                  (list (copy-seq name) (copy-list facts)
+                                        (logical-slot-copy-import-control-read-fd
+                                         fd (logical-slot-continuation-prepared-maximum-bytes)))))
+                            (check-directory)
+                            (funcall consume fd ledger))))
+                       (funcall consume nil nil))
+                 (check-directory)))
+             (invoke (kind model fd selected temp-fd temporary)
+               (let ((active t) (failed nil) (thread sb-thread:*current-thread*))
+                 (labels ((check ()
+                            (unless (and active (eq thread sb-thread:*current-thread*))
+                              (error "cold selector observation expired or changed thread"))
+                            (when failed (error "cold selector observation failed"))
+                            (sb-sys:without-interrupts
+                              (let ((complete nil))
+                                (unwind-protect
+                                     (multiple-value-prog1
+                                         (sb-sys:with-local-interrupts
+                                           (check-directory)
+                                           (dolist (entry (list (list fd selected)
+                                                                (list temp-fd temporary)))
+                                             (when (second entry)
+                                               (logical-slot-imported-check-held-file
+                                                directory (first (second entry)) (first entry)
+                                                (second (second entry)) (third (second entry)))))
+                                           t)
+                                       (setf complete t))
+                                  (unless complete (setf failed t)))))))
+                   (unwind-protect
+                        (progn
+                          (check)
+                          (multiple-value-prog1
+                              (funcall function kind (logical-slot-continuation-copy model)
+                                       (logical-slot-continuation-copy selected)
+                                       (logical-slot-continuation-copy temporary) #'check)
+                            (check)))
+                     (sb-sys:without-interrupts (setf active nil)))))))
+      (with-file
+        "selector"
+        (lambda (fd selected)
+          (multiple-value-bind (kind model)
+              (if selected (logical-slot-continuation-cold-decode-selected (third selected))
+                  (values :absent nil))
+            (with-file "selector.tmp"
+              (lambda (temp-fd temporary)
+                (invoke kind model fd selected temp-fd temporary)))))))))
+
+(defun call-with-logical-slot-continuation-cold-selector-observation
+    (storage function &key require-selected)
+  (call-with-logical-slot-continuation-cold-selector-files
+   (logical-slot-continuation-storage-call storage :directory)
+   (lambda () (logical-slot-continuation-storage-check storage))
+   function :require-selected require-selected))
+
+(defun call-with-logical-slot-continuation-cold-selected-files (storage function)
+  (call-with-logical-slot-continuation-cold-selector-observation
+   storage function :require-selected t))

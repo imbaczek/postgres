@@ -9,13 +9,15 @@
     (funcall *logical-slot-continuation-selector-test-hook* point storage))
   (logical-slot-continuation-storage-check storage))
 
-(defun logical-slot-continuation-selector-names (storage)
-  ;; Refuse unclassified entries and preserve them for investigation.
-  (let* ((directory (logical-slot-continuation-storage-call storage :directory))
-         (names (logical-slot-copy-import-control-names directory 3)))
+(defun logical-slot-continuation-selector-file-names (directory)
+  (let ((names (logical-slot-copy-import-control-names directory 3)))
     (unless (every (lambda (name) (member name '("selector" "selector.tmp") :test #'equal)) names)
       (error "continuation directory has unclassified entries"))
     names))
+
+(defun logical-slot-continuation-selector-names (storage)
+  (logical-slot-continuation-selector-file-names
+   (logical-slot-continuation-storage-call storage :directory)))
 
 (defun logical-slot-continuation-selector-check-open (storage name fd identity)
   (let* ((directory (logical-slot-continuation-storage-call storage :directory))
