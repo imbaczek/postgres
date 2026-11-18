@@ -69,6 +69,12 @@ A missing root is an error; there is no fallback to globals."
          (member (startup-setting-value (startup-configuration-settings configuration) "archive_mode")
                  '("on" "always") :test #'equal))))
 
+(defun startup-standby-wal-archive-enabled-p ()
+  (let ((configuration (startup-capture-configuration)))
+    (and configuration
+         (equal "always" (startup-setting-value
+                          (startup-configuration-settings configuration) "archive_mode")))))
+
 (defun startup-archive-command ()
   (let ((configuration (startup-capture-configuration)))
     (when configuration

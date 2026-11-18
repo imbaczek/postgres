@@ -2589,13 +2589,13 @@ Without WAL, write the catalog, call ON-DURABLE with NIL, and return no values."
           (setf *wal-pending-btree-split* nil))))
     commit-lsn))
 
-(defun wal-segment-entry-names ()
+(defun wal-segment-entry-names (&optional (directory (wal-directory)))
   "Return raw WAL entry names, including dangling links.
 
-Follow a symlink at the WAL directory itself. Enumeration errors are reported."
+Follow a symlink at DIRECTORY itself. Enumeration errors are reported."
   (remove-if-not (lambda (name)
                    (and (> (length name) 4) (uiop:string-suffix-p name ".wal")))
-                 (directory-entry-names (wal-directory) :follow-symlinks t)))
+                 (directory-entry-names directory :follow-symlinks t)))
 
 (defun wal-discover-segments (&optional (timeline *wal-insert-timeline*)
                                 (namespace *wal-segment-namespace*))
@@ -4194,11 +4194,19 @@ The caller holds the WAL lock and syncs the status directory."
     (when (minusp fd) (error "cannot open WAL archive source: ~a" name))
     fd))
 
+(defun wal-archive-directory-binding-p (held named)
+  "Compare directory identity and permissions without comparing mutable timestamps."
+  (and (= (first held) (first named))
+       (= (second held) (second named))
+       (= (third held) (third named))
+       (= (fifth held) (fifth named))
+       (= (ninth held) (ninth named))))
+
 (defun wal-archive-check-wal-directory (wal-fd)
   (physical-image-check-directory wal-fd nil t)
-  (unless (equal (physical-image-file-facts wal-fd)
-                 (physical-image-file-facts
-                  wal-fd (string-right-trim "/" (namestring (wal-directory)))))
+  (unless (wal-archive-directory-binding-p (physical-image-file-facts wal-fd)
+                                           (physical-image-file-facts
+                                            wal-fd (string-right-trim "/" (namestring (wal-directory)))))
     (error "WAL directory no longer names the held archive source directory")))
 
 (defun wal-archive-check-source (wal-fd name source-fd)
@@ -4295,8 +4303,51 @@ Return NIL when either file cannot be safely checked."
                  (zerop (logand (third facts) #o022))
                  (= (sb-posix:geteuid) (fifth facts))
                  (= (ninth facts) (ninth (physical-image-file-facts wal-fd)))
-                 (equal facts (physical-image-file-facts wal-fd "archive_status")))
+                 (wal-archive-directory-binding-p facts (physical-image-file-facts wal-fd "archive_status")))
       (error "invalid WAL archive status directory"))))
+
+(defun wal-archive-check-private-child (parent-fd name fd)
+  (physical-image-check-directory fd)
+  (let ((facts (physical-image-file-facts fd)))
+    (unless (and (= (ninth facts) (ninth (physical-image-file-facts parent-fd)))
+                 (wal-archive-directory-binding-p facts (physical-image-file-facts parent-fd name)))
+      (error "invalid standby archive directory: ~a" name))))
+
+(defun call-with-wal-archive-private-child (parent-fd name function)
+  (sb-sys:without-interrupts
+    (unless (or (zerop (physical-image-mkdirat parent-fd name #o700))
+                (= (sb-alien:get-errno) sb-posix:eexist))
+      (error "cannot create standby archive directory: ~a" name))
+    (let ((fd (physical-image-openat parent-fd name
+                                     (logior sb-posix:o-rdonly sb-posix:o-directory
+                                             sb-posix:o-nofollow +postmaster-o-cloexec+) 0)))
+      (when (minusp fd) (error "cannot open standby archive directory: ~a" name))
+      (unwind-protect
+           (progn
+             (wal-archive-check-private-child parent-fd name fd)
+             (sb-posix:fsync parent-fd)
+             (sb-sys:with-local-interrupts
+               (funcall function fd)))
+        (sb-posix:close fd)))))
+
+(defun call-with-standby-wal-archive-directory (function)
+  "Open the durable staging area and pass its descriptor and binding check."
+  (sb-sys:without-interrupts
+    (let ((wal-fd (wal-archive-open-wal-directory)))
+      (unwind-protect
+           (progn
+             (wal-archive-check-wal-directory wal-fd)
+             (sb-sys:with-local-interrupts
+               (call-with-wal-archive-private-child
+                wal-fd "standby_archive"
+                (lambda (stage-fd)
+                  (call-with-wal-archive-private-child stage-fd "archive_status" #'identity)
+                  (flet ((check-directory (fd)
+                           (wal-archive-check-wal-directory wal-fd)
+                           (wal-archive-check-private-child wal-fd "standby_archive" fd)))
+                    (check-directory stage-fd)
+                    (funcall function stage-fd #'check-directory))))))
+        (sb-posix:close wal-fd)))))
 
 (defun wal-archive-run-shell (template name wal-fd directory)
   "Run the archive command and wait for it to exit.
@@ -4497,7 +4548,9 @@ when the command fails."
                    ((wal-archive-done-matches-p directory-fd status-fd name source-fd)
                     (check-directories)
                     :already-done)
-                   ((wal-archive-run-shell template name directory-fd directory)
+                   ((progn
+                      (sb-posix:fsync directory-fd)
+                      (wal-archive-run-shell template name directory-fd directory))
                     (check-directories)
                     (unless (equal facts (wal-archive-check-source directory-fd name source-fd))
                       (error "staged WAL archive source changed during command: ~a" name))
@@ -4584,18 +4637,42 @@ Ensure its ready marker is durable and return the item and storage epoch."
                  (when status-fd (sb-posix:close status-fd))
               (when wal-fd (sb-posix:close wal-fd)))))))))
 
+(defun wal-archiver-step-staged (template)
+  "Archive the earliest pending staged segment, retaining failed work for retry."
+  (call-with-standby-wal-archive-directory
+   (lambda (fd check-directory)
+     (loop for name in (sort (directory-entry-names (physical-image-fd-path fd)
+                                                    :follow-symlinks t)
+                             #'string<)
+           do (multiple-value-bind (timeline segment)
+                  (wal-parse-segment-name (subseq name 0 (- (length name) 4)) :timeline)
+                (when timeline
+                  (case (wal-archive-attempt-staged fd timeline segment template check-directory)
+                    (:archived (return t))
+                    (:already-done nil)
+                    (otherwise
+                     (warn "archive_command failed for staged WAL ~a; will retry" name)
+                     (return nil)))))))))
+
+(declaim (ftype function startup-standby-wal-archive-enabled-p))
+
 (defun wal-archiver-step ()
   (let ((template (startup-archive-command)))
     (when (and template (plusp (length template)))
-      (multiple-value-bind (item epoch)
-          (sb-thread:with-mutex (*wal-lock*)
-            (wal-archive-pending-item-under-lock))
-        (when item
-          (if (wal-archive-attempt item template :epoch epoch)
-              t
-              (progn
-                (warn "archive_command failed for WAL item ~a; will retry" item)
-                nil)))))))
+      (or (and (startup-standby-wal-archive-enabled-p)
+               (handler-case (wal-archiver-step-staged template)
+                 (error (condition)
+                   (warn "staged WAL archiver will retry: ~a" condition)
+                   nil)))
+          (multiple-value-bind (item epoch)
+              (sb-thread:with-mutex (*wal-lock*)
+                (wal-archive-pending-item-under-lock))
+            (when item
+              (if (wal-archive-attempt item template :epoch epoch)
+                  t
+                  (progn
+                    (warn "archive_command failed for WAL item ~a; will retry" item)
+                    nil))))))))
 
 (defun wal-archiver-try-step ()
   (handler-case (wal-archiver-step)
