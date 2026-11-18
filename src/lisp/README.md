@@ -55,23 +55,25 @@ option by itself never starts a listener.
 TCP startup uses the first matching `pg_hba.conf` rule for the actual peer and
 startup user/database. The implicit default trusts loopback connections for
 ordinary and physical replication startup. The supported methods are `trust`,
-`reject`, and `scram-sha-256` for the bootstrap `postgres` role. Invalid methods
+`reject`, and `scram-sha-256` for supported login roles. Invalid methods
 and selectors reject the candidate configuration.
 `hba_file` and
 `ident_file` select the files, and reload validates a new policy before publishing
 it. Implicit paths are under the original `-D`/`PGDATA` configuration directory;
 explicit relative paths resolve against the invocation directory. Empty or
 comment-only ident files are supported; a missing ident file is
-nonfatal. SQL role authorization is not implemented: admitted SQL sessions use
-the `postgres` role. Native TCP listens on IPv4; scoped IPv6 HBA addresses are
+nonfatal. Admitted SQL sessions retain their login role identity. Role and grant
+support is limited to the implemented SQL and physical administration paths; it
+is not a complete PostgreSQL authorization system. Native TCP listens on IPv4; scoped IPv6 HBA addresses are
 unsupported. The separate control REPL does not use this policy.
 
 `bin/initdb --auth-host=scram-sha-256 --pwfile=FILE` initializes a
 password-backed primary. It uses libpq to derive a verifier from the first
 line of the password file and stores the verifier in a private file in PGDATA.
 The server uses OpenSSL 3 for SCRAM proof verification. Native physical backups
-preserve HBA policy and the private bootstrap verifier. Password management
-for additional roles remains open.
+preserve HBA policy and persisted SCRAM roles. Supported role and grant changes
+are transactional and survive restart and native clone; rolled-back changes do
+not persist.
 
 On first initialization, missing implicit policy files located in owned PGDATA are
 created without replacing existing files. Once the initialization marker exists,
@@ -139,10 +141,20 @@ SIGKILL can leave a `.pg-native-backup.*` sibling.
 Source startup sweeps abandoned stages only for the current cluster identity;
 stages belonging to an old reseed or relocated cluster are left alone.
 
-The unchanged Patroni follow method has also been tested against a promoted
-descendant and an explicit local native reseed. A former primary cannot directly
-follow without verified native recovery provenance; native rewind and safe
-offline primary adoption remain open. No coordinator is included.
+Pinned Patroni 4.1.5 has exercised its stock `post_bootstrap` role provisioning
+and a supplied-leader lifecycle through clone, promotion, native rewind and
+former-primary rejoin. The SCRAM lifecycle uses a dedicated rewind login for
+Patroni’s checkpoint query and native rewind, then normal Patroni replication
+credentials for follow. The four SQL file grants cover only the supported
+rewind files. A cluster administrator also sets the native `NATIVE_REWIND`
+role option to authorize native capture. Grant this option only to roles
+trusted to read a full physical image, including credential data in the catalog
+and WAL. The option permits rewind commands within the existing lease protocol.
+Regular streaming, base backup, and slot management still require replication
+privileges. Any operating-system account with access to PGDATA, its physical
+backups, or its WAL archives must be trusted with the same data.
+A former primary cannot directly follow without verified native recovery
+provenance. No coordinator is included.
 
 An existing verified native recovery base and control can also start with
 `standby.signal`. Startup samples the signal names once, enables streaming recovery

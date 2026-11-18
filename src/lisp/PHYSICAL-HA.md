@@ -16,9 +16,9 @@ rewind, and former-primary rejoin. A separate crash fixture verifies
 synchronous durability from a client acknowledgment ledger. The stock Patroni
 lifecycle fixture drives clone through rejoin using a supplied leader. Stock
 Patroni monitoring, synchronous candidate selection, recovery configuration,
-and trust bootstrap also have direct acceptance tests.
+and stock post-bootstrap role provisioning also have direct acceptance tests.
 
-Three areas still separate this evidence from closeout:
+Two areas still separate this evidence from closeout:
 
 1. Connect native standby feedback to the primary's cleanup decisions.
    Physical slot images can store separate data and catalog transaction
@@ -29,10 +29,7 @@ Three areas still separate this evidence from closeout:
    horizons. Cold startup rejects horizons it cannot verify across a
    checkpoint. Catalog feedback and Patroni's logical slot readiness and
    slot copy path still need acceptance.
-2. Exercise post-bootstrap role provisioning through stock Patroni and verify
-   password-backed rewind and rejoin. Native streaming clone already preserves
-   the bootstrap verifier and passes a login check.
-3. Qualify archive recovery with a configured streaming source across a
+2. Qualify archive recovery with a configured streaming source across a
    timeline fork, and settle archive backlog and cleanup behavior. State the
    tested rewind topology and interruption limits in the supported lifecycle
    contract.
@@ -775,9 +772,8 @@ passed; evidence is in `/home/imbaczek/proj/pg-ha-artifacts/patroni-descendant/`
 
 This local shared-filesystem reseed is not Patroni's default or remote bootstrap
 clone. A former primary, even without divergence, lacks the native provenance
-required for direct follow. Safe offline prefix-proved adoption, authenticated
-native backup export and installation, and native rewind remain open; C rewind
-tools are not compatible with native storage.
+required for direct follow. Subsequent milestones implemented authenticated native backup and native rewind;
+C rewind tools are not compatible with native storage.
 
 ### Empty-FIFO WAL writer
 
@@ -5073,7 +5069,7 @@ unchanged generated SQL, with fixtures supplying the surrounding state.
 | Synchronous configuration | `ConfigHandler.set_synchronous_standby_names` sets and clears the value by reload and treats the same value as a no-op. The primary PID stays the same. | `t/interop/patroni-bootstrap.py` passed in 93.98 s on the ramdisk. |
 | Process and promotion | Pinned process discovery, PID start-time rejection, direct start and stop are exercised for the implemented configuration subset. `Postgresql.promote` uses native utilities and waits for durable production state. | `t/interop/patroni-start.py` and promotion acceptance |
 | Physical slots | Unchanged `SlotsHandler` creates and loads a physical slot, queries view and function forms, advances it and drops it. The fixture supplies database transport. | `t/interop/physical-slots.py:62-93` |
-| Replica lifecycle | Pinned Patroni clone, follow, promotion, rewind and rejoin run with a leader supplied by the fixture. This includes source restart, physical slots and synchronous configuration. | `t/interop/patroni-reseed.py --case patroni-lifecycle` |
+| Replica lifecycle | Pinned Patroni clone, follow, promotion, rewind and rejoin run with a leader supplied by the fixture. This includes source restart, physical slots and synchronous configuration. The SCRAM variant uses a dedicated rewind account and ordinary replication credentials for follow. | `t/interop/patroni-reseed.py --case patroni-lifecycle-scram` passed in 356.99 s on the ramdisk. Clone took 1.87 s and former-primary construction took 49.09 s. |
 | Recovery configuration | `ConfigHandler.check_recovery_conf` classifies a changed upstream host as reload-only and reports a match after reload, restart and reattach. It detects a missing upstream after detach and falls back to configured settings during a source outage. The fixture checks the live receiver DSN and slot through Patroni. | `t/interop/patroni-follow.py` passed in 107.25 s on the ramdisk. |
 
 The live monitor passed in 100.87 s on the ramdisk. On fresh primaries,
@@ -5141,12 +5137,20 @@ accepts the correct password and rejects an incorrect password after it
 starts. The fixture took 24.23 s on the ramdisk. Three focused Rove tests
 passed, including checks for a missing, oversized, or non-private verifier.
 
-Distinct backend gaps remain:
+Stock Patroni 4.1.5 `post_bootstrap` role provisioning passed in 22.29 s on
+the ramdisk.
+Named physical tests cover restricted SQL and grants and role identity. Persisted
+SCRAM roles survive restart and native clone, while transaction rollback discards
+uncommitted changes. The dedicated SCRAM lifecycle exercises Patroni’s checkpoint
+query and native rewind with the rewind login, then follows with the normal
+replication credentials. Native capture requires the explicit `NATIVE_REWIND`
+role option in addition to the four SQL file grants. It authorizes a full
+physical image, including catalog and WAL credential data. The SQL file grants
+keep their limited file scope. Lease operations still require the exact lease
+request and token. The fixture supplies the leader and runs no coordinator.
 
-- `post_bootstrap` role provisioning and password-backed rewind and rejoin
-  still need acceptance.
-- Patroni-managed logical-slot synchronization needs separate work and testing,
-  including `hot_standby_feedback`, `pg_read_binary_file` and C slot files.
+Patroni-managed logical-slot synchronization remains open, including catalog
+feedback, slot readiness and the slot-copy path.
 
 The C fixture `t/interop/hot-standby-feedback-reference.py` takes a C binary
 directory and two ports. Run it with the pinned Patroni Python environment.
