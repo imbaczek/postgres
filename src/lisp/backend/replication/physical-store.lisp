@@ -171,13 +171,14 @@ The archive is a trusted source. Checksums detect accidental changes."
           ((>= status 126) (error "restore_command could not run for ~a" name)))))
 
 (defun wal-restore-proved-segment (template directory-fd system-id timeline segment namespace
-                                   &key working-directory check cancel-check restart-file)
+                                   &key working-directory check cancel-check restart-file partial)
   "Fetch a closed segment into an empty private directory owned by the caller.
 Return its bytes and proved end. A missing archive file returns NIL. The caller
 discards the entire staging directory after each attempt."
   (physical-image-check-directory directory-fd)
   (let* ((directory (physical-image-fd-path directory-fd))
-         (name (wal-segment-filename segment timeline namespace))
+         (segment-name (wal-segment-filename segment timeline namespace))
+         (name (if partial (concatenate 'string segment-name ".partial") segment-name))
          (proof-name (wal-archive-segment-proof-name name)))
     (directory-entry-names directory :follow-symlinks t :maximum-entries 0)
     (let ((bytes (wal-restore-archive-file template name directory-fd

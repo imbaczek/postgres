@@ -136,7 +136,16 @@ DIRECTORY-FD, when supplied, is the caller-held WAL directory descriptor."
       (sb-sys:without-interrupts
         (let ((wal-fd (wal-archive-open-wal-directory)))
           (unwind-protect
-               (wal-archive-stage-source wal-fd name prefix #'wal-archive-check-wal-directory)
+               (progn
+                 (wal-archive-stage-source wal-fd name prefix #'wal-archive-check-wal-directory)
+                 (when (>= (length prefix) +wal-header-size+)
+                   (wal-archive-stage-source
+                    wal-fd (wal-archive-segment-proof-name name)
+                    (wal-encode-archive-segment-proof
+                     (catalog-system-identifier) source-timeline
+                     (floor fork +wal-segment-size+) namespace fork prefix)
+                    #'wal-archive-check-wal-directory))
+                 name)
             (sb-posix:close wal-fd)))))))
 
 ;; Prefix staging can install several destination paths during rollover, so an

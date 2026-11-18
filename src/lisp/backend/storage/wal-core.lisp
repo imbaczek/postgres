@@ -4206,7 +4206,7 @@ Apply the durable, closed segment checks to WAL segments."
          (and (wal-archive-primary-ready-p)
               (member item (wal-archive-partial-items) :test #'equal)))
         ((wal-archive-proof-item-p item)
-         (and (wal-archive-primary-ready-p) (wal-archive-ready-segment-p (cdr item))))
+         (and (wal-archive-primary-ready-p) (wal-archive-item-ready-p (cdr item))))
         ((consp item)
          (and (wal-archive-primary-ready-p)
               (member item (wal-archive-history-items) :test #'equal)))
@@ -4655,19 +4655,26 @@ under the lock, and publish completion only after success."
 
 (declaim (ftype function wal-verify-archive-segment-proof))
 
-(defun wal-archive-primary-proof-matches-p (wal-fd status-fd segment proof-facts)
-  (let* ((name (wal-archive-item-name segment))
+(defun wal-archive-primary-proof-matches-p (wal-fd status-fd item proof-facts)
+  (let* ((name (wal-archive-item-name item))
          (proof-name (wal-archive-segment-proof-name name))
          (source-fd (wal-archive-open-source wal-fd name)))
     (unwind-protect
          (when (wal-archive-done-matches-p wal-fd status-fd name source-fd)
            (multiple-value-bind (bytes facts) (wal-archive-read-source-bytes wal-fd name)
              (multiple-value-bind (proof read-facts) (wal-archive-read-source-bytes wal-fd proof-name)
-               (and (equal facts (wal-archive-check-source wal-fd name source-fd))
-                    (or (null proof-facts) (equal proof-facts read-facts))
-                    (wal-verify-archive-segment-proof proof (catalog-system-identifier)
-                                                      *wal-insert-timeline* segment *wal-segment-namespace*
-                                                      bytes)))))
+               (when (and (equal facts (wal-archive-check-source wal-fd name source-fd))
+                          (or (null proof-facts) (equal proof-facts read-facts)))
+                 (if (wal-archive-partial-item-p item)
+                     (let* ((stem (subseq name 0 (- (length name) (length ".wal.partial"))))
+                            (namespace (if (= (length stem) 16) :legacy :timeline)))
+                       (multiple-value-bind (timeline segment) (wal-parse-segment-name stem namespace)
+                         (and timeline
+                              ;; The data receipt binds bytes checked against the committed child.
+                              (wal-verify-archive-segment-proof
+                               proof (catalog-system-identifier) timeline segment namespace bytes))))
+                     (wal-verify-archive-segment-proof
+                      proof (catalog-system-identifier) *wal-insert-timeline* item *wal-segment-namespace* bytes))))))
       (sb-posix:close source-fd))))
 
 (defun wal-record-primary-archive-rotation (segment end)
@@ -4799,7 +4806,10 @@ Ensure its ready marker is durable and return the item and storage epoch."
   (when (wal-archive-primary-ready-p)
     (let* ((segments (remove-if-not #'wal-archive-ready-segment-p (wal-discover-segments)))
            (items (append (wal-archive-history-items)
-                          (wal-archive-partial-items)
+                          (loop for partial in (wal-archive-partial-items)
+                                collect partial
+                                unless (member partial skip-proofs :test #'equal)
+                                  collect (cons :proof partial))
                           (loop for segment in segments
                                 collect segment
                                 unless (member segment skip-proofs :test #'eql)

@@ -1722,7 +1722,7 @@ Capture the floor and its timeline together before running the restore shell."
                 (physical-restore-cleanup-stages-at-startup fd))
            (sb-posix:close fd)))))))
 
-(defun physical-follow-fetch-archive (runtime command system-id timeline segment namespace)
+(defun physical-follow-fetch-archive (runtime command system-id timeline segment namespace &optional partial)
   "Fetch one proved extent through a private directory pinned under pg_wal."
   (let ((parent nil) (fd nil) (name nil) (facts nil))
     (unwind-protect
@@ -1750,7 +1750,7 @@ Capture the floor and its timeline together before running the restore shell."
              (physical-follow-authorize-receiver runtime)
              (check)
              (wal-restore-proved-segment command fd system-id timeline segment namespace
-                                         :working-directory *pgdata* :check #'check
+                                         :working-directory *pgdata* :check #'check :partial partial
                                          :cancel-check #'cancel-check
                                          :restart-file (physical-follow-archive-restart-file runtime namespace))))
       (unwind-protect
@@ -1765,11 +1765,22 @@ Capture the floor and its timeline together before running the restore shell."
          (segment (floor cursor +wal-segment-size+))
          (limit (physical-follow-runtime-boundary runtime)))
     (labels ((fetch (number)
-               (multiple-value-bind (bytes end)
-                   (physical-follow-fetch-archive runtime command system-id timeline number :timeline)
-                 (if (or bytes (/= timeline 1))
-                     (values bytes end)
-                     (physical-follow-fetch-archive runtime command system-id timeline number :legacy))))
+               (flet ((from-namespace (namespace)
+                        (multiple-value-bind (bytes end)
+                            (physical-follow-fetch-archive runtime command system-id timeline number namespace)
+                          (cond ((and bytes (or (null limit) (<= end limit)))
+                                 (values bytes end))
+                                ((and limit (plusp (mod limit +wal-segment-size+))
+                                      (= number (floor limit +wal-segment-size+)))
+                                 (multiple-value-bind (partial partial-end)
+                                     (physical-follow-fetch-archive
+                                      runtime command system-id timeline number namespace t)
+                                   (when (eql limit partial-end)
+                                     (values partial partial-end))))))))
+                 (multiple-value-bind (bytes end) (from-namespace :timeline)
+                   (if (or bytes (/= timeline 1))
+                       (values bytes end)
+                       (from-namespace :legacy)))))
              (admit (number bytes end &optional predecessor)
                (when (and bytes (or (null limit) (<= end limit)))
                  (with-physical-follow-generation-operation

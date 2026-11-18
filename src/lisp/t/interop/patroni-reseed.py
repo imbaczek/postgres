@@ -503,6 +503,12 @@ class ArchiveHistoryAcceptance(RewindSharedHistoryAcceptance):
         archived_partial = self.archive / partial.name
         assert stat.S_ISREG(archived_partial.lstat().st_mode)
         assert archived_partial.read_bytes() == partial.read_bytes()
+        proof_name = partial.name + ".proof"
+        follow.wait_for((wal / "archive_status" / (proof_name + ".done")).is_file)
+        proof = (self.archive / proof_name).read_bytes()
+        assert proof == (wal / proof_name).read_bytes()
+        assert len(proof) == 52 and proof[:4] == b"PWAP"
+        assert int.from_bytes(proof[32:40], "little") == fork
         assert not (self.archive / partial.name.removesuffix(".partial")).exists()
         self.result["archive_history"] = {"name": name, "text": promoted["history"],
                                           "local_partial": partial.name, "partial_size": offset}

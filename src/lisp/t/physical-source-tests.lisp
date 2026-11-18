@@ -131,12 +131,12 @@
              (template (format nil "cp -- '~a'\"%f\" \"%p\"" (namestring archive))))
         (pg::wal-ensure-directory-durable archive)
         (pg::wal-atomic-write-bytes segment-path bytes)
-        (flet ((restore (leaf &optional (command template))
+        (flet ((restore (leaf &optional (command template) partial)
                  (let ((stage (merge-pathnames leaf root)))
                    (sb-posix:mkdir (namestring stage) #o700)
                    (let ((fd (pg::physical-backup-open-directory stage)))
                      (unwind-protect
-                          (pg::wal-restore-proved-segment command fd 17 2 0 :timeline)
+                          (pg::wal-restore-proved-segment command fd 17 2 0 :timeline :partial partial)
                        (sb-posix:close fd))))))
           (ok (null (restore "missing/")))
           (pg::wal-atomic-write-bytes proof-path
@@ -144,6 +144,15 @@
           (multiple-value-bind (restored restored-end) (restore "valid/")
             (ok (equalp restored bytes))
             (ok (eql restored-end end)))
+          (let ((partial-name (concatenate 'string name ".partial")))
+            (pg::wal-atomic-write-bytes (merge-pathnames partial-name archive) bytes)
+            (ok (null (restore "partial-missing/" template t)))
+            (pg::wal-atomic-write-bytes
+             (merge-pathnames (pg::wal-archive-segment-proof-name partial-name) archive)
+             (pg::wal-encode-archive-segment-proof 17 2 0 :timeline end bytes))
+            (multiple-value-bind (restored restored-end) (restore "partial-valid/" template t)
+              (ok (equalp restored bytes))
+              (ok (eql restored-end end))))
           (pg::wal-atomic-write-bytes proof-path
                                       (pg::wal-encode-archive-segment-proof 18 2 0 :timeline end bytes))
           (ok (signals (restore "wrong-cluster/") 'error))
@@ -456,6 +465,38 @@
          (ok (probe-file (merge-pathnames
                           (concatenate 'string "archive-" (file-namestring (pg::wal-segment-path 0)))
                           pg::*pgdata*)))))))
+
+(deftest promotion-partial-proof-can-retry-after-child-recycling
+    (call-with-physical-source-fixture
+     (lambda ()
+       (let* ((pg::*wal-ready* t)
+              (pg::*wal-control-metadata* (list :db-state pg::+db-in-production+))
+              (pg::*wal-insert-timeline* 2)
+              (pg::*wal-segment-namespace* :timeline)
+              (settings (pg::startup-configuration-settings pg::*startup-installed-configuration*))
+              (prefix (sample-physical-record))
+              (fork (length prefix))
+              (name (pg::wal-archive-stage-promotion-partial 1 fork prefix :legacy))
+              (leaf (pg::wal-archive-segment-proof-name name))
+              (receipt (merge-pathnames (concatenate 'string "archive-" leaf) pg::*pgdata*))
+              (copy "cp -- \"%p\" \"archive-%f\""))
+         (setf (getf (gethash "archive_mode" settings) :value) "on"
+               (getf (gethash "archive_command" settings) :value)
+               (concatenate 'string "case \"%f\" in *.partial.proof) exit 1;; esac; " copy))
+         (pg::timeline-write-history 2 1 fork "committed child")
+         (pg::wal-atomic-write-bytes (pg::wal-segment-path 0) prefix)
+         (ok (pg::wal-archiver-step))
+         (ok (pg::wal-archiver-step))
+         (ok (pg::wal-archiver-step))
+         (ok (not (probe-file receipt)))
+         (sb-thread:with-mutex (pg::*wal-lock*)
+           (ok (pg::wal-archive-recycle-segment 0)))
+         (ok (not (probe-file (pg::wal-segment-path 0))))
+         (setf (getf (gethash "archive_command" settings) :value) copy)
+         (ok (pg::wal-archiver-step))
+         (ok (= fork (pg::wal-verify-archive-segment-proof
+                      (pg::read-bounded-regular-file receipt pg::+wal-archive-segment-proof-size+)
+                      (pg::catalog-system-identifier) 1 0 :legacy prefix)))))))
 
 (deftest physical-source-legacy-pin-is-readable-before-handoff
     (call-with-physical-source-fixture
