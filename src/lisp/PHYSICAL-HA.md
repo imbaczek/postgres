@@ -82,10 +82,17 @@ Two recovery areas still need work.
    environment. It passed in 38.48 s on the ramdisk. A focused test exercises
    the real shell and receiver loop with a simulated streaming handshake. The
    existing live Patroni follow regression without a restore command passed
-   in 79.70 s on the ramdisk. Recovery from archived timeline history and
-   partial segments remains open, as does enabling `restore_command` on a
-   running standby that has no receiver. Startup from an archive without a
-   prior native receive state still needs qualification.
+   in 79.70 s on the ramdisk. The `--reload-restore` test uses Patroni 4.1.5
+   configuration and reload to enable `restore_command` on a running managed
+   replay-only standby with empty `primary_conninfo`. The same process starts
+   archive receipt, then reconnects through `follow_one` after the source
+   returns. The run passed in 126.98 s on the ramdisk, along with three focused
+   tests. Edits between nonempty restore command templates preserve the
+   current generation. Changing the command also preserves the generation
+   when a streaming source is configured.
+   Recovery from archived timeline history and partial segments remains open.
+   Startup from an archive without a prior native receive state still needs
+   qualification.
    Offline rewind has a separate restore path. Archive producer work still needs
    repeated-promotion and mode-handoff tests, safe queue reclamation, and
    bounded backlog scans.
