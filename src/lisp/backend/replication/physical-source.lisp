@@ -44,7 +44,6 @@ For a sender context also check the calling backend and source incarnation."
                           (not (recovery-in-progress-p))
                           (= (physical-sender-system-id owner) (catalog-system-identifier))
                           (= (physical-sender-timeline owner) *wal-insert-timeline*)
-                          (eq (physical-sender-namespace owner) *wal-segment-namespace*)
                           (let ((slot (physical-sender-public-slot owner)))
                             (or (null slot)
                                 (and (eq slot (gethash (physical-sender-public-name owner)
@@ -57,6 +56,9 @@ For a sender context also check the calling backend and source incarnation."
                                      (eq (physical-sender-backend owner)
                                          (wal-replication-slot-active-owner-backend slot))))))))
       (wal-invalid-input "physical sender no longer owns its retained source context"))
+    (when (and (physical-sender-p owner)
+               (not (eq (physical-sender-namespace owner) *wal-segment-namespace*)))
+      (ereport "57P01" "WAL filename namespace changed; reconnect to resume streaming"))
     pin))
 
 (declaim (ftype function physical-follow-pin-end-lsn))
