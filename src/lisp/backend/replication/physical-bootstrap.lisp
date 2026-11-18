@@ -712,8 +712,9 @@ The slot is dropped on every exit; a verified origin remains after cancellation.
 
 (defun physical-backup-send-file (directory entry timeline emit &key pages)
   "Send a checked bundle file as a header, data frames and an end frame.
-Each data frame owns a fresh payload; hash the same bytes copied into it.
-Check the file length and digest before sending the end frame."
+Compare each offered page digest with the source page before sending a reference.
+Send source bytes on mismatch. Hash all source bytes and check the complete file
+length and digest before sending the end frame."
   (destructuring-bind (name size expected-digest) entry
     (unless (and (physical-backup-bundle-path-p name timeline)
                  (typep size '(unsigned-byte 64))
@@ -832,6 +833,7 @@ Check the file length and digest before sending the end frame."
 ;; the digest; the caller owns the output stream and its durability.
 
 (defun physical-backup-read-page-reference (frame offset remaining reader)
+  "Read an offered local page and verify its length and digest against the reference."
   (unless (and reader (= (length frame) 17) (zerop (mod offset +blcksz+))
                (<= +blcksz+ remaining) (= offset (replication-read-u64 frame 1)))
     (error "invalid native backup page reference"))
@@ -845,8 +847,8 @@ Check the file length and digest before sending the end frame."
 
 (defun physical-backup-receive-file-content (size expected-digest next output &optional relative page-reader)
   "Receive file data and return its digest after checking the end frame.
-Validate each data extent before writing it, and hash the same bytes written.
-The caller checks the file header and owns the output."
+Validate each data extent or page reference before writing it. Hash the assembled
+bytes against the sealed file digest. The caller checks the header and owns output."
   (let ((digest #xCBF29CE484222325))
     (loop with remaining = size
           while (plusp remaining)

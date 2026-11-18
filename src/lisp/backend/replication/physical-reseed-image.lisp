@@ -339,6 +339,8 @@ Installation requires separate checks."
     candidates))
 
 (defun physical-rewind-filter-changed-pages (owner target fork candidates)
+  "Scan target WAL from FORK through its endpoint and remove changed pages.
+Remove a reset fork and clear all candidates for catalog changes."
   (let ((*pgdata* (physical-adoption-owner-directory owner))
         (*physical-image-context* nil))
     (multiple-value-bind (cursor files complete)
@@ -372,6 +374,7 @@ Installation requires separate checks."
   candidates)
 
 (defun physical-rewind-read-local-page (context name offset)
+  "Read a complete local page through the held image context and recheck its file."
   (multiple-value-bind (parent leaf) (physical-image-parent context name)
     (call-with-physical-image-input-at
      parent leaf
@@ -387,6 +390,8 @@ Installation requires separate checks."
      :element-type '(unsigned-byte 8))))
 
 (defun physical-rewind-page-offers (owner target fork offers context)
+  "Offer digests of unchanged local candidate pages when a fork is known.
+Read each page under the held target context."
   (when fork
     (let ((candidates (physical-rewind-filter-changed-pages
                        owner target fork (physical-rewind-page-candidates offers))))
@@ -402,9 +407,10 @@ Installation requires separate checks."
 (defun physical-rewind-capture-image (owner destination destination-fd client request &key fork)
   "Receive a source image using relation offers from the locked target.
 Hold a read descriptor for the target and a receive descriptor for the image.
-Reuse files only when the offered name, size and digest match. Verify the
-complete image and READY source lease, then recheck the target.
-Return the manifest, lease record and reused entries."
+Offer unchanged pages selected from target WAL and reread requested pages through
+the held descriptor. Reuse files only when name, size and digest match. Verify
+the complete image and READY source lease, then recheck the target.
+Return the manifest, lease record, reused files, reused pages and page offers."
   (let* ((target (physical-rewind-inspect-primary owner))
          (reused nil)
          (reused-pages nil))
