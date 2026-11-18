@@ -6,9 +6,9 @@
   (mapcar #'pg-index-relfilenode (table-indexes table)))
 
 (defun vacuum-data-oldest-xmin (&optional exclude-snapshot)
-  "Return the data removal horizon from local snapshots, transactions, and physical slots.
+  "Return the data removal horizon from local activity and physical feedback.
 Exclude EXCLUDE-SNAPSHOT from the local horizon."
-  (wal-limit-xmin-by-physical-slots (oldest-xmin exclude-snapshot)))
+  (wal-limit-xmin-by-physical-feedback (oldest-xmin exclude-snapshot) :include-senders t))
 
 (defun vacuum-compute-freeze-cutoff
     (old-relfrozenxid oldest-xmin next-xid &key forced-freeze-cutoff)

@@ -490,7 +490,8 @@ base and bounds apply feedback, not the anchor cursor."
   (sb-sys:without-interrupts
     (sb-thread:with-mutex (*wal-lock*)
       (when (eq owner (gethash name *physical-source-senders*))
-        (remhash name *physical-source-senders*)))
+        (remhash name *physical-source-senders*))
+      (remhash owner *wal-physical-sender-xmins*))
     (when (and (physical-sender-p owner) (physical-sender-public-slot owner))
       (wal-release-replication-slot-owner
        (physical-sender-public-name owner) owner (physical-sender-public-slot owner)))))
@@ -670,10 +671,12 @@ receipt confirmation succeeds."
   status)
 
 (defun physical-source-confirm-xmin (owner data catalog)
-  "Save feedback for the public slot owned by this sender.
-Ignore the report if either horizon is outside the recent XID range. A NIL
-horizon clears its field. A reported XID can only advance an existing field.
-Check ownership under WAL and save changes before updating the in-memory slot."
+  "Publish feedback for the current sender under WAL.
+Ignore the whole report if either horizon is outside the recent XID range.
+For a public slot, NIL clears a field and a reported XID can only advance it.
+Save those changes before updating the slot in memory.
+For a slotless sender, replace its transient horizon with the older of the
+reported XIDs when DATA is present, or clear it when DATA is NIL."
   (let ((next (next-full-xid)))
     (unless (every (lambda (xid)
                      (or (null xid) (<= 0 (- next xid) #x80000000)))
@@ -687,20 +690,24 @@ Check ownership under WAL and save changes before updating the in-memory slot."
                   (physical-source-check-sender-under-lock (physical-sender-name owner) owner)
                 (pg-error (condition) (return-from publish condition)))
               (let ((slot (physical-sender-public-slot owner)))
-                (when slot
-                  (let* ((old (physical-slot-horizons slot))
-                         (merged (mapcar (lambda (previous reported)
-                                           (if (and previous reported)
-                                               (max previous reported)
-                                               reported))
-                                         (or old '(nil nil)) (list data catalog)))
-                         (updated (when (some #'identity merged) merged)))
-                    (unless (equal old updated)
-                      (let ((candidate (wal-copy-replication-slot-with-profile slot)))
-                        (setf (physical-slot-horizons candidate) updated)
-                        (begin-publication)
-                        (wal-save-replication-slot candidate)
-                        (setf (physical-slot-horizons slot) updated))))))
+                (if slot
+                    (let* ((old (physical-slot-horizons slot))
+                           (merged (mapcar (lambda (previous reported)
+                                             (if (and previous reported)
+                                                 (max previous reported)
+                                                 reported))
+                                           (or old '(nil nil)) (list data catalog)))
+                           (updated (when (some #'identity merged) merged)))
+                      (unless (equal old updated)
+                        (let ((candidate (wal-copy-replication-slot-with-profile slot)))
+                          (setf (physical-slot-horizons candidate) updated)
+                          (begin-publication)
+                          (wal-save-replication-slot candidate)
+                          (setf (physical-slot-horizons slot) updated))))
+                    (if data
+                        (setf (gethash owner *wal-physical-sender-xmins*)
+                              (min data (or catalog data)))
+                        (remhash owner *wal-physical-sender-xmins*))))
               nil))))
     (when rejection (error rejection))))
 

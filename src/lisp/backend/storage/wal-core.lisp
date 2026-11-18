@@ -260,14 +260,21 @@ Logical updates guard identity, progress and the first terminal cause."
   "Test the explicit physical kind, not the database field."
   (eq :physical (wal-replication-slot-kind slot)))
 
-(defun wal-limit-xmin-by-physical-slots (xmin)
-  "Lower XMIN to the data horizon of any nonlost physical slot."
+(defvar *wal-physical-sender-xmins* (make-hash-table :test #'eq)
+  "Transient data horizons of slotless senders, guarded by *WAL-LOCK*.")
+
+(defun wal-limit-xmin-by-physical-feedback (xmin &key include-senders)
+  "Lower XMIN to the oldest data horizon of any nonlost physical slot.
+INCLUDE-SENDERS also applies transient horizons held by slotless senders."
   (sb-thread:with-mutex (*wal-lock*)
     (loop for slot being the hash-values of *wal-replication-slots*
           when (and (wal-physical-slot-p slot)
                     (not (eq :lost (wal-replication-slot-wal-status slot))))
             do (let ((slot-xmin (first (physical-slot-horizons slot))))
-                 (when slot-xmin (setf xmin (min xmin slot-xmin))))))
+                 (when slot-xmin (setf xmin (min xmin slot-xmin)))))
+    (when include-senders
+      (loop for sender-xmin being the hash-values of *wal-physical-sender-xmins*
+            do (setf xmin (min xmin sender-xmin)))))
   xmin)
 
 (defun wal-valid-slot-plugin-state-p (plugin database-oid confirmed-flush-lsn)

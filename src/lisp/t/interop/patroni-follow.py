@@ -192,6 +192,38 @@ def check_feedback_reload(node, root, target_data, ports, target_pid):
     print('patroni-follow: standby feedback publishes and clears data xmin on reload PASS', flush=True)
 
 
+def check_slotless_feedback(node, source, root, target_data, ports):
+    path = target_data / 'postgresql.conf'
+    original = path.read_text()
+    enabled = (original + "\nprimary_slot_name = ''\nhot_standby_feedback = on\n"
+               "wal_receiver_status_interval = 1\n")
+
+    def reload_configuration(text):
+        path.write_text(text)
+        control(node.is_running(), root / 'target.sock', '(request-configuration-reload)')
+
+    def source_has_feedback(expected):
+        return ':SLOTLESS-FEEDBACK' in control(
+            source, root / 'source.sock',
+            f'(sb-thread:with-mutex (*wal-lock*) '
+            f'  (when (= {expected} (hash-table-count *wal-physical-sender-xmins*)) '
+            '     :slotless-feedback))').upper()
+
+    try:
+        reload_configuration(enabled)
+        wait_for(lambda: query(ports[1], 'SELECT status,slot_name FROM pg_stat_get_wal_receiver()')
+                 == [('streaming', None)])
+        wait_for(lambda: source_has_feedback(1))
+        reload_configuration(enabled + "\nprimary_conninfo = ''\n")
+        wait_for(lambda: query(ports[1], 'SELECT pid FROM pg_stat_get_wal_receiver()') == [(None,)])
+        wait_for(lambda: source_has_feedback(0))
+    finally:
+        reload_configuration(original)
+    wait_for(lambda: query(ports[1], 'SELECT status,slot_name FROM pg_stat_get_wal_receiver()')
+             == [('streaming', 'follow_one')])
+    print('patroni-follow: slotless feedback clears when its sender disconnects PASS', flush=True)
+
+
 def exercise(root, ports, source_log):
     source_data, target_data = root / 'source', root / "replica 'one'"
     source_socket = root / 'source.sock'
@@ -242,6 +274,7 @@ def exercise(root, ports, source_log):
         check_live_receiver(node, '127.0.0.1', ports[0])
         check_source_sender(source, root)
         check_feedback_reload(node, root, target_data, ports, target_pid)
+        check_slotless_feedback(node, source, root, target_data, ports)
         replacement = Member(0, 'source', None,
                              {'conn_url': f'postgres://localhost:{ports[0]}/postgres'})
         check_recovery_conf(node, replacement, (True, False))

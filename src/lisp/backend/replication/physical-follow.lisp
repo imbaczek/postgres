@@ -1559,14 +1559,12 @@ complete source XID coverage."
                 (let ((snapshot-xmin (oldest-active-snapshot-xmin)))
                   (reduce #'min (getf source :running)
                           :initial-value (min *next-xid* (or snapshot-xmin *next-xid*)))))))))
-    (when xmin (wal-limit-xmin-by-physical-slots xmin))))
+    (when xmin (wal-limit-xmin-by-physical-feedback xmin))))
 
 (defun physical-follow-send-horizon-feedback (client runtime sent-at sent-enabled)
-  "Send periodic data feedback for a public slot, or clear it when disabled.
+  "Send periodic data feedback to the source, or clear it when disabled.
 Return the last successful send time and enabled state. Wait for a valid xmin
 before sending an enabled report."
-  (unless (physical-follow-config-public-slot (physical-follow-runtime-config runtime))
-    (return-from physical-follow-send-horizon-feedback (values sent-at sent-enabled)))
   (let* ((configuration (startup-capture-configuration))
          (settings (when configuration (startup-configuration-settings configuration)))
          (interval (when settings (startup-setting-value settings "wal_receiver_status_interval")))
