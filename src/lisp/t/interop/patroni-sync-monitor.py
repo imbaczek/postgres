@@ -1,6 +1,7 @@
 """Run pinned Patroni synchronous monitoring through its real SQL connection pool."""
 import argparse
 from contextlib import ExitStack
+from datetime import datetime, timezone
 import importlib.metadata
 from pathlib import Path
 import runpy
@@ -222,8 +223,10 @@ def check_native_streaming(connection, server):
     monitor_node, trace = monitor(connection, PostgresqlRole.PRIMARY, server.data)
     cleanup.callback(monitor_node.connection_pool.close)
     try:
-        for name in ('sync_a', 'sync_b'):
-            start_follower(connection, server, name, cleanup)
+        configure(connection, '')
+        first = start_follower(connection, server, 'sync_a', cleanup)
+        check_replay_timestamp(connection, first)
+        start_follower(connection, server, 'sync_b', cleanup)
         monitor_node._should_query_slots = True
         slot_row = monitor_node.query(monitor_node.cluster_info_query)[0]
         assert len(slot_row) == 16
@@ -268,10 +271,45 @@ def check_native_streaming(connection, server):
             traceback.print_exc()
 
 
+def check_replay_timestamp(connection, standby):
+    timestamp_sql = 'SELECT pg_catalog.pg_last_xact_replay_timestamp()'
+    assert standby.query(timestamp_sql) == [(None,)]
+    with connection.cursor() as cursor:
+        cursor.execute('CREATE TABLE replay_time_probe (i integer)')
+    for i in (1, 2):
+        if i == 2:
+            standby.query('SELECT pg_wal_replay_pause()')
+        try:
+            if i == 2:
+                follow['wait_for'](lambda: standby.query(
+                    'SELECT pg_get_wal_replay_pause_state()') == [('paused',)])
+            before = datetime.now(timezone.utc)
+            with connection.cursor() as cursor:
+                cursor.execute('INSERT INTO replay_time_probe VALUES (%s)', (i,))
+            after = datetime.now(timezone.utc)
+            barrier = lsn_number(scalar(connection, 'SELECT pg_current_wal_flush_lsn()'))
+            if i == 2:
+                follow['wait_for'](lambda: lsn_number(standby.query(
+                    'SELECT pg_last_wal_receive_lsn()')[0][0] or '0/0') >= barrier)
+                assert standby.query(timestamp_sql) == [(timestamp,)]
+        finally:
+            if i == 2:
+                standby.query('SELECT pg_wal_replay_resume()')
+        follow['wait_for'](lambda: lsn_number(standby.query(
+            'SELECT pg_last_wal_replay_lsn()')[0][0]) >= barrier)
+        timestamp = standby.query(timestamp_sql)[0][0]
+        assert before <= timestamp <= after, (before, timestamp, after)
+    print('native: replay timestamp tracks applied commits and stays unchanged while paused PASS', flush=True)
+
+
 def check(native, reference, server):
     assert importlib.metadata.version('patroni') == '4.1.5'
     global_config.update(None, {'synchronous_mode': True})
     assert global_config.is_synchronous_mode
+    for connection in (native, reference):
+        with connection.cursor() as cursor:
+            cursor.execute('SELECT pg_catalog.pg_last_xact_replay_timestamp()')
+            assert cursor.description[0].type_code == 1184 and cursor.fetchone() == (None,)
     check_one(reference, 'C')
     check_one(native, 'native')
     check_streaming(reference, 'C')

@@ -346,7 +346,7 @@ exist\" messages."
 
 (defun analyze-metadata-function (name arguments)
   (cond
-    ((string= name "pg_postmaster_start_time")
+    ((member name '("pg_postmaster_start_time" "pg_last_xact_replay_timestamp") :test #'string=)
      (when arguments
        (ereport "42883" "function ~a(~a) does not exist" name (call-signature arguments)))
      (list :func name nil :type :timestamptz :typmod -1))
@@ -1721,7 +1721,7 @@ only when a non-NULL call executes; explicit text arguments arrive here then."
       ((member name '("lower" "current_setting") :test #'string=)
        (analyze-setting-function name args))
       ((member name '("array_length" "pg_get_expr" "pg_get_replica_identity_index"
-                      "pg_postmaster_start_time") :test #'string=)
+                      "pg_postmaster_start_time" "pg_last_xact_replay_timestamp") :test #'string=)
        (analyze-metadata-function name args))
       ((member name '("version" "pg_lisp_runtime" "pg_current_wal_lsn"
                       "pg_current_wal_flush_lsn" "pg_is_in_recovery"
@@ -4569,6 +4569,9 @@ the full 64-bit ID as a signed value."
     ((string= name "pg_stat_get_wal_receiver") (wal-receiver-result))
     ((string= name "pg_control_checkpoint") (native-control-checkpoint-result))
     ((string= name "pg_postmaster_start_time") (postmaster-start-timestamp))
+    ((string= name "pg_last_xact_replay_timestamp")
+     (let ((timestamp (or *last-replay-xact-timestamp* 0)))
+       (if (zerop timestamp) +null+ timestamp)))
     ((member name '("json_typeof" "jsonb_typeof" "json_array_length" "jsonb_array_length")
              :test #'string=)
      (sql-strict-let ((value (first args)))

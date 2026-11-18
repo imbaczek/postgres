@@ -594,6 +594,9 @@ Updating source membership does not change existing snapshots."
           (getf *physical-recovery-state* :source-reservation) (copy-list reservation)
           *next-xid* next-xid *xid-batch-end* next-xid
           *last-replay-lsn* (wal-record-end record))
+    (when (= (wal-record-type record) +wal-record-commit+)
+      (setf *last-replay-xact-timestamp*
+            (wal-decode-commit-timestamp (wal-record-payload record))))
     (when (= (wal-record-type record) +wal-record-checkpoint+)
       (setf (getf *physical-recovery-state* :source-checkpoint)
             (wal-checkpoint-record-snapshot record)))))

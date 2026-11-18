@@ -72,6 +72,9 @@
 (defvar *last-replay-lsn* nil
   "Last verified applied WAL boundary; NIL before any recovery has applied an image.")
 
+(defvar *last-replay-xact-timestamp* nil
+  "Source commit time, in PostgreSQL epoch microseconds, from this server's replay.")
+
 (defvar *physical-recovery-failed-p* nil
   "A failed replay never admits further SQL until process restart.")
 
