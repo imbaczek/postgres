@@ -4540,6 +4540,27 @@ When SYNC is true, sync the receipt and directory. Recheck both named files."
   (wal-namespace-file-stat
    (merge-pathnames name (physical-image-fd-path wal-fd)) t))
 
+(defun wal-archive-remove-retired-markers (wal-fd status-fd names)
+  "Remove status entries after their WAL sources have been durably unlinked."
+  (handler-case
+      (let ((directory (physical-image-fd-path status-fd))
+            (changed nil))
+        (wal-archive-check-status-directory wal-fd status-fd)
+        (dolist (name names)
+          (dolist (suffix '(".ready" ".done"))
+            (let ((marker (concatenate 'string name suffix)))
+              (handler-case
+                  (when (wal-namespace-file-stat (merge-pathnames marker directory) t)
+                    (if (zerop (port-unlinkat status-fd marker 0))
+                        (setf changed t)
+                        (warn "could not remove retired WAL archive marker: ~a" marker)))
+                (error (condition)
+                  (warn "could not inspect retired WAL archive marker ~a: ~a" marker condition))))))
+        (when changed (sb-posix:fsync status-fd)))
+    (error (condition)
+      (warn "could not clean retired WAL archive markers: ~a" condition)))
+  (values))
+
 (defun wal-archive-recycle-segment (segment)
   "Under the WAL lock, unlink a segment only after its completion receipt matches.
 Keep the descriptors open through unlink and sync the WAL directory."
@@ -4573,13 +4594,17 @@ Keep the descriptors open through unlink and sync the WAL directory."
                                 t)))
                         (error () nil))
                       (zerop (port-unlinkat wal-fd name 0)))
-             (when (and proof-fd
-                        (not (handler-case
-                                 (and (equal proof-facts (wal-archive-check-source wal-fd proof-name proof-fd))
-                                      (zerop (port-unlinkat wal-fd proof-name 0)))
-                               (error () nil))))
-               (warn "could not remove retired archive proof: ~a" proof-name))
-             (sb-posix:fsync wal-fd)
+             (let ((proof-retired
+                     (or (not proof-fd)
+                         (handler-case
+                             (and (equal proof-facts (wal-archive-check-source wal-fd proof-name proof-fd))
+                                  (zerop (port-unlinkat wal-fd proof-name 0)))
+                           (error () nil)))))
+               (unless proof-retired
+                 (warn "could not remove retired archive proof: ~a" proof-name))
+               (sb-posix:fsync wal-fd)
+               (wal-archive-remove-retired-markers
+                wal-fd status-fd (if proof-retired (list name proof-name) (list name))))
              t)
         (unwind-protect
              (when proof-fd (sb-posix:close proof-fd))
@@ -4880,41 +4905,84 @@ Skip an optional partial when it cannot be checked or does not match."
                  (sb-posix:close fd)))))
       (if (or partial proof) (handler-case (pending) (error () nil)) (pending)))))
 
-(defun wal-archive-pending-item-under-lock (&optional skip-proofs)
-  "Find pending history or a completed segment under the WAL lock.
-Ensure its ready marker is durable and return the item and storage epoch."
-  (assert (sb-thread:holding-mutex-p *wal-lock*))
+(defstruct wal-archive-scan epoch items)
+
+(defvar *wal-archive-primary-scan* nil)
+
+(defun wal-archive-reset-scan ()
+  (when *wal-archive-primary-scan*
+    (setf (wal-archive-scan-items *wal-archive-primary-scan*) nil)))
+
+(defun wal-archive-primary-items (segments)
+  (append (wal-archive-history-items)
+          (loop for partial in (wal-archive-partial-items)
+                collect partial
+                collect (cons :proof partial))
+          segments))
+
+(defconstant +wal-archive-check-batch-size+ 32)
+
+(defun wal-archive-select-pending-item (scan skip-proofs)
+  "Check at most 32 candidates before releasing the WAL lock."
+  (wal-ensure-directory-durable (merge-pathnames "archive_status/" (wal-directory)))
+  (sb-sys:without-interrupts
+    (let ((wal-fd (wal-archive-open-wal-directory))
+          (status-fd nil))
+      (unwind-protect
+           (progn
+             (setf status-fd (wal-archive-open-status-directory wal-fd))
+             (wal-archive-check-wal-directory wal-fd)
+             (wal-archive-check-status-directory wal-fd status-fd)
+             (loop repeat +wal-archive-check-batch-size+
+                   while (wal-archive-scan-items scan)
+                   do (let ((item (pop (wal-archive-scan-items scan))))
+                        (when (and (not (and (wal-archive-proof-item-p item)
+                                             (member (cdr item) skip-proofs :test #'equal)))
+                                   (wal-archive-item-ready-p item)
+                                   (wal-archive-item-pending-p wal-fd status-fd item))
+                          (sb-posix:fsync status-fd)
+                          (return item)))))
+        (unwind-protect
+             (when status-fd (sb-posix:close status-fd))
+          (sb-posix:close wal-fd))))))
+
+(defun wal-archive-primary-epoch ()
   (when (wal-archive-primary-ready-p)
-    (let* ((segments (remove-if-not #'wal-archive-ready-segment-p (wal-discover-segments)))
-           (items (append (wal-archive-history-items)
-                          (loop for partial in (wal-archive-partial-items)
-                                collect partial
-                                unless (member partial skip-proofs :test #'equal)
-                                  collect (cons :proof partial))
-                          (loop for segment in segments
-                                collect segment
-                                unless (member segment skip-proofs :test #'eql)
-                                  collect (cons :proof segment))))
-           (wal-fd nil) (status-fd nil))
-      (when items
-        (wal-ensure-directory-durable (merge-pathnames "archive_status/" (wal-directory)))
-        (sb-sys:without-interrupts
-          (unwind-protect
-               (progn
-                 (setf wal-fd (wal-archive-open-wal-directory)
-                       status-fd (wal-archive-open-status-directory wal-fd))
-                 (wal-archive-check-wal-directory wal-fd)
-                 (wal-archive-check-status-directory wal-fd status-fd)
-                 (dolist (item items)
-                   (when (wal-archive-item-pending-p wal-fd status-fd item)
-                     (sb-posix:fsync status-fd)
-                     (return-from wal-archive-pending-item-under-lock
-                       (values item (list *wal-storage-incarnation*
-                                          *wal-insert-timeline*
-                                          *wal-segment-namespace*))))))
-            (unwind-protect
-                 (when status-fd (sb-posix:close status-fd))
-              (when wal-fd (sb-posix:close wal-fd)))))))))
+    (list *wal-storage-incarnation* *wal-insert-timeline* *wal-segment-namespace*)))
+
+(defun wal-archive-refresh-primary-scan (scan epoch)
+  ;; The directory walk only supplies candidates. Under the WAL lock, check the
+  ;; epoch and take the history snapshot before testing candidates for readiness.
+  (destructuring-bind (incarnation timeline namespace) epoch
+    (declare (ignore incarnation))
+    (let ((segments (loop for segment in (wal-discover-segments timeline namespace)
+                          collect segment
+                          collect (cons :proof segment))))
+      (sb-thread:with-mutex (*wal-lock*)
+        (when (equal epoch (wal-archive-primary-epoch))
+          (setf (wal-archive-scan-epoch scan) epoch
+                (wal-archive-scan-items scan) (wal-archive-primary-items segments)))))))
+
+(defun wal-archive-next-primary-item (skip-proofs)
+  "Enumerate new candidates outside the WAL lock and check them in batches."
+  (let ((scan *wal-archive-primary-scan*)
+        (refreshed nil))
+    (loop
+      (let ((epoch
+              (sb-thread:with-mutex (*wal-lock*)
+                (let ((epoch (wal-archive-primary-epoch)))
+                  (unless epoch (return-from wal-archive-next-primary-item nil))
+                  (unless (equal epoch (wal-archive-scan-epoch scan))
+                    (wal-archive-reset-scan))
+                  (when (wal-archive-scan-items scan)
+                    (let ((item (wal-archive-select-pending-item scan skip-proofs)))
+                      (when item
+                        (return-from wal-archive-next-primary-item (values item epoch)))))
+                  epoch))))
+        (unless (wal-archive-scan-items scan)
+          (when refreshed (return nil))
+          (setf refreshed t)
+          (wal-archive-refresh-primary-scan scan epoch))))))
 
 (defun wal-archive-staged-name-p (name)
   (let ((segment-name (or (wal-archive-proof-segment-name name) name)))
@@ -4950,25 +5018,31 @@ Ensure its ready marker is durable and return the item and storage epoch."
 (declaim (ftype function physical-recovery-archive-receive-step))
 
 (defun wal-archiver-step-primary (template)
-  (let ((failed-proofs nil))
-    (loop
-      (multiple-value-bind (item epoch)
-          (sb-thread:with-mutex (*wal-lock*)
-            (wal-archive-pending-item-under-lock failed-proofs))
-        (unless item (return nil))
-        (if (wal-archive-proof-item-p item)
-            (progn
-              (handler-case
-                  (if (wal-archive-attempt item template :epoch epoch)
-                      (return t)
-                      (warn "archive_command failed for WAL proof ~a; will retry" (cdr item)))
-                (error (condition)
-                  (warn "could not archive WAL proof ~a: ~a" (cdr item) condition)))
-              (push (cdr item) failed-proofs))
-            (multiple-value-bind (archived status) (wal-archive-attempt item template :epoch epoch)
-              (unless (or archived (eq status :staged-pending))
-                (warn "archive_command failed for WAL item ~a; will retry" item))
-              (return archived)))))))
+  (let ((*wal-archive-primary-scan* (or *wal-archive-primary-scan* (make-wal-archive-scan)))
+        (failed-proofs nil)
+        (keep-scan nil))
+    (unwind-protect
+         (loop
+           (multiple-value-bind (item epoch)
+               (wal-archive-next-primary-item failed-proofs)
+             (unless item (return nil))
+             (if (wal-archive-proof-item-p item)
+                 (progn
+                   (handler-case
+                       (if (wal-archive-attempt item template :epoch epoch)
+                           (progn
+                             (setf keep-scan (null failed-proofs))
+                             (return t))
+                           (warn "archive_command failed for WAL proof ~a; will retry" (cdr item)))
+                     (error (condition)
+                       (warn "could not archive WAL proof ~a: ~a" (cdr item) condition)))
+                   (push (cdr item) failed-proofs))
+                 (multiple-value-bind (archived status) (wal-archive-attempt item template :epoch epoch)
+                   (unless (or archived (eq status :staged-pending))
+                     (warn "archive_command failed for WAL item ~a; will retry" item))
+                   (setf keep-scan (and archived (null failed-proofs)))
+                   (return archived))))
+           (unless keep-scan (wal-archive-reset-scan))))))
 
 (defun wal-archiver-step ()
   (let ((template (startup-archive-command)))
@@ -4989,6 +5063,93 @@ Ensure its ready marker is durable and return the item and storage epoch."
       (warn "WAL archiver will retry: ~a" condition)
       nil)))
 
+(defun wal-archive-retired-segment-name (marker)
+  "Return the full segment name for a canonical segment or proof marker."
+  (when (or (uiop:string-suffix-p marker ".ready")
+            (uiop:string-suffix-p marker ".done"))
+    (let* ((name (subseq marker 0 (position #\. marker :from-end t)))
+           (segment (or (wal-archive-proof-segment-name name) name))
+           (namespace (case (length segment) (20 :legacy) (28 :timeline))))
+      (when (and namespace (uiop:string-suffix-p segment ".wal"))
+        (multiple-value-bind (timeline number)
+            (wal-parse-segment-name (subseq segment 0 (- (length segment) 4)) namespace)
+          (when (and timeline (< number (floor *wal-durable-lsn* +wal-segment-size+)))
+            segment))))))
+
+(defun wal-archive-entry-absent-p (directory name)
+  (handler-case (progn (sb-posix:lstat (merge-pathnames name directory)) nil)
+    (sb-posix:syscall-error (condition)
+      (if (= (sb-posix:syscall-errno condition) sb-posix:enoent)
+          t
+          (error condition)))))
+
+(defun wal-archive-retire-orphan-proof (wal-fd status-fd name)
+  "Remove an orphan full-segment proof only with a matching completion receipt."
+  (handler-case
+      (let ((fd (wal-archive-open-source wal-fd name)))
+        (unwind-protect
+             (and (wal-archive-done-matches-p wal-fd status-fd name fd)
+                  (zerop (port-unlinkat wal-fd name 0)))
+          (sb-posix:close fd)))
+    (error (condition)
+      (warn "could not reclaim orphaned archive proof ~a: ~a" name condition)
+      nil)))
+
+(defun wal-archive-clean-retired-batch (wal-fd status-fd markers seen)
+  (wal-archive-check-wal-directory wal-fd)
+  (wal-archive-check-status-directory wal-fd status-fd)
+  (let ((directory (physical-image-fd-path wal-fd))
+        (retired nil))
+    (loop repeat +wal-archive-check-batch-size+
+          while markers
+          do (let ((name (wal-archive-retired-segment-name (pop markers))))
+               (when (and name (not (gethash name seen)))
+                 (setf (gethash name seen) t)
+                 (let ((proof (wal-archive-segment-proof-name name)))
+                   (when (and (wal-archive-entry-absent-p directory name)
+                              (or (wal-archive-entry-absent-p directory proof)
+                                  (wal-archive-retire-orphan-proof wal-fd status-fd proof)))
+                     (push name retired)
+                     (push proof retired))))))
+    (when retired
+      (sb-posix:fsync wal-fd)
+      (wal-archive-remove-retired-markers wal-fd status-fd retired)))
+  markers)
+
+(defun wal-archive-clean-retired-status ()
+  "Recover full-segment status cleanup interrupted after WAL retirement."
+  (handler-case
+      (sb-sys:without-interrupts
+        (let ((wal-fd nil)
+              (status-fd nil)
+              (epoch nil))
+          (unwind-protect
+               (progn
+                 (sb-thread:with-mutex (*wal-lock*)
+                   (setf epoch (wal-archive-primary-epoch))
+                   (unless epoch (return-from wal-archive-clean-retired-status nil))
+                   (setf wal-fd (wal-archive-open-wal-directory))
+                   (wal-archive-check-wal-directory wal-fd)
+                   (when (wal-archive-entry-absent-p (physical-image-fd-path wal-fd) "archive_status")
+                     (return-from wal-archive-clean-retired-status nil))
+                   (setf status-fd (wal-archive-open-status-directory wal-fd))
+                   (wal-archive-check-status-directory wal-fd status-fd))
+                 (sb-sys:with-local-interrupts
+                   (let ((markers (directory-entry-names (physical-image-fd-path status-fd)
+                                                         :follow-symlinks t))
+                         (seen (make-hash-table :test #'equal)))
+                     (loop while markers
+                           do (sb-thread:with-mutex (*wal-lock*)
+                                (unless (equal epoch (wal-archive-primary-epoch))
+                                  (return-from wal-archive-clean-retired-status nil))
+                                (setf markers (wal-archive-clean-retired-batch wal-fd status-fd markers seen)))))))
+            (unwind-protect
+                 (when status-fd (sb-posix:close status-fd))
+              (when wal-fd (sb-posix:close wal-fd))))))
+    (error (condition)
+      (warn "could not recover retired WAL archive status: ~a" condition)))
+  (values))
+
 (defun start-wal-archiver ()
   "Start the archiver when enabled. Retry pending work and drain it on shutdown."
   (when (startup-primary-wal-archive-enabled-p)
@@ -4999,7 +5160,9 @@ Ensure its ready marker is durable and return the item and storage epoch."
             *wal-archiver-thread*
             (sb-thread:make-thread
              (lambda ()
-               (let ((*pgdata* directory))
+               (let ((*pgdata* directory)
+                     (*wal-archive-primary-scan* (make-wal-archive-scan)))
+                 (wal-archive-clean-retired-status)
                  (loop
                    for archived = (wal-archiver-try-step)
                    until (if archived
