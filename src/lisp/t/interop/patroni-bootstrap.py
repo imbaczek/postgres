@@ -40,6 +40,19 @@ def check_rejected_targets(root):
     assert not list(root.glob(".pg-lisp-initdb-*"))
 
 
+def check_sync_config(node, port):
+    pid = node.is_running().pid
+    names = "FIRST 1 (missing_peer)"
+    show = "SHOW synchronous_standby_names"
+    assert node.config.set_synchronous_standby_names(names) is True
+    FOLLOW["wait_for"](lambda: FOLLOW["query"](port, show) == [(names,)])
+    assert node.config.set_synchronous_standby_names(names) is None
+    assert node.config.set_synchronous_standby_names(None) is True
+    FOLLOW["wait_for"](lambda: FOLLOW["query"](port, show) == [("",)])
+    assert node.is_running().pid == pid
+    print("Patroni 4.1.5 synchronous standby names set, no-op and clear PASS", flush=True)
+
+
 def check_bootstrap(root, precreated):
     root.mkdir(mode=0o700)
     data = root / "fresh pgdata"
@@ -72,6 +85,8 @@ def check_bootstrap(root, precreated):
         retry = subprocess.run([BIN / "initdb", data], capture_output=True, timeout=20)
         assert retry.returncode == 1
         assert FOLLOW["query"](port, "SELECT id FROM fresh_primary") == [(42,)]
+        if not precreated:
+            check_sync_config(node, port)
     finally:
         node.connection_pool.close()
         process = node.is_running()
