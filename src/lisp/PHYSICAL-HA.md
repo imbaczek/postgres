@@ -5049,10 +5049,20 @@ ramdisk. The native catalog exposes the bootstrap role's OID and name.
 Activity reports the role OID for admitted connections and NULL for
 provisional connections. The focused activity snapshot test passed.
 
+The live monitor passed in 131.60 s on the ramdisk. C and Lisp reported the
+peer as `127.0.0.1` with `inet` type OID 869, a JSON string, and `/32` on an
+explicit text cast. Activity records peers at admission and retains them across
+live reload. Connections admitted before this change acquire an address on
+reconnect. The focused Rove test verified that a snapshot retains its address
+after the registry entry is removed and returns NULL for provisional connections.
+This covers the text result and JSON paths. Binary results and SQL input for
+`inet` remain open.
+
 Distinct backend gaps remain:
 
-- The exact REST handler status SQL now fails at `client_addr` (SQLSTATE
-  `42703`). The probe took 5.75 s. JSON conversion still needs acceptance.
+- The exact REST handler status SQL now fails at `row_to_json(record)`
+  (SQLSTATE `42883`). Subsequent array aggregation and conversion remain to
+  be assessed.
 - Initial `Bootstrap.bootstrap` calls `pg_ctl initdb`, which the native
   utility does not implement. Authentication and role provisioning also
   require acceptance.
