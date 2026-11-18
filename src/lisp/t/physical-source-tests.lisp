@@ -161,6 +161,36 @@
                                             (file-namestring (pg::wal-segment-path 1)))
                                pg::*pgdata*)))))))
 
+(deftest primary-archiver-publishes-committed-history-before-segments
+    (call-with-physical-source-fixture
+     (lambda ()
+       (let* ((pg::*wal-ready* t)
+              (pg::*wal-control-metadata* (list :db-state pg::+db-in-production+))
+              (pg::*wal-insert-timeline* 2)
+              (pg::*wal-segment-namespace* :timeline)
+              (settings (pg::startup-configuration-settings pg::*startup-installed-configuration*))
+              (history (pg::timeline-history-filename 2))
+              (archived-history (merge-pathnames (concatenate 'string "archived-" history) pg::*pgdata*))
+              (archived-segment (merge-pathnames
+                                 (concatenate 'string "archived-" (file-namestring (pg::wal-segment-path 1)))
+                                 pg::*pgdata*)))
+         (setf (getf (gethash "archive_mode" settings) :value) "on"
+               (getf (gethash "archive_command" settings) :value) "cp -a -- \"%p\" \"archived-%f\"")
+         (pg::timeline-write-history 2 1 pg::+wal-segment-size+ "test promotion")
+         (with-open-file (stream (pg::wal-segment-path 1) :direction :output
+                                                          :element-type '(unsigned-byte 8))
+           (write-byte 3 stream))
+         (let ((pg::*physical-promotion-stopping-p* t))
+           (ok (not (pg::wal-archiver-step))))
+         (ok (not (probe-file archived-history)))
+         (ok (pg::wal-archiver-step))
+         (ok (string= (uiop:read-file-string (pg::timeline-history-path 2 pg::*pgdata*))
+                      (uiop:read-file-string archived-history)))
+         (ok (not (probe-file archived-segment)))
+         (ok (pg::wal-archiver-step))
+         (ok (probe-file archived-segment))
+         (ok (not (pg::wal-archiver-step)))))))
+
 (deftest physical-source-legacy-pin-is-readable-before-handoff
     (call-with-physical-source-fixture
      (lambda ()

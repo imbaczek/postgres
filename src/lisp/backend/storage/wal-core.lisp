@@ -4127,10 +4127,25 @@ release their claims to the retained WAL."
               (= sb-posix:s-ifreg (logand (sb-posix:stat-mode stat) sb-posix:s-ifmt))
               (<= 1 (sb-posix:stat-size stat) +wal-segment-size+)))))
 
-(defun wal-archive-create-ready (directory-fd segment)
+(declaim (ftype function timeline-history-filename))
+
+(defun wal-archive-item-name (item)
+  "Name the current committed timeline's history or a segment in its namespace."
+  (if (eq item :history)
+      (timeline-history-filename *wal-insert-timeline*)
+      (wal-segment-filename item *wal-insert-timeline* *wal-segment-namespace*)))
+
+(defun wal-archive-item-ready-p (item)
+  "Admit current child timeline history when the primary is ready.
+Apply the durable, closed segment checks to WAL segments."
+  (if (eq item :history)
+      (and (wal-archive-primary-ready-p) (> *wal-insert-timeline* 1))
+      (wal-archive-ready-segment-p item)))
+
+(defun wal-archive-create-ready (directory-fd item)
   "Create or validate an empty regular ready marker and sync it.
 The caller holds the WAL lock and syncs the status directory."
-  (let* ((filename (wal-segment-filename segment *wal-insert-timeline* *wal-segment-namespace*))
+  (let* ((filename (wal-archive-item-name item))
          (marker (query-temp-fd-child-path directory-fd (concatenate 'string filename ".ready")))
          (flags (logior sb-posix:o-wronly sb-posix:o-creat
                         sb-posix:o-nofollow sb-posix:o-nonblock)))
@@ -4308,8 +4323,8 @@ Keep the descriptors open through unlink and sync the WAL directory."
        (member (getf *wal-control-metadata* :db-state)
                (list +db-in-production+ +db-shutdowning+ +db-shutdowned+))))
 
-(defun wal-archive-attempt (segment template &key epoch)
-  "Archive one durable segment with the command outside the WAL lock.
+(defun wal-archive-attempt (item template &key epoch)
+  "Archive one durable WAL file with the command outside the WAL lock.
 Keep the source and directory descriptors open through the command, recheck them
 under the lock, and publish completion only after success."
   (when (or (zerop (length template)) (sb-thread:holding-mutex-p *wal-lock*))
@@ -4326,10 +4341,10 @@ under the lock, and publish completion only after success."
                                      (eql (second epoch) *wal-insert-timeline*)
                                      (eq (third epoch) *wal-segment-namespace*)
                                      (wal-archive-primary-ready-p)))
-                            (wal-archive-ready-segment-p segment))
+                            (wal-archive-item-ready-p item))
                  (return-from wal-archive-attempt nil))
                (setf incarnation *wal-storage-incarnation*
-                     name (wal-segment-filename segment *wal-insert-timeline* *wal-segment-namespace*)
+                     name (wal-archive-item-name item)
                      wal-fd (wal-archive-open-wal-directory)
                      status-fd (wal-archive-open-status-directory wal-fd)
                      source-fd (wal-archive-open-source wal-fd name))
@@ -4341,9 +4356,8 @@ under the lock, and publish completion only after success."
                (sb-thread:with-mutex (*wal-lock*)
                  (unless (and (or (null epoch) (wal-archive-primary-ready-p))
                               (eq incarnation *wal-storage-incarnation*)
-                              (string= name (wal-segment-filename
-                                             segment *wal-insert-timeline* *wal-segment-namespace*))
-                              (wal-archive-ready-segment-p segment)
+                              (string= name (wal-archive-item-name item))
+                              (wal-archive-item-ready-p item)
                               (equal facts (wal-archive-check-source wal-fd name source-fd)))
                    (error "WAL archive source changed during command: ~a" name))
                  (wal-archive-check-wal-directory wal-fd)
@@ -4389,14 +4403,15 @@ Exclude the open output segment and sync the status directory."
 
 (defvar *wal-archiver-stop* nil)
 
-(defun wal-archive-pending-segment-under-lock ()
-  "Find a completed segment without a matching receipt under the WAL lock.
-Ensure its ready marker is durable and return the segment and storage epoch."
+(defun wal-archive-pending-item-under-lock ()
+  "Find pending history or a completed segment under the WAL lock.
+Ensure its ready marker is durable and return the item and storage epoch."
   (assert (sb-thread:holding-mutex-p *wal-lock*))
   (when (wal-archive-primary-ready-p)
-    (let ((segments (remove-if-not #'wal-archive-ready-segment-p (wal-discover-segments)))
+    (let ((items (append (when (> *wal-insert-timeline* 1) (list :history))
+                         (remove-if-not #'wal-archive-ready-segment-p (wal-discover-segments))))
           (wal-fd nil) (status-fd nil))
-      (when segments
+      (when items
         (wal-ensure-directory-durable (merge-pathnames "archive_status/" (wal-directory)))
         (sb-sys:without-interrupts
           (unwind-protect
@@ -4405,17 +4420,17 @@ Ensure its ready marker is durable and return the segment and storage epoch."
                        status-fd (wal-archive-open-status-directory wal-fd))
                  (wal-archive-check-wal-directory wal-fd)
                  (wal-archive-check-status-directory wal-fd status-fd)
-                 (dolist (segment segments)
-                   (let* ((name (file-namestring (wal-segment-path segment)))
+                 (dolist (item items)
+                   (let* ((name (wal-archive-item-name item))
                           (fd (wal-archive-open-source wal-fd name)))
                      (unwind-protect
                           (unless (wal-archive-done-matches-p wal-fd status-fd name fd :sync nil)
-                            (wal-archive-create-ready status-fd segment)
+                            (wal-archive-create-ready status-fd item)
                             (sb-posix:fsync status-fd)
-                            (return-from wal-archive-pending-segment-under-lock
-                              (values segment (list *wal-storage-incarnation*
-                                                    *wal-insert-timeline*
-                                                    *wal-segment-namespace*))))
+                            (return-from wal-archive-pending-item-under-lock
+                              (values item (list *wal-storage-incarnation*
+                                                 *wal-insert-timeline*
+                                                 *wal-segment-namespace*))))
                        (sb-posix:close fd)))))
             (unwind-protect
                  (when status-fd (sb-posix:close status-fd))
@@ -4424,14 +4439,14 @@ Ensure its ready marker is durable and return the segment and storage epoch."
 (defun wal-archiver-step ()
   (let ((template (startup-archive-command)))
     (when (and template (plusp (length template)))
-      (multiple-value-bind (segment epoch)
+      (multiple-value-bind (item epoch)
           (sb-thread:with-mutex (*wal-lock*)
-            (wal-archive-pending-segment-under-lock))
-        (when segment
-          (if (wal-archive-attempt segment template :epoch epoch)
+            (wal-archive-pending-item-under-lock))
+        (when item
+          (if (wal-archive-attempt item template :epoch epoch)
               t
               (progn
-                (warn "archive_command failed for WAL segment ~d; will retry" segment)
+                (warn "archive_command failed for WAL item ~a; will retry" item)
                 nil)))))))
 
 (defun wal-archiver-try-step ()
