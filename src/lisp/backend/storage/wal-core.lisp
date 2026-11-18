@@ -4471,6 +4471,43 @@ under the lock, and publish completion only after success."
                (when status-fd (sb-posix:close status-fd))
             (when wal-fd (sb-posix:close wal-fd))))))))
 
+(defun wal-archive-attempt-staged (directory-fd timeline segment template check-directory)
+  "Archive one immutable staged standby segment and record success.
+The caller holds DIRECTORY-FD and serializes attempts for this staging area.
+Return :ARCHIVED for new success, :ALREADY-DONE for a matching receipt, or NIL
+when the command fails."
+  (when (or (zerop (length template)) (sb-thread:holding-mutex-p *wal-lock*))
+    (error "staged WAL archive attempt requires a command and an unlocked WAL mutex"))
+  (let ((name (wal-segment-filename segment timeline :timeline))
+        (directory *pgdata*)
+        (status-fd nil)
+        (source-fd nil))
+    (sb-sys:without-interrupts
+      (unwind-protect
+           (progn
+             (funcall check-directory directory-fd)
+             (setf status-fd (wal-archive-open-status-directory directory-fd)
+                   source-fd (wal-archive-open-source directory-fd name))
+             (wal-archive-check-status-directory directory-fd status-fd)
+             (let ((facts (wal-archive-check-source directory-fd name source-fd)))
+               (flet ((check-directories ()
+                        (funcall check-directory directory-fd)
+                        (wal-archive-check-status-directory directory-fd status-fd)))
+                 (cond
+                   ((wal-archive-done-matches-p directory-fd status-fd name source-fd)
+                    (check-directories)
+                    :already-done)
+                   ((wal-archive-run-shell template name directory-fd directory)
+                    (check-directories)
+                    (unless (equal facts (wal-archive-check-source directory-fd name source-fd))
+                      (error "staged WAL archive source changed during command: ~a" name))
+                    (wal-archive-publish-done status-fd name facts)
+                    (check-directories)
+                    :archived)))))
+        (unwind-protect
+             (when source-fd (sb-posix:close source-fd))
+          (when status-fd (sb-posix:close status-fd)))))))
+
 (defun wal-archive-reconcile-ready-under-lock ()
   "Create ready markers for completed durable segments under the WAL lock.
 Exclude the open output segment and sync the status directory."

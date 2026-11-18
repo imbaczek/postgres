@@ -613,7 +613,21 @@
                                                            bytes #'check-directory)
                              (push segment staged)))
                           (ok (notany #'probe-file paths))
-                          (ok (equalp first (pg::wal-archive-read-source-bytes fd name)))))
+                          (ok (equalp first (pg::wal-archive-read-source-bytes fd name))))
+                        (let* ((pg::*pgdata* root)
+                               (status (merge-pathnames "archive_status/" directory))
+                               (receipt (merge-pathnames (concatenate 'string name ".done") status))
+                               (target (merge-pathnames name root)))
+                          (sb-posix:mkdir (string-right-trim "/" (namestring status)) #o700)
+                          (ok (not (pg::wal-archive-attempt-staged fd 1 0 "exit 1" #'check-directory)))
+                          (ok (not (probe-file receipt)))
+                          (ok (eq :archived
+                                  (pg::wal-archive-attempt-staged fd 1 0 "cp \"%p\" \"%f\"" #'check-directory)))
+                          (ok (probe-file receipt))
+                          (ok (equalp first (pg::read-bounded-regular-file target (length first))))
+                          (ok (eq :already-done
+                                  (pg::wal-archive-attempt-staged fd 1 0 "rm \"%f\"" #'check-directory)))
+                          (ok (probe-file target))))
                    (sb-posix:close fd)))
             (pg::physical-store-close reopened))))))
 
