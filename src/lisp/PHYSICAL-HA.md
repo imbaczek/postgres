@@ -25,9 +25,9 @@ Three areas still separate this evidence from closeout:
    horizons, and the native sender saves them from incoming feedback frames.
    The standby sends data feedback with or without a named physical slot.
    Ordinary VACUUM and index builds use that horizon, and SQL reports the
-   slot's value as `xmin`. Catalog feedback and forced XID epoch
-   rollover remain open. Patroni's logical slot readiness and slot copy path
-   still need acceptance.
+   slot's value as `xmin`. A new forced XID rollover waits for older feedback
+   horizons. Catalog feedback and legacy rollover recovery still need
+   acceptance, as do Patroni's logical slot readiness and slot copy path.
 2. Exercise password-backed bootstrap and post-bootstrap role provisioning
    through stock Patroni.
 3. Qualify archive recovery with a configured streaming source across a
@@ -5148,9 +5148,7 @@ namespace changes.
 As in C's `ComputeXidHorizons`, the physical slot's data horizon holds back
 user-heap cleanup. Plain VACUUM applies it to the heap and TOAST. VACUUM FULL
 uses one captured cutoff for the heap rewrite and the rebuilt indexes.
-Catalog horizons remain separate from user-heap cleanup. The native forced
-epoch rollover resets transaction status and still needs an explicit policy for
-slots holding an older horizon.
+Catalog horizons remain separate from user-heap cleanup.
 
 The live VACUUM FULL regression passed in 13.08 s on the ramdisk. Its fixture
 sets a slot horizon through the control port, deletes a row, and runs VACUUM,
@@ -5179,6 +5177,19 @@ Patroni follow regression switched to slotless streaming, observed a horizon
 on the source, detached the standby with feedback still enabled, then verified
 that the horizon disappeared and named-slot streaming could resume. It passed
 in 87.50 s on the ramdisk. Four focused Rove tests passed in 36 ms of execution.
+
+Native forced rollover now checks both durable slot horizons and transient
+sender horizons before writing a wrap marker, freezing pages, or resetting
+transaction status. The WAL lock orders this check against feedback publication.
+Once the allocator reaches the boundary, reports can clear a horizon or advance
+it into the new epoch. An old pin can keep writes stopped until feedback is
+cleared, its sender disconnects if slotless, or its slot is dropped.
+
+A preexisting wrap marker with an older pin stops startup rather than assuming
+the interrupted wrap left old transaction status intact. Replay of reset records
+written by older builds still needs separate qualification. Four focused Rove
+tests passed in 36 ms, covering a blocked wrap, marker conflict, completion
+after release, and feedback at the end of the FullXID range.
 
 The three configuration and candidate test runs overlapped on the ramdisk.
 
