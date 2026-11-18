@@ -831,6 +831,33 @@
              (pg::timeline-parse-history 1 ""))
             (funcall function (list :root root :size size :base base :filler filler :first first :middle-bytes middle-bytes :last last :fork fork :eor eor :snapshot snapshot :checkpoint checkpoint :child child :identity identity :digest digest :reference reference :request request :directory directory :metadata metadata)))))))
 
+(deftest sealed-receive-wal-archive-requires-a-closed-segment
+    (call-with-historical-segment-source
+     (lambda (fixture)
+       (flet ((read-segment (timeline segment)
+                (pg::physical-retained-archive-segment
+                 (getf fixture :directory) (getf (getf fixture :reference) :root-id)
+                 (getf fixture :identity) (pg::timeline-parse-history 1 "")
+                 timeline segment)))
+         (multiple-value-bind (bytes end) (read-segment 1 0)
+           (ok (equalp bytes (getf fixture :first)))
+           (ok (= end (- pg::+wal-segment-size+ 17))))
+         (ok (equalp (read-segment 1 1) (getf fixture :middle-bytes)))
+         (ok (null (read-segment 1 2)))
+         (ok (null (read-segment 2 0)))
+         (let* ((directory (getf fixture :directory))
+                (identity (getf fixture :identity))
+                (history (pg::timeline-parse-history 1 ""))
+                (index (pg::physical-retained-inventory-read-index
+                        directory (getf (getf fixture :reference) :root-id) identity history)))
+           (remf index :base-overlap)
+           (let ((root (pg::physical-retained-object-publish
+                        directory :inventory (pg::physical-retained-inventory-image index)
+                        pg::+physical-retained-inventory-limit+)))
+             (ok (null (pg::physical-retained-archive-segment
+                        directory root identity history 1 0)))))))
+     :rotation-gap 17))
+
 (defun call-with-test-logical-wal-archive (function)
   (pg::call-with-logical-wal-archive
    (pg::catalog-system-identifier)

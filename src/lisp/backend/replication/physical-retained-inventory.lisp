@@ -227,12 +227,13 @@ The CRC detects accidental corruption; it does not authenticate the payload."
       (error "retained WAL inventory differs from required identity or history"))
     payload))
 
-(defun physical-retained-inventory-verify-entries (entries history loader &optional overlap on-record)
+(defun physical-retained-inventory-verify-entries (entries history loader &optional overlap on-record on-extent)
   "Validate checked, ordered entries using bounded LOADER reads.
 Keep only the current segment's shared prefix between images. ON-RECORD receives
 each validated record and its original bytes; validation continues through every
 entry even when a caller only uses a prefix. Later validation can still fail, so
-callbacks must keep partial results private until this function returns.
+callbacks must keep partial results private until this function returns. ON-EXTENT
+receives validated metadata and decoded bytes as read-only provisional data.
 Return T and the longest checked prefix of the final segment, not of all
 segments. With no entries, the second value is the supplied overlap buffer or NIL.
 The overlap is borrowed. An extent-decoded buffer is fresh relative to the encoded loader image.
@@ -256,15 +257,18 @@ proof, logical coverage and source authority."
                        (mismatch prefix bytes :end1 size :end2 size)))
             (error "retained WAL inventory has conflicting segment prefixes"))
           (when (or (null prefix) (> (length bytes) (length prefix)))
-            (setf prefix bytes)))))
+            (setf prefix bytes))
+          (when on-extent (funcall on-extent metadata bytes)))))
     (values t prefix)))
 
 (defun physical-retained-inventory-load
-    (directory id identity history &key on-record (reader #'physical-retained-object-read))
+    (directory id identity history &key on-record on-extent (reader #'physical-retained-object-read))
   "Read an inventory and validate all referenced extents sequentially.
 
 ON-RECORD receives each validated record and its original bytes, including records
-past any endpoint of interest to the caller. Return the freshly decoded payload."
+past any endpoint of interest. ON-EXTENT receives read-only provisional metadata
+and bytes. Keep callback results private until validation finishes.
+Return the freshly decoded payload."
   ;; READER may bind I/O to a held archive directory.  Like the default reader,
   ;; it must enforce each requested content ID and byte limit.
   (let ((payload (physical-retained-inventory-read-index directory id identity history reader)))
@@ -272,8 +276,41 @@ past any endpoint of interest to the caller. Return the freshly decoded payload.
      (getf payload :entries) history
      (lambda (image-id)
        (funcall reader directory :extent image-id +physical-retained-image-limit+))
-     (physical-retained-inventory-read-overlap directory payload reader) on-record)
+     (physical-retained-inventory-read-overlap directory payload reader) on-record on-extent)
     payload))
+
+(defun physical-retained-archive-segment (directory root identity history timeline segment)
+  "Return a sealed segment image and end when the inventory proves both closure
+and contiguous coverage from the segment start or verified base overlap.
+A following contiguous extent can prove closure of a short image."
+  (let ((candidate nil) (end nil) (complete nil)
+                        (prefix-start nil) (prefix-end nil) (contiguous t) (candidate-covered nil))
+    (let ((inventory
+            (physical-retained-inventory-load
+             directory root identity history
+             :on-extent
+             (lambda (metadata bytes)
+               (let ((number (getf metadata :segment))
+                     (start (getf metadata :start))
+                     (finish (getf metadata :end)))
+                 (when (= number segment)
+                   (unless prefix-start (setf prefix-start start))
+                   (when (and prefix-end (/= prefix-end start))
+                     (setf contiguous nil))
+                   (setf prefix-end finish))
+                 (when (= timeline (getf metadata :file-timeline))
+                   (cond ((= number segment)
+                          (setf candidate bytes
+                                end finish
+                                candidate-covered contiguous
+                                complete (= (length bytes) +wal-segment-size+)))
+                         ((and candidate (= (1+ segment) number) (= end start))
+                          (setf complete t)))))))))
+      (when (and complete candidate-covered
+                 (or (<= prefix-start (* segment +wal-segment-size+))
+                     (and (= prefix-start (getf identity :base))
+                          (getf inventory :base-overlap))))
+        (values candidate end)))))
 
 (defun physical-retained-inventory-keep-entries (entries ids)
   "Select unique IDs from the previous inventory, preserving entry order."
