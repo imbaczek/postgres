@@ -403,6 +403,39 @@
         (with-open-file (input (pg::physical-store-segment-path store 0 2) :element-type '(unsigned-byte 8))
           (ok (= 88 (file-length input)))))))
 
+(deftest archive-history-selection-verifies-parent-before-durable-switch
+    (with-physical-store-directory (root)
+      (let* ((prefix (sample-physical-record))
+             (fork (length prefix))
+             (history (store-history-text 1 fork))
+             (eor (store-history-eor fork 2 1))
+             (wrong-prefix (copy-seq prefix))
+             (child (concatenate '(vector (unsigned-byte 8)) prefix eor))
+             (store (pg::physical-store-open root 123 1 :create t)))
+        (setf (aref wrong-prefix 0) 0)
+        (unwind-protect
+             (progn
+               (pg::physical-store-input store 0 prefix)
+               (pg::physical-store-flush store)
+               (let* ((control (pg::physical-store-path store "receive.control"))
+                      (before (lineage-test-bytes control)))
+                 (ok (null (pg::physical-store-select-archive-history store 2 history eor (1- fork) prefix)))
+                 (ok (null (pg::physical-store-select-archive-history store 2 history eor fork nil)))
+                 (ok (signals (pg::physical-store-select-archive-history
+                               store 2 history eor fork wrong-prefix) 'error))
+                 (ok (equalp before (lineage-test-bytes control))))
+               (ok (not (pg::physical-store-failed-p store)))
+               (ok (eql 2 (pg::physical-store-select-archive-history store 2 history eor fork child)))
+               (ok (= (length child)
+                      (pg::physical-store-admit-restored-segment store 2 0 child (length child) fork))))
+          (pg::physical-store-close store))
+        (let ((reopened (pg::physical-store-open root 123 1)))
+          (unwind-protect
+               (progn
+                 (ok (= 2 (pg::physical-store-selected-timeline reopened)))
+                 (ok (= (length child) (pg::physical-store-flushed-lsn reopened))))
+            (pg::physical-store-close reopened))))))
+
 (deftest archive-receive-rotation-uses-selected-end-of-recovery
     (with-physical-store-directory (root)
       (let* ((boundary pg::+wal-segment-size+)

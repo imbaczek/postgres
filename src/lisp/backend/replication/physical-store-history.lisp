@@ -159,6 +159,15 @@ The blob alone does not select history; control publication is the commit point.
                (zerop (physical-wal-decoder-used (physical-store-decoder store))))
     (error "receive history selection requires no unflushed input")))
 
+(defun physical-store-commit-history-under-lock (store selection bytes)
+  "Select a validated immutable history through the durable receive control."
+  (physical-store-publish-history store selection bytes)
+  (physical-store-save-control store (physical-store-flushed-lsn store)
+                               :digest (physical-store-flushed-digest store) :selection selection)
+  (setf (physical-store-selection store) selection)
+  (physical-store-test-point :after-history-selection store)
+  (getf selection :target))
+
 (defun physical-store-select-history (store target history-text eor-bytes)
   "Select a descendant receive history at the exact flushed fork.
 
@@ -176,12 +185,7 @@ reopen from disk to determine the durable selection."
                                           (physical-store-flushed-digest store))
       (unless (= (getf selection :fork) (physical-store-flushed-lsn store))
         (error "receive history requires the complete parent prefix through its fork"))
-      (physical-store-publish-history store selection bytes)
-      (physical-store-save-control store (physical-store-flushed-lsn store)
-                                   :digest (physical-store-flushed-digest store) :selection selection)
-      (setf (physical-store-selection store) selection)
-      (physical-store-test-point :after-history-selection store)
-      target)))
+      (physical-store-commit-history-under-lock store selection bytes))))
 
 (defun physical-store-prefix-timeline (store boundary)
   "Return the timeline owning the byte before a verified prefix boundary.

@@ -1807,10 +1807,20 @@ Selection still requires WAL transition evidence and durable publication."
              (when (eql limit proved-end)
                (values partial proved-end)))))))
 
+(defun physical-follow-fetch-archive-fork-prefix (runtime command system-id parent fork)
+  "Fetch proof-verified parent bytes ending exactly at a rotated child fork."
+  (let ((segment (floor fork +wal-segment-size+)))
+    (flet ((fetch (namespace)
+             (multiple-value-bind (bytes end)
+                 (physical-follow-fetch-archive-with-limit
+                  runtime command system-id parent segment namespace fork)
+               (when (eql fork end) bytes))))
+      (or (fetch :timeline) (when (= parent 1) (fetch :legacy))))))
+
 (defun physical-follow-archive-transition (runtime command local-history cursor)
   "Return immediate child history and EOR evidence at the durable parent fork.
-The child archive extent has already passed system, timeline and byte proof
-checks. The caller still has to compare overlap and publish the selection."
+Return the child extent and the bytes covering the parent overlap as well.
+The caller still has to compare that overlap and publish the selection."
   (multiple-value-bind (latest latest-text)
       (physical-follow-find-archive-history runtime command local-history cursor)
     (when latest
@@ -1839,7 +1849,14 @@ checks. The caller still has to compare overlap and publish the selection."
                   (let* ((raw (subseq bytes offset (+ offset +wal-end-of-recovery-record-size+)))
                          (record (wal-decode-record raw start)))
                     (when (= child (timeline-check-end-of-recovery record parent history))
-                      (values child text raw segment bytes))))))))))))
+                      (let ((fork-bytes
+                              (when (plusp (mod cursor +wal-segment-size+))
+                                (if (= segment (floor cursor +wal-segment-size+))
+                                    bytes
+                                    (physical-follow-fetch-archive-fork-prefix
+                                     runtime command system-id parent cursor)))))
+                        (when (or (zerop (mod cursor +wal-segment-size+)) fork-bytes)
+                          (values child text raw segment bytes fork-bytes))))))))))))))
 
 (defun physical-follow-restore-next (runtime command cursor)
   (let* ((timeline (physical-follow-runtime-receive-timeline runtime))

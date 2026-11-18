@@ -57,7 +57,7 @@ Return NIL when it is unavailable or cannot be verified."
         (physical-recovery-base-wal-prefix))
     (error () nil)))
 
-(defun physical-store-compare-restored-prefix (store segment bytes)
+(defun physical-store-compare-restored-prefix (store segment bytes &key validate-durable)
   "Check restored bytes against the retained floor and every durable overlapping record."
   (let* ((floor (physical-store-floor-lsn store))
          (first (floor floor +wal-segment-size+))
@@ -79,7 +79,8 @@ Return NIL when it is unavailable or cannot be verified."
           (unless (= size (length prefix))
             (error "retained receive floor lacks its exact WAL prefix"))
           (setf different (or (> size (length bytes)) (mismatch prefix bytes :end2 size)))))
-      (when (< (max floor (* segment +wal-segment-size+)) (physical-store-flushed-lsn store))
+      (when (or validate-durable
+                (< (max floor (* segment +wal-segment-size+)) (physical-store-flushed-lsn store)))
         (physical-store-validate-prefix
          store :on-record
          (lambda (record raw)
@@ -91,6 +92,30 @@ Return NIL when it is unavailable or cannot be verified."
                    (setf different t)))))))))
     (when different
       (error "restored WAL differs from the durable receive prefix"))))
+
+(defun physical-store-select-archive-history (store target history-text eor cursor fork-bytes)
+  "Select an archive child only after proving the live parent prefix at CURSOR.
+FORK-BYTES is the proof-verified extent containing the fork. A segment boundary
+needs no overlapping extent. Reject candidate errors before changing the store."
+  (sb-thread:with-mutex ((physical-store-mutex store))
+    (physical-store-check-live store)
+    (unless (= cursor (physical-store-flushed-lsn store))
+      (return-from physical-store-select-archive-history nil))
+    (physical-store-check-complete-input store)
+    (multiple-value-bind (segment offset) (wal-segment-and-offset cursor)
+      (unless (or (zerop offset) (and fork-bytes (>= (length fork-bytes) offset)))
+        (return-from physical-store-select-archive-history nil))
+      (if (zerop offset)
+          (with-physical-store-failure-latch (store)
+            (physical-store-validate-prefix store))
+          (physical-store-compare-restored-prefix store segment fork-bytes :validate-durable t)))
+    (multiple-value-bind (selection bytes)
+        (physical-store-history-candidate store target history-text eor
+                                          (physical-store-flushed-digest store))
+      (unless (= cursor (getf selection :fork))
+        (return-from physical-store-select-archive-history nil))
+      (with-physical-store-failure-latch (store)
+        (physical-store-commit-history-under-lock store selection bytes)))))
 
 (defun physical-store-admit-restored-segment (store timeline segment bytes end cursor
                                               &key closed-predecessor)
