@@ -317,9 +317,40 @@ active timeline goal before recovery preparation or redo."
 
 (defun physical-rewind-release-stage (lease-name)
   (sb-thread:with-mutex (*physical-backup-stage-lock*)
-    (remhash lease-name *physical-rewind-stage-readers*)
-    (when (remhash lease-name *physical-rewind-stage-retirements*)
-      (physical-rewind-remove-stage-under-lock lease-name))))
+    (let ((readers (gethash lease-name *physical-rewind-stage-readers*)))
+      (unless (and readers (plusp readers))
+        (error "rewind stage reader is not registered"))
+      (if (> readers 1)
+          (decf (gethash lease-name *physical-rewind-stage-readers*))
+          (progn
+            (remhash lease-name *physical-rewind-stage-readers*)
+            (when (remhash lease-name *physical-rewind-stage-retirements*)
+              (physical-rewind-remove-stage-under-lock lease-name)))))))
+
+(defun physical-rewind-pin-retained-stage (lease-name)
+  (sb-thread:with-mutex (*physical-backup-stage-lock*)
+    (when (gethash lease-name *physical-rewind-stage-retirements*)
+      (error "retained rewind stage is retiring"))
+    (multiple-value-bind (container root) (physical-backup-open-stage-container *catalog*)
+      (declare (ignore root))
+      (unless container (error "retained rewind stage is unavailable"))
+      (unwind-protect
+           (let ((fd (physical-rewind-open-stage-directory container (physical-rewind-stage-name lease-name))))
+             (incf (gethash lease-name *physical-rewind-stage-readers* 0))
+             fd)
+        (sb-posix:close container)))))
+
+(defun call-with-physical-rewind-retained-stage (lease-name function &key check-lease)
+  (let ((fd nil))
+    (unwind-protect
+         (progn
+           (sb-sys:without-interrupts
+             (setf fd (physical-rewind-pin-retained-stage lease-name)))
+           (when check-lease (funcall check-lease))
+           (call-with-physical-image-directory fd function :primary))
+      (when fd
+        (unwind-protect (sb-posix:close fd)
+          (physical-rewind-release-stage lease-name))))))
 
 (defun physical-rewind-cleanup-stages-at-startup (lease-records)
   (sb-thread:with-mutex (*physical-backup-stage-lock*)
@@ -665,7 +696,7 @@ Check the file length and digest before sending the end frame."
           (digest #xCBF29CE484222325)
           (buffer (make-array 65535 :element-type '(unsigned-byte 8))))
       (multiple-value-bind (input actual-size)
-          (open-bounded-regular-file (merge-pathnames name directory) size)
+          (open-bounded-regular-file (pgdata-resolve-path name directory) size)
         (unwind-protect
              (progn
                (unless (= size actual-size) (error "native backup bundle file length changed"))

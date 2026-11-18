@@ -58,7 +58,7 @@
         (list (cons "follow_proof_kind" "retained_timeline")))))))
 
 (defun pg-client-native-backup-lease-query (verb request &optional successor)
-  (unless (member verb '("CAPTURE_BACKUP_NATIVE" "BACKUP_LEASE_STATUS" "BACKUP_LEASE_ABORT"
+  (unless (member verb '("CAPTURE_BACKUP_NATIVE" "REPLAY_REWIND_NATIVE" "BACKUP_LEASE_STATUS" "BACKUP_LEASE_ABORT"
                          "BACKUP_LEASE_HANDOFF" "BACKUP_LEASE_CLEANUP_SELECTED") :test #'equal)
     (error "invalid native backup lease query command"))
   (let* ((request (physical-backup-lease-request-copy request))
@@ -262,8 +262,10 @@
         (setf options (append options (list (cons "relation_offers" text))))))
     (pg-client-native-backup-lease-option-query "CAPTURE_REWIND_NATIVE" options)))
 
-(defun physical-backup-lease-receive-remote (target channel request &key rewind offers reuse)
-  (let ((tag (if rewind "CAPTURE_REWIND_NATIVE" "CAPTURE_BACKUP_NATIVE")))
+(defun physical-backup-lease-receive-remote (target channel request &key rewind replay offers reuse)
+  (let ((tag (cond (replay "REPLAY_REWIND_NATIVE")
+                   (rewind "CAPTURE_REWIND_NATIVE")
+                   (t "CAPTURE_BACKUP_NATIVE"))))
     (physical-libpq-start-copy-out
      channel (if rewind
                  (pg-client-native-rewind-capture-query request offers)
@@ -284,10 +286,11 @@
 ;; Receive into the caller's empty directory, verify the manifest, then check
 ;; STATUS against the received image.  READY describes source retention at
 ;; that check, not a permanent guarantee; follow or handoff must revalidate.
-(defun physical-backup-lease-capture-remote (directory channel request &key directory-fd rewind offers reuse)
+(defun physical-backup-lease-capture-remote (directory channel request &key directory-fd rewind replay offers reuse)
   (unless (and (eq (null offers) (null reuse))
                (or (null offers) rewind)
-               (or (null rewind) directory-fd))
+               (or (not (or rewind replay)) directory-fd)
+               (not (and rewind replay)))
     (error "native rewind capture requires a descriptor and a receiver for any offers"))
   (let ((request (physical-backup-lease-request-copy request))
         (target (physical-bootstrap-target directory)))
@@ -298,5 +301,5 @@
            directory-fd
            (lambda (anchored)
              (physical-backup-lease-receive-remote
-              anchored channel request :rewind rewind :offers offers :reuse reuse))))
+              anchored channel request :rewind rewind :replay replay :offers offers :reuse reuse))))
         (physical-backup-lease-receive-remote target channel request))))

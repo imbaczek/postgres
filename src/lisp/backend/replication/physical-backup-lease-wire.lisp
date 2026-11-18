@@ -170,7 +170,7 @@ Each unique entry contains a relation name, size and digest."
       (ereport "25P02" "current transaction is aborted"))
     (check-recovery-available)
     (case (logical-replication-command-type command)
-      ((:physical-lease-capture :physical-lease-capture-rewind)
+      ((:physical-lease-capture :physical-lease-capture-rewind :physical-lease-replay-rewind)
        (prevent-recovery-primary-operation "leased native backup")
        (when *swank-listener-enabled-p*
          (ereport "55000" "leased native backup requires Swank to be off"))
@@ -401,3 +401,45 @@ Each unique entry contains a relation name, size and digest."
     (wal-input-validation-error () (ereport "55000" "backup lease capture is not valid for this source"))
     (pg-error (condition) (error condition))
     (error () (ereport "XX000" "leased native backup failed"))))
+
+(defun physical-rewind-ready-replay-record (request)
+  (let ((record (physical-backup-lease-status request)))
+    (unless (and (eq :ready (getf record :phase)) (getf record :rewind-seal-digest))
+      (ereport "55000" "backup lease has no replayable rewind image"))
+    record))
+
+(defun physical-rewind-replay-image (image record)
+  (let ((base (getf record :base))
+        (request (getf record :request)))
+    (multiple-value-bind (manifest digest) (recovery-read-manifest image)
+      (unless (and (equal base (physical-backup-lease-captured-base manifest digest))
+                   (= (getf manifest :timeline) (getf request :timeline))
+                   (= (getf manifest :system-id) (getf request :system-id)))
+        (error "rewind replay manifest differs from the original lease"))
+      (values manifest (physical-rewind-stage-sealed-entries
+                        image request base manifest (getf record :rewind-seal-digest))))))
+
+(defun start-native-rewind-replay (stream command)
+  (handler-case
+      (progn
+        (physical-backup-lease-wire-preflight command)
+        (let* ((request (physical-backup-lease-command-request command))
+               (record (physical-rewind-ready-replay-record request)))
+          (call-with-native-backup-copy-out
+           stream "REPLAY_REWIND_NATIVE"
+           (lambda (directory begin-copy)
+             (multiple-value-bind (manifest entries) (physical-rewind-replay-image directory record)
+               (funcall begin-copy)
+               (values manifest entries)))
+           :with-existing-image
+           (lambda (send-image)
+             (call-with-physical-rewind-retained-stage
+              (getf request :name)
+              send-image
+              :check-lease
+              (lambda ()
+                (unless (equal record (physical-rewind-ready-replay-record request))
+                  (ereport "55000" "rewind image lease changed during replay admission"))))))))
+    (wal-input-validation-error () (ereport "55000" "rewind replay is not valid for this source"))
+    (pg-error (condition) (error condition))
+    (error () (ereport "55000" "retained rewind image is unavailable"))))

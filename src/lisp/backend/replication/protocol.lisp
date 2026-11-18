@@ -218,7 +218,8 @@
     ("BACKUP_LEASE_PREPARE_FOLLOW" . :physical-lease-prepare-follow)
     ("BACKUP_LEASE_CANCEL_FOLLOW" . :physical-lease-cancel-follow)
     ("BACKUP_LEASE_PROVE_REWIND" . :physical-lease-prove-rewind)
-    ("CAPTURE_REWIND_NATIVE" . :physical-lease-capture-rewind)))
+    ("CAPTURE_REWIND_NATIVE" . :physical-lease-capture-rewind)
+    ("REPLAY_REWIND_NATIVE" . :physical-lease-replay-rewind)))
 
 (defun parse-replication-command (query)
   (let* ((words (replication-command-words query))
@@ -1084,7 +1085,7 @@ The caller releases the slot before sending shutdown completion."
                                                                   :physical-lease-capture :physical-lease-status :physical-lease-abort :physical-lease-handoff
                                                                   :physical-lease-cleanup-selected
                                                                   :physical-lease-prepare-follow :physical-lease-cancel-follow
-                                                                  :physical-lease-prove-rewind :physical-lease-capture-rewind
+                                                                  :physical-lease-prove-rewind :physical-lease-capture-rewind :physical-lease-replay-rewind
                                                                   :physical-identify-rewind-origin))
              (backend-explicit *backend*))
     (ereport "25001" "~a cannot run inside a transaction block"
@@ -1093,6 +1094,7 @@ The caller releases the slot before sending shutdown completion."
                (:physical-backup "BASE_BACKUP_NATIVE")
                (:physical-lease-capture "CAPTURE_BACKUP_NATIVE")
                (:physical-lease-capture-rewind "CAPTURE_REWIND_NATIVE")
+               (:physical-lease-replay-rewind "REPLAY_REWIND_NATIVE")
                (:physical-lease-status "BACKUP_LEASE_STATUS")
                (:physical-lease-abort "BACKUP_LEASE_ABORT")
                (:physical-lease-handoff "BACKUP_LEASE_HANDOFF")
@@ -1144,6 +1146,7 @@ The caller releases the slot before sending shutdown completion."
             (:physical-backup (start-native-physical-backup stream command))
             ((:physical-lease-capture :physical-lease-capture-rewind)
              (start-native-backup-lease-capture stream command))
+            (:physical-lease-replay-rewind (start-native-rewind-replay stream command))
             ((:physical-lease-status :physical-lease-abort :physical-lease-handoff
                                      :physical-lease-cleanup-selected
               :physical-lease-prepare-follow :physical-lease-cancel-follow :physical-lease-prove-rewind)

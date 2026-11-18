@@ -151,42 +151,48 @@ Only explicit proof_kind retained_timeline selects the retained proof."
 ;; Allocate the stage before CopyOutResponse, and delete it on every exit,
 ;; including before CopyDone and successful command completion.  After COPY
 ;; starts, report errors if possible and abort the stream before propagating.
-(defun call-with-native-backup-copy-out (stream tag producer &key reuse retain-stage)
+(defun call-with-native-backup-copy-out (stream tag producer &key reuse retain-stage with-existing-image)
   (call-with-wal-sender-stream
    (lambda ()
-     (let ((stage nil) (copy-mode nil))
-       (handler-case
-           (progn
-             (unwind-protect
-                  (progn
-                    (sb-sys:without-interrupts (setf stage (physical-backup-create-stage)))
-                    (flet ((begin-copy ()
-                             (when copy-mode (error "native backup COPY already started"))
-                             (let ((response (make-payload)))
-                               (payload-push-byte response 1)
-                               (payload-push-u16 response 0)
-                               (setf copy-mode t)
-                               (copy-write-frame stream #\H response)
-                               (finish-output stream))))
-                      (multiple-value-bind (manifest expected-entries retained) (funcall producer stage #'begin-copy)
-                        (unless copy-mode (error "native backup producer did not start COPY"))
-                        (let ((image (or retained stage)))
-                          (physical-bootstrap-test-point :before-stream image)
-                          (physical-backup-send-bundle
-                           image manifest
-                           (lambda (payload) (copy-write-frame stream #\d payload) (finish-output stream))
-                           :reuse reuse :expected-entries expected-entries)))))
-               (when stage (physical-backup-delete-stage stage :missing-ok retain-stage)))
-             (copy-write-frame stream #\c (make-payload))
-             (send-command-complete stream tag)
-             (send-ready-for-query stream (transaction-status-char)))
-         (error (condition)
-           (let ((failure (native-backup-command-condition condition copy-mode)))
-             (when copy-mode
-               (when (open-stream-p stream)
-                 (ignore-errors (send-error-response stream failure)))
-               (ignore-errors (close stream :abort t)))
-             (error failure))))))
+     (let ((copy-mode nil))
+       (labels ((begin-copy ()
+                  (when copy-mode (error "native backup COPY already started"))
+                  (let ((response (make-payload)))
+                    (payload-push-byte response 1)
+                    (payload-push-u16 response 0)
+                    (setf copy-mode t)
+                    (copy-write-frame stream #\H response)
+                    (finish-output stream)))
+                (send-image (directory)
+                  (multiple-value-bind (manifest expected-entries retained)
+                      (funcall producer directory #'begin-copy)
+                    (unless copy-mode (error "native backup producer did not start COPY"))
+                    (let ((image (or retained directory)))
+                      (physical-bootstrap-test-point :before-stream image)
+                      (physical-backup-send-bundle
+                       image manifest
+                       (lambda (payload) (copy-write-frame stream #\d payload) (finish-output stream))
+                       :reuse reuse :expected-entries expected-entries)))))
+         (handler-case
+             (progn
+               (if with-existing-image
+                   (funcall with-existing-image #'send-image)
+                   (let ((stage nil))
+                     (unwind-protect
+                          (progn
+                            (sb-sys:without-interrupts (setf stage (physical-backup-create-stage)))
+                            (send-image stage))
+                       (when stage (physical-backup-delete-stage stage :missing-ok retain-stage)))))
+               (copy-write-frame stream #\c (make-payload))
+               (send-command-complete stream tag)
+               (send-ready-for-query stream (transaction-status-char)))
+           (error (condition)
+             (let ((failure (native-backup-command-condition condition copy-mode)))
+               (when copy-mode
+                 (when (open-stream-p stream)
+                   (ignore-errors (send-error-response stream failure)))
+                 (ignore-errors (close stream :abort t)))
+               (error failure)))))))
    :kind :backup))
 
 ;; Admit only a primary physical sender.  Stage the image under quiescence,
