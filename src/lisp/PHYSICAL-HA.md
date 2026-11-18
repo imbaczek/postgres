@@ -31,10 +31,12 @@ Two areas still separate this evidence from closeout:
      advances the standby's confirmed position. A consumer continued across
      promotion and resumed after the promoted primary restarted. Finite WAL
      caps and independent catalog horizon advancement still need qualification.
-2. Qualify archive recovery with a configured streaming source across a
-   timeline fork, and settle archive backlog and cleanup behavior. State the
-   tested rewind topology and interruption limits in the supported lifecycle
-   contract.
+2. State the tested rewind topology and interruption limits in the supported
+   lifecycle contract. The primary archive worker now drains large queues
+   in bounded lock acquisitions and recovers interrupted local cleanup.
+   A standby configured for streaming replayed archived WAL across a fork
+   and began streaming at the end of the archived child segment. Checkpoint
+   notification still has a synchronous scan.
 
 Close the goal against those backend cases and a rerun of the supplied-leader
 lifecycle. Record broader C behavior gaps separately so that the acceptance
@@ -136,12 +138,33 @@ Two recovery areas still need work.
    durable selection. On restart, with the history file withheld from the
    archive, the observer republished the selected history. It replayed the
    child-only row and retained it across a clean restart. Both processes exited
-   with the expected SIGKILL. The run passed in 55.96 s on the ramdisk. End-to-end
-   archive recovery across a fork with a bound streaming source remains open.
+   with the expected SIGKILL. The run passed in 55.96 s on the ramdisk.
+   The live `--case archive-descendant-bound` test restored the child history,
+   the parent partial and its proof, and the child segment proof with
+    streaming configured. The receiver started on timeline 2 at the exact
+    end LSN in the child proof, then received a new write over the named
+    physical slot. It restarted with that write intact and received another
+    write. The run with the exact cursor assertion passed in 52.11 s on the
+    ramdisk. The archive-only case passed in 48.26 s.
    Archive recovery from other base layouts still needs qualification.
-   Offline rewind has a separate restore path. Archive producer work still needs
-   repeated-promotion and mode-handoff tests, safe queue reclamation, and
-   bounded backlog scans.
+    Offline rewind has a separate restore path. The standby archive fixture
+    promoted a node running with `archive_mode=always`, drained its staged WAL
+    and proofs, and restarted it with `archive_mode=on`. It then archived new
+    timeline 2 WAL and its proof without rerunning archive commands for
+    timeline 1. A new standby then took a base backup from that writer,
+    replayed a write over streaming, and promoted after the writer stopped.
+    Its timeline 3 archive history extended timeline 2's history. The archived
+    timeline 2 partial matched the fork offset, and its proof recorded the exact
+    fork LSN. The combined run took 66.00 s on the ramdisk. The primary worker
+    reuses a scan across successful uploads and revalidates candidates before
+    use. A 97-file regression test checks ordering and discovery of new work
+    after the scan. Both primary selection and startup cleanup enumerate outside
+    the WAL lock and check at most 32 queue entries per lock acquisition. The
+    worker still holds a snapshot of the directory, promotion lineage checks
+    scale with history length, and checkpoint notification has a separate
+    synchronous scan.
+    Fourteen focused archive, promotion, and recycling tests passed in 2.53 s
+    of Rove execution.
 
    Startup now removes abandoned restore stages under a pinned, owned PGDATA
    root. The live archive-to-stream test sent SIGKILL after partial restore
@@ -194,8 +217,8 @@ Three focused tests passed, including a compacted descendant floor.
 C describes `%r` as the oldest WAL file needed for restart
 (`src/backend/access/transam/xlogarchive.c:141`). Native filename suffixes,
 legacy names, and proof files differ, so archive cleanup tools must understand
-those names. End-to-end bound descendant partial restore and archive cleanup
-remain open.
+those names. Bound descendant partial restore has live coverage. Archive
+backlog and cleanup remain open.
 
 Native WAL can rotate early when the next record will not fit. The closed
 segment can be shorter than 16 MiB. Rotation syncs the old stream and its
@@ -327,9 +350,17 @@ The pinned Patroni `archive-promotion-history` run verified that both the partia
 and its proof reached the archive in 27.03 s on the ramdisk. Five focused tests
 passed in 1.92 s, covering exact and mismatched fork selection, missing and
 matching proofs, and retry after child recycling using the data receipt. The
-fork-selection tests simulated the runtime boundary. A live archive-only
-descendant restore has since passed as described above. End-to-end bound
-descendant restore remains open.
+fork-selection tests simulated the runtime boundary. The live archive-only
+and bound archive-to-stream descendant runs are described above.
+
+When recycling primary WAL, the native implementation syncs the WAL directory
+after unlinking the retired files, then removes their exact archive status
+entries. It keeps a proof's status entries if the proof could not be removed.
+When the archiver starts on a primary, it also reclaims status entries left by
+an interruption during recycling. The scan covers full segments below the
+durable frontier. If a segment is absent but its proof remains, the archiver
+can remove the proof after validating its completion receipt. An absent proof
+needs no receipt. History and promotion partials are outside this cleanup.
 
 The `rewind-worker-target-archive` case uses the native archiver on a divergent
 former primary to produce the WAL segment that contains the common fork.
