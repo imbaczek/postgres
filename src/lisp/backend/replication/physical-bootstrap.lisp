@@ -174,18 +174,32 @@ active timeline goal before recovery preparation or redo."
 
 ;; Remove children through directory descriptors, without following symlinks.
 ;; Callers validate the owner and stage directory before allowing removal.
-(defun physical-backup-remove-stage-tree (parent name)
-  (let* ((path (query-temp-fd-child-path parent name))
-         (stat (sb-posix:lstat path)))
-    (if (sb-posix:s-isdir (sb-posix:stat-mode stat))
-        (let ((fd (physical-backup-open-directory (pathname path))))
-          (unwind-protect
-               (multiple-value-bind (names complete) (query-temp-directory-entry-names fd)
-                 (unless complete (error "native backup stage enumeration failed"))
-                 (dolist (child names) (physical-backup-remove-stage-tree fd child)))
-            (sb-posix:close fd))
-          (sb-posix:rmdir path))
-        (sb-posix:unlink path))))
+(defun physical-backup-remove-stage-tree (parent name &key mount expected)
+  (let ((path (query-temp-fd-child-path parent name))
+        (observed (when mount (physical-image-file-facts parent name))))
+    (flet ((check (actual)
+             (let ((original (or expected observed)))
+               (unless (and (= mount (ninth actual))
+                            (equal (subseq original 0 3) (subseq actual 0 3))
+                            (= (fifth original) (fifth actual)))
+                 (error "native backup stage cleanup found a different object or mount")))))
+      (when observed (check observed))
+      (let ((stat (sb-posix:lstat path)))
+        (if (sb-posix:s-isdir (sb-posix:stat-mode stat))
+            (let ((fd (physical-backup-open-directory (pathname path))))
+              (unwind-protect
+                   (progn
+                     (when observed (check (physical-image-file-facts fd)))
+                     (multiple-value-bind (names complete) (query-temp-directory-entry-names fd)
+                       (unless complete (error "native backup stage enumeration failed"))
+                       (dolist (child names)
+                         (physical-backup-remove-stage-tree fd child :mount mount)))
+                     (when observed (check (physical-image-file-facts parent name)))
+                     (sb-posix:rmdir path))
+                (sb-posix:close fd)))
+            (progn
+              (when observed (check (physical-image-file-facts parent name)))
+              (sb-posix:unlink path)))))))
 
 (defun physical-backup-cleanup-stages ()
   (sb-thread:with-mutex (*physical-backup-stage-lock*)
@@ -793,7 +807,7 @@ Check the file length and digest before sending the end frame."
 ;; Consume exactly the declared data extent and its end frame while checking
 ;; the digest; the caller owns the output stream and its durability.
 
-(defun physical-backup-receive-file-content (size expected-digest next output)
+(defun physical-backup-receive-file-content (size expected-digest next output &optional relative)
   "Receive file data and return its digest after checking the end frame.
 Validate each data extent before writing it, and hash the same bytes written.
 The caller checks the file header and owns the output."
@@ -806,6 +820,9 @@ The caller checks the file header and owns the output."
                (error "invalid native backup file data extent"))
              (setf digest (physical-store-update-digest-span digest frame 1 (1+ count)))
              (write-sequence frame output :start 1 :end (1+ count))
+             (when (and relative *physical-image-test-hook* (< count remaining))
+               (finish-output output)
+               (funcall *physical-image-test-hook* :after-partial-receive relative))
              (decf remaining count))
     (let ((end (physical-backup-read-frame next)))
       (unless (and (= (length end) 1) (= (aref end 0) (char-code #\E))
@@ -834,7 +851,7 @@ The caller checks the file header and owns the output."
                   (call-with-physical-image-output
                    directory name
                    (lambda (output)
-                     (physical-backup-receive-file-content size expected-digest next output)))
+                     (physical-backup-receive-file-content size expected-digest next output name)))
                   (let* ((path (merge-pathnames name directory))
                          (parent (uiop:pathname-directory-pathname path))
                          (digest nil))

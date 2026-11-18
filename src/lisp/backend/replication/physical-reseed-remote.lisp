@@ -233,11 +233,87 @@ Bind capture to the accepted source observed during discovery."
         record (pg-client-native-backup-lease-status client (getf record :request))))
      :helper helper)))
 
-(defun physical-rewind-resume-capture (owner record &key helper)
+(defun physical-rewind-replay-into-stage (owner record client fd scratch-fd)
+  (call-with-physical-backup-image-directory
+   scratch-fd
+   (lambda (scratch)
+     (let ((source *physical-image-context*)
+           (image (physical-reseed-image-check scratch)))
+       (let ((*physical-image-context* nil))
+         (physical-reseed-image-check-source client record image))
+       (physical-reseed-image-check-rewind-origin owner client record scratch image)
+       (call-with-physical-image-repair-directory
+        fd
+        (lambda (stage)
+          (let ((target *physical-image-context*)
+                (entries (getf image :files)))
+            (physical-rewind-check-partial-inventory target entries)
+            (dolist (entry entries) (physical-rewind-repair-file source target entry))
+            (let ((*physical-image-context* nil))
+              (physical-reseed-require-journal owner record)
+              (let ((facts (getf record :stage)))
+                (physical-reseed-stage-facts owner (getf facts :directory) fd :expected facts))
+              (physical-reseed-image-check-source client record image))
+            (physical-image-check-children target)
+            (dolist (name '("base" "global" "pg_wal"))
+              (unless (assoc name (physical-image-context-children target) :test #'equal)
+                (physical-image-open-child target name)))
+            (physical-rewind-check-partial-inventory target entries)
+            (dolist (entry entries) (physical-rewind-repair-file source target entry :append t))
+            (physical-reseed-image-check stage image))))))))
+
+(defun physical-rewind-replay-scratch (owner record fd scratch &key helper)
+  (let* ((parent (uiop:pathname-parent-directory-pathname scratch))
+         (name (car (last (pathname-directory scratch))))
+         (parent-fd (physical-backup-open-directory parent))
+         (created nil))
+    (unwind-protect
+         (progn
+           (sb-sys:without-interrupts
+             (sb-posix:mkdir (query-temp-fd-child-path parent-fd name) #o700)
+             (setf created (physical-image-file-facts parent-fd name)))
+           (call-with-physical-reseed-stage
+            owner scratch
+            (lambda (directory facts scratch-fd)
+              (declare (ignore facts))
+              (unless (and (equal created (physical-image-file-facts scratch-fd))
+                           (equal created (physical-image-file-facts parent-fd name)))
+                (error "rewind replay scratch directory changed before receive"))
+              (physical-reseed-image-check-mounts owner fd scratch-fd)
+              (call-with-physical-reseed-client
+               owner record
+               (lambda (client)
+                 (let ((*pgdata* (physical-adoption-owner-directory owner)))
+                   (physical-backup-lease-capture-remote
+                    directory client (getf record :request) :directory-fd scratch-fd :replay t))
+                 (physical-rewind-replay-into-stage owner record client fd scratch-fd))
+               :helper helper))))
+      (unwind-protect
+           (when created
+             (physical-backup-remove-stage-tree parent-fd name :mount (ninth created) :expected created)
+             (sb-posix:fsync parent-fd))
+        (sb-posix:close parent-fd)))))
+
+(defun physical-rewind-resume-ready-stage (owner record status make-scratch helper)
+  (let ((stage (getf record :stage)))
+    (call-with-physical-reseed-stage
+     owner (getf stage :directory)
+     (lambda (directory facts fd)
+       (declare (ignore directory facts))
+       (let ((image (ignore-errors
+                     (call-with-physical-backup-image-directory fd #'physical-reseed-image-check))))
+         (if image
+             (physical-backup-lease-check-received-status
+              (getf image :manifest) (getf image :manifest-digest) (getf record :request) status)
+             (physical-rewind-replay-scratch owner record fd (funcall make-scratch) :helper helper))))
+     :empty nil :expected stage)))
+
+(defun physical-rewind-resume-capture (owner record make-scratch &key helper)
   (physical-reseed-require-journal owner record)
   (let ((status (physical-reseed-status owner :helper helper)))
     (when (eq :ready (getf status :phase))
-      (return-from physical-rewind-resume-capture status))
+      (return-from physical-rewind-resume-capture
+        (physical-rewind-resume-ready-stage owner record status make-scratch helper)))
     (when status (error "native rewind source capture is not ready"))
     (let ((request (getf record :request)) (stage (getf record :stage)))
       (call-with-physical-reseed-stage

@@ -285,6 +285,22 @@
 (defun call-with-physical-backup-image-directory (borrowed-fd function)
   (call-with-physical-image-directory borrowed-fd function t))
 
+(defun call-with-physical-image-repair-directory (fd function)
+  (call-with-physical-image-owned-context
+   fd nil
+   (lambda (context)
+     (let* ((root (physical-image-context-root-fd context))
+            (directory (physical-image-context-root-path context))
+            (children (directory-entry-names directory :follow-symlinks t)))
+       (dolist (name '("base" "global" "pg_wal"))
+         (when (member name children :test #'equal)
+           (physical-image-open-child context name :existing t)))
+       (let ((*physical-image-context* context))
+         (multiple-value-prog1 (funcall function directory)
+           (physical-image-check-children context)
+           (dolist (entry (physical-image-context-children context)) (sb-posix:fsync (cdr entry)))
+           (sb-posix:fsync root)))))))
+
 ;; Create a private 0600 file exclusively relative to a held directory, without
 ;; following symlinks.  Sync the file and parent before reporting success.
 
@@ -339,7 +355,7 @@
 (defun call-with-physical-image-input-at (parent leaf function
                                           &key (element-type 'character)
                                             (if-does-not-exist :error) (external-format :default)
-                                            primary-permissions)
+                                            primary-permissions append-only)
   (unless (and (stringp leaf) (plusp (length leaf))
                (not (find #\/ leaf)) (not (find (code-char 0) leaf))
                (not (member leaf '("." "..") :test #'equal)))
@@ -349,7 +365,8 @@
       (unwind-protect
            (progn
              (setf fd (physical-image-openat
-                       parent leaf (logior sb-posix:o-rdonly sb-posix:o-nofollow sb-posix:o-nonblock
+                       parent leaf (logior (if append-only (logior sb-posix:o-rdwr sb-posix:o-append) sb-posix:o-rdonly)
+                                           sb-posix:o-nofollow sb-posix:o-nonblock
                                            +postmaster-o-cloexec+) 0))
              (when (minusp fd)
                (setf fd nil)
@@ -363,7 +380,7 @@
                             (member (logand #o7777 (sb-posix:stat-mode stat))
                                     (if primary-permissions '(#o600 #o640 #o644) '(#o600))))
                  (error "physical image input is not a private regular file")))
-             (setf stream (sb-sys:make-fd-stream fd :input t :element-type element-type
+             (setf stream (sb-sys:make-fd-stream fd :input t :output append-only :element-type element-type
                                                     :external-format external-format))
              (sb-sys:with-local-interrupts (funcall function stream)))
         (if stream (close stream) (when fd (sb-posix:close fd)))))))

@@ -118,6 +118,99 @@
    (getf image :manifest) (getf image :manifest-digest) (getf record :request)
    (pg-client-native-backup-lease-status client (getf record :request))))
 
+(defun physical-rewind-check-partial-inventory (target entries)
+  (let ((root (physical-image-context-root-fd target))
+        (children (physical-image-context-children target))
+        (names (mapcar #'first entries)))
+    (physical-image-check-children target)
+    (flet ((check (fd allowed)
+             (unless (subsetp (directory-entry-names (physical-image-fd-path fd) :follow-symlinks t)
+                              allowed :test #'equal)
+               (error "rewind receive stage has unexpected entries"))))
+      (check root (append (mapcar #'car children) (remove-if (lambda (name) (find #\/ name)) names)))
+      (dolist (entry children)
+        (unless (= (ninth (physical-image-file-facts root))
+                   (ninth (physical-image-file-facts (cdr entry))))
+          (error "rewind receive stage child is on a different mount"))
+        (let ((prefix (concatenate 'string (car entry) "/")))
+          (check (cdr entry) (loop for name in names
+                                   when (uiop:string-prefix-p prefix name)
+                                     collect (subseq name (length prefix)))))))))
+
+(defun physical-rewind-prefix-parent-present-p (context relative)
+  (let ((slash (position #\/ relative)))
+    (or (null slash)
+        (assoc (subseq relative 0 slash) (physical-image-context-children context) :test #'equal))))
+
+(defun physical-rewind-check-file-observation (fd parent name observed)
+  (unless (and (equal observed (physical-image-file-facts fd))
+               (equal observed (physical-image-file-facts parent name))
+               (= (ninth observed) (ninth (physical-image-file-facts parent))))
+    (error "rewind replay file identity changed")))
+
+(defun physical-rewind-match-and-extend (source source-parent source-name output parent name entry append)
+  (let* ((source-fd (sb-sys:fd-stream-fd source))
+         (target-fd (sb-sys:fd-stream-fd output))
+         (sealed (physical-image-file-facts source-fd))
+         (partial (physical-image-file-facts target-fd))
+         (length (sixth partial))
+         (size (second entry))
+         (source-buffer (make-array 65536 :element-type '(unsigned-byte 8)))
+         (target-buffer (make-array 65536 :element-type '(unsigned-byte 8))))
+    (unless (and (= (sixth sealed) size) (<= length size))
+      (error "rewind receive file has an invalid prefix length"))
+    (loop with remaining = length
+          while (plusp remaining)
+          for count = (min remaining (length source-buffer))
+          do (unless (and (= count (read-sequence source-buffer source :end count)
+                             (read-sequence target-buffer output :end count))
+                          (not (mismatch source-buffer target-buffer :end1 count :end2 count)))
+               (error "rewind receive file is not a prefix of the retained image"))
+             (decf remaining count))
+    (physical-rewind-check-file-observation source-fd source-parent source-name sealed)
+    (physical-rewind-check-file-observation target-fd parent name partial)
+    (when (and append (< length size))
+      (unless (file-position output length) (error "cannot seek to rewind receive file end"))
+      (loop with remaining = (- size length)
+            while (plusp remaining)
+            for count = (min remaining (length source-buffer))
+            do (unless (= count (read-sequence source-buffer source :end count))
+                 (error "retained rewind file was truncated"))
+               (write-sequence source-buffer output :end count)
+               (finish-output output)
+               (when *physical-image-test-hook*
+                 (funcall *physical-image-test-hook* :after-rewind-prefix-append (first entry)))
+               (decf remaining count)))
+    (when append
+      (fsync-stream output)
+      (sb-posix:fsync parent)
+      (let ((actual (physical-image-file-facts target-fd)))
+        (unless (and (= (sixth actual) size)
+                     (equal (subseq partial 0 5) (subseq actual 0 5)))
+          (error "rewind receive file changed during append"))
+        (physical-rewind-check-file-observation target-fd parent name actual))
+      (physical-rewind-check-file-observation source-fd source-parent source-name sealed))))
+
+(defun physical-rewind-repair-file (source target entry &key append)
+  (let ((relative (first entry)))
+    (when (physical-rewind-prefix-parent-present-p target relative)
+      (multiple-value-bind (parent name) (physical-image-parent target relative)
+        (call-with-physical-image-input-at
+         parent name
+         (lambda (existing)
+           (cond (existing
+                  (multiple-value-bind (source-parent source-name) (physical-image-parent source relative)
+                    (call-with-physical-image-input-at
+                     source-parent source-name
+                     (lambda (input)
+                       (physical-rewind-match-and-extend input source-parent source-name
+                                                         existing parent name entry append))
+                     :element-type '(unsigned-byte 8))))
+                 (append
+                  (destructuring-bind (name size digest) entry
+                    (physical-image-copy-file source target name size digest)))))
+         :if-does-not-exist nil :element-type '(unsigned-byte 8) :append-only append)))))
+
 (defun physical-rewind-prove-shared-history (owner source-root source-image origin-identity)
   "Compare shared WAL from the target's export base up to the fork.
 Hold the stopped target's lock and the verified source image's descriptor scope.
