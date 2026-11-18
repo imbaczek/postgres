@@ -57,6 +57,92 @@ Return NIL when it is unavailable or cannot be verified."
         (physical-recovery-base-wal-prefix))
     (error () nil)))
 
+(defun physical-store-compare-restored-prefix (store segment bytes)
+  "Check restored bytes against the retained floor and every durable overlapping record."
+  (let* ((floor (physical-store-floor-lsn store))
+         (first (floor floor +wal-segment-size+))
+         (root (physical-store-retained-root store))
+         (different nil))
+    (with-physical-store-failure-latch (store)
+      (when (and (= segment first) (plusp (mod floor +wal-segment-size+)))
+        (let* ((entries (when root
+                          (physical-store-read-retained-control store (physical-store-control-tuple store))
+                          (getf (physical-retained-inventory-load
+                                 (physical-store-retained-directory store) root
+                                 (physical-store-retained-identity store)
+                                 (physical-store-retained-history store))
+                                :entries)))
+               (prefix (progn
+                         (when root (physical-store-check-retained-coverage store entries))
+                         (physical-retained-seal-initial-prefix store entries)))
+               (size (mod floor +wal-segment-size+)))
+          (unless (= size (length prefix))
+            (error "retained receive floor lacks its exact WAL prefix"))
+          (setf different (or (> size (length bytes)) (mismatch prefix bytes :end2 size)))))
+      (when (< (max floor (* segment +wal-segment-size+)) (physical-store-flushed-lsn store))
+        (physical-store-validate-prefix
+         store :on-record
+         (lambda (record raw)
+           (multiple-value-bind (number offset) (floor (wal-record-start record) +wal-segment-size+)
+             (when (= segment number)
+               (let ((end (+ offset (length raw))))
+                 (when (or (> end (length bytes))
+                           (mismatch raw bytes :start2 offset :end2 end))
+                   (setf different t)))))))))
+    (when different
+      (error "restored WAL differs from the durable receive prefix"))))
+
+(defun physical-store-admit-restored-segment (store timeline segment bytes end cursor
+                                              &key closed-predecessor)
+  "Extend the receive store with proof-verified archive bytes.
+For a rotation, CLOSED-PREDECESSOR is the verified previous segment ending at
+CURSOR. A selected end-of-recovery record or a tail too short for any record
+also establishes the rotation. Validate before writing and return the new
+flush point, or NIL if the archive cannot advance the current frontier."
+  (sb-thread:with-mutex ((physical-store-mutex store))
+    (physical-store-check-live store)
+    (unless (and (= cursor (physical-store-flushed-lsn store)) (< cursor end))
+      (return-from physical-store-admit-restored-segment nil))
+    (physical-store-check-complete-input store)
+    (let* ((current (floor cursor +wal-segment-size+))
+           (offset (mod cursor +wal-segment-size+))
+           (start (* segment +wal-segment-size+))
+           (input-start (max start cursor))
+           (selection (physical-store-selection store))
+           (decoder (make-physical-wal-decoder :start-lsn cursor))
+           (records nil)
+           (previous cursor))
+      (unless (and (= end (+ start (length bytes)))
+                   (<= (length bytes) +wal-segment-size+))
+        (error "invalid restored WAL extent"))
+      (cond ((= segment current)
+             (physical-store-compare-restored-prefix store segment bytes))
+            ((and (= segment (1+ current)) (plusp offset))
+             (cond ((= offset (length closed-predecessor))
+                    (physical-store-compare-restored-prefix store current closed-predecessor))
+                   ((or (< (- +wal-segment-size+ offset) +wal-header-size+)
+                        (and (eql cursor (getf selection :fork))
+                             (eql timeline (getf selection :target))))
+                    (with-physical-store-failure-latch (store)
+                      (physical-store-validate-prefix store)))
+                   (t (return-from physical-store-admit-restored-segment nil))))
+            (t (return-from physical-store-admit-restored-segment nil)))
+      (physical-wal-decode-input
+       decoder input-start (subseq bytes (- input-start start))
+       :on-record
+       (lambda (record raw)
+         (unless (= timeline (physical-store-history-check-record store record raw previous))
+           (error "restored WAL belongs to a different selected timeline"))
+         (setf previous (wal-record-end record))
+         (push (cons record raw) records)))
+      (unless (= previous end)
+        (error "restored WAL ends inside a record"))
+      (with-physical-store-failure-latch (store)
+        (dolist (entry (nreverse records))
+          (physical-store-write-record store (car entry) (cdr entry)))
+        (setf (physical-store-decoder store) decoder)
+        (physical-store-flush-under-lock store)))))
+
 (defun physical-store-live-archive-segment-under-lock (store timeline segment)
   "Return the exact closed receive segment and its end while holding STORE's mutex."
   (let* ((floor (physical-store-floor-lsn store))

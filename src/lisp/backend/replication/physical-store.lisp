@@ -79,16 +79,22 @@ the archive outside the receive spool; otherwise it is stored beneath the spool.
       (error condition))))
   t)
 
+(defmacro with-physical-store-failure-latch ((store) &body body)
+  "Latch failures in an operation that may have changed the receive store."
+  (let ((owner (gensym "STORE")))
+    `(let ((,owner ,store))
+       (handler-case (progn ,@body)
+         (error (condition)
+           (setf (physical-store-failed-p ,owner) t)
+           (error condition))))))
+
 (defmacro with-physical-store ((store) &body body)
   "Serialize one receiver operation and latch any failure before releasing ownership."
   (let ((owner (gensym "STORE")))
     `(let ((,owner ,store))
        (sb-thread:with-mutex ((physical-store-mutex ,owner))
          (physical-store-check-live ,owner)
-         (handler-case (progn ,@body)
-           (error (condition)
-             (setf (physical-store-failed-p ,owner) t)
-             (error condition)))))))
+         (with-physical-store-failure-latch (,owner) ,@body)))))
 
 (defun physical-store-test-point (point store)
   (when *physical-store-test-hook*
@@ -646,15 +652,19 @@ still requires process restart; reconnect alone never clears a failure latch."
      :on-record (lambda (record raw) (physical-store-write-record store record raw)))
     (physical-store-written-lsn store)))
 
+(defun physical-store-flush-under-lock (store)
+  "Persist complete records before publishing the new receive frontier."
+  (when (< (physical-store-flushed-lsn store) (physical-store-written-lsn store))
+    (when (physical-store-stream store)
+      (fsync-stream (physical-store-stream store)))
+    (fsync-directory (physical-store-directory store))
+    (physical-store-test-point :after-segment-fsync store)
+    (physical-store-save-control store (physical-store-written-lsn store))
+    (setf (physical-store-flushed-lsn store) (physical-store-written-lsn store)
+          (physical-store-flushed-digest store) (physical-store-written-digest store)))
+  (physical-store-flushed-lsn store))
+
 (defun physical-store-flush (store)
   "Fsync WAL and names, then persist the manifest, then publish acknowledged flush."
   (with-physical-store (store)
-    (when (< (physical-store-flushed-lsn store) (physical-store-written-lsn store))
-      (when (physical-store-stream store)
-        (fsync-stream (physical-store-stream store)))
-      (fsync-directory (physical-store-directory store))
-      (physical-store-test-point :after-segment-fsync store)
-      (physical-store-save-control store (physical-store-written-lsn store))
-      (setf (physical-store-flushed-lsn store) (physical-store-written-lsn store)
-            (physical-store-flushed-digest store) (physical-store-written-digest store)))
-    (physical-store-flushed-lsn store)))
+    (physical-store-flush-under-lock store)))

@@ -14,6 +14,70 @@
 (defun sample-physical-record (&optional (start 0))
   (pg::wal-encode-record pg::+wal-record-batch-start+ 0 start (empty-octets)))
 
+(deftest archive-receive-preflights-before-publishing-wal
+    (with-physical-store-directory (root)
+      (let* ((first (sample-physical-record))
+             (cursor (length first))
+             (second (sample-physical-record cursor))
+             (bytes (concatenate '(vector (unsigned-byte 8)) first second))
+             (end (length bytes))
+             (third (sample-physical-record end))
+             (partial (concatenate '(vector (unsigned-byte 8)) bytes (subseq third 0 1)))
+             (different-prefix (copy-seq bytes))
+             (store (pg::physical-store-open root 123 1 :create t)))
+        (setf (aref different-prefix 0) 0)
+        (unwind-protect
+             (progn
+               (pg::physical-store-input store 0 first)
+               (ok (= cursor (pg::physical-store-flush store)))
+               (ok (null (pg::physical-store-admit-restored-segment store 1 0 bytes end 0)))
+               (ok (signals (pg::physical-store-admit-restored-segment
+                             store 1 0 different-prefix end cursor) 'error))
+               (ok (signals (pg::physical-store-admit-restored-segment
+                             store 1 0 partial (length partial) cursor) 'error))
+               (ok (signals (pg::physical-store-admit-restored-segment store 2 0 bytes end cursor) 'error))
+               (ok (= cursor (pg::physical-store-written-lsn store)
+                      (pg::physical-store-flushed-lsn store)))
+               (ok (not (pg::physical-store-failed-p store)))
+               (ok (= end (pg::physical-store-admit-restored-segment store 1 0 bytes end cursor)))
+               (pg::physical-store-input store end third)
+               (ok (= (+ end (length third)) (pg::physical-store-flush store))))
+          (pg::physical-store-close store))
+        (let ((reopened (pg::physical-store-open root 123 1)))
+          (unwind-protect
+               (ok (= (+ end (length third)) (pg::physical-store-flushed-lsn reopened)))
+            (pg::physical-store-close reopened))))))
+
+(deftest archive-receive-requires-proof-of-short-rotation
+    (with-physical-store-directory (root)
+      (let* ((first (sample-physical-record))
+             (cursor (length first))
+             (boundary pg::+wal-segment-size+)
+             (small (sample-physical-record boundary))
+             (large (pg::wal-encode-record
+                     pg::+wal-record-batch-start+ 0 boundary
+                     (make-array (- boundary pg::+wal-header-size+)
+                                 :element-type '(unsigned-byte 8) :initial-element 0)))
+             (end (+ boundary (length large)))
+             (store (pg::physical-store-open root 123 1 :create t)))
+        (unwind-protect
+             (progn
+               (pg::physical-store-input store 0 first)
+               (pg::physical-store-flush store)
+               (ok (null (pg::physical-store-admit-restored-segment store 1 1 large end cursor)))
+               (ok (signals (pg::physical-store-admit-restored-segment
+                             store 1 1 small (+ boundary (length small)) cursor
+                             :closed-predecessor first) 'error))
+               (ok (not (pg::physical-store-failed-p store)))
+               (ok (= cursor (pg::physical-store-flushed-lsn store)))
+               (ok (= end (pg::physical-store-admit-restored-segment
+                           store 1 1 large end cursor :closed-predecessor first))))
+          (pg::physical-store-close store))
+        (let ((reopened (pg::physical-store-open root 123 1)))
+          (unwind-protect
+               (ok (= end (pg::physical-store-flushed-lsn reopened)))
+            (pg::physical-store-close reopened))))))
+
 (cl-spec:defproperty physical-store-open-handoff-preserves-validated-store
     ((start (range integer 0 3)))
   (:about pg::physical-store-open)

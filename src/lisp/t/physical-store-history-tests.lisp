@@ -403,6 +403,32 @@
         (with-open-file (input (pg::physical-store-segment-path store 0 2) :element-type '(unsigned-byte 8))
           (ok (= 88 (file-length input)))))))
 
+(deftest archive-receive-rotation-uses-selected-end-of-recovery
+    (with-physical-store-directory (root)
+      (let* ((boundary pg::+wal-segment-size+)
+             (base (- boundary 72))
+             (fork (- boundary 40))
+             (eor (store-history-eor fork 2 1))
+             (end (+ boundary (length eor)))
+             (store (pg::physical-store-open root 123 1 :create t :start-lsn base)))
+        (unwind-protect
+             (progn
+               (pg::physical-store-input store base (sample-physical-record base))
+               (pg::physical-store-flush store)
+               (pg::physical-store-select-history store 2 (store-history-text 1 fork) eor)
+               (ok (signals (pg::physical-store-admit-restored-segment
+                             store 2 1 (store-history-eor fork 3 1) end fork) 'error))
+               (ok (= fork (pg::physical-store-flushed-lsn store)))
+               (ok (not (pg::physical-store-failed-p store)))
+               (ok (= end (pg::physical-store-admit-restored-segment store 2 1 eor end fork))))
+          (pg::physical-store-close store))
+        (let ((reopened (pg::physical-store-open root 123 1)))
+          (unwind-protect
+               (progn
+                 (ok (= end (pg::physical-store-flushed-lsn reopened)))
+                 (ok (= 2 (pg::physical-store-prefix-timeline reopened end))))
+            (pg::physical-store-close reopened))))))
+
 (deftest receive-history-rotation-compaction-keeps-transition-proof
     (with-physical-store-directory (root)
       (let* ((segment pg::+wal-segment-size+) (base (- segment 72)) (fork (- segment 40))
