@@ -2,6 +2,7 @@
 
 (deftest promotion-retained-directory-uses-held-root-without-syncing-proc-ancestors
     (with-physical-store-directory (root)
+      (sb-posix:chmod root #o700)
       (let ((fd (pg::physical-backup-open-directory root)))
         (unwind-protect
              (let* ((pg::*pgdata* (pg::physical-image-fd-path fd))
@@ -24,6 +25,7 @@
 
 (deftest promotion-retained-directory-rejects-substitute-root-symlink-and-permissions
     (with-physical-store-directory (root)
+      (sb-posix:chmod root #o700)
       (let* ((other (merge-pathnames "other/" root))
              (target (merge-pathnames "pg_physical_retained" root))
              (fd (pg::physical-backup-open-directory root)))
