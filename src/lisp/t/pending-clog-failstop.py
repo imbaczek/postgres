@@ -223,6 +223,43 @@ def run_reset_crash_case():
         print(f'artifacts: {server.root}', flush=True)
 
 
+def run_ambiguous_feedback_checkpoint_case(reset_before_checkpoint):
+    server = OwnedLisp()
+    try:
+        server.start()
+        connection = Connection(server.port)
+        try:
+            connection.query("SELECT pg_create_physical_replication_slot('old_feedback')")
+        finally:
+            connection.close()
+        server.control(
+            '(sb-thread:with-mutex (*xid-lock*) '
+            '(setf *next-xid* (+ +xid-cycle+ +first-normal-xid+) *xid-batch-end* *next-xid*) '
+            '(save-next-xid))')
+        if reset_before_checkpoint:
+            server.control('(complete-xid-wraparound)')
+        server.control(
+            '(sb-thread:with-mutex (*wal-lock*) '
+            '(let* ((slot (gethash "old_feedback" *wal-replication-slots*)) '
+            '(candidate (wal-copy-replication-slot-with-profile slot))) '
+            '(setf (physical-slot-horizons candidate) (list nil (1- +xid-cycle+))) '
+            '(wal-save-replication-slot candidate) '
+            '(setf (physical-slot-horizons slot) (physical-slot-horizons candidate)))) '
+            '(wal-checkpoint-core)')
+        server.stop(immediate=True)
+        try:
+            server.start()
+        except RuntimeError:
+            assert 'cannot verify retained physical feedback' in (server.root / 'server.log').read_text()
+        else:
+            raise AssertionError('cold primary admitted an ambiguous old feedback horizon')
+        print(f'pending-clog: cold start refuses ambiguous checkpoint feedback '
+              f'(reset={reset_before_checkpoint}) PASS', flush=True)
+    finally:
+        server.stop()
+        print(f'artifacts: {server.root}', flush=True)
+
+
 def run_cross_thread_completion_case():
     server = OwnedLisp()
     actor = witness = None
@@ -307,4 +344,6 @@ if __name__ == '__main__':
         run_case(after_write)
     run_crash_case()
     run_reset_crash_case()
+    for reset_before_checkpoint in (False, True):
+        run_ambiguous_feedback_checkpoint_case(reset_before_checkpoint)
     run_cross_thread_completion_case()

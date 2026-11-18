@@ -920,17 +920,27 @@ CL's RENAME-FILE merges a relative target with the source's directory."
   (values))
 
 (defun check-primary-feedback-after-replay (reset-boundary)
-  "Reject retained feedback older than the recovered transaction status boundary.
-At the first XID of an epoch, the next XID alone proves only that the
-previous epoch began. A replayed reset can establish the later boundary."
+  "Reject retained feedback when startup cannot account for its transaction status."
   (let* ((next (next-full-xid))
          (epoch-start (xid-epoch-start (min next +max-xid+)))
          (boundary (max (or reset-boundary 0)
                         (if (> next epoch-start)
                             epoch-start
-                            (- epoch-start +xid-cycle+)))))
-    (when (< (wal-limit-xmin-by-physical-feedback boundary :include-catalog t) boundary)
-      (error "retained physical feedback precedes the recovered transaction status boundary"))))
+                            (- epoch-start +xid-cycle+))))
+         (oldest (wal-limit-xmin-by-physical-feedback (max boundary epoch-start) :include-catalog t)))
+    (when (< oldest boundary)
+      (error "retained physical feedback precedes the recovered transaction status boundary"))
+    ;; At the first XID of an epoch, a checkpoint can hide a completed reset.
+    ;; A checkpoint with an old active XID predates the reset, which waits
+    ;; for all old transactions to end.
+    (when (and (< oldest epoch-start)
+               (= next epoch-start)
+               (plusp *wal-checkpoint-lsn*)
+               (>= (or (getf *wal-checkpoint-snapshot* :next-xid) epoch-start)
+                   epoch-start)
+               (not (< 0 (or (getf *wal-checkpoint-snapshot* :oldest-active-xid) 0)
+                       epoch-start)))
+      (error "cannot verify retained physical feedback across the checkpoint's XID epoch boundary"))))
 
 (defun initialize-primary-storage (&key imported-startup)
   "Initialize a cold or promoted primary from its durable WAL/control checkpoint.
