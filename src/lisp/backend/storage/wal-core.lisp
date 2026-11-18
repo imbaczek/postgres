@@ -696,7 +696,7 @@ Legacy 16-hex segment names always belong to timeline 1."
                                    (namespace *wal-segment-namespace*))
   (merge-pathnames (wal-segment-filename segment timeline namespace) (wal-directory)))
 
-(defun wal-shell-file-command (template filename path setting)
+(defun wal-shell-file-command (template filename path setting &key restart-file)
   "Expand the file, path, and literal-percent escapes in a WAL shell command.
 The setting supplies shell quoting. Expand each replacement exactly once."
   (with-output-to-string (command)
@@ -711,6 +711,9 @@ The setting supplies shell quoting. Expand each replacement exactly once."
                   (#\% (write-char #\% command))
                   (#\f (write-string filename command))
                   (#\p (write-string path command))
+                  (#\r
+                   (unless restart-file (error "unsupported ~a placeholder" setting))
+                   (write-string restart-file command))
                   (otherwise (error "unsupported ~a placeholder" setting))))))))
 
 (defun wal-run-cancellable-restore-shell (command directory check)
@@ -735,12 +738,12 @@ The setting supplies shell quoting. Expand each replacement exactly once."
           (sb-ext:process-wait process))
         (sb-ext:process-close process)))))
 
-(defun wal-run-restore-command (template name directory-fd &key directory check
+(defun wal-run-restore-command (template name directory-fd &key directory check restart-file
                                                              (setting "restore_command"))
   "Run a restore command with an absolute output path through the held descriptor.
 When CHECK signals cancellation, terminate and reap the owned shell."
   (let* ((output (format nil "/proc/~d/fd/~d/~a" (sb-posix:getpid) directory-fd name))
-         (command (wal-shell-file-command template name output setting)))
+         (command (wal-shell-file-command template name output setting :restart-file restart-file)))
     (if check
         (wal-run-cancellable-restore-shell command directory check)
         (nth-value 2

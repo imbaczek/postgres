@@ -1641,6 +1641,19 @@ Receipt ends there; replay remains free to reach its own policy fence."
 
 (declaim (ftype function startup-restore-command))
 
+(defun physical-follow-archive-restart-file (runtime namespace)
+  "Name the oldest segment needed by the durable receive floor.
+Capture the floor and its timeline together before running the restore shell."
+  (with-physical-follow-generation-operation
+    (physical-follow-require-runtime-generation runtime)
+    (check-physical-recovery-work)
+    (let ((store *physical-receive-store*))
+      (sb-thread:with-mutex ((physical-store-mutex store))
+        (physical-store-check-live store)
+        (let* ((floor (physical-store-floor-lsn store))
+               (timeline (physical-store-prefix-timeline store floor)))
+          (wal-segment-filename (floor floor +wal-segment-size+) timeline namespace))))))
+
 (defun physical-follow-fetch-archive (runtime command system-id timeline segment namespace)
   "Fetch one proved extent through a private directory pinned under pg_wal."
   (let ((parent nil) (fd nil) (name nil) (facts nil))
@@ -1670,7 +1683,8 @@ Receipt ends there; replay remains free to reach its own policy fence."
              (check)
              (wal-restore-proved-segment command fd system-id timeline segment namespace
                                          :working-directory *pgdata* :check #'check
-                                         :cancel-check #'cancel-check)))
+                                         :cancel-check #'cancel-check
+                                         :restart-file (physical-follow-archive-restart-file runtime namespace))))
       (unwind-protect
            (when facts
              (physical-backup-remove-stage-tree parent name :mount (ninth facts) :expected facts))

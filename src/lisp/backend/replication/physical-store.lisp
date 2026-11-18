@@ -155,10 +155,11 @@ The archive is a trusted source. Checksums detect accidental changes."
       (error "WAL archive proof differs from the expected segment"))
     end))
 
-(defun wal-restore-archive-file (template name directory-fd minimum maximum directory check cancel-check)
+(defun wal-restore-archive-file (template name directory-fd minimum maximum directory check cancel-check restart-file)
   (let* ((path (merge-pathnames name (physical-image-fd-path directory-fd)))
          (status (wal-run-restore-command template name directory-fd
-                                          :directory directory :check cancel-check)))
+                                          :directory directory :check cancel-check
+                                          :restart-file restart-file)))
     (when check (funcall check))
     (physical-image-check-directory directory-fd)
     (cond ((zerop status)
@@ -170,7 +171,7 @@ The archive is a trusted source. Checksums detect accidental changes."
           ((>= status 126) (error "restore_command could not run for ~a" name)))))
 
 (defun wal-restore-proved-segment (template directory-fd system-id timeline segment namespace
-                                   &key working-directory check cancel-check)
+                                   &key working-directory check cancel-check restart-file)
   "Fetch a closed segment into an empty private directory owned by the caller.
 Return its bytes and proved end. A missing archive file returns NIL. The caller
 discards the entire staging directory after each attempt."
@@ -181,7 +182,7 @@ discards the entire staging directory after each attempt."
     (directory-entry-names directory :follow-symlinks t :maximum-entries 0)
     (let ((bytes (wal-restore-archive-file template name directory-fd
                                            +wal-header-size+ +wal-segment-size+
-                                           working-directory check cancel-check)))
+                                           working-directory check cancel-check restart-file)))
       (when bytes
         ;; A command for the segment must not also supply its proof output.
         (handler-case
@@ -194,7 +195,7 @@ discards the entire staging directory after each attempt."
         (let ((proof (wal-restore-archive-file template proof-name directory-fd
                                                +wal-archive-segment-proof-size+
                                                +wal-archive-segment-proof-size+
-                                               working-directory check cancel-check)))
+                                               working-directory check cancel-check restart-file)))
           (when proof
             (values bytes (wal-verify-archive-segment-proof
                            proof system-id timeline segment namespace bytes))))))))

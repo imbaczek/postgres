@@ -160,7 +160,7 @@ def restore_then_stream(root, source_port, target_port):
     archive.mkdir()
     archive_command = f'cp -- "%p" {shlex.quote(str(archive))}/"%f"'
     restore_command = (
-        f'echo "%f" >> {shlex.quote(str(attempts))}; '
+        f'printf "%%s %%s\\n" "%f" "%r" >> {shlex.quote(str(attempts))}; '
         f'test -f {shlex.quote(str(archive))}/"%f" && cp -- {shlex.quote(str(archive))}/"%f" "%p"'
     )
     args = [str(follow.BASE / "pg-lisp.sh"), "-D", str(source_data), "-p", str(source_port),
@@ -205,7 +205,8 @@ def restore_then_stream(root, source_port, target_port):
             attempts.unlink(missing_ok=True)
             assert node.start(timeout=90) is True
             rows = "SELECT count(*), max(id) FROM archive_probe"
-            follow.wait_for(lambda: attempts.is_file() and proof_name in attempts.read_text().splitlines())
+            first_attempt = f"{proof_name} 0000000000000000.wal"
+            follow.wait_for(lambda: attempts.is_file() and first_attempt in attempts.read_text().splitlines())
             assert follow.query(target_port, rows) == [(0, None)]
             withheld.rename(proof)
             follow.wait_for(lambda: follow.query(

@@ -868,6 +868,26 @@
                   (sb-posix:syscall-error (condition)
                     (= sb-posix:esrch (sb-posix:syscall-errno condition))))))))))
 
+(deftest archive-restore-cutoff-uses-durable-floor-and-filename-grammar
+    (with-physical-store-directory (root)
+      (let* ((start (+ pg::+wal-segment-size+ 32))
+             (store (pg::physical-store-open root 123 1 :create t :start-lsn start))
+             (pg::*physical-receive-store* store)
+             (pg::*physical-recovery-state* (list :system-id 123 :timeline 1 :end start))
+             (pg::*physical-recovery-failed-p* nil)
+             (pg::*physical-shutdown-state* nil)
+             (runtime (pg::make-physical-follow-runtime)))
+        (unwind-protect
+             (progn
+               (ok (equal "0000000000000001.wal"
+                          (pg::physical-follow-archive-restart-file runtime :legacy)))
+               (ok (equal "000000010000000000000001.wal"
+                          (pg::physical-follow-archive-restart-file runtime :timeline)))
+               (ok (equal "restore x %f %r %"
+                          (pg::wal-shell-file-command "restore %f %p %r %%" "x" "%f" "restore_command"
+                                                      :restart-file "%r"))))
+          (pg::physical-store-close store)))))
+
 (deftest native-receiver-restores-before-streaming-at-durable-cursor
     (with-physical-store-directory (root)
       (let* ((pg::*pgdata* root)

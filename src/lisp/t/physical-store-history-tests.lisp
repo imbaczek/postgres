@@ -453,7 +453,11 @@
                  (ok (= (+ segment 56) (pg::physical-store-floor-lsn reopened)))
                  (ok (= digest (pg::physical-store-floor-digest reopened)))
                  (ok (= (+ segment 88) (pg::physical-store-flushed-lsn reopened)))
-                 (ok (= 2 (pg::physical-store-prefix-timeline reopened (+ segment 56)))))
+                 (ok (= 2 (pg::physical-store-prefix-timeline reopened (+ segment 56))))
+                 (let ((pg::*physical-receive-store* reopened))
+                   (ok (equal "000000020000000000000001.wal"
+                              (pg::physical-follow-archive-restart-file
+                               (pg::make-physical-follow-runtime) :timeline)))))
             (pg::physical-store-close reopened))))))
 
 (deftest receive-history-successive-selections-preserve-all-ancestry
