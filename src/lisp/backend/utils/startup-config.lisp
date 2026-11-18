@@ -718,6 +718,7 @@ commit timestamp tracking off, and each listed recovery target empty.
 Return SETTINGS after validation."
   (unless (member (startup-setting-value settings "wal_level") '("replica" "logical") :test #'equal)
     (error "wal_level=minimal requires unimplemented minimal WAL generation"))
+  ;; Configuration inspection can report an archive mode that server admission rejects.
   (unless (or *startup-inspect-archive-settings-p*
               (equal "off" (startup-setting-value settings "archive_mode")))
     (error "archive_mode requires unimplemented WAL archiving"))
@@ -1170,10 +1171,8 @@ SELECT current_setting or pg_settings may first wait while settling a snapshot."
 
 (defun startup-settings-row (name entry &optional (configuration (startup-capture-configuration)))
   "Expose actual installed settings in guc_funcs.c column units and provenance.
-WAL level and synchronous commit enum values list supported canonical names;
-aliases are hidden. Other rows have NULL enum values. CONFIGURATION supplies the
-slot policy and provenance from the same root as ENTRY, without rereading the
-environment."
+List canonical enum names for WAL level, archive mode and synchronous commit.
+CONFIGURATION supplies slot policy and provenance from the same root as ENTRY."
   (let* ((spec (assoc name *startup-setting-specs* :test #'string=))
          (source (getf entry :source))
          (unit (case (seventh spec) (:seconds "s") (:milliseconds "ms")
