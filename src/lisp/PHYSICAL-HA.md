@@ -90,7 +90,8 @@ Two recovery areas still need work.
    tests. Edits between nonempty restore command templates preserve the
    current generation. Changing the command also preserves the generation
    when a streaming source is configured.
-   Recovery from archived timeline history and partial segments remains open.
+   Archive timeline discovery and a live descendant test of partial restore
+   remain open.
    Startup from an archive without a prior native receive state still needs
    qualification.
    Offline rewind has a separate restore path. Archive producer work still needs
@@ -148,7 +149,8 @@ Three focused tests passed, including a compacted descendant floor.
 C describes `%r` as the oldest WAL file needed for restart
 (`src/backend/access/transam/xlogarchive.c:141`). Native filename suffixes,
 legacy names, and proof files differ, so archive cleanup tools must understand
-those names. History and partial recovery and archive cleanup remain open.
+those names. Archive timeline discovery, live bound descendant partial restore,
+and archive cleanup remain open.
 
 Native WAL can rotate early when the next record will not fit. The closed
 segment can be shorter than 16 MiB. Rotation syncs the old stream and its
@@ -271,6 +273,17 @@ WAL archiving available. The live Patroni case recorded completion for the
 1,807,425-byte partial and compared the archived bytes against the local child
 prefix. The full-file archive name was absent. The run took 27.28 s. Strict
 compilation and eight focused heads took 63.22 s.
+
+Promotion partials now receive a proof after the partial archive receipt. Restore
+accepts a partial only when its proof matches the requested segment and the exact
+selected fork. A data receipt allows a proof retry after the child WAL has been
+recycled. Older partials without proofs require a regenerated proof before restore.
+The pinned Patroni `archive-promotion-history` run verified that both the partial
+and its proof reached the archive in 27.03 s on the ramdisk. Five focused tests
+passed in 1.92 s, covering exact and mismatched fork selection, missing and
+matching proofs, and retry after child recycling using the data receipt. The
+fork-selection tests simulated the runtime boundary. A live bound descendant
+partial restore and archive timeline discovery remain open.
 
 The `rewind-worker-target-archive` case uses the native archiver on a divergent
 former primary to produce the WAL segment that contains the common fork.
