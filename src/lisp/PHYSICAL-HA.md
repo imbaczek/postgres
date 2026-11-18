@@ -21,8 +21,12 @@ existing file prefix against a verified replay before appending missing bytes.
 The crash rehearsal killed both the initial receive and the first repair. A
 killed repair can leave a private replay workspace. Recovery requires any
 surviving prefix to match the image, so a torn write can require manual repair.
-Remaining work includes retrieving missing target WAL from an archive and
-covering the remaining stock Patroni rewind queries.
+Stock Patroni 4.1.5 reads the stopped target's `restore_command` and invokes
+`pg_rewind --restore-target-wal` with an external configuration file. The
+test refuses missing WAL with restore disabled, refuses a truncated archive
+segment, and rejoins using valid WAL.
+Native rewind keeps fetched segments in a private cache outside PGDATA.
+Remaining work includes covering the other stock Patroni rewind queries.
 C `pg_rewind` uses the target WAL to identify changed pages. Native rewind
 reuses whole matching relation files. C physical WAL and disk interoperability
 are outside the verified behavior.

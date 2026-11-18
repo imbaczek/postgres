@@ -944,9 +944,11 @@
    receipt and repair of a READY image, and during journaled install, follow
    configuration, and retirement. The interrupted-receive test retains the
    original stage and file inodes across both kills. A killed repair can leave
-   a private replay workspace. Missing target WAL still needs archive
-   retrieval. C pg_rewind builds a changed-page map from target WAL. Native
-   rewind reuses whole matching relation files.
+   a private replay workspace. Stock Patroni selects `--restore-target-wal`
+   from the stopped target's configuration. The live test retrieves missing
+   native WAL into a private cache, rejects a truncated archive, and rejoins.
+   C pg_rewind builds a changed-page map from target WAL. Native rewind
+   reuses whole matching relation files.
   Coordination stays outside this backend work.
 
 - [x] Keep ready native physical senders through the primary shutdown checkpoint.
