@@ -70,8 +70,8 @@ unsupported. The separate control REPL does not use this policy.
 password-backed primary. It uses libpq to derive a verifier from the first
 line of the password file and stores the verifier in a private file in PGDATA.
 The server uses OpenSSL 3 for SCRAM proof verification. Native physical backups
-preserve HBA policy. Verifier transfer and password management for additional
-roles still need implementation.
+preserve HBA policy and the private bootstrap verifier. Password management
+for additional roles remains open.
 
 On first initialization, missing implicit policy files located in owned PGDATA are
 created without replacing existing files. Once the initialization marker exists,

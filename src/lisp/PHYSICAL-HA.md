@@ -29,8 +29,9 @@ Three areas still separate this evidence from closeout:
    horizons. Cold startup rejects horizons it cannot verify across a
    checkpoint. Catalog feedback and Patroni's logical slot readiness and
    slot copy path still need acceptance.
-2. Exercise post-bootstrap role provisioning through stock Patroni and carry
-   bootstrap credentials through native physical backup and rejoin.
+2. Exercise post-bootstrap role provisioning through stock Patroni and verify
+   password-backed rewind and rejoin. Native streaming clone already preserves
+   the bootstrap verifier and passes a login check.
 3. Qualify archive recovery with a configured streaming source across a
    timeline fork, and settle archive backlog and cleanup behavior. State the
    tested rewind topology and interruption limits in the supported lifecycle
@@ -5134,10 +5135,16 @@ incorrect passwords across a cold restart, and verified that a stalled
 handshake times out while the next connection succeeds. Two focused
 admission and HBA tests passed.
 
+The native streaming backup fixture uses the C `pg_basebackup -X stream`
+client. The clone preserves the exact verifier bytes at mode `0600` and
+accepts the correct password and rejects an incorrect password after it
+starts. The fixture took 24.23 s on the ramdisk. Three focused Rove tests
+passed, including checks for a missing, oversized, or non-private verifier.
+
 Distinct backend gaps remain:
 
-- `post_bootstrap` role provisioning and verifier transfer through native
-  physical backup and rejoin still need implementation and acceptance.
+- `post_bootstrap` role provisioning and password-backed rewind and rejoin
+  still need acceptance.
 - Patroni-managed logical-slot synchronization needs separate work and testing,
   including `hot_standby_feedback`, `pg_read_binary_file` and C slot files.
 
