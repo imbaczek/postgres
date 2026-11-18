@@ -60,11 +60,9 @@ Three items remain for backend closeout.
    stock Patroni 4.1.5. Include generated configuration, utility invocation,
    connection recovery, and the supported slot and synchronous settings. Keep
    leadership supplied by the harness.
-2. Complete the server-side archive comparison against C. Qualify interruption
-   during command execution and receipt publication, cover timeline history
-   and promotion, add standby
-   `archive_mode=always`, and use an archive produced by the worker for
-   stopped-target restore.
+2. Complete the server-side archive comparison against C. Cover timeline
+   history and promotion, add standby `archive_mode=always`, and use an archive
+   produced by the worker for stopped-target restore.
 3. Expand native rewind beyond the qualified immediate-child topology, or
    record that limit in the supported contract. C can find a common ancestor
    further back in the timeline histories. Also decide how to handle torn local
@@ -156,6 +154,20 @@ Both runs preserved all 2,550 rows. Each archived file still matched the
 16,774,077 source bytes after the source segment was recycled. The runs took
 19 s and 18 s at one-second resolution. The archive command had returned
 before each kill.
+
+A separate run killed the primary while an archive shell was waiting before
+opening its source. The shell survived the kill and overlapped the successful
+retry on the new primary. When released, it reported that its old source path
+was gone. The run took 19 s. A command that has already opened the source or
+started writing the destination still needs to tolerate an overlapping retry.
+
+Two receipt publication tests used process SIGKILL at specified points. After
+the receipt file sync and before rename, restart ran the command again and
+published completion. After rename and before the status directory sync, the
+visible receipt survived in the running kernel and restart skipped the command.
+Both tests verified the archive bytes after checkpoint recycled the source
+and checked that all 2,550 rows survived. They took 22 s and 21 s, respectively.
+These tests exercise process crashes while the operating system stays up.
 
 The recycle path must preserve archive-eligible files until durable success
 is recorded. Reconstruct pending work after restart from durable WAL and status,
