@@ -613,6 +613,19 @@ The configuration lock is released before inspecting the store."
          (startup-configuration-timeout configuration)
          (startup-configuration-wal-bytes configuration))))))
 
+(defun physical-recovery-archive-receive-step ()
+  "Stage durable receive WAL while admission keeps the receive store alive."
+  (with-live-operation-if-admitted
+    (when (and *physical-receive-store* (recovery-in-progress-p)
+               (not *physical-recovery-failed-p*)
+               (not (member *physical-shutdown-state* '(:prepared :failed))))
+      (handler-case (physical-store-stage-receive-archive *physical-receive-store*)
+        (physical-archive-staging-error (condition)
+          (admin-log "standby receive WAL staging will retry: ~a" condition))
+        (error (condition)
+          (setf *physical-recovery-failed-p* t)
+          (admin-log "standby receive WAL staging failed: ~a" condition))))))
+
 (defun physical-recovery-restartpoint-core (&key stage-archive)
   "Publish while admission pins replay, or while this thread owns quiescence.
 Never acquire the reload mutex here: a replayer may own it while draining SQL."
@@ -627,8 +640,11 @@ Never acquire the reload mutex here: a replayer may own it while draining SQL."
   (let ((finished nil))
     (unwind-protect
          (let ((lsn (handler-case
-                        (physical-store-compact *physical-receive-store* *last-replay-lsn*
-                                                #'physical-restartpoint-publish :stage-archive stage-archive)
+                        (progn
+                          (when (startup-standby-wal-archive-enabled-p)
+                            (physical-store-stage-receive-archive *physical-receive-store*))
+                          (physical-store-compact *physical-receive-store* *last-replay-lsn*
+                                                  #'physical-restartpoint-publish :stage-archive stage-archive))
                       (physical-archive-staging-error (condition)
                         (unless (physical-store-failed-p *physical-receive-store*)
                           (setf finished t))

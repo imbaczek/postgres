@@ -132,20 +132,81 @@ Return the staged name and proved end, or NIL until the segment is closed."
       (let ((name (wal-segment-filename segment timeline :timeline)))
         (values (wal-archive-stage-source directory-fd name bytes check-directory) end)))))
 
+(defun physical-store-archive-candidates-under-lock (store start limit)
+  "List candidate timeline and segment pairs from both receive tiers."
+  (let ((pairs (make-hash-table :test #'equal))
+        (root (physical-store-retained-root store)))
+    (flet ((note (timeline segment)
+             (when (<= start segment (1- limit))
+               (setf (gethash (list timeline segment) pairs) t))))
+      (multiple-value-bind (segment offset) (floor (physical-store-base-lsn store) +wal-segment-size+)
+        (when (plusp offset)
+          (note (physical-store-timeline store) segment)))
+      (dolist (entry (physical-store-history-segment-entries store))
+        (note (first entry) (second entry)))
+      (when root
+        (physical-store-read-retained-control store (physical-store-control-tuple store))
+        (let ((inventory (physical-retained-inventory-read-index
+                          (physical-store-retained-directory store) root
+                          (physical-store-retained-identity store)
+                          (physical-store-retained-history store))))
+          (dolist (entry (getf inventory :entries))
+            (let ((metadata (third entry)))
+              (note (getf metadata :file-timeline) (getf metadata :segment)))))))
+    (sort (loop for pair being the hash-keys of pairs collect pair)
+          (lambda (left right)
+            (or (< (second left) (second right))
+                (and (= (second left) (second right)) (< (first left) (first right))))))))
+
+(defun physical-store-stage-archive-candidates-under-lock (store entries stage-archive)
+  "Verify each candidate and return any staging callback error without fencing STORE."
+  (dolist (entry entries)
+    (destructuring-bind (timeline segment &rest ignored) entry
+      (declare (ignore ignored))
+      (let ((bytes (physical-store-live-archive-segment-under-lock store timeline segment)))
+        (when bytes
+          (handler-case (funcall stage-archive timeline segment bytes)
+            (error (condition)
+              (return condition))))))))
+
+(defun physical-store-stage-receive-archive (store)
+  "Stage complete segments through durable receipt, independently of replay."
+  (flet ((start ()
+           (or (physical-store-archive-scan-limit store)
+               (floor (physical-store-base-lsn store) +wal-segment-size+)))
+         (limit ()
+           (floor (physical-store-flushed-lsn store) +wal-segment-size+)))
+    (when (< (start) (limit))
+      (handler-case
+          (call-with-standby-wal-archive-directory
+           (lambda (fd check-directory)
+             (let ((failure
+                     (with-physical-store (store)
+                       (let* ((limit (limit))
+                              (entries (physical-store-archive-candidates-under-lock store (start) limit))
+                              (failure
+                                (physical-store-stage-archive-candidates-under-lock
+                                 store entries
+                                 (lambda (timeline segment bytes)
+                                   (wal-archive-stage-source
+                                    fd (wal-segment-filename segment timeline :timeline) bytes check-directory)))))
+                         (unless failure
+                           (setf (physical-store-archive-scan-limit store) limit))
+                         failure))))
+               (when failure (error failure)))))
+        (error (condition)
+          (if (physical-store-failed-p store)
+              (error condition)
+              (error 'physical-archive-staging-error :cause condition)))))))
+
 (defun physical-store-stage-compaction-archive-under-lock (store cursor stage-archive)
-  "Give STAGE-ARCHIVE each closed receive segment that compaction can remove.
-The callback must durably stage the bytes before returning and must not call
+  "Stage closed receive segments that compaction can remove.
+STAGE-ARCHIVE must durably stage the bytes before returning and must not call
 back into STORE. Return the callback's error without fencing the receive store."
-  (let ((limit (floor cursor +wal-segment-size+)))
-    (dolist (entry (physical-store-history-segment-entries store))
-      (destructuring-bind (timeline segment path) entry
-        (declare (ignore path))
-        (when (< segment limit)
-          (let ((bytes (physical-store-live-archive-segment-under-lock store timeline segment)))
-            (when bytes
-              (handler-case (funcall stage-archive timeline segment bytes)
-                (error (condition)
-                  (return-from physical-store-stage-compaction-archive-under-lock condition))))))))))
+  (let* ((limit (floor cursor +wal-segment-size+))
+         (entries (remove-if-not (lambda (entry) (< (second entry) limit))
+                                 (physical-store-history-segment-entries store))))
+    (physical-store-stage-archive-candidates-under-lock store entries stage-archive)))
 
 (defun physical-retained-seal-start-group (seal record timeline)
   "Start a segment group using the verified prefix, coalescing the latest entry when possible."

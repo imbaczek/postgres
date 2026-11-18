@@ -4656,23 +4656,28 @@ Ensure its ready marker is durable and return the item and storage epoch."
 
 (declaim (ftype function startup-standby-wal-archive-enabled-p))
 
+(declaim (ftype function physical-recovery-archive-receive-step))
+
 (defun wal-archiver-step ()
   (let ((template (startup-archive-command)))
     (when (and template (plusp (length template)))
-      (or (and (startup-standby-wal-archive-enabled-p)
-               (handler-case (wal-archiver-step-staged template)
-                 (error (condition)
-                   (warn "staged WAL archiver will retry: ~a" condition)
-                   nil)))
-          (multiple-value-bind (item epoch)
-              (sb-thread:with-mutex (*wal-lock*)
-                (wal-archive-pending-item-under-lock))
-            (when item
-              (if (wal-archive-attempt item template :epoch epoch)
-                  t
-                  (progn
-                    (warn "archive_command failed for WAL item ~a; will retry" item)
-                    nil))))))))
+      (let ((standby-archive-p (startup-standby-wal-archive-enabled-p)))
+        (when standby-archive-p
+          (physical-recovery-archive-receive-step))
+        (or (and standby-archive-p
+                 (handler-case (wal-archiver-step-staged template)
+                   (error (condition)
+                     (warn "staged WAL archiver will retry: ~a" condition)
+                     nil)))
+            (multiple-value-bind (item epoch)
+                (sb-thread:with-mutex (*wal-lock*)
+                  (wal-archive-pending-item-under-lock))
+              (when item
+                (if (wal-archive-attempt item template :epoch epoch)
+                    t
+                    (progn
+                      (warn "archive_command failed for WAL item ~a; will retry" item)
+                      nil)))))))))
 
 (defun wal-archiver-try-step ()
   (handler-case (wal-archiver-step)
