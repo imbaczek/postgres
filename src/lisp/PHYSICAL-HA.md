@@ -26,7 +26,10 @@ Stock Patroni 4.1.5 reads the stopped target's `restore_command` and invokes
 test refuses missing WAL with restore disabled, refuses a truncated archive
 segment, and rejoins using valid WAL.
 Native rewind keeps fetched segments in a private cache outside PGDATA.
-Remaining work includes covering the other stock Patroni rewind queries.
+With no checkpoint hint, stock Patroni checks the source timeline through SQL
+and completes rewind and rejoin. The fixture uses distinct connection settings
+with the same login. Offline configuration queries report `archive_mode` and
+`archive_command`. Server-side WAL archiving remains open.
 C `pg_rewind` uses the target WAL to identify changed pages. Native rewind
 reuses whole matching relation files. C physical WAL and disk interoperability
 are outside the verified behavior.

@@ -947,6 +947,8 @@
    a private replay workspace. Stock Patroni selects `--restore-target-wal`
    from the stopped target's configuration. The live test retrieves missing
    native WAL into a private cache, rejects a truncated archive, and rejoins.
+   Stock Patroni also passes its source checkpoint query with no leader hint
+   and reads the disabled archive settings through `postgres -C`.
    C pg_rewind builds a changed-page map from target WAL. Native rewind
    reuses whole matching relation files.
   Coordination stays outside this backend work.
