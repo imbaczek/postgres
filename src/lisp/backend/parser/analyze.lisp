@@ -1004,7 +1004,8 @@ then argument types. Only ambiguity and type failures carry the cast hint."
          (make-sql-record
           :fields +physical-slot-advance-result-fields+
           :values (vector (first arguments)
-                          (wal-advance-physical-replication-slot (first arguments) (second arguments)))))
+                          (wal-advance-physical-replication-slot
+                           (first arguments) (second arguments) :allow-standby-logical t))))
         (t (wal-drop-replication-slot (first arguments)) nil))))
 
 (defun analyze-call-argument-list (name arguments table &optional variadic schema)

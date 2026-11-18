@@ -1547,19 +1547,37 @@ the feedback send and network completion run outside the fence."
       (with-live-operation (physical-follow-require-runtime-generation runtime)))))
 
 (defun physical-follow-data-feedback-xmin ()
-  "Return the data horizon at a complete, applied source transaction boundary.
-Include local readers and physical slots. Return NIL until replay supplies
-complete source XID coverage."
-  (let ((xmin
-          (sb-thread:with-mutex (*xid-lock*)
-            (let ((source (getf *physical-recovery-state* :source-xids)))
-              (when (and (getf source :complete)
-                         (eql *next-xid* (getf source :next-xid))
-                         (eql *last-replay-lsn* (getf source :through)))
-                (let ((snapshot-xmin (oldest-active-snapshot-xmin)))
-                  (reduce #'min (getf source :running)
-                          :initial-value (min *next-xid* (or snapshot-xmin *next-xid*)))))))))
-    (when xmin (wal-limit-xmin-by-physical-feedback xmin))))
+  "Return the data and catalog horizons at a complete, applied source transaction boundary.
+Include local readers and slot pins. Return NIL until replay supplies complete
+source XID coverage."
+  (multiple-value-bind (xmin recovery-state replay-lsn next-xid)
+      (sb-thread:with-mutex (*xid-lock*)
+        (let ((source (getf *physical-recovery-state* :source-xids)))
+          (when (and (getf source :complete)
+                     (eql *next-xid* (getf source :next-xid))
+                     (eql *last-replay-lsn* (getf source :through)))
+            (let ((snapshot-xmin (oldest-active-snapshot-xmin)))
+              (values (reduce #'min (getf source :running)
+                              :initial-value (min *next-xid* (or snapshot-xmin *next-xid*)))
+                      *physical-recovery-state*
+                      *last-replay-lsn* *next-xid*)))))
+    (when xmin
+      (let* ((system-id (getf recovery-state :system-id))
+             (history (when (and system-id (getf recovery-state :timeline))
+                        (physical-recovery-resource-history *physical-receive-store* recovery-state))))
+        (wal-physical-feedback-horizons xmin :logical-system-id system-id
+                                             :replay-lsn replay-lsn :next-xid next-xid
+                                             :logical-history history
+                                             :logical-policy (getf recovery-state :source-logical-fact))))))
+
+(defun physical-follow-horizon-feedback-payload (timestamp xmin catalog-xmin)
+  (let ((payload (make-payload)))
+    (payload-push-byte payload (char-code #\h))
+    (pg-client-push-u64 payload timestamp)
+    (dolist (horizon (list xmin catalog-xmin))
+      (payload-push-u32 payload (if horizon (xid32-of horizon) 0))
+      (payload-push-u32 payload (if horizon (ldb (byte 32 32) horizon) 0)))
+    payload))
 
 (defun physical-follow-send-horizon-feedback (client runtime sent-at sent-enabled)
   "Send periodic data feedback to the source, or clear it when disabled.
@@ -1575,20 +1593,30 @@ before sending an enabled report."
                (or (not (eql enabled sent-enabled))
                    (and enabled (>= (- now sent-at)
                                     (* interval internal-time-units-per-second)))))
-      (let ((xmin (with-physical-follow-generation-operation
-                    (physical-follow-require-runtime-generation runtime)
-                    (check-recovery-available)
-                    (when enabled (physical-follow-data-feedback-xmin)))))
+      (multiple-value-bind (xmin catalog-xmin)
+          (with-physical-follow-generation-operation
+            (physical-follow-require-runtime-generation runtime)
+            (check-recovery-available)
+            (when enabled (physical-follow-data-feedback-xmin)))
         (when (or (not enabled) (running-xacts-normal-xid-p xmin))
-          (let ((payload (make-payload)))
-            (payload-push-byte payload (char-code #\h))
-            (pg-client-push-u64 payload (postgres-current-timestamp))
-            (payload-push-u32 payload (if xmin (xid32-of xmin) 0))
-            (payload-push-u32 payload (if xmin (ldb (byte 32 32) xmin) 0))
-            (pg-client-push-u64 payload 0)
+          (let ((payload (physical-follow-horizon-feedback-payload
+                          (postgres-current-timestamp) xmin catalog-xmin)))
             (sb-ext:with-timeout 10 (physical-client-feedback client payload)))
           (return-from physical-follow-send-horizon-feedback (values now enabled)))))
     (values sent-at sent-enabled)))
+
+(defun physical-follow-admit-logical-slots (runtime)
+  "Publish copied slots once this receiver has replayed their required WAL."
+  (when (some #'logical-slot-standby-entry-covered-p *standby-logical-slots-awaiting-replay*)
+    ;; A lifecycle owner can hold either lock while joining this receiver.
+    (sb-thread:with-mutex (*physical-follow-command-lock* :wait-p nil)
+      (sb-thread:with-mutex (*reload-run-lock* :wait-p nil)
+        (with-live-operation-quiescence
+          (call-with-physical-follow-generation-fence
+           (lambda ()
+             (physical-follow-require-runtime-generation runtime)
+             (check-recovery-available)
+             (logical-slot-admit-replayed-standby-entries *physical-receive-store*))))))))
 
 (defun physical-follow-copy-stream (client runtime)
   (physical-follow-monitor-connected runtime)
@@ -1605,6 +1633,7 @@ before sending an enabled report."
                     (physical-follow-finish-bound-stream client runtime)))
                  (:idle nil)
                  (otherwise (physical-follow-reject "unexpected native replication frame"))))
+             (physical-follow-admit-logical-slots runtime)
              (multiple-value-setq (sent-at sent-enabled)
                (physical-follow-send-horizon-feedback client runtime sent-at sent-enabled))
              (physical-follow-feedback client runtime))))

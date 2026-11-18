@@ -73,19 +73,24 @@
   (multiple-value-prog1 (logical-wal-cursor-next cursor)
     (logical-slot-startup-check-authority source)))
 
-(defun logical-slot-startup-scan-pending (source slot cursor)
-  ;; The caller establishes candidate and cursor authority before this scan.
+(defun logical-slot-rebuild-pending-from-cursor (slot cursor end next-record)
+  "Rebuild unconfirmed transaction positions along the caller's checked cursor."
   (let ((progress (make-logical-slot-startup-progress (wal-replication-slot-confirmed-flush-lsn slot)))
         (*wal-recovery-reservation-batch-clean-p* nil))
     (loop
       (multiple-value-bind (record bytes record-owner carrier kind)
-          (logical-slot-startup-next-record source cursor)
+          (funcall next-record cursor)
         (declare (ignore bytes record-owner carrier))
         (unless record (return))
         (logical-slot-startup-accept-record progress record kind)))
-    (unless (= (logical-wal-cursor-position cursor) (logical-slot-startup-source-end source))
-      (error "startup pending reconstruction did not reach its captured horizon"))
+    (unless (= (logical-wal-cursor-position cursor) end)
+      (error "pending reconstruction did not reach its captured horizon"))
     (logical-slot-startup-progress-pending progress)))
+
+(defun logical-slot-startup-scan-pending (source slot cursor)
+  (logical-slot-rebuild-pending-from-cursor
+   slot cursor (logical-slot-startup-source-end source)
+   (lambda (cursor) (logical-slot-startup-next-record source cursor))))
 
 (defun logical-slot-startup-derive-pending-with-cursor (source slot cursor)
   ;; Reuse the pending reconstruction for this exact captured source,
@@ -225,11 +230,15 @@
       (t :insufficient))))
 
 (defun logical-slot-startup-check-eligibility (source slot)
-  ;; Reserved slots currently require local anchors and current logical ON.
-  ;; Ancestral or imported generation and lifetime, and uninterrupted ON/OFF
-  ;; evidence, require a later eligibility proof.
-  (unless (logical-slot-startup-local-anchor-p slot (logical-slot-startup-source-history source))
-    (error "ancestral logical slot startup requires lifetime and import eligibility"))
+  (let ((history (logical-slot-startup-source-history source)))
+    (unless (logical-slot-startup-local-anchor-p slot history)
+      (let ((metadata (nth-value 6 (wal-read-control-fields))))
+        (unless (and (getf metadata :logical-slot-evidence-digest)
+                     (logical-slot-promotion-evidence-covers-slot-p
+                      (logical-slot-promotion-read-committed-evidence
+                       metadata (logical-slot-startup-source-timeline source) history)
+                      slot))
+          (error "ancestral logical slot startup requires lifetime and import eligibility")))))
   (sb-thread:with-mutex (*wal-lock*)
     (logical-slot-startup-check-source source)
     (let* ((policy (wal-checked-logical-policy-under-lock))

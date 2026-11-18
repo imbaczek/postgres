@@ -409,15 +409,18 @@ five integers as a list so EQUAL compares metadata without case-folding strings.
       metadata)))
 
 (defun wal-control-metadata-valid-p (metadata)
-  (and (listp metadata) (member (length metadata) '(6 8 10 12 14 16))
+  (and (listp metadata) (member (length metadata) '(6 8 10 12 14 16 18))
        (let ((keys (loop for (key value) on metadata by #'cddr collect key)))
          (and (= (/ (length metadata) 2) (length (remove-duplicates keys)))
               (null (set-difference '(:system-id :db-state :state-time) keys))
               (null (set-difference keys '(:system-id :db-state :state-time :retained-reference
                                            :resource-parameters :resource-lsn :resource-timeline
-                                           :page-checksum-version)))
+                                           :page-checksum-version :logical-slot-evidence-digest)))
               (or (not (member :page-checksum-version keys))
                   (eql 1 (getf metadata :page-checksum-version)))
+              (or (not (member :logical-slot-evidence-digest keys))
+                  (and (member :retained-reference keys)
+                       (typep (getf metadata :logical-slot-evidence-digest) '(unsigned-byte 64))))
               (or (not (member :retained-reference keys))
                   (wal-retained-reference-valid-p (getf metadata :retained-reference)))))
        (typep (getf metadata :system-id) '(unsigned-byte 64))
@@ -439,6 +442,8 @@ five integers as a list so EQUAL compares metadata without case-folding strings.
           (when (getf metadata :retained-reference)
             (list :retained-reference (copy-list (getf metadata :retained-reference))))
           (wal-copy-control-resource-fields metadata)
+          (when (getf metadata :logical-slot-evidence-digest)
+            (list :logical-slot-evidence-digest (getf metadata :logical-slot-evidence-digest)))
           (when (getf metadata :page-checksum-version)
             (list :page-checksum-version (getf metadata :page-checksum-version)))))
 
@@ -447,8 +452,9 @@ five integers as a list so EQUAL compares metadata without case-folding strings.
 Return the copied metadata and whether either field was removed."
   (let* ((copy (copy-list metadata))
          (removed-reference (remf copy :retained-reference))
+         (removed-logical-evidence (remf copy :logical-slot-evidence-digest))
          (removed-checksum (remf copy :page-checksum-version)))
-    (values copy (or removed-reference removed-checksum))))
+    (values copy (or removed-reference removed-logical-evidence removed-checksum))))
 
 (defun wal-encode-control-image (checkpoint durable snapshot
                                  &key (timeline 1) (namespace :legacy) metadata
@@ -492,6 +498,9 @@ The CRC covers all fields before the CRC itself."
                      (format nil "~a R ~a ~d ~d" prefix (wal-resource-parameters-hex parameters)
                              (getf metadata :resource-lsn) (getf metadata :resource-timeline))
                      prefix))
+         (prefix (if (getf metadata :logical-slot-evidence-digest)
+                     (format nil "~a L ~d" prefix (getf metadata :logical-slot-evidence-digest))
+                     prefix))
          (prefix (if (getf metadata :page-checksum-version)
                      (format nil "~a C1" prefix)
                      prefix))
@@ -504,7 +513,12 @@ The control CRC does not verify relation pages. Legacy resource facts may be unk
   (let* ((fields (and line (wal-split-fields line)))
          (version (first fields))
          (v6 (equal version "PGWAL6"))
-         (checksum-p (and v6 (member (length fields) '(12 16 18 22))))
+         (checksum-p (and v6 (member (length fields) '(12 16 18 20 22 24))))
+         (base-fields (if checksum-p (append (butlast fields 2) (last fields)) fields))
+         (logical-evidence-p (and v6 (member (length base-fields) '(19 23))))
+         (metadata-fields (if logical-evidence-p
+                              (append (butlast base-fields 3) (last base-fields))
+                              base-fields))
          (identities (member version '("PGWAL5" "PGWAL6") :test #'equal))
          (v4 (equal version "PGWAL4"))
          (checkpoint (handler-case-noninterrupt (parse-integer (second fields)) (condition nil)))
@@ -515,9 +529,10 @@ The control CRC does not verify relation pages. Legacy resource facts may be unk
                                  ((equal (sixth fields) "timeline") :timeline))
                         :legacy))
          (crc (handler-case-noninterrupt (parse-integer (car (last fields)) :radix 16) (condition nil))))
-    (unless (and (cond (v6 (if checksum-p
-                               (equal "C1" (first (last fields 2)))
-                               (member (length fields) '(8 11 15 17 21))))
+    (unless (and (cond (v6 (and (member (length metadata-fields) '(8 11 15 17 21))
+                                (or (not checksum-p) (equal "C1" (first (last fields 2))))
+                                (or (not logical-evidence-p)
+                                    (equal "L" (first (last base-fields 3))))))
                        (identities (= (length fields) 7))
                        (v4 (= (length fields) 5))
                        (t (and (= (length fields) 4)
@@ -540,7 +555,15 @@ The control CRC does not verify relation pages. Legacy resource facts may be unk
       (let ((metadata
               (when v6
                 (wal-decode-control-metadata
-                 (if checksum-p (append (butlast fields 2) (last fields)) fields)))))
+                 metadata-fields))))
+        (when logical-evidence-p
+          (setf metadata
+                (append metadata
+                        (list :logical-slot-evidence-digest
+                              (handler-case-noninterrupt (parse-integer (first (last base-fields 2)))
+                                                         (condition nil)))))
+          (unless (wal-control-metadata-valid-p metadata)
+            (error "invalid logical slot evidence in primary control")))
         (when checksum-p
           (setf metadata (append metadata (list :page-checksum-version 1))))
         (unless (wal-control-resource-position-valid-p metadata durable timeline)

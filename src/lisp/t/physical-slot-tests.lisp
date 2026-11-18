@@ -369,9 +369,160 @@
       (let ((slot (physical-slot-test-object)))
         (setf (gethash "public_physical" pg::*wal-replication-slots*) slot
               (pg::physical-slot-horizons slot) '(36 33))
-        (ok (= 36 (pg::physical-follow-data-feedback-xmin))))
+        (ok (equal '(36 33) (multiple-value-list (pg::physical-follow-data-feedback-xmin))))
+        (setf (pg::wal-replication-slot-wal-status slot) :lost)
+        (ok (equal '(38 nil) (multiple-value-list (pg::physical-follow-data-feedback-xmin)))))
       (incf pg::*last-replay-lsn*)
       (ok (null (pg::physical-follow-data-feedback-xmin)))))
+
+(deftest standby-feedback-includes-only-covered-logical-catalog-pins
+    (let* ((pg::*wal-replication-slots* (make-hash-table :test #'equal))
+           (pg::*active-snapshot-set* (make-hash-table :test #'eq))
+           (pg::*next-xid* 55)
+           (pg::*last-replay-lsn* 128)
+           (pg::*physical-recovery-state*
+             (list :system-id 41 :timeline 1
+                   :source-logical-fact (list :enabled t :through 128 :coverage-start 16)
+                   :source-xids (list :complete t :next-xid 55 :through 128 :running '(40 49))))
+           (slot (pg::make-wal-replication-slot
+                  :name "logical" :kind :logical :wal-status :reserved
+                  :restart-lsn 32 :consistent-lsn 64 :confirmed-flush-lsn 96
+                  :catalog-xmin 33 :restart-timeline 1 :confirmed-timeline 1
+                  :logical-provenance (pg::make-logical-slot-provenance 41 1 64 1 nil nil))))
+      (setf (gethash "logical" pg::*wal-replication-slots*) slot)
+      (flet ((horizons () (multiple-value-list (pg::physical-follow-data-feedback-xmin))))
+        (ok (equal '(40 33) (horizons)))
+        (setf (getf (getf pg::*physical-recovery-state* :source-logical-fact) :logical-on-start-lsn) 65)
+        (ok (equal '(40 nil) (horizons)))
+        (setf (getf (getf pg::*physical-recovery-state* :source-logical-fact) :logical-on-start-lsn) 16)
+        (setf (pg::wal-replication-slot-confirmed-timeline slot) 2)
+        (ok (equal '(40 nil) (horizons)))
+        (setf (pg::wal-replication-slot-confirmed-timeline slot) 1
+              (pg::wal-replication-slot-confirmed-flush-lsn slot) 129)
+        (ok (equal '(40 nil) (horizons)))
+        (setf (pg::wal-replication-slot-confirmed-flush-lsn slot) 96
+              (pg::wal-replication-slot-wal-status slot) :lost)
+        (ok (equal '(40 nil) (horizons)))
+        (setf (pg::wal-replication-slot-wal-status slot) :reserved
+              (getf pg::*physical-recovery-state* :system-id) 42)
+        (ok (equal '(40 nil) (horizons))))))
+
+(deftest standby-logical-slot-rejects-state-replaced-during-proof
+    (with-physical-store-directory (root)
+      (let* ((pg::*pgdata* root)
+             (directory (pg::wal-replication-slot-directory))
+             (slot (pg::make-wal-replication-slot
+                    :name "copied_slot" :kind :logical :plugin "pgoutput" :database-oid 16384
+                    :invalidation-cause :none
+                    :restart-lsn 32 :consistent-lsn 64 :confirmed-flush-lsn 96
+                    :catalog-xmin 33 :restart-timeline 1 :confirmed-timeline 1
+                    :logical-provenance (pg::make-logical-slot-provenance 41 1 64 1)))
+             (bytes (pg::wal-encode-replication-slot slot))
+             (entry (pg::logical-slot-startup-entry-from-image
+                     bytes "copied_slot" #'pg::wal-decode-replication-slot-image)))
+        (pg::wal-ensure-directory-durable directory)
+        (pg::slot-state-create directory "copied_slot" bytes)
+        (ok (not (signals (pg::logical-slot-recheck-standby-entry entry) 'error)))
+        (let* ((physical (physical-slot-test-object))
+               (rows (list (list "copied_slot" (pg::bytes->string bytes)))))
+          (physical-slot-test-create-state physical)
+          (ok (signals (pg::physical-promotion-read-physical-slots) 'error))
+          (let ((slots (pg::physical-promotion-read-physical-slots :logical-rows rows)))
+            (ok (equal '("public_physical") (mapcar #'pg::wal-replication-slot-name slots))))
+          (ok (signals (pg::physical-promotion-read-physical-slots
+                        :logical-rows (cons (list "missing" (pg::bytes->string bytes)) rows))
+                       'error)))
+        (let ((pg::*wal-replication-slots* (make-hash-table :test #'equal)))
+          (setf (gethash "copied_slot" pg::*wal-replication-slots*)
+                (pg::logical-slot-startup-entry-slot entry))
+          (sb-thread:with-mutex (pg::*wal-lock*)
+            (let ((entries (pg::logical-slot-promotion-source-entries)))
+              (ok (= 1 (length entries)))
+              (ok (equalp bytes (pg::logical-slot-startup-entry-bytes (first entries)))))
+            (setf (pg::wal-replication-slot-confirmed-flush-lsn slot) 97)
+            (pg::slot-state-update directory "copied_slot" (pg::wal-encode-replication-slot slot))
+            (ok (signals (pg::logical-slot-promotion-source-entries) 'error))))
+        (ok (signals (pg::logical-slot-recheck-standby-entry entry) 'error)))))
+
+(deftest standby-logical-promotion-evidence-binds-images-to-fork
+    (let* ((slot (pg::make-wal-replication-slot
+                  :name "copied_slot" :kind :logical :plugin "pgoutput" :database-oid 16384
+                  :invalidation-cause :none :catalog-xmin 33
+                  :restart-lsn 32 :consistent-lsn 64 :confirmed-flush-lsn 97
+                  :restart-timeline 1 :confirmed-timeline 1
+                  :logical-provenance (pg::make-logical-slot-provenance 41 1 64 1)))
+           (row (list "copied_slot" (pg::bytes->string (pg::wal-encode-replication-slot slot))))
+           (reference '(:root-id 1 :base-timeline 1 :base 32 :manifest-digest 2
+                        :end 128 :end-digest 3))
+           (evidence (list :system-id 41 :parent-timeline 1 :child-timeline 2
+                           :fork 128 :retained-reference reference :slots (list row)))
+           (image (pg::logical-slot-promotion-evidence-image evidence)))
+      (ok (equal evidence (pg::logical-slot-promotion-evidence-decode image)))
+      (let ((bad (copy-list evidence)))
+        (setf (getf bad :system-id) 42)
+        (ok (signals (pg::logical-slot-promotion-evidence-image bad) 'error))
+        (setf (getf bad :system-id) 41
+              (getf bad :fork) 96)
+        (ok (signals (pg::logical-slot-promotion-evidence-image bad) 'error))
+        (setf (getf bad :fork) 128
+              (getf bad :slots) (list row row))
+        (ok (signals (pg::logical-slot-promotion-evidence-image bad) 'error)))
+      (with-physical-store-directory (root)
+        (let* ((pg::*pgdata* root)
+               (control (list :system-id 41 :timeline 1 :promotion-child 2
+                              :applied 128 :retained-reference reference)))
+          (ensure-directories-exist (merge-pathnames "global/" root))
+          (let* ((directory (pg::wal-replication-slot-directory))
+                 (slot-bytes (pg::string->bytes (second row)))
+                 (entry (pg::logical-slot-startup-entry-from-image
+                         slot-bytes (first row) #'pg::wal-decode-replication-slot-image)))
+            (pg::wal-ensure-directory-durable directory)
+            (pg::slot-state-create directory (first row) slot-bytes)
+            (multiple-value-bind (control-image pending)
+                (pg::physical-promotion-make-pending
+                 '(:system-id 41 :timeline 1 :manifest-digest 2 :checkpoint 32)
+                 '(:lsn 128 :next-xid 55) #() 5 :legacy 2 0 reference
+                 :promotion-logical-decoding-enabled t :promotion-wal-level :replica
+                 :logical-slot-source-entries (list entry))
+              (let ((encoded (pg::physical-recovery-decode-control control-image)))
+                (ok (eql (getf pending :logical-slot-evidence-digest)
+                         (getf encoded :logical-slot-evidence-digest)))
+                (ok (equal evidence (pg::logical-slot-promotion-read-evidence encoded))))))
+          (let* ((digest (pg::logical-slot-promotion-publish-evidence evidence))
+                 (path (pg::logical-slot-promotion-evidence-path digest)))
+            (setf (getf control :logical-slot-evidence-digest) digest)
+            (ok (= digest (pg::logical-slot-promotion-publish-evidence evidence)))
+            (ok (equal evidence (pg::logical-slot-promotion-read-evidence control)))
+            (let* ((history (pg::timeline-parse-history 2 (format nil "1 0/80 promotion~%")))
+                   (committed (pg::logical-slot-promotion-read-committed-evidence control 2 history)))
+              (ok (equal evidence committed))
+              (ok (pg::logical-slot-promotion-evidence-covers-slot-p committed slot))
+              (setf (pg::wal-replication-slot-confirmed-flush-lsn slot) 130)
+              (ok (pg::logical-slot-promotion-evidence-covers-slot-p committed slot))
+              (setf (pg::wal-replication-slot-confirmed-flush-lsn slot) 96)
+              (ok (not (pg::logical-slot-promotion-evidence-covers-slot-p committed slot)))
+              (let ((replacement
+                      (pg::make-wal-replication-slot
+                       :name "copied_slot" :kind :logical :plugin "pgoutput" :database-oid 16384
+                       :restart-lsn 32 :consistent-lsn 64 :confirmed-flush-lsn 130 :catalog-xmin 33
+                       :logical-provenance (pg::make-logical-slot-provenance 41 2 64 1))))
+                (ok (not (pg::logical-slot-promotion-evidence-covers-slot-p committed replacement)))))
+            (setf (getf control :promotion-child) 3)
+            (ok (signals (pg::logical-slot-promotion-read-evidence control) 'error))
+            (setf (getf control :promotion-child) 2)
+            (setf (aref image (- (length image) 2)) 0)
+            (ok (signals (pg::logical-slot-promotion-evidence-decode image) 'error))
+            (pg::wal-atomic-write-bytes path image)
+            (ok (signals (pg::logical-slot-promotion-read-evidence control) 'error))
+            (ok (signals (pg::logical-slot-promotion-publish-evidence evidence) 'error)))))))
+
+(deftest standby-feedback-packet-keeps-catalog-and-data-epochs-independent
+    (let ((packet (pg::physical-follow-horizon-feedback-payload
+                   1 (+ (ash 4 32) 23) (+ (ash 3 32) 17))))
+      (ok (equalp packet #(#x68 0 0 0 0 0 0 0 1 0 0 0 23 0 0 0 4 0 0 0 17 0 0 0 3))))
+  (let ((packet (pg::physical-follow-horizon-feedback-payload 0 nil nil)))
+    (ok (= 25 (length packet)))
+    (ok (every #'zerop (subseq packet 1)))))
 
 (deftest physical-slot-data-horizon-bounds-vacuum
     (let* ((pg::*wal-replication-slots* (make-hash-table :test #'equal))

@@ -9,13 +9,14 @@ import tempfile
 utility = runpy.run_path(str(Path(__file__).resolve().parents[2] / "bin/pg_ctl"))
 
 
-def image(pending=False, fact=b"", intents=b"", full=False):
+def image(pending=False, fact=b"", intents=b"", full=False, slot_evidence=False):
     magic, phase, size = (b"PGRSTAT4", 3, 88) if pending else (b"PGRSTAT3", 2, 72)
     if full:
         assert pending
         size = 148
     core = bytearray(size - 4)
-    struct.pack_into("<8sII", core, 0, magic, phase | ((1 << 30) if fact else 0), 1)
+    flags = ((1 << 30) if fact else 0) | ((1 << 29) if slot_evidence else 0)
+    struct.pack_into("<8sII", core, 0, magic, phase | flags, 1)
     struct.pack_into("<5QI", core, 16, 11, 17, 32, 160, 3, 5)
     if pending:
         struct.pack_into("<IIQ", core, 68, 3, 1, 1)
@@ -24,7 +25,8 @@ def image(pending=False, fact=b"", intents=b"", full=False):
         struct.pack_into("<QI4Q", core, 100, 1, 1, 32, 17, 160, 23)
         core += struct.pack("<8s6IQII", b"PGRES001", 100, 8, 10, 0, 128, 0, 32, 1, 0)
         core += struct.pack("<8sIIQQIIQQIIQ", b"PGFPWFC1", 3, 0, 32, 152, 1, 1, 32, 160, 1, 0, 0)
-    data = core + intents + fact + bytes(4)
+    digest = struct.pack("<Q", 7) if slot_evidence else b""
+    data = core + intents + fact + digest + bytes(4)
     struct.pack_into("<I", data, len(data) - 4, utility["crc32c"](data))
     return data
 
@@ -53,6 +55,10 @@ def main():
         assert len(maximum) == 407
         control.write_bytes(maximum)
         assert utility["recovery_phase"](root) == 3
+        extended = image(True, fact(interval=True), fpw + logical, full=True, slot_evidence=True)
+        assert len(extended) == 415
+        control.write_bytes(extended)
+        assert utility["recovery_phase"](root) == 3
         for payload_size in (104, 112, 152, 160):
             end = 32 + 32 + payload_size
             fpw_fact = struct.pack("<8sIIQQIIQQIIQ", b"PGFPWFC1", 3, 0,
@@ -64,6 +70,8 @@ def main():
             image(fact=b"BADMAGIC" + fact()[8:]),
             image(fact=fact(), intents=logical),
             image(pending=True, fact=fact(), intents=b"PGLOGPI1" + bytes([0, 2]) + bytes(8)),
+            image(slot_evidence=True),
+            image(pending=True, slot_evidence=True),
         ]
         for data in invalid:
             control.write_bytes(data)
@@ -73,7 +81,14 @@ def main():
                 pass
             else:
                 raise AssertionError("pg_ctl accepted invalid recovery control")
-    print("pg-ctl-recovery-control: logical fact, interval, and pending policy layouts PASS")
+        control.unlink()
+        (root / "global").mkdir()
+        primary = root / "global/pg_wal_control"
+        for tail in (b"L 7", b"L 7 C1"):
+            fields = b"PGWAL6 160 160 3 3 timeline - 11 6 0 1 1 32 17 152 23 " + tail
+            primary.write_bytes(fields + b" %08X\n" % utility["crc32c"](fields))
+            assert utility["primary_committed"](root)
+    print("pg-ctl-recovery-control: logical facts, pending policies, and slot evidence PASS")
 
 
 if __name__ == "__main__":

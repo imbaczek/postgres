@@ -20,7 +20,7 @@
 Call under admission or owned quiescence. Report shutdown separately so the
 orchestrator can yield before intent without marking recovery failed.
 ALLOW-RESOURCE-PAUSE is used only to restore recovery workers after a failed attempt."
-  (logical-slot-copy-check-promotion)
+  (logical-slot-copy-check-promotion :allow-standby-logical t)
   (check-recovery-available)
   (unless allow-resource-pause (check-physical-resource-promotion))
   (when (shutdown-in-progress-p) (error 'physical-promotion-shutdown))
@@ -82,6 +82,10 @@ after release."
                (*physical-resource-pause* :resource-paused)
                ((not drained) :deferred)
                (t
+                (when *standby-logical-slots-awaiting-replay*
+                  (logical-slot-admit-replayed-standby-entries *physical-receive-store*))
+                (when (or *standby-logical-slots-awaiting-replay* *standby-logical-slots-rejected*)
+                  (return-from attempt :logical-slots-pending))
                 (handler-case (physical-recovery-restartpoint-core)
                   (physical-archive-staging-error (condition)
                     (when *physical-recovery-failed-p* (error condition))
@@ -235,7 +239,8 @@ already completed promotion; errors before completion still fail closed."
                       (physical-promotion-test-point :after-online-worker-join)
                       (loop for result = (physical-promotion-try-online publication)
                             unless (eq result :deferred)
-                              do (when (member result '(:awaiting-child-initialization :resource-paused :archive-staging-deferred))
+                              do (when (member result '(:awaiting-child-initialization :resource-paused :archive-staging-deferred
+                                                        :logical-slots-pending))
                                    (physical-promotion-resume-recovery-workers config paused restartpoint))
                                  (setf finished t) (return result)
                             do (sleep 0.05)))
@@ -370,6 +375,8 @@ writer admission. Cold startup also uses it to discard stale requests."
                 (let ((result (physical-recovery-promote)))
                   (setf *physical-promotion-accepted-p*
                         (not (null (member result '(:awaiting-child-initialization :archive-staging-deferred)))))
+                  (when (eq result :logical-slots-pending)
+                    (admin-log "promotion deferred because copied logical slots lack replay proof"))
                   result))))
       (error (condition)
         (admin-log "native promotion failed: ~a" condition)))))

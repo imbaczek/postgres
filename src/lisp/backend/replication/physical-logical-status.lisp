@@ -67,7 +67,7 @@ CRC."
 
 (defconstant +physical-recovery-control-maximum-bytes+
   (+ 196 +physical-fpw-fact-size+ +physical-promotion-fpw-intent-size+
-     +physical-logical-interval-fact-size+ +physical-promotion-logical-intent-size+))
+     +physical-logical-interval-fact-size+ +physical-promotion-logical-intent-size+ 8))
 
 (defun physical-logical-control-core-size (bytes)
   "Separate the optional logical fact from the control image.
@@ -75,13 +75,15 @@ The word before the CRC identifies the fact's optional 16-byte suffix."
   (unless (and (typep bytes '(vector (unsigned-byte 8)))
                (<= 60 (length bytes) +physical-recovery-control-maximum-bytes+))
     (error "invalid physical recovery control length"))
-  (let* ((present (logbitp 30 (wal-u32 bytes 8)))
-         (extension (if present (wal-u32 bytes (- (length bytes) 8)) 0))
-         (size (- (length bytes)
-                  (if present (+ +physical-logical-fact-size+ extension) 0))))
+  (let* ((phase (wal-u32 bytes 8))
+         (present (logbitp 30 phase))
+         (evidence-p (logbitp 29 phase))
+         (core-end (- (length bytes) (if evidence-p 8 0)))
+         (extension (if present (wal-u32 bytes (- core-end 8)) 0))
+         (size (- core-end (if present (+ +physical-logical-fact-size+ extension) 0))))
     (unless (and (member extension '(0 16)) (>= size 60))
       (error "truncated or unsupported logical recovery control fact"))
-    (values size present)))
+    (values size present (when evidence-p (- core-end 4)))))
 
 (defun physical-logical-state-fields (fact)
   (%make-wal-logical-status

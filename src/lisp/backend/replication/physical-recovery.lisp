@@ -44,7 +44,7 @@ level must be supplied together as a valid pair, distinct from the source fact."
                          promotion-child promotion-generation promotion-source-namespace retained-reference resource-fact fpw-fact logical-fact
                          (promotion-full-page-writes nil promotion-fpw-intent-p)
                          (promotion-logical-decoding-enabled nil promotion-logical-intent-p)
-                         (promotion-wal-level nil promotion-wal-level-p)
+                         (promotion-wal-level nil promotion-wal-level-p) logical-slot-evidence-digest
                        &allow-other-keys)
       control
     (and (member phase '(0 1 2 3))
@@ -72,6 +72,9 @@ level must be supplied together as a valid pair, distinct from the source fact."
          (or (null logical-fact)
              (and (member control-version '(3 4))
                   (physical-logical-fact-at-p logical-fact applied applied-timeline)))
+         (or (null logical-slot-evidence-digest)
+             (and (= phase 3) (= control-version 4) retained-reference
+                  (typep logical-slot-evidence-digest '(unsigned-byte 64))))
          (or (null retained-reference)
              (and (= phase 3) (= control-version 4)
                   (wal-retained-reference-valid-p retained-reference)
@@ -126,7 +129,8 @@ level must be supplied together as a valid pair, distinct from the source fact."
                                           promotion-child promotion-generation promotion-source-namespace retained-reference resource-fact fpw-fact logical-fact
                                           (promotion-full-page-writes nil promotion-fpw-intent-p)
                                           (promotion-logical-decoding-enabled nil promotion-logical-intent-p)
-                                          (promotion-wal-level nil promotion-wal-level-p))
+                                          (promotion-wal-level nil promotion-wal-level-p)
+                                          logical-slot-evidence-digest)
   "Encode recovery progress and optional extensions under one CRC.
 Ordinary and pending images may append resource and source FPW facts. Pending
 images may then append a 17-byte FPW intent and an 18-byte logical intent, in
@@ -146,7 +150,8 @@ extensions do not change the format version."
                                (logical-intent-offset (+ intent-offset (if promotion-fpw-intent-p +physical-promotion-fpw-intent-size+ 0)))
                                (logical-offset (+ logical-intent-offset
                                                   (if promotion-logical-intent-p +physical-promotion-logical-intent-size+ 0)))
-                               (crc-offset (+ logical-offset (if logical-fact (physical-logical-fact-image-size logical-fact) 0))))
+                               (evidence-offset (+ logical-offset (if logical-fact (physical-logical-fact-image-size logical-fact) 0)))
+                               (crc-offset (+ evidence-offset (if logical-slot-evidence-digest 8 0))))
     (unless (physical-recovery-control-valid-p
              (append (list :control-version version :phase phase :system-id system-id :timeline timeline
                            :manifest-digest manifest-digest :checkpoint checkpoint :applied applied
@@ -154,7 +159,8 @@ extensions do not change the format version."
                            :applied-timeline applied-timeline :history-target history-target :history-digest history-digest
                            :promotion-child promotion-child :promotion-generation promotion-generation
                            :promotion-source-namespace promotion-source-namespace :retained-reference retained-reference
-                           :resource-fact resource-fact :fpw-fact fpw-fact :logical-fact logical-fact)
+                           :resource-fact resource-fact :fpw-fact fpw-fact :logical-fact logical-fact
+                           :logical-slot-evidence-digest logical-slot-evidence-digest)
                      (when promotion-fpw-intent-p
                        (list :promotion-full-page-writes promotion-full-page-writes))
                      (when promotion-logical-intent-p
@@ -163,7 +169,8 @@ extensions do not change the format version."
       (error "unrepresentable physical recovery control state"))
     (let ((bytes (make-array (+ crc-offset 4) :element-type '(unsigned-byte 8) :initial-element 0)))
       (replace bytes (if pending #(80 71 82 83 84 65 84 52) #(80 71 82 83 84 65 84 51)))
-      (wal-set-u32 bytes 8 (logior phase (if logical-fact #x40000000 0)
+      (wal-set-u32 bytes 8 (logior phase (if logical-slot-evidence-digest #x20000000 0)
+                                   (if logical-fact #x40000000 0)
                                    (if (= next-xid 18446744073709551616) #x80000000 0)))
       (wal-set-u32 bytes 12 timeline)
       (wal-set-u64 bytes 16 system-id)
@@ -194,19 +201,22 @@ extensions do not change the format version."
                  :start1 logical-intent-offset))
       (when logical-fact
         (replace bytes (physical-logical-encode-fact logical-fact) :start1 logical-offset))
+      (when logical-slot-evidence-digest
+        (wal-set-u64 bytes evidence-offset logical-slot-evidence-digest))
       (wal-set-u32 bytes crc-offset (wal-crc32 bytes))
       bytes)))
 
 (defun physical-recovery-decode-control (bytes)
   "Decode an exact native control layout and verify its CRC before accepting facts.
 The optional source FPW fact, pending-only FPW and logical intents, and source
-logical fact precede the single CRC in that order. Bit 30 marks the logical fact;
-bit 31 marks next-XID exhaustion. The maximum image is 407 bytes. After stripping
-the logical fact, length modulo four identifies no intent, FPW, logical or both.
+logical fact precede the CRC in that order. Bit 29 marks the pending slot evidence
+digest immediately before the CRC. Bit 30 marks the logical fact and bit 31 marks
+next-XID exhaustion. After stripping evidence and the logical fact, length modulo
+four identifies no intent, FPW, logical or both.
 The decoder checks intent magic, value and reserved bytes. An absent intent
 leaves that policy unspecified; a present NIL means OFF independently of source facts.
 A logical intent yields both its status and configured WAL level."
-  (multiple-value-bind (logical-size logical-p) (physical-logical-control-core-size bytes)
+  (multiple-value-bind (logical-size logical-p evidence-offset) (physical-logical-control-core-size bytes)
     (multiple-value-bind (size promotion-fpw-intent-p promotion-logical-intent-p)
         (physical-promotion-intents-core-size logical-size)
       (unless (member size '(60 72 88 104 120 132 136 144 148 152 160 176 180
@@ -245,7 +255,7 @@ A logical intent yields both its status and configured WAL level."
           (error "promotion policy intent requires pending recovery control"))
         (let ((control
                 (list :control-version version
-                      :phase (if (member version '(3 4)) (logand raw-phase #x3fffffff) raw-phase)
+                      :phase (if (member version '(3 4)) (logand raw-phase #x1fffffff) raw-phase)
                       :timeline (wal-u32 bytes 12)
                       :system-id (wal-u64 bytes 16) :manifest-digest (wal-u64 bytes 24)
                       :checkpoint (wal-u64 bytes 32) :applied (wal-u64 bytes 40)
@@ -283,7 +293,9 @@ A logical intent yields both its status and configured WAL level."
                     (getf control :promotion-wal-level) level)))
           (when logical-p
             (setf (getf control :logical-fact)
-                  (physical-logical-decode-fact (subseq bytes logical-offset crc-offset))))
+                  (physical-logical-decode-fact (subseq bytes logical-offset (or evidence-offset crc-offset)))))
+          (when evidence-offset
+            (setf (getf control :logical-slot-evidence-digest) (wal-u64 bytes evidence-offset)))
           (unless (physical-recovery-control-valid-p control :legacy legacy)
             (error "corrupt or unsupported physical recovery control"))
           control)))))
@@ -940,7 +952,9 @@ installing the recovery store."
                (sb-sys:without-interrupts
                  (setf *clog-stream* (open (clog-path) :element-type '(unsigned-byte 8)
                                                        :direction :input :if-does-not-exist :error))))
-             (wal-load-replication-slots)
+             (if streaming
+                 (logical-slot-restore-standby-inventory store)
+                 (wal-load-replication-slots))
              (catalog-refresh-oldest-relfrozenxid))
            (setf finished t))
       (unless finished

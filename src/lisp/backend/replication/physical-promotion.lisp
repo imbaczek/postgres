@@ -37,7 +37,7 @@ a configuration setting.")
 
 (defun physical-promotion-check-context (phase &key preserve-readers)
   "Check PHASE, the caller's promotion exclusion and the copied-slot fence."
-  (logical-slot-copy-check-promotion)
+  (logical-slot-copy-check-promotion :allow-standby-logical (= phase 2))
   (physical-promotion-check-lifecycle-context phase :preserve-readers preserve-readers))
 
 (defun physical-promotion-check-reader-snapshots (backends parked)
@@ -392,11 +392,19 @@ Older pending control may lack the fact; then the selected generation supplies i
       (error "pending promotion resource fact differs from its selected generation"))
     (copy-tree (or frozen source))))
 
+(defun physical-promotion-logical-source-rows (entries)
+  (declare (notinline logical-slot-startup-entry-slot logical-slot-startup-entry-bytes))
+  (loop for entry in entries
+        for slot = (logical-slot-startup-entry-slot entry)
+        collect (list (wal-replication-slot-name slot)
+                      (bytes->string (logical-slot-startup-entry-bytes entry)))))
+
 (defun physical-promotion-make-pending
     (state metadata prefix generation namespace child time reference
      &key (promotion-full-page-writes nil promotion-fpw-intent-p)
        (promotion-logical-decoding-enabled nil promotion-logical-intent-p)
-       (promotion-wal-level nil promotion-wal-level-p))
+       (promotion-wal-level nil promotion-wal-level-p)
+       logical-slot-source-entries)
   "Build pending control bytes and runtime state for the selected archive.
 The caller publishes the bytes and installs the state after owner handoff.
 Freeze source evidence from the selected restartpoint and save the supplied
@@ -407,6 +415,17 @@ the saved intents rather than capturing them again."
          (next (getf metadata :next-xid))
          (source-fpw (physical-promotion-frozen-fpw-fact nil metadata))
          (source-logical (physical-promotion-frozen-logical-fact nil metadata))
+         (slot-digest
+           (when logical-slot-source-entries
+             (unless (and promotion-logical-intent-p promotion-logical-decoding-enabled)
+               (error "copied slots require logical decoding in the child"))
+             (dolist (entry logical-slot-source-entries)
+               (logical-slot-recheck-standby-entry entry))
+             (logical-slot-promotion-publish-evidence
+              (list :system-id (getf state :system-id)
+                    :parent-timeline (physical-recovery-replay-timeline state)
+                    :child-timeline child :fork fork :retained-reference reference
+                    :slots (physical-promotion-logical-source-rows logical-slot-source-entries)))))
          (bytes (apply #'physical-recovery-control-image
                        3 (getf state :system-id) (getf state :timeline)
                        (getf state :manifest-digest) (getf state :checkpoint) fork next
@@ -414,6 +433,7 @@ the saved intents rather than capturing them again."
                        :applied-timeline (physical-recovery-replay-timeline state)
                        :history-target (getf state :history-target) :history-digest (getf state :history-digest)
                        :promotion-source-namespace namespace :retained-reference reference
+                       :logical-slot-evidence-digest slot-digest
                        :resource-fact (getf metadata :source-resource-fact)
                        :fpw-fact source-fpw
                        (append (when source-logical (list :logical-fact source-logical))
@@ -467,17 +487,21 @@ Fence recovery if publication started but did not complete."
 With an import OWNER, prove its source before history and floor changes, then
 recheck before freezing and before retained publication. Return pending state;
 the outer scope installs it after the owner has retired."
+  (declare (notinline logical-slot-startup-entry-slot))
   (unless (and (physical-promotion-intent-publication-p publication)
                (not (physical-promotion-intent-publication-started-p publication))
                (sb-thread:holding-mutex-p *physical-restartpoint-start-lock*)
                (sb-thread:holding-mutex-p *timeline-history-lock*))
     (error "promotion intent core requires its owned publication scope"))
-  (let* ((configured (startup-promotion-policy-arguments))
+  (let* ((logical-entries (unless owner
+                            (sb-thread:with-mutex (*wal-lock*)
+                              (logical-slot-promotion-source-entries))))
+         (configured (startup-promotion-policy-arguments))
          (policy (if owner (logical-slot-copy-import-intent-policy owner context configured)
                      (progn
                        (when context (error "promotion intent has context without an owner"))
-                       (logical-slot-copy-check-promotion)
-                       configured)))
+                       (logical-slot-copy-check-promotion :allow-standby-logical t)
+                       (logical-slot-copy-import-add-interest configured logical-entries))))
          (parent (when owner (logical-slot-copy-import-intent-parent owner context))))
     (check-physical-resource-promotion)
     (physical-follow-promotion-cleanup-config)
@@ -495,9 +519,14 @@ the outer scope installs it after the owner has retired."
         (when (and *catalog* (not (physical-history-catalog-images-equal-p catalog (catalog-image-bytes))))
           (error "promotion retained catalog differs from its restartpoint"))
         (multiple-value-bind (fork next) (physical-promotion-check-progress state metadata prefix generation)
+          (when logical-entries
+            (logical-slot-prove-standby-prefix
+             *physical-receive-store* (mapcar #'logical-slot-startup-entry-slot logical-entries)))
           (apply #'physical-promotion-preflight-runtime
                  next (getf (getf metadata :source-reservation) :bound) fork
-                 (when parent (list parent)))
+                 (cond (logical-entries
+                        (list parent (physical-promotion-logical-source-rows logical-entries)))
+                       (parent (list parent))))
           (when (and owner
                      (not (equal policy
                                  (logical-slot-copy-import-intent-policy owner context configured))))
@@ -513,7 +542,8 @@ the outer scope installs it after the owner has retired."
                  (lambda (reference)
                    (apply #'physical-promotion-make-pending
                           state metadata prefix generation namespace child
-                          (- (get-universal-time) 2208988800) reference policy))
+                          (- (get-universal-time) 2208988800) reference
+                          :logical-slot-source-entries logical-entries policy))
                  (when parent (list parent))))))))
 
 (defun physical-promotion-publish-intent (&optional requested-child)
@@ -571,7 +601,8 @@ root FD. The caller retains the pair for the call; it passes to slot inventory."
                     '(:control-version :phase :system-id :timeline :manifest-digest
                       :checkpoint :applied :next-xid :db-state :state-time
                       :promotion-child :promotion-generation :promotion-source-namespace
-                      :promotion-full-page-writes :promotion-logical-decoding-enabled :promotion-wal-level))
+                      :promotion-full-page-writes :promotion-logical-decoding-enabled :promotion-wal-level
+                      :logical-slot-evidence-digest))
              (eql (not (null (get-properties state '(:promotion-full-page-writes))))
                   (not (null (get-properties control '(:promotion-full-page-writes)))))
              (eql (not (null (get-properties state '(:promotion-logical-decoding-enabled))))

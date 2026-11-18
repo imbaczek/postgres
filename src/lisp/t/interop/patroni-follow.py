@@ -4,6 +4,7 @@ Only the PostgreSQL control layer runs: no DCS, election or HA loop is involved.
 Artifacts are retained for inspection, and the actual server control socket is
 available for debugging startup and receiver failures.
 """
+import argparse
 import ctypes
 import importlib.metadata
 import json
@@ -12,27 +13,32 @@ import os
 from pathlib import Path
 import shutil
 import shlex
+import select
 import signal
 import socket
+import struct
 import subprocess
 import tempfile
 import time
+from types import SimpleNamespace
 
 import psycopg2
+from psycopg2.extras import LogicalReplicationConnection
 import psutil
-from patroni.dcs import Member
+from patroni.dcs import Leader, Member
 from patroni.postgresql import Postgresql
 from patroni.async_executor import CriticalTask
 from patroni.postgresql.config import ConfigHandler, parse_dsn
 from patroni.postgresql.mpp import Null
 from patroni.postgresql.misc import PostgresqlRole
+from patroni.postgresql.slots import SlotsAdvanceThread
 
 
 BASE = Path(__file__).resolve().parents[2]
 
 
-def query(port, sql):
-    connection = psycopg2.connect(host='127.0.0.1', port=port, user='postgres',
+def query(port, sql, user='postgres'):
+    connection = psycopg2.connect(host='127.0.0.1', port=port, user=user,
                                   dbname='postgres', connect_timeout=2)
     try:
         connection.autocommit = True
@@ -183,13 +189,36 @@ def check_feedback_reload(node, root, target_data, ports, target_pid):
         wait_for(lambda: query(ports[1], 'SHOW hot_standby_feedback') == [('on',)])
         wait_for(lambda: any(xmin is not None and catalog_xmin is None
                              for xmin, catalog_xmin in query(ports[0], slot_query)))
+        # Exercise the feedback transport with a replay-covered registry entry.
+        # Slot installation and Patroni's readiness queue have separate inputs.
+        pin = int(query(ports[0], slot_query)[0][0])
+        control(node.is_running(), root / 'target.sock',
+                '(multiple-value-bind (system-id through) '
+                '    (sb-thread:with-mutex (*xid-lock*) '
+                '      (values (getf *physical-recovery-state* :system-id) *last-replay-lsn*)) '
+                '  (sb-thread:with-mutex (*wal-lock*) '
+                '    (setf (gethash "feedback_probe" *wal-replication-slots*) '
+                '          (make-wal-replication-slot :name "feedback_probe" :kind :logical '
+                '            :wal-status :reserved :restart-lsn through :consistent-lsn through '
+                f'            :confirmed-flush-lsn through :catalog-xmin {pin} '
+                '            :restart-timeline 1 :confirmed-timeline 1 '
+                '            :logical-provenance (make-logical-slot-provenance system-id 1 through 1)))))')
+        try:
+            wait_for(lambda: any(xmin is not None and catalog_xmin == str(pin)
+                                 for xmin, catalog_xmin in query(ports[0], slot_query)))
+        finally:
+            control(node.is_running(), root / 'target.sock',
+                    '(sb-thread:with-mutex (*wal-lock*) '
+                    '  (remhash "feedback_probe" *wal-replication-slots*))')
+        wait_for(lambda: any(xmin is not None and catalog_xmin is None
+                             for xmin, catalog_xmin in query(ports[0], slot_query)))
     finally:
         path.write_text(config)
         reload_configuration()
     wait_for(lambda: query(ports[0], slot_query) == [(None, None)])
     assert query(ports[0], owner_query) == owner
     assert int((target_data / 'postmaster.pid').read_text().splitlines()[0]) == target_pid
-    print('patroni-follow: standby feedback publishes and clears data xmin on reload PASS', flush=True)
+    print('patroni-follow: standby feedback publishes and clears independent horizons PASS', flush=True)
 
 
 def check_slotless_feedback(node, source, root, target_data, ports):
@@ -224,12 +253,178 @@ def check_slotless_feedback(node, source, root, target_data, ports):
     print('patroni-follow: slotless feedback clears when its sender disconnects PASS', flush=True)
 
 
-def exercise(root, ports, source_log):
+def grant_rewind_file_queries(port, user):
+    for signature in ('pg_stat_file(text, boolean)', 'pg_ls_dir(text, boolean, boolean)',
+                      'pg_read_binary_file(text)',
+                      'pg_read_binary_file(text, bigint, bigint, boolean)'):
+        query(port, f'GRANT EXECUTE ON FUNCTION pg_catalog.{signature} TO {user}')
+
+
+def check_logical_slot_export(port, source_data):
+    query(port, "SELECT * FROM pg_create_logical_replication_slot('copy_probe', 'pgoutput')")
+    try:
+        rows = query(port, """
+            SELECT slot_name, slot_type, datname, plugin, catalog_xmin,
+                   pg_catalog.pg_wal_lsn_diff(confirmed_flush_lsn, '0/0')::bigint,
+                   pg_catalog.pg_read_binary_file('pg_replslot/' || slot_name || '/state')
+            FROM pg_catalog.pg_get_replication_slots()
+            JOIN pg_catalog.pg_database ON datoid = oid
+            WHERE NOT failover AND NOT pg_catalog.pg_is_in_recovery()
+              AND slot_name = ANY(ARRAY['copy_probe'])
+        """)
+        [(name, kind, database, plugin, catalog_xmin, confirmed, state)] = rows
+        assert (name, kind, database, plugin) == ('copy_probe', 'logical', 'postgres', 'pgoutput')
+        assert int(catalog_xmin) > 0 and confirmed > 0
+        assert bytes(state) == (source_data / 'pg_replslot/copy_probe/state').read_bytes()
+        query(port, 'CREATE ROLE copy_rewind LOGIN')
+        try:
+            grant_rewind_file_queries(port, 'copy_rewind')
+            assert query(port, "SELECT pg_catalog.pg_read_binary_file('PG_VERSION')", user='copy_rewind')
+            try:
+                query(port, "SELECT pg_catalog.pg_read_binary_file('pg_replslot/copy_probe/state')",
+                      user='copy_rewind')
+            except psycopg2.errors.InsufficientPrivilege:
+                pass
+            else:
+                raise AssertionError('a rewind file grant allowed logical slot export')
+            query(port, 'ALTER ROLE copy_rewind NATIVE_REWIND')
+            assert query(port, "SELECT pg_catalog.pg_read_binary_file('pg_replslot/copy_probe/state')",
+                         user='copy_rewind') == [(state,)]
+            try:
+                query(port, "SELECT * FROM pg_catalog.pg_get_replication_slots()", user='copy_rewind')
+            except psycopg2.errors.InsufficientPrivilege:
+                pass
+            else:
+                raise AssertionError('rewind role read unrestricted slot metadata')
+        finally:
+            query(port, 'ALTER ROLE copy_rewind NOLOGIN')
+    finally:
+        query(port, "SELECT pg_drop_replication_slot('copy_probe')")
+    print('patroni-follow: stock logical slot export query returns durable state PASS', flush=True)
+
+
+def acknowledge_logical_commits(port, expected_ids, *, interior=False):
+    connection = psycopg2.connect(host='127.0.0.1', port=port, user='postgres', dbname='postgres',
+                                  connect_timeout=2, connection_factory=LogicalReplicationConnection)
+    try:
+        with connection.cursor() as cursor:
+            cursor.start_replication(slot_name='live_copy', options={
+                'proto_version': '1', 'publication_names': 'live_copy_pub',
+            })
+            deadline = time.monotonic() + 10
+            rows = []
+            commits = 0
+            while time.monotonic() < deadline:
+                message = cursor.read_message()
+                if message is None:
+                    select.select([cursor], [], [], 0.1)
+                elif message.payload[:1] == b'I':
+                    assert message.payload[5:9] == b'N\x00\x01t'
+                    size = struct.unpack_from('!I', message.payload, 9)[0]
+                    rows.append(int(message.payload[13:13 + size]))
+                elif message.payload[:1] == b'C':
+                    commits += 1
+                    if commits < len(expected_ids):
+                        continue
+                    assert rows == expected_ids, rows
+                    start, end = struct.unpack_from('!QQ', message.payload, 2)
+                    position = start + 1 if interior else end
+                    assert start < position <= end
+                    cursor.send_feedback(write_lsn=position, flush_lsn=position,
+                                         apply_lsn=position, force=True)
+                    position_sql = ("SELECT pg_wal_lsn_diff(confirmed_flush_lsn, '0/0')::bigint "
+                                    "FROM pg_replication_slots "
+                                    "WHERE slot_name = 'live_copy'")
+                    wait_for(lambda: query(port, position_sql) == [(position,)], seconds=10)
+                    return position
+            raise AssertionError('logical stream did not send the expected commit')
+    finally:
+        connection.close()
+
+
+def create_live_copy_slot(port):
+    query(port, 'CREATE PUBLICATION live_copy_pub FOR TABLE follow_items')
+    return query(port, "SELECT lsn FROM pg_create_logical_replication_slot('live_copy','pgoutput')")[0][0]
+
+
+def check_stock_logical_copy(node, member, source, root, target_data, ports, *, before_base=False):
+    source_port, target_port = ports
+    if before_base:
+        acknowledge_logical_commits(source_port, [2])
+    control(node.is_running(), root / 'target.sock', '(physical-follow-stop)')
+    if not before_base:
+        create_live_copy_slot(source_port)
+    query(source_port, 'INSERT INTO follow_items VALUES (3)')
+    confirmed = acknowledge_logical_commits(source_port, [3], interior=True)
+    assert query(target_port, 'SELECT max(id) FROM follow_items') == [(2,)]
+
+    definition = {'type': 'logical', 'database': 'postgres', 'plugin': 'pgoutput'}
+    cluster = SimpleNamespace(
+        leader=Leader(0, None, member),
+        get_replication_slots=lambda *args, **kwargs: {'live_copy': definition},
+        get_slot_name_on_primary=lambda name, tags: 'follow_one',
+    )
+    handler = node.slots_handler
+    handler.copy_logical_slots(cluster, None, ['live_copy'])
+    assert (target_data / 'pg_replslot/live_copy/state').is_file()
+    slot_query = "SELECT catalog_xmin::text FROM pg_replication_slots WHERE slot_name = 'live_copy'"
+    expected = query(source_port, slot_query)
+    assert expected and expected[0][0] is not None
+    wait_for(lambda: query(target_port, slot_query) == expected, seconds=15)
+    assert query(target_port, "SELECT pg_wal_lsn_diff(confirmed_flush_lsn, '0/0')::bigint "
+                              "FROM pg_replication_slots "
+                              "WHERE slot_name = 'live_copy'") == [(confirmed,)]
+    assert query(target_port, 'SELECT pg_is_in_recovery()') == [(True,)]
+    print('patroni-follow: stock copy restarts and loads the logical slot PASS', flush=True)
+
+    path = target_data / 'postgresql.conf'
+    with path.open('a') as config:
+        config.write('\nhot_standby_feedback = on\nwal_receiver_status_interval = 1\n')
+    control(node.is_running(), root / 'target.sock', '(request-configuration-reload)')
+    handler.schedule()
+    handler.load_replication_slots()
+    assert 'live_copy' in handler._logical_slots_processing_queue
+    physical_query = slot_query.replace('live_copy', 'follow_one')
+    wait_for(lambda: query(source_port, physical_query) == expected, seconds=15)
+    assert handler.check_logical_slots_readiness(cluster, None)
+    assert 'live_copy' not in handler._logical_slots_processing_queue
+    print('patroni-follow: stock readiness accepts the copied slot PASS', flush=True)
+
+    advanced = acknowledge_logical_commits(source_port, [3])
+    assert advanced > confirmed
+    node.reset_cluster_info_state(None)
+    assert node.replay_lsn() >= advanced
+    handler._advance = SlotsAdvanceThread(handler)
+    assert not handler._ensure_logical_slots_replica({'live_copy': {**definition, 'lsn': advanced}})
+    confirmed_query = ("SELECT pg_wal_lsn_diff(confirmed_flush_lsn, '0/0')::bigint "
+                       "FROM pg_replication_slots WHERE slot_name = 'live_copy'")
+    wait_for(lambda: query(target_port, confirmed_query) == [(advanced,)], seconds=15)
+    query(source_port, 'INSERT INTO follow_items VALUES (6)')
+    wait_for(lambda: query(target_port, 'SELECT id FROM follow_items WHERE id = 6') == [(6,)])
+    print('patroni-follow: stock logical-slot worker advances the standby copy PASS', flush=True)
+    source.send_signal(signal.SIGINT)
+    assert source.wait(timeout=45) == 0
+    assert node.promote(30, CriticalTask()) is True
+    assert query(target_port, 'SELECT pg_is_in_recovery()') == [(False,)]
+    assert query(target_port, slot_query) == expected
+    query(target_port, 'INSERT INTO follow_items VALUES (4)')
+    print('patroni-follow: promotion preserves the copied logical slot PASS', flush=True)
+    acknowledged = acknowledge_logical_commits(target_port, [6, 4])
+    assert acknowledged > advanced
+    assert node.restart(timeout=30) is True
+    assert query(target_port, 'SELECT pg_is_in_recovery()') == [(False,)]
+    query(target_port, 'INSERT INTO follow_items VALUES (5)')
+    assert acknowledge_logical_commits(target_port, [5]) > acknowledged
+    print('patroni-follow: logical consumer crosses the fork and resumes after restart PASS', flush=True)
+
+
+def exercise(root, ports, source_log, *, logical_slot_copy=False, logical_slot_before_base=False):
     source_data, target_data = root / 'source', root / "replica 'one'"
     source_socket = root / 'source.sock'
     source = subprocess.Popen(
         [str(BASE / 'pg-lisp.sh'), '-D', str(source_data), '-p', str(ports[0]),
-         '--control-socket', str(source_socket)], stdout=source_log, stderr=source_log)
+         '-c', 'wal_level=logical', '--control-socket', str(source_socket)],
+        stdout=source_log, stderr=source_log)
     node = None
     try:
         def source_ready():
@@ -253,12 +448,19 @@ def exercise(root, ports, source_log):
         assert refused.returncode == 1 and 'does not own' in refused.stderr, refused.stderr
         query(ports[0], 'CREATE TABLE follow_items (id integer PRIMARY KEY)')
         query(ports[0], 'INSERT INTO follow_items VALUES (1)')
+        check_logical_slot_export(ports[0], source_data)
+        birth = create_live_copy_slot(ports[0]) if logical_slot_before_base else None
         query(ports[0], "SELECT pg_create_physical_replication_slot('follow_one',true)")
         target_data.mkdir(mode=0o700)
         control(source, source_socket,
                 f'(physical-base-backup {json.dumps(str(target_data) + "/")} "patroni_follow")')
         (target_data / 'postgresql.conf').write_text('# Native base, managed by Patroni.\n')
-        node = Postgresql(configuration(target_data, ports[1], root), Null())
+        config = configuration(target_data, ports[1], root)
+        if logical_slot_copy or logical_slot_before_base:
+            query(ports[0], 'CREATE ROLE patroni_slot_rewind LOGIN NATIVE_REWIND')
+            grant_rewind_file_queries(ports[0], 'patroni_slot_rewind')
+            config['authentication']['rewind'] = {'username': 'patroni_slot_rewind'}
+        node = Postgresql(config, Null())
         assert node.controldata()['max_locks_per_xact setting'] == '128'
         member = Member(0, 'source', None,
                         {'conn_url': f'postgres://127.0.0.1:{ports[0]}/postgres'})
@@ -266,6 +468,8 @@ def exercise(root, ports, source_log):
         target_pid = int((target_data / 'postmaster.pid').read_text().splitlines()[0])
         assert node.is_running().pid == target_pid
         assert query(ports[1], 'SELECT pg_is_in_recovery()') == [(True,)]
+        if birth is not None:
+            assert query(ports[1], f"SELECT pg_last_wal_replay_lsn() > '{birth}'::pg_lsn") == [(True,)]
         query(ports[0], 'INSERT INTO follow_items VALUES (2)')
         wait_for(lambda: query(ports[1], 'SELECT id FROM follow_items ORDER BY id') == [(1,), (2,)])
         assert query(ports[1], 'SELECT status,slot_name FROM pg_stat_get_wal_receiver()') == [
@@ -274,6 +478,10 @@ def exercise(root, ports, source_log):
         check_live_receiver(node, '127.0.0.1', ports[0])
         check_source_sender(source, root)
         check_feedback_reload(node, root, target_data, ports, target_pid)
+        if logical_slot_copy or logical_slot_before_base:
+            check_stock_logical_copy(node, member, source, root, target_data, ports,
+                                     before_base=logical_slot_before_base)
+            return
         check_slotless_feedback(node, source, root, target_data, ports)
         replacement = Member(0, 'source', None,
                              {'conn_url': f'postgres://localhost:{ports[0]}/postgres'})
@@ -395,6 +603,13 @@ def exercise(root, ports, source_log):
 
 
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    cases = parser.add_mutually_exclusive_group()
+    cases.add_argument('--logical-slot-copy', action='store_true',
+                       help='exercise stock logical-slot copying and readiness')
+    cases.add_argument('--logical-slot-before-base', action='store_true',
+                       help='copy a logical slot created before the standby base')
+    args = parser.parse_args()
     if not __debug__:
         raise RuntimeError('This assertion-based oracle requires Python without -O.')
     assert importlib.metadata.version('patroni') == '4.1.5'
@@ -416,7 +631,8 @@ def main():
         ports = first.getsockname()[1], second.getsockname()[1]
     print(f'patroni-follow: artifacts={root}; ports={ports}', flush=True)
     with (root / 'source.log').open('w') as log:
-        exercise(root, ports, log)
+        exercise(root, ports, log, logical_slot_copy=args.logical_slot_copy,
+                 logical_slot_before_base=args.logical_slot_before_base)
 
 
 if __name__ == '__main__':

@@ -48,19 +48,19 @@
         (wal-encode-replication-slot copy))
       (wal-encode-replication-slot slot)))
 
-(defun logical-slot-startup-entry-from-image (bytes name)
-  (let ((slot (wal-decode-replication-slot bytes name)))
+(defun logical-slot-startup-entry-from-image (bytes name &optional (decoder #'wal-decode-replication-slot))
+  (let ((slot (funcall decoder bytes name)))
     (%make-logical-slot-startup-entry
      :slot slot :bytes (copy-seq bytes) :image (logical-slot-startup-candidate-image slot)
      :profile (wal-slot-profile slot) :provenance (wal-replication-slot-logical-provenance slot))))
 
-(defun logical-slot-startup-read-inventory (&key cleanup root parent-fd local-workspace)
+(defun logical-slot-startup-read-inventory (&key cleanup root parent-fd local-workspace (decoder #'wal-decode-replication-slot))
   "Read canonical slot state into startup entries.
 Inventory is strict by default.  Local startup, capture, recovery and
 promotion may explicitly skip the local workspace; incoming images stay strict."
   (apply #'slot-state-map
          (or root (wal-replication-slot-directory))
-         #'logical-slot-startup-entry-from-image
+         (lambda (bytes name) (logical-slot-startup-entry-from-image bytes name decoder))
          :cleanup cleanup :local-workspace local-workspace
          (when parent-fd (list :parent-fd parent-fd))))
 

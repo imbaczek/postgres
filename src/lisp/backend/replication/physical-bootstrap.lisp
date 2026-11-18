@@ -790,10 +790,51 @@ The slot is dropped on every exit; a verified origin remains after cancellation.
       (when entries
         (values (pop entries) t)))))
 
+(defun patroni-slot-state-file-name (path)
+  "Recognize the exact SQL path used to copy a logical slot."
+  (let ((prefix "pg_replslot/")
+        (suffix "/state"))
+    (when (and (uiop:string-prefix-p prefix path)
+               (uiop:string-suffix-p path suffix)
+               (> (length path) (+ (length prefix) (length suffix))))
+      (let ((name (subseq path (length prefix) (- (length path) (length suffix)))))
+        (when (slot-state-valid-name-p name) name)))))
+
+(defun sql-read-logical-slot-state (name)
+  "Read a durable logical slot image from the active primary."
+  (let* ((user (backend-startup-user *backend*))
+         (role (authentication-committed-role user)))
+    (unless (if role
+                (or (pg-role-superuser-p role) (role-can-rewind-native-p role))
+                (string= user "postgres"))
+      (ereport "42501" "permission denied for logical slot state")))
+  (when (recovery-in-progress-p)
+    (ereport "55000" "logical slot state can only be exported on the primary"))
+  (sb-thread:with-mutex (*wal-lock*)
+    (let ((slot (wal-find-usable-replication-slot-under-lock name)))
+      (unless (and slot (wal-logical-slot-p slot)
+                   (eq :reserved (wal-replication-slot-wal-status slot))
+                   (wal-replication-slot-logical-provenance slot)
+                   (null (wal-replication-slot-child-owner slot))
+                   (wal-replication-slot-confirmed-flush-lsn slot)
+                   (running-xacts-normal-xid-p (wal-replication-slot-catalog-xmin slot)))
+        (ereport "58P01" "copyable logical slot state does not exist"))
+      (slot-state-read
+       (wal-replication-slot-directory) name
+       (lambda (bytes expected-name)
+         (wal-decode-replication-slot bytes expected-name)
+         (unless (equalp bytes (wal-encode-replication-slot slot))
+           (ereport "55000" "logical slot state differs from the registered slot"))
+         bytes)))))
+
 (defun sql-rewind-read-binary-file (name &optional (offset 0 ranged-p) length missing-ok)
   (require-rewind-function-grant (if ranged-p :read-binary-file-range :read-binary-file))
   (when (member +null+ (list name offset length missing-ok))
     (return-from sql-rewind-read-binary-file +null+))
+  (unless ranged-p
+    (let ((slot-name (patroni-slot-state-file-name name)))
+      (when slot-name
+        (return-from sql-rewind-read-binary-file (sql-read-logical-slot-state slot-name)))))
   (unless (rewind-readable-file-p name)
     (ereport "42501" "file is outside the rewind read scope"))
   (when (and ranged-p (minusp length))

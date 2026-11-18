@@ -57,6 +57,32 @@
            (setf (symbol-function 'pg::physical-promotion-try-online) attempt
                  (symbol-function 'pg::physical-promotion-resume-recovery-workers) restore))))))
 
+(deftest promotion-awaiting-logical-slot-proof-restores-workers
+    (call-with-promotion-fixture
+     (lambda (root store)
+       (declare (ignore root store))
+       (let ((attempt (symbol-function 'pg::physical-promotion-try-online))
+             (restore (symbol-function 'pg::physical-promotion-resume-recovery-workers))
+             (restored nil))
+         (unwind-protect
+              (progn
+                (setf (symbol-function 'pg::physical-promotion-try-online)
+                      (lambda (&optional publication)
+                        (declare (ignore publication))
+                        :logical-slots-pending)
+                      (symbol-function 'pg::physical-promotion-resume-recovery-workers)
+                      (lambda (config paused restartpoint)
+                        (declare (ignore config paused restartpoint))
+                        (setf restored t pg::*physical-promotion-stopping-p* nil)))
+                (call-with-current-promotion-owner
+                 (lambda ()
+                   (ok (eq :logical-slots-pending (pg::physical-recovery-promote)))))
+                (ok restored)
+                (ok (not pg::*physical-recovery-failed-p*))
+                (ok (= 2 (getf pg::*physical-recovery-state* :phase))))
+           (setf (symbol-function 'pg::physical-promotion-try-online) attempt
+                 (symbol-function 'pg::physical-promotion-resume-recovery-workers) restore))))))
+
 (deftest pending-intent-encodes-and-owns-its-known-resource-fact
     (with-promotion-fixture (root store)
       (declare (ignore root store))

@@ -379,6 +379,8 @@ interrupted temporary in place for reconciliation."
          (reference (getf *physical-recovery-state* :retained-reference)))
     (setf metadata (append metadata (wal-copy-control-resource-fields snapshot)))
     (when reference (setf (getf metadata :retained-reference) (copy-list reference)))
+    (let ((digest (getf *physical-recovery-state* :logical-slot-evidence-digest)))
+      (when digest (setf (getf metadata :logical-slot-evidence-digest) digest)))
     (wal-encode-control-image (getf plan :end) (getf plan :end) snapshot
                               :timeline (getf plan :child) :checkpoint-timeline (getf plan :child)
                               :namespace :timeline :metadata metadata)))

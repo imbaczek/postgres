@@ -202,42 +202,55 @@ allocation. All four values must be canonical counters or the exhaustion sentine
        (or (= (floor actual +xid-cycle+) (floor floor +xid-cycle+))
            (= floor (min +max-xid-one-past+ (xid-next-epoch-boundary actual))))))
 
-(defun physical-promotion-read-physical-slots (&key reconcile-live parent)
-  "Read canonical physical state under promotion exclusion, rejecting unfinished I/O.
-Live promotion preserves exact registry objects and their runtime ownership.
-PARENT, when supplied, pairs the original named absolute PGDATA directory with
-its held root FD. The name supports lstat binding; the FD is duplicated for
-relative opens. Do not use a /proc alias as the named root. Only this borrowed
-pair disables stabilization."
-  ;; Inventory is read through held directory descriptors. Reconciliation
-  ;; returns the matching live objects so their owners remain intact.
+(defun physical-promotion-read-physical-slots (&key reconcile-live parent logical-rows)
+  "Read physical slots and require exact coverage of any supplied logical rows.
+PARENT carries the original named PGDATA directory and its held root FD.
+Reconciliation preserves the matching live physical slot objects."
   (unless (or (null parent)
               (and (consp parent) (pathnamep (car parent))
                    (uiop:absolute-pathname-p (car parent))
                    (uiop:directory-pathname-p (car parent))
                    (typep (cdr parent) 'fixnum) (not (minusp (cdr parent)))))
     (error "promotion slot parent requires a named directory and held descriptor"))
-  (let ((slots
-          (slot-state-map
-           (if parent (merge-pathnames "pg_replslot/" (car parent))
-               (wal-replication-slot-directory))
-           (lambda (bytes name)
-             (let ((slot (physical-slot-decode bytes name)))
-               (when reconcile-live
-                 (let ((live (gethash name *wal-replication-slots*)))
-                   (unless (and (wal-replication-slot-p live) (wal-physical-slot-p live))
-                     (error "promotion slot registry differs from its physical inventory"))
-                   (wal-require-usable-replication-slot live)
-                   (setf (wal-replication-slot-inactive-since slot)
-                         (wal-replication-slot-inactive-since live))
-                   (unless (equalp (physical-slot-encode slot) (physical-slot-encode live))
-                     (error "promotion slot durable state differs from its live generation"))
-                   (setf slot live)))
-               slot))
-           :parent-fd (and parent (cdr parent)) :stabilize (null parent) :local-workspace t)))
-    (when (and reconcile-live (/= (length slots) (hash-table-count *wal-replication-slots*)))
-      (error "promotion slot registry has unpersisted generations"))
-    (nreverse slots)))
+  (let ((expected (when logical-rows (make-hash-table :test #'equal))))
+    (dolist (row logical-rows)
+      (setf (gethash (first row) expected) (string->bytes (second row))))
+    (let ((slots
+            (slot-state-map
+             (if parent (merge-pathnames "pg_replslot/" (car parent))
+                 (wal-replication-slot-directory))
+             (lambda (bytes name)
+               (let ((logical (and expected (gethash name expected))))
+                 (if logical
+                     (progn
+                       (unless (equalp logical bytes)
+                         (error "durable logical slot ~a differs from pending promotion evidence" name))
+                       (when reconcile-live
+                         (let ((live (gethash name *wal-replication-slots*)))
+                           (unless (and live (wal-logical-slot-p live)
+                                        (equalp bytes (wal-encode-replication-slot
+                                                       (wal-require-usable-replication-slot live))))
+                             (error "live logical slot ~a differs from pending promotion evidence" name))))
+                       (remhash name expected)
+                       nil)
+                     (let ((slot (physical-slot-decode bytes name)))
+                       (when reconcile-live
+                         (let ((live (gethash name *wal-replication-slots*)))
+                           (unless (and (wal-replication-slot-p live) (wal-physical-slot-p live))
+                             (error "promotion slot registry differs from its physical inventory"))
+                           (wal-require-usable-replication-slot live)
+                           (setf (wal-replication-slot-inactive-since slot)
+                                 (wal-replication-slot-inactive-since live))
+                           (unless (equalp (physical-slot-encode slot) (physical-slot-encode live))
+                             (error "promotion slot durable state differs from its live generation"))
+                           (setf slot live)))
+                       slot))))
+             :parent-fd (and parent (cdr parent)) :stabilize (null parent) :local-workspace t)))
+      (when (and expected (plusp (hash-table-count expected)))
+        (error "pending promotion evidence names missing logical slots"))
+      (when (and reconcile-live (/= (length slots) (hash-table-count *wal-replication-slots*)))
+        (error "promotion slot registry has unpersisted generations"))
+      (nreverse (delete nil slots)))))
 
 (defun physical-promotion-check-slot-prefix (slots state &key committed)
   "Check physical identity and prove reserved restart floors through STATE's fork.
@@ -284,13 +297,14 @@ segment is available. A committed child must contain the same fork prefix."
   "Check persistent disk slots before pending promotion publishes child state.
 Skip valid temporary images here; cold startup removes them before resource
 checks. Live promotion separately validates and preserves temporary owners."
-  (let ((slots (if parent
-                   (physical-promotion-read-physical-slots :parent parent)
-                   (physical-promotion-read-physical-slots))))
+  (let* ((evidence (when (getf state :logical-slot-evidence-digest)
+                     (logical-slot-promotion-read-evidence state)))
+         (slots (physical-promotion-read-physical-slots :parent parent
+                                                        :logical-rows (getf evidence :slots))))
     (physical-promotion-check-slot-prefix
      (remove-if #'wal-replication-slot-temporary-p slots) state)))
 
-(defun physical-promotion-check-live-retention (fork &optional slot-parent)
+(defun physical-promotion-check-live-retention (fork &optional slot-parent logical-rows)
   "Check live public physical slots and ordinary snapshot pins before promotion.
 Phase 2 uses the standby batch proof; a committed child checks its fork prefix.
 Logical slots and private source pins require separate ownership rules.
@@ -298,7 +312,11 @@ SLOT-PARENT, when supplied, is the caller-held named root and FD pair."
   (unless (and (zerop (hash-table-count *physical-source-pins*))
                (null (directory-entry-names (physical-source-pin-directory))))
     (error "live promotion requires an empty private source-pin inventory"))
-  (let ((slots (physical-promotion-read-physical-slots :reconcile-live t :parent slot-parent)))
+  (let* ((state *physical-recovery-state*)
+         (evidence (when (getf state :logical-slot-evidence-digest)
+                     (logical-slot-promotion-read-evidence state)))
+         (slots (physical-promotion-read-physical-slots :reconcile-live t :parent slot-parent
+                                                        :logical-rows (or logical-rows (getf evidence :slots)))))
     (when slots
       (unless (and *physical-recovery-state*
                    (= fork (if (= 2 (getf *physical-recovery-state* :phase))
@@ -337,7 +355,7 @@ This check does not repair stale bits as C TrimCLOG does."
               do (unless (loop for index below count always (zerop (aref bytes index)))
                    (error "live promotion found settled future CLOG status")))))))
 
-(defun physical-promotion-preflight-runtime (actual bound fork &optional slot-parent)
+(defun physical-promotion-preflight-runtime (actual bound fork &optional slot-parent logical-rows)
   "Check runtime state and return the canonical child allocation floor.
 
 The floor covers actual next XID, complete source capacity and the local disk
@@ -347,8 +365,9 @@ SLOT-PARENT, when supplied, is the caller-held named root and FD pair."
          (next (canonical-next-full-xid (max actual (1+ bound) local-floor))))
     (unless (physical-promotion-live-xid-floor-valid-p actual next *xid-batch-end* local-floor)
       (error "promotion allocation floor skips its wraparound gate"))
-    (if slot-parent (physical-promotion-check-live-retention fork slot-parent)
-        (physical-promotion-check-live-retention fork))
+    (cond (logical-rows (physical-promotion-check-live-retention fork slot-parent logical-rows))
+          (slot-parent (physical-promotion-check-live-retention fork slot-parent))
+          (t (physical-promotion-check-live-retention fork)))
     (when *clog-stream* (physical-promotion-check-clog-tail actual next))
     next))
 
@@ -478,6 +497,53 @@ live promotion notifies them after releasing its fence. NIL notifies immediately
       (sync-replication-new-source-incarnation))
   (physical-promotion-test-point :after-child-primary-ready))
 
+(defun physical-promotion-rebuild-live-logical-slots ()
+  "Reconstruct copied-slot progress before opening the promoted child."
+  (let* ((state *physical-recovery-state*)
+         (metadata *wal-control-metadata*)
+         (digest (getf metadata :logical-slot-evidence-digest)))
+    (when digest
+      (physical-promotion-check-lifecycle-context 3 :preserve-readers t)
+      (let* ((timeline *wal-insert-timeline*)
+             (history (timeline-read-history timeline))
+             (end *wal-durable-lsn*)
+             (system-id (catalog-system-identifier))
+             (evidence (logical-slot-promotion-read-committed-evidence metadata timeline history))
+             (rows (getf evidence :slots))
+             (slots
+               (sb-thread:with-mutex (*wal-lock*)
+                 (physical-promotion-read-physical-slots :reconcile-live t :logical-rows rows)
+                 (mapcar (lambda (row) (gethash (first row) *wal-replication-slots*)) rows))))
+        (flet ((guard ()
+                 (and (eq metadata *wal-control-metadata*)
+                      (= timeline *wal-insert-timeline*)
+                      (= end *wal-durable-lsn*)
+                      (eq *live-operation-quiescence-owner-thread* sb-thread:*current-thread*)
+                      (not *live-operation-drain-open*))))
+          (let ((pending
+                  (let ((*physical-recovery-state* nil))
+                    (call-with-logical-wal-archive-core
+                     system-id history :timeline #'guard #'catalog-system-identifier
+                     (lambda (archive)
+                       (mapcar
+                        (lambda (slot)
+                          (multiple-value-bind (owner role) (logical-slot-startup-start-position slot history)
+                            (call-with-logical-wal-cursor
+                             history :timeline (wal-replication-slot-restart-lsn slot) end owner role #'guard
+                             (lambda (cursor)
+                               (logical-slot-rebuild-pending-from-cursor
+                                slot cursor end #'logical-wal-cursor-next))
+                             :archive archive :batch-policy :logical-reader)))
+                        slots))))))
+            (sb-thread:with-mutex (*wal-lock*)
+              (unless (and (eq state *physical-recovery-state*) (guard))
+                (error "logical slot child changed during WAL reconstruction"))
+              (physical-promotion-read-physical-slots :reconcile-live t :logical-rows rows)
+              (mapc (lambda (slot progress)
+                      (setf (wal-replication-slot-pending-xids slot) progress))
+                    slots pending)))))))
+  (values))
+
 (defun physical-promotion-start-live-child-primary (&optional publication)
   "Privately adopt the child, close the receive spool and finish promotion.
 
@@ -485,6 +551,7 @@ Keep the existing CLOG stream, storage handles and reader state. The completion
 caller must keep admission closed and fence any failure. PUBLICATION carries
 sender retirement to the outer live promotion."
   (physical-promotion-adopt-live-child-runtime)
+  (physical-promotion-rebuild-live-logical-slots)
   (when *physical-receive-store* (physical-store-close *physical-receive-store*))
   (setf *physical-receive-store* nil)
   (physical-promotion-finish-child-primary publication))

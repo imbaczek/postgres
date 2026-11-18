@@ -135,7 +135,46 @@
     (logical-slot-copy-verify-recovery-startup))
   (values))
 
-(defun logical-slot-copy-check-promotion ()
+(defun logical-slot-promotion-source-entries ()
+  "Capture the durable logical slot images matching the standby registry."
+  (assert (sb-thread:holding-mutex-p *wal-lock*))
+  (let ((logical-count
+          (loop for slot being the hash-values of *wal-replication-slots*
+                count (wal-logical-slot-p slot))))
+    (when (plusp logical-count)
+      (let ((entries
+              (slot-state-map
+               (wal-replication-slot-directory)
+               (lambda (bytes name)
+                 (let* ((entry (logical-slot-startup-entry-from-image
+                                bytes name #'wal-decode-replication-slot-image))
+                        (slot (logical-slot-startup-entry-slot entry)))
+                   (when (wal-logical-slot-p slot)
+                     (let ((live (gethash name *wal-replication-slots*)))
+                       (unless (and live (wal-logical-slot-p live))
+                         (error "durable logical slot ~a is missing from the standby registry" name))
+                       (wal-require-usable-replication-slot live)
+                       (unless (equalp bytes (wal-encode-replication-slot live))
+                         (error "durable logical slot ~a differs from its standby registry entry" name))
+                       entry))))
+               :stabilize t :local-workspace t)))
+        (let ((logical (remove nil entries)))
+          (unless (= logical-count (length logical))
+            (error "standby logical slot registry has unpersisted generations"))
+          (sort logical #'string<
+                :key (lambda (entry)
+                       (wal-replication-slot-name (logical-slot-startup-entry-slot entry)))))))))
+
+(defun logical-slot-copy-check-promotion (&key allow-standby-logical)
+  (when (recovery-in-progress-p)
+    (let ((phase (getf *physical-recovery-state* :phase)))
+      (cond ((and allow-standby-logical (eql phase 2)))
+            ((getf *physical-recovery-state* :logical-slot-evidence-digest)
+             (logical-slot-promotion-read-evidence *physical-recovery-state*))
+            ((if (sb-thread:holding-mutex-p *wal-lock*)
+                 (logical-slot-promotion-source-entries)
+                 (sb-thread:with-mutex (*wal-lock*) (logical-slot-promotion-source-entries)))
+             (error "standby logical slots require promotion reconciliation")))))
   ;; Fence both promotion and destructive recovery retirement until the copied
   ;; import is reconciled.  Proof files, including temporary files, do not
   ;; authorize either operation.

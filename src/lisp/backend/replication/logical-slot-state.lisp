@@ -286,30 +286,41 @@ with the prefix end, including at a fork. Copy the optional ON pair as captured.
     (error "an empty WAL prefix has no timeline owner"))
   (timeline-at-point (1- lsn) history))
 
-(defun logical-slot-check-primary-history (slot history)
-  "Check stored logical slot positions against primary lineage geometry.
-This does not prove exact WAL bytes, slot lifetime or import authority."
+(defun logical-slot-standby-policy-covers-p (slot policy replay)
+  "Check that replay proves continuous logical WAL from the slot's birth."
+  (let ((start (or (getf policy :logical-on-start-lsn) (getf policy :coverage-start))))
+    (and (getf policy :enabled)
+         (eql replay (getf policy :through))
+         start
+         (<= start (wal-replication-slot-consistent-lsn slot)))))
+
+(defun logical-slot-history-positions-p (slot history)
+  "Check the slot's positions against lineage geometry."
   (let* ((provenance (wal-replication-slot-logical-provenance slot))
          (birth (wal-replication-slot-consistent-lsn slot))
          (on (logical-slot-provenance-on-start-lsn provenance))
          (confirmed (wal-replication-slot-confirmed-flush-lsn slot))
          (restart (wal-replication-slot-restart-lsn slot))
          (restart-timeline (wal-replication-slot-restart-timeline slot)))
-    (unless (and (plusp birth)
-                 (timeline-prefix-boundary-p
-                  (logical-slot-provenance-birth-timeline provenance) birth history)
-                 (or (null on)
-                     (and (plusp on)
-                          (timeline-prefix-boundary-p
-                           (logical-slot-provenance-on-start-timeline provenance) on history)))
-                 (or (null confirmed)
-                     (and (plusp confirmed)
-                          (timeline-prefix-boundary-p
-                           (wal-replication-slot-confirmed-timeline slot) confirmed history)))
-                 (if (zerop restart)
-                     (eql restart-timeline (timeline-at-point 0 history))
-                     (timeline-prefix-boundary-p restart-timeline restart history)))
-      (error "logical slot provenance is outside current primary history")))
+    (and (plusp birth)
+         (timeline-prefix-boundary-p
+          (logical-slot-provenance-birth-timeline provenance) birth history)
+         (or (null on)
+             (and (plusp on)
+                  (timeline-prefix-boundary-p
+                   (logical-slot-provenance-on-start-timeline provenance) on history)))
+         (or (null confirmed)
+             (and (plusp confirmed)
+                  (timeline-prefix-boundary-p
+                   (wal-replication-slot-confirmed-timeline slot) confirmed history)))
+         (if (zerop restart)
+             (eql restart-timeline (timeline-at-point 0 history))
+             (timeline-prefix-boundary-p restart-timeline restart history)))))
+
+(defun logical-slot-check-primary-history (slot history)
+  "Check stored slot positions against primary lineage geometry."
+  (unless (logical-slot-history-positions-p slot history)
+    (error "logical slot provenance is outside current primary history"))
   (values))
 
 (defun logical-slot-check-startup-history (slots)

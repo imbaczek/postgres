@@ -144,6 +144,7 @@ Logical updates guard identity, progress and the first terminal cause."
   ;; Process-local publication and retirement state. An uncertain logical slot
   ;; keeps its old pin and requires a cold load before further use.
   (drop-claim nil) (creation-failed-p nil) (state-uncertain-p nil)
+  (catalog-xmin nil)
   (logical-provenance nil :read-only t)
   (child-owner nil :read-only t)
   confirmed-timeline invalidation-cause
@@ -263,21 +264,59 @@ Logical updates guard identity, progress and the first terminal cause."
 (defvar *wal-physical-sender-xmins* (make-hash-table :test #'eq)
   "Transient data horizons of slotless senders, guarded by *WAL-LOCK*.")
 
+(defun wal-logical-slot-covered-p (slot end-lsn)
+  "Check that all positions in SLOT are covered by a WAL prefix ending at END-LSN."
+  (let ((confirmed (wal-replication-slot-confirmed-flush-lsn slot)))
+    (and (typep end-lsn '(unsigned-byte 64))
+         (<= (wal-replication-slot-restart-lsn slot) end-lsn)
+         (<= (wal-replication-slot-consistent-lsn slot) end-lsn)
+         (or (null confirmed) (<= confirmed end-lsn)))))
+
+(defun wal-standby-logical-catalog-xmin (slot system-id replay-lsn next-xid history policy)
+  "Return the catalog pin of a usable logical slot covered by this replay boundary."
+  (declare (notinline logical-slot-provenance-system-id))
+  (let ((provenance (wal-replication-slot-logical-provenance slot))
+        (horizon (wal-replication-slot-catalog-xmin slot)))
+    (when (and system-id provenance (running-xacts-normal-xid-p horizon)
+               (eql system-id (logical-slot-provenance-system-id provenance))
+               (eq :reserved (wal-replication-slot-wal-status slot))
+               (not (or (wal-replication-slot-drop-claim slot)
+                        (wal-replication-slot-creation-failed-p slot)
+                        (wal-replication-slot-state-uncertain-p slot)))
+               (wal-logical-slot-covered-p slot replay-lsn)
+               (<= (xid-epoch-start (min next-xid +max-xid+)) horizon next-xid)
+               (<= (- next-xid horizon) #x80000000)
+               (logical-slot-history-positions-p slot history)
+               (logical-slot-standby-policy-covers-p slot policy replay-lsn))
+      horizon)))
+
+(defun wal-physical-feedback-horizons (xmin &key include-senders logical-system-id replay-lsn next-xid
+                                              logical-history logical-policy)
+  "Return separate data and catalog minima under the slot registry lock.
+With LOGICAL-SYSTEM-ID, also consider logical catalog pins covered by replay."
+  (let ((catalog-xmin nil))
+    (flet ((note-catalog (catalog)
+             (when catalog
+               (setf catalog-xmin (if catalog-xmin (min catalog-xmin catalog) catalog)))))
+      (sb-thread:with-mutex (*wal-lock*)
+        (loop for slot being the hash-values of *wal-replication-slots*
+              do (cond ((and (wal-physical-slot-p slot)
+                             (not (eq :lost (wal-replication-slot-wal-status slot))))
+                        (destructuring-bind (&optional data catalog) (physical-slot-horizons slot)
+                          (when data (setf xmin (min xmin data)))
+                          (note-catalog catalog)))
+                       ((and logical-system-id logical-history (wal-logical-slot-p slot))
+                        (note-catalog (wal-standby-logical-catalog-xmin
+                                       slot logical-system-id replay-lsn next-xid logical-history logical-policy)))))
+        (when include-senders
+          (loop for sender-xmin being the hash-values of *wal-physical-sender-xmins*
+                do (setf xmin (min xmin sender-xmin))))))
+    (values xmin catalog-xmin)))
+
 (defun wal-limit-xmin-by-physical-feedback (xmin &key include-senders include-catalog)
-  "Lower XMIN to the oldest data horizon of any nonlost physical slot.
-INCLUDE-SENDERS also applies transient horizons held by slotless senders.
-INCLUDE-CATALOG includes the separate catalog horizon of each physical slot."
-  (sb-thread:with-mutex (*wal-lock*)
-    (loop for slot being the hash-values of *wal-replication-slots*
-          when (and (wal-physical-slot-p slot)
-                    (not (eq :lost (wal-replication-slot-wal-status slot))))
-            do (destructuring-bind (&optional data catalog) (physical-slot-horizons slot)
-                 (when data (setf xmin (min xmin data)))
-                 (when (and include-catalog catalog) (setf xmin (min xmin catalog)))))
-    (when include-senders
-      (loop for sender-xmin being the hash-values of *wal-physical-sender-xmins*
-            do (setf xmin (min xmin sender-xmin)))))
-  xmin)
+  "Lower XMIN to retained physical feedback. Include catalog pins only on request."
+  (multiple-value-bind (data catalog) (wal-physical-feedback-horizons xmin :include-senders include-senders)
+    (if (and include-catalog catalog) (min data catalog) data)))
 
 (defun wal-valid-slot-plugin-state-p (plugin database-oid confirmed-flush-lsn)
   "A standard slot must be database-bound and confirmed in its first durable image."
@@ -311,6 +350,12 @@ INCLUDE-CATALOG includes the separate catalog horizon of each physical slot."
 (defvar *wal-xid-first-lsn* (make-hash-table :test #'eql))
 (defvar *wal-snapshot-retention-pins* (make-hash-table :test #'eq))
 (defvar *wal-replication-slots* (make-hash-table :test #'equal))
+
+(defvar *standby-logical-slots-awaiting-replay* nil
+  "Copied slot entries held out of the public registry until receive WAL proves them.")
+
+(defvar *standby-logical-slots-rejected* nil
+  "Copied slots whose proof failed; their durable files still fence promotion.")
 
 (defvar *max-replication-slots* 10
   "Shared capacity for all public slot names, including temporary and lost slots.")
@@ -3617,12 +3662,7 @@ must separately validate system, history, lifetime, replay and storage context."
   "Decode a slot for local reads and startup, checking logical LSNs against durable WAL."
   (let ((slot (wal-decode-replication-slot-image bytes expected-name)))
     (when (wal-logical-slot-p slot)
-      (unless (and (typep *wal-durable-lsn* '(unsigned-byte 64))
-                   (<= (wal-replication-slot-restart-lsn slot) *wal-durable-lsn*)
-                   (<= (wal-replication-slot-consistent-lsn slot) *wal-durable-lsn*)
-                   (or (null (wal-replication-slot-confirmed-flush-lsn slot))
-                       (<= (wal-replication-slot-confirmed-flush-lsn slot)
-                           *wal-durable-lsn*)))
+      (unless (wal-logical-slot-covered-p slot *wal-durable-lsn*)
         (error "replication slot file ~a is corrupt or outside durable WAL" expected-name)))
     slot))
 

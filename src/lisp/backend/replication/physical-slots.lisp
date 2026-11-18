@@ -107,7 +107,7 @@ Eligible ancestor segments may satisfy a public physical slot."
 ;;; Standby startup validates the slot batch against retained and received WAL.
 ;;; Startup isolation or exclusive quiescence keeps the mutable spool stable.
 
-(defun physical-slot-check-receive-chain (store index replay)
+(defun physical-slot-check-receive-chain (store index replay &key restart-positions prefix-positions)
   "Scan retained extents and spool once from base through floor to durable flush.
 Check native gaps, the FNV floor and flush digests, and a replay record boundary.
 The caller protects the root and excludes changes to the receive spool."
@@ -117,6 +117,8 @@ The caller protects the root and excludes changes to the receive spool."
          (floor (physical-store-floor-lsn store))
          (floor-seen (= cursor floor))
          (replay-seen (= cursor replay)))
+    (setf restart-positions (remove cursor restart-positions)
+          prefix-positions (remove cursor prefix-positions))
     (when (and floor-seen (/= digest (physical-store-floor-digest store)))
       (error "physical slot receive floor has an invalid base digest"))
     (physical-follow-map-active-prefix
@@ -125,7 +127,10 @@ The caller protects the root and excludes changes to the receive spool."
        (unless (= cursor (wal-record-start record))
          (wal-lineage-check-gap cursor record history))
        (setf cursor (wal-record-end record)
-             digest (physical-store-update-digest digest raw))
+             digest (physical-store-update-digest digest raw)
+             restart-positions (remove cursor
+                                       (remove (wal-record-start record) restart-positions))
+             prefix-positions (remove cursor prefix-positions))
        (when (= cursor replay) (setf replay-seen t))
        (when (= cursor floor)
          (unless (= digest (physical-store-floor-digest store))
@@ -138,6 +143,8 @@ The caller protects the root and excludes changes to the receive spool."
                  (= cursor (physical-store-flushed-lsn store))
                  (= digest (physical-store-flushed-digest store)))
       (error "physical slot WAL does not reach its replay and durable receive boundaries"))
+    (when (or restart-positions prefix-positions)
+      (error "logical slot positions lack exact boundaries in retained receive WAL"))
     t))
 
 (defun physical-slot-check-standby-control (state system-id replay)
@@ -164,7 +171,7 @@ require replay to cover both the base and durable applied position."
       (unless (every (lambda (restart) (>= restart origin)) restarts)
         (error "physical slot restart precedes the immutable standby overlap")))))
 
-(defun physical-slot-check-standby-receive (store state replay)
+(defun physical-slot-check-standby-receive (store state replay &key restart-positions prefix-positions)
   "Check receive identity and replay against a checked candidate, then recheck
 its control tuple. The caller holds a root lease and excludes spool mutation;
 the candidate and tuple recheck alone do not protect the spool."
@@ -179,7 +186,9 @@ the candidate and tuple recheck alone do not protect the spool."
          (candidate (physical-follow-copy-checked-store store))
          (index (physical-follow-controller-index candidate)))
     (physical-recovery-check-store-point candidate replay (physical-recovery-replay-timeline state))
-    (physical-slot-check-receive-chain candidate index replay)
+    (physical-slot-check-receive-chain candidate index replay
+                                       :restart-positions restart-positions
+                                       :prefix-positions prefix-positions)
     (unless (equal tuple (physical-store-control-tuple store))
       (error "physical slot receive state changed during validation"))
     (physical-store-read-retained-control store tuple))
@@ -502,7 +511,33 @@ verify the base floor before publishing under WAL."
                      (timeline-parse-history
                       *wal-insert-timeline* (bytes->string (timeline-history-bytes *wal-insert-timeline*))))))))
 
-(defun wal-advance-physical-replication-slot (name target)
+(defun wal-advance-standby-logical-slot-under-lock (slot target frontier)
+  "Save a pgoutput filter position without releasing its proven restart anchor."
+  (assert (sb-thread:holding-mutex-p *wal-lock*))
+  (let ((confirmed (wal-replication-slot-confirmed-flush-lsn slot))
+        (name (wal-replication-slot-name slot)))
+    (unless (and *physical-receive-store*
+                 (equal "pgoutput" (wal-replication-slot-plugin slot))
+                 (null (wal-replication-slot-child-owner slot))
+                 (wal-replication-slot-logical-provenance slot)
+                 (eq :reserved (wal-replication-slot-wal-status slot))
+                 confirmed
+                 (logical-slot-standby-policy-covers-p
+                  slot (getf *physical-recovery-state* :source-logical-fact) frontier))
+      (ereport "55000" "logical slot ~s cannot advance in standby recovery" name))
+    (when (wal-replication-slot-active-owner slot)
+      (ereport "55006" "replication slot ~s is active" name))
+    (when (< target confirmed)
+      (ereport "55000" "cannot advance replication slot ~s backwards" name))
+    (when (> target confirmed)
+      (let ((candidate (wal-copy-replication-slot-with-profile slot)))
+        (setf (wal-replication-slot-confirmed-flush-lsn candidate) target
+              (wal-replication-slot-confirmed-timeline candidate)
+              (physical-slot-current-prefix-timeline target))
+        (logical-slot-save-update-under-lock slot candidate)))
+    target))
+
+(defun wal-advance-physical-replication-slot (name target &key allow-standby-logical)
   "Advance a reserved slot up to durable primary WAL or standby replay.
 Save the candidate before changing the stable slot object; TARGET may be an
 interior position on a standby."
@@ -520,7 +555,11 @@ interior position on a standby."
         (unless slot (ereport "42704" "replication slot ~s does not exist" name))
 
         (unless (wal-physical-slot-p slot)
-          (ereport "0A000" "logical slot SQL advancement is not supported"))
+          (progn
+            (when (and allow-standby-logical (recovery-in-progress-p))
+              (return-from wal-advance-physical-replication-slot
+                (wal-advance-standby-logical-slot-under-lock slot target frontier)))
+            (ereport "0A000" "logical slot SQL advancement is not supported")))
         (when (and (wal-replication-slot-active-owner slot)
                    (not (physical-slot-owned-by-backend-p slot *backend*)))
           (ereport "55006" "replication slot ~s is active" name))

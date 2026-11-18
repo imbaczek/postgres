@@ -165,6 +165,127 @@ The caller publishes the results before waking the writer."
 
 (declaim (ftype function logical-slot-continuation-restore-startup))
 
+(defun logical-slot-check-standby-candidate (slot state history replay)
+  "Check a copied logical slot against the applied source identity and policy."
+  (let* ((provenance (wal-replication-slot-logical-provenance slot))
+         (pin (wal-replication-slot-catalog-xmin slot))
+         (policy (getf state :source-logical-fact)))
+    (unless (and provenance
+                 (eql (logical-slot-provenance-system-id provenance) (getf state :system-id))
+                 (not (wal-replication-slot-child-owner slot))
+                 (eq :reserved (wal-replication-slot-wal-status slot))
+                 (wal-replication-slot-database-oid slot)
+                 (wal-replication-slot-confirmed-flush-lsn slot)
+                 (running-xacts-normal-xid-p pin)
+                 (<= (xid-epoch-start (min *next-xid* +max-xid+)) pin *next-xid*)
+                 (wal-logical-slot-covered-p slot replay)
+                 (logical-slot-history-positions-p slot history)
+                 (logical-slot-standby-policy-covers-p slot policy replay))
+      (error "logical slot ~a is outside supported standby recovery coverage"
+             (wal-replication-slot-name slot)))))
+
+(defun logical-slot-prove-standby-prefix (store slots)
+  "Prove slot anchors on the retained receive chain under startup or quiescence."
+  (let* ((state *physical-recovery-state*)
+         (replay *last-replay-lsn*)
+         (system-id (physical-slot-startup-system-id))
+         (history (physical-store-retained-history store))
+         (control (physical-slot-check-standby-control state system-id replay)))
+    (dolist (slot slots)
+      (logical-slot-check-standby-candidate slot state history replay)
+      (when (< (wal-replication-slot-consistent-lsn slot) (physical-store-base-lsn store))
+        (let ((provenance (wal-replication-slot-logical-provenance slot))
+              (policy (getf state :source-logical-fact)))
+          (unless (and (>= (wal-replication-slot-restart-lsn slot) (physical-store-base-lsn store))
+                       (logical-slot-provenance-on-start-lsn provenance)
+                       (eql (logical-slot-provenance-on-start-lsn provenance)
+                            (getf policy :logical-on-start-lsn))
+                       (eql (logical-slot-provenance-on-start-timeline provenance)
+                            (getf policy :logical-on-start-timeline)))
+            (error "pre-base logical slot ~a lacks its retained restart or original ON interval"
+                   (wal-replication-slot-name slot))))))
+    (physical-follow-call-with-receive-root
+     store
+     (lambda ()
+       (physical-slot-check-standby-receive
+        store state replay
+        :restart-positions (mapcar #'wal-replication-slot-restart-lsn slots)
+        :prefix-positions (loop for slot in slots
+                                for birth = (wal-replication-slot-consistent-lsn slot)
+                                when (>= birth (physical-store-base-lsn store))
+                                  collect birth
+                                ;; pgoutput confirmation is a filter position.
+                                unless (equal (wal-replication-slot-plugin slot) "pgoutput")
+                                  collect (wal-replication-slot-confirmed-flush-lsn slot)))))
+    (unless (and (eq state *physical-recovery-state*)
+                 (= replay *last-replay-lsn*)
+                 (equalp control (physical-recovery-read-control *pgdata*)))
+      (error "logical slot recovery control changed during validation"))
+    control))
+
+(defun logical-slot-recheck-standby-entry (entry)
+  "Check that a proved slot still has the exact bytes captured before the scan."
+  (let* ((slot (logical-slot-startup-entry-slot entry))
+         (name (wal-replication-slot-name slot)))
+    (slot-state-read
+     (wal-replication-slot-directory) name
+     (lambda (bytes expected-name)
+       (declare (ignore expected-name))
+       (unless (equalp bytes (logical-slot-startup-entry-bytes entry))
+         (error "logical slot ~a changed during receive validation" name))))))
+
+(defun logical-slot-publish-standby-entries (entries registry)
+  (dolist (entry entries)
+    (let* ((slot (logical-slot-startup-entry-slot entry))
+           (name (wal-replication-slot-name slot)))
+      (logical-slot-recheck-standby-entry entry)
+      (when (gethash name registry) (error "duplicate WAL replication slot ~a" name))))
+  (dolist (entry entries)
+    (let ((slot (logical-slot-startup-entry-slot entry)))
+      (setf (gethash (wal-replication-slot-name slot) registry) slot))))
+
+(defun logical-slot-standby-entry-covered-p (entry)
+  (wal-logical-slot-covered-p (logical-slot-startup-entry-slot entry) *last-replay-lsn*))
+
+(defun logical-slot-admit-replayed-standby-entries (store)
+  "Admit copied entries after replay catches up, while the receive chain is quiescent."
+  (let ((ready (remove-if-not #'logical-slot-standby-entry-covered-p
+                              *standby-logical-slots-awaiting-replay*)))
+    (when ready
+      (handler-case
+          (progn
+            (logical-slot-prove-standby-prefix store (mapcar #'logical-slot-startup-entry-slot ready))
+            (sb-thread:with-mutex (*wal-lock*)
+              (wal-check-replication-slot-capacity-for-count
+               (+ (hash-table-count *wal-replication-slots*) (1- (length ready)))
+               *max-replication-slots*)
+              (logical-slot-publish-standby-entries ready *wal-replication-slots*)))
+        (error (condition)
+          (setf *standby-logical-slots-rejected*
+                (nconc ready *standby-logical-slots-rejected*))
+          (admin-log "copied logical slot admission deferred until restart: ~a" condition)))
+      (setf *standby-logical-slots-awaiting-replay*
+            (set-difference *standby-logical-slots-awaiting-replay* ready)))))
+
+(defun logical-slot-restore-standby-inventory (store)
+  "Restore covered copied slots and defer slots that are ahead of replay."
+  (let* ((entries (logical-slot-startup-read-inventory :cleanup t :local-workspace t
+                                                       :decoder #'wal-decode-replication-slot-image))
+         (slots (mapcar #'logical-slot-startup-entry-slot entries))
+         (physical (remove-if-not #'wal-physical-slot-p slots))
+         (logical (remove-if-not (lambda (entry)
+                                   (wal-logical-slot-p (logical-slot-startup-entry-slot entry)))
+                                 entries))
+         (restored (logical-slot-prepare-startup-inventory
+                    physical nil (postgres-current-timestamp))))
+    (when logical
+      (wal-check-replication-slot-capacity-for-count (+ (hash-table-count restored) (1- (length logical))) *max-replication-slots*))
+    (setf *standby-logical-slots-awaiting-replay* logical
+          *standby-logical-slots-rejected* nil
+          *wal-replication-slots* restored)
+    (logical-slot-admit-replayed-standby-entries store)
+    (values)))
+
 (defun logical-slot-load-startup-inventory (gate-owner ownership)
   (when (or gate-owner ownership)
     (check-primary-storage-startup-context gate-owner ownership))

@@ -46,27 +46,29 @@ def read_regular(path, limit):
 def recovery_phase(root):
     """Read bounded native recovery control and return its checked phase.
 
-    Bit 30 marks a logical fact immediately before the CRC. Its final size field
-    identifies the optional ON interval. Strip that fact first; the length modulo
+    Bit 29 marks a pending slot evidence digest before the CRC. Bit 30 marks
+    the logical fact and its optional ON interval. Strip both; the length modulo
     four identifies the two optional pending promotion intents. All sections
     share one CRC. The backend still checks source ancestry before promoting.
     """
-    data = read_regular(root / "physical-recovery.control", 407)
+    data = read_regular(root / "physical-recovery.control", 415)
     if len(data) < 72:
         raise ValueError("invalid native recovery control length")
     ordinary = data[:8] == b"PGRSTAT3"
     pending = data[:8] == b"PGRSTAT4"
     raw_phase = struct.unpack_from("<I", data, 8)[0]
+    slot_evidence = bool(raw_phase & (1 << 29))
+    fact_end = len(data) - 4 - (8 if slot_evidence else 0)
     logical_size = 0
     if raw_phase & (1 << 30):
-        suffix_size = struct.unpack_from("<I", data, len(data) - 8)[0]
+        suffix_size = struct.unpack_from("<I", data, fact_end - 4)[0]
         if suffix_size not in (0, 16):
             raise ValueError("invalid native recovery logical fact length")
         logical_size = 88 + suffix_size
-    logical_end = len(data) - 4 - logical_size
+    logical_end = fact_end - logical_size
     residue = (logical_end + 4) % 4
     intent, logical_intent = bool(residue & 1), bool(residue & 2)
-    phase = raw_phase & 0x3fffffff
+    phase = raw_phase & 0x1fffffff
     if (intent or logical_intent) and not (pending and phase == 3):
         raise ValueError("invalid native recovery control length")
     core_size = logical_end + 4 - (17 if intent else 0) - (18 if logical_intent else 0)
@@ -78,6 +80,8 @@ def recovery_phase(root):
     size = resource_end + 4 - (48 if known else 0)
     if not ((ordinary and size in (72, 88)) or (pending and size in (88, 104, 132, 148))):
         raise ValueError("invalid native recovery control")
+    if slot_evidence and not (pending and phase == 3 and size in (132, 148)):
+        raise ValueError("native slot evidence requires a retained promotion fork")
     saved = struct.unpack_from("<I", data, len(data) - 4)[0]
     if crc32c(data[:-4] + b"\0" * 4) != saved:
         raise ValueError("native recovery control checksum mismatch")
@@ -103,7 +107,7 @@ def recovery_phase(root):
                 and not any(policy[10:])):
             raise ValueError("invalid native promotion logical intent")
     if logical_size:
-        validate_logical_fact(data[logical_end:-4], applied, applied_timeline)
+        validate_logical_fact(data[logical_end:fact_end], applied, applied_timeline)
     return phase
 
 
@@ -234,8 +238,8 @@ def primary_committed(root):
     requires lifecycle metadata. Promote also verifies the PGDATA owner.
     """
     fields = read_regular(root / "global/pg_wal_control", 1025).split()
-    checksum_format = len(fields) in (12, 16, 18, 22)
-    if ((not checksum_format and len(fields) not in (8, 11, 15, 17, 21))
+    checksum_format = len(fields) in (12, 16, 18, 20, 22, 24)
+    if ((not checksum_format and len(fields) not in (8, 11, 15, 17, 19, 21, 23))
             or fields[0] != b"PGWAL6"):
         raise ValueError("invalid native WAL control")
     if crc32c(b" ".join(fields[:-1])) != int(fields[-1], 16):
@@ -244,6 +248,11 @@ def primary_committed(root):
         if fields[-2] != b"C1":
             raise ValueError("unsupported native page checksum format")
         fields.pop(-2)
+    if len(fields) in (19, 23):
+        if (fields[-3] != b"L" or re.fullmatch(rb"[0-9]+", fields[-2]) is None
+                or int(fields[-2]) >= 2**64):
+            raise ValueError("invalid native logical slot evidence reference")
+        del fields[-3:-1]
     validate_resource_fields(fields)
     return (int(fields[3]) > 1 and fields[3] == fields[4] and fields[5] == b"timeline"
             and len(fields) in (11, 15, 17, 21) and fields[8] == b"6"

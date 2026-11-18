@@ -471,10 +471,59 @@ rule signals a fatal error."
                   (eq (first expression) :from-function)
                   (rewind-sql-expression-p (second expression)))))))
 
+(defun rewind-slot-name-list-p (expression)
+  "Accept the bound parameter or the literal slot-name array sent by Patroni."
+  (or (equal expression '(:parameter 1))
+      (and (consp expression) (eq (first expression) :array-literal)
+           (every (lambda (item)
+                    (and (consp item) (eq (first item) :const)
+                         (stringp (second item)) (null (cddr item))))
+                  (second expression))
+           (null (cddr expression)))))
+
+(defun rewind-slot-query-matches-p (statement template)
+  "Compare the fixed query AST, allowing only its slot-name array to vary."
+  (cond
+    ((equal template '(:parameter 1)) (rewind-slot-name-list-p statement))
+    ((consp template)
+     (and (consp statement)
+          (rewind-slot-query-matches-p (car statement) (car template))
+          (rewind-slot-query-matches-p (cdr statement) (cdr template))))
+    ((sql-derived-relation-p template)
+     (and (sql-derived-relation-p statement)
+          (equal (sql-derived-relation-query statement) (sql-derived-relation-query template))))
+    ((sql-relation-name-p template)
+     (and (sql-relation-name-p statement)
+          (equal (sql-relation-name-schema statement) (sql-relation-name-schema template))
+          (equal (sql-relation-name-name statement) (sql-relation-name-name template))))
+    (t (equal statement template))))
+
+(defun rewind-patroni-slot-query-p (statement)
+  "Allow Patroni's read-only slot queries for a login authorized for native rewind."
+  (and (role-can-rewind-native-p (authentication-committed-role (backend-startup-user *backend*)))
+       (some (lambda (template) (rewind-slot-query-matches-p statement template))
+             (load-time-value
+              (append
+               (parse-statements
+                "SELECT slot_name, catalog_xmin FROM pg_catalog.pg_get_replication_slots()
+                 WHERE NOT pg_catalog.pg_is_in_recovery() AND slot_name = ANY($1)")
+               (loop for filter in '("" "NOT failover AND ")
+                     append
+                     (parse-statements
+                      (format nil
+                              "SELECT slot_name, slot_type, datname, plugin, catalog_xmin,
+                                      pg_catalog.pg_wal_lsn_diff(confirmed_flush_lsn, '0/0')::bigint,
+                                      pg_catalog.pg_read_binary_file('pg_replslot/' || slot_name || '/state')
+                               FROM pg_catalog.pg_get_replication_slots()
+                               JOIN pg_catalog.pg_database ON datoid = oid
+                               WHERE ~aNOT pg_catalog.pg_is_in_recovery()
+                                 AND slot_name = ANY($1)" filter)))) t))))
+
 (defun check-rewind-sql-statements (statements)
   (when (rewind-restricted-sql-session-p)
     (dolist (statement statements)
       (unless (or (member (getf statement :type) '(:begin :commit :rollback))
+                  (rewind-patroni-slot-query-p statement)
                   (and (eq (getf statement :type) :select)
                        (loop for (key value) on statement by #'cddr
                              always (or (null value)

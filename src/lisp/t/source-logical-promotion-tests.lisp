@@ -31,6 +31,61 @@
                    :promotion-generation 9 :promotion-source-namespace :legacy
                    :promotion-wal-level :replica)))))
 
+(deftest pending-control-binds-standby-logical-slot-evidence
+    (let* ((reference '(:root-id 2 :base-timeline 1 :base 32 :manifest-digest 4
+                        :end 152 :end-digest 5))
+           (fact (source-logical-promotion-fact t 119))
+           (arguments (list 3 42 1 4 32 152 50 :state-time 0 :promotion-child 4
+                                               :promotion-generation 9 :promotion-source-namespace :legacy
+                                               :logical-fact fact :promotion-full-page-writes t
+                                               :promotion-logical-decoding-enabled t :promotion-wal-level :replica))
+           (bytes (apply #'pg::physical-recovery-control-image
+                         (append arguments (list :retained-reference reference :logical-slot-evidence-digest 7))))
+           (decoded (pg::physical-recovery-decode-control bytes)))
+      (ok (= 7 (getf decoded :logical-slot-evidence-digest)))
+      (ok (equalp fact (getf decoded :logical-fact)))
+      (ok (getf decoded :promotion-full-page-writes))
+      (ok (getf decoded :promotion-logical-decoding-enabled))
+      (ok (equal reference (getf decoded :retained-reference)))
+      (ok (intake-fails-p
+           (lambda () (apply #'pg::physical-recovery-control-image
+                             (append arguments (list :logical-slot-evidence-digest 7))))))
+      (ok (intake-fails-p
+           (lambda () (pg::physical-recovery-control-image 2 42 1 4 32 152 50
+                                                           :logical-slot-evidence-digest 7))))
+      (let ((corrupt (copy-seq bytes)))
+        (setf (aref corrupt (- (length corrupt) 12)) 0)
+        (ok (intake-fails-p (lambda () (pg::physical-recovery-decode-control corrupt)))))))
+
+(deftest child-control-preserves-local-logical-slot-evidence
+    (let* ((pg::*physical-recovery-state* (promotion-logical-test-plan-state 216 t t :unknown :legacy))
+           (reference '(:root-id 2 :base-timeline 1 :base 32 :manifest-digest 4
+                        :end 216 :end-digest 5))
+           (plan (pg::physical-promotion-checkpoint-plan pg::*physical-recovery-state* 20000 1003)))
+      (setf (getf pg::*physical-recovery-state* :system-id) 42
+            (getf pg::*physical-recovery-state* :retained-reference) reference
+            (getf pg::*physical-recovery-state* :logical-slot-evidence-digest) 7)
+      (let* ((bytes (pg::physical-promotion-child-control-image plan 1003))
+             (metadata (nth-value 6 (pg::wal-decode-control-line (pg::bytes->string bytes))))
+             (refreshed (pg::wal-refresh-control-metadata metadata 6 1004)))
+        (ok (= 7 (getf metadata :logical-slot-evidence-digest)))
+        (ok (equal reference (getf metadata :retained-reference)))
+        (ok (= 7 (getf refreshed :logical-slot-evidence-digest)))
+        (setf refreshed (append refreshed (list :page-checksum-version 1)))
+        (let* ((snapshot (getf plan :snapshot))
+               (end (getf plan :end))
+               (child (getf plan :child))
+               (rewritten (pg::wal-encode-control-image end end snapshot :timeline child
+                                                                         :namespace :timeline :metadata refreshed)))
+          (ok (equal refreshed
+                     (nth-value 6 (pg::wal-decode-control-line (pg::bytes->string rewritten))))))
+        (multiple-value-bind (base removed) (pg::wal-control-base-metadata refreshed)
+          (ok removed)
+          (ok (not (get-properties base '(:logical-slot-evidence-digest :retained-reference))))
+          (ok (pg::wal-control-metadata-valid-p base)))
+        (remf refreshed :retained-reference)
+        (ok (not (pg::wal-control-metadata-valid-p refreshed))))))
+
 (deftest promotion-logical-plan-freezes-configured-level-independently
     (dolist (pair '((nil :replica) (t :replica) (t :logical)))
       (destructuring-bind (desired level) pair
