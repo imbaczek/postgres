@@ -4205,17 +4205,18 @@ The caller holds the WAL lock and syncs the status directory."
 
 (declaim (ftype function timeline-read-history-stream))
 
-(defun wal-archive-read-history-bytes (wal-fd timeline)
-  "Read history through a held source descriptor and recheck its named file facts."
-  (let* ((name (timeline-history-filename timeline))
-         (fd (wal-archive-open-source wal-fd name))
+(defun wal-archive-read-source-bytes (wal-fd name &key sync)
+  (let* ((fd (wal-archive-open-source wal-fd name))
          (stream nil))
     (unwind-protect
          (let ((facts (wal-archive-check-source wal-fd name fd)))
            (setf stream (sb-sys:make-fd-stream fd :input t :element-type '(unsigned-byte 8)))
            (let ((bytes (timeline-read-history-stream stream)))
+             (when sync
+               (sb-posix:fsync fd)
+               (sb-posix:fsync wal-fd))
              (unless (equal facts (wal-archive-check-source wal-fd name fd))
-               (error "WAL archive history changed during read: ~a" name))
+               (error "WAL archive source changed during read: ~a" name))
              (values bytes facts)))
       (if stream (close stream) (sb-posix:close fd)))))
 
@@ -4231,7 +4232,7 @@ When SOURCE-NAME is selected, require its facts to match the held archive source
                (timeline-archive-history-items
                 *wal-insert-timeline*
                 (lambda (timeline)
-                  (multiple-value-bind (bytes facts) (wal-archive-read-history-bytes wal-fd timeline)
+                  (multiple-value-bind (bytes facts) (wal-archive-read-source-bytes wal-fd (timeline-history-filename timeline))
                     (when (and source-name (string= source-name (timeline-history-filename timeline))
                                (not (equal source-facts facts)))
                       (error "WAL archive history changed before command: ~a" source-name))

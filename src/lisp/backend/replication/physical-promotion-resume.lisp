@@ -198,6 +198,10 @@ reuse partially restored state."
                  (physical-promotion-open-pending-store state :on-open (lambda (opened) (setf store opened)))
                  (physical-promotion-validate-cold-state state metadata prefix generation store artifact-checker)
                  (physical-promotion-ensure-pending-retained state metadata store)
+                 (when (and (startup-primary-wal-archive-enabled-p)
+                            (wal-namespace-file-stat
+                             (timeline-history-path (getf state :promotion-child) *pgdata*) t))
+                   (physical-promotion-stage-archive-partial state prefix))
                  (physical-promotion-test-point :before-pending-restore)
                  (physical-promotion-restore-cold-state state store)
                  (physical-promotion-test-point :after-pending-restore))))

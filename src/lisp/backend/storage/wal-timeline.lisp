@@ -81,6 +81,59 @@ DIRECTORY-FD, when supplied, is the caller-held WAL directory descriptor."
           (when (and temporary (not finished))
             (ignore-errors (sb-posix:unlink (namestring temporary)))))))))
 
+(defun wal-archive-promotion-partial-name (source-timeline fork namespace)
+  (multiple-value-bind (segment offset) (wal-segment-and-offset fork)
+    (when (plusp offset)
+      (concatenate 'string (wal-segment-filename segment source-timeline namespace) ".partial"))))
+
+(defun wal-archive-write-promotion-partial (wal-fd name prefix)
+  "Sync the verified fork prefix and install it without replacing an existing file."
+  (let ((template (merge-pathnames ".archive-partial-XXXXXX" (physical-image-fd-path wal-fd)))
+        (fd nil) (temporary nil) (stream nil) (installed nil))
+    (unwind-protect
+         (progn
+           (multiple-value-bind (descriptor path) (open-exclusive-temporary-file template)
+             (setf fd descriptor temporary (file-namestring path)))
+           (setf stream (sb-sys:make-fd-stream fd :output t :element-type '(unsigned-byte 8)))
+           (write-sequence prefix stream)
+           (finish-output stream)
+           (sb-posix:fsync fd)
+           (unless (equal (physical-image-file-facts fd)
+                          (physical-image-file-facts wal-fd temporary))
+             (error "promotion archive temporary changed"))
+           (wal-archive-check-wal-directory wal-fd)
+           (slot-state-rename-no-replace wal-fd temporary wal-fd name)
+           (setf installed t)
+           (sb-posix:fsync wal-fd))
+      (unwind-protect
+           (when (and temporary (not installed)
+                      (ignore-errors (equal (physical-image-file-facts fd)
+                                            (physical-image-file-facts wal-fd temporary))))
+             (port-unlinkat wal-fd temporary 0))
+        (cond (stream (close stream :abort t))
+              (fd (sb-posix:close fd)))))))
+
+(defun wal-archive-stage-promotion-partial (source-timeline fork prefix namespace)
+  "Stage the verified fork prefix as an archive partial when needed.
+On retry, accept an existing partial only when its bytes match."
+  (let ((name (wal-archive-promotion-partial-name source-timeline fork namespace)))
+    (when name
+      (unless (and (typep prefix '(vector (unsigned-byte 8)))
+                   (= (length prefix) (mod fork +wal-segment-size+)))
+        (error "invalid promotion archive prefix"))
+      (sb-sys:without-interrupts
+        (let ((wal-fd (wal-archive-open-wal-directory)))
+          (unwind-protect
+               (let ((path (merge-pathnames name (physical-image-fd-path wal-fd))))
+                 (wal-archive-check-wal-directory wal-fd)
+                 (if (wal-namespace-file-stat path t)
+                     (unless (equalp prefix
+                                     (wal-archive-read-source-bytes wal-fd name :sync t))
+                       (error "existing promotion archive partial differs: ~a" name))
+                     (wal-archive-write-promotion-partial wal-fd name prefix)))
+            (sb-posix:close wal-fd))))
+      name)))
+
 ;; Prefix staging can install several destination paths during rollover, so an
 ;; observer's ledger must distinguish paths.  The scratch stream is closed before
 ;; installation; install callbacks therefore have no borrowed descriptor.

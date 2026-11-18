@@ -596,6 +596,14 @@ root FD. The caller retains the pair for the call; it passes to slot inventory."
           (physical-promotion-check-pending-slots state slot-parent)
           (physical-promotion-check-pending-slots state)))))
 
+(defun physical-promotion-stage-archive-partial (state prefix)
+  "Stage the verified parent fork prefix for archiving when enabled.
+The same check permits a cold promotion retry."
+  (when (startup-primary-wal-archive-enabled-p)
+    (wal-archive-stage-promotion-partial
+     (physical-recovery-replay-timeline state) (getf state :applied)
+     prefix (physical-promotion-parent-namespace state))))
+
 (defun physical-promotion-install-prefix ()
   "Install the verified pending child prefix before history/EOR; never admit writes.
 Retry only while child history is absent. Later transition recovery must inspect
@@ -606,11 +614,14 @@ history/EOR instead of calling this helper and overwriting child WAL."
         (declare (ignore catalog))
         (physical-promotion-check-pending state metadata prefix generation)
         (physical-promotion-ensure-pending-retained state metadata)
-        (let ((fork (getf state :applied)) (child (getf state :promotion-child)) (finished nil))
+        (let ((fork (getf state :applied)) (child (getf state :promotion-child))
+                                           (parent (physical-recovery-replay-timeline state))
+                                           (namespace (physical-promotion-parent-namespace state)) (finished nil))
           (wal-namespace-file-stat (wal-segment-path (floor fork +wal-segment-size+) child :timeline) t)
           (unwind-protect
                (prog1
-                   (wal-install-timeline-prefix (physical-recovery-replay-timeline state) child fork prefix
-                                                (physical-promotion-parent-namespace state))
+                   (progn
+                     (physical-promotion-stage-archive-partial state prefix)
+                     (wal-install-timeline-prefix parent child fork prefix namespace))
                  (setf finished t))
             (unless finished (setf *physical-recovery-failed-p* t))))))))

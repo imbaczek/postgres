@@ -211,6 +211,28 @@
          (pg::timeline-write-history 2 1 pg::+wal-segment-size+ "different bytes")
          (ok (equal '((:history . 3)) (pg::wal-archive-history-items)))))))
 
+(deftest promotion-archive-partial-stages-only-the-verified-fork-prefix
+    (call-with-physical-source-fixture
+     (lambda ()
+       (let* ((prefix (make-array 5 :element-type '(unsigned-byte 8)
+                                    :initial-contents '(1 2 3 4 5)))
+              (different (make-array 5 :element-type '(unsigned-byte 8)
+                                       :initial-element 0))
+              (name "0000000000000000.wal.partial")
+              (path (merge-pathnames name (pg::wal-directory))))
+         (ok (null (pg::wal-archive-stage-promotion-partial
+                    1 pg::+wal-segment-size+ #() :legacy)))
+         (ok (string= name (pg::wal-archive-stage-promotion-partial 1 5 prefix :legacy)))
+         (ok (equalp prefix (pg::read-bounded-regular-file path 5)))
+         (let ((facts (pg::physical-image-file-facts -100 (namestring path))))
+           (ok (string= name (pg::wal-archive-stage-promotion-partial 1 5 prefix :legacy)))
+           (ok (equal facts (pg::physical-image-file-facts -100 (namestring path)))))
+         (ok (signals (pg::wal-archive-stage-promotion-partial 1 5 different :legacy) 'error))
+         (sb-posix:link (namestring path)
+                        (namestring (merge-pathnames "partial-hardlink" pg::*pgdata*)))
+         (ok (signals (pg::wal-archive-stage-promotion-partial 1 5 prefix :legacy) 'error))
+         (ok (equalp prefix (pg::read-bounded-regular-file path 5)))))))
+
 (deftest physical-source-legacy-pin-is-readable-before-handoff
     (call-with-physical-source-fixture
      (lambda ()
