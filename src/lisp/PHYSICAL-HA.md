@@ -90,10 +90,15 @@ Two recovery areas still need work.
    tests. Edits between nonempty restore command templates preserve the
    current generation. Changing the command also preserves the generation
    when a streaming source is configured.
-   Archive timeline discovery and a live descendant test of partial restore
-   remain open.
-   Startup from an archive without a prior native receive state still needs
-   qualification.
+   Archive-only recovery with an unbound `latest` policy now discovers and
+   selects descendant history. The live `--case archive-descendant` test copied
+   the original base to a new observer with empty `primary_conninfo`, replayed
+   the actual parent partial and child EOR, and read a child-only row. A clean
+   restart verified recovery again. It passed in 46.12 s on the ramdisk, and
+   five focused tests also passed. Bound streaming selection and fixed timeline
+   policies retain their existing path. End-to-end bound restore and crash
+   injection remain open.
+   Archive recovery from other base layouts still needs qualification.
    Offline rewind has a separate restore path. Archive producer work still needs
    repeated-promotion and mode-handoff tests, safe queue reclamation, and
    bounded backlog scans.
@@ -149,8 +154,8 @@ Three focused tests passed, including a compacted descendant floor.
 C describes `%r` as the oldest WAL file needed for restart
 (`src/backend/access/transam/xlogarchive.c:141`). Native filename suffixes,
 legacy names, and proof files differ, so archive cleanup tools must understand
-those names. Archive timeline discovery, live bound descendant partial restore,
-and archive cleanup remain open.
+those names. End-to-end bound descendant partial restore and archive cleanup
+remain open.
 
 Native WAL can rotate early when the next record will not fit. The closed
 segment can be shorter than 16 MiB. Rotation syncs the old stream and its
@@ -282,8 +287,9 @@ The pinned Patroni `archive-promotion-history` run verified that both the partia
 and its proof reached the archive in 27.03 s on the ramdisk. Five focused tests
 passed in 1.92 s, covering exact and mismatched fork selection, missing and
 matching proofs, and retry after child recycling using the data receipt. The
-fork-selection tests simulated the runtime boundary. A live bound descendant
-partial restore and archive timeline discovery remain open.
+fork-selection tests simulated the runtime boundary. A live archive-only
+descendant restore has since passed as described above. End-to-end bound
+descendant restore remains open.
 
 The `rewind-worker-target-archive` case uses the native archiver on a divergent
 former primary to produce the WAL segment that contains the common fork.
