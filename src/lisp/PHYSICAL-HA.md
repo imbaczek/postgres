@@ -271,7 +271,15 @@ The standby worker submits `.wal.proof` companions after recording successful
 archival of the matching WAL segment. It retries proof failures without
 blocking later WAL. The proof records the exact end of the segment.
 The live cold-restart and promotion test took 57.57 s. Three focused tests
-took 1.31 s. Primary proof emission and an online consumer remain open.
+took 1.31 s.
+
+Primary rotation now captures the exact segment end for proof emission. The
+worker publishes the proof after the matching WAL receipt exists and the
+durable frontier covers that end. A failed proof does not hold up later archive
+commands. Recycling checks both receipts and verifies that the proof matches
+the WAL bytes before removing the local files. Three focused tests took
+0.49 s. The live test passed on an earlier build in 54.30 s. Online restore
+and proof handling during namespace migration remain open.
 
 The recycle path must preserve archive-eligible files until durable success
 is recorded. Reconstruct pending work after restart from durable WAL and status,
