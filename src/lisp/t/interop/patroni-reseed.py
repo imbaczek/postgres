@@ -548,15 +548,17 @@ class ArchiveDescendantAcceptance(ArchiveHistoryAcceptance):
             observer_port = reservation.getsockname()[1]
         config = follow.configuration(data, observer_port, root)
         archive = shlex.quote(str(self.archive))
-        config["recovery_conf"] = {"restore_command": f'test -f {archive}/"%f" && cp -- {archive}/"%f" "%p"'}
+        self.configure_archive_observer(config, archive, root, port)
         node = Postgresql(config, Null())
         try:
             self.start_archive_observer(node, root, self.archive / proof)
-            assert follow.query(observer_port, "SHOW primary_conninfo") == [("",)]
+            self.check_archive_route(observer_port)
             follow.wait_for(lambda: self.has_child_row(observer_port))
+            self.check_archive_handoff(observer_port, port, root, proof)
             assert follow.query(observer_port, "SELECT pg_is_in_recovery()") == [(True,)]
             assert node.restart(timeout=90) is True
-            assert self.has_child_row(observer_port)
+            follow.wait_for(lambda: self.has_child_row(observer_port))
+            self.check_archive_restart(observer_port, port)
             self.result["checks"].append(self.label)
         finally:
             self.stop_target(node)
@@ -564,12 +566,72 @@ class ArchiveDescendantAcceptance(ArchiveHistoryAcceptance):
     def start_archive_observer(self, node, root, proof):
         assert node.follow(None, timeout=90) is True
 
+    def configure_archive_observer(self, config, archive, root, source_port):
+        config["recovery_conf"] = {"restore_command": f'test -f {archive}/"%f" && cp -- {archive}/"%f" "%p"'}
+
+    def check_archive_route(self, port):
+        assert follow.query(port, "SHOW primary_conninfo") == [("",)]
+
+    def check_archive_handoff(self, observer_port, source_port, root, proof):
+        pass
+
+    def check_archive_restart(self, observer_port, source_port):
+        pass
+
     @staticmethod
     def has_child_row(port):
         try:
-            return follow.query(port, "SELECT id FROM patroni_reseed_child_only") == [(42,)]
+            return follow.query(port, "SELECT id FROM patroni_reseed_child_only WHERE id = 42") == [(42,)]
         except follow.psycopg2.errors.UndefinedTable:
             return False
+
+
+class ArchiveDescendantBoundAcceptance(ArchiveDescendantAcceptance):
+    label = "archive-descendant-bound"
+
+    def configure_archive_observer(self, config, archive, root, source_port):
+        super().configure_archive_observer(config, archive, root, source_port)
+        attempts = shlex.quote(str(root / "restored-files"))
+        config["recovery_conf"]["restore_command"] += f' && printf "%%s\\n" "%f" >> {attempts}'
+        follow.query(source_port, "SELECT pg_create_physical_replication_slot('follow_one',true)")
+        self.archive_member = Member(0, "promoted", None,
+                                     {"conn_url": f"postgres://127.0.0.1:{source_port}/postgres"})
+
+    def start_archive_observer(self, node, root, proof):
+        assert node.follow(self.archive_member, timeout=90) is True
+
+    def check_archive_route(self, port):
+        assert follow.query(port, "SHOW primary_conninfo")[0][0]
+
+    def check_archive_handoff(self, observer_port, source_port, root, proof):
+        attempts = root / "restored-files"
+        history = self.result["archive_history"]
+        parent_partial = history["local_partial"]
+        required = {history["name"], parent_partial, parent_partial + ".proof", proof}
+        follow.wait_for(lambda: attempts.is_file() and
+                        required.issubset(attempts.read_text().splitlines()), seconds=45)
+        proof_bytes = (self.archive / proof).read_bytes()
+        assert len(proof_bytes) == 52 and proof_bytes[:4] == b"PWAP"
+        archive_end = int.from_bytes(proof_bytes[32:40], "little")
+        cursor = ("SELECT status,slot_name,receive_start_tli,"
+                  "pg_wal_lsn_diff(receive_start_lsn,'0/0'::pg_lsn)::bigint "
+                  "FROM pg_stat_get_wal_receiver()")
+        follow.wait_for(lambda: follow.query(observer_port, cursor) ==
+                        [("streaming", "follow_one", 2, archive_end)])
+        self.check_streamed_row(observer_port, source_port, 43)
+
+    def check_archive_restart(self, observer_port, source_port):
+        follow.wait_for(lambda: follow.query(observer_port,
+                        "SELECT id FROM patroni_reseed_child_only WHERE id = 43") == [(43,)])
+        self.check_streamed_row(observer_port, source_port, 44)
+
+    @staticmethod
+    def check_streamed_row(observer_port, source_port, row):
+        receiver = "SELECT status,slot_name FROM pg_stat_get_wal_receiver()"
+        follow.wait_for(lambda: follow.query(observer_port, receiver) == [("streaming", "follow_one")])
+        follow.query(source_port, f"INSERT INTO patroni_reseed_child_only VALUES ({row})")
+        follow.wait_for(lambda: follow.query(observer_port,
+                        f"SELECT id FROM patroni_reseed_child_only WHERE id = {row}") == [(row,)])
 
 
 class ArchiveDescendantCrashAcceptance(ArchiveDescendantAcceptance):
@@ -1362,7 +1424,8 @@ def main():
     cases = {"synthetic": Acceptance, "former-primary": FormerPrimaryAcceptance,
                "rewind-shared-history": RewindSharedHistoryAcceptance,
                "archive-promotion-history": ArchiveHistoryAcceptance,
-                 "archive-descendant": ArchiveDescendantAcceptance,
+                  "archive-descendant": ArchiveDescendantAcceptance,
+                  "archive-descendant-bound": ArchiveDescendantBoundAcceptance,
                  "archive-descendant-crash": ArchiveDescendantCrashAcceptance,
                "rewind-page-reuse": RewindPageReuseAcceptance,
              "rewind-install": RewindInstallAcceptance,
