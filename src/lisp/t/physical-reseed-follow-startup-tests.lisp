@@ -269,7 +269,7 @@
                        (symbol-function 'pg::physical-reseed-follow-check-terminal-startup)
                        (lambda (observation) (setf observed observation) (funcall gate observation))
                        (symbol-function 'pg::postmaster-open-data-lock)
-                       (lambda () (setf lock (funcall open-lock))))
+                       (lambda (&rest arguments) (setf lock (apply open-lock arguments))))
                  (ok (handler-case
                          (progn (pg::physical-reseed-follow-own-startup "127.0.0.1" 5439) nil)
                        (error (condition)
@@ -322,7 +322,7 @@
                                  (setf fired t)
                                  (reseed-follow-owner-test-write path bytes))))
                            (symbol-function 'pg::postmaster-open-data-lock)
-                           (lambda () (setf lock (funcall open-lock))))
+                           (lambda (&rest arguments) (setf lock (apply open-lock arguments))))
                      (ok (handler-case
                              (progn (pg::physical-reseed-follow-own-startup "127.0.0.1" 5439) nil)
                            (error (condition)
