@@ -5035,13 +5035,19 @@ unchanged generated SQL, with fixtures supplying the surrounding state.
 | Physical slots | Unchanged `SlotsHandler` creates and loads a physical slot, queries view and function forms, advances it and drops it. The fixture supplies database transport. | `t/interop/physical-slots.py:62-93` |
 | Replica lifecycle | Real pinned Patroni clone, follow, promotion, rewind and rejoin are composed with a leader supplied by the fixture. This includes source restart, physical slots and synchronous configuration; it is not leader election. | `t/interop/patroni-reseed.py --case patroni-lifecycle` |
 
+The live monitor passed in 100.87 s on the ramdisk. On fresh primaries,
+`pg_last_xact_replay_timestamp()` returned a typed NULL on both engines.
+The native standby reported the source commit time after durable replay.
+It kept the previous timestamp while receiving WAL during a replay pause.
+The timestamp belongs to the current server process. Legacy native commits
+without a timestamp yield NULL. C also tracks abort and prepared-transaction
+records. Native WAL currently records transaction times on commits.
+
 Distinct backend gaps remain:
 
-- The exact REST handler status SQL returned a row on C. The native probe
-  failed with SQLSTATE `42883` because `pg_last_xact_replay_timestamp()` is
-  missing. The query also needs sender activity fields `usesysid` and
-  `client_addr`, role lookup and JSON conversion. The probe took 12.79 s on
-  the ramdisk.
+- A fresh exact REST handler status SQL probe now fails on native at the missing
+  `pg_catalog.pg_authid` relation (SQLSTATE `42P01`). The query also needs sender
+  activity fields `usesysid` and `client_addr`, role lookup and JSON conversion.
 - Initial `Bootstrap.bootstrap` calls `pg_ctl initdb`, which the native
   utility does not implement. Authentication and role provisioning also
   require acceptance.
