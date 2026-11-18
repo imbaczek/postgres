@@ -23,9 +23,9 @@ Three areas still separate this evidence from closeout:
 1. Connect native standby feedback to the primary's cleanup decisions.
    Physical slot images can store separate data and catalog transaction
    horizons, and the native sender saves them from incoming feedback frames.
-   The standby sends data feedback for a named physical slot. Ordinary VACUUM
-   and index builds use that horizon, and SQL reports it as `xmin`. Catalog
-   feedback, slotless feedback, and the interaction with forced XID epoch
+   The standby sends data feedback with or without a named physical slot.
+   Ordinary VACUUM and index builds use that horizon, and SQL reports the
+   slot's value as `xmin`. Catalog feedback and forced XID epoch
    rollover remain open. Patroni's logical slot readiness and slot copy path
    still need acceptance.
 2. Exercise password-backed bootstrap and post-bootstrap role provisioning
@@ -5171,6 +5171,14 @@ enabled and disabled feedback through the configuration worker, checked that
 postmaster PID and primary sender PID. Native SIGHUP also reloads code and
 can reconnect the receiver. Four focused Rove tests passed in 28 ms of test
 execution.
+
+Without a public slot, the primary holds the data horizon on the sender
+connection, as C does with the sender's process xmin. A report can replace or
+clear it. Disconnect removes the horizon with the sender's claim. The pinned
+Patroni follow regression switched to slotless streaming, observed a horizon
+on the source, detached the standby with feedback still enabled, then verified
+that the horizon disappeared and named-slot streaming could resume. It passed
+in 87.50 s on the ramdisk. Four focused Rove tests passed in 36 ms of execution.
 
 The three configuration and candidate test runs overlapped on the ramdisk.
 
