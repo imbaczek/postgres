@@ -1794,6 +1794,53 @@ Selection still requires WAL transition evidence and durable publication."
                    (<= cursor (timeline-history-entry-end ancestor)))
           (values history text))))))
 
+(defun physical-follow-fetch-archive-with-limit (runtime command system-id timeline segment namespace limit)
+  "Fetch a proved closed extent or a partial that ends exactly at the fork."
+  (multiple-value-bind (bytes end)
+      (physical-follow-fetch-archive runtime command system-id timeline segment namespace)
+    (cond ((and bytes (or (null limit) (<= end limit)))
+           (values bytes end))
+          ((and limit (plusp (mod limit +wal-segment-size+))
+                (= segment (floor limit +wal-segment-size+)))
+           (multiple-value-bind (partial proved-end)
+               (physical-follow-fetch-archive runtime command system-id timeline segment namespace t)
+             (when (eql limit proved-end)
+               (values partial proved-end)))))))
+
+(defun physical-follow-archive-transition (runtime command local-history cursor)
+  "Return immediate child history and EOR evidence at the durable parent fork.
+The child archive extent has already passed system, timeline and byte proof
+checks. The caller still has to compare overlap and publish the selection."
+  (multiple-value-bind (latest latest-text)
+      (physical-follow-find-archive-history runtime command local-history cursor)
+    (when latest
+      (let* ((parent (timeline-history-entry-timeline (first local-history)))
+             (position (position parent latest :key #'timeline-history-entry-timeline))
+             (child-entry (nth (1- position) latest))
+             (child (timeline-history-entry-timeline child-entry)))
+        (when (= cursor (timeline-history-entry-begin child-entry))
+          (let* ((text (if (eq child-entry (first latest))
+                           latest-text
+                           (let ((bytes (physical-follow-fetch-archive-history runtime command child)))
+                             (when bytes (bytes->string bytes)))))
+                 (history (when text (timeline-check-lineage (timeline-parse-history child text)))))
+            (unless (and history (physical-store-history-extends-p history latest)
+                         (eql parent (and (second history)
+                                          (timeline-history-entry-timeline (second history)))))
+              (return-from physical-follow-archive-transition nil))
+            (let* ((start (wal-record-start-after cursor +wal-end-of-recovery-record-size+))
+                   (segment (floor start +wal-segment-size+))
+                   (offset (mod start +wal-segment-size+))
+                   (system-id (getf *physical-recovery-state* :system-id))
+                   (child-end (timeline-history-entry-end child-entry)))
+              (let ((bytes (physical-follow-fetch-archive-with-limit
+                            runtime command system-id child segment :timeline child-end)))
+                (when (and bytes (<= (+ offset +wal-end-of-recovery-record-size+) (length bytes)))
+                  (let* ((raw (subseq bytes offset (+ offset +wal-end-of-recovery-record-size+)))
+                         (record (wal-decode-record raw start)))
+                    (when (= child (timeline-check-end-of-recovery record parent history))
+                      (values child text raw segment bytes))))))))))))
+
 (defun physical-follow-restore-next (runtime command cursor)
   (let* ((timeline (physical-follow-runtime-receive-timeline runtime))
          (system-id (getf *physical-recovery-state* :system-id))
@@ -1801,17 +1848,8 @@ Selection still requires WAL transition evidence and durable publication."
          (limit (physical-follow-runtime-boundary runtime)))
     (labels ((fetch (number)
                (flet ((from-namespace (namespace)
-                        (multiple-value-bind (bytes end)
-                            (physical-follow-fetch-archive runtime command system-id timeline number namespace)
-                          (cond ((and bytes (or (null limit) (<= end limit)))
-                                 (values bytes end))
-                                ((and limit (plusp (mod limit +wal-segment-size+))
-                                      (= number (floor limit +wal-segment-size+)))
-                                 (multiple-value-bind (partial partial-end)
-                                     (physical-follow-fetch-archive
-                                      runtime command system-id timeline number namespace t)
-                                   (when (eql limit partial-end)
-                                     (values partial partial-end))))))))
+                        (physical-follow-fetch-archive-with-limit
+                         runtime command system-id timeline number namespace limit)))
                  (multiple-value-bind (bytes end) (from-namespace :timeline)
                    (if (or bytes (/= timeline 1))
                        (values bytes end)

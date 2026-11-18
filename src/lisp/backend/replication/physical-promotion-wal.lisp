@@ -10,8 +10,7 @@
   "Build stable EOR bytes using the frozen time and configured WAL level.
 An absent legacy intent retains the historical level 2 bytes."
   (let* ((fork (getf state :applied))
-         (remaining (- +wal-segment-size+ (mod fork +wal-segment-size+)))
-         (start (if (<= +wal-end-of-recovery-record-size+ remaining) fork (+ fork remaining)))
+         (start (wal-record-start-after fork +wal-end-of-recovery-record-size+))
          (time (* 1000000 (- (getf state :state-time) 946684800)))
          (intent-p (not (null (get-properties state '(:promotion-logical-decoding-enabled)))))
          (level-p (not (null (get-properties state '(:promotion-wal-level)))))

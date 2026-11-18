@@ -912,6 +912,66 @@
                                                       :restart-file "%r"))))
           (pg::physical-store-close store)))))
 
+(deftest archive-transition-evidence-requires-proved-child-eor
+    (with-physical-store-directory (root)
+      (let* ((pg::*pgdata* root)
+             (store (pg::physical-store-open root 123 1 :create t))
+             (pg::*physical-receive-store* store)
+             (pg::*physical-recovery-state* (list :system-id 123 :timeline 1 :end 0))
+             (pg::*physical-recovery-failed-p* nil)
+             (pg::*shutdown* pg::+no-shutdown+)
+             (runtime (pg::make-physical-follow-runtime))
+             (archive (merge-pathnames "archive/" root))
+             (local (pg::timeline-parse-history 1 ""))
+             (command "test -f \"archive/%f\" && cp -- \"archive/%f\" \"%p\""))
+        (unwind-protect
+             (progn
+               (pg::wal-ensure-directory-durable (pg::wal-directory))
+               (pg::wal-ensure-directory-durable archive)
+               (dolist (fork (list 32 (- pg::+wal-segment-size+ 40)))
+                 (let* ((start (pg::wal-record-start-after fork pg::+wal-end-of-recovery-record-size+))
+                        (segment (floor start pg::+wal-segment-size+))
+                        (offset (mod start pg::+wal-segment-size+))
+                        (eor (store-history-eor fork 2 1))
+                        (bytes (make-array (+ offset (length eor))
+                                           :element-type '(unsigned-byte 8) :initial-element 0))
+                        (text (format nil "1 ~X/~X fork~%" (ash fork -32) (ldb (byte 32 0) fork)))
+                        (name (pg::wal-segment-filename segment 2 :timeline))
+                        (proof-path (merge-pathnames (pg::wal-archive-segment-proof-name name) archive)))
+                   (pg::wal-atomic-write-bytes (merge-pathnames (pg::timeline-history-filename 2) archive)
+                                               (pg::string->bytes text))
+                   (replace bytes eor :start1 offset)
+                   (pg::wal-atomic-write-bytes (merge-pathnames name archive) bytes)
+                   (ok (null (pg::physical-follow-archive-transition runtime command local fork)))
+                   (pg::wal-atomic-write-bytes
+                    proof-path (pg::wal-encode-archive-segment-proof
+                                123 2 segment :timeline (+ start (length eor)) bytes))
+                   (multiple-value-bind (child history raw carrier)
+                       (pg::physical-follow-archive-transition runtime command local fork)
+                     (ok (eql child 2))
+                     (ok (equal history text))
+                     (ok (equalp raw eor))
+                     (ok (eql carrier segment)))
+                   (ok (null (pg::physical-follow-archive-transition runtime command local (1- fork))))
+                   (when (zerop segment)
+                     (let* ((next-fork (+ start (length eor)))
+                            (latest (merge-pathnames (pg::timeline-history-filename 3) archive))
+                            (partial (concatenate 'string name ".partial")))
+                       (pg::wal-atomic-write-bytes
+                        latest (pg::string->bytes (format nil "~a2 0/~X later fork~%" text next-fork)))
+                       (rename-file (merge-pathnames name archive) (merge-pathnames partial archive))
+                       (rename-file proof-path
+                                    (merge-pathnames (pg::wal-archive-segment-proof-name partial) archive))
+                       (ok (eql 2 (pg::physical-follow-archive-transition runtime command local fork)))
+                       (delete-file latest)))
+                   (replace bytes (store-history-eor fork 3 1) :start1 offset)
+                   (pg::wal-atomic-write-bytes (merge-pathnames name archive) bytes)
+                   (pg::wal-atomic-write-bytes
+                    proof-path (pg::wal-encode-archive-segment-proof
+                                123 2 segment :timeline (+ start (length eor)) bytes))
+                   (ok (signals (pg::physical-follow-archive-transition runtime command local fork) 'error)))))
+          (pg::physical-store-close store)))))
+
 (deftest archive-history-discovery-checks-ancestry-and-durable-cursor
     (with-physical-store-directory (root)
       (let* ((pg::*pgdata* root)
