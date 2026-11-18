@@ -5043,11 +5043,16 @@ The timestamp belongs to the current server process. Legacy native commits
 without a timestamp yield NULL. C also tracks abort and prepared-transaction
 records. Native WAL currently records transaction times on commits.
 
+The correlated `pg_authid` lookup returned `(10, postgres)` with types
+`oid` and `name` on C and Lisp. The live monitor passed in 113.73 s on the
+ramdisk. The native catalog exposes the bootstrap role's OID and name.
+Activity reports the role OID for admitted connections and NULL for
+provisional connections. The focused activity snapshot test passed.
+
 Distinct backend gaps remain:
 
-- A fresh exact REST handler status SQL probe now fails on native at the missing
-  `pg_catalog.pg_authid` relation (SQLSTATE `42P01`). The query also needs sender
-  activity fields `usesysid` and `client_addr`, role lookup and JSON conversion.
+- The exact REST handler status SQL now fails at `client_addr` (SQLSTATE
+  `42703`). The probe took 5.75 s. JSON conversion still needs acceptance.
 - Initial `Bootstrap.bootstrap` calls `pg_ctl initdb`, which the native
   utility does not implement. Authentication and role provisioning also
   require acceptance.
