@@ -31,6 +31,31 @@
           (pg::fsync-stream stream)))
       (funcall function))))
 
+(deftest primary-archive-proof-tracks-the-writer-rotation-end
+    (call-with-physical-source-fixture
+     (lambda ()
+       (let* ((pg::*wal-output-stream* nil)
+              (pg::*wal-output-segment* nil)
+              (pg::*wal-new-segments* nil)
+              (settings (pg::startup-configuration-settings pg::*startup-installed-configuration*))
+              (first (sample-physical-record))
+              (later (concatenate '(vector (unsigned-byte 8)) first (sample-physical-record (length first))))
+              (path (pg::wal-segment-path 0))
+              (proof (merge-pathnames (pg::wal-archive-segment-proof-name (file-namestring path))
+                                      (pg::wal-directory))))
+         (setf (getf (gethash "archive_mode" settings) :value) "on")
+         (dolist (bytes (list first later))
+           (pg::wal-atomic-write-bytes path bytes)
+           (let ((pg::*wal-end-lsn* (length bytes)))
+             (unwind-protect
+                  (pg::wal-open-output 1)
+               (when pg::*wal-output-stream* (close pg::*wal-output-stream*))
+               (setf pg::*wal-output-stream* nil pg::*wal-output-segment* nil)))
+           (ok (= (length bytes)
+                  (pg::wal-verify-archive-segment-proof
+                   (pg::read-bounded-regular-file proof pg::+wal-archive-segment-proof-size+)
+                   (pg::catalog-system-identifier) 1 0 :legacy bytes))))))))
+
 (deftest primary-archive-ready-follows-control-and-fences-recycling
     (call-with-physical-source-fixture
      (lambda ()

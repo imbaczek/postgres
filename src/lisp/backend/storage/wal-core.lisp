@@ -1552,6 +1552,14 @@ during cleanup, and keep backend termination from replacing a latched WAL failur
 (defun wal-next-record-start (length)
   (wal-record-start-after *wal-end-lsn* length))
 
+(declaim (ftype function wal-record-primary-archive-rotation))
+
+(defun wal-note-primary-archive-rotation (next-segment)
+  (when (and (plusp *wal-end-lsn*) (startup-primary-wal-archive-enabled-p))
+    (let ((previous (floor (1- *wal-end-lsn*) +wal-segment-size+)))
+      (when (< previous next-segment)
+        (wal-record-primary-archive-rotation previous *wal-end-lsn*)))))
+
 (defun wal-open-output (segment)
   (unless (eql segment *wal-output-segment*)
     (when *wal-output-stream*
@@ -1566,6 +1574,7 @@ during cleanup, and keep backend termination from replacing a latched WAL failur
         (setf *wal-new-segments* '()))
       (close *wal-output-stream*)
       (setf *wal-output-stream* nil))
+    (wal-note-primary-archive-rotation segment)
     (let* ((path (wal-segment-path segment))
            (newp (not (probe-file path))))
       (setf *wal-output-stream*
@@ -4571,6 +4580,31 @@ under the lock, and publish completion only after success."
 
 (defun wal-archive-segment-proof-name (name)
   (concatenate 'string name ".proof"))
+
+(declaim (ftype function wal-encode-archive-segment-proof wal-archive-stage-source))
+
+(defun wal-record-primary-archive-rotation (segment end)
+  "Persist the writer's end before the first record enters the next segment."
+  (sb-sys:without-interrupts
+    (let ((fd (wal-archive-open-wal-directory))
+          (name (wal-segment-filename segment *wal-insert-timeline* *wal-segment-namespace*)))
+      (unwind-protect
+           (progn
+             (wal-archive-check-wal-directory fd)
+             (let* ((bytes (wal-archive-read-source-bytes fd name :sync t))
+                    (proof (wal-encode-archive-segment-proof
+                            (catalog-system-identifier) *wal-insert-timeline* segment
+                            *wal-segment-namespace* end bytes))
+                    (leaf (wal-archive-segment-proof-name name))
+                    (path (merge-pathnames leaf (physical-image-fd-path fd))))
+               ;; A crash can reopen and extend this segment before rotation is durable.
+               (when (and (wal-namespace-file-stat path t)
+                          (not (equalp proof (wal-archive-read-source-bytes fd leaf))))
+                 (wal-archive-check-wal-directory fd)
+                 (unless (zerop (port-unlinkat fd leaf 0))
+                   (error "cannot replace provisional WAL archive proof: ~a" leaf)))
+               (wal-archive-stage-source fd leaf proof #'wal-archive-check-wal-directory)))
+        (sb-posix:close fd)))))
 
 (defun wal-archive-proof-segment-name (name)
   (when (uiop:string-suffix-p name ".wal.proof")
