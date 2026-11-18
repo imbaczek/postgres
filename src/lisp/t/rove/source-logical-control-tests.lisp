@@ -80,7 +80,7 @@
                                                         :fpw t :retained t :intent nil :logical-intent nil :exhausted t))
                (size (physical-logical-fact-image-size fact))
                (offset (- (length bytes) (+ 4 size))))
-          (rove:ok (= (- +physical-recovery-control-maximum-bytes+ (if known 0 16))
+          (rove:ok (= (- +physical-recovery-control-maximum-bytes+ 8 (if known 0 16))
                       (length bytes)))
           (dotimes (i size)
             (let ((bad (copy-seq bytes)))

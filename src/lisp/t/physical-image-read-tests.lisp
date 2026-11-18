@@ -194,8 +194,8 @@
            (unwind-protect
                 (progn
                   (setf (symbol-function 'pg::physical-image-check-directory)
-                        (lambda (fd &optional device)
-                          (prog1 (funcall original fd device)
+                        (lambda (fd &optional device primary-permissions)
+                          (prog1 (funcall original fd device primary-permissions)
                             (pushnew fd acquired)
                             (when (= cut (incf calls))
                               (setf injected t)
