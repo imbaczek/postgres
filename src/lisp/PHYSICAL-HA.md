@@ -60,10 +60,10 @@ Three items remain for backend closeout.
    stock Patroni 4.1.5. Include generated configuration, utility invocation,
    connection recovery, and the supported slot and synchronous settings. Keep
    leadership supplied by the harness.
-2. Complete the server-side archive comparison against C. Send staged partial
-   segments from the old timeline to the archive, add standby
-   `archive_mode=always`, and use an archive produced by the worker for
-   stopped-target restore.
+2. Complete the server-side archive comparison against C. Add standby
+   `archive_mode=always`, use an archive produced by the worker for
+   stopped-target restore, and qualify archive retries across repeated
+   promotion.
 3. Expand native rewind beyond the qualified immediate-child topology, or
    record that limit in the supported contract. C can find a common ancestor
    further back in the timeline histories. Also decide how to handle torn local
@@ -195,12 +195,21 @@ fork prefix as `.wal.partial` before installing the child prefix. An exact
 segment boundary needs no partial. Staging syncs the separate file and publishes
 it without replacing an existing name. A retry compares the held file bytes
 and identity and syncs the owning directory. Cold pending promotion can stage
-the same validated prefix after child history has appeared. The primary archive
-worker still needs to select and send these staged files.
+the same validated prefix after child history has appeared.
 
 The live Patroni fixture verified a regular 1,807,425-byte partial against the
 child WAL through the reported fork. The run took 27.46 s. Strict compilation
 and seven focused heads took 63.09 s. The live run exercised ordinary promotion.
+
+The primary worker now selects staged partials from committed timeline forks
+at or before the durable WAL endpoint, after history files and before ordinary
+segments. It compares the exact fork-length prefix against the local child WAL
+and checks source identity before and after the command. An unusable optional
+partial, including one whose source can no longer be checked, leaves regular
+WAL archiving available. The live Patroni case recorded completion for the
+1,807,425-byte partial and compared the archived bytes against the local child
+prefix. The full-file archive name was absent. The run took 27.28 s. Strict
+compilation and eight focused heads took 63.22 s.
 
 The recycle path must preserve archive-eligible files until durable success
 is recorded. Reconstruct pending work after restart from durable WAL and status,

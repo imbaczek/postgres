@@ -493,6 +493,12 @@ class ArchiveHistoryAcceptance(RewindSharedHistoryAcceptance):
         assert stat.S_ISREG(partial.lstat().st_mode)
         assert partial.stat().st_size == offset
         assert partial.read_bytes() == child.read_bytes()[:offset]
+        partial_receipt = wal / "archive_status" / (partial.name + ".done")
+        follow.wait_for(partial_receipt.is_file)
+        archived_partial = self.archive / partial.name
+        assert stat.S_ISREG(archived_partial.lstat().st_mode)
+        assert archived_partial.read_bytes() == partial.read_bytes()
+        assert not (self.archive / partial.name.removesuffix(".partial")).exists()
         self.result["archive_history"] = {"name": name, "text": promoted["history"],
                                           "local_partial": partial.name, "partial_size": offset}
 
