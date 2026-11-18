@@ -218,6 +218,21 @@ restores the worker-produced file exactly once, rewinds the target, and rejoins
 it to the promoted source. The 16,772,156-byte archive remains unchanged through
 rewind. The reviewed run took 235.59 s.
 
+C's standby receiver marks a segment ready for the archiver after syncing
+and closing it in `archive_mode=always`. Native standby WAL lives in a
+receive spool and a retained inventory selected by durable control. The
+retained inventory reader can now extract a closed native segment. It requires
+validated coverage from the segment boundary or a checked base overlap. A
+full-size segment closes at its boundary. A shorter segment requires an
+adjacent successor on the same timeline with a matching logical endpoint.
+The reader verifies the whole inventory before returning bytes.
+
+The focused fixture covers full and short segments, an open tail, a timeline
+mismatch, and an otherwise valid inventory with the checked overlap removed.
+Strict compilation and two focused heads took 66.13 s. Runtime integration
+still needs to stage complete durable receive segments while replay is paused
+and retain them through compaction and restart until archive completion.
+
 The recycle path must preserve archive-eligible files until durable success
 is recorded. Reconstruct pending work after restart from durable WAL and status,
 including loss of a notification after the segment became durable. Run the
