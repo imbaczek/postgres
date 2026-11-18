@@ -574,7 +574,7 @@
                 (:lost (setf (pg::wal-replication-slot-wal-status public) :lost))
                 (:timeline (incf pg::*wal-insert-timeline*))
                 (:namespace (setf pg::*wal-segment-namespace* :timeline)))
-              (ok (equal "55000"
+              (ok (equal (if (eq change :namespace) "57P01" "55000")
                          (recovery-state-of (lambda () (pg::physical-source-read-next
                                                         (pg::physical-source-pin-name pin) owner base)))))
               (ok (intake-fails-p
