@@ -551,7 +551,7 @@ class ArchiveDescendantAcceptance(ArchiveHistoryAcceptance):
         config["recovery_conf"] = {"restore_command": f'test -f {archive}/"%f" && cp -- {archive}/"%f" "%p"'}
         node = Postgresql(config, Null())
         try:
-            assert node.follow(None, timeout=90) is True
+            self.start_archive_observer(node, root, self.archive / proof)
             assert follow.query(observer_port, "SHOW primary_conninfo") == [("",)]
             follow.wait_for(lambda: self.has_child_row(observer_port))
             assert follow.query(observer_port, "SELECT pg_is_in_recovery()") == [(True,)]
@@ -561,12 +561,74 @@ class ArchiveDescendantAcceptance(ArchiveHistoryAcceptance):
         finally:
             self.stop_target(node)
 
+    def start_archive_observer(self, node, root, proof):
+        assert node.follow(None, timeout=90) is True
+
     @staticmethod
     def has_child_row(port):
         try:
             return follow.query(port, "SELECT id FROM patroni_reseed_child_only") == [(42,)]
         except follow.psycopg2.errors.UndefinedTable:
             return False
+
+
+class ArchiveDescendantCrashAcceptance(ArchiveDescendantAcceptance):
+    label = "archive-descendant-crash"
+
+    def start_archive_observer(self, node, root, proof):
+        data = root / "data"
+        history = self.result["archive_history"]["name"]
+        canonical = data / "pg_wal" / history
+        control_socket = root / "target.sock"
+        receive = data / "pg_physical_receive"
+        archived = self.archive / history
+        cuts = (("after-history-publication", 0, lambda: node.follow(None, timeout=90)),
+                ("after-history-selection", int(canonical.stem, 16), lambda: node.start(timeout=90)))
+        for point, selected, start in cuts:
+            self.crash_history_publication(node, control_socket, proof, point, start)
+            control = (receive / "receive.control").read_bytes()
+            assert len(control) in (68, 80, 96) and control[:8] == b"PGPHYS03"
+            # The 68-byte format ends with its checksum at this offset.
+            target = int.from_bytes(control[64:68], "little") if len(control) >= 80 else 0
+            assert target == selected
+            blob, = receive.glob(f"{canonical.stem}-*.history")
+            if selected:
+                digest = int.from_bytes(control[68:76], "little")
+                assert blob == published == receive / f"{target:08X}-{digest:016X}.history"
+            else:
+                published = blob
+            assert not canonical.exists()
+            control_socket.unlink(missing_ok=True)
+        # Startup must republish the selected history with no archive copy available.
+        withheld = root / history
+        archived.rename(withheld)
+        try:
+            assert node.start(timeout=90) is True
+            assert canonical.read_bytes() == withheld.read_bytes()
+        finally:
+            withheld.rename(archived)
+
+    def crash_history_publication(self, node, control_socket, proof, point, start):
+        withheld = control_socket.with_name(proof.name)
+        proof.rename(withheld)
+        try:
+            assert start() is True
+            process = node.is_running()
+            marker = control_socket.with_name(f"{point}.marker")
+            follow.control(process, control_socket,
+                           "(setf *physical-store-test-hook* "
+                           "(lambda (point store) (declare (ignore store)) "
+                           f"(when (eq point :{point}) "
+                           f"(with-open-file (out {cancellation.lisp_string(str(marker))} :direction :output) "
+                           "(format out \"~d~%\" (sb-posix:getpid)) (fsync-stream out)) "
+                           "(sb-posix:kill (sb-posix:getpid) 9))))")
+        finally:
+            withheld.rename(proof)
+        status = process.wait(timeout=90)
+        self.result["processes"].append(
+            {"kind": point, "pid": process.pid, "exit": status,
+             "expected_exit": -signal.SIGKILL})
+        assert status == -signal.SIGKILL and int(marker.read_text()) == process.pid
 
 
 class RewindPageReuseAcceptance(RewindSharedHistoryAcceptance):
@@ -1268,6 +1330,7 @@ def main():
                "rewind-shared-history": RewindSharedHistoryAcceptance,
                "archive-promotion-history": ArchiveHistoryAcceptance,
                  "archive-descendant": ArchiveDescendantAcceptance,
+                 "archive-descendant-crash": ArchiveDescendantCrashAcceptance,
                "rewind-page-reuse": RewindPageReuseAcceptance,
              "rewind-install": RewindInstallAcceptance,
              "rewind-cli": RewindCliAcceptance,
