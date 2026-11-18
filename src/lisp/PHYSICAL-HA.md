@@ -68,14 +68,17 @@ on the ramdisk, including 2.06 s for clone and 263.09 s for the configured phase
 The existing `rewind-patroni` regression passed in 251.55 s with its fixture's
 missing configuration probe warnings.
 
-Two recovery areas remain open.
+Two recovery areas still need work.
 
-1. Implement online archive recovery. C recovery can obtain WAL from archive,
-   local files, and streaming through `WaitForWALToBecomeAvailable` and
-   `RestoreArchivedFile`. Native online recovery rejects a nonempty
-   `restore_command`. Offline rewind already has a separate restore path.
-   Archive producer work still needs repeated-promotion and mode-handoff
-   tests, safe queue reclamation, and bounded backlog scans.
+1. Extend online archive recovery. A native standby configured to stream can
+   restore proved closed WAL with `restore_command` before connecting. It uses
+   the selected history and the existing source transition handshake. A focused test
+   exercises the real shell and receiver loop with a simulated streaming handshake.
+   The existing live Patroni follow regression without a restore command passed
+   in 79.70 s on the ramdisk. Archive-only startup, archive history and partial
+   recovery, `%r`, and crash-stage reaping remain open. Offline rewind has a
+   separate restore path. Archive producer work still needs repeated-promotion
+   and mode-handoff tests, safe queue reclamation, and bounded backlog scans.
 2. Set the supported rewind limits. C `findCommonAncestorTimeline` walks
    both histories and can find a fork before the immediate parent. The
    native live evidence covers the immediate-child case. Torn private replay
@@ -295,8 +298,9 @@ worker publishes the proof after the matching WAL receipt exists and the
 durable frontier covers that end. A failed proof does not hold up later archive
 commands. Recycling checks both receipts and verifies that the proof matches
 the WAL bytes before removing the local files. Three focused tests took
-0.49 s. The live test passed on an earlier build in 54.30 s. Online restore
-remains open. Namespace migration verifies eligible legacy proofs and stages
+0.49 s. The live test passed on an earlier build in 54.30 s. At that checkpoint,
+online restore remained open; the connected standby path is now covered as
+described above. Namespace migration verifies eligible legacy proofs and stages
 their qualified companions before publishing control. Startup reconciliation
 removes the inactive proof before removing its WAL alias. The focused test
 checks both rollback and committed cleanup.
@@ -4667,8 +4671,9 @@ arithmetic and complete temporal/time-zone behavior are unfinished.
 The receiver probe exposed zero send-time placeholders in shared native sender
 helpers. XLogData and keepalive frames now use `postgres-current-timestamp`, as
 C walsender does. Signed timestamp decoding reuses `pg-client-i64`. The real
-`restore_command` SIGHUP setting has its C empty default and normal provenance;
-nonempty commands are rejected because archive recovery is not implemented.
+`restore_command` SIGHUP setting has its C empty default and normal provenance.
+At this checkpoint nonempty commands were rejected; the connected standby archive
+restore path described above was implemented later.
 
 Pinned Patroni 4.1.5's ordinary 16-column `cluster_info_query` now runs unchanged
 on primary, bootstrap standby, active/paused standby and stopped follow. The
