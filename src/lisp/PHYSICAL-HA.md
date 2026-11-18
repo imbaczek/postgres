@@ -117,8 +117,16 @@ Publication uses a separate exclusive temporary, syncs the file, renames it,
 and syncs the status directory. The fixture verifies nonzero exit, an exact
 copy of a short segment, a source replacement, and a hard link left at the
 old fixed temporary pathname. Strict compilation and both focused test heads
-took 65.43 s. The scheduler and recycler still need to read and validate
-completion records.
+took 65.43 s.
+
+The recycler now verifies the completion record against the held WAL file.
+It checks the receipt's ownership and permissions, syncs it and its directory,
+rechecks the bindings, then unlinks through the held WAL directory and syncs
+that directory. It stops at the first unproved segment below the normal
+recycling floor. The regression covers a receipt for a later segment, a
+world-writable receipt, and a stale receipt after a source write. Strict
+compilation and three test heads took 75.69 s. Automatic command scheduling
+and startup admission are still open.
 
 The recycle path must preserve archive-eligible files until durable success
 is recorded. Reconstruct pending work after restart from durable WAL and status,
