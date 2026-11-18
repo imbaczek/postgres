@@ -54,8 +54,9 @@ option by itself never starts a listener.
 
 TCP startup uses the first matching `pg_hba.conf` rule for the actual peer and
 startup user/database. The implicit default trusts loopback connections for
-ordinary and physical replication startup. The supported methods are `trust` and
-`reject`; unsupported methods and selectors reject the candidate configuration.
+ordinary and physical replication startup. The supported methods are `trust`,
+`reject`, and `scram-sha-256` for the bootstrap `postgres` role. Invalid methods
+and selectors reject the candidate configuration.
 `hba_file` and
 `ident_file` select the files, and reload validates a new policy before publishing
 it. Implicit paths are under the original `-D`/`PGDATA` configuration directory;
@@ -64,6 +65,13 @@ comment-only ident files are supported; a missing ident file is
 nonfatal. SQL role authorization is not implemented: admitted SQL sessions use
 the `postgres` role. Native TCP listens on IPv4; scoped IPv6 HBA addresses are
 unsupported. The separate control REPL does not use this policy.
+
+`bin/initdb --auth-host=scram-sha-256 --pwfile=FILE` initializes a
+password-backed primary. It uses libpq to derive a verifier from the first
+line of the password file and stores the verifier in a private file in PGDATA.
+The server uses OpenSSL 3 for SCRAM proof verification. Native physical backups
+preserve HBA policy. Verifier transfer and password management for additional
+roles still need implementation.
 
 On first initialization, missing implicit policy files located in owned PGDATA are
 created without replacing existing files. Once the initialization marker exists,

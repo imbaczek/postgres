@@ -29,8 +29,8 @@ Three areas still separate this evidence from closeout:
    horizons. Cold startup rejects horizons it cannot verify across a
    checkpoint. Catalog feedback and Patroni's logical slot readiness and
    slot copy path still need acceptance.
-2. Exercise password-backed bootstrap and post-bootstrap role provisioning
-   through stock Patroni.
+2. Exercise post-bootstrap role provisioning through stock Patroni and carry
+   bootstrap credentials through native physical backup and rejoin.
 3. Qualify archive recovery with a configured streaming source across a
    timeline fork, and settle archive backlog and cleanup behavior. State the
    tested rewind topology and interruption limits in the supported lifecycle
@@ -5110,7 +5110,7 @@ starts a primary under trust authentication for `postgres`.
 and precreated empty PGDATA. It checks the clean control state and absence of
 a PID file before startup, then verifies the system identifier and a SQL
 write. Failure cases include reinitialization, a failed child process,
-symlink and nonempty targets, and unsupported host authentication. Native
+symlink and nonempty targets, and a missing SCRAM password file. Native
 init builds a sibling directory and publishes it with an atomic rename.
 A precreated empty PGDATA receives a new directory inode.
 
@@ -5124,13 +5124,20 @@ verifies the client proof against a caller-supplied verifier. The disposable
 fixture supplied that verifier through the control port. Real libpq accepted
 the correct password and rejected the wrong one. The fixture also checked
 the empty initial response and immediate rejection of a non-password frame.
-It passed in 16.38 s on the ramdisk. HBA dispatch and durable bootstrap
-credentials still need live integration.
+It passed in 16.38 s on the ramdisk.
+
+Pinned Patroni now supplies `--pwfile` to native `initdb` and starts a primary
+with SCRAM on TCP. Initdb stores only the verifier for the bootstrap
+`postgres` role. Trust and SCRAM bootstrap cases passed in 79.30 s on the
+ramdisk. The native wire fixture passed in 15.94 s. It checked correct and
+incorrect passwords across a cold restart, and verified that a stalled
+handshake times out while the next connection succeeds. Two focused
+admission and HBA tests passed.
 
 Distinct backend gaps remain:
 
-- Password-backed `initdb` and `post_bootstrap` role provisioning still need
-  implementation and acceptance.
+- `post_bootstrap` role provisioning and verifier transfer through native
+  physical backup and rejoin still need implementation and acceptance.
 - Patroni-managed logical-slot synchronization needs separate work and testing,
   including `hot_standby_feedback`, `pg_read_binary_file` and C slot files.
 
