@@ -5084,6 +5084,20 @@ Distinct backend gaps remain:
 - Patroni-managed logical-slot synchronization needs separate work and testing,
   including `hot_standby_feedback`, `pg_read_binary_file` and C slot files.
 
+The C fixture `t/interop/hot-standby-feedback-reference.py` takes a C binary
+directory and two ports. Run it with the pinned Patroni Python environment.
+It passed against C 20devel in 3.05 s on the ramdisk. With a logical slot on
+the standby, the primary's physical slot retains the exact `xmin` and
+`catalog_xmin` across disconnect, checkpoint and restart. Disabling feedback
+clears both. Re-enabling restores both, and dropping the standby logical slot
+clears only `catalog_xmin`.
+
+C computes the two horizons in `GetReplicationHorizons` and applies them in
+`PhysicalReplicationSlotNewXmin`. Patroni uses the retained catalog horizon
+to assess slot readiness. Native slot reporting currently returns NULL for
+both horizons. Native feedback and support for Patroni's slot-copy path remain
+open.
+
 The three configuration and candidate test runs overlapped on the ramdisk.
 
 Local evidence and the REST probe are in
