@@ -246,7 +246,7 @@
     (:time-array 1183 -1) (:timetz-array 1270 -1) (:timestamp-array 1115 -1)
     (:timestamptz-array 1185 -1) (:interval-array 1187 -1) (:pg-lsn-array 3221 -1)
     (:bit-array 1561 -1) (:oid 26 4) (:oid8 6437 8) (:xid 28 4) (:pg-node-tree 194 -1) (:record 2249 -1)
-    (:void 2278 4) (:pg-lsn 3220 8) (:numeric 1700 -1) (:float4 700 4)
+    (:void 2278 4) (:inet 869 -1) (:pg-lsn 3220 8) (:numeric 1700 -1) (:float4 700 4)
     (:float8 701 8) (:date 1082 4) (:time 1083 8) (:timetz 1266 12)
     (:timestamp 1114 8) (:interval 1186 16) (:bit 1560 -1)))
 
@@ -278,6 +278,7 @@ exist\" messages."
     (:int4 "integer")
     (:int8 "bigint")
     (:pg-lsn "pg_lsn")
+    (:inet "inet")
     (:oid "oid")
     (:oid8 "oid8")
     (:void "void")
@@ -480,7 +481,7 @@ result is text for typeof and int4 for array_length."
     (unless (or *defer-function-constant-coercion-p*
                 (member element-type '(:record :text :varchar :name :bool :int2 :int4 :int8
                                        :numeric :float4 :float8 :json :jsonb :bytea :oid :oid8 :xid :char :bit :date
-                                       :time :timetz :timestamp :timestamptz :interval :pg-lsn :int2vector)))
+                                       :time :timetz :timestamp :timestamptz :interval :pg-lsn :inet :int2vector)))
       (ereport "0A000" "to_jsonb for type ~a is not supported" type))
     (list :func name arguments :type (if (string= name "to_json") :json :jsonb) :typmod -1)))
 
@@ -2002,9 +2003,11 @@ syntax is checked before the final signed-width range check for TYPE."
           (push number values))))))
 
 (defun sql-cast-string-value (value source target)
-  (if (eq source :bool)
-      (if (eq target :name) (if value "t" "f") (if value "true" "false"))
-      (value->text value source)))
+  (cond ((eq source :bool)
+         (if (eq target :name) (if value "t" "f") (if value "true" "false")))
+        ((and (eq source :inet) (member target '(:text :varchar)))
+         (format nil "~a/~d" (value->text value source) (* 8 (length value))))
+        (t (value->text value source))))
 
 (defun sql-pg-lsn-input (text)
   "Follow pg_parse_lsn: exactly two components of one to eight ASCII hex digits."
@@ -5322,6 +5325,7 @@ truncate and interpret the result at TYPE's signed width."
     ((eq type :interval) (sql-interval-output v))
     ((eq type :timestamp) (sql-timestamp-output v nil nil (sql-session-date-style) (sql-session-date-order)))
     ((eq type :pg-lsn) (wal-format-lsn v))
+    ((eq type :inet) (authentication-peer-text v))
     ((eq type :timestamptz) (sql-timestamptz-output v))
     ((eq type :record) (sql-record-output v))
     ((sql-array-element-type type) (sql-array-output v))
@@ -5391,7 +5395,7 @@ truncate and interpret the result at TYPE's signed width."
                   (if (sql-array-p item)
                       (array-value item :int2)
                       (map 'vector (lambda (number) (scalar number :int2)) item)))
-                 ((member scalar-type '(:bytea :oid :oid8 :xid :char :bit :time :timetz :interval :pg-lsn))
+                 ((member scalar-type '(:bytea :oid :oid8 :xid :char :bit :time :timetz :interval :pg-lsn :inet))
                   (value->text item scalar-type))
                  ((eq scalar-type :json) (sql-jsonb-value (sql-jsonb-input item)))
                  ((eq scalar-type :jsonb) (sql-jsonb-value item))

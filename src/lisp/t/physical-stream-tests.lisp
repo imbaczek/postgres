@@ -289,22 +289,27 @@
 (deftest activity-status-subset-uses-live-backends-and-snapshots-results
     (let* ((pg::*backend-registry* (make-hash-table :test #'eql))
            (pg::*backend-admission-classes* (make-hash-table :test #'eq))
+           (pg::*backend-client-addresses* (make-hash-table :test #'eq))
+           (peer (make-array 4 :element-type '(unsigned-byte 8) :initial-contents '(127 0 0 1)))
            (backend (pg::make-backend :pid 2352 :application-name "ordinary_sql"))
            (other (pg::make-backend :pid 2353 :application-name "replication"
                                     :replication-mode :physical))
            (pg::*select-set-functions-allowed-p* t))
-      (setf (gethash backend pg::*backend-admission-classes*) :sql
-            (gethash 2352 pg::*backend-registry*) backend
+      (setf (gethash 2352 pg::*backend-registry*) backend
             (gethash 2353 pg::*backend-registry*) other)
+      (pg::postmaster-admit-startup-backend backend 1 1 peer)
+      (setf (aref peer 0) 10)
       (let* ((call (physical-slot-test-analyze-call
                     "SELECT pg_catalog.pg_stat_get_activity(2352)"))
              (iterator (pg::make-sql-set-function-iterator call nil)))
-        (ok (equal '(("pid" :int4) ("usesysid" :oid) ("application_name" :text))
+        (ok (equal '(("pid" :int4) ("usesysid" :oid) ("application_name" :text)
+                     ("client_addr" :inet))
                    (getf (cdddr call) :fields)))
         (remhash 2352 pg::*backend-registry*)
+        (remhash backend pg::*backend-client-addresses*)
         (multiple-value-bind (record present) (funcall iterator)
           (ok present)
-          (ok (equalp #(2352 10 "ordinary_sql") (pg::sql-record-values record))))
+          (ok (equalp (vector 2352 10 "ordinary_sql" #(127 0 0 1)) (pg::sql-record-values record))))
         (multiple-value-bind (record present) (funcall iterator)
           (ok (null record))
           (ok (not present))))
@@ -319,7 +324,7 @@
              (iterator (pg::make-sql-set-function-iterator call nil)))
         (multiple-value-bind (record present) (funcall iterator)
           (ok present)
-          (ok (equalp (vector 2353 pg::+null+ "replication") (pg::sql-record-values record)))))
+          (ok (equalp (vector 2353 pg::+null+ "replication" pg::+null+) (pg::sql-record-values record)))))
       (ok (equal "42883" (recovery-state-of
                           (lambda () (physical-slot-test-analyze-call
                                       "SELECT pg_stat_get_activity(1::bigint)")))))))

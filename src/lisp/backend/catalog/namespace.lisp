@@ -229,7 +229,9 @@
   "Expose the SQL identity of the bootstrap role in catalog column order."
   (list (vector +bootstrap-role-oid+ (current-user-name))))
 
-(defparameter +activity-result-fields+ '(("pid" :int4) ("usesysid" :oid) ("application_name" :text)))
+(defparameter +activity-result-fields+
+  '(("pid" :int4) ("usesysid" :oid) ("application_name" :text)
+    ("client_addr" :inet)))
 
 (defun sql-wal-sender-row (snapshot)
   "Convert a detached sender snapshot to C's twelve-column status record.
@@ -265,7 +267,8 @@ A provisional connection has no SQL role until startup admission succeeds."
              collect (vector (backend-pid backend)
                              (if (gethash backend *backend-admission-classes*)
                                  +bootstrap-role-oid+ +null+)
-                             (copy-seq (or (backend-application-name backend) "")))))))
+                             (copy-seq (or (backend-application-name backend) ""))
+                             (or (gethash backend *backend-client-addresses*) +null+))))))
 
 (defparameter +wal-receiver-result-fields+
   '(("pid" :int4) ("status" :text) ("receive_start_lsn" :pg-lsn)
@@ -660,7 +663,7 @@ Capture policy and keep size once for every row in the snapshot."
 
 (defun sql-type-storage-code (type)
   "Return PostgreSQL's default typstorage code for a supported TYPE."
-  (cond ((eq type :numeric) #\m)
+  (cond ((member type '(:numeric :inet)) #\m)
         ((or (sql-array-element-type type)
              (member type '(:text :varchar :bytea :json :jsonb :bit :pg-node-tree :record
                             :bytea-array :json-array :jsonb-array)))

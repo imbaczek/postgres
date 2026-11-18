@@ -311,11 +311,12 @@ def check(native, reference, server):
             cursor.execute('SELECT pg_catalog.pg_last_xact_replay_timestamp()')
             assert cursor.description[0].type_code == 1184 and cursor.fetchone() == (None,)
             cursor.execute("""
-                SELECT usesysid, (SELECT rolname FROM pg_catalog.pg_authid WHERE oid = usesysid)
+                SELECT usesysid, (SELECT rolname FROM pg_catalog.pg_authid WHERE oid = usesysid),
+                       client_addr, to_json(client_addr), client_addr::text
                 FROM pg_catalog.pg_stat_get_activity(pg_backend_pid())
             """)
-            assert [column.type_code for column in cursor.description] == [26, 19]
-            assert cursor.fetchall() == [(10, 'postgres')]
+            assert [column.type_code for column in cursor.description] == [26, 19, 869, 114, 25]
+            assert cursor.fetchall() == [(10, 'postgres', '127.0.0.1', '127.0.0.1', '127.0.0.1/32')]
     check_one(reference, 'C')
     check_one(native, 'native')
     check_streaming(reference, 'C')

@@ -91,6 +91,9 @@ The registry lock protects this queue. MAIN retires it after all clients leave."
   "Backend-generation quota reservations, protected by the registry lock.
 DEFVAR preserves reservations across function reloads.")
 
+(defvar *backend-client-addresses* (make-hash-table :test #'eq)
+  "Numeric peer addresses captured at admission, protected by the registry lock.")
+
 (declaim (special *live-operation-lock* *live-operation-cv*
                   *live-operation-backend-query-tokens*
                   *live-operation-admission-open*
@@ -105,7 +108,7 @@ DEFVAR preserves reservations across function reloads.")
   (sb-thread:with-mutex (*backend-registry-lock*)
     (gethash pid *backend-registry*)))
 
-(defun postmaster-admit-startup-backend (backend connections senders)
+(defun postmaster-admit-startup-backend (backend connections senders &optional peer)
   "Reserve the SQL or WAL-sender quota using explicit captured limits.
 Check exact PID ownership before accepting a repeated reservation; the class
 cannot change. Exhaustion raises FATAL before authentication success is sent."
@@ -130,7 +133,9 @@ cannot change. Exhaustion raises FATAL before authentication success is sent."
                            limit)
             (ereport-fatal "53300" "sorry, too many clients already")))
       (sb-sys:without-interrupts
-        (setf (gethash backend *backend-admission-classes*) kind))))
+        (setf (gethash backend *backend-admission-classes*) kind)
+        (when (and (typep peer '(vector (unsigned-byte 8))) (member (length peer) '(4 16)))
+          (setf (gethash backend *backend-client-addresses*) (copy-seq peer))))))
   backend)
 
 (defun register-backend (backend)
@@ -208,6 +213,7 @@ Registry removal is conditional on exact ownership; repeated cleanup is safe."
     (unwind-protect
          (progn
            (remhash backend *backend-admission-classes*)
+           (remhash backend *backend-client-addresses*)
            (when (eq (gethash (backend-pid backend) *backend-registry*) backend)
              (remhash (backend-pid backend) *backend-registry*)
              (decf *n-backends*)))

@@ -161,7 +161,8 @@ Like C ReportChangedGUCOptions, recovery can only change from on to off."
                             user database peer (backend-replication-mode backend))
   (postmaster-admit-startup-backend
    backend (startup-configuration-max-connections configuration)
-   (startup-configuration-max-senders configuration)))
+   (startup-configuration-max-senders configuration)
+   peer))
 
 (defun process-startup (stream body)
   "Parse startup mode, check availability and authenticate before reserving quota.
