@@ -5029,6 +5029,7 @@ unchanged generated SQL, with fixtures supplying the surrounding state.
 | --- | --- | --- |
 | `Postgresql.TL_LSN` | Both write and flush fragments on primary and standby, including paused replay, with returned types and positions checked. | `t/interop/patroni-tl-lsn.py` |
 | Cluster monitoring | Unchanged 16-column cluster query covers primary and receiver states, including absent, connecting, streaming and paused; checkpoint/control tests also cover the standby-leader branch. | `t/interop/receiver-sql.py`, `t/interop/control-checkpoint.py` |
+| REST status | Unchanged Patroni 4.1.5 `RestApiHandler.get_postgresql_status` runs real queries with surrounding state supplied by the fixture. C and Lisp primaries passed with empty sender lists and with FIRST/ANY senders. A live Lisp standby reported replay timestamp, LSN and streaming status. | `t/interop/patroni-sync-monitor.py` passed in 105.37 s on the ramdisk. |
 | Synchronous monitoring | Real Patroni monitor and sync-change method exercise primary and promoted roles, the unchanged `DO` statement, and FIRST/ANY sender JSON, slot-query branch and disconnect. The native test uses real followers. Patroni's query uses underlying functions and does not require the still-missing `pg_stat_replication` view. | `t/interop/patroni-sync-monitor.py`; C and native passed in 73.81 s on the ramdisk. |
 | Connections and configuration | Real `NamedConnection` checks startup options, resets, reconnect, timeout and recovery after cancellation. `ConfigHandler` query acceptance is limited to the tested settings and configurations; it is not acceptance of every generated configuration. | `t/interop/patroni-start.py` |
 | Process and promotion | Pinned process discovery, PID start-time rejection, direct start and stop are exercised for the implemented configuration subset. `Postgresql.promote` uses native utilities and waits for durable production state. | `t/interop/patroni-start.py` and promotion acceptance |
@@ -5058,11 +5059,13 @@ after the registry entry is removed and returns NULL for provisional connections
 This covers the text result and JSON paths. Binary results and SQL input for
 `inet` remain open.
 
+The REST query uses `row_to_json`, `array_agg(json)` and `array_to_json`.
+Grouped and window aggregates retain the JSON element type. C comparison
+tests cover compact and pretty output, empty sets and NULL arguments.
+Five focused spill tests and nine window tests passed.
+
 Distinct backend gaps remain:
 
-- The exact REST handler status SQL now fails at `row_to_json(record)`
-  (SQLSTATE `42883`). Subsequent array aggregation and conversion remain to
-  be assessed.
 - Initial `Bootstrap.bootstrap` calls `pg_ctl initdb`, which the native
   utility does not implement. Authentication and role provisioning also
   require acceptance.
