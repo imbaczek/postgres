@@ -483,7 +483,18 @@ class ArchiveHistoryAcceptance(RewindSharedHistoryAcceptance):
         follow.wait_for(receipt.is_file)
         assert stat.S_ISREG(destination.lstat().st_mode)
         assert destination.read_bytes() == (wal / name).read_bytes() == promoted["history"].encode()
-        self.result["archive_history"] = {"name": name, "text": promoted["history"]}
+        fork = lsn_number(promoted["history"].split()[1])
+        segment, offset = divmod(fork, 16 * 1024 * 1024)
+        assert offset > 0
+        partial, = wal.glob("*.wal.partial")
+        assert partial.name in {f"{segment:016X}.wal.partial",
+                                f"00000001{segment // 256:08X}{segment % 256:08X}.wal.partial"}
+        child = wal / f"00000002{segment // 256:08X}{segment % 256:08X}.wal"
+        assert stat.S_ISREG(partial.lstat().st_mode)
+        assert partial.stat().st_size == offset
+        assert partial.read_bytes() == child.read_bytes()[:offset]
+        self.result["archive_history"] = {"name": name, "text": promoted["history"],
+                                          "local_partial": partial.name, "partial_size": offset}
 
     def configured(self):
         self.create_rewind_target()
