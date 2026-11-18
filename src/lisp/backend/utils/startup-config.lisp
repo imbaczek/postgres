@@ -735,9 +735,6 @@ commit timestamp tracking off, and each listed recovery target empty.
 Return SETTINGS after validation."
   (unless (member (startup-setting-value settings "wal_level") '("replica" "logical") :test #'equal)
     (error "wal_level=minimal requires unimplemented minimal WAL generation"))
-  (when (and (not *startup-inspect-archive-settings-p*)
-             (equal "always" (startup-setting-value settings "archive_mode")))
-    (error "archive_mode=always requires unimplemented standby WAL archiving"))
   (when (plusp (startup-setting-value settings "max_prepared_transactions"))
     (error "positive max_prepared_transactions requires unimplemented prepared transactions"))
   (when (startup-setting-value settings "track_commit_timestamp")
