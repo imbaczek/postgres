@@ -4,6 +4,7 @@
   :depends-on ("pg/logical-slot-fixtures" "rove" "cl-spec/check-it")
   :serial t
   :components ((:file "t/rove/support")
+               (:file "t/rove/scram-tests")
                (:file "t/rove/hot-path-tests")
                (:file "t/rove/ascii-span-tests")
                (:file "t/rove/metadata-literal-tests")

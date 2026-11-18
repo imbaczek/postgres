@@ -34,6 +34,7 @@
       :components ((:file "pqcomm.hot")
                    (:file "pqcomm")
                    (:file "pqformat")
+                   (:file "scram")
                    (:file "hba")))
      (:module "storage"
       :serial t
