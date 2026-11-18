@@ -203,3 +203,26 @@
                    (ok (null (pg::directory-entry-names other))))
               (setf (symbol-function 'pg::physical-libpq-start-copy-out) old)
               (sb-posix:close fd)))))))
+
+(deftest rewind-scratch-cleanup-keeps-its-original-directory-identity
+    (with-physical-store-directory (root)
+      (let* ((path (merge-pathnames "scratch/" root))
+             (fd (pg::physical-backup-open-directory root)))
+        (unwind-protect
+             (progn
+               (sb-posix:mkdir (namestring path) #o700)
+               (let ((facts (pg::physical-image-file-facts fd "scratch")))
+                 (sb-posix:mkdir (namestring (merge-pathnames "base/" path)) #o700)
+                 (pg::physical-backup-remove-stage-tree fd "scratch" :mount (ninth facts) :expected facts)
+                 (ok (not (probe-file path))))
+               (sb-posix:mkdir (namestring path) #o700)
+               (let ((facts (pg::physical-image-file-facts fd "scratch"))
+                     (moved (merge-pathnames "moved/" root)))
+                 (sb-posix:rename (namestring path) (namestring moved))
+                 (sb-posix:mkdir (namestring path) #o700)
+                 (ok (signals (pg::physical-backup-remove-stage-tree
+                               fd "scratch" :mount (ninth facts) :expected facts)
+                              'error))
+                 (ok (probe-file moved))
+                 (ok (probe-file path))))
+          (sb-posix:close fd)))))

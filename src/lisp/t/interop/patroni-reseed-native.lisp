@@ -176,6 +176,13 @@
            :helper helper))))))
   (write-line "REWIND-REPLAY PASS"))
 
+(defun native-patroni-rewind-crash-at-image-step (step)
+  (setf *physical-image-test-hook*
+        (lambda (point path)
+          (declare (ignore path))
+          (when (eq point step)
+            (sb-posix:kill (sb-posix:getpid) sb-posix:sigkill)))))
+
 (defun native-patroni-rewind-crash-before-capture ()
   (setf *physical-reseed-remote-test-hook*
         (lambda (point)

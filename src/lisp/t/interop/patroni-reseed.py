@@ -593,6 +593,46 @@ class RewindFirstCaptureCliAcceptance(RewindCaptureResumeCliAcceptance):
     captured = False
 
 
+class RewindPartialCaptureCliAcceptance(RewindCaptureResumeCliAcceptance):
+    label = "rewind-cli-partial-capture"
+
+    def interrupt(self, target, step, arguments, env):
+        self.process("rewind-capture-crash" if step == "after-partial-receive" else "rewind-repair-crash",
+                     self.native_arguments() + [
+                         "--eval", f"(pg::native-patroni-rewind-crash-at-image-step :{step})",
+                         "--load", str(cancellation.LISP / "bin/pg-rewind.lisp"),
+                         "--end-toplevel-options", "-D", str(target), *arguments],
+                     timeout=240, env=env, expected=-signal.SIGKILL)
+
+    def execute_rewind(self, target, conninfo):
+        env = dict(os.environ, SBCL=self.sbcl, PG_LIBPQ_HELPER=self.helper)
+        self.interrupt(target, "after-partial-receive", ["--source-server", conninfo], env)
+        stage, = target.parent.glob(".pg-rewind.*/stage")
+        retained, = self.retained_rewind_stages()
+        journal = (target / "physical-reseed.attempt").read_bytes()
+        partial, = [path for path in stage.rglob("*") if path.is_file()
+                    and 0 < path.stat().st_size < (retained / path.relative_to(stage)).stat().st_size]
+        original = partial.read_bytes()
+        stage_inode, file_inode = stage.stat().st_ino, partial.stat().st_ino
+        with (retained / partial.relative_to(stage)).open("rb") as file:
+            assert file.read(len(original)) == original
+        self.interrupt(target, "after-rewind-prefix-append", ["--resume"], env)
+        assert (target / "physical-reseed.attempt").read_bytes() == journal
+        assert not (target / "physical-reseed.install").exists()
+        assert stage.stat().st_ino == stage_inode and partial.stat().st_ino == file_inode
+        extended = partial.read_bytes()
+        assert len(extended) > len(original) and extended.startswith(original)
+        with (retained / partial.relative_to(stage)).open("rb") as file:
+            assert file.read(len(extended)) == extended
+        _, resumed = self.process("rewind-capture-resume", [
+            str(cancellation.LISP / "bin/pg_rewind"), "-D", str(target), "--resume"],
+            timeout=900, env=env)
+        assert not self.retained_rewind_stages()
+        assert stage.stat().st_ino == stage_inode and partial.stat().st_ino == file_inode
+        assert partial.read_bytes().startswith(extended)
+        return resumed
+
+
 class RewindResumeCliAcceptance(RewindCliAcceptance):
     label = "rewind-cli-resume"
 
@@ -863,6 +903,7 @@ def main():
              "rewind-cli": RewindCliAcceptance,
              "rewind-cli-capture-resume": RewindCaptureResumeCliAcceptance,
              "rewind-cli-first-capture": RewindFirstCaptureCliAcceptance,
+               "rewind-cli-partial-capture": RewindPartialCaptureCliAcceptance,
              "rewind-cli-resume": RewindResumeCliAcceptance,
              "rewind-patroni": RewindPatroniAcceptance,
              "rewind-patroni-dirty": RewindDirtyPatroniAcceptance,
