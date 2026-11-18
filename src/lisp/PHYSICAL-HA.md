@@ -95,9 +95,13 @@ Two recovery areas still need work.
    the original base to a new observer with empty `primary_conninfo`, replayed
    the actual parent partial and child EOR, and read a child-only row. A clean
    restart verified recovery again. It passed in 46.12 s on the ramdisk, and
-   five focused tests also passed. Bound streaming selection and fixed timeline
-   policies retain their existing path. End-to-end bound restore and crash
-   injection remain open.
+   five focused tests also passed. The `--case archive-descendant-crash` live
+   test killed the observer after immutable history publication and again after
+   durable selection. On restart, with the history file withheld from the
+   archive, the observer republished the selected history. It replayed the
+   child-only row and retained it across a clean restart. Both processes exited
+   with the expected SIGKILL. The run passed in 55.96 s on the ramdisk. End-to-end
+   archive recovery across a fork with a bound streaming source remains open.
    Archive recovery from other base layouts still needs qualification.
    Offline rewind has a separate restore path. Archive producer work still needs
    repeated-promotion and mode-handoff tests, safe queue reclamation, and
