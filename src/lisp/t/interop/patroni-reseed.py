@@ -272,22 +272,27 @@ class FormerPrimaryAcceptance(Acceptance):
         self.control("(pg::physical-base-backup " +
                      cancellation.lisp_string(str(data) + "/") + " \"former_primary_seed\")")
 
+    def prepare_child_for_follow(self, node, member):
+        pass
+
     def initialize_target(self, target):
         started = time.monotonic()
         # Leave room for target.sock under the AF_UNIX path length limit.
         root = self.server.root / "child"
         data = root / "data"
         self.seed_child(data)
-        (data / "postgresql.conf").write_text("# Native replacement source.\n")
         with socket.socket() as reservation:
             reservation.bind(("127.0.0.1", 0))
             port = reservation.getsockname()[1]
-        config = follow.configuration(data, port, root)
-        config["name"] = "replacement_source"
+        # Read PG_VERSION from the source because a clone destination starts empty.
+        config = follow.configuration(self.server.data, port, root)
+        config.update(name="replacement_source", data_dir=str(data))
         node = Postgresql(config, Null())
         try:
             member = Member(0, "original", None,
                             {"conn_url": f"postgres://127.0.0.1:{self.server.port}/postgres"})
+            self.prepare_child_for_follow(node, member)
+            (data / "postgresql.conf").touch()
             assert node.follow(member, timeout=90) is True
             follow.wait_for(lambda: follow.query(port, "SELECT id FROM patroni_reseed_probe") == [(1,)])
             original = identity(self.server.port)
@@ -365,6 +370,7 @@ class RewindSharedHistoryAcceptance(FormerPrimaryAcceptance):
         return path
 
     def seed_child(self, data):
+        self.origin = self.capture("rewind-origin")
         data.parent.mkdir(mode=0o700)
         shutil.copytree(self.origin, data)
 
@@ -401,7 +407,6 @@ class RewindSharedHistoryAcceptance(FormerPrimaryAcceptance):
             follow.query(self.server.port,
                          f"INSERT INTO rewind_reuse_payload VALUES({i},'{payload}')")
         follow.query(self.server.port, "SELECT pg_create_physical_replication_slot('replacement_source',true)")
-        self.origin = self.capture("rewind-origin")
         target = self.server.root / "rewind-target"
         self.initialize_target(target)
         follow.query(self.server.port, "INSERT INTO patroni_reseed_probe VALUES(2001)")
@@ -936,6 +941,79 @@ class RewindPatroniAcceptance(RewindInstallAcceptance):
         self.check_rejoined(target, port)
 
 
+class PatroniLifecycleAcceptance(RewindPatroniAcceptance):
+    label = "patroni-lifecycle"
+    receiver_status = "SELECT status, slot_name FROM pg_stat_get_wal_receiver()"
+
+    def seed_child(self, data):
+        data.parent.mkdir(mode=0o700)
+        data.mkdir(mode=0o700)
+
+    def prepare_child_for_follow(self, node, member):
+        started = time.monotonic()
+        with patch.dict(os.environ, SBCL=self.sbcl, PG_LIBPQ_HELPER=self.helper):
+            assert node.bootstrap.clone(member) is True
+        data = Path(node.data_dir)
+        assert (data / "physical-backup.manifest").is_file()
+        assert (data / "postgresql.conf").is_file()
+        self.result["checks"].append("patroni-clone")
+        self.result.setdefault("timings", []).append(
+            {"case": "patroni-clone", "elapsed_seconds": time.monotonic() - started,
+             "outcome": "pass"})
+
+    def configured(self):
+        (self.server.data / "postgresql.conf").touch()
+        follow.query(self.server.port, "CREATE TABLE patroni_lifecycle_sync(id integer)")
+        super().configured()
+
+    def fence_original(self, node, port):
+        source = self.server.port
+        self.wait_for_slot(port, "replacement_source")
+        previous = node.is_running().pid
+        assert node.restart(timeout=90) is True
+        assert node.is_running().pid != previous
+        self.wait_for_slot(port, "replacement_source")
+        config = self.server.data / "postgresql.conf"
+        original = config.read_bytes()
+        names = "FIRST 1 (replacement_source)"
+        try:
+            config.write_bytes(original + f"\nsynchronous_standby_names = '{names}'\n".encode())
+            assert follow.query(source, "SELECT pg_reload_conf()") == [(True,)]
+            follow.wait_for(lambda: follow.query(
+                source, "SELECT w.sync_state FROM pg_stat_get_wal_senders() w, "
+                        "pg_stat_get_activity(w.pid) "
+                        "WHERE application_name = 'replacement_source' "
+                        "AND w.state = 'streaming'") == [("sync",)])
+            with closing(follow.psycopg2.connect(
+                    host="127.0.0.1", port=source, user="postgres", dbname="postgres",
+                    connect_timeout=2)) as connection, connection.cursor() as cursor:
+                connection.autocommit = True
+                cursor.execute("SET statement_timeout TO '30s'")
+                cursor.execute("SET synchronous_commit TO remote_apply")
+                cursor.execute("INSERT INTO patroni_lifecycle_sync VALUES(70)")
+            self.check_synchronous_commit(port)
+        finally:
+            config.write_bytes(original)
+            assert follow.query(source, "SELECT pg_reload_conf()") == [(True,)]
+            follow.wait_for(lambda: follow.query(source, "SHOW synchronous_standby_names") == [("",)])
+        self.result["checks"].append("patroni-reconnect-physical-slot-and-remote-apply")
+        super().fence_original(node, port)
+
+    def check_synchronous_commit(self, port):
+        assert follow.query(port, "SELECT id FROM patroni_lifecycle_sync") == [(70,)]
+
+    def wait_for_slot(self, port, slot):
+        follow.wait_for(lambda: follow.query(port, self.receiver_status) == [("streaming", slot)])
+
+    def verify_promotion(self, port):
+        self.check_synchronous_commit(port)
+
+    def check_standby(self, port, expected):
+        super().check_standby(port, expected)
+        self.check_synchronous_commit(port)
+        self.wait_for_slot(port, "follow_one")
+
+
 class RewindPatroniCheckpointAcceptance(RewindPatroniAcceptance):
     label = "rewind-patroni-checkpoint-query"
 
@@ -1141,6 +1219,7 @@ def main():
                "rewind-cli-partial-capture": RewindPartialCaptureCliAcceptance,
              "rewind-cli-resume": RewindResumeCliAcceptance,
              "rewind-patroni": RewindPatroniAcceptance,
+                 "patroni-lifecycle": PatroniLifecycleAcceptance,
                "rewind-patroni-checkpoint-query": RewindPatroniCheckpointAcceptance,
              "rewind-patroni-dirty": RewindDirtyPatroniAcceptance,
              "manual-failover": ManualFailoverAcceptance}
