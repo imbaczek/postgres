@@ -838,7 +838,8 @@
                 (pg::physical-retained-archive-segment
                  (getf fixture :directory) (getf (getf fixture :reference) :root-id)
                  (getf fixture :identity) (pg::timeline-parse-history 1 "")
-                 timeline segment)))
+                 timeline segment
+                 :base-prefix-reader (lambda () (error "indexed overlap should suffice")))))
          (multiple-value-bind (bytes end) (read-segment 1 0)
            (ok (equalp bytes (getf fixture :first)))
            (ok (= end (- pg::+wal-segment-size+ 17))))
@@ -855,7 +856,11 @@
                         directory :inventory (pg::physical-retained-inventory-image index)
                         pg::+physical-retained-inventory-limit+)))
              (ok (null (pg::physical-retained-archive-segment
-                        directory root identity history 1 0)))))))
+                        directory root identity history 1 0)))
+             (ok (equalp (getf fixture :first)
+                         (pg::physical-retained-archive-segment
+                          directory root identity history 1 0
+                          :base-prefix-reader (lambda () (subseq (getf fixture :base) 0 (getf identity :base))))))))))
      :rotation-gap 17))
 
 (defun call-with-test-logical-wal-archive (function)

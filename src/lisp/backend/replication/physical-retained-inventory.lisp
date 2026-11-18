@@ -279,9 +279,16 @@ Return the freshly decoded payload."
      (physical-retained-inventory-read-overlap directory payload reader) on-record on-extent)
     payload))
 
-(defun physical-retained-archive-segment (directory root identity history timeline segment)
+(defun physical-retained-archive-base-prefix-matches-p (base-prefix candidate start)
+  (and base-prefix
+       (= (length base-prefix) (mod start +wal-segment-size+))
+       (<= (length base-prefix) (length candidate))
+       (null (mismatch base-prefix candidate :end2 (length base-prefix)))))
+
+(defun physical-retained-archive-segment (directory root identity history timeline segment &key base-prefix-reader)
   "Return a sealed segment image and end when the inventory proves both closure
 and contiguous coverage from the segment start or verified base overlap.
+BASE-PREFIX-READER can supply a matching base prefix when overlap is absent.
 A following contiguous extent can prove closure of a short image."
   (let ((candidate nil) (end nil) (complete nil)
                         (prefix-start nil) (prefix-end nil) (contiguous t) (candidate-covered nil))
@@ -309,7 +316,10 @@ A following contiguous extent can prove closure of a short image."
       (when (and complete candidate-covered
                  (or (<= prefix-start (* segment +wal-segment-size+))
                      (and (= prefix-start (getf identity :base))
-                          (getf inventory :base-overlap))))
+                          (or (getf inventory :base-overlap)
+                              (and base-prefix-reader
+                                   (physical-retained-archive-base-prefix-matches-p
+                                    (funcall base-prefix-reader) candidate prefix-start))))))
         (values candidate end)))))
 
 (defun physical-retained-inventory-keep-entries (entries ids)

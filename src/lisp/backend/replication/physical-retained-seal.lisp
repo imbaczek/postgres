@@ -47,6 +47,81 @@ floors beyond the base, including empty segment boundaries."
     (setf (fill-pointer bytes) needed)
     (replace bytes raw :start1 used)))
 
+(defun physical-store-archive-base-prefix (store)
+  "Read the verified base prefix when the recovery identity matches STORE.
+Return NIL when it is unavailable or cannot be verified."
+  (handler-case
+      (when (and *physical-recovery-state*
+                 (equal (physical-store-retained-identity store)
+                        (physical-recovery-retained-identity)))
+        (physical-recovery-base-wal-prefix))
+    (error () nil)))
+
+(defun physical-store-live-archive-segment (store timeline segment)
+  "Build a closed segment from verified retained and live receive data under the store lock.
+Require coverage from the segment start or matching base prefix and the requested
+timeline. Return the image and end only after closure is proved."
+  (with-physical-store (store)
+    (let* ((floor (physical-store-floor-lsn store))
+           (first (floor floor +wal-segment-size+))
+           (root (physical-store-retained-root store))
+           (directory (physical-store-retained-directory store))
+           (identity (physical-store-retained-identity store))
+           (history (physical-store-retained-history store))
+           (base (physical-store-base-lsn store))
+           (interior-base (and (= segment (floor base +wal-segment-size+))
+                               (plusp (mod base +wal-segment-size+)))))
+      (when root
+        (physical-store-read-retained-control store (physical-store-control-tuple store)))
+      (when (< segment first)
+        (return-from physical-store-live-archive-segment
+          (when root (physical-retained-archive-segment
+                      directory root identity history timeline segment
+                      :base-prefix-reader (lambda () (physical-store-archive-base-prefix store))))))
+      (let* ((inventory
+               (when (and (= segment first) root)
+                 (let ((verified (physical-retained-inventory-load directory root identity history)))
+                   (physical-store-check-retained-coverage store (getf verified :entries))
+                   verified)))
+             (base-prefix (when (and interior-base (not (getf inventory :base-overlap)))
+                            (physical-store-archive-base-prefix store)))
+             (prefix
+               (when (= segment first)
+                 (if (and interior-base (not root))
+                     (or base-prefix (return-from physical-store-live-archive-segment nil))
+                     (physical-retained-seal-initial-prefix store (getf inventory :entries)))))
+             (bytes (make-array (max 4096 (length prefix)) :element-type '(unsigned-byte 8)
+                                                           :adjustable t :fill-pointer (length prefix)))
+             (seal (%make-physical-retained-seal :bytes bytes))
+             (cursor floor) (owner (when (plusp (length prefix))
+                                     (physical-store-prefix-timeline store floor)))
+             (end nil) (complete nil))
+        (when (and (= segment first) (/= (length prefix) (mod floor +wal-segment-size+)))
+          (error "archive candidate lacks the verified receive floor prefix"))
+        (when (and interior-base (not (getf inventory :base-overlap))
+                   (not (physical-retained-archive-base-prefix-matches-p base-prefix prefix base)))
+          (return-from physical-store-live-archive-segment nil))
+        (replace bytes prefix)
+        (when owner (setf end floor))
+        (physical-store-validate-prefix
+         store :on-record
+         (lambda (record raw)
+           (let* ((start (wal-record-start record))
+                  (number (floor start +wal-segment-size+))
+                  (carrier (physical-store-history-check-record store record raw cursor)))
+             (cond ((= number segment)
+                    (unless (= (mod start +wal-segment-size+)
+                               (length (physical-retained-seal-bytes seal)))
+                      (error "archive candidate lacks its exact receive prefix"))
+                    (physical-retained-seal-append seal raw)
+                    (setf owner carrier end (wal-record-end record)
+                          complete (= (length (physical-retained-seal-bytes seal)) +wal-segment-size+)))
+                   ((and end (eql owner carrier) (= cursor end) (= number (1+ segment)))
+                    (setf complete t)))
+             (setf cursor (wal-record-end record)))))
+        (when (and complete (eql owner timeline))
+          (values (physical-retained-seal-bytes seal) end))))))
+
 (defun physical-retained-seal-start-group (seal record timeline)
   "Start a segment group using the verified prefix, coalescing the latest entry when possible."
   (let* ((segment (floor (wal-record-start record) +wal-segment-size+))

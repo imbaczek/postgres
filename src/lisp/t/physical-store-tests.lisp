@@ -530,6 +530,32 @@
         (unwind-protect (ok (= 32 (pg::physical-store-flushed-lsn reopened)))
           (pg::physical-store-close reopened)))))
 
+(deftest receive-archive-segment-needs-durable-rotation
+    (with-physical-store-directory (root)
+      (let* ((first (sample-physical-record))
+             (boundary pg::+wal-segment-size+)
+             (second (pg::wal-encode-record
+                      pg::+wal-record-batch-start+ 0 boundary
+                      (make-array (- boundary pg::+wal-header-size+)
+                                  :element-type '(unsigned-byte 8) :initial-element 0)))
+             (store (pg::physical-store-open root 123 1 :create t)))
+        (unwind-protect
+             (progn
+               (pg::physical-store-input store 0 first)
+               (pg::physical-store-flush store)
+               (pg::physical-store-input store boundary second)
+               (ok (null (pg::physical-store-live-archive-segment store 1 0)))
+               (pg::physical-store-flush store)
+               (multiple-value-bind (bytes end) (pg::physical-store-live-archive-segment store 1 0)
+                 (ok (equalp bytes first))
+                 (ok (= end (length first))))
+               (ok (null (pg::physical-store-live-archive-segment store 2 0))))
+          (pg::physical-store-close store))
+        (let ((reopened (pg::physical-store-open root 123 1)))
+          (unwind-protect
+               (ok (equalp (pg::physical-store-live-archive-segment reopened 1 0) first))
+            (pg::physical-store-close reopened))))))
+
 (deftest physical-store-preserves-source-octets
     (with-physical-store-directory (root)
       (let ((bytes (sample-physical-record))
