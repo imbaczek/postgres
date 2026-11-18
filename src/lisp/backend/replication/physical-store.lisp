@@ -363,6 +363,12 @@ external modification."
              (format stream "receive WAL archive staging failed: ~a"
                      (physical-archive-staging-error-cause condition)))))
 
+(defun physical-store-publish-restartpoint-without-compaction (store cursor publish)
+  "Publish a restartpoint while keeping the receive floor and spool intact."
+  (with-physical-store (store)
+    (funcall publish (physical-store-prefix-digest-under-lock store cursor))
+    cursor))
+
 (defun physical-store-compact (store cursor publish-restartpoint &key stage-archive)
   "Publish a durable restartpoint before advancing and cleaning the receive floor.
 

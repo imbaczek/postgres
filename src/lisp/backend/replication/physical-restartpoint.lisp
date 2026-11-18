@@ -626,7 +626,7 @@ The configuration lock is released before inspecting the store."
           (setf *physical-recovery-failed-p* t)
           (admin-log "standby receive WAL staging failed: ~a" condition))))))
 
-(defun physical-recovery-restartpoint-core (&key stage-archive)
+(defun physical-recovery-restartpoint-core (&key stage-archive preserve-archive-on-error)
   "Publish while admission pins replay, or while this thread owns quiescence.
 Never acquire the reload mutex here: a replayer may own it while draining SQL."
   (unless (or (plusp *live-operation-depth*)
@@ -637,7 +637,7 @@ Never acquire the reload mutex here: a replayer may own it while draining SQL."
   (unless (and (recovery-in-progress-p) *physical-receive-store*)
     (error "restartpoint requires streaming recovery"))
   (when *swank-listener-enabled-p* (error "restartpoint requires Swank to be off"))
-  (let ((finished nil))
+  (let ((finished nil) (compacted t))
     (unwind-protect
          (let ((lsn (handler-case
                         (progn
@@ -646,10 +646,15 @@ Never acquire the reload mutex here: a replayer may own it while draining SQL."
                           (physical-store-compact *physical-receive-store* *last-replay-lsn*
                                                   #'physical-restartpoint-publish :stage-archive stage-archive))
                       (physical-archive-staging-error (condition)
-                        (unless (physical-store-failed-p *physical-receive-store*)
-                          (setf finished t))
-                        (error condition)))))
-           (physical-restartpoint-remove-old-generations)
+                        (when (physical-store-failed-p *physical-receive-store*) (error condition))
+                        (unless preserve-archive-on-error
+                          (setf finished t)
+                          (error condition))
+                        (setf compacted nil)
+                        (admin-log "standby shutdown retaining WAL for archive retry: ~a" condition)
+                        (physical-store-publish-restartpoint-without-compaction
+                         *physical-receive-store* *last-replay-lsn* #'physical-restartpoint-publish)))))
+           (when compacted (physical-restartpoint-remove-old-generations))
            (setf *physical-restartpoint-last-time* (get-internal-real-time)
                  finished t)
            lsn)
@@ -769,10 +774,10 @@ Join workers before taking reload or admission gates; do not exit the process."
                                    (physical-store-written-lsn *physical-receive-store*)))
                           (physical-recovery-flush)))
                       (setf terminal (if *physical-receive-store*
-                                         (physical-recovery-restartpoint-core)
+                                         (physical-recovery-restartpoint-core :preserve-archive-on-error t)
                                          (or *last-replay-lsn* (getf *physical-recovery-state* :end))))
                       ;; C records clean recovery even when no checkpoint advanced.
-                      ;; Publish only after durable data/pointer/floor and while gated.
+                      ;; Publish while gated, after durable data, pointer and receive state.
                       (setf *physical-recovery-state*
                             (physical-recovery-write-control
                              *physical-recovery-state* (getf *physical-recovery-state* :phase)
