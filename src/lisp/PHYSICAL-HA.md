@@ -29,7 +29,7 @@ Native rewind keeps fetched segments in a private cache outside PGDATA.
 With no checkpoint hint, stock Patroni checks the source timeline through SQL
 and completes rewind and rejoin. The fixture uses distinct connection settings
 with the same login. Offline configuration queries report `archive_mode` and
-`archive_command`. Server-side WAL archiving remains open.
+`archive_command`. Primary WAL archiving now runs with `archive_mode=on`.
 C `pg_rewind` maps pages changed on the target and relies on recovery to replay
 subsequent source changes. Native rewind reuses whole matching relation files.
 When discovery proves the fork, it also offers up to 256 candidate pages across
@@ -60,9 +60,10 @@ Three items remain for backend closeout.
    stock Patroni 4.1.5. Include generated configuration, utility invocation,
    connection recovery, and the supported slot and synchronous settings. Keep
    leadership supplied by the harness.
-2. Add a server-side archive producer and qualify publish, retry and restart
-   behavior against C. Reading archives and reporting settings exercise only
-   the consumer and inspection paths.
+2. Complete the server-side archive comparison against C. Qualify the primary
+   worker across crash cuts, timeline history and promotion, add standby
+   `archive_mode=always`, and use an archive produced by the worker for
+   stopped-target restore.
 3. Expand native rewind beyond the qualified immediate-child topology, or
    record that limit in the supported contract. C can find a common ancestor
    further back in the timeline histories. Also decide how to handle torn local
@@ -104,15 +105,15 @@ can wait for rotation. Recompute eligibility after cold recovery.
 
 The native readiness path now creates durable empty `.ready` files after
 primary recovery and during checkpoint recycling. Reconciliation runs even
-when another fence has deferred deletion. Startup still rejects archive mode
-until a completion worker exists. The focused fixture enables archive mode in
-an installed test configuration and checks the frontier, recreation of a
-missing marker, and retention in the presence of an unverified `.done` file.
+when another fence has deferred deletion. The focused fixture checks the
+frontier, recreation of a missing marker, and retention in the presence of an
+unverified `.done` file.
 Strict compilation and the two focused test heads took 66.10 s on the ramdisk.
 
-The internal archive attempt runs the command from PGDATA outside the WAL lock.
-`%p` points to the held source descriptor. Only a zero exit and a successful
-recheck of the source and directory identities allow publication of `.done`.
+The archive attempt runs the command from PGDATA outside the WAL lock.
+`%p` names the regular file through a held WAL directory descriptor. Only a
+zero exit and a successful recheck of the source and directory identities
+allow publication of `.done`.
 Publication uses a separate exclusive temporary, syncs the file, renames it,
 and syncs the status directory. The fixture verifies nonzero exit, an exact
 copy of a short segment, a source replacement, and a hard link left at the
@@ -125,8 +126,24 @@ rechecks the bindings, then unlinks through the held WAL directory and syncs
 that directory. It stops at the first unproved segment below the normal
 recycling floor. The regression covers a receipt for a later segment, a
 world-writable receipt, and a stale receipt after a source write. Strict
-compilation and three test heads took 75.69 s. Automatic command scheduling
-and startup admission are still open.
+compilation and three test heads took 75.69 s.
+
+With `archive_mode=on`, the worker checks the current primary timeline for
+completed segments. It waits for primary publication after promotion, retries
+failed attempts, and skips segments with matching receipts. Orderly shutdown
+runs a final pass after the checkpoint and waits up to ten seconds for the
+worker. A command may be repeated after a crash or a timeout. Commands must
+tolerate retries, including an overlapping attempt after a crash, and return
+zero only after the destination is complete. Backlog processing still rescans
+completed receipts under the WAL lock. Startup rejects `archive_mode=always`
+until standby archiving is implemented.
+
+In the live restart test, the command initially failed and the candidate
+remained pending. After orderly restart, `cp -a` produced a regular file
+matching all 16,774,077 source bytes. Both SQL configuration views reported the
+active command, all 2,550 rows survived, and the checkpoint and stop completed.
+The run took 20 s at one-second timing resolution. Strict compilation and five
+focused test heads took 64.07 s, including 48.33 s to load the test system.
 
 The recycle path must preserve archive-eligible files until durable success
 is recorded. Reconstruct pending work after restart from durable WAL and status,
