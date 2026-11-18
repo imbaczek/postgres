@@ -4313,9 +4313,9 @@ Return NIL when either file cannot be safely checked."
                  (wal-archive-directory-binding-p facts (physical-image-file-facts parent-fd name)))
       (error "invalid standby archive directory: ~a" name))))
 
-(defun call-with-wal-archive-private-child (parent-fd name function)
+(defun call-with-wal-archive-private-child (parent-fd name function &key existing-only)
   (sb-sys:without-interrupts
-    (unless (or (zerop (physical-image-mkdirat parent-fd name #o700))
+    (unless (or existing-only (zerop (physical-image-mkdirat parent-fd name #o700))
                 (= (sb-alien:get-errno) sb-posix:eexist))
       (error "cannot create standby archive directory: ~a" name))
     (let ((fd (physical-image-openat parent-fd name
@@ -4325,7 +4325,7 @@ Return NIL when either file cannot be safely checked."
       (unwind-protect
            (progn
              (wal-archive-check-private-child parent-fd name fd)
-             (sb-posix:fsync parent-fd)
+             (unless existing-only (sb-posix:fsync parent-fd))
              (sb-sys:with-local-interrupts
                (funcall function fd)))
         (sb-posix:close fd)))))
@@ -4469,8 +4469,9 @@ Keep the descriptors open through unlink and sync the WAL directory."
 (defun wal-archive-staged-history-state (wal-fd name primary-facts)
   "Recognize a matching history already owned by the standby archive queue."
   (handler-case
-      (call-with-standby-wal-archive-directory
-       (lambda (stage-fd check-directory)
+      (call-with-wal-archive-private-child
+       wal-fd "standby_archive"
+       (lambda (stage-fd)
          (let ((path (merge-pathnames name (physical-image-fd-path stage-fd))))
            (when (wal-namespace-file-stat path t)
              (sb-sys:without-interrupts
@@ -4480,16 +4481,19 @@ Keep the descriptors open through unlink and sync the WAL directory."
                         (when (and (equal facts (wal-archive-check-source stage-fd name source-fd))
                                    (multiple-value-bind (primary-bytes facts) (wal-archive-read-source-bytes wal-fd name)
                                      (and (equal primary-facts facts) (equalp bytes primary-bytes))))
-                          (let ((status-fd (wal-archive-open-status-directory stage-fd)))
-                            (unwind-protect
-                                 (let ((done (wal-archive-done-matches-p stage-fd status-fd name source-fd)))
-                                   (funcall check-directory stage-fd)
-                                   (wal-archive-check-status-directory stage-fd status-fd)
-                                   (unless (equal facts (wal-archive-check-source stage-fd name source-fd))
-                                     (error "staged history changed during archive handoff"))
-                                   (if done :done :pending))
-                              (sb-posix:close status-fd)))))
-                   (sb-posix:close source-fd))))))))
+                          (call-with-wal-archive-private-child
+                           stage-fd "archive_status"
+                           (lambda (status-fd)
+                             (let ((done (wal-archive-done-matches-p stage-fd status-fd name source-fd)))
+                               (wal-archive-check-wal-directory wal-fd)
+                               (wal-archive-check-private-child wal-fd "standby_archive" stage-fd)
+                               (wal-archive-check-private-child stage-fd "archive_status" status-fd)
+                               (unless (equal facts (wal-archive-check-source stage-fd name source-fd))
+                                 (error "staged history changed during archive handoff"))
+                               (if done :done :pending)))
+                           :existing-only t)))
+                   (sb-posix:close source-fd)))))))
+       :existing-only t)
     (error () nil)))
 
 (defun wal-archive-attempt (item template &key epoch)
@@ -4530,10 +4534,9 @@ under the lock, and publish completion only after success."
                       (unless (member item (wal-archive-history-items name facts) :test #'equal)
                         (return-from wal-archive-attempt nil)))))
              ;; Reuse the standby receipt only for identical committed history.
-             (let ((staged (when (and (consp item) (not (wal-archive-partial-item-p item))
-                                      (startup-standby-wal-archive-enabled-p))
+             (let ((staged (when (and (consp item) (not (wal-archive-partial-item-p item)))
                              (wal-archive-staged-history-state wal-fd name facts))))
-               (when (eq staged :pending)
+               (when (and (eq staged :pending) (startup-standby-wal-archive-enabled-p))
                  (return-from wal-archive-attempt (values nil :staged-pending)))
                (when (or (eq staged :done) (wal-archive-run-shell template name wal-fd directory))
                  (sb-thread:with-mutex (*wal-lock*)
