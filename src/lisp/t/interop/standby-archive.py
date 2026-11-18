@@ -35,6 +35,84 @@ def advance_wal(port, start, endpoint):
     raise AssertionError(f"source did not reach {endpoint}")
 
 
+def check_primary_archive_handoff(node, port, data, archive, attempts, command, last):
+    wal = data / "pg_wal"
+    archive_status = wal / "archive_status"
+    history = "00000002.history"
+    follow.wait_for((archive_status / (history + ".done")).is_file)
+    assert (archive / history).read_bytes() == (wal / history).read_bytes()
+
+    (data / "postgresql.auto.conf").write_text(
+        "archive_mode = on\narchive_command = '" + command.replace("'", "''") + "'\n")
+    previous_attempts = attempts.read_text().splitlines()
+    assert node.restart(timeout=90) is True
+    assert follow.query(port, "SHOW archive_mode") == [("on",)]
+    assert follow.query(port, "SELECT pg_is_in_recovery()") == [(False,)]
+    last = advance_wal(port, last + 1, "0/3000000")
+    assert follow.query(port, "SELECT max(id) FROM archive_probe") == [(last,)]
+    child = "000000020000000000000002.wal"
+    proof_name = child + ".proof"
+    follow.wait_for((archive_status / (proof_name + ".done")).is_file)
+    proof = (archive / proof_name).read_bytes()
+    assert len(proof) == 52 and proof[:4] == b"PWAP"
+    end = 2 * 16 * 1024 * 1024 + (archive / child).stat().st_size
+    assert int.from_bytes(proof[32:40], "little") == end
+    new_attempts = attempts.read_text().splitlines()[len(previous_attempts):]
+    assert child in new_attempts and proof_name in new_attempts
+    assert not any(name.startswith("00000001") for name in new_attempts)
+    return last
+
+
+def check_second_promotion(upstream, upstream_port, root, archive, command, last):
+    root.mkdir(mode=0o700)
+    data = root / "data"
+    conninfo = f"host=127.0.0.1 port={upstream_port} user=postgres dbname=postgres"
+    follow.query(upstream_port, "SELECT pg_create_physical_replication_slot('follow_one',true)")
+    subprocess.run([str(follow.BASE / "bin/pg_basebackup"), "-D", str(data),
+                    "-X", "stream", "-d", conninfo], check=True, timeout=90)
+    (data / "postgresql.auto.conf").write_text(
+        "archive_mode = on\narchive_command = '" + command.replace("'", "''") + "'\n")
+    with socket.socket() as reservation:
+        reservation.bind(("127.0.0.1", 0))
+        port = reservation.getsockname()[1]
+    node = follow.Postgresql(follow.configuration(data, port, root), follow.Null())
+    member = follow.Member(0, "promoted", None,
+                           {"conn_url": f"postgres://127.0.0.1:{upstream_port}/postgres"})
+    try:
+        assert node.follow(member, timeout=90) is True
+        follow.query(upstream_port, f"INSERT INTO archive_probe VALUES ({last + 1})")
+        follow.wait_for(lambda: follow.query(port, "SELECT max(id) FROM archive_probe") == [(last + 1,)])
+        assert upstream.stop(mode="fast", checkpoint=False, stop_timeout=45)
+        assert follow.query(port, "SELECT pg_promote(true,30)") == [(True,)]
+        follow.query(port, f"INSERT INTO archive_probe VALUES ({last + 2})")
+        assert follow.query(port, "SELECT max(id) FROM archive_probe") == [(last + 2,)]
+
+        status = data / "pg_wal/archive_status"
+        history = "00000003.history"
+        follow.wait_for((status / (history + ".done")).is_file)
+        previous = (archive / "00000002.history").read_bytes()
+        current = (archive / history).read_bytes()
+        assert current.startswith(previous)
+        timeline, location, _ = current[len(previous):].split(maxsplit=2)
+        assert timeline == b"2"
+        high, low = (int(part, 16) for part in location.split(b"/"))
+        fork = (high << 32) + low
+        segment, offset = divmod(fork, 16 * 1024 * 1024)
+        assert offset > 0
+        partial = f"00000002{segment // 256:08X}{segment % 256:08X}.wal.partial"
+        proof_name = partial + ".proof"
+        follow.wait_for((status / (proof_name + ".done")).is_file)
+        assert (archive / partial).stat().st_size == offset
+        proof = (archive / proof_name).read_bytes()
+        assert len(proof) == 52 and proof[:4] == b"PWAP"
+        assert int.from_bytes(proof[32:40], "little") == fork
+        assert node.stop(mode="fast", checkpoint=False, stop_timeout=45)
+    finally:
+        node.connection_pool.close()
+        if node.is_running():
+            node.stop(mode="immediate", checkpoint=False, stop_timeout=30)
+
+
 def exercise(root, source_port, target_port):
     source_data, target_data = root / "source", root / "replica"
     source_socket = root / "source.sock"
@@ -139,7 +217,11 @@ def exercise(root, source_port, target_port):
                 end = index * 16 * 1024 * 1024 + (archive / name).stat().st_size
                 assert int.from_bytes(proof[32:40], "little") == end
             print("standby-archive: promoted writer archived receive WAL and its end proofs", flush=True)
-            assert node.stop(mode="fast", checkpoint=False, stop_timeout=45)
+            last = check_primary_archive_handoff(node, target_port, target_data,
+                                                 archive, attempts, command, last + 1)
+            print("standby-archive: restarted in archive_mode=on and archived writer WAL", flush=True)
+            check_second_promotion(node, target_port, root / "second-promotion", archive, command, last)
+            print("standby-archive: second promotion archived timeline history and fork proof", flush=True)
         finally:
             try:
                 if node is not None:
