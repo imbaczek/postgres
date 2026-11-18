@@ -121,13 +121,13 @@ Two recovery areas still need work.
    prefixes can also require manual repair. State both limits in the
    lifecycle contract and qualify any wider support separately.
 
-The current namespace process test passes the crash and restart cases through
-inactive alias cleanup. Its continued-follow case fails on both the proof
-migration change and its parent. The active sender fences the namespace change
-with SQLSTATE 55000, and the receiver stops. The earlier continued-follow pass
-recorded below is historical. A fresh run needs to demonstrate either safe
-reconnection for a legacy standby or an explicit migration procedure that
-restarts follow.
+The namespace process test now passes all crash cuts, preserves WAL bytes, and
+continues follow across migration. An active stream from a superseded namespace
+ends with SQLSTATE 57P01. The standby reconnects from its durable receive
+cursor and replays new writes on the same base. The run also covers bootstrap
+and restart with qualified filenames and passed in 64.41 s on the ramdisk.
+The independent checkpoint decoder now accepts the logical-decoding fields
+written by the server. Its 16 Python checks passed.
 
 C physical WAL and disk compatibility would require format and replay work
 separate from matching C behavior. The mixed-engine switchovers establish
