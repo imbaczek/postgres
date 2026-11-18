@@ -157,9 +157,16 @@ def restore_then_stream(root, source_port, target_port):
     source_socket = root / "source.sock"
     archive = root / "archive"
     attempts = root / "restore-attempts"
+    block = root / "block-restore"
+    shell_pid = root / "restore-shell-pid"
     archive.mkdir()
     archive_command = f'cp -- "%p" {shlex.quote(str(archive))}/"%f"'
+    marker = shlex.quote(str(shell_pid))
+    pending_marker = shlex.quote(str(shell_pid.with_suffix(".tmp")))
     restore_command = (
+        f'if test -f {shlex.quote(str(block))}; then '
+        f'printf partial > "%p" && printf "%%s\\n" "$$" > {pending_marker} && '
+        f'mv -- {pending_marker} {marker} && exec sleep 300; exit 1; fi; '
         f'printf "%%s %%s\\n" "%f" "%r" >> {shlex.quote(str(attempts))}; '
         f'test -f {shlex.quote(str(archive))}/"%f" && cp -- {shlex.quote(str(archive))}/"%f" "%p"'
     )
@@ -203,7 +210,30 @@ def restore_then_stream(root, source_port, target_port):
             withheld = root / proof_name
             proof.rename(withheld)
             attempts.unlink(missing_ok=True)
+            block.touch()
             assert node.start(timeout=90) is True
+            follow.wait_for(shell_pid.is_file)
+            shell = int(shell_pid.read_text())
+            child = node.is_running()
+            assert child is not None
+            try:
+                child.kill()
+                child.wait(timeout=15)
+            finally:
+                try:
+                    os.kill(shell, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                os.waitpid(shell, 0)
+            block.unlink()
+            stages = list((target_data / "pg_wal").glob(".pg-restore.*"))
+            assert len(stages) == 1 and stages[0].is_dir(), stages
+            staged, = stages[0].iterdir()
+            assert staged.read_bytes() == b"partial"
+            (root / "target.sock").unlink(missing_ok=True)
+            assert node.start(timeout=90) is True
+            assert not stages[0].exists()
+            print("archive-restore: cold restart removed the interrupted restore stage", flush=True)
             rows = "SELECT count(*), max(id) FROM archive_probe"
             first_attempt = f"{proof_name} 0000000000000000.wal"
             follow.wait_for(lambda: attempts.is_file() and first_attempt in attempts.read_text().splitlines())

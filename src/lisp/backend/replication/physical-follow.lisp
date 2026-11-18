@@ -1654,6 +1654,74 @@ Capture the floor and its timeline together before running the restore shell."
                (timeline (physical-store-prefix-timeline store floor)))
           (wal-segment-filename (floor floor +wal-segment-size+) timeline namespace))))))
 
+(defparameter *physical-restore-stage-template* ".pg-restore.XXXXXX")
+
+(defun physical-restore-stage-name-p (name)
+  (let* ((template *physical-restore-stage-template*)
+         (prefix-end (- (length template) 6)))
+    (and (= (length name) (length template))
+         (null (mismatch name template :end1 prefix-end :end2 prefix-end))
+         (every (lambda (character)
+                  (find character "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"))
+                (subseq name prefix-end)))))
+
+(defun physical-restore-remove-startup-stage (parent name)
+  (handler-case
+      (call-with-wal-archive-private-child
+       parent name
+       (lambda (fd)
+         (wal-archive-check-wal-directory parent)
+         (let ((facts (physical-image-file-facts fd)))
+           (physical-backup-remove-stage-tree parent name :mount (ninth facts) :expected facts)
+           t))
+       :existing-only t)
+    (error (condition)
+      (admin-log "could not remove abandoned restore stage ~a: ~a" name condition)
+      nil)))
+
+(defun physical-restore-cleanup-stages-at-startup (root-fd)
+  "Remove abandoned restore work below the held PGDATA directory."
+  (handler-case
+      (sb-sys:without-interrupts
+        (let ((parent (physical-image-openat
+                       root-fd "pg_wal"
+                       (logior sb-posix:o-rdonly sb-posix:o-directory
+                               sb-posix:o-nofollow +postmaster-o-cloexec+) 0)))
+          (when (minusp parent)
+            (unless (= (sb-alien:get-errno) sb-posix:enoent)
+              (error "could not open WAL directory"))
+            (return-from physical-restore-cleanup-stages-at-startup nil))
+          (unwind-protect
+               (sb-sys:with-local-interrupts
+                 (wal-archive-check-wal-directory parent)
+                 (multiple-value-bind (names complete) (query-temp-directory-entry-names parent)
+                   (unless complete (error "could not enumerate WAL directory"))
+                   (let ((removed nil))
+                     (dolist (name names)
+                       (when (and (physical-restore-stage-name-p name)
+                                  (physical-restore-remove-startup-stage parent name))
+                         (setf removed t)))
+                     (when removed (sb-posix:fsync parent)))))
+            (sb-posix:close parent))))
+    (error (condition)
+      (admin-log "could not clean abandoned restore stages: ~a" condition))))
+
+(defun physical-restore-cleanup-owned-stages-at-startup ()
+  "Pin the directory whose postmaster lock we own before opening pg_wal."
+  (call-with-postmaster-ownership
+   (lambda (owner)
+     (sb-sys:without-interrupts
+       (let ((fd (physical-backup-open-directory (postmaster-ownership-directory owner))))
+         (unwind-protect
+              (sb-sys:with-local-interrupts
+                (let ((stat (sb-posix:fstat fd)))
+                  (unless (and (= (sb-posix:stat-dev stat) (postmaster-ownership-device owner))
+                               (= (sb-posix:stat-ino stat) (postmaster-ownership-inode owner)))
+                    (error "restore stage cleanup requires the owned PGDATA directory")))
+                (postmaster-check-ownership owner)
+                (physical-restore-cleanup-stages-at-startup fd))
+           (sb-posix:close fd)))))))
+
 (defun physical-follow-fetch-archive (runtime command system-id timeline segment namespace)
   "Fetch one proved extent through a private directory pinned under pg_wal."
   (let ((parent nil) (fd nil) (name nil) (facts nil))
@@ -1662,7 +1730,7 @@ Capture the floor and its timeline together before running the restore shell."
            (sb-sys:without-interrupts
              (setf parent (wal-archive-open-wal-directory))
              (let ((stage (sb-posix:mkdtemp
-                           (namestring (merge-pathnames ".pg-restore.XXXXXX"
+                           (namestring (merge-pathnames *physical-restore-stage-template*
                                                         (physical-image-fd-path parent))))))
                (setf name (file-namestring stage)
                      fd (physical-backup-open-directory (pathname stage))

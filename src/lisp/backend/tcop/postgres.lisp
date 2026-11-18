@@ -1091,6 +1091,7 @@ throughout replay and shutdown."
         (physical-export-origin-load)
         (physical-backup-lease-reconcile-startup)
         (physical-rewind-cleanup-stages-at-startup *physical-backup-lease-records*)
+        (physical-restore-cleanup-owned-stages-at-startup)
         (if imported
             (logical-slot-imported-startup-check-policy)
             (physical-follow-prepare-managed-startup))
