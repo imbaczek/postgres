@@ -112,6 +112,43 @@ inputs use the historical generic calculation.  BYTES is read without mutation."
                                       (* (logxor digest octet) #x100000001B3))))
         digest)))
 
+(defconstant +wal-archive-segment-proof-size+ 52)
+
+(defun wal-encode-archive-segment-proof (system-id timeline segment namespace end bytes)
+  "Encode producer evidence for the exact bytes and logical end of a closed segment.
+END must come from the producer's durable rotation or receive evidence."
+  (unless (and (typep system-id '(unsigned-byte 64))
+               (typep end '(unsigned-byte 64))
+               (typep bytes '(vector (unsigned-byte 8)))
+               (<= +wal-header-size+ (length bytes) +wal-segment-size+))
+    (error "invalid WAL archive proof input"))
+  (wal-segment-filename segment timeline namespace)
+  (unless (= end (+ (* segment +wal-segment-size+) (length bytes)))
+    (error "WAL archive size differs from its proved end"))
+  (let ((proof (make-array +wal-archive-segment-proof-size+
+                           :element-type '(unsigned-byte 8) :initial-element 0)))
+    (replace proof #(80 87 65 80))
+    (wal-set-u32 proof 4 1)
+    (wal-set-u64 proof 8 system-id)
+    (wal-set-u32 proof 16 timeline)
+    (wal-set-u32 proof 20 (ecase namespace (:legacy 0) (:timeline 1)))
+    (wal-set-u64 proof 24 segment)
+    (wal-set-u64 proof 32 end)
+    (wal-set-u64 proof 40 (physical-store-update-digest #xCBF29CE484222325 bytes))
+    (wal-set-u32 proof 48 (wal-crc32 proof 0 48))
+    proof))
+
+(defun wal-verify-archive-segment-proof (proof system-id timeline segment namespace bytes)
+  "Return the proved end of BYTES for the expected cluster and archive name.
+The archive is a trusted source. Checksums detect accidental changes."
+  (unless (and (typep proof '(vector (unsigned-byte 8)))
+               (= (length proof) +wal-archive-segment-proof-size+))
+    (error "invalid WAL archive proof size"))
+  (let ((end (wal-u64 proof 32)))
+    (unless (equalp proof (wal-encode-archive-segment-proof system-id timeline segment namespace end bytes))
+      (error "WAL archive proof differs from the expected segment"))
+    end))
+
 (defun physical-store-update-digest-span (digest bytes start end)
   "Extend DIGEST over the half-open span [START, END) without changing BYTES.
 For an unsigned 64-bit digest, simple octet vector and valid fixnum bounds,

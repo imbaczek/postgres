@@ -530,6 +530,38 @@
         (unwind-protect (ok (= 32 (pg::physical-store-flushed-lsn reopened)))
           (pg::physical-store-close reopened)))))
 
+(deftest wal-archive-segment-proof-binds-identity-and-exact-content
+    (let* ((first (sample-physical-record))
+           (bytes (concatenate '(vector (unsigned-byte 8)) first (sample-physical-record (length first))))
+           (end (length bytes))
+           (proof (pg::wal-encode-archive-segment-proof 123 1 0 :timeline end bytes)))
+      (ok (= end (pg::wal-verify-archive-segment-proof proof 123 1 0 :timeline bytes)))
+      (ok (signals (pg::wal-verify-archive-segment-proof proof 123 1 0 :timeline first) 'error))
+      (ok (signals (pg::wal-verify-archive-segment-proof proof 124 1 0 :timeline bytes) 'error))
+      (ok (signals (pg::wal-verify-archive-segment-proof proof 123 2 0 :timeline bytes) 'error))
+      (ok (signals (pg::wal-verify-archive-segment-proof proof 123 1 1 :timeline bytes) 'error))
+      (ok (signals (pg::wal-verify-archive-segment-proof proof 123 1 0 :legacy bytes) 'error))
+      (let ((legacy (pg::wal-encode-archive-segment-proof 123 1 0 :legacy end bytes)))
+        (ok (= end (pg::wal-verify-archive-segment-proof legacy 123 1 0 :legacy bytes)))
+        (ok (signals (pg::wal-encode-archive-segment-proof 123 2 0 :legacy end bytes) 'error)))
+      (let ((different (concatenate '(vector (unsigned-byte 8)) first
+                                    (pg::wal-encode-record pg::+wal-record-maintenance+ 0
+                                                           (length first) (empty-octets))))
+            (damaged (copy-seq proof)))
+        (setf (aref damaged 4) 2)
+        (ok (signals (pg::wal-verify-archive-segment-proof proof 123 1 0 :timeline different) 'error))
+        (ok (signals (pg::wal-verify-archive-segment-proof damaged 123 1 0 :timeline bytes) 'error))
+        (ok (signals (pg::wal-verify-archive-segment-proof (subseq proof 1) 123 1 0 :timeline bytes) 'error))))
+  (let ((bytes (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)))
+    (ok (equalp #(80 87 65 80 1 0 0 0 0 0 0 0 0 0 0 0 1 0 0 0 0 0 0 0 0 0
+                  0 0 0 0 0 0 32 0 0 0 0 0 0 0 165 245 138 77 120 16 130 12 92 123 156 153)
+                (pg::wal-encode-archive-segment-proof 0 1 0 :legacy 32 bytes))))
+  (let* ((size pg::+wal-segment-size+)
+         (bytes (make-array size :element-type '(unsigned-byte 8) :initial-element 0))
+         (end (* 2 size))
+         (proof (pg::wal-encode-archive-segment-proof 123 2 1 :timeline end bytes)))
+    (ok (= end (pg::wal-verify-archive-segment-proof proof 123 2 1 :timeline bytes)))))
+
 (deftest receive-archive-segment-needs-durable-rotation
     (with-physical-store-directory (root)
       (let* ((first (sample-physical-record))
