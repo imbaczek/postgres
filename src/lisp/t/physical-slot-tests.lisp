@@ -395,6 +395,24 @@
       (remhash "second" pg::*wal-replication-slots*)
       (ok (= 100 (pg::vacuum-data-oldest-xmin)))))
 
+(deftest cold-primary-rejects-feedback-older-than-recovered-clog
+    (let* ((boundary (+ pg::+xid-cycle+ pg::+first-normal-xid+))
+           (pg::*next-xid* boundary)
+           (pg::*wal-replication-slots* (make-hash-table :test #'equal))
+           (slot (physical-slot-test-object)))
+      (setf (gethash "public_physical" pg::*wal-replication-slots*) slot
+            (pg::physical-slot-horizons slot) (list nil (1- pg::+xid-cycle+)))
+      (ok (not (signals (pg::check-primary-feedback-after-replay nil) 'error)))
+      (ok (signals (pg::check-primary-feedback-after-replay boundary) 'error))
+      (incf pg::*next-xid*)
+      (ok (signals (pg::check-primary-feedback-after-replay nil) 'error))
+      (setf (pg::physical-slot-horizons slot) (list boundary nil))
+      (ok (not (signals (pg::check-primary-feedback-after-replay boundary) 'error)))
+      (setf pg::*next-xid* (+ boundary pg::+xid-cycle+))
+      (ok (not (signals (pg::check-primary-feedback-after-replay nil) 'error)))
+      (setf (pg::physical-slot-horizons slot) (list (1- pg::+xid-cycle+) nil))
+      (ok (signals (pg::check-primary-feedback-after-replay nil) 'error))))
+
 (deftest physical-feedback-defers-forced-xid-wrap
     (let* ((boundary (+ pg::+xid-cycle+ pg::+first-normal-xid+))
            (pg::*next-xid* boundary)

@@ -125,6 +125,7 @@
                                       :xid 3 :start 216 :end 256
                                       :payload (make-array 8 :element-type '(unsigned-byte 8)
                                                              :initial-element 0)))
+             (boundary (+ +xid-cycle+ +first-normal-xid+))
              (names '(wal-scan wal-replay-record clog-fsync))
              (originals (mapcar #'symbol-function names))
              (syncs 0))
@@ -139,7 +140,8 @@
                        (setf *wal-storage-incarnation* (gensym "CLOG-REPLAY-NEW-")
                              *wal-recovery-group-active* nil))
                      (symbol-function 'clog-fsync) (lambda () (incf syncs)))
-               (wal-recover)
+               (wal-set-u64 (wal-record-payload record) 0 boundary)
+               (rove:ok (= boundary (wal-recover)))
                (rove:ok (= 1 syncs))
                (rove:ok (not (eq old *wal-storage-incarnation*)))
                (if (eq enabled :unknown)

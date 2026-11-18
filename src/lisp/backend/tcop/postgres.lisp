@@ -919,6 +919,19 @@ CL's RENAME-FILE merges a relative target with the source's directory."
   (startup-check-retired-storage)
   (values))
 
+(defun check-primary-feedback-after-replay (reset-boundary)
+  "Reject retained feedback older than the recovered transaction status boundary.
+At the first XID of an epoch, the next XID alone proves only that the
+previous epoch began. A replayed reset can establish the later boundary."
+  (let* ((next (next-full-xid))
+         (epoch-start (xid-epoch-start (min next +max-xid+)))
+         (boundary (max (or reset-boundary 0)
+                        (if (> next epoch-start)
+                            epoch-start
+                            (- epoch-start +xid-cycle+)))))
+    (when (< (wal-limit-xmin-by-physical-feedback boundary :include-catalog t) boundary)
+      (error "retained physical feedback precedes the recovered transaction status boundary"))))
+
 (defun initialize-primary-storage (&key imported-startup)
   "Initialize a cold or promoted primary from its durable WAL/control checkpoint.
 Hold the drained admission gate and borrow the real postmaster ownership."
@@ -934,14 +947,15 @@ Hold the drained admission gate and borrow the real postmaster ownership."
         (wal-mark-primary-startup)
         (wal-init)
         (xact-init)
-        (wal-recover)
-        (when (startup-primary-wal-archive-enabled-p)
-          (with-wal-critical (wal-archive-try-reconcile-ready-under-lock)))
-        (note-primary-startup-replay)
-        ;; Replay can change the state checked above.  Check again before
-        ;; restoring slots, which can also remove temporary slot files.
-        (check-primary-storage-startup-context gate-owner ownership)
-        (wal-load-replication-slots :gate-owner gate-owner :ownership ownership)
+        (let ((reset-boundary (wal-recover)))
+          (when (startup-primary-wal-archive-enabled-p)
+            (with-wal-critical (wal-archive-try-reconcile-ready-under-lock)))
+          (note-primary-startup-replay)
+          ;; Replay can change the state checked above. Check again before
+          ;; restoring slots, which can also remove temporary slot files.
+          (check-primary-storage-startup-context gate-owner ownership)
+          (wal-load-replication-slots :gate-owner gate-owner :ownership ownership)
+          (check-primary-feedback-after-replay reset-boundary))
         (catalog-init)
         (wal-ensure-directory-durable (merge-pathnames "base/" *pgdata*))
         (physical-backup-lease-load-records)

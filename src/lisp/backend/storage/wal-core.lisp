@@ -3261,12 +3261,14 @@ Validate logical status privately before each new terminal's redo. Carry private
 FPW evidence to a new token only after a validated CLOG reset terminal closes its
 batch; reject other storage rotations. Publish FPW and logical status only after
 the full scan and CLOG sync succeed. The caller must exclude storage lifecycle
-changes throughout."
+changes throughout. Return the greatest CLOG reset boundary replayed after
+the checkpoint, or NIL when no reset was replayed."
   (let* ((incarnation *wal-storage-incarnation*)
          (fpw-state (wal-fpw-state-from-checkpoint *wal-checkpoint-snapshot* incarnation))
          (logical-status (wal-logical-status-from-checkpoint *wal-checkpoint-snapshot*))
          (*wal-recovery-page-spool-enabled* t)
-         (resource-record nil))
+         (resource-record nil)
+         (reset-boundary nil))
     (with-wal-replay-staging ()
       (wal-scan
        (lambda (record)
@@ -3292,6 +3294,9 @@ changes throughout."
              (when (= (wal-record-type record) +wal-record-parameter-change+)
                (setf resource-record record))
              (when (and terminal-p (not *wal-recovery-group-active*))
+               (when (= (wal-record-type record) +wal-record-clog-reset+)
+                 (let ((boundary (wal-read-u64-payload (wal-record-payload record))))
+                   (setf reset-boundary (max boundary (or reset-boundary 0)))))
                (setf fpw-state (wal-fpw-state-next
                                 fpw-state record *wal-insert-timeline* incarnation)
                      logical-status next-logical-status)))))))
@@ -3300,8 +3305,8 @@ changes throughout."
     (clog-fsync)
     (with-wal-critical
       (wal-fpw-install-recovered-state fpw-state incarnation)
-      (wal-install-recovered-logical-policy logical-status incarnation)))
-  (values))
+      (wal-install-recovered-logical-policy logical-status incarnation))
+    reset-boundary))
 
 (defun wal-atomic-write-bytes (path bytes)
   (with-atomic-output (stream
