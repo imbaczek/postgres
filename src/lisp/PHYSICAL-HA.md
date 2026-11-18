@@ -110,6 +110,16 @@ an installed test configuration and checks the frontier, recreation of a
 missing marker, and retention in the presence of an unverified `.done` file.
 Strict compilation and the two focused test heads took 66.10 s on the ramdisk.
 
+The internal archive attempt runs the command from PGDATA outside the WAL lock.
+`%p` points to the held source descriptor. Only a zero exit and a successful
+recheck of the source and directory identities allow publication of `.done`.
+Publication uses a separate exclusive temporary, syncs the file, renames it,
+and syncs the status directory. The fixture verifies nonzero exit, an exact
+copy of a short segment, a source replacement, and a hard link left at the
+old fixed temporary pathname. Strict compilation and both focused test heads
+took 65.43 s. The scheduler and recycler still need to read and validate
+completion records.
+
 The recycle path must preserve archive-eligible files until durable success
 is recorded. Reconstruct pending work after restart from durable WAL and status,
 including loss of a notification after the segment became durable. Run the
