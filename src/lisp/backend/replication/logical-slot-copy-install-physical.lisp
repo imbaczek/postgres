@@ -27,7 +27,7 @@ live value for comparison."
              (unless (and (wal-replication-slot-p live) (wal-physical-slot-p live))
                (error "installation physical registry changed its object kind"))
              (wal-require-usable-replication-slot live)
-             (let ((normalized (copy-wal-replication-slot disk)))
+             (let ((normalized (wal-copy-replication-slot-with-profile disk)))
                (setf (wal-replication-slot-inactive-since normalized)
                      (wal-replication-slot-inactive-since live))
                (unless (equalp (physical-slot-encode normalized) (physical-slot-encode live))

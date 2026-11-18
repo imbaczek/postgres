@@ -355,6 +355,24 @@
       (setf (pg::wal-replication-slot-kind slot) :unknown)
       (ok (signals (pg::wal-encode-replication-slot slot) 'error))))
 
+(deftest physical-slot-format-preserves-independent-horizons
+    (let* ((slot (physical-slot-test-object :restart 33))
+           (name (pg::wal-replication-slot-name slot))
+           (legacy (pg::physical-slot-encode slot)))
+      (ok (null (pg::physical-slot-horizons (pg::physical-slot-decode legacy name))))
+      (dolist (horizons '((4294967300 4294967301) (4294967300 nil) (nil 4294967301)))
+        (setf (pg::physical-slot-horizons slot) horizons)
+        (let* ((copy (pg::wal-copy-replication-slot-with-profile slot))
+               (encoded (pg::physical-slot-encode copy))
+               (decoded (pg::physical-slot-decode encoded name)))
+          (ok (equal (pg::physical-slot-horizons decoded) horizons))
+          (ok (equalp (pg::physical-slot-encode decoded) encoded))))
+      (setf (pg::physical-slot-horizons slot) nil)
+      (ok (equalp (pg::physical-slot-encode slot) legacy))
+      (dolist (invalid '((nil nil) (4294967297 nil) (nil 18446744073709551616)))
+        (setf (pg::physical-slot-horizons slot) invalid)
+        (ok (signals (pg::physical-slot-encode slot) 'error)))))
+
 (deftest physical-slot-format-rejects-logical-state-or-an-incomplete-restart-pair
     (dolist (arguments '((:restart 32 :timeline nil)
                          (:restart nil :timeline 1)))

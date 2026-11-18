@@ -177,11 +177,28 @@ Logical updates guard identity, progress and the first terminal cause."
   (setf (gethash slot *wal-slot-profiles*) profile)
   slot)
 
+(defvar *physical-slot-horizons*
+  (make-hash-table :test #'eq :weakness :key :synchronized t)
+  "Optional durable data and catalog horizons, keyed by physical slot generation.")
+
+(defun physical-slot-horizons (slot)
+  "Return the stored (data catalog) FullTransactionIds, or NIL when both are absent."
+  (gethash slot *physical-slot-horizons*))
+
+(defun (setf physical-slot-horizons) (horizons slot)
+  "Store HORIZONS as supplied, or clear the stored pair when HORIZONS is NIL."
+  (if horizons
+      (setf (gethash slot *physical-slot-horizons*) horizons)
+      (remhash slot *physical-slot-horizons*))
+  horizons)
+
 (defun wal-copy-replication-slot-with-profile (slot)
-  "Copy a slot while preserving its immutable durable transport profile."
+  "Copy a slot while preserving its durable side metadata."
   (let ((copy (copy-wal-replication-slot slot)))
     (unless (eq (wal-slot-profile slot) :text)
       (wal-slot-set-initial-profile copy (wal-slot-profile slot)))
+    (let ((horizons (physical-slot-horizons slot)))
+      (when horizons (setf (physical-slot-horizons copy) (copy-list horizons))))
     copy))
 
 (defun wal-logical-slot-p (slot)

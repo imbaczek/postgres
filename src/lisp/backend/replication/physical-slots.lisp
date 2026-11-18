@@ -4,6 +4,16 @@
 ;;; Slot ownership is process-local; the image records retention identity and
 ;;; restart state, not the active owner.
 
+(defun physical-slot-horizons-valid-p (horizons)
+  "Check optional normal FullTransactionIds without conflating data and catalog."
+  (or (null horizons)
+      (and (typep horizons '(cons t (cons t null)))
+           (some #'identity horizons)
+           (every (lambda (xid)
+                    (or (null xid)
+                        (and (typep xid '(unsigned-byte 64)) (<= 3 (ldb (byte 32 0) xid)))))
+                  horizons))))
+
 (defun physical-slot-state-valid-p (slot)
   "Check physical kind and durable field shape, including the paired nullable
 restart LSN and timeline. Logical provenance, child owner, confirmed timeline
@@ -27,6 +37,7 @@ and cause must be NIL. A null restart or lost slot does not retain WAL."
                   (typep timeline '(integer 1 4294967295))))
          (member (wal-replication-slot-wal-status slot) '(:reserved :lost))
          (member (wal-replication-slot-temporary-p slot) '(nil t))
+         (physical-slot-horizons-valid-p (physical-slot-horizons slot))
          (typep (wal-replication-slot-inactive-since slot) '(signed-byte 64)))))
 
 (defun physical-slot-check-position (slot system-id history frontier)
@@ -265,13 +276,18 @@ Validate primary WAL here; standby slots are checked together after loading."
   "Encode checked durable slot fields with a checksum. Active and temporary
 owners and pending process state are not persisted."
   (unless (physical-slot-state-valid-p slot) (error "invalid physical replication slot state"))
-  (let* ((prefix (format nil "PGPHYSICALSLOT1 ~a ~d ~a ~a ~a ~d ~d"
-                         (wal-replication-slot-name slot) (wal-replication-slot-system-id slot)
-                         (or (wal-replication-slot-restart-timeline slot) "-")
-                         (or (wal-replication-slot-restart-lsn slot) "-")
-                         (string-downcase (symbol-name (wal-replication-slot-wal-status slot)))
-                         (if (wal-replication-slot-temporary-p slot) 1 0)
-                         (wal-replication-slot-inactive-since slot)))
+  (let* ((base-prefix (format nil "PGPHYSICALSLOT1 ~a ~d ~a ~a ~a ~d ~d"
+                              (wal-replication-slot-name slot) (wal-replication-slot-system-id slot)
+                              (or (wal-replication-slot-restart-timeline slot) "-")
+                              (or (wal-replication-slot-restart-lsn slot) "-")
+                              (string-downcase (symbol-name (wal-replication-slot-wal-status slot)))
+                              (if (wal-replication-slot-temporary-p slot) 1 0)
+                              (wal-replication-slot-inactive-since slot)))
+         (horizons (physical-slot-horizons slot))
+         (prefix (if horizons
+                     (format nil "~a ~:[-~;~:*~d~] ~:[-~;~:*~d~]" base-prefix
+                             (first horizons) (second horizons))
+                     base-prefix))
          (crc (wal-crc32 (string->bytes prefix))))
     (string->bytes (format nil "~a ~8,'0X~%" prefix crc))))
 
@@ -296,14 +312,15 @@ The returned slot has fresh process-local ownership and transaction state."
     (error "invalid physical replication slot image"))
   (let* ((text (bytes->string (subseq bytes 0 (1- (length bytes)))))
          (fields (wal-split-fields text))
-         (prefix-end (position #\Space text :from-end t)))
-    (unless (and (= 9 (length fields)) (equal (first fields) "PGPHYSICALSLOT1")
+         (prefix-end (position #\Space text :from-end t))
+         (crc (car (last fields))))
+    (unless (and (member (length fields) '(9 11)) (equal (first fields) "PGPHYSICALSLOT1")
                  (equal name (second fields)) (wal-valid-replication-slot-name-p name)
                  (member (sixth fields) '("reserved" "lost") :test #'equal)
                  (member (seventh fields) '("0" "1") :test #'equal)
-                 (= 8 (length (ninth fields)))
-                 (every (lambda (char) (find char "0123456789ABCDEFabcdef")) (ninth fields))
-                 (= (parse-integer (ninth fields) :radix 16)
+                 (= 8 (length crc))
+                 (every (lambda (char) (find char "0123456789ABCDEFabcdef")) crc)
+                 (= (parse-integer crc :radix 16)
                     (wal-crc32 (string->bytes (subseq text 0 prefix-end)))))
       (error "physical replication slot name, schema or checksum differs"))
     (let ((slot (make-wal-replication-slot
@@ -314,6 +331,10 @@ The returned slot has fresh process-local ownership and transaction state."
                  :wal-status (if (equal (sixth fields) "reserved") :reserved :lost)
                  :temporary-p (equal (seventh fields) "1")
                  :inactive-since (physical-slot-number (eighth fields) :signed t))))
+      (when (= 11 (length fields))
+        (setf (physical-slot-horizons slot)
+              (list (physical-slot-number (ninth fields) :nullable t)
+                    (physical-slot-number (tenth fields) :nullable t))))
       (unless (physical-slot-state-valid-p slot) (error "invalid decoded physical replication slot state"))
       slot)))
 
@@ -509,7 +530,7 @@ interior position on a standby."
         (when (< target (wal-replication-slot-restart-lsn slot))
           (ereport "55000" "cannot advance replication slot ~s backwards" name))
         (when (> target (wal-replication-slot-restart-lsn slot))
-          (let ((candidate (copy-wal-replication-slot slot))
+          (let ((candidate (wal-copy-replication-slot-with-profile slot))
                 (timeline (physical-slot-current-prefix-timeline target)))
             (setf (wal-replication-slot-restart-lsn candidate) target
                   (wal-replication-slot-restart-timeline candidate) timeline)
