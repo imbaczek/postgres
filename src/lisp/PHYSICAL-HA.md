@@ -47,9 +47,8 @@ standby restart, promotion, and rejoin of a former writer. The synchronous
 durability tests include independent client acknowledgments and cold recovery
 of the credited native replicas while the source stays down. Pinned Patroni
 acceptance covers individual backend calls, replica clone and cancellation, and
-the supplied-leader rejoin sequence. The call inventory below is historical and
-still needs reconciliation against the equivalent C behavior and the tests added
-since that inventory.
+the supplied-leader rejoin sequence. The call inventory below records the
+exercised interfaces and remaining backend gaps.
 
 The page-reuse fixture took 49.71 s. The partial-capture rehearsal took 256.83 s
 and rejoined after killing both initial capture and the first repair. Strict
@@ -5021,30 +5020,38 @@ Do not add SQL functions returning guessed standby state to make probes pass.
 
 ## Patroni call inventory
 
-Reference version: [Patroni v4.1.5](https://github.com/patroni/patroni/tree/v4.1.5).
-The process/driver smoke test pins psycopg2-binary 2.9.11 and psutil 7.1.3;
-`t/interop/patroni-requirements.txt` records the complete tested Python environment. This inventory
-is incomplete until bootstrap, slots, sync, rewind and driver
-modules have also been inspected and their calls exercised. Config and process
-call sites below have partial native acceptance; the complete interface matrix
-remains unverified.
+The reference is pinned Patroni 4.1.5. `t/interop/patroni-requirements.txt`
+records the tested Python environment, including psycopg2-binary 2.9.11 and
+psutil 7.1.3. These are backend interface tests using real Patroni methods or
+unchanged generated SQL, with fixtures supplying the surrounding state.
 
-| Source | Observed contract | Implementation status |
+| Interface | Exercised contract and scope | Evidence |
 | --- | --- | --- |
-| `postgresql/__init__.py`, `TL_LSN` | Recovery state, WAL filename timeline, current/flush LSN, receive/replay LSN differences, replay pause state | Inventory started; backend implementations and exact SQL composition require audit |
-| `Postgresql.__init__` | `PG_VERSION`, `global/pg_control`, process discovery and current settings | Native pg-lisp metadata/layout and lifecycle mapping require audit |
-| `postgresql/connection.py`, `NamedConnection` | Real psycopg connection, integer server version, parameterized queries, error/reconnect behavior | psycopg2 2.9.11 simple parameterized SQL/version smoke passes; actual NamedConnection queries/reconnect suite remains |
-| `ConnectionPool.conn_kwargs` | Startup options for statement timeout and extension-qualified settings; application name and connection timeout | Startup-option handling requires audit |
-| `config.py:load_current_server_parameters` | Parameterized `pg_settings` query with `current_setting`, setting provenance/sourcefile and `ANY`/`ALL` array comparisons | Exact SQL/parser, catalog and driver array adaptation require audit |
-| `config.py:_get_pg_settings`, `_read_recovery_params` | `name, setting, unit, vartype, context, sourcefile`; distinguishes restart-only from reloadable recovery changes | Real GUC registry and recovery config/restart semantics required |
-| `postmaster.py:_read_postmaster_pidfile`, `_is_postmaster_process` | Multi-line PID file, PGDATA, start time, port and listener metadata; PID reuse/start-time safety checks | Real v4.1.5 discovery/start-time rejection and signal_stop smoke pass with owned Linux PID file; full startup/config/shutdown lifecycle remains |
-| `postmaster.py:start` | Direct executable launch with `-D`, `--config-file=...` and options; process survives launcher | Real pinned direct start passes for the implemented configuration subset; complete generated configurations remain unsupported |
-| `Postgresql.promote`, `controldata`, `_wait_promote` | Native utility request, durable production-state wait, system identity and checkpoint timeline | Full pinned method passes with native pg_ctl/pg_controldata; DCS and complete utility/version matrix remain outside this acceptance |
+| `Postgresql.TL_LSN` | Both write and flush fragments on primary and standby, including paused replay, with returned types and positions checked. | `t/interop/patroni-tl-lsn.py` |
+| Cluster monitoring | Unchanged 16-column cluster query covers primary and receiver states, including absent, connecting, streaming and paused; checkpoint/control tests also cover the standby-leader branch. | `t/interop/receiver-sql.py`, `t/interop/control-checkpoint.py` |
+| Synchronous monitoring | Real Patroni monitor and sync-change method exercise primary and promoted roles, the unchanged `DO` statement, and FIRST/ANY sender JSON, slot-query branch and disconnect. The native test uses real followers. Patroni's query uses underlying functions and does not require the still-missing `pg_stat_replication` view. | `t/interop/patroni-sync-monitor.py`; C and native passed in 73.81 s on the ramdisk. |
+| Connections and configuration | Real `NamedConnection` checks startup options, resets, reconnect, timeout and recovery after cancellation. `ConfigHandler` query acceptance is limited to the tested settings and configurations; it is not acceptance of every generated configuration. | `t/interop/patroni-start.py` |
+| Process and promotion | Pinned process discovery, PID start-time rejection, direct start and stop are exercised for the implemented configuration subset. `Postgresql.promote` uses native utilities and waits for durable production state. | `t/interop/patroni-start.py` and promotion acceptance |
+| Physical slots | Unchanged `SlotsHandler` creates and loads a physical slot, queries view and function forms, advances it and drops it. The fixture supplies database transport. | `t/interop/physical-slots.py:62-93` |
+| Replica lifecycle | Real pinned Patroni clone, follow, promotion, rewind and rejoin are composed with a leader supplied by the fixture. This includes source restart, physical slots and synchronous configuration; it is not leader election. | `t/interop/patroni-reseed.py --case patroni-lifecycle` |
 
+Distinct backend gaps remain:
 
-Primary references:
-[Postgresql control layer](https://github.com/patroni/patroni/blob/v4.1.5/patroni/postgresql/__init__.py),
-[connection layer](https://github.com/patroni/patroni/blob/v4.1.5/patroni/postgresql/connection.py).
+- The exact REST handler status SQL returned a row on C. The native probe
+  failed with SQLSTATE `42883` because `pg_last_xact_replay_timestamp()` is
+  missing. The query also needs sender activity fields `usesysid` and
+  `client_addr`, role lookup and JSON conversion. The probe took 12.79 s on
+  the ramdisk.
+- Initial `Bootstrap.bootstrap` calls `pg_ctl initdb`, which the native
+  utility does not implement. Authentication and role provisioning also
+  require acceptance.
+- Patroni-managed logical-slot synchronization needs separate work and testing,
+  including `hot_standby_feedback`, `pg_read_binary_file` and C slot files.
+- Stock `SyncHandler.current_state`, `ConfigHandler.set_synchronous_standby_names`
+  and `ConfigHandler.check_recovery_conf` still need direct acceptance.
+
+Local evidence and the REST probe are in
+`~/proj/pg-ha-artifacts/patroni-call-inventory/`.
 
 ## Implementation order and completion evidence
 
