@@ -60,8 +60,9 @@ Three items remain for backend closeout.
    stock Patroni 4.1.5. Include generated configuration, utility invocation,
    connection recovery, and the supported slot and synchronous settings. Keep
    leadership supplied by the harness.
-2. Complete the server-side archive comparison against C. Qualify the primary
-   worker across crash cuts, timeline history and promotion, add standby
+2. Complete the server-side archive comparison against C. Qualify interruption
+   during command execution and receipt publication, cover timeline history
+   and promotion, add standby
    `archive_mode=always`, and use an archive produced by the worker for
    stopped-target restore.
 3. Expand native rewind beyond the qualified immediate-child topology, or
@@ -144,6 +145,17 @@ matching all 16,774,077 source bytes. Both SQL configuration views reported the
 active command, all 2,550 rows survived, and the checkpoint and stop completed.
 The run took 20 s at one-second timing resolution. Strict compilation and five
 focused test heads took 64.07 s, including 48.33 s to load the test system.
+
+Two further live runs killed the primary after an unsuccessful archive attempt.
+Both removed the pending notification while the server was stopped. On restart,
+the worker rebuilt it and recorded completion before checkpoint recycling.
+In the first run the archive destination was empty. In the second it held
+the full segment from an earlier command that returned failure. The retry
+compared the bytes and kept that file's inode, size and modification time.
+Both runs preserved all 2,550 rows. Each archived file still matched the
+16,774,077 source bytes after the source segment was recycled. The runs took
+19 s and 18 s at one-second resolution. The archive command had returned
+before each kill.
 
 The recycle path must preserve archive-eligible files until durable success
 is recorded. Reconstruct pending work after restart from durable WAL and status,
