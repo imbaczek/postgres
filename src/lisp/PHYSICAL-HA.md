@@ -5119,6 +5119,14 @@ proof checks. They load OpenSSL 3 through `libcrypto.so.3` on first use.
 The focused Rove vector passed in a fresh Lisp worker and checked both keys,
 the server signature, and rejection of shortened and modified proofs.
 
+The SCRAM wire exchange now sends PostgreSQL's SASL startup frames and
+verifies the client proof against a caller-supplied verifier. The disposable
+fixture supplied that verifier through the control port. Real libpq accepted
+the correct password and rejected the wrong one. The fixture also checked
+the empty initial response and immediate rejection of a non-password frame.
+It passed in 16.38 s on the ramdisk. HBA dispatch and durable bootstrap
+credentials still need live integration.
+
 Distinct backend gaps remain:
 
 - Password-backed `initdb` and `post_bootstrap` role provisioning still need
