@@ -229,6 +229,8 @@ A reseed owner must hold a stopped target with no PID file."
                  (check-directory leaf)
                  (when (query-temp-lstat output)
                    (error "rewind archive output already exists"))
+                 ;; An absolute path through the held cache descriptor lets the
+                 ;; command change directory before writing to %p.
                  (let ((command (physical-rewind-restore-command
                                  template name
                                  (format nil "/proc/~d/fd/~d/~a" (sb-posix:getpid) directory-fd name))))

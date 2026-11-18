@@ -1237,6 +1237,7 @@ installing settings, taking PGDATA ownership or starting listeners."
   (multiple-value-bind (native overrides) (startup-cli-inputs argv)
     (let ((name (gethash "config-output" native)))
       (when name
+        ;; Read restore_command for configuration reporting before startup.
         (let* ((*startup-rewind-restore-command-p* t)
                (settings (startup-load-settings native overrides))
                (entry (gethash (string-downcase name) settings)))

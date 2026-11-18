@@ -700,6 +700,7 @@ Legacy 16-hex segment names always belong to timeline 1."
 
 (defun wal-read-segment-path (segment &optional (timeline *wal-insert-timeline*)
                                         (namespace *wal-segment-namespace*))
+  ;; The offline fallback applies only when the local segment is absent.
   (let ((path (wal-segment-path segment timeline namespace)))
     (if (and *wal-offline-segment-fallback* (not *physical-image-context*)
              (handler-case (progn (sb-posix:lstat (namestring path)) nil)
