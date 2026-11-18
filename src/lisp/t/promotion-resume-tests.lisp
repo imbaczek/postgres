@@ -90,6 +90,7 @@
              (mapcar (lambda (name) (cons name (symbol-function name)))
                      '(pg::physical-store-open pg::physical-recovery-open-receive-store
                        pg::physical-replay-from pg::wal-load-replication-slots
+                       pg::logical-slot-restore-standby-inventory
                        pg::catalog-refresh-oldest-relfrozenxid pg::smgr-close-all pg::physical-store-close
                        cl:open pg::load-catalog pg::physical-restartpoint-prepare-storage))))
        (labels ((original (name) (cdr (assoc name originals)))
@@ -105,6 +106,13 @@
                      (sb-thread:interrupt-thread
                       sb-thread:*current-thread*
                       (lambda () (error "injected cold storage failure"))))))
+                (after-slot-load ()
+                  (capture)
+                  (case ,point
+                    (:slots (inject))
+                    ((:close-smgr :close-store)
+                     (setf cleanup-armed t)
+                     (error "injected cold storage failure"))))
                 (capture ()
                   (setf clog pg::*clog-stream*)
                   (pushnew (sb-thread:with-mutex (pg::*smgr-lock*) (pg::smgr-open-locked 900))
@@ -151,14 +159,13 @@
                                (capture)
                                (when (eq ,point :replay) (inject))))
                            (symbol-function 'pg::wal-load-replication-slots)
-                           (lambda ()
-                             (funcall (original 'pg::wal-load-replication-slots))
-                             (capture)
-                             (case ,point
-                               (:slots (inject))
-                               ((:close-smgr :close-store)
-                                (setf cleanup-armed t)
-                                (error "injected cold storage failure"))))
+                           (lambda (&rest arguments)
+                             (apply (original 'pg::wal-load-replication-slots) arguments)
+                             (after-slot-load))
+                           (symbol-function 'pg::logical-slot-restore-standby-inventory)
+                           (lambda (store)
+                             (funcall (original 'pg::logical-slot-restore-standby-inventory) store)
+                             (after-slot-load))
                            (symbol-function 'pg::catalog-refresh-oldest-relfrozenxid)
                            (lambda ()
                              (prog1 (funcall (original 'pg::catalog-refresh-oldest-relfrozenxid))
