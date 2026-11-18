@@ -102,6 +102,14 @@ the local WAL incarnation, timeline and namespace. Use the observed file
 length for a short segment. A full file still open for append at a boundary
 can wait for rotation. Recompute eligibility after cold recovery.
 
+The native readiness path now creates durable empty `.ready` files after
+primary recovery and during checkpoint recycling. Reconciliation runs even
+when another fence has deferred deletion. Startup still rejects archive mode
+until a completion worker exists. The focused fixture enables archive mode in
+an installed test configuration and checks the frontier, recreation of a
+missing marker, and retention in the presence of an unverified `.done` file.
+Strict compilation and the two focused test heads took 66.10 s on the ramdisk.
+
 The recycle path must preserve archive-eligible files until durable success
 is recorded. Reconstruct pending work after restart from durable WAL and status,
 including loss of a notification after the segment became durable. Run the
