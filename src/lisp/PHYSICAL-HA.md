@@ -5030,11 +5030,13 @@ unchanged generated SQL, with fixtures supplying the surrounding state.
 | `Postgresql.TL_LSN` | Both write and flush fragments on primary and standby, including paused replay, with returned types and positions checked. | `t/interop/patroni-tl-lsn.py` |
 | Cluster monitoring | Unchanged 16-column cluster query covers primary and receiver states, including absent, connecting, streaming and paused; checkpoint/control tests also cover the standby-leader branch. | `t/interop/receiver-sql.py`, `t/interop/control-checkpoint.py` |
 | REST status | Unchanged Patroni 4.1.5 `RestApiHandler.get_postgresql_status` runs real queries with surrounding state supplied by the fixture. C and Lisp primaries passed with empty sender lists and with FIRST/ANY senders. A live Lisp standby reported replay timestamp, LSN and streaming status. | `t/interop/patroni-sync-monitor.py` passed in 105.37 s on the ramdisk. |
-| Synchronous monitoring | Real Patroni monitor and sync-change method exercise primary and promoted roles, the unchanged `DO` statement, and FIRST/ANY sender JSON, slot-query branch and disconnect. The native test uses real followers. Patroni's query uses underlying functions and does not require the still-missing `pg_stat_replication` view. | `t/interop/patroni-sync-monitor.py`; C and native passed in 73.81 s on the ramdisk. |
-| Connections and configuration | Real `NamedConnection` checks startup options, resets, reconnect, timeout and recovery after cancellation. `ConfigHandler` query acceptance is limited to the tested settings and configurations; it is not acceptance of every generated configuration. | `t/interop/patroni-start.py` |
+| Synchronous monitoring | Pinned monitoring covers live sender and slot JSON and the unchanged sync-change `DO`. With a fixture member list and live Lisp followers, `SyncHandler.current_state` confirmed `sync_a` under FIRST and both peers under ANY. Patroni queries the sender and activity functions directly. | `t/interop/patroni-sync-monitor.py` passed in 121.31 s on the ramdisk. |
+| Connections and configuration | Real `NamedConnection` checks startup options, resets, reconnect, timeout and recovery after cancellation. | `t/interop/patroni-start.py` |
+| Synchronous configuration | `ConfigHandler.set_synchronous_standby_names` sets and clears the value by reload and treats the same value as a no-op. The primary PID stays the same. | `t/interop/patroni-bootstrap.py` passed in 93.98 s on the ramdisk. |
 | Process and promotion | Pinned process discovery, PID start-time rejection, direct start and stop are exercised for the implemented configuration subset. `Postgresql.promote` uses native utilities and waits for durable production state. | `t/interop/patroni-start.py` and promotion acceptance |
 | Physical slots | Unchanged `SlotsHandler` creates and loads a physical slot, queries view and function forms, advances it and drops it. The fixture supplies database transport. | `t/interop/physical-slots.py:62-93` |
-| Replica lifecycle | Real pinned Patroni clone, follow, promotion, rewind and rejoin are composed with a leader supplied by the fixture. This includes source restart, physical slots and synchronous configuration; it is not leader election. | `t/interop/patroni-reseed.py --case patroni-lifecycle` |
+| Replica lifecycle | Pinned Patroni clone, follow, promotion, rewind and rejoin run with a leader supplied by the fixture. This includes source restart, physical slots and synchronous configuration. | `t/interop/patroni-reseed.py --case patroni-lifecycle` |
+| Recovery configuration | `ConfigHandler.check_recovery_conf` classifies a changed upstream host as reload-only and reports a match after reload, restart and reattach. It detects a missing upstream after detach and falls back to configured settings during a source outage. The fixture checks the live receiver DSN and slot through Patroni. | `t/interop/patroni-follow.py` passed in 107.25 s on the ramdisk. |
 
 The live monitor passed in 100.87 s on the ramdisk. On fresh primaries,
 `pg_last_xact_replay_timestamp()` returned a typed NULL on both engines.
@@ -5081,8 +5083,8 @@ Distinct backend gaps remain:
   implementation and acceptance.
 - Patroni-managed logical-slot synchronization needs separate work and testing,
   including `hot_standby_feedback`, `pg_read_binary_file` and C slot files.
-- Stock `SyncHandler.current_state`, `ConfigHandler.set_synchronous_standby_names`
-  and `ConfigHandler.check_recovery_conf` still need direct acceptance.
+
+The three configuration and candidate test runs overlapped on the ramdisk.
 
 Local evidence and the REST probe are in
 `~/proj/pg-ha-artifacts/patroni-call-inventory/`.
