@@ -1328,11 +1328,16 @@ Range and negative checks occur when the LIMIT executes."
                                 (catalog-sql-quote-ident name)))
                           values))))))
 
+(defun parse-setting-name (p)
+  (format nil "~{~a~^.~}"
+          (cons (pident p)
+                (loop while (match-punct p #\.) collect (pident p)))))
+
 (defun parse-set (p)
   (let ((session-p (match-kw p "session")))
     (when (match-kw p "local")
       (when session-p (syntax-error p "SESSION and LOCAL are alternatives"))
-      (let ((name (pident p)))
+      (let ((name (parse-setting-name p)))
         (unless (member name *session-local-setting-names* :test #'string-equal)
           (ereport "0A000" "SET LOCAL is only supported for application_name and synchronous_commit"))
         (when (eq (pkind p) :op) (pnext p))
@@ -1363,7 +1368,7 @@ Range and negative checks occur when the LIMIT executes."
        (list :type :set :session-characteristics-p t
              :name "transaction_isolation" :value "read committed"))
       (t
-       (let ((name (pident p)))
+       (let ((name (parse-setting-name p)))
          (when (eq (pkind p) :op)
            (pnext p))
          (match-kw p "to")
@@ -1373,7 +1378,7 @@ Range and negative checks occur when the LIMIT executes."
                           (parse-set-value p))))))))
 
 (defun parse-show (p)
-  (let ((name (pident p)))
+  (let ((name (parse-setting-name p)))
     (when (string= name "transaction")
       (expect-kw p "isolation")
       (expect-kw p "level")
@@ -1388,7 +1393,7 @@ Range and negative checks occur when the LIMIT executes."
      (expect-kw p "zone")
      (list :type :reset :name "timezone"))
     (t
-     (list :type :reset :name (pident p)))))
+     (list :type :reset :name (parse-setting-name p)))))
 
 ;;; ---- expressions ----
 

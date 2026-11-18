@@ -1160,6 +1160,23 @@
       (ok (intake-fails-p (lambda () (pg::session-set-extra-setting "statement_timeout" "-1"))))
       (ok (intake-fails-p (lambda () (pg::session-apply-startup-options '(("options" . "-c port=5434"))))))))
 
+(deftest session-settings-for-patroni-role-setup
+    (let ((pg::*backend* (pg::make-backend)))
+      (flet ((run-sql (sql)
+               (pg::execute-simple-query-statements (make-broadcast-stream)
+                                                    (pg::parse-statements sql))))
+        (run-sql "SET log_statement TO none; SET log_min_duration_statement TO -1;
+                  SET log_min_error_statement TO 'log'; SET pg_stat_statements.track_utility TO 'off';
+                  SET pgaudit.log TO none; SHOW pg_stat_statements.track_utility")
+        (ok (equal "log" (pg::sql-setting-value "log_min_error_statement")))
+        (ok (equal "off" (pg::sql-setting-value "pg_stat_statements.track_utility")))
+        (ok (equal "none" (pg::sql-setting-value "pgaudit.log")))
+        (run-sql "RESET log_statement; RESET log_min_duration_statement; RESET log_min_error_statement;
+                  RESET pg_stat_statements.track_utility; RESET pgaudit.log")
+        (ok (equal "error" (pg::sql-setting-value "log_min_error_statement")))
+        (ok (equal "" (pg::sql-setting-value "pg_stat_statements.track_utility")))
+        (ok (intake-fails-p (lambda () (run-sql "SET log_statement TO all")))))))
+
 (cl-spec:defproperty session-options-roundtrip-backslash-escaped-tokens
     ((bits (range integer 0 4611686018427387903)) (size (range integer 1 40)))
   (:about pg::split-session-options)

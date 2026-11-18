@@ -16,7 +16,10 @@
                 parts))))
 
 (defparameter *session-format-defaults*
-  '(("datestyle" . "ISO, MDY") ("intervalstyle" . "postgres") ("extra_float_digits" . 1) ("bytea_output" . "hex")))
+  '(("datestyle" . "ISO, MDY") ("intervalstyle" . "postgres")
+    ("extra_float_digits" . 1) ("bytea_output" . "hex")
+    ("log_statement" . "none") ("log_min_duration_statement" . "-1")
+    ("log_min_error_statement" . "error")))
 
 (defun session-integer-setting (name value minimum maximum unit)
   (handler-case
@@ -69,6 +72,17 @@
   (cond
     ((string= name "statement_timeout")
      (session-integer-setting name value 0 2147483647 :milliseconds))
+    ;; Native SQL does not emit statement logs. Accept the settings callers
+    ;; use to suppress them, and refuse settings that would enable logging.
+    ((member name '("log_statement" "log_min_duration_statement" "log_min_error_statement")
+             :test #'string=)
+     (let ((setting (string-downcase (princ-to-string value))))
+       (unless (member setting (cond ((string= name "log_statement") '("none"))
+                                     ((string= name "log_min_duration_statement") '("-1"))
+                                     (t '("error" "log")))
+                       :test #'string=)
+         (ereport "0A000" "unsupported statement logging setting for ~a" name))
+       setting))
     ((string= name "extra_float_digits") (session-integer-setting name value -15 3 nil))
     ((string= name "bytea_output")
      (unless (member value '("hex" "escape") :test #'string-equal)
