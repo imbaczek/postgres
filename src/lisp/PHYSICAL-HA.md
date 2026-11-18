@@ -73,6 +73,51 @@ separate from matching C behavior. The mixed-engine switchovers establish
 logical interoperability. Coordinated leader election, automatic failover,
 and blue-green orchestration remain outside this goal.
 
+## Server-side WAL archive contract
+
+C syncs a completed segment before creating its archive notification in
+`XLogWrite`. The archiver runs the configured command separately, records
+success, and retries failures. `RemoveOldXlogFiles` checks that archival is
+done before recycling the file. Timeline history publication has its own
+notification path. See `src/backend/access/transam/xlog.c`,
+`src/backend/access/transam/xlogarchive.c`, and
+`src/backend/postmaster/pgarch.c`.
+
+The shell archiver expands `%f` to the filename, `%p` to the input path, and
+`%%` to a literal percent. The administrator supplies shell quoting. Native
+offline rewind uses the same three escapes for its restore command, with
+`%p` naming an output path.
+
+Native WAL can rotate early when the next record will not fit. The closed
+segment can be shorter than 16 MiB. Rotation syncs the old stream and its
+directory entry, even in the middle of a batch. The durable control endpoint
+advances separately. A native archive worker must use the durable control
+frontier and the segment's timeline identity to establish that local recovery
+will preserve the exact bytes. File size, closure of the stream, and the mere
+presence of a successor file are insufficient on their own.
+
+For primary rotation, start with closed canonical files whose segment number
+is strictly below the segment number of the durable control endpoint. Confirm
+the local WAL incarnation, timeline and namespace. Use the observed file
+length for a short segment. A full file still open for append at a boundary
+can wait for rotation. Recompute eligibility after cold recovery.
+
+The recycle path must preserve archive-eligible files until durable success
+is recorded. Reconstruct pending work after restart from durable WAL and status,
+including loss of a notification after the segment became durable. Run the
+archive command outside WAL exclusion. Check that a successful status refers
+to the same file and timeline before allowing recycling. A crash after the
+command succeeds can cause the same file to be submitted again.
+
+Compare native and C behavior with an initially failing command, a restart
+while archive work is pending, and an eventual successful archive followed
+by recycling. Verify the copied bytes independently and use a produced archive
+in the existing stopped-target restore fixture. Qualify timeline history and
+standby `archive_mode=always` separately, since the receive store and its
+retained extents have different owners from the primary writer. In C,
+`archive_mode=on` archives WAL from normal operation. `always` also archives
+files received or restored during recovery.
+
 ## Physical sender shutdown
 
 On smart or fast primary shutdown, ready physical senders can survive the final
