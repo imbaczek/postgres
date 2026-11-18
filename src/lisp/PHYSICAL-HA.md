@@ -29,8 +29,10 @@ Two areas still separate this evidence from closeout:
      horizons. Cold startup rejects horizons it cannot verify across a
      checkpoint. Stock Patroni copies logical slots, checks readiness, and
      advances the standby's confirmed position. A consumer continued across
-     promotion and resumed after the promoted primary restarted. Finite WAL
-     caps and independent catalog horizon advancement still need qualification.
+     promotion and resumed after the promoted primary restarted. A finite
+     physical slot cap was checked against C, including WAL removal and
+     restart. Catalog horizon advancement was verified through the stock
+     Patroni worker and below a compacted receive floor.
 2. State the tested rewind topology and interruption limits in the supported
    lifecycle contract. The primary archive worker now drains large queues
    in bounded lock acquisitions and recovers interrupted local cleanup.
@@ -2229,8 +2231,12 @@ metadata ignores XID and snapshot floors as C does.
 The explicit native byte cap and private proof-pin cap still invalidate when
 exceeded even if `wal_keep_size` retains the underlying files; reload does not
 revive lost slots. Wire tests against native and C cover metadata thresholds,
-safe size, unlimited caps and reload. Native file recycling has Rove coverage;
-the C wire oracle does not test actual C file recycling. The full physical suite
+safe size, unlimited caps and reload. The `wal-keep.py --checkpoint-loss`
+case uses a standard 1 MB slot cap and a 32 MB WAL floor. A checkpoint retains
+the slot and its exact WAL file until the floor is reloaded to zero. The next
+checkpoint removes the file and reports `wal_removed`. A cold restart
+preserves the loss. The case passed on native in 52.66 s and C in 0.77 s on
+the ramdisk. The full physical suite
 passed 987 tests, interop 185 and legacy 1,155 checks, with strict cold compilation
 passing. Seed 42 and 43 properties passed 200 trials each; input coverage and
 rejection counts remain unmeasured.
@@ -5187,9 +5193,12 @@ handoff have supplied-leader acceptance with a moving logical consumer.
 
 The C fixture `t/interop/hot-standby-feedback-reference.py` takes a C binary
 directory and two ports. Run it with the pinned Patroni Python environment.
-It passed against C 20devel in 3.05 s on the ramdisk. With a logical slot on
-the standby, the primary's physical slot retains the exact `xmin` and
-`catalog_xmin` across disconnect, checkpoint and restart. Disabling feedback
+It passed against C 20devel in 4.13 s on the ramdisk. A repeatable-read
+transaction on the standby held the data horizon at 664. After replaying a
+running-transactions snapshot, SQL advancement moved the standby logical
+slot's catalog horizon from 664 to 672. The primary's physical slot reported
+the new catalog horizon while retaining the old data horizon. The slot's
+post-disconnect horizons survived checkpoint and primary restart. Disabling feedback
 clears both. Re-enabling restores both, and dropping the standby logical slot
 clears only `catalog_xmin`.
 
@@ -5226,8 +5235,24 @@ restart. `--logical-slot-before-base` verifies the same sequence for a slot
 created before the standby base. The latest pre-base run used a dedicated
 `NATIVE_REWIND` login under local trust and took 38.90 s on the ramdisk. The
 earlier post-base run took 23.07 s. Ordinary follow and promotion took 80.45 s.
-The psycopg3 fallback, finite WAL caps, and independent catalog horizon
-advancement remain open.
+The psycopg3 fallback remains open.
+
+The native pgoutput sender now tracks the terminal LSN and full catalog XID
+from a complete running-transaction record. It saves a newer horizon only
+when the consumer flush covers that record. The promoted-writer fixture
+verified advancement after a new transaction and preservation after a clean
+restart in 39.25 s on the ramdisk. Standby replay also retains recent complete
+running-transaction records after applying them durably. SQL advancement
+can publish the newest such horizon at or below its requested LSN, even
+when replay is ahead of that LSN. The stock Patroni worker advanced the
+standby slot and the primary received the new catalog feedback. Both
+post-base and pre-base runs verified promotion and restart on the ramdisk.
+The replay cache holds up to 1,024 complete records. When it has no evidence
+for a target, standby advancement checks the retained and receive WAL chain
+outside the WAL lock. The pre-base fixture compacted the receive spool past
+the requested advancement LSN and cleared the cache. The stock worker raised
+the catalog horizon from retained WAL, and the updated slot survived promotion
+and restart. That run took 24.23 s. The post-base cache path passed in 28.65 s.
 
 Six focused physical-slot tests passed in 36 ms of Rove execution, covering
 image round trips, checksum rejection, file dispatch, and startup. The full
