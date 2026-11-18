@@ -23,7 +23,7 @@ import psutil
 from patroni.dcs import Member
 from patroni.postgresql import Postgresql
 from patroni.async_executor import CriticalTask
-from patroni.postgresql.config import ConfigHandler
+from patroni.postgresql.config import ConfigHandler, parse_dsn
 from patroni.postgresql.mpp import Null
 from patroni.postgresql.misc import PostgresqlRole
 
@@ -150,6 +150,19 @@ def check_source_sender(process, root):
             f'(assert (= *patroni-source-sender-pid* {pid}))')
 
 
+def check_recovery_conf(node, member, expected):
+    # Patroni clears its SQL status snapshot at the start of each HA loop.
+    node.reset_cluster_info_state(None)
+    actual = node.config.check_recovery_conf(member)
+    assert actual == expected, (actual, expected)
+
+
+def check_live_receiver(node, host, port):
+    assert node.primary_slot_name() == 'follow_one'
+    conninfo = parse_dsn(node.primary_conninfo() or '')
+    assert conninfo and conninfo.get('host') == host and conninfo.get('port') == str(port), conninfo
+
+
 def exercise(root, ports, source_log):
     source_data, target_data = root / 'source', root / "replica 'one'"
     source_socket = root / 'source.sock'
@@ -196,15 +209,20 @@ def exercise(root, ports, source_log):
         wait_for(lambda: query(ports[1], 'SELECT id FROM follow_items ORDER BY id') == [(1,), (2,)])
         assert query(ports[1], 'SELECT status,slot_name FROM pg_stat_get_wal_receiver()') == [
             ('streaming', 'follow_one')]
+        check_recovery_conf(node, member, (False, False))
+        check_live_receiver(node, '127.0.0.1', ports[0])
         check_source_sender(source, root)
         replacement = Member(0, 'source', None,
                              {'conn_url': f'postgres://localhost:{ports[0]}/postgres'})
+        check_recovery_conf(node, replacement, (True, False))
         assert node.follow(replacement, do_reload=True) is True
         wait_for(lambda: 'host=localhost' in query(ports[1], 'SHOW primary_conninfo')[0][0]
                  and query(ports[1], 'SELECT status,slot_name FROM pg_stat_get_wal_receiver()')
                  == [('streaming', 'follow_one')])
         query(ports[0], 'INSERT INTO follow_items VALUES (3)')
         wait_for(lambda: query(ports[1], 'SELECT id FROM follow_items ORDER BY id') == [(1,), (2,), (3,)])
+        check_recovery_conf(node, replacement, (False, False))
+        check_live_receiver(node, 'localhost', ports[0])
         assert int((target_data / 'postmaster.pid').read_text().splitlines()[0]) == target_pid
         check_source_sender(source, root)
         assert node.follow(replacement, timeout=90) is True
@@ -215,10 +233,14 @@ def exercise(root, ports, source_log):
         assert query(ports[1], 'SELECT status,slot_name FROM pg_stat_get_wal_receiver()') == [
             ('streaming', 'follow_one')]
         restarted_pid = node.is_running().pid
+        check_recovery_conf(node, replacement, (False, False))
+        check_live_receiver(node, 'localhost', ports[0])
         check_source_sender(source, root)
         assert node.follow(None, do_reload=True) is True
         wait_for(lambda: query(ports[1], 'SHOW primary_conninfo') == [('',)]
                  and query(ports[1], 'SELECT pid FROM pg_stat_get_wal_receiver()') == [(None,)])
+        check_recovery_conf(node, None, (False, False))
+        check_recovery_conf(node, member, (True, False))
         wait_for(lambda: query(ports[0], "SELECT active FROM pg_replication_slots WHERE slot_name='follow_one'")
                  == [(False,)])
         wait_for(lambda: ':SOURCE-SENDER-RETIRED' in control(
@@ -231,6 +253,7 @@ def exercise(root, ports, source_log):
         wait_for(lambda: query(ports[1], 'SELECT id FROM follow_items ORDER BY id')
                  == [(1,), (2,), (3,), (4,), (5,)])
         assert node.is_running().pid == restarted_pid
+        check_recovery_conf(node, member, (False, False))
         target = node.is_running()
         control(target, root / 'target.sock',
                 '(defparameter *patroni-restart-runtime* *physical-follow-runtime*) '
@@ -257,6 +280,8 @@ def exercise(root, ports, source_log):
                      for code in ('57P01', '08006', '08001')))
             control(target, root / 'target.sock', healthy)
             assert query(ports[1], 'SELECT pg_is_in_recovery()') == [(True,)]
+            check_recovery_conf(node, member, (False, False))
+            assert not node.primary_conninfo()
             source_socket.unlink(missing_ok=True)
             source = subprocess.Popen(
                 [str(BASE / 'pg-lisp.sh'), '-D', str(source_data), '-p', str(ports[0]),
