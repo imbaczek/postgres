@@ -267,6 +267,12 @@ checking that both files contain the same bytes. Three focused tests took
 72.08 s, including cold compilation. A live multi-timeline history test
 remains open.
 
+The standby worker submits `.wal.proof` companions after recording successful
+archival of the matching WAL segment. It retries proof failures without
+blocking later WAL. The proof records the exact end of the segment.
+The live cold-restart and promotion test took 57.57 s. Three focused tests
+took 1.31 s. Primary proof emission and an online consumer remain open.
+
 The recycle path must preserve archive-eligible files until durable success
 is recorded. Reconstruct pending work after restart from durable WAL and status,
 including loss of a notification after the segment became durable. Run the
