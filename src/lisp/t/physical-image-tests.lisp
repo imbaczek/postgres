@@ -288,6 +288,4 @@
              (pg::wal-shell-file-command "restore %f '%p'" "%p" "scratch/%f" "rewind restore_command")))
   (dolist (template '("restore %" "restore %r" "restore %s"))
     (ok (signals (pg::wal-shell-file-command template "X.wal" "scratch" "rewind restore_command") 'error)))
-  (ok (signals (pg::startup-normalize-setting "restore_command" "cp %f %p") 'error))
-  (let ((pg::*startup-inspect-archive-settings-p* t))
-    (ok (equal "cp %f %p" (pg::startup-normalize-setting "restore_command" "cp %f %p")))))
+  (ok (equal "cp %f %p" (pg::startup-normalize-setting "restore_command" "cp %f %p"))))

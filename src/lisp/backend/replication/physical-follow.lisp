@@ -1639,6 +1639,88 @@ Receipt ends there; replay remains free to reach its own policy fence."
                  (not (physical-follow-receiver-stopped-p runtime)))
         (setf (physical-follow-runtime-transition runtime) transition)))))
 
+(declaim (ftype function startup-restore-command))
+
+(defun physical-follow-fetch-archive (runtime command system-id timeline segment namespace)
+  "Fetch one proved extent through a private directory pinned under pg_wal."
+  (let ((parent nil) (fd nil) (name nil) (facts nil))
+    (unwind-protect
+         (progn
+           (sb-sys:without-interrupts
+             (setf parent (wal-archive-open-wal-directory))
+             (let ((stage (sb-posix:mkdtemp
+                           (namestring (merge-pathnames ".pg-restore.XXXXXX"
+                                                        (physical-image-fd-path parent))))))
+               (setf name (file-namestring stage)
+                     fd (physical-backup-open-directory (pathname stage))
+                     facts (progn
+                             (wal-archive-check-private-child parent name fd)
+                             (physical-image-file-facts fd)))))
+           (labels ((cancel-check ()
+                      (when (or (physical-follow-receiver-stopped-p runtime)
+                                (shutdown-in-progress-p)
+                                (not (physical-follow-generation-current-p
+                                      (physical-follow-runtime-generation runtime))))
+                        (error 'physical-follow-receiver-stopped)))
+                    (check ()
+                      (cancel-check)
+                      (wal-archive-check-wal-directory parent)
+                      (wal-archive-check-private-child parent name fd)))
+             (physical-follow-authorize-receiver runtime)
+             (check)
+             (wal-restore-proved-segment command fd system-id timeline segment namespace
+                                         :working-directory *pgdata* :check #'check
+                                         :cancel-check #'cancel-check)))
+      (unwind-protect
+           (when facts
+             (physical-backup-remove-stage-tree parent name :mount (ninth facts) :expected facts))
+        (when fd (sb-posix:close fd))
+        (when parent (sb-posix:close parent))))))
+
+(defun physical-follow-restore-next (runtime command cursor)
+  (let* ((timeline (physical-follow-runtime-receive-timeline runtime))
+         (system-id (getf *physical-recovery-state* :system-id))
+         (segment (floor cursor +wal-segment-size+))
+         (limit (physical-follow-runtime-boundary runtime)))
+    (labels ((fetch (number)
+               (multiple-value-bind (bytes end)
+                   (physical-follow-fetch-archive runtime command system-id timeline number :timeline)
+                 (if (or bytes (/= timeline 1))
+                     (values bytes end)
+                     (physical-follow-fetch-archive runtime command system-id timeline number :legacy))))
+             (admit (number bytes end &optional predecessor)
+               (when (and bytes (or (null limit) (<= end limit)))
+                 (with-physical-follow-generation-operation
+                   (physical-follow-require-runtime-generation runtime)
+                   (check-physical-recovery-work)
+                   (unless (physical-follow-receiver-stopped-p runtime)
+                     (let ((flush (physical-store-admit-restored-segment
+                                   *physical-receive-store* timeline number bytes end cursor
+                                   :closed-predecessor predecessor)))
+                       (when flush (setf (getf *physical-recovery-state* :receive-lsn) flush))
+                       flush))))))
+      (unless (and limit (>= cursor limit))
+        (multiple-value-bind (bytes end) (fetch segment)
+          (cond ((and end (> end cursor)) (admit segment bytes end))
+                ((plusp (mod cursor +wal-segment-size+))
+                 (multiple-value-bind (next next-end) (fetch (1+ segment))
+                   (admit (1+ segment) next next-end (when (eql end cursor) bytes))))))))))
+
+(defun physical-follow-restore-before-streaming (runtime cursor)
+  "Try the archive at the durable cursor before opening a streaming connection."
+  (let ((command (startup-restore-command)))
+    (when (and command (plusp (length command)))
+      (loop
+        (let ((next (handler-case (physical-follow-restore-next runtime command cursor)
+                      (physical-client-stopped (condition) (error condition))
+                      (error (condition)
+                        (when (physical-follow-terminal-p condition) (error condition))
+                        (admin-log "native archive recovery could not restore WAL: ~a" condition)
+                        nil))))
+          (unless next (return))
+          (setf cursor next)))))
+  cursor)
+
 (defun physical-follow-receiver-loop (runtime)
   "Receive until stopped or a transition is ready.
 A live reload cannot replace this active loop frame; restart the receiver to
@@ -1649,6 +1731,9 @@ adopt changes to its reset logic."
                                (physical-follow-require-runtime-generation runtime)
                                (check-recovery-available)
                                (physical-store-reset-unflushed *physical-receive-store*))))
+                 (setf cursor (physical-follow-restore-before-streaming runtime cursor))
+                 (when (physical-follow-receiver-stopped-p runtime)
+                   (return-from physical-follow-receiver-loop :stopped))
                  (let ((result (physical-follow-session runtime cursor)))
                    (when result
                      (physical-follow-publish-transition runtime result)

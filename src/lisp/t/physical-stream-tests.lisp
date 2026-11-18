@@ -851,6 +851,64 @@
                (ok (= 64 (pg::physical-store-flushed-lsn store))))
           (pg::physical-store-close store)))))
 
+(deftest archive-restore-cancellation-reaps-shell
+    (with-physical-store-directory (root)
+      (let ((marker (merge-pathnames "pid" root)))
+        (ok (signals
+             (sb-ext:with-timeout 5
+               (pg::wal-run-cancellable-restore-shell
+                "echo $$ > pid; exec sleep 60" root
+                (lambda ()
+                  (when (probe-file marker)
+                    (error 'pg::physical-follow-receiver-stopped)))))
+             'pg::physical-follow-receiver-stopped))
+        (with-open-file (stream marker)
+          (let ((pid (parse-integer (read-line stream))))
+            (ok (handler-case (progn (sb-posix:kill pid 0) nil)
+                  (sb-posix:syscall-error (condition)
+                    (= sb-posix:esrch (sb-posix:syscall-errno condition))))))))))
+
+(deftest native-receiver-restores-before-streaming-at-durable-cursor
+    (with-physical-store-directory (root)
+      (let* ((pg::*pgdata* root)
+             (store (pg::physical-store-open root 123 1 :create t))
+             (pg::*physical-receive-store* store)
+             (pg::*physical-recovery-state* (list :system-id 123 :timeline 1 :end 0))
+             (pg::*physical-recovery-failed-p* nil)
+             (pg::*shutdown* pg::+no-shutdown+)
+             (pg::*startup-installed-configuration*
+               (physical-slot-test-configuration
+                (pg::make-wal-slot-retention-policy :mode :bytes :limit 1073741824) 0))
+             (settings (pg::startup-configuration-settings pg::*startup-installed-configuration*))
+             (runtime (pg::make-physical-follow-runtime))
+             (original (symbol-function 'pg::physical-follow-session))
+             (bytes (sample-physical-record))
+             (end (length bytes))
+             (archive (merge-pathnames "archive/" root))
+             (name (pg::wal-segment-filename 0 1 :timeline))
+             (seen nil))
+        (unwind-protect
+             (progn
+               (pg::wal-ensure-directory-durable (pg::wal-directory))
+               (pg::wal-ensure-directory-durable archive)
+               (pg::wal-atomic-write-bytes (merge-pathnames name archive) bytes)
+               (pg::wal-atomic-write-bytes
+                (merge-pathnames (pg::wal-archive-segment-proof-name name) archive)
+                (pg::wal-encode-archive-segment-proof 123 1 0 :timeline end bytes))
+               (setf (getf (gethash "restore_command" settings) :value)
+                     "test -f \"archive/%f\" && cp -- \"archive/%f\" \"%p\"")
+               (setf (symbol-function 'pg::physical-follow-session)
+                     (lambda (state cursor)
+                       (setf seen cursor (pg::physical-follow-runtime-stopped-p state) t)
+                       nil))
+               (pg::physical-follow-receiver-loop runtime)
+               (ok (eql end seen))
+               (ok (= end (pg::physical-store-flushed-lsn store)))
+               (ok (= end (getf pg::*physical-recovery-state* :receive-lsn)))
+               (ok (null (pg::directory-entry-names (pg::wal-directory)))))
+          (setf (symbol-function 'pg::physical-follow-session) original)
+          (pg::physical-store-close store)))))
+
 (deftest native-receiver-retries-sbcl-timeout-without-escaping-thread
     (with-physical-store-directory (root)
       (let* ((store (pg::physical-store-open root 123 1 :create t))

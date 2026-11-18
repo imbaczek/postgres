@@ -713,16 +713,39 @@ The setting supplies shell quoting. Expand each replacement exactly once."
                   (#\p (write-string path command))
                   (otherwise (error "unsupported ~a placeholder" setting))))))))
 
-(defun wal-run-restore-command (template name directory-fd &key directory (setting "restore_command"))
+(defun wal-run-cancellable-restore-shell (command directory check)
+  (let ((process nil) (finished nil))
+    (unwind-protect
+         (progn
+           (funcall check)
+           (sb-sys:without-interrupts
+             ;; With no inherited stdin, SBCL gives the shell its own process group.
+             (setf process (sb-ext:run-program "/bin/sh" (list "-c" command)
+                                               :directory directory :input nil :output nil
+                                               :error nil :wait nil)))
+           (loop while (sb-ext:process-alive-p process)
+                 do (funcall check) (sleep 0.05))
+           (sb-ext:process-wait process)
+           (setf finished t)
+           (+ (if (eq (sb-ext:process-status process) :signaled) 128 0)
+              (sb-ext:process-exit-code process)))
+      (when process
+        (unless finished
+          (sb-ext:process-kill process sb-posix:sigkill :process-group)
+          (sb-ext:process-wait process))
+        (sb-ext:process-close process)))))
+
+(defun wal-run-restore-command (template name directory-fd &key directory check
+                                                             (setting "restore_command"))
   "Run a restore command with an absolute output path through the held descriptor.
-Return the shell exit status so the caller can recheck ownership before using it."
+When CHECK signals cancellation, terminate and reap the owned shell."
   (let* ((output (format nil "/proc/~d/fd/~d/~a" (sb-posix:getpid) directory-fd name))
          (command (wal-shell-file-command template name output setting)))
-    (multiple-value-bind (out err status)
-        (uiop:run-program (list "/bin/sh" "-c" command) :directory directory
-                                                        :output nil :error-output nil :ignore-error-status t)
-      (declare (ignore out err))
-      status)))
+    (if check
+        (wal-run-cancellable-restore-shell command directory check)
+        (nth-value 2
+                   (uiop:run-program (list "/bin/sh" "-c" command) :directory directory
+                                                                   :output nil :error-output nil :ignore-error-status t)))))
 
 (defvar *wal-offline-segment-fallback* nil)
 

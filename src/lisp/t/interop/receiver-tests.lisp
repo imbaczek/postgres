@@ -52,15 +52,14 @@
                 (ok (= 1 calls)))
            (setf (symbol-function 'pg::wal-receiver-result) original))))))
 
-(deftest receiver-timestamp-output-and-disabled-archive-restore
+(deftest receiver-timestamp-output-and-archive-restore-setting
     (dolist (example '((0 "2000-01-01 00:00:00+00")
                        (1 "2000-01-01 00:00:00.000001+00")
                        (-1 "1999-12-31 23:59:59.999999+00")
                        (1230000 "2000-01-01 00:00:01.23+00")))
       (ok (equal (second example) (pg::sql-timestamptz-output (first example)))))
   (ok (equal "" (pg::startup-normalize-setting "restore_command" "")))
-  (ok (handler-case (progn (pg::startup-normalize-setting "restore_command" "cp %f %p") nil)
-        (error () t))))
+  (ok (equal "cp %f %p" (pg::startup-normalize-setting "restore_command" "cp %f %p"))))
 
 (deftest receiver-timestamps-use-signed-wire-values
     (ok (= -1 (pg::pg-client-i64 (octets '(255 255 255 255 255 255 255 255)) 0)))
