@@ -53,6 +53,11 @@ def main():
         assert len(maximum) == 407
         control.write_bytes(maximum)
         assert utility["recovery_phase"](root) == 3
+        for payload_size in (104, 112, 152, 160):
+            end = 32 + 32 + payload_size
+            fpw_fact = struct.pack("<8sIIQQIIQQIIQ", b"PGFPWFC1", 3, 0,
+                                   32, end, 1, 1, 32, end, 1, 0, 0)
+            utility["validate_fpw_fact"](fpw_fact, end, 1)
         invalid = [
             image(fact=fact(through=159)),
             image(fact=fact(interval=True, interval_start=1)),

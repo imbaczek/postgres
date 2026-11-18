@@ -147,7 +147,8 @@ def validate_fpw_fact(data, applied, applied_timeline):
              and 1 <= coverage_timeline <= timeline <= through_timeline
              and through == applied and through_timeline == applied_timeline
              and start // segment == (end - 1) // segment
-             and ((end - start - 32 in (88, 96, 136, 144)) if checkpoint else end - start == 48))
+             and ((end - start - 32 in (88, 96, 104, 112, 136, 144, 152, 160))
+                  if checkpoint else end - start == 48))
     if has_disable:
         own_disable = not checkpoint and not flags & 1
         valid = (valid and coverage <= disabled <= start
