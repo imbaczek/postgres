@@ -669,12 +669,58 @@ receipt confirmation succeeds."
     (ereport-fatal "08P01" "invalid or regressing native physical feedback"))
   status)
 
-(defun physical-stream-feedback (stream)
-  (sb-ext:with-timeout 10 (replication-standby-status stream t)))
+(defun physical-source-confirm-xmin (owner data catalog)
+  "Save feedback for the public slot owned by this sender.
+Ignore the report if either horizon is outside the recent XID range. A NIL
+horizon clears its field. A reported XID can only advance an existing field.
+Check ownership under WAL and save changes before updating the in-memory slot."
+  (let ((next (next-full-xid)))
+    (unless (every (lambda (xid)
+                     (or (null xid) (<= 0 (- next xid) #x80000000)))
+                   (list data catalog))
+      (return-from physical-source-confirm-xmin nil)))
+  (let ((rejection
+          (block publish
+            (with-wal-publication-fence (begin-publication)
+              ;; A namespace change is a reconnect, even between frame read and save.
+              (handler-case
+                  (physical-source-check-sender-under-lock (physical-sender-name owner) owner)
+                (pg-error (condition) (return-from publish condition)))
+              (let ((slot (physical-sender-public-slot owner)))
+                (when slot
+                  (let* ((old (physical-slot-horizons slot))
+                         (merged (mapcar (lambda (previous reported)
+                                           (if (and previous reported)
+                                               (max previous reported)
+                                               reported))
+                                         (or old '(nil nil)) (list data catalog)))
+                         (updated (when (some #'identity merged) merged)))
+                    (unless (equal old updated)
+                      (let ((candidate (wal-copy-replication-slot-with-profile slot)))
+                        (setf (physical-slot-horizons candidate) updated)
+                        (begin-publication)
+                        (wal-save-replication-slot candidate)
+                        (setf (physical-slot-horizons slot) updated))))))
+              nil))))
+    (when rejection (error rejection))))
 
-(defun physical-stream-read-status (stream previous sent base)
+(defun physical-stream-feedback (stream owner)
+  "Read status and process any interleaved feedback. Frame reads share one
+deadline. Feedback processing itself runs outside the socket timeout."
+  (let ((deadline (+ (get-internal-real-time) (* 10 internal-time-units-per-second))))
+    (replication-standby-status
+     stream t
+     (lambda (data catalog)
+       (with-live-operation (physical-source-confirm-xmin owner data catalog)))
+     (lambda (input)
+       (let ((remaining (- deadline (get-internal-real-time))))
+         (unless (plusp remaining) (error 'sb-ext:timeout))
+         (sb-ext:with-timeout (/ remaining internal-time-units-per-second)
+           (read-message-frame input)))))))
+
+(defun physical-stream-read-status (stream owner previous sent base)
   "Read outside admission; validate monotonic progress under short admission."
-  (multiple-value-bind (reply done) (physical-stream-feedback stream)
+  (multiple-value-bind (reply done) (physical-stream-feedback stream owner)
     (when done (signal 'physical-stream-copy-done))
     (when reply
       (with-live-operation
@@ -713,7 +759,7 @@ Validate and confirm any status messages received before that completion."
   (write-message stream #\c (make-payload))
   (loop
     (multiple-value-bind (status done)
-        (sb-ext:with-timeout 10 (replication-standby-status stream t))
+        (physical-stream-feedback stream owner)
       (when done (return t))
       (unless status (return nil))
       (setf previous
@@ -761,7 +807,7 @@ A historic stream stops at its fork before sending child end-of-recovery WAL."
                   do (physical-stream-send-data stream (+ (wal-record-start record) offset)
                                                 durable (subseq raw offset end))
                      (setf status (physical-stream-read-status
-                                   stream status (+ (wal-record-start record) end) base))
+                                   stream owner status (+ (wal-record-start record) end) base))
                      (unless status (return-from physical-stream-send-loop))
                      (physical-source-confirm-status command owner status)
                      (when *physical-stream-test-hook*
@@ -769,7 +815,7 @@ A historic stream stops at its fork before sending child end-of-recovery WAL."
             (progn
               (wal-sender-set-state *wal-sender* "streaming")
               (physical-stream-send-keepalive stream durable)
-              (setf status (physical-stream-read-status stream status cursor base))
+              (setf status (physical-stream-read-status stream owner status cursor base))
               (unless status (return))
               (physical-source-confirm-status command owner status)
               (sleep 0.05)))
@@ -808,7 +854,7 @@ At the fork, complete without entering Copy mode. Always release both sender cla
                            command owner
                            (lambda (durable)
                              (physical-stream-send-keepalive stream (if limit (min durable limit) durable))
-                             (setf status (physical-stream-read-status stream status cursor base))
+                             (setf status (physical-stream-read-status stream owner status cursor base))
                              (unless status (error 'end-of-file :stream stream))
                              (setf feedback status)))
                         (declare (ignore verified))

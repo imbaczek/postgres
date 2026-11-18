@@ -327,28 +327,39 @@ On a standby, receipt ahead of replay is reported only on the replay timeline."
   (let ((value (replication-read-u64 bytes offset)))
     (if (logbitp 63 value) (- value (ash 1 64)) value)))
 
-(defun replication-standby-status (stream &optional allow-copy-done)
-  "Read a standby status, or NIL at EOF.
-When ALLOW-COPY-DONE is true, accept an empty CopyDone as a second true value
-and an empty Terminate as EOF. Other malformed messages remain protocol errors."
-  (multiple-value-bind (type length-bytes payload) (read-message-frame stream)
-    (declare (ignore length-bytes))
-    (when (null type)
-      (return-from replication-standby-status nil))
-    (when (and allow-copy-done (= type (char-code #\c))
-               (typep payload '(vector (unsigned-byte 8))) (zerop (length payload)))
-      (return-from replication-standby-status (values nil t)))
-    (when (and allow-copy-done (= type (char-code #\X))
-               (typep payload '(vector (unsigned-byte 8))) (zerop (length payload)))
-      (error 'end-of-file :stream stream))
-    (unless (and (= type (char-code #\d))
-                 (= (length payload) 34)
-                 (= (aref payload 0) (char-code #\r)))
-      (ereport-fatal "08P01" "expected a standby status update in CopyBoth mode"))
-    (list :write (replication-read-u64 payload 1)
-          :flush (replication-read-u64 payload 9)
-          :apply (replication-read-u64 payload 17)
-          :reply-time (replication-read-i64 payload 25))))
+(defun replication-standby-status (stream &optional allow-copy-done feedback-handler (read-frame #'read-message-frame))
+  "Read a standby status or NIL at EOF. With ALLOW-COPY-DONE, return NIL and T
+for an empty CopyDone and signal EOF for an empty Terminate. When supplied,
+FEEDBACK-HANDLER receives the data and catalog horizons of each interleaved
+feedback message after READ-FRAME returns. Reserved XIDs become NIL."
+  (loop
+    (multiple-value-bind (type length-bytes payload) (funcall read-frame stream)
+      (declare (ignore length-bytes))
+      (cond
+        ((null type) (return nil))
+        ((and allow-copy-done (= type (char-code #\c))
+              (typep payload '(vector (unsigned-byte 8))) (zerop (length payload)))
+         (return (values nil t)))
+        ((and allow-copy-done (= type (char-code #\X))
+              (typep payload '(vector (unsigned-byte 8))) (zerop (length payload)))
+         (error 'end-of-file :stream stream))
+        ((and (= type (char-code #\d)) (= (length payload) 34)
+              (= (aref payload 0) (char-code #\r)))
+         (return (list :write (replication-read-u64 payload 1)
+                       :flush (replication-read-u64 payload 9)
+                       :apply (replication-read-u64 payload 17)
+                       :reply-time (replication-read-i64 payload 25))))
+        ((and feedback-handler (= type (char-code #\d)) (= (length payload) 25)
+              (= (aref payload 0) (char-code #\h)))
+         (flet ((horizon (offset)
+                  (let* ((words (replication-read-u64 payload offset))
+                         (xid (ldb (byte 32 32) words))
+                         (epoch (ldb (byte 32 0) words)))
+                    (when (>= xid 3)
+                      (logior (ash epoch 32) xid)))))
+           (funcall feedback-handler (horizon 9) (horizon 17))))
+        (t
+         (ereport-fatal "08P01" "expected a standby status update in CopyBoth mode"))))))
 
 (defun send-copy-both-response (stream)
   ;; CopyBothResponse: text format and zero result columns.
