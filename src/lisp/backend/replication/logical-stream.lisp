@@ -1589,6 +1589,8 @@ executor, so capture the same operation before transaction commit."
               (= (logical-change-database-oid change)
                  (logical-reader-state-database-oid state)))
             (logical-reader-state-changes state)))
+         (metadata (when (wal-empty-metadata-terminal-type-p record-type)
+                     (wal-validate-empty-metadata-terminal record *wal-recovery-reservation-batch-clean-p*)))
          (commit-timestamp nil)
          (spool (logical-reader-state-spool state))
          (has-changes (or changes spool))
@@ -1598,8 +1600,6 @@ executor, so capture the same operation before transaction commit."
          (row-change-p (or (logical-reader-state-row-p state)
                            (some (lambda (change) (member (logical-change-kind change)
                                                           '(:insert :update :delete :truncate))) changes))))
-    (when (wal-empty-metadata-terminal-type-p record-type)
-      (wal-validate-empty-metadata-terminal record *wal-recovery-reservation-batch-clean-p*))
     (cond
       ((= record-type +wal-record-commit+)
        (when has-changes
@@ -1639,7 +1639,9 @@ executor, so capture the same operation before transaction commit."
            (logical-reader-state-catalog-p state)
            (logical-reader-state-row-p state))
        (error "logical changes are attached to an unsupported WAL terminal")))
-    (wal-logical-reader-reset-batch state nil)))
+    (wal-logical-reader-reset-batch state nil)
+    (when (= record-type +wal-record-running-xacts+)
+      (running-xacts-catalog-xmin metadata))))
 
 (defun wal-logical-reader-has-database-changes-p (state)
   (or (logical-reader-state-spool state)
@@ -1658,7 +1660,7 @@ executor, so capture the same operation before transaction commit."
     (ereport "22023" "logical WAL scan byte limit must be positive"))
   (values))
 
-(defun wal-logical-reader-return (transactions progress-lsn exhausted-p)
+(defun wal-logical-reader-return (transactions progress-lsn exhausted-p &optional catalog-evidence)
   "Return transactions, the processed frontier and whether the scan reached its
 captured horizon. An early limit returns false for exhaustion."
   (when (and *wal-logical-slot-owner*
@@ -1666,13 +1668,13 @@ captured horizon. An early limit returns false for exhaustion."
     (setf *wal-logical-slot-read-progress*
           (max (or *wal-logical-slot-read-progress* progress-lsn)
                progress-lsn)))
-  (values transactions progress-lsn exhausted-p))
+  (values transactions progress-lsn exhausted-p catalog-evidence))
 
 ;; Imported reads do not grant ACK publication.  Check that fence before
 ;; persisting standard feedback, even if the reader has returned progress.
 
 (defun wal-acknowledge-standard-replication-slot
-    (name acknowledged-lsn restart-floor sent-lsn)
+    (name acknowledged-lsn restart-floor sent-lsn &optional catalog-evidence)
   "Persist exact standard feedback while retaining an aligned decoding cursor.
 RESTART-FLOOR is a complete batch boundary at or below the reported flush,
 tracked by the bounded sender. SENT-LSN never includes an unfinished frame."
@@ -1703,7 +1705,7 @@ tracked by the bounded sender. SENT-LSN never includes an unfinished frame."
                        restart-floor acknowledged-lsn))
         (ereport "22023" "standard feedback is outside safe replication progress"))
       (wal-persist-replication-slot-ack-under-lock
-       slot acknowledged-lsn restart-floor))))
+       slot acknowledged-lsn restart-floor catalog-evidence))))
 
 (defun wal-check-logical-start-under-lock (slot name requested-lsn)
   "Check start bounds and return confirmed LSN, or NIL for initial copy."
@@ -2027,7 +2029,7 @@ metadata; the legacy scan path rejects it."
     (scan max-transactions max-bytes max-scan-bytes
      &key cursor (output-start (wal-retained-slot-scan-start scan)) allow-filter)
   "Read complete batches and return transactions, progress, exhaustion and the
-last finished terminal.  Replay before OUTPUT-START validates independently
+last finished terminal and complete catalog horizon evidence in reverse WAL order.  Replay before OUTPUT-START validates independently
 within the frozen horizon.  MAX-SCAN-BYTES is a soft forward limit measured
 from OUTPUT-START to completed ordinary batch progress, including WAL without
 rows; it is not a cap on total decoding. Check limits at completed batches
@@ -2040,7 +2042,9 @@ and leave an incomplete tail invisible."
         (values '() start-lsn t nil)))
     (let ((*wal-recovery-reservation-batch-clean-p* nil)
           (state (make-logical-reader-state :database-oid (wal-retained-slot-scan-database scan)))
-          (transaction-count 0) (change-bytes 0) (progress-lsn start-lsn) (finished-terminal nil))
+          (transaction-count 0) (change-bytes 0) (progress-lsn start-lsn) (finished-terminal nil)
+          (catalog-evidence nil) (catalog-evidence-count 0)
+          (track-catalog (equal (wal-retained-slot-scan-plugin scan) "pgoutput")))
       (unwind-protect
            (progn
              (loop for record = (wal-logical-reader-next-record scan cursor)
@@ -2069,8 +2073,11 @@ and leave an incomplete tail invisible."
                                            (> (+ change-bytes batch-bytes) max-bytes)))
                               (return-from wal-logical-slot-read-transactions-from-scan
                                 (values (nreverse (logical-reader-state-transactions state))
-                                        progress-lsn nil finished-terminal)))
-                            (wal-logical-reader-finish-batch state record emit)
+                                        progress-lsn nil finished-terminal catalog-evidence)))
+                            (let ((xmin (wal-logical-reader-finish-batch state record emit)))
+                              (when (and emit xmin track-catalog)
+                                (push (cons (wal-record-end record) xmin) catalog-evidence)
+                                (incf catalog-evidence-count)))
                             (setf finished-terminal (wal-record-end record))
                             (when (= (wal-record-end record) start-lsn)
                               (setf boundary-proven t))
@@ -2081,13 +2088,14 @@ and leave an incomplete tail invisible."
                                 (incf change-bytes batch-bytes))
                               (when (or (>= transaction-count max-transactions)
                                         (>= change-bytes max-bytes)
+                                        (>= catalog-evidence-count 64)
                                         (>= (- progress-lsn start-lsn) max-scan-bytes))
                                 (return-from wal-logical-slot-read-transactions-from-scan
                                   (values (nreverse (logical-reader-state-transactions state))
-                                          progress-lsn nil finished-terminal)))))))))
+                                          progress-lsn nil finished-terminal catalog-evidence)))))))))
              (unless boundary-proven
                (error "requested position is not a completed logical WAL boundary"))
-             (values (nreverse (logical-reader-state-transactions state)) progress-lsn t finished-terminal))
+             (values (nreverse (logical-reader-state-transactions state)) progress-lsn t finished-terminal catalog-evidence))
         (wal-logical-reader-reset-batch state nil)))))
 
 (defun wal-logical-slot-read-transactions-from-cursor
@@ -2100,7 +2108,7 @@ baseline and end-of-recovery alone do not establish a continuation."
     (call-with-logical-slot-wal-cursor-from-scan
      scan owner role
      (lambda (cursor source)
-       (multiple-value-bind (transactions progress exhausted finished-terminal)
+       (multiple-value-bind (transactions progress exhausted finished-terminal catalog-evidence)
            (wal-logical-slot-read-transactions-from-scan
             scan max-transactions max-bytes max-scan-bytes
             :cursor cursor :output-start requested :allow-filter allow-filter)
@@ -2110,7 +2118,7 @@ baseline and end-of-recovery alone do not establish a continuation."
                       (eql progress finished-terminal))
              (setf *wal-logical-slot-read-continuation*
                    (logical-wal-certify-boundary source progress)))
-           (wal-logical-reader-return transactions progress exhausted))))
+           (wal-logical-reader-return transactions progress exhausted catalog-evidence))))
      :batch-policy :logical-reader)))
 
 (defun wal-logical-slot-read-transactions

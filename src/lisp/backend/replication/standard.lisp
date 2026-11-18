@@ -18,7 +18,7 @@
   (last-send-time (get-internal-real-time))
   (last-reply-time (get-internal-real-time)))
 
-(defun standard-note-frontier (state boundary)
+(defun standard-note-frontier (state boundary &optional catalog-evidence)
   "Track only fully sent/filtered batch boundaries, bounded independently of WAL."
   (let ((confirmed (wal-replication-slot-confirmed-flush-lsn
                     (standard-stream-slot-object state))))
@@ -27,7 +27,7 @@
     (if (<= boundary confirmed)
         (setf (standard-stream-restart-floor state)
               (max boundary (standard-stream-restart-floor state)))
-        (let ((entry (list boundary)))
+        (let ((entry (list (cons boundary catalog-evidence))))
           (when (>= (standard-stream-pending-count state) +standard-stream-boundary-limit+)
             (error "standard replication boundary queue is full"))
           (if (standard-stream-pending-tail state)
@@ -44,14 +44,23 @@
          (safe (standard-stream-safe-frontier state))
          (remaining (standard-stream-pending-boundaries state))
          (floor (standard-stream-restart-floor state))
-         (count (standard-stream-pending-count state)))
+         (count (standard-stream-pending-count state))
+         (catalog-evidence nil))
     (when (and (> flush (wal-replication-slot-confirmed-flush-lsn slot)) (<= flush safe))
-      (loop while (and remaining (<= (car remaining) flush))
-            do (setf floor (pop remaining))
-               (decf count))
+      (loop while remaining
+            do (destructuring-bind (boundary . snapshots) (first remaining)
+                 (dolist (evidence snapshots)
+                   (when (and (<= (car evidence) flush)
+                              (or (null catalog-evidence)
+                                  (> (cdr evidence) (cdr catalog-evidence))))
+                     (setf catalog-evidence evidence)))
+                 (when (> boundary flush) (return))
+                 (setf floor boundary)
+                 (pop remaining)
+                 (decf count)))
       (logical-test-failpoint :before-slot-acknowledgment (standard-stream-slot-name state) flush)
       (wal-acknowledge-standard-replication-slot
-       (standard-stream-slot-name state) flush floor safe)
+       (standard-stream-slot-name state) flush floor safe catalog-evidence)
       (setf (standard-stream-pending-boundaries state) remaining
             (standard-stream-pending-count state) count
             (standard-stream-restart-floor state) floor)
@@ -547,7 +556,7 @@ after the slot is released, with a single COPY 0 command completion."
         (when (< (standard-stream-pending-count state) +standard-stream-boundary-limit+)
           (call-with-logical-reader-spools
            (lambda ()
-             (multiple-value-bind (transactions progress exhausted-p)
+             (multiple-value-bind (transactions progress exhausted-p catalog-evidence)
                  (with-live-operation
                    (wal-logical-slot-read-transactions
                     (standard-stream-slot-name state)
@@ -561,7 +570,7 @@ after the slot is released, with a single COPY 0 command completion."
                      (return-from streaming nil))))
                (when (> progress (standard-stream-scan-cursor state))
                  (setf advanced t (standard-stream-scan-cursor state) progress)
-                 (standard-note-frontier state progress)
+                 (standard-note-frontier state progress catalog-evidence)
                  (with-live-operation (standard-acknowledge-flush state)))))))
         (standard-maybe-keepalive state)
         (when (and (not (standard-stream-stop-reason state))

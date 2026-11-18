@@ -576,6 +576,43 @@ The progress save copies facts at the publication boundary."
           (when (or logical-fact (getf *physical-recovery-state* :source-logical-fact))
             (list :logical-fact logical-fact))))
 
+(defconstant +physical-replay-catalog-evidence-limit+ 1024)
+
+(defstruct physical-replay-catalog-evidence
+  (next 0)
+  (entries (make-array +physical-replay-catalog-evidence-limit+ :initial-element nil)))
+
+(defun physical-replay-note-catalog-evidence (record)
+  "Record a durable running-transaction terminal under the XID lock."
+  (let ((type (wal-record-type record)))
+    (cond
+      ((or (= type +wal-record-end-of-recovery+) (= type +wal-record-clog-reset+))
+       (remf *physical-recovery-state* :catalog-evidence))
+      ((= type +wal-record-running-xacts+)
+       (let ((xmin (running-xacts-catalog-xmin (wal-running-xacts-record-info record))))
+         (when xmin
+           (let* ((history (or (getf *physical-recovery-state* :catalog-evidence)
+                               (setf (getf *physical-recovery-state* :catalog-evidence)
+                                     (make-physical-replay-catalog-evidence))))
+                  (next (physical-replay-catalog-evidence-next history)))
+             (setf (aref (physical-replay-catalog-evidence-entries history) next)
+                   (list (wal-record-end record) xmin
+                         (getf *physical-recovery-state* :replay-timeline))
+                   (physical-replay-catalog-evidence-next history)
+                   (mod (1+ next) +physical-replay-catalog-evidence-limit+)))))))))
+
+(defun physical-replay-catalog-evidence-at (target)
+  "Return the newest retained running-transaction terminal at or below TARGET."
+  (sb-thread:with-mutex (*xid-lock*)
+    (let ((history (getf *physical-recovery-state* :catalog-evidence)))
+      (when history
+        (loop with entries = (physical-replay-catalog-evidence-entries history)
+              with next = (physical-replay-catalog-evidence-next history)
+              for distance from 1 to +physical-replay-catalog-evidence-limit+
+              for item = (aref entries (mod (- next distance) +physical-replay-catalog-evidence-limit+))
+              while item
+              when (<= (first item) target) return item)))))
+
 (defun physical-replay-publish-progress (record next-xid reservation source-xids &key replay-timeline
                                                                                    (resource-fact (getf *physical-recovery-state* :source-resource-fact))
                                                                                    (fpw-fact (getf *physical-recovery-state* :source-fpw-fact))
@@ -591,6 +628,7 @@ Updating source membership does not change existing snapshots."
          (append (when replay-timeline (list :replay-timeline replay-timeline))
                  (physical-replay-fact-arguments resource-fact fpw-fact logical-fact)))
   (sb-thread:with-mutex (*xid-lock*)
+    (physical-replay-note-catalog-evidence record)
     (setf (getf *physical-recovery-state* :source-xids) (copy-tree source-xids)
           (getf *physical-recovery-state* :source-reservation) (copy-list reservation)
           *next-xid* next-xid *xid-batch-end* next-xid

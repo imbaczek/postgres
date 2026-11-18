@@ -921,12 +921,14 @@
          (wal-create-replication-slot-file slot)
          (setf (gethash "fixture" *wal-replication-slots*) slot
                (wal-replication-slot-confirmed-flush-lsn candidate) 90
-               (wal-replication-slot-restart-lsn candidate) 48)
+               (wal-replication-slot-restart-lsn candidate) 48
+               (wal-replication-slot-catalog-xmin candidate) 102)
          (rove:ok (eq slot
                       (sb-thread:with-mutex (*wal-lock*)
                         (logical-slot-save-update-under-lock slot candidate))))
          (rove:ok (= 90 (wal-replication-slot-confirmed-flush-lsn slot)))
          (rove:ok (= 48 (wal-replication-slot-restart-lsn slot)))
+         (rove:ok (= 102 (wal-replication-slot-catalog-xmin slot)))
          (rove:ok (eq (wal-replication-slot-pending-xids candidate)
                       (wal-replication-slot-pending-xids slot)))
          (rove:ok (not (wal-replication-slot-state-uncertain-p slot)))
@@ -935,7 +937,7 @@
                            (wal-read-replication-slot (wal-replication-slot-path "fixture")))))))))
 
 (rove:deftest logical-slot-guard-rejects-identity-and-progress-changes-before-save
-    (dolist (mode '(:stale :provenance :database :birth :plugin :profile :backward))
+    (dolist (mode '(:stale :provenance :database :birth :plugin :profile :backward :catalog-backward :catalog-clear))
       (call-with-canonical-wal-slot-fixture
        (lambda ()
          (let* ((slot (unit-logical-provenance-slot :plugin "pg_lisp"))
@@ -943,6 +945,8 @@
                                (unit-logical-provenance-slot :plugin "pg_lisp" :generation 1)
                                (wal-copy-replication-slot-with-profile slot)))
                 (writes 0))
+           (setf (wal-replication-slot-catalog-xmin slot) 100
+                 (wal-replication-slot-catalog-xmin candidate) 100)
            (wal-create-replication-slot-file slot)
            (setf (gethash "fixture" *wal-replication-slots*) slot)
            (ecase mode
@@ -953,7 +957,9 @@
              (:birth (setf (wal-replication-slot-consistent-lsn candidate) 66))
              (:plugin (setf (wal-replication-slot-plugin candidate) "pgoutput"))
              (:profile (setf (gethash candidate *wal-slot-profiles*) :binary-bytea))
-             (:backward (setf (wal-replication-slot-confirmed-flush-lsn candidate) 79)))
+             (:backward (setf (wal-replication-slot-confirmed-flush-lsn candidate) 79))
+             (:catalog-backward (setf (wal-replication-slot-catalog-xmin candidate) 99))
+             (:catalog-clear (setf (wal-replication-slot-catalog-xmin candidate) nil)))
            (let ((*logical-test-failpoint-hook*
                    (lambda (point &rest ignored)
                      (declare (ignore ignored))

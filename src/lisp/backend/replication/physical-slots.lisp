@@ -107,7 +107,7 @@ Eligible ancestor segments may satisfy a public physical slot."
 ;;; Standby startup validates the slot batch against retained and received WAL.
 ;;; Startup isolation or exclusive quiescence keeps the mutable spool stable.
 
-(defun physical-slot-check-receive-chain (store index replay &key restart-positions prefix-positions)
+(defun physical-slot-check-receive-chain (store index replay &key restart-positions prefix-positions on-record)
   "Scan retained extents and spool once from base through floor to durable flush.
 Check native gaps, the FNV floor and flush digests, and a replay record boundary.
 The caller protects the root and excludes changes to the receive spool."
@@ -137,7 +137,8 @@ The caller protects the root and excludes changes to the receive spool."
            (error "physical slot archive and receive floor digests differ"))
          (setf floor-seen t))
        (when (and (> cursor floor) (not floor-seen))
-         (error "physical slot archive skipped the receive floor")))
+         (error "physical slot archive skipped the receive floor"))
+       (when on-record (funcall on-record record)))
      (physical-store-base-lsn store))
     (unless (and floor-seen replay-seen
                  (= cursor (physical-store-flushed-lsn store))
@@ -511,30 +512,103 @@ verify the base floor before publishing under WAL."
                      (timeline-parse-history
                       *wal-insert-timeline* (bytes->string (timeline-history-bytes *wal-insert-timeline*))))))))
 
-(defun wal-advance-standby-logical-slot-under-lock (slot target frontier)
+(declaim (ftype function physical-replay-catalog-evidence-at))
+
+(declaim (ftype function physical-follow-copy-replay-candidate))
+
+(defun physical-slot-retained-catalog-evidence (store replay target)
+  "Recover a catalog horizon from the checked applied prefix through TARGET."
+  (assert (not (sb-thread:holding-mutex-p *wal-lock*)))
+  (sb-thread:with-mutex ((physical-store-mutex store))
+    (physical-store-check-live store)
+    (physical-store-read-retained-control store (physical-store-control-tuple store))
+    (physical-follow-call-with-receive-root
+     store
+     (lambda ()
+       (let ((candidate (physical-follow-copy-replay-candidate store))
+             (*wal-recovery-reservation-batch-clean-p* nil)
+             (evidence nil))
+         ;; The original mutex prevents spool mutation. The checked copy may
+         ;; take its own mutex as the mapper reads the durable records.
+         (setf (physical-store-mutex candidate) (sb-thread:make-mutex))
+         (physical-slot-check-receive-chain
+          candidate (physical-follow-controller-index candidate) replay
+          :on-record
+          (lambda (record)
+            (let ((end (wal-record-end record)) (type (wal-record-type record)))
+              (when (<= end target)
+                (cond
+                  ((= type +wal-record-batch-start+)
+                   (wal-note-recovery-batch-record record))
+                  ((= type +wal-record-running-xacts+)
+                   (let ((xmin (running-xacts-catalog-xmin
+                                (wal-validate-empty-metadata-terminal
+                                 record *wal-recovery-reservation-batch-clean-p*))))
+                     (setf *wal-recovery-reservation-batch-clean-p* nil)
+                     (when xmin
+                       (setf evidence (list end xmin (physical-store-prefix-timeline candidate end))))))
+                  (t
+                   (setf *wal-recovery-reservation-batch-clean-p* nil)
+                   (when (or (= type +wal-record-end-of-recovery+) (= type +wal-record-clog-reset+))
+                     (setf evidence nil))))))))
+         evidence)))))
+
+(defun physical-slot-standby-logical-advance-p (slot frontier)
+  (and slot *physical-receive-store*
+       (wal-logical-slot-p slot)
+       (equal "pgoutput" (wal-replication-slot-plugin slot))
+       (null (wal-replication-slot-child-owner slot))
+       (wal-replication-slot-logical-provenance slot)
+       (eq :reserved (wal-replication-slot-wal-status slot))
+       (wal-replication-slot-confirmed-flush-lsn slot)
+       (logical-slot-standby-policy-covers-p
+        slot (getf *physical-recovery-state* :source-logical-fact) frontier)))
+
+(defun physical-slot-prepare-retained-catalog-evidence (name target)
+  "Capture a standby slot and replay position before reading retained WAL."
+  (multiple-value-bind (slot store replay)
+      (sb-thread:with-mutex (*wal-lock*)
+        (let* ((slot (wal-find-usable-replication-slot-under-lock name))
+               (store *physical-receive-store*)
+               (replay *last-replay-lsn*)
+               (confirmed (and slot (wal-replication-slot-confirmed-flush-lsn slot))))
+          (when (and (recovery-in-progress-p)
+                     (physical-slot-standby-logical-advance-p slot replay)
+                     (null (wal-replication-slot-active-owner slot))
+                     (<= confirmed (min target replay))
+                     (null (physical-replay-catalog-evidence-at (min target replay))))
+            (values slot store replay))))
+    (when slot
+      (let ((evidence (physical-slot-retained-catalog-evidence store replay (min target replay))))
+        (when evidence
+          (list slot store evidence))))))
+
+(defun wal-advance-standby-logical-slot-under-lock (slot target frontier &optional retained)
   "Save a pgoutput filter position without releasing its proven restart anchor."
   (assert (sb-thread:holding-mutex-p *wal-lock*))
   (let ((confirmed (wal-replication-slot-confirmed-flush-lsn slot))
         (name (wal-replication-slot-name slot)))
-    (unless (and *physical-receive-store*
-                 (equal "pgoutput" (wal-replication-slot-plugin slot))
-                 (null (wal-replication-slot-child-owner slot))
-                 (wal-replication-slot-logical-provenance slot)
-                 (eq :reserved (wal-replication-slot-wal-status slot))
-                 confirmed
-                 (logical-slot-standby-policy-covers-p
-                  slot (getf *physical-recovery-state* :source-logical-fact) frontier))
+    (unless (physical-slot-standby-logical-advance-p slot frontier)
       (ereport "55000" "logical slot ~s cannot advance in standby recovery" name))
     (when (wal-replication-slot-active-owner slot)
       (ereport "55006" "replication slot ~s is active" name))
     (when (< target confirmed)
       (ereport "55000" "cannot advance replication slot ~s backwards" name))
-    (when (> target confirmed)
+    (destructuring-bind (&optional end xmin timeline)
+        (or (physical-replay-catalog-evidence-at target)
+            (and (eq slot (first retained)) (eq *physical-receive-store* (second retained))
+                 (third retained)))
       (let ((candidate (wal-copy-replication-slot-with-profile slot)))
-        (setf (wal-replication-slot-confirmed-flush-lsn candidate) target
-              (wal-replication-slot-confirmed-timeline candidate)
-              (physical-slot-current-prefix-timeline target))
-        (logical-slot-save-update-under-lock slot candidate)))
+        (when (and end (eql timeline (physical-slot-current-prefix-timeline end)))
+          (logical-slot-apply-catalog-evidence candidate target (cons end xmin)))
+        (when (> target confirmed)
+          (setf (wal-replication-slot-confirmed-flush-lsn candidate) target
+                (wal-replication-slot-confirmed-timeline candidate)
+                (physical-slot-current-prefix-timeline target)))
+        (when (or (> target confirmed)
+                  (not (eql (wal-replication-slot-catalog-xmin slot)
+                            (wal-replication-slot-catalog-xmin candidate))))
+          (logical-slot-save-update-under-lock slot candidate))))
     target))
 
 (defun wal-advance-physical-replication-slot (name target &key allow-standby-logical)
@@ -546,38 +620,40 @@ interior position on a standby."
   (when (recovery-in-progress-p)
     (physical-slot-check-live-admission)
     (check-physical-recovery-work))
-  (sb-sys:without-interrupts
-    (sb-thread:with-mutex (*wal-lock*)
-      (wal-check-healthy)
-      (let* ((frontier (if (recovery-in-progress-p) *last-replay-lsn* *wal-durable-lsn*))
-             (target (min target frontier))
-             (slot (wal-find-usable-replication-slot-under-lock name)))
-        (unless slot (ereport "42704" "replication slot ~s does not exist" name))
+  (let ((retained (when allow-standby-logical
+                    (physical-slot-prepare-retained-catalog-evidence name target))))
+    (sb-sys:without-interrupts
+      (sb-thread:with-mutex (*wal-lock*)
+        (wal-check-healthy)
+        (let* ((frontier (if (recovery-in-progress-p) *last-replay-lsn* *wal-durable-lsn*))
+               (target (min target frontier))
+               (slot (wal-find-usable-replication-slot-under-lock name)))
+          (unless slot (ereport "42704" "replication slot ~s does not exist" name))
 
-        (unless (wal-physical-slot-p slot)
-          (progn
-            (when (and allow-standby-logical (recovery-in-progress-p))
-              (return-from wal-advance-physical-replication-slot
-                (wal-advance-standby-logical-slot-under-lock slot target frontier)))
-            (ereport "0A000" "logical slot SQL advancement is not supported")))
-        (when (and (wal-replication-slot-active-owner slot)
-                   (not (physical-slot-owned-by-backend-p slot *backend*)))
-          (ereport "55006" "replication slot ~s is active" name))
-        (unless (and (eq :reserved (wal-replication-slot-wal-status slot))
-                     (wal-replication-slot-restart-lsn slot))
-          (ereport "55000" "replication slot ~s has never reserved WAL or is invalidated" name))
-        (when (< target (wal-replication-slot-restart-lsn slot))
-          (ereport "55000" "cannot advance replication slot ~s backwards" name))
-        (when (> target (wal-replication-slot-restart-lsn slot))
-          (let ((candidate (wal-copy-replication-slot-with-profile slot))
-                (timeline (physical-slot-current-prefix-timeline target)))
-            (setf (wal-replication-slot-restart-lsn candidate) target
-                  (wal-replication-slot-restart-timeline candidate) timeline)
-            (wal-save-replication-slot candidate)
-            (setf (wal-replication-slot-restart-lsn slot) target
-                  (wal-replication-slot-restart-timeline slot) timeline)))
-        (setf (wal-replication-slot-inactive-since slot) (postgres-current-timestamp))
-        target))))
+          (unless (wal-physical-slot-p slot)
+            (progn
+              (when (and allow-standby-logical (recovery-in-progress-p))
+                (return-from wal-advance-physical-replication-slot
+                  (wal-advance-standby-logical-slot-under-lock slot target frontier retained)))
+              (ereport "0A000" "logical slot SQL advancement is not supported")))
+          (when (and (wal-replication-slot-active-owner slot)
+                     (not (physical-slot-owned-by-backend-p slot *backend*)))
+            (ereport "55006" "replication slot ~s is active" name))
+          (unless (and (eq :reserved (wal-replication-slot-wal-status slot))
+                       (wal-replication-slot-restart-lsn slot))
+            (ereport "55000" "replication slot ~s has never reserved WAL or is invalidated" name))
+          (when (< target (wal-replication-slot-restart-lsn slot))
+            (ereport "55000" "cannot advance replication slot ~s backwards" name))
+          (when (> target (wal-replication-slot-restart-lsn slot))
+            (let ((candidate (wal-copy-replication-slot-with-profile slot))
+                  (timeline (physical-slot-current-prefix-timeline target)))
+              (setf (wal-replication-slot-restart-lsn candidate) target
+                    (wal-replication-slot-restart-timeline candidate) timeline)
+              (wal-save-replication-slot candidate)
+              (setf (wal-replication-slot-restart-lsn slot) target
+                    (wal-replication-slot-restart-timeline slot) timeline)))
+          (setf (wal-replication-slot-inactive-since slot) (postgres-current-timestamp))
+          target)))))
 
 (defun physical-slot-retained-for-cold-cleanup-p (slot)
   (let ((capability (wal-replication-slot-temporary-lifetime slot)))

@@ -201,6 +201,12 @@ NIL state stays unknown until an anchor. Inferred XIDs may already have aborted.
     (error "invalid native running transaction record"))
   (wal-decode-running-xacts (wal-record-payload record)))
 
+(defun running-xacts-catalog-xmin (snapshot)
+  "Return the conservative catalog horizon from a validated complete snapshot."
+  (when (getf snapshot :complete)
+    (let ((xmin (or (first (getf snapshot :running)) (getf snapshot :next-xid))))
+      (when (running-xacts-normal-xid-p xmin) xmin))))
+
 ;;; The caller holds the WAL lock.  As in LogStandbySnapshot, keep the XID
 ;;; lock from capturing the actual next XID and active set through appending
 ;;; the batch marker and metadata.  Release it before the normal row batch;

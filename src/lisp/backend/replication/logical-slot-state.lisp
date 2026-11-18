@@ -174,8 +174,8 @@ Live updates still require the exact provenance object under the WAL lock."
   "Check CANDIDATE against the exact live registry SLOT under the WAL lock.
 Require the same provenance object, child owner, identity fields and
 transport profile.
-Confirmed progress cannot move backward. Once a terminal cause is set, its
-cause and durable progress positions cannot change."
+Confirmed progress and the full catalog XID cannot move backward. Once a
+terminal cause is set, its cause and durable progress cannot change."
   (assert (sb-thread:holding-mutex-p *wal-lock*))
   (wal-require-logical-slot slot)
   (wal-require-logical-slot candidate)
@@ -191,10 +191,16 @@ cause and durable progress positions cannot change."
   (let ((cause (logical-slot-effective-invalidation-cause slot))
         (next (logical-slot-effective-invalidation-cause candidate))
         (confirmed (wal-replication-slot-confirmed-flush-lsn slot))
-        (next-confirmed (wal-replication-slot-confirmed-flush-lsn candidate)))
+        (next-confirmed (wal-replication-slot-confirmed-flush-lsn candidate))
+        (catalog (wal-replication-slot-catalog-xmin slot))
+        (next-catalog (wal-replication-slot-catalog-xmin candidate)))
     (unless (and (or (eq cause :none) (eq cause next))
                  (or (null confirmed)
                      (and next-confirmed (<= confirmed next-confirmed)))
+                 (or (null catalog)
+                     (and next-catalog (<= catalog next-catalog)))
+                 (or (and (eq cause :none) (eq next :none))
+                     (eql catalog next-catalog))
                  (or (eq cause :none)
                      (and (eql confirmed next-confirmed)
                           (eql (wal-replication-slot-restart-lsn slot)
@@ -205,6 +211,18 @@ cause and durable progress positions cannot change."
                                (wal-replication-slot-confirmed-timeline candidate)))))
       (error "logical slot update changes terminal cause or moves acknowledged progress backwards")))
   (values))
+
+(defun logical-slot-apply-catalog-evidence (candidate position evidence)
+  "Raise CANDIDATE's full catalog XID using a validated WAL snapshot.
+EVIDENCE is its terminal LSN and oldest running full XID. Callers certify
+the WAL lineage and bound POSITION by acknowledged or applied WAL."
+  (when (and evidence
+             (wal-replication-slot-logical-provenance candidate)
+             (< (wal-replication-slot-consistent-lsn candidate) (car evidence))
+             (<= (car evidence) position)
+             (running-xacts-normal-xid-p (cdr evidence))
+             (> (cdr evidence) (or (wal-replication-slot-catalog-xmin candidate) 0)))
+    (setf (wal-replication-slot-catalog-xmin candidate) (cdr evidence))))
 
 (defun logical-slot-save-update-under-lock (slot candidate)
   "Save CANDIDATE and publish its fixed fields to SLOT under the WAL lock.
@@ -229,6 +247,8 @@ is required before acknowledgment, saving or scanning can resume."
                    (wal-replication-slot-restart-timeline candidate)
                    (wal-replication-slot-pending-xids slot)
                    (wal-replication-slot-pending-xids candidate)
+                   (wal-replication-slot-catalog-xmin slot)
+                   (wal-replication-slot-catalog-xmin candidate)
                    (wal-replication-slot-invalidation-cause slot)
                    (wal-replication-slot-invalidation-cause candidate)
                    (wal-replication-slot-wal-status slot)

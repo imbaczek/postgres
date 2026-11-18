@@ -28,6 +28,41 @@
                                        :seed 4017))))
       (ok (eq :passed (getf data :status)) (format nil "~s" data))))
 
+(deftest standby-catalog-evidence-is-bounded-by-the-requested-prefix
+    (let* ((pg::*physical-recovery-state* (list :replay-timeline 2))
+           (next (+ (ash 1 32) 5))
+           (old (source-xids-record pg::+wal-record-running-xacts+ 100
+                                    (pg::wal-encode-running-xacts next (list #xfffffffe) t)))
+           (gap (source-xids-record pg::+wal-record-running-xacts+ (pg::wal-record-end old)
+                                    (pg::wal-encode-running-xacts next nil nil)))
+           (new (source-xids-record pg::+wal-record-running-xacts+ (pg::wal-record-end gap)
+                                    (pg::wal-encode-running-xacts next nil t))))
+      (sb-thread:with-mutex (pg::*xid-lock*)
+        (dolist (record (list old gap new))
+          (pg::physical-replay-note-catalog-evidence record)))
+      (ok (null (pg::physical-replay-catalog-evidence-at (1- (pg::wal-record-end old)))))
+      (ok (equal (list (pg::wal-record-end old) #xfffffffe 2)
+                 (pg::physical-replay-catalog-evidence-at (pg::wal-record-end gap))))
+      (ok (equal (list (pg::wal-record-end new) next 2)
+                 (pg::physical-replay-catalog-evidence-at (pg::wal-record-end new))))
+      (sb-thread:with-mutex (pg::*xid-lock*)
+        (pg::physical-replay-note-catalog-evidence
+         (source-xids-record pg::+wal-record-clog-reset+ (pg::wal-record-end new) (empty-octets))))
+      (ok (null (pg::physical-replay-catalog-evidence-at (pg::wal-record-end new))))
+      (let ((first-end nil) (second-end nil) (last-end nil))
+        (sb-thread:with-mutex (pg::*xid-lock*)
+          (loop with start = 100
+                for xmin from 10 to (+ 10 pg::+physical-replay-catalog-evidence-limit+)
+                for record = (source-xids-record pg::+wal-record-running-xacts+ start
+                                                 (pg::wal-encode-running-xacts xmin nil t))
+                do (setf start (pg::wal-record-end record) last-end start)
+                   (case xmin (10 (setf first-end start)) (11 (setf second-end start)))
+                   (pg::physical-replay-note-catalog-evidence record)))
+        (ok (null (pg::physical-replay-catalog-evidence-at first-end)))
+        (ok (equal (list second-end 11 2) (pg::physical-replay-catalog-evidence-at second-end)))
+        (ok (equal (list last-end (+ 10 pg::+physical-replay-catalog-evidence-limit+) 2)
+                   (pg::physical-replay-catalog-evidence-at last-end))))))
+
 (deftest source-anchors-preserve-ordered-commit-exclusions
     (let* ((first (source-xids-record pg::+wal-record-running-xacts+ 100
                                       (pg::wal-encode-running-xacts 8 '(5 7) t)))

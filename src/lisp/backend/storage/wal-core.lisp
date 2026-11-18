@@ -3837,16 +3837,19 @@ durability before saving the slot."
               (wal-slot-restart-for-ack restart-floor pending)))
     candidate))
 
+(declaim (ftype function logical-slot-apply-catalog-evidence))
+
 (defun wal-persist-replication-slot-ack-under-lock (slot acknowledged-lsn
-                                                    &optional (restart-floor acknowledged-lsn))
+                                                    &optional (restart-floor acknowledged-lsn) catalog-evidence)
   "Persist an already-validated acknowledgment while *WAL-LOCK* is held.
 Known provenance selects timeline owners from primary history; slots with
 unknown provenance retain the LSN-only path. The guarded update saves before publishing progress
 to the live slot. Startup and scan admission also check history, since no-op
 acknowledgments and resume paths can return before this helper."
   (wal-check-slot-ack-publication-under-lock slot)
-  (logical-slot-save-update-under-lock
-   slot (wal-replication-slot-ack-candidate-under-lock slot acknowledged-lsn restart-floor)))
+  (let ((candidate (wal-replication-slot-ack-candidate-under-lock slot acknowledged-lsn restart-floor)))
+    (logical-slot-apply-catalog-evidence candidate acknowledged-lsn catalog-evidence)
+    (logical-slot-save-update-under-lock slot candidate)))
 
 (declaim (ftype function call-with-logical-slot-terminal-check))
 

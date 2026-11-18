@@ -335,7 +335,10 @@ def acknowledge_logical_commits(port, expected_ids, *, interior=False):
                     position_sql = ("SELECT pg_wal_lsn_diff(confirmed_flush_lsn, '0/0')::bigint "
                                     "FROM pg_replication_slots "
                                     "WHERE slot_name = 'live_copy'")
-                    wait_for(lambda: query(port, position_sql) == [(position,)], seconds=10)
+                    try:
+                        wait_for(lambda: query(port, position_sql) == [(position,)], seconds=10)
+                    except AssertionError as error:
+                        raise AssertionError((position, query(port, position_sql))) from error
                     return position
             raise AssertionError('logical stream did not send the expected commit')
     finally:
@@ -390,29 +393,47 @@ def check_stock_logical_copy(node, member, source, root, target_data, ports, *, 
     assert 'live_copy' not in handler._logical_slots_processing_queue
     print('patroni-follow: stock readiness accepts the copied slot PASS', flush=True)
 
-    advanced = acknowledge_logical_commits(source_port, [3])
+    query(source_port, 'INSERT INTO follow_items VALUES (6)')
+    advanced = acknowledge_logical_commits(source_port, [3, 6])
     assert advanced > confirmed
+    newer_catalog = query(source_port, slot_query)
+    assert int(newer_catalog[0][0]) > int(expected[0][0])
+    assert query(target_port, slot_query) == expected
+    assert query(source_port, physical_query) == expected
+    query(source_port, 'INSERT INTO follow_items VALUES (7)')
+    wait_for(lambda: query(target_port, 'SELECT id FROM follow_items WHERE id = 7') == [(7,)])
     node.reset_cluster_info_state(None)
-    assert node.replay_lsn() >= advanced
+    assert node.replay_lsn() > advanced
+    if before_base:
+        query(target_port, 'CHECKPOINT')
+        receive = (target_data / 'pg_physical_receive/receive.control').read_bytes()
+        floor = int.from_bytes(receive[48:56], 'little')
+        assert floor > advanced, (floor, advanced)
+        control(node.is_running(), root / 'target.sock',
+                '(sb-thread:with-mutex (*xid-lock*) '
+                '(assert (remf *physical-recovery-state* :catalog-evidence)))')
     handler._advance = SlotsAdvanceThread(handler)
     assert not handler._ensure_logical_slots_replica({'live_copy': {**definition, 'lsn': advanced}})
     confirmed_query = ("SELECT pg_wal_lsn_diff(confirmed_flush_lsn, '0/0')::bigint "
                        "FROM pg_replication_slots WHERE slot_name = 'live_copy'")
     wait_for(lambda: query(target_port, confirmed_query) == [(advanced,)], seconds=15)
-    query(source_port, 'INSERT INTO follow_items VALUES (6)')
-    wait_for(lambda: query(target_port, 'SELECT id FROM follow_items WHERE id = 6') == [(6,)])
+    assert query(target_port, slot_query) == newer_catalog
+    wait_for(lambda: query(source_port, physical_query) == newer_catalog, seconds=15)
     print('patroni-follow: stock logical-slot worker advances the standby copy PASS', flush=True)
     source.send_signal(signal.SIGINT)
     assert source.wait(timeout=45) == 0
     assert node.promote(30, CriticalTask()) is True
     assert query(target_port, 'SELECT pg_is_in_recovery()') == [(False,)]
-    assert query(target_port, slot_query) == expected
+    assert query(target_port, slot_query) == newer_catalog
     query(target_port, 'INSERT INTO follow_items VALUES (4)')
     print('patroni-follow: promotion preserves the copied logical slot PASS', flush=True)
-    acknowledged = acknowledge_logical_commits(target_port, [6, 4])
+    acknowledged = acknowledge_logical_commits(target_port, [7, 4])
     assert acknowledged > advanced
+    catalog_after_ack = query(target_port, slot_query)
+    assert int(catalog_after_ack[0][0]) > int(newer_catalog[0][0])
     assert node.restart(timeout=30) is True
     assert query(target_port, 'SELECT pg_is_in_recovery()') == [(False,)]
+    assert query(target_port, slot_query) == catalog_after_ack
     query(target_port, 'INSERT INTO follow_items VALUES (5)')
     assert acknowledge_logical_commits(target_port, [5]) > acknowledged
     print('patroni-follow: logical consumer crosses the fork and resumes after restart PASS', flush=True)

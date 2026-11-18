@@ -60,7 +60,8 @@
            (ok (= *standard-slot-test-restart* (pg::wal-replication-slot-restart-lsn slot))
                "the pre-boundary active XID still pins its earlier WAL")
            (clrhash (pg::wal-replication-slot-pending-xids slot))
-           (pg::standard-note-frontier state second)
+           (pg::standard-note-frontier state second (list (cons second 43) (cons flush 42)))
+           (ok (not (eql 42 (pg::wal-replication-slot-catalog-xmin slot))))
            (pg::standard-acknowledge-flush state)
            (ok (= flush (pg::wal-replication-slot-confirmed-flush-lsn slot)))
            (ok (= first (pg::wal-replication-slot-restart-lsn slot))
@@ -68,10 +69,13 @@
            (let ((decoded (pg::wal-read-replication-slot
                            (pg::wal-replication-slot-path "native_slot"))))
              (ok (= flush (pg::wal-replication-slot-confirmed-flush-lsn decoded)))
-             (ok (= first (pg::wal-replication-slot-restart-lsn decoded))))
+             (ok (= first (pg::wal-replication-slot-restart-lsn decoded)))
+             (ok (= 42 (pg::wal-replication-slot-catalog-xmin decoded)))
+             (ok (= 42 (pg::wal-replication-slot-catalog-xmin slot))))
            (pg::standard-accept-feedback state (standard-test-feedback 0 0 0))
            (ok (= flush (pg::wal-replication-slot-confirmed-flush-lsn slot)))
-           (ok (equal (list second) (pg::standard-stream-pending-boundaries state)))
+           (ok (equal (list (list second (cons second 43) (cons flush 42)))
+                      (pg::standard-stream-pending-boundaries state)))
            (ok (equal "22023"
                       (sqlstate-of
                        (pg::standard-accept-feedback
