@@ -203,7 +203,7 @@ def start_follower(connection, server, name, cleanup):
     data = root / 'data'
     data.mkdir(parents=True, mode=0o700)
     scalar(connection, f"SELECT pg_create_physical_replication_slot('{name}',true)")
-    server.control(f'(physical-base-backup "{data}/" "monitor_{name}")')
+    server.control(f'(physical-base-backup "{data}/" "monitor_{name}")', timeout=45)
     (data / 'postgresql.conf').write_text('# Native base managed by Patroni.\n')
     with socket.socket() as reservation:
         reservation.bind(('127.0.0.1', 0))
@@ -310,6 +310,12 @@ def check(native, reference, server):
         with connection.cursor() as cursor:
             cursor.execute('SELECT pg_catalog.pg_last_xact_replay_timestamp()')
             assert cursor.description[0].type_code == 1184 and cursor.fetchone() == (None,)
+            cursor.execute("""
+                SELECT usesysid, (SELECT rolname FROM pg_catalog.pg_authid WHERE oid = usesysid)
+                FROM pg_catalog.pg_stat_get_activity(pg_backend_pid())
+            """)
+            assert [column.type_code for column in cursor.description] == [26, 19]
+            assert cursor.fetchall() == [(10, 'postgres')]
     check_one(reference, 'C')
     check_one(native, 'native')
     check_streaming(reference, 'C')

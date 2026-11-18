@@ -4634,7 +4634,7 @@ the full 64-bit ID as a signed value."
      (backend-database *backend*))
     ((string= name "current_schema") (current-schema-name))
     ((member name '("current_user" "session_user" "user") :test #'string=)
-     "postgres")
+     (current-user-name))
     ((string= name "current_catalog")
      (backend-database *backend*))
     ((string= name "pg_backend_pid")

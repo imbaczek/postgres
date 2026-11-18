@@ -223,7 +223,13 @@
     ("flush_lag" :interval) ("replay_lag" :interval) ("sync_priority" :int4)
     ("sync_state" :text) ("reply_time" :timestamptz)))
 
-(defparameter +activity-result-fields+ '(("pid" :int4) ("application_name" :text)))
+(defconstant +bootstrap-role-oid+ 10)
+
+(defun sql-authid-rows ()
+  "Expose the SQL identity of the bootstrap role in catalog column order."
+  (list (vector +bootstrap-role-oid+ (current-user-name))))
+
+(defparameter +activity-result-fields+ '(("pid" :int4) ("usesysid" :oid) ("application_name" :text)))
 
 (defun sql-wal-sender-row (snapshot)
   "Convert a detached sender snapshot to C's twelve-column status record.
@@ -249,14 +255,17 @@ Report its captured priority and synchronous state; unknown positions and lag ar
                                (mapcar #'sql-wal-sender-row (wal-sender-snapshots))))
 
 (defun make-activity-result-iterator (pid)
-  "Return PID and application name for the selected backend, or all for SQL NULL.
-This subset has no ordinary-role statistics visibility filtering."
+  "Snapshot activity for the selected backend, or all for SQL NULL.
+A provisional connection has no SQL role until startup admission succeeds."
   (make-status-record-iterator
    +activity-result-fields+
-   (loop for backend in (list-backends)
-         when (or (eq pid +null+) (= pid (backend-pid backend)))
-           collect (vector (backend-pid backend)
-                           (copy-seq (or (backend-application-name backend) ""))))))
+   (sb-thread:with-mutex (*backend-registry-lock*)
+     (loop for backend being the hash-values of *backend-registry*
+           when (or (eq pid +null+) (= pid (backend-pid backend)))
+             collect (vector (backend-pid backend)
+                             (if (gethash backend *backend-admission-classes*)
+                                 +bootstrap-role-oid+ +null+)
+                             (copy-seq (or (backend-application-name backend) "")))))))
 
 (defparameter +wal-receiver-result-fields+
   '(("pid" :int4) ("status" :text) ("receive_start_lsn" :pg-lsn)
@@ -495,6 +504,8 @@ synchronous_commit. Reject unsupported parameters and other local settings."
   (list
    (list :oid 12109 :name "pg_settings" :kind #\v
          :rows 'startup-settings-rows :fields +sql-settings-fields+)
+   (list :oid 1260 :name "pg_authid" :kind #\r :rows 'sql-authid-rows
+         :fields '(("oid" :oid t 1) ("rolname" :name t 2)))
    (list :oid 1262 :name "pg_database" :kind #\r :rows 'sql-database-rows
          :fields '(("oid" :oid t 1) ("datname" :name t 2)))
    (list :oid 1259 :name "pg_class" :kind #\r :rows 'sql-class-rows
@@ -814,8 +825,7 @@ Capture policy and keep size once for every row in the snapshot."
             collect (vector
                      (or (pg-publication-oid publication) +null+)
                      (pg-publication-name publication)
-                     ;; The implemented role model has one owner, bootstrap superuser 10.
-                     10
+                     +bootstrap-role-oid+
                      (not (null (pg-publication-all-tables-p publication)))
                      (eq (pg-publication-sequences publication) :all)
                      (not (null (member :insert actions)))

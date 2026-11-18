@@ -220,7 +220,7 @@ SQL role authorization remains separate and currently uses the postgres role."
           (send-parameter-status stream "standard_conforming_strings" "on")
           (send-parameter-status stream "IntervalStyle" "postgres")
           (send-parameter-status stream "is_superuser" "on")
-          (send-parameter-status stream "session_authorization" "postgres")
+          (send-parameter-status stream "session_authorization" (current-user-name))
           (session-report-parameter stream "application_name" (sql-setting-value "application_name"))
           (send-parameter-status stream "default_transaction_read_only" "off")
           (report-hot-standby-status stream t)
