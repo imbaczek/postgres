@@ -185,6 +185,22 @@ class ResourceControlTests(unittest.TestCase):
                         with self.assertRaises(AssertionError):
                             DECODE_CHECKPOINT(bad)
 
+    def test_checkpoint_logical_on_interval_after_commit_timestamps(self):
+        data = bytearray(112)
+        data[:8] = b"PGCKPT02"
+        struct.pack_into("<6QqIIQII", data, 8, 64, 208, 64,
+                         50, 1002, 10000, 1793030000, 2, 1, 3, 1, 228)
+        struct.pack_into("<QI", data, 96, 48, 1)
+        facts = DECODE_CHECKPOINT(data)
+        self.assertIs(True, facts["logical_decoding_enabled"])
+        self.assertEqual((48, 1), (facts["logical_on_start_lsn"], facts["logical_on_start_timeline"]))
+        self.assertEqual(0, facts["oldest_commit_ts_xid"])
+        for offset, value in ((84, 164), (88, 1), (96, 32), (104, 3), (108, 1)):
+            bad = data.copy()
+            bad[offset] = value
+            with self.assertRaises(AssertionError):
+                DECODE_CHECKPOINT(bad)
+
     def test_checkpoint_full_page_writes_preserves_false_in_control_copy(self):
         for policy, flags in ((None, 0), (False, 8), (True, 24)):
             with self.subTest(policy=policy):
@@ -199,7 +215,7 @@ class ResourceControlTests(unittest.TestCase):
                 self.assertEqual(policy is not None, "full_page_writes" in facts)
                 if policy is not None:
                     self.assertIs(policy, facts["full_page_writes"])
-                for illegal in (16, 20, 32):
+                for illegal in (16, 20, 64, 128):
                     bad = snapshot.copy()
                     struct.pack_into("<I", bad, 84, illegal)
                     with self.assertRaises(AssertionError):

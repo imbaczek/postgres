@@ -11,31 +11,41 @@ def resource_values(data):
     return values
 
 
-def checkpoint_commit_ts_fact(data):
-    assert len(data) in (88, 96, 136, 144)
+def checkpoint_layout(data):
+    assert len(data) >= 88
     assert data[:8] in (b"PGCKPT01", b"PGCKPT02")
     flags = int.from_bytes(data[84:88], "little")
-    known = bool(flags & 4)
-    assert flags <= 31 and known == (len(data) in (96, 144))
+    resource_end = len(data) - (8 if flags & 4 else 0) - (16 if flags & 128 else 0)
+    assert resource_end in (88, 136) and flags <= 255
     assert not flags & 16 or flags & 8
+    assert not flags & 64 or flags & 32
     assert data[:8] == b"PGCKPT02" or (len(data) == 88 and flags == 0)
-    if not known:
+    if flags & 4:
+        assert not any(data[resource_end:resource_end + 8])
+    if flags & 128:
+        assert flags & 96 == 96 and not any(data[-4:])
+        lsn = int.from_bytes(data[-16:-8], "little")
+        timeline = int.from_bytes(data[-8:-4], "little")
+        assert 33 <= lsn <= int.from_bytes(data[8:16], "little")
+        assert 1 <= timeline <= int.from_bytes(data[64:68], "little")
+    return flags, resource_end
+
+
+def checkpoint_commit_ts_fact(data):
+    flags, _ = checkpoint_layout(data)
+    if not flags & 4:
         return None
-    pair = tuple(int.from_bytes(data[index:index + 4], "little")
-                 for index in range(len(data) - 8, len(data), 4))
-    assert pair == (0, 0)
-    return pair
+    return (0, 0)
 
 
 def checkpoint_full_page_writes_fact(data):
-    checkpoint_commit_ts_fact(data)
-    flags = int.from_bytes(data[84:88], "little")
+    flags, _ = checkpoint_layout(data)
     return bool(flags & 16) if flags & 8 else None
 
 
 def checkpoint_resource_fact(data):
-    checkpoint_commit_ts_fact(data)
-    if len(data) in (88, 96):
+    _, resource_end = checkpoint_layout(data)
+    if resource_end == 88:
         return None
     assert data[:8] == b"PGCKPT02" and not any(data[132:136])
     values = resource_values(data[88:120])
@@ -64,7 +74,7 @@ def source_fpw_fact(data, applied, applied_timeline):
     assert 1 <= fact["coverage_timeline"] <= fact["witness_timeline"] <= fact["through_timeline"]
     assert (fact["through"], fact["through_timeline"]) == (applied, applied_timeline)
     assert start // (16 * 1024 * 1024) == (end - 1) // (16 * 1024 * 1024)
-    assert (end - start - 32 in (88, 96, 136, 144)) if checkpoint else (end - start == 48)
+    assert (end - start - 32 in (88, 96, 104, 112, 136, 144, 152, 160)) if checkpoint else (end - start == 48)
     if disabled:
         position, timeline = fact["last_disable_start"], fact["last_disable_timeline"]
         assert fact["coverage_start"] <= position <= start
