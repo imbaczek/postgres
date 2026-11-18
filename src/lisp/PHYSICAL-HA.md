@@ -233,6 +233,17 @@ Strict compilation and two focused heads took 66.13 s. Runtime integration
 still needs to stage complete durable receive segments while replay is paused
 and retain them through compaction and restart until archive completion.
 
+The receive-store reader now checks the durable spool under store ownership.
+It assembles the requested segment through the flush frontier, using a
+verified retained prefix when the receive floor falls inside the segment.
+For an interior base it uses a checked indexed overlap first and reads the
+manifest-bound base file only when needed. The reader requires durable
+rotation on the same timeline for a short segment. The disk-spool fixture
+rejects an unflushed successor and reads the closed segment after reopen.
+The worker still needs to stage these bytes durably and invoke the command
+outside the receive-store mutex. Strict compilation and three focused test
+heads took 67.67 s.
+
 The recycle path must preserve archive-eligible files until durable success
 is recorded. Reconstruct pending work after restart from durable WAL and status,
 including loss of a notification after the segment became durable. Run the
