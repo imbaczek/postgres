@@ -83,7 +83,7 @@ Two recovery areas still need work.
    the real shell and receiver loop with a simulated streaming handshake. The
    existing live Patroni follow regression
    without a restore command passed in 79.70 s on the ramdisk. Archive timeline
-   history and partial recovery, `%r`, startup cleanup of crash stages, and
+   history and partial recovery, startup cleanup of crash stages, and
    enabling `restore_command` live when no receiver exists remain open. Startup
    from an archive without a prior native receive state still needs qualification.
    Offline rewind has a separate restore path. Archive producer work still needs
@@ -122,6 +122,17 @@ The shell archiver expands `%f` to the filename, `%p` to the input path, and
 `%%` to a literal percent. The administrator supplies shell quoting. Native
 offline rewind uses the same three escapes for its restore command, with
 `%p` naming an output path.
+
+Online standby restore expands `%r` to the WAL filename that contains the
+durable receive floor, using the requested native namespace. The segment and
+its proof use the same cutoff. The live archive-to-stream test checked the
+first legacy proof request and its cutoff and passed in 51.47 s on the ramdisk.
+Three focused tests passed, including a compacted descendant floor.
+
+C describes `%r` as the oldest WAL file needed for restart
+(`src/backend/access/transam/xlogarchive.c:141`). Native filename suffixes,
+legacy names, and proof files differ, so archive cleanup tools must understand
+those names. History and partial recovery and archive cleanup remain open.
 
 Native WAL can rotate early when the next record will not fit. The closed
 segment can be shorter than 16 MiB. Rotation syncs the old stream and its
