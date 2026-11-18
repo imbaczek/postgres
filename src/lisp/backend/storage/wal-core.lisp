@@ -713,6 +713,17 @@ The setting supplies shell quoting. Expand each replacement exactly once."
                   (#\p (write-string path command))
                   (otherwise (error "unsupported ~a placeholder" setting))))))))
 
+(defun wal-run-restore-command (template name directory-fd &key directory (setting "restore_command"))
+  "Run a restore command with an absolute output path through the held descriptor.
+Return the shell exit status so the caller can recheck ownership before using it."
+  (let* ((output (format nil "/proc/~d/fd/~d/~a" (sb-posix:getpid) directory-fd name))
+         (command (wal-shell-file-command template name output setting)))
+    (multiple-value-bind (out err status)
+        (uiop:run-program (list "/bin/sh" "-c" command) :directory directory
+                                                        :output nil :error-output nil :ignore-error-status t)
+      (declare (ignore out err))
+      status)))
+
 (defvar *wal-offline-segment-fallback* nil)
 
 (defun wal-read-segment-path (segment &optional (timeline *wal-insert-timeline*)

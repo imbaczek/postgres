@@ -163,9 +163,6 @@ A reseed owner must hold a stopped target with no PID file."
 (defun physical-rewind-inspect-primary (owner)
   (physical-inspect-clean-primary owner #'physical-rewind-check-reader))
 
-(defun physical-rewind-restore-command (template filename output)
-  (wal-shell-file-command template filename output "rewind restore_command"))
-
 (defun physical-rewind-check-archived-segment (directory-fd filename)
   (let ((facts (physical-image-file-facts directory-fd filename)))
     (unless (and (= sb-posix:s-ifreg (logand (third facts) sb-posix:s-ifmt))
@@ -216,27 +213,19 @@ A reseed owner must hold a stopped target with no PID file."
                  (check-directory leaf)
                  (when (query-temp-lstat output)
                    (error "rewind archive output already exists"))
-                 ;; An absolute path through the held cache descriptor lets the
-                 ;; command change directory before writing to %p.
-                 (let ((command (physical-rewind-restore-command
-                                 template name
-                                 (format nil "/proc/~d/fd/~d/~a" (sb-posix:getpid) directory-fd name))))
-                   (multiple-value-bind (out err status)
-                       (uiop:run-program (list "/bin/sh" "-c" command)
-                                         :output nil :error-output nil
-                                         :ignore-error-status t)
-                     (declare (ignore out err))
-                     (physical-rewind-check-reader owner)
-                     (check-directory leaf)
-                     (cond ((zerop status)
-                            (if (query-temp-lstat output)
-                                (progn
-                                  (setf (gethash name cache)
-                                        (physical-rewind-check-archived-segment directory-fd name))
-                                  output)
-                                (setf (gethash name cache) nil)))
-                           ((>= status 126) (error "rewind restore_command could not run"))
-                           (t (setf (gethash name cache) nil))))))))
+                 (let ((status (wal-run-restore-command
+                                template name directory-fd :setting "rewind restore_command")))
+                   (physical-rewind-check-reader owner)
+                   (check-directory leaf)
+                   (cond ((zerop status)
+                          (if (query-temp-lstat output)
+                              (progn
+                                (setf (gethash name cache)
+                                      (physical-rewind-check-archived-segment directory-fd name))
+                                output)
+                              (setf (gethash name cache) nil)))
+                         ((>= status 126) (error "rewind restore_command could not run"))
+                         (t (setf (gethash name cache) nil)))))))
       (unwind-protect
            (let ((*wal-offline-segment-fallback* #'restore))
              (funcall function owner))
